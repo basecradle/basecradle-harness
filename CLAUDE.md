@@ -110,6 +110,8 @@ BaseCradle is built across multiple repositories — the private Rails core, the
 
 **Paste-text always ends with `---`.** Whenever you hand Drawk a block of text to paste into another Claude Code instance — a cross-repo handoff, a kickoff prompt, a convention sync, *anything* — its final line is `---` and nothing else, marking exactly where the pasted text ends and the conversation resumes. Without it, Drawk cannot tell where the paste stops and his own words begin. This is non-negotiable.
 
+**Don't park when you have queued work.** Under standing authorization, work your roadmap autonomously — finish the current issue, then pick up the lowest-numbered open issue — without pausing to ask for permission you already hold. Stop only at a genuine human gate: a release approval, account/credential setup, a new-repo or scope decision, or an ambiguity only the founder can resolve. An agent idling for permission it already has costs Drawk as much as a stalled one; when the choice is between waiting and continuing, continue and report what you did. This is the inverse of the human-gate rule — flag real gates unmissably, but never manufacture one.
+
 ### Repo sovereignty
 
 The ecosystem runs on **constitutional federalism** — see `constitution.md` → "Sovereignty and Governance" for the full principle. The operational consequences for *this* repo:
