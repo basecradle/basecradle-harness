@@ -37,7 +37,8 @@ class MemoryTool(Tool):
     description = (
         "Your long-term memory. Use it to remember facts across the conversation. "
         "action='write' stores value under key; action='read' returns the value for "
-        "key; action='list' returns every key you have stored."
+        "key; action='list' returns every key you have stored. If you are not sure of "
+        "the exact key, use 'list' first — a read that misses tells you the keys you do have."
     )
     parameters = {
         "type": "object",
@@ -87,7 +88,11 @@ class MemoryTool(Tool):
     def _read(self, key: str) -> str:
         store = self._load()
         if key not in store:
-            return f"No memory stored under {key!r}."
+            # Tell the model the keys it *does* have, so a wrong guess (common when a
+            # fresh agent recalls across a restart) can self-correct on the next call.
+            if store:
+                return f"No memory stored under {key!r}. Stored keys: {', '.join(sorted(store))}."
+            return f"No memory stored under {key!r}. You have no memories yet."
         return store[key]
 
     def _list(self) -> str:
