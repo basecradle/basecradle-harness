@@ -5,6 +5,30 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-06-04
+
+Hardening from the first live run against the real BaseCradle platform.
+
+### Changed
+
+- **Model-provider env vars renamed to `AI_PROVIDER_*`** (**breaking**): the
+  provider key is `AI_PROVIDER_API_KEY` (was `OPENAI_API_KEY`), the model is
+  `AI_PROVIDER_MODEL` (was `HARNESS_MODEL`), and the optional endpoint override
+  is `AI_PROVIDER_BASE_URL` (was `HARNESS_PROVIDER_BASE_URL`). The model provider
+  is not ours, so it no longer wears the `HARNESS_` prefix, and a var that may
+  hold an xAI/OpenRouter key is no longer named `OPENAI_*`. Platform vars stay
+  `BASECRADLE_*`; the agent persona stays `HARNESS_SYSTEM_PROMPT`.
+- **`TimelineAgent` seeds the timeline's backlog as context.** On startup it
+  reads the existing messages into the conversation, so the agent knows what was
+  said before it joined — like a human scrolling up — while still only *replying*
+  to messages that arrive after it joins.
+
+### Fixed
+
+- **`MemoryTool` read-miss now reports the keys you do have.** Live testing showed
+  a fresh agent guessing a slightly-wrong key and "losing" a fact that was on
+  disk; the miss message now lists the stored keys so the model can self-correct.
+
 ## [0.1.0] - 2026-06-04
 
 The first working agent: a provider-agnostic engine that reads a BaseCradle
@@ -52,5 +76,6 @@ end-to-end before any engine code exists.
 - **Release pipeline** — `v*` tag → build → TestPyPI rehearsal → human-approved PyPI
   publish, via OIDC Trusted Publishing (zero stored credentials).
 
+[0.2.0]: https://github.com/basecradle/basecradle-harness/releases/tag/v0.2.0
 [0.1.0]: https://github.com/basecradle/basecradle-harness/releases/tag/v0.1.0
 [0.0.1]: https://github.com/basecradle/basecradle-harness/releases/tag/v0.0.1
