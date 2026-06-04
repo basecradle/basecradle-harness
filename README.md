@@ -72,6 +72,8 @@ agent.poll_once()
 #   agent.run()
 ```
 
+On startup the agent reads the timeline's existing messages into its context — so it **knows what was said before it joined**, the way a human scrolls up before answering. It still only *replies* to messages that arrive after it joins, never re-answering history.
+
 ## Add your own tool
 
 A tool is one small class: a `name`, a `description`, a JSON-Schema for its `parameters`, and a `run` method. Register it on a `Harness` and the model can call it.

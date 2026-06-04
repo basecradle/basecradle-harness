@@ -25,6 +25,7 @@ from basecradle import BaseCradle
 
 from basecradle_harness._harness import Harness
 from basecradle_harness._memory import MemoryTool
+from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
 
 DEFAULT_POLL_INTERVAL = 2.0
@@ -33,9 +34,12 @@ DEFAULT_POLL_INTERVAL = 2.0
 class TimelineAgent:
     """Runs a `Harness` against one BaseCradle timeline by polling it.
 
-    On construction it resolves the timeline and its own identity, and marks the
-    timeline's current newest message as the high-water mark — so it replies only
-    to messages that arrive *after* it joins, never to history.
+    On construction it resolves the timeline and its own identity, reads the
+    timeline as it stands, and does two things with it: marks the newest message
+    as the high-water mark — so it *replies* only to messages that arrive after
+    it joins, never to history — and seeds the agent's context with the backlog,
+    so it *knows* what was said before it joined, the way a human who joins a
+    channel scrolls up before answering.
 
     Args:
         harness: The agent brain + tools.
@@ -52,7 +56,14 @@ class TimelineAgent:
         self.timeline_uuid = timeline
         self.timeline = self.client.timelines.get(timeline)
         self.me_uuid = self.client.me.identity.uuid
-        self._last_seen: str | None = self._newest_message_uuid()
+
+        # One read of the timeline serves both jobs: the newest message becomes
+        # the high-water mark, and the whole backlog (oldest first) is seeded
+        # into the agent's conversation as context.
+        existing = list(self.client.messages.filter(timeline=self.timeline_uuid))  # newest first
+        self._last_seen: str | None = existing[0].content.uuid if existing else None
+        for message in reversed(existing):
+            self.harness.history.append(self._as_turn(message))
 
     @classmethod
     def from_env(cls) -> TimelineAgent:
@@ -74,7 +85,7 @@ class TimelineAgent:
         for message in self._new_messages():
             if message.user.uuid == self.me_uuid:
                 continue  # never reply to ourselves
-            reply = self.harness.send(message.content.body)
+            reply = self.harness.send(self._incoming_text(message))
             if reply.strip():
                 posted.append(self.timeline.messages.create(body=reply))
         return posted
@@ -89,12 +100,24 @@ class TimelineAgent:
                 return
             time.sleep(interval)
 
-    # --- reading new messages, newest-first, up to the high-water mark --------
+    # --- turning timeline messages into conversation turns --------------------
 
-    def _newest_message_uuid(self) -> str | None:
-        for message in self.client.messages.filter(timeline=self.timeline_uuid):
-            return message.content.uuid
-        return None
+    def _incoming_text(self, message: object) -> str:
+        """Another peer's message as the agent hears it: prefixed with who spoke."""
+        return f"{message.user.handle}: {message.content.body}"
+
+    def _as_turn(self, message: object) -> Message:
+        """A historical timeline message as a conversation turn for the engine.
+
+        The agent's own posts become assistant turns; everyone else's become user
+        turns tagged with the speaker, so the model can tell a multi-party
+        conversation apart.
+        """
+        if message.user.uuid == self.me_uuid:
+            return Message.assistant(content=message.content.body)
+        return Message.user(content=self._incoming_text(message))
+
+    # --- reading new messages, newest-first, up to the high-water mark --------
 
     def _new_messages(self) -> list[object]:
         """Messages newer than the high-water mark, in chronological order."""

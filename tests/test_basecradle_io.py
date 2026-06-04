@@ -81,8 +81,10 @@ class CannedProvider:
     def __init__(self, text="Hello, John."):
         self.text = text
         self.prompts: list[str] = []
+        self.last_messages: list = []  # the full context of the most recent call
 
     def chat(self, messages, tools=None):
+        self.last_messages = list(messages)
         self.prompts.append(messages[-1].content)
         return Message.assistant(content=self.text)
 
@@ -126,6 +128,54 @@ def test_construction_resolves_identity_and_high_water_mark(platform):
     assert agent._last_seen == M0
 
 
+def test_construction_seeds_the_backlog_as_context(platform):
+    """Prior timeline messages become conversation turns — the agent knows the history."""
+    wire(
+        platform,
+        message_pages=[
+            page(
+                message(uuid=M2, body="anyone around?"),  # newest first on the wire
+                message(uuid=M1, body="hi all", mine=True),
+                message(uuid=M0, body="welcome"),
+            )
+        ],
+    )
+    agent, _ = build_agent()
+
+    # Seeded oldest-first; others are user turns tagged with the speaker, the
+    # agent's own posts are assistant turns.
+    seeded = [(m.role, m.content) for m in agent.harness.history]
+    assert seeded == [
+        ("user", "john: welcome"),
+        ("assistant", "hi all"),
+        ("user", "john: anyone around?"),
+    ]
+
+
+def test_reply_sees_the_backlog_before_the_new_message(platform):
+    """When the agent answers a new message, the prior context is in front of it."""
+    wire(
+        platform,
+        message_pages=[
+            page(message(uuid=M0, body="we were discussing Ruby")),  # backlog at startup
+            page(
+                message(uuid=M1, body="what did we decide?"),
+                message(uuid=M0, body="we were discussing Ruby"),
+            ),
+        ],
+    )
+    provider = CannedProvider()
+    agent, _ = build_agent(provider)
+
+    agent.poll_once()
+
+    context = [(m.role, m.content) for m in provider.last_messages]
+    assert context == [
+        ("user", "john: we were discussing Ruby"),  # the backlog, seeded
+        ("user", "john: what did we decide?"),  # the new message it is answering
+    ]
+
+
 # --- responding --------------------------------------------------------------
 
 
@@ -143,7 +193,7 @@ def test_responds_to_a_new_message_end_to_end(platform):
     posted = agent.poll_once()
 
     assert len(posted) == 1
-    assert provider.prompts == ["What's the status?"]
+    assert provider.prompts == ["john: What's the status?"]  # tagged with the speaker
     post_route = platform.post(f"/timelines/{TIMELINE_UUID}/messages")
     assert post_route.called
     sent = post_route.calls.last.request
@@ -197,7 +247,7 @@ def test_multiple_new_messages_handled_oldest_first(platform):
     posted = agent.poll_once()
 
     assert len(posted) == 2
-    assert provider.prompts == ["first", "second"]  # chronological
+    assert provider.prompts == ["john: first", "john: second"]  # chronological, speaker-tagged
 
 
 # --- the poll loop -----------------------------------------------------------
