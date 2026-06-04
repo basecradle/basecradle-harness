@@ -108,6 +108,8 @@ When a step needs a human action — a gate only Drawk can clear (registering a 
 
 BaseCradle is built across multiple repositories — the private Rails core, the public SDKs, and future ecosystem repos — each worked on by its own Claude Code sessions. Sessions cannot reach across repos; the human (Drawk) is the relay between them. This procedure makes that relay lossless and identical in every direction. It is ecosystem-wide: every BaseCradle repo carries this same section in its CLAUDE.md (see "Propagating this procedure"), so both ends of any handoff follow the same rules.
 
+**Paste-text always ends with `---`.** Whenever you hand Drawk a block of text to paste into another Claude Code instance — a cross-repo handoff, a kickoff prompt, a convention sync, *anything* — its final line is `---` and nothing else, marking exactly where the pasted text ends and the conversation resumes. Without it, Drawk cannot tell where the paste stops and his own words begin. This is non-negotiable.
+
 ### Repo sovereignty
 
 The ecosystem runs on **constitutional federalism** — see `constitution.md` → "Sovereignty and Governance" for the full principle. The operational consequences for *this* repo:
