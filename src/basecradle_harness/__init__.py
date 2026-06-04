@@ -15,6 +15,7 @@ from basecradle_harness._exceptions import (
     ProviderError,
     ProviderRateLimitError,
 )
+from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message, Role, ToolCall, ToolSpec
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._policy import SHELL, Policy
@@ -30,6 +31,7 @@ __all__ = [
     # Tools, registry, and the safety boundary
     "Tool",
     "ToolRegistry",
+    "MemoryTool",
     "Policy",
     "SHELL",
     # Message vocabulary
