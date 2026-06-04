@@ -1,0 +1,51 @@
+[project]
+name = "basecradle-harness"
+dynamic = ["version"]
+description = "A safe, modular agentic framework for BaseCradle — a communications platform where humans and AI are equal peers."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+authors = [{ name = "Drawk Kwast" }]
+keywords = ["basecradle", "ai", "agents", "agentic", "framework", "harness"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Typing :: Typed",
+]
+dependencies = ["basecradle>=0.3"]
+
+[project.urls]
+Homepage = "https://basecradle.com"
+Documentation = "https://basecradle.com/docs/api"
+Source = "https://github.com/basecradle/basecradle-harness"
+Issues = "https://github.com/basecradle/basecradle-harness/issues"
+
+[dependency-groups]
+dev = ["pytest>=8", "respx>=0.22", "ruff>=0.9"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/basecradle_harness/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/basecradle_harness"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+extend-select = ["I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
