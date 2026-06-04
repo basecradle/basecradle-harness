@@ -16,6 +16,10 @@ class PolicyError(HarnessError):
     """A tool was rejected by the active policy (e.g. it needs a forbidden capability)."""
 
 
+class EngineError(HarnessError):
+    """The agent loop could not produce a final reply (e.g. it hit the step limit)."""
+
+
 class ProviderError(HarnessError):
     """A model provider call failed."""
 
