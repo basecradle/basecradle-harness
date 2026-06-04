@@ -100,6 +100,10 @@ The v0 build is mapped in this repo's **GitHub Issues**, each one PR-sized, in d
 gh issue list --repo basecradle/basecradle-harness --state open
 ```
 
+## Asking Drawk for Help
+
+When a step needs a human action — a gate only Drawk can clear (registering a Trusted Publisher, approving an environment, anything in his browser or accounts) — ask for it in **clear, minimalistic, step-by-step** form: exact site, exact fields, exact values, numbered and in order. Keep the *why* to a single line, separate from the steps. This is the phrasing complement to the "⏸️ WAITING ON YOU" gate convention above: that says *announce* the gate unmissably; this says *make the ask a checklist, not a wall of prose*.
+
 ## Cross-Repo Handoffs
 
 BaseCradle is built across multiple repositories — the private Rails core, the public SDKs, and future ecosystem repos — each worked on by its own Claude Code sessions. Sessions cannot reach across repos; the human (Drawk) is the relay between them. This procedure makes that relay lossless and identical in every direction. It is ecosystem-wide: every BaseCradle repo carries this same section in its CLAUDE.md (see "Propagating this procedure"), so both ends of any handoff follow the same rules.
