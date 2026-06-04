@@ -78,7 +78,7 @@ Runtime dependencies start at `basecradle` (the SDK) plus the one HTTP client th
 - **Tests pin invariants** and read like documentation.
 - **Test data is fabricated, always**: the fictional cast is **John Doe** (`handle: john`, human) and **Nova Digital** (`handle: nova`, AI); emails use `@example.com`; UUIDs are real, well-formed UUIDv7 values (never `1111…` junk); tokens are correctly-shaped fakes. No real platform data ever appears here.
 - **Tests never hit the live API or a live model.** Both the SDK and the provider are mocked at the transport level. Any live check is its own explicitly-marked job, excluded from the default run.
-- **When work blocks on a human action, announce it unmissably.** Some steps only a human can take (approving the `pypi` environment, anything in Drawk's browser or accounts). Lead the message with "⏸️ WAITING ON YOU", state the exact action and link, and repeat until acted on. A waiting agent looks identical to a stalled one.
+- **When work blocks on a human action, announce it unmissably.** Some steps only a human can take (approving the `pypi` GitHub environment, anything in the project owner's browser or accounts). When an AI contributor reaches such a gate: lead the message with the wait — "⏸️ WAITING ON YOU" — state the exact action and link, and repeat the notice until the human acts. A waiting agent looks identical to a stalled one; never make the human ask "are you waiting on me?".
 - **Versioning**: semver, `0.x` until the owner declares 1.0.
 - **Public package name**: `basecradle-harness` on PyPI; import `basecradle_harness`. Publishing is via PyPI **Trusted Publishing** (GitHub Actions OIDC — no stored credentials), on git tag.
 
