@@ -221,8 +221,8 @@ def test_run_polls_the_requested_number_of_times(platform):
 def test_from_env_wires_a_full_agent(platform, monkeypatch):
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-    monkeypatch.setenv("HARNESS_MODEL", "gpt-4o")
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
     wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
 
     agent = TimelineAgent.from_env()

@@ -245,7 +245,7 @@ def test_malformed_response_raises_provider_error(router, provider):
 
 
 def test_api_key_falls_back_to_env(monkeypatch, router):
-    monkeypatch.setenv("OPENAI_API_KEY", "sk-env-key")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-env-key")
     provider = OpenAICompatibleProvider(model="gpt-4o", base_url=BASE_URL)
     route = router.post(CHAT_URL).mock(
         return_value=httpx.Response(200, json=completion(content="ok"))
@@ -258,8 +258,8 @@ def test_api_key_falls_back_to_env(monkeypatch, router):
 
 
 def test_missing_api_key_is_a_clear_error(monkeypatch):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+    monkeypatch.delenv("AI_PROVIDER_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="AI_PROVIDER_API_KEY"):
         OpenAICompatibleProvider(model="gpt-4o")
 
 

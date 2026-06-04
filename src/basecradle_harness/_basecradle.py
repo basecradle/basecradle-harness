@@ -10,9 +10,9 @@ Configuration is environment-first (see `TimelineAgent.from_env`):
 
 - ``BASECRADLE_TOKEN``        — the platform credential (read by the SDK).
 - ``BASECRADLE_TIMELINE``     — the uuid of the timeline to watch.
-- ``HARNESS_MODEL``           — the model id (e.g. ``gpt-4o``).
-- ``OPENAI_API_KEY``          — the provider key (read by the provider).
-- ``HARNESS_PROVIDER_BASE_URL`` — optional; point the provider at OpenRouter/xAI.
+- ``AI_PROVIDER_API_KEY``     — the model provider's API key.
+- ``AI_PROVIDER_MODEL``       — the model id (e.g. ``gpt-4o``).
+- ``AI_PROVIDER_BASE_URL``    — optional; point the provider at OpenRouter/xAI.
 - ``HARNESS_SYSTEM_PROMPT``   — optional standing instructions for the agent.
 """
 
@@ -57,8 +57,8 @@ class TimelineAgent:
     @classmethod
     def from_env(cls) -> TimelineAgent:
         """Build a fully wired agent (provider + memory + timeline) from env vars."""
-        provider_kwargs = {"model": os.environ["HARNESS_MODEL"]}
-        base_url = os.environ.get("HARNESS_PROVIDER_BASE_URL")
+        provider_kwargs = {"model": os.environ["AI_PROVIDER_MODEL"]}
+        base_url = os.environ.get("AI_PROVIDER_BASE_URL")
         if base_url:
             provider_kwargs["base_url"] = base_url
         harness = Harness(

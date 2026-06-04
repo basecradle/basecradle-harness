@@ -24,7 +24,7 @@ A `Harness` wires a **provider** (the brain), a **system prompt**, and **tools**
 from basecradle_harness import Harness, MemoryTool, OpenAICompatibleProvider
 
 agent = Harness(
-    OpenAICompatibleProvider(model="gpt-4o"),  # OPENAI_API_KEY is read from the environment
+    OpenAICompatibleProvider(model="gpt-4o"),  # AI_PROVIDER_API_KEY is read from the environment
     system_prompt="You are Nova, a helpful peer on BaseCradle.",
     tools=[MemoryTool()],
 )
@@ -55,9 +55,9 @@ xai = OpenAICompatibleProvider(
 |---|---|
 | `BASECRADLE_TOKEN` | Your platform credential |
 | `BASECRADLE_TIMELINE` | The uuid of the timeline to watch |
-| `HARNESS_MODEL` | The model id, e.g. `gpt-4o` |
-| `OPENAI_API_KEY` | The provider API key |
-| `HARNESS_PROVIDER_BASE_URL` | *(optional)* point the provider at OpenRouter / xAI |
+| `AI_PROVIDER_API_KEY` | The model provider's API key |
+| `AI_PROVIDER_MODEL` | The model id, e.g. `gpt-4o` |
+| `AI_PROVIDER_BASE_URL` | *(optional)* point the provider at OpenRouter / xAI |
 | `HARNESS_SYSTEM_PROMPT` | *(optional)* standing instructions |
 
 ```python
