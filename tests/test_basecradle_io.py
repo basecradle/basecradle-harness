@@ -1,0 +1,234 @@
+"""The BaseCradle timeline I/O, against a respx-mocked platform.
+
+No live platform call: respx stands in for the SDK's HTTP transport, returning
+wire-shaped payloads (dashboard, timeline, message list, message create). The
+fictional cast: Nova Digital (handle ``nova``, AI) is the agent; John Doe
+(``john``, human) posts the messages it answers.
+"""
+
+import json
+
+import httpx
+import pytest
+import respx
+from basecradle import BaseCradle
+
+from basecradle_harness import Harness, MemoryTool, Message, TimelineAgent
+
+BC_URL = "https://basecradle.com"
+FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
+
+NOVA_UUID = "019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"  # the agent (me)
+JOHN_UUID = "019e7750-66ee-7e50-9e54-3bf8c3d6a8f1"  # the human
+TIMELINE_UUID = "019e7750-66ee-7f53-829f-13a8a710b6da"
+
+# Well-formed UUIDv7 message ids, oldest → newest.
+M0 = "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"
+M1 = "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70"
+M2 = "019e7753-6c3d-7e4f-8051-3c4d5e6f7081"
+REPLY = "019e7754-7d4e-7f50-9162-4d5e6f708192"
+
+
+# --- wire payload builders ---------------------------------------------------
+
+
+def message(*, uuid, body, mine=False):
+    actor = (
+        {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}
+        if mine
+        else {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"}
+    )
+    return {
+        "type": "message",
+        "created_at": "2026-06-04T00:00:00.000Z",
+        "user": actor,
+        "timeline": {"uuid": TIMELINE_UUID},
+        "content": {"uuid": uuid, "body": body},
+    }
+
+
+def page(*messages):
+    """A single (last) page of a cursor-paginated message list."""
+    return {"messages": list(messages), "next_cursor": None}
+
+
+def dashboard():
+    return {"identity": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}}
+
+
+def timeline():
+    # The timeline-get envelope is two keys: the timeline subject and its items.
+    return {
+        "timeline": {
+            "uuid": TIMELINE_UUID,
+            "name": "Incident response",
+            "locked": False,
+            "created_at": "2026-06-01T00:00:00.000Z",
+            "updated_at": "2026-06-02T00:00:00.000Z",
+            "owner": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
+            "participants": [
+                {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}
+            ],
+        },
+        "items": [],
+    }
+
+
+# --- a canned provider, so the agent has a brain without a model -------------
+
+
+class CannedProvider:
+    def __init__(self, text="Hello, John."):
+        self.text = text
+        self.prompts: list[str] = []
+
+    def chat(self, messages, tools=None):
+        self.prompts.append(messages[-1].content)
+        return Message.assistant(content=self.text)
+
+
+@pytest.fixture
+def platform():
+    with respx.mock(base_url=BC_URL, assert_all_called=False) as router:
+        yield router
+
+
+def wire(router, *, message_pages):
+    """Register the four platform routes; `message_pages` drives the list endpoint."""
+    router.get("/users/dashboard").mock(return_value=httpx.Response(200, json=dashboard()))
+    router.get(f"/timelines/{TIMELINE_UUID}").mock(
+        return_value=httpx.Response(200, json=timeline())
+    )
+    router.get("/messages").mock(side_effect=[httpx.Response(200, json=p) for p in message_pages])
+    router.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
+        return_value=httpx.Response(
+            201, json={"message": message(uuid=REPLY, body="reply", mine=True)}
+        )
+    )
+
+
+def build_agent(provider=None):
+    """Build the agent against an already-active respx. Returns (agent, provider)."""
+    provider = provider or CannedProvider()
+    client = BaseCradle(token=FAKE_TOKEN)
+    agent = TimelineAgent(Harness(provider), timeline=TIMELINE_UUID, client=client)
+    return agent, provider
+
+
+# --- construction ------------------------------------------------------------
+
+
+def test_construction_resolves_identity_and_high_water_mark(platform):
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+    agent, _ = build_agent()
+
+    assert agent.me_uuid == NOVA_UUID
+    assert agent._last_seen == M0
+
+
+# --- responding --------------------------------------------------------------
+
+
+def test_responds_to_a_new_message_end_to_end(platform):
+    wire(
+        platform,
+        message_pages=[
+            page(message(uuid=M0, body="old")),
+            page(message(uuid=M1, body="What's the status?"), message(uuid=M0, body="old")),
+        ],
+    )
+    provider = CannedProvider(text="All clear, John.")
+    agent, _ = build_agent(provider)
+
+    posted = agent.poll_once()
+
+    assert len(posted) == 1
+    assert provider.prompts == ["What's the status?"]
+    post_route = platform.post(f"/timelines/{TIMELINE_UUID}/messages")
+    assert post_route.called
+    sent = post_route.calls.last.request
+    assert json.loads(sent.content) == {"message": {"body": "All clear, John."}}
+
+
+def test_does_not_reply_to_its_own_messages(platform):
+    wire(
+        platform,
+        message_pages=[
+            page(message(uuid=M0, body="old")),
+            page(message(uuid=M1, body="my own post", mine=True), message(uuid=M0, body="old")),
+        ],
+    )
+    provider = CannedProvider()
+    agent, _ = build_agent(provider)
+
+    posted = agent.poll_once()
+
+    assert posted == []
+    assert provider.prompts == []
+    assert not platform.post(f"/timelines/{TIMELINE_UUID}/messages").called
+
+
+def test_no_new_messages_means_no_reply(platform):
+    wire(
+        platform,
+        message_pages=[page(message(uuid=M0, body="old")), page(message(uuid=M0, body="old"))],
+    )
+    agent, provider = build_agent()
+
+    assert agent.poll_once() == []
+    assert provider.prompts == []
+
+
+def test_multiple_new_messages_handled_oldest_first(platform):
+    wire(
+        platform,
+        message_pages=[
+            page(message(uuid=M0, body="old")),
+            page(
+                message(uuid=M2, body="second"),
+                message(uuid=M1, body="first"),
+                message(uuid=M0, body="old"),
+            ),
+        ],
+    )
+    provider = CannedProvider()
+    agent, _ = build_agent(provider)
+
+    posted = agent.poll_once()
+
+    assert len(posted) == 2
+    assert provider.prompts == ["first", "second"]  # chronological
+
+
+# --- the poll loop -----------------------------------------------------------
+
+
+def test_run_polls_the_requested_number_of_times(platform):
+    wire(
+        platform,
+        message_pages=[page(message(uuid=M0, body="old"))] * 3,  # init + two polls, nothing new
+    )
+    agent, _ = build_agent()
+
+    agent.run(interval=0, max_polls=2)
+
+    assert platform.get("/messages").call_count == 3  # 1 priming + 2 polls
+
+
+# --- env configuration -------------------------------------------------------
+
+
+def test_from_env_wires_a_full_agent(platform, monkeypatch):
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("HARNESS_MODEL", "gpt-4o")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+
+    agent = TimelineAgent.from_env()
+
+    assert agent.timeline_uuid == TIMELINE_UUID
+    assert agent.me_uuid == NOVA_UUID
+    # The shipped memory tool is wired in by default.
+    assert "memory" in agent.harness.tools
+    assert isinstance(agent.harness.tools.get("memory"), MemoryTool)
