@@ -12,6 +12,10 @@ class HarnessError(Exception):
     """Root of every error Harness raises."""
 
 
+class PolicyError(HarnessError):
+    """A tool was rejected by the active policy (e.g. it needs a forbidden capability)."""
+
+
 class ProviderError(HarnessError):
     """A model provider call failed."""
 
