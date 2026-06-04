@@ -39,7 +39,7 @@ class OpenAICompatibleProvider:
 
     Args:
         model: The model id to request (e.g. ``"gpt-4o"``, ``"grok-2"``).
-        api_key: The bearer token. Falls back to ``OPENAI_API_KEY`` when omitted.
+        api_key: The bearer token. Falls back to ``AI_PROVIDER_API_KEY`` when omitted.
         base_url: The API root. Defaults to OpenAI; point it at OpenRouter or
             xAI to use those.
         timeout: Per-request timeout in seconds.
@@ -57,10 +57,10 @@ class OpenAICompatibleProvider:
         timeout: float = DEFAULT_TIMEOUT,
         **default_params: Any,
     ) -> None:
-        key = api_key or os.environ.get("OPENAI_API_KEY")
+        key = api_key or os.environ.get("AI_PROVIDER_API_KEY")
         if not key:
             raise ValueError(
-                "No API key: pass api_key=... or set the OPENAI_API_KEY environment variable."
+                "No API key: pass api_key=... or set the AI_PROVIDER_API_KEY environment variable."
             )
         self.model = model
         self.base_url = base_url.rstrip("/")
