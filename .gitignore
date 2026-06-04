@@ -1,3 +1,6 @@
+# Claude Code session runtime scratch (never belongs in the repo)
+.claude/scheduled_tasks.lock
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
