@@ -8,6 +8,7 @@ https://basecradle.com · API docs: https://basecradle.com/docs/api
 
 from basecradle_harness._exceptions import (
     HarnessError,
+    PolicyError,
     ProviderAPIError,
     ProviderAuthError,
     ProviderConnectionError,
@@ -16,7 +17,9 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._messages import Message, Role, ToolCall, ToolSpec
 from basecradle_harness._openai import OpenAICompatibleProvider
+from basecradle_harness._policy import SHELL, Policy
 from basecradle_harness._provider import Provider
+from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._version import __version__
 
 __all__ = [
@@ -24,6 +27,11 @@ __all__ = [
     # Provider contract + adapter
     "Provider",
     "OpenAICompatibleProvider",
+    # Tools, registry, and the safety boundary
+    "Tool",
+    "ToolRegistry",
+    "Policy",
+    "SHELL",
     # Message vocabulary
     "Message",
     "Role",
@@ -31,6 +39,7 @@ __all__ = [
     "ToolSpec",
     # Errors
     "HarnessError",
+    "PolicyError",
     "ProviderError",
     "ProviderConnectionError",
     "ProviderAPIError",
