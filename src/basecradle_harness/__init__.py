@@ -6,7 +6,9 @@ core with clean extension points for human AI developers to fork and extend.
 https://basecradle.com · API docs: https://basecradle.com/docs/api
 """
 
+from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
+    EngineError,
     HarnessError,
     PolicyError,
     ProviderAPIError,
@@ -15,6 +17,7 @@ from basecradle_harness._exceptions import (
     ProviderError,
     ProviderRateLimitError,
 )
+from basecradle_harness._harness import Harness
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message, Role, ToolCall, ToolSpec
 from basecradle_harness._openai import OpenAICompatibleProvider
@@ -25,6 +28,9 @@ from basecradle_harness._version import __version__
 
 __all__ = [
     "__version__",
+    # The agent
+    "Harness",
+    "Engine",
     # Provider contract + adapter
     "Provider",
     "OpenAICompatibleProvider",
@@ -42,6 +48,7 @@ __all__ = [
     # Errors
     "HarnessError",
     "PolicyError",
+    "EngineError",
     "ProviderError",
     "ProviderConnectionError",
     "ProviderAPIError",
