@@ -6,6 +6,7 @@ core with clean extension points for human AI developers to fork and extend.
 https://basecradle.com · API docs: https://basecradle.com/docs/api
 """
 
+from basecradle_harness._basecradle import TimelineAgent
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
     EngineError,
@@ -31,6 +32,7 @@ __all__ = [
     # The agent
     "Harness",
     "Engine",
+    "TimelineAgent",
     # Provider contract + adapter
     "Provider",
     "OpenAICompatibleProvider",
