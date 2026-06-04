@@ -146,8 +146,6 @@ Every BaseCradle ecosystem repo carries this same "Cross-Repo Handoffs" section 
 
 ## Development Commands
 
-To be established with the project scaffold (first PR). Target shape:
-
 ```bash
 uv sync                  # install everything (creates .venv)
 uv run pytest            # tests (offline — the default)
