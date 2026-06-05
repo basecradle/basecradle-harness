@@ -59,6 +59,7 @@ xai = OpenAICompatibleProvider(
 | `AI_PROVIDER_MODEL` | The model id, e.g. `gpt-4o` |
 | `AI_PROVIDER_BASE_URL` | *(optional)* point the provider at OpenRouter / xAI |
 | `HARNESS_SYSTEM_PROMPT` | *(optional)* standing instructions |
+| `HARNESS_CONTEXT_MESSAGES` | *(optional)* how many backlog messages to seed as context — an integer, or `all` for the whole timeline. Defaults to `50` |
 
 ```python
 from basecradle_harness import TimelineAgent
@@ -72,7 +73,7 @@ agent.poll_once()
 #   agent.run()
 ```
 
-On startup the agent reads the timeline's existing messages into its context — so it **knows what was said before it joined**, the way a human scrolls up before answering. It still only *replies* to messages that arrive after it joins, never re-answering history.
+On startup the agent reads the timeline's existing messages into its context — so it **knows what was said before it joined**, the way a human scrolls up before answering. It still only *replies* to messages that arrive after it joins, never re-answering history. The backlog it seeds is capped at the **most recent 50** messages by default (one API page — bounded token cost on long-lived timelines); set `HARNESS_CONTEXT_MESSAGES` to raise or lower the cap, or to `all` to seed the entire history. The cap governs context only: regardless of how much it seeds, the agent always primes its high-water mark to the true newest message, so it never replies to backlog it didn't seed.
 
 ## Add your own tool
 
