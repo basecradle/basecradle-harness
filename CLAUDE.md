@@ -78,7 +78,7 @@ Runtime dependencies start at `basecradle` (the SDK) plus the one HTTP client th
 - **Tests pin invariants** and read like documentation.
 - **Test data is fabricated, always**: the fictional cast is **John Doe** (`handle: john`, human) and **Nova Digital** (`handle: nova`, AI); emails use `@example.com`; UUIDs are real, well-formed UUIDv7 values (never `1111…` junk); tokens are correctly-shaped fakes. No real platform data ever appears here.
 - **Tests never hit the live API or a live model.** Both the SDK and the provider are mocked at the transport level. Any live check is its own explicitly-marked job, excluded from the default run.
-- **When work blocks on a human action, announce it unmissably.** Some steps only a human can take (approving the `pypi` GitHub environment, anything in the project owner's browser or accounts). When an AI contributor reaches such a gate: lead the message with the wait — "⏸️ WAITING ON YOU" — state the exact action and link, and repeat the notice until the human acts. A waiting agent looks identical to a stalled one; never make the human ask "are you waiting on me?".
+- **When work blocks on a human action, announce it unmissably — but only a genuine gate blocks.** Some steps only a human can take (approving the `pypi` GitHub environment, anything in the project owner's browser or accounts). When an AI contributor reaches such a gate: lead the message with the wait — "⏸️ WAITING ON YOU" — state the exact action and link, and repeat the notice until the human acts. A waiting agent looks identical to a stalled one; never make the human ask "are you waiting on me?". **Phrase the ask as a checklist, not prose:** exact site, exact fields, exact values, numbered and in order, with the *why* kept to a single line separate from the steps. And know what *isn't* a gate: a merely gate-*shaped* step that is not one of the genuinely-enumerated human gates — see "Don't park when you have queued work" under Cross-Repo Handoffs (a release approval, account/credential setup, a new-repo or scope decision, or a founder-only ambiguity) — does **not** block. Continue, and report what you did.
 - **Versioning**: semver, `0.x` until the owner declares 1.0.
 - **Public package name**: `basecradle-harness` on PyPI; import `basecradle_harness`. Publishing is via PyPI **Trusted Publishing** (GitHub Actions OIDC — no stored credentials), on git tag.
 
@@ -86,23 +86,23 @@ Runtime dependencies start at `basecradle` (the SDK) plus the one HTTP client th
 
 Mirror the Python SDK's pipeline (`../sdks/python/.github/workflows/release.yml` is the template): pushing a `v*` tag → build → TestPyPI rehearsal → human approval → PyPI, all via OIDC Trusted Publishing (zero stored credentials). The workflow filename and the environment names (`testpypi`, `pypi`) are **contractual** — they match the Trusted Publisher registrations on PyPI/TestPyPI; renaming any of them breaks the trust relationship. The `pypi` environment requires the owner's approval.
 
+**Do not put `Closes #N` on a release PR.** A merged PR auto-closes its issue on merge — before the publish is approved and confirmed live — and an issue that closed before its work was proven on PyPI is a lie. Close the release issue **by hand, only after the package is verified live on PyPI**, recording the verification (version + URL) in the closing comment.
+
 ## First Milestone — Reserve the Name Professionally
 
 Before building any engine code, ship a real, metadata-complete **`0.0.1`** placeholder to PyPI through the Trusted Publishing pipeline. This claims `basecradle-harness` (a legitimate early release under our own brand — not squatting) *and* proves the entire release machine end-to-end before real code exists.
 
 ⏸️ This ends at a **human gate**: only Drawk can approve the `pypi` environment and confirm the package is live. Announce the wait unmissably.
 
+**The release close-discipline applies here too:** do **not** put `Closes #N` on the name-reservation PR — that would close this milestone issue on merge, *before* Drawk approves the publish and the package is confirmed live. Close it manually once `basecradle-harness 0.0.1` is verified on PyPI, with the verification recorded in the closing comment.
+
 ## Where to Start
 
-The v0 build is mapped in this repo's **GitHub Issues**, each one PR-sized, in dependency order. As captain of this repo you may refine or reorder them — but the architecture above and the v0 scope are settled. Start at the lowest open issue number, plan-first for anything non-trivial.
+The v0 build is mapped in this repo's **GitHub Issues**, each one PR-sized, in dependency order. As captain of this repo you may refine or reorder them — but the architecture above and the v0 scope are settled. That reordering authority covers **your own v0 roadmap issues only.** **Handoff issues from sibling repos are worked in arrival / lowest-first order and never silently reordered** — a sibling waiting on a handoff must not be deprioritized invisibly. Start at the lowest open issue number, plan-first for anything non-trivial.
 
 ```bash
 gh issue list --repo basecradle/basecradle-harness --state open
 ```
-
-## Asking Drawk for Help
-
-When a step needs a human action — a gate only Drawk can clear (registering a Trusted Publisher, approving an environment, anything in his browser or accounts) — ask for it in **clear, minimalistic, step-by-step** form: exact site, exact fields, exact values, numbered and in order. Keep the *why* to a single line, separate from the steps. This is the phrasing complement to the "⏸️ WAITING ON YOU" gate convention above: that says *announce* the gate unmissably; this says *make the ask a checklist, not a wall of prose*.
 
 ## Cross-Repo Handoffs
 
@@ -150,7 +150,7 @@ When Drawk pastes a prompt beginning `Cross-repo handoff:`:
 1. Read the referenced issue(s) in full before acting — the issue is the spec.
 2. Execute under **this** repo's conventions (its own CLAUDE.md, workflow, tests). The sending repo's conventions do not transfer.
 3. Respect the issue's ordering constraints (e.g., verify a dependency has deployed before releasing).
-4. When done, **post the completion report as a comment on the originating issue** — what shipped, version numbers, links — led by the cross-repo header (e.g. `**basecradle-ruby AI → basecradle AI**`). The issue is the record; the comment is where the other agent reads the result. Send a return-trigger handoff (per "Sending work to another repo") **only if** the other agent is blocked waiting on this work; otherwise the comment and the issue's state are the signal. Close the issue if its definition of done assigns closing to you; otherwise leave it for whoever it names.
+4. When done, **post the completion report as a comment on the originating issue** — what shipped, version numbers, links — led by the cross-repo header (e.g. `**basecradle-ruby AI → basecradle AI**`). The issue is the record; the comment is where the other agent reads the result. Send a return-trigger handoff (per "Sending work to another repo") **only if** the other agent is blocked waiting on this work; otherwise the comment and the issue's state are the signal. Close the issue if its definition of done assigns closing to you; otherwise leave it for whoever it names. **Never auto-close a handoff issue with `Closes #N` in a PR** — auto-close fires on merge, before the work is verified live and before the originating repo signs off, and a handoff issue that closes early lies to the agent waiting on it. Close handoff issues by hand, only after the definition of done is met, per the rule above.
 
 ### Propagating this procedure
 
