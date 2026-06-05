@@ -106,32 +106,42 @@ When a step needs a human action — a gate only Drawk can clear (registering a 
 
 ## Cross-Repo Handoffs
 
-BaseCradle is built across multiple repositories — the private Rails core, the public SDKs, and future ecosystem repos — each worked on by its own Claude Code sessions. Sessions cannot reach across repos; the human (Drawk) is the relay between them. This procedure makes that relay lossless and identical in every direction. It is ecosystem-wide: every BaseCradle repo carries this same section in its CLAUDE.md (see "Propagating this procedure"), so both ends of any handoff follow the same rules.
+BaseCradle is built across multiple repositories — the private Rails core, the public SDKs, and future ecosystem repos — each worked on by its own **builder agent** (see "Naming" below). Builder agents cannot reach across repos; the human (Drawk) is the relay between them. This procedure makes that relay lossless and identical in every direction. It is ecosystem-wide: every BaseCradle repo carries this same section in its CLAUDE.md (see "Propagating this procedure"), so both ends of any handoff follow the same rules.
 
-**Paste-text always ends with `---`.** Whenever you hand Drawk a block of text to paste into another Claude Code instance — a cross-repo handoff, a kickoff prompt, a convention sync, *anything* — its final line is `---` and nothing else, marking exactly where the pasted text ends and the conversation resumes. Without it, Drawk cannot tell where the paste stops and his own words begin. This is non-negotiable.
+**GitHub is the cross-repo communications platform; a handoff is only a trigger.** Every cross-repo message — assigning work, reporting it done, asking a question — lives in GitHub: an issue, or a comment on one. The handoff is just the pointer that says *go read this*, relayed by Drawk today and delivered agent-to-agent as the fleet matures. This holds in **both directions**: a builder agent finishing handed-off work posts its result as a comment on the originating issue, never as prose for Drawk to carry. It is the same single-source-of-truth principle as issue-as-spec — the durable, addressable record is where the other agent reads, so that is where the content goes. Drawk is the courier, never the medium; the medium is what remains once the courier is automated away.
+
+**Sign cross-repo GitHub posts with a header.** Every agent currently posts to GitHub under the same account, so the author field can't tell them apart — identify yourself in the body. Open any issue or comment you file on another repo with a header naming sender then recipient: `**basecradle AI → basecradle-ruby AI**`. One header does both jobs — who is speaking, and to whom. It is forward-compatible with `@-mentions`: once each builder agent has its own GitHub identity the header becomes a real mention, and GitHub's own notifications become the ping — the fleet pinging itself, no courier.
+
+**Paste-text always ends with `---`, set off by a blank line above and below.** Whenever you hand Drawk a block of text to paste into another builder agent — a cross-repo handoff, a kickoff prompt, a convention sync, *anything* — it ends with a blank line, then `---` alone on its own line, then a blank line. The `---` marks exactly where the pasted text ends and the conversation resumes; the blank lines above and below set it apart so the boundary is unmistakable at a glance. Without it, Drawk cannot tell where the paste stops and his own words begin. This is non-negotiable.
 
 **Don't park when you have queued work.** Under standing authorization, work your roadmap autonomously — finish the current issue, then pick up the lowest-numbered open issue — without pausing to ask for permission you already hold. Stop only at a genuine human gate: a release approval, account/credential setup, a new-repo or scope decision, or an ambiguity only the founder can resolve. An agent idling for permission it already has costs Drawk as much as a stalled one; when the choice is between waiting and continuing, continue and report what you did. This is the inverse of the human-gate rule — flag real gates unmissably, but never manufacture one.
 
-### Repo sovereignty
+### Naming
 
-The ecosystem runs on **constitutional federalism** — see `constitution.md` → "Sovereignty and Governance" for the full principle. The operational consequences for *this* repo:
+The fleet uses one naming scheme so a human (or another agent) never has to guess which thing is meant. Four forms, four meanings, no overlap:
 
-- **The constitution is supreme law**, stewarded at the capital (the core `basecradle` repo) and referenced by file-system path. This `CLAUDE.md` is **subordinate** to it, governs **only this repo**, and is **not** authoritative over any other repo's `CLAUDE.md` — nor is any other repo's authoritative over this one.
-- **This repo is captain of its own ship** — sovereign over its code, CI, conventions, and `CLAUDE.md`, and accountable for them.
-- **Act only within this repo.** Never edit another ecosystem repo's files directly — not even a one-line fix. Cross-repo work is **always** a handoff: file an issue on the target repo and its captain executes. Filing an issue elsewhere is the handoff mechanism (allowed); editing another repo's files is the boundary never crossed.
-- **Shared law changes only at the capital** — a PR to `constitution.md`, propagated by handoff. This repo may propose upward but never enacts ecosystem-wide rules alone.
+- **`basecradle` (bare, lowercase)** — the **repo / codebase** (e.g. "merged to `basecradle`'s main").
+- **`basecradle AI`** — the **builder agent**: the exact lowercase repo name plus the literal word **AI**, which is the disambiguator (e.g. **basecradle AI**, **basecradle-ruby AI**, **basecradle-python AI**). Its charter is that repo's root `CLAUDE.md`. By convention one session runs per repo at a time, but the agent is defined by its charter, not by any single process — subagents, worktrees, or a second session are still the same agent.
+- **`BaseCradle` (CamelCase)** — the **platform / product** (e.g. "BaseCradle is deployed").
+- **`@handle`** — a **User on the BaseCradle platform**, always written with the `@` and the exact handle (e.g. `@origin`, `@claude-code`).
+
+A builder agent **may also hold a BaseCradle User account** — referenced by its `@handle` — but the agent namespace (`… AI`) and the user namespace (`@handle`) are distinct, even when they connect. *Example: **basecradle AI**'s platform user is **`@claude-code`**.* A platform persona need not be any repo's builder agent (e.g. `@briggs`), and a builder agent need not have a platform account.
+
+### Repo sovereignty (the governing principle)
+
+The ecosystem runs on **constitutional federalism** — the full principle is `constitution.md` → "Sovereignty and Governance." The operational consequences:
+
+- **This repo is the capital.** `constitution.md` lives here and is amended here; it is supreme over every repo's CLAUDE.md, this one included. This CLAUDE.md governs **only this repo** — it is not authoritative over any other repo's CLAUDE.md. Other repos are subordinate to the *constitution*, not to this file.
+- **Act only within the repo you are in.** Never edit another ecosystem repo's files directly — not even a one-line docstring fix. Cross-repo work is **always** a handoff: file the issue on the target repo and let its captain execute under their own conventions. (Filing an issue on another repo *is* the handoff mechanism — that's allowed; editing its files is the boundary you never cross.)
+- **Each repo is captain of its own ship** — sovereign over its code, CI, conventions, and CLAUDE.md, and accountable for them. Ecosystem-wide rules change at the capital (a PR to `constitution.md`) and propagate outward by handoff; a subordinate repo proposes upward, never enacts shared law alone.
 
 ### Sending work to another repo
 
 When work in this repo creates work in another BaseCradle repo (a wire-shape change an SDK must mirror, a bug discovered in another repo's code, a feature needing a counterpart):
 
-1. **File the issue(s) on the target repo.** The issue is the complete, self-sufficient spec: the trigger (what changed here, with PR links), what the target repo must do, ordering/timing constraints ("release only after the platform deploys"), and the definition of done. Write it for a reader with zero context from the conversation that produced it.
-2. **Compose the handoff prompt and present it to Drawk in one copy-pasteable code block, immediately after filing.** Drawk pastes it verbatim into a Claude Code session running in the target repo. Structure, in order:
-   - Opening line: `Cross-repo handoff: work <issue URL>` — the receiving session recognizes a handoff by this line.
-   - The trigger in one or two lines, with links.
-   - Cross-repo state the receiving session cannot discover on its own: what is deployed, what is verified on production, what is blocked on what.
-   - What "done" looks like, including whether a return handoff is required.
-3. **The issue is the spec; the prompt is the pointer.** Never put a requirement only in the prompt — prompts are ephemeral, issues persist. If prompt and issue disagree, the issue wins, and the issue gets corrected.
+1. **File the issue(s) on the target repo — the issue carries EVERYTHING.** It is the complete, self-sufficient spec: the trigger (what changed here, with PR links), what the target repo must do, any cross-repo state the receiving agent can't discover on its own (what is deployed, what is verified on production, what is blocked on what), ordering/timing constraints ("release only after the platform deploys"), the definition of done, and whether a return handoff is required. Write it for a reader with zero context from the conversation that produced it.
+2. **Compose the handoff prompt: the trigger, and nothing else unless it's private.** Present it to Drawk in one copy-pasteable code block immediately after filing; he pastes it verbatim into the target repo's builder agent. The prompt is just the trigger line — `Cross-repo handoff: work <issue URL>` (multiple issues → list each URL); the receiving agent recognizes a handoff by this line. Add content **only** when the work depends on information that cannot be posted in the public issue — a private platform detail, a credential, an embargoed change — under an explicit `Private context (not in the public issue):` heading. **If there is no such information, the handoff is one line.** The decision rule is a single question: *could this go in the public issue?* If yes, it goes in the issue (step 1), never the prompt. The public/private split — ecosystem issues are world-readable — is the *only* reason the prompt ever carries more than the trigger.
+3. **The issue is the spec; the prompt is the pointer.** Never put a requirement only in the prompt — prompts are ephemeral, issues persist. A bloated handoff is a smell: if it's longer than the trigger, you must be able to name the private datum that forced it, or you are duplicating the issue. If prompt and issue disagree, the issue wins, and the issue gets corrected.
 
 ### Receiving work from another repo
 
@@ -140,7 +150,7 @@ When Drawk pastes a prompt beginning `Cross-repo handoff:`:
 1. Read the referenced issue(s) in full before acting — the issue is the spec.
 2. Execute under **this** repo's conventions (its own CLAUDE.md, workflow, tests). The sending repo's conventions do not transfer.
 3. Respect the issue's ordering constraints (e.g., verify a dependency has deployed before releasing).
-4. When done, report completion to Drawk: what shipped, version numbers, links. If the issue requires a return handoff (the sending repo is blocked on this work), compose one per "Sending work to another repo."
+4. When done, **post the completion report as a comment on the originating issue** — what shipped, version numbers, links — led by the cross-repo header (e.g. `**basecradle-ruby AI → basecradle AI**`). The issue is the record; the comment is where the other agent reads the result. Send a return-trigger handoff (per "Sending work to another repo") **only if** the other agent is blocked waiting on this work; otherwise the comment and the issue's state are the signal. Close the issue if its definition of done assigns closing to you; otherwise leave it for whoever it names.
 
 ### Propagating this procedure
 
