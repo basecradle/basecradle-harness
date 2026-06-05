@@ -14,6 +14,10 @@ import respx
 from basecradle import BaseCradle
 
 from basecradle_harness import Harness, MemoryTool, Message, TimelineAgent
+from basecradle_harness._basecradle import (
+    DEFAULT_CONTEXT_MESSAGES,
+    _context_messages_from_env,
+)
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -26,7 +30,8 @@ TIMELINE_UUID = "019e7750-66ee-7f53-829f-13a8a710b6da"
 M0 = "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"
 M1 = "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70"
 M2 = "019e7753-6c3d-7e4f-8051-3c4d5e6f7081"
-REPLY = "019e7754-7d4e-7f50-9162-4d5e6f708192"
+M3 = "019e7754-7d4e-7e60-8172-4d5e6f708192"
+REPLY = "019e7755-8e5f-7f70-9283-5e6f70819203"
 
 
 # --- wire payload builders ---------------------------------------------------
@@ -47,9 +52,9 @@ def message(*, uuid, body, mine=False):
     }
 
 
-def page(*messages):
-    """A single (last) page of a cursor-paginated message list."""
-    return {"messages": list(messages), "next_cursor": None}
+def page(*messages, next_cursor=None):
+    """One page of a cursor-paginated message list (last page unless given a cursor)."""
+    return {"messages": list(messages), "next_cursor": next_cursor}
 
 
 def dashboard():
@@ -109,11 +114,14 @@ def wire(router, *, message_pages):
     )
 
 
-def build_agent(provider=None):
-    """Build the agent against an already-active respx. Returns (agent, provider)."""
+def build_agent(provider=None, **kwargs):
+    """Build the agent against an already-active respx. Returns (agent, provider).
+
+    Extra kwargs (e.g. `context_messages`) pass straight through to TimelineAgent.
+    """
     provider = provider or CannedProvider()
     client = BaseCradle(token=FAKE_TOKEN)
-    agent = TimelineAgent(Harness(provider), timeline=TIMELINE_UUID, client=client)
+    agent = TimelineAgent(Harness(provider), timeline=TIMELINE_UUID, client=client, **kwargs)
     return agent, provider
 
 
@@ -174,6 +182,129 @@ def test_reply_sees_the_backlog_before_the_new_message(platform):
         ("user", "john: we were discussing Ruby"),  # the backlog, seeded
         ("user", "john: what did we decide?"),  # the new message it is answering
     ]
+
+
+# --- bounding the seeded backlog (context cap) -------------------------------
+
+
+def test_context_cap_seeds_only_the_most_recent_n(platform):
+    """A finite cap seeds the most recent N messages, still oldest-first."""
+    wire(
+        platform,
+        message_pages=[
+            page(
+                message(uuid=M3, body="newest"),  # newest first on the wire
+                message(uuid=M2, body="third"),
+                message(uuid=M1, body="second"),
+                message(uuid=M0, body="oldest"),
+            )
+        ],
+    )
+    agent, _ = build_agent(context_messages=2)
+
+    seeded = [(m.role, m.content) for m in agent.harness.history]
+    assert seeded == [
+        ("user", "john: third"),  # the most recent 2, oldest-first
+        ("user", "john: newest"),
+    ]
+    assert agent._last_seen == M3  # high-water mark is still the true newest
+
+
+def test_context_cap_none_seeds_the_whole_backlog(platform):
+    """`None` opts back into seeding everything."""
+    wire(
+        platform,
+        message_pages=[
+            page(
+                message(uuid=M2, body="third"),
+                message(uuid=M1, body="second"),
+                message(uuid=M0, body="oldest"),
+            )
+        ],
+    )
+    agent, _ = build_agent(context_messages=None)
+
+    seeded = [m.content for m in agent.harness.history]
+    assert seeded == ["john: oldest", "john: second", "john: third"]
+
+
+def test_context_cap_zero_seeds_nothing_but_keeps_high_water_mark(platform):
+    """A cap of 0 seeds no context, yet still primes the mark to the newest."""
+    wire(
+        platform,
+        message_pages=[
+            page(message(uuid=M1, body="newest"), message(uuid=M0, body="oldest")),
+            # second read (poll): nothing newer than M1
+            page(message(uuid=M1, body="newest"), message(uuid=M0, body="oldest")),
+        ],
+    )
+    provider = CannedProvider()
+    agent, _ = build_agent(provider, context_messages=0)
+
+    assert agent.harness.history == []  # no backlog seeded
+    assert agent._last_seen == M1  # but the mark is the true newest
+
+    # The cap governs context only — the agent still ignores the backlog as
+    # "already seen" and replies to nothing here.
+    assert agent.poll_once() == []
+    assert provider.prompts == []
+
+
+def test_context_cap_does_not_change_which_messages_get_replies(platform):
+    """Capping the seed never makes the agent answer history it didn't seed."""
+    wire(
+        platform,
+        message_pages=[
+            page(  # startup: a backlog of three, capped to one
+                message(uuid=M2, body="third"),
+                message(uuid=M1, body="second"),
+                message(uuid=M0, body="first"),
+            ),
+            page(  # poll: one genuinely new message on top of the same backlog
+                message(uuid=M3, body="brand new"),
+                message(uuid=M2, body="third"),
+                message(uuid=M1, body="second"),
+                message(uuid=M0, body="first"),
+            ),
+        ],
+    )
+    provider = CannedProvider()
+    agent, _ = build_agent(provider, context_messages=1)
+
+    posted = agent.poll_once()
+
+    assert len(posted) == 1
+    assert provider.prompts == ["john: brand new"]  # only the new message, not the backlog
+
+
+def test_capped_seed_does_not_paginate_the_whole_timeline(platform):
+    """An islice'd seed fetches only the pages it needs — not every page."""
+    wire(
+        platform,
+        message_pages=[
+            page(  # first page; a cursor means more pages exist behind it
+                message(uuid=M3, body="newest"),
+                message(uuid=M2, body="third"),
+                next_cursor="019e7760-0000-7000-8000-000000000000",
+            ),
+            page(message(uuid=M1, body="second"), message(uuid=M0, body="oldest")),
+        ],
+    )
+    build_agent(context_messages=2)
+
+    # The cap is satisfied by the first page, so the second page is never fetched.
+    assert platform.get("/messages").call_count == 1
+
+
+def test_negative_context_messages_is_rejected():
+    """The cap is validated before any network call — fail fast on nonsense."""
+    with pytest.raises(ValueError):
+        TimelineAgent(
+            Harness(CannedProvider()),
+            timeline=TIMELINE_UUID,
+            client=BaseCradle(token=FAKE_TOKEN),
+            context_messages=-1,
+        )
 
 
 # --- responding --------------------------------------------------------------
@@ -282,3 +413,35 @@ def test_from_env_wires_a_full_agent(platform, monkeypatch):
     # The shipped memory tool is wired in by default.
     assert "memory" in agent.harness.tools
     assert isinstance(agent.harness.tools.get("memory"), MemoryTool)
+
+
+def test_from_env_honors_the_context_messages_cap(platform, monkeypatch):
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("HARNESS_CONTEXT_MESSAGES", "1")
+    wire(
+        platform,
+        message_pages=[page(message(uuid=M1, body="newest"), message(uuid=M0, body="oldest"))],
+    )
+
+    agent = TimelineAgent.from_env()
+
+    seeded = [m.content for m in agent.harness.history]
+    assert seeded == ["john: newest"]  # the env cap of 1 took only the most recent
+    assert agent._last_seen == M1
+
+
+def test_context_messages_from_env_parses_int_all_and_default(monkeypatch):
+    monkeypatch.delenv("HARNESS_CONTEXT_MESSAGES", raising=False)
+    assert _context_messages_from_env() == DEFAULT_CONTEXT_MESSAGES  # unset → default
+
+    monkeypatch.setenv("HARNESS_CONTEXT_MESSAGES", "all")
+    assert _context_messages_from_env() is None  # sentinel → seed everything
+
+    monkeypatch.setenv("HARNESS_CONTEXT_MESSAGES", "ALL")
+    assert _context_messages_from_env() is None  # case-insensitive
+
+    monkeypatch.setenv("HARNESS_CONTEXT_MESSAGES", "7")
+    assert _context_messages_from_env() == 7
