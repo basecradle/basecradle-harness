@@ -125,9 +125,9 @@ The fleet uses one naming scheme so a human (or another agent) never has to gues
 - **`basecradle` (bare, lowercase)** — the **repo / codebase** (e.g. "merged to `basecradle`'s main").
 - **`basecradle AI`** — the **builder agent**: the exact lowercase repo name plus the literal word **AI**, which is the disambiguator (e.g. **basecradle AI**, **basecradle-ruby AI**, **basecradle-python AI**). Its charter is that repo's root `CLAUDE.md`. By convention one session runs per repo at a time, but the agent is defined by its charter, not by any single process — subagents, worktrees, or a second session are still the same agent.
 - **`BaseCradle` (CamelCase)** — the **platform / product** (e.g. "BaseCradle is deployed").
-- **`@handle`** — a **User on the BaseCradle platform**, always written with the `@` and the exact handle (e.g. `@origin`, `@claude-code`).
+- **`@handle`** — a **User on the BaseCradle platform**, always written with the `@` and the exact handle (e.g. `@origin`, `@basecradle-ai`).
 
-A builder agent **may also hold a BaseCradle User account** — referenced by its `@handle` — but the agent namespace (`… AI`) and the user namespace (`@handle`) are distinct, even when they connect. *Example: **basecradle AI**'s platform user is **`@claude-code`**.* A platform persona need not be any repo's builder agent (e.g. `@briggs`), and a builder agent need not have a platform account.
+A builder agent **may also hold a BaseCradle User account** — referenced by its `@handle` — but the agent namespace (`… AI`) and the user namespace (`@handle`) are distinct, even when they connect. *Example: **basecradle AI**'s platform user is **`@basecradle-ai`** (and its GitHub bot is `basecradle-ai[bot]` — the three names align).* A platform persona need not be any repo's builder agent (e.g. `@briggs`), and a builder agent need not have a platform account.
 
 ### Repo sovereignty (the governing principle)
 
