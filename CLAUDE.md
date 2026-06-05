@@ -53,7 +53,9 @@ These are settled. Six decisions, in dependency order of importance:
 
 **In:** A developer runs `pip install basecradle-harness`, sets `BASECRADLE_TOKEN` + a model key, and an agent participates in a BaseCradle timeline **locally** — reads messages, thinks via an OpenAI-compatible model, uses the **memory** tool, and replies. Single agent, one machine, fully hackable. v0 receives platform events by **polling a timeline through the SDK** (no webhook infrastructure required).
 
-**Out (deferred, on purpose):** Lightsail provisioning, the `basecradle-router` webhook daemon, multi-tenancy, multi-user OS isolation, the curl-pipe installer, native non-OpenAI provider SDKs, a browser tool. The router, when we build it, is **its own repo** (`basecradle-router`).
+**Out (deferred, on purpose):** the curl-pipe installer, native non-OpenAI provider SDKs, a browser tool.
+
+**Not built here at all:** the webhook router that wakes an agent on platform events lives in its own repo — [`basecradle-router`](https://github.com/basecradle/basecradle-router), a modular webhook daemon (source-agnostic core + pluggable **route** modules) on the fleet's home server. Its `basecradle` route is the platform-event/wake path that was once anticipated here; harness points to that repo rather than planning a competing one. The deployment concerns that path implies — Lightsail / home-server provisioning, multi-tenancy, multi-user OS isolation — are owned by basecradle-router and the home server, not harness. Harness stays focused on the agent runtime: engine, providers, tools, memory.
 
 **Ship the toy that proves the core; productionize after it's real.**
 
