@@ -24,6 +24,7 @@ from basecradle_harness._messages import Message, Role, ToolCall, ToolSpec
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._policy import SHELL, Policy
 from basecradle_harness._provider import Provider
+from basecradle_harness._session import Session
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._version import __version__
 
@@ -31,6 +32,7 @@ __all__ = [
     "__version__",
     # The agent
     "Harness",
+    "Session",
     "Engine",
     "TimelineAgent",
     # Provider contract + adapter

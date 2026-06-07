@@ -65,6 +65,36 @@ class Message:
         """A tool's result, answering the call with id `tool_call_id`."""
         return cls(role="tool", content=content, tool_call_id=tool_call_id)
 
+    def to_dict(self) -> dict[str, Any]:
+        """A JSON-safe mapping of this turn, for persisting a session transcript.
+
+        Only the fields that carry meaning for this role are emitted, so a stored
+        transcript reads cleanly: a plain user turn is just `{role, content}`.
+        """
+        data: dict[str, Any] = {"role": self.role}
+        if self.content is not None:
+            data["content"] = self.content
+        if self.tool_calls:
+            data["tool_calls"] = [
+                {"id": c.id, "name": c.name, "arguments": c.arguments} for c in self.tool_calls
+            ]
+        if self.tool_call_id is not None:
+            data["tool_call_id"] = self.tool_call_id
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Message:
+        """Rebuild a `Message` from `to_dict` output — the read side of persistence."""
+        return cls(
+            role=data["role"],
+            content=data.get("content"),
+            tool_calls=[
+                ToolCall(id=c["id"], name=c["name"], arguments=c.get("arguments", {}))
+                for c in data.get("tool_calls", [])
+            ],
+            tool_call_id=data.get("tool_call_id"),
+        )
+
 
 @dataclass
 class ToolSpec:
