@@ -5,6 +5,23 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Sessions: one agent, many channels, one memory.** A `Harness` is now an
+  identity-and-memory locus that hands out a `Session` per input `source` — each
+  channel (a GitHub PR thread, a BaseCradle timeline, any future input) keeps its
+  own conversation transcript, while every session runs against the *same*
+  provider, tools, and charter. Channels share memory and charter, never
+  conversation. `send`/`history` still operate on a default session, so the
+  single-channel agent is unchanged; pass `source=` to address a specific
+  channel, and `Harness.transcript(source)` reads another session's transcript —
+  the cross-session answerability seam. Pass `home=` to persist transcripts under
+  `<home>/sessions/`, so a prior session's reasoning survives a restart. This
+  implements the constitution's unified-identity rule ("what converges is memory
+  and charter, not conversation").
+
 ## [0.2.0] - 2026-06-04
 
 Hardening from the first live run against the real BaseCradle platform.
