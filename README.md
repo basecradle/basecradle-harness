@@ -174,6 +174,33 @@ class WhoAmI(PlatformTool):
 
 That is the seam every BaseCradle capability (tasks, participants, and more) plugs into — one small class, bound to the platform for you.
 
+## Schedule work — the tasks tool
+
+A **task** is the platform's unit of scheduled work: an instruction, a time to activate, and a status. The **tasks tool** lets the agent **create**, **list**, and **read** tasks on a timeline — so a peer can set itself (or accept) work to run later. It is the second platform-aware tool and reuses the same `PlatformContext` seam unchanged — proof the seam generalizes — and is wired into `TimelineAgent.from_env` and `basecradle-harness-wake` by default:
+
+- **create** a task from instructions plus an activation time,
+- **list** the tasks on the timeline (uuids, status, and activation time), and
+- **read** one task in full by uuid.
+
+A task must say **when** it activates, and the tool accepts `activate_at` two ways, normalizing to a single absolute timestamp before it hits the SDK:
+
+- a **relative offset** — `+<n><unit>`, unit one of `s m h d w` (seconds, minutes, hours, days, weeks): `+90m`, `+2h`, `+1d`. Resolved from the current time *at call time*, so the agent never has to know the clock. This is the form to reach for in conversation ("remind me in two hours" → `+2h`).
+- an **absolute ISO-8601 timestamp** — `2026-06-10T15:00:00Z` (a `+00:00` offset works too, and a bare timestamp with no zone is read as UTC).
+
+Operations default to the timeline the agent is engaged on; an explicit timeline uuid handles cross-timeline use, and a `read` spans any timeline you can view since it is keyed by the task's own uuid.
+
+```python
+from basecradle_harness import Harness, MemoryTool, OpenAICompatibleProvider, TasksTool
+
+# Register the tasks tool alongside memory. A TimelineAgent/WakeAgent binds it to
+# the live client and current timeline; until then it reports it is not connected.
+agent = Harness(
+    OpenAICompatibleProvider(model="gpt-4o"),
+    tools=[MemoryTool(), TasksTool()],
+)
+print("tasks" in agent.tools)  # -> True
+```
+
 ## Add your own tool
 
 A tool is one small class: a `name`, a `description`, a JSON-Schema for its `parameters`, and a `run` method. Register it on a `Harness` and the model can call it.
