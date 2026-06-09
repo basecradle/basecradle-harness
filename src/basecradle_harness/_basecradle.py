@@ -21,6 +21,9 @@ Configuration is environment-first (see `TimelineAgent.from_env`):
 - ``HARNESS_SYSTEM_PROMPT``   — optional standing instructions for the agent.
 - ``HARNESS_CONTEXT_MESSAGES`` — optional; how many backlog messages to seed as
   context (an int, or ``all`` for the whole timeline). Unset → the default.
+- ``HARNESS_ONBOARD``         — optional; wake seeded with Dashboard orientation
+  (default on). Set falsy (``0``/``false``/``no``/``off``) to wake with only the
+  operator's charter.
 """
 
 from __future__ import annotations
@@ -55,6 +58,11 @@ class TimelineAgent:
     slice of) the backlog, so it *knows* what was said before it joined, the way
     a human who joins a channel scrolls up before answering.
 
+    It also *onboards* itself on its Dashboard: the same `bc.me` read that answers
+    "who am I?" also answers "what is this place?", and (when `onboard` is on) that
+    orientation is prepended to the agent's charter — so a freshly-woken peer comes
+    up already knowing what BaseCradle is and where the docs/API live.
+
     Args:
         harness: The agent brain + tools.
         timeline: The uuid of the timeline to watch.
@@ -66,6 +74,15 @@ class TimelineAgent:
             backlog (the pre-cap behavior). The high-water mark is always the
             true newest message, regardless of this cap — seeding less never
             makes the agent reply to history.
+        onboard: When `True` (the default), prepend a bounded orientation drawn
+            from the agent's Dashboard (what BaseCradle is, what the agent is
+            here, where the docs/API live) to `harness.system_prompt`, composing
+            with the operator's prompt rather than replacing it. Set `False` to
+            wake with only the operator's charter. A Dashboard that carries no
+            orientation (e.g. an older API) leaves the charter untouched either
+            way. This mutates the harness's charter, so it takes effect for
+            sessions created after construction (the timeline's own session
+            included); it does not retroactively reseed a session created before.
     """
 
     def __init__(
@@ -75,6 +92,7 @@ class TimelineAgent:
         timeline: str,
         client: BaseCradle | None = None,
         context_messages: int | None = DEFAULT_CONTEXT_MESSAGES,
+        onboard: bool = True,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -82,7 +100,20 @@ class TimelineAgent:
         self.client = client or BaseCradle()
         self.timeline_uuid = timeline
         self.timeline = self.client.timelines.get(timeline)
-        self.me_uuid = self.client.me.identity.uuid
+
+        # One Dashboard read answers "who am I?" and, when onboarding, "what is this
+        # place?" The Dashboard is the literal page a fresh peer wakes on; reading
+        # `bc.me` once serves both — `me` is uncached, so we never fetch it twice.
+        dashboard = self.client.me
+        self.me_uuid = dashboard.identity.uuid
+        if onboard:
+            # Prepend the Dashboard orientation to the operator's charter (orientation
+            # first — the standing instructions speak to an agent that already knows
+            # where it is). Mutating before the seed below is deliberate: that seed is
+            # the first session access, so the composed charter reaches every session.
+            self.harness.system_prompt = _compose_prompt(
+                _orientation(dashboard), self.harness.system_prompt
+            )
 
         # One newest-first read serves both jobs. The high-water mark needs only
         # the newest message; the seed wants the most recent `context_messages`.
@@ -118,6 +149,7 @@ class TimelineAgent:
             timeline=os.environ["BASECRADLE_TIMELINE"],
             client=_client_from_env(),
             context_messages=_context_messages_from_env(),
+            onboard=_onboard_from_env(),
         )
 
     def poll_once(self) -> list[object]:
@@ -207,6 +239,83 @@ def _client_from_env() -> BaseCradle:
         "existing token (preferred), or set BASECRADLE_EMAIL + BASECRADLE_PASSWORD to "
         "mint one on startup."
     )
+
+
+# The Dashboard documentation links worth putting in front of a fresh peer, as
+# (label, wire-field) pairs in the order they read. Each is included only if the
+# Dashboard actually returned it, so an older API contributes only what it has.
+_DOC_LINKS = (
+    ("User guide", "user_guide"),
+    ("API", "api"),
+    ("API reference", "reference"),
+    ("OpenAPI", "openapi"),
+    ("Changelog", "changelog"),
+)
+
+
+def _orientation(dashboard: object) -> str | None:
+    """A bounded startup briefing built from the agent's Dashboard.
+
+    The Dashboard answers "what is this place, and what am I here?" — its
+    ``environment`` (name, summary, what you are) plus the ``documentation`` links.
+    We render only the fields the Dashboard actually returned (the SDK raises on a
+    field the API omitted, so each is read defensively), and only short, fixed
+    pieces — never unbounded content. Returns ``None`` when the Dashboard carries
+    no orientation at all (e.g. an older API form), so the caller leaves the
+    charter untouched rather than seeding an empty heading.
+    """
+    lines: list[str] = []
+
+    env = getattr(dashboard, "environment", None)
+    if env is not None:
+        name = getattr(env, "name", None)
+        summary = getattr(env, "summary", None)
+        you_are = getattr(env, "you_are", None)
+        if name and summary:
+            lines.append(f"You are on {name} — {summary}")
+        elif summary:
+            lines.append(summary)
+        if you_are:
+            lines.append(f"Here, you are {you_are}.")
+
+    docs = getattr(dashboard, "documentation", None)
+    if docs is not None:
+        doc_lines = [
+            f"- {label}: {url}"
+            for label, field in _DOC_LINKS
+            if (url := getattr(docs, field, None))
+        ]
+        if doc_lines:
+            lines.append("Documentation:")
+            lines.extend(doc_lines)
+
+    if not lines:
+        return None
+    return "Your BaseCradle orientation:\n" + "\n".join(lines)
+
+
+def _compose_prompt(orientation: str | None, system_prompt: str | None) -> str | None:
+    """Join the Dashboard orientation and the operator's charter, orientation first.
+
+    Either may be absent: with neither, the charter stays `None`; with one, it is
+    used alone — so onboarding never fabricates a prompt where there was none.
+    """
+    parts = [part for part in (orientation, system_prompt) if part]
+    return "\n\n".join(parts) if parts else None
+
+
+def _onboard_from_env() -> bool:
+    """Read ``HARNESS_ONBOARD`` into the `onboard` flag — on unless explicitly off.
+
+    Onboarding is the default (a peer waking on its Dashboard is the point); set
+    ``HARNESS_ONBOARD`` to an explicit off token (``0``/``false``/``no``/``off``)
+    to wake with only the operator's charter. Unset — or any other value, blank
+    included — leaves it on: it is off only when explicitly turned off.
+    """
+    raw = os.environ.get("HARNESS_ONBOARD")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _context_messages_from_env() -> int | None:
