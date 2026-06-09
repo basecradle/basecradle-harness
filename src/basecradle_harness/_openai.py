@@ -21,13 +21,8 @@ from typing import Any
 
 import httpx
 
-from basecradle_harness._exceptions import (
-    ProviderAPIError,
-    ProviderAuthError,
-    ProviderConnectionError,
-    ProviderError,
-    ProviderRateLimitError,
-)
+from basecradle_harness._exceptions import ProviderConnectionError, ProviderError
+from basecradle_harness._http import raise_for_status
 from basecradle_harness._messages import Message, ToolCall, ToolSpec
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -84,7 +79,7 @@ class OpenAICompatibleProvider:
             raise ProviderConnectionError(f"Could not reach the provider: {exc}") from exc
 
         if response.status_code >= 400:
-            _raise_for_status(response)
+            raise_for_status(response)
 
         return _message_from_wire(response.json())
 
@@ -158,31 +153,3 @@ def _message_from_wire(data: dict[str, Any]) -> Message:
         tool_calls.append(ToolCall(id=raw["id"], name=function["name"], arguments=arguments))
 
     return Message(role="assistant", content=message.get("content"), tool_calls=tool_calls)
-
-
-def _raise_for_status(response: httpx.Response) -> None:
-    """Map an error response onto the typed provider exceptions."""
-    status = response.status_code
-    body = response.text
-    if status in (401, 403):
-        raise ProviderAuthError(
-            f"Provider rejected the API key (HTTP {status}).", status_code=status, body=body
-        )
-    if status == 429:
-        raise ProviderRateLimitError(
-            "Provider rate-limited the request (HTTP 429).",
-            status_code=status,
-            body=body,
-            retry_after=_retry_after(response),
-        )
-    raise ProviderAPIError(f"Provider returned HTTP {status}.", status_code=status, body=body)
-
-
-def _retry_after(response: httpx.Response) -> float | None:
-    raw = response.headers.get("Retry-After")
-    if raw is None:
-        return None
-    try:
-        return float(raw)
-    except ValueError:
-        return None
