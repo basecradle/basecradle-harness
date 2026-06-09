@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-09
+
+The agent grows up for fleet deployment: it can be woken per-event by a router,
+holds one identity across many channels, comes up onto the platform under its own
+power, and orients itself on its Dashboard.
+
 ### Added
 
 - **Wake mode: a one-shot, per-event entrypoint for router deployment.** A new
@@ -36,6 +42,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `<home>/sessions/`, so a prior session's reasoning survives a restart. This
   implements the constitution's unified-identity rule ("what converges is memory
   and charter, not conversation").
+
+- **Wake-on-Dashboard onboarding.** On startup `TimelineAgent` reads its Dashboard
+  (the same `bc.me` call that answers "who am I?") and prepends a bounded
+  orientation — what BaseCradle is, what the agent is here, where the docs and API
+  live — to the operator's system prompt, so a freshly-woken peer comes up already
+  knowing the platform it's on, no human briefing required. On by default and
+  composing with (not replacing) the operator's charter; set `HARNESS_ONBOARD` to
+  a falsy value (`0`/`false`/`no`/`off`) to wake with only your own prompt. A
+  Dashboard with no orientation (an older API) leaves the charter untouched.
+
+- **Credential bootstrap: mint a token from email + password.** With no
+  `BASECRADLE_TOKEN` set, `TimelineAgent.from_env` falls back to
+  `BASECRADLE_EMAIL` + `BASECRADLE_PASSWORD`, minting a token on startup via the
+  SDK's `login` — so a credential-only agent comes up under its own power, no
+  pre-minted token and no human in the loop. The token path stays preferred (least
+  privilege); the password is used once to mint and is never logged, stored, or
+  placed on the agent's reasoning surface. `BASECRADLE_SESSION_NAME` optionally
+  labels the minted credential.
 
 ## [0.2.0] - 2026-06-04
 
