@@ -35,6 +35,7 @@ from urllib.parse import quote
 
 from basecradle import BaseCradle
 
+from basecradle_harness._assets import AssetsTool
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
@@ -51,6 +52,7 @@ from basecradle_harness._exceptions import HarnessError, ProviderError
 from basecradle_harness._harness import Harness
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._openai import OpenAICompatibleProvider
+from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._session import Session
 
 
@@ -131,6 +133,16 @@ class WakeAgent:
         self.marks = marks or MarkStore(harness.home)  # type: ignore[arg-type]
         self.timeline = self.client.timelines.get(timeline)
 
+        # Bind the live platform handle into every platform-aware tool — the same
+        # seam the poll loop uses, so a router-woken peer can act on the timeline
+        # exactly as a polling one. One wake serves one timeline; bind once.
+        bind_platform_tools(
+            self.harness.tools,
+            PlatformContext(
+                client=self.client, timeline=self.timeline_uuid, home=self.harness.home
+            ),
+        )
+
         # One Dashboard read answers "who am I?" and, when onboarding, "what is this
         # place?" — exactly as the poll loop does, so a router-woken peer is oriented
         # the same as a polling one. Mutating the charter here (before any session is
@@ -164,7 +176,7 @@ class WakeAgent:
         harness = Harness(
             OpenAICompatibleProvider(**provider_kwargs),
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
-            tools=[MemoryTool()],
+            tools=[MemoryTool(), AssetsTool()],
             home=home,
         )
         return cls(

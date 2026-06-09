@@ -384,6 +384,21 @@ def test_wake_uses_a_timeline_scoped_session(platform, tmp_path):
     assert f"timeline:{TIMELINE_UUID}" in agent.harness.sessions
 
 
+def test_wake_binds_platform_tools_to_its_timeline(platform, tmp_path):
+    """A platform-aware tool in the harness is wired to this wake's client + timeline."""
+    from basecradle_harness import AssetsTool
+
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(CountingProvider(), tools=[AssetsTool()], home=tmp_path)
+    WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+
+    assets = harness.tools.get("assets")
+    assert assets.bound is True
+    assert assets.context.timeline == TIMELINE_UUID
+    assert assets.context.client is client
+    assert assets.context.home == tmp_path
+
+
 # --- construction guards -----------------------------------------------------
 
 

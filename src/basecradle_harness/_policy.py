@@ -32,7 +32,16 @@ if TYPE_CHECKING:
 # The locked profile forbids it; this is the line between Harness and Cradle.
 SHELL = "shell"
 
+# The capability to act on the BaseCradle platform through the SDK — what every
+# platform-aware tool (assets, and the later Phase-2 tranches) needs. It is *not*
+# dangerous: the shipped locked profile permits it, because reading and posting on
+# the platform is the whole point of a peer. It is named as a capability anyway so
+# the boundary is honest — a profile that wanted a platform-blind agent could
+# forbid it, exactly as `SHELL` is forbidden, with no change to any tool.
+BASECRADLE = "basecradle"
+
 # What the safe, shipped profile refuses. A frozenset so it cannot be mutated.
+# `BASECRADLE` is deliberately absent — platform I/O is permitted under `locked()`.
 DANGEROUS_CAPABILITIES = frozenset({SHELL})
 
 

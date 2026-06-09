@@ -6,11 +6,13 @@ core with clean extension points for human AI developers to fork and extend.
 https://basecradle.com · API docs: https://basecradle.com/docs/api
 """
 
+from basecradle_harness._assets import AssetsTool
 from basecradle_harness._basecradle import TimelineAgent
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
     EngineError,
     HarnessError,
+    PlatformError,
     PolicyError,
     ProviderAPIError,
     ProviderAuthError,
@@ -22,7 +24,12 @@ from basecradle_harness._harness import Harness
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message, Role, ToolCall, ToolSpec
 from basecradle_harness._openai import OpenAICompatibleProvider
-from basecradle_harness._policy import SHELL, Policy
+from basecradle_harness._platform import (
+    PlatformContext,
+    PlatformTool,
+    bind_platform_tools,
+)
+from basecradle_harness._policy import BASECRADLE, SHELL, Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._session import Session
 from basecradle_harness._tools import Tool, ToolRegistry
@@ -47,6 +54,12 @@ __all__ = [
     "MemoryTool",
     "Policy",
     "SHELL",
+    "BASECRADLE",
+    # Platform-aware tools (the SDK as tools)
+    "PlatformTool",
+    "PlatformContext",
+    "AssetsTool",
+    "bind_platform_tools",
     # Message vocabulary
     "Message",
     "Role",
@@ -55,6 +68,7 @@ __all__ = [
     # Errors
     "HarnessError",
     "PolicyError",
+    "PlatformError",
     "EngineError",
     "ProviderError",
     "ProviderConnectionError",
