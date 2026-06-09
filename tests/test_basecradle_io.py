@@ -17,7 +17,10 @@ from basecradle_harness import Harness, MemoryTool, Message, TimelineAgent
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _client_from_env,
+    _compose_prompt,
     _context_messages_from_env,
+    _onboard_from_env,
+    _orientation,
 )
 
 BC_URL = "https://basecradle.com"
@@ -63,6 +66,25 @@ def dashboard():
     return {"identity": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}}
 
 
+def full_dashboard():
+    """A Dashboard with the orientation sections a fresh peer wakes on."""
+    return {
+        "identity": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+        "environment": {
+            "name": "BaseCradle",
+            "summary": "a communications platform where humans and AI are peers",
+            "you_are": "a first-class peer with your own timelines",
+        },
+        "documentation": {
+            "user_guide": "https://basecradle.com/docs",
+            "api": "https://basecradle.com/docs/api",
+            "changelog": "https://basecradle.com/docs/changelog",
+            "openapi": "https://basecradle.com/openapi.json",
+            "reference": "https://basecradle.com/docs/reference",
+        },
+    }
+
+
 def timeline():
     # The timeline-get envelope is two keys: the timeline subject and its items.
     return {
@@ -102,9 +124,15 @@ def platform():
         yield router
 
 
-def wire(router, *, message_pages):
-    """Register the four platform routes; `message_pages` drives the list endpoint."""
-    router.get("/users/dashboard").mock(return_value=httpx.Response(200, json=dashboard()))
+def wire(router, *, message_pages, dashboard_payload=None):
+    """Register the four platform routes; `message_pages` drives the list endpoint.
+
+    `dashboard_payload` overrides the (identity-only) default — pass
+    `full_dashboard()` to exercise wake-on-dashboard onboarding.
+    """
+    router.get("/users/dashboard").mock(
+        return_value=httpx.Response(200, json=dashboard_payload or dashboard())
+    )
     router.get(f"/timelines/{TIMELINE_UUID}").mock(
         return_value=httpx.Response(200, json=timeline())
     )
@@ -116,14 +144,16 @@ def wire(router, *, message_pages):
     )
 
 
-def build_agent(provider=None, **kwargs):
+def build_agent(provider=None, *, system_prompt=None, **kwargs):
     """Build the agent against an already-active respx. Returns (agent, provider).
 
-    Extra kwargs (e.g. `context_messages`) pass straight through to TimelineAgent.
+    `system_prompt` seeds the Harness charter; extra kwargs (e.g. `context_messages`,
+    `onboard`) pass straight through to TimelineAgent.
     """
     provider = provider or CannedProvider()
     client = BaseCradle(token=FAKE_TOKEN)
-    agent = TimelineAgent(Harness(provider), timeline=TIMELINE_UUID, client=client, **kwargs)
+    harness = Harness(provider, system_prompt=system_prompt)
+    agent = TimelineAgent(harness, timeline=TIMELINE_UUID, client=client, **kwargs)
     return agent, provider
 
 
@@ -526,3 +556,148 @@ def test_from_env_bootstraps_from_credentials_end_to_end(no_credentials, monkeyp
     assert platform.get("/users/dashboard").calls.last.request.headers["Authorization"] == (
         f"Bearer {MINTED_TOKEN}"
     )
+
+
+# --- wake-on-dashboard onboarding --------------------------------------------
+
+
+def test_onboarding_seeds_dashboard_orientation_into_the_charter(platform):
+    """A fresh peer wakes already knowing what BaseCradle is and where the docs live."""
+    wire(
+        platform,
+        message_pages=[page(message(uuid=M0, body="hi"))],
+        dashboard_payload=full_dashboard(),
+    )
+    agent, _ = build_agent()  # onboard defaults on
+
+    charter = agent.harness.system_prompt
+    assert charter is not None
+    assert "communications platform where humans and AI are peers" in charter  # summary
+    assert "a first-class peer with your own timelines" in charter  # you_are
+    assert "https://basecradle.com/docs/api" in charter  # a documentation link
+
+    # And it reaches a session as the system turn the agent actually wakes with.
+    first_turn = agent.harness.history[0]
+    assert first_turn.role == "system"
+    assert "Your BaseCradle orientation:" in first_turn.content
+
+
+def test_onboarding_composes_with_the_operator_prompt(platform):
+    """Orientation is prepended to the operator's charter, not a replacement of it."""
+    wire(
+        platform,
+        message_pages=[page(message(uuid=M0, body="hi"))],
+        dashboard_payload=full_dashboard(),
+    )
+    agent, _ = build_agent(system_prompt="You are Nova. Be concise.")
+
+    charter = agent.harness.system_prompt
+    # Both are present, orientation first, operator's charter after.
+    assert charter.startswith("Your BaseCradle orientation:")
+    assert "You are Nova. Be concise." in charter
+    assert charter.index("Your BaseCradle orientation:") < charter.index("You are Nova.")
+
+
+def test_onboarding_disabled_leaves_only_the_operator_charter(platform):
+    """`onboard=False` wakes with only the operator's prompt — no Dashboard text."""
+    wire(
+        platform,
+        message_pages=[page(message(uuid=M0, body="hi"))],
+        dashboard_payload=full_dashboard(),
+    )
+    agent, _ = build_agent(system_prompt="You are Nova.", onboard=False)
+
+    assert agent.harness.system_prompt == "You are Nova."
+
+
+def test_onboarding_is_a_noop_when_the_dashboard_has_no_orientation(platform):
+    """An identity-only Dashboard (older API) leaves the charter untouched."""
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])  # identity-only dashboard
+    agent, _ = build_agent(system_prompt="You are Nova.")
+
+    assert agent.harness.system_prompt == "You are Nova."  # unchanged, no empty heading
+
+
+def test_from_env_onboards_by_default(platform, monkeypatch):
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.delenv("HARNESS_ONBOARD", raising=False)
+    monkeypatch.delenv("HARNESS_SYSTEM_PROMPT", raising=False)
+    wire(
+        platform,
+        message_pages=[page(message(uuid=M0, body="hi"))],
+        dashboard_payload=full_dashboard(),
+    )
+
+    agent = TimelineAgent.from_env()
+
+    assert "Your BaseCradle orientation:" in agent.harness.system_prompt
+
+
+def test_from_env_onboarding_can_be_disabled(platform, monkeypatch):
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("HARNESS_ONBOARD", "0")
+    monkeypatch.setenv("HARNESS_SYSTEM_PROMPT", "You are Nova.")
+    wire(
+        platform,
+        message_pages=[page(message(uuid=M0, body="hi"))],
+        dashboard_payload=full_dashboard(),
+    )
+
+    agent = TimelineAgent.from_env()
+
+    assert agent.harness.system_prompt == "You are Nova."  # onboarding off → no orientation
+
+
+# --- the orientation/compose/flag helpers, in isolation ----------------------
+
+
+def test_orientation_renders_environment_and_documentation():
+    from basecradle import BaseCradle as _BC
+
+    with respx.mock(base_url=BC_URL, assert_all_called=False) as router:
+        router.get("/users/dashboard").mock(return_value=httpx.Response(200, json=full_dashboard()))
+        dash = _BC(token=FAKE_TOKEN).me
+        text = _orientation(dash)
+
+    assert text.startswith("Your BaseCradle orientation:")
+    assert "You are on BaseCradle — a communications platform" in text
+    assert "Here, you are a first-class peer" in text
+    assert "- API: https://basecradle.com/docs/api" in text
+    assert "- Changelog: https://basecradle.com/docs/changelog" in text
+
+
+def test_orientation_is_none_when_the_dashboard_lacks_orientation():
+    from basecradle import BaseCradle as _BC
+
+    with respx.mock(base_url=BC_URL, assert_all_called=False) as router:
+        router.get("/users/dashboard").mock(return_value=httpx.Response(200, json=dashboard()))
+        dash = _BC(token=FAKE_TOKEN).me
+        assert _orientation(dash) is None  # identity-only → nothing to say
+
+
+def test_compose_prompt_orders_and_handles_absence():
+    assert _compose_prompt("ORIENT", "CHARTER") == "ORIENT\n\nCHARTER"
+    assert _compose_prompt("ORIENT", None) == "ORIENT"
+    assert _compose_prompt(None, "CHARTER") == "CHARTER"
+    assert _compose_prompt(None, None) is None
+
+
+def test_onboard_from_env_defaults_on_and_parses_falsy(monkeypatch):
+    monkeypatch.delenv("HARNESS_ONBOARD", raising=False)
+    assert _onboard_from_env() is True  # unset → on
+
+    for falsy in ("0", "false", "False", "no", "off", " OFF "):
+        monkeypatch.setenv("HARNESS_ONBOARD", falsy)
+        assert _onboard_from_env() is False
+
+    # Unset stays on; so does any non-off value, blank included — off only when
+    # explicitly turned off.
+    for truthy in ("1", "true", "yes", "on", "", "   "):
+        monkeypatch.setenv("HARNESS_ONBOARD", truthy)
+        assert _onboard_from_env() is True
