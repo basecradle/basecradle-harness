@@ -10,12 +10,14 @@ mocked — so these tests pin the tool against the SDK's true surface, the way t
 constitution asks (mock at the transport level, never the live API).
 """
 
+import base64
+
 import httpx
 import pytest
 import respx
 from basecradle import BaseCradle
 
-from basecradle_harness import AssetsTool, PlatformContext, PlatformError
+from basecradle_harness import AssetsTool, PlatformContext, PlatformError, ToolResult
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -29,8 +31,11 @@ OTHER_TIMELINE = "019e7760-1234-7abc-8def-0123456789ab"
 A_TEXT = "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"
 A_BIN = "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70"
 A_BIG = "019e7753-6c3d-7e4f-8051-3c4d5e6f7081"
+A_IMG = "019e7754-7d4e-7f50-8162-4d5e6f708192"
 
 BLOB_URL = f"{BC_URL}/rails/active_storage/blobs/redirect/abc123/notes.md"
+IMG_URL = f"{BC_URL}/rails/active_storage/blobs/redirect/img456/cat.png"
+PNG_BYTES = b"\x89PNG\r\n\x1a\n fake pixels"
 
 
 # --- wire payload builders ---------------------------------------------------
@@ -75,6 +80,16 @@ def binary_asset():
 
 def big_text_asset():
     return asset(uuid=A_BIG, filename="huge.log", content_type="text/plain", byte_size=2_000_000)
+
+
+def image_asset(*, content_type="image/png", byte_size=None, filename="cat.png"):
+    return asset(
+        uuid=A_IMG,
+        filename=filename,
+        content_type=content_type,
+        byte_size=byte_size if byte_size is not None else len(PNG_BYTES),
+        url=IMG_URL,
+    )
 
 
 def _numbered_asset(i):
@@ -223,6 +238,94 @@ def test_read_treats_undecodable_text_as_binary(tool):
 
 def test_read_without_a_uuid_is_a_friendly_error(tool):
     assert "needs the asset's uuid" in tool.run(action="read")
+
+
+def test_read_of_an_image_points_at_the_view_action(tool):
+    """A binary read of an image nudges the model toward 'view' so it can look."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
+            return_value=httpx.Response(200, json={"asset": image_asset()})
+        )
+        # No blob route: read still must not download a binary.
+        result = tool.run(action="read", uuid=A_IMG)
+
+    assert "view" in result
+    assert "cat.png" in result
+
+
+# --- view --------------------------------------------------------------------
+
+
+def test_view_returns_the_image_as_a_data_url(tool):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
+            return_value=httpx.Response(200, json={"asset": image_asset()})
+        )
+        mock.get(IMG_URL).mock(return_value=httpx.Response(200, content=PNG_BYTES))
+        result = tool.run(action="view", uuid=A_IMG)
+
+    assert isinstance(result, ToolResult)
+    assert "cat.png" in result.text
+    assert len(result.images) == 1
+    image = result.images[0]
+    assert image.alt == "cat.png"
+    expected = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+    assert image.url == expected
+
+
+def test_view_rejects_a_non_image(tool):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_BIN}").mock(
+            return_value=httpx.Response(200, json={"asset": binary_asset()})
+        )
+        # No blob route: a non-image is refused without downloading.
+        result = tool.run(action="view", uuid=A_BIN)
+
+    assert isinstance(result, str)
+    assert "not an image" in result
+
+
+def test_view_rejects_an_unviewable_image_type(tool):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
+            return_value=httpx.Response(
+                200, json={"asset": image_asset(content_type="image/svg+xml", filename="x.svg")}
+            )
+        )
+        result = tool.run(action="view", uuid=A_IMG)
+
+    assert isinstance(result, str)
+    assert "not viewable" in result
+
+
+def test_view_rejects_an_oversized_image(tool):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
+            return_value=httpx.Response(
+                200, json={"asset": image_asset(byte_size=30 * 1024 * 1024)}
+            )
+        )
+        # No blob route: an oversized image is refused without downloading.
+        result = tool.run(action="view", uuid=A_IMG)
+
+    assert isinstance(result, str)
+    assert "too large" in result
+
+
+def test_view_rejects_an_empty_image(tool):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
+            return_value=httpx.Response(200, json={"asset": image_asset(byte_size=0)})
+        )
+        # No blob route: an empty file is refused without downloading.
+        result = tool.run(action="view", uuid=A_IMG)
+
+    assert isinstance(result, str)
+    assert "empty file" in result
+
+
+def test_view_without_a_uuid_is_a_friendly_error(tool):
+    assert "needs the asset's uuid" in tool.run(action="view")
 
 
 # --- create ------------------------------------------------------------------

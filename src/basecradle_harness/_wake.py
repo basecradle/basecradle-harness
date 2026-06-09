@@ -52,6 +52,7 @@ from basecradle_harness._basecradle import (
 from basecradle_harness._exceptions import HarnessError, ProviderError
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
+from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._session import Session
@@ -174,7 +175,14 @@ class WakeAgent:
         harness = Harness(
             _provider_from_env(),
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
-            tools=[MemoryTool(), AssetsTool(), TasksTool(), TimelinesTool(), TrustTool()],
+            tools=[
+                MemoryTool(),
+                AssetsTool(),
+                TasksTool(),
+                TimelinesTool(),
+                TrustTool(),
+                GenerateImageTool(),
+            ],
             home=home,
         )
         return cls(

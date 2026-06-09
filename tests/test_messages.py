@@ -1,6 +1,6 @@
 """The normalized message vocabulary: constructors and defaults."""
 
-from basecradle_harness import Message, ToolCall, ToolSpec
+from basecradle_harness import ImageContent, Message, ToolCall, ToolResult, ToolSpec
 
 
 def test_role_constructors_set_the_role():
@@ -42,3 +42,32 @@ def test_tool_spec_holds_json_schema_parameters():
     )
     assert spec.name == "search"
     assert spec.parameters["properties"]["q"]["type"] == "string"
+
+
+# --- images & tool results ---------------------------------------------------
+
+
+def test_message_carries_no_images_by_default():
+    assert Message.user("hi").images == []
+
+
+def test_tool_result_defaults_to_no_images():
+    result = ToolResult(text="done")
+    assert result.text == "done"
+    assert result.images == []
+
+
+def test_message_with_images_round_trips_through_dict():
+    original = Message(
+        role="user",
+        content="(Showing image: cat.png)",
+        images=[ImageContent(url="data:image/png;base64,AAAA", alt="cat.png")],
+    )
+    restored = Message.from_dict(original.to_dict())
+    assert restored.content == "(Showing image: cat.png)"
+    assert restored.images == [ImageContent(url="data:image/png;base64,AAAA", alt="cat.png")]
+
+
+def test_to_dict_omits_images_when_there_are_none():
+    # A plain turn stays clean — no empty `images` key cluttering the transcript.
+    assert "images" not in Message.user("hi").to_dict()

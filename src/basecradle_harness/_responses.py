@@ -12,6 +12,11 @@ The adapter is deliberately OpenAI-only (Responses is an OpenAI API), and it is
 purely additive — `OpenAICompatibleProvider` stays the default; an agent opts
 into this one when it wants web search (and, later, other built-ins).
 
+It is also the path that **sees images**: when a turn carries `images` (a peer
+shared a picture and the engine injected it as input — see `Engine`), the message
+is serialized with `input_image` parts so a vision-capable model perceives it.
+The Chat Completions adapter ignores `images`, so the default path is untouched.
+
 Two kinds of tool coexist in one turn, and the split is the whole design:
 
 - **Built-in tools** (`web_search`, and later `image_generation`, …) are declared
@@ -160,9 +165,11 @@ def _message_to_input(message: Message) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     # The assistant's prior function calls are replayed as `function_call` items so
     # the model sees its own tool use; their results follow as `function_call_output`
-    # on the `tool` turns. The text (if any) is a normal message item.
-    if message.content is not None:
-        items.append({"role": _input_role(message.role), "content": message.content})
+    # on the `tool` turns. The text (if any) is a normal message item — and when the
+    # turn also carries images (vision), its content becomes a parts list so the
+    # model sees the picture, not just text about it.
+    if message.content is not None or message.images:
+        items.append({"role": _input_role(message.role), "content": _input_content(message)})
     for call in message.tool_calls:
         items.append(
             {
@@ -173,6 +180,25 @@ def _message_to_input(message: Message) -> list[dict[str, Any]]:
             }
         )
     return items
+
+
+def _input_content(message: Message) -> str | list[dict[str, Any]]:
+    """The Responses `content` for a message: a plain string, or input parts.
+
+    Without images it stays a string — every existing turn serializes exactly as
+    before. With images it becomes a parts list: the text (if any) as an
+    ``input_text`` part, then one ``input_image`` part per image. In the Responses
+    API ``image_url`` is the reference string itself (an ``https://`` or ``data:``
+    URL), not a nested object as in Chat Completions.
+    """
+    if not message.images:
+        return message.content or ""
+    parts: list[dict[str, Any]] = []
+    if message.content:
+        parts.append({"type": "input_text", "text": message.content})
+    for image in message.images:
+        parts.append({"type": "input_image", "image_url": image.url})
+    return parts
 
 
 def _input_role(role: str) -> str:

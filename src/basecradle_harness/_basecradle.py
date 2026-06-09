@@ -40,6 +40,7 @@ from basecradle import BaseCradle
 from basecradle_harness._assets import AssetsTool
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
+from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
@@ -153,7 +154,14 @@ class TimelineAgent:
         harness = Harness(
             _provider_from_env(),
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
-            tools=[MemoryTool(), AssetsTool(), TasksTool(), TimelinesTool(), TrustTool()],
+            tools=[
+                MemoryTool(),
+                AssetsTool(),
+                TasksTool(),
+                TimelinesTool(),
+                TrustTool(),
+                GenerateImageTool(),
+            ],
         )
         return cls(
             harness,

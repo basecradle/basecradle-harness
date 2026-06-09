@@ -13,6 +13,7 @@ import pytest
 
 from basecradle_harness import (
     HarnessError,
+    ImageContent,
     Message,
     OpenAIResponsesProvider,
     Provider,
@@ -367,6 +368,69 @@ def test_full_tool_round_trip(router, responses_provider):
 
     assert second.tool_calls == []
     assert second.content == "It's sunny in Dallas."
+
+
+# --- Vision: images become input_image parts ---------------------------------
+
+
+def test_a_message_with_an_image_serializes_to_input_parts(router, responses_provider):
+    """A turn carrying an image becomes a parts list: input_text + input_image."""
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("A tabby cat.")))
+    )
+
+    history = [
+        Message.user("What's in this image?"),
+        Message(
+            role="user",
+            content="(Showing image: cat.png)",
+            images=[ImageContent(url="data:image/png;base64,AAAA", alt="cat.png")],
+        ),
+    ]
+    responses_provider.chat(history)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["input"] == [
+        {"role": "user", "content": "What's in this image?"},
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "(Showing image: cat.png)"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        },
+    ]
+
+
+def test_an_image_only_turn_omits_the_input_text_part(router, responses_provider):
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("ok")))
+    )
+
+    history = [
+        Message(role="user", images=[ImageContent(url="https://img.test/a.png")]),
+    ]
+    responses_provider.chat(history)
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["input"] == [
+        {
+            "role": "user",
+            "content": [{"type": "input_image", "image_url": "https://img.test/a.png"}],
+        },
+    ]
+
+
+def test_a_plain_text_turn_still_serializes_as_a_string(router, responses_provider):
+    """No images → content stays a bare string, exactly as before (no regression)."""
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("ok")))
+    )
+
+    responses_provider.chat([Message.user("plain text")])
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["input"] == [{"role": "user", "content": "plain text"}]
 
 
 # --- Errors ------------------------------------------------------------------

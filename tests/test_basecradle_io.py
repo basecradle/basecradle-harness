@@ -465,8 +465,9 @@ def test_from_env_wires_a_full_agent(platform, monkeypatch):
     assert tasks.bound is True
     assert tasks.context.timeline == TIMELINE_UUID
     assert tasks.context.client is agent.client
-    # And the governance tools (timelines + trust), bound the same way.
-    for name in ("timelines", "trust"):
+    # And the governance tools (timelines + trust) and the image generator, bound
+    # the same way — the media tranche ships generate_image on by default.
+    for name in ("timelines", "trust", "generate_image"):
         assert name in agent.harness.tools
         tool = agent.harness.tools.get(name)
         assert tool.bound is True

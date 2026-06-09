@@ -11,12 +11,21 @@ One turn (`run`) is: ask the provider for the next message; if it is plain text,
 that is the reply; if it carries tool calls, run each through the registry,
 append the results, and ask again — until the model answers with no more calls
 or the step limit is hit.
+
+A tool may return more than text. When it returns a `ToolResult` carrying images
+(the assets tool's `view` action does, so a peer can *see* a picture), the engine
+appends the text as the `tool` result and then injects the images as a synthetic
+`user` turn — because on every provider a function-tool *result* is text-only;
+an image has to enter as model *input*. Once the model has answered, the engine
+**evicts** those pixels (keeping a short text breadcrumb), so a viewed image is
+not re-sent — and re-billed — on every later turn. Viewing is on-demand: cheap to
+do again, never a standing cost.
 """
 
 from __future__ import annotations
 
 from basecradle_harness._exceptions import EngineError
-from basecradle_harness._messages import Message
+from basecradle_harness._messages import ImageContent, Message, ToolResult
 from basecradle_harness._provider import Provider
 from basecradle_harness._tools import ToolRegistry
 
@@ -49,19 +58,33 @@ class Engine:
         message. Raises `EngineError` if no final reply arrives within `max_steps`.
         """
         specs = self.tools.specs() or None
-        for _ in range(self.max_steps):
-            reply = self.provider.chat(messages, tools=specs)
-            messages.append(reply)
-            if not reply.tool_calls:
-                return reply
-            for call in reply.tool_calls:
-                result = self._run_tool(call.name, call.arguments)
-                messages.append(Message.tool(tool_call_id=call.id, content=result))
-        raise EngineError(
-            f"No final reply after {self.max_steps} steps; the model kept calling tools."
-        )
+        shown: list[Message] = []  # image turns injected this run, evicted before returning
+        # The eviction must happen however the loop ends — including the max_steps
+        # error path — or a viewed image's base64 lingers in the (mutated-in-place)
+        # transcript and is re-sent on every later turn, the cost this exists to avoid.
+        try:
+            for _ in range(self.max_steps):
+                reply = self.provider.chat(messages, tools=specs)
+                messages.append(reply)
+                if not reply.tool_calls:
+                    return reply
+                for call in reply.tool_calls:
+                    result = self._run_tool(call.name, call.arguments)
+                    text, images = _split_result(result)
+                    messages.append(Message.tool(tool_call_id=call.id, content=text))
+                    if images:
+                        # A function-tool result is text-only on every provider, so an
+                        # image enters as model *input*: a synthetic user turn carrying it.
+                        shown_turn = Message(role="user", content=_caption(images), images=images)
+                        messages.append(shown_turn)
+                        shown.append(shown_turn)
+            raise EngineError(
+                f"No final reply after {self.max_steps} steps; the model kept calling tools."
+            )
+        finally:
+            _evict_images(shown)
 
-    def _run_tool(self, name: str, arguments: dict) -> str:
+    def _run_tool(self, name: str, arguments: dict) -> str | ToolResult:
         """Run one tool call, turning any failure into a result the model can read.
 
         Errors are fed back as the tool's output rather than raised: a model that
@@ -76,3 +99,34 @@ class Engine:
             return tool.run(**arguments)
         except Exception as exc:  # noqa: BLE001 - any tool failure becomes model-readable
             return f"Error running {name!r}: {exc}"
+
+
+def _split_result(result: str | ToolResult) -> tuple[str, list[ImageContent]]:
+    """Normalize a tool's return into (text, images) — a plain `str` has no images."""
+    if isinstance(result, ToolResult):
+        return result.text, result.images
+    return result, []
+
+
+def _caption(images: list[ImageContent]) -> str:
+    """A one-line caption for an injected image turn, naming the images shown.
+
+    It rides along as the user turn's text, so a provider that cannot render
+    images still sees *what* was shared, and it stays as the breadcrumb after the
+    pixels are evicted.
+    """
+    names = ", ".join(image.alt or "image" for image in images)
+    return f"(Showing image: {names})"
+
+
+def _evict_images(shown: list[Message]) -> None:
+    """Drop the pixels from injected image turns once the model has answered.
+
+    The model has already seen the image and folded it into its reply, so the raw
+    bytes need not persist into the transcript — keeping them would re-send and
+    re-bill the image on every later turn. The text caption stays as a breadcrumb,
+    so the conversation still reads coherently; viewing again is a fresh, bounded,
+    on-demand fetch.
+    """
+    for turn in shown:
+        turn.images = []
