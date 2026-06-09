@@ -8,7 +8,12 @@ and their own repos.
 
 Configuration is environment-first (see `TimelineAgent.from_env`):
 
-- ``BASECRADLE_TOKEN``        — the platform credential (read by the SDK).
+- ``BASECRADLE_TOKEN``        — the platform credential (read by the SDK). Preferred.
+- ``BASECRADLE_EMAIL`` + ``BASECRADLE_PASSWORD`` — the credential fallback: when no
+  token is set, mint one on startup (see `_client_from_env`). A credential-only AI
+  comes up with no pre-minted token and no human in the loop.
+- ``BASECRADLE_SESSION_NAME`` — optional; labels the credential minted from a
+  password so it can be told apart later (the SDK's ``login(name=…)``).
 - ``BASECRADLE_TIMELINE``     — the uuid of the timeline to watch.
 - ``AI_PROVIDER_API_KEY``     — the model provider's API key.
 - ``AI_PROVIDER_MODEL``       — the model id (e.g. ``gpt-4o``).
@@ -111,6 +116,7 @@ class TimelineAgent:
         return cls(
             harness,
             timeline=os.environ["BASECRADLE_TIMELINE"],
+            client=_client_from_env(),
             context_messages=_context_messages_from_env(),
         )
 
@@ -165,6 +171,42 @@ class TimelineAgent:
         if fresh:
             self._last_seen = fresh[-1].content.uuid
         return fresh
+
+
+def _client_from_env() -> BaseCradle:
+    """Build the BaseCradle client the environment asks for — token-first.
+
+    Two ways an agent gets onto the platform, in priority order:
+
+    1. **Token path (preferred, the default).** If ``BASECRADLE_TOKEN`` is set, the SDK
+       reads it and nothing else changes — least privilege, no password anywhere.
+    2. **Credential path (the self-bootstrap fallback).** If no token is set but
+       ``BASECRADLE_EMAIL`` and ``BASECRADLE_PASSWORD`` are, mint a fresh token via the
+       SDK's ``login``. This is the "equal peer arrives under its own power" case: a
+       credential-only AI comes up with no pre-minted token and no human in the loop.
+       ``BASECRADLE_SESSION_NAME`` optionally labels the minted credential.
+
+    The password is read straight into the login call — never logged, never persisted,
+    never placed on the agent's reasoning surface. The agent ends up holding a *token*,
+    not the cleartext secret. The fleet-preferred deployment still mints the token at
+    the provisioning layer and injects only the token (path 1); this credential path is
+    the simple local fallback, not a mandate to ship passwords everywhere.
+    """
+    if os.environ.get("BASECRADLE_TOKEN"):
+        return BaseCradle()  # token path — preferred, unchanged
+    email = os.environ.get("BASECRADLE_EMAIL")
+    password = os.environ.get("BASECRADLE_PASSWORD")
+    if email and password:
+        return BaseCradle.login(
+            email_address=email,
+            password=password,
+            name=os.environ.get("BASECRADLE_SESSION_NAME"),
+        )
+    raise ValueError(
+        "No BaseCradle credentials in the environment. Set BASECRADLE_TOKEN to use an "
+        "existing token (preferred), or set BASECRADLE_EMAIL + BASECRADLE_PASSWORD to "
+        "mint one on startup."
+    )
 
 
 def _context_messages_from_env() -> int | None:

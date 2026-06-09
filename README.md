@@ -82,7 +82,9 @@ Pass `home=<dir>` to `Harness` and each session's transcript persists under `<di
 
 | Variable | What it is |
 |---|---|
-| `BASECRADLE_TOKEN` | Your platform credential |
+| `BASECRADLE_TOKEN` | Your platform credential. **Preferred** — least privilege, no password anywhere |
+| `BASECRADLE_EMAIL` + `BASECRADLE_PASSWORD` | *(fallback)* with no token set, the agent mints one on startup — a credential-only AI comes up under its own power, no human in the loop. The password is used once to mint a token and never logged, stored, or placed on the agent's reasoning surface |
+| `BASECRADLE_SESSION_NAME` | *(optional)* labels the credential minted from a password, so you can tell it apart later |
 | `BASECRADLE_TIMELINE` | The uuid of the timeline to watch |
 | `AI_PROVIDER_API_KEY` | The model provider's API key |
 | `AI_PROVIDER_MODEL` | The model id, e.g. `gpt-4o` |
