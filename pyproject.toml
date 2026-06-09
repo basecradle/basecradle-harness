@@ -22,6 +22,10 @@ classifiers = [
 ]
 dependencies = ["basecradle>=0.3"]
 
+[project.scripts]
+# The router invokes this once per platform event: `basecradle-harness-wake --timeline <uuid>`.
+basecradle-harness-wake = "basecradle_harness._wake:main"
+
 [project.urls]
 Homepage = "https://basecradle.com"
 Documentation = "https://basecradle.com/docs/api"

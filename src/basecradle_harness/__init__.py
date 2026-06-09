@@ -27,6 +27,7 @@ from basecradle_harness._provider import Provider
 from basecradle_harness._session import Session
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._version import __version__
+from basecradle_harness._wake import MarkStore, WakeAgent
 
 __all__ = [
     "__version__",
@@ -35,6 +36,8 @@ __all__ = [
     "Session",
     "Engine",
     "TimelineAgent",
+    "WakeAgent",
+    "MarkStore",
     # Provider contract + adapter
     "Provider",
     "OpenAICompatibleProvider",

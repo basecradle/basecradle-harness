@@ -9,6 +9,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Wake mode: a one-shot, per-event entrypoint for router deployment.** A new
+  `basecradle-harness-wake --timeline <uuid>` console script (also `python -m
+  basecradle_harness`) answers a timeline's unseen messages in a single process
+  and exits — the command [basecradle-router](https://github.com/basecradle/basecradle-router)
+  invokes once per platform event, instead of the long-lived `TimelineAgent.run`
+  poll loop. Because each wake is a separate process, the per-timeline high-water
+  mark now **persists** under a required `HARNESS_HOME` (advanced after every
+  reply), so two events close together or a router retry never produce a
+  duplicate reply; the `timeline:<uuid>` session transcript persists there too, so
+  the conversation survives across wakes without re-seeding the backlog. A wake
+  with nothing new makes no model call and exits `0`; a hard config/credential
+  failure exits non-zero. New public API: `WakeAgent` and `MarkStore`. The first
+  wake infers its starting point from an optional `--message` trigger, else the
+  agent's own latest post (a lossless poll→wake cutover), else the newest message.
+
 - **Sessions: one agent, many channels, one memory.** A `Harness` is now an
   identity-and-memory locus that hands out a `Session` per input `source` — each
   channel (a GitHub PR thread, a BaseCradle timeline, any future input) keeps its
