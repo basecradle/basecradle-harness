@@ -117,20 +117,15 @@ class TimelineAgent:
 
         # One newest-first read serves both jobs. The high-water mark needs only
         # the newest message; the seed wants the most recent `context_messages`.
-        # `filter()` is a lazy, auto-paginating iterator, so `islice` fetches
-        # just the pages it needs — a capped seed never paginates the whole
-        # timeline. We read `max(cap, 1)` so the mark is still the true newest
-        # even when the seed is empty (cap of 0).
-        newest_first = self.client.messages.filter(timeline=self.timeline_uuid)
-        if context_messages is None:
-            recent = list(newest_first)
-        else:
-            recent = list(itertools.islice(newest_first, max(context_messages, 1)))
+        # `_recent` is lazy and auto-paginating, so a capped seed fetches just the
+        # pages it needs — never the whole timeline — and always includes the true
+        # newest message so the mark is right even when the seed is empty (cap 0).
+        recent = _recent(self.client.messages.filter(timeline=self.timeline_uuid), context_messages)
         self._last_seen: str | None = recent[0].content.uuid if recent else None
 
         to_seed = recent if context_messages is None else recent[:context_messages]
         for message in reversed(to_seed):  # oldest-first into history
-            self.harness.history.append(self._as_turn(message))
+            self.harness.history.append(_as_turn(message, self.me_uuid))
 
     @classmethod
     def from_env(cls) -> TimelineAgent:
@@ -158,7 +153,7 @@ class TimelineAgent:
         for message in self._new_messages():
             if message.user.uuid == self.me_uuid:
                 continue  # never reply to ourselves
-            reply = self.harness.send(self._incoming_text(message))
+            reply = self.harness.send(_incoming_text(message))
             if reply.strip():
                 posted.append(self.timeline.messages.create(body=reply))
         return posted
@@ -173,36 +168,64 @@ class TimelineAgent:
                 return
             time.sleep(interval)
 
-    # --- turning timeline messages into conversation turns --------------------
-
-    def _incoming_text(self, message: object) -> str:
-        """Another peer's message as the agent hears it: prefixed with who spoke."""
-        return f"{message.user.handle}: {message.content.body}"
-
-    def _as_turn(self, message: object) -> Message:
-        """A historical timeline message as a conversation turn for the engine.
-
-        The agent's own posts become assistant turns; everyone else's become user
-        turns tagged with the speaker, so the model can tell a multi-party
-        conversation apart.
-        """
-        if message.user.uuid == self.me_uuid:
-            return Message.assistant(content=message.content.body)
-        return Message.user(content=self._incoming_text(message))
-
     # --- reading new messages, newest-first, up to the high-water mark --------
 
     def _new_messages(self) -> list[object]:
         """Messages newer than the high-water mark, in chronological order."""
-        fresh = []
-        for message in self.client.messages.filter(timeline=self.timeline_uuid):
-            if message.content.uuid == self._last_seen:
-                break
-            fresh.append(message)
-        fresh.reverse()
+        fresh = _messages_since(
+            self.client.messages.filter(timeline=self.timeline_uuid), self._last_seen
+        )
         if fresh:
             self._last_seen = fresh[-1].content.uuid
         return fresh
+
+
+# --- shared message helpers (used by both the poll loop and wake mode) -------
+
+
+def _recent(messages: object, cap: int | None) -> list[object]:
+    """The most recent `cap` messages from a newest-first iterable; `None` → all.
+
+    `messages` is the SDK's lazy, auto-paginating filter, so a finite cap fetches
+    only the pages it needs rather than the whole timeline. `max(cap, 1)` keeps the
+    true newest message in the result even at a cap of 0, so a high-water mark
+    derived from it is still correct when no context is seeded.
+    """
+    if cap is None:
+        return list(messages)
+    return list(itertools.islice(messages, max(cap, 1)))
+
+
+def _messages_since(messages: object, mark: str | None) -> list[object]:
+    """Messages from a newest-first iterable that are newer than `mark`, chronological.
+
+    Walks newest-first and stops at the high-water mark (`mark`), so it reads only
+    the unseen head of the timeline, then reverses to chronological order. A `mark`
+    of `None` (or one no longer present) yields everything it iterates.
+    """
+    fresh = []
+    for message in messages:
+        if message.content.uuid == mark:
+            break
+        fresh.append(message)
+    fresh.reverse()
+    return fresh
+
+
+def _incoming_text(message: object) -> str:
+    """Another peer's message as the agent hears it: prefixed with who spoke."""
+    return f"{message.user.handle}: {message.content.body}"
+
+
+def _as_turn(message: object, me_uuid: str) -> Message:
+    """A timeline message as a conversation turn for the engine.
+
+    The agent's own posts become assistant turns; everyone else's become user turns
+    tagged with the speaker, so the model can tell a multi-party conversation apart.
+    """
+    if message.user.uuid == me_uuid:
+        return Message.assistant(content=message.content.body)
+    return Message.user(content=_incoming_text(message))
 
 
 def _client_from_env() -> BaseCradle:
