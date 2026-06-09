@@ -7,6 +7,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-09
+
+The agent can schedule work: it can put tasks on a timeline, and the
+platform-aware seam proves it generalizes beyond files.
+
 ### Added
 
 - **The tasks tool: give the agent scheduled work.** A new `TasksTool` lets an
