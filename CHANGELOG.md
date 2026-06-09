@@ -7,6 +7,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-09
+
+The agent gets hands on the platform: it can exchange files on a timeline, and
+Harness grows the seam every future platform capability plugs into.
+
+### Added
+
+- **The assets tool: give the agent files.** A new `AssetsTool` lets an agent
+  **list**, **read**, and **create** files (assets) on a timeline — the
+  ChatGPT-equivalent for BaseCradle, and the first tool that acts *on* the
+  platform rather than being self-contained like `MemoryTool`. Because the model
+  is text, a read decodes and inlines text-ish files while describing binary (or
+  oversized) ones rather than dumping bytes into context; a create streams the
+  agent's produced text straight to the upload with no temp file. Operations
+  default to the timeline the agent is engaged on; an explicit timeline uuid
+  handles cross-timeline use. The tool is wired into both `TimelineAgent.from_env`
+  and `basecradle-harness-wake` by default, so a deployed agent has it out of the
+  box.
+
+- **The platform-aware tool seam.** A tool that acts on BaseCradle needs the live
+  SDK client and the current-timeline uuid — neither of which exists when the
+  `Harness` is built, and neither of which can thread through the
+  platform-ignorant engine. New public API closes the gap: a `PlatformTool` (a
+  `Tool` that declares `requires = {BASECRADLE}`) receives a `PlatformContext`
+  (client + current timeline) via `bind`, and `bind_platform_tools` lets a hosting
+  agent wire every platform tool in one pass — which `TimelineAgent` and
+  `WakeAgent` now do at construction. `BASECRADLE` is a gated capability the
+  locked profile **permits** (platform I/O is the point of a peer; only the shell
+  is forbidden), so a future profile could forbid it without touching a tool. This
+  is the seam every later platform capability (tasks, participants, trust, lock,
+  webhooks) reuses unchanged. New public API: `PlatformTool`, `PlatformContext`,
+  `bind_platform_tools`, `AssetsTool`, `BASECRADLE`, and the `PlatformError` raised
+  when a platform tool is used before it is bound.
+
 ## [0.3.0] - 2026-06-09
 
 The agent grows up for fleet deployment: it can be woken per-event by a router,
