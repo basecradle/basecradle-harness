@@ -1,4 +1,4 @@
-"""Give the agent files: list, read, and create assets on a BaseCradle timeline.
+"""Give the agent files: list, read, view, and create assets on a BaseCradle timeline.
 
 This is the first tool that acts *on* the platform, so it is the first
 `PlatformTool` — it reaches the SDK client and the current timeline through the
@@ -7,12 +7,17 @@ contract `MemoryTool` follows: an `action` enum, branching in `run`, a string
 back for the model to read. A contributor adds the next platform tranche (tasks,
 participants, …) by copying this shape.
 
-Three actions, the file equivalent of what a human peer does on a timeline:
+Four actions, the file equivalent of what a human peer does on a timeline:
 
 - **list** — what files are here, with the uuids needed to read them.
 - **read** — download one file and surface it. The model is text, so a text-ish
   file comes back decoded; a binary (or oversized) file comes back as metadata
   plus a "not inlined" note rather than a wall of bytes dumped into context.
+- **view** — *look at* an image file. Where `read` refuses a binary, `view`
+  fetches an image and hands it back as a `ToolResult` carrying the picture, so a
+  vision-capable model (the Responses path) actually sees it. This is the
+  on-demand "look at this asset" step — images are never inlined eagerly, only
+  when the agent chooses to look.
 - **create** — upload content the agent produced (the common path: text → file),
   with an optional description.
 
@@ -28,18 +33,30 @@ scratch under `HARNESS_HOME` and clean up" is to never write scratch at all.
 
 from __future__ import annotations
 
+import base64
 import io
 import itertools
 from typing import Any
 
 import httpx
 
+from basecradle_harness._messages import ImageContent, ToolResult
 from basecradle_harness._platform import PlatformTool
 
 # A text-ish file is decoded and inlined; anything else is described, not dumped.
 # `byte_size` over this cap is treated as not-inlinable even when text, so a huge
 # log never blows up the model's context. 256 KiB is generous for prose/code.
 MAX_INLINE_BYTES = 256 * 1024
+
+# The largest image `view` will inline as model input. Vision images are heavier
+# than text but the model can handle a real photo; 20 MiB matches OpenAI's
+# per-image input ceiling. Larger than this is described, not shown.
+MAX_IMAGE_BYTES = 20 * 1024 * 1024
+
+# Image content types a vision model can take as input. Kept to the formats the
+# model providers document so `view` gives a clean "can't show that" rather than
+# letting an unsupported type fail deep in the provider call.
+_VIEWABLE_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
 # How many assets one `list` returns. A timeline rarely has more; the cap keeps a
 # pathological one from flooding context. When it bites, the reply says so.
@@ -67,7 +84,7 @@ _TEXTUAL_APPLICATION_TYPES = frozenset(
 
 
 class AssetsTool(PlatformTool):
-    """List, read, and create files (assets) on the agent's current timeline.
+    """List, read, view, and create files (assets) on the agent's current timeline.
 
     A `PlatformTool`: the hosting agent binds the SDK client and current-timeline
     uuid before the loop runs. Until bound, `run` reports it is not connected
@@ -79,21 +96,23 @@ class AssetsTool(PlatformTool):
         "Exchange files on the timeline, the way a peer shares an attachment. "
         "action='list' shows the files here with their uuids; action='read' "
         "downloads one file by uuid and returns its text (binary files come back as "
-        "a description, not raw bytes); action='create' uploads a new file from the "
-        "text content you provide, with a filename and an optional description. "
-        "Operations use the current timeline unless you pass a timeline uuid."
+        "a description, not raw bytes); action='view' looks at an image file by uuid "
+        "so you can actually see it and describe or reason about it; action='create' "
+        "uploads a new file from the text content you provide, with a filename and an "
+        "optional description. Operations use the current timeline unless you pass a "
+        "timeline uuid."
     )
     parameters = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "read", "create"],
+                "enum": ["list", "read", "view", "create"],
                 "description": "What to do.",
             },
             "uuid": {
                 "type": "string",
-                "description": "The asset's uuid (read only). Get it from 'list'.",
+                "description": "The asset's uuid (read/view only). Get it from 'list'.",
             },
             "content": {
                 "type": "string",
@@ -126,8 +145,12 @@ class AssetsTool(PlatformTool):
         filename: str | None = None,
         description: str | None = None,
         timeline: str | None = None,
-    ) -> str:
-        """Dispatch on `action`. Returns a message written for the model to read."""
+    ) -> str | ToolResult:
+        """Dispatch on `action`. Returns a message written for the model to read.
+
+        `view` may return a `ToolResult` carrying the image for the model to see;
+        every other action returns a plain string.
+        """
         target = timeline or self.context.timeline
         if action == "list":
             return self._list(target)
@@ -135,11 +158,15 @@ class AssetsTool(PlatformTool):
             if not uuid:
                 return "Error: 'read' needs the asset's uuid. Use 'list' to find it."
             return self._read(uuid)
+        if action == "view":
+            if not uuid:
+                return "Error: 'view' needs the asset's uuid. Use 'list' to find it."
+            return self._view(uuid)
         if action == "create":
             if content is None or not filename:
                 return "Error: 'create' needs both 'content' and a 'filename'."
             return self._create(target, content, filename, description)
-        return f"Error: unknown action {action!r}. Use 'list', 'read', or 'create'."
+        return f"Error: unknown action {action!r}. Use 'list', 'read', 'view', or 'create'."
 
     # --- list ----------------------------------------------------------------
 
@@ -172,7 +199,8 @@ class AssetsTool(PlatformTool):
                 if not _is_text(file.content_type)
                 else f"{file.byte_size} bytes, over the {MAX_INLINE_BYTES}-byte inline limit"
             )
-            return f"{meta}\n({why} — not inlined. The file is on the timeline by that uuid.)"
+            hint = " Use action='view' to look at it." if _is_image(file.content_type) else ""
+            return f"{meta}\n({why} — not inlined. The file is on the timeline by that uuid.{hint})"
 
         data = self._download(file.url)
         try:
@@ -181,6 +209,40 @@ class AssetsTool(PlatformTool):
             # Declared text but not valid UTF-8 — treat as binary rather than guess.
             return f"{meta}\n(not valid UTF-8 text — not inlined.)"
         return f"{meta}\n\n{text}"
+
+    # --- view ----------------------------------------------------------------
+
+    def _view(self, uuid: str) -> str | ToolResult:
+        """Fetch an image asset and hand it back for the model to actually see.
+
+        Returns a `ToolResult` whose `images` the engine routes into the model's
+        input as a data URL — self-contained, so it does not depend on the model's
+        servers reaching the blob URL. A non-image (or oversized) asset comes back
+        as a plain string explaining why it can't be shown, never as raw bytes.
+        """
+        client = self.context.client
+        asset = client.assets.get(uuid)
+        file = asset.content.file
+        meta = _describe(asset)
+
+        if not _is_image(file.content_type):
+            return f"{meta}\n(not an image — 'view' is for images. Use 'read' for text files.)"
+        if _media_type(file.content_type) not in _VIEWABLE_IMAGE_TYPES:
+            return f"{meta}\n(image type not viewable; supported: PNG, JPEG, GIF, WebP.)"
+        if file.byte_size <= 0:
+            return f"{meta}\n(empty file — nothing to view.)"
+        if file.byte_size > MAX_IMAGE_BYTES:
+            return (
+                f"{meta}\n({file.byte_size} bytes, over the {MAX_IMAGE_BYTES}-byte view "
+                "limit — too large to look at.)"
+            )
+
+        data = self._download(file.url)
+        data_url = _data_url(file.content_type, data)
+        return ToolResult(
+            text=f"{meta}\nLooking at this image now.",
+            images=[ImageContent(url=data_url, alt=file.filename)],
+        )
 
     @staticmethod
     def _download(url: str) -> bytes:
@@ -197,17 +259,27 @@ class AssetsTool(PlatformTool):
     # --- create --------------------------------------------------------------
 
     def _create(self, timeline: str, content: str, filename: str, description: str | None) -> str:
-        client = self.context.client
-        # An in-memory buffer named so the SDK (and the server) see the filename.
-        # No temp file: the produced text goes straight to multipart upload.
-        buffer = io.BytesIO(content.encode("utf-8"))
-        buffer.name = filename
-        assets = client.timelines.get(timeline).assets
-        asset = assets.create(file=buffer, description=description)
+        # The produced text goes straight to the upload as bytes — no temp file.
+        asset = _upload(
+            self.context.client, timeline, content.encode("utf-8"), filename, description
+        )
         return f"Uploaded {filename!r} ({asset.content.file.byte_size} bytes). {_describe(asset)}"
 
 
 # --- shared rendering / type helpers -----------------------------------------
+
+
+def _upload(client: Any, timeline: str, data: bytes, filename: str, description: str | None) -> Any:
+    """Upload raw bytes as a named asset on a timeline; return the created asset.
+
+    The one place the SDK upload contract lives, shared by the assets tool's
+    ``create`` and the image generator: an in-memory buffer named so the SDK (and
+    the server) see the filename, streamed straight to the multipart create. No
+    temp file — the strongest version of "keep scratch bounded" is no scratch.
+    """
+    buffer = io.BytesIO(data)
+    buffer.name = filename
+    return client.timelines.get(timeline).assets.create(file=buffer, description=description)
 
 
 def _describe(asset: Any) -> str:
@@ -229,13 +301,39 @@ def _describe(asset: Any) -> str:
     return line
 
 
+def _media_type(content_type: str) -> str:
+    """The bare media type: parameters stripped, lowercased (e.g. ``image/png``).
+
+    The one parser the type checks share, so ``view``'s viewable-type gate and the
+    data URL it builds can never disagree on the same input.
+    """
+    return content_type.split(";", 1)[0].strip().lower()
+
+
 def _is_text(content_type: str) -> bool:
     """Whether a file of this content type should be decoded and inlined as text."""
     if not content_type:
         return False
-    base = content_type.split(";", 1)[0].strip().lower()
+    base = _media_type(content_type)
     if base.startswith("text/"):
         return True
     if base.endswith("+json") or base.endswith("+xml"):
         return True
     return base in _TEXTUAL_APPLICATION_TYPES
+
+
+def _is_image(content_type: str) -> bool:
+    """Whether a file of this content type is an image (a candidate for `view`)."""
+    if not content_type:
+        return False
+    return _media_type(content_type).startswith("image/")
+
+
+def _data_url(content_type: str, data: bytes) -> str:
+    """A ``data:`` URL for the image bytes, so the input is self-contained.
+
+    Uses the bare media type (stripped of any parameters) and base64-encodes the
+    blob — the form the model providers accept for an inline image.
+    """
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{_media_type(content_type)};base64,{encoded}"

@@ -2,13 +2,17 @@
 
 A `Provider` adapter translates between these types and its own wire format, so
 nothing above the provider layer ever sees an OpenAI (or xAI, or OpenRouter)
-payload. Three small dataclasses are the whole vocabulary:
+payload. A handful of small dataclasses are the whole vocabulary:
 
 - `Message` — one turn in the conversation (system / user / assistant / tool).
 - `ToolCall` — the model asking to run a tool, with `arguments` already parsed
   into a `dict` (never a JSON string — that is a wire detail the adapter owns).
 - `ToolSpec` — a tool offered to the model: a name, a description, and a
   JSON-Schema description of its parameters.
+- `ImageContent` — an image to place in the model's *input* (vision), so a peer
+  can see a picture, not just read text about it.
+- `ToolResult` — a tool's richer return: text plus any images it wants shown to
+  the model. A tool that only has text just returns a `str`, as before.
 """
 
 from __future__ import annotations
@@ -17,6 +21,39 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 Role = Literal["system", "user", "assistant", "tool"]
+
+
+@dataclass
+class ImageContent:
+    """An image placed in the model's input, so a vision-capable model can see it.
+
+    `url` is a fully-formed image reference the provider consumes directly: an
+    ``https://`` URL, or a ``data:<media-type>;base64,<...>`` data URL. The harness
+    inlines fetched asset bytes as a data URL so the input is self-contained — it
+    does not depend on the model's servers reaching a (possibly short-lived,
+    possibly access-controlled) blob URL.
+
+    `alt` is a short human label (typically the filename), used as a breadcrumb in
+    the transcript once the pixels are evicted (see `Engine`), so a stored
+    conversation still reads coherently without carrying base64 forever.
+    """
+
+    url: str
+    alt: str | None = None
+
+
+@dataclass
+class ToolResult:
+    """A tool's return when plain text is not enough: text plus images to show.
+
+    `text` is what a `tool` turn carries back to the model, exactly as a `str`
+    return would. `images` are placed into the model's *input* on the next turn —
+    the mechanism behind seeing an asset, since a function-tool *result* is
+    text-only on every provider. A tool with nothing to show just returns a `str`.
+    """
+
+    text: str
+    images: list[ImageContent] = field(default_factory=list)
 
 
 @dataclass
@@ -39,12 +76,16 @@ class Message:
     `content` is the text (absent on an assistant turn that is purely tool
     calls). `tool_calls` is populated only on assistant turns. `tool_call_id`
     is set only on a `tool` turn, linking a result back to the call it answers.
+    `images` is populated only on the synthetic `user` turn the engine injects to
+    *show* the model an image (vision); a provider that cannot render images
+    simply ignores it, so a text-only adapter is unaffected.
     """
 
     role: Role
     content: str | None = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
+    images: list[ImageContent] = field(default_factory=list)
 
     @classmethod
     def system(cls, content: str) -> Message:
@@ -80,6 +121,8 @@ class Message:
             ]
         if self.tool_call_id is not None:
             data["tool_call_id"] = self.tool_call_id
+        if self.images:
+            data["images"] = [{"url": i.url, "alt": i.alt} for i in self.images]
         return data
 
     @classmethod
@@ -93,6 +136,7 @@ class Message:
                 for c in data.get("tool_calls", [])
             ],
             tool_call_id=data.get("tool_call_id"),
+            images=[ImageContent(url=i["url"], alt=i.get("alt")) for i in data.get("images", [])],
         )
 
 

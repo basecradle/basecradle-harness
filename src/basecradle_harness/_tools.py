@@ -28,7 +28,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from basecradle_harness._exceptions import PolicyError
-from basecradle_harness._messages import ToolSpec
+from basecradle_harness._messages import ToolResult, ToolSpec
 from basecradle_harness._policy import Policy
 
 # The JSON Schema for a tool that takes no arguments.
@@ -54,8 +54,14 @@ class Tool(ABC):
     requires: frozenset[str] = frozenset()
 
     @abstractmethod
-    def run(self, **kwargs: Any) -> str:
-        """Execute the tool and return its result as a string."""
+    def run(self, **kwargs: Any) -> str | ToolResult:
+        """Execute the tool and return its result.
+
+        Return a `str` for the common case — text the model reads. Return a
+        `ToolResult` when the tool also has *images* to show the model (vision);
+        the engine routes those into the model's input on the next turn. Most
+        tools only ever return a `str`.
+        """
 
     def to_spec(self) -> ToolSpec:
         """The provider-neutral schema the model is shown."""
@@ -93,7 +99,7 @@ class ToolRegistry:
         """The tool registered under `name`, or `KeyError` if absent."""
         return self._tools[name]
 
-    def run(self, name: str, **kwargs: Any) -> str:
+    def run(self, name: str, **kwargs: Any) -> str | ToolResult:
         """Invoke a registered tool by name."""
         return self.get(name).run(**kwargs)
 

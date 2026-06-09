@@ -22,8 +22,16 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
+from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._memory import MemoryTool
-from basecradle_harness._messages import Message, Role, ToolCall, ToolSpec
+from basecradle_harness._messages import (
+    ImageContent,
+    Message,
+    Role,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
+)
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._platform import (
     PlatformContext,
@@ -66,12 +74,15 @@ __all__ = [
     "TasksTool",
     "TimelinesTool",
     "TrustTool",
+    "GenerateImageTool",
     "bind_platform_tools",
     # Message vocabulary
     "Message",
     "Role",
     "ToolCall",
+    "ToolResult",
     "ToolSpec",
+    "ImageContent",
     # Errors
     "HarnessError",
     "PolicyError",
