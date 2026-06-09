@@ -457,6 +457,13 @@ def test_from_env_wires_a_full_agent(platform, monkeypatch):
     assert tasks.bound is True
     assert tasks.context.timeline == TIMELINE_UUID
     assert tasks.context.client is agent.client
+    # And the governance tools (timelines + trust), bound the same way.
+    for name in ("timelines", "trust"):
+        assert name in agent.harness.tools
+        tool = agent.harness.tools.get(name)
+        assert tool.bound is True
+        assert tool.context.timeline == TIMELINE_UUID
+        assert tool.context.client is agent.client
 
 
 def test_from_env_honors_the_context_messages_cap(platform, monkeypatch):
