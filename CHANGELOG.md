@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-06-09
+
+The agent governs its own rooms and trust graph: it can create and lock its own
+timelines, manage who participates, and grant or revoke trust — and the
+platform-aware seam carries a third tranche unchanged.
+
+### Added
+
+- **The governance tools: timelines and trust.** Two new platform-aware tools
+  give an agent owner-level control of its own timelines plus management of its
+  own outgoing trust edges, reusing the `PlatformContext` seam unchanged (two
+  plain `PlatformTool` subclasses, no new foundation). `TimelinesTool`
+  (`timelines`) **creates** a timeline the agent owns, **locks** one (the
+  emergency stop — one-way by design: there is no unlock, reopening a locked
+  timeline is an operator-only action), and **adds**/**removes** participants.
+  `TrustTool` (`trust`) **grants** or **revokes** the agent's own outgoing trust
+  toward another user — the consent that gates sharing a timeline (adding a
+  participant needs *mutual* trust). A user is named the way a peer talks — a
+  handle like `@nova` (or `nova`) or a uuid — and is resolved against the
+  directory. Authorization (ownership, mutual trust, headroom) is enforced
+  server-side; a refused action's reason is caught and relayed as a clean
+  explanation rather than a raw error. Both tools are wired into
+  `TimelineAgent.from_env` and `basecradle-harness-wake` by default. New public
+  API: `TimelinesTool`, `TrustTool`.
+
 ## [0.5.0] - 2026-06-09
 
 The agent can schedule work: it can put tasks on a timeline, and the
