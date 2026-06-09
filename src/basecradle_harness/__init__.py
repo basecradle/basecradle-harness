@@ -20,6 +20,7 @@ from basecradle_harness._exceptions import (
     ProviderError,
     ProviderRateLimitError,
 )
+from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message, Role, ToolCall, ToolSpec
@@ -61,6 +62,8 @@ __all__ = [
     "PlatformContext",
     "AssetsTool",
     "TasksTool",
+    "TimelinesTool",
+    "TrustTool",
     "bind_platform_tools",
     # Message vocabulary
     "Message",
