@@ -1,5 +1,7 @@
 # Claude Code session runtime scratch (never belongs in the repo)
 .claude/scheduled_tasks.lock
+# Personal, machine-local Claude Code settings (per-developer; never shared)
+.claude/settings.local.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
