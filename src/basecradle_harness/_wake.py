@@ -54,6 +54,7 @@ from basecradle_harness._memory import MemoryTool
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._session import Session
+from basecradle_harness._tasks import TasksTool
 
 
 class MarkStore:
@@ -176,7 +177,7 @@ class WakeAgent:
         harness = Harness(
             OpenAICompatibleProvider(**provider_kwargs),
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
-            tools=[MemoryTool(), AssetsTool()],
+            tools=[MemoryTool(), AssetsTool(), TasksTool()],
             home=home,
         )
         return cls(

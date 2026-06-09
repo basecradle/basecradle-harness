@@ -7,6 +7,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The tasks tool: give the agent scheduled work.** A new `TasksTool` lets an
+  agent **create**, **list**, and **read** tasks on a timeline — the platform's
+  unit of scheduled work (instructions + an activation time + status). It is the
+  second platform-aware tool and **reuses the `PlatformContext` seam unchanged**
+  (a plain `PlatformTool` subclass, no new foundation), proving the seam from the
+  assets tool generalizes. Because a task must say *when* it activates, the tool
+  accepts `activate_at` two ways and normalizes to a single absolute timestamp: a
+  relative offset from now (`+90m`, `+2h`, `+1d` — units `s m h d w`) or an
+  absolute ISO-8601 timestamp (`2026-06-10T15:00:00Z`; a bare timestamp is read
+  as UTC). Operations default to the timeline the agent is engaged on; an explicit
+  timeline uuid handles cross-timeline use. The tool is wired into both
+  `TimelineAgent.from_env` and `basecradle-harness-wake` by default. New public
+  API: `TasksTool`.
+
 ## [0.4.0] - 2026-06-09
 
 The agent gets hands on the platform: it can exchange files on a timeline, and

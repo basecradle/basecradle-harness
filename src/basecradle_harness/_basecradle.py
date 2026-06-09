@@ -40,6 +40,7 @@ from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
+from basecradle_harness._tasks import TasksTool
 
 DEFAULT_POLL_INTERVAL = 2.0
 
@@ -150,7 +151,7 @@ class TimelineAgent:
         harness = Harness(
             OpenAICompatibleProvider(**provider_kwargs),
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
-            tools=[MemoryTool(), AssetsTool()],
+            tools=[MemoryTool(), AssetsTool(), TasksTool()],
         )
         return cls(
             harness,

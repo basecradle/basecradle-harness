@@ -32,6 +32,7 @@ from basecradle_harness._platform import (
 from basecradle_harness._policy import BASECRADLE, SHELL, Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._session import Session
+from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._version import __version__
 from basecradle_harness._wake import MarkStore, WakeAgent
@@ -59,6 +60,7 @@ __all__ = [
     "PlatformTool",
     "PlatformContext",
     "AssetsTool",
+    "TasksTool",
     "bind_platform_tools",
     # Message vocabulary
     "Message",
