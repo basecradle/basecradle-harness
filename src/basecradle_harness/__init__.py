@@ -32,6 +32,7 @@ from basecradle_harness._platform import (
 )
 from basecradle_harness._policy import BASECRADLE, SHELL, Policy
 from basecradle_harness._provider import Provider
+from basecradle_harness._responses import OpenAIResponsesProvider
 from basecradle_harness._session import Session
 from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
@@ -47,9 +48,10 @@ __all__ = [
     "TimelineAgent",
     "WakeAgent",
     "MarkStore",
-    # Provider contract + adapter
+    # Provider contract + adapters
     "Provider",
     "OpenAICompatibleProvider",
+    "OpenAIResponsesProvider",
     # Tools, registry, and the safety boundary
     "Tool",
     "ToolRegistry",

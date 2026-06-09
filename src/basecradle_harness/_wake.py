@@ -46,13 +46,13 @@ from basecradle_harness._basecradle import (
     _messages_since,
     _onboard_from_env,
     _orientation,
+    _provider_from_env,
     _recent,
 )
 from basecradle_harness._exceptions import HarnessError, ProviderError
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._memory import MemoryTool
-from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._session import Session
 from basecradle_harness._tasks import TasksTool
@@ -171,12 +171,8 @@ class WakeAgent:
                 "Wake mode requires HARNESS_HOME — the directory where the agent's "
                 "transcript and high-water mark persist across wakes."
             )
-        provider_kwargs = {"model": os.environ["AI_PROVIDER_MODEL"]}
-        base_url = os.environ.get("AI_PROVIDER_BASE_URL")
-        if base_url:
-            provider_kwargs["base_url"] = base_url
         harness = Harness(
-            OpenAICompatibleProvider(**provider_kwargs),
+            _provider_from_env(),
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
             tools=[MemoryTool(), AssetsTool(), TasksTool(), TimelinesTool(), TrustTool()],
             home=home,

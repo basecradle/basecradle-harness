@@ -13,7 +13,14 @@ import pytest
 import respx
 from basecradle import BaseCradle
 
-from basecradle_harness import Harness, MemoryTool, Message, TimelineAgent
+from basecradle_harness import (
+    Harness,
+    MemoryTool,
+    Message,
+    OpenAICompatibleProvider,
+    OpenAIResponsesProvider,
+    TimelineAgent,
+)
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _client_from_env,
@@ -21,6 +28,7 @@ from basecradle_harness._basecradle import (
     _context_messages_from_env,
     _onboard_from_env,
     _orientation,
+    _provider_from_env,
 )
 
 BC_URL = "https://basecradle.com"
@@ -496,6 +504,71 @@ def test_context_messages_from_env_parses_int_all_and_default(monkeypatch):
 
     monkeypatch.setenv("HARNESS_CONTEXT_MESSAGES", "7")
     assert _context_messages_from_env() == 7
+
+
+# --- provider selection (AI_PROVIDER_API) ------------------------------------
+
+
+def test_provider_from_env_defaults_to_chat_completions(monkeypatch):
+    monkeypatch.delenv("AI_PROVIDER_API", raising=False)
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+
+    provider = _provider_from_env()
+
+    assert isinstance(provider, OpenAICompatibleProvider)
+
+
+def test_provider_from_env_selects_responses(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER_API", "responses")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+
+    provider = _provider_from_env()
+
+    assert isinstance(provider, OpenAIResponsesProvider)
+
+
+def test_provider_from_env_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER_API", "Responses")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+
+    assert isinstance(_provider_from_env(), OpenAIResponsesProvider)
+
+
+def test_provider_from_env_passes_base_url_through(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER_API", "chat")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "grok-2")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_PROVIDER_BASE_URL", "https://api.x.ai/v1")
+
+    provider = _provider_from_env()
+
+    assert provider.base_url == "https://api.x.ai/v1"
+
+
+def test_provider_from_env_rejects_an_unknown_api(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER_API", "telepathy")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+
+    with pytest.raises(ValueError, match="AI_PROVIDER_API"):
+        _provider_from_env()
+
+
+def test_from_env_wires_the_responses_provider(platform, monkeypatch):
+    """End to end: AI_PROVIDER_API=responses gives the agent the Responses brain."""
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_PROVIDER_API", "responses")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+
+    agent = TimelineAgent.from_env()
+
+    assert isinstance(agent.harness.provider, OpenAIResponsesProvider)
 
 
 # --- credential bootstrap (mint a token from email + password) ---------------

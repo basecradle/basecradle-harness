@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-09
+
+The agent can search the web. A second provider adapter speaks OpenAI's Responses
+API and turns on its built-in, server-side `web_search` tool — composed with the
+agent's own platform tools in a single turn — proving the provider extension point
+the same way the platform tranches proved the tool seam.
+
+### Added
+
+- **The OpenAI Responses provider: built-in web search.** A new
+  `OpenAIResponsesProvider` satisfies the existing `Provider` contract but speaks
+  OpenAI's **Responses API** (`POST /v1/responses`) instead of Chat Completions,
+  to reach the one thing the compatible API cannot: **server-side built-in tools**.
+  It enables `web_search` by default — OpenAI runs the search inside the API call
+  and returns the model's answer grounded in live sources, which the adapter
+  surfaces with a deduplicated `Sources:` footer from the `url_citation`
+  annotations. Built-in tools (resolved server-side, never executed by the harness)
+  and **custom function tools** (the platform tools + memory, still looped through
+  the engine) coexist in one turn, so an agent can search the web *and* act on the
+  platform in the same conversation. The default `OpenAICompatibleProvider` (Chat
+  Completions, portable across OpenAI/xAI/OpenRouter) is **untouched** and remains
+  the default; an agent opts in with `AI_PROVIDER_API=responses` (default `chat`),
+  honored by both `TimelineAgent.from_env` and `basecradle-harness-wake`. Built-in
+  handling is general — enabling another built-in (e.g. image generation) later is
+  registering its type, not a rewrite. New public API: `OpenAIResponsesProvider`.
+
 ## [0.6.0] - 2026-06-09
 
 The agent governs its own rooms and trust graph: it can create and lock its own

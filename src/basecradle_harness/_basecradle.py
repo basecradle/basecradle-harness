@@ -18,6 +18,9 @@ Configuration is environment-first (see `TimelineAgent.from_env`):
 - ``AI_PROVIDER_API_KEY``     — the model provider's API key.
 - ``AI_PROVIDER_MODEL``       — the model id (e.g. ``gpt-4o``).
 - ``AI_PROVIDER_BASE_URL``    — optional; point the provider at OpenRouter/xAI.
+- ``AI_PROVIDER_API``         — optional; ``chat`` (default, the portable
+  OpenAI-compatible Chat Completions adapter) or ``responses`` (OpenAI's Responses
+  API, which adds the built-in ``web_search`` tool). See `_provider_from_env`.
 - ``HARNESS_SYSTEM_PROMPT``   — optional standing instructions for the agent.
 - ``HARNESS_CONTEXT_MESSAGES`` — optional; how many backlog messages to seed as
   context (an int, or ``all`` for the whole timeline). Unset → the default.
@@ -41,6 +44,8 @@ from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
+from basecradle_harness._provider import Provider
+from basecradle_harness._responses import OpenAIResponsesProvider
 from basecradle_harness._tasks import TasksTool
 
 DEFAULT_POLL_INTERVAL = 2.0
@@ -145,12 +150,8 @@ class TimelineAgent:
     @classmethod
     def from_env(cls) -> TimelineAgent:
         """Build a fully wired agent (provider + memory + timeline) from env vars."""
-        provider_kwargs = {"model": os.environ["AI_PROVIDER_MODEL"]}
-        base_url = os.environ.get("AI_PROVIDER_BASE_URL")
-        if base_url:
-            provider_kwargs["base_url"] = base_url
         harness = Harness(
-            OpenAICompatibleProvider(**provider_kwargs),
+            _provider_from_env(),
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
             tools=[MemoryTool(), AssetsTool(), TasksTool(), TimelinesTool(), TrustTool()],
         )
@@ -340,6 +341,34 @@ def _compose_prompt(orientation: str | None, system_prompt: str | None) -> str |
     """
     parts = [part for part in (orientation, system_prompt) if part]
     return "\n\n".join(parts) if parts else None
+
+
+def _provider_from_env() -> Provider:
+    """Build the model provider the environment selects — Chat Completions by default.
+
+    ``AI_PROVIDER_API`` chooses the adapter:
+
+    - unset or ``chat`` → `OpenAICompatibleProvider`, the portable Chat Completions
+      adapter (OpenAI, xAI, OpenRouter). The default — nothing changes for existing
+      deployments.
+    - ``responses`` → `OpenAIResponsesProvider`, OpenAI's Responses API, which
+      enables the built-in ``web_search`` tool. OpenAI-only by nature.
+
+    Both read ``AI_PROVIDER_MODEL`` and the optional ``AI_PROVIDER_BASE_URL``; both
+    fall back to ``AI_PROVIDER_API_KEY`` for the key. An unrecognized value is a
+    clear error rather than a silent fall-through to the default.
+    """
+    kwargs: dict[str, str] = {"model": os.environ["AI_PROVIDER_MODEL"]}
+    base_url = os.environ.get("AI_PROVIDER_BASE_URL")
+    if base_url:
+        kwargs["base_url"] = base_url
+
+    api = (os.environ.get("AI_PROVIDER_API") or "chat").strip().lower()
+    if api == "responses":
+        return OpenAIResponsesProvider(**kwargs)
+    if api == "chat":
+        return OpenAICompatibleProvider(**kwargs)
+    raise ValueError(f"Unknown AI_PROVIDER_API {api!r}; expected 'chat' (default) or 'responses'.")
 
 
 def _onboard_from_env() -> bool:
