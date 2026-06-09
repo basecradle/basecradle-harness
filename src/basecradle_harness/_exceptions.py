@@ -16,6 +16,15 @@ class PolicyError(HarnessError):
     """A tool was rejected by the active policy (e.g. it needs a forbidden capability)."""
 
 
+class PlatformError(HarnessError):
+    """A platform-aware tool could not act on the platform.
+
+    Most often: the tool was invoked before a hosting agent
+    (`TimelineAgent`/`WakeAgent`) bound its live `PlatformContext`, so it has no
+    SDK client or current timeline to act through.
+    """
+
+
 class EngineError(HarnessError):
     """The agent loop could not produce a final reply (e.g. it hit the step limit)."""
 

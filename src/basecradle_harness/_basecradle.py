@@ -34,10 +34,12 @@ import time
 
 from basecradle import BaseCradle
 
+from basecradle_harness._assets import AssetsTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
+from basecradle_harness._platform import PlatformContext, bind_platform_tools
 
 DEFAULT_POLL_INTERVAL = 2.0
 
@@ -101,6 +103,17 @@ class TimelineAgent:
         self.timeline_uuid = timeline
         self.timeline = self.client.timelines.get(timeline)
 
+        # Wire the live platform handle into every platform-aware tool now that the
+        # client and current timeline are resolved. This is the seam every Phase-2
+        # tool reuses; a plain tool (memory) is skipped. One timeline per agent, so
+        # binding once is correct — cross-timeline use is an explicit op argument.
+        bind_platform_tools(
+            self.harness.tools,
+            PlatformContext(
+                client=self.client, timeline=self.timeline_uuid, home=self.harness.home
+            ),
+        )
+
         # One Dashboard read answers "who am I?" and, when onboarding, "what is this
         # place?" The Dashboard is the literal page a fresh peer wakes on; reading
         # `bc.me` once serves both — `me` is uncached, so we never fetch it twice.
@@ -137,7 +150,7 @@ class TimelineAgent:
         harness = Harness(
             OpenAICompatibleProvider(**provider_kwargs),
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
-            tools=[MemoryTool()],
+            tools=[MemoryTool(), AssetsTool()],
         )
         return cls(
             harness,
