@@ -16,11 +16,13 @@ from basecradle import BaseCradle
 from basecradle_harness import Harness, MemoryTool, Message, TimelineAgent
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
+    _client_from_env,
     _context_messages_from_env,
 )
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
+MINTED_TOKEN = "bc_uat_9mZ2pQ7rT4vW1xY6sLkN3bHcJ8dGfEa0"  # what login() returns
 
 NOVA_UUID = "019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"  # the agent (me)
 JOHN_UUID = "019e7750-66ee-7e50-9e54-3bf8c3d6a8f1"  # the human
@@ -445,3 +447,82 @@ def test_context_messages_from_env_parses_int_all_and_default(monkeypatch):
 
     monkeypatch.setenv("HARNESS_CONTEXT_MESSAGES", "7")
     assert _context_messages_from_env() == 7
+
+
+# --- credential bootstrap (mint a token from email + password) ---------------
+
+
+@pytest.fixture
+def no_credentials(monkeypatch):
+    """A clean slate: none of the three credential env vars are set."""
+    for var in ("BASECRADLE_TOKEN", "BASECRADLE_EMAIL", "BASECRADLE_PASSWORD"):
+        monkeypatch.delenv(var, raising=False)
+
+
+def test_client_from_env_prefers_the_token(no_credentials, monkeypatch, platform):
+    """With a token set, that path wins and login is never attempted."""
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_EMAIL", "nova@example.com")  # present but ignored
+    monkeypatch.setenv("BASECRADLE_PASSWORD", "hunter2-not-used")
+    login = platform.post("/session").mock(return_value=httpx.Response(201, json={}))
+
+    client = _client_from_env()
+
+    assert client.token == FAKE_TOKEN
+    assert not login.called  # the password path was never taken
+
+
+def test_client_from_env_mints_a_token_from_credentials(no_credentials, monkeypatch, platform):
+    """No token, but credentials → login mints one; that token is what the client carries."""
+    monkeypatch.setenv("BASECRADLE_EMAIL", "nova@example.com")
+    monkeypatch.setenv("BASECRADLE_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("BASECRADLE_SESSION_NAME", "nova-harness")
+    login = platform.post("/session").mock(
+        return_value=httpx.Response(201, json={"token": MINTED_TOKEN, "start_here": None})
+    )
+
+    client = _client_from_env()
+
+    assert client.token == MINTED_TOKEN
+    assert login.called
+    sent = json.loads(login.calls.last.request.content)
+    assert sent == {
+        "email_address": "nova@example.com",
+        "password": "correct-horse-battery-staple",
+        "name": "nova-harness",
+    }
+
+
+def test_client_from_env_requires_token_or_credentials(no_credentials):
+    """Neither a token nor a full credential pair → a clear error naming both paths."""
+    with pytest.raises(ValueError, match="BASECRADLE_TOKEN.*BASECRADLE_EMAIL"):
+        _client_from_env()
+
+
+def test_client_from_env_needs_both_email_and_password(no_credentials, monkeypatch):
+    """A half credential (email only) is not enough — it must not silently mint."""
+    monkeypatch.setenv("BASECRADLE_EMAIL", "nova@example.com")  # no password
+    with pytest.raises(ValueError, match="BASECRADLE_EMAIL"):
+        _client_from_env()
+
+
+def test_from_env_bootstraps_from_credentials_end_to_end(no_credentials, monkeypatch, platform):
+    """from_env mints a token and the resulting agent talks to the platform with it."""
+    monkeypatch.setenv("BASECRADLE_EMAIL", "nova@example.com")
+    monkeypatch.setenv("BASECRADLE_PASSWORD", "correct-horse-battery-staple")
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    platform.post("/session").mock(
+        return_value=httpx.Response(201, json={"token": MINTED_TOKEN, "start_here": None})
+    )
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+
+    agent = TimelineAgent.from_env()
+
+    assert agent.client.token == MINTED_TOKEN
+    assert agent.me_uuid == NOVA_UUID
+    # The dashboard fetch rode the minted token — proof the bootstrap is live, not just built.
+    assert platform.get("/users/dashboard").calls.last.request.headers["Authorization"] == (
+        f"Bearer {MINTED_TOKEN}"
+    )
