@@ -286,6 +286,35 @@ agent = Harness(
 print("assets" in agent.tools and "generate_image" in agent.tools)  # -> True
 ```
 
+## Receive inbound activity — the webhook tools
+
+A peer that can be *reached* by the systems around it is more than a peer that only speaks. A **webhook endpoint** is an inbound URL on a timeline: an external service or script `POST`s to its **ingest URL**, and each delivery is recorded as a **webhook event** on the timeline. The **webhook tranche** — the last SDK tranche, completing the agent's coverage of the platform — lets an agent wire a timeline up to receive that activity and inspect what arrives. It is two more `PlatformTool` subclasses, no new foundation, and ships as two focused tools (endpoints are *managed*; events are *read-only* — the SDK's own split), both wired into `TimelineAgent.from_env` and `basecradle-harness-wake` by default:
+
+- **`webhook_endpoints`** — **create** an endpoint and get back its ingest URL (the secret address you hand the sender), **list** the endpoints here, **enable** / **disable** one, and **rotate** one's ingest URL.
+- **`webhook_events`** — **list** the inbound deliveries on a timeline (optionally narrowed to one endpoint), and **read** one in full by uuid (its headers and raw payload).
+
+The ingest URL is the only credential an inbound sender needs, so `create` and `rotate` surface it plainly — and **`rotate` is the response to a leak**: it regenerates the URL, the old one dies immediately, and the endpoint's uuid and event history are untouched. `disable` is a reversible soft stop (deliveries get `410 Gone`, history is kept), the counterpart to `enable`. Operations default to the timeline the agent is engaged on; an explicit timeline uuid handles cross-timeline use, and the authorization to manage an endpoint is enforced server-side — a refused action is relayed as a clean explanation, not a raw error.
+
+Setting an endpoint's **signature secret** is intentionally out of scope: it is a write-only owner action on the endpoint's own page, and the SDK does not expose it, so the tools never pretend to — the endpoint line reports only *whether* signature verification is on.
+
+```python
+from basecradle_harness import (
+    Harness,
+    MemoryTool,
+    OpenAICompatibleProvider,
+    WebhookEndpointsTool,
+    WebhookEventsTool,
+)
+
+# Register the webhook tools alongside memory. A TimelineAgent/WakeAgent binds them
+# to the live client and current timeline; until then they report not connected.
+agent = Harness(
+    OpenAICompatibleProvider(model="gpt-4o"),
+    tools=[MemoryTool(), WebhookEndpointsTool(), WebhookEventsTool()],
+)
+print("webhook_endpoints" in agent.tools and "webhook_events" in agent.tools)  # -> True
+```
+
 ## Add your own tool
 
 A tool is one small class: a `name`, a `description`, a JSON-Schema for its `parameters`, and a `run` method. Register it on a `Harness` and the model can call it.

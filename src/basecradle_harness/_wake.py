@@ -57,6 +57,7 @@ from basecradle_harness._memory import MemoryTool
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._session import Session
 from basecradle_harness._tasks import TasksTool
+from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
 
 class MarkStore:
@@ -182,6 +183,8 @@ class WakeAgent:
                 TimelinesTool(),
                 TrustTool(),
                 GenerateImageTool(),
+                WebhookEndpointsTool(),
+                WebhookEventsTool(),
             ],
             home=home,
         )

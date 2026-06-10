@@ -46,6 +46,7 @@ from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._version import __version__
 from basecradle_harness._wake import MarkStore, WakeAgent
+from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
 __all__ = [
     "__version__",
@@ -75,6 +76,8 @@ __all__ = [
     "TimelinesTool",
     "TrustTool",
     "GenerateImageTool",
+    "WebhookEndpointsTool",
+    "WebhookEventsTool",
     "bind_platform_tools",
     # Message vocabulary
     "Message",
