@@ -48,6 +48,7 @@ from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._provider import Provider
 from basecradle_harness._responses import OpenAIResponsesProvider
 from basecradle_harness._tasks import TasksTool
+from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
 DEFAULT_POLL_INTERVAL = 2.0
 
@@ -161,6 +162,8 @@ class TimelineAgent:
                 TimelinesTool(),
                 TrustTool(),
                 GenerateImageTool(),
+                WebhookEndpointsTool(),
+                WebhookEventsTool(),
             ],
         )
         return cls(
