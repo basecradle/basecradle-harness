@@ -7,6 +7,7 @@ https://basecradle.com · API docs: https://basecradle.com/docs/api
 """
 
 from basecradle_harness._assets import AssetsTool
+from basecradle_harness._audio import HearAudioTool
 from basecradle_harness._basecradle import TimelineAgent
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
@@ -72,6 +73,7 @@ __all__ = [
     "PlatformTool",
     "PlatformContext",
     "AssetsTool",
+    "HearAudioTool",
     "TasksTool",
     "TimelinesTool",
     "TrustTool",
