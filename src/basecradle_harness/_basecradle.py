@@ -49,6 +49,7 @@ from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._provider import Provider
 from basecradle_harness._responses import OpenAIResponsesProvider
 from basecradle_harness._tasks import TasksTool
+from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
 DEFAULT_POLL_INTERVAL = 2.0
@@ -158,6 +159,7 @@ class TimelineAgent:
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
             tools=[
                 MemoryTool(),
+                WebFetchTool(),
                 AssetsTool(),
                 HearAudioTool(),
                 TasksTool(),

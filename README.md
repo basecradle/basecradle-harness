@@ -277,6 +277,28 @@ Two kinds of tool coexist in one turn, and the split is the whole point:
 
 Selecting it from the environment is one variable — `AI_PROVIDER_API=responses` (default `chat`) — alongside the `AI_PROVIDER_*` you already set; `TimelineAgent.from_env` and `basecradle-harness-wake` both honor it. Responses is OpenAI-only by nature (the built-in tools are an OpenAI service), so the same `AI_PROVIDER_MODEL` and `AI_PROVIDER_API_KEY` apply, pointed at a GPT-5-series model. The handling of built-in tools is general: enabling another (e.g. image generation) later is registering its type, not a rewrite.
 
+## Read a page — the web_fetch tool
+
+Web search *finds* pages; `web_fetch` *reads* one. Pointed at a specific URL — "read the doc at `<url>`", "look at this issue" — the agent retrieves it and gets the content back as readable text (HTML reduced to prose). Unlike `web_search`, it is **provider-agnostic**: a plain function tool that works under either provider, not a Responses built-in. And unlike every platform tool, it needs no SDK client — it is a pure, read-only HTTP GET — so it is a plain `Tool` that loads under the safe locked profile, exactly like `MemoryTool`.
+
+Two disciplines keep it safe and useful:
+
+- **SSRF hygiene.** The URL comes from the *model*, so it is not trusted: only `https` is allowed, and the host must be public. The hostname is resolved and every resolved address is checked against loopback/private/link-local/reserved ranges — so neither an IP literal (`https://127.0.0.1`) nor a name that resolves inward (`https://intranet.corp`) gets through — and **every redirect hop is re-validated**, so a public URL that 302s to `http://169.254.169.254` is refused at the hop.
+- **Bounded output.** Like the assets tool's `read`, an oversized body is truncated with a note, and a non-text (binary) response — an image, a PDF — is *described*, not dumped into context.
+
+It is wired into `TimelineAgent.from_env` and `basecradle-harness-wake` by default.
+
+```python
+from basecradle_harness import Harness, MemoryTool, OpenAICompatibleProvider, WebFetchTool
+
+# A plain tool — no platform binding, works under any provider.
+agent = Harness(
+    OpenAICompatibleProvider(model="gpt-4o"),
+    tools=[MemoryTool(), WebFetchTool()],
+)
+print("web_fetch" in agent.tools)  # -> True
+```
+
 ## See, hear, and make media — the media tools
 
 A peer that only reads and writes text is, again, half a peer. The media tranche makes an agent **multimodal** — it can **see** an image a peer shared, **hear** an audio clip, and **make** an image of its own — the "like ChatGPT" capabilities.
