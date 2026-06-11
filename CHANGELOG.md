@@ -7,6 +7,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-11
+
+A woken agent now **acts on inbound webhook deliveries**, not just messages. The agent
+could already manage webhook endpoints and read events; this makes a delivery actually
+wake-actionable — the harness half of the end-to-end inbound path (the router half, an
+event-allow-list fix to wake on `webhook_event.received`, lives in
+[basecradle-router](https://github.com/basecradle/basecradle-router)).
+
+### Added
+
+- **Wake mode reconciles inbound webhook events.** A wake now surfaces a timeline's
+  unseen `webhook_event`s — not only its messages — and lets the agent act on them. A
+  received webhook event is *not* a timeline item the way a message or an activated task
+  is, so the timeline scan would otherwise miss it; the wake fetches unseen deliveries
+  through the SDK's webhook-events read surface under their **own** high-water mark, with
+  the same idempotency the message path has (advanced per delivery, crash- and
+  retry-safe). Each delivery is surfaced to the model with its endpoint, content type,
+  and payload (a large payload is truncated with a pointer to the `webhook_events` tool
+  for the full body). Messages and webhook events advance independent marks, so
+  reconciling one never re-surfaces the other.
+- **`--event <uuid>` on `basecradle-harness-wake`** (env `BASECRADLE_EVENT`): the uuid of
+  the triggering webhook delivery. On a `webhook_event.received` wake the router passes it
+  so the **first** wake acts on exactly that delivery rather than baselining it as seen;
+  with no trigger, a first wake only baselines the event mark, so a fresh agent never
+  replays a backlog of historical deliveries it was not woken for. `MarkStore` is now
+  namespaced by item kind (messages keep their original on-disk location, so a deployed
+  agent's existing marks still resolve).
+
+Scoped to wake mode, where router-delivered events matter; `task.activated` already
+arrives as a timeline item and needs only the router fix. The poll loop
+(`TimelineAgent`) is unchanged.
+
 ## [0.12.0] - 2026-06-11
 
 The agent can now **read a specific web page**, not just search for one. `web_search`

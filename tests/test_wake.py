@@ -59,6 +59,32 @@ def page(*messages):
     return {"messages": list(messages), "next_cursor": None}
 
 
+# Well-formed UUIDv7 webhook-event and endpoint ids, oldest → newest.
+EP = "019e7760-1111-7aaa-8bbb-1c2d3e4f5061"
+E0 = "019e7761-2222-7bbb-8ccc-2d3e4f506172"
+E1 = "019e7762-3333-7ccc-8ddd-3e4f50617283"
+
+
+def event(*, uuid, payload, content_type="application/json"):
+    return {
+        "type": "webhook_event",
+        "created_at": "2026-06-04T00:00:00.000Z",
+        "timeline": {"uuid": TIMELINE_UUID},
+        "webhook_endpoint": {"uuid": EP},
+        "content": {
+            "uuid": uuid,
+            "content_type": content_type,
+            "headers": {"x-source": "github"},
+            "payload": payload,
+            "ingest_token_at_receipt": "tok_abc",
+        },
+    }
+
+
+def event_page(*events):
+    return {"webhook_events": list(events), "next_cursor": None}
+
+
 def dashboard():
     return {"identity": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}}
 
@@ -106,12 +132,21 @@ def platform():
                 201, json={"message": message(uuid=REPLY, body="reply", mine=True)}
             )
         )
+        # By default a timeline has no inbound webhook deliveries, so a wake's
+        # reconciliation of them is a clean no-op. Tests that exercise the path
+        # override this with `serve_events`.
+        router.get("/webhook_events").mock(return_value=httpx.Response(200, json=event_page()))
         yield router
 
 
 def serve_messages(platform, *pages):
     """Drive the (newest-first) message list endpoint; one page per read."""
     platform.get("/messages").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
+
+
+def serve_events(platform, *pages):
+    """Drive the (newest-first) webhook-event list endpoint; one page per read."""
+    platform.get("/webhook_events").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
 
 
 def build_wake(home, provider=None, *, system_prompt=None, onboard=False, **kwargs):
@@ -371,6 +406,137 @@ def test_does_not_reply_to_its_own_new_message(platform, tmp_path):
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
 
 
+# --- inbound webhook deliveries (webhook_event.received) ---------------------
+
+
+def test_first_wake_acts_on_the_triggering_event(platform, tmp_path):
+    """The router wakes the agent on a delivery and names it; the agent acts on it."""
+    serve_messages(platform, page())  # no messages on the timeline
+    serve_events(platform, event_page(event(uuid=E0, payload='{"action":"opened"}')))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake(event_trigger=E0)
+
+    assert len(posted) == 1  # the agent perceived the delivery and replied
+    assert len(provider.prompts) == 1
+    assert "inbound webhook" in provider.prompts[0]
+    assert '{"action":"opened"}' in provider.prompts[0]  # the payload reached the model
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0
+
+
+def test_first_wake_without_a_trigger_baselines_events_without_acting(platform, tmp_path):
+    """A wake that wasn't a webhook delivery (no event trigger) doesn't replay history."""
+    serve_messages(platform, page())
+    serve_events(platform, event_page(event(uuid=E0, payload="old delivery")))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()  # no event_trigger — e.g. a message-driven or first-ever wake
+
+    assert posted == []
+    assert provider.prompts == []  # the historical delivery is not acted on...
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0  # ...but baselined
+
+
+def test_event_after_a_mark_is_acted_on(platform, tmp_path):
+    """Steady state: a delivery newer than the persisted event mark is acted on."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, E0, kind="webhook_events")
+    serve_messages(platform, page())
+    serve_events(platform, event_page(event(uuid=E1, payload="new"), event(uuid=E0, payload="old")))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert "new" in provider.prompts[0]
+    assert "old" not in provider.prompts[0]  # the already-seen one is skipped
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E1
+
+
+def test_event_wake_is_idempotent_across_processes(platform, tmp_path):
+    """A second process (same home) sees the persisted event mark and acts on nothing."""
+    serve_messages(platform, page(), page())
+    serve_events(
+        platform,
+        event_page(event(uuid=E0, payload="x")),
+        event_page(event(uuid=E0, payload="x")),
+    )
+    first, _ = build_wake(tmp_path)
+    assert len(first.wake(event_trigger=E0)) == 1
+
+    second, second_provider = build_wake(tmp_path)
+    assert second.wake(event_trigger=E0) == []  # E0 already handled
+    assert second_provider.prompts == []  # the model was never consulted
+
+
+def test_messages_and_events_both_surface_in_one_wake(platform, tmp_path):
+    """One wake reconciles a new message and a new delivery, in the same session."""
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    serve_events(platform, event_page(event(uuid=E0, payload="ping")))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake(event_trigger=E0)
+
+    assert len(posted) == 2  # a reply to the message and an action on the delivery
+    assert any("john: hi" in p for p in provider.prompts)
+    assert any("inbound webhook" in p for p in provider.prompts)
+    # Each kind advanced its own mark, independently.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0
+
+
+def test_no_events_makes_no_provider_call(platform, tmp_path):
+    """A wake with an event mark already at the newest delivery makes no model call."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, E0, kind="webhook_events")
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)  # and no new messages either
+    serve_messages(platform, page(message(uuid=M0, body="old")))
+    serve_events(platform, event_page(event(uuid=E0, payload="old")))
+    agent, provider = build_wake(tmp_path)
+
+    assert agent.wake() == []
+    assert provider.prompts == []
+
+
+def test_trigger_past_the_fetch_window_is_fetched_not_dropped(platform, tmp_path):
+    """A burst can push the triggering event past the bounded first-wake fetch; it must
+    still be acted on (fetched directly), never silently replaced by the newest."""
+    serve_messages(platform, page())
+    # The window the first wake fetches does NOT contain E0 (the trigger) — a burst of
+    # newer deliveries (E1) crowded it out (context_messages=1 forces a 1-event window).
+    serve_events(platform, event_page(event(uuid=E1, payload="newer burst event")))
+    # The trigger is reachable by uuid, the way the SDK fetches one event.
+    platform.get(f"/webhook_events/{E0}").mock(
+        return_value=httpx.Response(
+            200, json={"webhook_event": event(uuid=E0, payload="THE TRIGGER")}
+        )
+    )
+    agent, provider = build_wake(tmp_path, context_messages=1)
+
+    posted = agent.wake(event_trigger=E0)
+
+    # Both the named trigger (fetched directly) and the window's newer event are acted on.
+    assert any("THE TRIGGER" in p for p in provider.prompts)
+    assert any("newer burst event" in p for p in provider.prompts)
+    assert len(posted) == 2
+    assert (
+        MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E1
+    )  # baselined to newest
+
+
+def test_large_event_payload_is_truncated_with_a_pointer(platform, tmp_path):
+    """A firehose payload is truncated, with a pointer to the webhook_events tool."""
+    serve_messages(platform, page())
+    big = "x" * (9 * 1024)
+    serve_events(platform, event_page(event(uuid=E0, payload=big)))
+    agent, provider = build_wake(tmp_path)
+
+    agent.wake(event_trigger=E0)
+
+    prompt = provider.prompts[0]
+    assert "payload truncated" in prompt
+    assert "webhook_events tool" in prompt
+    assert len(prompt) < len(big)  # not the whole body
+
+
 # --- the session key + shared memory -----------------------------------------
 
 
@@ -433,6 +599,7 @@ def wake_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HARNESS_ONBOARD", "0")
     monkeypatch.delenv("BASECRADLE_TIMELINE", raising=False)
     monkeypatch.delenv("BASECRADLE_MESSAGE", raising=False)
+    monkeypatch.delenv("BASECRADLE_EVENT", raising=False)
     return tmp_path
 
 
@@ -480,6 +647,15 @@ def test_main_reads_the_timeline_from_the_environment(platform, wake_env, monkey
     _serve_openai_and_messages(platform, page(message(uuid=M0, body="hi")))
 
     assert main([]) == 0  # no --timeline flag; BASECRADLE_TIMELINE supplies it
+
+
+def test_main_acts_on_a_webhook_event_trigger(platform, wake_env):
+    """`--event` forwards the triggering delivery through to the wake (the router path)."""
+    _serve_openai_and_messages(platform, page())  # no messages
+    serve_events(platform, event_page(event(uuid=E0, payload='{"x":1}')))
+
+    assert main(["--timeline", TIMELINE_UUID, "--event", E0]) == 0
+    assert platform.post(f"/timelines/{TIMELINE_UUID}/messages").called  # it acted on the delivery
 
 
 def test_main_without_a_timeline_errors(wake_env):
