@@ -16,13 +16,21 @@ loop never needed become load-bearing:
    `Session` already gives us: with `Harness(home=...)` and a `timeline:<uuid>`
    source, each wake reloads the prior transcript instead of starting blank.
 
-A wake reconciles **every** kind of unseen item on the timeline, not just messages.
-An inbound **webhook delivery** is the case the timeline scan would otherwise miss:
-a received `webhook_event` is not a timeline item the way a message or an activated
-task is, so a woken agent never sees one unless it goes looking. The wake does that
-lookup — surfacing unseen webhook events through the SDK's webhook-events read
-surface under their own high-water mark — so a peer woken by `webhook_event.received`
-perceives and can act on the delivery, with the same idempotency the message path has.
+A wake reconciles **every** kind of unseen actionable item on the timeline, not just
+messages. Two cases the message scan would otherwise miss:
+
+- An inbound **webhook delivery**: a received `webhook_event` is not a timeline item,
+  so the wake fetches unseen ones through the SDK's webhook-events read surface, under
+  their own high-water mark, and acts on them.
+- A newly-**activated task**: a `task.activated` wake fires when a scheduled task comes
+  due, but the activation is not a fresh timeline item the scan surfaces — so the wake
+  lists the timeline's *activated* tasks and carries out the instructions of any it has
+  not handled yet. Activated tasks are tracked by a persisted seen-set rather than a
+  high-water mark, because activation order does not track creation order (a task
+  scheduled earlier can come due later) and a task has no terminal status to mark done.
+
+So a peer woken by `webhook_event.received` or `task.activated` perceives and acts on
+the trigger, with the same idempotency across processes the message path has.
 
 Everything else — identity, Dashboard onboarding, turning messages into turns,
 the newest-first scan up to the mark — is shared with `TimelineAgent`.
@@ -72,11 +80,14 @@ from basecradle_harness._tasks import TasksTool
 from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
-# The kinds of timeline item the wake reconciles, each with its own high-water mark
-# (a webhook delivery and a message advance independently). `messages` keeps the
-# original on-disk location so a deployed agent's existing marks still resolve.
+# The kinds of timeline item the wake reconciles. Messages and webhook events are
+# creation-ordered streams tracked by a high-water mark (below); activated tasks are
+# not (a task scheduled earlier can activate later, and a task has no "done" status),
+# so they are tracked by a persisted seen-set instead. `messages` keeps the original
+# on-disk mark location so a deployed agent's existing marks still resolve.
 _MESSAGES = "messages"
 _EVENTS = "webhook_events"
+_TASKS = "tasks"
 
 
 class MarkStore:
@@ -112,6 +123,37 @@ class MarkStore:
         base = self.root / "marks"
         folder = base if kind == _MESSAGES else base / kind
         return folder / f"{quote(timeline, safe='')}.txt"
+
+
+class SeenStore:
+    """Per-timeline sets of handled item uuids, persisted under the agent's home.
+
+    A high-water mark works for a creation-ordered stream (messages, webhook events):
+    everything at or before the mark is seen. Activated **tasks** are not such a
+    stream — a task scheduled earlier can activate later, so activation order does not
+    track creation order, and a task carries no terminal "done" status the agent could
+    set. So idempotency here is a *set*: the uuids already acted on, persisted one per
+    line under `<root>/seen/<kind>/<timeline>.txt`. Appended to (not rewritten) after
+    each item is handled, so a crash mid-batch resumes without re-acting on the rest.
+    """
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+
+    def all(self, timeline: str, *, kind: str) -> set[str]:
+        path = self._path(timeline, kind)
+        if not path.exists():
+            return set()
+        return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+    def add(self, timeline: str, uuid: str, *, kind: str) -> None:
+        path = self._path(timeline, kind)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a") as handle:
+            handle.write(uuid + "\n")
+
+    def _path(self, timeline: str, kind: str) -> Path:
+        return self.root / "seen" / kind / f"{quote(timeline, safe='')}.txt"
 
 
 class WakeAgent:
@@ -162,6 +204,9 @@ class WakeAgent:
         self.source = f"timeline:{timeline}"
         self.context_messages = context_messages
         self.marks = marks or MarkStore(harness.home)  # type: ignore[arg-type]
+        # Activated tasks are tracked by a seen-set, not a high-water mark (see
+        # `SeenStore`); it lives beside the marks, under the same home root.
+        self.seen = SeenStore(self.marks.root)
         self.timeline = self.client.timelines.get(timeline)
 
         # Bind the live platform handle into every platform-aware tool — the same
@@ -226,23 +271,28 @@ class WakeAgent:
         )
 
     def wake(self, *, trigger: str | None = None, event_trigger: str | None = None) -> list[object]:
-        """Reconcile this timeline once — unseen messages *and* inbound webhook events
-        — and return everything posted in response.
+        """Reconcile this timeline once — unseen messages, inbound webhook deliveries,
+        *and* newly-activated tasks — and return everything posted in response.
 
-        A wake surfaces every kind of unseen item on the timeline, each tracked by its
-        own high-water mark so the two never re-surface each other. Messages and
-        webhook events both reply through the one session, so the agent perceives them
-        in a single coherent conversation. Either way, if nothing is unseen, no
-        provider call is made and nothing is posted.
+        A wake surfaces every kind of unseen actionable item on the timeline, not just
+        new messages, because each kind arrives by a different route: a message and an
+        activated-task item are read from the timeline, a webhook delivery and a task
+        activation are not items the timeline scan would surface on their own. Each kind
+        has its own idempotency record so reconciling one never re-surfaces another, and
+        all reply through the one session, so the agent perceives them in a single
+        coherent conversation. If nothing is unseen, no provider call is made and nothing
+        is posted.
 
         `trigger` is the optional uuid of the message that fired the wake; `event_trigger`
-        is the optional uuid of the webhook event that fired it (the router passes the
-        relevant one). Each only sharpens its own first-wake bootstrap and is ignored
-        once that kind's mark exists.
+        the optional uuid of the webhook event that fired it (the router passes whichever
+        is relevant). Each only sharpens its own first-wake bootstrap and is ignored once
+        that kind's record exists. Task activations need no trigger — the reconcile finds
+        every activated-but-unhandled task, keeping the router thin.
         """
         session = self.harness.session(self.source)
         posted = self._wake_messages(session, trigger)
         posted += self._wake_events(session, event_trigger)
+        posted += self._wake_tasks(session)
         return posted
 
     # --- messages ------------------------------------------------------------
@@ -323,19 +373,68 @@ class WakeAgent:
         return ([triggered, *window]) if triggered is not None else window
 
     def _respond_events(self, session: Session, events: list[object]) -> list[object]:
-        """Act on each webhook delivery in order, advancing the event mark per delivery.
+        """Act on each webhook delivery in order, advancing the event mark per delivery."""
+        return self._act_on(
+            session,
+            events,
+            _incoming_event_text,
+            lambda event: self.marks.set(self.timeline_uuid, event.content.uuid, kind=_EVENTS),
+        )
 
-        Mirrors `_respond` for messages: the mark advances after each event (not once
-        at the end), so a crash or router retry mid-batch resumes after the last
-        delivery handled, never re-acting on one; and any reply is posted *before* the
-        mark advances, keeping at-least-once semantics over a possible duplicate.
+    # --- activated tasks -----------------------------------------------------
+
+    def _wake_tasks(self, session: Session) -> list[object]:
+        """Carry out every activated-but-unhandled task on the timeline.
+
+        A task activation is not a timeline item the wake's message scan would surface,
+        so — like a webhook delivery — the agent must go looking. Unlike messages and
+        events, an activated task is not a creation-ordered stream a high-water mark can
+        track (a task scheduled earlier can activate later) and carries no terminal
+        status the agent could set, so idempotency is a persisted *seen-set* (see
+        `SeenStore`): act on each activated task whose uuid is not yet recorded, then
+        record it. An activated-but-unhandled task is genuinely undone work — not stale
+        history — so acting on all of them is correct, and needs no router-passed
+        trigger, which keeps the router thin.
+
+        The full activated list is drained (no `context_messages` window): a task is
+        acted on one at a time, never seeded as history, so there is no token-cost
+        argument for a cap — and a cap would silently drop tasks beyond it, since a
+        newly-due task can sit anywhere in the (creation-ordered) list and no high-water
+        mark guarantees a re-scan. The per-wake cost is the count of activated tasks on
+        the timeline, the same order as the seen-set read this already does.
+        """
+        activated = list(self.client.tasks.filter(timeline=self.timeline_uuid, status="activated"))
+        if not activated:
+            return []
+        seen = self.seen.all(self.timeline_uuid, kind=_TASKS)
+        # Oldest-first, so the agent works the backlog in the order it was scheduled.
+        unhandled = [task for task in reversed(activated) if task.content.uuid not in seen]
+        return self._act_on(
+            session,
+            unhandled,
+            _activated_task_text,
+            lambda task: self.seen.add(self.timeline_uuid, task.content.uuid, kind=_TASKS),
+        )
+
+    # --- the shared act-on loop ----------------------------------------------
+
+    def _act_on(self, session: Session, items, render, record) -> list[object]:
+        """Engage the model on each item in order, posting any reply and recording it.
+
+        The one loop behind both webhook-event and activated-task reconciliation (and
+        the same shape `_respond` uses for messages): the idempotency record advances
+        after *each* item, so a crash or router retry mid-batch resumes after the last
+        item handled; and the reply is posted *before* the record advances, so the
+        semantics are at-least-once — a possible duplicate over a dropped action, which
+        on a comms platform is the better failure. `render` turns an item into the text
+        the model reads; `record` marks it handled (a mark advance, or a seen-set add).
         """
         posted = []
-        for event in events:
-            reply = session.send(_incoming_event_text(event))
+        for item in items:
+            reply = session.send(render(item))
             if reply.strip():
                 posted.append(self.timeline.messages.create(body=reply))
-            self.marks.set(self.timeline_uuid, event.content.uuid, kind=_EVENTS)
+            record(item)
         return posted
 
     # --- the first wake: infer a high-water mark from the timeline ------------
@@ -455,6 +554,20 @@ def _incoming_event_text(event: object) -> str:
         f"(event {content.uuid}, endpoint {event.webhook_endpoint.uuid}, "
         f"content_type {content.content_type}). Decide whether and how to act on it. "
         f"Its payload:\n{payload}"
+    )
+
+
+def _activated_task_text(task: object) -> str:
+    """A newly-activated task as the agent hears it: its instructions, to carry out now.
+
+    A task is work the agent (or a peer) scheduled for this moment, so it is phrased as
+    a directive to act, not a notification to consider — the activation *is* the cue.
+    """
+    content = task.content
+    return (
+        "A task you scheduled has activated and is due now "
+        f"(task {content.uuid}, scheduled for {content.activate_at}). "
+        f"Carry out its instructions:\n{content.instructions}"
     )
 
 
