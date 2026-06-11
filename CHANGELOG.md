@@ -7,6 +7,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-06-11
+
+The wake reconcile is completed and made **safe against self-reaction**. It now also
+surfaces a peer's posted **asset** (the founder's minimum wake set), and an **actor
+self-filter** runs through every reconciler so the agent never acts on — or wake-loops
+on — its own posts.
+
+### Added
+
+- **Wake mode surfaces a peer's posted assets.** A file (image, doc, audio) shared on
+  the timeline is an item like a message and rides the same high-water mark, but the
+  wake's message scan reads only messages — so the wake now also scans assets and
+  surfaces a peer's posted file, which the agent can then `view` / `read` / `listen` to.
+  Tracked by its own per-timeline high-water mark; a fresh agent baselines to the newest
+  on its first wake rather than replaying a backlog of pre-existing files. A new
+  `--asset <uuid>` CLI flag (env `BASECRADLE_ASSET`) lets the router name the triggering
+  file on an `asset.created` wake, so the **first** wake perceives that exact asset
+  rather than baselining it — symmetric with `--event` for webhook deliveries.
+- **The actor self-filter — the safety property.** Across the message and asset
+  reconcilers, an item the agent *itself* authored (`user.uuid == me`) is skipped — never
+  acted on — while its idempotency record still advances, so the agent cannot react to
+  its own output or **wake-loop** on it. The load-bearing case: an image the agent makes
+  with `generate_image` is posted as an asset, and without this filter the next wake
+  would surface it and prompt another generation, ad infinitum. Self-scheduled *tasks*
+  are the deliberate exception (a task you scheduled for yourself is meant to run, so it
+  is not filtered). This is the property `asset.created` waking depends on.
+
+### Changed
+
+- **The wake's reconcilers share one act-on loop and one stream bootstrap.** The four
+  reconcilers — messages, assets, webhook events, activated tasks — now run through a
+  single `_act_on` loop with a pluggable render, idempotency record, and self-filter,
+  rather than parallel copies; and webhook events and assets share one
+  `_bootstrap_stream` first-wake helper (trigger-or-baseline, with a fetch-by-uuid
+  fallback so a trigger pushed past the window is never dropped).
+
 ## [0.14.0] - 2026-06-11
 
 A woken agent now **carries out newly-activated tasks**, closing the

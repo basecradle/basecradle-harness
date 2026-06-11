@@ -109,6 +109,40 @@ def task_page(*tasks):
     return {"tasks": list(tasks), "next_cursor": None}
 
 
+# Well-formed UUIDv7 asset ids.
+A0 = "019e7780-7777-7aaa-8bbb-728394051627"
+A1 = "019e7781-8888-7bbb-8ccc-839405162738"
+
+
+def asset(*, uuid, filename="photo.png", content_type="image/png", description="", mine=False):
+    actor = (
+        {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}
+        if mine
+        else {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"}
+    )
+    return {
+        "type": "asset",
+        "created_at": "2026-06-04T00:00:00.000Z",
+        "user": actor,
+        "timeline": {"uuid": TIMELINE_UUID},
+        "content": {
+            "uuid": uuid,
+            "description": description,
+            "file": {
+                "filename": filename,
+                "byte_size": 2048,
+                "content_type": content_type,
+                "checksum": "Yp9p9C8m6Xv2qS1nKQ0r3w==",
+                "url": f"{BC_URL}/blobs/{uuid}",
+            },
+        },
+    }
+
+
+def asset_page(*assets):
+    return {"assets": list(assets), "next_cursor": None}
+
+
 def dashboard():
     return {"identity": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}}
 
@@ -156,9 +190,10 @@ def platform():
                 201, json={"message": message(uuid=REPLY, body="reply", mine=True)}
             )
         )
-        # By default a timeline has no inbound webhook deliveries and no activated
-        # tasks, so a wake's reconciliation of them is a clean no-op. Tests that
-        # exercise those paths override these with `serve_events` / `serve_tasks`.
+        # By default a timeline has no posted assets, no inbound webhook deliveries,
+        # and no activated tasks, so a wake's reconciliation of them is a clean no-op.
+        # Tests that exercise those paths override these with the matching `serve_*`.
+        router.get("/assets").mock(return_value=httpx.Response(200, json=asset_page()))
         router.get("/webhook_events").mock(return_value=httpx.Response(200, json=event_page()))
         router.get("/tasks").mock(return_value=httpx.Response(200, json=task_page()))
         yield router
@@ -177,6 +212,11 @@ def serve_events(platform, *pages):
 def serve_tasks(platform, *pages):
     """Drive the (newest-first) task list endpoint; one page per read."""
     platform.get("/tasks").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
+
+
+def serve_assets(platform, *pages):
+    """Drive the (newest-first) asset list endpoint; one page per read."""
+    platform.get("/assets").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
 
 
 def build_wake(home, provider=None, *, system_prompt=None, onboard=False, **kwargs):
@@ -677,6 +717,118 @@ def test_no_activated_tasks_makes_no_provider_call(platform, tmp_path):
 
     assert agent.wake() == []
     assert provider.prompts == []
+
+
+# --- a peer's posted assets (+ the actor self-filter, the safety property) ---
+
+
+def test_a_peer_posted_asset_is_surfaced(platform, tmp_path):
+    """A file a peer shares is perceived on wake (the founder's minimum wake set)."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")  # past the baseline
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert "john posted a file" in provider.prompts[0]
+    assert "diagram.png" in provider.prompts[0]
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
+
+
+def test_own_posted_asset_is_not_acted_on(platform, tmp_path):
+    """THE SAFETY PROPERTY: the agent never acts on its own posted asset (e.g. an image
+    it generated), so a generated image cannot wake it to generate another — no loop.
+    The mark still advances, so the own asset is not re-scanned forever."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    # The newest asset is the agent's OWN — a generate_image output, say.
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="generated.png", mine=True)))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert posted == []  # nothing posted in response to its own file
+    assert provider.prompts == []  # the model was never even consulted — no wake-loop
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # but marked seen
+
+
+def test_own_asset_is_skipped_but_a_peer_asset_beside_it_is_acted_on(platform, tmp_path):
+    """The self-filter is per-item: the agent's own asset is skipped, a peer's is not,
+    and the mark advances past both."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    # Newest-first: the agent's own A1, then John's... use A1 (mine) newest, plus a
+    # peer asset that is also unseen.
+    peer = asset(uuid="019e7781-9999-7ccc-8ddd-940516273849", filename="from-john.png")
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="mine.png", mine=True), peer))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1  # only the peer's asset drew a response
+    assert "from-john.png" in provider.prompts[0]
+    assert "mine.png" not in provider.prompts[0]
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # mark past the newest
+
+
+def test_first_asset_wake_baselines_without_acting(platform, tmp_path):
+    """A fresh agent does not react to a backlog of files posted before it arrived."""
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="old.png")))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert posted == []
+    assert provider.prompts == []
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # baselined
+
+
+def test_first_asset_wake_with_a_trigger_perceives_that_asset(platform, tmp_path):
+    """On an asset.created wake the router names the asset; the first wake perceives it
+    (rather than baselining it away), so the very first posted file is not missed."""
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="just-posted.png")))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake(asset_trigger=A1)
+
+    assert len(posted) == 1
+    assert "just-posted.png" in provider.prompts[0]
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
+
+
+def test_own_asset_trigger_is_still_self_filtered(platform, tmp_path):
+    """Even if a wake fires on the agent's own asset, the self-filter holds on the
+    trigger path — no action, no loop."""
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="mine.png", mine=True)))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake(asset_trigger=A1)
+
+    assert posted == []
+    assert provider.prompts == []
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # baselined, not acted
+
+
+def test_asset_reconcile_is_idempotent_across_processes(platform, tmp_path):
+    """A re-invoked wake sees the persisted asset mark and acts on nothing."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page(), page())
+    serve_assets(
+        platform,
+        asset_page(asset(uuid=A1, filename="x.png")),
+        asset_page(asset(uuid=A1, filename="x.png")),
+    )
+    first, _ = build_wake(tmp_path)
+    assert len(first.wake()) == 1
+
+    second, second_provider = build_wake(tmp_path)
+    assert second.wake() == []
+    assert second_provider.prompts == []
 
 
 # --- the session key + shared memory -----------------------------------------
