@@ -62,7 +62,9 @@ _VIEWABLE_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "imag
 # pathological one from flooding context. When it bites, the reply says so.
 DEFAULT_LIST_LIMIT = 50
 
-# Download timeout (seconds) for a `read`. The URL is a dereferenceable blob link.
+# Download timeout (seconds) for a blob fetch (`read`, `view`, and audio `listen`).
+# The URL is a dereferenceable blob link; 30s also bounds a larger audio fetch (up
+# to the 25 MiB transcription ceiling), which on a slow link returns a clean error.
 _DOWNLOAD_TIMEOUT = 30.0
 
 # `application/*` content types that are really text. `text/*`, `*+json`, and
@@ -199,10 +201,15 @@ class AssetsTool(PlatformTool):
                 if not _is_text(file.content_type)
                 else f"{file.byte_size} bytes, over the {MAX_INLINE_BYTES}-byte inline limit"
             )
-            hint = " Use action='view' to look at it." if _is_image(file.content_type) else ""
+            if _is_image(file.content_type):
+                hint = " Use action='view' to look at it."
+            elif _is_audio(file.content_type):
+                hint = " Use the 'listen' tool to hear what it says."
+            else:
+                hint = ""
             return f"{meta}\n({why} — not inlined. The file is on the timeline by that uuid.{hint})"
 
-        data = self._download(file.url)
+        data = _download(file.url)
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -237,24 +244,12 @@ class AssetsTool(PlatformTool):
                 "limit — too large to look at.)"
             )
 
-        data = self._download(file.url)
+        data = _download(file.url)
         data_url = _data_url(file.content_type, data)
         return ToolResult(
             text=f"{meta}\nLooking at this image now.",
             images=[ImageContent(url=data_url, alt=file.filename)],
         )
-
-    @staticmethod
-    def _download(url: str) -> bytes:
-        """Fetch the blob bytes from its dereferenceable URL.
-
-        A plain GET (following the redirect the platform's blob URL issues) — the
-        URL is already authorized, so it carries no API token. Kept off the SDK on
-        purpose: the SDK speaks to API paths, this is a direct blob fetch.
-        """
-        response = httpx.get(url, follow_redirects=True, timeout=_DOWNLOAD_TIMEOUT)
-        response.raise_for_status()
-        return response.content
 
     # --- create --------------------------------------------------------------
 
@@ -267,6 +262,19 @@ class AssetsTool(PlatformTool):
 
 
 # --- shared rendering / type helpers -----------------------------------------
+
+
+def _download(url: str) -> bytes:
+    """Fetch the blob bytes from its dereferenceable URL.
+
+    A plain GET (following the redirect the platform's blob URL issues) — the URL is
+    already authorized, so it carries no API token. Kept off the SDK on purpose: the
+    SDK speaks to API paths, this is a direct blob fetch. Shared by the assets tool
+    (`read`/`view`) and the audio tool (`listen`), the one place a blob is fetched.
+    """
+    response = httpx.get(url, follow_redirects=True, timeout=_DOWNLOAD_TIMEOUT)
+    response.raise_for_status()
+    return response.content
 
 
 def _upload(client: Any, timeline: str, data: bytes, filename: str, description: str | None) -> Any:
@@ -327,6 +335,13 @@ def _is_image(content_type: str) -> bool:
     if not content_type:
         return False
     return _media_type(content_type).startswith("image/")
+
+
+def _is_audio(content_type: str) -> bool:
+    """Whether a file of this content type is audio (a candidate for `listen`)."""
+    if not content_type:
+        return False
+    return _media_type(content_type).startswith("audio/")
 
 
 def _data_url(content_type: str, data: bytes) -> str:

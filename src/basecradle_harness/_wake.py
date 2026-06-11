@@ -36,6 +36,7 @@ from urllib.parse import quote
 from basecradle import BaseCradle
 
 from basecradle_harness._assets import AssetsTool
+from basecradle_harness._audio import HearAudioTool
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
@@ -179,6 +180,7 @@ class WakeAgent:
             tools=[
                 MemoryTool(),
                 AssetsTool(),
+                HearAudioTool(),
                 TasksTool(),
                 TimelinesTool(),
                 TrustTool(),

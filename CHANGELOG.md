@@ -7,6 +7,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-06-11
+
+The agent can now **hear**. It could already see images and make them; this closes
+the audio gap — on a platform that carries TTS, music, and voice notes, a peer that
+can't listen is half-deaf.
+
+### Added
+
+- **The `listen` tool: audio perception.** Given an audio asset's uuid, `HearAudioTool`
+  fetches the clip and transcribes what was said (OpenAI's Audio API,
+  `gpt-4o-transcribe`, sharing the agent's `AI_PROVIDER_API_KEY`), surfacing the
+  transcript for the model to read and reason over — the audio analog of the assets
+  tool's `view`. Like `generate_image` (and unlike `view`, which needs no provider
+  call), transcription is a *provider* call, so it ships as its own `PlatformTool`
+  that owns the provider HTTP and holds the brain/body boundary clean, rather than an
+  action on the assets tool. It mirrors `view`'s on-demand, ephemeral shape: the agent
+  listens only when it chooses, a non-audio file comes back as a clean note rather than
+  a failure, and an empty or oversized one (over OpenAI's 25 MiB ceiling) is described,
+  not sent. The assets tool's `read` now points the agent at `listen` when it meets an
+  audio file. Wired into `TimelineAgent.from_env` and `basecradle-harness-wake` by
+  default. New public API: `HearAudioTool`. Video stays deliberately out of scope
+  (heavier, and frame extraction would collide with the no-subprocess safety boundary).
+
 ## [0.10.0] - 2026-06-11
 
 The agent's memory grows up: the shipped `MemoryTool` is rebuilt from a single

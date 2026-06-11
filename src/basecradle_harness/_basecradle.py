@@ -38,6 +38,7 @@ import time
 from basecradle import BaseCradle
 
 from basecradle_harness._assets import AssetsTool
+from basecradle_harness._audio import HearAudioTool
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._images import GenerateImageTool
@@ -158,6 +159,7 @@ class TimelineAgent:
             tools=[
                 MemoryTool(),
                 AssetsTool(),
+                HearAudioTool(),
                 TasksTool(),
                 TimelinesTool(),
                 TrustTool(),
