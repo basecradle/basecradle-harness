@@ -19,7 +19,7 @@ import pytest
 import respx
 from basecradle import BaseCradle
 
-from basecradle_harness import Harness, MarkStore, Message, WakeAgent
+from basecradle_harness import Harness, MarkStore, Message, SeenStore, WakeAgent
 from basecradle_harness._wake import main
 
 BC_URL = "https://basecradle.com"
@@ -85,6 +85,30 @@ def event_page(*events):
     return {"webhook_events": list(events), "next_cursor": None}
 
 
+# Well-formed UUIDv7 task ids.
+T0 = "019e7770-5555-7eee-8fff-506172839405"
+T1 = "019e7771-6666-7fff-8aaa-617283940516"
+
+
+def task(*, uuid, instructions, status="activated", activate_at="2026-06-11T06:00:00+00:00"):
+    return {
+        "type": "task",
+        "created_at": "2026-06-10T00:00:00.000Z",
+        "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+        "timeline": {"uuid": TIMELINE_UUID},
+        "content": {
+            "uuid": uuid,
+            "instructions": instructions,
+            "activate_at": activate_at,
+            "status": status,
+        },
+    }
+
+
+def task_page(*tasks):
+    return {"tasks": list(tasks), "next_cursor": None}
+
+
 def dashboard():
     return {"identity": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}}
 
@@ -132,10 +156,11 @@ def platform():
                 201, json={"message": message(uuid=REPLY, body="reply", mine=True)}
             )
         )
-        # By default a timeline has no inbound webhook deliveries, so a wake's
-        # reconciliation of them is a clean no-op. Tests that exercise the path
-        # override this with `serve_events`.
+        # By default a timeline has no inbound webhook deliveries and no activated
+        # tasks, so a wake's reconciliation of them is a clean no-op. Tests that
+        # exercise those paths override these with `serve_events` / `serve_tasks`.
         router.get("/webhook_events").mock(return_value=httpx.Response(200, json=event_page()))
+        router.get("/tasks").mock(return_value=httpx.Response(200, json=task_page()))
         yield router
 
 
@@ -147,6 +172,11 @@ def serve_messages(platform, *pages):
 def serve_events(platform, *pages):
     """Drive the (newest-first) webhook-event list endpoint; one page per read."""
     platform.get("/webhook_events").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
+
+
+def serve_tasks(platform, *pages):
+    """Drive the (newest-first) task list endpoint; one page per read."""
+    platform.get("/tasks").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
 
 
 def build_wake(home, provider=None, *, system_prompt=None, onboard=False, **kwargs):
@@ -535,6 +565,118 @@ def test_large_event_payload_is_truncated_with_a_pointer(platform, tmp_path):
     assert "payload truncated" in prompt
     assert "webhook_events tool" in prompt
     assert len(prompt) < len(big)  # not the whole body
+
+
+# --- newly-activated tasks (task.activated) ----------------------------------
+
+
+def test_activated_task_is_carried_out(platform, tmp_path):
+    """A task.activated wake makes the agent carry out the task's instructions."""
+    serve_messages(platform, page())  # no messages
+    serve_tasks(
+        platform, task_page(task(uuid=T0, instructions="generate a silly monkey and post it"))
+    )
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1  # the agent acted on the activated task
+    assert len(provider.prompts) == 1
+    assert "generate a silly monkey and post it" in provider.prompts[0]
+    assert "activated" in provider.prompts[0]
+    assert T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
+
+
+def test_only_activated_tasks_are_fetched(platform, tmp_path):
+    """The reconcile asks the platform only for activated tasks, never pending ones."""
+    serve_messages(platform, page())
+    serve_tasks(platform, task_page(task(uuid=T0, instructions="do the thing")))
+    agent, _ = build_wake(tmp_path)
+
+    agent.wake()
+
+    assert "status=activated" in str(platform.get("/tasks").calls.last.request.url)
+
+
+def test_activated_task_is_idempotent_across_processes(platform, tmp_path):
+    """A second process (same home) sees the seen-set and does not re-run the task."""
+    serve_messages(platform, page(), page())
+    serve_tasks(
+        platform,
+        task_page(task(uuid=T0, instructions="post the monkey")),
+        task_page(task(uuid=T0, instructions="post the monkey")),
+    )
+    first, _ = build_wake(tmp_path)
+    assert len(first.wake()) == 1
+
+    second, second_provider = build_wake(tmp_path)
+    assert second.wake() == []  # T0 already handled
+    assert second_provider.prompts == []  # the model was never consulted
+
+
+def test_already_handled_task_is_skipped_when_a_new_one_activates(platform, tmp_path):
+    """With T0 already done, a wake acts only on the newly-activated T1."""
+    SeenStore(tmp_path).add(TIMELINE_UUID, T0, kind="tasks")
+    serve_messages(platform, page())
+    # Newest-first from the platform: T1 (new) then T0 (already handled).
+    serve_tasks(
+        platform,
+        task_page(
+            task(uuid=T1, instructions="newer task"),
+            task(uuid=T0, instructions="older task"),
+        ),
+    )
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert "newer task" in provider.prompts[0]
+    assert "older task" not in provider.prompts[0]
+
+
+def test_multiple_activated_tasks_done_oldest_first(platform, tmp_path):
+    """A burst of unhandled activations is worked oldest-first, in schedule order."""
+    serve_messages(platform, page())
+    serve_tasks(
+        platform,
+        task_page(task(uuid=T1, instructions="second"), task(uuid=T0, instructions="first")),
+    )
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 2
+    assert provider.prompts[0].endswith("first")  # T0, the older task, first
+    assert provider.prompts[1].endswith("second")
+
+
+def test_a_large_activation_burst_is_fully_drained(platform, tmp_path):
+    """All activated tasks are carried out, even a burst larger than the context cap —
+    the task reconcile is not windowed, so none is silently dropped."""
+    burst = 60  # larger than the default context_messages window (50)
+    uuids = [f"019e7772-0000-7000-8000-{i:012d}" for i in range(burst)]
+    # Newest-first from the platform (highest index first).
+    tasks = [task(uuid=u, instructions=f"task {i}") for i, u in reversed(list(enumerate(uuids)))]
+    serve_messages(platform, page())
+    serve_tasks(platform, task_page(*tasks))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == burst  # every one acted on, not just the newest 50
+    assert len(SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")) == burst
+
+
+def test_no_activated_tasks_makes_no_provider_call(platform, tmp_path):
+    """A wake with nothing activated (and nothing else new) makes no model call."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)  # no new messages
+    serve_messages(platform, page(message(uuid=M0, body="old")))
+    # tasks default to an empty page from the fixture
+    agent, provider = build_wake(tmp_path)
+
+    assert agent.wake() == []
+    assert provider.prompts == []
 
 
 # --- the session key + shared memory -----------------------------------------

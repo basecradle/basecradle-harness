@@ -7,6 +7,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-11
+
+A woken agent now **carries out newly-activated tasks**, closing the
+**schedule → activate → wake → act** loop. The sibling of 0.13.0's webhook-delivery
+work: both stem from the wake having been message-only. (Found live: the router
+already wakes the harness on `task.activated`, but the wake exited in under a second
+without acting, because it reconciled only messages.)
+
+### Added
+
+- **Wake mode reconciles newly-activated tasks.** On wake, the agent now lists the
+  timeline's *activated* tasks and carries out the instructions of any it has not
+  handled yet — not only its new messages. A task activation is not a fresh timeline
+  item the message scan would surface, so (like a webhook delivery) the agent goes
+  looking. Unlike messages and webhook events, an activated task is **not** a
+  creation-ordered stream a high-water mark can track — a task scheduled earlier can
+  come due later, and a task carries no terminal "done" status — so idempotency is a
+  persisted **seen-set** (`SeenStore`, new public API): act on each activated task whose
+  uuid is not yet recorded, then record it, advancing per task so a crash or router
+  retry mid-batch never re-runs one. An activated-but-unhandled task is genuinely undone
+  work (not stale history), so the agent does all of them, oldest-first, and needs no
+  router-passed trigger — a timeline-scoped reconcile keeps the router thin. The wake's
+  three reconcilers (messages, webhook events, tasks) now share one act-on-items loop.
+
+This is the task sibling of 0.13.0's `webhook_event.received` work; the poll loop
+(`TimelineAgent`) is unchanged.
+
 ## [0.13.0] - 2026-06-11
 
 A woken agent now **acts on inbound webhook deliveries**, not just messages. The agent
