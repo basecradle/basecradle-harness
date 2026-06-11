@@ -494,17 +494,40 @@ def test_first_wake_acts_on_the_triggering_event(platform, tmp_path):
     assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0
 
 
-def test_first_wake_without_a_trigger_baselines_events_without_acting(platform, tmp_path):
-    """A wake that wasn't a webhook delivery (no event trigger) doesn't replay history."""
+def test_first_wake_without_a_trigger_acts_on_the_newest_delivery(platform, tmp_path):
+    """THE BUG-2 REGRESSION: the router wakes a harness agent with the timeline uuid
+    alone — it never passes `--event` — so a webhook wake arrives with no trigger. The
+    first wake must still act on the delivery (the newest unseen one), not baseline it
+    away. The old behavior dropped every first delivery; that is exactly what made
+    `webhook_event.received` surface nothing live."""
     serve_messages(platform, page())
-    serve_events(platform, event_page(event(uuid=E0, payload="old delivery")))
+    serve_events(platform, event_page(event(uuid=E0, payload="PAPAYA-CLEAN-42")))
     agent, provider = build_wake(tmp_path)
 
-    posted = agent.wake()  # no event_trigger — e.g. a message-driven or first-ever wake
+    posted = agent.wake()  # no event_trigger — the real router contract
 
-    assert posted == []
-    assert provider.prompts == []  # the historical delivery is not acted on...
-    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0  # ...but baselined
+    assert len(posted) == 1  # the delivery was acted on autonomously
+    assert "inbound webhook" in provider.prompts[0]
+    assert "PAPAYA-CLEAN-42" in provider.prompts[0]  # the payload reached the model
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0  # and marked
+
+
+def test_first_wake_without_a_trigger_acts_on_newest_event_only(platform, tmp_path):
+    """A first event wake with no trigger acts on the newest unseen delivery and marks
+    past the rest, so a fresh agent is bounded to one action, not a backlog replay."""
+    serve_messages(platform, page())
+    serve_events(
+        platform,
+        event_page(event(uuid=E1, payload="newest"), event(uuid=E0, payload="older")),
+    )
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert "newest" in provider.prompts[0]
+    assert all("older" not in p for p in provider.prompts)  # the backlog is not replayed
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E1
 
 
 def test_event_after_a_mark_is_acted_on(platform, tmp_path):
@@ -654,6 +677,38 @@ def test_activated_task_is_idempotent_across_processes(platform, tmp_path):
     assert second_provider.prompts == []  # the model was never consulted
 
 
+def test_activated_task_is_claimed_before_acting_so_a_crash_cannot_refire(platform, tmp_path):
+    """THE BUG-1 REGRESSION: a task is recorded seen BEFORE its action runs, so an action
+    that fails part-way — most importantly one that already posted a side effect whose
+    `asset.created` re-wakes the agent — can never re-surface the still-`activated` task
+    and re-run it. That act-then-record gap was the live monkey pile-up. At-most-once."""
+    serve_messages(platform, page(), page())
+    serve_tasks(
+        platform,
+        task_page(task(uuid=T0, instructions="generate a monkey and post it")),
+        task_page(task(uuid=T0, instructions="generate a monkey and post it")),
+    )
+
+    class DiesOnTheTask:
+        """Stands in for an action that blows up after the task was claimed."""
+
+        prompts: list[str] = []
+
+        def chat(self, messages, tools=None):
+            raise RuntimeError("the action crashed mid-flight")
+
+    first, _ = build_wake(tmp_path, DiesOnTheTask())
+    with pytest.raises(RuntimeError):
+        first.wake()
+    # The crash propagated, but the task was already claimed — so it is recorded seen.
+    assert T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
+
+    # A later wake (working brain) does NOT re-run it: no re-fire, no monkey pile-up.
+    second, second_provider = build_wake(tmp_path)
+    assert second.wake() == []
+    assert second_provider.prompts == []  # the model was never consulted again
+
+
 def test_already_handled_task_is_skipped_when_a_new_one_activates(platform, tmp_path):
     """With T0 already done, a wake acts only on the newly-activated T1."""
     SeenStore(tmp_path).add(TIMELINE_UUID, T0, kind="tasks")
@@ -773,17 +828,38 @@ def test_own_asset_is_skipped_but_a_peer_asset_beside_it_is_acted_on(platform, t
     assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # mark past the newest
 
 
-def test_first_asset_wake_baselines_without_acting(platform, tmp_path):
-    """A fresh agent does not react to a backlog of files posted before it arrived."""
+def test_first_asset_wake_without_a_trigger_acts_on_the_newest_asset(platform, tmp_path):
+    """The router wakes with the timeline uuid alone (no `--asset`), so a peer's posted
+    asset arrives with no trigger. The first wake acts on the newest unseen asset rather
+    than baselining it away, so a peer's file actually surfaces under the real router
+    contract — bounded to the newest, not a backlog replay."""
     serve_messages(platform, page())
-    serve_assets(platform, asset_page(asset(uuid=A1, filename="old.png")))
+    serve_assets(
+        platform,
+        asset_page(asset(uuid=A1, filename="newest.png"), asset(uuid=A0, filename="older.png")),
+    )
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()  # no asset_trigger — the real router contract
+
+    assert len(posted) == 1
+    assert "newest.png" in provider.prompts[0]
+    assert all("older.png" not in p for p in provider.prompts)  # the backlog is not replayed
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
+
+
+def test_first_asset_wake_on_own_post_is_self_filtered_without_a_trigger(platform, tmp_path):
+    """The self-filter holds on the no-trigger first wake too: if the newest asset is the
+    agent's own (a generated image), it is marked but not acted on — no wake-loop."""
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="generated.png", mine=True)))
     agent, provider = build_wake(tmp_path)
 
     posted = agent.wake()
 
-    assert posted == []
-    assert provider.prompts == []
-    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # baselined
+    assert posted == []  # own asset never acted on
+    assert provider.prompts == []  # the model was never consulted — no loop
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # but marked seen
 
 
 def test_first_asset_wake_with_a_trigger_perceives_that_asset(platform, tmp_path):
@@ -944,12 +1020,22 @@ def test_main_reads_the_timeline_from_the_environment(platform, wake_env, monkey
 
 
 def test_main_acts_on_a_webhook_event_trigger(platform, wake_env):
-    """`--event` forwards the triggering delivery through to the wake (the router path)."""
+    """`--event` forwards the triggering delivery through to the wake (a manual path)."""
     _serve_openai_and_messages(platform, page())  # no messages
     serve_events(platform, event_page(event(uuid=E0, payload='{"x":1}')))
 
     assert main(["--timeline", TIMELINE_UUID, "--event", E0]) == 0
     assert platform.post(f"/timelines/{TIMELINE_UUID}/messages").called  # it acted on the delivery
+
+
+def test_main_acts_on_a_webhook_delivery_with_no_event_flag(platform, wake_env):
+    """THE REAL ROUTER INVOCATION: `--timeline <uuid>` alone, no `--event`. A delivery
+    present on the timeline is still acted on — the bug-2 fix at the CLI boundary."""
+    _serve_openai_and_messages(platform, page())  # no messages
+    serve_events(platform, event_page(event(uuid=E0, payload="PAPAYA-CLEAN-42")))
+
+    assert main(["--timeline", TIMELINE_UUID]) == 0  # exactly what the router runs
+    assert platform.post(f"/timelines/{TIMELINE_UUID}/messages").called  # acted, unaided
 
 
 def test_main_without_a_timeline_errors(wake_env):
