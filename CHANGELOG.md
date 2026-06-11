@@ -7,6 +7,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-11
+
+The agent can now **read a specific web page**, not just search for one. `web_search`
+finds what is out there; `web_fetch` retrieves a URL the agent was pointed at and reads
+its content.
+
+### Added
+
+- **The `web_fetch` tool: read the content of a specific URL.** Given an absolute
+  `https` URL, `WebFetchTool` fetches the page and returns its content as readable text
+  (HTML reduced to prose by a stdlib parser — no new dependency). Unlike `web_search`
+  (a Responses built-in), it is provider-agnostic, and unlike the platform tools it
+  needs no SDK client — it is a pure, read-only HTTP GET, so it ships as a plain `Tool`
+  that loads under the safe locked profile, exactly like `MemoryTool`. Two disciplines
+  keep it safe: **SSRF hygiene** — the model-supplied URL must be `https` to a public
+  host, enforced by resolving the hostname and checking every resolved address against
+  loopback/private/link-local/reserved ranges (so neither an IP literal nor a name that
+  resolves inward gets through), with **every redirect hop re-validated** so a public
+  URL cannot 302 into a private target; and **bounded output** — an oversized body is
+  truncated with a note and a non-text (binary) response is described, not dumped into
+  context, mirroring the assets tool's `read`. Wired into `TimelineAgent.from_env` and
+  `basecradle-harness-wake` by default. New public API: `WebFetchTool`.
+
 ## [0.11.0] - 2026-06-11
 
 The agent can now **hear**. It could already see images and make them; this closes

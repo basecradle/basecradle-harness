@@ -453,6 +453,8 @@ def test_from_env_wires_a_full_agent(platform, monkeypatch):
     # The shipped memory tool is wired in by default.
     assert "memory" in agent.harness.tools
     assert isinstance(agent.harness.tools.get("memory"), MemoryTool)
+    # And web_fetch — a plain tool (no platform binding), like memory.
+    assert "web_fetch" in agent.harness.tools
     # The assets tool too, bound to this agent's client and current timeline.
     assert "assets" in agent.harness.tools
     assets = agent.harness.tools.get("assets")

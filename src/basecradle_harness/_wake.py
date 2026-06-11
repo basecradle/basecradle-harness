@@ -58,6 +58,7 @@ from basecradle_harness._memory import MemoryTool
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._session import Session
 from basecradle_harness._tasks import TasksTool
+from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
 
@@ -179,6 +180,7 @@ class WakeAgent:
             system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
             tools=[
                 MemoryTool(),
+                WebFetchTool(),
                 AssetsTool(),
                 HearAudioTool(),
                 TasksTool(),
