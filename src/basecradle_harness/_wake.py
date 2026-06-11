@@ -16,13 +16,24 @@ loop never needed become load-bearing:
    `Session` already gives us: with `Harness(home=...)` and a `timeline:<uuid>`
    source, each wake reloads the prior transcript instead of starting blank.
 
+A wake reconciles **every** kind of unseen item on the timeline, not just messages.
+An inbound **webhook delivery** is the case the timeline scan would otherwise miss:
+a received `webhook_event` is not a timeline item the way a message or an activated
+task is, so a woken agent never sees one unless it goes looking. The wake does that
+lookup — surfacing unseen webhook events through the SDK's webhook-events read
+surface under their own high-water mark — so a peer woken by `webhook_event.received`
+perceives and can act on the delivery, with the same idempotency the message path has.
+
 Everything else — identity, Dashboard onboarding, turning messages into turns,
 the newest-first scan up to the mark — is shared with `TimelineAgent`.
 
 The command is `basecradle-harness-wake --timeline <uuid>` (also runnable as
-`python -m basecradle_harness`); see `main`. It works from the timeline uuid
-alone; an optional `--message <uuid>` names the triggering message for a precise
-first-wake bootstrap (see `_bootstrap_split`).
+`python -m basecradle_harness`); see `main`. It works from the timeline uuid alone;
+an optional `--message <uuid>` names the triggering message and `--event <uuid>` the
+triggering webhook event, each sharpening its own first-wake bootstrap (see
+`_bootstrap_split` and `_event_bootstrap_split`). On a `webhook_event.received` wake
+the router passes `--event` so the first wake acts on exactly the delivery that woke
+the agent rather than baselining it as already-seen.
 """
 
 from __future__ import annotations
@@ -33,7 +44,7 @@ import sys
 from pathlib import Path
 from urllib.parse import quote
 
-from basecradle import BaseCradle
+from basecradle import BaseCradle, BaseCradleError
 
 from basecradle_harness._assets import AssetsTool
 from basecradle_harness._audio import HearAudioTool
@@ -61,32 +72,46 @@ from basecradle_harness._tasks import TasksTool
 from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
+# The kinds of timeline item the wake reconciles, each with its own high-water mark
+# (a webhook delivery and a message advance independently). `messages` keeps the
+# original on-disk location so a deployed agent's existing marks still resolve.
+_MESSAGES = "messages"
+_EVENTS = "webhook_events"
+
 
 class MarkStore:
-    """Per-timeline high-water marks, persisted under the agent's home.
+    """Per-timeline, per-kind high-water marks, persisted under the agent's home.
 
-    One file per timeline (`<root>/marks/<timeline>.txt`, the uuid percent-encoded
-    into a safe filename), holding the uuid of the newest message the agent has
-    handled. This is what makes wake mode idempotent across separate processes:
-    the next wake reads the mark and skips everything at or before it.
+    One file per (kind, timeline) — `<root>/marks/<timeline>.txt` for messages (the
+    original location, kept for backward compatibility) and
+    `<root>/marks/<kind>/<timeline>.txt` for any other kind, the uuid percent-encoded
+    into a safe filename — holding the uuid of the newest item of that kind the agent
+    has handled. This is what makes wake mode idempotent across separate processes:
+    the next wake reads the mark and skips everything at or before it. Messages and
+    webhook events advance their marks independently, so reconciling one never
+    re-surfaces the other.
     """
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
 
-    def get(self, timeline: str) -> str | None:
-        path = self._path(timeline)
+    def get(self, timeline: str, *, kind: str = _MESSAGES) -> str | None:
+        path = self._path(timeline, kind)
         if not path.exists():
             return None
         return path.read_text().strip() or None
 
-    def set(self, timeline: str, uuid: str) -> None:
-        path = self._path(timeline)
+    def set(self, timeline: str, uuid: str, *, kind: str = _MESSAGES) -> None:
+        path = self._path(timeline, kind)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(uuid)
 
-    def _path(self, timeline: str) -> Path:
-        return self.root / "marks" / f"{quote(timeline, safe='')}.txt"
+    def _path(self, timeline: str, kind: str = _MESSAGES) -> Path:
+        # Messages live directly under `marks/` (the original layout); every other
+        # kind gets its own subdirectory, so the namespaces never collide.
+        base = self.root / "marks"
+        folder = base if kind == _MESSAGES else base / kind
+        return folder / f"{quote(timeline, safe='')}.txt"
 
 
 class WakeAgent:
@@ -200,22 +225,118 @@ class WakeAgent:
             onboard=_onboard_from_env(),
         )
 
-    def wake(self, *, trigger: str | None = None) -> list[object]:
-        """Answer this timeline's unseen messages once and return what was posted.
+    def wake(self, *, trigger: str | None = None, event_trigger: str | None = None) -> list[object]:
+        """Reconcile this timeline once — unseen messages *and* inbound webhook events
+        — and return everything posted in response.
 
-        With a persisted mark, replies to everything newer than it. Without one
-        (the first wake), bootstraps a mark first (see `_bootstrap`). Either way, if
-        nothing is unseen, no provider call is made and nothing is posted.
+        A wake surfaces every kind of unseen item on the timeline, each tracked by its
+        own high-water mark so the two never re-surface each other. Messages and
+        webhook events both reply through the one session, so the agent perceives them
+        in a single coherent conversation. Either way, if nothing is unseen, no
+        provider call is made and nothing is posted.
 
-        `trigger` is the optional uuid of the message that fired the event; it only
-        sharpens the first-wake bootstrap and is ignored once a mark exists.
+        `trigger` is the optional uuid of the message that fired the wake; `event_trigger`
+        is the optional uuid of the webhook event that fired it (the router passes the
+        relevant one). Each only sharpens its own first-wake bootstrap and is ignored
+        once that kind's mark exists.
         """
         session = self.harness.session(self.source)
+        posted = self._wake_messages(session, trigger)
+        posted += self._wake_events(session, event_trigger)
+        return posted
+
+    # --- messages ------------------------------------------------------------
+
+    def _wake_messages(self, session: Session, trigger: str | None) -> list[object]:
+        """Answer unseen messages: bootstrap on the first wake, else reply incrementally."""
         mark = self.marks.get(self.timeline_uuid)
         if mark is None:
             return self._bootstrap(session, trigger)
         unseen = _messages_since(self.client.messages.filter(timeline=self.timeline_uuid), mark)
         return self._respond(session, unseen)
+
+    # --- webhook events ------------------------------------------------------
+
+    def _wake_events(self, session: Session, event_trigger: str | None) -> list[object]:
+        """Surface unseen inbound webhook deliveries and let the agent act on them.
+
+        A received webhook event is *not* a timeline item the way a message or an
+        activated task is — so a woken agent never sees one unless it goes looking.
+        This is that lookup: the same idempotent high-water-mark discipline used for
+        messages, over the SDK's webhook-events read surface. On the first wake the
+        router's `event_trigger` (the delivery that woke the agent) is acted on; with
+        no trigger the first wake only baselines the mark, so a fresh agent does not
+        replay a backlog of historical deliveries.
+        """
+        mark = self.marks.get(self.timeline_uuid, kind=_EVENTS)
+        if mark is None:
+            return self._bootstrap_events(session, event_trigger)
+        unseen = _events_since(self.client.webhook_events.filter(timeline=self.timeline_uuid), mark)
+        return self._respond_events(session, unseen)
+
+    def _bootstrap_events(self, session: Session, event_trigger: str | None) -> list[object]:
+        """The first webhook-event wake for a timeline: there is no persisted mark yet.
+
+        With no trigger, act on nothing — only baseline the mark — so a fresh agent is
+        not flooded by historical deliveries it was never woken for. With a trigger, act
+        on that delivery and everything newer (events are not seeded as conversational
+        history the way messages are — a webhook payload is an item to act on, not
+        backlog to scroll), then baseline the mark to the true newest so the next wake
+        is a normal incremental one.
+        """
+        events_filter = self.client.webhook_events.filter(timeline=self.timeline_uuid)
+        recent = _recent(events_filter, self.context_messages)
+        if event_trigger is None:
+            if recent:  # baseline only; nothing acted on
+                self.marks.set(self.timeline_uuid, recent[0].content.uuid, kind=_EVENTS)
+            return []
+
+        to_act = self._events_from_trigger(recent, event_trigger)
+        if not to_act:
+            return []  # no such event and an empty timeline: nothing to do, nothing to mark
+        posted = self._respond_events(session, to_act)
+        # Baseline to the newest delivery we saw — the window's newest, or (when the
+        # trigger sat past the window and the window was empty) the trigger itself.
+        newest = recent[0].content.uuid if recent else to_act[-1].content.uuid
+        self.marks.set(self.timeline_uuid, newest, kind=_EVENTS)
+        return posted
+
+    def _events_from_trigger(self, recent: list[object], event_trigger: str) -> list[object]:
+        """The deliveries to act on for a named trigger, oldest-first.
+
+        Normally the trigger is in the fetched window: act on it and everything newer.
+        If a burst pushed it *past* the window (more than `context_messages` newer
+        deliveries arrived before this wake fired), the windowed scan would miss it — so
+        fetch the named event directly and act on it together with the window, rather
+        than silently dropping the one delivery the router explicitly woke us for.
+        """
+        for i, event in enumerate(recent):
+            if event.content.uuid == event_trigger:
+                return list(reversed(recent[: i + 1]))  # trigger and newer, chronological
+        # Trigger not in the window: fetch it directly so it is never dropped, and act
+        # on it before the window (it is older than everything fetched).
+        try:
+            triggered = self.client.webhook_events.get(event_trigger)
+        except BaseCradleError:
+            triggered = None  # gone or unreadable — act on what we can still see
+        window = list(reversed(recent))  # all newer than the trigger, chronological
+        return ([triggered, *window]) if triggered is not None else window
+
+    def _respond_events(self, session: Session, events: list[object]) -> list[object]:
+        """Act on each webhook delivery in order, advancing the event mark per delivery.
+
+        Mirrors `_respond` for messages: the mark advances after each event (not once
+        at the end), so a crash or router retry mid-batch resumes after the last
+        delivery handled, never re-acting on one; and any reply is posted *before* the
+        mark advances, keeping at-least-once semantics over a possible duplicate.
+        """
+        posted = []
+        for event in events:
+            reply = session.send(_incoming_event_text(event))
+            if reply.strip():
+                posted.append(self.timeline.messages.create(body=reply))
+            self.marks.set(self.timeline_uuid, event.content.uuid, kind=_EVENTS)
+        return posted
 
     # --- the first wake: infer a high-water mark from the timeline ------------
 
@@ -304,6 +425,39 @@ def _has_conversation(session: Session) -> bool:
     return any(turn.role in ("user", "assistant") for turn in session.history)
 
 
+# A webhook event shares a message's newest-first ordering and `.content.uuid`
+# shape, so the same high-water-mark scan walks both. Aliased (not re-implemented)
+# to keep the two in lockstep.
+_events_since = _messages_since
+
+# How much of a webhook payload to put in front of the model directly. A large body
+# is truncated with a pointer to the webhook_events tool, which reads it in full —
+# the same describe-don't-dump discipline the assets tool uses.
+_MAX_EVENT_PAYLOAD = 8 * 1024
+
+
+def _incoming_event_text(event: object) -> str:
+    """An inbound webhook delivery as the agent hears it: what arrived, and its payload.
+
+    A large payload is truncated with a pointer to the `webhook_events` tool (which
+    reads the full headers and body by uuid), so a firehose delivery cannot blow up
+    the model's context.
+    """
+    content = event.content
+    payload = content.payload
+    if len(payload) > _MAX_EVENT_PAYLOAD:
+        payload = (
+            payload[:_MAX_EVENT_PAYLOAD].rstrip()
+            + f"\n… (payload truncated — use the webhook_events tool to read {content.uuid} in full)"
+        )
+    return (
+        "An inbound webhook was just delivered to this timeline "
+        f"(event {content.uuid}, endpoint {event.webhook_endpoint.uuid}, "
+        f"content_type {content.content_type}). Decide whether and how to act on it. "
+        f"Its payload:\n{payload}"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     """The `basecradle-harness-wake` entrypoint: one wake, then exit.
 
@@ -324,13 +478,21 @@ def main(argv: list[str] | None = None) -> int:
         default=os.environ.get("BASECRADLE_MESSAGE"),
         help="optional uuid of the triggering message; sharpens the first-wake bootstrap.",
     )
+    parser.add_argument(
+        "--event",
+        default=os.environ.get("BASECRADLE_EVENT"),
+        help=(
+            "optional uuid of the triggering webhook event; the router passes it on a "
+            "webhook_event.received wake so the first wake acts on that delivery."
+        ),
+    )
     args = parser.parse_args(argv)
     if not args.timeline:
         parser.error("a timeline uuid is required (--timeline or BASECRADLE_TIMELINE)")
 
     try:
         agent = WakeAgent.from_env(timeline=args.timeline)
-        agent.wake(trigger=args.message)
+        agent.wake(trigger=args.message, event_trigger=args.event)
     except (HarnessError, ProviderError, ValueError, KeyError) as error:
         print(f"basecradle-harness-wake: {error}", file=sys.stderr)
         return 1
