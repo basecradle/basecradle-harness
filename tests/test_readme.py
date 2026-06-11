@@ -73,12 +73,15 @@ def _timeline():
 
 class TestReadmeExamples:
     @pytest.fixture(autouse=True)
-    def mocked_world(self, monkeypatch):
+    def mocked_world(self, monkeypatch, tmp_path):
         """A mocked model and platform — enough for every README block to run."""
         monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-readme-key")
         monkeypatch.setenv("BASECRADLE_TOKEN", "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa")
         monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
         monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+        # Isolate the agent's home so a memory example's writes land in a temp DB,
+        # never the real `~/.basecradle_harness/memory.db`.
+        monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
 
         with respx.mock(assert_all_called=False) as router:
             # The model: always a plain text reply (no tool calls), so examples terminate.

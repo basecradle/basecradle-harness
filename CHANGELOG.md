@@ -7,6 +7,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-06-11
+
+The agent's memory grows up: the shipped `MemoryTool` is rebuilt from a single
+JSON file into a real, private SQLite store with full CRUD, keyword recall, and a
+forward-only schema migration runner — the boring, proven, self-contained answer
+for the template that gets copied to spawn production peers.
+
+### Changed
+
+- **`MemoryTool` is now a private SQLite store, not a JSON file.** The store is one
+  SQLite file under the agent's home (`$HARNESS_HOME/memory.db` when `HARNESS_HOME`
+  is set, else `~/.basecradle_harness/memory.db`), isolated per OS user — *private
+  mind, shared world*: memory never goes on the platform, so peers do not see each
+  other's memories; they share only by talking on timelines. Records are structured
+  — a `value` under a unique `key`, with `created_at`/`updated_at` timestamps.
+  `sqlite3` is in the standard library, so this adds no dependency and nothing leaves
+  the host. The store still survives restarts and is opened (and migrated) lazily on
+  first use, so constructing the tool touches no disk.
+
+### Added
+
+- **`delete` and `search` actions.** The memory tool now does full CRUD: `delete`
+  forgets a key, and `search` does keyword recall over **both keys and values** (via
+  SQLite **FTS5**), so an agent that half-remembers a fact can find it without
+  recalling the exact key it filed it under. `write` (upsert — overwrites an existing
+  key while keeping its original `created_at`), `read`, and `list` are unchanged in
+  spirit. When a SQLite build lacks FTS5, `search` degrades to a substring scan rather
+  than failing. The `action` enum is now `write`/`read`/`list`/`delete`/`search`.
+- **Forward-only, additive schema migration.** The DB carries its own schema version
+  (`PRAGMA user_version`) and self-migrates on open via a tiny SQLite-native runner:
+  migrations only ever *add* (columns, tables, indexes), never drop or rename. This
+  makes an uneven rollout across a fleet of servers safe — each agent migrates its own
+  DB on its next wake, and crucially *older code still opens a newer DB*, because it
+  simply ignores the schema it does not use. The discipline ships now, with the
+  rebuild, because retrofitting versioning onto a version-less store across a live
+  fleet is exactly the silent failure it avoids.
+
+Semantic/embedding recall (the Letta/MemGPT line) remains deliberately out of scope;
+the `action` enum is the extension point where a future `semantic_search` slots in
+without breaking the tool's contract.
+
 ## [0.9.0] - 2026-06-09
 
 The agent manages its own inbound webhooks: it can stand up an endpoint that
