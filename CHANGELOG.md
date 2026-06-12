@@ -7,6 +7,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-12
+
+One coherent **token lifecycle**: an agent reuses its existing token for everything and
+mints a new one **only when there is no token or the token is dead** — fixing two opposite
+failures. A credential-only agent (email + password, no token) used to mint a brand-new
+token — a new platform `Session` — on *every* wake (sprawl), because nothing was ever
+persisted. A token-only agent reused its token but could **never recover when it died**: a
+dead token won the token-first precedence with no fallback, stranding the agent. Founder
+directive (2026-06-11), surfaced from the @jt outage.
+
+### Added
+
+- **`BASECRADLE_ENV_FILE` — token persistence.** A minted (or re-minted) token is written
+  back to the `BASECRADLE_TOKEN=` line of the file the agent sources its own env from (its
+  `agent.env`), named by this new env var. That one env var **is** the persistence layer:
+  the next wake sources the file, finds the token, and reuses it — so a credential-only
+  agent mints **once**, not once per wake. The write is surgical and atomic — only the
+  token line is touched (its `export `/indentation prefix preserved; appended in the file's
+  own style if absent), every other secret left byte-for-byte, and the file replaced via a
+  same-directory temp file + `os.replace` at its original mode (a fresh file is `0600`). No
+  parallel token store is invented. Unset → the token is not persisted and a clear warning
+  is logged (a credential-only agent then mints per wake, as before).
+
+### Fixed
+
+- **A dead token now self-heals: re-mint → re-persist → retry, with no human.** A new
+  `SelfHealingBaseCradle` (returned by `_client_from_env` for both poll and wake paths)
+  catches a 401 on any platform call, re-mints from `BASECRADLE_EMAIL` + `BASECRADLE_PASSWORD`,
+  swaps the new token onto the live client (so every resource and tool already holding it
+  picks it up), persists it to `BASECRADLE_ENV_FILE`, and retries the call once. Every SDK
+  call routes through `BaseCradle.request`, so the single override covers construction, the
+  poll loop, the wake reconcile, and tool calls alike. The retry is one-shot — a still-dead
+  token raises rather than looping. With **no** credentials to re-mint from (token-only and
+  dead), it fails **loudly** with a remediation message rather than silently spinning.
+
 ## [0.15.1] - 2026-06-11
 
 Two live wake-reconcile bugs fixed: **inbound webhook deliveries never surfaced**, and

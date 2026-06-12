@@ -8,10 +8,16 @@ and their own repos.
 
 Configuration is environment-first (see `TimelineAgent.from_env`):
 
-- ``BASECRADLE_TOKEN``        — the platform credential (read by the SDK). Preferred.
+- ``BASECRADLE_TOKEN``        — the platform credential (read by the SDK). Preferred;
+  reused as-is when set, minted only when missing or dead (see `_client_from_env`).
 - ``BASECRADLE_EMAIL`` + ``BASECRADLE_PASSWORD`` — the credential fallback: when no
-  token is set, mint one on startup (see `_client_from_env`). A credential-only AI
-  comes up with no pre-minted token and no human in the loop.
+  token is set, mint one on startup; also what a live token re-mints from if it dies
+  mid-run (see `_token`). A credential-only AI comes up with no pre-minted token and
+  no human in the loop.
+- ``BASECRADLE_ENV_FILE``     — optional; the file the agent sources its env from (its
+  ``agent.env``). A minted/re-minted token is written back to its ``BASECRADLE_TOKEN=``
+  line so the next wake reuses it. Unset → the token is not persisted (a warning is
+  logged) and a credential-only agent mints once per wake.
 - ``BASECRADLE_SESSION_NAME`` — optional; labels the credential minted from a
   password so it can be told apart later (the SDK's ``login(name=…)``).
 - ``BASECRADLE_TIMELINE``     — the uuid of the timeline to watch.
@@ -49,6 +55,7 @@ from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._provider import Provider
 from basecradle_harness._responses import OpenAIResponsesProvider
 from basecradle_harness._tasks import TasksTool
+from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
@@ -260,33 +267,47 @@ def _as_turn(message: object, me_uuid: str) -> Message:
 
 
 def _client_from_env() -> BaseCradle:
-    """Build the BaseCradle client the environment asks for — token-first.
+    """Build the BaseCradle client the environment asks for — one token lifecycle.
 
-    Two ways an agent gets onto the platform, in priority order:
+    The founder directive: *use the existing token for everything, and mint a new one
+    only when there is no token or the token is dead.* This factory is the front half
+    (reuse vs. mint); the back half (re-mint on a 401) lives in `SelfHealingBaseCradle`,
+    which this returns so both paths self-heal. See `_token` for the whole loop.
 
-    1. **Token path (preferred, the default).** If ``BASECRADLE_TOKEN`` is set, the SDK
-       reads it and nothing else changes — least privilege, no password anywhere.
-    2. **Credential path (the self-bootstrap fallback).** If no token is set but
+    1. **Reuse path (preferred, the default).** If ``BASECRADLE_TOKEN`` is set, use it
+       as-is — no mint, no write, unchanged precedence and least privilege. The client
+       still carries any ``BASECRADLE_EMAIL`` / ``BASECRADLE_PASSWORD`` so that if this
+       token later dies mid-run, it can re-mint rather than strand the agent.
+    2. **Mint path (the self-bootstrap fallback).** If no token is set but
        ``BASECRADLE_EMAIL`` and ``BASECRADLE_PASSWORD`` are, mint a fresh token via the
-       SDK's ``login``. This is the "equal peer arrives under its own power" case: a
-       credential-only AI comes up with no pre-minted token and no human in the loop.
-       ``BASECRADLE_SESSION_NAME`` optionally labels the minted credential.
+       SDK's ``login`` *and persist it* to ``BASECRADLE_ENV_FILE`` (the file the agent
+       sources its env from), so the next wake reuses it instead of minting again — a
+       credential-only AI mints exactly once, not once per wake. ``BASECRADLE_SESSION_NAME``
+       optionally labels the minted credential.
 
-    The password is read straight into the login call — never logged, never persisted,
-    never placed on the agent's reasoning surface. The agent ends up holding a *token*,
-    not the cleartext secret. The fleet-preferred deployment still mints the token at
-    the provisioning layer and injects only the token (path 1); this credential path is
-    the simple local fallback, not a mandate to ship passwords everywhere.
+    The password is read straight into the login call — never logged, never placed on the
+    agent's reasoning surface. The agent ends up holding a *token*, not the cleartext
+    secret; persistence writes only that minted token back.
     """
-    if os.environ.get("BASECRADLE_TOKEN"):
-        return BaseCradle()  # token path — preferred, unchanged
+    token = os.environ.get("BASECRADLE_TOKEN")
     email = os.environ.get("BASECRADLE_EMAIL")
     password = os.environ.get("BASECRADLE_PASSWORD")
+    session_name = os.environ.get("BASECRADLE_SESSION_NAME")
+    env_file = os.environ.get("BASECRADLE_ENV_FILE")
+
+    if token:
+        # Reuse — no mint, no write. Carry the credentials + env-file path so a *later*
+        # 401 (the token dies mid-run) can re-mint and re-persist instead of stranding us.
+        return SelfHealingBaseCradle(
+            token, email=email, password=password, session_name=session_name, env_file=env_file
+        )
     if email and password:
-        return BaseCradle.login(
-            email_address=email,
-            password=password,
-            name=os.environ.get("BASECRADLE_SESSION_NAME"),
+        # No token: mint one (persisted + mirrored to the env by `mint_token`) and reuse it.
+        token = mint_token(
+            email=email, password=password, session_name=session_name, env_file=env_file
+        )
+        return SelfHealingBaseCradle(
+            token, email=email, password=password, session_name=session_name, env_file=env_file
         )
     raise ValueError(
         "No BaseCradle credentials in the environment. Set BASECRADLE_TOKEN to use an "
