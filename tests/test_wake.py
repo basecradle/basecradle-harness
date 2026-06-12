@@ -12,7 +12,9 @@ only thing that carries between them is what is written to disk. The cast is the
 fixed fiction: Nova Digital (``nova``, AI) is the agent; John Doe (``john``).
 """
 
+import hmac
 import json
+from hashlib import sha256
 
 import httpx
 import pytest
@@ -1056,3 +1058,106 @@ def test_main_returns_nonzero_on_missing_provider_config(platform, wake_env, mon
     monkeypatch.delenv("AI_PROVIDER_MODEL", raising=False)
 
     assert main(["--timeline", TIMELINE_UUID]) == 1
+
+
+# --- NOC synthetic-probe short-circuit (issue #106) --------------------------
+#
+# A woken harness recognizes a signed NOC probe (see `_probe`) and acks it at the
+# reconcile layer WITHOUT a model call, so the message-seam heartbeat is token-free at
+# rest. These pin the wake-level contract: ack the probe, no provider call, advance the
+# mark, leave the transcript clean; an unsigned/forged marker falls through to the model.
+
+PROBE_SECRET = "noc-probe-secret-do-not-use-in-prod"
+PROBE_NONCE = "0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d"
+
+
+def probe_marker(nonce=PROBE_NONCE, secret=PROBE_SECRET):
+    """A correctly-signed BCNOC1 marker line (mirrors basecradle-noc's marker.mint)."""
+    sig = hmac.new(secret.encode(), f"BCNOC1 {nonce}".encode(), sha256).hexdigest()
+    return f"BCNOC1 {nonce} {sig}"
+
+
+def _conversational_turns(agent):
+    """The user/assistant turns in the wake's session — empty means a clean transcript."""
+    history = agent.harness.session(agent.source).history
+    return [turn for turn in history if turn.role in ("user", "assistant")]
+
+
+def test_a_signed_probe_is_acked_without_the_model(platform, tmp_path):
+    """A valid probe from a peer → a BCNOC1-ACK, zero model calls, mark advanced, clean transcript."""
+    body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
+    serve_messages(platform, page(message(uuid=M0, body=body)))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1  # the ack
+    assert provider.prompts == []  # the model never ran — token-free
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
+    assert agent.marks.get(TIMELINE_UUID) == M0  # mark advanced exactly as a normal reply
+    assert _conversational_turns(agent) == []  # probe never entered the session transcript
+
+
+def test_an_acked_probe_is_idempotent_across_wakes(platform, tmp_path):
+    """The mark advance means a second process re-reconciling acks nothing more."""
+    body = probe_marker()
+    serve_messages(
+        platform,
+        page(message(uuid=M0, body=body)),  # first wake sees the probe
+        page(message(uuid=M0, body=body)),  # second wake re-reads, now past the mark
+    )
+    agent1, _ = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+    agent1.wake()
+
+    agent2, provider2 = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+    posted = agent2.wake()
+
+    assert posted == []  # nothing newer than the mark
+    assert provider2.prompts == []
+
+
+def test_a_forged_marker_falls_through_to_the_model(platform, tmp_path):
+    """Right shape, wrong signature → an ordinary message answered by the model."""
+    forged = f"BCNOC1 {PROBE_NONCE} {'0' * 64}"
+    serve_messages(platform, page(message(uuid=M0, body=forged)))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert provider.prompts == [f"john: {forged}"]  # the model ran on it as a normal message
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert json.loads(sent.content) == {"message": {"body": "Hello, John."}}
+
+
+def test_without_a_probe_secret_a_valid_marker_is_an_ordinary_message(platform, tmp_path):
+    """Feature off (no NOC_PROBE_SECRET) → even a real probe goes to the model, unchanged."""
+    serve_messages(platform, page(message(uuid=M0, body=probe_marker())))
+    agent, provider = build_wake(tmp_path)  # no probe_secret
+
+    agent.wake()
+
+    assert provider.prompts == [f"john: {probe_marker()}"]  # short-circuit disabled
+
+
+def test_a_self_authored_probe_is_filtered_not_acked(platform, tmp_path):
+    """Self-filter precedence: a probe the agent itself posted is skipped, never acked."""
+    serve_messages(platform, page(message(uuid=M0, body=probe_marker(), mine=True)))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert posted == []  # own item: never acted on
+    assert provider.prompts == []
+    assert agent.marks.get(TIMELINE_UUID) == M0  # but the mark still advances
+
+
+def test_a_blank_probe_secret_keeps_the_short_circuit_off(platform, tmp_path):
+    """A set-but-empty secret must not enable verification against an empty HMAC key."""
+    serve_messages(platform, page(message(uuid=M0, body=probe_marker())))
+    agent, provider = build_wake(tmp_path, probe_secret="")  # blank, e.g. an unfilled env var
+
+    agent.wake()
+
+    assert provider.prompts == [f"john: {probe_marker()}"]  # treated as an ordinary message

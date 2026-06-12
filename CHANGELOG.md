@@ -7,6 +7,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-12
+
+The harness half of the NOC's **message-seam** contract: a woken agent recognizes a signed
+NOC **synthetic probe** and acks it **at the reconcile layer, before any model call**, so
+the NOC's seam heartbeat (*message → router-wake → reply*) runs **token-free at rest**. The
+NOC drives that path on a cadence and alerts when the loop doesn't close — a class of
+silent death no single repo's CI can see, because no repo owns the whole path.
+
+### Added
+
+- **NOC synthetic-probe short-circuit (`NOC_PROBE_SECRET`).** In wake mode, a message whose
+  body carries a valid signed marker `BCNOC1 <nonce> <hmac>` (`<hmac> =
+  HMAC-SHA256("BCNOC1 <nonce>", probe_secret)`, **constant-time compared**) is answered with
+  the deterministic ack `BCNOC1-ACK <nonce>` and **never reaches the model** — no provider
+  call, no tokens, nothing into the session transcript. New `_probe` module
+  (`verify_probe` / `ack_line`) is the verifying mirror of basecradle-noc's `marker.py`;
+  the two halves agree byte-for-byte (pinned by a literal HMAC test vector). The
+  short-circuit lives in `_wake.py` → `_act_on` for **message items only**, after the actor
+  self-filter and before the model call, and advances the high-water mark exactly as a
+  normal reply (at-least-once, so a crash re-acks; a duplicate ack is harmless).
+  - **Marker is HMAC-signed, not a bare sentinel — deliberately.** The short-circuit fires
+    *before* the model, so a forgeable marker would let any peer spend the free-ack path
+    *and*, far worse, get a real message silently mistaken for a probe and never answered —
+    the exact silent-death the NOC exists to catch, manufactured on demand. Only a holder
+    of `NOC_PROBE_SECRET` can mint a valid marker.
+  - **Opt-in and inert by default.** With `NOC_PROBE_SECRET` unset the short-circuit is off
+    and every message goes to the model exactly as before — zero impact on any non-NOC
+    deployment. The var name matches the NOC box's (`basecradle_noc/config.py`), so one
+    provisioned value serves both halves.
+  - Live end-to-end verification on @jt is gated on the NOC sender account + the secret
+    being provisioned (basecradle-noc#1, founder/capital); the harness half ships fully
+    unit-tested offline ahead of those gates.
+
 ## [0.16.0] - 2026-06-12
 
 One coherent **token lifecycle**: an agent reuses its existing token for everything and
