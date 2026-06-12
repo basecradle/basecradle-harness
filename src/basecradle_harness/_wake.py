@@ -85,6 +85,7 @@ from basecradle_harness._harness import Harness
 from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
+from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import Session
 from basecradle_harness._tasks import TasksTool
 from basecradle_harness._webfetch import WebFetchTool
@@ -201,6 +202,7 @@ class WakeAgent:
         marks: MarkStore | None = None,
         context_messages: int | None = DEFAULT_CONTEXT_MESSAGES,
         onboard: bool = True,
+        probe_secret: str | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -214,6 +216,10 @@ class WakeAgent:
         self.timeline_uuid = timeline
         self.source = f"timeline:{timeline}"
         self.context_messages = context_messages
+        # The shared HMAC key for the NOC synthetic-probe marker (see `_probe`). Set →
+        # the message reconcile recognizes a signed probe and acks it token-free, before
+        # the model. Unset → the short-circuit is off and every message goes to the model.
+        self.probe_secret = probe_secret
         self.marks = marks or MarkStore(harness.home)  # type: ignore[arg-type]
         # Activated tasks are tracked by a seen-set, not a high-water mark (see
         # `SeenStore`); it lives beside the marks, under the same home root.
@@ -255,6 +261,11 @@ class WakeAgent:
         Session) on every wake. `_client_from_env` mints only when the token is missing
         or dead and writes it back to `BASECRADLE_ENV_FILE`, so the next wake — which
         sources that same file — reuses it. See `_token` for the full lifecycle.
+
+        `NOC_PROBE_SECRET` (optional) is the shared HMAC key for the NOC's synthetic-probe
+        marker. Set → a recognized probe is acked token-free before the model (see
+        `_probe`); unset → the short-circuit is off. The same var name the NOC box uses,
+        so one provisioned value serves both halves of the message-seam contract.
         """
         home = os.environ.get("HARNESS_HOME")
         if not home:
@@ -285,6 +296,9 @@ class WakeAgent:
             client=_client_from_env(),
             context_messages=_context_messages_from_env(),
             onboard=_onboard_from_env(),
+            # `or None` so a set-but-blank NOC_PROBE_SECRET (an exported-but-unfilled
+            # secret) reads as *off*, not as "enabled with an empty HMAC key".
+            probe_secret=os.environ.get("NOC_PROBE_SECRET") or None,
         )
 
     def wake(
@@ -540,13 +554,30 @@ class WakeAgent:
     # --- the shared act-on loop ----------------------------------------------
 
     def _act_on(
-        self, session: Session, items, render, record, skip=None, claim_first: bool = False
+        self,
+        session: Session,
+        items,
+        render,
+        record,
+        skip=None,
+        claim_first: bool = False,
+        probe=None,
     ) -> list[object]:
         """Engage the model on each item in order, posting any reply and recording it.
 
         The one loop behind all four reconcilers — messages, webhook events, activated
         tasks, and posted assets. `render` turns an item into the text the model reads;
         `record` marks it handled (a mark advance, or a seen-set add).
+
+        `probe(item)` is the **NOC synthetic-probe short-circuit**, passed only by the
+        message reconciler. When it returns a nonce (the item is a valid signed probe —
+        see `_probe`), the loop posts the deterministic ack and records the item **without
+        calling the model** — no provider request, no tokens, nothing into the transcript —
+        so the message-seam heartbeat runs token-free at rest. It is checked *after* the
+        self-filter (a probe is from a distinct peer, never the agent's own) and *before*
+        `render`/`session.send`, and follows the same at-least-once order as a normal reply
+        (post, then record), so a crash mid-batch re-acks — a duplicate ack is harmless
+        (the prober matches the first ack carrying its nonce).
 
         **Two recording disciplines, chosen by `claim_first`:**
 
@@ -582,6 +613,12 @@ class WakeAgent:
             if skip is not None and skip(item):
                 record(item)  # own post: never acted on, but marked so it is not re-scanned
                 continue
+            if probe is not None and (nonce := probe(item)) is not None:
+                # A verified NOC probe: ack token-free (no model call), then record — the
+                # same at-least-once order as a normal reply, so a crash re-acks safely.
+                posted.append(self.timeline.messages.create(body=ack_line(nonce)))
+                record(item)
+                continue
             if claim_first:
                 record(item)  # at-most-once: claim before acting so a crash cannot re-fire it
             reply = session.send(render(item))
@@ -594,6 +631,20 @@ class WakeAgent:
     def _is_own(self, item: object) -> bool:
         """Whether an item was authored by this agent — the actor self-filter's test."""
         return item.user.uuid == self.me_uuid
+
+    def _probe_nonce(self, item: object) -> str | None:
+        """The nonce if a message is a valid signed NOC probe, else `None` (the short-circuit).
+
+        Off unless `NOC_PROBE_SECRET` was provisioned (`probe_secret` set and non-empty):
+        with no secret there is nothing to verify against, so every message falls through
+        to the model, exactly as before this capability existed. A falsy secret (`None`
+        *or* an empty string) keeps it off, so a blank env var never enables verification
+        against an empty key. `item.content.body` is safe here because only the message
+        reconciler (`_respond`) passes `probe=`; other item kinds never reach this.
+        """
+        if not self.probe_secret:
+            return None
+        return verify_probe(item.content.body, self.probe_secret)
 
     # --- the first wake: infer a high-water mark from the timeline ------------
 
@@ -657,7 +708,9 @@ class WakeAgent:
     def _respond(self, session: Session, messages: list[object]) -> list[object]:
         """Reply to each message in chronological order, advancing the mark per reply.
 
-        Our own posts are skipped (the actor self-filter) but still advance the mark.
+        Our own posts are skipped (the actor self-filter) but still advance the mark, and a
+        recognized NOC probe is acked token-free before the model (`probe=`). This is the
+        only reconciler that passes `probe`, so the short-circuit is message-only.
         Delegates to the shared `_act_on` loop — see it for the crash-safe, at-least-once
         ordering that every reconciler shares.
         """
@@ -667,6 +720,7 @@ class WakeAgent:
             _incoming_text,
             lambda message: self.marks.set(self.timeline_uuid, message.content.uuid),
             skip=self._is_own,
+            probe=self._probe_nonce,
         )
 
 
