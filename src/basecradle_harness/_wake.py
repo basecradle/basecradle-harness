@@ -43,12 +43,15 @@ Everything else — identity, Dashboard onboarding, turning messages into turns,
 the newest-first scan up to the mark — is shared with `TimelineAgent`.
 
 The command is `basecradle-harness-wake --timeline <uuid>` (also runnable as
-`python -m basecradle_harness`); see `main`. It works from the timeline uuid alone;
-optional `--message`, `--event`, and `--asset` uuids name the triggering message,
-webhook event, or posted asset, each sharpening its own first-wake bootstrap (see
-`_bootstrap_split` and `_bootstrap_stream`). On a `webhook_event.received` or
-`asset.created` wake the router passes the matching trigger so the first wake acts on
-exactly the item that woke the agent rather than baselining it as already-seen.
+`python -m basecradle_harness`); see `main`. **In production it works from the timeline
+uuid alone** — the router wakes a harness agent with `--timeline <uuid>` and nothing
+else (see basecradle-router `wake_command`), never naming the item that fired the wake.
+So the reconcile cannot lean on a trigger: each kind surfaces its own newest unseen item
+on a first wake and everything past its mark thereafter, with no router help. The optional
+`--message`, `--event`, and `--asset` uuids still name a triggering item when a manual or
+future-router invocation passes one — each sharpens its own first-wake bootstrap (see
+`_bootstrap_split` and `_bootstrap_stream`) — but they are not required for a delivery,
+asset, or task to be acted on.
 """
 
 from __future__ import annotations
@@ -299,10 +302,14 @@ class WakeAgent:
         made and nothing is posted.
 
         `trigger`, `event_trigger`, and `asset_trigger` are the optional uuids of the
-        message, webhook event, or asset that fired the wake (the router passes whichever
-        is relevant). Each only sharpens its own first-wake bootstrap and is ignored once
-        that kind's record exists. Task activations need no trigger — the reconcile finds
-        every activated-but-unhandled task, keeping the router thin.
+        message, webhook event, or asset that fired the wake. **The router never passes
+        them** — it wakes a harness agent with the timeline uuid alone — so each kind
+        finds its own unseen items unaided: the newest on a first wake, everything past its
+        mark thereafter. The triggers remain accepted for a manual or future-router
+        invocation that does name an item (each only sharpens its own first-wake bootstrap
+        and is ignored once that kind's record exists), but nothing depends on them. Task
+        activations never used a trigger — the reconcile finds every activated-but-unhandled
+        task, keeping the router thin.
         """
         session = self.harness.session(self.source)
         posted = self._wake_messages(session, trigger)
@@ -330,10 +337,12 @@ class WakeAgent:
         mark — but the wake's *message* scan reads only messages, so a file a peer
         shares would otherwise go unseen. This is the founder's minimum wake set: a
         peer posts an image or a doc, and the agent perceives it (and can `view`,
-        `read`, or `listen` to it via the assets/audio tools). On the first wake the
-        router's `asset_trigger` (the asset whose `asset.created` fired the wake) is
-        acted on; with no trigger the first wake only baselines, so a fresh agent does
-        not replay a backlog of files posted before it arrived.
+        `read`, or `listen` to it via the assets/audio tools). The router wakes with the
+        timeline uuid alone, so on the first wake (no mark, no `asset_trigger`) the agent
+        acts on the **newest** unseen asset — the one that almost certainly woke it —
+        bounding a fresh agent to a single action rather than replaying every file posted
+        before it arrived. A named `asset_trigger`, when a manual/future invocation passes
+        one, acts on that asset and everything newer.
 
         The **actor self-filter** is load-bearing here: an asset the agent itself posted
         — most importantly an image it just generated with `generate_image` — is skipped
@@ -373,10 +382,14 @@ class WakeAgent:
         A received webhook event is *not* a timeline item the way a message or an
         activated task is — so a woken agent never sees one unless it goes looking.
         This is that lookup: the same idempotent high-water-mark discipline used for
-        messages, over the SDK's webhook-events read surface. On the first wake the
-        router's `event_trigger` (the delivery that woke the agent) is acted on; with
-        no trigger the first wake only baselines the mark, so a fresh agent does not
-        replay a backlog of historical deliveries.
+        messages, over the SDK's webhook-events read surface. The router wakes with the
+        timeline uuid alone, so on the first wake (no mark, no `event_trigger`) the agent
+        acts on the **newest** unseen delivery — the one that almost certainly woke it.
+        This is the fix for the live bug where a `webhook_event.received` wake surfaced
+        nothing: the old first-wake baselined silently when no trigger was passed, and the
+        router never passes one, so every first delivery was dropped. A named
+        `event_trigger`, when a manual/future invocation passes one, acts on that delivery
+        and everything newer.
         """
         mark = self.marks.get(self.timeline_uuid, kind=_EVENTS)
         if mark is None:
@@ -396,20 +409,49 @@ class WakeAgent:
     def _bootstrap_stream(self, session, items_filter, trigger, kind, fetch_one, respond):
         """First wake for a creation-ordered, mark-tracked stream (webhook events, assets).
 
-        There is no persisted mark yet. With no trigger, act on nothing — only baseline
-        the mark to the newest item — so a fresh agent is not flooded by a backlog it was
-        never woken for. With a trigger (the item that woke the agent — a webhook
-        delivery, or the asset whose `asset.created` fired the wake), act on that item and
-        everything newer, then baseline to the true newest so the next wake is incremental.
-        `respond` applies that stream's own discipline (e.g. the actor self-filter for
-        assets); `fetch_one` retrieves the trigger by uuid if a burst pushed it past the
-        fetched window, so the item the router woke us for is never silently dropped.
+        There is no persisted mark yet. **The router wakes a harness agent with the
+        timeline uuid alone — it never names the triggering item** (see basecradle-router
+        `wake_command`), so in production `trigger` is always `None`. A no-trigger first
+        wake therefore acts on the **newest** unseen item — the one that almost certainly
+        woke us — exactly as the message bootstrap replies to the newest message on a fresh
+        join; `respond` advances the mark to it (and applies the asset self-filter, so the
+        agent's own newest post is marked-but-not-acted, never a wake-loop). Older items
+        are left behind, not replayed, so a fresh agent is bounded to a single action
+        rather than flooded by a backlog it was never woken for. Acting on the newest is
+        what makes a webhook delivery (and a peer's posted asset) actually surface under
+        the real router contract; baselining silently was the live bug where the first
+        delivery of each kind was dropped.
+
+        With a trigger (a manual or future-router invocation that does name the item), act
+        on that item and everything newer, then baseline to the true newest so the next
+        wake is incremental. `fetch_one` retrieves the trigger by uuid if a burst pushed it
+        past the fetched window, so a named item is never silently dropped.
+
+        **Known bound — newest-only acts on one item on a *cold* first wake.** This is the
+        first reconcile of this kind *ever* (no mark yet), so "newest only" is intentional:
+        it bounds a fresh agent to a single action instead of replaying a backlog. Two
+        edges fall out of it, both strictly better than the old baseline-silently behavior
+        (which acted on nothing) and both confined to the cold first wake — every wake
+        after the mark exists acts on **all** unseen items past it:
+        - *Cold-start burst:* if several items of this kind predate the very first wake,
+          only the newest is acted on and the rest are marked seen. In the live router flow
+          each new item triggers its own wake, so this only bites items delivered before the
+          agent ever reconciled this kind.
+        - *Self-authored newest:* if the newest item is the agent's own (a just-generated
+          asset), the self-filter makes the wake a no-op and the mark still advances past an
+          older unseen peer item. Acceptable for the same reason — in the per-event flow the
+          peer item had its own earlier wake.
+        If a future need makes dropping a cold-start burst unacceptable (e.g. webhook
+        deliveries that must each be processed), act on all of `recent` here for that kind
+        rather than `recent[0]`, accepting the join-time replay that trades against.
         """
         recent = _recent(items_filter, self.context_messages)
         if trigger is None:
-            if recent:  # baseline only; nothing acted on
-                self.marks.set(self.timeline_uuid, recent[0].content.uuid, kind=kind)
-            return []
+            if not recent:
+                return []
+            # Act on the newest unseen item; `respond` advances the mark to it. See the
+            # "Known bound" note above for why a cold first wake acts on only the newest.
+            return respond(session, [recent[0]])
         to_act = self._from_trigger(recent, trigger, fetch_one)
         if not to_act:
             return []  # no such item and an empty stream: nothing to do, nothing to mark
@@ -458,8 +500,13 @@ class WakeAgent:
         events, an activated task is not a creation-ordered stream a high-water mark can
         track (a task scheduled earlier can activate later) and carries no terminal
         status the agent could set, so idempotency is a persisted *seen-set* (see
-        `SeenStore`): act on each activated task whose uuid is not yet recorded, then
-        record it. An activated-but-unhandled task is genuinely undone work — not stale
+        `SeenStore`): act on each activated task whose uuid is not yet recorded. The task
+        is recorded **before** it is acted on (`claim_first`), not after — a task is
+        at-most-once, so an action that re-wakes the agent (a generated image posts an
+        `asset.created`) cannot re-surface the still-`activated` task and re-run it. That
+        re-fire was the live monkey pile-up: the task stayed `activated`, its image-post
+        re-woke the agent, and an act-then-record order let the unrecorded task fire again
+        and again. An activated-but-unhandled task is genuinely undone work — not stale
         history — so acting on all of them is correct, and needs no router-passed
         trigger, which keeps the router thin.
 
@@ -481,20 +528,35 @@ class WakeAgent:
             unhandled,
             _activated_task_text,
             lambda task: self.seen.add(self.timeline_uuid, task.content.uuid, kind=_TASKS),
+            claim_first=True,
         )
 
     # --- the shared act-on loop ----------------------------------------------
 
-    def _act_on(self, session: Session, items, render, record, skip=None) -> list[object]:
+    def _act_on(
+        self, session: Session, items, render, record, skip=None, claim_first: bool = False
+    ) -> list[object]:
         """Engage the model on each item in order, posting any reply and recording it.
 
         The one loop behind all four reconcilers — messages, webhook events, activated
-        tasks, and posted assets. The idempotency record advances after *each* item, so
-        a crash or router retry mid-batch resumes after the last item handled; and the
-        reply is posted *before* the record advances, so the semantics are at-least-once
-        — a possible duplicate over a dropped action, which on a comms platform is the
-        better failure. `render` turns an item into the text the model reads; `record`
-        marks it handled (a mark advance, or a seen-set add).
+        tasks, and posted assets. `render` turns an item into the text the model reads;
+        `record` marks it handled (a mark advance, or a seen-set add).
+
+        **Two recording disciplines, chosen by `claim_first`:**
+
+        - *At-least-once* (`claim_first=False`, the default — messages, events, assets):
+          the reply is posted *before* the record advances, so a crash or router retry
+          mid-batch re-acts on the un-recorded item. A possible duplicate over a dropped
+          action is the better failure on a comms platform.
+        - *At-most-once* (`claim_first=True` — activated tasks): the record advances
+          *before* the action runs, so an action that fails part-way (most importantly
+          one that already posted a side effect — a generated image whose `asset.created`
+          will wake the agent again) can **never re-fire**. A self-scheduled task must run
+          exactly once even if its own output re-wakes the agent; a one-time dropped task
+          on a crash is far better than the runaway re-execution it would otherwise cause.
+
+        Either way the record advances after (or before) *each* item independently, so the
+        batch is crash-resumable at item granularity.
 
         `skip(item)` is the **actor self-filter** — the safety property. When it returns
         true (the item is the agent's *own* authored post — a message it sent, an image
@@ -502,14 +564,25 @@ class WakeAgent:
         the agent never reacts to its own output and never wake-loops on it (a generated
         image that re-woke the agent to generate another would be a runaway), while the
         skipped item is still marked seen so it is not re-scanned forever.
+
+        `skip` and `claim_first` are independent axes that **may** both apply: skip is
+        checked first, so an own item is recorded once and never acted on regardless of
+        `claim_first`. (No current reconciler passes both — tasks are at-most-once with no
+        self-filter; assets/messages self-filter at-least-once — but the precedence is
+        well-defined if one ever does.)
         """
         posted = []
         for item in items:
-            if skip is None or not skip(item):
-                reply = session.send(render(item))
-                if reply.strip():
-                    posted.append(self.timeline.messages.create(body=reply))
-            record(item)
+            if skip is not None and skip(item):
+                record(item)  # own post: never acted on, but marked so it is not re-scanned
+                continue
+            if claim_first:
+                record(item)  # at-most-once: claim before acting so a crash cannot re-fire it
+            reply = session.send(render(item))
+            if reply.strip():
+                posted.append(self.timeline.messages.create(body=reply))
+            if not claim_first:
+                record(item)  # at-least-once: mark after the post, so a crash re-acts
         return posted
 
     def _is_own(self, item: object) -> bool:

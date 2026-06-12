@@ -7,6 +7,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-06-11
+
+Two live wake-reconcile bugs fixed: **inbound webhook deliveries never surfaced**, and
+**activated tasks re-fired** on every later wake. Both traced to the same reality the
+mocked tests never modeled — **the router wakes a harness agent with the timeline uuid
+alone; it never names the triggering item** — plus an act-then-record ordering that let a
+task re-run itself.
+
+### Fixed
+
+- **A `webhook_event.received` (or `asset.created`) wake now acts on the delivery without
+  a router-passed trigger.** The router wakes a harness agent with `--timeline <uuid>` and
+  nothing else (basecradle-router `wake_command`), so the triggering item is never named —
+  yet the events/assets first-wake bootstrap baselined *silently* when no trigger was
+  passed, marking the delivery seen without acting. Every first delivery of each kind was
+  therefore dropped, which is why inbound webhooks surfaced nothing live despite the
+  handler shipping in 0.15.0. A no-trigger first wake now acts on the **newest** unseen
+  item — the one that almost certainly woke the agent — exactly as the message bootstrap
+  replies to the newest message on a fresh join, while still marking past older items so a
+  fresh agent is bounded to a single action rather than replaying a backlog. The optional
+  `--event` / `--asset` / `--message` flags remain accepted for a manual or future-router
+  invocation that *does* name an item; nothing depends on them.
+- **An activated task fires at most once, even when its own output re-wakes the agent.** A
+  self-scheduled task (e.g. "generate an image and post it") stays `activated` on the
+  platform and carries no terminal status, so the only guard against re-execution is the
+  persisted seen-set — but the seen-set advanced *after* the action, so a task whose action
+  posted an asset would be re-woken by that `asset.created`, find itself still unrecorded,
+  and run again, piling up duplicate output. Activated tasks are now **claimed (recorded
+  seen) before** the action runs (at-most-once), so a task can never re-fire regardless of
+  what its action does or what re-wakes the agent. Messages, assets, and webhook events keep
+  their at-least-once ordering (a duplicate over a dropped action is the better failure on a
+  comms platform); the at-most-once discipline is the deliberate, task-specific exception.
+
 ## [0.15.0] - 2026-06-11
 
 The wake reconcile is completed and made **safe against self-reaction**. It now also
