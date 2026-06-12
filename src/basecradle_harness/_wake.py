@@ -249,6 +249,12 @@ class WakeAgent:
         wake mode requires: it is where the transcript and the high-water mark
         persist across the separate processes a router spawns. `timeline` overrides
         `BASECRADLE_TIMELINE` (the router passes it on the command line).
+
+        Token reuse matters most here: each wake is a fresh process, so without
+        persistence a credential-only agent would mint a new token (a new platform
+        Session) on every wake. `_client_from_env` mints only when the token is missing
+        or dead and writes it back to `BASECRADLE_ENV_FILE`, so the next wake — which
+        sources that same file — reuses it. See `_token` for the full lifecycle.
         """
         home = os.environ.get("HARNESS_HOME")
         if not home:

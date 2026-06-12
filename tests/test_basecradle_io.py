@@ -598,11 +598,18 @@ def test_client_from_env_prefers_the_token(no_credentials, monkeypatch, platform
     assert not login.called  # the password path was never taken
 
 
-def test_client_from_env_mints_a_token_from_credentials(no_credentials, monkeypatch, platform):
-    """No token, but credentials → login mints one; that token is what the client carries."""
+def test_client_from_env_mints_a_token_from_credentials(
+    no_credentials, monkeypatch, platform, tmp_path
+):
+    """No token, but credentials → login mints one; that token is carried *and persisted*."""
     monkeypatch.setenv("BASECRADLE_EMAIL", "nova@example.com")
     monkeypatch.setenv("BASECRADLE_PASSWORD", "correct-horse-battery-staple")
     monkeypatch.setenv("BASECRADLE_SESSION_NAME", "nova-harness")
+    env = tmp_path / "agent.env"
+    env.write_text(
+        "BASECRADLE_EMAIL=nova@example.com\nBASECRADLE_PASSWORD=correct-horse-battery-staple\n"
+    )
+    monkeypatch.setenv("BASECRADLE_ENV_FILE", str(env))
     login = platform.post("/session").mock(
         return_value=httpx.Response(201, json={"token": MINTED_TOKEN, "start_here": None})
     )
@@ -617,6 +624,8 @@ def test_client_from_env_mints_a_token_from_credentials(no_credentials, monkeypa
         "password": "correct-horse-battery-staple",
         "name": "nova-harness",
     }
+    # The minted token is written back to the env file so the next wake reuses it.
+    assert f"BASECRADLE_TOKEN={MINTED_TOKEN}" in env.read_text()
 
 
 def test_client_from_env_requires_token_or_credentials(no_credentials):
