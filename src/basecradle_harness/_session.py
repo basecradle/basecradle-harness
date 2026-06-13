@@ -29,7 +29,7 @@ import json
 from pathlib import Path
 
 from basecradle_harness._engine import Engine
-from basecradle_harness._messages import Message
+from basecradle_harness._messages import ImageContent, Message
 
 
 class Session:
@@ -65,16 +65,31 @@ class Session:
         if not self.history and system_prompt:
             self.history.append(Message.system(system_prompt))
 
-    def send(self, text: str) -> str:
+    def send(self, text: str, *, images: list[ImageContent] | None = None) -> str:
         """Send one user message, run the loop to a text reply, persist the turn.
 
         The full exchange is appended to `history` (and saved if this session has
         a path), so memory of *this* conversation carries into its next `send` —
         while the agent's durable memory, shared through the engine, carries
         across every conversation.
+
+        `images` places pictures *in front of* the model on this turn (vision), so a
+        peer's posted file is perceived directly rather than only described — the asset
+        wake uses this. Once the model has answered, the pixels are **evicted** from the
+        turn (the text stays as a breadcrumb): the same cost discipline the engine
+        applies to a viewed image, so a presented picture is never re-sent (or re-billed)
+        on a later turn, nor persisted as base64 into the transcript on disk.
         """
-        self.history.append(Message.user(text))
-        reply = self.engine.run(self.history)
+        turn = Message(role="user", content=text, images=list(images) if images else [])
+        self.history.append(turn)
+        try:
+            reply = self.engine.run(self.history)
+        finally:
+            # Evict the pixels however the loop ends — including the error path — so a
+            # failed turn cannot leave base64 in `history` to be re-sent (or persisted) on
+            # a later `send`. Mirrors the engine's own finally-based image eviction. The
+            # text stays as a breadcrumb; `_save` below only runs when the turn succeeded.
+            turn.images = []
         self._save()
         return reply.content or ""
 

@@ -8,8 +8,11 @@ As elsewhere, a `ScriptedProvider` replays prepared assistant turns, so the loop
 runs with no model and no network.
 """
 
+import pytest
+
 from basecradle_harness import (
     Harness,
+    ImageContent,
     MemoryTool,
     Message,
     Session,
@@ -172,3 +175,51 @@ def test_message_to_dict_from_dict_round_trips_a_tool_call():
 def test_session_is_exported_and_constructible_directly():
     # Session is part of the public surface for callers wiring their own routing.
     assert isinstance(Session, type)
+
+
+# --- Presented images (vision) are shown once, then evicted ------------------
+
+
+def test_send_presents_images_then_evicts_the_pixels():
+    """An image passed to `send` reaches the model on that turn, then its pixels are
+    dropped from history (the text breadcrumb stays) so it is never re-sent later."""
+    image = ImageContent(url="data:image/png;base64,AAAA", alt="cat.png")
+
+    class CapturesImages:
+        """Snapshots the last turn's images at chat time, before the session evicts them."""
+
+        def __init__(self):
+            self.seen = None
+
+        def chat(self, messages, tools=None):
+            self.seen = list(messages[-1].images)
+            return text("I see a cat.")
+
+    provider = CapturesImages()
+    session = Session("timeline:x", Harness(provider).engine)
+
+    reply = session.send("look at this", images=[image])
+
+    assert reply == "I see a cat."
+    assert provider.seen == [image]  # the model saw the pixels on the turn they were sent
+    # …but they were evicted from the stored history afterward (text breadcrumb kept).
+    user_turn = session.history[0]
+    assert user_turn.content == "look at this"
+    assert user_turn.images == []
+
+
+def test_presented_images_are_evicted_even_when_the_turn_fails():
+    """COST DISCIPLINE: if the engine raises, the pixels are still evicted, so a failed
+    turn cannot leave base64 in history to be re-sent (or persisted) on a later send."""
+
+    class Boom:
+        def chat(self, messages, tools=None):
+            raise RuntimeError("model exploded mid-turn")
+
+    session = Session("timeline:x", Harness(Boom()).engine)
+    image = ImageContent(url="data:image/png;base64,AAAA", alt="cat.png")
+
+    with pytest.raises(RuntimeError):
+        session.send("look at this", images=[image])
+
+    assert session.history[-1].images == []  # evicted on the error path too
