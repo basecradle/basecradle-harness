@@ -88,6 +88,7 @@ from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import Session
 from basecradle_harness._tasks import TasksTool
+from basecradle_harness._version import __version__
 from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
@@ -829,6 +830,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="basecradle-harness-wake",
         description="Answer one BaseCradle timeline's unseen messages, then exit (router wake mode).",
+    )
+    # A token-free, model-free, timeline-free way to ask a deployed box "what version
+    # are you actually running?" — the cheap probe a fleet drift-guard runs on-box to
+    # catch a published-but-not-deployed release before it goes silent. Prints
+    # "basecradle-harness-wake <version>" and exits 0 (argparse's built-in action).
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+        help="print the installed basecradle-harness version and exit.",
     )
     parser.add_argument(
         "--timeline",

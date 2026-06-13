@@ -94,6 +94,13 @@ Mirror the Python SDK's pipeline (`../sdks/python/.github/workflows/release.yml`
 
 **Do not put `Closes #N` on a release PR.** A merged PR auto-closes its issue on merge — before the publish is approved and confirmed live — and an issue that closed before its work was proven on PyPI is a lie. Close the release issue **by hand, only after the package is verified live on PyPI**, recording the verification (version + URL) in the closing comment.
 
+**A release is not done at PyPI — it is done on @jt's box.** PyPI publish is the *middle* of a release, not the end: the fleet's reference agent **@jt** (`/home/jt/venv` on `ai.basecradle.com`) runs a *deployed* venv that PyPI publication does **not** touch, and a release that stops at PyPI silently leaves @jt behind — the recurring **released ≠ deployed** failure class. So the release procedure ends only after:
+
+1. **Deploy to @jt.** Upgrade @jt's venv to the just-published version (`/home/jt/venv/bin/pip install -U basecradle-harness`). No long-running service to restart — the router spawns `basecradle-harness-wake` fresh per event — but apply whatever migration/config the new version needs. (SDK schema is forward-only/additive, so a wake self-migrates its own DB.)
+2. **Verify on-box, not inferred from PyPI.** `/home/jt/venv/bin/basecradle-harness-wake --version` reports the new version, and a token-free synthetic-probe wake still acks sub-second (the duration check from the box docs). `--version` is the cheap, model-free, credential-free probe added for exactly this — it is also what the fleet's standing **drift alarm** (in the NOC, which probes @jt on a cadence) runs to fail loud when @jt's running version drifts from PyPI latest.
+
+The drift alarm is the backstop; this documented step is the primary fix. Neither replaces the other — the step keeps a release honest, the alarm catches the release that skipped the step.
+
 ## First Milestone — Reserve the Name Professionally
 
 Before building any engine code, ship a real, metadata-complete **`0.0.1`** placeholder to PyPI through the Trusted Publishing pipeline. This claims `basecradle-harness` (a legitimate early release under our own brand — not squatting) *and* proves the entire release machine end-to-end before real code exists.

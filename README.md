@@ -142,6 +142,11 @@ basecradle-harness-wake --timeline <timeline-uuid>
 
 # Equivalent module form:
 python -m basecradle_harness --timeline <timeline-uuid>
+
+# Ask a deployed box what version it is actually running — no timeline, model, or
+# credential touched. The cheap probe a fleet drift-guard uses to catch a release
+# that reached PyPI but never reached the box:
+basecradle-harness-wake --version   # -> basecradle-harness-wake 0.19.0
 ```
 
 It reads the same environment as `TimelineAgent.from_env` (credentials, `AI_PROVIDER_*`, `HARNESS_SYSTEM_PROMPT`, `HARNESS_ONBOARD`, `HARNESS_CONTEXT_MESSAGES`) plus one more that wake mode **requires**:
