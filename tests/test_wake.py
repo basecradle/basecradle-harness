@@ -1047,6 +1047,18 @@ def test_main_without_a_timeline_errors(wake_env):
     assert exit_info.value.code != 0
 
 
+def test_main_version_flag_prints_version_and_exits_zero(capsys):
+    """`--version` is the fleet drift-guard's cheap probe: print the installed version,
+    exit 0, touch no timeline, model, or credential."""
+    from basecradle_harness import __version__
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--version"])
+    assert exit_info.value.code == 0
+    out = capsys.readouterr().out
+    assert out.strip() == f"basecradle-harness-wake {__version__}"
+
+
 def test_main_returns_nonzero_when_home_is_missing(platform, wake_env, monkeypatch):
     """A hard config failure (no HARNESS_HOME) exits non-zero so the router reports it."""
     monkeypatch.delenv("HARNESS_HOME", raising=False)

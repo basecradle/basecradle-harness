@@ -7,6 +7,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-13
+
+Closes the **released ≠ deployed** gap on the fleet's reference box (@jt): a release that
+publishes to PyPI but never reaches @jt's running venv used to go silent. This adds the
+cheap on-box probe a drift-guard needs, and makes deploying-to-@jt part of "release done"
+rather than an unwritten manual step.
+
+### Added
+
+- **`basecradle-harness-wake --version`.** Prints `basecradle-harness-wake <version>` and
+  exits 0 — touching no timeline, no model, and no credential. This is the token-free,
+  model-free probe a fleet drift-guard runs on a deployed box to ask "what version are you
+  *actually* running?", so a published-but-not-deployed release fails loud instead of
+  silently leaving @jt behind. The active drift alarm itself lives in the NOC (it already
+  probes @jt on a cadence); this is the harness half it calls.
+
+### Changed
+
+- **Release procedure now ends at the box, not at PyPI** (`CLAUDE.md` → Releasing): a
+  release is not done until 0.x is deployed to @jt and verified on-box (`--version` plus a
+  token-free synthetic-probe wake), with that step documented inline.
+
 ## [0.18.0] - 2026-06-12
 
 Completes the **three-seam** NOC synthetic-probe short-circuit. 0.17.0 shipped the
