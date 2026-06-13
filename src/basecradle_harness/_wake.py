@@ -216,9 +216,10 @@ class WakeAgent:
         self.timeline_uuid = timeline
         self.source = f"timeline:{timeline}"
         self.context_messages = context_messages
-        # The shared HMAC key for the NOC synthetic-probe marker (see `_probe`). Set →
-        # the message reconcile recognizes a signed probe and acks it token-free, before
-        # the model. Unset → the short-circuit is off and every message goes to the model.
+        # The shared HMAC key for the NOC synthetic-probe marker (see `_probe`). Set → the
+        # message, webhook, and task reconciles each recognize a signed probe in their own
+        # carrier field and ack it token-free, before the model. Unset → the short-circuit
+        # is off and every item goes to the model.
         self.probe_secret = probe_secret
         self.marks = marks or MarkStore(harness.home)  # type: ignore[arg-type]
         # Activated tasks are tracked by a seen-set, not a high-water mark (see
@@ -264,8 +265,9 @@ class WakeAgent:
 
         `NOC_PROBE_SECRET` (optional) is the shared HMAC key for the NOC's synthetic-probe
         marker. Set → a recognized probe is acked token-free before the model (see
-        `_probe`); unset → the short-circuit is off. The same var name the NOC box uses,
-        so one provisioned value serves both halves of the message-seam contract.
+        `_probe`), across the message, webhook, and task seams alike; unset → the
+        short-circuit is off. The same var name the NOC box uses, so one provisioned value
+        serves the harness half of all three seam contracts.
         """
         home = os.environ.get("HARNESS_HOME")
         if not home:
@@ -502,12 +504,21 @@ class WakeAgent:
         return [triggered, *window] if triggered is not None else window
 
     def _respond_events(self, session: Session, events: list[object]) -> list[object]:
-        """Act on each webhook delivery in order, advancing the event mark per delivery."""
+        """Act on each webhook delivery in order, advancing the event mark per delivery.
+
+        A recognized NOC probe — read from the delivery's **payload** — is acked token-free
+        before the model (`probe=`), plain at-least-once like messages (post the ack, then
+        advance the mark): no `claim_first` subtlety here, that is the task seam's concern.
+        The short-circuit runs *inside* `_act_on`, after `_bootstrap_stream` has already
+        selected the item, so the #100 cold-first-wake bootstrap (newest unseen delivery
+        only — which on a quiet probe timeline is the probe) is preserved unchanged.
+        """
         return self._act_on(
             session,
             events,
             _incoming_event_text,
             lambda event: self.marks.set(self.timeline_uuid, event.content.uuid, kind=_EVENTS),
+            probe=lambda event: self._probe_nonce(event.content.payload),
         )
 
     # --- activated tasks -----------------------------------------------------
@@ -549,6 +560,15 @@ class WakeAgent:
             _activated_task_text,
             lambda task: self.seen.add(self.timeline_uuid, task.content.uuid, kind=_TASKS),
             claim_first=True,
+            # A NOC probe task is recognized from its **instructions** and acked token-free.
+            # `_act_on` checks `probe` *before* `claim_first`, so the probe is acked
+            # at-least-once (post, then record) — NOT claim-first. That is correct and must
+            # be preserved: a probe's only side-effect is @jt's own ack (self-filtered, and
+            # router wakes are serialized), so there is no re-fire hazard to guard against,
+            # and at-least-once is the safe failure direction for a monitor — a crash before
+            # recording re-acks (harmless) rather than marking the task seen with no ack ever
+            # posted, which would manufacture a false FAIL. See task-seam.md §4.
+            probe=lambda task: self._probe_nonce(task.content.instructions),
         )
 
     # --- the shared act-on loop ----------------------------------------------
@@ -569,15 +589,21 @@ class WakeAgent:
         tasks, and posted assets. `render` turns an item into the text the model reads;
         `record` marks it handled (a mark advance, or a seen-set add).
 
-        `probe(item)` is the **NOC synthetic-probe short-circuit**, passed only by the
-        message reconciler. When it returns a nonce (the item is a valid signed probe —
-        see `_probe`), the loop posts the deterministic ack and records the item **without
+        `probe(item)` is the **NOC synthetic-probe short-circuit**, passed by all three
+        reconcilers — messages, webhook events, and activated tasks — each reading the
+        marker from its own carrier field (a message body, a webhook payload, a task's
+        instructions). When it returns a nonce (the item is a valid signed probe — see
+        `_probe`), the loop posts the deterministic ack and records the item **without
         calling the model** — no provider request, no tokens, nothing into the transcript —
-        so the message-seam heartbeat runs token-free at rest. It is checked *after* the
-        self-filter (a probe is from a distinct peer, never the agent's own) and *before*
-        `render`/`session.send`, and follows the same at-least-once order as a normal reply
-        (post, then record), so a crash mid-batch re-acks — a duplicate ack is harmless
-        (the prober matches the first ack carrying its nonce).
+        so the message-, webhook-, and task-seam heartbeats all run token-free at rest. It
+        is checked *after* the self-filter (a probe is from a distinct peer, never the
+        agent's own) and *before* both `claim_first` and `render`/`session.send`, and
+        follows the same at-least-once order as a normal reply (post, then record), so a
+        crash mid-batch re-acks — a duplicate ack is harmless (the prober matches the first
+        ack carrying its nonce). The probe-before-`claim_first` order is **load-bearing for
+        the task seam**: a probe task is acked at-least-once, never claim-first, so a crash
+        before recording re-acks rather than silently marking it seen with no ack (which
+        would manufacture a false monitor FAIL — task-seam.md §4).
 
         **Two recording disciplines, chosen by `claim_first`:**
 
@@ -632,19 +658,20 @@ class WakeAgent:
         """Whether an item was authored by this agent — the actor self-filter's test."""
         return item.user.uuid == self.me_uuid
 
-    def _probe_nonce(self, item: object) -> str | None:
-        """The nonce if a message is a valid signed NOC probe, else `None` (the short-circuit).
+    def _probe_nonce(self, carrier: str) -> str | None:
+        """The nonce if `carrier` holds a valid signed NOC probe, else `None` (the short-circuit).
 
         Off unless `NOC_PROBE_SECRET` was provisioned (`probe_secret` set and non-empty):
-        with no secret there is nothing to verify against, so every message falls through
-        to the model, exactly as before this capability existed. A falsy secret (`None`
-        *or* an empty string) keeps it off, so a blank env var never enables verification
-        against an empty key. `item.content.body` is safe here because only the message
-        reconciler (`_respond`) passes `probe=`; other item kinds never reach this.
+        with no secret there is nothing to verify against, so every item falls through to
+        the model, exactly as before this capability existed. A falsy secret (`None` *or*
+        an empty string) keeps it off, so a blank env var never enables verification against
+        an empty key. `carrier` is the field each reconciler reads the marker from — a
+        message body, a task's instructions, or a webhook payload — so one signed-marker
+        check serves all three seams (the NOC's message, task, and webhook contracts).
         """
         if not self.probe_secret:
             return None
-        return verify_probe(item.content.body, self.probe_secret)
+        return verify_probe(carrier, self.probe_secret)
 
     # --- the first wake: infer a high-water mark from the timeline ------------
 
@@ -709,10 +736,11 @@ class WakeAgent:
         """Reply to each message in chronological order, advancing the mark per reply.
 
         Our own posts are skipped (the actor self-filter) but still advance the mark, and a
-        recognized NOC probe is acked token-free before the model (`probe=`). This is the
-        only reconciler that passes `probe`, so the short-circuit is message-only.
-        Delegates to the shared `_act_on` loop — see it for the crash-safe, at-least-once
-        ordering that every reconciler shares.
+        recognized NOC probe — read from the message **body** — is acked token-free before
+        the model (`probe=`). The task and webhook reconcilers pass the same `probe=` over
+        their own carrier fields, so the short-circuit spans all three seams. Delegates to
+        the shared `_act_on` loop — see it for the crash-safe, at-least-once ordering that
+        every reconciler shares.
         """
         return self._act_on(
             session,
@@ -720,7 +748,7 @@ class WakeAgent:
             _incoming_text,
             lambda message: self.marks.set(self.timeline_uuid, message.content.uuid),
             skip=self._is_own,
-            probe=self._probe_nonce,
+            probe=lambda message: self._probe_nonce(message.content.body),
         )
 
 

@@ -19,7 +19,7 @@ from hashlib import sha256
 import httpx
 import pytest
 import respx
-from basecradle import BaseCradle
+from basecradle import BaseCradle, BaseCradleError
 
 from basecradle_harness import Harness, MarkStore, Message, SeenStore, WakeAgent
 from basecradle_harness._wake import main
@@ -1161,3 +1161,123 @@ def test_a_blank_probe_secret_keeps_the_short_circuit_off(platform, tmp_path):
     agent.wake()
 
     assert provider.prompts == [f"john: {probe_marker()}"]  # treated as an ordinary message
+
+
+# --- NOC probe short-circuit: the TASK seam (issue #110) ---------------------
+#
+# The same recognize-and-ack discipline as the message seam, but the marker rides the
+# task's *instructions*. The load-bearing subtlety is ordering: `_act_on` checks `probe`
+# BEFORE `claim_first`, so a probe task is acked at-least-once (post, then record), never
+# claim-first — the safe failure direction for a monitor (task-seam.md §4).
+
+
+def test_a_signed_probe_task_is_acked_without_the_model(platform, tmp_path):
+    """A probe in a task's instructions → a BCNOC1-ACK, zero model calls, task recorded
+    seen, clean transcript. The task-seam heartbeat runs token-free at rest."""
+    instructions = f"NOC task-seam probe — please disregard.\n{probe_marker()}"
+    serve_messages(platform, page())
+    serve_tasks(platform, task_page(task(uuid=T0, instructions=instructions)))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1  # the ack
+    assert provider.prompts == []  # the model never ran — token-free
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
+    assert T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")  # recorded seen
+    assert _conversational_turns(agent) == []  # probe never entered the session transcript
+
+
+def test_a_probe_task_is_acked_at_least_once_not_claim_first(platform, tmp_path):
+    """LOAD-BEARING: `_act_on` checks `probe` before `claim_first`, so a probe task is
+    acked at-least-once (post, THEN record), never pre-claimed. If the ack post fails, the
+    task is NOT recorded seen — it retries next wake. This is the safe failure direction:
+    were the probe path 'fixed' to claim-first, the task would be marked seen with no ack
+    ever posted → the loop never closes → a false FAIL (task-seam.md §4)."""
+    serve_messages(platform, page())
+    serve_tasks(platform, task_page(task(uuid=T0, instructions=probe_marker())))
+    # The ack post fails this wake (a crash between post-attempt and record).
+    platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
+        return_value=httpx.Response(500, json={"error": "boom"})
+    )
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    with pytest.raises(BaseCradleError):
+        agent.wake()
+
+    assert provider.prompts == []  # still no model call — the probe was recognized
+    # NOT pre-claimed: claim-first would have recorded it before the failed post.
+    assert T0 not in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
+
+
+def test_a_task_without_a_marker_falls_through_to_the_model(platform, tmp_path):
+    """An ordinary activated task (no marker) is still carried out by the model, unchanged."""
+    serve_messages(platform, page())
+    serve_tasks(platform, task_page(task(uuid=T0, instructions="post the daily summary")))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert len(provider.prompts) == 1
+    assert "post the daily summary" in provider.prompts[0]  # the model ran on it
+
+
+# --- NOC probe short-circuit: the WEBHOOK seam (issue #110) ------------------
+#
+# The closest of the three to the message seam: webhook deliveries reconcile with the
+# same at-least-once discipline (no `claim_first`); the marker rides the event *payload*.
+# The short-circuit runs inside `_act_on`, after `_bootstrap_stream` selects the item, so
+# the #100 cold-first-wake bootstrap (newest unseen delivery only) is preserved.
+
+
+def test_a_signed_probe_event_is_acked_without_the_model(platform, tmp_path):
+    """A probe in a webhook payload, on a cold first wake → a BCNOC1-ACK, zero model
+    calls, event mark advanced, clean transcript. The webhook-seam heartbeat is token-free
+    at rest. This is the cold-first-wake path (no mark, no trigger → newest delivery), so
+    it also pins that the #100 bootstrap composes with the short-circuit: one delivery on a
+    quiet probe timeline, so newest = the probe, and it is acked rather than sent to the model."""
+    serve_messages(platform, page())
+    serve_events(platform, event_page(event(uuid=E0, payload=f"webhook probe\n{probe_marker()}")))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1  # the ack
+    assert provider.prompts == []  # the model never ran — token-free
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0  # mark advanced
+    assert _conversational_turns(agent) == []  # probe never entered the session transcript
+
+
+def test_a_probe_event_after_a_mark_is_acked(platform, tmp_path):
+    """Steady state (mark exists): a probe delivery newer than the mark is acked token-free,
+    and the older already-seen delivery is left alone."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, E0, kind="webhook_events")
+    serve_messages(platform, page())
+    serve_events(
+        platform,
+        event_page(event(uuid=E1, payload=probe_marker()), event(uuid=E0, payload="old")),
+    )
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert provider.prompts == []  # no model call
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E1
+
+
+def test_an_event_without_a_marker_falls_through_to_the_model(platform, tmp_path):
+    """An ordinary inbound delivery (no marker) still reaches the model, unchanged."""
+    serve_messages(platform, page())
+    serve_events(platform, event_page(event(uuid=E0, payload='{"action":"opened"}')))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert len(provider.prompts) == 1
+    assert "inbound webhook" in provider.prompts[0]  # the model ran on it
