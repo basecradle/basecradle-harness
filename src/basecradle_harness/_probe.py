@@ -1,10 +1,13 @@
-"""Recognize a NOC synthetic-probe marker — the harness half of the message-seam contract.
+"""Recognize a NOC synthetic-probe marker — the harness half of the NOC seam contracts.
 
-The NOC ([basecradle-noc](https://github.com/basecradle/basecradle-noc)) drives the seam
-*message posted → router wakes the recipient → agent replies* on a cadence and alerts when
-the loop doesn't close. For that heartbeat to run **token-free at rest**, a woken harness
-must recognize a NOC probe and ack it **at the reconcile layer, before any model call**
-(see `_wake.py` → `_act_on`). This module is the recognition + ack half of that.
+The NOC ([basecradle-noc](https://github.com/basecradle/basecradle-noc)) drives each
+wake seam — *message posted*, *webhook delivered*, and *task activated*, each → *router
+wakes the recipient → agent acts* — on a cadence and alerts when a loop doesn't close. For
+those heartbeats to run **token-free at rest**, a woken harness must recognize a NOC probe
+and ack it **at the reconcile layer, before any model call** (see `_wake.py` → `_act_on`,
+whose `probe=` hook all three reconcilers pass). The marker is identical across seams; only
+the carrier field differs (a message body, a webhook payload, a task's instructions). This
+module is the recognition + ack half of all three contracts.
 
 It is the **verifying mirror** of basecradle-noc's ``src/basecradle_noc/marker.py`` (the
 sender half). The two live in separate repos — harness cannot import the NOC package, and

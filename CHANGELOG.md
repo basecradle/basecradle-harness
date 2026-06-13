@@ -7,6 +7,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-12
+
+Completes the **three-seam** NOC synthetic-probe short-circuit. 0.17.0 shipped the
+message seam; this adds the **task** and **webhook** seams, so all three of the NOC's wake
+paths — *message → wake → reply*, *task activated → wake → act*, *webhook delivered → wake
+→ act* — recognize a signed probe and ack it **at the reconcile layer, before any model
+call**, and run **token-free at rest**. The marker scheme and `NOC_PROBE_SECRET` are
+unchanged from 0.17.0; only the carrier field differs per seam.
+
+### Added
+
+- **Task-seam short-circuit.** In wake mode, an activated task whose **instructions** carry
+  a valid signed `BCNOC1 <nonce> <hmac>` marker is acked with `BCNOC1-ACK <nonce>` and
+  **never reaches the model** — no provider call, no tokens, nothing into the transcript.
+  - **At-least-once, not claim-first — load-bearing.** `_act_on` checks `probe` *before*
+    `claim_first`, so a probe task is acked at-least-once (post the ack, *then* record),
+    bypassing the at-most-once `claim_first` that normal tasks use. This is correct and is
+    preserved deliberately: a probe's only side-effect is @jt's own ack (self-filtered on
+    any re-wake) and router wakes are serialized, so the re-fire hazard `claim_first` guards
+    against is absent — while at-least-once is the safe failure direction for a monitor. A
+    crash between ack and record re-acks (harmless; the prober matches the first ack); the
+    inverse (record-first, then crash) would mark the task seen with no ack ever posted, the
+    loop never closes, and the monitor manufactures a **false FAIL** — exactly what the NOC
+    forbids.
+- **Webhook-seam short-circuit.** In wake mode, an inbound webhook delivery whose **payload**
+  carries a valid signed marker is acked the same way and **never reaches the model**. Plain
+  at-least-once (post the ack, then advance the event high-water mark), identical to
+  messages. The short-circuit runs *inside* `_act_on`, after `_bootstrap_stream` selects the
+  item, so the #100 cold-first-wake bootstrap (newest unseen delivery only — which on a
+  quiet probe timeline is the probe itself) is preserved unchanged.
+- **Uniform egress.** Whichever seam matched, the ack is always `BCNOC1-ACK <nonce>` posted
+  as a **timeline message** by @jt — so the NOC verifies *the wake arrived and @jt acted*
+  regardless of how the synthetic event reached the agent. `NOC_PROBE_SECRET` is reused
+  unchanged; no new configuration. With it unset, all three short-circuits are off and every
+  item goes to the model exactly as before.
+
 ## [0.17.0] - 2026-06-12
 
 The harness half of the NOC's **message-seam** contract: a woken agent recognizes a signed
