@@ -7,6 +7,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-06-13
+
+Makes a posted **asset** a real wake — the **4th seam**. A peer who shares a file now
+*wakes a viewing agent that actually perceives it*, and a signed synthetic asset probe is
+acked token-free at rest, exactly like the message/task/webhook seams. This is the
+foundational harness step before the router is flipped to wake on `asset.created`.
+
+### Added
+
+- **Asset perception on wake.** When an asset wake fires, the harness fetches the file and
+  presents an **image inline** to the model, so a vision-capable agent *sees* a peer's
+  picture on wake rather than only reading a description of it (the same self-contained
+  `data:` URL the `view` tool uses). Media whose perception depth is out of scope here — a
+  doc, audio, video, or an unviewable/oversized image — degrades gracefully to a
+  description naming the file and its type, never an error. The presented pixels are
+  evicted after the turn, so an image is shown once and never re-sent (or re-billed, or
+  persisted as base64) on a later wake.
+- **The asset seam's NOC synthetic-probe short-circuit (the 4th).** A signed `BCNOC1`
+  marker carried in an asset's **description** is recognized at the reconcile layer and
+  acked token-free — before the model *and* before the file is ever fetched — completing
+  the seam set alongside the message body, task instructions, and webhook payload carriers.
+  The carrier field (`description`) is the contract the NOC's asset probe agrees with.
+
+### Changed
+
+- **`Session.send` accepts images** to place in front of the model on a turn (vision),
+  evicting them after the model answers — the mechanism behind eager asset perception,
+  applying the same cost discipline the engine already applies to a viewed image.
+- The asset viewability gate (which images can be shown, fetched as a `data:` URL) is now
+  one shared helper (`_assets.image_input`) behind both the `view` tool and the asset-wake
+  perception path, so the two never diverge on what renders.
+
 ## [0.19.0] - 2026-06-13
 
 Closes the **released ≠ deployed** gap on the fleet's reference box (@jt): a release that

@@ -227,29 +227,12 @@ class AssetsTool(PlatformTool):
         servers reaching the blob URL. A non-image (or oversized) asset comes back
         as a plain string explaining why it can't be shown, never as raw bytes.
         """
-        client = self.context.client
-        asset = client.assets.get(uuid)
-        file = asset.content.file
+        asset = self.context.client.assets.get(uuid)
         meta = _describe(asset)
-
-        if not _is_image(file.content_type):
-            return f"{meta}\n(not an image — 'view' is for images. Use 'read' for text files.)"
-        if _media_type(file.content_type) not in _VIEWABLE_IMAGE_TYPES:
-            return f"{meta}\n(image type not viewable; supported: PNG, JPEG, GIF, WebP.)"
-        if file.byte_size <= 0:
-            return f"{meta}\n(empty file — nothing to view.)"
-        if file.byte_size > MAX_IMAGE_BYTES:
-            return (
-                f"{meta}\n({file.byte_size} bytes, over the {MAX_IMAGE_BYTES}-byte view "
-                "limit — too large to look at.)"
-            )
-
-        data = _download(file.url)
-        data_url = _data_url(file.content_type, data)
-        return ToolResult(
-            text=f"{meta}\nLooking at this image now.",
-            images=[ImageContent(url=data_url, alt=file.filename)],
-        )
+        result = image_input(asset.content.file)
+        if isinstance(result, str):
+            return f"{meta}\n({result})"  # a reason it can't be shown — not raw bytes
+        return ToolResult(text=f"{meta}\nLooking at this image now.", images=[result])
 
     # --- create --------------------------------------------------------------
 
@@ -342,6 +325,30 @@ def _is_audio(content_type: str) -> bool:
     if not content_type:
         return False
     return _media_type(content_type).startswith("audio/")
+
+
+def image_input(file: Any) -> ImageContent | str:
+    """A viewable image file as self-contained model input, or a reason it can't be shown.
+
+    The single viewability gate shared by the assets ``view`` action and the asset-wake
+    perception path (`_wake._perceive_asset`), so "the agent chose to look" and "the agent
+    was shown a peer's file on wake" never diverge on *which* images render. Returns an
+    `ImageContent` — the bytes fetched and inlined as a ``data:`` URL, so the input does
+    not depend on the model's servers reaching the (possibly short-lived) blob URL — when
+    the file is a supported image within the size ceiling. Otherwise returns a short reason
+    string the caller surfaces. A download failure propagates as an ``httpx`` error for the
+    caller to handle (the wake degrades to a description; ``view`` lets it surface).
+    """
+    if not _is_image(file.content_type):
+        return "not an image — 'view' is for images. Use 'read' for text files."
+    if _media_type(file.content_type) not in _VIEWABLE_IMAGE_TYPES:
+        return "image type not viewable; supported: PNG, JPEG, GIF, WebP."
+    if file.byte_size <= 0:
+        return "empty file — nothing to view."
+    if file.byte_size > MAX_IMAGE_BYTES:
+        return f"{file.byte_size} bytes, over the {MAX_IMAGE_BYTES}-byte view limit — too large to look at."
+    data = _download(file.url)
+    return ImageContent(url=_data_url(file.content_type, data), alt=file.filename)
 
 
 def _data_url(content_type: str, data: bytes) -> str:

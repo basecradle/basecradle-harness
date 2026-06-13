@@ -12,6 +12,7 @@ only thing that carries between them is what is written to disk. The cast is the
 fixed fiction: Nova Digital (``nova``, AI) is the agent; John Doe (``john``).
 """
 
+import base64
 import hmac
 import json
 from hashlib import sha256
@@ -26,6 +27,11 @@ from basecradle_harness._wake import main
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
+
+# A tiny stand-in for a real image blob: the asset builder points every asset's blob
+# url at `{BC_URL}/blobs/<uuid>`, and the `platform` fixture serves these bytes there,
+# so an asset wake's eager image fetch (perception) succeeds without a per-test mock.
+PNG_BYTES = b"\x89PNG\r\n\x1a\n fake pixels"
 
 NOVA_UUID = "019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"  # the agent (me)
 JOHN_UUID = "019e7750-66ee-7e50-9e54-3bf8c3d6a8f1"  # the human
@@ -173,9 +179,14 @@ class CountingProvider:
         self.text = text
         self.prompts: list[str] = []
         self.last_messages: list = []
+        # A snapshot of the images on the last turn at *chat time* — captured before the
+        # session evicts the pixels, so a test can assert an asset image was actually
+        # presented to the model (the live object's `.images` is emptied after the turn).
+        self.last_images: list = []
 
     def chat(self, messages, tools=None):
         self.last_messages = list(messages)
+        self.last_images = list(messages[-1].images)
         self.prompts.append(messages[-1].content)
         return Message.assistant(content=self.text)
 
@@ -198,6 +209,12 @@ def platform():
         router.get("/assets").mock(return_value=httpx.Response(200, json=asset_page()))
         router.get("/webhook_events").mock(return_value=httpx.Response(200, json=event_page()))
         router.get("/tasks").mock(return_value=httpx.Response(200, json=task_page()))
+        # A peer's posted image is fetched and shown to the model on wake (perception),
+        # so every asset's blob url resolves to image bytes by default. A test exercising
+        # a download failure overrides this with a 5xx/connection error.
+        router.get(path__regex=r"^/blobs/").mock(
+            return_value=httpx.Response(200, content=PNG_BYTES)
+        )
         yield router
 
 
@@ -794,6 +811,78 @@ def test_a_peer_posted_asset_is_surfaced(platform, tmp_path):
     assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
 
 
+def test_a_posted_image_is_shown_to_the_model(platform, tmp_path):
+    """PERCEPTION: a peer's image is fetched and presented inline, so a vision-capable
+    agent actually *sees* the picture on wake — not merely a description of it."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, provider = build_wake(tmp_path)
+
+    agent.wake()
+
+    # The image rode into the model's input as a self-contained data URL (the same form
+    # the `view` tool uses), captured at chat time before the session evicts the pixels.
+    assert len(provider.last_images) == 1
+    expected = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+    assert provider.last_images[0].url == expected
+    assert provider.last_images[0].alt == "diagram.png"
+
+
+def test_a_shown_image_is_not_persisted_as_base64(platform, tmp_path):
+    """COST DISCIPLINE: the presented pixels are evicted after the turn, so the data URL
+    never lands in the on-disk transcript to be re-sent (and re-billed) on the next wake."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, _ = build_wake(tmp_path)
+
+    agent.wake()
+
+    # The session transcript persists under `<home>/sessions/`; no base64 image survives
+    # in it, but the text breadcrumb (the asset's filename) does.
+    blob = "".join(p.read_text() for p in tmp_path.rglob("*.json"))
+    assert "base64" not in blob
+    assert "diagram.png" in blob
+
+
+def test_a_non_image_asset_degrades_to_a_description(platform, tmp_path):
+    """A file the wake can't show inline (here a PDF) is acknowledged by name and type,
+    never an error — the graceful seam for media whose perception depth is out of scope."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(
+        platform,
+        asset_page(asset(uuid=A1, filename="report.pdf", content_type="application/pdf")),
+    )
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1  # acted on, gracefully
+    assert provider.last_images == []  # nothing shown — a PDF isn't viewable
+    assert "report.pdf" in provider.prompts[0]
+    assert "application/pdf" in provider.prompts[0]  # the type is acknowledged
+
+
+def test_an_image_whose_download_fails_degrades_gracefully(platform, tmp_path):
+    """A fetch failure on a viewable image is not an error: the wake falls back to a
+    description so the agent still perceives *that* a file was shared, just not its pixels."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="broken.png")))
+    # The blob fetch fails this wake (e.g. the blob store hiccuped).
+    platform.get(path__regex=r"^/blobs/").mock(return_value=httpx.Response(503))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1  # still acted on, not crashed
+    assert provider.last_images == []  # the picture couldn't be shown
+    assert "broken.png" in provider.prompts[0]  # but the file is still acknowledged
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
+
+
 def test_own_posted_asset_is_not_acted_on(platform, tmp_path):
     """THE SAFETY PROPERTY: the agent never acts on its own posted asset (e.g. an image
     it generated), so a generated image cannot wake it to generate another — no loop.
@@ -1293,3 +1382,102 @@ def test_an_event_without_a_marker_falls_through_to_the_model(platform, tmp_path
     assert len(posted) == 1
     assert len(provider.prompts) == 1
     assert "inbound webhook" in provider.prompts[0]  # the model ran on it
+
+
+# --- NOC probe short-circuit: the ASSET seam (issue #114) --------------------
+#
+# The 4th seam. The marker rides the asset's **description** — the asset analog of a
+# message body / task instructions / webhook payload (see `_asset_marker_carrier`). Like
+# the message and webhook seams it is at-least-once (no `claim_first`), and the probe is
+# acked *before* the asset's file is ever fetched, so a synthetic asset probe costs no
+# download and no model call. The carrier field (`description`) is the contract the NOC's
+# asset probe must agree with.
+
+
+def test_a_signed_probe_asset_is_acked_without_the_model(platform, tmp_path):
+    """A probe in an asset's description → a BCNOC1-ACK, zero model calls, mark advanced,
+    clean transcript. The asset-seam heartbeat runs token-free at rest."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(
+        platform,
+        asset_page(asset(uuid=A1, filename="probe.png", description=probe_marker())),
+    )
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1  # the ack
+    assert provider.prompts == []  # the model never ran — token-free
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # mark advanced
+    assert _conversational_turns(agent) == []  # probe never entered the session transcript
+
+
+def test_a_probe_asset_is_acked_before_its_file_is_fetched(platform, tmp_path):
+    """The short-circuit runs before perception: a probe asset is acked with no blob
+    download at all — the asset analog of acking before a model call."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(
+        platform,
+        asset_page(asset(uuid=A1, filename="probe.png", description=probe_marker())),
+    )
+    agent, _ = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    agent.wake()
+
+    assert not platform.get(path__regex=r"^/blobs/").called  # the file was never fetched
+
+
+def test_a_probe_asset_on_a_cold_first_wake_is_acked(platform, tmp_path):
+    """The #100 cold-first-wake bootstrap (no mark, no trigger → newest unseen asset)
+    composes with the short-circuit: on a quiet probe timeline the newest asset is the
+    probe, and it is acked token-free rather than perceived."""
+    serve_messages(platform, page())
+    serve_assets(
+        platform, asset_page(asset(uuid=A1, filename="probe.png", description=probe_marker()))
+    )
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()  # no asset_trigger — the real router contract
+
+    assert len(posted) == 1
+    assert provider.prompts == []  # the model never ran
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
+
+
+def test_an_asset_without_a_marker_is_perceived_not_acked(platform, tmp_path):
+    """An ordinary posted file (no marker in its description) is perceived by the model,
+    unchanged — the short-circuit only fires on a correctly-signed probe."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert len(posted) == 1
+    assert len(provider.prompts) == 1
+    assert "diagram.png" in provider.prompts[0]  # the model perceived it
+
+
+def test_a_self_authored_probe_asset_is_filtered_not_acked(platform, tmp_path):
+    """Self-filter precedence holds on the asset seam too: a probe asset the agent itself
+    posted is skipped, never acked (and its file is never fetched)."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(
+        platform,
+        asset_page(asset(uuid=A1, filename="mine.png", description=probe_marker(), mine=True)),
+    )
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert posted == []  # own item: never acted on, never acked
+    assert provider.prompts == []
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1  # but the mark advances

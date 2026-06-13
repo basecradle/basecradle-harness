@@ -21,8 +21,11 @@ messages. Three cases the message scan would otherwise miss:
 
 - A peer's posted **asset**: a file (image, doc, audio) shared on the timeline is an
   item like a message, so it rides the same high-water mark — but the message scan
-  reads only messages, so the wake also scans assets and surfaces a peer's file, which
-  the agent can then `view`/`read`/`listen` to.
+  reads only messages, so the wake also scans assets and *perceives* a peer's file. An
+  image is fetched and shown to the model inline, so a vision-capable agent actually
+  sees the picture on wake; media it cannot yet fully perceive (a doc, audio, video)
+  degrades to a description naming the file and its type, with the `view`/`read`/`listen`
+  tools available to engage further on demand.
 - An inbound **webhook delivery**: a received `webhook_event` is not a timeline item,
   so the wake fetches unseen ones through the SDK's webhook-events read surface, under
   their own high-water mark, and acts on them.
@@ -62,9 +65,10 @@ import sys
 from pathlib import Path
 from urllib.parse import quote
 
+import httpx
 from basecradle import BaseCradle, BaseCradleError
 
-from basecradle_harness._assets import AssetsTool, _describe
+from basecradle_harness._assets import AssetsTool, _describe, _is_image, image_input
 from basecradle_harness._audio import HearAudioTool
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
@@ -84,6 +88,7 @@ from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._memory import MemoryTool
+from basecradle_harness._messages import ImageContent
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import Session
@@ -388,14 +393,49 @@ class WakeAgent:
         return self._respond_assets(session, unseen)
 
     def _respond_assets(self, session: Session, assets: list[object]) -> list[object]:
-        """Engage with each newly-posted asset, skipping the agent's own (the self-filter)."""
+        """Perceive each newly-posted asset, skipping the agent's own (the self-filter).
+
+        `_perceive_asset` fetches the file and presents an image **inline** so the agent
+        actually sees a peer's picture (not just a description of it); media it cannot yet
+        fully perceive degrades to a description rather than erroring. A recognized NOC
+        synthetic-probe — read from the asset's **description**, the asset analog of a
+        message body / task instructions / webhook payload (see `_asset_marker_carrier`) —
+        is acked token-free before the model (`probe=`), the 4th seam's short-circuit. The
+        probe check runs *before* the fetch, so a probe asset is acked without any download.
+        """
         return self._act_on(
             session,
             assets,
-            _incoming_asset_text,
+            self._perceive_asset,
             lambda asset: self.marks.set(self.timeline_uuid, asset.content.uuid, kind=_ASSETS),
             skip=self._is_own,
+            probe=lambda asset: self._probe_nonce(_asset_marker_carrier(asset)),
         )
+
+    def _perceive_asset(self, asset: object) -> tuple[str, list[ImageContent]]:
+        """A peer's posted asset as the agent perceives it: an image shown, else described.
+
+        The asset-wake's perception step, and the reason the seam is more than a
+        notification: for a viewable image the bytes are fetched and handed to the model as
+        input (via `image_input`, the same gate the `view` tool uses), so a vision-capable
+        agent *sees* the shared picture on wake. Anything it cannot yet fully perceive —
+        a non-image file, an unviewable/oversized image, or an image whose download fails —
+        degrades to the text description (`_incoming_asset_text`), which names the file and
+        its type and points at the tools, so the seam is graceful, never an error. Audio/
+        video perception *depth* is out of scope here (it rides the perception done-bar
+        thread); this handles their seam by acknowledging the file rather than choking on it.
+        """
+        file = asset.content.file
+        if _is_image(file.content_type):
+            try:
+                shown = image_input(file)
+            except httpx.HTTPError:
+                shown = None  # fetch failed: degrade to a description, never an error
+            if isinstance(shown, ImageContent):
+                intro = f"{asset.user.handle} posted a file to this timeline: {_describe(asset)}."
+                return f"{intro} Looking at it now.", [shown]
+        # Non-image, unviewable/oversized image, or a failed fetch: describe, don't show.
+        return _incoming_asset_text(asset), []
 
     # --- webhook events ------------------------------------------------------
 
@@ -587,16 +627,19 @@ class WakeAgent:
         """Engage the model on each item in order, posting any reply and recording it.
 
         The one loop behind all four reconcilers — messages, webhook events, activated
-        tasks, and posted assets. `render` turns an item into the text the model reads;
-        `record` marks it handled (a mark advance, or a seen-set add).
+        tasks, and posted assets. `render` turns an item into the text the model reads, or
+        a `(text, images)` pair when the item carries pictures to *show* the model (the
+        asset-perception path); `record` marks it handled (a mark advance, or a seen-set add).
 
-        `probe(item)` is the **NOC synthetic-probe short-circuit**, passed by all three
-        reconcilers — messages, webhook events, and activated tasks — each reading the
-        marker from its own carrier field (a message body, a webhook payload, a task's
-        instructions). When it returns a nonce (the item is a valid signed probe — see
+        `probe(item)` is the **NOC synthetic-probe short-circuit**, passed by all four
+        reconcilers — messages, webhook events, activated tasks, and posted assets — each
+        reading the marker from its own carrier field (a message body, a webhook payload, a
+        task's instructions, an asset's description). When it returns a nonce (the item is a
+        valid signed probe — see
         `_probe`), the loop posts the deterministic ack and records the item **without
         calling the model** — no provider request, no tokens, nothing into the transcript —
-        so the message-, webhook-, and task-seam heartbeats all run token-free at rest. It
+        so the message-, webhook-, task-, and asset-seam heartbeats all run token-free at
+        rest (an asset probe is acked before its file is ever fetched). It
         is checked *after* the self-filter (a probe is from a distinct peer, never the
         agent's own) and *before* both `claim_first` and `render`/`session.send`, and
         follows the same at-least-once order as a normal reply (post, then record), so a
@@ -648,7 +691,12 @@ class WakeAgent:
                 continue
             if claim_first:
                 record(item)  # at-most-once: claim before acting so a crash cannot re-fire it
-            reply = session.send(render(item))
+            # `render` returns the text the model reads, or a (text, images) pair when the
+            # item carries pictures to *show* the model (the asset-perception path). Images
+            # ride into the model's input on this turn and are evicted after (see `Session`).
+            rendered = render(item)
+            text, images = rendered if isinstance(rendered, tuple) else (rendered, [])
+            reply = session.send(text, images=images)
             if reply.strip():
                 posted.append(self.timeline.messages.create(body=reply))
             if not claim_first:
@@ -667,8 +715,9 @@ class WakeAgent:
         the model, exactly as before this capability existed. A falsy secret (`None` *or*
         an empty string) keeps it off, so a blank env var never enables verification against
         an empty key. `carrier` is the field each reconciler reads the marker from — a
-        message body, a task's instructions, or a webhook payload — so one signed-marker
-        check serves all three seams (the NOC's message, task, and webhook contracts).
+        message body, a task's instructions, a webhook payload, or an asset's description —
+        so one signed-marker check serves all four seams (the NOC's message, task, webhook,
+        and asset contracts).
         """
         if not self.probe_secret:
             return None
@@ -765,11 +814,27 @@ _events_since = _messages_since
 _assets_since = _messages_since
 
 
+def _asset_marker_carrier(asset: object) -> str:
+    """The asset field the NOC synthetic-probe marker rides in — the 4th seam's carrier.
+
+    The asset analog of a message body / task instructions / webhook payload. The chosen
+    field is the asset's **description**: the one free-text field a peer (or the NOC
+    prober) controls on an upload, so a synthetic asset probe is minted by creating a tiny
+    asset whose `description` is the `BCNOC1 …` marker. This is the contract the NOC's
+    asset probe must agree with byte-for-byte. The field is optional, so an absent (or
+    `None`) description reads as empty — an ordinary file with no description simply falls
+    through to perception, never mistaken for a probe.
+    """
+    return getattr(asset.content, "description", None) or ""
+
+
 def _incoming_asset_text(asset: object) -> str:
     """A peer's posted file as the agent hears it: who shared what, and how to open it.
 
-    Surfaces the asset's metadata (the shared `_describe` rendering) and points the
-    agent at the tools that actually open it, rather than inlining the bytes — looking
+    The description fallback for the asset-perception path: used for media the wake cannot
+    show inline (a non-image file, an unviewable/oversized image, or one whose download
+    failed). Surfaces the asset's metadata (the shared `_describe` rendering) and points
+    the agent at the tools that actually open it, rather than inlining the bytes — looking
     is a deliberate, on-demand step, the same discipline `view`/`read`/`listen` follow.
     """
     return (
