@@ -43,7 +43,7 @@ import re
 
 from basecradle import BaseCradleError, User
 
-from basecradle_harness._platform import PlatformTool
+from basecradle_harness._platform import PlatformTool, explain
 
 # A user reference that is a uuid goes straight to `bc.users.get`; anything else is
 # treated as a handle and resolved by scanning the directory. Standard UUID shape
@@ -76,7 +76,9 @@ class TimelinesTool(PlatformTool):
         "viewer; adding or removing a participant needs you to own the timeline, and "
         "adding someone also needs mutual trust with them — if the platform refuses, "
         "you get the reason back. Timeline-scoped actions use the current timeline "
-        "unless you pass a timeline uuid."
+        "unless you pass a timeline uuid. Because 'lock' is irreversible, it will only "
+        "fire when you ALSO pass 'confirm' set to the exact uuid of the timeline you "
+        "mean to freeze — locking is NOT how you list, leave, or delete a timeline."
     )
     parameters = {
         "type": "object",
@@ -105,6 +107,15 @@ class TimelinesTool(PlatformTool):
                     "timeline you are engaged on."
                 ),
             },
+            "confirm": {
+                "type": "string",
+                "description": (
+                    "Required for 'lock' only: set it to the exact uuid of the timeline "
+                    "you intend to permanently freeze. This deliberate echo is the guard "
+                    "against an accidental, irreversible lock — a bare lock without it is "
+                    "refused. Ignored by every other action."
+                ),
+            },
         },
         "required": ["action"],
     }
@@ -123,6 +134,7 @@ class TimelinesTool(PlatformTool):
         name: str | None = None,
         user: str | None = None,
         timeline: str | None = None,
+        confirm: str | None = None,
     ) -> str:
         """Dispatch on `action`. Returns a message written for the model to read."""
         if action not in self._PHRASE:
@@ -137,7 +149,7 @@ class TimelinesTool(PlatformTool):
                 return self._create(name)
             target = timeline or self.context.timeline
             if action == "lock":
-                return self._lock(target)
+                return self._lock(target, confirm)
             # add_participant / remove_participant
             if not user:
                 return f"Error: '{action}' needs a 'user' (a handle like '@nova' or a uuid)."
@@ -148,7 +160,7 @@ class TimelinesTool(PlatformTool):
         except _UserNotFound as error:
             return f"Error: {error}"
         except BaseCradleError as error:
-            return f"Couldn't {self._PHRASE[action]}: {_explain(error)}"
+            return f"Couldn't {self._PHRASE[action]}: {explain(error)}"
 
     # --- actions -------------------------------------------------------------
 
@@ -156,7 +168,25 @@ class TimelinesTool(PlatformTool):
         timeline = self.context.client.timelines.create(name=name)
         return f"Created timeline {timeline.name!r} (uuid={timeline.uuid}). You own it."
 
-    def _lock(self, target: str) -> str:
+    def _lock(self, target: str, confirm: str | None) -> str:
+        """Lock the timeline — but only behind the deliberate-confirm guard.
+
+        `lock` is the one irreversible action this tool exposes: there is no unlock in
+        the platform API, so a single mis-aimed tool call (the live failure: a model that
+        wanted to *list* or *delete* a timeline grabbed `lock` instead) must not be able to
+        fire it. The guard is a deliberate echo — `confirm` has to equal the exact uuid of
+        the timeline being frozen — so a reflexive `action='lock'` with no (or a wrong)
+        confirm is refused with an explanation, never the cheap default grab.
+        """
+        if confirm != target:
+            return (
+                f"Refused to lock timeline {target}: locking is the IRREVERSIBLE emergency "
+                "stop — it permanently freezes the timeline and there is no unlock "
+                "(reopening is an operator-only action). It is NOT how you list, leave, or "
+                "delete a timeline, and this tool cannot do those. If you truly mean to "
+                "permanently freeze this timeline, call lock again with confirm set to its "
+                f"uuid: confirm={target!r}."
+            )
         timeline = self.context.client.timelines.get(target)
         timeline.lock()
         return (
@@ -226,17 +256,30 @@ class TrustTool(PlatformTool):
         except _UserNotFound as error:
             return f"Error: {error}"
         except BaseCradleError as error:
-            return f"Couldn't {self._PHRASE[action]}: {_explain(error)}"
+            return f"Couldn't {self._PHRASE[action]}: {explain(error)}"
 
     # --- actions -------------------------------------------------------------
 
     def _grant(self, user: User) -> str:
+        """Grant the outgoing trust edge, reporting only the edge actually changed.
+
+        Trust is directional in storage (you change your *own* outgoing edge) and mutual
+        only at the gate. The old wording — "you now trust X, and they trust you, trust is
+        mutual" — mis-taught the model that granting makes trust reciprocal. So this reports
+        just the edge it changed (your outgoing trust), and mentions the reverse edge only
+        when it genuinely already exists, framed as a pre-existing fact, never as a
+        consequence of this grant.
+        """
         user.grant_trust()
-        if user.trust.mutual:
-            return f"You now trust @{user.handle}, and they trust you — trust is mutual."
+        edge = f"You now trust @{user.handle} — your own outgoing edge; trust is one-directional."
+        if user.trust.trusts_you:
+            return (
+                f"{edge} They already trusted you, so trust is now mutual both ways — "
+                "the gate for sharing a timeline with them is met."
+            )
         return (
-            f"You now trust @{user.handle}. Trust is not yet mutual: they have not trusted "
-            "you back, so you cannot share a timeline until they do."
+            f"{edge} They have not trusted you back, so it is not yet mutual: you cannot "
+            "share a timeline with them until they do."
         )
 
     def _revoke(self, user: User) -> str:
@@ -268,13 +311,3 @@ def _resolve_user(client, reference: str) -> User:
     raise _UserNotFound(
         f"No user with handle '@{handle}' is visible to you. Check the handle, or use a uuid."
     )
-
-
-def _explain(error: BaseCradleError) -> str:
-    """The most human-readable string a platform error carries.
-
-    API errors are RFC 9457 problem documents: `detail` is the human sentence, with
-    `title` and the raw message as fallbacks. This is what makes a refused action an
-    explanation the agent can relay, not a traceback.
-    """
-    return error.detail or error.title or str(error)

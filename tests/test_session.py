@@ -223,3 +223,23 @@ def test_presented_images_are_evicted_even_when_the_turn_fails():
         session.send("look at this", images=[image])
 
     assert session.history[-1].images == []  # evicted on the error path too
+
+
+def test_note_records_a_system_turn_without_calling_the_model(tmp_path):
+    """`Session.note` carries an out-of-band fact (a reply that couldn't be delivered)
+    into the transcript at zero model cost, and persists it like any turn."""
+
+    class NeverCalled:
+        def chat(self, messages, tools=None):
+            raise AssertionError("note must not invoke the model")
+
+    path = tmp_path / "transcript.json"
+    session = Session("timeline:x", Harness(NeverCalled()).engine, path=path)
+
+    session.note("(Couldn't post that reply to the timeline: it is locked.)")
+
+    assert session.history[-1].role == "system"
+    assert "Couldn't post" in session.history[-1].content
+    # Persisted: a fresh session over the same path reloads the note.
+    reloaded = Session("timeline:x", Harness(NeverCalled()).engine, path=path)
+    assert any("Couldn't post" in t.content for t in reloaded.history)

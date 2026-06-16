@@ -20,9 +20,10 @@ from hashlib import sha256
 import httpx
 import pytest
 import respx
-from basecradle import BaseCradle, BaseCradleError
+from basecradle import BaseCradle
 
-from basecradle_harness import Harness, MarkStore, Message, SeenStore, WakeAgent
+from basecradle_harness import ClaimStore, Harness, MarkStore, Message, SeenStore, WakeAgent
+from basecradle_harness._messages import ToolCall
 from basecradle_harness._wake import main
 
 BC_URL = "https://basecradle.com"
@@ -326,12 +327,15 @@ def test_multiple_unseen_messages_answered_oldest_first(platform, tmp_path):
 # --- idempotency across a crash / retry mid-batch ----------------------------
 
 
-def test_mark_advances_after_each_reply(platform, tmp_path):
-    """The mark is persisted per message, so a retry resumes without duplicating.
+def test_a_mid_batch_crash_does_not_reprocess_the_crashed_message(platform, tmp_path):
+    """B3: claim-first — a forced mid-wake failure advances the mark over the crashed
+    message, so it is never reprocessed (no model turn re-burned, no tool action re-fired).
 
-    The provider raises on the *second* message, mimicking a process that dies
-    mid-batch. The mark must already reflect the first message, so the retry only
-    has the second left to answer.
+    The provider raises on the *second* message, mimicking a process that dies mid-batch.
+    Because each message is claimed and marked seen *before* it is acted on, both the
+    answered first message and the crashed second leave the mark at the true newest — a
+    retry replies to nothing rather than re-answering M2 on every later wake (the live
+    reprocess loop). At-most-once: a one-time dropped reply beats a backlog re-answered.
     """
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
     serve_messages(
@@ -357,8 +361,130 @@ def test_mark_advances_after_each_reply(platform, tmp_path):
     with pytest.raises(RuntimeError):
         agent.wake()
 
-    # The first message was answered and its mark persisted before the crash.
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+    # Both messages were claimed and marked seen before acting, so the mark is the newest —
+    # the crashed M2 will not be re-answered on the next wake.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M2, kind="messages") is False  # M2 was claimed
+
+    # A retry (fresh process, same home) sees the advanced mark and replies to nothing.
+    serve_messages(platform, page(message(uuid=M2, body="second"), message(uuid=M1, body="first")))
+    retry, retry_provider = build_wake(tmp_path)
+    assert retry.wake() == []
+    assert retry_provider.prompts == []
+
+
+# --- B2: a wake never crashes on an SDK / engine error -----------------------
+
+
+def _locked_problem():
+    """An RFC 9457 problem doc for a locked timeline — what the post is refused with."""
+    return {
+        "status": 403,
+        "code": "timeline_locked",
+        "title": "Timeline Locked",
+        "detail": "This timeline is locked and is not accepting new content.",
+    }
+
+
+def test_a_locked_timeline_post_degrades_instead_of_crashing(platform, tmp_path):
+    """B2: a reply refused by a locked timeline degrades to an in-conversation note, never
+    a crash. The model still ran, the message is still marked seen (no reprocess loop), and
+    the wake completes cleanly (exit 0)."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="hi"), message(uuid=M0, body="old")))
+    platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
+        return_value=httpx.Response(403, json=_locked_problem())
+    )
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()  # must not raise
+
+    assert posted == []  # the reply could not be delivered
+    assert provider.prompts == ["john: hi"]  # the model still ran
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # marked seen despite the failed post
+    # The failed delivery is recorded as a note in the transcript, so the record stays honest.
+    notes = [t.content for t in agent.harness.session(agent.source).history if t.role == "system"]
+    assert any("Couldn't post that reply" in n for n in notes)
+
+
+def test_main_returns_zero_on_a_locked_timeline(platform, wake_env):
+    """B2 end to end: the entrypoint exits 0 on a locked timeline — no traceback escapes.
+
+    The model replies, but the timeline refuses the post (`timeline_locked`); the degrade
+    keeps the wake clean and the exit code 0, so the router sees success, not a crash."""
+    _serve_openai_and_messages(platform, page(message(uuid=M0, body="status?")))
+    platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
+        return_value=httpx.Response(403, json=_locked_problem())
+    )
+
+    assert main(["--timeline", TIMELINE_UUID]) == 0
+
+
+def test_max_steps_degrades_to_a_graceful_reply(platform, tmp_path):
+    """B2: the engine's step cap (EngineError) degrades to a short "I got stuck" reply that
+    is posted, rather than crashing the wake. The message is still marked seen."""
+    serve_messages(platform, page(message(uuid=M0, body="do something complicated")))
+
+    class LoopingProvider:
+        """A brain that always asks for a tool, so the loop never settles → max_steps."""
+
+        def __init__(self):
+            self.prompts = []
+
+        def chat(self, messages, tools=None):
+            self.prompts.append(messages[-1].content)
+            return Message.assistant(
+                content=None,
+                tool_calls=[ToolCall(id="call_1", name="memory", arguments={"action": "list"})],
+            )
+
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(LoopingProvider(), home=tmp_path, max_steps=2)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+
+    posted = agent.wake()  # must not raise
+
+    assert len(posted) == 1
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert "got stuck" in json.loads(sent.content)["message"]["body"]
+    assert agent.marks.get(TIMELINE_UUID) == M0  # still marked seen — no reprocess
+
+
+# --- B8: concurrent wakes handle a message exactly once -----------------------
+
+
+def test_two_concurrent_wakes_reply_to_a_message_exactly_once(platform, tmp_path):
+    """B8: an upload firing asset.created + message.created spawns two wakes that both see
+    the same unseen message. The atomic claim makes exactly one of them act — the second,
+    losing the claim, replies to nothing. (The two wakes are simulated by claiming M1 with
+    the first agent's ClaimStore before the second runs — the post-claim race resolved.)"""
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="new"), message(uuid=M0, body="old")))
+
+    # The first wake wins the claim and replies.
+    first, first_provider = build_wake(tmp_path)
+    assert len(first.wake()) == 1
+    assert first_provider.prompts == ["john: new"]
+
+    # A second, concurrent wake (fresh process) had already read mark=M0 and computed M1 as
+    # unseen — but the mark has since advanced AND M1 is claimed, so it acts on nothing.
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)  # simulate it still holding the stale mark
+    serve_messages(platform, page(message(uuid=M1, body="new"), message(uuid=M0, body="old")))
+    second, second_provider = build_wake(tmp_path)
+
+    assert second.wake() == []  # the claim blocked the duplicate
+    assert second_provider.prompts == []  # the model was never consulted a second time
+
+
+def test_claim_store_is_atomic_exactly_once(tmp_path):
+    """The claim primitive: the first claim of (kind, timeline, uuid) wins, any later one
+    loses — the exclusive-create that makes concurrent wakes mutually exclusive."""
+    claims = ClaimStore(tmp_path)
+    assert claims.claim(TIMELINE_UUID, M1, kind="messages") is True
+    assert claims.claim(TIMELINE_UUID, M1, kind="messages") is False  # already owned
+    # A different uuid, or the same uuid under a different kind, is an independent claim.
+    assert claims.claim(TIMELINE_UUID, M2, kind="messages") is True
+    assert claims.claim(TIMELINE_UUID, M1, kind="assets") is True
 
 
 # --- the conversation persists across wakes ----------------------------------
@@ -1268,8 +1394,8 @@ def test_a_blank_probe_secret_keeps_the_short_circuit_off(platform, tmp_path):
 #
 # The same recognize-and-ack discipline as the message seam, but the marker rides the
 # task's *instructions*. The load-bearing subtlety is ordering: `_act_on` checks `probe`
-# BEFORE `claim_first`, so a probe task is acked at-least-once (post, then record), never
-# claim-first — the safe failure direction for a monitor (task-seam.md §4).
+# BEFORE the atomic claim, so a probe task is acked at-least-once (post, then record) and
+# never claimed — the safe failure direction for a monitor (task-seam.md §4).
 
 
 def test_a_signed_probe_task_is_acked_without_the_model(platform, tmp_path):
@@ -1290,26 +1416,33 @@ def test_a_signed_probe_task_is_acked_without_the_model(platform, tmp_path):
     assert _conversational_turns(agent) == []  # probe never entered the session transcript
 
 
-def test_a_probe_task_is_acked_at_least_once_not_claim_first(platform, tmp_path):
-    """LOAD-BEARING: `_act_on` checks `probe` before `claim_first`, so a probe task is
-    acked at-least-once (post, THEN record), never pre-claimed. If the ack post fails, the
+def test_a_probe_task_is_acked_at_least_once_not_claimed(platform, tmp_path):
+    """LOAD-BEARING: `_act_on` checks `probe` before claiming, so a probe task is acked
+    at-least-once (post, THEN record), never pre-claimed. If the ack post is refused, the
     task is NOT recorded seen — it retries next wake. This is the safe failure direction:
     were the probe path 'fixed' to claim-first, the task would be marked seen with no ack
-    ever posted → the loop never closes → a false FAIL (task-seam.md §4)."""
+    ever posted → the loop never closes → a false FAIL (task-seam.md §4).
+
+    Under B2 a refused post no longer crashes the wake; the at-least-once guarantee is
+    preserved by recording only after a *successful* ack, and the probe seam stays
+    trace-free — a refused ack degrades SILENTLY (no transcript note), never polluting the
+    deliberately-empty probe transcript or mislabeling the heartbeat ack as a 'reply'."""
     serve_messages(platform, page())
     serve_tasks(platform, task_page(task(uuid=T0, instructions=probe_marker())))
-    # The ack post fails this wake (a crash between post-attempt and record).
+    # The ack post is refused this wake (a locked timeline / transient 5xx).
     platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
         return_value=httpx.Response(500, json={"error": "boom"})
     )
     agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
 
-    with pytest.raises(BaseCradleError):
-        agent.wake()
+    posted = agent.wake()  # B2: degrades gracefully, never crashes
 
+    assert posted == []  # the ack never made it out
     assert provider.prompts == []  # still no model call — the probe was recognized
-    # NOT pre-claimed: claim-first would have recorded it before the failed post.
+    # NOT recorded: a failed ack must retry, never mark the task seen with no ack posted.
     assert T0 not in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
+    # Trace-free: a refused probe ack writes NO note, so the probe transcript stays empty.
+    assert agent.harness.session(agent.source).history == []
 
 
 def test_a_task_without_a_marker_falls_through_to_the_model(platform, tmp_path):
@@ -1327,8 +1460,8 @@ def test_a_task_without_a_marker_falls_through_to_the_model(platform, tmp_path):
 
 # --- NOC probe short-circuit: the WEBHOOK seam (issue #110) ------------------
 #
-# The closest of the three to the message seam: webhook deliveries reconcile with the
-# same at-least-once discipline (no `claim_first`); the marker rides the event *payload*.
+# The closest of the three to the message seam: a probe webhook delivery is acked
+# at-least-once and never claimed; the marker rides the event *payload*.
 # The short-circuit runs inside `_act_on`, after `_bootstrap_stream` selects the item, so
 # the #100 cold-first-wake bootstrap (newest unseen delivery only) is preserved.
 
@@ -1388,7 +1521,7 @@ def test_an_event_without_a_marker_falls_through_to_the_model(platform, tmp_path
 #
 # The 4th seam. The marker rides the asset's **description** — the asset analog of a
 # message body / task instructions / webhook payload (see `_asset_marker_carrier`). Like
-# the message and webhook seams it is at-least-once (no `claim_first`), and the probe is
+# the message and webhook seams the probe is at-least-once and never claimed, and it is
 # acked *before* the asset's file is ever fetched, so a synthetic asset probe costs no
 # download and no model call. The carrier field (`description`) is the contract the NOC's
 # asset probe must agree with.

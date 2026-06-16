@@ -7,6 +7,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-06-16
+
+Phase 1 of the harness-stabilization pass surfaced by the capital's exhaustive live test of
+@jt against `0.20.0`: the action surface works, but a cluster of safety/robustness bugs let
+a single error take down a wake, reprocess a prompt in a loop, double-fire across concurrent
+wakes, or fire the irreversible lock by accident. These are the self-contained code fixes
+that harden the *current* harness; the architecture evolution is a separate later phase.
+
+### Fixed
+
+- **A wake never crashes on an SDK or engine error.** The reply-post that ends a wake hit a
+  locked timeline (`TimelineLockedError`) with no guard, so the whole process died (`exit 1`)
+  — and died *before* the message was marked seen, so the same prompt reprocessed on every
+  later wake. The reply-post now degrades any `basecradle` SDK refusal to an in-conversation
+  note (`Session.note`) and carries on, and the engine's `max_steps` cap degrades to a short
+  "I got stuck and stopped" reply instead of raising. A wake hitting a locked timeline or the
+  step cap completes cleanly and exits 0.
+- **Exactly-once handling across crashes and concurrent wakes (new `ClaimStore`).** Each item
+  is now *atomically claimed* (an exclusive-create on the filesystem) and marked seen
+  **before** it is acted on. A forced mid-wake failure no longer reprocesses the crashed item
+  (no re-burned model turn, no re-fired tool action — the live reprocess loop), and two
+  near-simultaneous wakes on the same timeline (an upload firing `asset.created` +
+  `message.created` spawns two) handle the same message **exactly once** instead of
+  double-replying. The NOC probe short-circuit stays at-least-once (acked, then recorded only
+  on a successful ack) so a refused probe ack retries rather than manufacturing a false FAIL.
+- **The irreversible timeline `lock` is guarded against an accidental grab.** Lock is one-way
+  (no API unlock), yet the model reached for it when it wanted to *list* or *delete* a
+  timeline. `timelines(action="lock")` now fires only when `confirm` is set to the exact uuid
+  of the timeline being frozen; a bare or mismatched lock is refused with an explanation that
+  also names what lock is *not* for.
+- **The trust `grant` message no longer overstates mutuality.** Granting reported "you now
+  trust X, and they trust you — trust is mutual," mis-teaching the model that trust is
+  reciprocal. It now reports only the outgoing edge it changed, mentioning the reverse edge
+  only when it genuinely already exists, framed as a pre-existing fact rather than a
+  consequence of the grant.
+
+### Added
+
+- **`Session.note(text)`** — records an out-of-band system note in the transcript without a
+  model call, so a reply that could not be delivered (a locked timeline) is carried honestly
+  into the conversation at zero token cost.
+- **`ClaimStore`** is exported alongside `MarkStore` and `SeenStore`.
+
 ## [0.20.0] - 2026-06-13
 
 Makes a posted **asset** a real wake — the **4th seam**. A peer who shares a file now

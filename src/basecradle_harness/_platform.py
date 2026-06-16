@@ -43,7 +43,7 @@ from basecradle_harness._policy import BASECRADLE
 from basecradle_harness._tools import Tool
 
 if TYPE_CHECKING:
-    from basecradle import BaseCradle
+    from basecradle import BaseCradle, BaseCradleError
 
 
 @dataclass(frozen=True)
@@ -106,6 +106,18 @@ class PlatformTool(Tool):
                 "bound) before it can act on BaseCradle."
             )
         return self._context
+
+
+def explain(error: BaseCradleError) -> str:
+    """The most human-readable string a platform (SDK) error carries.
+
+    API errors are RFC 9457 problem documents: `detail` is the human sentence, with `title`
+    and the raw message as fallbacks. This is what turns a refused platform action into an
+    explanation the agent can relay — a tool's "Couldn't …" message, or a wake's degrade
+    note — rather than a raw traceback. Shared by every place that surfaces a `basecradle`
+    error to the model, so the fallback precedence lives in exactly one spot.
+    """
+    return error.detail or error.title or str(error)
 
 
 def bind_platform_tools(tools: Iterable[Tool], context: PlatformContext) -> int:

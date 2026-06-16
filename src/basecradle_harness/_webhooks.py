@@ -49,7 +49,7 @@ import itertools
 
 from basecradle import BaseCradleError
 
-from basecradle_harness._platform import PlatformTool
+from basecradle_harness._platform import PlatformTool, explain
 
 # How many endpoints/events one `list` returns. The cap keeps a pathological
 # timeline from flooding the model's context; when it bites, the reply says there
@@ -152,7 +152,7 @@ class WebhookEndpointsTool(PlatformTool):
                 return self._set_enabled(uuid, enabled=False)
             return self._rotate(uuid)
         except BaseCradleError as error:
-            return f"Couldn't {self._PHRASE[action]}: {_explain(error)}"
+            return f"Couldn't {self._PHRASE[action]}: {explain(error)}"
 
     # --- actions -------------------------------------------------------------
 
@@ -269,7 +269,7 @@ class WebhookEventsTool(PlatformTool):
                 return self._read(uuid)
         except BaseCradleError as error:
             verb = "list the events" if action == "list" else "read the event"
-            return f"Couldn't {verb}: {_explain(error)}"
+            return f"Couldn't {verb}: {explain(error)}"
         return f"Error: unknown action {action!r}. Use 'list' or 'read'."
 
     # --- actions -------------------------------------------------------------
@@ -327,13 +327,3 @@ def _describe_event(event) -> str:
         f"content_type={content.content_type} · endpoint={event.webhook_endpoint.uuid} "
         f"— {payload}"
     )
-
-
-def _explain(error: BaseCradleError) -> str:
-    """The most human-readable string a platform error carries.
-
-    API errors are RFC 9457 problem documents: `detail` is the human sentence, with
-    `title` and the raw message as fallbacks. This is what makes a refused action an
-    explanation the agent can relay, not a traceback.
-    """
-    return error.detail or error.title or str(error)
