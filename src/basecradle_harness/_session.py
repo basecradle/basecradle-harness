@@ -93,6 +93,18 @@ class Session:
         self._save()
         return reply.content or ""
 
+    def note(self, text: str) -> None:
+        """Record an out-of-band system note in the transcript — no model call.
+
+        For a fact the conversation should carry that the model did not produce: most
+        pointedly, a reply that could *not* be delivered because the platform refused the
+        post (a locked timeline). Recording it keeps the agent's own transcript honest and
+        gives the next turn the context, while costing nothing — no provider request, no
+        tokens. Persisted like any turn when the session has a path.
+        """
+        self.history.append(Message.system(text))
+        self._save()
+
     # --- transcript persistence: load on construct, save on every turn --------
 
     def _load(self) -> list[Message]:

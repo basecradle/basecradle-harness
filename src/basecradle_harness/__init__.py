@@ -46,7 +46,7 @@ from basecradle_harness._session import Session
 from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._version import __version__
-from basecradle_harness._wake import MarkStore, SeenStore, WakeAgent
+from basecradle_harness._wake import ClaimStore, MarkStore, SeenStore, WakeAgent
 from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
@@ -60,6 +60,7 @@ __all__ = [
     "WakeAgent",
     "MarkStore",
     "SeenStore",
+    "ClaimStore",
     # Provider contract + adapters
     "Provider",
     "OpenAICompatibleProvider",

@@ -152,12 +152,33 @@ def test_lock_freezes_the_current_timeline_and_says_it_is_one_way(timelines):
         lock = mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/lock").mock(
             return_value=httpx.Response(200, json={"locked": True})
         )
-        result = timelines.run(action="lock")
+        # Confirm echoes the exact uuid of the timeline being frozen — the deliberate guard.
+        result = timelines.run(action="lock", confirm=TIMELINE_UUID)
 
     assert lock.called
     assert "Locked timeline" in result
     assert "one-way" in result
     assert "operator-only" in result
+
+
+def test_lock_without_confirm_is_refused_and_never_touches_the_platform(timelines):
+    """B1: a bare lock (no confirm) is refused locally — the irreversible op never fires.
+
+    This is the live failure: a model wanting to list/delete a timeline grabbed `lock`.
+    No lock route is mocked, so the guard must short-circuit before any HTTP goes out."""
+    result = timelines.run(action="lock")
+
+    assert "Refused to lock" in result
+    assert "IRREVERSIBLE" in result
+    assert "list, leave, or delete" in result  # names what it is NOT for
+    assert TIMELINE_UUID in result  # tells the model the exact confirm value to use
+
+
+def test_lock_with_a_wrong_confirm_is_refused(timelines):
+    """A confirm that does not match the target uuid is not a deliberate echo — refused."""
+    result = timelines.run(action="lock", confirm="not-the-uuid")
+
+    assert "Refused to lock" in result
 
 
 def test_lock_can_target_an_explicit_timeline(timelines):
@@ -168,7 +189,8 @@ def test_lock_can_target_an_explicit_timeline(timelines):
         lock = mock.post(f"{BC_URL}/timelines/{OTHER_TIMELINE}/lock").mock(
             return_value=httpx.Response(200, json={"locked": True})
         )
-        timelines.run(action="lock", timeline=OTHER_TIMELINE)
+        # Confirm must echo the explicit target, not the bound timeline.
+        timelines.run(action="lock", timeline=OTHER_TIMELINE, confirm=OTHER_TIMELINE)
 
     assert lock.called  # it locked the explicit timeline, not the bound one
 
@@ -288,6 +310,8 @@ def test_grant_trust_by_handle_reports_not_yet_mutual(trust):
     assert route.called
     assert "You now trust @john" in result
     assert "not yet mutual" in result
+    # B4: granting must not claim the reverse edge when it doesn't exist.
+    assert "they trust you" not in result.lower()
 
 
 def test_grant_trust_reports_mutual_when_reciprocated(trust):
@@ -299,7 +323,10 @@ def test_grant_trust_reports_mutual_when_reciprocated(trust):
         )
         result = trust.run(action="grant", user="john")
 
-    assert "trust is mutual" in result
+    # B4: mutuality is reported as a pre-existing reverse edge ("they already trusted you"),
+    # framed as fact, not as a consequence of this directional grant.
+    assert "now mutual" in result
+    assert "already trusted you" in result
 
 
 def test_grant_trust_by_uuid_skips_the_directory(trust):

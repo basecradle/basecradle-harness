@@ -83,13 +83,13 @@ from basecradle_harness._basecradle import (
     _provider_from_env,
     _recent,
 )
-from basecradle_harness._exceptions import HarnessError, ProviderError
+from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import ImageContent
-from basecradle_harness._platform import PlatformContext, bind_platform_tools
+from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import Session
 from basecradle_harness._tasks import TasksTool
@@ -174,6 +174,56 @@ class SeenStore:
         return self.root / "seen" / kind / f"{quote(timeline, safe='')}.txt"
 
 
+class ClaimStore:
+    """Per-item atomic claims, so concurrent wakes handle each item exactly once.
+
+    A high-water mark (`MarkStore`) and a seen-set (`SeenStore`) make a wake idempotent
+    across *sequential* processes — a later wake reads the record and skips. Neither is
+    safe across *concurrent* ones: two wakes firing at once (an upload posts
+    `asset.created` and `message.created` together, so the router spawns two) both read the
+    same record, both find the same message unseen, and both reply — the live duplicate, or
+    worse a duplicated tool action. A claim closes that race with the one operation a POSIX
+    filesystem makes atomic: an exclusive create. The first wake to create
+    `<root>/claims/<kind>/<timeline>/<uuid>` wins and acts; a concurrent create raises
+    `FileExistsError`, so the loser knows the item is already owned and skips it.
+
+    Claiming *before* acting also subsumes single-process crash-idempotency: a wake that
+    claims an item and then dies (or fails partway) leaves the claim behind, so the retry
+    skips it rather than re-running its turn and re-firing its tool actions — the live
+    reprocess loop. This is the at-most-once discipline a message needs: a one-time dropped
+    reply on a crash is far better than a backlog re-answered, with tool side effects, on
+    every later wake.
+
+    **Known bound — claims are not pruned.** One tiny empty file accrues per handled item,
+    the same unbounded-growth shape the task `SeenStore` already has. Items are small and
+    the files are empty; if it ever matters, claims at or below a kind's high-water mark are
+    dead (that item is never re-scanned) and prunable by UUIDv7 order. Out of scope here.
+    """
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+
+    def claim(self, timeline: str, uuid: str, *, kind: str) -> bool:
+        """Atomically claim `(kind, timeline, uuid)`. True if this wake won it, else False.
+
+        Wins by exclusively creating the claim file: the first caller succeeds, any
+        concurrent (or later) caller gets `FileExistsError` and is told the item is already
+        owned. The create is the whole synchronization — no lock, no read-modify-write race.
+        """
+        path = self._path(timeline, kind, uuid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False
+        os.close(handle)
+        return True
+
+    def _path(self, timeline: str, kind: str, uuid: str) -> Path:
+        folder = self.root / "claims" / kind / quote(timeline, safe="")
+        return folder / f"{quote(uuid, safe='')}.claim"
+
+
 class WakeAgent:
     """Answers one timeline's unseen messages in a single process, then is done.
 
@@ -231,6 +281,10 @@ class WakeAgent:
         # Activated tasks are tracked by a seen-set, not a high-water mark (see
         # `SeenStore`); it lives beside the marks, under the same home root.
         self.seen = SeenStore(self.marks.root)
+        # Per-item atomic claims (see `ClaimStore`): the exactly-once guard that makes
+        # `_act_on` safe across concurrent wakes and crash-resumable without reprocessing.
+        # Lives beside the marks and the seen-set, under the same home root.
+        self.claims = ClaimStore(self.marks.root)
         self.timeline = self.client.timelines.get(timeline)
 
         # Bind the live platform handle into every platform-aware tool — the same
@@ -408,6 +462,7 @@ class WakeAgent:
             assets,
             self._perceive_asset,
             lambda asset: self.marks.set(self.timeline_uuid, asset.content.uuid, kind=_ASSETS),
+            kind=_ASSETS,
             skip=self._is_own,
             probe=lambda asset: self._probe_nonce(_asset_marker_carrier(asset)),
         )
@@ -548,8 +603,8 @@ class WakeAgent:
         """Act on each webhook delivery in order, advancing the event mark per delivery.
 
         A recognized NOC probe — read from the delivery's **payload** — is acked token-free
-        before the model (`probe=`), plain at-least-once like messages (post the ack, then
-        advance the mark): no `claim_first` subtlety here, that is the task seam's concern.
+        before the model (`probe=`), at-least-once (post the ack, then record): the probe
+        seam is never claimed, so a refused ack re-acks next wake rather than going silent.
         The short-circuit runs *inside* `_act_on`, after `_bootstrap_stream` has already
         selected the item, so the #100 cold-first-wake bootstrap (newest unseen delivery
         only — which on a quiet probe timeline is the probe) is preserved unchanged.
@@ -559,6 +614,7 @@ class WakeAgent:
             events,
             _incoming_event_text,
             lambda event: self.marks.set(self.timeline_uuid, event.content.uuid, kind=_EVENTS),
+            kind=_EVENTS,
             probe=lambda event: self._probe_nonce(event.content.payload),
         )
 
@@ -572,10 +628,11 @@ class WakeAgent:
         events, an activated task is not a creation-ordered stream a high-water mark can
         track (a task scheduled earlier can activate later) and carries no terminal
         status the agent could set, so idempotency is a persisted *seen-set* (see
-        `SeenStore`): act on each activated task whose uuid is not yet recorded. The task
-        is recorded **before** it is acted on (`claim_first`), not after — a task is
-        at-most-once, so an action that re-wakes the agent (a generated image posts an
-        `asset.created`) cannot re-surface the still-`activated` task and re-run it. That
+        `SeenStore`), now backed by an atomic per-task claim (`ClaimStore`) for safety across
+        concurrent wakes too: act on each activated task whose uuid is not yet recorded. The
+        task is recorded and claimed **before** it is acted on (claim-first), not after — a
+        task is at-most-once, so an action that re-wakes the agent (a generated image posts
+        an `asset.created`) cannot re-surface the still-`activated` task and re-run it. That
         re-fire was the live monkey pile-up: the task stayed `activated`, its image-post
         re-woke the agent, and an act-then-record order let the unrecorded task fire again
         and again. An activated-but-unhandled task is genuinely undone work — not stale
@@ -600,15 +657,15 @@ class WakeAgent:
             unhandled,
             _activated_task_text,
             lambda task: self.seen.add(self.timeline_uuid, task.content.uuid, kind=_TASKS),
-            claim_first=True,
+            kind=_TASKS,
             # A NOC probe task is recognized from its **instructions** and acked token-free.
-            # `_act_on` checks `probe` *before* `claim_first`, so the probe is acked
-            # at-least-once (post, then record) — NOT claim-first. That is correct and must
-            # be preserved: a probe's only side-effect is @jt's own ack (self-filtered, and
-            # router wakes are serialized), so there is no re-fire hazard to guard against,
-            # and at-least-once is the safe failure direction for a monitor — a crash before
-            # recording re-acks (harmless) rather than marking the task seen with no ack ever
-            # posted, which would manufacture a false FAIL. See task-seam.md §4.
+            # `_act_on` checks `probe` *before* claiming, so the probe is acked at-least-once
+            # (post, then record) and never claimed. That is correct and must be preserved: a
+            # probe's only side-effect is @jt's own ack (self-filtered, and router wakes are
+            # serialized), so there is no re-fire hazard to guard against, and at-least-once
+            # is the safe failure direction for a monitor — a crash before recording re-acks
+            # (harmless) rather than leaving the task claimed-but-unacked, which would
+            # manufacture a false FAIL. See task-seam.md §4.
             probe=lambda task: self._probe_nonce(task.content.instructions),
         )
 
@@ -620,8 +677,8 @@ class WakeAgent:
         items,
         render,
         record,
+        kind: str,
         skip=None,
-        claim_first: bool = False,
         probe=None,
     ) -> list[object]:
         """Engage the model on each item in order, posting any reply and recording it.
@@ -629,54 +686,57 @@ class WakeAgent:
         The one loop behind all four reconcilers — messages, webhook events, activated
         tasks, and posted assets. `render` turns an item into the text the model reads, or
         a `(text, images)` pair when the item carries pictures to *show* the model (the
-        asset-perception path); `record` marks it handled (a mark advance, or a seen-set add).
+        asset-perception path); `record` marks it handled (a mark advance, or a seen-set
+        add); `kind` namespaces its atomic claim (see `ClaimStore`). **`kind` must match the
+        namespace `record` writes to** — they are the same per-reconciler constant
+        (`_MESSAGES`/`_ASSETS`/`_EVENTS`/`_TASKS`); if they ever diverge, claims land in one
+        namespace while marks land in another and the exactly-once guard silently goes dead.
+
+        **Exactly-once, claim-first (`ClaimStore`).** Before acting on an item, the loop
+        *atomically claims* it. The first wake to claim wins and acts; a concurrent wake
+        loses the claim and skips — so two near-simultaneous wakes (an upload firing
+        `asset.created` + `message.created` spawns two) handle the same message exactly
+        once instead of double-replying. Because the claim lands *before* the action, it
+        also makes a crashed or partial wake non-reprocessing: the claim persists, so the
+        retry skips the item rather than re-running its turn and re-firing its tool actions.
+        The `record` (mark/seen advance) likewise lands before the action. The **claim is the
+        authoritative exactly-once guard**; the high-water mark is a best-effort scan bound
+        that may briefly rewind under truly concurrent wakes (two wakes claiming adjacent
+        items in either order) — harmless, because a rewound mark only re-scans an item whose
+        claim then blocks the duplicate. This is at-most-once by design —
+        a one-time dropped reply on a hard crash beats a backlog re-answered, with side
+        effects, on every later wake (the live reprocess loop). Tasks gain the same
+        cross-process exclusivity their image-post re-fire never had.
 
         `probe(item)` is the **NOC synthetic-probe short-circuit**, passed by all four
         reconcilers — messages, webhook events, activated tasks, and posted assets — each
         reading the marker from its own carrier field (a message body, a webhook payload, a
         task's instructions, an asset's description). When it returns a nonce (the item is a
-        valid signed probe — see
-        `_probe`), the loop posts the deterministic ack and records the item **without
-        calling the model** — no provider request, no tokens, nothing into the transcript —
-        so the message-, webhook-, task-, and asset-seam heartbeats all run token-free at
-        rest (an asset probe is acked before its file is ever fetched). It
-        is checked *after* the self-filter (a probe is from a distinct peer, never the
-        agent's own) and *before* both `claim_first` and `render`/`session.send`, and
-        follows the same at-least-once order as a normal reply (post, then record), so a
-        crash mid-batch re-acks — a duplicate ack is harmless (the prober matches the first
-        ack carrying its nonce). The probe-before-`claim_first` order is **load-bearing for
-        the task seam**: a probe task is acked at-least-once, never claim-first, so a crash
-        before recording re-acks rather than silently marking it seen with no ack (which
-        would manufacture a false monitor FAIL — task-seam.md §4).
+        valid signed probe — see `_probe`), the loop posts the deterministic ack and records
+        the item **without calling the model** — no provider request, no tokens, nothing
+        into the transcript — so the message-, webhook-, task-, and asset-seam heartbeats
+        all run token-free at rest (an asset probe is acked before its file is ever
+        fetched). It is checked *after* the self-filter (a probe is from a distinct peer,
+        never the agent's own) and **before the claim**, and follows an at-least-once order
+        (post the ack, *then* record), so a crash mid-batch re-acks. This probe-before-claim
+        order is **load-bearing for the task seam**: a probe is never claimed, so a crash
+        before recording re-acks (harmless — the prober matches the first ack carrying its
+        nonce) rather than leaving the item claimed-but-unacked, which would manufacture a
+        false monitor FAIL (task-seam.md §4).
 
-        **Two recording disciplines, chosen by `claim_first`:**
-
-        - *At-least-once* (`claim_first=False`, the default — messages, events, assets):
-          the reply is posted *before* the record advances, so a crash or router retry
-          mid-batch re-acts on the un-recorded item. A possible duplicate over a dropped
-          action is the better failure on a comms platform.
-        - *At-most-once* (`claim_first=True` — activated tasks): the record advances
-          *before* the action runs, so an action that fails part-way (most importantly
-          one that already posted a side effect — a generated image whose `asset.created`
-          will wake the agent again) can **never re-fire**. A self-scheduled task must run
-          exactly once even if its own output re-wakes the agent; a one-time dropped task
-          on a crash is far better than the runaway re-execution it would otherwise cause.
-
-        Either way the record advances after (or before) *each* item independently, so the
-        batch is crash-resumable at item granularity.
+        **Never crash the wake (B2).** Both platform-touching steps degrade instead of
+        raising: a refused post (`self._post`, most pointedly a locked timeline) becomes an
+        in-conversation note and the loop carries on; an engine that hits its step cap
+        (`self._engage`) becomes a short "I got stuck" reply. So a wake that hits a locked
+        timeline or the step cap posts a graceful note and exits 0 — no unhandled exception
+        reaches the entrypoint, and the item is still recorded (no reprocess).
 
         `skip(item)` is the **actor self-filter** — the safety property. When it returns
-        true (the item is the agent's *own* authored post — a message it sent, an image
-        it generated), the item is *not* acted on, but its record **still advances**, so
-        the agent never reacts to its own output and never wake-loops on it (a generated
-        image that re-woke the agent to generate another would be a runaway), while the
-        skipped item is still marked seen so it is not re-scanned forever.
-
-        `skip` and `claim_first` are independent axes that **may** both apply: skip is
-        checked first, so an own item is recorded once and never acted on regardless of
-        `claim_first`. (No current reconciler passes both — tasks are at-most-once with no
-        self-filter; assets/messages self-filter at-least-once — but the precedence is
-        well-defined if one ever does.)
+        true (the item is the agent's *own* authored post — a message it sent, an image it
+        generated), the item is *not* acted on, but its record **still advances** (no claim
+        needed — there is no action to make exclusive), so the agent never reacts to its own
+        output and never wake-loops on it, while the skipped item is still marked seen so it
+        is not re-scanned forever.
         """
         posted = []
         for item in items:
@@ -684,24 +744,67 @@ class WakeAgent:
                 record(item)  # own post: never acted on, but marked so it is not re-scanned
                 continue
             if probe is not None and (nonce := probe(item)) is not None:
-                # A verified NOC probe: ack token-free (no model call), then record — the
-                # same at-least-once order as a normal reply, so a crash re-acks safely.
-                posted.append(self.timeline.messages.create(body=ack_line(nonce)))
-                record(item)
+                # A verified NOC probe: ack token-free (no model call), and record only
+                # *after* a successful ack — at-least-once, never claimed. A refused ack
+                # degrades *silently* (`note=False` keeps the probe seam trace-free) and
+                # leaves the item unrecorded, so the next wake re-acks rather than marking it
+                # seen with no ack ever posted (a false monitor FAIL — task-seam.md §4).
+                ack = self._post(session, ack_line(nonce), note=False)
+                if ack is not None:
+                    posted.append(ack)
+                    record(item)
                 continue
-            if claim_first:
-                record(item)  # at-most-once: claim before acting so a crash cannot re-fire it
+            if not self.claims.claim(self.timeline_uuid, item.content.uuid, kind=kind):
+                continue  # a concurrent (or crashed prior) wake already owns this item
+            record(item)  # claim-first: mark seen before acting, so a failed wake won't reprocess
             # `render` returns the text the model reads, or a (text, images) pair when the
             # item carries pictures to *show* the model (the asset-perception path). Images
             # ride into the model's input on this turn and are evicted after (see `Session`).
             rendered = render(item)
             text, images = rendered if isinstance(rendered, tuple) else (rendered, [])
-            reply = session.send(text, images=images)
+            reply = self._engage(session, text, images)
             if reply.strip():
-                posted.append(self.timeline.messages.create(body=reply))
-            if not claim_first:
-                record(item)  # at-least-once: mark after the post, so a crash re-acts
+                sent = self._post(session, reply)
+                if sent is not None:
+                    posted.append(sent)
         return posted
+
+    def _engage(self, session: Session, text: str, images: list[ImageContent]) -> str:
+        """Run the model on one item, degrading the engine's step-cap to a graceful reply.
+
+        The think→act loop bounds runaway tool use with `max_steps` (`_engine`), raising
+        `EngineError` when the model never settles on a reply. A wake must not crash on
+        that — so it degrades to a short, honest note the peer can read, and the batch
+        carries on. Other failures still propagate (the entrypoint reports them cleanly);
+        this catches only the step-cap, the one the issue names.
+        """
+        try:
+            return session.send(text, images=images)
+        except EngineError:
+            return "I got stuck working through that and stopped before reaching an answer."
+
+    def _post(self, session: Session, body: str, *, note: bool = True) -> object | None:
+        """Post a reply to the timeline, degrading any SDK refusal instead of crashing.
+
+        The reply-post is the line that crashed the live wake: a locked timeline (even one
+        self-locked earlier in the same turn) raises `TimelineLockedError`, and with no
+        guard the whole wake died (`exit 1`) — *before* the message was marked seen, so the
+        same prompt reprocessed on every later wake. Here any `basecradle` SDK error is
+        caught and `None` is returned so the caller carries on (the item is still marked
+        seen); the wake exits 0.
+
+        For a normal reply (`note=True`) the failure is also recorded as a note in the
+        transcript, so the agent's own record stays honest. A NOC probe ack passes
+        `note=False`: the probe seam is deliberately trace-free (model-free, nothing into the
+        transcript), so a refused ack must degrade *silently* — a note would both break that
+        invariant and mislabel the heartbeat ack as a "reply".
+        """
+        try:
+            return self.timeline.messages.create(body=body)
+        except BaseCradleError as error:
+            if note:
+                session.note(f"(Couldn't post that reply to the timeline: {explain(error)})")
+            return None
 
     def _is_own(self, item: object) -> bool:
         """Whether an item was authored by this agent — the actor self-filter's test."""
@@ -797,6 +900,7 @@ class WakeAgent:
             messages,
             _incoming_text,
             lambda message: self.marks.set(self.timeline_uuid, message.content.uuid),
+            kind=_MESSAGES,
             skip=self._is_own,
             probe=lambda message: self._probe_nonce(message.content.body),
         )
@@ -939,7 +1043,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         agent = WakeAgent.from_env(timeline=args.timeline)
         agent.wake(trigger=args.message, event_trigger=args.event, asset_trigger=args.asset)
-    except (HarnessError, ProviderError, ValueError, KeyError) as error:
+    except (HarnessError, ProviderError, BaseCradleError, ValueError, KeyError) as error:
+        # `_act_on` degrades the per-item failures (a locked-timeline post, the engine's
+        # step cap) in flight, so a wake reaching a locked timeline still exits 0. A
+        # BaseCradleError caught here is a harder failure — setup, an unreadable timeline —
+        # which the router should see as a clean non-zero exit, never a raw traceback.
         print(f"basecradle-harness-wake: {error}", file=sys.stderr)
         return 1
     return 0
