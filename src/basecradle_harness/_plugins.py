@@ -161,12 +161,18 @@ class ToolPlugin:
 
     `requires` lists the activation preconditions (all must hold). `name` defaults to the
     impl's ``name`` (or the builtin wire name); set it only to override.
+
+    `note` is an optional one-line gotcha the function schema cannot convey (e.g. lock's
+    irreversibility). It is rendered into the generated tool manifest (the persistent Turn-0
+    brief) beside the tool's name; a plugin without one just lists its name. Additive — an
+    existing plugin that sets no `note` is unaffected.
     """
 
     impl: type[Tool] | None = None
     builtin: str | None = None
     requires: tuple[Requirement, ...] = ()
     name: str | None = None
+    note: str | None = None
 
     def __post_init__(self) -> None:
         if (self.impl is None) == (self.builtin is None):
@@ -212,11 +218,16 @@ class ResolvedTools:
             the Responses adapter's ``builtin_tools``).
         skipped: ``(name, reason)`` for every plugin that did **not** activate, for logging —
             the visible "why isn't this tool here?" trail.
+        manifest: ``(name, note)`` for every **active** tool — function tools and built-ins
+            alike, in resolution order — the source the persistent Turn-0 brief renders into
+            its "Your active tools right now" block. ``note`` is the plugin's optional gotcha,
+            or ``None``. Always matches the active provider + drop-ins, so it can never drift.
     """
 
     tools: list[Tool] = field(default_factory=list)
     builtins: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    manifest: list[tuple[str, str | None]] = field(default_factory=list)
 
 
 def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> ResolvedTools:
@@ -247,14 +258,16 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
 
     tools: list[Tool] = []
     builtins: list[str] = []
+    manifest: list[tuple[str, str | None]] = []
     for plugin in claimed.values():
+        manifest.append((plugin.resolved_name, plugin.note))
         if plugin.is_builtin:
             assert plugin.builtin is not None
             builtins.append(plugin.builtin)
         else:
             assert plugin.impl is not None
             tools.append(plugin.impl())
-    return ResolvedTools(tools=tools, builtins=builtins, skipped=skipped)
+    return ResolvedTools(tools=tools, builtins=builtins, skipped=skipped, manifest=manifest)
 
 
 # --- loading plugin files -----------------------------------------------------

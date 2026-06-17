@@ -487,21 +487,27 @@ def test_resolve_tools_and_provider_flips_the_active_set_with_the_api(monkeypatc
     monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
 
     monkeypatch.setenv("AI_PROVIDER_API", "responses")
-    provider, tools = _resolve_tools_and_provider()
+    provider, resolved = _resolve_tools_and_provider()
     assert isinstance(provider, OpenAIResponsesProvider)
     # web_search is enabled on the provider as a server-side built-in (driven by the plugin)…
     assert {"type": "web_search"} in provider._builtin_tools
     # …but it is never a function tool the engine runs.
-    names = {t.name for t in tools}
+    names = {t.name for t in resolved.tools}
     assert "web_search" not in names
     assert "generate_image" in names  # OpenAI-coupled tool, key present → on
+    # The manifest names the active tools — including the server-side built-in, which is not
+    # a function tool — so the brief can list exactly what the model can call.
+    manifest_names = {name for name, _ in resolved.manifest}
+    assert "web_search" in manifest_names
+    assert "generate_image" in manifest_names
     provider.close()
 
     monkeypatch.setenv("AI_PROVIDER_API", "chat")
-    chat_provider, chat_tools = _resolve_tools_and_provider()
+    chat_provider, chat_resolved = _resolve_tools_and_provider()
     assert isinstance(chat_provider, OpenAICompatibleProvider)
     # Same function tools; the Responses-only built-in is gone.
-    assert {t.name for t in chat_tools} == names
+    assert {t.name for t in chat_resolved.tools} == names
+    assert "web_search" not in {name for name, _ in chat_resolved.manifest}
     chat_provider.close()
 
 

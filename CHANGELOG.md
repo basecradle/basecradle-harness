@@ -7,6 +7,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-06-16
+
+Phase 2 · **Group 3** — `initialize.md`: the **persistent operating brief**. Turn 0 stops
+being a one-time onboarding seed (Group 1's field-scrape, which aged into the distant past
+of a long transcript) and becomes a brief **re-asserted on every wake**, composed of the
+framework's `initialize.md` + a generated manifest of the agent's *active* tools + the live
+`dashboard.md` primer + the operator's `system-prompt.md`. This lands the last knowledge
+findings (B6/C1/B7) and reinforces B1 by teaching the model the trust model, lock
+irreversibility, and tool honesty correctly in Turn 0 — without a read.
+
+### Added
+
+- **Persistent, composed Turn 0.** A `WakeAgent` re-asserts the operating brief at the head
+  of every wake's work (lazily, just before the model is first engaged — so an idle or
+  probe-only wake pays nothing), so the agent's standing context stays recent in a long
+  transcript instead of being buried at turn 1.
+- **The default `initialize.md`.** Lean, high-signal, provider-independent operating
+  guidance — the gotchas the function schemas can't convey (trust is directional in storage
+  but mutual at the gate; locking is one-way and irreversible; if you lack a tool say so;
+  don't reflexively refuse on trigger words). Ships under `_defaults/prompts/`,
+  conffile-managed like every other default.
+- **Generated tool manifest.** "Your active tools right now: …" rendered from Group 2's
+  resolution (`ResolvedTools.manifest`) — function tools and server-side built-ins alike, in
+  resolution order. Always matches the active provider and the operator's drop-ins, so it
+  can never drift from what the model can actually call.
+- **Optional per-tool `note` on the plugin contract.** A `ToolPlugin` may carry a one-line
+  gotcha the schema can't convey (e.g. lock's irreversibility); the manifest renders it
+  beside the tool's name. Additive — a plugin without one just lists its name. The shipped
+  `lock` plugin sets one.
+- **`compose_brief`, `render_manifest`, `fetch_dashboard_md`** (the `_brief` module) and the
+  prompt accessors **`prompt_text` / `system_prompt_text`** are exported from the package.
+
+### Changed
+
+- **`ResolvedTools` gains a `manifest`** — `(name, note)` for every active tool — the source
+  the brief renders.
+- **`_resolve_tools_and_provider` returns the full `ResolvedTools`** (not just the function
+  tools), so the wake can thread the manifest into the brief.
+- **The live `dashboard.md` replaces the structured field-scrape** as the brief's
+  orientation. A fetch failure **degrades gracefully** — the brief is composed from the
+  remaining parts and the wake never breaks.
+- **@jt needs no migration.** With no config home it composes the brief from the packaged
+  `initialize.md` + its `HARNESS_SYSTEM_PROMPT` personality + the live dashboard + the
+  generated manifest — behavior-preserving, and it gains the persistent brief.
+
+### Boundary
+
+The poll-loop `TimelineAgent` keeps its Group-1 startup onboarding (a single long-lived
+process has no per-wake re-assertion to make). The `MemoryProvider` (Group 4), MCP loading
+(Group 5), and the circuit-breaker (Group 6) remain later groups.
+
 ## [0.24.0] - 2026-06-16
 
 Phase 2 · **Group 2b** — the first new tools built on the Group 2 plugin framework: the

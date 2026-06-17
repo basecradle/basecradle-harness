@@ -368,6 +368,78 @@ def _strip_html_comments(text: str) -> str:
     return _HTML_COMMENT_RE.sub("", text)
 
 
+# --- sourcing one prompt at a time (the persistent brief) ---------------------
+
+# The prompt files the brief composes individually (`initialize.md`, `system-prompt.md`).
+# Unlike `charter_from_config`, which joins both into one charter, the persistent Turn-0
+# brief interleaves the manifest and the live dashboard *between* them, so it needs each
+# prompt's text on its own. These two helpers source one file with the same
+# "config-home-if-installed, else the packaged default" precedent `load_plugins` uses.
+
+
+def _prompts_installed(root: Path) -> bool:
+    """Whether the config home's ``prompts/`` defaults have been installed (manifest-recorded).
+
+    The same signal `load_plugins` uses for ``tools/``: once the installer has written a
+    ``prompts/`` default, the config home is authoritative for prompts — an operator's edit,
+    or *deletion*, wins, and the packaged default is no longer consulted. Until then (a
+    never-installed home, or one predating these defaults) the packaged defaults load
+    directly, so an un-migrated agent like @jt still composes a full brief.
+    """
+    return any(key.startswith("prompts/") for key in _read_manifest(root))
+
+
+def _packaged_prompt(name: str) -> str | None:
+    """The packaged default text for ``prompts/<name>``, or ``None`` if not shipped."""
+    res = resources.files("basecradle_harness").joinpath(_DEFAULTS_PACKAGE, "prompts", name)
+    if not res.is_file():
+        return None
+    return res.read_text(encoding="utf-8")
+
+
+def prompt_text(name: str, home: str | os.PathLike[str] | None = None) -> str | None:
+    """One shipped prompt's text: the config-home file if installed, else the packaged default.
+
+    HTML comments (operator notes) are stripped; the result is whitespace-trimmed. Returns
+    ``None`` when the file is absent — once prompts are installed an operator *deletion* is
+    honored (no resurrection from the package); before that the packaged default is the
+    source. This is the brief's accessor for the provider-independent ``initialize.md``.
+    """
+    root = config_home(home)
+    if _prompts_installed(root):
+        path = root / "prompts" / name
+        raw = path.read_text(encoding="utf-8") if path.exists() else None
+    else:
+        raw = _packaged_prompt(name)
+    if raw is None:
+        return None
+    return _strip_html_comments(raw).strip() or None
+
+
+def system_prompt_text(home: str | os.PathLike[str] | None = None) -> str | None:
+    """The personality charter for the brief: ``system-prompt.md``, with the legacy fallback.
+
+    Resolution mirrors `charter_from_env`'s "files win once installed, else the legacy env
+    var" precedent, scoped to the personality slot:
+
+    - **Prompts installed** → the config-home ``system-prompt.md`` (an operator deletion
+      honored as ``None``); the env var is no longer consulted.
+    - **Not installed** → ``HARNESS_SYSTEM_PROMPT`` if set (the un-migrated agent like @jt
+      keeps its env personality), else the packaged default.
+    """
+    root = config_home(home)
+    if _prompts_installed(root):
+        path = root / "prompts" / "system-prompt.md"
+        if not path.exists():
+            return None  # operator deleted it → honored, no resurrection
+        return _strip_html_comments(path.read_text(encoding="utf-8")).strip() or None
+    env = os.environ.get("HARNESS_SYSTEM_PROMPT")
+    if env:
+        return env  # un-migrated agent: its env personality is the legacy charter
+    packaged = _packaged_prompt("system-prompt.md")
+    return _strip_html_comments(packaged).strip() or None if packaged else None
+
+
 # --- the CLI ------------------------------------------------------------------
 
 

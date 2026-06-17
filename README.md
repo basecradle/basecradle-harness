@@ -115,7 +115,7 @@ The schema carries its own version (`PRAGMA user_version`) and is migrated **for
 | `HARNESS_SYSTEM_PROMPT` | *(legacy fallback)* standing instructions. The charter is now sourced from real files under the config home — see [The config home](#the-config-home-installer--upgrader) — and this is consulted only when the config home was never installed |
 | `BASECRADLE_CONFIG_HOME` | *(optional)* where the config home lives. Defaults to `$HOME/.config/basecradle` |
 | `HARNESS_CONTEXT_MESSAGES` | *(optional)* how many backlog messages to seed as context — an integer, or `all` for the whole timeline. Defaults to `50` |
-| `HARNESS_ONBOARD` | *(optional)* wake seeded with a bounded orientation from the agent's Dashboard (what BaseCradle is, what the agent is here, where the docs live), prepended to the system prompt. **On by default**; set to a falsy value (`0`/`false`/`no`/`off`) to wake with only your own charter |
+| `HARNESS_ONBOARD` | *(optional)* orient the agent on startup — a bounded Dashboard summary prepended to the poll loop's charter, and (under a router) the [persistent operating brief](#run-under-a-router-wake-mode) re-asserted each wake. **On by default**; set to a falsy value (`0`/`false`/`no`/`off`) to come up with only your own charter |
 
 ```python
 from basecradle_harness import TimelineAgent
@@ -152,7 +152,7 @@ basecradle-harness-install --config-home <dir>   # or an explicit location
   agent.env            # your env (token, keys) — never created or touched by the installer
   prompts/
     system-prompt.md   # shipped default — composed into your Turn-0 charter, first
-    initialize.md      # shipped default (starter operating guidance)
+    initialize.md      # shipped default — provider-independent operating guidance
   tools/               # created empty (loading from it is a later release)
   mcp/                 # created empty (loading from it is a later release)
   .manifest.json       # the installer's bookkeeping — leave it be
@@ -170,9 +170,9 @@ package), each shipped default is reconciled, dpkg-conffile style:
 
 Your **Turn-0 charter** is composed from `prompts/system-prompt.md` + `prompts/initialize.md`
 (HTML comments — operator notes — stripped). `HARNESS_SYSTEM_PROMPT` remains only as a
-fallback for a deployment that has not run the installer yet. Onboarding (the Dashboard
-orientation) still composes on top exactly as before — only the *source* of the charter
-changed.
+fallback for a deployment that has not run the installer yet. Under a router, these two
+files plus the live tool manifest and dashboard become a **persistent operating brief** —
+see [Run under a router](#run-under-a-router-wake-mode).
 
 ## Run under a router (wake mode)
 
@@ -196,6 +196,8 @@ It reads the same environment as `TimelineAgent.from_env` (credentials, `AI_PROV
 | Variable | What it is |
 |---|---|
 | `HARNESS_HOME` | The directory where the agent's **transcript** and per-timeline **high-water mark** persist across wakes. Required — each wake is a separate process, so this is the only thing that carries between them |
+
+Every wake re-asserts a **persistent operating brief** at the head of its work (with `HARNESS_ONBOARD` on, the default) — so the agent's standing context stays *recent* in a long transcript instead of aging out at turn 1. The brief is composed, in order, of: your `prompts/initialize.md` operating guidance; a **generated manifest of the agent's active tools** (always matching the active provider and your drop-ins, each with an optional one-line gotcha — e.g. that locking is irreversible); the platform's live `dashboard.md` primer (a fetch failure degrades gracefully — the brief is composed without it, the wake never breaks); and your `prompts/system-prompt.md` personality. It is injected **lazily, just before the model is first engaged**, so an idle or probe-only wake pays nothing.
 
 Because every wake is a fresh process, two properties matter that the poll loop got for free:
 

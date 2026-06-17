@@ -54,11 +54,15 @@ from basecradle_harness._install import charter_from_env
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
-from basecradle_harness._plugins import ActivationContext, load_plugins, resolve_plugins
+from basecradle_harness._plugins import (
+    ActivationContext,
+    ResolvedTools,
+    load_plugins,
+    resolve_plugins,
+)
 from basecradle_harness._provider import Provider
 from basecradle_harness._responses import OpenAIResponsesProvider
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
-from basecradle_harness._tools import Tool
 
 DEFAULT_POLL_INTERVAL = 2.0
 
@@ -162,11 +166,11 @@ class TimelineAgent:
     @classmethod
     def from_env(cls) -> TimelineAgent:
         """Build a fully wired agent (provider + tool plugins + timeline) from env vars."""
-        provider, tools = _resolve_tools_and_provider()
+        provider, resolved = _resolve_tools_and_provider()
         harness = Harness(
             provider,
             system_prompt=charter_from_env(),
-            tools=tools,
+            tools=resolved.tools,
         )
         return cls(
             harness,
@@ -413,7 +417,7 @@ def _provider_from_env(builtins: Sequence[str] = (), api: str | None = None) -> 
     return OpenAICompatibleProvider(**kwargs)
 
 
-def _resolve_tools_and_provider() -> tuple[Provider, list[Tool]]:
+def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools]:
     """Resolve the active tool set and a matching provider from the config home + env.
 
     The single seam both `TimelineAgent.from_env` and `WakeAgent.from_env` use to wire their
@@ -421,14 +425,17 @@ def _resolve_tools_and_provider() -> tuple[Provider, list[Tool]]:
     tool plugins (the ``tools/`` overlay, else packaged defaults — see `load_plugins`);
     resolves them against the active config (`resolve_plugins`), so an OpenAI-coupled tool or
     a Responses-only built-in self-excludes when its requirement isn't met; then builds the
-    provider with the resolved built-ins. Returns the provider and the instantiated function
-    tools, which the caller hands to `Harness` (where the policy gate still applies on top).
+    provider with the resolved built-ins.
+
+    Returns the provider and the whole `ResolvedTools` — the caller hands ``.tools`` to
+    `Harness` (where the policy gate still applies on top) and, for the wake, threads
+    ``.manifest`` into the persistent Turn-0 brief so it names exactly the active tools.
     """
     api = _provider_api_from_env()
     ctx = ActivationContext(provider_api=api, env=os.environ)
     resolved = resolve_plugins(load_plugins(), ctx)
     provider = _provider_from_env(builtins=resolved.builtins, api=api)
-    return provider, resolved.tools
+    return provider, resolved
 
 
 def _onboard_from_env() -> bool:

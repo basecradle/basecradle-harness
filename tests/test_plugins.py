@@ -89,6 +89,31 @@ def test_resolve_splits_active_plugins_into_function_tools_and_builtins():
     assert resolved.builtins == ["web_search"]
 
 
+def test_resolution_builds_a_manifest_of_active_tools_with_notes():
+    # The manifest names every active tool — function tools and built-ins alike, in
+    # resolution order — carrying each plugin's optional `note` (or None). It is the source
+    # the persistent brief renders, so it must match exactly what activated.
+    plugins = [
+        ToolPlugin(impl=_Echo, note="a gotcha the schema can't convey."),
+        ToolPlugin(impl=_Other),  # no note → None
+        ToolPlugin(builtin="web_search", requires=(ProviderAPI("responses"),)),
+    ]
+    resolved = resolve_plugins(plugins, _ctx(api="responses"))
+    assert resolved.manifest == [
+        ("echo", "a gotcha the schema can't convey."),
+        ("other", None),
+        ("web_search", None),
+    ]
+
+
+def test_manifest_omits_inactive_plugins():
+    # A plugin whose requirements aren't met never registers, so it never appears in the
+    # manifest — the brief can't list a present-but-broken tool the model couldn't call.
+    plugins = [ToolPlugin(impl=_Echo), ToolPlugin(impl=_Other, requires=(OpenAIKey(),))]
+    resolved = resolve_plugins(plugins, _ctx())  # no key → `other` self-excludes
+    assert [name for name, _ in resolved.manifest] == ["echo"]
+
+
 def test_an_unmet_requirement_excludes_the_plugin_and_records_why():
     plugins = [
         ToolPlugin(impl=_Echo, requires=(OpenAIKey(),)),

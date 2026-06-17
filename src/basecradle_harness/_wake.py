@@ -60,6 +60,7 @@ asset, or task to be acted on.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -73,23 +74,24 @@ from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
     _client_from_env,
-    _compose_prompt,
     _context_messages_from_env,
     _incoming_text,
     _messages_since,
     _onboard_from_env,
-    _orientation,
     _recent,
     _resolve_tools_and_provider,
 )
+from basecradle_harness._brief import compose_brief, fetch_dashboard_md, render_manifest
 from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
 from basecradle_harness._harness import Harness
-from basecradle_harness._install import charter_from_env
+from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
 from basecradle_harness._messages import ImageContent
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import Session
 from basecradle_harness._version import __version__
+
+_log = logging.getLogger("basecradle_harness")
 
 # The kinds of timeline item the wake reconciles. Messages and webhook events are
 # creation-ordered streams tracked by a high-water mark (below); activated tasks are
@@ -239,8 +241,17 @@ class WakeAgent:
         context_messages: How many backlog messages to seed as context on the
             first wake (see `_bootstrap`). The default bounds token cost; `None`
             seeds the whole backlog.
-        onboard: Prepend the Dashboard orientation to the charter (as
-            `TimelineAgent` does). On by default.
+        onboard: Re-assert the persistent operating brief on every wake (see
+            `_reassert_brief`). On by default. When on, the brief — `initialize.md`
+            + the live tool manifest + the live `dashboard.md` + `system-prompt.md`
+            — supersedes a static turn-0 charter, so the agent's standing context
+            stays recent in a long transcript rather than aging out at turn 1. Off
+            wakes with only the operator's charter, seeded once at turn 0.
+        tool_manifest: ``(name, note)`` for the agent's active tools, rendered into
+            the brief so it names exactly what the model can call. Defaults to the
+            harness's registered function tools (no notes) when not supplied;
+            `from_env` threads the precise `ResolvedTools.manifest` (built-ins and
+            notes included).
     """
 
     def __init__(
@@ -253,6 +264,7 @@ class WakeAgent:
         context_messages: int | None = DEFAULT_CONTEXT_MESSAGES,
         onboard: bool = True,
         probe_secret: str | None = None,
+        tool_manifest: list[tuple[str, str | None]] | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -266,6 +278,12 @@ class WakeAgent:
         self.timeline_uuid = timeline
         self.source = f"timeline:{timeline}"
         self.context_messages = context_messages
+        self.onboard = onboard
+        self.tool_manifest = tool_manifest
+        # The persistent brief is composed and injected at most once per `wake()` — lazily,
+        # right before the first time the model is actually engaged — so an idle or probe-only
+        # wake neither fetches the live dashboard nor bloats the transcript. Reset each wake.
+        self._brief_asserted = False
         # The shared HMAC key for the NOC synthetic-probe marker (see `_probe`). Set → the
         # message, webhook, and task reconciles each recognize a signed probe in their own
         # carrier field and ack it token-free, before the model. Unset → the short-circuit
@@ -291,16 +309,16 @@ class WakeAgent:
             ),
         )
 
-        # One Dashboard read answers "who am I?" and, when onboarding, "what is this
-        # place?" — exactly as the poll loop does, so a router-woken peer is oriented
-        # the same as a polling one. Mutating the charter here (before any session is
-        # created in `wake`) means the composed prompt reaches a fresh session.
-        dashboard = self.client.me
-        self.me_uuid = dashboard.identity.uuid
+        # One Dashboard read answers "who am I?" — the identity uuid the actor self-filter
+        # tests every item against. (The brief's orientation is the *live* `dashboard.md`
+        # primer, fetched per wake in `_reassert_brief`, not this structured read.)
+        self.me_uuid = self.client.me.identity.uuid
         if onboard:
-            self.harness.system_prompt = _compose_prompt(
-                _orientation(dashboard), self.harness.system_prompt
-            )
+            # The persistent brief is re-asserted on every wake (see `_reassert_brief`) and
+            # carries the personality charter (`system-prompt.md`) itself, so a static turn-0
+            # seed would only duplicate it. Clear it; the brief is the charter now. With
+            # onboarding off the operator's turn-0 charter stands as before.
+            self.harness.system_prompt = None
 
     @classmethod
     def from_env(cls, *, timeline: str | None = None) -> WakeAgent:
@@ -329,11 +347,11 @@ class WakeAgent:
                 "Wake mode requires HARNESS_HOME — the directory where the agent's "
                 "transcript and high-water mark persist across wakes."
             )
-        provider, tools = _resolve_tools_and_provider()
+        provider, resolved = _resolve_tools_and_provider()
         harness = Harness(
             provider,
             system_prompt=charter_from_env(),
-            tools=tools,
+            tools=resolved.tools,
             home=home,
         )
         return cls(
@@ -345,6 +363,9 @@ class WakeAgent:
             # `or None` so a set-but-blank NOC_PROBE_SECRET (an exported-but-unfilled
             # secret) reads as *off*, not as "enabled with an empty HMAC key".
             probe_secret=os.environ.get("NOC_PROBE_SECRET") or None,
+            # The active tool manifest (built-ins + notes) for the persistent brief, so it
+            # names exactly the tools this config resolved — never a present-but-broken one.
+            tool_manifest=resolved.manifest,
         )
 
     def wake(
@@ -378,6 +399,7 @@ class WakeAgent:
         task, keeping the router thin.
         """
         session = self.harness.session(self.source)
+        self._brief_asserted = False  # re-assert the brief once this wake, before the model
         posted = self._wake_messages(session, trigger)
         posted += self._wake_assets(session, asset_trigger)
         posted += self._wake_events(session, event_trigger)
@@ -761,11 +783,77 @@ class WakeAgent:
         that — so it degrades to a short, honest note the peer can read, and the batch
         carries on. Other failures still propagate (the entrypoint reports them cleanly);
         this catches only the step-cap, the one the issue names.
+
+        The persistent brief is re-asserted here, just before the user turn — so it is
+        present and recent for *this* model call. It fires at most once per wake (lazily, so
+        a probe-only or self-skip-only wake never pays the live dashboard fetch) and lands
+        ahead of the item it should govern.
         """
+        self._reassert_brief(session)
         try:
             return session.send(text, images=images)
         except EngineError:
             return "I got stuck working through that and stopped before reaching an answer."
+
+    def _reassert_brief(self, session: Session) -> None:
+        """Inject the persistent operating brief as a system turn — once per wake, when onboarding.
+
+        This is what makes Turn 0 *persistent*: rather than a one-time onboarding seed that
+        ages into the distant past of a long transcript, the brief is re-asserted at the head
+        of every wake's work, so the agent's standing context (how to operate, what tools it
+        has, where it is, who it is) is always recent in the conversation. Composed lazily and
+        injected at most once per wake — a no-op when onboarding is off or already asserted.
+        """
+        if not self.onboard or self._brief_asserted:
+            return
+        self._brief_asserted = True  # set first: a failed compose/note still won't retry-loop
+        brief = self._compose_brief()
+        if brief:
+            session.note(brief)
+        else:
+            # Onboarding is on yet the brief composed empty (every part absent — deleted
+            # prompts, a failed dashboard, no tools). Not an error, but log it: an agent
+            # waking with no standing context is worth a breadcrumb, not a silent gap.
+            _log.info("Persistent brief composed empty this wake; proceeding without it.")
+
+    def _compose_brief(self) -> str | None:
+        """Compose the persistent brief for this wake: initialize + manifest + dashboard + charter.
+
+        The four parts, in order (see `basecradle_harness._brief`): the provider-independent
+        `initialize.md` operating guidance, the generated manifest of the agent's *active*
+        tools, the live `dashboard.md` primer (fetched fresh each wake; a fetch failure
+        degrades to omitting it, never breaking the wake), and the operator's `system-prompt.md`
+        personality charter. Any part may be absent and the brief is composed from the rest.
+
+        **Never break the wake.** `fetch_dashboard_md` already swallows its (network) failures,
+        but the prompt-file reads can also raise (a permission/IO error on `prompts/*.md`
+        mid-wake) — so the whole composition is guarded too: any failure degrades to *no brief*
+        and the wake carries on, the same invariant the dashboard fetch is held to.
+        """
+        try:
+            return compose_brief(
+                initialize=prompt_text("initialize.md"),
+                manifest=render_manifest(self._manifest_entries()),
+                dashboard=fetch_dashboard_md(self.client),
+                system_prompt=system_prompt_text(),
+            )
+        except Exception:  # noqa: BLE001 - the brief must never break the wake; degrade to none
+            _log.warning(
+                "Failed to compose the persistent brief; proceeding without it.", exc_info=True
+            )
+            return None
+
+    def _manifest_entries(self) -> list[tuple[str, str | None]]:
+        """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.
+
+        `from_env` threads the precise `ResolvedTools.manifest` (built-ins and notes included);
+        a `WakeAgent` built directly (a test, or an embedder wiring its own `Harness`) falls
+        back to the registered function tools by name, so the brief still names what the model
+        can call even without the resolver's metadata.
+        """
+        if self.tool_manifest is not None:
+            return list(self.tool_manifest)
+        return [(tool.name, None) for tool in self.harness.tools]
 
     def _post(self, session: Session, body: str, *, note: bool = True) -> object | None:
         """Post a reply to the timeline, degrading any SDK refusal instead of crashing.
