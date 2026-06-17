@@ -231,8 +231,8 @@ for the location: `--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.conf
   prompts/
     system-prompt.md   # shipped default — composed into Turn 0 first
     initialize.md      # shipped default — provider-independent operating guidance (Group 3)
-  tools/               # created empty; loading from it is a later group
-  mcp/                 # created empty; loading from it is a later group
+  tools/               # tool-plugin overlay (drop-in *.py); add/override/disable (Group 2)
+  mcp/                 # MCP server configs (drop-in *.json); empty by default = safe (Group 5)
   .manifest.json       # bookkeeping: the hash of every shipped default as installed
 ```
 
@@ -300,9 +300,9 @@ capital's exhaustive @jt test, each a default plugin under `_defaults/tools/` wi
   (`create`, `read`, `list`, `add_participant`, `remove_participant`) — no irreversible
   action.
 
-**Boundary:** MCP loading from `mcp/` and the circuit-breaker are later groups (5–6); the
-`MemoryProvider` lands in Group 4 (below). The **knowledge fixes** (B6/C1/B7), the generated
-tool manifest, and the persistent Turn 0 land in Group 3, below.
+**Boundary:** MCP loading from `mcp/` lands in Group 5 (below); the circuit-breaker is
+Group 6. The `MemoryProvider` lands in Group 4 (below). The **knowledge fixes** (B6/C1/B7),
+the generated tool manifest, and the persistent Turn 0 land in Group 3, below.
 
 ### Persistent Turn 0: the operating brief (Phase 2 · Group 3)
 
@@ -372,14 +372,56 @@ reference adapter to prove it end-to-end, **without changing the default's behav
   its tools fold into the resolved set (deduped by name), so the brief manifest is unchanged.
 - **The MemPalace reference adapter** (`_mempalace.py`) — an **optional extra**
   (`pip install basecradle-harness[mempalace]`). A real `MemoryProvider` over MemPalace's
-  local **library** API (not its MCP tools — that path is Group 5): `observe` mines each
-  exchange (`convo_miner.mine_convos`), `context` retrieves top-K relevant chunks across all
-  timelines (`searcher.search_memories`). Supplies **no model-facing tool** (memory is
-  automatic), so a MemPalace agent runs with BaseCradle-only tools.
+  local **library** API (not its MCP tools — that is the separate MCP path, Group 5 below):
+  `observe` mines each exchange (`convo_miner.mine_convos`), `context` retrieves top-K
+  relevant chunks across all timelines (`searcher.search_memories`). Supplies **no
+  model-facing tool** (memory is automatic), so a MemPalace agent runs with BaseCradle-only
+  tools.
 
-**Boundary:** MemPalace's *MCP-tools* path is Group 5; the circuit-breaker is Group 6. The
-"Memory Prince" agent provisioning + the cross-timeline proof are the **capital's** job,
-post-ship.
+**Boundary:** the circuit-breaker is Group 6. The "Memory Prince" agent provisioning + the
+cross-timeline proof are the **capital's** job, post-ship.
+
+### MCP Drop-In + Safe-by-Default (Phase 2 · Group 5)
+
+**MCP is supported.** The harness is an [MCP](https://modelcontextprotocol.io) **client**
+(`_mcp.py`): drop a server config into the config home's `mcp/` dir and that server's tools
+become part of the agent's active tool set on the next wake — no code change, the same
+"everything in the folder is active" model as the `tools/` overlay (Group 2). *(This
+reverses the earlier "MCP is out of scope / deferred" stance — a founder decision.)*
+
+- **The `mcp/` overlay.** One server per `mcp/<name>.json`, following the **standard MCP
+  config shape** so a published server's snippet drops in unmodified — stdio
+  (`{"command", "args", "env"}`) or Streamable HTTP (`{"url", "headers"}`); a single-entry
+  `{"mcpServers": {…}}` wrapper is unwrapped. Drop-to-add / delete-to-disable. `mcp/` ships
+  **empty**, so there is nothing for the conffile upgrader to reconcile and an
+  operator-added file is never touched. Secrets in `env` are passed to the subprocess
+  **literally** via `Popen(env=…)` — never shell-sourced (`shell=False` always; the
+  basecradle-router#109 lesson).
+- **Client + activation.** A small synchronous JSON-RPC client (stdio subprocess or HTTP)
+  handshakes, `tools/list`s, and proxies `tools/call`. Each discovered tool becomes a plain
+  function `Tool` (namespaced `<server>__<tool>`), so it composes under **both** the Chat
+  and Responses providers and appears in the generated Turn-0 manifest like any other tool.
+  A server that fails to start/handshake/list **self-excludes** — its tools drop and the
+  failure lands in `skipped` with a reason — exactly the Group-2 activation robustness bar;
+  a flaky server **never crashes the wake**. (Per-wake startup latency is the trade for the
+  process-per-event model; documented in `_mcp.py`.)
+- **Safe-by-default, made explicit.** A fresh install is safe by construction: empty `mcp/`,
+  and the locked `Policy` denies shell/exec. Loading an MCP server — **or** a drop-in
+  `tools/` tool that needs a policy-denied capability — is the operator *knowingly leaving
+  the safe zone*, so the harness **surfaces** it rather than hiding it: a clear **log line**
+  and an **opt-out notice** rendered into the persistent Turn-0 brief (`ResolvedTools.notices`
+  → `render_safety` → `compose_brief`). "All bets off" is a stated, auditable transition,
+  never silent. The **activation-vs-policy split** is preserved: an MCP proxy carries no
+  in-process capability so it registers under the locked policy (the opt-out is *surfaced*,
+  not refused), while a `tools/` tool that declares `SHELL` is **filtered out and surfaced**
+  (`_apply_safe_policy`) rather than crashing — the policy is never bypassed by activation.
+- **First consumer.** MemPalace's MCP server (its *tools* path, distinct from Group 4's
+  *library* path) is the validation target.
+
+**Boundary:** the cross-wake **circuit-breaker is Group 6**. MCP **media** results (image /
+embedded-resource content blocks) render as a text marker, not model vision input — a
+documented bound. Live @jt verification (drop a server in, confirm tools activate + a call
+works, confirm safe-by-default with empty `mcp/`) is the **capital's** job, post-ship.
 
 ## Development Commands
 

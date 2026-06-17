@@ -9,7 +9,12 @@ https://basecradle.com · API docs: https://basecradle.com/docs/api
 from basecradle_harness._assets import AssetsTool
 from basecradle_harness._audio import HearAudioTool
 from basecradle_harness._basecradle import TimelineAgent
-from basecradle_harness._brief import compose_brief, fetch_dashboard_md, render_manifest
+from basecradle_harness._brief import (
+    compose_brief,
+    fetch_dashboard_md,
+    render_manifest,
+    render_safety,
+)
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
     EngineError,
@@ -34,6 +39,17 @@ from basecradle_harness._install import (
     system_prompt_text,
 )
 from basecradle_harness._lock import LockTool
+from basecradle_harness._mcp import (
+    HttpMcpClient,
+    McpClient,
+    McpError,
+    McpResolution,
+    McpServerConfig,
+    McpTool,
+    StdioMcpClient,
+    load_mcp_configs,
+    load_mcp_tools,
+)
 from basecradle_harness._memory import MemoryTool, SqliteMemoryStore
 from basecradle_harness._memory_provider import (
     MemoryExchange,
@@ -100,6 +116,7 @@ __all__ = [
     # The persistent Turn-0 operating brief
     "compose_brief",
     "render_manifest",
+    "render_safety",
     "fetch_dashboard_md",
     # Provider contract + adapters
     "Provider",
@@ -130,6 +147,16 @@ __all__ = [
     "ResolvedTools",
     "resolve_plugins",
     "load_plugins",
+    # MCP drop-in: the harness as an MCP client (safe-by-default, opt-out surfaced)
+    "McpClient",
+    "StdioMcpClient",
+    "HttpMcpClient",
+    "McpServerConfig",
+    "McpTool",
+    "McpResolution",
+    "McpError",
+    "load_mcp_configs",
+    "load_mcp_tools",
     # Platform-aware tools (the SDK as tools)
     "PlatformTool",
     "PlatformContext",
