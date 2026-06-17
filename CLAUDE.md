@@ -418,10 +418,58 @@ reverses the earlier "MCP is out of scope / deferred" stance — a founder decis
 - **First consumer.** MemPalace's MCP server (its *tools* path, distinct from Group 4's
   *library* path) is the validation target.
 
-**Boundary:** the cross-wake **circuit-breaker is Group 6**. MCP **media** results (image /
-embedded-resource content blocks) render as a text marker, not model vision input — a
+**Boundary:** the cross-wake **circuit-breaker is Group 6** (below). MCP **media** results
+(image / embedded-resource content blocks) render as a text marker, not model vision input — a
 documented bound. Live @jt verification (drop a server in, confirm tools activate + a call
 works, confirm safe-by-default with empty `mcp/`) is the **capital's** job, post-ship.
+
+### Cross-Wake Circuit-Breaker (Phase 2 · Group 6)
+
+**The last group.** A two-repo, two-layer breaker for an *unknown* cross-wake runaway loop —
+the agent is woken, a side effect posts, the post fires a platform event, the router wakes it
+again → a tight cycle burning provider tokens and box resources. This is the **harness layer**
+(a per-timeline self-breaker); [`basecradle-router`](https://github.com/basecradle/basecradle-router)
+carries the sibling **cross-agent** breaker. The two are **independent** — no shared protocol,
+each trips on its own view, together defense-in-depth. It backstops what the existing guards
+miss: `max_steps` bounds an *intra*-wake tool loop, the **actor self-filter** stops the
+simplest self-post→self-wake loop, and B3/B8 fixed the *known* cross-wake loops — Group 6 is
+the generic backstop for a *novel* one, most plausibly from a custom `tools/` plugin (Group 2)
+or a drop-in MCP server (Group 5).
+
+- **`WakeBreaker`** (`_wake.py`) — a rolling-window rate limiter on **wakes per timeline**,
+  persisted under `$HARNESS_HOME` beside the `marks/`/`seen/`/`claims/` stores so it survives
+  the process-per-wake model: `breaker/<timeline>.wakes` holds the windowed wake timestamps
+  (pruned each wake, so the file stays bounded even under a fast runaway) and
+  `breaker/<timeline>.tripped` is the **durable trip marker**. `record_and_check` records each
+  wake and returns a `BreakerDecision`; `WakeAgent.wake` calls it **first**, before the session
+  is loaded or the model is ever engaged.
+- **Trip → self-decline, token-free.** Over the cap within the window the wake **self-declines**
+  — **no provider call**, acts on nothing (the whole point is to stop the burn, the same
+  token-free discipline as the NOC probe short-circuit) — writes the trip marker, logs at
+  `WARNING`, and posts **one** loud alert to the timeline. The alert fires only on the trip
+  *transition* (the durable marker is the one-time guard, so it never per-tripped-wake loops;
+  the actor self-filter keeps the agent from waking on its own alert). Every later wake for a
+  tripped timeline keeps short-circuiting.
+- **Reset = auto-cooldown (the stated choice).** Once the burst subsides — the window clears
+  back under the cap **and** the cooldown has elapsed since the trip — the breaker clears the
+  marker, restarts the window, posts a recovery note, and resumes normal operation, with
+  trip+reset logged. A transient burst self-heals while the loud alert still leaves a human a
+  breadcrumb; clearing the trip marker by hand is the equivalent operator reset. A dropped
+  wake is recoverable — the cursor-paginated read API is the source of truth, so the next
+  healthy wake reconciles anything missed (the best-effort-push principle).
+- **Generous, tunable defaults.** **10 wakes / 60 s** per timeline by default — generous so
+  legitimate multi-peer activity never trips it (a genuine runaway fires continuously and blows
+  past the cap; the agent's own posts are self-filtered and never wake it, so only inbound
+  items count). Tunable via `HARNESS_WAKE_BREAKER_MAX` / `HARNESS_WAKE_BREAKER_WINDOW` /
+  `HARNESS_WAKE_BREAKER_COOLDOWN` (cooldown defaults to the window); a cap of `0` (or below)
+  disables it (the operator escape hatch).
+
+**Boundary:** the breaker is a **wake-mode property** — the poll-loop `TimelineAgent` (one
+long-lived process) has no per-wake re-entry to rate-limit and is unaffected. It builds **no**
+harness↔router protocol: the harness trips on its own per-timeline view; if it self-declines,
+the router still counts the wake and trips its own backstop. **The capital verifies live on
+@jt** (drive a synthetic runaway, confirm the breaker trips + alerts once + makes no provider
+call, confirm reset) and **closes the handoff issue by hand** after that live verify.
 
 ## Development Commands
 

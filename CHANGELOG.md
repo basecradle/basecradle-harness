@@ -7,6 +7,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-06-17
+
+Phase 2 · **Group 6** (the last group) — **the cross-wake circuit-breaker.** A per-timeline
+self-breaker that is the generic backstop for an *unknown* runaway wake loop: the agent is
+woken, some side effect posts, the post fires a platform event, the router wakes it again →
+a tight cross-wake cycle burning provider tokens and box resources. The in-wake `max_steps`
+cap, the actor self-filter, and the known B3/B8 fixes each stop a *specific* loop; this
+backstops the novel one — most plausibly introduced by a custom `tools/` plugin (Group 2) or
+a drop-in MCP server (Group 5). This is the **harness layer** of a two-layer, two-repo
+defense; [`basecradle-router`](https://github.com/basecradle/basecradle-router) carries the
+complementary **cross-agent** breaker. The two are independent — no shared protocol, each
+trips on its own view, together defense-in-depth.
+
+### Added
+
+- **`WakeBreaker`** (`basecradle_harness._wake`) — a rolling-window rate limiter on **wakes
+  per timeline**, persisted under `HARNESS_HOME` beside the `marks/`/`seen/`/`claims/` stores
+  (`breaker/<timeline>.wakes` holds the windowed wake timestamps; `breaker/<timeline>.tripped`
+  is the durable trip marker), so it survives the process-per-wake model. `record_and_check`
+  records each wake and returns a `BreakerDecision`.
+- **Trip → self-decline, token-free.** Over the cap within the window, the wake **self-declines
+  before the session is loaded or the model is ever engaged** — **no provider call** — posts a
+  single loud alert to the timeline and logs at `WARNING`. The alert fires **once**, on the
+  trip *transition* only (the durable marker is the one-time guard, so the alert never loops;
+  the actor self-filter keeps the agent from waking on its own alert). Every later wake for a
+  tripped timeline keeps short-circuiting.
+- **Auto-reset (the preferred reset).** Once the burst subsides — the window clears back under
+  the cap **and** the cooldown has elapsed since the trip — the breaker clears the marker,
+  restarts the window, posts a recovery note, and resumes normal operation. A transient
+  runaway self-heals while the loud alert still leaves a human a breadcrumb; clearing the trip
+  marker by hand is the equivalent operator reset. A short-circuited wake is recoverable — the
+  cursor-paginated read API is the source of truth, so the next healthy wake reconciles
+  anything missed.
+- **Generous, tunable defaults.** Default **10 wakes / 60 s** per timeline — deliberately
+  generous so legitimate multi-peer activity never trips it (a genuine runaway fires
+  continuously and blows past the cap; the agent's own posts are self-filtered and never wake
+  it, so only inbound items count). Tunable via `HARNESS_WAKE_BREAKER_MAX` /
+  `HARNESS_WAKE_BREAKER_WINDOW` / `HARNESS_WAKE_BREAKER_COOLDOWN` (cooldown defaults to the
+  window); a cap of `0` (or below) disables the breaker entirely (the operator escape hatch).
+  Wired on by construction for every `WakeAgent`, env-tuned via `WakeAgent.from_env`. The
+  poll-loop `TimelineAgent` is unaffected — the breaker is a wake-mode property. `WakeBreaker`
+  and `BreakerDecision` are exported.
+
 ## [0.27.0] - 2026-06-17
 
 Phase 2 · **Group 5** — **MCP drop-in + safe-by-default made explicit.** The harness

@@ -22,9 +22,18 @@ import pytest
 import respx
 from basecradle import BaseCradle
 
-from basecradle_harness import ClaimStore, Harness, MarkStore, Message, SeenStore, WakeAgent
+from basecradle_harness import (
+    BreakerDecision,
+    ClaimStore,
+    Harness,
+    MarkStore,
+    Message,
+    SeenStore,
+    WakeAgent,
+    WakeBreaker,
+)
 from basecradle_harness._messages import ToolCall
-from basecradle_harness._wake import main
+from basecradle_harness._wake import _BREAKER_RESET_ALERT, _BREAKER_TRIP_ALERT, main
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -1753,3 +1762,198 @@ def test_a_brief_composition_failure_does_not_break_the_wake(platform, tmp_path,
 
     assert len(posted) == 1  # the wake still replied despite the compose failure
     assert _brief_turns(agent) == []  # …with no brief, rather than crashing
+
+
+# --- Group 6: the cross-wake circuit-breaker ---------------------------------
+
+
+class FakeClock:
+    """A deterministic, advanceable clock — so a synthetic wake burst is reproducible."""
+
+    def __init__(self, t: float = 1_000_000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+    def advance(self, seconds: float) -> None:
+        self.t += seconds
+
+
+def _alert_bodies(platform):
+    """Every message body posted to the timeline — replies and breaker alerts alike."""
+    calls = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls
+    return [json.loads(c.request.content)["message"]["body"] for c in calls]
+
+
+def test_wake_breaker_trips_over_the_cap_and_auto_resets(tmp_path):
+    """The breaker state machine, unit-level: under the cap is fine, over it trips once, a
+    continuing burst stays tripped, and once the window clears past the cooldown it auto-resets."""
+    clock = FakeClock()
+    breaker = WakeBreaker(tmp_path, max_wakes=3, window=60.0, now=clock)
+
+    # Three wakes at the same instant: at the cap, not over it — no trip.
+    for i in range(3):
+        decision = breaker.record_and_check(TIMELINE_UUID)
+        assert decision == BreakerDecision(
+            short_circuit=False, tripped=False, reset=False, count=i + 1
+        )
+
+    # The fourth wake is over the cap → TRIP (the one-time transition).
+    decision = breaker.record_and_check(TIMELINE_UUID)
+    assert decision.short_circuit and decision.tripped and decision.count == 4
+    assert breaker.tripped(TIMELINE_UUID)
+
+    # A fifth wake while the burst continues: still short-circuits, but it is *not* a fresh
+    # trip transition (so the caller won't re-alert).
+    decision = breaker.record_and_check(TIMELINE_UUID)
+    assert decision.short_circuit and not decision.tripped and not decision.reset
+
+    # The burst stops; advance past the window + cooldown so it clears → AUTO-RESET.
+    clock.advance(200)
+    decision = breaker.record_and_check(TIMELINE_UUID)
+    assert decision.reset and not decision.short_circuit
+    assert not breaker.tripped(TIMELINE_UUID)
+
+
+def test_wake_breaker_normal_load_never_trips(tmp_path):
+    """A steady, human-paced cadence (one wake every 30 s, cap 10/60 s) never trips —
+    legitimate multi-peer activity must stay clear of the breaker."""
+    clock = FakeClock()
+    breaker = WakeBreaker(tmp_path, max_wakes=10, window=60.0, now=clock)
+    for _ in range(50):
+        clock.advance(30)  # at most ~2 wakes in any 60 s window
+        decision = breaker.record_and_check(TIMELINE_UUID)
+        assert not decision.short_circuit and not decision.tripped
+
+
+def test_wake_breaker_disabled_when_cap_is_zero(tmp_path):
+    """Cap 0 is the operator escape hatch: the breaker is off and never short-circuits."""
+    breaker = WakeBreaker(tmp_path, max_wakes=0, window=60.0)
+    assert not breaker.enabled
+    for _ in range(100):
+        assert not breaker.record_and_check(TIMELINE_UUID).short_circuit
+    assert not breaker.tripped(TIMELINE_UUID)
+
+
+def test_wake_breaker_trip_marker_persists_across_processes(tmp_path):
+    """The trip marker is durable: a brand-new breaker (a fresh process) over the same home
+    sees the timeline is tripped and keeps short-circuiting — wake mode is process-per-event."""
+    clock = FakeClock()
+    first = WakeBreaker(tmp_path, max_wakes=1, window=60.0, now=clock)
+    first.record_and_check(TIMELINE_UUID)  # count 1 — at the cap
+    assert first.record_and_check(TIMELINE_UUID).tripped  # count 2 — over → trip
+
+    second = WakeBreaker(tmp_path, max_wakes=1, window=60.0, now=clock)
+    assert second.tripped(TIMELINE_UUID)
+    assert second.record_and_check(TIMELINE_UUID).short_circuit
+
+
+def test_wake_breaker_from_env_reads_tunables(tmp_path, monkeypatch):
+    """The three env knobs configure the breaker; cooldown defaults to the window when unset."""
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_MAX", "5")
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_WINDOW", "30")
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_COOLDOWN", "45")
+    breaker = WakeBreaker.from_env(tmp_path)
+    assert (breaker.max_wakes, breaker.window, breaker.cooldown) == (5, 30.0, 45.0)
+
+    monkeypatch.delenv("HARNESS_WAKE_BREAKER_COOLDOWN")
+    assert WakeBreaker.from_env(tmp_path).cooldown == 30.0  # defaults to the window
+
+    for var in ("HARNESS_WAKE_BREAKER_MAX", "HARNESS_WAKE_BREAKER_WINDOW"):
+        monkeypatch.delenv(var)
+    default = WakeBreaker.from_env(tmp_path)
+    assert (default.max_wakes, default.window) == (10, 60.0)  # generous safe defaults
+
+
+def _wake_with_breaker(tmp_path, provider, clock, *, max_wakes, window=60.0):
+    """A fresh wake (a stand-in router process) sharing the on-disk breaker state + clock."""
+    breaker = WakeBreaker(tmp_path, max_wakes=max_wakes, window=window, now=clock)
+    agent, _ = build_wake(tmp_path, provider, breaker=breaker)
+    return agent
+
+
+def test_a_wake_burst_trips_self_declines_and_alerts_exactly_once(platform, tmp_path):
+    """End to end: a runaway burst trips the breaker; the tripping (and every later) wake makes
+    NO provider call, the loud alert posts exactly once, and the unseen message is left
+    recoverable (its mark never advanced)."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+
+    def wake_with(*page_messages):
+        serve_messages(platform, page(*page_messages))
+        return _wake_with_breaker(tmp_path, provider, clock, max_wakes=2).wake()
+
+    # Two healthy wakes, each answering a new message → two provider calls.
+    assert len(wake_with(message(uuid=M1, body="one"), message(uuid=M0, body="old"))) == 1
+    assert len(wake_with(message(uuid=M2, body="two"), message(uuid=M1, body="one"))) == 1
+    assert provider.prompts == ["john: one", "john: two"]
+
+    # The third wake would answer M3 — but it is over the cap in the window: TRIP, self-decline.
+    assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
+    assert provider.prompts == ["john: one", "john: two"]  # the model was NOT called
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2  # M3 unseen → recoverable next healthy wake
+
+    # A fourth, still-tripped wake also makes no provider call — and posts no second alert.
+    assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
+    assert provider.prompts == ["john: one", "john: two"]
+
+    # Exactly one loud trip alert across the whole burst (the trip transition only).
+    assert _alert_bodies(platform).count(_BREAKER_TRIP_ALERT) == 1
+
+
+def test_the_breaker_auto_resets_and_resumes_after_the_burst_clears(platform, tmp_path):
+    """Once the burst clears past the cooldown, the next wake auto-resets: it posts the recovery
+    alert and resumes normal operation (answers the message it had been declining)."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+
+    def wake_with(*page_messages):
+        serve_messages(platform, page(*page_messages))
+        return _wake_with_breaker(tmp_path, provider, clock, max_wakes=2).wake()
+
+    # Drive a trip (two healthy, then the third trips).
+    wake_with(message(uuid=M1, body="one"), message(uuid=M0, body="old"))
+    wake_with(message(uuid=M2, body="two"), message(uuid=M1, body="one"))
+    assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
+    assert provider.prompts == ["john: one", "john: two"]
+
+    # The burst stops; time passes past the window + cooldown. The next wake auto-resets and
+    # answers M3, the message it had been declining.
+    clock.advance(200)
+    posted = wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two"))
+    assert len(posted) == 1
+    assert provider.prompts == ["john: one", "john: two", "john: three"]  # resumed
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M3
+    assert _alert_bodies(platform).count(_BREAKER_RESET_ALERT) == 1  # recovery alert posted once
+
+
+def test_a_tripped_wake_alert_degrades_on_a_locked_timeline(platform, tmp_path):
+    """The breaker's own alert post is best-effort: a locked timeline refusing it is swallowed,
+    the wake still self-declines cleanly (no crash, no provider call)."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    # Pre-fill the window so the very next wake trips (cap 1; two recorded wakes already in window).
+    pre = WakeBreaker(tmp_path, max_wakes=1, window=60.0, now=clock)
+    pre.record_and_check(TIMELINE_UUID)
+    pre.record_and_check(TIMELINE_UUID)  # now tripped on disk
+    # The timeline refuses every post (locked).
+    platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
+        return_value=httpx.Response(403, json=_locked_problem())
+    )
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+
+    posted = _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()  # must not raise
+
+    assert posted == []
+    assert provider.prompts == []  # tripped → no provider call
+
+
+def test_a_directly_constructed_wake_gets_a_default_breaker(platform, tmp_path):
+    """A `WakeAgent` built without an explicit breaker still has one (the generous default),
+    so the backstop is on by construction, not only via `from_env`."""
+    agent, _ = build_wake(tmp_path)
+    assert isinstance(agent.breaker, WakeBreaker)
+    assert agent.breaker.max_wakes == 10 and agent.breaker.window == 60.0
