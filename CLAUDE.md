@@ -300,9 +300,9 @@ capital's exhaustive @jt test, each a default plugin under `_defaults/tools/` wi
   (`create`, `read`, `list`, `add_participant`, `remove_participant`) — no irreversible
   action.
 
-**Boundary:** MCP loading from `mcp/`, the `MemoryProvider`, and the circuit-breaker are
-later groups (4–6). The **knowledge fixes** (B6/C1/B7), the generated tool manifest, and the
-persistent Turn 0 land in Group 3, below.
+**Boundary:** MCP loading from `mcp/` and the circuit-breaker are later groups (5–6); the
+`MemoryProvider` lands in Group 4 (below). The **knowledge fixes** (B6/C1/B7), the generated
+tool manifest, and the persistent Turn 0 land in Group 3, below.
 
 ### Persistent Turn 0: the operating brief (Phase 2 · Group 3)
 
@@ -339,6 +339,47 @@ generated manifest (behavior-preserving, and it gains the persistent brief).
 **Boundary:** the **poll-loop `TimelineAgent`** keeps its Group-1 startup onboarding — a
 single long-lived process has no per-wake re-assertion to make; the persistent brief is a
 wake-mode property.
+
+### Pluggable Memory (Phase 2 · Group 4)
+
+The leading memory systems (Mem0/Zep/MemPalace/Letta) are **middleware**, not a key-value
+box: they *observe* the conversation to auto-capture facts and *inject* prompt-ready context
+before the model runs — not just `write(key, value)`. The shipped default (a `MemoryTool`
+fused to SQLite) had no seam for that. This group builds the seam and ships a real MemPalace
+reference adapter to prove it end-to-end, **without changing the default's behavior**.
+
+- **The `MemoryProvider` interface** (`_memory_provider.py`) — four *optional* surfaces:
+  **tools** (model-facing ops, default the `MemoryTool`), **store** (the durable engine),
+  **`observe(exchange)`** (a wake-loop hook fired after each exchange, for auto-capture), and
+  **`context(scope)`** (a Turn-0 hook returning prompt-ready memory to inject into the
+  persistent brief). `observe`/`context` **default to no-ops**. **Scope is the agent
+  identity** (timeline as metadata): memory is the agent's *one private mind spanning all its
+  timelines* — the basis for cross-timeline recall.
+- **The default, split (`_memory.py`).** The fused `MemoryTool` is split into
+  `SqliteMemoryStore` (the five-op engine) + `MemoryTool` (a thin surface dispatching onto a
+  store). The default `SqliteMemoryProvider` wires the tool over a private host-local store
+  with **no-op hooks** — explicit, write-it-yourself memory exactly as before (**@jt
+  unchanged**). `MemoryTool(path=…)` still works standalone; `MemoryTool(store=…)` shares a
+  provider's store.
+- **The wake hooks.** A `WakeAgent` fires `observe` after each real exchange (never on a
+  probe ack or a self-skip) and injects `context` into Turn 0 — relevant to the turn, since
+  the incoming text is the retrieval query. **A hook failure degrades gracefully and never
+  breaks the wake** (the dashboard-fetch invariant). Hooks are a wake-mode property: the
+  poll-loop `TimelineAgent` keeps the memory tool but does not fire them.
+- **Provider selection.** `HARNESS_MEMORY_PROVIDER` — `sqlite` (default), `mempalace`, or a
+  dotted `module:Class` path to any custom `MemoryProvider`. One provider per agent. Memory
+  graduated from a tool plugin (`_defaults/tools/memory.py` removed) to its own subsystem;
+  its tools fold into the resolved set (deduped by name), so the brief manifest is unchanged.
+- **The MemPalace reference adapter** (`_mempalace.py`) — an **optional extra**
+  (`pip install basecradle-harness[mempalace]`). A real `MemoryProvider` over MemPalace's
+  local **library** API (not its MCP tools — that path is Group 5): `observe` mines each
+  exchange (`convo_miner.mine_convos`), `context` retrieves top-K relevant chunks across all
+  timelines (`searcher.search_memories`). Supplies **no model-facing tool** (memory is
+  automatic), so a MemPalace agent runs with BaseCradle-only tools.
+
+**Boundary:** MemPalace's *MCP-tools* path is Group 5; the circuit-breaker is Group 6. The
+"Memory Prince" agent provisioning + the cross-timeline proof are the **capital's** job,
+post-ship.
 
 ## Development Commands
 

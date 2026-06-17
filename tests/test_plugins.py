@@ -151,8 +151,9 @@ def test_exactly_one_of_two_same_named_variants_activates_per_config():
 # --- behavior-preserving: the packaged defaults under each provider ----------
 
 # The full default function-tool set every existing deployment has, independent of provider.
+# Memory is no longer a tool plugin — it graduated to the `MemoryProvider` subsystem (Group 4),
+# so it is wired from the provider, not loaded here. See test_memory_provider.py.
 _DEFAULT_TOOLS = {
-    "memory",
     "web_fetch",
     "assets",
     "listen",
@@ -216,22 +217,22 @@ def test_overlay_add_override_and_disable(tmp_path):
     # OVERRIDE — a later-sorted file reusing a default's name wins.
     (tools_dir / "zz_override.py").write_text(
         "from basecradle_harness import Tool, ToolPlugin\n"
-        "class Mem(Tool):\n"
-        "    name = 'memory'\n"
+        "class FetchOverride(Tool):\n"
+        "    name = 'web_fetch'\n"
         "    description = 'override'\n"
         "    def run(self, **kw):\n"
         "        return 'overridden'\n"
-        "PLUGIN = ToolPlugin(impl=Mem)\n"
+        "PLUGIN = ToolPlugin(impl=FetchOverride)\n"
     )
     # DISABLE — deleting a default's file removes the tool.
-    (tools_dir / "web_fetch.py").unlink()
+    (tools_dir / "assets.py").unlink()
 
     resolved = resolve_plugins(load_plugins(home), _ctx(AI_PROVIDER_API_KEY="sk"))
     names = {t.name for t in resolved.tools}
     assert "greet" in names  # added
-    assert "web_fetch" not in names  # disabled
-    memory = next(t for t in resolved.tools if t.name == "memory")
-    assert memory.run() == "overridden"  # overridden impl won
+    assert "assets" not in names  # disabled
+    fetch = next(t for t in resolved.tools if t.name == "web_fetch")
+    assert fetch.run() == "overridden"  # overridden impl won
 
 
 def test_a_broken_overlay_file_is_skipped_not_fatal(tmp_path):
@@ -241,7 +242,7 @@ def test_a_broken_overlay_file_is_skipped_not_fatal(tmp_path):
 
     # The broken file is skipped; the shipped defaults still load.
     plugins = load_plugins(home)
-    assert any(p.resolved_name == "memory" for p in plugins)
+    assert any(p.resolved_name == "web_fetch" for p in plugins)
 
 
 def test_deleting_every_default_yields_no_tools_once_installed(tmp_path):

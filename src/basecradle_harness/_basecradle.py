@@ -51,6 +51,7 @@ from basecradle import BaseCradle
 
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env
+from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
@@ -165,8 +166,15 @@ class TimelineAgent:
 
     @classmethod
     def from_env(cls) -> TimelineAgent:
-        """Build a fully wired agent (provider + tool plugins + timeline) from env vars."""
-        provider, resolved = _resolve_tools_and_provider()
+        """Build a fully wired agent (provider + tool plugins + timeline) from env vars.
+
+        The memory provider's tools are already folded into ``resolved.tools``
+        (`_resolve_tools_and_provider`), so the poll loop keeps the memory tool it always
+        had. Its `observe`/`context` middleware hooks are a wake-mode property (the boundary
+        of this group), so the poll loop does not fire them — the provider object is built
+        but not held here.
+        """
+        provider, resolved, _memory = _resolve_tools_and_provider()
         harness = Harness(
             provider,
             system_prompt=charter_from_env(),
@@ -417,25 +425,54 @@ def _provider_from_env(builtins: Sequence[str] = (), api: str | None = None) -> 
     return OpenAICompatibleProvider(**kwargs)
 
 
-def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools]:
-    """Resolve the active tool set and a matching provider from the config home + env.
+def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvider]:
+    """Resolve the active tools, the model provider, and the memory provider from config + env.
 
     The single seam both `TimelineAgent.from_env` and `WakeAgent.from_env` use to wire their
     tools, replacing the old hardcoded list. It: reads the active provider API; loads the
     tool plugins (the ``tools/`` overlay, else packaged defaults — see `load_plugins`);
     resolves them against the active config (`resolve_plugins`), so an OpenAI-coupled tool or
-    a Responses-only built-in self-excludes when its requirement isn't met; then builds the
-    provider with the resolved built-ins.
+    a Responses-only built-in self-excludes when its requirement isn't met; builds the
+    **memory provider** (`memory_provider_from_env`) and folds *its* model-facing tools into
+    the resolved set (`_merge_memory_tools`); then builds the model provider with the
+    resolved built-ins.
 
-    Returns the provider and the whole `ResolvedTools` — the caller hands ``.tools`` to
-    `Harness` (where the policy gate still applies on top) and, for the wake, threads
-    ``.manifest`` into the persistent Turn-0 brief so it names exactly the active tools.
+    Memory is a provider now, not a hardcoded plugin — so the memory tool comes from
+    ``memory.tools()`` (the default SQLite provider supplies the `MemoryTool`; an
+    automatic-only provider like MemPalace supplies none). Returns the model provider, the
+    merged `ResolvedTools` (``.tools`` → `Harness`, where the policy gate still applies;
+    ``.manifest`` → the persistent Turn-0 brief), and the memory provider itself, which the
+    wake holds to fire its `observe`/`context` hooks.
     """
     api = _provider_api_from_env()
     ctx = ActivationContext(provider_api=api, env=os.environ)
     resolved = resolve_plugins(load_plugins(), ctx)
+    memory = memory_provider_from_env()
+    resolved = _merge_memory_tools(resolved, memory)
     provider = _provider_from_env(builtins=resolved.builtins, api=api)
-    return provider, resolved
+    return provider, resolved, memory
+
+
+def _merge_memory_tools(resolved: ResolvedTools, memory: MemoryProvider) -> ResolvedTools:
+    """Fold the memory provider's tools into the resolved set, deduped by name.
+
+    Memory graduated from a tool plugin to its own provider subsystem, so its tool is
+    appended here rather than loaded from ``_defaults/tools/``. Dedup by name is a safety
+    net for a config home that *predates* this change and still carries an orphaned
+    ``tools/memory.py``: the plugin-loaded tool wins and the provider's duplicate is dropped,
+    so the registry never sees two ``memory`` tools. The manifest is extended in lockstep so
+    the persistent brief lists the memory tool exactly once.
+    """
+    existing = {tool.name for tool in resolved.tools}
+    added = [tool for tool in memory.tools() if tool.name not in existing]
+    if not added:
+        return resolved
+    return ResolvedTools(
+        tools=resolved.tools + added,
+        builtins=resolved.builtins,
+        skipped=resolved.skipped,
+        manifest=resolved.manifest + [(tool.name, None) for tool in added],
+    )
 
 
 def _onboard_from_env() -> bool:

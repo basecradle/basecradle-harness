@@ -22,6 +22,12 @@ classifiers = [
 ]
 dependencies = ["basecradle>=0.3"]
 
+[project.optional-dependencies]
+# The MemPalace memory provider (a reference `MemoryProvider`): a local-first OSS memory
+# system (ChromaDB + SQLite). Kept out of the base install so the core stays light — the
+# adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace.
+mempalace = ["mempalace>=3.4"]
+
 [project.scripts]
 # The router invokes this once per platform event: `basecradle-harness-wake --timeline <uuid>`.
 basecradle-harness-wake = "basecradle_harness._wake:main"

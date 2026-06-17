@@ -68,7 +68,7 @@ def test_install_copies_the_shipped_tool_plugin_defaults_into_tools(tmp_path):
     install(home)
 
     tools = home / "tools"
-    for name in ("memory.py", "generate_image.py", "web_search.py"):
+    for name in ("web_fetch.py", "generate_image.py", "web_search.py"):
         assert (tools / name).exists()
     # The tool defaults are manifest-tracked, which is also the "tools are installed" signal
     # `load_plugins` keys on to treat the overlay as authoritative.
