@@ -34,7 +34,14 @@ from basecradle_harness._install import (
     system_prompt_text,
 )
 from basecradle_harness._lock import LockTool
-from basecradle_harness._memory import MemoryTool
+from basecradle_harness._memory import MemoryTool, SqliteMemoryStore
+from basecradle_harness._memory_provider import (
+    MemoryExchange,
+    MemoryProvider,
+    MemoryScope,
+    SqliteMemoryProvider,
+    memory_provider_from_env,
+)
 from basecradle_harness._messages import (
     ImageContent,
     Message,
@@ -104,6 +111,13 @@ __all__ = [
     "MemoryTool",
     "WebFetchTool",
     "Policy",
+    # Pluggable memory: the provider seam (tools + store + observe/context hooks)
+    "MemoryProvider",
+    "SqliteMemoryProvider",
+    "SqliteMemoryStore",
+    "MemoryScope",
+    "MemoryExchange",
+    "memory_provider_from_env",
     "SHELL",
     "BASECRADLE",
     # Tool plugin framework: (name + requires + impl), provider-aware activation

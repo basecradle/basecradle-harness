@@ -7,6 +7,55 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-06-16
+
+Phase 2 · **Group 4** — **pluggable memory.** The leading memory systems
+(Mem0/Zep/MemPalace/Letta) are *middleware*: they observe the conversation to
+auto-capture facts and inject prompt-ready context before the model runs — not just
+`write(key, value)`. The shipped default (a `MemoryTool` fused to SQLite) had no seam for
+that. This group builds the seam and ships a real MemPalace reference adapter to prove it
+end-to-end, while leaving the default's behavior exactly as it was.
+
+### Added
+
+- **The `MemoryProvider` interface** — four *optional* surfaces: **tools** (model-facing
+  ops), **store** (the durable engine), **`observe(exchange)`** (a wake-loop hook fired
+  after each exchange, for auto-capture), and **`context(scope)`** (a Turn-0 hook returning
+  prompt-ready memory to inject). `observe`/`context` default to no-ops. Scope is the
+  **agent identity** (timeline as metadata), so memory is the agent's one private mind
+  spanning all its timelines — the basis for cross-timeline recall.
+- **`SqliteMemoryStore`** — the five durable ops (write/read/list/delete/search) split out
+  of `MemoryTool` as a standalone engine a provider's hooks can read and write.
+- **`SqliteMemoryProvider`** — the default: `MemoryTool` over a private host-local
+  `SqliteMemoryStore`, with `observe`/`context` as no-ops. Behavior-preserving — an agent
+  on it has exactly the explicit, write-it-yourself memory it had before the seam (@jt
+  unchanged).
+- **The observe/context wake hooks.** A `WakeAgent` fires `observe` after each real
+  exchange and injects `context` into the persistent Turn-0 brief (relevant to the turn —
+  the incoming text is the retrieval query). Both degrade gracefully: a raising hook is
+  swallowed and **never breaks the wake**.
+- **Provider selection** via `HARNESS_MEMORY_PROVIDER` — `sqlite` (default), `mempalace`,
+  or a dotted `module:Class` path to any custom `MemoryProvider`. One provider per agent.
+- **The MemPalace reference adapter** (`basecradle-harness[mempalace]`, an optional extra)
+  — a real `MemoryProvider` over MemPalace's local library API: `observe` mines each
+  exchange (`convo_miner.mine_convos`), `context` retrieves top-K relevant chunks
+  (`searcher.search_memories`) across all timelines. Supplies no model-facing tool (memory
+  is automatic). Uses the library API, **not** MemPalace's MCP tools (that path is Group 5).
+- **`memory` block in `compose_brief`** — the recalled context is injected just before the
+  charter, the way middleware memory systems inject retrieved context before the system
+  prompt. Defaults to absent, so the four-part brief is unchanged when there is no memory.
+
+### Changed
+
+- **`MemoryTool` is now a thin surface over a store.** `MemoryTool(path=…)` works exactly
+  as before; `MemoryTool(store=…)` shares a provider's store. The model-facing behavior and
+  every response string are unchanged.
+- **Memory graduated from a tool plugin to its own provider subsystem.** The
+  `_defaults/tools/memory.py` plugin is removed; the memory tool now comes from
+  `memory_provider.tools()` and is folded into the resolved set (deduped by name, so a
+  config home that predates this still works). The manifest still lists `memory`, so the
+  persistent brief is unchanged.
+
 ## [0.25.0] - 2026-06-16
 
 Phase 2 · **Group 3** — `initialize.md`: the **persistent operating brief**. Turn 0 stops

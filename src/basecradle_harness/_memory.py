@@ -1,10 +1,27 @@
-"""The one tool Harness ships: the agent's private, persistent memory.
+"""The default memory: a private, persistent SQLite store and its tool surface.
 
 This is the template that gets mass-copied to spawn production peers, so it is a
 real memory system rather than a toy: a single SQLite file, full CRUD
 (`write`/`read`/`list`/`delete`), keyword recall over key *and* value via FTS5
 (`search` — so an agent need not remember its own exact keys), and a forward-only
 schema migration runner so an uneven rollout across a fleet of servers is safe.
+
+**Surface vs. engine (the Group 4 split).** Memory is now a *pluggable provider*
+(`basecradle_harness._memory_provider`), so the one class this module used to fuse
+is split along the seam the provider draws:
+
+- `SqliteMemoryStore` — the **engine**: the five durable ops (write/read/list/
+  delete/search) over the SQLite file, returning model-readable strings. It knows
+  nothing about being a tool; a provider's `observe`/`context` hooks could read and
+  write it directly.
+- `MemoryTool` — the **model-facing surface**: a `Tool` that dispatches the five
+  actions onto a store. It owns its store by default (so the simple
+  ``MemoryTool(path=…)`` still works unchanged), or shares one a provider hands it.
+
+The default `SqliteMemoryProvider` wires `MemoryTool` over a `SqliteMemoryStore`;
+its `observe`/`context` hooks are deliberate no-ops, so explicit-memory behavior is
+exactly what it was before the split. A richer provider (e.g. the MemPalace adapter)
+swaps the engine and lights the hooks up without touching this surface.
 
 **Private mind, shared world.** Memory is each agent's own store under its home
 (`$HARNESS_HOME/memory.db`), isolated per OS user. It never goes on the platform —
@@ -13,8 +30,8 @@ peers do not see each other's memories; they share only by talking on timelines.
 Storage is one SQLite file, the boring self-contained answer: no external service,
 no vector DB, nothing leaves the host. `sqlite3` is in the standard library, so
 this adds no dependency. Semantic/embedding recall (the Letta/MemGPT line) is
-deliberately out of scope; the `action` enum is the extension point where a future
-`semantic_search` slots in without breaking this tool's contract.
+deliberately out of scope for the default; it arrives as a *different provider*
+(the pluggable seam), not as a new action bolted onto this store.
 
 The schema is versioned with ``PRAGMA user_version`` and migrated **forward-only
 and additively** on open (see `_migrate`): never drop or rename, only add. That is
@@ -68,93 +85,36 @@ _MIGRATIONS: dict[int, str] = {
 SEARCH_LIMIT = 20
 
 
-class MemoryTool(Tool):
-    """Store, recall, list, delete, and search facts, persisted in a SQLite file.
+class SqliteMemoryStore:
+    """The five durable memory ops over one SQLite file — the engine behind the tool.
 
-    The agent's long-term memory: each fact is a ``value`` under a unique ``key``,
-    with ``created_at``/``updated_at`` timestamps. ``search`` does keyword recall
-    over both key and value (SQLite FTS5), so the agent can find a fact without
-    remembering the exact key it used.
+    Store, recall, list, delete, and search facts persisted in a single SQLite file.
+    Each fact is a ``value`` under a unique ``key``, with ``created_at``/``updated_at``
+    timestamps; ``search`` does keyword recall over both key and value (SQLite FTS5),
+    so the agent can find a fact without remembering the exact key it used. Every method
+    returns a string written for the model to read — the engine is the source of those
+    messages, and `MemoryTool` is a thin dispatcher over it.
+
+    This is the default `MemoryProvider`'s store surface
+    (`basecradle_harness._memory_provider.SqliteMemoryProvider`): a provider's
+    `observe`/`context` hooks may read and write the same instance the tool uses.
 
     Args:
         path: Where the SQLite store lives. Defaults to ``$HARNESS_HOME/memory.db``
             when ``HARNESS_HOME`` is set, else ``~/.basecradle_harness/memory.db``;
             pass a path (e.g. a temp file in tests) to point it elsewhere. The
             parent directory is created on first use. The connection is opened
-            lazily on the first call and reused for the process's life.
+            lazily on the first call and reused for the store's life.
     """
-
-    name = "memory"
-    description = (
-        "Your long-term memory. Use it to remember facts across the conversation and "
-        "across restarts. action='write' stores value under key (overwrites if the key "
-        "exists); action='read' returns the value for key; action='list' returns every "
-        "key you have stored; action='delete' forgets a key; action='search' finds "
-        "memories by keyword across both keys and values — use it when you remember "
-        "roughly what a fact was about but not the exact key you filed it under."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["write", "read", "list", "delete", "search"],
-                "description": "What to do.",
-            },
-            "key": {
-                "type": "string",
-                "description": "The label to store or recall under (write, read, delete).",
-            },
-            "value": {
-                "type": "string",
-                "description": "The fact to store (write only).",
-            },
-            "query": {
-                "type": "string",
-                "description": "Keywords to recall by, matched over keys and values (search only).",
-            },
-        },
-        "required": ["action"],
-    }
 
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else _default_path()
         self._conn: sqlite3.Connection | None = None
         self._fts = False  # set when the connection opens, once FTS5 support is known
 
-    def run(
-        self,
-        action: str,
-        key: str | None = None,
-        value: str | None = None,
-        query: str | None = None,
-    ) -> str:
-        """Dispatch on `action`. Returns a message written for the model to read."""
-        if action == "write":
-            if not key or value is None:
-                return "Error: 'write' needs both a key and a value."
-            return self._write(key, value)
-        if action == "read":
-            if not key:
-                return "Error: 'read' needs a key."
-            return self._read(key)
-        if action == "list":
-            return self._list()
-        if action == "delete":
-            if not key:
-                return "Error: 'delete' needs a key."
-            return self._delete(key)
-        if action == "search":
-            if not query or not query.strip():
-                return "Error: 'search' needs a query."
-            return self._search(query)
-        return (
-            f"Error: unknown action {action!r}. Use 'write', 'read', 'list', 'delete', or 'search'."
-        )
+    # --- the five ops --------------------------------------------------------
 
-    # --- actions -------------------------------------------------------------
-
-    def _write(self, key: str, value: str) -> str:
+    def write(self, key: str, value: str) -> str:
         now = _now()
         conn = self._connect()
         # Upsert: a new key is inserted with both timestamps; an existing key keeps
@@ -171,7 +131,7 @@ class MemoryTool(Tool):
         conn.commit()
         return f"Remembered {key!r}."
 
-    def _read(self, key: str) -> str:
+    def read(self, key: str) -> str:
         conn = self._connect()
         row = conn.execute("SELECT value FROM memories WHERE key = ?", (key,)).fetchone()
         if row is not None:
@@ -183,13 +143,13 @@ class MemoryTool(Tool):
             return f"No memory stored under {key!r}. Stored keys: {', '.join(keys)}."
         return f"No memory stored under {key!r}. You have no memories yet."
 
-    def _list(self) -> str:
+    def list(self) -> str:
         keys = self._keys()
         if not keys:
             return "No memories stored yet."
         return ", ".join(keys)
 
-    def _delete(self, key: str) -> str:
+    def delete(self, key: str) -> str:
         conn = self._connect()
         cursor = conn.execute("DELETE FROM memories WHERE key = ?", (key,))
         conn.commit()
@@ -197,7 +157,7 @@ class MemoryTool(Tool):
             return f"No memory stored under {key!r}; nothing to delete."
         return f"Forgot {key!r}."
 
-    def _search(self, query: str) -> str:
+    def search(self, query: str) -> str:
         conn = self._connect()
         if self._fts:
             rows = conn.execute(
@@ -246,9 +206,9 @@ class MemoryTool(Tool):
     def _connect(self) -> sqlite3.Connection:
         """Open (once) the SQLite connection, migrating the schema and wiring FTS.
 
-        Lazy so constructing the tool touches no disk; cached so a process opens the
+        Lazy so constructing the store touches no disk; cached so a process opens the
         DB once. The connection lives for the process's life — each wake is a fresh
-        process with a fresh tool, so there is no cross-process connection to manage.
+        process with a fresh store, so there is no cross-process connection to manage.
         """
         if self._conn is None:
             self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +223,107 @@ class MemoryTool(Tool):
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+
+class MemoryTool(Tool):
+    """The model-facing memory tool: write/read/list/delete/search over a store.
+
+    A thin dispatcher that turns the model's ``action`` into a call on a
+    `SqliteMemoryStore`. It owns its store by default — so the simple
+    ``MemoryTool(path=…)`` keeps working exactly as before the Group 4 split — or
+    shares one a `MemoryProvider` hands it, so the provider's `observe`/`context`
+    hooks and the model's explicit ops all see the same facts.
+
+    Args:
+        path: Where the SQLite store lives when this tool constructs its own. Ignored
+            when ``store`` is given. Defaults to ``$HARNESS_HOME/memory.db`` (else a
+            dotdir under ``$HOME``); see `SqliteMemoryStore`.
+        store: An existing store to dispatch onto, shared with a provider. When set,
+            ``path`` is not consulted and `close` leaves the store alone — the
+            provider that owns it is responsible for closing it.
+    """
+
+    name = "memory"
+    description = (
+        "Your long-term memory. Use it to remember facts across the conversation and "
+        "across restarts. action='write' stores value under key (overwrites if the key "
+        "exists); action='read' returns the value for key; action='list' returns every "
+        "key you have stored; action='delete' forgets a key; action='search' finds "
+        "memories by keyword across both keys and values — use it when you remember "
+        "roughly what a fact was about but not the exact key you filed it under."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["write", "read", "list", "delete", "search"],
+                "description": "What to do.",
+            },
+            "key": {
+                "type": "string",
+                "description": "The label to store or recall under (write, read, delete).",
+            },
+            "value": {
+                "type": "string",
+                "description": "The fact to store (write only).",
+            },
+            "query": {
+                "type": "string",
+                "description": "Keywords to recall by, matched over keys and values (search only).",
+            },
+        },
+        "required": ["action"],
+    }
+
+    def __init__(
+        self, path: str | Path | None = None, *, store: SqliteMemoryStore | None = None
+    ) -> None:
+        # Own a store (the standalone default) or share one a provider passes in. `_owns`
+        # gates `close`: a tool that built its store closes it; one given a shared store
+        # leaves closing to the provider that owns it.
+        self.store = store if store is not None else SqliteMemoryStore(path)
+        self._owns = store is None
+
+    @property
+    def path(self) -> Path:
+        """The store's file path — kept for callers/tests that read it off the tool."""
+        return self.store.path
+
+    def run(
+        self,
+        action: str,
+        key: str | None = None,
+        value: str | None = None,
+        query: str | None = None,
+    ) -> str:
+        """Dispatch on `action`. Returns a message written for the model to read."""
+        if action == "write":
+            if not key or value is None:
+                return "Error: 'write' needs both a key and a value."
+            return self.store.write(key, value)
+        if action == "read":
+            if not key:
+                return "Error: 'read' needs a key."
+            return self.store.read(key)
+        if action == "list":
+            return self.store.list()
+        if action == "delete":
+            if not key:
+                return "Error: 'delete' needs a key."
+            return self.store.delete(key)
+        if action == "search":
+            if not query or not query.strip():
+                return "Error: 'search' needs a query."
+            return self.store.search(query)
+        return (
+            f"Error: unknown action {action!r}. Use 'write', 'read', 'list', 'delete', or 'search'."
+        )
+
+    def close(self) -> None:
+        """Close the store if this tool owns it; a shared store is the provider's to close."""
+        if self._owns:
+            self.store.close()
 
 
 # --- module helpers ----------------------------------------------------------

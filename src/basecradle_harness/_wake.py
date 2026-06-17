@@ -85,6 +85,7 @@ from basecradle_harness._brief import compose_brief, fetch_dashboard_md, render_
 from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
+from basecradle_harness._memory_provider import MemoryExchange, MemoryProvider, MemoryScope
 from basecradle_harness._messages import ImageContent
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
@@ -252,6 +253,13 @@ class WakeAgent:
             harness's registered function tools (no notes) when not supplied;
             `from_env` threads the precise `ResolvedTools.manifest` (built-ins and
             notes included).
+        memory_provider: The agent's pluggable memory backend (see
+            `basecradle_harness._memory_provider`). Its `observe` hook fires after every
+            exchange and its `context` hook injects recalled memory into the persistent
+            brief. ``None`` (the default for a directly-constructed wake) disables both
+            hooks — the memory tool, if any, still comes from the harness's registry.
+            `from_env` passes the env-selected provider (default SQLite, whose hooks are
+            no-ops, so behavior is unchanged).
     """
 
     def __init__(
@@ -265,6 +273,7 @@ class WakeAgent:
         onboard: bool = True,
         probe_secret: str | None = None,
         tool_manifest: list[tuple[str, str | None]] | None = None,
+        memory_provider: MemoryProvider | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -280,6 +289,7 @@ class WakeAgent:
         self.context_messages = context_messages
         self.onboard = onboard
         self.tool_manifest = tool_manifest
+        self.memory_provider = memory_provider
         # The persistent brief is composed and injected at most once per `wake()` — lazily,
         # right before the first time the model is actually engaged — so an idle or probe-only
         # wake neither fetches the live dashboard nor bloats the transcript. Reset each wake.
@@ -347,7 +357,7 @@ class WakeAgent:
                 "Wake mode requires HARNESS_HOME — the directory where the agent's "
                 "transcript and high-water mark persist across wakes."
             )
-        provider, resolved = _resolve_tools_and_provider()
+        provider, resolved, memory = _resolve_tools_and_provider()
         harness = Harness(
             provider,
             system_prompt=charter_from_env(),
@@ -366,6 +376,9 @@ class WakeAgent:
             # The active tool manifest (built-ins + notes) for the persistent brief, so it
             # names exactly the tools this config resolved — never a present-but-broken one.
             tool_manifest=resolved.manifest,
+            # The env-selected memory provider, whose observe/context hooks fire in the wake
+            # loop. Default SQLite → no-op hooks → behavior unchanged for @jt.
+            memory_provider=memory,
         )
 
     def wake(
@@ -773,6 +786,9 @@ class WakeAgent:
                 sent = self._post(session, reply)
                 if sent is not None:
                     posted.append(sent)
+                # The exchange happened — hand it to the memory provider to capture, whether
+                # or not the post landed (a locked timeline still produced a real exchange).
+                self._observe(text, reply)
         return posted
 
     def _engage(self, session: Session, text: str, images: list[ImageContent]) -> str:
@@ -787,15 +803,16 @@ class WakeAgent:
         The persistent brief is re-asserted here, just before the user turn — so it is
         present and recent for *this* model call. It fires at most once per wake (lazily, so
         a probe-only or self-skip-only wake never pays the live dashboard fetch) and lands
-        ahead of the item it should govern.
+        ahead of the item it should govern. The item's text is the retrieval query the memory
+        provider's `context` hook ranks against, so recalled memory is relevant to this turn.
         """
-        self._reassert_brief(session)
+        self._reassert_brief(session, query=text)
         try:
             return session.send(text, images=images)
         except EngineError:
             return "I got stuck working through that and stopped before reaching an answer."
 
-    def _reassert_brief(self, session: Session) -> None:
+    def _reassert_brief(self, session: Session, *, query: str | None = None) -> None:
         """Inject the persistent operating brief as a system turn — once per wake, when onboarding.
 
         This is what makes Turn 0 *persistent*: rather than a one-time onboarding seed that
@@ -807,7 +824,7 @@ class WakeAgent:
         if not self.onboard or self._brief_asserted:
             return
         self._brief_asserted = True  # set first: a failed compose/note still won't retry-loop
-        brief = self._compose_brief()
+        brief = self._compose_brief(query)
         if brief:
             session.note(brief)
         else:
@@ -816,25 +833,29 @@ class WakeAgent:
             # waking with no standing context is worth a breadcrumb, not a silent gap.
             _log.info("Persistent brief composed empty this wake; proceeding without it.")
 
-    def _compose_brief(self) -> str | None:
-        """Compose the persistent brief for this wake: initialize + manifest + dashboard + charter.
+    def _compose_brief(self, query: str | None = None) -> str | None:
+        """Compose the persistent brief for this wake: initialize + manifest + dashboard + memory + charter.
 
-        The four parts, in order (see `basecradle_harness._brief`): the provider-independent
+        The parts, in order (see `basecradle_harness._brief`): the provider-independent
         `initialize.md` operating guidance, the generated manifest of the agent's *active*
         tools, the live `dashboard.md` primer (fetched fresh each wake; a fetch failure
-        degrades to omitting it, never breaking the wake), and the operator's `system-prompt.md`
-        personality charter. Any part may be absent and the brief is composed from the rest.
+        degrades to omitting it, never breaking the wake), the memory provider's recalled
+        **context** for this turn (its `context` hook — omitted when there is none or the
+        provider's hook is a no-op), and the operator's `system-prompt.md` personality
+        charter. Any part may be absent and the brief is composed from the rest.
 
-        **Never break the wake.** `fetch_dashboard_md` already swallows its (network) failures,
-        but the prompt-file reads can also raise (a permission/IO error on `prompts/*.md`
-        mid-wake) — so the whole composition is guarded too: any failure degrades to *no brief*
-        and the wake carries on, the same invariant the dashboard fetch is held to.
+        **Never break the wake.** `fetch_dashboard_md` already swallows its (network) failures
+        and `_memory_context` swallows the provider's, but the prompt-file reads can also raise
+        (a permission/IO error on `prompts/*.md` mid-wake) — so the whole composition is
+        guarded too: any failure degrades to *no brief* and the wake carries on, the same
+        invariant the dashboard fetch is held to.
         """
         try:
             return compose_brief(
                 initialize=prompt_text("initialize.md"),
                 manifest=render_manifest(self._manifest_entries()),
                 dashboard=fetch_dashboard_md(self.client),
+                memory=self._memory_context(query),
                 system_prompt=system_prompt_text(),
             )
         except Exception:  # noqa: BLE001 - the brief must never break the wake; degrade to none
@@ -842,6 +863,50 @@ class WakeAgent:
                 "Failed to compose the persistent brief; proceeding without it.", exc_info=True
             )
             return None
+
+    def _memory_context(self, query: str | None) -> str | None:
+        """The memory provider's recalled context for this turn, guarded — never breaks the wake.
+
+        Calls the provider's `context` hook with the agent-scoped `MemoryScope` (the query is
+        the incoming turn's text, so a relevance-ranked provider retrieves against it). A no
+        provider, or a provider whose hook is a no-op, yields ``None`` and the brief omits the
+        section. A hook that *raises* degrades to ``None`` — a memory backend hiccup must not
+        drop the whole brief, let alone the wake — distinct from `_compose_brief`'s outer guard
+        so a memory failure costs only the memory section, not the rest of the brief.
+        """
+        if self.memory_provider is None:
+            return None
+        try:
+            return self.memory_provider.context(
+                MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid, query=query)
+            )
+        except Exception:  # noqa: BLE001 - a memory hook must never break the brief; degrade to none
+            _log.warning(
+                "Memory provider context() failed; omitting recalled memory.", exc_info=True
+            )
+            return None
+
+    def _observe(self, user: str, assistant: str) -> None:
+        """Hand a completed exchange to the memory provider's `observe` hook, guarded.
+
+        Fires after each real exchange (never on a probe ack or a self-skip — those never
+        reach here). A no provider, or one whose hook is a no-op (the default SQLite
+        provider), does nothing. A hook that *raises* is swallowed: auto-capture is a
+        best-effort side channel and must never break the wake or drop the reply that already
+        posted.
+        """
+        if self.memory_provider is None:
+            return
+        try:
+            self.memory_provider.observe(
+                MemoryExchange(
+                    user=user,
+                    assistant=assistant,
+                    scope=MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid),
+                )
+            )
+        except Exception:  # noqa: BLE001 - a memory hook must never break the wake; swallow it
+            _log.warning("Memory provider observe() failed; continuing.", exc_info=True)
 
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
         """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.

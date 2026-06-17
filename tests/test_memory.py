@@ -131,7 +131,7 @@ def test_search_falls_back_to_substring_when_fts5_is_absent(tmp_path, monkeypatc
     tool.run(action="write", key="home_city", value="Dallas, Texas")
     tool.run(action="write", key="role", value="Ruby developer")
 
-    assert tool._fts is False  # the fallback path is genuinely exercised
+    assert tool.store._fts is False  # the fallback path is genuinely exercised
     # Per-term OR recall: order-independent, like the FTS path.
     assert "role: Ruby developer" in tool.run(action="search", query="developer Ruby")
     # A bare '%' is a literal, not a match-everything wildcard.
@@ -282,7 +282,7 @@ def test_runs_through_the_registry(memory):
 
 def _timestamps(memory, key):
     """(created_at, updated_at) for a key, read straight from the DB."""
-    conn = memory._connect()
+    conn = memory.store._connect()
     return conn.execute(
         "SELECT created_at, updated_at FROM memories WHERE key = ?", (key,)
     ).fetchone()
