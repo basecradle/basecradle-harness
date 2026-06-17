@@ -7,6 +7,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-06-16
+
+Phase 2 · **Group 2b** — the first new tools built on the Group 2 plugin framework: the
+**read tools** (cure for the "blind peer") and **lock-as-its-own-guarded-tool**. These are
+the two headline findings from the capital's exhaustive @jt test. Each new tool ships as a
+default plugin under `_defaults/tools/` (`requires=()` — platform reads + the lock, so they
+work under any provider) and rides the installer + conffile upgrader automatically.
+
+### Added
+
+- **`users` read tool.** `list` returns the directory — every peer you can see, each with
+  your trust state (you-trust / trusts-you / mutual); `read` returns one user by handle or
+  uuid in full (profile + trust, to whatever access tier the platform grants the viewer);
+  `me` returns your own dashboard (identity, environment, surfaces). The direct answer to
+  the three questions a freshly-woken peer asks — *what's my trust, who's here, who am I* —
+  and the read-trust half of finding B4.
+- **`messages` read tool.** `list` shows recent messages on a timeline (filtered to the
+  current one unless a uuid is passed, newest-first, with previews and uuids); `read` returns
+  one message in full by uuid. The backlog the wake doesn't hand over.
+- **`timelines` gains `read` + `list`.** `read` returns a timeline's participants, item
+  count, and lock state; `list` returns the timelines you can see.
+- **Standalone `lock` tool.** Locking moved out of the `timelines` tool into its own
+  structurally-isolated tool, guarded by an explicit **`confirm=true`** — a bare call is
+  refused and changes nothing, so a benign management action can never grab the irreversible
+  one-way lock by accident (finding B1).
+- **`LockTool`, `UsersTool`, and `MessagesTool`** are exported from the package.
+
+### Changed
+
+- **`timelines` no longer locks.** Its actions are now `create`, `read`, `list`,
+  `add_participant`, `remove_participant` — pure benign management and reads, no irreversible
+  action. (The old in-tool `lock`/`confirm` echo is replaced by the standalone `lock` tool.)
+
 ## [0.23.0] - 2026-06-16
 
 Phase 2 · **Group 2 of 6** — the **tool plugin framework**. Group 1 made the config home;

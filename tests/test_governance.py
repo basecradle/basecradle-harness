@@ -9,7 +9,8 @@ The tools run through a *real* `BaseCradle` client — only its HTTP is mocked �
 these tests pin the tools against the SDK's true surface, the way the constitution
 asks (mock at the transport level, never the live API). The headline invariants:
 a refused action (not owner, no mutual trust) comes back as a clean explanation,
-and lock is one-way (there is no unlock to test, by design).
+and `timelines` no longer locks at all — the irreversible action moved to its own
+guarded `LockTool` (see `test_lock.py`).
 """
 
 import json
@@ -141,58 +142,80 @@ def test_create_without_a_name_is_a_friendly_error(timelines):
     assert "needs a 'name'" in timelines.run(action="create")
 
 
-# --- timelines: lock ---------------------------------------------------------
+# --- timelines: read / list --------------------------------------------------
 
 
-def test_lock_freezes_the_current_timeline_and_says_it_is_one_way(timelines):
+def test_read_reports_participants_lock_state_and_item_count(timelines):
+    participants = [
+        {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+        {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
+    ]
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
-            return_value=httpx.Response(200, json=timeline_envelope())
+            return_value=httpx.Response(200, json=timeline_envelope(participants=participants))
         )
-        lock = mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/lock").mock(
-            return_value=httpx.Response(200, json={"locked": True})
-        )
-        # Confirm echoes the exact uuid of the timeline being frozen — the deliberate guard.
-        result = timelines.run(action="lock", confirm=TIMELINE_UUID)
+        result = timelines.run(action="read")
 
-    assert lock.called
-    assert "Locked timeline" in result
-    assert "one-way" in result
-    assert "operator-only" in result
+    assert "Incident response" in result
+    assert "locked=False" in result
+    assert "Owner: @nova" in result
+    assert "@nova" in result and "@john" in result  # both participants rendered
+    assert "Items: 0" in result  # the envelope ships no items
 
 
-def test_lock_without_confirm_is_refused_and_never_touches_the_platform(timelines):
-    """B1: a bare lock (no confirm) is refused locally — the irreversible op never fires.
-
-    This is the live failure: a model wanting to list/delete a timeline grabbed `lock`.
-    No lock route is mocked, so the guard must short-circuit before any HTTP goes out."""
-    result = timelines.run(action="lock")
-
-    assert "Refused to lock" in result
-    assert "IRREVERSIBLE" in result
-    assert "list, leave, or delete" in result  # names what it is NOT for
-    assert TIMELINE_UUID in result  # tells the model the exact confirm value to use
-
-
-def test_lock_with_a_wrong_confirm_is_refused(timelines):
-    """A confirm that does not match the target uuid is not a deliberate echo — refused."""
-    result = timelines.run(action="lock", confirm="not-the-uuid")
-
-    assert "Refused to lock" in result
-
-
-def test_lock_can_target_an_explicit_timeline(timelines):
+def test_read_can_target_an_explicit_timeline(timelines):
     with respx.mock(assert_all_called=True) as mock:
-        mock.get(f"{BC_URL}/timelines/{OTHER_TIMELINE}").mock(
+        route = mock.get(f"{BC_URL}/timelines/{OTHER_TIMELINE}").mock(
             return_value=httpx.Response(200, json=timeline_envelope(uuid=OTHER_TIMELINE))
         )
-        lock = mock.post(f"{BC_URL}/timelines/{OTHER_TIMELINE}/lock").mock(
-            return_value=httpx.Response(200, json={"locked": True})
-        )
-        # Confirm must echo the explicit target, not the bound timeline.
-        timelines.run(action="lock", timeline=OTHER_TIMELINE, confirm=OTHER_TIMELINE)
+        result = timelines.run(action="read", timeline=OTHER_TIMELINE)
 
-    assert lock.called  # it locked the explicit timeline, not the bound one
+    assert route.called  # it read the explicit timeline, not the bound one
+    assert OTHER_TIMELINE in result
+
+
+def test_list_shows_the_timelines_you_can_see(timelines):
+    page = {
+        "timelines": [
+            {
+                "uuid": TIMELINE_UUID,
+                "name": "Incident response",
+                "locked": False,
+                "created_at": "2026-06-01T00:00:00.000Z",
+                "updated_at": "2026-06-02T00:00:00.000Z",
+                "owner": {
+                    "uuid": NOVA_UUID,
+                    "handle": "nova",
+                    "name": "Nova Digital",
+                    "kind": "ai",
+                },
+                "participants": [],
+            }
+        ],
+        "next_cursor": None,
+    }
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/timelines").mock(return_value=httpx.Response(200, json=page))
+        result = timelines.run(action="list")
+
+    assert "Incident response" in result
+    assert TIMELINE_UUID in result
+    assert "owner=@nova" in result
+
+
+def test_list_with_no_timelines_says_so(timelines):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/timelines").mock(
+            return_value=httpx.Response(200, json={"timelines": [], "next_cursor": None})
+        )
+        assert "can't see any timelines" in timelines.run(action="list")
+
+
+def test_timelines_no_longer_locks(timelines):
+    """B1: lock moved to its own tool — `timelines` does not accept it as an action."""
+    result = timelines.run(action="lock")
+
+    assert "unknown action" in result
 
 
 # --- timelines: add / remove participant -------------------------------------
@@ -292,7 +315,7 @@ def test_timelines_unknown_action_is_reported(timelines):
 
 def test_timelines_unbound_tool_raises_platform_error():
     with pytest.raises(PlatformError):
-        TimelinesTool().run(action="lock")
+        TimelinesTool().run(action="read")
 
 
 # --- trust: grant ------------------------------------------------------------

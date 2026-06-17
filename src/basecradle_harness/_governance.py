@@ -8,7 +8,11 @@ focused tools rather than one muddy catch-all — one resource per tool, the sha
 assets and tasks established:
 
 - `TimelinesTool` — a peer running its own rooms: **create** a timeline it owns,
-  **add** / **remove** a participant, and **lock** a timeline (the emergency stop).
+  **read** one (its participants, item count, and lock state), **list** the ones it
+  can see, and **add** / **remove** a participant. It is pure benign management and
+  reads — no irreversible action. (Locking moved to its own guarded `LockTool`, in
+  `_lock.py`, so a benign management call can never grab the one-way action by
+  accident — finding B1 from the capital's @jt test.)
 - `TrustTool` — a peer managing its own outgoing trust edges: **grant** or
   **revoke** trust toward another user. Trust is the consent currency that gates
   sharing a timeline (adding a participant needs *mutual* trust), so the two tools
@@ -16,17 +20,11 @@ assets and tasks established:
 
 **Authorization is the platform's job, not ours.** Adding a participant requires
 ownership, mutual trust with every existing viewer, and headroom; removing one
-requires ownership too. Locking is the emergency stop — open to any viewer, by
-design (anyone in the room can pull it). All of that is enforced server-side. A
-denied action comes back as a typed `BaseCradleError` whose `detail` is written
-for a human — so these tools **catch it and surface that explanation** rather than
-letting the agent flail on a raw traceback. Trusting is self-scoped (your own
-outgoing edge) and always permitted; the platform silently ignores trusting
-yourself.
-
-**Lock is intentionally one-way.** There is no unlock in the platform API or the
-SDK, by design: unlocking a locked timeline is an operator-only console action.
-So `TimelinesTool` locks only — it never pretends to offer an unlock, and says so.
+requires ownership too. All of that is enforced server-side. A denied action comes
+back as a typed `BaseCradleError` whose `detail` is written for a human — so these
+tools **catch it and surface that explanation** rather than letting the agent flail
+on a raw traceback. Trusting is self-scoped (your own outgoing edge) and always
+permitted; the platform silently ignores trusting yourself.
 
 **User resolution.** A conversational agent says "trust @origin" or "add nova to
 this timeline," not a uuid. Both tools accept a user reference as either a
@@ -39,11 +37,16 @@ nothing touches the filesystem.
 
 from __future__ import annotations
 
+import itertools
 import re
 
 from basecradle import BaseCradleError, User
 
 from basecradle_harness._platform import PlatformTool, explain
+
+# How many timelines one `list` returns before eliding — the same defensive cap the
+# tasks/assets/reads tools use, to keep a pathological account from flooding context.
+DEFAULT_LIST_LIMIT = 50
 
 # A user reference that is a uuid goes straight to `bc.users.get`; anything else is
 # treated as a handle and resolved by scanning the directory. Standard UUID shape
@@ -58,34 +61,33 @@ class _UserNotFound(Exception):
 
 
 class TimelinesTool(PlatformTool):
-    """Create, lock, and manage participants on timelines the agent owns.
+    """Create, read, list, and manage participants on timelines the agent can see.
 
-    A `PlatformTool`: the hosting agent binds the SDK client and current-timeline
-    uuid before the loop runs. Until bound, `run` reports it is not connected (via
-    `PlatformError`) rather than failing obscurely.
+    Pure benign management and reads — no irreversible action (locking is its own
+    guarded `LockTool`). A `PlatformTool`: the hosting agent binds the SDK client and
+    current-timeline uuid before the loop runs. Until bound, `run` reports it is not
+    connected (via `PlatformError`) rather than failing obscurely.
     """
 
     name = "timelines"
     description = (
-        "Run your own timelines. action='create' makes a new timeline you own from a "
-        "name; action='lock' permanently freezes a timeline's content (the emergency "
-        "stop — this is ONE-WAY, there is no unlock; reopening a locked timeline is an "
-        "operator-only action); action='add_participant' adds a user to a timeline you "
-        "own; action='remove_participant' removes one. A 'user' is a handle like "
-        "'@nova' (or 'nova') or a uuid. Locking is the emergency stop, open to any "
-        "viewer; adding or removing a participant needs you to own the timeline, and "
-        "adding someone also needs mutual trust with them — if the platform refuses, "
-        "you get the reason back. Timeline-scoped actions use the current timeline "
-        "unless you pass a timeline uuid. Because 'lock' is irreversible, it will only "
-        "fire when you ALSO pass 'confirm' set to the exact uuid of the timeline you "
-        "mean to freeze — locking is NOT how you list, leave, or delete a timeline."
+        "Run and inspect your timelines. action='create' makes a new timeline you own "
+        "from a name; action='read' returns one timeline's participants, item count, and "
+        "lock state (the current one unless you pass a timeline uuid); action='list' shows "
+        "the timelines you can see; action='add_participant' adds a user to a timeline you "
+        "own; action='remove_participant' removes one. A 'user' is a handle like '@nova' "
+        "(or 'nova') or a uuid. Adding or removing a participant needs you to own the "
+        "timeline, and adding someone also needs mutual trust with them — if the platform "
+        "refuses, you get the reason back. Timeline-scoped actions use the current timeline "
+        "unless you pass a timeline uuid. To permanently freeze a timeline, use the "
+        "separate 'lock' tool — this tool never locks."
     )
     parameters = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "lock", "add_participant", "remove_participant"],
+                "enum": ["create", "read", "list", "add_participant", "remove_participant"],
                 "description": "What to do.",
             },
             "name": {
@@ -103,17 +105,8 @@ class TimelinesTool(PlatformTool):
                 "type": "string",
                 "description": (
                     "Optional timeline uuid to act on instead of the current one "
-                    "(lock / add_participant / remove_participant). Omit to use the "
+                    "(read / add_participant / remove_participant). Omit to use the "
                     "timeline you are engaged on."
-                ),
-            },
-            "confirm": {
-                "type": "string",
-                "description": (
-                    "Required for 'lock' only: set it to the exact uuid of the timeline "
-                    "you intend to permanently freeze. This deliberate echo is the guard "
-                    "against an accidental, irreversible lock — a bare lock without it is "
-                    "refused. Ignored by every other action."
                 ),
             },
         },
@@ -123,7 +116,8 @@ class TimelinesTool(PlatformTool):
     # Human-readable verb per action, for a clean message when the platform refuses.
     _PHRASE = {
         "create": "create the timeline",
-        "lock": "lock the timeline",
+        "read": "read the timeline",
+        "list": "list the timelines",
         "add_participant": "add the participant",
         "remove_participant": "remove the participant",
     }
@@ -134,12 +128,11 @@ class TimelinesTool(PlatformTool):
         name: str | None = None,
         user: str | None = None,
         timeline: str | None = None,
-        confirm: str | None = None,
     ) -> str:
         """Dispatch on `action`. Returns a message written for the model to read."""
         if action not in self._PHRASE:
             return (
-                f"Error: unknown action {action!r}. Use 'create', 'lock', "
+                f"Error: unknown action {action!r}. Use 'create', 'read', 'list', "
                 "'add_participant', or 'remove_participant'."
             )
         try:
@@ -147,9 +140,11 @@ class TimelinesTool(PlatformTool):
                 if not name:
                     return "Error: 'create' needs a 'name' for the timeline."
                 return self._create(name)
+            if action == "list":
+                return self._list()
             target = timeline or self.context.timeline
-            if action == "lock":
-                return self._lock(target, confirm)
+            if action == "read":
+                return self._read(target)
             # add_participant / remove_participant
             if not user:
                 return f"Error: '{action}' needs a 'user' (a handle like '@nova' or a uuid)."
@@ -168,31 +163,32 @@ class TimelinesTool(PlatformTool):
         timeline = self.context.client.timelines.create(name=name)
         return f"Created timeline {timeline.name!r} (uuid={timeline.uuid}). You own it."
 
-    def _lock(self, target: str, confirm: str | None) -> str:
-        """Lock the timeline — but only behind the deliberate-confirm guard.
-
-        `lock` is the one irreversible action this tool exposes: there is no unlock in
-        the platform API, so a single mis-aimed tool call (the live failure: a model that
-        wanted to *list* or *delete* a timeline grabbed `lock` instead) must not be able to
-        fire it. The guard is a deliberate echo — `confirm` has to equal the exact uuid of
-        the timeline being frozen — so a reflexive `action='lock'` with no (or a wrong)
-        confirm is refused with an explanation, never the cheap default grab.
-        """
-        if confirm != target:
-            return (
-                f"Refused to lock timeline {target}: locking is the IRREVERSIBLE emergency "
-                "stop — it permanently freezes the timeline and there is no unlock "
-                "(reopening is an operator-only action). It is NOT how you list, leave, or "
-                "delete a timeline, and this tool cannot do those. If you truly mean to "
-                "permanently freeze this timeline, call lock again with confirm set to its "
-                f"uuid: confirm={target!r}."
-            )
+    def _read(self, target: str) -> str:
+        """One timeline: its owner, participants, lock state, and item count."""
         timeline = self.context.client.timelines.get(target)
-        timeline.lock()
+        participants = ", ".join(f"@{p.handle}" for p in timeline.participants) or "none"
         return (
-            f"Locked timeline {timeline.name!r} (uuid={timeline.uuid}). Its content is now "
-            "frozen permanently — this is one-way; reopening it is an operator-only action."
+            f"Timeline {timeline.name!r} (uuid={timeline.uuid}) · "
+            f"locked={timeline.locked}\n"
+            f"Owner: @{timeline.owner.handle} ({timeline.owner.name})\n"
+            f"Participants: {participants}\n"
+            f"Items: {len(timeline.items)}"
         )
+
+    def _list(self) -> str:
+        client = self.context.client
+        # The SDK resource is lazy and paginating; islice pulls one past the cap so
+        # "there may be more" is only said when a (limit + 1)th timeline truly exists.
+        timelines = list(itertools.islice(client.timelines, DEFAULT_LIST_LIMIT + 1))
+        if not timelines:
+            return "You can't see any timelines yet."
+        lines = [
+            f"uuid={t.uuid} · {t.name!r} · locked={t.locked} · owner=@{t.owner.handle}"
+            for t in timelines[:DEFAULT_LIST_LIMIT]
+        ]
+        if len(timelines) > DEFAULT_LIST_LIMIT:
+            lines.append(f"(showing the {DEFAULT_LIST_LIMIT} most recent; there may be more)")
+        return "Timelines you can see (newest first):\n" + "\n".join(lines)
 
     def _add_participant(self, target: str, user: User) -> str:
         timeline = self.context.client.timelines.get(target)
