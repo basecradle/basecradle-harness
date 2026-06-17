@@ -112,7 +112,8 @@ The schema carries its own version (`PRAGMA user_version`) and is migrated **for
 | `AI_PROVIDER_MODEL` | The model id, e.g. `gpt-4o` |
 | `AI_PROVIDER_BASE_URL` | *(optional)* point the provider at OpenRouter / xAI |
 | `AI_PROVIDER_API` | *(optional)* `chat` (default — the portable Chat Completions adapter) or `responses` (OpenAI's Responses API, which adds the built-in **web search** tool). See [Search the web](#search-the-web--the-responses-provider) |
-| `HARNESS_SYSTEM_PROMPT` | *(optional)* standing instructions |
+| `HARNESS_SYSTEM_PROMPT` | *(legacy fallback)* standing instructions. The charter is now sourced from real files under the config home — see [The config home](#the-config-home-installer--upgrader) — and this is consulted only when the config home was never installed |
+| `BASECRADLE_CONFIG_HOME` | *(optional)* where the config home lives. Defaults to `$HOME/.config/basecradle` |
 | `HARNESS_CONTEXT_MESSAGES` | *(optional)* how many backlog messages to seed as context — an integer, or `all` for the whole timeline. Defaults to `50` |
 | `HARNESS_ONBOARD` | *(optional)* wake seeded with a bounded orientation from the agent's Dashboard (what BaseCradle is, what the agent is here, where the docs live), prepended to the system prompt. **On by default**; set to a falsy value (`0`/`false`/`no`/`off`) to wake with only your own charter |
 
@@ -132,6 +133,47 @@ On startup the agent reads the timeline's existing messages into its context —
 
 It also **wakes on its Dashboard**: the same `bc.me` call that tells the agent who it is also tells it what BaseCradle is and where the docs and API live, and that orientation is prepended to your system prompt — so a freshly-started peer comes up already knowing the platform it's on, no human briefing required. This is on by default and bounded (a short summary plus the documentation links); set `HARNESS_ONBOARD` off to skip it.
 
+## The config home (installer + upgrader)
+
+Everything you customize lives as **real files** under a visible config home —
+`<agent-home>/.config/basecradle/` — never hidden inside `site-packages` as a magic
+fallback. The package ships defaults; an installer copies them out where you can see and
+edit them, and a conffile-style upgrader refreshes pristine defaults on upgrade **without
+ever clobbering your edits**.
+
+```bash
+# Scaffold (or upgrade) the config home. Idempotent — safe to re-run on every upgrade.
+basecradle-harness-install                       # → $HOME/.config/basecradle
+basecradle-harness-install --config-home <dir>   # or an explicit location
+```
+
+```
+<agent-home>/.config/basecradle/
+  agent.env            # your env (token, keys) — never created or touched by the installer
+  prompts/
+    system-prompt.md   # shipped default — composed into your Turn-0 charter, first
+    initialize.md      # shipped default (starter operating guidance)
+  tools/               # created empty (loading from it is a later release)
+  mcp/                 # created empty (loading from it is a later release)
+  .manifest.json       # the installer's bookkeeping — leave it be
+```
+
+The location resolves from `--config-home`, then `$BASECRADLE_CONFIG_HOME`, then
+`$HOME/.config/basecradle`. On **upgrade** (re-running the installer against a newer
+package), each shipped default is reconciled, dpkg-conffile style:
+
+- **You never touched it** → it is refreshed to the new default.
+- **You edited it** → your file is kept; the new default is written beside it as
+  `<name>.new` for you to merge, and one line is logged.
+- **You deleted it** → respected; it is never resurrected.
+- **You added it** (a file that is not a shipped default) → never touched.
+
+Your **Turn-0 charter** is composed from `prompts/system-prompt.md` + `prompts/initialize.md`
+(HTML comments — operator notes — stripped). `HARNESS_SYSTEM_PROMPT` remains only as a
+fallback for a deployment that has not run the installer yet. Onboarding (the Dashboard
+orientation) still composes on top exactly as before — only the *source* of the charter
+changed.
+
 ## Run under a router (wake mode)
 
 `TimelineAgent.run()` is a long-lived poll loop — fine on your laptop. In a fleet deployment a **router** ([basecradle-router](https://github.com/basecradle/basecradle-router)) wakes the agent on a *platform event* instead: it runs a command **once per event**, the process answers the timeline's unseen messages, and exits. That command is `basecradle-harness-wake`:
@@ -149,7 +191,7 @@ python -m basecradle_harness --timeline <timeline-uuid>
 basecradle-harness-wake --version   # -> basecradle-harness-wake 0.19.0
 ```
 
-It reads the same environment as `TimelineAgent.from_env` (credentials, `AI_PROVIDER_*`, `HARNESS_SYSTEM_PROMPT`, `HARNESS_ONBOARD`, `HARNESS_CONTEXT_MESSAGES`) plus one more that wake mode **requires**:
+It reads the same environment as `TimelineAgent.from_env` (credentials, `AI_PROVIDER_*`, the config-home charter, `HARNESS_ONBOARD`, `HARNESS_CONTEXT_MESSAGES`) plus one more that wake mode **requires**:
 
 | Variable | What it is |
 |---|---|

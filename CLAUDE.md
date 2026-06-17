@@ -218,6 +218,46 @@ When you receive a trigger beginning `Cross-repo handoff:` — pasted by Drawk (
 
 Every BaseCradle ecosystem repo carries this same "Cross-Repo Handoffs" section in its CLAUDE.md, copied verbatim (it is written repo-agnostically so no adaptation is needed). When handing off to a repo whose CLAUDE.md lacks the section — always true for a brand-new repo — the handoff prompt's definition of done includes adding it, copied from the capital's `CLAUDE.md` fetched from GitHub (`basecradle/basecradle` → `CLAUDE.md`, with fleet credentials) — the same mechanism public repos use to reference `constitution.md`; never a machine-local path.
 
+## Config Home (Install / Upgrade)
+
+Everything an operator customizes lives as **real files** under a visible config home —
+`<agent-home>/.config/basecradle/` — never hidden inside `site-packages` as a magic
+fallback. The package *ships* defaults; the installer *copies* them out. Resolution order
+for the location: `--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.config/basecradle`.
+
+```
+<agent-home>/.config/basecradle/
+  agent.env            # the operator's env (token, keys) — never created or touched by the installer
+  prompts/
+    system-prompt.md   # shipped default — composed into Turn 0 first
+    initialize.md      # shipped default (starter; richer default is a later group)
+  tools/               # created empty; loading from it is a later group
+  mcp/                 # created empty; loading from it is a later group
+  .manifest.json       # bookkeeping: the hash of every shipped default as installed
+```
+
+- **Installer — `basecradle-harness-install`** (`basecradle_harness._install`). Idempotent
+  and re-runnable: a first run scaffolds the dirs and writes the shipped defaults; a re-run
+  against a newer package *upgrades*. A fleet rollout simply re-runs it per agent over a
+  pinned version.
+- **Conffile upgrader (the discipline).** Per shipped default, compared dpkg-conffile style
+  against the manifest hash and the on-disk file: **untouched** → refresh with the new
+  default; **user-edited** → keep theirs, write the new default beside it as `<name>.new`,
+  log one line; **user-deleted** → respect it, never resurrect; **user-added** (not a
+  shipped default) → never touched. The operator's dir is never clobbered; only pristine
+  defaults refresh.
+- **Charter sourcing.** The Turn-0 operator charter is composed from
+  `prompts/system-prompt.md` + `prompts/initialize.md` (HTML comments, which are
+  operator-facing notes, stripped). `HARNESS_SYSTEM_PROMPT` is a **legacy fallback** only,
+  consulted when the config home was never installed. Onboarding (the Dashboard
+  orientation) still composes on top — the *source* changed, not the composition.
+
+**Boundary:** this is the config / install / upgrade foundation only. Loading tools from
+`tools/`, MCP from `mcp/`, the persistent Turn 0, and the generated tool manifest are later
+Phase-2 groups. Deployment proper — provisioning a venv, wiring the router/service on the
+home server — remains the home server's and [`basecradle-router`](https://github.com/basecradle/basecradle-router)'s
+concern, not the installer's (per the spine: harness owns the agent runtime, not the box).
+
 ## Development Commands
 
 ```bash
@@ -226,4 +266,5 @@ uv run pytest            # tests (offline — the default)
 uv run ruff check .      # lint
 uv run ruff format .     # format
 uv build                 # build the wheel + sdist
+basecradle-harness-install --config-home <dir>   # scaffold/upgrade a config home
 ```

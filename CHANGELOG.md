@@ -7,6 +7,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-06-16
+
+Phase 2 · **Group 1 of 6** — the config / install / upgrade foundation the rest of the
+evolution sits on. This group establishes **where things live and how install/upgrade
+works**; it does not change the tool system or prompt composition (those are later groups).
+
+Everything an operator customizes now lives as **real files** under a visible config home —
+`<agent-home>/.config/basecradle/` — instead of hidden inside `site-packages` as a magic
+fallback. The package ships defaults; the installer copies them out; a conffile-style
+upgrader refreshes pristine defaults on upgrade **without ever clobbering an operator's
+edits**.
+
+### Added
+
+- **The config home + installer (`basecradle-harness-install`).** A new idempotent,
+  re-runnable console script scaffolds `<agent-home>/.config/basecradle/` with `prompts/`,
+  `tools/`, and `mcp/` directories, writes the shipped charter defaults
+  (`prompts/system-prompt.md`, a starter `prompts/initialize.md`), and records the hash of
+  every shipped default in a `.manifest.json`. `tools/` and `mcp/` are created empty —
+  *loading* from them is a later group. The location resolves from `--config-home`, then
+  `$BASECRADLE_CONFIG_HOME`, then `$HOME/.config/basecradle`.
+- **A conffile-style upgrader (the core of this group).** Re-running the installer against
+  a newer package reconciles each shipped default, dpkg-conffile style, against the
+  manifest hash and the on-disk file: an **untouched** default is refreshed; a
+  **user-edited** file is kept and the new default is written beside it as `<name>.new`; a
+  **user-deleted** file is respected (never resurrected); a **user-added** file is never
+  touched (the reconcile only ever walks the *shipped* default set). This per-agent
+  reconcile is what a fleet rollout loops over a pinned version.
+- **`install`, `config_home`, `charter_from_config`, and `InstallReport`** are exported from
+  the package.
+
+### Changed
+
+- **The Turn-0 charter is sourced from files, not an env var.** `TimelineAgent.from_env`
+  and `basecradle-harness-wake` now compose the operator charter from
+  `prompts/system-prompt.md` + `prompts/initialize.md` under the config home (HTML comments,
+  which are operator-facing notes, stripped). `HARNESS_SYSTEM_PROMPT` is retained only as a
+  **legacy fallback** for a deployment that has not yet run the installer, so the migration
+  is lossless. Onboarding (the Dashboard orientation) composes on top exactly as before —
+  the *source* of the charter changed, not the composition. Persistent Turn 0 and the
+  generated tool manifest remain a later group.
+
 ## [0.21.0] - 2026-06-16
 
 Phase 1 of the harness-stabilization pass surfaced by the capital's exhaustive live test of

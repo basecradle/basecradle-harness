@@ -18,6 +18,19 @@ RESPONSES_URL = f"{BASE_URL}/responses"
 FAKE_KEY = "sk-test-0123456789abcdefghijklmnop"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_config_home(tmp_path_factory, monkeypatch):
+    """Point the config home at an empty temp dir so no test reads the real ``$HOME``.
+
+    The charter is now sourced from files under ``$BASECRADLE_CONFIG_HOME`` (default
+    ``$HOME/.config/basecradle``). Without this, a dev/CI box that has ever run
+    ``basecradle-harness-install`` would leak its real charter into every ``from_env``
+    test. Pinning the var to a fresh, empty dir makes the whole suite hermetic; a test
+    that exercises the config home overrides it (or passes an explicit ``home=``).
+    """
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(tmp_path_factory.mktemp("config-home")))
+
+
 @pytest.fixture
 def router():
     """A respx router; routes are matched by absolute URL."""
