@@ -153,6 +153,43 @@ def test_upgrade_is_a_no_op_when_the_operator_already_has_the_new_default(tmp_pa
     assert not (home / "prompts" / "system-prompt.md.new").exists()
 
 
+def test_rerunning_the_same_version_over_an_edit_is_a_no_op(tmp_path):
+    """An edit + a re-run of the *same* package must not churn out a redundant ``.new``."""
+    home = tmp_path / "cfg"
+    install(home, defaults=V1)
+    (home / "prompts" / "system-prompt.md").write_text("MY charter\n")  # operator edits
+
+    report = install(home, defaults=V1)  # same version again — no new default to offer
+
+    assert report.actions["prompts/system-prompt.md"] == UNCHANGED
+    assert not (home / "prompts" / "system-prompt.md.new").exists()
+
+
+def test_an_edited_file_is_re_offered_on_each_genuinely_new_default_version(tmp_path):
+    """The manifest records the *current* shipped default, so a later version re-offers ``.new``.
+
+    Locks the subtle invariant behind ``updated[rel] = new`` being recorded unconditionally:
+    after an edit is kept against v2, a genuinely different v3 default must still produce a
+    fresh ``.new`` (the edit is never silently stranded on a stale baseline).
+    """
+    home = tmp_path / "cfg"
+    v1 = {"prompts/system-prompt.md": "v1\n"}
+    v2 = {"prompts/system-prompt.md": "v2\n"}
+    v3 = {"prompts/system-prompt.md": "v3\n"}
+    install(home, defaults=v1)
+    edited = home / "prompts" / "system-prompt.md"
+    edited.write_text("MINE\n")
+
+    r2 = install(home, defaults=v2)
+    assert r2.actions["prompts/system-prompt.md"] == KEPT_EDITED
+    assert (home / "prompts" / "system-prompt.md.new").read_text() == "v2\n"
+
+    r3 = install(home, defaults=v3)
+    assert r3.actions["prompts/system-prompt.md"] == KEPT_EDITED
+    assert edited.read_text() == "MINE\n"  # the edit is still kept verbatim
+    assert (home / "prompts" / "system-prompt.md.new").read_text() == "v3\n"  # re-offered, fresh
+
+
 # --- config-home resolution --------------------------------------------------
 
 
