@@ -277,11 +277,32 @@ register** — the model never sees a present-but-broken tool.
   defaults load directly — the same files-or-fallback precedent as the charter.
 
 **Boundary:** this group is the plugin **mechanism** only — behavior-preserving over the
-existing tools. The new **read tools** and **lock-as-a-guarded-tool** (Group 2b), MCP
-loading from `mcp/`, the persistent Turn 0, and the generated tool manifest (Group 3) are
-later. Deployment proper — provisioning a venv, wiring the router/service on the home
-server — remains the home server's and [`basecradle-router`](https://github.com/basecradle/basecradle-router)'s
+existing tools. Deployment proper — provisioning a venv, wiring the router/service on the
+home server — remains the home server's and [`basecradle-router`](https://github.com/basecradle/basecradle-router)'s
 concern, not the installer's (per the spine: harness owns the agent runtime, not the box).
+
+### Read Tools + Standalone Lock (Phase 2 · Group 2b)
+
+The first new tools built on the Group 2 framework — the two headline findings from the
+capital's exhaustive @jt test, each a default plugin under `_defaults/tools/` with
+`requires=()` (provider-agnostic platform reads + the lock):
+
+- **The read tools (B5, the "blind peer").** An agent could *act* on the platform but not
+  *look*. `users` (`_reads.py`) — `list` the directory with your trust state per user,
+  `read` one user by handle-or-uuid, `me` your own dashboard; this is the direct cure for the
+  three opening questions (*my trust / who's here / who am I*) and lands B4's read-trust.
+  `messages` (`_reads.py`) — `list`/`read` the message backlog the wake doesn't hand over.
+  `timelines` also gains `read` + `list`. Access tiers are **API-enforced** — a read surfaces
+  only what the viewer is entitled to, and never invents a withheld field.
+- **Lock-as-its-own-guarded-tool (B1).** `lock` (`_lock.py`) is pulled out of `timelines`
+  into its own structurally-isolated tool, guarded by an explicit **`confirm=true`** (a bare
+  call is refused, changes nothing). `timelines` becomes pure benign management + reads
+  (`create`, `read`, `list`, `add_participant`, `remove_participant`) — no irreversible
+  action.
+
+**Boundary:** the **knowledge fixes** (B6/C1/B7 in `initialize.md`), the generated tool
+manifest, the persistent Turn 0, MCP loading from `mcp/`, the `MemoryProvider`, and the
+circuit-breaker are later groups (3–6).
 
 ## Development Commands
 
