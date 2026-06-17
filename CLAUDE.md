@@ -252,10 +252,35 @@ for the location: `--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.conf
   consulted when the config home was never installed. Onboarding (the Dashboard
   orientation) still composes on top — the *source* changed, not the composition.
 
-**Boundary:** this is the config / install / upgrade foundation only. Loading tools from
-`tools/`, MCP from `mcp/`, the persistent Turn 0, and the generated tool manifest are later
-Phase-2 groups. Deployment proper — provisioning a venv, wiring the router/service on the
-home server — remains the home server's and [`basecradle-router`](https://github.com/basecradle/basecradle-router)'s
+### Tool Plugins (Phase 2 · Group 2)
+
+Tools are **drop-in plugins**, not a hardcoded list. Each is a `ToolPlugin` declaring
+`(name + requires + impl)`: `impl` is the `Tool` class (or a `builtin` wire name for a
+server-side tool the provider runs), and `requires` is what the **active config** must
+provide for the tool to be usable. A plugin whose `requires` aren't met **does not
+register** — the model never sees a present-but-broken tool.
+
+- **Two gates, kept apart.** *Activation* (`ToolPlugin.requires`: a provider API, an API
+  key — `ProviderAPI`, `EnvSet`, `OpenAIKey`, checked against an `ActivationContext`) is
+  distinct from the *policy/safety* gate (`Tool.requires` capabilities like `SHELL`, refused
+  at `ToolRegistry.register`). A plugin can be active yet still policy-refused; both apply.
+- **Provider-aware.** `web_search` requires the Responses API and drops on Chat Completions;
+  `generate_image`/`listen` require an OpenAI key. When two plugins share a `name` with
+  different `requires`, **exactly one activates per config**. The Responses provider's
+  built-ins are plugin-driven, not a constructor default.
+- **The `tools/` overlay.** The installer copies the default tool plugins (`*.py` files
+  shipped under `_defaults/tools/`) into the config home's `tools/`, which is the operator's
+  overlay: **add** a file (new tool), **override** a default by reusing its `name`,
+  **disable** a default by **deleting** its file (the conffile upgrader's no-resurrect rule
+  respects the deletion). `tools/` is authoritative once the installer has populated it;
+  until then (never-installed, or a config home predating tool defaults) the packaged
+  defaults load directly — the same files-or-fallback precedent as the charter.
+
+**Boundary:** this group is the plugin **mechanism** only — behavior-preserving over the
+existing tools. The new **read tools** and **lock-as-a-guarded-tool** (Group 2b), MCP
+loading from `mcp/`, the persistent Turn 0, and the generated tool manifest (Group 3) are
+later. Deployment proper — provisioning a venv, wiring the router/service on the home
+server — remains the home server's and [`basecradle-router`](https://github.com/basecradle/basecradle-router)'s
 concern, not the installer's (per the spine: harness owns the agent runtime, not the box).
 
 ## Development Commands

@@ -45,6 +45,17 @@ from basecradle_harness._platform import (
     PlatformTool,
     bind_platform_tools,
 )
+from basecradle_harness._plugins import (
+    ActivationContext,
+    EnvSet,
+    OpenAIKey,
+    ProviderAPI,
+    Requirement,
+    ResolvedTools,
+    ToolPlugin,
+    load_plugins,
+    resolve_plugins,
+)
 from basecradle_harness._policy import BASECRADLE, SHELL, Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._responses import OpenAIResponsesProvider
@@ -84,6 +95,16 @@ __all__ = [
     "Policy",
     "SHELL",
     "BASECRADLE",
+    # Tool plugin framework: (name + requires + impl), provider-aware activation
+    "ToolPlugin",
+    "Requirement",
+    "ProviderAPI",
+    "EnvSet",
+    "OpenAIKey",
+    "ActivationContext",
+    "ResolvedTools",
+    "resolve_plugins",
+    "load_plugins",
     # Platform-aware tools (the SDK as tools)
     "PlatformTool",
     "PlatformContext",

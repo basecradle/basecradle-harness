@@ -29,6 +29,7 @@ from basecradle_harness._basecradle import (
     _onboard_from_env,
     _orientation,
     _provider_from_env,
+    _resolve_tools_and_provider,
 )
 
 BC_URL = "https://basecradle.com"
@@ -476,6 +477,32 @@ def test_from_env_wires_a_full_agent(platform, monkeypatch):
         assert tool.bound is True
         assert tool.context.timeline == TIMELINE_UUID
         assert tool.context.client is agent.client
+
+
+def test_resolve_tools_and_provider_flips_the_active_set_with_the_api(monkeypatch):
+    # The tool set + provider built-ins are plugin-resolved now, so flipping AI_PROVIDER_API
+    # changes the active set: web_search (a Responses-only built-in) is on under `responses`
+    # and gone under `chat`. The function tools stay the same across both — behavior-preserving.
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+
+    monkeypatch.setenv("AI_PROVIDER_API", "responses")
+    provider, tools = _resolve_tools_and_provider()
+    assert isinstance(provider, OpenAIResponsesProvider)
+    # web_search is enabled on the provider as a server-side built-in (driven by the plugin)…
+    assert {"type": "web_search"} in provider._builtin_tools
+    # …but it is never a function tool the engine runs.
+    names = {t.name for t in tools}
+    assert "web_search" not in names
+    assert "generate_image" in names  # OpenAI-coupled tool, key present → on
+    provider.close()
+
+    monkeypatch.setenv("AI_PROVIDER_API", "chat")
+    chat_provider, chat_tools = _resolve_tools_and_provider()
+    assert isinstance(chat_provider, OpenAICompatibleProvider)
+    # Same function tools; the Responses-only built-in is gone.
+    assert {t.name for t in chat_tools} == names
+    chat_provider.close()
 
 
 def test_from_env_honors_the_context_messages_cap(platform, monkeypatch):
