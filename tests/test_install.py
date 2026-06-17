@@ -56,6 +56,24 @@ def test_install_scaffolds_the_config_home_and_writes_shipped_defaults(tmp_path)
     assert report.config_home == home
 
 
+def test_install_copies_the_shipped_tool_plugin_defaults_into_tools(tmp_path):
+    # Group 2 ships the default tools as real plugin files under `_defaults/tools/`; the
+    # installer copies them into the config home's `tools/` overlay (and the upgrader manages
+    # them with the same conffile discipline as the prompt defaults — proven generically by
+    # the four-case tests below using a `tools/` path).
+    home = tmp_path / "cfg"
+
+    install(home)
+
+    tools = home / "tools"
+    for name in ("memory.py", "generate_image.py", "web_search.py"):
+        assert (tools / name).exists()
+    # The tool defaults are manifest-tracked, which is also the "tools are installed" signal
+    # `load_plugins` keys on to treat the overlay as authoritative.
+    manifest = json.loads((home / _MANIFEST_NAME).read_text())
+    assert any(key.startswith("tools/") for key in manifest)
+
+
 def test_install_records_every_shipped_default_hash_in_the_manifest(tmp_path):
     home = tmp_path / "cfg"
     install(home)

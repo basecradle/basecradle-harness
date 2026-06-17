@@ -7,6 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-06-16
+
+Phase 2 · **Group 2 of 6** — the **tool plugin framework**. Group 1 made the config home;
+this turns tools from baked-in registry entries into **drop-in plugins** declaring
+`(name + requires + impl)`, resolved against the active provider, loaded from the `tools/`
+overlay. **Behavior-preserving:** the existing tool set is unchanged on the OpenAI-Responses
+provider — this is the mechanism, not new capabilities (read tools and lock-as-a-tool are
+Group 2b; the generated tool manifest is Group 3).
+
+### Added
+
+- **The plugin contract `ToolPlugin(name + requires + impl)`.** A tool is now a small plugin
+  declaring its model-facing `name`, the `requires` it needs to be **active** (a provider
+  API, an API key), and its `impl` (a `Tool` class) — or a `builtin` wire name for a
+  server-side tool the provider runs. A plugin whose requirements aren't met **does not
+  register**, so the model never sees a present-but-broken tool. Activation is a distinct
+  axis from the policy/safety gate (`Tool.requires` capabilities), which still applies on top.
+- **Provider-aware activation.** Requirements (`ProviderAPI`, `EnvSet`, `OpenAIKey`) are
+  checked against an `ActivationContext` (the selected provider API + the env). The
+  OpenAI-coupled tools (`generate_image`, `listen`) require an OpenAI key and self-exclude
+  without one; `web_search` requires the Responses API and drops on Chat Completions. When
+  two plugins share a `name` with different `requires`, **exactly one activates per config**.
+  The Responses provider's built-ins are now **plugin-driven**, not a constructor default.
+- **The `tools/` overlay.** The installer copies the default tool plugins (real `*.py` files
+  under `_defaults/tools/`) into the config home's `tools/` dir, which is the operator's
+  overlay: **add** a file to register a new tool, **override** a default by reusing its
+  `name`, **disable** a default by **deleting** its file. The conffile upgrader manages these
+  default files exactly as it does the prompt defaults (refresh pristine / keep edited as
+  `.new` / respect a deletion / never touch operator files).
+- **`ToolPlugin`, `Requirement`, `ProviderAPI`, `EnvSet`, `OpenAIKey`, `ActivationContext`,
+  `ResolvedTools`, `resolve_plugins`, and `load_plugins`** are exported from the package.
+
+### Changed
+
+- **`TimelineAgent.from_env` / `WakeAgent.from_env` resolve their tools from plugins** rather
+  than a hardcoded list — the `tools/` overlay when the installer has populated it, else the
+  packaged defaults (so an un-upgraded or un-installed deployment still comes up fully armed,
+  mirroring the charter's files-or-fallback precedent). The resulting tool set is identical to
+  before under the same config.
+
 ## [0.22.0] - 2026-06-16
 
 Phase 2 · **Group 1 of 6** — the config / install / upgrade foundation the rest of the

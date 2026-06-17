@@ -26,7 +26,9 @@ Configuration is environment-first (see `TimelineAgent.from_env`):
 - ``AI_PROVIDER_BASE_URL``    — optional; point the provider at OpenRouter/xAI.
 - ``AI_PROVIDER_API``         — optional; ``chat`` (default, the portable
   OpenAI-compatible Chat Completions adapter) or ``responses`` (OpenAI's Responses
-  API, which adds the built-in ``web_search`` tool). See `_provider_from_env`.
+  API, which can run server-side built-ins like ``web_search``). It also selects which
+  tool plugins activate — the ``web_search`` built-in needs ``responses``. See
+  `_provider_from_env` and `basecradle_harness._plugins`.
 - ``HARNESS_SYSTEM_PROMPT``   — **legacy fallback** for the agent's standing charter. The
   charter is now sourced from real files under the config home —
   ``prompts/system-prompt.md`` + ``prompts/initialize.md`` (see `basecradle_harness._install`)
@@ -43,25 +45,20 @@ from __future__ import annotations
 import itertools
 import os
 import time
+from collections.abc import Sequence
 
 from basecradle import BaseCradle
 
-from basecradle_harness._assets import AssetsTool
-from basecradle_harness._audio import HearAudioTool
-from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
-from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._install import charter_from_env
-from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
+from basecradle_harness._plugins import ActivationContext, load_plugins, resolve_plugins
 from basecradle_harness._provider import Provider
 from basecradle_harness._responses import OpenAIResponsesProvider
-from basecradle_harness._tasks import TasksTool
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
-from basecradle_harness._webfetch import WebFetchTool
-from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
+from basecradle_harness._tools import Tool
 
 DEFAULT_POLL_INTERVAL = 2.0
 
@@ -164,22 +161,12 @@ class TimelineAgent:
 
     @classmethod
     def from_env(cls) -> TimelineAgent:
-        """Build a fully wired agent (provider + memory + timeline) from env vars."""
+        """Build a fully wired agent (provider + tool plugins + timeline) from env vars."""
+        provider, tools = _resolve_tools_and_provider()
         harness = Harness(
-            _provider_from_env(),
+            provider,
             system_prompt=charter_from_env(),
-            tools=[
-                MemoryTool(),
-                WebFetchTool(),
-                AssetsTool(),
-                HearAudioTool(),
-                TasksTool(),
-                TimelinesTool(),
-                TrustTool(),
-                GenerateImageTool(),
-                WebhookEndpointsTool(),
-                WebhookEventsTool(),
-            ],
+            tools=tools,
         )
         return cls(
             harness,
@@ -383,32 +370,65 @@ def _compose_prompt(orientation: str | None, system_prompt: str | None) -> str |
     return "\n\n".join(parts) if parts else None
 
 
-def _provider_from_env() -> Provider:
+def _provider_api_from_env() -> str:
+    """The selected provider API — ``chat`` (default) or ``responses`` — validated.
+
+    Read in one place so the provider build and the plugin activation context agree on the
+    value. An unrecognized value is a clear error, never a silent fall-through to the default.
+    """
+    api = (os.environ.get("AI_PROVIDER_API") or "chat").strip().lower()
+    if api not in {"chat", "responses"}:
+        raise ValueError(
+            f"Unknown AI_PROVIDER_API {api!r}; expected 'chat' (default) or 'responses'."
+        )
+    return api
+
+
+def _provider_from_env(builtins: Sequence[str] = (), api: str | None = None) -> Provider:
     """Build the model provider the environment selects — Chat Completions by default.
 
     ``AI_PROVIDER_API`` chooses the adapter:
 
     - unset or ``chat`` → `OpenAICompatibleProvider`, the portable Chat Completions
       adapter (OpenAI, xAI, OpenRouter). The default — nothing changes for existing
-      deployments.
-    - ``responses`` → `OpenAIResponsesProvider`, OpenAI's Responses API, which
-      enables the built-in ``web_search`` tool. OpenAI-only by nature.
+      deployments. It has no server-side built-ins, so ``builtins`` is not applicable.
+    - ``responses`` → `OpenAIResponsesProvider`, OpenAI's Responses API. Its server-side
+      built-ins (``web_search``, …) are **plugin-driven** now: `builtins` is the resolved
+      set of active built-in tool plugins (see `_resolve_tools_and_provider`), passed
+      through as ``builtin_tools`` so the active built-ins follow the same overlay/activation
+      rules as every other tool — not a constructor default.
 
     Both read ``AI_PROVIDER_MODEL`` and the optional ``AI_PROVIDER_BASE_URL``; both
-    fall back to ``AI_PROVIDER_API_KEY`` for the key. An unrecognized value is a
-    clear error rather than a silent fall-through to the default.
+    fall back to ``AI_PROVIDER_API_KEY`` for the key. ``api`` lets a caller that already
+    resolved the provider API (`_resolve_tools_and_provider`) pass it in so it is read and
+    validated exactly once; left ``None`` it is read from the environment here.
     """
     kwargs: dict[str, str] = {"model": os.environ["AI_PROVIDER_MODEL"]}
     base_url = os.environ.get("AI_PROVIDER_BASE_URL")
     if base_url:
         kwargs["base_url"] = base_url
 
-    api = (os.environ.get("AI_PROVIDER_API") or "chat").strip().lower()
-    if api == "responses":
-        return OpenAIResponsesProvider(**kwargs)
-    if api == "chat":
-        return OpenAICompatibleProvider(**kwargs)
-    raise ValueError(f"Unknown AI_PROVIDER_API {api!r}; expected 'chat' (default) or 'responses'.")
+    if (api or _provider_api_from_env()) == "responses":
+        return OpenAIResponsesProvider(**kwargs, builtin_tools=list(builtins))
+    return OpenAICompatibleProvider(**kwargs)
+
+
+def _resolve_tools_and_provider() -> tuple[Provider, list[Tool]]:
+    """Resolve the active tool set and a matching provider from the config home + env.
+
+    The single seam both `TimelineAgent.from_env` and `WakeAgent.from_env` use to wire their
+    tools, replacing the old hardcoded list. It: reads the active provider API; loads the
+    tool plugins (the ``tools/`` overlay, else packaged defaults — see `load_plugins`);
+    resolves them against the active config (`resolve_plugins`), so an OpenAI-coupled tool or
+    a Responses-only built-in self-excludes when its requirement isn't met; then builds the
+    provider with the resolved built-ins. Returns the provider and the instantiated function
+    tools, which the caller hands to `Harness` (where the policy gate still applies on top).
+    """
+    api = _provider_api_from_env()
+    ctx = ActivationContext(provider_api=api, env=os.environ)
+    resolved = resolve_plugins(load_plugins(), ctx)
+    provider = _provider_from_env(builtins=resolved.builtins, api=api)
+    return provider, resolved.tools
 
 
 def _onboard_from_env() -> bool:

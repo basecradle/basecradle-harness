@@ -68,8 +68,7 @@ from urllib.parse import quote
 import httpx
 from basecradle import BaseCradle, BaseCradleError
 
-from basecradle_harness._assets import AssetsTool, _describe, _is_image, image_input
-from basecradle_harness._audio import HearAudioTool
+from basecradle_harness._assets import _describe, _is_image, image_input
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
@@ -80,23 +79,17 @@ from basecradle_harness._basecradle import (
     _messages_since,
     _onboard_from_env,
     _orientation,
-    _provider_from_env,
     _recent,
+    _resolve_tools_and_provider,
 )
 from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
-from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
-from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._install import charter_from_env
-from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import ImageContent
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import Session
-from basecradle_harness._tasks import TasksTool
 from basecradle_harness._version import __version__
-from basecradle_harness._webfetch import WebFetchTool
-from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
 
 # The kinds of timeline item the wake reconciles. Messages and webhook events are
 # creation-ordered streams tracked by a high-water mark (below); activated tasks are
@@ -336,21 +329,11 @@ class WakeAgent:
                 "Wake mode requires HARNESS_HOME — the directory where the agent's "
                 "transcript and high-water mark persist across wakes."
             )
+        provider, tools = _resolve_tools_and_provider()
         harness = Harness(
-            _provider_from_env(),
+            provider,
             system_prompt=charter_from_env(),
-            tools=[
-                MemoryTool(),
-                WebFetchTool(),
-                AssetsTool(),
-                HearAudioTool(),
-                TasksTool(),
-                TimelinesTool(),
-                TrustTool(),
-                GenerateImageTool(),
-                WebhookEndpointsTool(),
-                WebhookEventsTool(),
-            ],
+            tools=tools,
             home=home,
         )
         return cls(

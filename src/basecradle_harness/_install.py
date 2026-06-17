@@ -108,6 +108,11 @@ def _packaged_defaults() -> dict[str, str]:
 
     def walk(node, prefix: str) -> None:  # node is an importlib.resources Traversable
         for child in node.iterdir():
+            # Skip Python's bytecode cache: the shipped tool-plugin defaults are real `.py`
+            # files, so importing them (or a stray editable-install artifact) can leave a
+            # `__pycache__/*.pyc` here — binary, not a default, and not utf-8 text.
+            if child.name == "__pycache__":
+                continue
             rel = f"{prefix}{child.name}"
             if child.is_dir():
                 walk(child, f"{rel}/")
