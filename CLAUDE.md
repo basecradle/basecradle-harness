@@ -230,7 +230,7 @@ for the location: `--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.conf
   agent.env            # the operator's env (token, keys) — never created or touched by the installer
   prompts/
     system-prompt.md   # shipped default — composed into Turn 0 first
-    initialize.md      # shipped default (starter; richer default is a later group)
+    initialize.md      # shipped default — provider-independent operating guidance (Group 3)
   tools/               # created empty; loading from it is a later group
   mcp/                 # created empty; loading from it is a later group
   .manifest.json       # bookkeeping: the hash of every shipped default as installed
@@ -300,9 +300,45 @@ capital's exhaustive @jt test, each a default plugin under `_defaults/tools/` wi
   (`create`, `read`, `list`, `add_participant`, `remove_participant`) — no irreversible
   action.
 
-**Boundary:** the **knowledge fixes** (B6/C1/B7 in `initialize.md`), the generated tool
-manifest, the persistent Turn 0, MCP loading from `mcp/`, the `MemoryProvider`, and the
-circuit-breaker are later groups (3–6).
+**Boundary:** MCP loading from `mcp/`, the `MemoryProvider`, and the circuit-breaker are
+later groups (4–6). The **knowledge fixes** (B6/C1/B7), the generated tool manifest, and the
+persistent Turn 0 land in Group 3, below.
+
+### Persistent Turn 0: the operating brief (Phase 2 · Group 3)
+
+Turn 0 stops being a one-time onboarding seed (Group 1's `_orientation` field-scrape, which
+ages into the distant past of a long transcript) and becomes a brief **re-asserted on every
+wake**. A `WakeAgent` injects it at the head of each wake's work — **lazily, just before the
+model is first engaged**, so an idle or probe-only wake neither bloats the transcript nor
+fetches the live dashboard. Composed, in order, of four parts (`_brief.py`):
+
+1. **`initialize.md`** (`prompts/`, authored framework default) — lean, high-signal,
+   **provider-independent** operating guidance: the cross-cutting gotchas the function
+   schemas can't convey (trust is **directional in storage, mutual at the gate** — B6;
+   locking is **one-way and irreversible** — B1; **if you lack a tool, say so** — B7; don't
+   reflexively refuse on trigger words like "secret"). This is where the knowledge findings
+   are taught — in Turn 0, *without* a read.
+2. **Generated tool manifest** — "Your active tools right now: …" from Group 2's resolution
+   (`ResolvedTools.manifest`), each tool with its optional one-line `note`. Always matches
+   the active provider + drop-ins, so it can never drift from what the model can call.
+3. **Live `dashboard.md`** — the platform's *maintained* primer, fetched fresh from
+   `/users/dashboard.md` over the SDK client's authenticated transport (the SDK has no typed
+   markdown accessor yet). **A fetch failure degrades gracefully** — the brief is composed
+   from the rest and the wake never breaks. Replaces Group 1's structured field-scrape.
+4. **`system-prompt.md`** (`prompts/`, personality) — `HARNESS_SYSTEM_PROMPT` remains the
+   legacy fallback for an un-migrated agent.
+
+**The optional per-tool `note`** is additive to the Group 2 plugin contract: a `ToolPlugin`
+may carry a one-line gotcha (the shipped `lock` plugin does), rendered into the manifest; a
+plugin without one just lists its name.
+
+**@jt needs no migration** — with no config home it composes the brief from the packaged
+`initialize.md` + its `HARNESS_SYSTEM_PROMPT` personality + the live dashboard + the
+generated manifest (behavior-preserving, and it gains the persistent brief).
+
+**Boundary:** the **poll-loop `TimelineAgent`** keeps its Group-1 startup onboarding — a
+single long-lived process has no per-wake re-assertion to make; the persistent brief is a
+wake-mode property.
 
 ## Development Commands
 

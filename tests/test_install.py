@@ -25,6 +25,8 @@ from basecradle_harness._install import (
     charter_from_config,
     charter_from_env,
     main,
+    prompt_text,
+    system_prompt_text,
 )
 
 # Synthetic default sets, used to drive the upgrader's four cases deterministically: v1 is
@@ -285,6 +287,54 @@ def test_a_deliberately_blanked_charter_wins_over_the_legacy_var(tmp_path, monke
     # present-but-empty: files win, so the charter is empty — not the legacy env var.
     assert charter_from_config(home) == ""
     assert charter_from_env() == ""
+
+
+# --- sourcing one prompt at a time (the persistent brief) --------------------
+
+
+def test_prompt_text_falls_back_to_the_packaged_default_when_not_installed(tmp_path):
+    # No config home installed → the packaged default is the source, so an un-migrated agent
+    # (like @jt) still composes a full brief. The shipped initialize.md carries the trust note.
+    text = prompt_text("initialize.md", tmp_path / "absent")
+    assert "Trust is directional in storage, mutual at the gate." in text
+    assert "<!--" not in text  # the operator-note comment is stripped before composition
+
+
+def test_prompt_text_prefers_the_installed_file_and_strips_comments(tmp_path):
+    home = tmp_path / "cfg"
+    install(home)
+    (home / "prompts" / "initialize.md").write_text("<!-- note -->\nMy own guidance.\n")
+
+    assert prompt_text("initialize.md", home) == "My own guidance."
+
+
+def test_prompt_text_honors_a_deletion_once_installed(tmp_path):
+    # Installed, then deleted → respected (None), never resurrected from the package.
+    home = tmp_path / "cfg"
+    install(home)
+    (home / "prompts" / "initialize.md").unlink()
+
+    assert prompt_text("initialize.md", home) is None
+
+
+def test_system_prompt_text_uses_the_legacy_env_when_not_installed(tmp_path, monkeypatch):
+    # @jt has no config home; its HARNESS_SYSTEM_PROMPT is the personality slot of the brief.
+    monkeypatch.setenv("HARNESS_SYSTEM_PROMPT", "You are JT, a test peer.")
+    assert system_prompt_text(tmp_path / "absent") == "You are JT, a test peer."
+
+
+def test_system_prompt_text_defaults_to_the_packaged_personality(tmp_path, monkeypatch):
+    monkeypatch.delenv("HARNESS_SYSTEM_PROMPT", raising=False)
+    assert system_prompt_text(tmp_path / "absent") == "You are a helpful peer on BaseCradle."
+
+
+def test_system_prompt_text_prefers_installed_files_over_the_legacy_env(tmp_path, monkeypatch):
+    home = tmp_path / "cfg"
+    install(home)
+    (home / "prompts" / "system-prompt.md").write_text("You are Nova.\n")
+    monkeypatch.setenv("HARNESS_SYSTEM_PROMPT", "legacy charter")
+
+    assert system_prompt_text(home) == "You are Nova."
 
 
 # --- the CLI -----------------------------------------------------------------

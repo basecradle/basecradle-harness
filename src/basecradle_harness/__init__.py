@@ -9,6 +9,7 @@ https://basecradle.com · API docs: https://basecradle.com/docs/api
 from basecradle_harness._assets import AssetsTool
 from basecradle_harness._audio import HearAudioTool
 from basecradle_harness._basecradle import TimelineAgent
+from basecradle_harness._brief import compose_brief, fetch_dashboard_md, render_manifest
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
     EngineError,
@@ -29,6 +30,8 @@ from basecradle_harness._install import (
     charter_from_config,
     config_home,
     install,
+    prompt_text,
+    system_prompt_text,
 )
 from basecradle_harness._lock import LockTool
 from basecradle_harness._memory import MemoryTool
@@ -81,10 +84,16 @@ __all__ = [
     "install",
     "config_home",
     "charter_from_config",
+    "prompt_text",
+    "system_prompt_text",
     "InstallReport",
     "MarkStore",
     "SeenStore",
     "ClaimStore",
+    # The persistent Turn-0 operating brief
+    "compose_brief",
+    "render_manifest",
+    "fetch_dashboard_md",
     # Provider contract + adapters
     "Provider",
     "OpenAICompatibleProvider",
