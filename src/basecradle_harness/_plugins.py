@@ -222,12 +222,17 @@ class ResolvedTools:
             alike, in resolution order — the source the persistent Turn-0 brief renders into
             its "Your active tools right now" block. ``note`` is the plugin's optional gotcha,
             or ``None``. Always matches the active provider + drop-ins, so it can never drift.
+        notices: Safe-by-default opt-out lines surfaced in the Turn-0 brief — one per active
+            MCP server, plus any tool refused by the locked policy (Group 5, Part B). Empty
+            for a pure-Harness config; populated only when the operator has knowingly left
+            the safe zone, so "all bets off" is stated and auditable, never silent.
     """
 
     tools: list[Tool] = field(default_factory=list)
     builtins: list[str] = field(default_factory=list)
     skipped: list[tuple[str, str]] = field(default_factory=list)
     manifest: list[tuple[str, str | None]] = field(default_factory=list)
+    notices: list[str] = field(default_factory=list)
 
 
 def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> ResolvedTools:

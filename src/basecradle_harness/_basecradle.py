@@ -43,6 +43,7 @@ Configuration is environment-first (see `TimelineAgent.from_env`):
 from __future__ import annotations
 
 import itertools
+import logging
 import os
 import time
 from collections.abc import Sequence
@@ -51,6 +52,7 @@ from basecradle import BaseCradle
 
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env
+from basecradle_harness._mcp import McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
@@ -61,9 +63,13 @@ from basecradle_harness._plugins import (
     load_plugins,
     resolve_plugins,
 )
+from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._responses import OpenAIResponsesProvider
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
+from basecradle_harness._tools import Tool
+
+_log = logging.getLogger("basecradle_harness")
 
 DEFAULT_POLL_INTERVAL = 2.0
 
@@ -439,16 +445,24 @@ def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvid
 
     Memory is a provider now, not a hardcoded plugin — so the memory tool comes from
     ``memory.tools()`` (the default SQLite provider supplies the `MemoryTool`; an
-    automatic-only provider like MemPalace supplies none). Returns the model provider, the
-    merged `ResolvedTools` (``.tools`` → `Harness`, where the policy gate still applies;
-    ``.manifest`` → the persistent Turn-0 brief), and the memory provider itself, which the
-    wake holds to fire its `observe`/`context` hooks.
+    automatic-only provider like MemPalace supplies none). **MCP drop-ins** (Group 5) fold
+    in next: every server configured under the config home's ``mcp/`` dir is connected, its
+    tools proxied into the set, and its safe-by-default opt-out surfaced in ``.notices``
+    (`_merge_mcp_tools`) — with ``mcp/`` empty (the default) this is a no-op. Finally the
+    **locked policy** is applied here too (`_apply_safe_policy`): a drop-in tool that needs a
+    forbidden capability is dropped and surfaced rather than crashing `Harness` construction,
+    so the safe boundary degrades gracefully. Returns the model provider, the merged
+    `ResolvedTools` (``.tools`` → `Harness`, where the policy gate still applies as
+    defense-in-depth; ``.manifest``/``.notices`` → the persistent Turn-0 brief), and the
+    memory provider itself, which the wake holds to fire its `observe`/`context` hooks.
     """
     api = _provider_api_from_env()
     ctx = ActivationContext(provider_api=api, env=os.environ)
     resolved = resolve_plugins(load_plugins(), ctx)
     memory = memory_provider_from_env()
     resolved = _merge_memory_tools(resolved, memory)
+    resolved = _merge_mcp_tools(resolved, load_mcp_tools())
+    resolved = _apply_safe_policy(resolved)
     provider = _provider_from_env(builtins=resolved.builtins, api=api)
     return provider, resolved, memory
 
@@ -472,6 +486,72 @@ def _merge_memory_tools(resolved: ResolvedTools, memory: MemoryProvider) -> Reso
         builtins=resolved.builtins,
         skipped=resolved.skipped,
         manifest=resolved.manifest + [(tool.name, None) for tool in added],
+        notices=resolved.notices,
+    )
+
+
+def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedTools:
+    """Fold an `McpResolution` into the resolved set: tools, manifest, skips, and notices.
+
+    Each active MCP server's proxy tools join ``.tools`` (deduped by name as a safety net —
+    MCP names are namespaced ``<server>__<tool>``, so a collision means an operator's
+    ``tools/`` overlay already claimed the name, which wins). The per-tool manifest entries
+    and the per-server safe-by-default opt-out `notices` extend the brief's inputs, and a
+    failed server's ``(name, reason)`` rides ``.skipped`` like a Group-2 activation skip.
+    With ``mcp/`` empty the `McpResolution` is empty and this returns ``resolved`` unchanged.
+    """
+    if not mcp.tools and not mcp.skipped and not mcp.notices:
+        return resolved
+    existing = {tool.name for tool in resolved.tools}
+    added = [tool for tool in mcp.tools if tool.name not in existing]
+    added_manifest = [entry for entry in mcp.manifest if entry[0] not in existing]
+    return ResolvedTools(
+        tools=resolved.tools + added,
+        builtins=resolved.builtins,
+        skipped=resolved.skipped + mcp.skipped,
+        manifest=resolved.manifest + added_manifest,
+        notices=resolved.notices + mcp.notices,
+    )
+
+
+def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) -> ResolvedTools:
+    """Drop any resolved tool the locked policy forbids, surfacing the refusal in the brief.
+
+    `Harness` already gates tools through the policy at registration — but it does so by
+    *raising* `PolicyError`, which on the env-resolution path would crash the whole wake the
+    moment a drop-in ``tools/`` tool declared a forbidden capability (e.g. ``SHELL``). That
+    is the wrong failure shape for a peer: one bad operator tool should self-exclude, not
+    take the agent down. So the safe boundary is applied here as a *filter* — a forbidden
+    tool is removed from ``.tools`` and its manifest entry, recorded in ``.skipped``, and
+    surfaced as a `notices` line — exactly the Group-2 robustness bar, now extended to the
+    policy gate (Part B). The policy is **not** bypassed: the tool never reaches the
+    registry, and the locked `Harness` re-checks the survivors as defense-in-depth. Safe by
+    default stays a policy property; activation never overrides it.
+    """
+    policy = policy or Policy.locked()
+    permitted: list[Tool] = []
+    refused: dict[str, str] = {}
+    notices = list(resolved.notices)
+    skipped = list(resolved.skipped)
+    for tool in resolved.tools:
+        if policy.permits(tool):
+            permitted.append(tool)
+            continue
+        blocked = ", ".join(sorted(tool.requires & policy.forbidden))
+        reason = f"refused by the safe-by-default policy: needs {blocked}"
+        refused[tool.name] = reason
+        skipped.append((tool.name, reason))
+        notices.append(f"Tool {tool.name!r} {reason}; not loaded.")
+        _log.warning("Tool %r %s; not loaded.", tool.name, reason)
+    if not refused:
+        return resolved
+    manifest = [entry for entry in resolved.manifest if entry[0] not in refused]
+    return ResolvedTools(
+        tools=permitted,
+        builtins=resolved.builtins,
+        skipped=skipped,
+        manifest=manifest,
+        notices=notices,
     )
 
 

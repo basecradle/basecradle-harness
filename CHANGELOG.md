@@ -7,6 +7,61 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-06-17
+
+Phase 2 · **Group 5** — **MCP drop-in + safe-by-default made explicit.** The harness
+becomes an [MCP](https://modelcontextprotocol.io) **client**: drop a server config into the
+config home's `mcp/` dir and that server's tools become part of the agent's active tool set
+on the next wake — no code change, the same "everything in the folder is active" model as
+the `tools/` overlay. And the harness's safe-by-default posture is made **explicit**: it
+ships with no MCP servers and a policy that denies shell; adding a server (or a custom tool
+that needs a denied capability) is a deliberate, surfaced opt-out — "all bets off," stated
+and auditable, never silent. This reverses the earlier "MCP is out of scope" stance (a
+founder decision).
+
+### Added
+
+- **The harness as an MCP client** (`basecradle_harness._mcp`) — a small, synchronous
+  JSON-RPC client over **stdio** (a spawned subprocess) or **Streamable HTTP**, with no new
+  dependency (httpx comes via the SDK; stdio is stdlib). It handshakes, `tools/list`s, and
+  proxies `tools/call`. Each discovered tool is exposed as a plain function `Tool`
+  (namespaced `<server>__<tool>`), so it composes under **both** the Chat and Responses
+  providers and appears in the generated Turn-0 manifest like any other tool.
+- **The `mcp/` overlay.** One server per `mcp/<name>.json`, following the **standard MCP
+  config shape** (stdio: `command`/`args`/`env`; HTTP: `url`/`headers`; a single-entry
+  `{"mcpServers": {…}}` wrapper is unwrapped) so a published server's snippet drops in
+  unmodified. Drop-to-add / delete-to-disable, consistent with the `tools/` overlay. `mcp/`
+  ships **empty** (safe by default), so there is nothing for the conffile upgrader to
+  reconcile and an operator-added file is never touched.
+- **Safe-by-default opt-out surfacing.** Loading an MCP server is surfaced — a **log line**
+  and an **opt-out notice** rendered into the persistent Turn-0 brief
+  (`ResolvedTools.notices` → `render_safety` → `compose_brief`), so "this agent has left the
+  safe-by-default zone" is stated and auditable. The same surfacing covers a drop-in
+  `tools/` tool the locked policy refuses, which is now **filtered out and surfaced**
+  (`_apply_safe_policy`) rather than crashing `Harness` construction.
+- **`HARNESS_MCP_TIMEOUT`** — the per-request timeout bounding a slow/hung MCP server (so it
+  degrades to a skip or a tool error, never a stalled wake). Defaults to 20s.
+
+### Changed
+
+- **Safe by construction stays a policy property.** An MCP proxy tool carries no in-process
+  capability, so it registers under the locked policy (the opt-out is *surfaced*, not
+  refused); a `tools/` tool that declares `SHELL` is still denied — the activation-vs-policy
+  split is preserved, and the policy is never bypassed by mere activation.
+- A failed/missing MCP server **self-excludes** (its tools are skipped with a reason),
+  never a hard wake failure — the Group-2 activation robustness bar, extended to MCP.
+- **`CLAUDE.md`** — the "MCP is out of scope / deferred" stance is **reversed** to the new
+  rule (MCP via the `mcp/` drop-in; safe-by-default with no servers; adding one is a
+  surfaced opt-out), with a new Group-5 section and updated config-home/upgrader docs.
+
+### Known bounds
+
+- An MCP **media** result (image / embedded-resource content blocks) renders as a text
+  marker, not model-vision input — out of scope here.
+- A stdio server is spawned **per wake** (process-per-event model), adding its handshake +
+  `tools/list` latency to each wake that has MCP configured; with `mcp/` empty (the default)
+  a wake pays nothing. A pooled/long-lived server is a possible future optimization.
+
 ## [0.26.0] - 2026-06-16
 
 Phase 2 · **Group 4** — **pluggable memory.** The leading memory systems

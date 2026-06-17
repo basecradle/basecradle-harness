@@ -14,8 +14,8 @@ The layout the installer scaffolds::
       prompts/
         system-prompt.md   # shipped default
         initialize.md      # shipped default (starter; the richer default is a later group)
-      tools/               # empty this group (loading from it is a later group)
-      mcp/                 # empty this group (loading from it is a later group)
+      tools/               # tool-plugin overlay (drop-in *.py) — loaded by `_plugins` (Group 2)
+      mcp/                 # MCP server configs (drop-in *.json) — loaded by `_mcp` (Group 5)
       .manifest.json       # bookkeeping: the hash of every shipped default as installed
 
 **The conffile upgrader.** Re-running the installer against a newer package is an
@@ -35,11 +35,12 @@ and against the on-disk file:
 The operator's config dir is never clobbered; only pristine defaults refresh. This
 per-agent reconcile is exactly what a fleet rollout loops over a pinned version.
 
-**Boundary (this group).** Tool defaults stay package-registered; the ``tools/`` and
-``mcp/`` dirs are created but loading from them is a later group, as is the persistent
-Turn 0 and the generated tool manifest. This module owns *where things live and how
-install/upgrade works* — not the tool system or prompt composition beyond sourcing the
-charter from files (`charter_from_config`).
+**Boundary.** This module owns *where things live and how install/upgrade works* — it
+scaffolds the ``tools/`` and ``mcp/`` overlay dirs and reconciles the shipped defaults,
+but the loading of those overlays lives elsewhere (`_plugins` for ``tools/``, `_mcp` for
+``mcp/``), as does prompt composition beyond sourcing the charter from files
+(`charter_from_config`). ``mcp/`` ships **empty** (safe by default), so it has no shipped
+defaults for the upgrader to reconcile and an operator-added server file is never touched.
 """
 
 from __future__ import annotations

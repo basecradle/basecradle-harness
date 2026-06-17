@@ -81,7 +81,12 @@ from basecradle_harness._basecradle import (
     _recent,
     _resolve_tools_and_provider,
 )
-from basecradle_harness._brief import compose_brief, fetch_dashboard_md, render_manifest
+from basecradle_harness._brief import (
+    compose_brief,
+    fetch_dashboard_md,
+    render_manifest,
+    render_safety,
+)
 from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
@@ -274,6 +279,7 @@ class WakeAgent:
         probe_secret: str | None = None,
         tool_manifest: list[tuple[str, str | None]] | None = None,
         memory_provider: MemoryProvider | None = None,
+        safety_notices: list[str] | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -290,6 +296,10 @@ class WakeAgent:
         self.onboard = onboard
         self.tool_manifest = tool_manifest
         self.memory_provider = memory_provider
+        # Safe-by-default opt-out notices (active MCP servers, policy-refused drop-in tools)
+        # surfaced into the persistent brief, so "all bets off" is stated and auditable —
+        # empty for a pure-Harness config.
+        self.safety_notices = safety_notices
         # The persistent brief is composed and injected at most once per `wake()` — lazily,
         # right before the first time the model is actually engaged — so an idle or probe-only
         # wake neither fetches the live dashboard nor bloats the transcript. Reset each wake.
@@ -379,6 +389,9 @@ class WakeAgent:
             # The env-selected memory provider, whose observe/context hooks fire in the wake
             # loop. Default SQLite → no-op hooks → behavior unchanged for @jt.
             memory_provider=memory,
+            # Safe-by-default opt-out notices from tool resolution (active MCP servers,
+            # policy-refused drop-ins). Empty by default → no safety section in the brief.
+            safety_notices=resolved.notices,
         )
 
     def wake(
@@ -834,12 +847,14 @@ class WakeAgent:
             _log.info("Persistent brief composed empty this wake; proceeding without it.")
 
     def _compose_brief(self, query: str | None = None) -> str | None:
-        """Compose the persistent brief for this wake: initialize + manifest + dashboard + memory + charter.
+        """Compose the persistent brief: initialize + manifest + safety + dashboard + memory + charter.
 
         The parts, in order (see `basecradle_harness._brief`): the provider-independent
         `initialize.md` operating guidance, the generated manifest of the agent's *active*
-        tools, the live `dashboard.md` primer (fetched fresh each wake; a fetch failure
-        degrades to omitting it, never breaking the wake), the memory provider's recalled
+        tools, the **safe-by-default opt-out notice** (active MCP servers / policy-refused
+        drop-ins — omitted when there are none), the live `dashboard.md` primer (fetched
+        fresh each wake; a fetch failure degrades to omitting it, never breaking the wake),
+        the memory provider's recalled
         **context** for this turn (its `context` hook — omitted when there is none or the
         provider's hook is a no-op), and the operator's `system-prompt.md` personality
         charter. Any part may be absent and the brief is composed from the rest.
@@ -854,6 +869,7 @@ class WakeAgent:
             return compose_brief(
                 initialize=prompt_text("initialize.md"),
                 manifest=render_manifest(self._manifest_entries()),
+                safety=render_safety(self.safety_notices),
                 dashboard=fetch_dashboard_md(self.client),
                 memory=self._memory_context(query),
                 system_prompt=system_prompt_text(),

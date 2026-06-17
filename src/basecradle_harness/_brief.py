@@ -45,10 +45,27 @@ def render_manifest(entries: Sequence[tuple[str, str | None]]) -> str | None:
     return "\n".join(lines)
 
 
+def render_safety(notices: Sequence[str] | None) -> str | None:
+    """The safe-by-default opt-out block, from the resolved set's `notices`, or ``None``.
+
+    Each notice is one line — an active MCP server, or a drop-in tool the locked policy
+    refused (Group 5, Part B). Returns ``None`` for an empty/absent list, so a pure-Harness
+    agent (no MCP, no policy-refused tool) composes exactly the brief it did before, with no
+    safety section at all. When present, the block is headed so the agent reads it as the
+    auditable "you have left the safe-by-default zone" marker the brief must not hide.
+    """
+    lines = [notice for notice in (notices or []) if notice and notice.strip()]
+    if not lines:
+        return None
+    header = "⚠ Safe-by-default opt-out — this agent has loaded tools beyond the shipped safe set:"
+    return "\n".join([header, *(f"- {line}" for line in lines)])
+
+
 def compose_brief(
     *,
     initialize: str | None,
     manifest: str | None,
+    safety: str | None = None,
     dashboard: str | None,
     memory: str | None = None,
     system_prompt: str | None,
@@ -56,20 +73,22 @@ def compose_brief(
     """Join the brief parts in order, skipping any that are absent or empty.
 
     Order is load-bearing: operating guidance first (how to act), then the tools the agent
-    has, then the live dashboard (where it is), then any recalled **memory** relevant to the
-    turn (the memory provider's `context` hook — injected just before the charter, the way
-    middleware memory systems inject retrieved context before the system prompt), then the
-    personality charter. Any part may be absent — a missing dashboard (fetch failed), a
-    memory provider that recalled nothing, an operator who blanked their charter — and the
-    brief is composed from whatever remains. With nothing at all, returns ``None``.
+    has, then the **safe-by-default opt-out notice** (right after the tools it annotates —
+    Group 5), then the live dashboard (where it is), then any recalled **memory** relevant
+    to the turn (the memory provider's `context` hook — injected just before the charter, the
+    way middleware memory systems inject retrieved context before the system prompt), then
+    the personality charter. Any part may be absent — a missing dashboard (fetch failed), a
+    memory provider that recalled nothing, no MCP/policy opt-out, an operator who blanked
+    their charter — and the brief is composed from whatever remains. With nothing at all,
+    returns ``None``.
 
-    ``memory`` defaults to ``None`` so a caller with no memory context (the common case, and
-    the default SQLite provider whose `context` is a no-op) composes exactly the four-part
-    brief it did before this seam existed.
+    ``safety`` and ``memory`` default to ``None`` so a caller with neither (the common case:
+    no MCP drop-in, and the default SQLite provider whose `context` is a no-op) composes
+    exactly the brief it did before these seams existed.
     """
     parts = [
         part
-        for part in (initialize, manifest, dashboard, memory, system_prompt)
+        for part in (initialize, manifest, safety, dashboard, memory, system_prompt)
         if part and part.strip()
     ]
     return "\n\n".join(parts) if parts else None

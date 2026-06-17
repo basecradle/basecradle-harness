@@ -153,8 +153,8 @@ basecradle-harness-install --config-home <dir>   # or an explicit location
   prompts/
     system-prompt.md   # shipped default — composed into your Turn-0 charter, first
     initialize.md      # shipped default — provider-independent operating guidance
-  tools/               # created empty (loading from it is a later release)
-  mcp/                 # created empty (loading from it is a later release)
+  tools/               # tool-plugin overlay — drop in a *.py to add/override/disable a tool
+  mcp/                 # MCP server configs — drop in a *.json to add a server; empty = safe
   .manifest.json       # the installer's bookkeeping — leave it be
 ```
 
@@ -472,6 +472,24 @@ print(Uppercase().run(text="hello"))  # -> HELLO
 
 That is the whole contract. A tool that needs a dangerous capability declares it (e.g. `requires = frozenset({SHELL})`) and is **refused by the safe profile** — the shipped Harness will not load it.
 
+## Plug in an MCP server
+
+The harness is an [MCP](https://modelcontextprotocol.io) **client**. Drop one server config into the config home's `mcp/` dir and that server's tools join your agent's active tool set on the next wake — no code change, the same drop-in model as `tools/`.
+
+```jsonc
+// ~/.config/basecradle/mcp/mempalace.json — one server per file (the stem names it)
+{ "command": "uvx", "args": ["mempalace-mcp"], "env": { "API_KEY": "…" } }
+```
+
+```jsonc
+// or a remote server over Streamable HTTP
+{ "url": "https://host/mcp", "headers": { "Authorization": "Bearer …" } }
+```
+
+The shape is the standard MCP config, so a published server's snippet drops in unmodified; a single-entry `{"mcpServers": {…}}` wrapper works too. Each discovered tool appears to the model as `<server>__<tool>` and proxies straight to the server. **Drop to add, delete to disable.** A server that fails to start or list its tools self-excludes (its tools are skipped with a reason) — it never crashes the wake.
+
+`mcp/` ships **empty**: a fresh install talks to no external server. Adding one is a deliberate step *out* of the safe-by-default zone — see below.
+
 ## Add your own provider
 
 A provider is **any object with a `chat(messages, tools=None) -> Message` method**. There is nothing to inherit; implement that one method and you have a new brain.
@@ -515,6 +533,8 @@ except PolicyError as error:
 ```
 
 This is the property that makes Harness trustworthy to deploy by default — and the honest prototype for **Cradle**, its later sibling, which is the *same engine* on an unlocked policy.
+
+Leaving the safe zone is **explicit and surfaced**, never silent. The one way to extend the agent beyond the shipped safe set is your own deliberate act — dropping an [MCP server](#plug-in-an-mcp-server) into `mcp/`, or adding a `tools/` tool that needs a denied capability. When you do, the harness says so: a log line, and an opt-out notice carried in the agent's persistent operating brief ("this agent has extended beyond the safe-by-default tool set"). An MCP server is external code the harness can't police, so dropping one in is *your* call — and an auditable one. (A `tools/` tool that asks for `SHELL` is still refused outright; the policy is never bypassed.)
 
 ## License
 
