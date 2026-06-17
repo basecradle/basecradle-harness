@@ -87,6 +87,7 @@ from basecradle_harness._exceptions import EngineError, HarnessError, ProviderEr
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._images import GenerateImageTool
+from basecradle_harness._install import charter_from_env
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import ImageContent
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
@@ -337,7 +338,7 @@ class WakeAgent:
             )
         harness = Harness(
             _provider_from_env(),
-            system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
+            system_prompt=charter_from_env(),
             tools=[
                 MemoryTool(),
                 WebFetchTool(),

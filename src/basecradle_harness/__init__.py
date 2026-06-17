@@ -24,6 +24,12 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._images import GenerateImageTool
+from basecradle_harness._install import (
+    InstallReport,
+    charter_from_config,
+    config_home,
+    install,
+)
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import (
     ImageContent,
@@ -58,6 +64,11 @@ __all__ = [
     "Engine",
     "TimelineAgent",
     "WakeAgent",
+    # Config home: installer + conffile upgrader
+    "install",
+    "config_home",
+    "charter_from_config",
+    "InstallReport",
     "MarkStore",
     "SeenStore",
     "ClaimStore",

@@ -25,6 +25,9 @@ dependencies = ["basecradle>=0.3"]
 [project.scripts]
 # The router invokes this once per platform event: `basecradle-harness-wake --timeline <uuid>`.
 basecradle-harness-wake = "basecradle_harness._wake:main"
+# Scaffold (and upgrade) the operator's config home: prompts/, tools/, mcp/, and the shipped
+# charter defaults. Idempotent — a fleet rollout re-runs it per agent over a pinned version.
+basecradle-harness-install = "basecradle_harness._install:main"
 
 [project.urls]
 Homepage = "https://basecradle.com"

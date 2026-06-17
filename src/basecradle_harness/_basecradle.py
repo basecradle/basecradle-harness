@@ -27,7 +27,10 @@ Configuration is environment-first (see `TimelineAgent.from_env`):
 - ``AI_PROVIDER_API``         — optional; ``chat`` (default, the portable
   OpenAI-compatible Chat Completions adapter) or ``responses`` (OpenAI's Responses
   API, which adds the built-in ``web_search`` tool). See `_provider_from_env`.
-- ``HARNESS_SYSTEM_PROMPT``   — optional standing instructions for the agent.
+- ``HARNESS_SYSTEM_PROMPT``   — **legacy fallback** for the agent's standing charter. The
+  charter is now sourced from real files under the config home —
+  ``prompts/system-prompt.md`` + ``prompts/initialize.md`` (see `basecradle_harness._install`)
+  — and this env var is consulted only when the config home was never installed.
 - ``HARNESS_CONTEXT_MESSAGES`` — optional; how many backlog messages to seed as
   context (an int, or ``all`` for the whole timeline). Unset → the default.
 - ``HARNESS_ONBOARD``         — optional; wake seeded with Dashboard orientation
@@ -48,6 +51,7 @@ from basecradle_harness._audio import HearAudioTool
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._images import GenerateImageTool
+from basecradle_harness._install import charter_from_env
 from basecradle_harness._memory import MemoryTool
 from basecradle_harness._messages import Message
 from basecradle_harness._openai import OpenAICompatibleProvider
@@ -163,7 +167,7 @@ class TimelineAgent:
         """Build a fully wired agent (provider + memory + timeline) from env vars."""
         harness = Harness(
             _provider_from_env(),
-            system_prompt=os.environ.get("HARNESS_SYSTEM_PROMPT"),
+            system_prompt=charter_from_env(),
             tools=[
                 MemoryTool(),
                 WebFetchTool(),
