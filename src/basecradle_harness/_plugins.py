@@ -63,8 +63,8 @@ class ActivationContext:
     """The active config a plugin's `requires` are checked against.
 
     Args:
-        provider_api: The selected provider API — ``"chat"`` or ``"responses"`` (the value
-            of ``AI_PROVIDER_API``). What a `ProviderAPI` requirement matches on.
+        provider_api: The selected provider API — ``"chat"``, ``"responses"``, or ``"xai"``
+            (the value of ``AI_PROVIDER_API``). What a `ProviderAPI` requirement matches on.
         env: An environment snapshot (usually ``os.environ``) — what an `EnvSet` / `OpenAIKey`
             requirement reads. Passed in rather than read globally so resolution is pure and
             a test can drive it without touching the process environment.
@@ -126,13 +126,17 @@ class EnvSet(Requirement):
 
 @dataclass(frozen=True)
 class OpenAIKey(EnvSet):
-    """Met iff an OpenAI API key (``AI_PROVIDER_API_KEY``) is present.
+    """Met iff an OpenAI API key (``AI_PROVIDER_API_KEY``) is present **and** this isn't xAI.
 
     The honest activation requirement for the OpenAI-coupled tools (``generate_image``,
-    ``listen``): they call OpenAI's Images/Audio APIs with the agent's key under *either*
-    provider, so what they truly need is that key — not a particular provider adapter.
-    Whether the key is genuinely an *OpenAI* key (vs. an xAI/OpenRouter key behind the same
-    var) can't be told from the environment; key-present is the strongest non-fragile proxy.
+    ``listen``): they call OpenAI's Images/Audio APIs with the agent's key under the ``chat``
+    or ``responses`` provider, so what they truly need is that key — not a particular adapter.
+    Whether the key behind the shared var is genuinely an *OpenAI* key can't be told in
+    general; key-present is the strongest non-fragile proxy. The **one** case we *can* tell is
+    the xAI-native profile (``AI_PROVIDER_API=xai``): there the key is an xAI key and these
+    OpenAI tools must **not** activate (an xAI agent's stack touches no OpenAI surface — the
+    grok media tools cover it instead), so the profile is excluded here by construction rather
+    than left to the operator to curate.
 
     It is an `EnvSet` (inheriting the env-presence check) with the right default var and a
     plugin-author-friendly name and reason — so a default plugin reads ``requires=(OpenAIKey(),)``.
@@ -140,9 +144,12 @@ class OpenAIKey(EnvSet):
 
     var: str = "AI_PROVIDER_API_KEY"
 
+    def met(self, ctx: ActivationContext) -> bool:
+        return super().met(ctx) and ctx.provider_api != "xai"
+
     @property
     def reason(self) -> str:
-        return "needs an OpenAI API key (AI_PROVIDER_API_KEY)"
+        return "needs an OpenAI API key (AI_PROVIDER_API_KEY) and a non-xAI provider"
 
 
 # --- the plugin ---------------------------------------------------------------

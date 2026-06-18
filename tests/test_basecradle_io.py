@@ -597,6 +597,50 @@ def test_provider_from_env_rejects_an_unknown_api(monkeypatch):
         _provider_from_env()
 
 
+def test_provider_from_env_xai_builds_the_responses_adapter_at_api_x_ai(monkeypatch):
+    # Eddie's profile: the Responses wire (what xAI speaks), defaulted to api.x.ai — no new
+    # adapter class, just the Responses adapter pointed at xAI.
+    monkeypatch.setenv("AI_PROVIDER_API", "xai")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "xai-test-key")
+    monkeypatch.delenv("AI_PROVIDER_BASE_URL", raising=False)
+
+    provider = _provider_from_env(builtins=["web_search", "x_search"])
+
+    assert isinstance(provider, OpenAIResponsesProvider)
+    assert provider.base_url == "https://api.x.ai/v1"
+
+
+def test_provider_from_env_xai_honors_an_explicit_base_url(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER_API", "xai")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "xai-test-key")
+    monkeypatch.setenv("AI_PROVIDER_BASE_URL", "https://xai-proxy.internal/v1")
+
+    provider = _provider_from_env()
+
+    assert provider.base_url == "https://xai-proxy.internal/v1"
+
+
+def test_from_env_wires_the_xai_profile_with_live_search_builtins(platform, monkeypatch):
+    """End to end: AI_PROVIDER_API=xai gives Eddie the Responses brain at xAI with Live Search."""
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_PROVIDER_API", "xai")
+    monkeypatch.setenv("AI_PROVIDER_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_PROVIDER_API_KEY", "xai-test-key")
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+
+    agent = TimelineAgent.from_env()
+
+    assert isinstance(agent.harness.provider, OpenAIResponsesProvider)
+    assert agent.harness.provider.base_url == "https://api.x.ai/v1"
+    # The grok media tools are active; the OpenAI image tools are not (no OpenAI surface).
+    names = {t.name for t in agent.harness.tools}
+    assert {"grok_generate_image", "grok_generate_video"} <= names
+    assert not ({"generate_image", "edit_image", "listen"} & names)
+
+
 def test_from_env_wires_the_responses_provider(platform, monkeypatch):
     """End to end: AI_PROVIDER_API=responses gives the agent the Responses brain."""
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)

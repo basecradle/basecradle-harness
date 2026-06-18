@@ -28,6 +28,7 @@ from basecradle_harness._exceptions import (
     ProviderRateLimitError,
 )
 from basecradle_harness._governance import TimelinesTool, TrustTool
+from basecradle_harness._grok import GrokGenerateImageTool, GrokGenerateVideoTool
 from basecradle_harness._harness import Harness
 from basecradle_harness._images import EditImageTool, GenerateImageTool
 from basecradle_harness._install import (
@@ -179,6 +180,8 @@ __all__ = [
     "MessagesTool",
     "GenerateImageTool",
     "EditImageTool",
+    "GrokGenerateImageTool",
+    "GrokGenerateVideoTool",
     "WebhookEndpointsTool",
     "WebhookEventsTool",
     "bind_platform_tools",

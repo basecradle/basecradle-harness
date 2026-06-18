@@ -270,8 +270,23 @@ def test_removing_the_whole_tools_dir_once_installed_yields_no_tools(tmp_path):
     assert load_plugins(home) == []
 
 
+# The xAI-profile-only defaults: loaded under every config but active only under api="xai".
+_XAI_DEFAULTS = {"web_search", "x_search", "grok_generate_image", "grok_generate_video"}
+
+
 def test_a_never_installed_config_home_falls_back_to_packaged_defaults(tmp_path):
     # No install() has run: tools/ is absent and the manifest records no tool files, so the
     # packaged defaults load directly (an un-upgraded deployment still comes up fully armed).
     plugins = load_plugins(tmp_path / "never-installed")
-    assert {p.resolved_name for p in plugins} == _DEFAULT_TOOLS | {"web_search"}
+    assert {p.resolved_name for p in plugins} == _DEFAULT_TOOLS | _XAI_DEFAULTS
+
+
+def test_xai_profile_activates_grok_tools_and_live_search_drops_openai_tools():
+    # Eddie's profile: the grok media tools and xAI Live Search built-ins activate, the
+    # OpenAI-coupled tools (generate_image/edit_image/listen) self-exclude, and OpenAI's own
+    # web_search built-in (ProviderAPI("responses")) does not leak in — only xAI's does.
+    resolved = resolve_plugins(load_plugins(), _ctx(api="xai", AI_PROVIDER_API_KEY="xai-key"))
+    names = {t.name for t in resolved.tools}
+    assert {"grok_generate_image", "grok_generate_video"} <= names
+    assert not ({"generate_image", "edit_image", "listen"} & names)
+    assert sorted(resolved.builtins) == ["web_search", "x_search"]

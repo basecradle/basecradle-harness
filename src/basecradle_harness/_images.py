@@ -47,9 +47,7 @@ than re-validated here, so this never drifts as the model's surface evolves.
 from __future__ import annotations
 
 import base64
-import json
 import os
-import re
 from typing import Any
 
 import httpx
@@ -57,11 +55,11 @@ from basecradle import BaseCradleError
 
 from basecradle_harness._assets import _describe, _download, _upload
 from basecradle_harness._exceptions import (
-    ProviderAPIError,
     ProviderConnectionError,
     ProviderError,
 )
 from basecradle_harness._http import raise_for_status
+from basecradle_harness._media import provider_error_message, slugify
 from basecradle_harness._platform import PlatformTool, explain
 
 #: OpenAI's Images API root. Image generation/editing is an OpenAI service; this
@@ -508,28 +506,13 @@ def _as_uuid_list(image: list[str] | str | None) -> list[str]:
 def _provider_message(exc: ProviderError) -> str:
     """A legible relay of an Images-API failure, for the model to pass to the user.
 
-    A `ProviderAPIError`'s own ``str`` is only the generic "Provider returned HTTP
-    400" — the *real* cause lives in its response ``body``, where OpenAI puts it under
-    ``error.message`` (e.g. "Compression less than 100 is not supported for PNG output
-    format"). Strand the AI with the generic status and it can only relay an opaque
-    "HTTP 400"; surface the body instead so it relays the true cause. A plain
-    `ProviderError` (e.g. a 200 carrying no image) already has a useful ``str``. Fail
-    loud *and legible* — the tool-building discipline's Principle 5 (capital live
-    verify, #140).
+    Delegates to the shared `provider_error_message` (the same relay the grok media tools use):
+    a `ProviderAPIError`'s own ``str`` is only the generic "Provider returned HTTP 400" — the
+    real cause lives in its body under ``error.message`` (e.g. "Compression less than 100 is
+    not supported for PNG output format"). Surface that so the AI relays the true cause, not an
+    opaque status — Principle 5 (capital live verify, #140).
     """
-    if not isinstance(exc, ProviderAPIError):
-        return str(exc)
-    detail = ""
-    body = exc.body or ""
-    if body:
-        try:
-            error = json.loads(body).get("error")
-            if isinstance(error, dict):
-                detail = str(error.get("message") or "")
-        except (ValueError, AttributeError):
-            detail = ""
-        detail = detail or body.strip()
-    return f"the image API rejected the request — {detail or exc}"
+    return provider_error_message(exc, "the image API")
 
 
 def _decode_image(body: dict[str, Any]) -> bytes:
@@ -555,10 +538,4 @@ def _image_filename(filename: str | None, fallback_text: str, output_format: str
     """
     ext = _FORMAT_EXTENSIONS.get((output_format or "png").lower(), "png")
     base = filename.rsplit(".", 1)[0] if filename else fallback_text
-    return f"{_slug(base) or 'image'}.{ext}"
-
-
-def _slug(text: str) -> str:
-    """A short, filename-safe slug: lowercased words joined by hyphens, capped."""
-    words = re.findall(r"[a-z0-9]+", text.lower())
-    return "-".join(words)[:48].strip("-")
+    return f"{slugify(base) or 'image'}.{ext}"
