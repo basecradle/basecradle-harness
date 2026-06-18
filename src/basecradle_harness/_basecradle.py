@@ -389,15 +389,22 @@ def _compose_prompt(orientation: str | None, system_prompt: str | None) -> str |
 
 
 def _provider_api_from_env() -> str:
-    """The selected provider API — ``chat`` (default) or ``responses`` — validated.
+    """The selected provider API — ``chat`` (default), ``responses``, or ``xai`` — validated.
 
     Read in one place so the provider build and the plugin activation context agree on the
     value. An unrecognized value is a clear error, never a silent fall-through to the default.
+
+    ``xai`` is the xAI-native profile: it builds the *Responses* adapter (xAI exposes a
+    Responses API, and ``OpenAIResponsesProvider`` speaks that wire — the "OpenAI" in the name
+    is the wire format, not the vendor) pointed at ``api.x.ai``, and it is the activation
+    discriminator that turns on xAI's server-side ``web_search`` / ``x_search`` Live-Search
+    built-ins and the grok media tools while turning *off* the OpenAI-coupled tools — so an
+    xAI agent's stack touches no OpenAI surface.
     """
     api = (os.environ.get("AI_PROVIDER_API") or "chat").strip().lower()
-    if api not in {"chat", "responses"}:
+    if api not in {"chat", "responses", "xai"}:
         raise ValueError(
-            f"Unknown AI_PROVIDER_API {api!r}; expected 'chat' (default) or 'responses'."
+            f"Unknown AI_PROVIDER_API {api!r}; expected 'chat' (default), 'responses', or 'xai'."
         )
     return api
 
@@ -415,6 +422,10 @@ def _provider_from_env(builtins: Sequence[str] = (), api: str | None = None) -> 
       set of active built-in tool plugins (see `_resolve_tools_and_provider`), passed
       through as ``builtin_tools`` so the active built-ins follow the same overlay/activation
       rules as every other tool — not a constructor default.
+    - ``xai`` → the **same** `OpenAIResponsesProvider` (the Responses wire is what xAI's API
+      speaks) but defaulted to ``api.x.ai`` — no new adapter class, just the Responses adapter
+      pointed at xAI. Its resolved built-ins are xAI's ``web_search`` / ``x_search`` (Live
+      Search), gated on this profile. ``AI_PROVIDER_BASE_URL`` still overrides the default.
 
     Both read ``AI_PROVIDER_MODEL`` and the optional ``AI_PROVIDER_BASE_URL``; both
     fall back to ``AI_PROVIDER_API_KEY`` for the key. ``api`` lets a caller that already
@@ -426,7 +437,10 @@ def _provider_from_env(builtins: Sequence[str] = (), api: str | None = None) -> 
     if base_url:
         kwargs["base_url"] = base_url
 
-    if (api or _provider_api_from_env()) == "responses":
+    resolved_api = api or _provider_api_from_env()
+    if resolved_api in ("responses", "xai"):
+        if resolved_api == "xai":
+            kwargs.setdefault("base_url", "https://api.x.ai/v1")
         return OpenAIResponsesProvider(**kwargs, builtin_tools=list(builtins))
     return OpenAICompatibleProvider(**kwargs)
 

@@ -7,6 +7,68 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-06-17
+
+**Eddie Murphy — the xAI-native profile: Live Search + grok media tools.** The harness's
+"done-bar" acceptance work: a fully-xAI persona whose stack touches no OpenAI surface — not the
+provider, not the key, not the tools. Built under the tool-building discipline (learn the full
+surface → decide coverage deliberately → split by operation → test every built option).
+
+A framing correction shaped Part A: the handoff anticipated a brand-new *native* adapter
+driving Chat Completions `search_parameters`, but xAI **deprecated `search_parameters` on
+2026-01-12** in favor of server-side search **tools on the Responses API**. So there is no new
+adapter class — the `xai` profile reuses `OpenAIResponsesProvider` (the "OpenAI" in the name is
+the *wire format*, not the vendor; xAI's API speaks the Responses wire) pointed at `api.x.ai`,
+and Live Search is delivered by xAI's server-side `web_search` / `x_search` built-ins. xAI's
+Responses API returns OpenAI-style `url_citation` annotations, so the existing citation parsing
+already grounds Eddie's answers in sources unchanged.
+
+### Added
+
+- **`AI_PROVIDER_API=xai` — the xAI-native profile.** Selects the Responses adapter defaulted to
+  `https://api.x.ai/v1` (override with `AI_PROVIDER_BASE_URL`), and is the activation
+  discriminator that turns xAI's Live-Search built-ins and the grok media tools **on** while
+  turning the OpenAI-coupled tools **off** — so an xAI agent (grok-4.3 chat) gets a clean,
+  all-xAI stack by construction. BaseCradle tools compose under it unchanged.
+- **xAI Live Search built-ins (`web_search` + `x_search`).** Two default built-in plugins
+  (`_defaults/tools/xai_search.py`), gated on the `xai` profile: grok searches the live web and
+  𝕏 itself and returns sourced, cited answers. Disable either by deleting its plugin line; the
+  `web_search` name coexists with OpenAI's Responses built-in (different `requires`), so exactly
+  one activates per config.
+- **`grok_generate_image`** (`_grok.py`) — text → image via xAI's Images endpoint
+  (`grok-imagine-image-quality`). Optional `aspect_ratio` / `resolution` pass-throughs; the
+  default call is the always-valid core (`model` + `prompt` + `response_format=b64_json`, with a
+  `url`-encoded fallback). `n>1` deliberately skipped (founder decision, as for the OpenAI tool).
+- **`grok_generate_video`** (`_grok.py`) — the harness's **first video capability**. Text→video
+  **and** image→video (`image` = a source Asset uuid, resolved to a blob URL for xAI's
+  `image_url`). xAI's video endpoint is **asynchronous**: the tool submits, polls
+  `GET /v1/videos/{request_id}` until `done`, then downloads the clip and uploads it as an Asset
+  that renders inline. Full `duration` / `aspect_ratio` / `resolution` coverage.
+- **Activation:** the grok media tools require the `xai` profile (`ProviderAPI("xai")`), so they
+  self-exclude off any non-xAI config. (The honest discriminator: the API key var is shared
+  across vendors, so the *profile* — not a key-presence check — is what distinguishes xAI.)
+
+### Changed
+
+- **Shared media plumbing factored into `_media.py`** — the vendor-neutral bits the OpenAI image
+  tools and the grok media tools both need: the legible provider-error relay (Principle 5),
+  magic-byte format sniffing (so an uploaded Asset's extension follows the *real* bytes — the
+  hard-coded-`.png` bug generalized away), and safe-filename building. `_images.py` now delegates
+  to it; behavior is unchanged (confirmed by its existing tests).
+- **`OpenAIKey` now also excludes the `xai` profile.** The OpenAI-coupled tools (`generate_image`,
+  `edit_image`, `listen`) self-exclude under `AI_PROVIDER_API=xai`, so Eddie's stack carries no
+  OpenAI tools by construction rather than by operator curation. Behavior under `chat`/`responses`
+  is unchanged.
+
+### Boundary
+
+- Offline tests assert the harness's half (params sent, the async poll loop, the legible error
+  relay, sniffed filename extensions). The ground-truth checks — a real measured-dimension video
+  file, the posted Asset's actual pixels/content-type, Live Search returning real citations — are
+  **the capital's live `@jt`/Eddie verification**, which provisions Eddie (xai profile, grok media
+  tools, BaseCradle tools, no OpenAI tools), runs the full matrix, and **closes the handoff by
+  hand** after that live verify.
+
 ## [0.29.1] - 2026-06-17
 
 **Image tools — two fixes from the capital's live `@jt` verification of 0.29.0.** The
