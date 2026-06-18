@@ -118,6 +118,36 @@ The v0 build is mapped in this repo's **GitHub Issues**, each one PR-sized, in d
 gh issue list --repo basecradle/basecradle-harness --state open
 ```
 
+## Fleet Bot Identity / Auth Routing
+
+This repo's builder agent — **basecradle-harness AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-harness-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to the shared human account (`drawkkwast`). The shared "Cross-Repo Handoffs" block carries the *principle* ("post under your own bot identity"); this section carries the concrete *how*, so the agent never falls through to the ambient `gh` login and posts in agent voice as the founder (the constitution's *"never anonymously behind the founder's account"*).
+
+| Field | Value |
+|---|---|
+| App slug | `basecradle-harness-ai` |
+| App ID | `3969651` |
+| Bot user ID | `290979505` |
+| Commit-author | `basecradle-harness-ai[bot] <290979505+basecradle-harness-ai[bot]@users.noreply.github.com>` |
+
+Operational setup for a session that will push or post as the bot:
+
+- **Git author (local, never committed).** This clone's `.git/config` is set to the bot — set it explicitly after a fresh clone, since `.git/config` does not travel with the repo:
+  ```bash
+  git config --local user.name "basecradle-harness-ai[bot]"
+  git config --local user.email "290979505+basecradle-harness-ai[bot]@users.noreply.github.com"
+  ```
+- **Auth routing.** Mint a short-lived (~1h) installation token with the shared fleet helper and route **both** `gh` and `git push` through it — otherwise `gh` falls through to the ambient login (the founder's), and the write lands as `drawkkwast` instead of the bot:
+  ```bash
+  export GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-harness-ai)"
+  # With GH_TOKEN exported, `gh issue comment` / `gh pr create` / `gh pr merge` all act as the bot.
+  # Push over HTTPS with the token in the URL (the `origin` remote is SSH-as-Drawk; what
+  # decides the GitHub actor is the API token, not the push transport):
+  git push "https://x-access-token:${GH_TOKEN}@github.com/basecradle/basecradle-harness.git" <branch>
+  ```
+  The helper (`gh-app-token`) and registry (`fleet-apps.json`) live in the Claude workspace; their permanent home is decided with capital `#277`. `--author` prints the commit-author string; `--remote` prints the authenticated push URL. (The installation token cannot hit user-only endpoints — `gh api user` returns `403`; check it against the repo, e.g. `gh api repos/basecradle/basecradle-harness`.)
+- **No `Co-Authored-By` trailer on bot commits.** A fleet commit authored by `basecradle-harness-ai[bot]` carries **no** `Co-Authored-By` trailer — the commit author already *is* the agent, so a co-author line would be redundant and wrong (this restates the Conventions bullet, here in operational context).
+- **CI and bot PRs.** This repo's CI uses **no** Actions secrets (lint + tests on public inputs), so a bot-authored PR runs CI normally and needs no actor guard. (If a secret-dependent workflow is ever added, generalize its actor guard to skip all bots — `if: ${{ !endsWith(github.actor, '[bot]') }}` — because bot-triggered PRs run in a restricted context where Actions secrets resolve empty.)
+
 ## Polling GitHub (or any shared external API) — rate-limit floor
 
 Polling a shared service on a loop shares one IP with every other agent on the machine; flood it and GitHub temporarily IP-blocks the whole box (this has happened). Stay far under the limits.
