@@ -492,7 +492,11 @@ client — never the provider built-in, keeping the brain/body boundary clean (`
   follows `output_format`** so its content-type does too (the server infers type from the
   name) — this fixed the old hard-coded `.png` bug. Enum/range constraints are documented in
   the schema and **enforced by the API, not re-validated here**, so coverage never drifts as
-  the model's surface evolves.
+  the model's surface evolves. **`output_compression` is dropped for png** (the default
+  format): OpenAI hard-400s it there and the model fills the field in freely, so dropping it
+  where the API ignores it anyway keeps png from failing in practice (capital live-verify).
+  Image-API failures relay the **provider's actual message** (dug out of the response body),
+  not a generic `HTTP 400`, so the AI passes the true cause to the user (Principle 5).
 - **`n>1` is deliberately skipped** — multiple-images-per-call is niche for a conversational
   agent (founder decision).
 
