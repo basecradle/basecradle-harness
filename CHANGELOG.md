@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.29.1] - 2026-06-17
+
+**Image tools — two fixes from the capital's live `@jt` verification of 0.29.0.** The
+jpeg/webp/edit/size coverage shipped in 0.29.0 was confirmed correct against ground truth;
+re-running the full matrix caught two issues, both in the shared `_ImageTool` base.
+
+### Fixed
+
+- **`output_compression` no longer breaks png.** OpenAI hard-rejects `output_compression` on
+  png output (`HTTP 400 invalid_png_output_compression`), and png is the default format — so a
+  model that filled in the schema field (it does, freely) made **png generate and edit fail in
+  practice**. The shared coverage builder now **drops `output_compression` when the format is
+  png or unset**, where the API ignores it anyway — turning a live footgun into a no-op rather
+  than trusting the model to avoid it.
+- **Image-API errors are now legible.** A provider failure reached the model as a generic
+  `Provider returned HTTP 400`, stranding it with an opaque status it couldn't relay. The tools
+  now surface the provider's **actual** message from the response body (e.g. *"Compression less
+  than 100 is not supported for PNG output format"*), so the AI relays the true cause to the
+  user — fail loud *and* legible (the tool-building discipline's Principle 5).
+
 ## [0.29.0] - 2026-06-17
 
 **Image tools — full `gpt-image-2` coverage.** The media tranche brought to the model's full

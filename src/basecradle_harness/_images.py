@@ -47,6 +47,7 @@ than re-validated here, so this never drifts as the model's surface evolves.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 from typing import Any
@@ -55,7 +56,11 @@ import httpx
 from basecradle import BaseCradleError
 
 from basecradle_harness._assets import _describe, _download, _upload
-from basecradle_harness._exceptions import ProviderConnectionError, ProviderError
+from basecradle_harness._exceptions import (
+    ProviderAPIError,
+    ProviderConnectionError,
+    ProviderError,
+)
 from basecradle_harness._http import raise_for_status
 from basecradle_harness._platform import PlatformTool, explain
 
@@ -110,7 +115,8 @@ _COVERAGE_PROPERTIES = {
         "type": "integer",
         "description": (
             "Optional compression level 0-100 for jpeg/webp output only (lower = smaller "
-            "file, lower quality). Ignored for png; do not set it with output_format='png'."
+            "file, lower quality). Has no effect on png and is dropped automatically there, "
+            "so png output is never blocked by it."
         ),
     },
 }
@@ -180,7 +186,14 @@ class _ImageTool(PlatformTool):
             params["background"] = background
         if output_format:
             params["output_format"] = output_format
-        if output_compression is not None:
+        # ``output_compression`` is jpeg/webp-only: OpenAI hard-400s it on png
+        # ("Compression less than 100 is not supported for PNG output format"), and
+        # png is the default when no format is named. The model fills the schema field
+        # in freely, so dropping it for png here — where the docs already say it's
+        # ignored — turns a live footgun into a no-op rather than trusting the model to
+        # avoid it. (Capital live-verify, #140.)
+        fmt = (output_format or "png").lower()
+        if output_compression is not None and fmt != "png":
             params["output_compression"] = output_compression
         return params
 
@@ -312,7 +325,7 @@ class GenerateImageTool(_ImageTool):
         except ProviderConnectionError as exc:
             return f"Error generating image: could not reach the image API: {exc}"
         except ProviderError as exc:
-            return f"Error generating image: {exc}"
+            return f"Error generating image: {_provider_message(exc)}"
 
         target = timeline or self.context.timeline
         name = _image_filename(filename, prompt, output_format)
@@ -447,7 +460,7 @@ class EditImageTool(_ImageTool):
         except ProviderConnectionError as exc:
             return f"Error editing image: could not reach the image API: {exc}"
         except ProviderError as exc:
-            return f"Error editing image: {exc}"
+            return f"Error editing image: {_provider_message(exc)}"
 
         target = timeline or self.context.timeline
         name = _image_filename(filename, prompt, output_format)
@@ -490,6 +503,33 @@ def _as_uuid_list(image: list[str] | str | None) -> list[str]:
         return []
     items = [image] if isinstance(image, str) else list(image)
     return [u.strip() for u in items if isinstance(u, str) and u.strip()]
+
+
+def _provider_message(exc: ProviderError) -> str:
+    """A legible relay of an Images-API failure, for the model to pass to the user.
+
+    A `ProviderAPIError`'s own ``str`` is only the generic "Provider returned HTTP
+    400" — the *real* cause lives in its response ``body``, where OpenAI puts it under
+    ``error.message`` (e.g. "Compression less than 100 is not supported for PNG output
+    format"). Strand the AI with the generic status and it can only relay an opaque
+    "HTTP 400"; surface the body instead so it relays the true cause. A plain
+    `ProviderError` (e.g. a 200 carrying no image) already has a useful ``str``. Fail
+    loud *and legible* — the tool-building discipline's Principle 5 (capital live
+    verify, #140).
+    """
+    if not isinstance(exc, ProviderAPIError):
+        return str(exc)
+    detail = ""
+    body = exc.body or ""
+    if body:
+        try:
+            error = json.loads(body).get("error")
+            if isinstance(error, dict):
+                detail = str(error.get("message") or "")
+        except (ValueError, AttributeError):
+            detail = ""
+        detail = detail or body.strip()
+    return f"the image API rejected the request — {detail or exc}"
 
 
 def _decode_image(body: dict[str, Any]) -> bytes:

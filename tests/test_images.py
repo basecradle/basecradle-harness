@@ -213,6 +213,28 @@ def test_generate_passes_quality_background_and_compression(tool):
     assert sent["output_compression"] == 40
 
 
+def test_generate_drops_compression_for_png(tool):
+    # output_compression is jpeg/webp-only — OpenAI hard-400s it on png. The model fills
+    # the schema field in freely, so the tool must drop it for png or every such png
+    # request fails. (Capital live-verify bug 1, #140.)
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        gen = _mock_generate(mock, captured)
+        tool.run(prompt="a cat", output_format="png", output_compression=40)
+
+    assert "output_compression" not in json.loads(gen.calls.last.request.content)
+
+
+def test_generate_drops_compression_when_format_unset(tool):
+    # png is the default when no format is named, so an unset format must drop it too.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        gen = _mock_generate(mock, captured)
+        tool.run(prompt="a cat", output_compression=40)
+
+    assert "output_compression" not in json.loads(gen.calls.last.request.content)
+
+
 def test_generate_omits_unset_coverage_params(tool):
     # An unset knob is left out entirely, so the API picks its own default rather than
     # the harness inventing one. Only `size` (which has a tool default) always carries.
@@ -265,6 +287,26 @@ def test_an_api_error_is_relayed_to_the_model(tool):
         result = tool.run(prompt="something disallowed")
 
     assert "Error generating image" in result
+    # The provider's body — not a generic status — reaches the model.
+    assert "content policy violation" in result
+
+
+def test_an_api_error_relays_the_openai_message_not_a_bare_status(tool):
+    # The real reason lives in OpenAI's JSON body under error.message; the exception's
+    # own str is only "Provider returned HTTP 400". Surface the real reason so the AI
+    # can relay the true cause to the user. (Capital live-verify bug 2 / Principle 5.)
+    body = {
+        "error": {
+            "message": "Compression less than 100 is not supported for PNG output format",
+            "code": "invalid_png_output_compression",
+        }
+    }
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(IMAGES_URL).mock(return_value=httpx.Response(400, json=body))
+        result = tool.run(prompt="a cat")
+
+    assert "Compression less than 100 is not supported for PNG output format" in result
+    assert "Provider returned HTTP" not in result
 
 
 def test_an_empty_data_array_is_a_friendly_error(tool):
@@ -474,3 +516,4 @@ def test_edit_relays_an_images_api_error(edit_tool):
         result = edit_tool.run(image=[SOURCE_UUID], prompt="recolor")
 
     assert "Error editing image" in result
+    assert "bad mask" in result  # the provider's reason reaches the model, not "HTTP 400"
