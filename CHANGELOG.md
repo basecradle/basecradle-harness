@@ -7,6 +7,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-06-17
+
+**Image tools — full `gpt-image-2` coverage.** The media tranche brought to the model's full
+surface, and the first build under the tool-building discipline (learn the full surface →
+decide coverage deliberately → split by operation → test every built option). Two things,
+resolved together because they're the same surface: the harness could *generate* an image but
+not *edit* an uploaded one, and `generate_image` silently couldn't emit jpeg/webp (it
+hard-coded the `.png` filename, so a "save as JPG" request produced `image/png`).
+
+### Added
+
+- **`edit_image`** (`basecradle_harness.EditImageTool`) — a new default tool over OpenAI's
+  `/v1/images/edits`: edit one or more existing image Assets with a prompt (recolor, restyle,
+  composite). It resolves each source Asset by uuid and sends its **bytes, not a URL** (the
+  endpoint rejects URLs), with an optional `mask` Asset whose alpha channel marks the region
+  to change, and posts the edited result as a new Asset — exactly like `generate_image`. A
+  `PlatformTool` requiring `OpenAIKey()` (it self-excludes with no OpenAI key), so it composes
+  under both the Chat and Responses providers and appears in the Turn-0 manifest.
+- **Full shared coverage on both image tools** — `quality` (low/medium/high/auto),
+  `background` (opaque/auto — `gpt-image-2` has **no** transparent), `output_format`
+  (png/jpeg/webp), and `output_compression` (0–100, jpeg/webp only), alongside the existing
+  `size`. Enum/range constraints are documented in the schema and enforced by the API, not
+  re-validated in the harness, so coverage never drifts as the model's surface evolves.
+
+### Fixed
+
+- **`generate_image` no longer hard-codes `.png`.** The posted Asset's filename extension now
+  follows `output_format` (png → `.png`, jpeg → `.jpg`, webp → `.webp`), so its content-type
+  follows too (the server infers the type from the filename). A jpeg/webp request now actually
+  produces a jpeg/webp.
+
+### Notes
+
+- **`n>1` is deliberately skipped** on both tools — multiple-images-per-call is niche for a
+  conversational agent (founder decision).
+- The offline tests assert the harness's half of the contract (the params sent, the filename
+  extension posted); the ground-truth checks — the posted Asset's actual pixels / content-type
+  / file magic — are the capital's live @jt verification.
+
 ## [0.28.0] - 2026-06-17
 
 Phase 2 · **Group 6** (the last group) — **the cross-wake circuit-breaker.** A per-timeline

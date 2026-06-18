@@ -29,7 +29,7 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._harness import Harness
-from basecradle_harness._images import GenerateImageTool
+from basecradle_harness._images import EditImageTool, GenerateImageTool
 from basecradle_harness._install import (
     InstallReport,
     charter_from_config,
@@ -178,6 +178,7 @@ __all__ = [
     "UsersTool",
     "MessagesTool",
     "GenerateImageTool",
+    "EditImageTool",
     "WebhookEndpointsTool",
     "WebhookEventsTool",
     "bind_platform_tools",

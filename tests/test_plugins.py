@@ -164,6 +164,7 @@ _DEFAULT_TOOLS = {
     "users",
     "messages",
     "generate_image",
+    "edit_image",
     "webhook_endpoints",
     "webhook_events",
 }
@@ -184,8 +185,8 @@ def test_web_search_drops_on_chat_completions_the_other_tools_stay():
 def test_openai_coupled_tools_drop_without_an_openai_key():
     resolved = resolve_plugins(load_plugins(), _ctx(api="chat"))  # no key
     names = {t.name for t in resolved.tools}
-    assert "generate_image" not in names and "listen" not in names
-    assert _DEFAULT_TOOLS - {"generate_image", "listen"} == names
+    assert "generate_image" not in names and "edit_image" not in names and "listen" not in names
+    assert _DEFAULT_TOOLS - {"generate_image", "edit_image", "listen"} == names
 
 
 # --- the /tools overlay ------------------------------------------------------
