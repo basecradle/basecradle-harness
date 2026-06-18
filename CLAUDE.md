@@ -471,6 +471,36 @@ the router still counts the wake and trips its own backstop. **The capital verif
 @jt** (drive a synthetic runaway, confirm the breaker trips + alerts once + makes no provider
 call, confirm reset) and **closes the handoff issue by hand** after that live verify.
 
+### Image Tools — full gpt-image-2 coverage
+
+The media tranche, brought to the full ``gpt-image-2`` surface and built under the
+**tool-building discipline** (learn the full surface → decide coverage deliberately → split
+by operation → test every built option). Two tools, split by operation, both default plugins
+under `_defaults/tools/` requiring `OpenAIKey()` (they self-exclude with no OpenAI key), both
+`PlatformTool`s that own the OpenAI Images HTTP and upload the result through the bound SDK
+client — never the provider built-in, keeping the brain/body boundary clean (`_images.py`):
+
+- **`generate_image`** — text → image (`/v1/images/generations`, JSON body).
+- **`edit_image`** — image(s) → image (`/v1/images/edits`, **multipart**). It resolves each
+  source Asset by uuid and sends its **bytes, not a URL** (the endpoint rejects URLs), plus
+  an optional `mask` Asset (alpha channel marks the region to change). One or more sources —
+  multi-source composites.
+
+- **Shared coverage** (both tools): `size`, `quality` (low/medium/high/auto), `background`
+  (**opaque/auto only — gpt-image-2 has no transparent**), `output_format` (png/jpeg/webp),
+  `output_compression` (0–100, jpeg/webp only). The posted Asset's **filename extension
+  follows `output_format`** so its content-type does too (the server infers type from the
+  name) — this fixed the old hard-coded `.png` bug. Enum/range constraints are documented in
+  the schema and **enforced by the API, not re-validated here**, so coverage never drifts as
+  the model's surface evolves.
+- **`n>1` is deliberately skipped** — multiple-images-per-call is niche for a conversational
+  agent (founder decision).
+
+**Boundary:** offline tests assert the harness's half (params sent, filename extension). The
+ground-truth checks — the posted Asset's actual pixels / content-type / file magic, the full
+matrix in the handoff issue — are **the capital's live @jt verification** (it re-runs the
+matrix and **closes the handoff issue by hand** after that live verify).
+
 ## Development Commands
 
 ```bash
