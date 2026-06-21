@@ -260,8 +260,12 @@ def _messages_since(messages: object, mark: str | None) -> list[object]:
 
 
 def _incoming_text(message: object) -> str:
-    """Another peer's message as the agent hears it: prefixed with who spoke."""
-    return f"{message.user.handle}: {message.content.body}"
+    """Another peer's message as the agent hears it: when it arrived, then who spoke.
+
+    The leading ``[created_at]`` stamp is the item's own timeline timestamp, which the model
+    reads against the brief's `Current Time:` anchor to reason about how old the message is.
+    """
+    return f"[{message.created_at}] {message.user.handle}: {message.content.body}"
 
 
 def _as_turn(message: object, me_uuid: str) -> Message:

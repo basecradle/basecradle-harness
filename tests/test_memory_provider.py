@@ -289,7 +289,7 @@ def test_context_is_injected_into_the_turn0_brief(platform, tmp_path):
     assert briefs, "the provider's context() output should be in the Turn-0 brief"
     # The hook was scoped to the agent and handed the incoming turn as the retrieval query.
     assert provider.context_scopes[0].agent == NOVA_UUID
-    assert provider.context_scopes[0].query == "john: Where do I live?"
+    assert provider.context_scopes[0].query == "[2026-06-04T00:00:00.000Z] john: Where do I live?"
 
 
 def test_a_self_skip_does_not_observe(platform, tmp_path):

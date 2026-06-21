@@ -6,8 +6,12 @@ distant past of a long transcript. This is its replacement: a **brief re-asserte
 on every wake**, so the agent's standing operating context is always *recent* in
 the conversation, not buried at turn 1.
 
-The brief is composed, in order, of four parts:
+The brief is composed, in order, of a current-time anchor followed by four parts:
 
+0. **The current-time anchor** — `Current Time: <UTC> (<weekday>)`, composed in
+   `_wake.py::_now_line` and passed in fresh on every wake. It grounds the model in the
+   absolute "now" (the brief is re-composed and re-injected each wake, so it is always
+   current) and is the reference every inbound item's `[created_at]` stamp is read against.
 1. **`initialize.md`** — the framework's authored operating guidance: how to behave
    here, plus the cross-cutting gotchas the function schemas can't convey. Provider-
    independent (identical on every install).
@@ -63,6 +67,7 @@ def render_safety(notices: Sequence[str] | None) -> str | None:
 
 def compose_brief(
     *,
+    now: str | None = None,
     initialize: str | None,
     manifest: str | None,
     safety: str | None = None,
@@ -72,23 +77,24 @@ def compose_brief(
 ) -> str | None:
     """Join the brief parts in order, skipping any that are absent or empty.
 
-    Order is load-bearing: operating guidance first (how to act), then the tools the agent
-    has, then the **safe-by-default opt-out notice** (right after the tools it annotates —
-    Group 5), then the live dashboard (where it is), then any recalled **memory** relevant
-    to the turn (the memory provider's `context` hook — injected just before the charter, the
-    way middleware memory systems inject retrieved context before the system prompt), then
-    the personality charter. Any part may be absent — a missing dashboard (fetch failed), a
-    memory provider that recalled nothing, no MCP/policy opt-out, an operator who blanked
-    their charter — and the brief is composed from whatever remains. With nothing at all,
-    returns ``None``.
+    Order is load-bearing: the **current-time anchor** first (the absolute "now" every other
+    item's age is reasoned against — `_wake.py::_now_line`), then operating guidance (how to
+    act), then the tools the agent has, then the **safe-by-default opt-out notice** (right
+    after the tools it annotates — Group 5), then the live dashboard (where it is), then any
+    recalled **memory** relevant to the turn (the memory provider's `context` hook — injected
+    just before the charter, the way middleware memory systems inject retrieved context before
+    the system prompt), then the personality charter. Any part may be absent — a missing
+    dashboard (fetch failed), a memory provider that recalled nothing, no MCP/policy opt-out,
+    an operator who blanked their charter — and the brief is composed from whatever remains.
+    With nothing at all, returns ``None``.
 
-    ``safety`` and ``memory`` default to ``None`` so a caller with neither (the common case:
-    no MCP drop-in, and the default SQLite provider whose `context` is a no-op) composes
+    ``now``, ``safety``, and ``memory`` default to ``None`` so a caller with none of them (a
+    test exercising composition, or the common no-MCP / default-SQLite-provider case) composes
     exactly the brief it did before these seams existed.
     """
     parts = [
         part
-        for part in (initialize, manifest, safety, dashboard, memory, system_prompt)
+        for part in (now, initialize, manifest, safety, dashboard, memory, system_prompt)
         if part and part.strip()
     ]
     return "\n\n".join(parts) if parts else None
