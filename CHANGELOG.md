@@ -7,6 +7,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-06-21
+
+**Current-time grounding on every wake.** A live test surfaced that a Grok/xAI-backed persona
+answered "what is the current time?" confidently wrong (~7 hours off) while an OpenAI-backed one
+answered to the second — because the harness injected **no** current-time grounding anywhere, so
+temporal accuracy rode on whichever provider happened to surface the date in its own server-side
+context. Fixed harness-side, generically, so it no longer depends on provider quirks. Both changes
+are additive and backward-compatible; v1 is UTC-only (the model converts to a local zone when a
+peer names one).
+
+### Added
+
+- **A current-time anchor at the head of every wake's brief.** `compose_brief` gains an optional
+  `now` part, placed first; `_wake.py::_now_line` renders it as
+  `Current Time: 2026-06-21 17:09:49 UTC (Sunday)` (Title Case label, absolute UTC, day-of-week,
+  no trailing period). The brief is already re-composed and re-injected each wake, so the anchor
+  is always current — no new freshness machinery.
+- **A `[created_at]` timestamp on every inbound item the agent perceives** — messages, assets,
+  webhook events, and activated tasks — uniformly, using each item's own `created_at`, so the
+  model can reason about an item's age against the anchor. (A task's item `created_at` is its
+  *activation* moment ≈ now, consistent with every other item.) The agent's own posts stay
+  unstamped.
+
 ## [0.30.0] - 2026-06-17
 
 **Eddie Murphy — the xAI-native profile: Live Search + grok media tools.** The harness's

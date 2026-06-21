@@ -195,9 +195,9 @@ def test_construction_seeds_the_backlog_as_context(platform):
     # agent's own posts are assistant turns.
     seeded = [(m.role, m.content) for m in agent.harness.history]
     assert seeded == [
-        ("user", "john: welcome"),
+        ("user", "[2026-06-04T00:00:00.000Z] john: welcome"),
         ("assistant", "hi all"),
-        ("user", "john: anyone around?"),
+        ("user", "[2026-06-04T00:00:00.000Z] john: anyone around?"),
     ]
 
 
@@ -220,8 +220,11 @@ def test_reply_sees_the_backlog_before_the_new_message(platform):
 
     context = [(m.role, m.content) for m in provider.last_messages]
     assert context == [
-        ("user", "john: we were discussing Ruby"),  # the backlog, seeded
-        ("user", "john: what did we decide?"),  # the new message it is answering
+        ("user", "[2026-06-04T00:00:00.000Z] john: we were discussing Ruby"),  # the backlog, seeded
+        (
+            "user",
+            "[2026-06-04T00:00:00.000Z] john: what did we decide?",
+        ),  # the new message it is answering
     ]
 
 
@@ -245,8 +248,8 @@ def test_context_cap_seeds_only_the_most_recent_n(platform):
 
     seeded = [(m.role, m.content) for m in agent.harness.history]
     assert seeded == [
-        ("user", "john: third"),  # the most recent 2, oldest-first
-        ("user", "john: newest"),
+        ("user", "[2026-06-04T00:00:00.000Z] john: third"),  # the most recent 2, oldest-first
+        ("user", "[2026-06-04T00:00:00.000Z] john: newest"),
     ]
     assert agent._last_seen == M3  # high-water mark is still the true newest
 
@@ -266,7 +269,11 @@ def test_context_cap_none_seeds_the_whole_backlog(platform):
     agent, _ = build_agent(context_messages=None)
 
     seeded = [m.content for m in agent.harness.history]
-    assert seeded == ["john: oldest", "john: second", "john: third"]
+    assert seeded == [
+        "[2026-06-04T00:00:00.000Z] john: oldest",
+        "[2026-06-04T00:00:00.000Z] john: second",
+        "[2026-06-04T00:00:00.000Z] john: third",
+    ]
 
 
 def test_context_cap_zero_seeds_nothing_but_keeps_high_water_mark(platform):
@@ -315,7 +322,9 @@ def test_context_cap_does_not_change_which_messages_get_replies(platform):
     posted = agent.poll_once()
 
     assert len(posted) == 1
-    assert provider.prompts == ["john: brand new"]  # only the new message, not the backlog
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: brand new"
+    ]  # only the new message, not the backlog
 
 
 def test_capped_seed_does_not_paginate_the_whole_timeline(platform):
@@ -365,7 +374,9 @@ def test_responds_to_a_new_message_end_to_end(platform):
     posted = agent.poll_once()
 
     assert len(posted) == 1
-    assert provider.prompts == ["john: What's the status?"]  # tagged with the speaker
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: What's the status?"
+    ]  # tagged with the speaker
     post_route = platform.post(f"/timelines/{TIMELINE_UUID}/messages")
     assert post_route.called
     sent = post_route.calls.last.request
@@ -419,7 +430,10 @@ def test_multiple_new_messages_handled_oldest_first(platform):
     posted = agent.poll_once()
 
     assert len(posted) == 2
-    assert provider.prompts == ["john: first", "john: second"]  # chronological, speaker-tagged
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: first",
+        "[2026-06-04T00:00:00.000Z] john: second",
+    ]  # chronological, speaker-tagged
 
 
 # --- the poll loop -----------------------------------------------------------
@@ -528,7 +542,9 @@ def test_from_env_honors_the_context_messages_cap(platform, monkeypatch):
     agent = TimelineAgent.from_env()
 
     seeded = [m.content for m in agent.harness.history]
-    assert seeded == ["john: newest"]  # the env cap of 1 took only the most recent
+    assert seeded == [
+        "[2026-06-04T00:00:00.000Z] john: newest"
+    ]  # the env cap of 1 took only the most recent
     assert agent._last_seen == M1
 
 

@@ -15,7 +15,9 @@ fixed fiction: Nova Digital (``nova``, AI) is the agent; John Doe (``john``).
 import base64
 import hmac
 import json
+import re
 from hashlib import sha256
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -32,8 +34,17 @@ from basecradle_harness import (
     WakeAgent,
     WakeBreaker,
 )
+from basecradle_harness._basecradle import _incoming_text
 from basecradle_harness._messages import ToolCall
-from basecradle_harness._wake import _BREAKER_RESET_ALERT, _BREAKER_TRIP_ALERT, main
+from basecradle_harness._wake import (
+    _BREAKER_RESET_ALERT,
+    _BREAKER_TRIP_ALERT,
+    _activated_task_text,
+    _incoming_asset_text,
+    _incoming_event_text,
+    _now_line,
+    main,
+)
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -279,7 +290,7 @@ def test_single_new_message_gets_one_reply(platform, tmp_path):
     posted = agent.wake()
 
     assert len(posted) == 1
-    assert provider.prompts == ["john: What's the status?"]
+    assert provider.prompts == ["[2026-06-04T00:00:00.000Z] john: What's the status?"]
     sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
     assert json.loads(sent.content) == {"message": {"body": "Hello, John."}}
 
@@ -321,7 +332,7 @@ def test_new_message_after_a_mark_is_answered(platform, tmp_path):
     posted = agent.wake()
 
     assert len(posted) == 1
-    assert provider.prompts == ["john: new question"]
+    assert provider.prompts == ["[2026-06-04T00:00:00.000Z] john: new question"]
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # mark advanced
 
 
@@ -340,7 +351,10 @@ def test_multiple_unseen_messages_answered_oldest_first(platform, tmp_path):
     posted = agent.wake()
 
     assert len(posted) == 2
-    assert provider.prompts == ["john: first", "john: second"]  # chronological
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: first",
+        "[2026-06-04T00:00:00.000Z] john: second",
+    ]  # chronological
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
 
 
@@ -420,7 +434,7 @@ def test_a_locked_timeline_post_degrades_instead_of_crashing(platform, tmp_path)
     posted = agent.wake()  # must not raise
 
     assert posted == []  # the reply could not be delivered
-    assert provider.prompts == ["john: hi"]  # the model still ran
+    assert provider.prompts == ["[2026-06-04T00:00:00.000Z] john: hi"]  # the model still ran
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # marked seen despite the failed post
     # The failed delivery is recorded as a note in the transcript, so the record stays honest.
     notes = [t.content for t in agent.harness.session(agent.source).history if t.role == "system"]
@@ -484,7 +498,7 @@ def test_two_concurrent_wakes_reply_to_a_message_exactly_once(platform, tmp_path
     # The first wake wins the claim and replies.
     first, first_provider = build_wake(tmp_path)
     assert len(first.wake()) == 1
-    assert first_provider.prompts == ["john: new"]
+    assert first_provider.prompts == ["[2026-06-04T00:00:00.000Z] john: new"]
 
     # A second, concurrent wake (fresh process) had already read mark=M0 and computed M1 as
     # unseen — but the mark has since advanced AND M1 is claimed, so it acts on nothing.
@@ -525,9 +539,9 @@ def test_transcript_persists_across_wakes(platform, tmp_path):
 
     # The model saw the earlier exchange (loaded from disk) in front of the new turn.
     roles_and_text = [(m.role, m.content) for m in provider.last_messages]
-    assert ("user", "john: remember Ruby") in roles_and_text
+    assert ("user", "[2026-06-04T00:00:00.000Z] john: remember Ruby") in roles_and_text
     assert ("assistant", "Hello, John.") in roles_and_text
-    assert roles_and_text[-1] == ("user", "john: what did I say?")
+    assert roles_and_text[-1] == ("user", "[2026-06-04T00:00:00.000Z] john: what did I say?")
 
 
 # --- first-wake bootstrap rules ----------------------------------------------
@@ -549,7 +563,10 @@ def test_bootstrap_replies_to_everything_since_our_last_post(platform, tmp_path)
     posted = agent.wake()
 
     assert len(posted) == 2
-    assert provider.prompts == ["john: a follow-up", "john: and another"]
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: a follow-up",
+        "[2026-06-04T00:00:00.000Z] john: and another",
+    ]
     # M0 and our own M1 are context, not replied to; the mark is the true newest.
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M3
 
@@ -568,7 +585,10 @@ def test_bootstrap_with_trigger_replies_from_the_trigger_forward(platform, tmp_p
 
     agent.wake(trigger=M1)
 
-    assert provider.prompts == ["john: the trigger", "john: newest"]  # M1 forward
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: the trigger",
+        "[2026-06-04T00:00:00.000Z] john: newest",
+    ]  # M1 forward
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
 
 
@@ -587,7 +607,9 @@ def test_bootstrap_fresh_join_replies_to_newest_only(platform, tmp_path):
     posted = agent.wake()
 
     assert len(posted) == 1
-    assert provider.prompts == ["john: newest"]  # only the newest, history is context
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: newest"
+    ]  # only the newest, history is context
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
 
 
@@ -603,8 +625,11 @@ def test_bootstrap_seeds_history_as_context_before_replying(platform, tmp_path):
 
     context = [(m.role, m.content) for m in provider.last_messages]
     assert context == [
-        ("user", "john: we chose Ruby"),  # seeded backlog
-        ("user", "john: what did we decide?"),  # the message being answered
+        ("user", "[2026-06-04T00:00:00.000Z] john: we chose Ruby"),  # seeded backlog
+        (
+            "user",
+            "[2026-06-04T00:00:00.000Z] john: what did we decide?",
+        ),  # the message being answered
     ]
 
 
@@ -735,7 +760,7 @@ def test_messages_and_events_both_surface_in_one_wake(platform, tmp_path):
     posted = agent.wake(event_trigger=E0)
 
     assert len(posted) == 2  # a reply to the message and an action on the delivery
-    assert any("john: hi" in p for p in provider.prompts)
+    assert any("[2026-06-04T00:00:00.000Z] john: hi" in p for p in provider.prompts)
     assert any("inbound webhook" in p for p in provider.prompts)
     # Each kind advanced its own mark, independently.
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
@@ -1373,7 +1398,9 @@ def test_a_forged_marker_falls_through_to_the_model(platform, tmp_path):
     posted = agent.wake()
 
     assert len(posted) == 1
-    assert provider.prompts == [f"john: {forged}"]  # the model ran on it as a normal message
+    assert provider.prompts == [
+        f"[2026-06-04T00:00:00.000Z] john: {forged}"
+    ]  # the model ran on it as a normal message
     sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
     assert json.loads(sent.content) == {"message": {"body": "Hello, John."}}
 
@@ -1385,7 +1412,9 @@ def test_without_a_probe_secret_a_valid_marker_is_an_ordinary_message(platform, 
 
     agent.wake()
 
-    assert provider.prompts == [f"john: {probe_marker()}"]  # short-circuit disabled
+    assert provider.prompts == [
+        f"[2026-06-04T00:00:00.000Z] john: {probe_marker()}"
+    ]  # short-circuit disabled
 
 
 def test_a_self_authored_probe_is_filtered_not_acked(platform, tmp_path):
@@ -1407,7 +1436,9 @@ def test_a_blank_probe_secret_keeps_the_short_circuit_off(platform, tmp_path):
 
     agent.wake()
 
-    assert provider.prompts == [f"john: {probe_marker()}"]  # treated as an ordinary message
+    assert provider.prompts == [
+        f"[2026-06-04T00:00:00.000Z] john: {probe_marker()}"
+    ]  # treated as an ordinary message
 
 
 # --- NOC probe short-circuit: the TASK seam (issue #110) ---------------------
@@ -1888,16 +1919,25 @@ def test_a_wake_burst_trips_self_declines_and_alerts_exactly_once(platform, tmp_
     # Two healthy wakes, each answering a new message → two provider calls.
     assert len(wake_with(message(uuid=M1, body="one"), message(uuid=M0, body="old"))) == 1
     assert len(wake_with(message(uuid=M2, body="two"), message(uuid=M1, body="one"))) == 1
-    assert provider.prompts == ["john: one", "john: two"]
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: one",
+        "[2026-06-04T00:00:00.000Z] john: two",
+    ]
 
     # The third wake would answer M3 — but it is over the cap in the window: TRIP, self-decline.
     assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
-    assert provider.prompts == ["john: one", "john: two"]  # the model was NOT called
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: one",
+        "[2026-06-04T00:00:00.000Z] john: two",
+    ]  # the model was NOT called
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2  # M3 unseen → recoverable next healthy wake
 
     # A fourth, still-tripped wake also makes no provider call — and posts no second alert.
     assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
-    assert provider.prompts == ["john: one", "john: two"]
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: one",
+        "[2026-06-04T00:00:00.000Z] john: two",
+    ]
 
     # Exactly one loud trip alert across the whole burst (the trip transition only).
     assert _alert_bodies(platform).count(_BREAKER_TRIP_ALERT) == 1
@@ -1918,14 +1958,21 @@ def test_the_breaker_auto_resets_and_resumes_after_the_burst_clears(platform, tm
     wake_with(message(uuid=M1, body="one"), message(uuid=M0, body="old"))
     wake_with(message(uuid=M2, body="two"), message(uuid=M1, body="one"))
     assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
-    assert provider.prompts == ["john: one", "john: two"]
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: one",
+        "[2026-06-04T00:00:00.000Z] john: two",
+    ]
 
     # The burst stops; time passes past the window + cooldown. The next wake auto-resets and
     # answers M3, the message it had been declining.
     clock.advance(200)
     posted = wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two"))
     assert len(posted) == 1
-    assert provider.prompts == ["john: one", "john: two", "john: three"]  # resumed
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] john: one",
+        "[2026-06-04T00:00:00.000Z] john: two",
+        "[2026-06-04T00:00:00.000Z] john: three",
+    ]  # resumed
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M3
     assert _alert_bodies(platform).count(_BREAKER_RESET_ALERT) == 1  # recovery alert posted once
 
@@ -1957,3 +2004,76 @@ def test_a_directly_constructed_wake_gets_a_default_breaker(platform, tmp_path):
     agent, _ = build_wake(tmp_path)
     assert isinstance(agent.breaker, WakeBreaker)
     assert agent.breaker.max_wakes == 10 and agent.breaker.window == 60.0
+
+
+# --- current-time grounding: the brief anchor + per-item timestamps ----------
+#
+# Every model call is grounded in time two ways: an absolute "now" at the head of the
+# brief (`_now_line`), and a `[created_at]` stamp on every inbound item the agent
+# perceives, which the model reads against that anchor to reason about an item's age.
+
+# The created_at the wire fixtures above share, rendered as the agent perceives it.
+TS = "2026-06-04T00:00:00.000Z"
+
+
+def test_now_line_is_the_titlecased_utc_anchor():
+    # `Current Time: 2026-06-21 17:09:49 UTC (Sunday)` — Title Case label, absolute UTC,
+    # day-of-week, no trailing period (it's a label, not a sentence).
+    line = _now_line()
+    assert re.fullmatch(
+        r"Current Time: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \([A-Z][a-z]+day\)", line
+    )
+    assert not line.endswith(".")
+
+
+def test_incoming_message_is_timestamped():
+    msg = SimpleNamespace(
+        created_at=TS,
+        user=SimpleNamespace(handle="john"),
+        content=SimpleNamespace(body="what is the current time?"),
+    )
+    assert _incoming_text(msg) == f"[{TS}] john: what is the current time?"
+
+
+def test_incoming_asset_is_timestamped():
+    asset = SimpleNamespace(
+        created_at=TS,
+        user=SimpleNamespace(handle="john"),
+        content=SimpleNamespace(
+            uuid="019e7780-7777-7aaa-8bbb-728394051627",
+            description="",
+            file=SimpleNamespace(filename="photo.png", byte_size=2048, content_type="image/png"),
+        ),
+    )
+    assert _incoming_asset_text(asset).startswith(f"[{TS}] john posted a file")
+
+
+def test_incoming_event_is_timestamped():
+    event = SimpleNamespace(
+        created_at=TS,
+        webhook_endpoint=SimpleNamespace(uuid="019e7760-1111-7aaa-8bbb-1c2d3e4f5061"),
+        content=SimpleNamespace(
+            uuid="019e7761-2222-7bbb-8ccc-2d3e4f506172",
+            content_type="application/json",
+            payload='{"ok": true}',
+        ),
+    )
+    text = _incoming_event_text(event)
+    assert text.startswith(f"[{TS}] An inbound webhook was delivered")
+    assert "was just delivered" not in text  # the now-redundant "just" is dropped
+
+
+def test_activated_task_is_timestamped():
+    # The task ITEM's created_at is its activation moment (≈ now), not when it was
+    # scheduled — so the stamp reads consistent with every other inbound item.
+    task = SimpleNamespace(
+        created_at=TS,
+        content=SimpleNamespace(
+            uuid="019e7770-5555-7eee-8fff-506172839405",
+            activate_at="2026-06-11T06:00:00+00:00",
+            instructions="post the summary",
+        ),
+    )
+    text = _activated_task_text(task)
+    assert text.startswith(f"[{TS}] A task you scheduled has activated")
+    assert "scheduled for 2026-06-11T06:00:00+00:00" in text  # complementary, retained

@@ -47,6 +47,33 @@ def test_compose_brief_orders_the_four_parts():
     assert brief == "INIT\n\nMANIFEST\n\nDASH\n\nCHARTER"
 
 
+def test_compose_brief_places_the_now_anchor_first():
+    # The current-time anchor leads the brief, ahead of every other part, so the model
+    # reads "now" before anything whose age it must reason about.
+    brief = compose_brief(
+        now="Current Time: 2026-06-21 17:09:49 UTC (Sunday)",
+        initialize="INIT",
+        manifest="MANIFEST",
+        dashboard="DASH",
+        system_prompt="CHARTER",
+    )
+    assert brief == (
+        "Current Time: 2026-06-21 17:09:49 UTC (Sunday)\n\nINIT\n\nMANIFEST\n\nDASH\n\nCHARTER"
+    )
+
+
+def test_compose_brief_omits_the_now_anchor_when_absent():
+    # `now` defaults to None, so a caller that passes none composes exactly as before.
+    brief = compose_brief(
+        now=None,
+        initialize="INIT",
+        manifest="MANIFEST",
+        dashboard="DASH",
+        system_prompt="CHARTER",
+    )
+    assert brief == "INIT\n\nMANIFEST\n\nDASH\n\nCHARTER"
+
+
 def test_compose_brief_skips_absent_and_blank_parts():
     # A failed dashboard fetch (None) and a blanked charter (whitespace) both drop out, and
     # the brief is composed from what remains, in order — never a dangling blank section.

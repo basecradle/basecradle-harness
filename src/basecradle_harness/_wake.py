@@ -65,6 +65,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -818,7 +819,10 @@ class WakeAgent:
             except httpx.HTTPError:
                 shown = None  # fetch failed: degrade to a description, never an error
             if isinstance(shown, ImageContent):
-                intro = f"{asset.user.handle} posted a file to this timeline: {_describe(asset)}."
+                intro = (
+                    f"[{asset.created_at}] {asset.user.handle} posted a file to this "
+                    f"timeline: {_describe(asset)}."
+                )
                 return f"{intro} Looking at it now.", [shown]
         # Non-image, unviewable/oversized image, or a failed fetch: describe, don't show.
         return _incoming_asset_text(asset), []
@@ -1146,9 +1150,11 @@ class WakeAgent:
             _log.info("Persistent brief composed empty this wake; proceeding without it.")
 
     def _compose_brief(self, query: str | None = None) -> str | None:
-        """Compose the persistent brief: initialize + manifest + safety + dashboard + memory + charter.
+        """Compose the persistent brief: now + initialize + manifest + safety + dashboard + memory + charter.
 
-        The parts, in order (see `basecradle_harness._brief`): the provider-independent
+        The parts, in order (see `basecradle_harness._brief`): the **current-time anchor**
+        (`_now_line` — the absolute "now" the model reasons every item's age against, fresh
+        each wake since the brief is re-composed per wake), the provider-independent
         `initialize.md` operating guidance, the generated manifest of the agent's *active*
         tools, the **safe-by-default opt-out notice** (active MCP servers / policy-refused
         drop-ins — omitted when there are none), the live `dashboard.md` primer (fetched
@@ -1166,6 +1172,7 @@ class WakeAgent:
         """
         try:
             return compose_brief(
+                now=_now_line(),
                 initialize=prompt_text("initialize.md"),
                 manifest=render_manifest(self._manifest_entries()),
                 safety=render_safety(self.safety_notices),
@@ -1384,6 +1391,20 @@ def _asset_marker_carrier(asset: object) -> str:
     return getattr(asset.content, "description", None) or ""
 
 
+def _now_line() -> str:
+    """The current-time anchor injected at the head of every wake's brief.
+
+    Renders ``Current Time: 2026-06-21 17:09:49 UTC (Sunday)`` — Title Case label, absolute
+    UTC, and the day-of-week, with no trailing period (it's a label, not a sentence). The
+    brief is re-composed and re-injected on every wake, so this is always current; it is the
+    reference every inbound item's ``[created_at]`` stamp is reasoned against. Accuracy rides
+    on the host clock's NTP sync. UTC-only by design — the model converts to a local zone when
+    a peer names one.
+    """
+    n = datetime.now(timezone.utc)
+    return f"Current Time: {n:%Y-%m-%d %H:%M:%S} UTC ({n:%A})"
+
+
 def _incoming_asset_text(asset: object) -> str:
     """A peer's posted file as the agent hears it: who shared what, and how to open it.
 
@@ -1392,11 +1413,14 @@ def _incoming_asset_text(asset: object) -> str:
     failed). Surfaces the asset's metadata (the shared `_describe` rendering) and points
     the agent at the tools that actually open it, rather than inlining the bytes — looking
     is a deliberate, on-demand step, the same discipline `view`/`read`/`listen` follow.
+
+    The leading ``[created_at]`` stamp is the asset item's own timeline timestamp, read
+    against the brief's `Current Time:` anchor so the model can reason about its age.
     """
     return (
-        f"{asset.user.handle} posted a file to this timeline: {_describe(asset)}. "
-        "Use the assets tool to 'read' it (or 'view' an image / 'listen' to audio) if "
-        "you want to engage with it."
+        f"[{asset.created_at}] {asset.user.handle} posted a file to this timeline: "
+        f"{_describe(asset)}. Use the assets tool to 'read' it (or 'view' an image / "
+        "'listen' to audio) if you want to engage with it."
     )
 
 
@@ -1412,6 +1436,9 @@ def _incoming_event_text(event: object) -> str:
     A large payload is truncated with a pointer to the `webhook_events` tool (which
     reads the full headers and body by uuid), so a firehose delivery cannot blow up
     the model's context.
+
+    The leading ``[created_at]`` stamp is the event item's own timeline timestamp, read
+    against the brief's `Current Time:` anchor so the model can reason about its age.
     """
     content = event.content
     payload = content.payload
@@ -1421,7 +1448,7 @@ def _incoming_event_text(event: object) -> str:
             + f"\n… (payload truncated — use the webhook_events tool to read {content.uuid} in full)"
         )
     return (
-        "An inbound webhook was just delivered to this timeline "
+        f"[{event.created_at}] An inbound webhook was delivered to this timeline "
         f"(event {content.uuid}, endpoint {event.webhook_endpoint.uuid}, "
         f"content_type {content.content_type}). Decide whether and how to act on it. "
         f"Its payload:\n{payload}"
@@ -1433,10 +1460,16 @@ def _activated_task_text(task: object) -> str:
 
     A task is work the agent (or a peer) scheduled for this moment, so it is phrased as
     a directive to act, not a notification to consider — the activation *is* the cue.
+
+    The leading ``[created_at]`` stamp is the task **item**'s own timeline timestamp. A task's
+    Item is created when it *activates* (the platform's `Task::ActivationJob` inserts the Item
+    in the same transaction it flips the task to activated), not when it was scheduled — so
+    this reads ≈ now, consistent with every other inbound item, never "days ago." The
+    complementary ``scheduled for {activate_at}`` text stays.
     """
     content = task.content
     return (
-        "A task you scheduled has activated and is due now "
+        f"[{task.created_at}] A task you scheduled has activated and is due now "
         f"(task {content.uuid}, scheduled for {content.activate_at}). "
         f"Carry out its instructions:\n{content.instructions}"
     )
