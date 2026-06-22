@@ -21,11 +21,13 @@ FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
 
 
 def test_render_manifest_lists_names_and_notes():
-    text = render_manifest([("memory", None), ("lock", "irreversible; needs confirm=true.")])
+    text = render_manifest(
+        [("memory", None), ("lock", "irreversible; confirm must equal the uuid.")]
+    )
     assert text.splitlines() == [
         "Your active tools right now:",
         "- memory",
-        "- lock — irreversible; needs confirm=true.",
+        "- lock — irreversible; confirm must equal the uuid.",
     ]
 
 

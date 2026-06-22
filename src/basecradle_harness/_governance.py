@@ -63,10 +63,12 @@ class _UserNotFound(Exception):
 class TimelinesTool(PlatformTool):
     """Create, read, list, and manage participants on timelines the agent can see.
 
-    Pure benign management and reads — no irreversible action (locking is its own
-    guarded `LockTool`). A `PlatformTool`: the hosting agent binds the SDK client and
-    current-timeline uuid before the loop runs. Until bound, `run` reports it is not
-    connected (via `PlatformError`) rather than failing obscurely.
+    Pure benign management and reads — no irreversible action. The two irreversible
+    timeline actions live in their own guarded tools: `LockTool` (`_lock.py`) and
+    `DeleteTool` (`_delete.py`), both behind the shared uuid-confirm gate. A
+    `PlatformTool`: the hosting agent binds the SDK client and current-timeline uuid
+    before the loop runs. Until bound, `run` reports it is not connected (via
+    `PlatformError`) rather than failing obscurely.
     """
 
     name = "timelines"
@@ -79,8 +81,10 @@ class TimelinesTool(PlatformTool):
         "(or 'nova') or a uuid. Adding or removing a participant needs you to own the "
         "timeline, and adding someone also needs mutual trust with them — if the platform "
         "refuses, you get the reason back. Timeline-scoped actions use the current timeline "
-        "unless you pass a timeline uuid. To permanently freeze a timeline, use the "
-        "separate 'lock' tool — this tool never locks."
+        "unless you pass a timeline uuid. This tool takes no irreversible action: to "
+        "permanently freeze a timeline use the separate 'lock' tool, and to permanently "
+        "delete one (and all its content) use the separate 'delete' tool — this tool never "
+        "locks or deletes."
     )
     parameters = {
         "type": "object",

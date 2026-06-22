@@ -161,6 +161,7 @@ _DEFAULT_TOOLS = {
     "timelines",
     "trust",
     "lock",
+    "delete",
     "users",
     "messages",
     "generate_image",

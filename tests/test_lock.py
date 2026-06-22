@@ -1,13 +1,16 @@
-"""The standalone, confirm-guarded `LockTool`, against a respx-mocked platform.
+"""The standalone `LockTool`, behind the shared uuid-confirm gate, against a respx platform.
 
-Lock is the one irreversible platform action. Group 2b pulls it out of the
-`timelines` tool into its own tool so a benign management call can never grab it by
-accident (finding B1), behind a deliberate `confirm=true`. The headline invariants:
-a bare call (no confirm) never touches the platform, and `confirm=true` actually
-locks — the current timeline by default, or an explicit one.
+Lock is one of two irreversible timeline actions (delete is the other); both run through the
+one `ConfirmedTimelineAction` gate (see `_confirmed.py` and `test_delete.py`). Group 2b pulled
+lock out of the `timelines` tool into its own tool so a benign management call can never grab
+it by accident (finding B1); this re-unifies its gate with delete's: it acts only when
+`confirm` equals the **target timeline's uuid**, and a bare or mismatched call previews what
+would be frozen and touches nothing destructive. The headline invariants: a non-matching
+confirm never locks (only a benign preview GET goes out), and `confirm=<uuid>` actually locks —
+the current timeline by default, or an explicit one.
 
-Mocked at the transport level (a real `BaseCradle` client, only its HTTP stubbed),
-per the constitution. Cast: Nova Digital (``nova``, AI) freezing her own room.
+Mocked at the transport level (a real `BaseCradle` client, only its HTTP stubbed), per the
+constitution. Cast: Nova Digital (``nova``, AI) freezing her own room.
 """
 
 import httpx
@@ -25,7 +28,7 @@ TIMELINE_UUID = "019e7750-66ee-7f53-829f-13a8a710b6da"  # the current timeline
 OTHER_TIMELINE = "019e7760-1234-7abc-8def-0123456789ab"  # an explicit override
 
 
-def timeline_envelope(*, uuid=TIMELINE_UUID, name="Incident response", locked=False):
+def timeline_envelope(*, uuid=TIMELINE_UUID, name="Incident response", locked=False, items=0):
     """The subject-timeline envelope the SDK merges on get."""
     return {
         "timeline": {
@@ -37,7 +40,7 @@ def timeline_envelope(*, uuid=TIMELINE_UUID, name="Incident response", locked=Fa
             "owner": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
             "participants": [],
         },
-        "items": [],
+        "items": [{"uuid": f"019e7751-0000-7000-8000-00000000000{i}"} for i in range(items)],
     }
 
 
@@ -66,7 +69,7 @@ def lock(client):
     return t
 
 
-def test_confirm_true_freezes_the_current_timeline_and_says_it_is_one_way(lock):
+def test_confirm_uuid_freezes_the_current_timeline_and_says_it_is_one_way(lock):
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
             return_value=httpx.Response(200, json=timeline_envelope())
@@ -74,7 +77,7 @@ def test_confirm_true_freezes_the_current_timeline_and_says_it_is_one_way(lock):
         route = mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/lock").mock(
             return_value=httpx.Response(200, json={"locked": True})
         )
-        result = lock.run(confirm=True)
+        result = lock.run(confirm=TIMELINE_UUID)
 
     assert route.called
     assert "Locked timeline" in result
@@ -82,24 +85,42 @@ def test_confirm_true_freezes_the_current_timeline_and_says_it_is_one_way(lock):
     assert "operator-only" in result
 
 
-def test_without_confirm_it_is_refused_and_never_touches_the_platform(lock):
-    """B1: a bare call (no confirm) is refused locally — the irreversible op never fires.
+def test_a_bare_call_previews_what_would_be_frozen_and_never_locks(lock):
+    """B1 + preview-on-refuse: no confirm → a benign GET names the target, but no lock fires.
 
-    No lock route is mocked, so the guard must short-circuit before any HTTP goes out."""
-    result = lock.run()
+    Only the timeline GET is mocked; no lock route exists, so the gate must short-circuit
+    before any destructive HTTP goes out — and the refusal must name the timeline + how to
+    proceed with its uuid."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
+            return_value=httpx.Response(200, json=timeline_envelope(name="War Room", items=3))
+        )
+        result = lock.run()
 
     assert "Refused to lock" in result
-    assert "IRREVERSIBLE" in result
+    assert "War Room" in result  # the preview names what would be affected
+    assert "3 item(s)" in result  # ...and how much is at stake
     assert "list, leave, or delete" in result  # names what it is NOT for
-    assert "confirm=true" in result  # tells the model exactly how to proceed
+    assert f"confirm={TIMELINE_UUID}" in result  # the exact uuid to re-call with
 
 
-def test_confirm_false_is_also_refused(lock):
-    """An explicit confirm=false is not a deliberate yes — refused, nothing happens."""
-    assert "Refused to lock" in lock.run(confirm=False)
+def test_a_mismatched_confirm_is_refused_with_a_preview(lock):
+    """The old boolean confirm=true no longer locks — it does not match the uuid, so it previews.
+
+    This is the wrong-target gap the boolean left open: a confirm aimed at nothing (or the
+    wrong room) must not lock the current one."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
+            return_value=httpx.Response(200, json=timeline_envelope())
+        )
+        result = lock.run(confirm="true")
+
+    assert "Refused to lock" in result
+    assert "'true'" in result  # the refusal echoes the non-matching confirm it got
+    assert f"confirm={TIMELINE_UUID}" in result
 
 
-def test_confirm_true_can_target_an_explicit_timeline(lock):
+def test_confirm_uuid_can_target_an_explicit_timeline(lock):
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/timelines/{OTHER_TIMELINE}").mock(
             return_value=httpx.Response(200, json=timeline_envelope(uuid=OTHER_TIMELINE))
@@ -107,9 +128,21 @@ def test_confirm_true_can_target_an_explicit_timeline(lock):
         route = mock.post(f"{BC_URL}/timelines/{OTHER_TIMELINE}/lock").mock(
             return_value=httpx.Response(200, json={"locked": True})
         )
-        lock.run(confirm=True, timeline=OTHER_TIMELINE)
+        lock.run(confirm=OTHER_TIMELINE, timeline=OTHER_TIMELINE)
 
     assert route.called  # it locked the explicit timeline, not the bound one
+
+
+def test_confirm_must_match_the_targeted_timeline_not_the_current_one(lock):
+    """Targeting an explicit timeline but confirming the current one's uuid is a mismatch."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/timelines/{OTHER_TIMELINE}").mock(
+            return_value=httpx.Response(200, json=timeline_envelope(uuid=OTHER_TIMELINE))
+        )
+        result = lock.run(confirm=TIMELINE_UUID, timeline=OTHER_TIMELINE)
+
+    assert "Refused to lock" in result
+    assert f"confirm={OTHER_TIMELINE}" in result  # confirm must match the TARGET
 
 
 def test_a_platform_refusal_comes_back_as_a_clean_explanation(lock):
@@ -123,7 +156,7 @@ def test_a_platform_refusal_comes_back_as_a_clean_explanation(lock):
                 422, json=problem(status=422, code="already_locked", detail=detail)
             )
         )
-        result = lock.run(confirm=True)
+        result = lock.run(confirm=TIMELINE_UUID)
 
     assert "Couldn't lock the timeline" in result
     assert detail in result  # the server's own human explanation is relayed verbatim
@@ -131,4 +164,4 @@ def test_a_platform_refusal_comes_back_as_a_clean_explanation(lock):
 
 def test_unbound_tool_raises_platform_error():
     with pytest.raises(PlatformError):
-        LockTool().run(confirm=True)
+        LockTool().run(confirm=TIMELINE_UUID)

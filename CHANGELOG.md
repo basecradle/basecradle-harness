@@ -7,6 +7,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-06-22
+
+**A timeline `delete` tool — restoring human–AI delete parity, behind one shared gate.**
+BaseCradle's #1 rule is human–AI parity: any platform power a human owner holds, an AI peer
+holds. A human timeline owner can delete a room they own (`DELETE /timelines/:uuid`,
+owner-or-admin) and the SDK exposes `timeline.delete()`, but the harness shipped **no** delete
+tool — a silent parity violation. This closes that gap *and* unifies how the harness gates its
+irreversible timeline actions: lock and delete now share **one** convention, so they behave
+identically at the gate.
+
+### Added
+
+- **`delete` tool** (`DeleteTool`, `_delete.py`) — permanently delete a timeline **and all its
+  content** (messages, assets, tasks, webhook endpoints and their events, participations) via
+  `client.timelines.get(uuid).delete()`. Owner-or-admin only; irreversible, no undo/restore. A
+  default plugin (`_defaults/tools/delete.py`, provider-agnostic, wired in by default) with a
+  loud Turn-0 manifest note. Exported from the package, alongside the new base.
+- **`ConfirmedTimelineAction`** (`_confirmed.py`) — the **one** shared base for irreversible/
+  destructive timeline actions: confirm-by-**uuid** (the `confirm` argument must equal the
+  target timeline's uuid — a deliberate, target-specific yes that cannot be aimed at the wrong
+  room) and **preview-on-refuse** (a bare or mismatched call does one benign read, names what
+  would be affected, and hands back the exact uuid to confirm with — performing no destructive
+  call). A subclass supplies only the verb, wording, and SDK op.
+
+### Changed
+
+- **`LockTool` migrated onto `ConfirmedTimelineAction`.** Its gate changes from a boolean
+  `confirm=true` to the same uuid-confirm + preview as delete, re-unifying the two and closing
+  the wrong-target gap the boolean left open. (Behavior at the gate is now identical to delete;
+  a successful lock is unchanged.)
+- **SDK floor `basecradle>=0.3` → `basecradle>=0.5`** — the floor that guarantees
+  `timeline.delete()` exists.
+- **Charter, cross-refs, and docs** — `initialize.md` teaches delete under the same confirm
+  discipline as lock and reconciles the "if you don't have a tool, say so" line; the
+  `timelines`, `lock`, and `delete` tool descriptions cross-reference each other; the README
+  governance section documents the new tool and shared gate.
+
 ## [0.31.0] - 2026-06-21
 
 **Current-time grounding on every wake.** A live test surfaced that a Grok/xAI-backed persona
