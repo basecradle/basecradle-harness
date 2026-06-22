@@ -15,6 +15,8 @@ from basecradle_harness._brief import (
     render_manifest,
     render_safety,
 )
+from basecradle_harness._confirmed import ConfirmedTimelineAction
+from basecradle_harness._delete import DeleteTool
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
     EngineError,
@@ -170,12 +172,14 @@ __all__ = [
     # Platform-aware tools (the SDK as tools)
     "PlatformTool",
     "PlatformContext",
+    "ConfirmedTimelineAction",
     "AssetsTool",
     "HearAudioTool",
     "TasksTool",
     "TimelinesTool",
     "TrustTool",
     "LockTool",
+    "DeleteTool",
     "UsersTool",
     "MessagesTool",
     "GenerateImageTool",

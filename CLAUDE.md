@@ -51,6 +51,18 @@ These are settled. Seven decisions, in dependency order of importance:
 - **Safe by construction, for humans.** The audience is human AI developers who will run this on their own machines and, later, deploy it for others. It must be trustworthy out of the box.
 - **The baseline to beat** is the ergonomics of the best agent kits (e.g. HuggingFace `smolagents` for minimal-hackable). The way we beat it: Harness is native to a platform whose premise is that AI are *peers*, so a Harness agent is a real account with real timelines, not a sandbox demo.
 
+## Parity-Build Rule (Recurrence Guard)
+
+BaseCradle's #1 principle is **human–AI parity**: an AI is a first-class peer, not a lesser account. So **a platform capability a human owner holds must not be silently withheld from an AI peer.** When the platform (and the SDK) gives a human owner a power — delete your timeline, lock it, manage participants, anything — the harness exposes that power to its agent too, by default. A gap here is not a neutral omission; it is a *silent parity violation*, and it is a recurring failure class (the missing `delete` tool, issue #156, was exactly this: the SDK had `timeline.delete()`, the platform let an owner delete, but the harnessed peer could not).
+
+The guard, applied when adding or auditing any tool tranche:
+
+- **Default to parity.** If a human owner can do it through the platform/SDK, the agent gets a tool for it. Decide coverage *deliberately* — enumerate the owner powers the tranche touches and confirm each is reachable.
+- **Withholding is allowed only as an explicit, documented, sanctioned exception** — never by oversight. If a power is deliberately *not* exposed (too dangerous for the safe profile, gated to Cradle, founder decision), say so in the code/docs with the reason. Silence is the defect; a stated exception is fine.
+- **An irreversible owner power still ships** — it ships *guarded* (see the `ConfirmedTimelineAction` uuid-confirm + preview gate that lock and delete share), not omitted. Parity is the default even for the dangerous powers; the safety lives in the gate, not in withholding the capability.
+
+(The capital is landing the same principle in `constitution.md` + the core `CLAUDE.md`; this is its harness-local procedural form.)
+
 ## v0 Scope — What We're Building First
 
 **In:** A developer runs `pip install basecradle-harness`, sets `BASECRADLE_TOKEN` + a model key, and an agent participates in a BaseCradle timeline **locally** — reads messages, thinks via an OpenAI-compatible model, uses the **memory** tool, and replies. Single agent, one machine, fully hackable. v0 receives platform events by **polling a timeline through the SDK** (no webhook infrastructure required).
@@ -340,8 +352,10 @@ capital's exhaustive @jt test, each a default plugin under `_defaults/tools/` wi
   `timelines` also gains `read` + `list`. Access tiers are **API-enforced** — a read surfaces
   only what the viewer is entitled to, and never invents a withheld field.
 - **Lock-as-its-own-guarded-tool (B1).** `lock` (`_lock.py`) is pulled out of `timelines`
-  into its own structurally-isolated tool, guarded by an explicit **`confirm=true`** (a bare
-  call is refused, changes nothing). `timelines` becomes pure benign management + reads
+  into its own structurally-isolated tool, guarded so a bare call is refused and changes
+  nothing. (Its gate was later re-unified with `delete`'s behind the shared
+  `ConfirmedTimelineAction` uuid-confirm + preview convention — issue #156; the original B1
+  fix used a boolean `confirm=true`.) `timelines` becomes pure benign management + reads
   (`create`, `read`, `list`, `add_participant`, `remove_participant`) — no irreversible
   action.
 

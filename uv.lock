@@ -219,14 +219,14 @@ wheels = [
 
 [[package]]
 name = "basecradle"
-version = "0.3.0"
+version = "0.5.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b3/44/3b4c40f6c0e370ddb4192159aa58af29fd5ade5daf68dfa67a7ad0d59bb4/basecradle-0.3.0.tar.gz", hash = "sha256:a2f8595c832ca7046c699ebd65379cd4b048c54eb885b6ce86010af4fd5661a5", size = 69986, upload-time = "2026-06-03T07:07:40.934Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5a/10/7216f63393f6b2bb3a8532c658499cb5779e724459dc7ac274c8b780d0df/basecradle-0.5.0.tar.gz", hash = "sha256:a579229dd0f408f62bcc618d3475047489d51cce4b8187dfa3718fdc2467189a", size = 80407, upload-time = "2026-06-13T04:23:05.14Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/be/9b/42a1c2f81fcdf56c9731bf513fd0aa870b71311871545fab7f811f49f9fb/basecradle-0.3.0-py3-none-any.whl", hash = "sha256:588f2ef57abf5b83d7aa66c982c86c8d370c1a1aa95d3976f2ae01ac7edf667c", size = 28668, upload-time = "2026-06-03T07:07:36.855Z" },
+    { url = "https://files.pythonhosted.org/packages/91/48/4a8476303ec4e919687a5de58cb73ed21564b86249946f6e23c011b3599f/basecradle-0.5.0-py3-none-any.whl", hash = "sha256:250ced9e9575ccc959b0f511a90104eee4221265f0a0c54c87a35d0e50a440b2", size = 30000, upload-time = "2026-06-13T04:23:03.889Z" },
 ]
 
 [[package]]
@@ -250,7 +250,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "basecradle", specifier = ">=0.3" },
+    { name = "basecradle", specifier = ">=0.5" },
     { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.4" },
 ]
 provides-extras = ["mempalace"]
@@ -541,7 +541,7 @@ name = "exceptiongroup"
 version = "1.3.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+    { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/50/79/66800aadf48771f6b62f7eb014e352e5d06856655206165d775e675a02c9/exceptiongroup-1.3.1.tar.gz", hash = "sha256:8b412432c6055b0b7d14c310000ae93352ed6754f70fa8f7c34141f91c4e3219", size = 30371, upload-time = "2025-11-21T23:01:54.787Z" }
 wheels = [
