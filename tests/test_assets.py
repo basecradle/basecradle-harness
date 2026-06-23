@@ -328,6 +328,88 @@ def test_view_without_a_uuid_is_a_friendly_error(tool):
     assert "needs the asset's uuid" in tool.run(action="view")
 
 
+# --- view/read 'latest' (issue #161) -----------------------------------------
+
+
+def test_view_latest_resolves_to_the_newest_asset(tool):
+    """uuid='latest' views the most recent file — an image the agent just posted, no uuid handed it."""
+    with respx.mock(assert_all_called=True) as mock:
+        # The newest-first asset filter the resolver reads to find 'latest'.
+        mock.get(f"{BC_URL}/assets", params={"timeline": TIMELINE_UUID}).mock(
+            return_value=httpx.Response(
+                200, json={"assets": [image_asset(), text_asset()], "next_cursor": None}
+            )
+        )
+        # Then the normal view path fetches that asset by its resolved uuid and the blob.
+        mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
+            return_value=httpx.Response(200, json={"asset": image_asset()})
+        )
+        mock.get(IMG_URL).mock(return_value=httpx.Response(200, content=PNG_BYTES))
+        result = tool.run(action="view", uuid="latest")
+
+    assert isinstance(result, ToolResult)
+    assert "cat.png" in result.text
+    assert len(result.images) == 1
+
+
+def test_latest_is_case_insensitive(tool):
+    """'LATEST' (any case, surrounding space) resolves the same as 'latest'."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets", params={"timeline": TIMELINE_UUID}).mock(
+            return_value=httpx.Response(200, json={"assets": [image_asset()], "next_cursor": None})
+        )
+        mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
+            return_value=httpx.Response(200, json={"asset": image_asset()})
+        )
+        mock.get(IMG_URL).mock(return_value=httpx.Response(200, content=PNG_BYTES))
+        result = tool.run(action="view", uuid="  LATEST ")
+
+    assert isinstance(result, ToolResult)
+
+
+def test_read_latest_resolves_to_the_newest_asset(tool):
+    """uuid='latest' works for read too, not only view."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets", params={"timeline": TIMELINE_UUID}).mock(
+            return_value=httpx.Response(200, json={"assets": [text_asset()], "next_cursor": None})
+        )
+        mock.get(f"{BC_URL}/assets/{A_TEXT}").mock(
+            return_value=httpx.Response(200, json={"asset": text_asset()})
+        )
+        mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=b"# Notes\nlatest"))
+        result = tool.run(action="read", uuid="latest")
+
+    assert "# Notes\nlatest" in result
+
+
+def test_view_latest_on_an_empty_timeline_says_so(tool):
+    """'latest' against a timeline with no files is a clean message, not a crash or a bad fetch."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets", params={"timeline": TIMELINE_UUID}).mock(
+            return_value=httpx.Response(200, json={"assets": [], "next_cursor": None})
+        )
+        # No /assets/{uuid} route: 'latest' resolves to nothing, so no fetch is attempted.
+        result = tool.run(action="view", uuid="latest")
+
+    assert isinstance(result, str)
+    assert "No files" in result
+
+
+def test_latest_honors_an_explicit_timeline(tool):
+    """uuid='latest' resolves against the passed timeline, not only the bound current one."""
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets", params={"timeline": OTHER_TIMELINE}).mock(
+            return_value=httpx.Response(200, json={"assets": [image_asset()], "next_cursor": None})
+        )
+        mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
+            return_value=httpx.Response(200, json={"asset": image_asset()})
+        )
+        mock.get(IMG_URL).mock(return_value=httpx.Response(200, content=PNG_BYTES))
+        result = tool.run(action="view", uuid="latest", timeline=OTHER_TIMELINE)
+
+    assert isinstance(result, ToolResult)
+
+
 # --- create ------------------------------------------------------------------
 
 

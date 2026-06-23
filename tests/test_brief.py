@@ -11,7 +11,12 @@ import httpx
 import respx
 from basecradle import BaseCradle
 
-from basecradle_harness import compose_brief, fetch_dashboard_md, render_manifest
+from basecradle_harness import (
+    compose_brief,
+    fetch_dashboard_md,
+    render_defects,
+    render_manifest,
+)
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -34,6 +39,22 @@ def test_render_manifest_lists_names_and_notes():
 def test_render_manifest_is_none_when_empty():
     # No active tools → no heading, so the composer omits the section entirely.
     assert render_manifest([]) is None
+
+
+# --- render_defects (issue #160) ----------------------------------------------
+
+
+def test_render_defects_heads_the_broken_defaults_loudly():
+    text = render_defects(["web_fetch.py — failed to load: no module named x"])
+    lines = text.splitlines()
+    assert "defect" in lines[0].lower()  # a loud heading, not the safe-opt-out wording
+    assert lines[1] == "- web_fetch.py — failed to load: no module named x"
+
+
+def test_render_defects_is_none_when_healthy():
+    # Every shipped default loaded → no defect section, so the brief is exactly as before.
+    assert render_defects([]) is None
+    assert render_defects(None) is None
 
 
 # --- compose_brief ------------------------------------------------------------
@@ -62,6 +83,27 @@ def test_compose_brief_places_the_now_anchor_first():
     assert brief == (
         "Current Time: 2026-06-21 17:09:49 UTC (Sunday)\n\nINIT\n\nMANIFEST\n\nDASH\n\nCHARTER"
     )
+
+
+def test_compose_brief_places_defects_right_after_the_manifest():
+    # A tool defect lands immediately after the manifest it contradicts, before the dashboard —
+    # so the agent reads "you have these tools, but this one is broken" together (issue #160).
+    brief = compose_brief(
+        initialize="INIT",
+        manifest="MANIFEST",
+        defects="DEFECT",
+        dashboard="DASH",
+        system_prompt="CHARTER",
+    )
+    assert brief == "INIT\n\nMANIFEST\n\nDEFECT\n\nDASH\n\nCHARTER"
+
+
+def test_compose_brief_omits_defects_when_absent():
+    # `defects` defaults to None, so a healthy agent composes exactly as before.
+    brief = compose_brief(
+        initialize="INIT", manifest="MANIFEST", dashboard="DASH", system_prompt="CHARTER"
+    )
+    assert brief == "INIT\n\nMANIFEST\n\nDASH\n\nCHARTER"
 
 
 def test_compose_brief_omits_the_now_anchor_when_absent():

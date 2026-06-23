@@ -65,11 +65,33 @@ def render_safety(notices: Sequence[str] | None) -> str | None:
     return "\n".join([header, *(f"- {line}" for line in lines)])
 
 
+def render_defects(notices: Sequence[str] | None) -> str | None:
+    """The broken-shipped-default defect block, from the resolved set's `broken`, or ``None``.
+
+    Distinct from `render_safety`: a safe-by-default opt-out is something the operator *chose*,
+    while a broken shipped default is a **defect** — a capability silently disabled by a stale
+    overlay or a packaging bug (issue #160). The constitution forbids swallowing that quietly,
+    so when present it is headed loudly and listed, one line per broken default, in the Turn-0
+    brief — never mislabeled as an opt-out. Returns ``None`` for an empty/absent list, so a
+    healthy agent composes exactly the brief it did before.
+    """
+    lines = [notice for notice in (notices or []) if notice and notice.strip()]
+    if not lines:
+        return None
+    header = (
+        "⚠ Tool Defect — a shipped default tool failed to load, so its capability is "
+        "currently unavailable. If asked to use it, say it is unavailable; an operator can "
+        "fix it (run basecradle-harness-install, or repair the file):"
+    )
+    return "\n".join([header, *(f"- {line}" for line in lines)])
+
+
 def compose_brief(
     *,
     now: str | None = None,
     initialize: str | None,
     manifest: str | None,
+    defects: str | None = None,
     safety: str | None = None,
     dashboard: str | None,
     memory: str | None = None,
@@ -79,22 +101,24 @@ def compose_brief(
 
     Order is load-bearing: the **current-time anchor** first (the absolute "now" every other
     item's age is reasoned against — `_wake.py::_now_line`), then operating guidance (how to
-    act), then the tools the agent has, then the **safe-by-default opt-out notice** (right
-    after the tools it annotates — Group 5), then the live dashboard (where it is), then any
-    recalled **memory** relevant to the turn (the memory provider's `context` hook — injected
-    just before the charter, the way middleware memory systems inject retrieved context before
-    the system prompt), then the personality charter. Any part may be absent — a missing
-    dashboard (fetch failed), a memory provider that recalled nothing, no MCP/policy opt-out,
+    act), then the tools the agent has, then any **tool defect** (a shipped default that failed
+    to load — issue #160 — right after the manifest it contradicts, so the agent reads "you
+    have these tools, but this one is broken" together), then the **safe-by-default opt-out
+    notice** (Group 5), then the live dashboard (where it is), then any recalled **memory**
+    relevant to the turn (the memory provider's `context` hook — injected just before the
+    charter, the way middleware memory systems inject retrieved context before the system
+    prompt), then the personality charter. Any part may be absent — a missing dashboard (fetch
+    failed), a memory provider that recalled nothing, no MCP/policy opt-out, no broken default,
     an operator who blanked their charter — and the brief is composed from whatever remains.
     With nothing at all, returns ``None``.
 
-    ``now``, ``safety``, and ``memory`` default to ``None`` so a caller with none of them (a
-    test exercising composition, or the common no-MCP / default-SQLite-provider case) composes
-    exactly the brief it did before these seams existed.
+    ``now``, ``defects``, ``safety``, and ``memory`` default to ``None`` so a caller with none
+    of them (a test exercising composition, or the common no-MCP / default-SQLite-provider
+    case) composes exactly the brief it did before these seams existed.
     """
     parts = [
         part
-        for part in (now, initialize, manifest, safety, dashboard, memory, system_prompt)
+        for part in (now, initialize, manifest, defects, safety, dashboard, memory, system_prompt)
         if part and part.strip()
     ]
     return "\n\n".join(parts) if parts else None

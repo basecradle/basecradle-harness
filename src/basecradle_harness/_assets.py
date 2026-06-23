@@ -99,7 +99,9 @@ class AssetsTool(PlatformTool):
         "action='list' shows the files here with their uuids; action='read' "
         "downloads one file by uuid and returns its text (binary files come back as "
         "a description, not raw bytes); action='view' looks at an image file by uuid "
-        "so you can actually see it and describe or reason about it; action='create' "
+        "(or pass uuid='latest' to view the most recent file on the timeline, such as "
+        "an image you just posted) so you can actually see it and describe or reason "
+        "about it; action='create' "
         "uploads a new file from the text content you provide, with a filename and an "
         "optional description. Operations use the current timeline unless you pass a "
         "timeline uuid."
@@ -114,7 +116,12 @@ class AssetsTool(PlatformTool):
             },
             "uuid": {
                 "type": "string",
-                "description": "The asset's uuid (read/view only). Get it from 'list'.",
+                "description": (
+                    "The asset's uuid (read/view only). Get it from 'list', or pass "
+                    "'latest' for the most recent file on the timeline — e.g. an image "
+                    "you just generated and posted, so you can view it without being "
+                    "handed its uuid."
+                ),
             },
             "content": {
                 "type": "string",
@@ -159,16 +166,42 @@ class AssetsTool(PlatformTool):
         if action == "read":
             if not uuid:
                 return "Error: 'read' needs the asset's uuid. Use 'list' to find it."
-            return self._read(uuid)
+            resolved = self._resolve_uuid(uuid, target)
+            if resolved is None:
+                return "No files on this timeline yet — nothing to read."
+            return self._read(resolved)
         if action == "view":
             if not uuid:
                 return "Error: 'view' needs the asset's uuid. Use 'list' to find it."
-            return self._view(uuid)
+            resolved = self._resolve_uuid(uuid, target)
+            if resolved is None:
+                return "No files on this timeline yet — nothing to view."
+            return self._view(resolved)
         if action == "create":
             if content is None or not filename:
                 return "Error: 'create' needs both 'content' and a 'filename'."
             return self._create(target, content, filename, description)
         return f"Error: unknown action {action!r}. Use 'list', 'read', 'view', or 'create'."
+
+    # --- uuid resolution -----------------------------------------------------
+
+    def _resolve_uuid(self, uuid: str, timeline: str) -> str | None:
+        """Resolve a `read`/`view` uuid, mapping the ``'latest'`` alias to the newest asset.
+
+        An agent that just generated and posted an image cannot, on the same turn, view it
+        without being handed the new asset's uuid — its own post is self-filtered from the
+        wake's perception path, so the uuid never reaches its context (issue #161). The
+        ``'latest'`` alias closes that gap: it resolves to the **most recent file on the
+        target timeline** — which, right after a `generate_image`/`create`, is exactly the
+        file the agent just posted. The SDK's asset filter is newest-first and lazily
+        paginated, so this fetches only the first page's first item. Returns ``None`` when
+        the timeline has no files at all (the caller turns that into a clean message); any
+        other value is passed straight through as an explicit uuid.
+        """
+        if uuid.strip().lower() != "latest":
+            return uuid
+        newest = next(iter(self.context.client.assets.filter(timeline=timeline)), None)
+        return newest.content.uuid if newest is not None else None
 
     # --- list ----------------------------------------------------------------
 
