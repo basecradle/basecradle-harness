@@ -111,7 +111,7 @@ def test_listen_passes_the_api_key_and_filename(tool):
 
 
 def test_api_key_falls_back_to_env(client, monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("AI_API_KEY", FAKE_KEY)
     t = HearAudioTool(base_url=AUDIO_BASE)  # no key passed
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     with respx.mock(assert_all_called=True) as mock:
@@ -186,7 +186,7 @@ def test_missing_uuid_is_a_friendly_error(tool):
 
 
 def test_no_api_key_is_a_friendly_error(client, monkeypatch):
-    monkeypatch.delenv("AI_PROVIDER_API_KEY", raising=False)
+    monkeypatch.delenv("AI_API_KEY", raising=False)
     t = HearAudioTool(base_url=AUDIO_BASE)  # no key passed, none in env
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     with respx.mock(assert_all_called=True) as mock:
@@ -258,7 +258,7 @@ def test_spec_requires_a_uuid(tool):
 
 
 def test_an_unbound_tool_raises_platform_error(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("AI_API_KEY", FAKE_KEY)
     with pytest.raises(PlatformError):
         # Even fetching the asset needs a bound platform context.
         HearAudioTool(api_key=FAKE_KEY, base_url=AUDIO_BASE).run(uuid=A_AUDIO)

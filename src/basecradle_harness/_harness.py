@@ -20,10 +20,10 @@ Harness that could reach a subprocess.
 The simple case stays a one-liner — `send`/`history` operate on a default
 session, so a single-channel agent never has to think about sessions at all:
 
-    from basecradle_harness import Harness, OpenAICompatibleProvider, MemoryTool
+    from basecradle_harness import Harness, OpenAIProvider, MemoryTool
 
     agent = Harness(
-        OpenAICompatibleProvider(model="gpt-4o"),
+        OpenAIProvider(model="gpt-5.4-mini"),
         system_prompt="You are a helpful peer on BaseCradle.",
         tools=[MemoryTool()],
     )

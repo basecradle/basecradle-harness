@@ -66,6 +66,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib import metadata
 from pathlib import Path
 from urllib.parse import quote
 
@@ -1475,6 +1476,35 @@ def _activated_task_text(task: object) -> str:
     )
 
 
+# The PyPI distribution name for each AI_SDK value, so `--version` can report the *installed*
+# vendor-SDK version. Only `openai` ships an adapter in Milestone 1; the others are listed so a
+# later milestone's drift report names them without code change.
+_SDK_DISTRIBUTIONS = {"openai": "openai", "xai-sdk": "xai-sdk", "anthropic": "anthropic"}
+
+
+def _sdk_version(sdk: str) -> str | None:
+    """The installed version of the vendor SDK named by ``AI_SDK``, or ``None`` if absent."""
+    dist = _SDK_DISTRIBUTIONS.get(sdk, sdk)
+    try:
+        return metadata.version(dist)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def _version_string() -> str:
+    """``basecradle-harness-wake <harness> · <sdk> SDK <ver>`` — both versions an upgrade tracks.
+
+    Reports the harness version *and* the configured vendor SDK's installed version, so the
+    fleet drift alarm catches a stale SDK as well as a stale harness (released ≠ deployed
+    applies to the SDK pin too). With the SDK not installed it says so plainly — the same
+    "no LLM, by design" signal the provider build gives.
+    """
+    sdk = (os.environ.get("AI_SDK") or "openai").strip().lower()
+    version = _sdk_version(sdk)
+    sdk_note = f"{sdk} SDK {version}" if version else f"{sdk} SDK not installed"
+    return f"basecradle-harness-wake {__version__} · {sdk_note}"
+
+
 def main(argv: list[str] | None = None) -> int:
     """The `basecradle-harness-wake` entrypoint: one wake, then exit.
 
@@ -1487,13 +1517,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     # A token-free, model-free, timeline-free way to ask a deployed box "what version
     # are you actually running?" — the cheap probe a fleet drift-guard runs on-box to
-    # catch a published-but-not-deployed release before it goes silent. Prints
-    # "basecradle-harness-wake <version>" and exits 0 (argparse's built-in action).
+    # catch a published-but-not-deployed release before it goes silent. The harness reaches
+    # an LLM only through a vendor SDK, so an upgrade tracks **harness + vendor-SDK version
+    # together** (issue #158): this reports both, e.g.
+    # "basecradle-harness-wake 0.33.0 · openai SDK 2.43.0", so the drift alarm catches a stale
+    # SDK as well as a stale harness. Exits 0 (argparse's built-in action).
     parser.add_argument(
         "--version",
         action="version",
-        version=f"%(prog)s {__version__}",
-        help="print the installed basecradle-harness version and exit.",
+        version=_version_string(),
+        help="print the installed basecradle-harness and vendor-SDK versions, then exit.",
     )
     parser.add_argument(
         "--timeline",

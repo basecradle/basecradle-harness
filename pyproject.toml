@@ -22,7 +22,19 @@ classifiers = [
 ]
 dependencies = ["basecradle>=0.5"]
 
+# The harness reaches an LLM only through a vendor's official SDK — never hand-rolled HTTP.
+# The core depends on NO vendor SDK; each agent installs only the extra its AI_SDK names, so
+# the SDK version is pinned *in the extra* and tracked alongside the harness version on
+# upgrade. `pip install basecradle-harness[openai]` is the @jt / OpenAI stack; with no SDK
+# extra installed the harness comes up with no way to reach a model and says so plainly.
 [project.optional-dependencies]
+# The `openai` vendor SDK (AI_SDK=openai): the one adapter v0 ships. Drives the model loop
+# (Responses + Chat Completions), the server-side web_search built-in, vision, and the
+# gpt-image-2 / audio endpoints — all through this package, no harness-owned HTTP.
+# Pin: floor is the version Milestone 1 was built and tested against (2.43); major-capped so a
+# breaking 3.0 never auto-upgrades — the pin is bumped deliberately, in lockstep with the
+# harness version (issue #158), and `basecradle-harness-wake --version` reports both.
+openai = ["openai>=2.43,<3"]
 # The MemPalace memory provider (a reference `MemoryProvider`): a local-first OSS memory
 # system (ChromaDB + SQLite). Kept out of the base install so the core stays light — the
 # adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace.
@@ -42,7 +54,9 @@ Source = "https://github.com/basecradle/basecradle-harness"
 Issues = "https://github.com/basecradle/basecradle-harness/issues"
 
 [dependency-groups]
-dev = ["pytest>=8", "respx>=0.22", "ruff>=0.9"]
+# `openai` is a dev dep so the test suite exercises the real SDK adapter offline (respx
+# mocks its httpx transport); in production it ships only via the `openai` optional extra.
+dev = ["pytest>=8", "respx>=0.22", "ruff>=0.9", "openai>=2.43,<3"]
 
 [build-system]
 requires = ["hatchling>=1.27"]

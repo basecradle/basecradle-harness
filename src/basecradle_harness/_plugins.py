@@ -62,15 +62,29 @@ _DEFAULTS_TOOLS = ("_defaults", "tools")
 class ActivationContext:
     """The active config a plugin's `requires` are checked against.
 
+    The config model is three independent axes (issue #158): the **provider** (whose endpoint
+    + key), the **vendor SDK** the harness goes through, and the **model**. A plugin's
+    requirements gate on the ``(provider, sdk[, model])`` pairing — a server-side built-in or a
+    provider-coupled tool loads only under the pairing it actually works with.
+
     Args:
-        provider_api: The selected provider API — ``"chat"``, ``"responses"``, or ``"xai"``
-            (the value of ``AI_PROVIDER_API``). What a `ProviderAPI` requirement matches on.
+        provider: ``AI_PROVIDER`` — the vendor whose endpoint/key the agent uses
+            (``"openai"`` | ``"xai"`` | ``"openrouter"``). What a `Vendor` requirement matches.
+        sdk: ``AI_SDK`` — the PyPI package the harness imports to reach the model
+            (``"openai"`` | ``"xai-sdk"`` | …). Reserved for SDK-specific gating.
+        surface: The OpenAI adapter's internal wire surface — ``"responses"`` (default) or
+            ``"chat"``. What an `OpenAISurface` requirement matches (the ``web_search`` built-in
+            needs ``responses``).
+        model: ``AI_MODEL`` — the model id, for the rare model-specific gate.
         env: An environment snapshot (usually ``os.environ``) — what an `EnvSet` / `OpenAIKey`
-            requirement reads. Passed in rather than read globally so resolution is pure and
-            a test can drive it without touching the process environment.
+            requirement reads. Passed in rather than read globally so resolution is pure and a
+            test can drive it without touching the process environment.
     """
 
-    provider_api: str
+    provider: str
+    sdk: str
+    surface: str
+    model: str
     env: Mapping[str, str]
 
 
@@ -93,21 +107,41 @@ class Requirement(ABC):
 
 
 @dataclass(frozen=True)
-class ProviderAPI(Requirement):
-    """Met iff the active provider API equals `api` (``"chat"`` or ``"responses"``).
+class Vendor(Requirement):
+    """Met iff the active provider equals `name` (``"openai"`` | ``"xai"`` | ``"openrouter"``).
 
-    The requirement a Responses-only built-in declares: ``web_search`` requires
-    ``ProviderAPI("responses")`` and so self-excludes under Chat Completions.
+    The requirement a provider-coupled tool declares: the grok media tools and xAI Live Search
+    require ``Vendor("xai")`` and self-exclude everywhere else, so an xAI agent's stack touches
+    no OpenAI surface and an OpenAI agent never sees a grok-only tool.
     """
 
-    api: str
+    name: str
 
     def met(self, ctx: ActivationContext) -> bool:
-        return ctx.provider_api == self.api
+        return ctx.provider == self.name
 
     @property
     def reason(self) -> str:
-        return f"needs the {self.api!r} provider API"
+        return f"needs the {self.name!r} provider (AI_PROVIDER={self.name})"
+
+
+@dataclass(frozen=True)
+class OpenAISurface(Requirement):
+    """Met iff the OpenAI adapter's wire surface equals `surface` (``"responses"`` | ``"chat"``).
+
+    The requirement OpenAI's server-side ``web_search`` built-in declares (alongside
+    ``Vendor("openai")``): it exists only on the Responses surface, so it self-excludes under
+    Chat Completions.
+    """
+
+    surface: str
+
+    def met(self, ctx: ActivationContext) -> bool:
+        return ctx.surface == self.surface
+
+    @property
+    def reason(self) -> str:
+        return f"needs the OpenAI {self.surface!r} surface"
 
 
 @dataclass(frozen=True)
@@ -126,30 +160,26 @@ class EnvSet(Requirement):
 
 @dataclass(frozen=True)
 class OpenAIKey(EnvSet):
-    """Met iff an OpenAI API key (``AI_PROVIDER_API_KEY``) is present **and** this isn't xAI.
+    """Met iff the provider is ``openai`` **and** an API key (``AI_API_KEY``) is present.
 
-    The honest activation requirement for the OpenAI-coupled tools (``generate_image``,
-    ``listen``): they call OpenAI's Images/Audio APIs with the agent's key under the ``chat``
-    or ``responses`` provider, so what they truly need is that key — not a particular adapter.
-    Whether the key behind the shared var is genuinely an *OpenAI* key can't be told in
-    general; key-present is the strongest non-fragile proxy. The **one** case we *can* tell is
-    the xAI-native profile (``AI_PROVIDER_API=xai``): there the key is an xAI key and these
-    OpenAI tools must **not** activate (an xAI agent's stack touches no OpenAI surface — the
-    grok media tools cover it instead), so the profile is excluded here by construction rather
-    than left to the operator to curate.
+    The activation requirement for the OpenAI-coupled tools (``generate_image``,
+    ``edit_image``, ``listen``): they call OpenAI's Images/Audio endpoints through the
+    ``openai`` SDK with the agent's key, so they belong to the ``openai`` provider and need its
+    key set. Under any other provider (xAI, OpenRouter) they self-exclude — an xAI agent's
+    media stack is the grok tools instead, touching no OpenAI surface.
 
-    It is an `EnvSet` (inheriting the env-presence check) with the right default var and a
+    It is an `EnvSet` (inheriting the env-presence check) on the right default var, with a
     plugin-author-friendly name and reason — so a default plugin reads ``requires=(OpenAIKey(),)``.
     """
 
-    var: str = "AI_PROVIDER_API_KEY"
+    var: str = "AI_API_KEY"
 
     def met(self, ctx: ActivationContext) -> bool:
-        return super().met(ctx) and ctx.provider_api != "xai"
+        return super().met(ctx) and ctx.provider == "openai"
 
     @property
     def reason(self) -> str:
-        return "needs an OpenAI API key (AI_PROVIDER_API_KEY) and a non-xAI provider"
+        return "needs the openai provider (AI_PROVIDER=openai) and an API key (AI_API_KEY)"
 
 
 # --- the plugin ---------------------------------------------------------------

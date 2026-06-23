@@ -15,7 +15,7 @@ from basecradle_harness import (
     ToolRegistry,
     ToolSpec,
 )
-from basecradle_harness._openai import _tool_to_wire
+from basecradle_harness._openai_wire import chat_tool_to_wire
 from basecradle_harness._tools import NO_PARAMETERS
 
 
@@ -171,7 +171,7 @@ def test_registry_specs_serialize_through_the_provider_adapter():
     registry = ToolRegistry()
     registry.register(EchoTool())
 
-    wire = _tool_to_wire(registry.specs()[0])
+    wire = chat_tool_to_wire(registry.specs()[0])
     assert wire == {
         "type": "function",
         "function": {

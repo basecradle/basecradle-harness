@@ -14,9 +14,10 @@ from basecradle_harness import (
     ActivationContext,
     EnvSet,
     OpenAIKey,
-    ProviderAPI,
+    OpenAISurface,
     Tool,
     ToolPlugin,
+    Vendor,
     install,
     load_plugins,
     resolve_plugins,
@@ -40,8 +41,8 @@ class _Other(Tool):
         return "other"
 
 
-def _ctx(api="chat", **env):
-    return ActivationContext(provider_api=api, env=env)
+def _ctx(provider="openai", sdk="openai", surface="responses", model="gpt-5.4-mini", **env):
+    return ActivationContext(provider=provider, sdk=sdk, surface=surface, model=model, env=env)
 
 
 # --- the plugin contract -----------------------------------------------------
@@ -63,17 +64,25 @@ def test_resolved_name_defaults_to_the_impl_name_and_can_be_overridden():
 # --- requirements ------------------------------------------------------------
 
 
-def test_provider_api_requirement_matches_the_active_api():
-    req = ProviderAPI("responses")
-    assert req.met(_ctx(api="responses"))
-    assert not req.met(_ctx(api="chat"))
+def test_vendor_requirement_matches_the_active_provider():
+    req = Vendor("xai")
+    assert req.met(_ctx(provider="xai"))
+    assert not req.met(_ctx(provider="openai"))
+
+
+def test_openai_surface_requirement_matches_the_active_surface():
+    req = OpenAISurface("responses")
+    assert req.met(_ctx(surface="responses"))
+    assert not req.met(_ctx(surface="chat"))
 
 
 def test_env_and_openai_key_requirements_read_the_context_env():
     assert EnvSet("FOO").met(_ctx(FOO="x"))
     assert not EnvSet("FOO").met(_ctx())
-    assert OpenAIKey().met(_ctx(AI_PROVIDER_API_KEY="sk-test"))
-    assert not OpenAIKey().met(_ctx())
+    # OpenAIKey needs the openai provider AND a key — both, not either.
+    assert OpenAIKey().met(_ctx(provider="openai", AI_API_KEY="sk-test"))
+    assert not OpenAIKey().met(_ctx(provider="openai"))  # no key
+    assert not OpenAIKey().met(_ctx(provider="xai", AI_API_KEY="xai-key"))  # wrong provider
 
 
 # --- resolution --------------------------------------------------------------
@@ -82,9 +91,9 @@ def test_env_and_openai_key_requirements_read_the_context_env():
 def test_resolve_splits_active_plugins_into_function_tools_and_builtins():
     plugins = [
         ToolPlugin(impl=_Echo),
-        ToolPlugin(builtin="web_search", requires=(ProviderAPI("responses"),)),
+        ToolPlugin(builtin="web_search", requires=(OpenAISurface("responses"),)),
     ]
-    resolved = resolve_plugins(plugins, _ctx(api="responses"))
+    resolved = resolve_plugins(plugins, _ctx())
     assert [t.name for t in resolved.tools] == ["echo"]
     assert resolved.builtins == ["web_search"]
 
@@ -96,9 +105,9 @@ def test_resolution_builds_a_manifest_of_active_tools_with_notes():
     plugins = [
         ToolPlugin(impl=_Echo, note="a gotcha the schema can't convey."),
         ToolPlugin(impl=_Other),  # no note → None
-        ToolPlugin(builtin="web_search", requires=(ProviderAPI("responses"),)),
+        ToolPlugin(builtin="web_search", requires=(OpenAISurface("responses"),)),
     ]
-    resolved = resolve_plugins(plugins, _ctx(api="responses"))
+    resolved = resolve_plugins(plugins, _ctx())
     assert resolved.manifest == [
         ("echo", "a gotcha the schema can't convey."),
         ("other", None),
@@ -117,9 +126,9 @@ def test_manifest_omits_inactive_plugins():
 def test_an_unmet_requirement_excludes_the_plugin_and_records_why():
     plugins = [
         ToolPlugin(impl=_Echo, requires=(OpenAIKey(),)),
-        ToolPlugin(builtin="web_search", requires=(ProviderAPI("responses"),)),
+        ToolPlugin(builtin="web_search", requires=(OpenAISurface("responses"),)),
     ]
-    resolved = resolve_plugins(plugins, _ctx(api="chat"))  # no key, not responses
+    resolved = resolve_plugins(plugins, _ctx(surface="chat"))  # no key, not responses
     assert resolved.tools == []
     assert resolved.builtins == []
     skipped = dict(resolved.skipped)
@@ -137,12 +146,14 @@ def test_a_later_active_plugin_overrides_an_earlier_one_by_name():
 def test_exactly_one_of_two_same_named_variants_activates_per_config():
     # Two "search" plugins differing only in requires — the provider-variant case. Under each
     # provider exactly one is active, so the active set always has one "search", never two.
-    chat_variant = ToolPlugin(impl=_Echo, name="search", requires=(ProviderAPI("chat"),))
-    responses_variant = ToolPlugin(impl=_Other, name="search", requires=(ProviderAPI("responses"),))
+    chat_variant = ToolPlugin(impl=_Echo, name="search", requires=(OpenAISurface("chat"),))
+    responses_variant = ToolPlugin(
+        impl=_Other, name="search", requires=(OpenAISurface("responses"),)
+    )
     plugins = [chat_variant, responses_variant]
 
-    under_chat = resolve_plugins(plugins, _ctx(api="chat"))
-    under_responses = resolve_plugins(plugins, _ctx(api="responses"))
+    under_chat = resolve_plugins(plugins, _ctx(surface="chat"))
+    under_responses = resolve_plugins(plugins, _ctx())
 
     assert [type(t) for t in under_chat.tools] == [_Echo]
     assert [type(t) for t in under_responses.tools] == [_Other]
@@ -172,19 +183,19 @@ _DEFAULT_TOOLS = {
 
 
 def test_packaged_defaults_under_responses_match_todays_tool_set_plus_web_search():
-    resolved = resolve_plugins(load_plugins(), _ctx(api="responses", AI_PROVIDER_API_KEY="sk"))
+    resolved = resolve_plugins(load_plugins(), _ctx(AI_API_KEY="sk"))
     assert {t.name for t in resolved.tools} == _DEFAULT_TOOLS
     assert resolved.builtins == ["web_search"]  # the Responses built-in is active
 
 
 def test_web_search_drops_on_chat_completions_the_other_tools_stay():
-    resolved = resolve_plugins(load_plugins(), _ctx(api="chat", AI_PROVIDER_API_KEY="sk"))
+    resolved = resolve_plugins(load_plugins(), _ctx(surface="chat", AI_API_KEY="sk"))
     assert {t.name for t in resolved.tools} == _DEFAULT_TOOLS
     assert resolved.builtins == []  # web_search self-excludes off the Responses API
 
 
 def test_openai_coupled_tools_drop_without_an_openai_key():
-    resolved = resolve_plugins(load_plugins(), _ctx(api="chat"))  # no key
+    resolved = resolve_plugins(load_plugins(), _ctx(surface="chat"))  # no key
     names = {t.name for t in resolved.tools}
     assert "generate_image" not in names and "edit_image" not in names and "listen" not in names
     assert _DEFAULT_TOOLS - {"generate_image", "edit_image", "listen"} == names
@@ -229,7 +240,7 @@ def test_overlay_add_override_and_disable(tmp_path):
     # DISABLE — deleting a default's file removes the tool.
     (tools_dir / "assets.py").unlink()
 
-    resolved = resolve_plugins(load_plugins(home), _ctx(AI_PROVIDER_API_KEY="sk"))
+    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))
     names = {t.name for t in resolved.tools}
     assert "greet" in names  # added
     assert "assets" not in names  # disabled
@@ -271,7 +282,7 @@ def test_removing_the_whole_tools_dir_once_installed_yields_no_tools(tmp_path):
     assert load_plugins(home) == []
 
 
-# The xAI-profile-only defaults: loaded under every config but active only under api="xai".
+# The xAI-profile-only defaults: loaded under every config but active only under provider="xai".
 _XAI_DEFAULTS = {"web_search", "x_search", "grok_generate_image", "grok_generate_video"}
 
 
@@ -285,8 +296,8 @@ def test_a_never_installed_config_home_falls_back_to_packaged_defaults(tmp_path)
 def test_xai_profile_activates_grok_tools_and_live_search_drops_openai_tools():
     # Eddie's profile: the grok media tools and xAI Live Search built-ins activate, the
     # OpenAI-coupled tools (generate_image/edit_image/listen) self-exclude, and OpenAI's own
-    # web_search built-in (ProviderAPI("responses")) does not leak in — only xAI's does.
-    resolved = resolve_plugins(load_plugins(), _ctx(api="xai", AI_PROVIDER_API_KEY="xai-key"))
+    # web_search built-in (OpenAISurface("responses")) does not leak in — only xAI's does.
+    resolved = resolve_plugins(load_plugins(), _ctx(provider="xai", AI_API_KEY="xai-key"))
     names = {t.name for t in resolved.tools}
     assert {"grok_generate_image", "grok_generate_video"} <= names
     assert not ({"generate_image", "edit_image", "listen"} & names)

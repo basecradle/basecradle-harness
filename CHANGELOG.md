@@ -7,6 +7,58 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.33.0] - 2026-06-22
+
+**Milestone 1: the harness reaches an LLM only through a vendor's official SDK.** The provider
+layer was hand-rolled `httpx` that reimplemented vendor wire formats — the architecture defect
+this corrects (issue #158). The harness now ships **zero** of its own code to hit a model
+endpoint: it installs a named vendor SDK and calls that package for everything. This milestone
+proves the corrected architecture on one agent (@jt) and one SDK (`openai`); other
+providers/SDKs are later milestones, designed-for but not built.
+
+### Added
+
+- **`OpenAIProvider`** — the one adapter v0 ships, wrapping the official **`openai` SDK**. It
+  drives @jt's whole stack through the package: the model loop, the server-side `web_search`
+  built-in, function/tool calling, and vision (image input). Two internal **surfaces** —
+  `responses` (the default, @jt's) and `chat` — selected by the adapter-internal
+  `AI_OPENAI_SURFACE`, not a top-level config axis.
+- **The `openai` optional extra** — `pip install 'basecradle-harness[openai]'`. The harness
+  **core depends on no vendor SDK**; each agent installs only the extra its `AI_SDK` names,
+  which pins the SDK version. With no SDK importable the harness fails loud at startup ("no
+  LLM, by design") rather than deep in a wake.
+- **Three-axis config model** (a clean rename, one name per concept everywhere): `AI_PROVIDER`
+  (vendor — `openai`/`xai`/`openrouter`), `AI_SDK` (the PyPI package the harness imports),
+  `AI_MODEL`, `AI_API_KEY`, `AI_BASE_URL`. The capability-gating requirements are re-keyed to
+  match: `Vendor` and `OpenAISurface` replace `ProviderAPI`.
+- **`--version` reports the vendor-SDK version too** — `basecradle-harness-wake X · openai SDK
+  Y` — so an upgrade tracks **harness + SDK version together** and the fleet drift alarm
+  catches a stale SDK as well as a stale harness.
+- **Shared, transport-free OpenAI wire module** (`_openai_wire`): the request/response
+  serialization both the SDK adapter and the xAI interim adapter use, so the wire logic lives
+  once.
+
+### Changed
+
+- **Image (`gpt-image-2` generate/edit) and audio (`listen`) tools now call OpenAI through the
+  `openai` SDK** (`client.images` / `client.audio`), not hand-rolled `httpx` — the same
+  vendor-SDK rule, applied to every OpenAI-endpoint interaction in @jt's stack.
+- **Config rename — breaking:** `AI_PROVIDER_API_KEY` → `AI_API_KEY`, `AI_PROVIDER_MODEL` →
+  `AI_MODEL`, `AI_PROVIDER_BASE_URL` → `AI_BASE_URL`; `AI_PROVIDER_API` (`chat`/`responses`/
+  `xai`) is gone — split into `AI_PROVIDER` + the adapter-internal `AI_OPENAI_SURFACE`. The
+  exported `OpenAICompatibleProvider` (the hand-rolled Chat Completions adapter, the
+  lowest-common-denominator path) is removed; `ProviderAPI` is replaced by `Vendor` /
+  `OpenAISurface`.
+
+### Preserved
+
+- The **Tools / Memory / MCP** frameworks are unchanged — only the provider/LLM-interaction
+  layer and capability gating were rebuilt.
+- **xAI stays on its interim `httpx` path**, re-keyed to gate on `AI_PROVIDER=xai`
+  (`OpenAIResponsesProvider`, pointed at `api.x.ai`) — left as-is on purpose, not routed
+  through the `openai` SDK and not disabled, until the native `xai-sdk` adapter lands. It is
+  the one remaining hand-rolled model path, explicitly on death row.
+
 ## [0.32.0] - 2026-06-22
 
 **A timeline `delete` tool — restoring human–AI delete parity, behind one shared gate.**

@@ -34,7 +34,7 @@ These are settled. Seven decisions, in dependency order of importance:
 
 2. **One core, two profiles.** A provider-agnostic **agent engine** that knows nothing about "safe." Harness = engine + a **locked policy** (no shell/exec, curated tools). Cradle (later) = the *same engine* + an **unlocked policy** (shell, sudo, self-modification). We do **not** extract a separate `core` package yet — it lives here until Cradle proves it needs its own distribution. This is why "a Cradle AI spawns Harness sub-agents" comes for free: same engine, different policy.
 
-3. **Provider abstraction.** A thin `Provider` protocol — chat + tool-calling, nothing more. **v0 ships exactly one adapter: OpenAI-compatible**, which covers OpenAI, OpenRouter, *and* xAI's compatible endpoint by changing only `base_url` + `api_key` + `model`. A native xAI-SDK adapter is a later opt-in, justified only by an xAI-specific feature the compat API doesn't expose. **Adding a provider = implementing one protocol.** That is the hackability promise, kept honest.
+3. **Provider abstraction — *vendor-SDK only* (corrected, issue #158).** A thin `Provider` protocol — chat + tool-calling, nothing more — but the harness reaches an LLM **only through a vendor's official SDK, 100% of the time**: it ships **zero** of its own code to hit a model endpoint; no SDK installed → it cannot reach a model, by design. The config is **three independent axes** — `AI_PROVIDER` (whose endpoint + key), `AI_SDK` (the PyPI package the harness imports), `AI_MODEL` — and each agent installs only its SDK as an *extra* (`pip install 'basecradle-harness[openai]'`, which pins the SDK version). **v0 ships exactly one adapter: `openai`** (`OpenAIProvider`, both the Responses and Chat Completions surfaces via the `openai` package). Other SDK adapters (`xai-sdk`, OpenRouter, Anthropic) slot in later without touching the engine. **Adding a provider = one thin adapter wrapping the real SDK.** *(History: v0's first cut was a hand-rolled `httpx` "OpenAI-compatible" adapter — the lowest-common-denominator path issue #158 eliminated. The xAI profile is the one model path still on hand-rolled `httpx`, kept as-is on death row until its native `xai-sdk` adapter lands; the Phase-2 sections below predate the M1 correction and describe that earlier `httpx`/`AI_PROVIDER_API` era.)*
 
 4. **Tool interface + policy layer.** A tool is a small class with a `name`, JSON-schema parameters, and a `run()` method, registered in a `ToolRegistry`. A **policy layer** gates which tools a profile may load — Harness denies shell/exec **by construction, not by convention**. A contributor adds a capability by writing one tool class. **Memory** is the single shipped example tool: file/SQLite-backed, deliberately simple and swappable (Letta/MemGPT is reference reading, not something to clone).
 
@@ -65,7 +65,7 @@ The guard, applied when adding or auditing any tool tranche:
 
 ## v0 Scope — What We're Building First
 
-**In:** A developer runs `pip install basecradle-harness`, sets `BASECRADLE_TOKEN` + a model key, and an agent participates in a BaseCradle timeline **locally** — reads messages, thinks via an OpenAI-compatible model, uses the **memory** tool, and replies. Single agent, one machine, fully hackable. v0 receives platform events by **polling a timeline through the SDK** (no webhook infrastructure required).
+**In:** A developer runs `pip install 'basecradle-harness[openai]'`, sets `BASECRADLE_TOKEN` + `AI_API_KEY`, and an agent participates in a BaseCradle timeline **locally** — reads messages, thinks via a model reached through the `openai` SDK, uses the **memory** tool, and replies. Single agent, one machine, fully hackable. v0 receives platform events by **polling a timeline through the SDK** (no webhook infrastructure required).
 
 **Out (deferred, on purpose):** the curl-pipe installer, native non-OpenAI provider SDKs, a browser tool.
 
@@ -86,7 +86,7 @@ Mirrors the Python SDK for ecosystem consistency.
 | Packaging | **pyproject.toml** only | hatchling backend. No setup.py |
 | Types | Hints everywhere + **py.typed** | Types are documentation |
 
-Runtime dependencies start at `basecradle` (the SDK) plus the one HTTP client the provider adapter needs (httpx, already the SDK's dep). Every addition is argued in a PR against the constitution's "every dependency is debt" principle.
+Runtime dependencies start at `basecradle` (the SDK; brings httpx) and **no model-vendor SDK** — the vendor SDK ships only as an *optional extra* per `AI_SDK` (`[openai]` is the one v0 ships, pinning `openai`), so the core stays light and an agent installs only the brain it uses. Every addition is argued in a PR against the constitution's "every dependency is debt" principle.
 
 ## Conventions
 

@@ -1,8 +1,11 @@
-"""The OpenAI-compatible adapter, behind the provider-agnostic `Provider` seam.
+"""The ``openai`` SDK adapter (`OpenAIProvider`), behind the provider-agnostic `Provider` seam.
 
-Every test mocks the HTTP transport with respx — no model is ever called. The
-shapes here are the OpenAI chat-completions schema, which OpenRouter and xAI
-mirror; only `base_url` / `api_key` / `model` change between them.
+The harness reaches a model **only through a vendor SDK** (issue #158); this is that adapter
+for ``AI_SDK=openai``. Every test mocks the HTTP transport with respx — and because respx
+patches httpx at the transport level, it intercepts the ``openai`` SDK's *own* httpx client, so
+these tests drive the **real SDK** against SDK-valid response bodies without ever touching the
+network. Both surfaces are covered: ``chat`` (Chat Completions) and ``responses`` (the Responses
+API, with the server-side ``web_search`` built-in and vision).
 """
 
 import json
@@ -12,8 +15,9 @@ import pytest
 
 from basecradle_harness import (
     HarnessError,
+    ImageContent,
     Message,
-    OpenAICompatibleProvider,
+    OpenAIProvider,
     Provider,
     ProviderAPIError,
     ProviderAuthError,
@@ -24,7 +28,19 @@ from basecradle_harness import (
     ToolSpec,
 )
 from basecradle_harness._openai import DEFAULT_BASE_URL
-from tests.conftest import BASE_URL, CHAT_URL, FAKE_KEY, completion, wire_tool_call
+from tests.conftest import (
+    BASE_URL,
+    CHAT_URL,
+    FAKE_KEY,
+    RESPONSES_URL,
+    completion,
+    out_function_call,
+    out_message,
+    out_web_search_call,
+    responses_body,
+    url_citation,
+    wire_tool_call,
+)
 
 WEATHER_TOOL = ToolSpec(
     name="get_weather",
@@ -37,7 +53,13 @@ WEATHER_TOOL = ToolSpec(
 )
 
 
-# --- A plain text turn -------------------------------------------------------
+def _chat(**kw):
+    return OpenAIProvider(
+        model="gpt-4o", api_key=FAKE_KEY, base_url=BASE_URL, surface="chat", max_retries=0, **kw
+    )
+
+
+# === Chat surface ============================================================
 
 
 def test_chat_returns_assistant_text(router, provider):
@@ -65,21 +87,15 @@ def test_request_sends_model_and_messages(router, provider):
         {"role": "system", "content": "be terse"},
         {"role": "user", "content": "Hi"},
     ]
-    # No tools offered → no tools key at all.
-    assert "tools" not in body
+    assert "tools" not in body  # no tools offered → no tools key
 
 
 def test_authorization_header_carries_the_key(router, provider):
-    route = router.post(CHAT_URL).mock(
-        return_value=httpx.Response(200, json=completion(content="ok"))
-    )
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(content="ok")))
 
     provider.chat([Message.user("Hi")])
 
-    assert route.calls.last.request.headers["Authorization"] == f"Bearer {FAKE_KEY}"
-
-
-# --- Tool calling ------------------------------------------------------------
+    assert router.calls.last.request.headers["Authorization"] == f"Bearer {FAKE_KEY}"
 
 
 def test_tool_call_arguments_are_parsed_to_a_dict(router, provider):
@@ -101,7 +117,6 @@ def test_tool_call_arguments_are_parsed_to_a_dict(router, provider):
     assert reply.tool_calls == [
         ToolCall(id="call_1", name="get_weather", arguments={"city": "Dallas"})
     ]
-    # The wire's JSON-string arguments never leak out as a string.
     assert isinstance(reply.tool_calls[0].arguments, dict)
 
 
@@ -179,7 +194,6 @@ def test_full_tool_round_trip(router, provider):
     first = provider.chat(history, tools=[WEATHER_TOOL])
     assert first.tool_calls[0].name == "get_weather"
 
-    # The engine's job, done by hand here: append the call and its result.
     history.append(first)
     history.append(Message.tool(tool_call_id="call_1", content="sunny, 88F"))
     second = provider.chat(history, tools=[WEATHER_TOOL])
@@ -188,7 +202,122 @@ def test_full_tool_round_trip(router, provider):
     assert second.content == "It's sunny in Dallas."
 
 
-# --- Errors ------------------------------------------------------------------
+# === Responses surface =======================================================
+
+
+def test_responses_returns_assistant_text(router, responses_provider):
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("Hello, peer.")))
+    )
+
+    reply = responses_provider.chat([Message.user("Hi")])
+
+    assert reply.content == "Hello, peer."
+    assert reply.tool_calls == []
+
+
+def test_responses_targets_responses_with_input_and_developer_role(router, responses_provider):
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("ok")))
+    )
+
+    responses_provider.chat([Message.system("be terse"), Message.user("Hi")])
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["model"] == "gpt-5.4-mini"
+    # Chat's `messages` becomes Responses' `input`; `system` maps to the `developer` role.
+    assert body["input"] == [
+        {"role": "developer", "content": "be terse"},
+        {"role": "user", "content": "Hi"},
+    ]
+
+
+def test_web_search_builtin_is_offered_alongside_function_tools(router):
+    """A built-in (web_search) and a function tool coexist in one Responses turn."""
+    provider = OpenAIProvider(
+        model="gpt-5.4-mini",
+        api_key=FAKE_KEY,
+        base_url=BASE_URL,
+        surface="responses",
+        max_retries=0,
+        builtin_tools=["web_search"],
+    )
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("ok")))
+    )
+
+    provider.chat([Message.user("news?")], tools=[WEATHER_TOOL])
+
+    tools = json.loads(route.calls.last.request.content)["tools"]
+    assert {"type": "web_search"} in tools
+    # The function tool is the Responses *flat* shape (no nested `function` key).
+    assert {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Look up the weather for a city.",
+        "parameters": WEATHER_TOOL.parameters,
+    } in tools
+    provider.close()
+
+
+def test_responses_function_call_becomes_a_tool_call(router, responses_provider):
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=responses_body(
+                out_function_call(
+                    call_id="call_9", name="get_weather", arguments={"city": "Dallas"}
+                )
+            ),
+        )
+    )
+
+    reply = responses_provider.chat([Message.user("weather?")], tools=[WEATHER_TOOL])
+
+    assert reply.content is None
+    assert reply.tool_calls == [
+        ToolCall(id="call_9", name="get_weather", arguments={"city": "Dallas"})
+    ]
+
+
+def test_web_search_call_item_is_ignored_but_citations_are_kept(router, responses_provider):
+    """A server-side web_search_call is not a tool call; its citations footer the reply."""
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=responses_body(
+                out_web_search_call(),
+                out_message(
+                    "Here is the news.",
+                    annotations=[url_citation(url="https://ex.com/a", title="A")],
+                ),
+            ),
+        )
+    )
+
+    reply = responses_provider.chat([Message.user("news?")])
+
+    assert reply.tool_calls == []  # web_search_call is resolved server-side, never run here
+    assert "Here is the news." in reply.content
+    assert "Sources:" in reply.content
+    assert "https://ex.com/a" in reply.content
+
+
+def test_vision_image_is_sent_as_an_input_image_part(router, responses_provider):
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("I see a cat.")))
+    )
+
+    turn = Message.user("what's this?")
+    turn.images = [ImageContent(url="data:image/png;base64,AAAA", alt="cat.png")]
+    responses_provider.chat([turn])
+
+    content = json.loads(route.calls.last.request.content)["input"][0]["content"]
+    assert {"type": "input_text", "text": "what's this?"} in content
+    assert {"type": "input_image", "image_url": "data:image/png;base64,AAAA"} in content
+
+
+# === Errors (SDK exceptions → the harness provider hierarchy) ================
 
 
 def test_401_raises_provider_auth_error(router, provider):
@@ -223,8 +352,20 @@ def test_500_raises_provider_api_error_keeping_the_body(router, provider):
 
     assert exc.value.status_code == 500
     assert exc.value.body == "boom"
-    # Not auth or rate-limit, just the generic API error.
     assert not isinstance(exc.value, (ProviderAuthError, ProviderRateLimitError))
+
+
+def test_400_relays_the_providers_real_message(router, provider):
+    """A 400's body carries the true cause under error.message — kept for the relay."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(400, json={"error": {"message": "Unsupported value: 'foo'."}})
+    )
+
+    with pytest.raises(ProviderAPIError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert exc.value.status_code == 400
+    assert "Unsupported value" in exc.value.body
 
 
 def test_transport_failure_raises_connection_error(router, provider):
@@ -235,44 +376,52 @@ def test_transport_failure_raises_connection_error(router, provider):
 
 
 def test_malformed_response_raises_provider_error(router, provider):
+    """The SDK leniently constructs the model; an empty `choices` surfaces as ProviderError."""
     router.post(CHAT_URL).mock(return_value=httpx.Response(200, json={"unexpected": True}))
 
     with pytest.raises(ProviderError):
         provider.chat([Message.user("Hi")])
 
 
-# --- Construction & configuration -------------------------------------------
+# === Construction & configuration ===========================================
 
 
 def test_api_key_falls_back_to_env(monkeypatch, router):
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-env-key")
-    provider = OpenAICompatibleProvider(model="gpt-4o", base_url=BASE_URL)
-    route = router.post(CHAT_URL).mock(
-        return_value=httpx.Response(200, json=completion(content="ok"))
-    )
+    monkeypatch.setenv("AI_API_KEY", "sk-env-key")
+    provider = OpenAIProvider(model="gpt-4o", base_url=BASE_URL, surface="chat", max_retries=0)
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(content="ok")))
 
     provider.chat([Message.user("Hi")])
 
-    assert route.calls.last.request.headers["Authorization"] == "Bearer sk-env-key"
+    assert router.calls.last.request.headers["Authorization"] == "Bearer sk-env-key"
     provider.close()
 
 
 def test_missing_api_key_is_a_clear_error(monkeypatch):
-    monkeypatch.delenv("AI_PROVIDER_API_KEY", raising=False)
-    with pytest.raises(ValueError, match="AI_PROVIDER_API_KEY"):
-        OpenAICompatibleProvider(model="gpt-4o")
+    monkeypatch.delenv("AI_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="AI_API_KEY"):
+        OpenAIProvider(model="gpt-4o")
+
+
+def test_unknown_surface_is_a_clear_error():
+    with pytest.raises(ValueError, match="surface"):
+        OpenAIProvider(model="gpt-4o", api_key=FAKE_KEY, surface="telepathy")
 
 
 def test_default_base_url_is_openai():
-    provider = OpenAICompatibleProvider(model="gpt-4o", api_key=FAKE_KEY)
+    provider = OpenAIProvider(model="gpt-4o", api_key=FAKE_KEY)
     assert provider.base_url == DEFAULT_BASE_URL
     provider.close()
 
 
+def test_default_surface_is_responses():
+    provider = OpenAIProvider(model="gpt-4o", api_key=FAKE_KEY)
+    assert provider.surface == "responses"
+    provider.close()
+
+
 def test_default_params_pass_through(router):
-    provider = OpenAICompatibleProvider(
-        model="gpt-4o", api_key=FAKE_KEY, base_url=BASE_URL, temperature=0.2
-    )
+    provider = _chat(temperature=0.2)
     route = router.post(CHAT_URL).mock(
         return_value=httpx.Response(200, json=completion(content="ok"))
     )
@@ -286,12 +435,28 @@ def test_default_params_pass_through(router):
 
 
 def test_context_manager_closes(router):
-    with OpenAICompatibleProvider(model="gpt-4o", api_key=FAKE_KEY, base_url=BASE_URL) as provider:
+    with _chat() as provider:
         router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(content="ok")))
         assert provider.chat([Message.user("Hi")]).content == "ok"
 
 
-# --- The one-class promise ---------------------------------------------------
+def test_missing_sdk_is_a_clear_no_llm_error(monkeypatch):
+    """With the ``openai`` package unimportable, construction fails loud — "no LLM, by design"."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _no_openai(name, *args, **kwargs):
+        if name == "openai":
+            raise ModuleNotFoundError("No module named 'openai'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_openai)
+    with pytest.raises(ProviderError, match="openai"):
+        OpenAIProvider(model="gpt-4o", api_key=FAKE_KEY)
+
+
+# === The one-class promise ===================================================
 
 
 class EchoProvider:

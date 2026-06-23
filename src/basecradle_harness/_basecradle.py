@@ -21,14 +21,23 @@ Configuration is environment-first (see `TimelineAgent.from_env`):
 - ``BASECRADLE_SESSION_NAME`` — optional; labels the credential minted from a
   password so it can be told apart later (the SDK's ``login(name=…)``).
 - ``BASECRADLE_TIMELINE``     — the uuid of the timeline to watch.
-- ``AI_PROVIDER_API_KEY``     — the model provider's API key.
-- ``AI_PROVIDER_MODEL``       — the model id (e.g. ``gpt-4o``).
-- ``AI_PROVIDER_BASE_URL``    — optional; point the provider at OpenRouter/xAI.
-- ``AI_PROVIDER_API``         — optional; ``chat`` (default, the portable
-  OpenAI-compatible Chat Completions adapter) or ``responses`` (OpenAI's Responses
-  API, which can run server-side built-ins like ``web_search``). It also selects which
-  tool plugins activate — the ``web_search`` built-in needs ``responses``. See
-  `_provider_from_env` and `basecradle_harness._plugins`.
+
+The model config is **three independent axes** (issue #158) — one name per concept,
+identical in the env, the code, and the docs:
+
+- ``AI_PROVIDER``             — the vendor whose endpoint + key the agent uses:
+  ``openai`` (default) | ``xai`` | ``openrouter``. Milestone 1 wires ``openai`` (@jt) fully;
+  ``xai`` keeps its interim httpx path; ``openrouter`` is a later milestone.
+- ``AI_SDK``                  — the PyPI package the harness imports to reach the model:
+  ``openai`` (default). The harness reaches an LLM **only** through a vendor SDK; with the
+  named SDK not installed it comes up with no way to reach a model and says so.
+- ``AI_MODEL``                — the model id (e.g. ``gpt-5.4-mini``).
+- ``AI_API_KEY``             — the provider's API key.
+- ``AI_BASE_URL``            — optional; override the provider's endpoint.
+- ``AI_OPENAI_SURFACE``       — optional, **internal** to the ``openai`` adapter: ``responses``
+  (default, @jt's surface — the one that runs ``web_search`` and sees images) or ``chat``. Not
+  a top-level config axis; it also gates the ``web_search`` built-in. See `_provider_from_config`
+  and `basecradle_harness._plugins`.
 - ``HARNESS_SYSTEM_PROMPT``   — **legacy fallback** for the agent's standing charter. The
   charter is now sourced from real files under the config home —
   ``prompts/system-prompt.md`` + ``prompts/initialize.md`` (see `basecradle_harness._install`)
@@ -55,7 +64,7 @@ from basecradle_harness._install import charter_from_env
 from basecradle_harness._mcp import McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
-from basecradle_harness._openai import OpenAICompatibleProvider
+from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._plugins import (
     ActivationContext,
@@ -392,69 +401,88 @@ def _compose_prompt(orientation: str | None, system_prompt: str | None) -> str |
     return "\n\n".join(parts) if parts else None
 
 
-def _provider_api_from_env() -> str:
-    """The selected provider API — ``chat`` (default), ``responses``, or ``xai`` — validated.
+#: The config defaults: the @jt stack (OpenAI vendor, openai SDK, Responses surface).
+DEFAULT_PROVIDER = "openai"
+DEFAULT_SDK = "openai"
+DEFAULT_OPENAI_SURFACE = "responses"
+_PROVIDERS = ("openai", "xai", "openrouter")
+_SURFACES = ("responses", "chat")
 
-    Read in one place so the provider build and the plugin activation context agree on the
-    value. An unrecognized value is a clear error, never a silent fall-through to the default.
 
-    ``xai`` is the xAI-native profile: it builds the *Responses* adapter (xAI exposes a
-    Responses API, and ``OpenAIResponsesProvider`` speaks that wire — the "OpenAI" in the name
-    is the wire format, not the vendor) pointed at ``api.x.ai``, and it is the activation
-    discriminator that turns on xAI's server-side ``web_search`` / ``x_search`` Live-Search
-    built-ins and the grok media tools while turning *off* the OpenAI-coupled tools — so an
-    xAI agent's stack touches no OpenAI surface.
+def _config_from_env() -> tuple[str, str, str]:
+    """The ``(provider, sdk, surface)`` config triple from the environment, validated.
+
+    Read in one place so the provider build and the plugin activation context agree on every
+    axis. ``AI_PROVIDER`` and the openai adapter's internal ``AI_OPENAI_SURFACE`` are
+    validated here; an unrecognized value is a clear error, never a silent fall-through. The
+    SDK name is not constrained here — whether an adapter exists for it is decided when the
+    provider is built (`_provider_from_config`), so the error names the missing adapter.
     """
-    api = (os.environ.get("AI_PROVIDER_API") or "chat").strip().lower()
-    if api not in {"chat", "responses", "xai"}:
+    provider = (os.environ.get("AI_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
+    if provider not in _PROVIDERS:
+        raise ValueError(f"Unknown AI_PROVIDER {provider!r}; expected one of {_PROVIDERS}.")
+    sdk = (os.environ.get("AI_SDK") or DEFAULT_SDK).strip().lower()
+    surface = (os.environ.get("AI_OPENAI_SURFACE") or DEFAULT_OPENAI_SURFACE).strip().lower()
+    if surface not in _SURFACES:
         raise ValueError(
-            f"Unknown AI_PROVIDER_API {api!r}; expected 'chat' (default), 'responses', or 'xai'."
+            f"Unknown AI_OPENAI_SURFACE {surface!r}; expected 'responses' (default) or 'chat'."
         )
-    return api
+    return provider, sdk, surface
 
 
-def _provider_from_env(builtins: Sequence[str] = (), api: str | None = None) -> Provider:
-    """Build the model provider the environment selects — Chat Completions by default.
+def _provider_from_config(
+    provider: str, sdk: str, surface: str, *, builtins: Sequence[str] = ()
+) -> Provider:
+    """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
-    ``AI_PROVIDER_API`` chooses the adapter:
+    The harness reaches an LLM **only** through a vendor SDK. ``AI_PROVIDER`` (and, for
+    OpenAI, ``AI_SDK`` + ``AI_OPENAI_SURFACE``) pick the adapter:
 
-    - unset or ``chat`` → `OpenAICompatibleProvider`, the portable Chat Completions
-      adapter (OpenAI, xAI, OpenRouter). The default — nothing changes for existing
-      deployments. It has no server-side built-ins, so ``builtins`` is not applicable.
-    - ``responses`` → `OpenAIResponsesProvider`, OpenAI's Responses API. Its server-side
-      built-ins (``web_search``, …) are **plugin-driven** now: `builtins` is the resolved
-      set of active built-in tool plugins (see `_resolve_tools_and_provider`), passed
-      through as ``builtin_tools`` so the active built-ins follow the same overlay/activation
-      rules as every other tool — not a constructor default.
-    - ``xai`` → the **same** `OpenAIResponsesProvider` (the Responses wire is what xAI's API
-      speaks) but defaulted to ``api.x.ai`` — no new adapter class, just the Responses adapter
-      pointed at xAI. Its resolved built-ins are xAI's ``web_search`` / ``x_search`` (Live
-      Search), gated on this profile. ``AI_PROVIDER_BASE_URL`` still overrides the default.
+    - ``openai`` (default) → `OpenAIProvider`, the official ``openai`` SDK adapter. Milestone 1
+      ships only ``AI_SDK=openai``; any other SDK name is a clear "no adapter yet" error rather
+      than a silent fallback. ``builtins`` (the resolved server-side built-ins, e.g.
+      ``web_search``) are passed through as ``builtin_tools`` and apply on the Responses
+      surface — they follow the same overlay/activation rules as every other tool.
+    - ``xai`` → `OpenAIResponsesProvider`, the **interim httpx** Responses adapter pointed at
+      ``api.x.ai`` (death row until the native ``xai-sdk`` adapter lands — issue #158, Q3). Its
+      resolved built-ins are xAI's ``web_search`` / ``x_search`` (Live Search).
+    - ``openrouter`` → not built yet (a later milestone); a clear error.
 
-    Both read ``AI_PROVIDER_MODEL`` and the optional ``AI_PROVIDER_BASE_URL``; both
-    fall back to ``AI_PROVIDER_API_KEY`` for the key. ``api`` lets a caller that already
-    resolved the provider API (`_resolve_tools_and_provider`) pass it in so it is read and
-    validated exactly once; left ``None`` it is read from the environment here.
+    All read ``AI_MODEL`` and the optional ``AI_BASE_URL``, and fall back to ``AI_API_KEY`` for
+    the key.
     """
-    kwargs: dict[str, str] = {"model": os.environ["AI_PROVIDER_MODEL"]}
-    base_url = os.environ.get("AI_PROVIDER_BASE_URL")
-    if base_url:
-        kwargs["base_url"] = base_url
+    model = os.environ.get("AI_MODEL")
+    if not model:
+        raise ValueError("AI_MODEL is required — the model id to run (e.g. gpt-5.4-mini).")
+    base_url = os.environ.get("AI_BASE_URL")
 
-    resolved_api = api or _provider_api_from_env()
-    if resolved_api in ("responses", "xai"):
-        if resolved_api == "xai":
-            kwargs.setdefault("base_url", "https://api.x.ai/v1")
+    if provider == "xai":
+        kwargs: dict[str, str] = {"model": model}
+        if base_url:
+            kwargs["base_url"] = base_url
         return OpenAIResponsesProvider(**kwargs, builtin_tools=list(builtins))
-    return OpenAICompatibleProvider(**kwargs)
+    if provider == "openai":
+        if sdk != "openai":
+            raise ValueError(
+                f"AI_SDK={sdk!r} has no adapter yet — Milestone 1 implements only the "
+                "'openai' vendor SDK. Set AI_SDK=openai (or wait for a later milestone)."
+            )
+        return OpenAIProvider(
+            model, base_url=base_url, surface=surface, builtin_tools=list(builtins)
+        )
+    raise ValueError(
+        f"AI_PROVIDER={provider!r} has no adapter yet — Milestone 1 implements 'openai' "
+        "(and keeps 'xai' on its interim path). 'openrouter' is a later milestone."
+    )
 
 
 def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvider]:
     """Resolve the active tools, the model provider, and the memory provider from config + env.
 
     The single seam both `TimelineAgent.from_env` and `WakeAgent.from_env` use to wire their
-    tools, replacing the old hardcoded list. It: reads the active provider API; loads the
-    tool plugins (the ``tools/`` overlay, else packaged defaults — see `load_plugins`);
+    tools, replacing the old hardcoded list. It: reads the active ``(provider, sdk, surface)``
+    config; loads the tool plugins (the ``tools/`` overlay, else packaged defaults — see
+    `load_plugins`);
     resolves them against the active config (`resolve_plugins`), so an OpenAI-coupled tool or
     a Responses-only built-in self-excludes when its requirement isn't met; builds the
     **memory provider** (`memory_provider_from_env`) and folds *its* model-facing tools into
@@ -474,14 +502,20 @@ def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvid
     defense-in-depth; ``.manifest``/``.notices`` → the persistent Turn-0 brief), and the
     memory provider itself, which the wake holds to fire its `observe`/`context` hooks.
     """
-    api = _provider_api_from_env()
-    ctx = ActivationContext(provider_api=api, env=os.environ)
+    provider_name, sdk, surface = _config_from_env()
+    ctx = ActivationContext(
+        provider=provider_name,
+        sdk=sdk,
+        surface=surface,
+        model=os.environ.get("AI_MODEL", ""),
+        env=os.environ,
+    )
     resolved = resolve_plugins(load_plugins(), ctx)
     memory = memory_provider_from_env()
     resolved = _merge_memory_tools(resolved, memory)
     resolved = _merge_mcp_tools(resolved, load_mcp_tools())
     resolved = _apply_safe_policy(resolved)
-    provider = _provider_from_env(builtins=resolved.builtins, api=api)
+    provider = _provider_from_config(provider_name, sdk, surface, builtins=resolved.builtins)
     return provider, resolved, memory
 
 
