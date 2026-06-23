@@ -20,6 +20,8 @@ from basecradle_harness import (
     OpenAIProvider,
     OpenAIResponsesProvider,
     TimelineAgent,
+    config_home,
+    install,
 )
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
@@ -32,6 +34,7 @@ from basecradle_harness._basecradle import (
     _provider_from_config,
     _resolve_tools_and_provider,
 )
+from basecradle_harness._version import __version__
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -528,6 +531,45 @@ def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatc
     assert {t.name for t in chat_resolved.tools} == names
     assert "web_search" not in {name for name, _ in chat_resolved.manifest}
     chat_provider.close()
+
+
+def test_resolve_surfaces_a_broken_shipped_default_not_silently(monkeypatch):
+    # A shipped default that fails to import is surfaced in resolved.broken (→ the loud Turn-0
+    # brief defect section) and dropped from the active set, never silently swallowed (issue #160).
+    monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    home = config_home()  # the conftest-isolated temp config home
+    install(home)  # stamps the current version, so the upgrade reconcile is a no-op here
+    (home / "tools" / "web_fetch.py").write_text("import a_symbol_the_rebuild_removed_zzz\n")
+
+    provider, resolved, _memory = _resolve_tools_and_provider()
+    try:
+        assert any("web_fetch.py" in line for line in resolved.broken)  # surfaced as a defect
+        assert "web_fetch" not in {t.name for t in resolved.tools}  # the broken tool is gone
+    finally:
+        provider.close()
+
+
+def test_resolve_runs_the_upgrade_reconcile_before_loading_the_overlay(monkeypatch):
+    # The @jt root-cause fix is wired in: resolution runs the upgrade reconcile first, so an
+    # overlay left stale by a `pip install -U` (running version ≠ the stamp) is refreshed before
+    # it is loaded. Faithful refresh-of-a-changed-default is covered in test_install.py via the
+    # `defaults=` seam; here we pin that resolution actually *invokes* the reconcile, by the
+    # observable side effect — the stamp is advanced back to the running version.
+    from basecradle_harness import installed_version
+
+    monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    home = config_home()
+    install(home)
+    (home / ".version").write_text("0.0.0\n")  # simulate a config home from an older harness
+    assert installed_version(home) == "0.0.0"
+
+    provider, _resolved, _memory = _resolve_tools_and_provider()
+    try:
+        assert installed_version(home) == __version__  # the reconcile ran and re-stamped
+    finally:
+        provider.close()
 
 
 def test_from_env_honors_the_context_messages_cap(platform, monkeypatch):

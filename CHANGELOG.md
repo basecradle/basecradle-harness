@@ -7,6 +7,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-06-23
+
+**Provider-aware config-home upgrades, loud broken-default surfacing, and view-your-own-image.**
+Three fixes from the M1 @jt deploy (issues #160, #161).
+
+### Added
+
+- **`uuid='latest'` for the assets `view`/`read` actions** — an agent can now look at the most
+  recent file on the timeline (an image it just generated and posted) without being handed the
+  asset uuid (issue #161). The newest-first asset filter resolves it; an empty timeline returns a
+  clean message. Closes the "can't view my own image without the UUID" gap.
+- **Automatic config-home reconcile on upgrade** — the installer now stamps the harness version
+  that produced a config home (`.version`), and the runtime reconciles the overlay on the first
+  wake after a `pip install -U` (running version ≠ the stamp) *before* loading it. A `tools/`
+  overlay left stale by an upgrade — a default plugin the new version changed or whose imports it
+  removed — no longer silently outlives the upgrade and disables a capability (issue #160). A
+  never-installed agent (packaged-default fallback) is untouched.
+- **Loud broken-default surfacing** — a *shipped-default* tool plugin that fails to import is no
+  longer a silent skip: it is logged at `ERROR` and rendered into the persistent Turn-0 brief
+  under a loud "Tool defect" heading (the constitution's "never a silent swallow"). A broken
+  *operator-added* drop-in stays a soft skip — one bad file must not take the agent down.
+- **Provider-aware install / reconcile / load** (issue #160 scope expansion) — only the tool-plugin
+  defaults relevant to the agent's `AI_PROVIDER` are laid down (no grok/xAI plugins on an OpenAI
+  agent, and vice versa), a now-mismatched default a prior provider-blind install left behind is
+  pruned if pristine, and a provider-mismatched plugin file is never imported. Affinity is read
+  from each plugin's source via AST — **without importing it** — so a foreign plugin's vendor-SDK
+  import is never triggered (closing a latent silent-import-skip vector). `basecradle-harness-install`
+  gains `--provider` and `--all-providers`.
+
 ## [0.33.0] - 2026-06-22
 
 **Milestone 1: the harness reaches an LLM only through a vendor's official SDK.** The provider

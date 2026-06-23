@@ -12,6 +12,7 @@ from basecradle_harness._basecradle import TimelineAgent
 from basecradle_harness._brief import (
     compose_brief,
     fetch_dashboard_md,
+    render_defects,
     render_manifest,
     render_safety,
 )
@@ -38,7 +39,9 @@ from basecradle_harness._install import (
     charter_from_config,
     config_home,
     install,
+    installed_version,
     prompt_text,
+    reconcile_on_upgrade,
     system_prompt_text,
 )
 from basecradle_harness._lock import LockTool
@@ -78,6 +81,7 @@ from basecradle_harness._platform import (
 from basecradle_harness._plugins import (
     ActivationContext,
     EnvSet,
+    LoadedPlugins,
     OpenAIKey,
     OpenAISurface,
     Requirement,
@@ -85,6 +89,7 @@ from basecradle_harness._plugins import (
     ToolPlugin,
     Vendor,
     load_plugins,
+    load_plugins_report,
     resolve_plugins,
 )
 from basecradle_harness._policy import BASECRADLE, SHELL, Policy
@@ -116,6 +121,8 @@ __all__ = [
     "WakeAgent",
     # Config home: installer + conffile upgrader
     "install",
+    "reconcile_on_upgrade",
+    "installed_version",
     "config_home",
     "charter_from_config",
     "prompt_text",
@@ -130,6 +137,7 @@ __all__ = [
     "compose_brief",
     "render_manifest",
     "render_safety",
+    "render_defects",
     "fetch_dashboard_md",
     # Provider contract + adapters
     "Provider",
@@ -159,8 +167,10 @@ __all__ = [
     "OpenAIKey",
     "ActivationContext",
     "ResolvedTools",
+    "LoadedPlugins",
     "resolve_plugins",
     "load_plugins",
+    "load_plugins_report",
     # MCP drop-in: the harness as an MCP client (safe-by-default, opt-out surfaced)
     "McpClient",
     "StdioMcpClient",

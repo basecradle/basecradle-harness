@@ -170,6 +170,33 @@ package), each shipped default is reconciled, dpkg-conffile style:
 - **You deleted it** → respected; it is never resurrected.
 - **You added it** (a file that is not a shipped default) → never touched.
 
+**The upgrade reconcile is automatic.** `pip install -U basecradle-harness` upgrades the
+*package* but does not touch your *materialized* config home — so a `tools/` overlay copied
+out by the previous version would otherwise outlive the upgrade, and a default plugin the new
+version changed (or whose imports it removed) would silently go stale and disable a capability
+on a green deploy. To prevent that, the harness **stamps the version that produced the config
+home** (`.version`) and, on the first wake after an upgrade (running version ≠ the stamp),
+re-runs the reconcile above before loading the overlay. Running `basecradle-harness-install`
+by hand still works and is identical; it is just no longer required after every `pip -U`. A
+config home that was never installed (it runs off the packaged-default fallback) has nothing
+materialized to go stale, so the auto-reconcile leaves it alone.
+
+**The install is provider-aware.** Only the tool-plugin defaults relevant to the agent's
+`AI_PROVIDER` are laid down: an OpenAI agent gets no grok/xAI plugins cluttering its overlay (and
+vice versa), and a now-mismatched default an earlier provider-blind install left behind is pruned
+on the next reconcile — as long as you never edited it. The affinity is read from each plugin's
+source **without importing it** (so a foreign plugin's vendor-SDK import is never triggered — a
+plugin you did not install the SDK for can't break the load). `basecradle-harness-install` reads
+`AI_PROVIDER` by default; `--provider <name>` overrides it and `--all-providers` lays down every
+default regardless. The same filter applies at load time, so a provider-mismatched plugin file is
+never imported.
+
+**A broken shipped default fails loud, never silently.** If a *shipped-default* tool plugin
+fails to import (a stale overlay, or a packaging bug), the harness does not quietly drop it: it
+logs the defect at `ERROR` and surfaces it in the agent's persistent operating brief under a
+loud "Tool defect" heading, so a silently-disabled capability is impossible to miss. (A broken
+file *you* added stays a soft skip — one bad drop-in must not take the agent down.)
+
 Your **Turn-0 charter** is composed from `prompts/system-prompt.md` + `prompts/initialize.md`
 (HTML comments — operator notes — stripped). `HARNESS_SYSTEM_PROMPT` remains only as a
 fallback for a deployment that has not run the installer yet. Under a router, these two
@@ -232,7 +259,8 @@ It is a rolling-window rate limiter on **wakes per timeline**, persisted under `
 A peer that can only read and post text is half a peer. The **assets tool** lets the agent exchange *files* on a timeline the way a human does — the ChatGPT-equivalent for BaseCradle. It is wired in by default on `TimelineAgent.from_env` and `basecradle-harness-wake`, so a deployed agent can already:
 
 - **list** the files on the timeline (with the uuids needed to read them),
-- **read** a file — a text-ish file comes back decoded, a binary one as a description rather than a wall of bytes dumped into the model's context, and
+- **read** a file — a text-ish file comes back decoded, a binary one as a description rather than a wall of bytes dumped into the model's context,
+- **view** an image so a vision-capable agent actually sees it — by uuid, or pass `uuid='latest'` to look at the most recent file on the timeline (e.g. an image the agent just generated and posted, so it can view its own output without being handed the uuid), and
 - **create** a file from content the agent produced, with an optional description.
 
 Operations default to the timeline the agent is engaged on; an explicit timeline uuid handles cross-timeline use. The SDK is the only platform I/O, and nothing touches the filesystem — a read decodes in memory, a create streams straight to the upload.

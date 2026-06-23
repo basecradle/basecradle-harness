@@ -13,21 +13,26 @@ no second build, no package surgery.
 
 import json
 
-from basecradle_harness import config_home, install
+from basecradle_harness import config_home, install, installed_version, reconcile_on_upgrade
 from basecradle_harness._install import (
     _MANIFEST_NAME,
+    _VERSION_NAME,
     ALREADY_CURRENT,
     INSTALLED,
     KEPT_DELETED,
     KEPT_EDITED,
+    PRUNED,
     REFRESHED,
     UNCHANGED,
     charter_from_config,
     charter_from_env,
     main,
+    plugin_relevant_to,
+    plugin_source_providers,
     prompt_text,
     system_prompt_text,
 )
+from basecradle_harness._version import __version__
 
 # Synthetic default sets, used to drive the upgrader's four cases deterministically: v1 is
 # what we "ship" first, v2 changes one file so the reconcile has a genuine default change to
@@ -210,6 +215,175 @@ def test_an_edited_file_is_re_offered_on_each_genuinely_new_default_version(tmp_
     assert (home / "prompts" / "system-prompt.md.new").read_text() == "v3\n"  # re-offered, fresh
 
 
+# --- version stamp + upgrade reconcile (issue #160) --------------------------
+
+
+def test_install_stamps_the_harness_version(tmp_path):
+    home = tmp_path / "cfg"
+    install(home, defaults=V1)
+    assert (home / _VERSION_NAME).read_text().strip() == __version__
+    assert installed_version(home) == __version__
+
+
+def test_installed_version_is_none_when_never_installed(tmp_path):
+    # No install has run → no stamp → unknown (reads as "needs reconciling on next check").
+    assert installed_version(tmp_path / "never") is None
+
+
+def test_reconcile_on_upgrade_is_a_no_op_when_not_installed(tmp_path):
+    # A never-installed home runs off the packaged-default fallback — nothing materialized to
+    # go stale, so the reconcile must NOT auto-create a config home and flip it onto the overlay.
+    home = tmp_path / "never"
+    assert reconcile_on_upgrade(home) is None
+    assert not home.exists()
+
+
+def test_reconcile_on_upgrade_is_a_no_op_at_the_current_version(tmp_path):
+    home = tmp_path / "cfg"
+    install(home, defaults=V1)
+    # Same running version as the stamp → the overlay is current → nothing to do.
+    assert reconcile_on_upgrade(home, defaults=V2) is None
+    # V2's changed default was NOT applied — the no-op truly did nothing.
+    assert (home / "prompts" / "system-prompt.md").read_text() == "v1 charter\n"
+
+
+def test_reconcile_on_upgrade_refreshes_a_stale_overlay_after_a_version_bump(tmp_path):
+    """The @jt fix: a pip -U (running version ≠ stamped version) reconciles the stale overlay."""
+    home = tmp_path / "cfg"
+    install(home, defaults=V1)
+    # Simulate the config home having been produced by an older harness.
+    _write_old_version(home, "0.0.0")
+
+    report = reconcile_on_upgrade(home, defaults=V2)
+
+    assert report is not None  # it reconciled
+    # The pristine stale default was refreshed to the new one...
+    assert report.actions["prompts/system-prompt.md"] == REFRESHED
+    assert (home / "prompts" / "system-prompt.md").read_text() == "v2 charter\n"
+    # ...and the home is re-stamped with the running version, so the next wake is a no-op.
+    assert installed_version(home) == __version__
+
+
+def test_reconcile_on_upgrade_runs_once_for_a_home_predating_the_stamp(tmp_path):
+    """A config home installed before the stamp existed has no .version → reconcile once."""
+    home = tmp_path / "cfg"
+    install(home, defaults=V1)
+    (home / _VERSION_NAME).unlink()  # simulate a pre-stamp install
+
+    report = reconcile_on_upgrade(home, defaults=V2)
+
+    assert report is not None
+    assert (home / "prompts" / "system-prompt.md").read_text() == "v2 charter\n"
+    assert installed_version(home) == __version__  # now stamped going forward
+
+
+def _write_old_version(home, version):
+    """Overwrite the version stamp to simulate a config home produced by an older harness."""
+    (config_home(home) / _VERSION_NAME).write_text(version + "\n")
+
+
+# --- provider affinity (issue #160, scope expansion) -------------------------
+
+# Minimal plugin sources standing in for the shipped defaults' affinity shapes.
+_XAI_SRC = "from basecradle_harness import ToolPlugin, Vendor\nPLUGIN = ToolPlugin(builtin='x', requires=(Vendor('xai'),))\n"
+_OPENAI_KEY_SRC = "from basecradle_harness import GenerateImageTool, OpenAIKey, ToolPlugin\nPLUGIN = ToolPlugin(impl=GenerateImageTool, requires=(OpenAIKey(),))\n"
+_OPENAI_SURFACE_SRC = "from basecradle_harness import OpenAISurface, ToolPlugin, Vendor\nPLUGIN = ToolPlugin(builtin='web_search', requires=(Vendor('openai'), OpenAISurface('responses')))\n"
+_UNIVERSAL_SRC = (
+    "from basecradle_harness import AssetsTool, ToolPlugin\nPLUGIN = ToolPlugin(impl=AssetsTool)\n"
+)
+
+
+def test_plugin_source_providers_reads_affinity_without_importing():
+    assert plugin_source_providers(_XAI_SRC) == frozenset({"xai"})
+    assert plugin_source_providers(_OPENAI_KEY_SRC) == frozenset({"openai"})
+    assert plugin_source_providers(_OPENAI_SURFACE_SRC) == frozenset({"openai"})
+    assert plugin_source_providers(_UNIVERSAL_SRC) is None  # no markers → universal
+
+
+def test_plugin_source_providers_treats_broken_source_as_universal():
+    # Unparseable source → None (universal), so the loader still attempts it and the broken
+    # default surfaces as a defect rather than being hidden by the affinity check.
+    assert plugin_source_providers("this is not valid python :(") is None
+
+
+def test_plugin_relevant_to_gates_on_the_active_provider():
+    assert plugin_relevant_to(_XAI_SRC, "xai")
+    assert not plugin_relevant_to(_XAI_SRC, "openai")
+    assert plugin_relevant_to(_OPENAI_KEY_SRC, "openai")
+    assert not plugin_relevant_to(_OPENAI_KEY_SRC, "xai")
+    assert plugin_relevant_to(_UNIVERSAL_SRC, "xai")  # universal → relevant everywhere
+    assert plugin_relevant_to(_XAI_SRC, None)  # provider=None → no filtering
+
+
+# --- provider-aware install + prune (issue #160, scope expansion) ------------
+
+# The shipped tool defaults, by provider affinity (mirrors the real `_defaults/tools/`).
+_XAI_DEFAULTS = {"grok_generate_image.py", "grok_generate_video.py", "xai_search.py"}
+_OPENAI_DEFAULTS = {"generate_image.py", "edit_image.py", "hear_audio.py", "web_search.py"}
+
+
+def _tool_files(home):
+    return {p.name for p in (home / "tools").glob("*.py")}
+
+
+def test_install_for_openai_omits_the_grok_and_xai_tool_defaults(tmp_path):
+    # The @jt fix: a provider-aware install lays down no grok/xAI plugin on an OpenAI agent.
+    home = tmp_path / "cfg"
+    install(home, provider="openai")
+    files = _tool_files(home)
+    assert _XAI_DEFAULTS.isdisjoint(files)  # no grok/xai clutter
+    assert _OPENAI_DEFAULTS <= files  # the OpenAI-coupled defaults are present
+    assert "assets.py" in files  # universal defaults are always present
+
+
+def test_install_for_xai_omits_the_openai_coupled_tool_defaults(tmp_path):
+    home = tmp_path / "cfg"
+    install(home, provider="xai")
+    files = _tool_files(home)
+    assert _XAI_DEFAULTS <= files
+    assert _OPENAI_DEFAULTS.isdisjoint(files)
+    assert "assets.py" in files
+
+
+def test_install_unfiltered_lays_down_every_provider_default(tmp_path):
+    # The direct API default (provider=None) is provider-blind — every default, as before.
+    home = tmp_path / "cfg"
+    install(home)
+    files = _tool_files(home)
+    assert _XAI_DEFAULTS <= files and _OPENAI_DEFAULTS <= files
+
+
+def test_a_provider_switch_prunes_pristine_mismatched_defaults(tmp_path):
+    # The @jt de-clutter: a provider-blind install left grok/xai files; a later provider-aware
+    # reconcile removes them (they are ours, recorded, and pristine).
+    home = tmp_path / "cfg"
+    install(home)  # provider-blind: grok/xai present
+    assert _XAI_DEFAULTS <= _tool_files(home)
+
+    report = install(home, provider="openai")
+
+    assert _XAI_DEFAULTS.isdisjoint(_tool_files(home))  # pruned off disk
+    for name in _XAI_DEFAULTS:
+        assert report.actions[f"tools/{name}"] == PRUNED
+    # The manifest no longer tracks the pruned defaults, and the openai-coupled ones remain.
+    manifest = json.loads((home / _MANIFEST_NAME).read_text())
+    assert not any(name in key for key in manifest for name in _XAI_DEFAULTS)
+    assert "tools/generate_image.py" in manifest
+
+
+def test_a_prune_keeps_an_operator_edited_mismatched_default(tmp_path):
+    # If the operator edited a now-mismatched default, their edit wins — it is NOT pruned.
+    home = tmp_path / "cfg"
+    install(home)
+    edited = home / "tools" / "xai_search.py"
+    edited.write_text("# my hand-tuned version\n" + edited.read_text())
+
+    install(home, provider="openai")
+
+    assert edited.exists()  # the operator's edit is kept, never pruned
+    assert edited.read_text().startswith("# my hand-tuned version")
+
+
 # --- config-home resolution --------------------------------------------------
 
 
@@ -347,3 +521,30 @@ def test_cli_installs_to_the_given_config_home(tmp_path, capsys):
     assert (tmp_path / "cfg" / "prompts" / "system-prompt.md").exists()
     out = capsys.readouterr().out
     assert str(tmp_path / "cfg") in out
+
+
+def test_cli_is_provider_aware_from_the_env_by_default(tmp_path, monkeypatch, capsys):
+    # A bare install on an OpenAI agent (AI_PROVIDER=openai) lays down no grok/xAI clutter.
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    home = tmp_path / "cfg"
+    main(["--config-home", str(home)])
+    capsys.readouterr()
+    assert _XAI_DEFAULTS.isdisjoint(_tool_files(home))
+    assert _OPENAI_DEFAULTS <= _tool_files(home)
+
+
+def test_cli_all_providers_disables_the_filter(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    home = tmp_path / "cfg"
+    main(["--config-home", str(home), "--all-providers"])
+    capsys.readouterr()
+    assert _XAI_DEFAULTS <= _tool_files(home)  # every default, provider-blind
+
+
+def test_cli_provider_flag_overrides_the_env(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    home = tmp_path / "cfg"
+    main(["--config-home", str(home), "--provider", "xai"])
+    capsys.readouterr()
+    assert _XAI_DEFAULTS <= _tool_files(home)
+    assert _OPENAI_DEFAULTS.isdisjoint(_tool_files(home))

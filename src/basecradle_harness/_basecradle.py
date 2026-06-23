@@ -60,7 +60,7 @@ from collections.abc import Sequence
 from basecradle import BaseCradle
 
 from basecradle_harness._harness import Harness
-from basecradle_harness._install import charter_from_env
+from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
 from basecradle_harness._mcp import McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
@@ -69,7 +69,7 @@ from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._plugins import (
     ActivationContext,
     ResolvedTools,
-    load_plugins,
+    load_plugins_report,
     resolve_plugins,
 )
 from basecradle_harness._policy import Policy
@@ -502,7 +502,16 @@ def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvid
     defense-in-depth; ``.manifest``/``.notices`` → the persistent Turn-0 brief), and the
     memory provider itself, which the wake holds to fire its `observe`/`context` hooks.
     """
+    # Parse + validate the config first, then drive both the upgrade reconcile and the load with
+    # the *one* validated provider string — so an invalid AI_PROVIDER fails fast (before the
+    # reconcile mutates anything) and the reconcile and the load can never disagree on the
+    # provider (the divergence a second, unvalidated env read would risk).
     provider_name, sdk, surface = _config_from_env()
+    # Reconcile a materialized config home that a `pip install -U` left behind *before* loading
+    # the overlay, so a stale default plugin from the previous version is refreshed rather than
+    # loaded broken (issue #160). A no-op for a never-installed deployment (@jt) and for an
+    # already-current one; guarded so a reconcile hiccup never blocks startup.
+    _reconcile_config_on_upgrade(provider_name)
     ctx = ActivationContext(
         provider=provider_name,
         sdk=sdk,
@@ -510,13 +519,67 @@ def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvid
         model=os.environ.get("AI_MODEL", ""),
         env=os.environ,
     )
-    resolved = resolve_plugins(load_plugins(), ctx)
+    # Provider-aware load (issue #160): a plugin file whose source declares affinity for another
+    # provider is skipped before import, so an OpenAI agent neither loads nor risks importing the
+    # grok/xAI plugins. The resolver still applies the full activation gate on what remains.
+    loaded = load_plugins_report(provider=provider_name)
+    resolved = resolve_plugins(loaded.plugins, ctx)
     memory = memory_provider_from_env()
     resolved = _merge_memory_tools(resolved, memory)
     resolved = _merge_mcp_tools(resolved, load_mcp_tools())
     resolved = _apply_safe_policy(resolved)
+    # Surface any broken *shipped-default* plugin loudly in the Turn-0 brief — a defect, never
+    # a silent swallow (issue #160). Last, so it rides whatever the merges/policy produced.
+    resolved = _surface_broken_defaults(resolved, loaded.broken_defaults)
     provider = _provider_from_config(provider_name, sdk, surface, builtins=resolved.builtins)
     return provider, resolved, memory
+
+
+def _reconcile_config_on_upgrade(provider: str) -> None:
+    """Run the upgrade reconcile for `provider`, degrading any failure to a log line.
+
+    `provider` is the already-validated `AI_PROVIDER` from `_config_from_env`, threaded through so
+    the reconcile filters/prunes by exactly the provider the load will use — never a second,
+    independently-read env value that could diverge. The config-home refresh is a best-effort
+    convenience (the operator can always run `basecradle-harness-install` by hand), so a
+    permission/IO error reconciling it must not take the agent down — it degrades to the existing
+    (possibly stale) overlay, exactly the graceful-degradation bar the dashboard fetch and the
+    brief composition already hold to.
+    """
+    try:
+        reconcile_on_upgrade(provider=provider)
+    except Exception:  # noqa: BLE001 - a reconcile hiccup must never block the agent's startup
+        _log.warning(
+            "Config-home upgrade reconcile failed; continuing with the existing overlay.",
+            exc_info=True,
+        )
+
+
+def _surface_broken_defaults(
+    resolved: ResolvedTools, broken_defaults: list[tuple[str, str]]
+) -> ResolvedTools:
+    """Fold broken shipped-default plugins into the resolved set's `broken` defect lines.
+
+    Each ``(filename, error)`` becomes one Turn-0 brief defect line (rendered by
+    `_brief.render_defects` under its own loud heading) and rides ``.skipped`` too, for the
+    "why isn't this tool here?" trail. A *defect*, kept apart from `notices` (an intentional
+    opt-out): a shipped default that failed to load is a bug, not a choice. With nothing
+    broken this returns `resolved` unchanged, so a healthy agent's brief is untouched.
+    """
+    if not broken_defaults:
+        return resolved
+    broken_lines = [f"{name} — failed to load: {exc}" for name, exc in broken_defaults]
+    skipped = resolved.skipped + [
+        (name, f"shipped default failed to load: {exc}") for name, exc in broken_defaults
+    ]
+    return ResolvedTools(
+        tools=resolved.tools,
+        builtins=resolved.builtins,
+        skipped=skipped,
+        manifest=resolved.manifest,
+        notices=resolved.notices,
+        broken=resolved.broken + broken_lines,
+    )
 
 
 def _merge_memory_tools(resolved: ResolvedTools, memory: MemoryProvider) -> ResolvedTools:
@@ -539,6 +602,7 @@ def _merge_memory_tools(resolved: ResolvedTools, memory: MemoryProvider) -> Reso
         skipped=resolved.skipped,
         manifest=resolved.manifest + [(tool.name, None) for tool in added],
         notices=resolved.notices,
+        broken=resolved.broken,
     )
 
 
@@ -563,6 +627,7 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
         skipped=resolved.skipped + mcp.skipped,
         manifest=resolved.manifest + added_manifest,
         notices=resolved.notices + mcp.notices,
+        broken=resolved.broken,
     )
 
 
@@ -604,6 +669,7 @@ def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) ->
         skipped=skipped,
         manifest=manifest,
         notices=notices,
+        broken=resolved.broken,
     )
 
 

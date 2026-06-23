@@ -45,7 +45,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from basecradle_harness._install import _read_manifest, config_home
+from basecradle_harness._install import _read_manifest, config_home, plugin_relevant_to
 from basecradle_harness._tools import Tool
 
 _log = logging.getLogger("basecradle_harness")
@@ -263,6 +263,11 @@ class ResolvedTools:
             MCP server, plus any tool refused by the locked policy (Group 5, Part B). Empty
             for a pure-Harness config; populated only when the operator has knowingly left
             the safe zone, so "all bets off" is stated and auditable, never silent.
+        broken: Defect lines for **shipped-default** plugins that failed to load (issue #160)
+            — distinct from `notices` (an intentional opt-out) and from `skipped` (a normal,
+            expected activation miss). A broken default is a defect: the brief renders these
+            under their own loud heading so a silently-disabled capability is impossible to
+            miss. Empty when every shipped default loaded.
     """
 
     tools: list[Tool] = field(default_factory=list)
@@ -270,6 +275,7 @@ class ResolvedTools:
     skipped: list[tuple[str, str]] = field(default_factory=list)
     manifest: list[tuple[str, str | None]] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
+    broken: list[str] = field(default_factory=list)
 
 
 def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> ResolvedTools:
@@ -315,7 +321,38 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
 # --- loading plugin files -----------------------------------------------------
 
 
-def load_plugins(home: str | Path | None = None) -> list[ToolPlugin]:
+@dataclass(frozen=True)
+class LoadedPlugins:
+    """The result of loading the tool-plugin files: the good plugins, plus broken *defaults*.
+
+    `plugins` is the loadable set (the overlay's, else the packaged defaults'). `broken_defaults`
+    is ``(filename, error)`` for every **shipped-default** plugin file that failed to import or
+    declared no plugin — a *defect*, not a normal skip. The constitution forbids a silent
+    swallow here ("a tool an AI uses is built whole … never a silent swallow"), so a broken
+    default is surfaced loudly: logged at ``ERROR`` and rendered into the Turn-0 brief
+    (`_basecradle._surface_broken_defaults`), never vanished. A broken *operator-added* file
+    stays a soft skip — one bad drop-in must not take the agent down — so it is logged at
+    ``WARNING`` and left out of `broken_defaults`.
+    """
+
+    plugins: list[ToolPlugin] = field(default_factory=list)
+    broken_defaults: list[tuple[str, str]] = field(default_factory=list)
+
+
+def load_plugins(
+    home: str | Path | None = None, *, provider: str | None = None
+) -> list[ToolPlugin]:
+    """The loadable tool plugins for an agent — `load_plugins_report` without the defect list.
+
+    Kept as the simple accessor most callers want; see `load_plugins_report` for the source of
+    record, provider-aware loading, and the broken-default reporting.
+    """
+    return load_plugins_report(home, provider=provider).plugins
+
+
+def load_plugins_report(
+    home: str | Path | None = None, *, provider: str | None = None
+) -> LoadedPlugins:
     """Load the tool plugins for an agent: the ``/tools`` overlay, else packaged defaults.
 
     The config home's ``tools/`` dir is authoritative **once the installer has populated it**
@@ -327,6 +364,21 @@ def load_plugins(home: str | Path | None = None) -> list[ToolPlugin]:
     load directly, so an un-upgraded or un-installed deployment still comes up with the full
     default set — the same files the installer would copy. This mirrors the charter's
     "files-if-installed, else fallback" precedent.
+
+    ``provider`` makes the load **provider-aware** (issue #160): when named (the resolver passes
+    the active ``AI_PROVIDER``), a plugin file whose source declares affinity for a *different*
+    provider is **not imported** — its provider-mismatched tool would be gated off at activation
+    anyway, and skipping it pre-import sidesteps the latent hazard of importing a vendor SDK the
+    agent never installed (which would otherwise be the very silent-import-skip this guards). The
+    relevance check is source-only (AST, no execution — `_install.plugin_relevant_to`), so a
+    *broken* file is never hidden by it: it still attempts to import and surfaces as a defect.
+    ``None`` (the direct API / test default) imports every file, unfiltered.
+
+    Returns a `LoadedPlugins`: the loadable plugins, plus any **shipped-default** file that
+    failed to load (a defect to surface loudly — see `LoadedPlugins`). A broken file is a
+    broken *default* when its filename is one of the packaged ``_defaults/tools/`` names
+    (always true on the fallback path, where every file *is* a packaged default; true on the
+    overlay path only when the operator's broken file shadows a shipped default's name).
     """
     root = config_home(home)
     tools_dir = root / "tools"
@@ -334,26 +386,87 @@ def load_plugins(home: str | Path | None = None) -> list[ToolPlugin]:
     if tools_installed:
         # Installed → the overlay is authoritative; a removed dir/files is the operator's
         # deletion, honored (zero tools), never resurrected from the packaged defaults.
-        return _load_dir(tools_dir) if tools_dir.is_dir() else []
-    # Not yet installed for tools → load the packaged defaults straight from the package.
-    with resources.as_file(resources.files("basecradle_harness").joinpath(*_DEFAULTS_TOOLS)) as p:
-        return _load_dir(Path(p))
+        plugins, broken = _load_dir(tools_dir, provider) if tools_dir.is_dir() else ([], [])
+    else:
+        # Not yet installed for tools → load the packaged defaults straight from the package.
+        with resources.as_file(
+            resources.files("basecradle_harness").joinpath(*_DEFAULTS_TOOLS)
+        ) as p:
+            plugins, broken = _load_dir(Path(p), provider)
+    return _classify_broken(plugins, broken)
 
 
-def _load_dir(directory: Path) -> list[ToolPlugin]:
-    """Every `ToolPlugin` declared by the ``*.py`` files in `directory`, in filename order.
+def _classify_broken(plugins: list[ToolPlugin], broken: list[tuple[str, str]]) -> LoadedPlugins:
+    """Split broken files into loud shipped-default defects (ERROR) and soft operator skips.
 
-    Only ``*.py`` is loaded (so the upgrader's ``*.py.new`` shadow files are ignored). A file
-    that fails to import or declares no plugin is logged and skipped — one broken operator
-    file never takes the agent down with it.
+    The single classification point so the log level and the brief surfacing agree on what
+    counts as a defect. A broken file whose name is a packaged default is a defect — the
+    shipped tranche is broken, so it is logged at ``ERROR`` and returned in `broken_defaults`
+    for the Turn-0 brief. A broken operator file is a soft ``WARNING`` skip, dropped here.
+    """
+    default_names = _default_tool_filenames()
+    broken_defaults: list[tuple[str, str]] = []
+    for name, exc in broken:
+        if name in default_names:
+            _log.error(
+                "Shipped tool plugin %s failed to load: %s. This is a defect — the capability "
+                "is disabled until it is fixed (run basecradle-harness-install to refresh a "
+                "stale overlay, or repair the file).",
+                name,
+                exc,
+            )
+            broken_defaults.append((name, exc))
+        else:
+            _log.warning("Skipping tool plugin file %s: %s", name, exc)
+    return LoadedPlugins(plugins=plugins, broken_defaults=broken_defaults)
+
+
+def _default_tool_filenames() -> frozenset[str]:
+    """The basenames of the packaged ``_defaults/tools/*.py`` files — the shipped-default set."""
+    root = resources.files("basecradle_harness").joinpath(*_DEFAULTS_TOOLS)
+    return frozenset(
+        child.name for child in root.iterdir() if child.name.endswith(".py") and child.is_file()
+    )
+
+
+def _load_dir(
+    directory: Path, provider: str | None = None
+) -> tuple[list[ToolPlugin], list[tuple[str, str]]]:
+    """Load the ``*.py`` plugin files in `directory`: the declared plugins, and the broken ones.
+
+    Only ``*.py`` is loaded (so the upgrader's ``*.py.new`` shadow files are ignored). When
+    `provider` is named, a file whose source declares affinity for a *different* provider is
+    skipped **before import** (issue #160) — read as text and AST-checked, never executed, so a
+    foreign plugin's vendor-SDK import is never triggered. A file that fails to import or declares
+    no plugin is collected into the broken list (with its error) for the caller to classify and
+    log — `_classify_broken` decides whether it is a loud shipped-default defect or a soft
+    operator skip. Either way one broken file never takes the agent down: the loadable plugins are
+    still returned.
     """
     plugins: list[ToolPlugin] = []
+    broken: list[tuple[str, str]] = []
     for path in sorted(directory.glob("*.py")):
+        if provider is not None and not _relevant(path, provider):
+            continue  # provider-mismatched → don't even import it
         try:
             plugins.extend(_plugins_in_file(path))
-        except Exception as exc:  # noqa: BLE001 - a bad operator file is skipped, not fatal
-            _log.warning("Skipping tool plugin file %s: %s", path.name, exc)
-    return plugins
+        except Exception as exc:  # noqa: BLE001 - a bad file is collected, never fatal
+            broken.append((path.name, str(exc)))
+    return plugins, broken
+
+
+def _relevant(path: Path, provider: str) -> bool:
+    """Whether a plugin file is relevant to `provider`, read from source without importing it.
+
+    Reads the file as text and defers to `_install.plugin_relevant_to` (AST, no execution). An
+    unreadable file is treated as relevant — let the import attempt surface the real error rather
+    than silently skipping it on an IO hiccup.
+    """
+    try:
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return True
+    return plugin_relevant_to(source, provider)
 
 
 def _plugins_in_file(path: Path) -> list[ToolPlugin]:

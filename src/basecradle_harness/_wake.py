@@ -88,6 +88,7 @@ from basecradle_harness._basecradle import (
 from basecradle_harness._brief import (
     compose_brief,
     fetch_dashboard_md,
+    render_defects,
     render_manifest,
     render_safety,
 )
@@ -501,6 +502,7 @@ class WakeAgent:
         tool_manifest: list[tuple[str, str | None]] | None = None,
         memory_provider: MemoryProvider | None = None,
         safety_notices: list[str] | None = None,
+        defect_notices: list[str] | None = None,
         breaker: WakeBreaker | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
@@ -522,6 +524,10 @@ class WakeAgent:
         # surfaced into the persistent brief, so "all bets off" is stated and auditable —
         # empty for a pure-Harness config.
         self.safety_notices = safety_notices
+        # Broken-shipped-default defect notices surfaced into the brief under their own loud
+        # heading (issue #160), so a capability silently disabled by a stale overlay or a
+        # packaging bug is impossible to miss — empty when every shipped default loaded.
+        self.defect_notices = defect_notices
         # The persistent brief is composed and injected at most once per `wake()` — lazily,
         # right before the first time the model is actually engaged — so an idle or probe-only
         # wake neither fetches the live dashboard nor bloats the transcript. Reset each wake.
@@ -619,6 +625,9 @@ class WakeAgent:
             # Safe-by-default opt-out notices from tool resolution (active MCP servers,
             # policy-refused drop-ins). Empty by default → no safety section in the brief.
             safety_notices=resolved.notices,
+            # Broken-shipped-default defects from tool resolution (issue #160). Empty when
+            # every shipped default loaded → no defect section in the brief.
+            defect_notices=resolved.broken,
             # The env-tuned cross-wake circuit-breaker, persisted under HARNESS_HOME beside
             # the marks/seen/claims stores. Generous defaults; off only if explicitly capped
             # to 0. The router's cross-agent breaker is the complementary layer.
@@ -1151,7 +1160,7 @@ class WakeAgent:
             _log.info("Persistent brief composed empty this wake; proceeding without it.")
 
     def _compose_brief(self, query: str | None = None) -> str | None:
-        """Compose the persistent brief: now + initialize + manifest + safety + dashboard + memory + charter.
+        """Compose the persistent brief: now + initialize + manifest + defects + safety + dashboard + memory + charter.
 
         The parts, in order (see `basecradle_harness._brief`): the **current-time anchor**
         (`_now_line` — the absolute "now" the model reasons every item's age against, fresh
@@ -1176,6 +1185,7 @@ class WakeAgent:
                 now=_now_line(),
                 initialize=prompt_text("initialize.md"),
                 manifest=render_manifest(self._manifest_entries()),
+                defects=render_defects(self.defect_notices),
                 safety=render_safety(self.safety_notices),
                 dashboard=fetch_dashboard_md(self.client),
                 memory=self._memory_context(query),

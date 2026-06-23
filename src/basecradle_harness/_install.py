@@ -46,13 +46,19 @@ defaults for the upgrader to reconcile and an operator-added server file is neve
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib.resources as resources
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from basecradle_harness._version import __version__
+
+_log = logging.getLogger("basecradle_harness")
 
 # The directories the installer scaffolds under the config home. `prompts/` holds the
 # shipped charter defaults; `tools/` and `mcp/` are created empty this group (loading
@@ -63,6 +69,14 @@ _SCAFFOLD_DIRS = ("prompts", "tools", "mcp")
 # installed, so the upgrader can tell a pristine default from an edited one. Leading dot
 # signals "tooling — do not edit"; it is never composed into anything the model reads.
 _MANIFEST_NAME = ".manifest.json"
+
+# Bookkeeping, not an operator file: the harness version that last reconciled this config
+# home, so a wake can tell `pip install -U` happened and refresh the overlay before loading
+# it. Leading dot signals "tooling — do not edit"; it is never composed into anything the
+# model reads. A package upgrade bumps the package but does NOT touch this materialized
+# config home, so without this stamp a stale `tools/` overlay (a default plugin from the
+# previous version) silently outlives the upgrade — exactly the issue #160 failure.
+_VERSION_NAME = ".version"
 
 # The package subtree the shipped defaults live in. The installer copies these out to the
 # config home; it is the *only* place defaults exist — there is no magic in-package
@@ -90,6 +104,78 @@ def config_home(home: str | os.PathLike[str] | None = None) -> Path:
     if override:
         return Path(override).expanduser()
     return Path.home() / ".config" / "basecradle"
+
+
+# --- provider affinity (issue #160) -------------------------------------------
+
+# The active provider when none is named — mirrors `_basecradle.DEFAULT_PROVIDER`. Inlined as a
+# string (not imported) because `_basecradle` imports this module: the dependency runs one way.
+_DEFAULT_PROVIDER = "openai"
+
+# The `requires` marker calls (from `_plugins`) that declare a plugin's provider affinity in its
+# source. `Vendor("x")` ties a plugin to provider ``x``; `OpenAIKey()`/`OpenAISurface()` tie it to
+# ``openai``. Matched by *name in the source's AST* — so a provider-mismatched plugin is classified
+# WITHOUT importing it, which is the point: importing a foreign plugin could trip an import of a
+# vendor SDK the agent never installed (the very silent-import-skip this issue is about). Kept as
+# bare strings to avoid importing `_plugins`, which imports this module.
+_VENDOR_MARKER = "Vendor"
+_OPENAI_MARKERS = ("OpenAIKey", "OpenAISurface")
+
+
+def plugin_source_providers(source: str) -> frozenset[str] | None:
+    """The providers a tool-plugin's *source* declares affinity for, or ``None`` if universal.
+
+    Parses the source with `ast` and **never executes it**, so a plugin is classified without
+    importing it (and without triggering any vendor-SDK import it does at module load). A
+    ``Vendor("x")`` marker contributes provider ``x``; an ``OpenAIKey()``/``OpenAISurface()``
+    marker contributes ``openai``. No markers → ``None`` (provider-agnostic — relevant to every
+    agent). Unparseable source → ``None`` too: it is treated as universal so the *loader* still
+    attempts it and surfaces the real syntax error as a defect, rather than the affinity check
+    hiding a broken default.
+
+    The markers are matched by their *plain call name* in the source — the shipped defaults all
+    use ``Vendor``/``OpenAIKey``/``OpenAISurface`` directly (never aliased), which this is built
+    for. An operator file that imports a marker under an alias reads as universal (no affinity
+    detected) and so is loaded everywhere — a safe degrade (the resolver's real `requires` gate
+    still deactivates it off its provider), never a wrong exclusion.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    providers: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+        if name == _VENDOR_MARKER and node.args:
+            arg = node.args[0]
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                providers.add(arg.value)
+        elif name in _OPENAI_MARKERS:
+            providers.add("openai")
+    return frozenset(providers) or None
+
+
+def plugin_relevant_to(source: str, provider: str | None) -> bool:
+    """Whether a tool plugin (by its source) is relevant to the active provider.
+
+    ``provider=None`` means "don't filter" — every plugin is relevant (the unfiltered default the
+    direct `install`/`load_plugins` API and the tests use). With a provider named, a plugin is
+    relevant iff it declares no provider affinity (universal) or names this provider. This is the
+    single predicate both the installer (which lays down only relevant defaults) and the loader
+    (which imports only relevant files) apply, so the two never disagree.
+    """
+    if provider is None:
+        return True
+    affinity = plugin_source_providers(source)
+    return affinity is None or provider in affinity
+
+
+def active_provider_from_env() -> str:
+    """The active ``AI_PROVIDER`` for provider-aware install/reconcile, normalized (default openai)."""
+    return (os.environ.get("AI_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
 
 
 # --- the shipped defaults -----------------------------------------------------
@@ -138,6 +224,9 @@ KEPT_EDITED = "kept-edited"  # operator edited it → kept theirs, new default l
 KEPT_DELETED = "kept-deleted"  # operator deleted it → respected, not resurrected
 ALREADY_CURRENT = "already-current"  # on-disk already equals the new default → nothing to do
 UNCHANGED = "unchanged"  # shipped default unchanged since last install → left as-is
+PRUNED = (
+    "pruned"  # a previously-installed default is now provider-mismatched → removed (issue #160)
+)
 
 
 @dataclass
@@ -173,6 +262,7 @@ def install(
     home: str | os.PathLike[str] | None = None,
     *,
     defaults: dict[str, str] | None = None,
+    provider: str | None = None,
 ) -> InstallReport:
     """Scaffold the config home and reconcile the shipped defaults — idempotent, re-runnable.
 
@@ -186,6 +276,13 @@ def install(
     the shipped default set (the packaged defaults by default) — the seam a test uses to
     simulate a package upgrade by reconciling a *changed* default set against an existing
     install.
+
+    ``provider`` makes the reconcile **provider-aware** (issue #160): when named (the CLI and
+    the upgrade reconcile pass ``AI_PROVIDER``), a tool-plugin default whose source declares
+    affinity for a *different* provider — a grok/xAI plugin on an OpenAI agent — is **not** laid
+    down (it would be clutter the resolver gates off anyway, and a latent foreign-SDK import
+    hazard), and one a prior install already laid down is **pruned** if still pristine. ``None``
+    (the default the direct API and tests use) lays down every default unfiltered, as before.
     """
     root = config_home(home)
     report = InstallReport(config_home=root)
@@ -197,7 +294,8 @@ def install(
             report.created_dirs.append(name)
         directory.mkdir(parents=True, exist_ok=True)
 
-    shipped = _packaged_defaults() if defaults is None else defaults
+    shipped_all = _packaged_defaults() if defaults is None else defaults
+    shipped = _relevant_defaults(shipped_all, provider)
     recorded = _read_manifest(root)
     updated: dict[str, str] = dict(recorded)
 
@@ -205,7 +303,128 @@ def install(
         action = _reconcile(root, rel, shipped[rel], recorded, updated, report)
         report.actions[rel] = action
 
+    if shipped is not shipped_all:  # provider-aware: clean up now-mismatched defaults we own
+        _prune_mismatched_defaults(root, shipped_all, shipped, recorded, updated, report)
+
     _write_manifest(root, updated)
+    # Stamp the harness version that produced this config home, so a later wake can detect a
+    # `pip install -U` (running version ≠ stamped version) and reconcile the overlay before
+    # loading it. Written last, after the defaults are reconciled, so a crash mid-reconcile
+    # leaves the stamp behind rather than claiming an upgrade that did not complete.
+    _write_installed_version(root)
+    return report
+
+
+def _relevant_defaults(shipped: dict[str, str], provider: str | None) -> dict[str, str]:
+    """The shipped defaults relevant to `provider` — drops provider-mismatched ``tools/*.py``.
+
+    Only tool-plugin files carry provider affinity; ``prompts/`` and ``mcp/`` defaults are always
+    relevant. With ``provider=None`` the input is returned unchanged (the same object, so the
+    caller can cheaply tell no filtering happened and skip the prune pass).
+    """
+    if provider is None:
+        return shipped
+    return {
+        rel: text
+        for rel, text in shipped.items()
+        if not _is_tool_plugin(rel) or plugin_relevant_to(text, provider)
+    }
+
+
+def _is_tool_plugin(rel: str) -> bool:
+    """Whether a config-home-relative path is a tool-plugin file (the only provider-affine kind)."""
+    return rel.startswith("tools/") and rel.endswith(".py")
+
+
+def _prune_mismatched_defaults(
+    root: Path,
+    shipped_all: dict[str, str],
+    shipped: dict[str, str],
+    recorded: dict[str, str],
+    updated: dict[str, str],
+    report: InstallReport,
+) -> None:
+    """Remove a previously-installed tool default that is now provider-mismatched (issue #160).
+
+    The @jt symptom: an earlier, provider-blind install copied the grok/xAI plugins into an
+    OpenAI agent's overlay. A provider-aware reconcile cleans that up — but *only* a default we
+    own and the operator has not touched: a tool default that we recorded (`recorded`), that is a
+    real shipped default (`shipped_all`) yet relevant to a *different* provider (absent from the
+    filtered `shipped`), and whose on-disk bytes still match what we installed (pristine). An
+    operator-edited copy is left alone (their edit wins, exactly as the conffile rule keeps it);
+    a file already gone just has its stale manifest entry dropped. Nothing the operator added is
+    ever touched — the walk is over *recorded shipped defaults*, never the operator's directory.
+    """
+    for rel in list(recorded):
+        if not _is_tool_plugin(rel) or rel in shipped or rel not in shipped_all:
+            continue  # not a tool default we're now filtering out → leave it
+        target = root.joinpath(*rel.split("/"))
+        if not target.exists():
+            updated.pop(rel, None)  # already gone → drop the stale manifest entry
+            report.actions[rel] = KEPT_DELETED
+            continue
+        try:
+            pristine = _hash(target.read_text(encoding="utf-8")) == recorded.get(rel)
+        except OSError:
+            # Unreadable (permissions, a concurrent delete after the exists() check): leave it
+            # rather than delete-without-checking. Pruning is a best-effort de-clutter, so the
+            # safe failure is to keep the file and its manifest entry, never to remove blindly.
+            continue
+        if pristine:
+            target.unlink()  # pristine, ours, now mismatched → safe to remove
+            updated.pop(rel, None)
+            report.actions[rel] = PRUNED
+        # else: the operator edited this mismatched default → keep theirs, keep tracking it.
+
+
+def reconcile_on_upgrade(
+    home: str | os.PathLike[str] | None = None,
+    *,
+    defaults: dict[str, str] | None = None,
+    provider: str | None = None,
+) -> InstallReport | None:
+    """Reconcile a materialized config home after a package upgrade — the wake-time auto-install.
+
+    ``pip install -U basecradle-harness`` upgrades the *package* but never touches the
+    operator's *materialized* config home, so a `tools/` overlay copied out by the previous
+    version outlives the upgrade — and a default plugin that the new version changed (or whose
+    imports the new version removed) silently goes stale, disabling a capability on a green-CI
+    deploy (issue #160). This is the automatic fix: a wake calls it before loading the overlay,
+    and it re-runs the conffile reconcile (`install`) exactly when the running harness version
+    differs from the one stamped at the last install.
+
+    It acts **only on an already-installed config home** — one whose manifest records a prior
+    install. A never-installed deployment (like @jt, which runs off the packaged-default
+    fallback in `_plugins.load_plugins`) has nothing materialized to go stale: its tools load
+    straight from the freshly-upgraded package, so there is nothing to reconcile and this is a
+    no-op (it must **not** auto-create a config home and flip that agent onto the overlay path).
+    A config home installed by a harness predating this stamp has no ``.version`` file, which
+    reads as "unknown" and so reconciles once on the first upgrade, stamping it going forward.
+
+    The reconcile is **provider-aware** (issue #160): it filters and prunes tool-plugin defaults
+    by the active ``AI_PROVIDER`` (``provider``, defaulting to the env), so a grok/xAI default an
+    earlier provider-blind install left in an OpenAI agent's overlay is cleaned up on the upgrade.
+
+    Returns the `InstallReport` when it reconciled, or ``None`` when it was a no-op (not
+    installed, or already at the running version). ``defaults`` is forwarded to `install` — the
+    same test seam, to simulate a package whose shipped defaults changed.
+    """
+    root = config_home(home)
+    if not _read_manifest(root):
+        return None  # never installed → packaged-default fallback path; nothing materialized
+    if installed_version(root) == __version__:
+        return None  # config home already produced by the running version → overlay is current
+    report = install(
+        home,
+        defaults=defaults,
+        provider=provider if provider is not None else active_provider_from_env(),
+    )
+    _log.info(
+        "Config home %s reconciled to basecradle-harness %s after an upgrade: %s",
+        root,
+        __version__,
+        report.summary().replace("\n", " | "),
+    )
     return report
 
 
@@ -301,6 +520,35 @@ def _write_manifest(root: Path, manifest: dict[str, str]) -> None:
     """Persist the per-file default hashes, sorted for a stable, diff-friendly file."""
     body = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     _write(_manifest_path(root), body)
+
+
+# --- the version stamp --------------------------------------------------------
+
+
+def _version_path(root: Path) -> Path:
+    return root / _VERSION_NAME
+
+
+def installed_version(root: str | os.PathLike[str] | None = None) -> str | None:
+    """The harness version that last reconciled this config home, or ``None`` if unknown.
+
+    ``None`` for a never-installed home (no stamp) or one installed by a harness predating
+    the stamp (the file is absent) — both read as "needs reconciling on the next upgrade
+    check". A whitespace-only file also reads as ``None``. Kept separate from the manifest so
+    the version lives in its own one-line file, not mixed in among the per-path default hashes.
+    """
+    path = _version_path(config_home(root))
+    if not path.exists():
+        return None
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _write_installed_version(root: Path) -> None:
+    """Stamp the running harness version as the one that produced this config home."""
+    _write(_version_path(root), __version__ + "\n")
 
 
 # --- sourcing the charter from files ------------------------------------------
@@ -451,6 +699,12 @@ def main(argv: list[str] | None = None) -> int:
     against a newer package upgrades them conffile-style (refresh pristine, keep edited as
     ``.new``, respect deletions, never touch operator files). Prints a short summary and the
     config-home path so a rollout can log what changed. Exit 0 on success.
+
+    Provider-aware by default (issue #160): only the tool-plugin defaults relevant to the
+    agent's ``AI_PROVIDER`` are laid down (a grok/xAI plugin is not copied into an OpenAI
+    agent's overlay), and a now-mismatched one a prior install left behind is pruned.
+    ``--provider`` overrides the env; ``--all-providers`` disables the filter and lays down
+    every default (the old provider-blind behavior).
     """
     parser = argparse.ArgumentParser(
         prog="basecradle-harness-install",
@@ -468,8 +722,22 @@ def main(argv: list[str] | None = None) -> int:
             "$HOME/.config/basecradle)."
         ),
     )
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help=(
+            "lay down only the tool defaults relevant to this provider "
+            "(default: $AI_PROVIDER, else 'openai'). Use --all-providers to disable filtering."
+        ),
+    )
+    parser.add_argument(
+        "--all-providers",
+        action="store_true",
+        help="lay down every tool default regardless of provider (the provider-blind behavior).",
+    )
     args = parser.parse_args(argv)
 
-    report = install(args.config_home)
+    provider = None if args.all_providers else (args.provider or active_provider_from_env())
+    report = install(args.config_home, provider=provider)
     print(report.summary())
     return 0
