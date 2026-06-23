@@ -15,6 +15,8 @@ import respx
 README = Path(__file__).parent.parent / "README.md"
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+XAI_RESPONSES_URL = "https://api.x.ai/v1/responses"
 BC_URL = "https://basecradle.com"
 
 NOVA_UUID = "019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"
@@ -33,10 +35,33 @@ def _chat_completion(text="Sure thing, peer."):
     return {
         "id": "chatcmpl-readme",
         "object": "chat.completion",
+        "created": 0,
         "model": "gpt-4o",
         "choices": [
             {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
         ],
+    }
+
+
+def _responses_reply(text="Sure thing, peer."):
+    """A Responses-API reply body (SDK-valid) — the openai SDK adapter's default surface."""
+    return {
+        "id": "resp-readme",
+        "object": "response",
+        "created_at": 0,
+        "model": "gpt-5.4-mini",
+        "output": [
+            {
+                "id": "msg-readme",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        ],
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
     }
 
 
@@ -75,16 +100,25 @@ class TestReadmeExamples:
     @pytest.fixture(autouse=True)
     def mocked_world(self, monkeypatch, tmp_path):
         """A mocked model and platform — enough for every README block to run."""
-        monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-readme-key")
+        monkeypatch.setenv("AI_API_KEY", "sk-test-readme-key")
         monkeypatch.setenv("BASECRADLE_TOKEN", "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa")
         monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-        monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
+        monkeypatch.setenv("AI_MODEL", "gpt-4o")
         # Isolate the agent's home so a memory example's writes land in a temp DB,
         # never the real `~/.basecradle_harness/memory.db`.
         monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
 
         with respx.mock(assert_all_called=False) as router:
-            # The model: always a plain text reply (no tool calls), so examples terminate.
+            # The model: always a plain text reply (no tool calls), so examples terminate. The
+            # SDK adapter defaults to the Responses surface (@jt's), so mock that; the chat
+            # surface and the xAI interim Responses endpoint are mocked too for the examples
+            # that use them.
+            router.post(OPENAI_RESPONSES_URL).mock(
+                return_value=httpx.Response(200, json=_responses_reply())
+            )
+            router.post(XAI_RESPONSES_URL).mock(
+                return_value=httpx.Response(200, json=_responses_reply())
+            )
             router.post(OPENAI_CHAT_URL).mock(
                 return_value=httpx.Response(200, json=_chat_completion())
             )

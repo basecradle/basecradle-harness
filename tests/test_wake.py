@@ -1225,8 +1225,8 @@ def test_negative_context_messages_is_rejected(platform, tmp_path):
 def wake_env(monkeypatch, tmp_path):
     """The full environment the router would source before invoking the CLI."""
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
     monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
     monkeypatch.setenv("HARNESS_ONBOARD", "0")
     monkeypatch.delenv("BASECRADLE_TIMELINE", raising=False)
@@ -1236,21 +1236,31 @@ def wake_env(monkeypatch, tmp_path):
 
 
 def _serve_openai_and_messages(platform, *pages):
-    """A plain-text model reply plus the message pages — enough for `main` to run live."""
-    platform.post("https://api.openai.com/v1/chat/completions").mock(
+    """A plain-text model reply plus the message pages — enough for `main` to run live.
+
+    Wake mode runs the default @jt stack — the ``openai`` SDK on the **Responses** surface — so
+    the model call lands on ``/responses`` (SDK-validated body), not ``/chat/completions``.
+    """
+    platform.post("https://api.openai.com/v1/responses").mock(
         return_value=httpx.Response(
             200,
             json={
-                "id": "chatcmpl-wake",
-                "object": "chat.completion",
+                "id": "resp-wake",
+                "object": "response",
+                "created_at": 0,
                 "model": "gpt-4o",
-                "choices": [
+                "output": [
                     {
-                        "index": 0,
-                        "message": {"role": "assistant", "content": "On it."},
-                        "finish_reason": "stop",
+                        "id": "msg-wake",
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "On it.", "annotations": []}],
                     }
                 ],
+                "parallel_tool_calls": False,
+                "tool_choice": "auto",
+                "tools": [],
             },
         )
     )
@@ -1307,16 +1317,19 @@ def test_main_without_a_timeline_errors(wake_env):
     assert exit_info.value.code != 0
 
 
-def test_main_version_flag_prints_version_and_exits_zero(capsys):
-    """`--version` is the fleet drift-guard's cheap probe: print the installed version,
-    exit 0, touch no timeline, model, or credential."""
+def test_main_version_flag_prints_harness_and_sdk_versions_and_exits_zero(capsys):
+    """`--version` is the fleet drift-guard's cheap probe: print the installed harness **and**
+    vendor-SDK versions (an upgrade tracks both — issue #158), exit 0, touch no timeline, model,
+    or credential."""
+    import openai
+
     from basecradle_harness import __version__
 
     with pytest.raises(SystemExit) as exit_info:
         main(["--version"])
     assert exit_info.value.code == 0
-    out = capsys.readouterr().out
-    assert out.strip() == f"basecradle-harness-wake {__version__}"
+    out = capsys.readouterr().out.strip()
+    assert out == f"basecradle-harness-wake {__version__} · openai SDK {openai.__version__}"
 
 
 def test_main_returns_nonzero_when_home_is_missing(platform, wake_env, monkeypatch):
@@ -1327,7 +1340,7 @@ def test_main_returns_nonzero_when_home_is_missing(platform, wake_env, monkeypat
 
 
 def test_main_returns_nonzero_on_missing_provider_config(platform, wake_env, monkeypatch):
-    monkeypatch.delenv("AI_PROVIDER_MODEL", raising=False)
+    monkeypatch.delenv("AI_MODEL", raising=False)
 
     assert main(["--timeline", TIMELINE_UUID]) == 1
 

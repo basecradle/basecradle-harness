@@ -17,7 +17,7 @@ from basecradle_harness import (
     Harness,
     MemoryTool,
     Message,
-    OpenAICompatibleProvider,
+    OpenAIProvider,
     OpenAIResponsesProvider,
     TimelineAgent,
 )
@@ -25,10 +25,11 @@ from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _client_from_env,
     _compose_prompt,
+    _config_from_env,
     _context_messages_from_env,
     _onboard_from_env,
     _orientation,
-    _provider_from_env,
+    _provider_from_config,
     _resolve_tools_and_provider,
 )
 
@@ -457,8 +458,8 @@ def test_run_polls_the_requested_number_of_times(platform):
 def test_from_env_wires_a_full_agent(platform, monkeypatch):
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
     wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
 
     agent = TimelineAgent.from_env()
@@ -493,16 +494,17 @@ def test_from_env_wires_a_full_agent(platform, monkeypatch):
         assert tool.context.client is agent.client
 
 
-def test_resolve_tools_and_provider_flips_the_active_set_with_the_api(monkeypatch):
-    # The tool set + provider built-ins are plugin-resolved now, so flipping AI_PROVIDER_API
-    # changes the active set: web_search (a Responses-only built-in) is on under `responses`
-    # and gone under `chat`. The function tools stay the same across both — behavior-preserving.
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-5.4-mini")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatch):
+    # The tool set + provider built-ins are plugin-resolved, so flipping the openai adapter's
+    # surface changes the active set: web_search (a Responses-only built-in) is on under
+    # `responses` and gone under `chat`. The function tools stay the same — behavior-preserving.
+    monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
 
-    monkeypatch.setenv("AI_PROVIDER_API", "responses")
+    # Default config: openai provider, openai SDK, responses surface → web_search active.
     provider, resolved, _memory = _resolve_tools_and_provider()
-    assert isinstance(provider, OpenAIResponsesProvider)
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.surface == "responses"
     # web_search is enabled on the provider as a server-side built-in (driven by the plugin)…
     assert {"type": "web_search"} in provider._builtin_tools
     # …but it is never a function tool the engine runs.
@@ -514,14 +516,14 @@ def test_resolve_tools_and_provider_flips_the_active_set_with_the_api(monkeypatc
     # The manifest names the active tools — including the server-side built-in, which is not
     # a function tool — so the brief can list exactly what the model can call.
     manifest_names = {name for name, _ in resolved.manifest}
-    assert "web_search" in manifest_names
-    assert "generate_image" in manifest_names
-    assert "memory" in manifest_names  # the provider's tool is in the brief manifest too
+    assert {"web_search", "generate_image", "memory"} <= manifest_names
     provider.close()
 
-    monkeypatch.setenv("AI_PROVIDER_API", "chat")
+    monkeypatch.setenv("AI_OPENAI_SURFACE", "chat")
     chat_provider, chat_resolved, _chat_memory = _resolve_tools_and_provider()
-    assert isinstance(chat_provider, OpenAICompatibleProvider)
+    assert isinstance(chat_provider, OpenAIProvider)
+    assert chat_provider.surface == "chat"
+    assert chat_provider._builtin_tools == []  # web_search self-excludes off Responses
     # Same function tools; the Responses-only built-in is gone.
     assert {t.name for t in chat_resolved.tools} == names
     assert "web_search" not in {name for name, _ in chat_resolved.manifest}
@@ -531,8 +533,8 @@ def test_resolve_tools_and_provider_flips_the_active_set_with_the_api(monkeypatc
 def test_from_env_honors_the_context_messages_cap(platform, monkeypatch):
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
     monkeypatch.setenv("HARNESS_CONTEXT_MESSAGES", "1")
     wire(
         platform,
@@ -562,89 +564,117 @@ def test_context_messages_from_env_parses_int_all_and_default(monkeypatch):
     assert _context_messages_from_env() == 7
 
 
-# --- provider selection (AI_PROVIDER_API) ------------------------------------
+# --- config + provider selection (AI_PROVIDER / AI_SDK / AI_OPENAI_SURFACE) ---
 
 
-def test_provider_from_env_defaults_to_chat_completions(monkeypatch):
-    monkeypatch.delenv("AI_PROVIDER_API", raising=False)
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
-
-    provider = _provider_from_env()
-
-    assert isinstance(provider, OpenAICompatibleProvider)
+def _set_model_key(monkeypatch):
+    monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
 
 
-def test_provider_from_env_selects_responses(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API", "responses")
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-5.4-mini")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+def test_config_from_env_defaults_to_the_openai_sdk_responses_stack(monkeypatch):
+    for var in ("AI_PROVIDER", "AI_SDK", "AI_OPENAI_SURFACE"):
+        monkeypatch.delenv(var, raising=False)
+    assert _config_from_env() == ("openai", "openai", "responses")
 
-    provider = _provider_from_env()
+
+def test_config_from_env_is_case_insensitive(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "XAI")
+    monkeypatch.setenv("AI_OPENAI_SURFACE", "Chat")
+    provider, _sdk, surface = _config_from_env()
+    assert provider == "xai"
+    assert surface == "chat"
+
+
+def test_config_from_env_rejects_an_unknown_provider(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "telepathy")
+    with pytest.raises(ValueError, match="AI_PROVIDER"):
+        _config_from_env()
+
+
+def test_config_from_env_rejects_an_unknown_surface(monkeypatch):
+    monkeypatch.setenv("AI_OPENAI_SURFACE", "interpretive-dance")
+    with pytest.raises(ValueError, match="AI_OPENAI_SURFACE"):
+        _config_from_env()
+
+
+def test_provider_from_config_openai_builds_the_sdk_adapter(monkeypatch):
+    _set_model_key(monkeypatch)
+    provider = _provider_from_config("openai", "openai", "responses")
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.surface == "responses"
+    provider.close()
+
+
+def test_provider_from_config_openai_honors_the_chat_surface(monkeypatch):
+    _set_model_key(monkeypatch)
+    provider = _provider_from_config("openai", "openai", "chat")
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.surface == "chat"
+    provider.close()
+
+
+def test_provider_from_config_rejects_an_unimplemented_sdk(monkeypatch):
+    # Milestone 1 ships only the openai adapter; another SDK name is a clear "no adapter yet".
+    _set_model_key(monkeypatch)
+    with pytest.raises(ValueError, match="AI_SDK"):
+        _provider_from_config("openai", "anthropic", "responses")
+
+
+def test_provider_from_config_rejects_openrouter_for_now(monkeypatch):
+    _set_model_key(monkeypatch)
+    with pytest.raises(ValueError, match="openrouter"):
+        _provider_from_config("openrouter", "openai", "responses")
+
+
+def test_provider_from_config_requires_a_model(monkeypatch):
+    monkeypatch.delenv("AI_MODEL", raising=False)
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    with pytest.raises(ValueError, match="AI_MODEL"):
+        _provider_from_config("openai", "openai", "responses")
+
+
+def test_provider_from_config_passes_base_url_through(monkeypatch):
+    _set_model_key(monkeypatch)
+    monkeypatch.setenv("AI_BASE_URL", "https://openai-proxy.internal/v1")
+    provider = _provider_from_config("openai", "openai", "responses")
+    assert provider.base_url == "https://openai-proxy.internal/v1"
+    provider.close()
+
+
+def test_provider_from_config_xai_builds_the_interim_adapter_at_api_x_ai(monkeypatch):
+    # xAI's death-row path: the interim httpx Responses adapter, defaulted to api.x.ai.
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    monkeypatch.delenv("AI_BASE_URL", raising=False)
+
+    provider = _provider_from_config(
+        "xai", "openai", "responses", builtins=["web_search", "x_search"]
+    )
 
     assert isinstance(provider, OpenAIResponsesProvider)
-
-
-def test_provider_from_env_is_case_insensitive(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API", "Responses")
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-5.4-mini")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
-
-    assert isinstance(_provider_from_env(), OpenAIResponsesProvider)
-
-
-def test_provider_from_env_passes_base_url_through(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API", "chat")
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "grok-2")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
-    monkeypatch.setenv("AI_PROVIDER_BASE_URL", "https://api.x.ai/v1")
-
-    provider = _provider_from_env()
-
     assert provider.base_url == "https://api.x.ai/v1"
+    provider.close()
 
 
-def test_provider_from_env_rejects_an_unknown_api(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API", "telepathy")
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+def test_provider_from_config_xai_honors_an_explicit_base_url(monkeypatch):
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    monkeypatch.setenv("AI_BASE_URL", "https://xai-proxy.internal/v1")
 
-    with pytest.raises(ValueError, match="AI_PROVIDER_API"):
-        _provider_from_env()
-
-
-def test_provider_from_env_xai_builds_the_responses_adapter_at_api_x_ai(monkeypatch):
-    # Eddie's profile: the Responses wire (what xAI speaks), defaulted to api.x.ai — no new
-    # adapter class, just the Responses adapter pointed at xAI.
-    monkeypatch.setenv("AI_PROVIDER_API", "xai")
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "grok-4.3")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "xai-test-key")
-    monkeypatch.delenv("AI_PROVIDER_BASE_URL", raising=False)
-
-    provider = _provider_from_env(builtins=["web_search", "x_search"])
-
-    assert isinstance(provider, OpenAIResponsesProvider)
-    assert provider.base_url == "https://api.x.ai/v1"
-
-
-def test_provider_from_env_xai_honors_an_explicit_base_url(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API", "xai")
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "grok-4.3")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "xai-test-key")
-    monkeypatch.setenv("AI_PROVIDER_BASE_URL", "https://xai-proxy.internal/v1")
-
-    provider = _provider_from_env()
+    provider = _provider_from_config("xai", "openai", "responses")
 
     assert provider.base_url == "https://xai-proxy.internal/v1"
+    provider.close()
 
 
 def test_from_env_wires_the_xai_profile_with_live_search_builtins(platform, monkeypatch):
-    """End to end: AI_PROVIDER_API=xai gives Eddie the Responses brain at xAI with Live Search."""
+    """End to end: AI_PROVIDER=xai gives Eddie the interim Responses brain at xAI + Live Search."""
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-    monkeypatch.setenv("AI_PROVIDER_API", "xai")
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "grok-4.3")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "xai-test-key")
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
     wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
 
     agent = TimelineAgent.from_env()
@@ -657,18 +687,18 @@ def test_from_env_wires_the_xai_profile_with_live_search_builtins(platform, monk
     assert not ({"generate_image", "edit_image", "listen"} & names)
 
 
-def test_from_env_wires_the_responses_provider(platform, monkeypatch):
-    """End to end: AI_PROVIDER_API=responses gives the agent the Responses brain."""
+def test_from_env_wires_the_openai_sdk_provider_by_default(platform, monkeypatch):
+    """End to end: the default config gives the agent the openai-SDK Responses brain."""
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-    monkeypatch.setenv("AI_PROVIDER_API", "responses")
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-5.4-mini")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
     wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
 
     agent = TimelineAgent.from_env()
 
-    assert isinstance(agent.harness.provider, OpenAIResponsesProvider)
+    assert isinstance(agent.harness.provider, OpenAIProvider)
+    assert agent.harness.provider.surface == "responses"
 
 
 # --- credential bootstrap (mint a token from email + password) ---------------
@@ -742,8 +772,8 @@ def test_from_env_bootstraps_from_credentials_end_to_end(no_credentials, monkeyp
     monkeypatch.setenv("BASECRADLE_EMAIL", "nova@example.com")
     monkeypatch.setenv("BASECRADLE_PASSWORD", "correct-horse-battery-staple")
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
     platform.post("/session").mock(
         return_value=httpx.Response(201, json={"token": MINTED_TOKEN, "start_here": None})
     )
@@ -822,8 +852,8 @@ def test_onboarding_is_a_noop_when_the_dashboard_has_no_orientation(platform):
 def test_from_env_onboards_by_default(platform, monkeypatch):
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
     monkeypatch.delenv("HARNESS_ONBOARD", raising=False)
     monkeypatch.delenv("HARNESS_SYSTEM_PROMPT", raising=False)
     wire(
@@ -840,8 +870,8 @@ def test_from_env_onboards_by_default(platform, monkeypatch):
 def test_from_env_onboarding_can_be_disabled(platform, monkeypatch):
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
-    monkeypatch.setenv("AI_PROVIDER_MODEL", "gpt-4o")
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", "sk-test-key")
+    monkeypatch.setenv("AI_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
     monkeypatch.setenv("HARNESS_ONBOARD", "0")
     monkeypatch.setenv("HARNESS_SYSTEM_PROMPT", "You are Nova.")
     wire(

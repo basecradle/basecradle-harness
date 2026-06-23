@@ -27,9 +27,10 @@ stays a pure text/tool-call adapter, and the capability works under **either**
 provider — Chat Completions or Responses. It is the framework's core promise kept:
 a new capability is one small tool class.
 
-The image model is OpenAI's Images API (``/v1/images/generations`` and
-``/v1/images/edits``); it shares the agent's ``AI_PROVIDER_API_KEY`` (``gpt-5.4-mini``
-reasons, ``gpt-image-2`` paints, one key). A non-OpenAI key simply gets a
+The image model is OpenAI's Images API, reached **through the ``openai`` SDK**
+(``client.images.generate`` / ``client.images.edit``) — never hand-rolled HTTP, the same
+vendor-SDK rule the model loop follows (issue #158). It shares the agent's ``AI_API_KEY``
+(``gpt-5.4-mini`` reasons, ``gpt-image-2`` paints, one key). A non-OpenAI key simply gets a
 model-readable error back, like any tool failure.
 
 Coverage (audited to gpt-image-2's full surface)
@@ -46,7 +47,6 @@ than re-validated here, so this never drifts as the model's surface evolves.
 
 from __future__ import annotations
 
-import base64
 import os
 from typing import Any
 
@@ -58,8 +58,8 @@ from basecradle_harness._exceptions import (
     ProviderConnectionError,
     ProviderError,
 )
-from basecradle_harness._http import raise_for_status
-from basecradle_harness._media import provider_error_message, slugify
+from basecradle_harness._media import decode_image_payload, provider_error_message, slugify
+from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._platform import PlatformTool, explain
 
 #: OpenAI's Images API root. Image generation/editing is an OpenAI service; this
@@ -123,16 +123,16 @@ _COVERAGE_PROPERTIES = {
 class _ImageTool(PlatformTool):
     """Shared base for the generate/edit image tools: key, coverage, request, upload.
 
-    Both subclasses are `PlatformTool`s that hold the agent's ``AI_PROVIDER_API_KEY``
-    and own the OpenAI Images HTTP, then upload the result through the bound SDK
-    client. The only thing that differs is *which* Images endpoint they call and how
-    they build its request body — generate sends JSON, edit sends multipart with the
-    source bytes. Everything around that (key resolution, the shared coverage params,
-    decoding the base64 result, posting the Asset) lives here, once.
+    Both subclasses are `PlatformTool`s that hold the agent's ``AI_API_KEY`` and call the
+    OpenAI Images API **through the ``openai`` SDK** (``client.images``), then upload the result
+    through the bound platform SDK client. The only thing that differs is *which* SDK method
+    they call and how they shape its arguments — generate takes a prompt, edit takes the source
+    image bytes. Everything around that (key resolution, the shared coverage params, decoding
+    the result, posting the Asset) lives here, once.
 
     Args:
         api_key: The OpenAI key for the Images API. Falls back to
-            ``AI_PROVIDER_API_KEY`` at call time, so constructing the tool needs no
+            ``AI_API_KEY`` at call time, so constructing the tool needs no
             secret (a keyless construction just errors, readably, if used).
         base_url: The Images API root. Defaults to OpenAI.
         model: The image model. Defaults to ``gpt-image-2``.
@@ -159,7 +159,17 @@ class _ImageTool(PlatformTool):
 
     def _key(self) -> str | None:
         """The OpenAI key: the explicit one, or the agent's provider key from env."""
-        return self._api_key or os.environ.get("AI_PROVIDER_API_KEY")
+        return self._api_key or os.environ.get("AI_API_KEY")
+
+    def _client(self, key: str):
+        """An ``openai`` SDK client for the Images API, plus the module (for error mapping).
+
+        Built per call (image work is infrequent) and pointed at the configured base URL. The
+        harness reaches the Images endpoint only through this SDK — no harness-owned HTTP.
+        """
+        openai = require_openai_sdk()
+        client = openai.OpenAI(api_key=key, base_url=self._base_url, timeout=self._timeout)
+        return openai, client
 
     def _coverage_params(
         self,
@@ -195,33 +205,11 @@ class _ImageTool(PlatformTool):
             params["output_compression"] = output_compression
         return params
 
-    def _request(
-        self,
-        endpoint: str,
-        key: str,
-        *,
-        json: dict[str, Any] | None = None,
-        data: dict[str, Any] | None = None,
-        files: list[tuple[str, tuple[str, bytes, str]]] | None = None,
-    ) -> bytes:
-        """POST to an Images endpoint and return the decoded image bytes.
-
-        Generate posts ``json``; edit posts multipart (``data`` + ``files``). Failures
-        surface as the same typed `ProviderError`s the model-provider adapters raise —
-        the subclass's `run` catches them and relays the message to the model.
-        """
-        try:
-            with httpx.Client(
-                headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
-            ) as client:
-                response = client.post(
-                    f"{self._base_url}/{endpoint}", json=json, data=data, files=files
-                )
-        except httpx.RequestError as exc:
-            raise ProviderConnectionError(str(exc)) from exc
-        if response.status_code >= 400:
-            raise_for_status(response)  # raises a typed ProviderAPIError carrying the body
-        return _decode_image(response.json())
+    def _decode(self, response: object) -> bytes:
+        """The image bytes from an SDK Images response (``b64_json``, or a ``url`` to fetch)."""
+        return decode_image_payload(
+            response.model_dump(), download=_download, subject="the image API"
+        )
 
     def _post_asset(
         self,
@@ -302,24 +290,22 @@ class GenerateImageTool(_ImageTool):
         key = self._key()
         if not key:
             return (
-                "Error: no API key for image generation. Set AI_PROVIDER_API_KEY "
+                "Error: no API key for image generation. Set AI_API_KEY "
                 "(or pass api_key= to GenerateImageTool)."
             )
 
-        payload = {
-            "model": self._model,
-            "prompt": prompt,
-            "n": 1,
-            **self._coverage_params(
-                size=size,
-                quality=quality,
-                background=background,
-                output_format=output_format,
-                output_compression=output_compression,
-            ),
-        }
+        coverage = self._coverage_params(
+            size=size,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            output_compression=output_compression,
+        )
         try:
-            image_bytes = self._request("images/generations", key, json=payload)
+            openai, client = self._client(key)
+            with sdk_error_context(openai):
+                response = client.images.generate(model=self._model, prompt=prompt, n=1, **coverage)
+            image_bytes = self._decode(response)
         except ProviderConnectionError as exc:
             return f"Error generating image: could not reach the image API: {exc}"
         except ProviderError as exc:
@@ -430,31 +416,34 @@ class EditImageTool(_ImageTool):
         key = self._key()
         if not key:
             return (
-                "Error: no API key for image editing. Set AI_PROVIDER_API_KEY "
+                "Error: no API key for image editing. Set AI_API_KEY "
                 "(or pass api_key= to EditImageTool)."
             )
 
         try:
-            files = [self._source_part("image[]", uuid) for uuid in uuids]
-            if mask:
-                files.append(self._source_part("mask", mask))
+            sources = [self._source_part(uuid) for uuid in uuids]
+            mask_part = self._source_part(mask) if mask else None
         except _SourceError as exc:
             return str(exc)
 
-        payload = {
-            "model": self._model,
-            "prompt": prompt,
-            "n": 1,
-            **self._coverage_params(
-                size=size,
-                quality=quality,
-                background=background,
-                output_format=output_format,
-                output_compression=output_compression,
-            ),
-        }
+        coverage = self._coverage_params(
+            size=size,
+            quality=quality,
+            background=background,
+            output_format=output_format,
+            output_compression=output_compression,
+        )
+        # The SDK's ``image`` takes one file or a list; ``mask`` is a single file. Both are
+        # ``(filename, bytes, content_type)`` tuples — the bytes, not a URL (the edit endpoint
+        # rejects URLs), which is why each source is downloaded inline above.
+        extra: dict[str, Any] = {"mask": mask_part} if mask_part is not None else {}
         try:
-            image_bytes = self._request("images/edits", key, data=payload, files=files)
+            openai, client = self._client(key)
+            with sdk_error_context(openai):
+                response = client.images.edit(
+                    model=self._model, image=sources, prompt=prompt, n=1, **extra, **coverage
+                )
+            image_bytes = self._decode(response)
         except ProviderConnectionError as exc:
             return f"Error editing image: could not reach the image API: {exc}"
         except ProviderError as exc:
@@ -466,12 +455,12 @@ class EditImageTool(_ImageTool):
             target, image_bytes, name, description or f"Edited image: {prompt}", "Edited and posted"
         )
 
-    def _source_part(self, field: str, uuid: str) -> tuple[str, tuple[str, bytes, str]]:
-        """Resolve a source/mask Asset by uuid to a multipart part (bytes, not a URL).
+    def _source_part(self, uuid: str) -> tuple[str, bytes, str]:
+        """Resolve a source/mask Asset by uuid to an SDK file tuple (bytes, not a URL).
 
         The Images edit endpoint rejects URLs, so the bytes must be downloaded and sent
-        inline. A bad uuid (or a download failure) raises `_SourceError`, whose message
-        the caller relays to the model — far better than a raw traceback.
+        inline as a ``(filename, bytes, content_type)`` file the SDK uploads. A bad uuid (or a
+        download failure) raises `_SourceError`, whose message the caller relays to the model.
         """
         try:
             asset = self.context.client.assets.get(uuid)
@@ -483,7 +472,7 @@ class EditImageTool(_ImageTool):
             )
         except httpx.HTTPError as exc:
             raise _SourceError(f"Error editing image: couldn't download asset {uuid!r}: {exc}")
-        return (field, (file.filename, data, file.content_type))
+        return (file.filename, data, file.content_type)
 
 
 class _SourceError(Exception):
@@ -513,19 +502,6 @@ def _provider_message(exc: ProviderError) -> str:
     opaque status — Principle 5 (capital live verify, #140).
     """
     return provider_error_message(exc, "the image API")
-
-
-def _decode_image(body: dict[str, Any]) -> bytes:
-    """Pull the base64 image out of an Images API response and decode it to bytes."""
-    items = body.get("data") or []
-    item = items[0] if items else None
-    encoded = item.get("b64_json") if isinstance(item, dict) else None
-    if not encoded:
-        raise ProviderError("the image API returned no image data.")
-    try:
-        return base64.b64decode(encoded)
-    except (ValueError, TypeError) as exc:
-        raise ProviderError(f"the image API returned undecodable data: {exc}") from exc
 
 
 def _image_filename(filename: str | None, fallback_text: str, output_format: str | None) -> str:

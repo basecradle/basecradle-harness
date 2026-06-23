@@ -69,7 +69,7 @@ from basecradle_harness._messages import (
     ToolResult,
     ToolSpec,
 )
-from basecradle_harness._openai import OpenAICompatibleProvider
+from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._platform import (
     PlatformContext,
     PlatformTool,
@@ -79,10 +79,11 @@ from basecradle_harness._plugins import (
     ActivationContext,
     EnvSet,
     OpenAIKey,
-    ProviderAPI,
+    OpenAISurface,
     Requirement,
     ResolvedTools,
     ToolPlugin,
+    Vendor,
     load_plugins,
     resolve_plugins,
 )
@@ -132,7 +133,7 @@ __all__ = [
     "fetch_dashboard_md",
     # Provider contract + adapters
     "Provider",
-    "OpenAICompatibleProvider",
+    "OpenAIProvider",
     "OpenAIResponsesProvider",
     # Tools, registry, and the safety boundary
     "Tool",
@@ -152,7 +153,8 @@ __all__ = [
     # Tool plugin framework: (name + requires + impl), provider-aware activation
     "ToolPlugin",
     "Requirement",
-    "ProviderAPI",
+    "Vendor",
+    "OpenAISurface",
     "EnvSet",
     "OpenAIKey",
     "ActivationContext",

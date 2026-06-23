@@ -2,7 +2,7 @@
 
 The xAI-native counterpart to the OpenAI image tools (`_images.py`). These are **Eddie
 Murphy's** media hands — a fully-xAI persona — so they live in their own module, talk only to
-``api.x.ai``, and carry the agent's ``AI_PROVIDER_API_KEY`` (an xAI key for an xAI agent). Two
+``api.x.ai``, and carry the agent's ``AI_API_KEY`` (an xAI key for an xAI agent). Two
 tools, split by operation, the tool-building discipline (full surface → coverage decided →
 split by operation → every option tested):
 
@@ -94,7 +94,7 @@ class _GrokMediaTool(PlatformTool):
 
     def _key(self) -> str | None:
         """The xAI key: the explicit one, or the agent's provider key from the environment."""
-        return self._api_key or os.environ.get("AI_PROVIDER_API_KEY")
+        return self._api_key or os.environ.get("AI_API_KEY")
 
     def _request(
         self, key: str, method: str, endpoint: str, *, json: dict[str, Any] | None = None
@@ -184,10 +184,7 @@ class GrokGenerateImageTool(_GrokMediaTool):
             return "Error: 'grok_generate_image' needs a 'prompt' describing what to draw."
         key = self._key()
         if not key:
-            return (
-                "Error: no API key for image generation. Set AI_PROVIDER_API_KEY to the "
-                "agent's xAI key."
-            )
+            return "Error: no API key for image generation. Set AI_API_KEY to the agent's xAI key."
 
         # response_format=b64_json so the image comes back inline (no second fetch); aspect_ratio
         # and resolution are sent only when set, so the default call is always the valid core.
@@ -316,10 +313,7 @@ class GrokGenerateVideoTool(_GrokMediaTool):
             return "Error: 'grok_generate_video' needs a 'prompt' describing the video."
         key = self._key()
         if not key:
-            return (
-                "Error: no API key for video generation. Set AI_PROVIDER_API_KEY to the "
-                "agent's xAI key."
-            )
+            return "Error: no API key for video generation. Set AI_API_KEY to the agent's xAI key."
 
         payload: dict[str, Any] = {"model": self._model, "prompt": prompt}
         if duration is not None:

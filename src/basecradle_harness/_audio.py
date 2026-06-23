@@ -11,15 +11,17 @@ Why a sibling tool, not an action on the assets tool
 which sees the picture natively — no model-provider call. Transcription is different:
 it needs a *provider* call (OpenAI's transcription endpoint), exactly like image
 *generation*. So this follows `GenerateImageTool`'s shape, not `view`'s — a separate
-`PlatformTool` that holds the agent's ``AI_PROVIDER_API_KEY`` and owns the provider
-HTTP, keeping the brain/body boundary clean (the SDK never reaches the provider, the
-provider never reaches the SDK). The capability is one small tool class either way.
+`PlatformTool` that holds the agent's ``AI_API_KEY`` and reaches OpenAI's Audio endpoint
+**through the ``openai`` SDK** (``client.audio.transcriptions``), never hand-rolled HTTP —
+the same vendor-SDK rule the model loop follows (issue #158), keeping the brain/body boundary
+clean (the platform SDK never reaches the model provider, and vice versa). The capability is
+one small tool class either way.
 
 It mirrors `view`'s on-demand, ephemeral shape: the agent listens only when it
 chooses (never eagerly inlined), a non-audio asset comes back as a clean note rather
 than a failure, and an oversized one is described, not force-fed. The transcription
-model is OpenAI's Audio API (``/v1/audio/transcriptions``), sharing the agent's one
-key (``gpt-5.4-mini`` reasons, ``gpt-image-2`` paints, ``gpt-4o-transcribe`` listens).
+model is OpenAI's Audio API, sharing the agent's one key (``gpt-5.4-mini`` reasons,
+``gpt-image-2`` paints, ``gpt-4o-transcribe`` listens).
 
 Video is deliberately out of scope (heavier, and frame extraction would collide with
 the no-subprocess safety boundary) — when it comes, it gets its own pure-Python path.
@@ -29,11 +31,9 @@ from __future__ import annotations
 
 import os
 
-import httpx
-
 from basecradle_harness._assets import _describe, _download, _is_audio
 from basecradle_harness._exceptions import ProviderConnectionError, ProviderError
-from basecradle_harness._http import raise_for_status
+from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._platform import PlatformTool
 
 #: OpenAI's Audio API root. Transcription is an OpenAI service; this changes only for
@@ -55,11 +55,11 @@ class HearAudioTool(PlatformTool):
     A `PlatformTool`: it fetches the asset through the bound SDK client, so the
     hosting agent (`TimelineAgent`/`WakeAgent`) binds it before the loop, exactly
     like the assets tool. The transcription model's key is the agent's
-    ``AI_PROVIDER_API_KEY`` unless an explicit `api_key` is passed.
+    ``AI_API_KEY`` unless an explicit `api_key` is passed.
 
     Args:
         api_key: The OpenAI key for the Audio API. Falls back to
-            ``AI_PROVIDER_API_KEY`` at call time, so constructing the tool needs no
+            ``AI_API_KEY`` at call time, so constructing the tool needs no
             secret (a keyless construction just errors, readably, if used).
         base_url: The Audio API root. Defaults to OpenAI.
         model: The transcription model. Defaults to ``gpt-4o-transcribe``.
@@ -120,10 +120,10 @@ class HearAudioTool(PlatformTool):
                 "transcription limit — too large to listen to.)"
             )
 
-        key = self._api_key or os.environ.get("AI_PROVIDER_API_KEY")
+        key = self._api_key or os.environ.get("AI_API_KEY")
         if not key:
             return (
-                "Error: no API key for transcription. Set AI_PROVIDER_API_KEY "
+                "Error: no API key for transcription. Set AI_API_KEY "
                 "(or pass api_key= to HearAudioTool)."
             )
 
@@ -140,38 +140,31 @@ class HearAudioTool(PlatformTool):
         return f"{meta}\n\nTranscript:\n{transcript}"
 
     def _transcribe(self, data: bytes, filename: str, content_type: str, key: str) -> str:
-        """Send the audio to the transcription endpoint and return its text.
+        """Send the audio to the transcription endpoint (via the openai SDK) and return its text.
 
-        Failures surface as the same typed `ProviderError`s the model-provider
-        adapters raise — `run` catches them and relays the message to the model. The
-        audio rides as a multipart upload (the form the Audio API expects), so the
-        bytes never touch the filesystem.
+        Failures surface as the same typed `ProviderError`s the model adapter raises (mapped
+        from the SDK's exceptions by `sdk_error_context`) — `run` catches them and relays the
+        message to the model. The audio rides as an in-memory ``(filename, bytes, content_type)``
+        file the SDK uploads, so the bytes never touch the filesystem.
         """
-        try:
-            with httpx.Client(
-                headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
-            ) as client:
-                response = client.post(
-                    f"{self._base_url}/audio/transcriptions",
-                    files={"file": (filename, data, content_type)},
-                    data={"model": self._model},
-                )
-        except httpx.RequestError as exc:
-            raise ProviderConnectionError(str(exc)) from exc
-        if response.status_code >= 400:
-            raise_for_status(response)  # raises a typed ProviderAPIError carrying the body
-        return _extract_transcript(response.json())
+        openai = require_openai_sdk()
+        client = openai.OpenAI(api_key=key, base_url=self._base_url, timeout=self._timeout)
+        with sdk_error_context(openai):
+            response = client.audio.transcriptions.create(
+                model=self._model, file=(filename, data, content_type)
+            )
+        return _extract_transcript(response)
 
 
-def _extract_transcript(body: object) -> str:
-    """Pull the transcript text out of an Audio API response.
+def _extract_transcript(response: object) -> str:
+    """Pull the transcript text out of an SDK transcription result.
 
-    The default (``json``) response format is ``{"text": "..."}``. Anything else —
-    a non-object body (a proxy that returned a bare string/array), or a missing or
-    non-string ``text`` — is treated as a provider error rather than guessed at, so
+    The default (``json``) format gives a ``Transcription`` whose ``.text`` is the transcript.
+    Anything else — a bare string the SDK handed back from a non-standard (e.g. proxy) body, or
+    a result with no string ``text`` — is treated as a provider error rather than guessed at, so
     even a malformed response surfaces as model-readable text, never a traceback.
     """
-    text = body.get("text") if isinstance(body, dict) else None
+    text = getattr(response, "text", None)
     if not isinstance(text, str):
         raise ProviderError("the transcription API returned no text.")
     return text

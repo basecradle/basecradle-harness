@@ -257,14 +257,14 @@ def test_missing_prompt_is_a_friendly_error(tool):
 
 
 def test_no_api_key_is_a_friendly_error(client, monkeypatch):
-    monkeypatch.delenv("AI_PROVIDER_API_KEY", raising=False)
+    monkeypatch.delenv("AI_API_KEY", raising=False)
     t = GenerateImageTool(base_url=IMAGES_BASE)  # no key passed, none in env
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     assert "no API key" in t.run(prompt="a cat")
 
 
 def test_api_key_falls_back_to_env(client, monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("AI_API_KEY", FAKE_KEY)
     t = GenerateImageTool(base_url=IMAGES_BASE)
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     with respx.mock(assert_all_called=True) as mock:
@@ -329,7 +329,7 @@ def test_a_transport_failure_is_relayed_to_the_model(tool):
 
 
 def test_an_unbound_tool_raises_platform_error(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("AI_API_KEY", FAKE_KEY)
     with respx.mock(assert_all_called=True) as mock:
         mock.post(IMAGES_URL).mock(return_value=httpx.Response(200, json=images_response()))
         with pytest.raises(PlatformError):
@@ -490,7 +490,7 @@ def test_edit_without_a_source_image_is_a_friendly_error(edit_tool):
 
 
 def test_edit_with_no_api_key_is_a_friendly_error(client, monkeypatch):
-    monkeypatch.delenv("AI_PROVIDER_API_KEY", raising=False)
+    monkeypatch.delenv("AI_API_KEY", raising=False)
     t = EditImageTool(base_url=IMAGES_BASE)  # no key passed, none in env
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     assert "no API key" in t.run(image=[SOURCE_UUID], prompt="recolor")
