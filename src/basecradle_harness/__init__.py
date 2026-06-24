@@ -109,6 +109,7 @@ from basecradle_harness._wake import (
 )
 from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
+from basecradle_harness._xai_sdk import XaiSdkProvider
 
 __all__ = [
     "__version__",
@@ -141,6 +142,7 @@ __all__ = [
     # Provider contract + adapters
     "Provider",
     "OpenAIProvider",
+    "XaiSdkProvider",
     # Tools, registry, and the safety boundary
     "Tool",
     "ToolRegistry",
