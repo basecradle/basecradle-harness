@@ -162,13 +162,13 @@ def test_exactly_one_of_two_same_named_variants_activates_per_config():
 
 # --- behavior-preserving: the packaged defaults under each provider ----------
 
-# The full default function-tool set every existing deployment has, independent of provider.
-# Memory is no longer a tool plugin — it graduated to the `MemoryProvider` subsystem (Group 4),
-# so it is wired from the provider, not loaded here. See test_memory_provider.py.
+# The benign/platform function-tool set a default-riding deployment gets, independent of provider.
+# These keep the normal shipped-default → install-then-prune behavior. Memory is no longer a tool
+# plugin — it graduated to the `MemoryProvider` subsystem (Group 4), so it is wired from the
+# provider, not loaded here. See test_memory_provider.py.
 _DEFAULT_TOOLS = {
     "web_fetch",
     "assets",
-    "listen",
     "tasks",
     "timelines",
     "trust",
@@ -176,30 +176,34 @@ _DEFAULT_TOOLS = {
     "delete",
     "users",
     "messages",
-    "generate_image",
-    "edit_image",
     "webhook_endpoints",
     "webhook_events",
 }
 
+# Powerful tools are **opt-in everywhere** (issue #168): off by default on every provider,
+# activated only by an explicit `tools/` overlay. They are NOT in the packaged-default load.
+# OpenAI-coupled power *function* tools; `web_search` is a power *built-in* (tested separately).
+_OPENAI_POWER_TOOLS = {"generate_image", "edit_image", "listen"}
 
-def test_packaged_defaults_under_responses_match_todays_tool_set_plus_web_search():
+
+def test_packaged_defaults_are_benign_only_power_tools_are_opt_in():
+    # A default-riding agent (no overlay) gets the benign/platform tools only — every powerful
+    # tool (media gen, web search) is opt-in and absent from the packaged-default load (#168).
     resolved = resolve_plugins(load_plugins(), _ctx(AI_API_KEY="sk"))
-    assert {t.name for t in resolved.tools} == _DEFAULT_TOOLS
-    assert resolved.builtins == ["web_search"]  # the Responses built-in is active
-
-
-def test_web_search_drops_on_chat_completions_the_other_tools_stay():
-    resolved = resolve_plugins(load_plugins(), _ctx(surface="chat", AI_API_KEY="sk"))
-    assert {t.name for t in resolved.tools} == _DEFAULT_TOOLS
-    assert resolved.builtins == []  # web_search self-excludes off the Responses API
-
-
-def test_openai_coupled_tools_drop_without_an_openai_key():
-    resolved = resolve_plugins(load_plugins(), _ctx(surface="chat"))  # no key
     names = {t.name for t in resolved.tools}
-    assert "generate_image" not in names and "edit_image" not in names and "listen" not in names
-    assert _DEFAULT_TOOLS - {"generate_image", "edit_image", "listen"} == names
+    assert names == _DEFAULT_TOOLS
+    assert not (_OPENAI_POWER_TOOLS & names)  # no generate_image/edit_image/listen
+    assert resolved.builtins == []  # web_search is a power built-in → opt-in, not auto-on
+
+
+def test_power_tools_stay_opt_in_even_with_a_key_and_the_responses_surface():
+    # Even with everything a power tool's `requires` wants (openai key + responses surface), the
+    # packaged-default load never grants it — the safety default is capability-based, not gated
+    # on availability. Opt-in is the only path (the overlay; covered below).
+    resolved = resolve_plugins(load_plugins(), _ctx(AI_API_KEY="sk"))  # responses + key
+    names = {t.name for t in resolved.tools}
+    assert not (_OPENAI_POWER_TOOLS & names)
+    assert resolved.builtins == []
 
 
 # --- the /tools overlay ------------------------------------------------------
@@ -326,26 +330,55 @@ def test_removing_the_whole_tools_dir_once_installed_yields_no_tools(tmp_path):
     assert load_plugins(home) == []
 
 
-# The xAI-profile-only defaults: loaded under every config but active only under provider="xai".
+# The powerful xAI-affine defaults — opt-in everywhere (issue #168), so absent from a default
+# load; available only under provider="xai" (their `requires`) once opted into an overlay.
 _XAI_DEFAULTS = {"web_search", "x_search", "grok_generate_image", "grok_generate_video"}
 
 
-def test_a_never_installed_config_home_falls_back_to_packaged_defaults(tmp_path):
-    # No install() has run: tools/ is absent and the manifest records no tool files, so the
-    # packaged defaults load directly (an un-upgraded deployment still comes up fully armed).
+def test_a_never_installed_config_home_falls_back_to_benign_defaults_only(tmp_path):
+    # No install() has run: the packaged defaults load directly, but the **powerful** ones are
+    # opt-in (issue #168) and dropped — a default-riding agent comes up with the benign/platform
+    # set only, no media-gen / web-search auto-armed.
     plugins = load_plugins(tmp_path / "never-installed")
-    assert {p.resolved_name for p in plugins} == _DEFAULT_TOOLS | _XAI_DEFAULTS
+    names = {p.resolved_name for p in plugins}
+    assert names == _DEFAULT_TOOLS
+    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS) & names)
 
 
-def test_xai_profile_activates_grok_tools_and_live_search_drops_openai_tools():
-    # Eddie's profile: the grok media tools and xAI Live Search built-ins activate, the
-    # OpenAI-coupled tools (generate_image/edit_image/listen) self-exclude, and OpenAI's own
-    # web_search built-in (OpenAISurface("responses")) does not leak in — only xAI's does.
+def test_default_riding_xai_agent_is_benign_only_no_grok_tools_auto_armed():
+    # The safety crux (issue #168): a default-riding xai agent (e.g. an adversarial persona that
+    # was never given an overlay) gets ZERO powerful tools — the grok media tools and Live Search
+    # do NOT auto-activate from `Vendor("xai")`. Provider gates availability, never the default.
     resolved = resolve_plugins(load_plugins(), _ctx(provider="xai", AI_API_KEY="xai-key"))
     names = {t.name for t in resolved.tools}
-    assert {"grok_generate_image", "grok_generate_video"} <= names
-    assert not ({"generate_image", "edit_image", "listen"} & names)
-    assert sorted(resolved.builtins) == ["web_search", "x_search"]
+    assert names == _DEFAULT_TOOLS
+    assert not (_XAI_DEFAULTS & names)
+    assert resolved.builtins == []  # no web_search / x_search auto-armed
+
+
+def test_a_freshly_installed_home_loads_benign_tools_only_end_to_end(tmp_path):
+    # The headline safety property, end-to-end through install() + load(): a persona the installer
+    # scaffolded (overlay authoritative) comes up with the benign/platform set and ZERO powerful
+    # tools — no opt-in → none on disk → none loaded (the adversarial-persona guarantee).
+    home = tmp_path / "cfg"
+    install(home)  # no opt_in → benign defaults only on disk
+
+    plugins = load_plugins(home)
+    names = {p.resolved_name for p in plugins}
+    assert names == _DEFAULT_TOOLS
+    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS) & names)
+
+
+def test_opting_a_power_tool_into_the_overlay_activates_it_subject_to_availability(tmp_path):
+    # The opt-in path: a powerful tool present in the persona's overlay activates — gated only by
+    # its `requires` (availability). The grok tool runs under xai and self-excludes under openai.
+    home = tmp_path / "cfg"
+    install(home, provider="xai", opt_in=["grok_generate_image"])
+    assert (home / "tools" / "grok_generate_image.py").exists()  # scaffolded on explicit opt-in
+    under_xai = resolve_plugins(load_plugins(home), _ctx(provider="xai", AI_API_KEY="xai-key"))
+    assert "grok_generate_image" in {t.name for t in under_xai.tools}
+    under_openai = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))
+    assert "grok_generate_image" not in {t.name for t in under_openai.tools}  # availability gate
 
 
 # --- provider-aware loading (issue #160, scope expansion) --------------------
@@ -353,18 +386,22 @@ def test_xai_profile_activates_grok_tools_and_live_search_drops_openai_tools():
 
 def test_load_for_openai_does_not_even_import_the_grok_xai_plugins(tmp_path):
     # A provider-aware load skips the grok/xAI plugin files before import, so an OpenAI agent
-    # never imports them (sidestepping a foreign-SDK import hazard), not just deactivates them.
+    # never imports them (sidestepping a foreign-SDK import hazard). (The openai power tools are
+    # imported but opt-in-dropped — a separate concern, issue #168.)
     plugins = load_plugins(tmp_path / "never-installed", provider="openai")
     names = {p.resolved_name for p in plugins}
     assert not ({"grok_generate_image", "grok_generate_video", "x_search"} & names)
-    assert "generate_image" in names  # the OpenAI-coupled plugins still load
+    assert "assets" in names  # the benign defaults still load
 
 
 def test_load_for_xai_skips_the_openai_coupled_plugins(tmp_path):
     plugins = load_plugins(tmp_path / "never-installed", provider="xai")
     names = {p.resolved_name for p in plugins}
-    assert {"grok_generate_image", "grok_generate_video"} <= names
+    # Both the grok power tools (opt-in) and the openai-coupled ones (provider-mismatched) are
+    # absent from a default xai load; the benign defaults remain.
+    assert not (_XAI_DEFAULTS & names)
     assert "generate_image" not in names and "listen" not in names
+    assert "assets" in names
 
 
 def test_a_provider_mismatched_broken_file_is_not_imported_so_never_a_defect(tmp_path):

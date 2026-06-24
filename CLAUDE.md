@@ -347,6 +347,41 @@ existing tools. Deployment proper — provisioning a venv, wiring the router/ser
 home server — remains the home server's and [`basecradle-router`](https://github.com/basecradle/basecradle-router)'s
 concern, not the installer's (per the spine: harness owns the agent runtime, not the box).
 
+### Powerful Tools Are Opt-In — the capability rule (issue #168)
+
+**Tool assignment is a per-persona axis, classified by *capability*, not by provider.** A
+powerful/dangerous tool — media generation (image, **video**, audio), web/X search, code
+execution — **fails closed**: it is **off by default on every provider** and activates **only**
+when explicitly dropped into a persona's `tools/` overlay (the same "ships empty" stance as
+`mcp/`). A benign/platform tool (memory, assets, messages, timelines, tasks, trust, lock,
+delete, users, webhooks, web_fetch) keeps the normal shipped-default → install-then-prune
+behavior. This is **provider-agnostic**: the `requires` gate (`Vendor`/`OpenAIKey`) decides a
+powerful tool's *availability/wiring*, **never** the safety default — there is no "default on
+OpenAI, opt-in on xAI" split. *(Decided by the capital + founder, applying Option 1 uniformly;
+see [[classify-safety-by-capability-not-provider]].)*
+
+- **The flag.** A `ToolPlugin` marks itself `opt_in=True` (the seven powerful defaults:
+  `generate_image`, `edit_image`, `hear_audio`, OpenAI `web_search`, xAI `web_search`/`x_search`,
+  `grok_generate_image`, `grok_generate_video`). The packaged-default fallback **drops** opt-in
+  plugins; the installer **does not scaffold** them; both detect the flag from source via AST
+  (`_install.plugin_opts_in`, the no-import discipline shared with provider affinity).
+- **Granting one.** `basecradle-harness-install --opt-in <stems>` scaffolds the named powerful
+  defaults into the overlay (or drop the file in by hand). An opt-in plugin *present* in the
+  overlay activates, gated only by its `requires`.
+- **Grandfather, loudly.** On upgrade, a powerful tool a *prior* version had already scaffolded
+  into an existing config home is **kept, never silently stripped** (the founder's "tools stay
+  the same" migration rule) and **reported loudly** (`InstallReport.grandfathered` →
+  the CLI summary + a `WARNING`). New installs get the opt-in (off) default.
+- **Why it's a hard requirement.** Adversarial-by-design personas (the fleet's `pinky`/`the-brain`)
+  must be tool-less **by construction**, never "on unless someone remembered to prune." Any
+  provider/SDK-based default would silently arm whoever moves onto that provider next — the exact
+  safety violation this rule forecloses. *(The capital provisions those personas explicitly
+  tool-less at cutover; the loud grandfather report is what lets it confirm what to prune.)*
+
+**Boundary:** persona provisioning (cutting each agent's overlay to its target tool-set,
+re-provisioning `jt`/`eddie` in lockstep with the release) is the **capital's** on-box job; the
+harness ships the mechanism + the `--opt-in`/grandfather affordances and proves them with tests.
+
 ### Read Tools + Standalone Lock (Phase 2 · Group 2b)
 
 The first new tools built on the Group 2 framework — the two headline findings from the

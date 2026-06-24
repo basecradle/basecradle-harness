@@ -53,6 +53,7 @@ import json
 import logging
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -173,6 +174,31 @@ def plugin_relevant_to(source: str, provider: str | None) -> bool:
     return affinity is None or provider in affinity
 
 
+def plugin_opts_in(source: str) -> bool:
+    """Whether a tool-plugin's *source* declares it a powerful, opt-in tool (``opt_in=True``).
+
+    Parses the source with `ast` and **never executes it** — the same no-import discipline as
+    `plugin_source_providers`, so the installer can classify a default as opt-in without
+    importing it (and the loader and installer agree on the bucket). An ``opt_in=True`` keyword
+    in *any* ``ToolPlugin(...)`` call in the file marks the file's tools as powerful (issue
+    #168): off by default on every provider, scaffolded/loaded only on explicit opt-in. A file
+    with no such keyword (or unparseable source — treated as benign so the loader still attempts
+    it and surfaces a real error) is a benign default with the normal install-then-prune
+    behavior.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        for kw in node.keywords:
+            if kw.arg == "opt_in" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                return True
+    return False
+
+
 def active_provider_from_env() -> str:
     """The active ``AI_PROVIDER`` for provider-aware install/reconcile, normalized (default openai)."""
     return (os.environ.get("AI_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
@@ -237,6 +263,9 @@ class InstallReport:
     created_dirs: list[str] = field(default_factory=list)
     actions: dict[str, str] = field(default_factory=dict)
     new_files: list[str] = field(default_factory=list)  # the `.new` files written this run
+    # Power tools (now opt-in, issue #168) a *prior* version had scaffolded into this config home
+    # and that the upgrade KEPT rather than silently strip — the grandfather list, surfaced loudly.
+    grandfathered: list[str] = field(default_factory=list)
 
     def of(self, action: str) -> list[str]:
         """The relative paths whose outcome was ``action`` (for tests and the summary)."""
@@ -252,6 +281,15 @@ class InstallReport:
         lines = [head, tally]
         for rel in self.new_files:
             lines.append(f"  kept your edited {rel} — new default written to {rel}.new")
+        if self.grandfathered:
+            # Loud, never silent: an existing config keeps power tools that are now opt-in by
+            # default (issue #168). Name each so the operator sees the policy change and can
+            # delete any it no longer wants. New installs get the opt-in (off) default.
+            kept = ", ".join(self.grandfathered)
+            lines.append(
+                f"  kept (now opt-in, grandfathered from a prior install): {kept}. "
+                "These powerful tools are off by default for new agents; delete a file to drop it."
+            )
         return "\n".join(lines)
 
 
@@ -263,6 +301,7 @@ def install(
     *,
     defaults: dict[str, str] | None = None,
     provider: str | None = None,
+    opt_in: Sequence[str] = (),
 ) -> InstallReport:
     """Scaffold the config home and reconcile the shipped defaults — idempotent, re-runnable.
 
@@ -283,6 +322,15 @@ def install(
     down (it would be clutter the resolver gates off anyway, and a latent foreign-SDK import
     hazard), and one a prior install already laid down is **pruned** if still pristine. ``None``
     (the default the direct API and tests use) lays down every default unfiltered, as before.
+
+    **Powerful tools are opt-in (issue #168).** A tool-plugin default marked ``opt_in`` (media
+    generation, web/X search, code execution) is **not** scaffolded for a fresh agent — it ships
+    in the package but stays off until explicitly chosen, the same "ships empty" stance as
+    ``mcp/``. Two ways it still lands: it is named in ``opt_in`` (a list of plugin file stems,
+    e.g. ``["grok_generate_image"]`` — the ``--opt-in`` CLI flag), **or** a *prior* version had
+    already scaffolded it into this config home, in which case it is **grandfathered** — kept,
+    never silently stripped (the founder's "tools stay the same" migration rule) and reported
+    **loudly** in ``InstallReport.grandfathered``. Deletions stay respected either way.
     """
     root = config_home(home)
     report = InstallReport(config_home=root)
@@ -295,16 +343,40 @@ def install(
         directory.mkdir(parents=True, exist_ok=True)
 
     shipped_all = _packaged_defaults() if defaults is None else defaults
-    shipped = _relevant_defaults(shipped_all, provider)
+    shipped_provider = _relevant_defaults(shipped_all, provider)
     recorded = _read_manifest(root)
     updated: dict[str, str] = dict(recorded)
+
+    # Power tools (issue #168) are excluded from the scaffold set unless explicitly opted in or
+    # grandfathered (already recorded from a prior install). Kept separate from the provider
+    # filter so the provider-prune below still keys on `shipped_provider`, unchanged.
+    shipped, grandfathered_rels = _opt_in_scaffold_set(shipped_provider, recorded, opt_in)
+
+    # A typo in --opt-in (the stem-vs-name trap, e.g. "listen" for the file "hear_audio") would
+    # otherwise scaffold nothing, silently — so name any opt-in that matched no powerful default.
+    _warn_unmatched_opt_in(opt_in, shipped_all)
 
     for rel in sorted(shipped):
         action = _reconcile(root, rel, shipped[rel], recorded, updated, report)
         report.actions[rel] = action
 
-    if shipped is not shipped_all:  # provider-aware: clean up now-mismatched defaults we own
-        _prune_mismatched_defaults(root, shipped_all, shipped, recorded, updated, report)
+    # A grandfathered power tool is one we kept because it was already on disk — so report only
+    # those that are *actually present* after the reconcile. This catches every "not kept" case,
+    # not just KEPT_DELETED: a file the operator deleted whose source did not change this release
+    # reconciles as UNCHANGED (no write, still absent), and must not be reported as kept either.
+    report.grandfathered = [
+        rel for rel in grandfathered_rels if root.joinpath(*rel.split("/")).exists()
+    ]
+    if report.grandfathered:
+        _log.warning(
+            "Grandfathered %d power tool(s) now opt-in by default (issue #168), kept on this "
+            "existing config home rather than stripped: %s. New agents get them off by default.",
+            len(report.grandfathered),
+            ", ".join(report.grandfathered),
+        )
+
+    if shipped_provider is not shipped_all:  # provider-aware: clean up now-mismatched defaults
+        _prune_mismatched_defaults(root, shipped_all, shipped_provider, recorded, updated, report)
 
     _write_manifest(root, updated)
     # Stamp the harness version that produced this config home, so a later wake can detect a
@@ -334,6 +406,70 @@ def _relevant_defaults(shipped: dict[str, str], provider: str | None) -> dict[st
 def _is_tool_plugin(rel: str) -> bool:
     """Whether a config-home-relative path is a tool-plugin file (the only provider-affine kind)."""
     return rel.startswith("tools/") and rel.endswith(".py")
+
+
+def _power_tool_stems(shipped: dict[str, str]) -> set[str]:
+    """The file stems of every powerful (`opt_in`) tool-plugin default in `shipped`."""
+    return {
+        rel[len("tools/") : -len(".py")]
+        for rel, text in shipped.items()
+        if _is_tool_plugin(rel) and plugin_opts_in(text)
+    }
+
+
+def _warn_unmatched_opt_in(opt_in: Sequence[str], shipped_all: dict[str, str]) -> None:
+    """Warn (loudly, never silently) for any ``--opt-in`` name that matches no powerful default.
+
+    Catches the stem-vs-name trap (issue #168): ``--opt-in listen`` names the *tool* but the file
+    stem is ``hear_audio``, so it would otherwise scaffold nothing with no diagnostic — the
+    operator thinks they granted a tool that is silently absent. A name that matches a power tool
+    which is merely provider-mismatched is *not* flagged here (it is a real tool, just unavailable
+    for this provider); only a name matching no power tool at all is a likely typo.
+    """
+    known = _power_tool_stems(shipped_all)
+    unknown = sorted({name.removesuffix(".py") for name in opt_in} - known)
+    if unknown:
+        _log.warning(
+            "--opt-in named no powerful tool default and scaffolded nothing for: %s. The known "
+            "opt-in tools are: %s. (Pass the plugin *file stem*, e.g. 'hear_audio', not 'listen'.)",
+            ", ".join(unknown),
+            ", ".join(sorted(known)),
+        )
+
+
+def _opt_in_scaffold_set(
+    shipped: dict[str, str], recorded: dict[str, str], opt_in: Sequence[str]
+) -> tuple[dict[str, str], list[str]]:
+    """Filter the scaffold set for the opt-in policy (issue #168); return it + the grandfathered.
+
+    A powerful tool-plugin default (``opt_in=True`` in its source) is **excluded** from the
+    scaffold set — it ships in the package but stays off for a fresh agent — **unless**:
+
+    - it is named in ``opt_in`` (by its file stem, e.g. ``"grok_generate_image"``), an explicit
+      operator choice (the ``--opt-in`` flag), **or**
+    - it is already **recorded** (a prior install scaffolded it) — *grandfathered*, kept rather
+      than silently stripped (the founder's "tools stay the same" rule). Its ``rel`` is returned
+      in the second element so the caller can report it loudly.
+
+    Benign defaults (and all non-tool defaults) pass through untouched, keeping the normal
+    install-then-prune behavior. A grandfathered/opted-in default re-enters the reconcile, so a
+    respected deletion still wins (the caller drops a `KEPT_DELETED` one from the loud report).
+    """
+    opt_in_stems = {name.removesuffix(".py") for name in opt_in}
+    result: dict[str, str] = {}
+    grandfathered: list[str] = []
+    for rel, text in shipped.items():
+        if not (_is_tool_plugin(rel) and plugin_opts_in(text)):
+            result[rel] = text  # benign default / non-tool file → unchanged
+            continue
+        stem = rel[len("tools/") : -len(".py")]
+        if stem in opt_in_stems:
+            result[rel] = text  # explicit operator opt-in
+        elif rel in recorded:
+            result[rel] = text  # grandfathered: a prior install already laid it down
+            grandfathered.append(rel)
+        # else: powerful + neither opted-in nor previously installed → not scaffolded
+    return result, grandfathered
 
 
 def _prune_mismatched_defaults(
@@ -735,9 +871,21 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="lay down every tool default regardless of provider (the provider-blind behavior).",
     )
+    parser.add_argument(
+        "--opt-in",
+        default="",
+        metavar="NAMES",
+        help=(
+            "comma-separated plugin file stems to scaffold despite being powerful/opt-in tools "
+            "(issue #168) — e.g. --opt-in generate_image,web_search. Powerful tools (media "
+            "generation, web/X search, code execution) are off by default for a new agent; this "
+            "is how you grant one. Already-installed ones are kept (grandfathered) regardless."
+        ),
+    )
     args = parser.parse_args(argv)
 
     provider = None if args.all_providers else (args.provider or active_provider_from_env())
-    report = install(args.config_home, provider=provider)
+    opt_in = [name.strip() for name in args.opt_in.split(",") if name.strip()]
+    report = install(args.config_home, provider=provider, opt_in=opt_in)
     print(report.summary())
     return 0

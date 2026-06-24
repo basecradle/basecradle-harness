@@ -27,6 +27,7 @@ from basecradle_harness._install import (
     charter_from_config,
     charter_from_env,
     main,
+    plugin_opts_in,
     plugin_relevant_to,
     plugin_source_providers,
     prompt_text,
@@ -63,22 +64,83 @@ def test_install_scaffolds_the_config_home_and_writes_shipped_defaults(tmp_path)
     assert report.config_home == home
 
 
-def test_install_copies_the_shipped_tool_plugin_defaults_into_tools(tmp_path):
-    # Group 2 ships the default tools as real plugin files under `_defaults/tools/`; the
-    # installer copies them into the config home's `tools/` overlay (and the upgrader manages
-    # them with the same conffile discipline as the prompt defaults — proven generically by
-    # the four-case tests below using a `tools/` path).
+def test_install_copies_the_benign_tool_defaults_but_not_the_opt_in_power_tools(tmp_path):
+    # The installer copies the **benign** default tool plugins into `tools/`, but a powerful
+    # opt-in tool (issue #168) ships in the package and is NOT scaffolded for a fresh agent — the
+    # same "ships empty" stance as `mcp/`. The upgrader manages the benign defaults with the same
+    # conffile discipline as the prompt defaults (proven generically by the four-case tests below).
     home = tmp_path / "cfg"
 
     install(home)
 
     tools = home / "tools"
-    for name in ("web_fetch.py", "generate_image.py", "web_search.py"):
-        assert (tools / name).exists()
-    # The tool defaults are manifest-tracked, which is also the "tools are installed" signal
-    # `load_plugins` keys on to treat the overlay as authoritative.
+    assert (tools / "web_fetch.py").exists()  # benign → scaffolded
+    assert not (
+        tools / "generate_image.py"
+    ).exists()  # powerful (media gen) → opt-in, not laid down
+    assert not (tools / "web_search.py").exists()  # powerful (web search) → opt-in
+    # The benign tool defaults are manifest-tracked, which is also the "tools are installed"
+    # signal `load_plugins` keys on to treat the overlay as authoritative.
     manifest = json.loads((home / _MANIFEST_NAME).read_text())
     assert any(key.startswith("tools/") for key in manifest)
+    assert "tools/generate_image.py" not in manifest  # not scaffolded → not tracked
+
+
+def test_install_opt_in_scaffolds_a_named_power_tool(tmp_path):
+    # The explicit opt-in path (the --opt-in CLI flag): a named power tool IS laid down.
+    home = tmp_path / "cfg"
+
+    install(home, opt_in=["generate_image"])
+
+    assert (home / "tools" / "generate_image.py").exists()
+    assert not (home / "tools" / "edit_image.py").exists()  # only the named one
+
+
+def test_upgrade_grandfathers_a_previously_scaffolded_power_tool_loudly(tmp_path):
+    # Grandfather (capital decision, issue #168): a power tool a prior version laid down is KEPT
+    # on upgrade, never silently stripped — and reported loudly in `grandfathered`.
+    home = tmp_path / "cfg"
+    # Simulate a pre-#168 install that scaffolded generate_image as a default (opt it in here).
+    install(home, opt_in=["generate_image"])
+    assert (home / "tools" / "generate_image.py").exists()
+
+    # A later upgrade with no opt-in: the file is recorded, so it is grandfathered, not pruned.
+    report = install(home)
+
+    assert (home / "tools" / "generate_image.py").exists()  # kept
+    assert "tools/generate_image.py" in report.grandfathered
+    assert "grandfathered" in report.summary() and "generate_image" in report.summary()
+
+
+def test_a_fresh_install_does_not_grandfather_anything(tmp_path):
+    report = install(tmp_path / "cfg")
+    assert report.grandfathered == []
+
+
+def test_a_deleted_grandfathered_power_tool_is_not_reported_as_kept(tmp_path):
+    # An operator who DELETES a grandfathered power tool must not be told it was "kept" — the
+    # report is gated on the file actually existing on disk, not on the reconcile action (a
+    # deleted-but-source-unchanged file reconciles as UNCHANGED, not KEPT_DELETED).
+    home = tmp_path / "cfg"
+    install(home, opt_in=["generate_image"])  # a prior install scaffolded it
+    (home / "tools" / "generate_image.py").unlink()  # operator drops the capability
+
+    report = install(home)  # same-source upgrade
+
+    assert not (home / "tools" / "generate_image.py").exists()  # stays deleted, never resurrected
+    assert "tools/generate_image.py" not in report.grandfathered  # and NOT reported as kept
+
+
+def test_opt_in_with_an_unknown_stem_warns_loudly(tmp_path, caplog):
+    # The stem-vs-name trap: --opt-in listen (the tool name, not the file stem hear_audio) matches
+    # nothing and would scaffold silently — so it warns, naming the known opt-in tools.
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        install(tmp_path / "cfg", opt_in=["listen", "generate_image"])
+
+    assert "listen" in caplog.text and "hear_audio" in caplog.text
+    assert (tmp_path / "cfg" / "tools" / "generate_image.py").exists()  # the valid one still lands
 
 
 def test_install_records_every_shipped_default_hash_in_the_manifest(tmp_path):
@@ -306,6 +368,47 @@ def test_plugin_source_providers_treats_broken_source_as_universal():
     assert plugin_source_providers("this is not valid python :(") is None
 
 
+# --- the opt-in capability classifier (issue #168) ---------------------------
+
+_OPT_IN_SRC = "from basecradle_harness import GenerateImageTool, OpenAIKey, ToolPlugin\nPLUGIN = ToolPlugin(impl=GenerateImageTool, requires=(OpenAIKey(),), opt_in=True)\n"
+
+
+def test_plugin_opts_in_detects_the_flag_without_importing():
+    # The safety classifier: opt_in=True → powerful; absent or not-the-True-constant → benign.
+    assert plugin_opts_in(_OPT_IN_SRC) is True
+    assert plugin_opts_in(_OPENAI_KEY_SRC) is False  # no opt_in keyword → benign
+    assert plugin_opts_in(_UNIVERSAL_SRC) is False
+    # A non-`True` value must NOT read as opt-in (so a refactor to truthiness can't mis-bucket).
+    assert plugin_opts_in("PLUGIN = ToolPlugin(impl=X, opt_in=False)\n") is False
+    assert plugin_opts_in("PLUGIN = ToolPlugin(impl=X, opt_in=1)\n") is False
+    assert (
+        plugin_opts_in("flag = True  # opt_in=True only in a comment\nP = ToolPlugin(impl=X)")
+        is False
+    )
+    # Unparseable source → benign (fail-open to a defect the loader surfaces, never silently power).
+    assert plugin_opts_in("this is not valid python :(") is False
+
+
+def test_every_shipped_power_tool_default_is_classified_opt_in():
+    # The whole safety guarantee rests on these seven being flagged — pin it against the package.
+    from importlib.resources import files
+
+    power_stems = set()
+    root = files("basecradle_harness").joinpath("_defaults", "tools")
+    for child in root.iterdir():
+        if child.name.endswith(".py") and plugin_opts_in(child.read_text()):
+            power_stems.add(child.name[: -len(".py")])
+    assert power_stems == {
+        "generate_image",
+        "edit_image",
+        "hear_audio",
+        "web_search",
+        "xai_search",  # declares both web_search + x_search built-ins, both opt_in
+        "grok_generate_image",
+        "grok_generate_video",
+    }
+
+
 def test_plugin_relevant_to_gates_on_the_active_provider():
     assert plugin_relevant_to(_XAI_SRC, "xai")
     assert not plugin_relevant_to(_XAI_SRC, "openai")
@@ -320,44 +423,49 @@ def test_plugin_relevant_to_gates_on_the_active_provider():
 # The shipped tool defaults, by provider affinity (mirrors the real `_defaults/tools/`).
 _XAI_DEFAULTS = {"grok_generate_image.py", "grok_generate_video.py", "xai_search.py"}
 _OPENAI_DEFAULTS = {"generate_image.py", "edit_image.py", "hear_audio.py", "web_search.py"}
+# Every provider-affine default is now a powerful, opt-in tool (issue #168), so provider
+# affinity is observable at scaffold time only when the tool is explicitly opted in.
+_ALL_POWER_STEMS = [name[: -len(".py")] for name in _XAI_DEFAULTS | _OPENAI_DEFAULTS]
 
 
 def _tool_files(home):
     return {p.name for p in (home / "tools").glob("*.py")}
 
 
-def test_install_for_openai_omits_the_grok_and_xai_tool_defaults(tmp_path):
-    # The @jt fix: a provider-aware install lays down no grok/xAI plugin on an OpenAI agent.
+def test_opt_in_for_openai_lays_down_openai_power_tools_not_grok(tmp_path):
+    # Opt-in composes with provider affinity (issue #160 + #168): opting in every power tool on
+    # an OpenAI agent lays down the OpenAI-coupled ones and never the grok/xAI ones (mismatched).
     home = tmp_path / "cfg"
-    install(home, provider="openai")
+    install(home, provider="openai", opt_in=_ALL_POWER_STEMS)
     files = _tool_files(home)
-    assert _XAI_DEFAULTS.isdisjoint(files)  # no grok/xai clutter
-    assert _OPENAI_DEFAULTS <= files  # the OpenAI-coupled defaults are present
-    assert "assets.py" in files  # universal defaults are always present
+    assert _XAI_DEFAULTS.isdisjoint(files)  # grok/xai are provider-mismatched → never laid down
+    assert _OPENAI_DEFAULTS <= files  # the opted-in OpenAI-coupled power tools are present
+    assert "assets.py" in files  # benign universal defaults are always present
 
 
-def test_install_for_xai_omits_the_openai_coupled_tool_defaults(tmp_path):
+def test_opt_in_for_xai_lays_down_grok_tools_not_openai_coupled(tmp_path):
     home = tmp_path / "cfg"
-    install(home, provider="xai")
+    install(home, provider="xai", opt_in=_ALL_POWER_STEMS)
     files = _tool_files(home)
     assert _XAI_DEFAULTS <= files
     assert _OPENAI_DEFAULTS.isdisjoint(files)
     assert "assets.py" in files
 
 
-def test_install_unfiltered_lays_down_every_provider_default(tmp_path):
-    # The direct API default (provider=None) is provider-blind — every default, as before.
+def test_install_without_opt_in_lays_down_no_power_tools_on_any_provider(tmp_path):
+    # The safe default everywhere (issue #168): no opt-in → no power tool scaffolded, period.
     home = tmp_path / "cfg"
     install(home)
     files = _tool_files(home)
-    assert _XAI_DEFAULTS <= files and _OPENAI_DEFAULTS <= files
+    assert (_XAI_DEFAULTS | _OPENAI_DEFAULTS).isdisjoint(files)
+    assert "assets.py" in files  # benign defaults still present
 
 
-def test_a_provider_switch_prunes_pristine_mismatched_defaults(tmp_path):
-    # The @jt de-clutter: a provider-blind install left grok/xai files; a later provider-aware
-    # reconcile removes them (they are ours, recorded, and pristine).
+def test_a_provider_switch_prunes_a_pristine_mismatched_opted_in_default(tmp_path):
+    # A power tool opted in under one provider is pruned by a switch to a mismatched provider —
+    # the @jt de-clutter, now on the opt-in path (provider mismatch wins over grandfather).
     home = tmp_path / "cfg"
-    install(home)  # provider-blind: grok/xai present
+    install(home, opt_in=_ALL_POWER_STEMS)  # provider-blind: grok/xai present
     assert _XAI_DEFAULTS <= _tool_files(home)
 
     report = install(home, provider="openai")
@@ -365,7 +473,7 @@ def test_a_provider_switch_prunes_pristine_mismatched_defaults(tmp_path):
     assert _XAI_DEFAULTS.isdisjoint(_tool_files(home))  # pruned off disk
     for name in _XAI_DEFAULTS:
         assert report.actions[f"tools/{name}"] == PRUNED
-    # The manifest no longer tracks the pruned defaults, and the openai-coupled ones remain.
+    # The manifest no longer tracks the pruned defaults; the openai-coupled ones are grandfathered.
     manifest = json.loads((home / _MANIFEST_NAME).read_text())
     assert not any(name in key for key in manifest for name in _XAI_DEFAULTS)
     assert "tools/generate_image.py" in manifest
@@ -374,7 +482,7 @@ def test_a_provider_switch_prunes_pristine_mismatched_defaults(tmp_path):
 def test_a_prune_keeps_an_operator_edited_mismatched_default(tmp_path):
     # If the operator edited a now-mismatched default, their edit wins — it is NOT pruned.
     home = tmp_path / "cfg"
-    install(home)
+    install(home, opt_in=_ALL_POWER_STEMS)
     edited = home / "tools" / "xai_search.py"
     edited.write_text("# my hand-tuned version\n" + edited.read_text())
 
@@ -523,11 +631,22 @@ def test_cli_installs_to_the_given_config_home(tmp_path, capsys):
     assert str(tmp_path / "cfg") in out
 
 
-def test_cli_is_provider_aware_from_the_env_by_default(tmp_path, monkeypatch, capsys):
-    # A bare install on an OpenAI agent (AI_PROVIDER=openai) lays down no grok/xAI clutter.
+def test_cli_bare_install_lays_down_no_power_tools(tmp_path, monkeypatch, capsys):
+    # A bare CLI install lays down no powerful tools on any provider (issue #168) — only benign.
     monkeypatch.setenv("AI_PROVIDER", "openai")
     home = tmp_path / "cfg"
     main(["--config-home", str(home)])
+    capsys.readouterr()
+    assert (_XAI_DEFAULTS | _OPENAI_DEFAULTS).isdisjoint(_tool_files(home))
+    assert "assets.py" in _tool_files(home)
+
+
+def test_cli_opt_in_is_provider_aware_from_the_env(tmp_path, monkeypatch, capsys):
+    # --opt-in composes with the env provider: on an OpenAI agent it lays down the opted-in
+    # OpenAI power tools, never the grok/xAI ones (mismatched).
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    home = tmp_path / "cfg"
+    main(["--config-home", str(home), "--opt-in", ",".join(_ALL_POWER_STEMS)])
     capsys.readouterr()
     assert _XAI_DEFAULTS.isdisjoint(_tool_files(home))
     assert _OPENAI_DEFAULTS <= _tool_files(home)
@@ -536,15 +655,15 @@ def test_cli_is_provider_aware_from_the_env_by_default(tmp_path, monkeypatch, ca
 def test_cli_all_providers_disables_the_filter(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AI_PROVIDER", "openai")
     home = tmp_path / "cfg"
-    main(["--config-home", str(home), "--all-providers"])
+    main(["--config-home", str(home), "--all-providers", "--opt-in", ",".join(_ALL_POWER_STEMS)])
     capsys.readouterr()
-    assert _XAI_DEFAULTS <= _tool_files(home)  # every default, provider-blind
+    assert _XAI_DEFAULTS <= _tool_files(home)  # every opted-in power tool, provider-blind
 
 
 def test_cli_provider_flag_overrides_the_env(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("AI_PROVIDER", "openai")
     home = tmp_path / "cfg"
-    main(["--config-home", str(home), "--provider", "xai"])
+    main(["--config-home", str(home), "--provider", "xai", "--opt-in", ",".join(_ALL_POWER_STEMS)])
     capsys.readouterr()
     assert _XAI_DEFAULTS <= _tool_files(home)
     assert _OPENAI_DEFAULTS.isdisjoint(_tool_files(home))
