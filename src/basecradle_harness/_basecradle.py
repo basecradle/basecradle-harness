@@ -30,9 +30,9 @@ identical in the env, the code, and the docs:
   the one ``openai`` SDK adapter (xAI's endpoint speaks the same wire — ``AI_PROVIDER=xai`` points
   the SDK at ``api.x.ai``, issue #163); ``openrouter`` is a later milestone.
 - ``AI_SDK``                  — the **library/package name** of the SDK the harness imports to
-  reach the model: ``openai`` (default), later ``xai-sdk``, etc. The value is the importable
+  reach the model: ``openai`` (default), and ``xai-sdk`` (the committed next phase, #165). The value is the importable
   package, which also disambiguates it from the provider token (``AI_PROVIDER=xai`` selects
-  xAI's *endpoint*; ``AI_SDK=xai-sdk`` would select xAI's *native SDK*). The harness reaches an
+  xAI's *endpoint*; ``AI_SDK=xai-sdk`` selects xAI's *native SDK*, #165). The harness reaches an
   LLM **only** through a vendor SDK; with the named SDK not installed it comes up with no way to
   reach a model and says so. v0 ships exactly one adapter, ``openai``.
 - ``AI_MODEL``                — the model id (e.g. ``gpt-5.4-mini``).
@@ -544,7 +544,7 @@ def _provider_from_config(
     if sdk != "openai":
         raise ValueError(
             f"AI_SDK={sdk!r} has no adapter yet — v0 implements only the 'openai' vendor SDK. "
-            "Set AI_SDK=openai (the native 'xai-sdk' adapter is a later milestone)."
+            "Set AI_SDK=openai (the native 'xai-sdk' adapter is the committed next phase, #165)."
         )
     if provider not in ("openai", "xai"):
         raise ValueError(

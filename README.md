@@ -45,7 +45,7 @@ compatible = OpenAIProvider(
 )
 ```
 
-> The vendor axes are independent: **`AI_PROVIDER`** (whose endpoint + key), **`AI_SDK`** (the package the harness imports), and **`AI_MODEL`**. v0 implements `AI_SDK=openai` — and because xAI's endpoint speaks the same wire, that one adapter already runs the all-xAI [`xai` profile](#go-all-xai--the-xai-profile) (the `openai` SDK pointed at `api.x.ai`). A native `xai-sdk` adapter and OpenRouter are later milestones.
+> The vendor axes are independent: **`AI_PROVIDER`** (whose endpoint + key), **`AI_SDK`** (the package the harness imports), and **`AI_MODEL`**. v0 implements `AI_SDK=openai` — and because xAI's endpoint speaks the same wire, that one adapter already runs the all-xAI [`xai` profile](#go-all-xai--the-xai-profile) (the `openai` SDK pointed at `api.x.ai`). The native `xai-sdk` adapter is the **committed next phase** ([#165](https://github.com/basecradle/basecradle-harness/issues/165)); OpenRouter follows. BaseCradle is a research lab — the harness builds out the **full** provider × SDK × surface matrix, additively.
 
 ## One agent, many channels — shared memory, separate conversations
 
@@ -478,7 +478,7 @@ AI_MODEL=grok-4.3      # grok runs the conversation
 # AI_BASE_URL defaults to https://api.x.ai/v1 under this provider — override only to proxy
 ```
 
-> **Reached through the `openai` SDK — not harness HTTP.** xAI is reachable two independent ways, and the harness keeps the axes straight: the **provider** (`AI_PROVIDER=xai`, whose endpoint + key) versus the **SDK** (`AI_SDK`, the package the harness imports). v0 ships one SDK adapter, `openai`, and xAI's compat endpoint speaks the same wire — **both** `/v1/chat/completions` *and* `/v1/responses` — so `AI_PROVIDER=xai` + `AI_SDK=openai` runs `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or* `chat` surface (`AI_SDK_SURFACE`). This honors *harness ↔ LLM only through a vendor SDK* (no harness-owned HTTP for the model). A native `xai-sdk` adapter is a later milestone, built only when an xAI-only need forces it.
+> **Reached through the `openai` SDK — not harness HTTP.** xAI is reachable two independent ways, and the harness keeps the axes straight: the **provider** (`AI_PROVIDER=xai`, whose endpoint + key) versus the **SDK** (`AI_SDK`, the package the harness imports). v0 ships one SDK adapter, `openai`, and xAI's compat endpoint speaks the same wire — **both** `/v1/chat/completions` *and* `/v1/responses` — so `AI_PROVIDER=xai` + `AI_SDK=openai` runs `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or* `chat` surface (`AI_SDK_SURFACE`). This honors *harness ↔ LLM only through a vendor SDK* (no harness-owned HTTP for the model). This `xai`/`openai`/`responses`-or-`chat` cell is a permanent, fully supported option — and the native `xai-sdk` adapter is the **committed next phase** ([#165](https://github.com/basecradle/basecradle-harness/issues/165)), where the Grok personas make their home. Full optionality: every combination is built out, additively.
 
 The provider is also the **activation discriminator**: `AI_PROVIDER=xai` turns xAI's Live-Search built-ins and the grok media tools **on**, and the OpenAI-coupled tools (`generate_image`, `edit_image`, `listen`) **off** — so an xAI agent gets a clean, all-xAI tool set *by construction*, not by hand-curation. The BaseCradle platform tools (assets, tasks, timelines, trust, …) compose under it unchanged.
 

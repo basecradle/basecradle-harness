@@ -35,7 +35,10 @@ correction that brings xAI under the "vendor-SDK only" spine (#158).
 
 - **Config rename — breaking:** `AI_OPENAI_SURFACE` → `AI_SDK_SURFACE` (no deprecation alias).
 - **`AI_SDK` token convention documented** — the value is the SDK's library/package name
-  (`openai`, later `xai-sdk`), which also disambiguates it from the provider token.
+  (`openai`, and `xai-sdk` once the **committed next phase** (#165) lands), which also
+  disambiguates it from the provider token. The `xai`/`openai`/`responses`-or-`chat` cell this
+  release adds is a permanent matrix option — BaseCradle builds the full provider × SDK × surface
+  matrix additively, not "only when forced."
 
 ### Removed
 
