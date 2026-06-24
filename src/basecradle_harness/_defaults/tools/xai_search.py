@@ -7,15 +7,19 @@
 # carries a different requirement, so exactly one activates per config — the resolver settles it.
 from basecradle_harness import ToolPlugin, Vendor
 
+# Powerful (web/X search) → opt_in everywhere (issue #168): off by default, overlay opt-in only.
+# `requires` gates availability (the xai provider), never the safety default.
 PLUGINS = [
     ToolPlugin(
         builtin="web_search",
         requires=(Vendor("xai"),),
         note="xAI Live Search of the web — grok searches and cites live sources itself.",
+        opt_in=True,
     ),
     ToolPlugin(
         builtin="x_search",
         requires=(Vendor("xai"),),
         note="xAI Live Search of X (Twitter) — grok searches posts and cites them itself.",
+        opt_in=True,
     ),
 ]

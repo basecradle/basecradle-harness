@@ -7,7 +7,10 @@
 # plugin claims the `web_search` name instead (exactly one activates per config).
 from basecradle_harness import OpenAISurface, ToolPlugin, Vendor
 
+# Powerful (web search) → opt_in everywhere (issue #168): off by default, overlay opt-in only.
+# `requires` gates availability (openai + responses surface), never the safety default.
 PLUGIN = ToolPlugin(
     builtin="web_search",
     requires=(Vendor("openai"), OpenAISurface("responses")),
+    opt_in=True,
 )

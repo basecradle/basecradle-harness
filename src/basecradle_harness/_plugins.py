@@ -203,6 +203,17 @@ class ToolPlugin:
     irreversibility). It is rendered into the generated tool manifest (the persistent Turn-0
     brief) beside the tool's name; a plugin without one just lists its name. Additive — an
     existing plugin that sets no `note` is unaffected.
+
+    `opt_in` marks a **powerful/dangerous** tool — media generation (image, video, audio),
+    web/X search, code execution — that must **fail closed**: it is **off by default on every
+    provider** (issue #168) and activates **only** when the operator explicitly drops it into a
+    persona's ``tools/`` overlay (the same "ships empty" pattern as ``mcp/``). An opt-in plugin
+    is **not** auto-loaded from the packaged defaults and **not** auto-scaffolded by the
+    installer; a benign/platform plugin (the default, ``opt_in=False``) keeps the normal
+    shipped-default → install-then-prune behavior. This is a **capability** classification,
+    **provider-agnostic** — the `requires` gate (`Vendor`/`OpenAIKey`) decides *availability*,
+    never the safety default. Detected from source (AST) by `_install.plugin_opts_in` so the
+    installer and loader agree without importing the plugin.
     """
 
     impl: type[Tool] | None = None
@@ -210,6 +221,7 @@ class ToolPlugin:
     requires: tuple[Requirement, ...] = ()
     name: str | None = None
     note: str | None = None
+    opt_in: bool = False
 
     def __post_init__(self) -> None:
         if (self.impl is None) == (self.builtin is None):
@@ -385,14 +397,19 @@ def load_plugins_report(
     tools_installed = any(key.startswith("tools/") for key in _read_manifest(root))
     if tools_installed:
         # Installed → the overlay is authoritative; a removed dir/files is the operator's
-        # deletion, honored (zero tools), never resurrected from the packaged defaults.
+        # deletion, honored (zero tools), never resurrected from the packaged defaults. A
+        # powerful (`opt_in`) plugin *present here* is an explicit per-persona opt-in — kept.
         plugins, broken = _load_dir(tools_dir, provider) if tools_dir.is_dir() else ([], [])
     else:
-        # Not yet installed for tools → load the packaged defaults straight from the package.
+        # Not yet installed for tools → load the packaged defaults straight from the package,
+        # but **drop the opt-in (powerful) defaults**: they fail closed and activate only when
+        # explicitly dropped into a persona's overlay (issue #168), never from the packaged
+        # fallback. A default-riding persona thus resolves to benign/platform tools only.
         with resources.as_file(
             resources.files("basecradle_harness").joinpath(*_DEFAULTS_TOOLS)
         ) as p:
             plugins, broken = _load_dir(Path(p), provider)
+        plugins = [plugin for plugin in plugins if not plugin.opt_in]
     return _classify_broken(plugins, broken)
 
 
