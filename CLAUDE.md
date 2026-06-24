@@ -34,16 +34,16 @@ These are settled. Seven decisions, in dependency order of importance:
 
 2. **One core, two profiles.** A provider-agnostic **agent engine** that knows nothing about "safe." Harness = engine + a **locked policy** (no shell/exec, curated tools). Cradle (later) = the *same engine* + an **unlocked policy** (shell, sudo, self-modification). We do **not** extract a separate `core` package yet — it lives here until Cradle proves it needs its own distribution. This is why "a Cradle AI spawns Harness sub-agents" comes for free: same engine, different policy.
 
-3. **Provider abstraction — *vendor-SDK only* (corrected, issue #158).** A thin `Provider` protocol — chat + tool-calling, nothing more — but the harness reaches an LLM **only through a vendor's official SDK, 100% of the time**: it ships **zero** of its own code to hit a model endpoint; no SDK installed → it cannot reach a model, by design. The config is **three independent axes** — `AI_PROVIDER` (whose endpoint + key), `AI_SDK` (the PyPI package the harness imports), `AI_MODEL` — and each agent installs only its SDK as an *extra* (`pip install 'basecradle-harness[openai]'`, which pins the SDK version). The **SDK picks the adapter; the provider picks the endpoint** (its default `base_url` + key, `_PROVIDER_BASE_URLS`, overridable by `AI_BASE_URL`). **v0 ships exactly one adapter: `openai`** (`OpenAIProvider`, both the Responses and Chat Completions surfaces via the `openai` package). Other SDK adapters (`xai-sdk`, OpenRouter, Anthropic) slot in later without touching the engine. **Adding a provider = one thin adapter wrapping the real SDK.**
+3. **Provider abstraction — *vendor-SDK only* (corrected, issue #158).** A thin `Provider` protocol — chat + tool-calling, nothing more — but the harness reaches an LLM **only through a vendor's official SDK, 100% of the time**: it ships **zero** of its own code to hit a model endpoint; no SDK installed → it cannot reach a model, by design. The config is **three independent axes** — `AI_PROVIDER` (whose endpoint + key), `AI_SDK` (the PyPI package the harness imports), `AI_MODEL` — and each agent installs only its SDK as an *extra* (`pip install 'basecradle-harness[openai]'`, which pins the SDK version). The **SDK picks the adapter; the provider picks the endpoint** (its default `base_url` + key, `_PROVIDER_BASE_URLS`, overridable by `AI_BASE_URL`). **v0 ships exactly one adapter: `openai`** (`OpenAIProvider`, both the Responses and Chat Completions surfaces via the `openai` package); the native **`xai-sdk`** adapter is the **committed next phase** (issue #165), and OpenRouter / Anthropic follow. **BaseCradle is a research lab: the harness supports the *full* provider × SDK × surface matrix — full optionality, built out completely and additively, in phases.** Nothing here is "only when forced"; each adapter slots in without touching the engine. **Adding a provider = one thin adapter wrapping the real SDK.**
 
-   **`AI_SDK` token convention.** The value is the SDK's **library/package name** (`openai`, later `xai-sdk`) — what you'd `pip install` and `import`. This also disambiguates the SDK token from the provider token: `AI_PROVIDER=xai` selects xAI's *endpoint*; `AI_SDK=xai-sdk` would select xAI's *native SDK*.
+   **`AI_SDK` token convention.** The value is the SDK's **library/package name** (`openai`, and `xai-sdk` once #165 lands) — what you'd `pip install` and `import`. This also disambiguates the SDK token from the provider token: `AI_PROVIDER=xai` selects xAI's *endpoint*; `AI_SDK=xai-sdk` selects xAI's *native SDK* (the committed next phase, #165).
 
    **`surface` is a first-class, SDK-scoped concept with a uniform contract** (issue #163). A single SDK can speak a provider in more than one wire surface; the contract that governs *every* multi-surface SDK, so the next one needs no re-litigation:
    - Each SDK adapter declares its own `SURFACES` (allowed set) and `DEFAULT_SURFACE`. The `openai` adapter declares `("responses", "chat")` / `responses`; a single-surface SDK declares none.
    - `AI_SDK_SURFACE` selects among the **active** adapter's surfaces: **omitted → that adapter's `DEFAULT_SURFACE`**; **provided → validated against its `SURFACES`, hard-fail otherwise** (`_resolve_surface`). The one rule catches both a typo and a surface set on a single-surface SDK. The openai-shaped default does **not** live in the generic config reader.
    - `AI_SDK_SURFACE` is optional globally; single-surface SDKs never set it.
 
-   **xAI is reached through the `openai` SDK (issue #163), retiring the hand-rolled httpx path.** xAI's compat endpoint speaks the same wire as OpenAI — **both** `/v1/chat/completions` and `/v1/responses` — so `AI_PROVIDER=xai` + `AI_SDK=openai` runs `grok-4.3` through the real `openai` SDK pointed at `api.x.ai` (default `base_url`), over the `responses` *or* `chat` surface. This brings xAI under the "vendor-SDK only" spine; the earlier hand-rolled `httpx` "OpenAI-compatible" adapter (`OpenAIResponsesProvider`) that issue #158 began eliminating is now **deleted**, not merely on death row. **The web_search wiring diverges by endpoint vendor:** OpenAI's Responses runs web search from a `tools:[{type:"web_search"}]` entry; xAI runs Live Search from a top-level **`search_parameters`** body field (docs.x.ai) and does *not* accept the OpenAI entry — so under `AI_PROVIDER=xai` the active `web_search`/`x_search` built-ins are translated to `search_parameters` (`_xai_search_parameters`) and forwarded through the SDK's vendor-neutral `extra_body`, on both surfaces. A native `xai-sdk` adapter remains a later milestone (YAGNI). *(History: the Phase-2 sections below — the Eddie Murphy profile especially — predate this #163 correction and describe the earlier `httpx`/`OpenAIResponsesProvider`/`AI_PROVIDER_API` era; where they conflict with this point, this point wins.)*
+   **xAI is reached through the `openai` SDK (issue #163), retiring the hand-rolled httpx path.** xAI's compat endpoint speaks the same wire as OpenAI — **both** `/v1/chat/completions` and `/v1/responses` — so `AI_PROVIDER=xai` + `AI_SDK=openai` runs `grok-4.3` through the real `openai` SDK pointed at `api.x.ai` (default `base_url`), over the `responses` *or* `chat` surface. This brings xAI under the "vendor-SDK only" spine; the earlier hand-rolled `httpx` "OpenAI-compatible" adapter (`OpenAIResponsesProvider`) that issue #158 began eliminating is now **deleted**, not merely on death row. **The web_search wiring diverges by endpoint vendor:** OpenAI's Responses runs web search from a `tools:[{type:"web_search"}]` entry; xAI runs Live Search from a top-level **`search_parameters`** body field (docs.x.ai) and does *not* accept the OpenAI entry — so under `AI_PROVIDER=xai` the active `web_search`/`x_search` built-ins are translated to `search_parameters` (`_xai_search_parameters`) and forwarded through the SDK's vendor-neutral `extra_body`, on both surfaces. This `xai`/`openai`/`responses`-or-`chat` cell is a fully supported, permanent matrix option — **not** thrown away by what comes next: the native **`xai-sdk`** adapter is the **committed next phase** (issue #165), where the Grok personas (eddie/pinky/the-brain) make their home; this cell stays available to any AI that wants it. *(History: the Phase-2 sections below — the Eddie Murphy profile especially — predate this #163 correction and describe the earlier `httpx`/`OpenAIResponsesProvider`/`AI_PROVIDER_API` era; that whole section is now superseded by the reconciled note in its own header.)*
 
 4. **Tool interface + policy layer.** A tool is a small class with a `name`, JSON-schema parameters, and a `run()` method, registered in a `ToolRegistry`. A **policy layer** gates which tools a profile may load — Harness denies shell/exec **by construction, not by convention**. A contributor adds a capability by writing one tool class. **Memory** is the single shipped example tool: file/SQLite-backed, deliberately simple and swappable (Letta/MemGPT is reference reading, not something to clone).
 
@@ -575,36 +575,38 @@ matrix and **closes the handoff issue by hand** after that live verify).
 
 ### Eddie Murphy — the xAI-native profile (Live Search + grok media)
 
-> **Superseded in part by issue #163 (see spine point 3).** The *chat model path* described here
-> changed: the `xai` profile no longer uses the hand-rolled httpx `OpenAIResponsesProvider` (now
-> **deleted**) — `AI_PROVIDER=xai` + `AI_SDK=openai` reaches `grok-4.3` through the real `openai`
-> SDK pointed at `api.x.ai`, over the `responses` *or* `chat` surface (`AI_SDK_SURFACE`). Live
-> Search wires via xAI's `search_parameters` body field (through the SDK's `extra_body`), **not**
-> a `tools:[{type:web_search}]` entry — xAI does not accept OpenAI's tools shape (the README claim
-> that xAI "deprecated `search_parameters`" was wrong). The selector env var is `AI_PROVIDER`
-> (not the historical `AI_PROVIDER_API`). The **grok media tools** (`_grok.py`, `grok_generate_*`)
-> are unchanged — they hit xAI's Images/Video endpoints directly over httpx, independent of the
-> chat SDK. The narrative below is retained as history; where it conflicts, #163 / spine point 3 wins.
+> **Superseded by issues #163 and #165 (see spine point 3) — read this banner, not the dated
+> narrative below it.** Two corrections to the original Eddie work, both now authoritative:
+>
+> 1. **The chat model path changed (#163).** The `xai` profile no longer uses the hand-rolled
+>    httpx `OpenAIResponsesProvider` (now **deleted**). `AI_PROVIDER=xai` + `AI_SDK=openai` reaches
+>    `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or*
+>    `chat` surface (`AI_SDK_SURFACE`). The selector env var is `AI_PROVIDER` (not the historical
+>    `AI_PROVIDER_API`).
+> 2. **`search_parameters` was never deprecated** — that earlier claim was simply **wrong**. xAI
+>    runs Live Search from a top-level `search_parameters` body field on *both* its chat and
+>    responses surfaces, and does **not** accept OpenAI's `tools:[{type:web_search}]` entry. So
+>    under `AI_PROVIDER=xai` the harness translates the active `web_search`/`x_search` built-ins
+>    to `search_parameters`, forwarded through the SDK's `extra_body`.
+>
+> And the original "no new adapter class" premise is also reversed: the native **`xai-sdk`**
+> adapter **is** the committed next phase (issue #165), where eddie/pinky/the-brain make their
+> home. The **grok media tools** (`_grok.py`, `grok_generate_*`) are unchanged — they hit xAI's
+> Images/Video endpoints directly over httpx, independent of the chat SDK.
 
-The harness's **"done-bar" acceptance work**: a fully-xAI persona whose stack touches **no
-OpenAI surface** — not the provider, not the key, not the tools. Two axes, kept straight (the
+The harness's **"done-bar" acceptance work**: a fully-xAI persona. Two axes, kept straight (the
 founder was emphatic): the **provider adapter** (harness code / wire format) vs. the **endpoint
-vendor** (`base_url`).
+vendor** (`base_url`). The original handoff anticipated a brand-new native xAI adapter; the #163
+phase delivered the openai-SDK-at-xAI cell first, and the native `xai-sdk` adapter follows in
+#165 (so the once-"no new adapter class" framing no longer holds).
 
-**A framing correction shaped this** (a founder decision on the handoff): the issue anticipated
-a brand-new *native xAI adapter* driving Chat Completions `search_parameters`, but xAI
-**deprecated `search_parameters` on 2026-01-12** in favor of server-side search **tools on the
-Responses API**. So there is **no new adapter class** — building one on a deprecated path would
-be building on sand, and the Responses route is xAI's current one. The "OpenAI" in
-`OpenAIResponsesProvider` is the **wire format, not the vendor**: xAI's API speaks the Responses
-wire, so the `xai` profile *reuses that adapter* pointed at `api.x.ai`.
-
-- **`AI_PROVIDER_API=xai` — the profile selector** (`_provider_from_env`). Builds
-  `OpenAIResponsesProvider` defaulted to `https://api.x.ai/v1` (`AI_PROVIDER_BASE_URL` still
-  overrides), runs **grok-4.3** chat, and is the **activation discriminator**: it turns xAI's
-  Live-Search built-ins and the grok media tools **on** and the OpenAI-coupled tools **off**, so
-  the all-xAI stack is correct **by construction**, not by operator curation. BaseCradle tools
-  compose under it unchanged.
+- **The profile selector** (`_provider_from_env`, now keyed on `AI_PROVIDER=xai`) builds the chat
+  provider defaulted to `https://api.x.ai/v1` (`AI_BASE_URL` overrides), runs **grok-4.3** chat,
+  and is the **activation discriminator**: it turns xAI's Live-Search built-ins and the grok media
+  tools **on** and the OpenAI-coupled tools **off**, so the all-xAI stack is correct **by
+  construction**, not by operator curation. BaseCradle tools compose under it unchanged. *(Tool
+  gating moves to per-persona in #165 — provider-based gating would silently arm the adversarial
+  tool-less personas; see #165.)*
 - **Live Search = server-side built-ins, not a function tool** (`_defaults/tools/xai_search.py`):
   `web_search` (live web) + `x_search` (live 𝕏), gated on the `xai` profile. grok runs the search
   itself and returns sourced answers; xAI's Responses API emits OpenAI-style `url_citation`
