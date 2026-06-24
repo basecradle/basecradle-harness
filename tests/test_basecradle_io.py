@@ -8,6 +8,7 @@ fictional cast: Nova Digital (handle ``nova``, AI) is the agent; John Doe
 
 import json
 import os
+from pathlib import Path
 
 import httpx
 import pytest
@@ -20,6 +21,7 @@ from basecradle_harness import (
     Message,
     OpenAIProvider,
     TimelineAgent,
+    XaiSdkProvider,
     config_home,
     install,
 )
@@ -654,13 +656,34 @@ def test_config_from_env_rejects_an_unknown_surface(monkeypatch):
         _config_from_env()
 
 
-def test_config_from_env_rejects_a_surface_on_a_surfaceless_sdk(monkeypatch):
-    # The single rule also catches a surface set on an SDK that declares none (single-surface or
-    # not-yet-built) — here a hypothetical native xai-sdk.
+def test_config_from_env_xai_sdk_single_native_surface(monkeypatch):
+    # The native xai-sdk declares one surface ("native"); AI_SDK_SURFACE is left unset → it
+    # resolves to that default, and any *other* value fails clearly (issue #165).
     monkeypatch.setenv("AI_SDK", "xai-sdk")
+    monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
+    assert _config_from_env() == ("openai", "xai-sdk", "native")
+
     monkeypatch.setenv("AI_SDK_SURFACE", "responses")
     with pytest.raises(ValueError, match="AI_SDK_SURFACE"):
         _config_from_env()
+
+
+def test_provider_from_config_xai_sdk_builds_the_native_adapter(monkeypatch):
+    # AI_SDK=xai-sdk + AI_PROVIDER=xai → the native gRPC adapter (issue #165).
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    provider = _provider_from_config("xai", "xai-sdk", "native", builtins=["web_search"])
+    assert isinstance(provider, XaiSdkProvider)
+    assert provider._builtin_tools == ["web_search"]
+    provider.close()
+
+
+def test_provider_from_config_xai_sdk_requires_the_xai_provider(monkeypatch):
+    # The native SDK only reaches xAI's endpoint — pairing it with another provider fails clearly.
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    with pytest.raises(ValueError, match="AI_PROVIDER=xai"):
+        _provider_from_config("openai", "xai-sdk", "native")
 
 
 def test_provider_from_config_openai_builds_the_sdk_adapter(monkeypatch):
@@ -798,6 +821,58 @@ def test_from_env_wires_the_xai_profile_with_live_search_builtins(platform, monk
     names = {t.name for t in agent.harness.tools}
     assert {"grok_generate_image", "grok_generate_video"} <= names
     assert not ({"generate_image", "edit_image", "listen"} & names)
+
+
+def test_from_env_native_xai_sdk_eddie_keeps_his_opted_in_grok_tools(platform, monkeypatch):
+    """Eddie's end state (issue #165): AI_SDK=xai-sdk → the native gRPC brain, his grok tools kept.
+
+    The tool-neutral migration: the *brain* moves to the native SDK, but Eddie's tool-set is his
+    own per-persona overlay — opt-in grok tools, unchanged by the SDK swap.
+    """
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("AI_SDK", "xai-sdk")
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    install(
+        os.environ["BASECRADLE_CONFIG_HOME"],
+        provider="xai",
+        opt_in=["grok_generate_image", "grok_generate_video"],
+    )
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+
+    agent = TimelineAgent.from_env()
+
+    assert isinstance(agent.harness.provider, XaiSdkProvider)  # the native gRPC brain
+    names = {t.name for t in agent.harness.tools}
+    assert {"grok_generate_image", "grok_generate_video"} <= names  # his opted-in tools, kept
+
+
+def test_from_env_native_xai_sdk_adversarial_persona_resolves_tool_less(platform, monkeypatch):
+    """The safety crux (issues #165 + #168): an xai-sdk persona with an empty overlay gets the
+    native brain and is NOT armed by the SDK — no powerful tools, no platform tools."""
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("AI_SDK", "xai-sdk")
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    # Provisioned explicitly tool-less: an installed overlay, emptied (the capital's cutover).
+    home = Path(os.environ["BASECRADLE_CONFIG_HOME"])
+    install(home, provider="xai")
+    for plugin in (home / "tools").glob("*.py"):
+        plugin.unlink()
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+
+    agent = TimelineAgent.from_env()
+
+    assert isinstance(agent.harness.provider, XaiSdkProvider)
+    names = {t.name for t in agent.harness.tools}
+    # Not armed: no grok media, no Live Search, no platform tools — the SDK granted nothing.
+    assert not ({"grok_generate_image", "grok_generate_video"} & names)
+    assert not ({"assets", "messages", "timelines", "tasks", "trust", "lock", "delete"} & names)
+    assert names <= {"memory"}  # only its private mind remains (itself per-persona configurable)
 
 
 def test_from_env_wires_the_openai_sdk_provider_by_default(platform, monkeypatch):

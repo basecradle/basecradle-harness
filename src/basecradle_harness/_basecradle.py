@@ -34,7 +34,8 @@ identical in the env, the code, and the docs:
   package, which also disambiguates it from the provider token (``AI_PROVIDER=xai`` selects
   xAI's *endpoint*; ``AI_SDK=xai-sdk`` selects xAI's *native SDK*, #165). The harness reaches an
   LLM **only** through a vendor SDK; with the named SDK not installed it comes up with no way to
-  reach a model and says so. v0 ships exactly one adapter, ``openai``.
+  reach a model and says so. Two adapters ship: ``openai`` (the OpenAI-wire SDK — also xAI over
+  ``api.x.ai``) and ``xai-sdk`` (xAI's native gRPC SDK, #165).
 - ``AI_MODEL``                — the model id (e.g. ``gpt-5.4-mini``).
 - ``AI_API_KEY``             — the provider's API key.
 - ``AI_BASE_URL``            — optional; override the provider's endpoint.
@@ -91,6 +92,15 @@ from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._tools import Tool
+from basecradle_harness._xai_sdk import (
+    DEFAULT_SURFACE as XAI_SDK_DEFAULT_SURFACE,
+)
+from basecradle_harness._xai_sdk import (
+    SURFACES as XAI_SDK_SURFACES,
+)
+from basecradle_harness._xai_sdk import (
+    XaiSdkProvider,
+)
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -427,6 +437,9 @@ _PROVIDERS = ("openai", "xai", "openrouter")
 #: (no surfaces to pick from) and never sets the var. v0 ships only the ``openai`` adapter.
 _SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
     "openai": (OPENAI_SURFACES, OPENAI_DEFAULT_SURFACE),
+    # The native xai-sdk speaks a single (gRPC) surface; `AI_SDK_SURFACE` is left unset for it,
+    # and any other value fails clearly against this one-element set (issue #165).
+    "xai-sdk": (XAI_SDK_SURFACES, XAI_SDK_DEFAULT_SURFACE),
 }
 
 
@@ -521,9 +534,7 @@ def _provider_from_config(
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
     The harness reaches an LLM **only** through a vendor SDK, so the **SDK picks the adapter**
-    and the **provider picks the endpoint** (its default ``base_url`` + key). v0 ships exactly
-    one adapter, ``openai`` (`OpenAIProvider`); any other ``AI_SDK`` is a clear "no adapter yet"
-    error rather than a silent fallback.
+    and the **provider picks the endpoint** (its default ``base_url`` + key). Two adapters ship:
 
     - ``AI_SDK=openai`` → `OpenAIProvider`, the official ``openai`` SDK. It serves **both**
       wired providers, differing only by endpoint and how the search built-in is wired:
@@ -533,18 +544,33 @@ def _provider_from_config(
         ``grok-4.3`` over the ``responses`` *or* ``chat`` surface). xAI's Live-Search built-ins
         (``web_search`` / ``x_search``) are translated to a ``search_parameters`` body field
         (`_xai_search_parameters`) sent via ``extra_body`` — xAI's wiring, not OpenAI's.
-    - ``AI_PROVIDER=openrouter`` → not built yet (a later milestone); a clear error.
+    - ``AI_SDK=xai-sdk`` → `XaiSdkProvider`, the **native** xAI SDK (gRPC), the Grok personas'
+      end-state brain (issue #165). It talks **only** to ``AI_PROVIDER=xai``; the opted-in search
+      built-ins become a native `SearchParameters` object inside the adapter. Its single native
+      surface means ``AI_SDK_SURFACE`` is unset.
+    - Any other ``AI_SDK`` is a clear "no adapter yet" error; ``AI_PROVIDER=openrouter`` is a
+      later milestone.
 
-    All read ``AI_MODEL`` and fall back to ``AI_API_KEY`` for the key. ``base_url`` is
-    ``AI_BASE_URL`` if set, else the provider's canonical default (`_PROVIDER_BASE_URLS`).
+    All read ``AI_MODEL`` and fall back to ``AI_API_KEY`` for the key. For the openai SDK,
+    ``base_url`` is ``AI_BASE_URL`` if set, else the provider's canonical default
+    (`_PROVIDER_BASE_URLS`); the native xai-sdk uses its own endpoint (``api.x.ai``).
     """
     model = os.environ.get("AI_MODEL")
     if not model:
         raise ValueError("AI_MODEL is required — the model id to run (e.g. gpt-5.4-mini).")
+
+    if sdk == "xai-sdk":
+        if provider != "xai":
+            raise ValueError(
+                f"AI_SDK=xai-sdk reaches xAI's native endpoint, so it requires AI_PROVIDER=xai "
+                f"(got {provider!r}). Use AI_SDK=openai for a non-xAI provider."
+            )
+        return XaiSdkProvider(model, builtin_tools=list(builtins))
+
     if sdk != "openai":
         raise ValueError(
-            f"AI_SDK={sdk!r} has no adapter yet — v0 implements only the 'openai' vendor SDK. "
-            "Set AI_SDK=openai (the native 'xai-sdk' adapter is the committed next phase, #165)."
+            f"AI_SDK={sdk!r} has no adapter — the harness ships 'openai' (the OpenAI-wire SDK, "
+            "also xAI over api.x.ai) and 'xai-sdk' (native xAI). Set one of those."
         )
     if provider not in ("openai", "xai"):
         raise ValueError(

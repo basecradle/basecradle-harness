@@ -7,6 +7,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.37.0] - 2026-06-24
+
+**The native xAI adapter — grok over the official `xai-sdk` (gRPC), issue #165.** The second
+`Provider` adapter, and the first that is not OpenAI-wire: `AI_SDK=xai-sdk` reaches grok through
+xAI's own first-party SDK, no OpenAI-compatibility shim. The Grok personas' end-state brain;
+`AI_SDK=openai` pointed at `api.x.ai` (issue #163) stays a fully supported alternative.
+
+### Added
+
+- **`XaiSdkProvider`** (`basecradle_harness._xai_sdk`) — wraps the native **`xai-sdk`** gRPC client:
+  multi-turn chat, function/tool calling, vision (image input), and server-side **Live Search**
+  (opted-in `web_search`/`x_search` built-ins → a native `SearchParameters` object, citations
+  footered). Declares a single native `SURFACES`/`DEFAULT_SURFACE`, so `AI_SDK_SURFACE` is left
+  unset (any other value fails clearly). gRPC errors map onto the harness provider hierarchy
+  (auth / rate-limit / connection).
+- **The `xai-sdk` optional extra** — `pip install 'basecradle-harness[xai-sdk]'` (pins
+  `xai-sdk>=1.17,<2`). The core depends on no vendor SDK; an `xai-sdk` agent installs its own.
+- **Routing:** `AI_SDK=xai-sdk` builds the native adapter (requires `AI_PROVIDER=xai`); the
+  config reader and `_provider_from_config` route by SDK, the openai adapter unchanged.
+
+### Notes
+
+- **Tool-neutral migration (issues #165 + #168):** the native SDK is the *brain* only — tool
+  assignment stays per-persona via the `tools/` overlay. Proven by test: an `xai-sdk` persona with
+  opted-in grok tools keeps them; an empty-overlay (adversarial) persona resolves with **no**
+  powerful and **no** platform tools — the SDK arms nothing.
+- The grok **media** tools (`grok_generate_image`/`grok_generate_video`) are unchanged — httpx to
+  xAI's Images/Video endpoints, independent of the chat SDK, and per-persona opt-in.
+
 ## [0.36.0] - 2026-06-24
 
 **Powerful tools are opt-in everywhere — provider-agnostic, capability-based gating (issue

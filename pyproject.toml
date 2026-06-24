@@ -35,6 +35,11 @@ dependencies = ["basecradle>=0.5"]
 # breaking 3.0 never auto-upgrades — the pin is bumped deliberately, in lockstep with the
 # harness version (issue #158), and `basecradle-harness-wake --version` reports both.
 openai = ["openai>=2.43,<3"]
+# The native xAI SDK (AI_SDK=xai-sdk): the Grok personas' end-state brain (issue #165). A
+# gRPC client — grok chat + tool calling + Live Search, natively, no OpenAI-wire shim. Floor is
+# the version this adapter was built against (1.17); major-capped so a breaking 2.0 never
+# auto-upgrades. Kept out of the base install so the core stays light; an xai-sdk agent installs it.
+xai-sdk = ["xai-sdk>=1.17,<2"]
 # The MemPalace memory provider (a reference `MemoryProvider`): a local-first OSS memory
 # system (ChromaDB + SQLite). Kept out of the base install so the core stays light — the
 # adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace.
@@ -56,7 +61,11 @@ Issues = "https://github.com/basecradle/basecradle-harness/issues"
 [dependency-groups]
 # `openai` is a dev dep so the test suite exercises the real SDK adapter offline (respx
 # mocks its httpx transport); in production it ships only via the `openai` optional extra.
-dev = ["pytest>=8", "respx>=0.22", "ruff>=0.9", "openai>=2.43,<3"]
+# `openai` and `xai-sdk` are dev deps so the suite exercises both real SDK adapters offline —
+# openai's httpx transport is respx-mocked; the xai-sdk (gRPC) adapter builds real protos and
+# runs against an injected fake client, so neither ever touches the network. In production each
+# ships only via its optional extra.
+dev = ["pytest>=8", "respx>=0.22", "ruff>=0.9", "openai>=2.43,<3", "xai-sdk>=1.17,<2"]
 
 [build-system]
 requires = ["hatchling>=1.27"]
