@@ -18,8 +18,11 @@ xAI's own first-party SDK, no OpenAI-compatibility shim. The Grok personas' end-
 
 - **`XaiSdkProvider`** (`basecradle_harness._xai_sdk`) — wraps the native **`xai-sdk`** gRPC client:
   multi-turn chat, function/tool calling, vision (image input), and server-side **Live Search**
-  (opted-in `web_search`/`x_search` built-ins → a native `SearchParameters` object, citations
-  footered). Declares a single native `SURFACES`/`DEFAULT_SURFACE`, so `AI_SDK_SURFACE` is left
+  (opted-in `web_search`/`x_search` built-ins → xAI **Agent Tool** entries appended to the chat
+  `tools` list, `xai_sdk.tools.web_search()`/`x_search()`, citations footered — issue #171; the
+  native `SearchParameters` object first wired here was deprecated and rejected by the live gRPC
+  endpoint with `UNIMPLEMENTED` before release, so it never shipped). `x_search` is the single,
+  unified 𝕏 tool. Declares a single native `SURFACES`/`DEFAULT_SURFACE`, so `AI_SDK_SURFACE` is left
   unset (any other value fails clearly). gRPC errors map onto the harness provider hierarchy
   (auth / rate-limit / connection).
 - **The `xai-sdk` optional extra** — `pip install 'basecradle-harness[xai-sdk]'` (pins
@@ -35,6 +38,11 @@ xAI's own first-party SDK, no OpenAI-compatibility shim. The Grok personas' end-
   powerful and **no** platform tools — the SDK arms nothing.
 - The grok **media** tools (`grok_generate_image`/`grok_generate_video`) are unchanged — httpx to
   xAI's Images/Video endpoints, independent of the chat SDK, and per-persona opt-in.
+- **Live probe over mocks (issue #171):** the mocked-client tests inject a fake `xai_sdk.Client`,
+  so a wiring the *real* gRPC endpoint rejects still passes them — exactly how the deprecated
+  `SearchParameters` path slipped through. A new explicitly-marked `live` smoke
+  (`tests/test_xai_sdk_live.py`, `uv run pytest -m live`) hits `api.x.ai` for real and is excluded
+  from the default offline run; the capital re-runs it at the release gate.
 
 ## [0.36.0] - 2026-06-24
 

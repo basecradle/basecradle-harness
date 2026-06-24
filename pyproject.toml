@@ -85,3 +85,10 @@ extend-select = ["I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Live tests hit a real provider endpoint (a paid model call) and need a real key, so they are
+# their own explicitly-marked job, deselected from the default offline run (`-m "not live"`).
+# Opt in with `uv run pytest -m live` once the right key is in the environment.
+addopts = "-m 'not live'"
+markers = [
+    "live: hits a real provider endpoint (real key, real network, costs a model call); excluded from the default run",
+]

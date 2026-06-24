@@ -173,7 +173,9 @@ def test_vision_image_becomes_an_image_part():
     assert image_part.image_url.image_url == "data:image/png;base64,AAAA"
 
 
-def test_opted_in_search_builtins_become_native_search_parameters():
+def test_opted_in_search_builtins_become_agent_tools():
+    # Issue #171: the search built-ins are xAI Agent Tools appended to the chat `tools` list (the
+    # deprecated native `search_parameters` path is gone). Each is a real `chat_pb2.Tool` proto.
     provider = XaiSdkProvider(
         "grok-4.3",
         api_key=FAKE_KEY,
@@ -182,16 +184,34 @@ def test_opted_in_search_builtins_become_native_search_parameters():
     )
     provider.chat([Message.user("news?")])
 
-    sp = provider._client.chat.captured["search_parameters"]
-    assert sp.mode == "on"
-    assert sp.return_citations is True
-    assert [s.WhichOneof("source") for s in sp.sources] == ["web", "x"]
+    captured = provider._client.chat.captured
+    assert "search_parameters" not in captured  # the deprecated field is never sent
+    kinds = [t.WhichOneof("tool") for t in captured["tools"]]
+    assert kinds == ["web_search", "x_search"]
 
 
-def test_no_search_builtins_sends_no_search_parameters():
+def test_search_builtins_coexist_with_function_tools_in_one_list():
+    # Function tools and search Agent Tools share the single native `tools` list (both are Tools).
+    provider = XaiSdkProvider(
+        "grok-4.3",
+        api_key=FAKE_KEY,
+        client=_FakeClient(_response(content="ok")),
+        builtin_tools=["web_search"],
+    )
+    provider.chat([Message.user("weather then news?")], tools=[WEATHER_TOOL])
+
+    tools = provider._client.chat.captured["tools"]
+    assert tools[0].WhichOneof("tool") == "function"
+    assert tools[0].function.name == "get_weather"
+    assert tools[1].WhichOneof("tool") == "web_search"
+
+
+def test_no_search_builtins_sends_no_search_tool():
     provider = _provider(_response(content="hi"))
     provider.chat([Message.user("hi")])
-    assert "search_parameters" not in provider._client.chat.captured
+    captured = provider._client.chat.captured
+    assert "search_parameters" not in captured
+    assert "tools" not in captured  # no function tools and no search built-ins -> no tools at all
 
 
 def test_live_search_citations_footer_the_reply():
