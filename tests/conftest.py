@@ -1,10 +1,9 @@
 """Shared fixtures. All HTTP is mocked with respx — no test ever touches a model.
 
 The endpoint is a fabricated OpenAI-compatible host; the key is a correctly-shaped fake. respx
-mocks httpx at the transport level, so it intercepts the ``openai`` SDK's own httpx client the
-same way it intercepts the harness's hand-rolled httpx — the SDK adapter is tested against
-real, SDK-valid response bodies without any network. Model responses follow the OpenAI
-chat-completions / Responses schemas.
+mocks httpx at the transport level, so it intercepts the ``openai`` SDK's own httpx client
+without any network — the SDK adapter is tested against real, SDK-valid response bodies. Model
+responses follow the OpenAI chat-completions / Responses schemas.
 """
 
 import json
@@ -12,7 +11,7 @@ import json
 import pytest
 import respx
 
-from basecradle_harness import OpenAIProvider, OpenAIResponsesProvider
+from basecradle_harness import OpenAIProvider
 
 # A fabricated OpenAI-compatible endpoint and a correctly-shaped fake key.
 BASE_URL = "https://api.openai.test/v1"
@@ -65,18 +64,6 @@ def responses_provider():
         surface="responses",
         max_retries=0,
     )
-    yield p
-    p.close()
-
-
-@pytest.fixture
-def xai_responses_provider():
-    """The xAI **interim httpx** Responses adapter, pointed at the fabricated endpoint.
-
-    This is the death-row hand-rolled path the ``xai`` profile still uses until the native
-    ``xai-sdk`` adapter lands (issue #158, Q3) — exercised here to keep it honest.
-    """
-    p = OpenAIResponsesProvider(model="grok-4.3", api_key=FAKE_KEY, base_url=BASE_URL)
     yield p
     p.close()
 

@@ -7,6 +7,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.35.0] - 2026-06-23
+
+**`AI_SDK_SURFACE`: `surface` becomes a first-class, SDK-scoped concept; xAI runs through the
+`openai` SDK, retiring the hand-rolled httpx path (issue #163).** A clean rename plus the
+generalization that lets the next multi-surface SDK follow one uniform contract, and the routing
+correction that brings xAI under the "vendor-SDK only" spine (#158).
+
+### Added
+
+- **SDK-scoped `surface` contract.** Each SDK adapter declares its own `SURFACES` and
+  `DEFAULT_SURFACE` (the `openai` adapter: `("responses", "chat")` / `responses`). `AI_SDK_SURFACE`
+  selects among the *active* adapter's surfaces — **omitted → the adapter's default; provided →
+  validated against its `SURFACES`, a hard error otherwise** (`_resolve_surface`). The single rule
+  catches both a typo and a surface set on a single-surface SDK. The openai-shaped default no
+  longer lives in the generic config reader.
+- **xAI over the `openai` SDK** — `AI_PROVIDER=xai` + `AI_SDK=openai` runs `grok-4.3` through the
+  real `openai` SDK pointed at `api.x.ai` (default `base_url`, `AI_BASE_URL` overrides), over the
+  `responses` *or* `chat` surface. The **SDK picks the adapter; the provider picks the endpoint.**
+- **Vendor-neutral `extra_body` on `OpenAIProvider`** — non-standard top-level body fields are
+  forwarded as-is on both surfaces through the SDK's own `extra_body`. This is the seam for xAI's
+  Live Search: the active `web_search`/`x_search` built-ins are translated to xAI's
+  **`search_parameters`** body field (`_xai_search_parameters`), since xAI does **not** accept
+  OpenAI's `tools:[{type:"web_search"}]` entry — the web_search wiring diverges by endpoint vendor.
+
+### Changed
+
+- **Config rename — breaking:** `AI_OPENAI_SURFACE` → `AI_SDK_SURFACE` (no deprecation alias).
+- **`AI_SDK` token convention documented** — the value is the SDK's library/package name
+  (`openai`, later `xai-sdk`), which also disambiguates it from the provider token.
+
+### Removed
+
+- **`OpenAIResponsesProvider`** (the interim hand-rolled httpx Responses adapter) — **deleted**,
+  public export and all. xAI now reaches grok through the `openai` SDK (above), so the last
+  hand-rolled model path is gone and the "vendor-SDK only" spine holds for every wired provider.
+
 ## [0.34.0] - 2026-06-23
 
 **Provider-aware config-home upgrades, loud broken-default surfacing, and view-your-own-image.**

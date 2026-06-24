@@ -26,18 +26,24 @@ The model config is **three independent axes** (issue #158) — one name per con
 identical in the env, the code, and the docs:
 
 - ``AI_PROVIDER``             — the vendor whose endpoint + key the agent uses:
-  ``openai`` (default) | ``xai`` | ``openrouter``. Milestone 1 wires ``openai`` (@jt) fully;
-  ``xai`` keeps its interim httpx path; ``openrouter`` is a later milestone.
-- ``AI_SDK``                  — the PyPI package the harness imports to reach the model:
-  ``openai`` (default). The harness reaches an LLM **only** through a vendor SDK; with the
-  named SDK not installed it comes up with no way to reach a model and says so.
+  ``openai`` (default) | ``xai`` | ``openrouter``. Both ``openai`` and ``xai`` are wired through
+  the one ``openai`` SDK adapter (xAI's endpoint speaks the same wire — ``AI_PROVIDER=xai`` points
+  the SDK at ``api.x.ai``, issue #163); ``openrouter`` is a later milestone.
+- ``AI_SDK``                  — the **library/package name** of the SDK the harness imports to
+  reach the model: ``openai`` (default), later ``xai-sdk``, etc. The value is the importable
+  package, which also disambiguates it from the provider token (``AI_PROVIDER=xai`` selects
+  xAI's *endpoint*; ``AI_SDK=xai-sdk`` would select xAI's *native SDK*). The harness reaches an
+  LLM **only** through a vendor SDK; with the named SDK not installed it comes up with no way to
+  reach a model and says so. v0 ships exactly one adapter, ``openai``.
 - ``AI_MODEL``                — the model id (e.g. ``gpt-5.4-mini``).
 - ``AI_API_KEY``             — the provider's API key.
 - ``AI_BASE_URL``            — optional; override the provider's endpoint.
-- ``AI_OPENAI_SURFACE``       — optional, **internal** to the ``openai`` adapter: ``responses``
-  (default, @jt's surface — the one that runs ``web_search`` and sees images) or ``chat``. Not
-  a top-level config axis; it also gates the ``web_search`` built-in. See `_provider_from_config`
-  and `basecradle_harness._plugins`.
+- ``AI_SDK_SURFACE``          — optional; **SDK-scoped**, not a top-level config axis. The
+  active SDK adapter declares its own ``SURFACES`` + ``DEFAULT_SURFACE``; this var selects among
+  them (omitted → the adapter's default; provided-but-unlisted → a hard fail). The ``openai``
+  adapter has two — ``responses`` (default, @jt's surface — the one that runs ``web_search`` and
+  sees images) and ``chat``; a single-surface SDK never sets it. See `_resolve_surface`,
+  `_provider_from_config`, and `basecradle_harness._plugins`.
 - ``HARNESS_SYSTEM_PROMPT``   — **legacy fallback** for the agent's standing charter. The
   charter is now sourced from real files under the config home —
   ``prompts/system-prompt.md`` + ``prompts/initialize.md`` (see `basecradle_harness._install`)
@@ -56,6 +62,7 @@ import logging
 import os
 import time
 from collections.abc import Sequence
+from typing import Any
 
 from basecradle import BaseCradle
 
@@ -64,7 +71,15 @@ from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
 from basecradle_harness._mcp import McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
-from basecradle_harness._openai import OpenAIProvider
+from basecradle_harness._openai import (
+    DEFAULT_SURFACE as OPENAI_DEFAULT_SURFACE,
+)
+from basecradle_harness._openai import (
+    SURFACES as OPENAI_SURFACES,
+)
+from basecradle_harness._openai import (
+    OpenAIProvider,
+)
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._plugins import (
     ActivationContext,
@@ -74,7 +89,6 @@ from basecradle_harness._plugins import (
 )
 from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
-from basecradle_harness._responses import OpenAIResponsesProvider
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._tools import Tool
 
@@ -404,30 +418,101 @@ def _compose_prompt(orientation: str | None, system_prompt: str | None) -> str |
 #: The config defaults: the @jt stack (OpenAI vendor, openai SDK, Responses surface).
 DEFAULT_PROVIDER = "openai"
 DEFAULT_SDK = "openai"
-DEFAULT_OPENAI_SURFACE = "responses"
 _PROVIDERS = ("openai", "xai", "openrouter")
-_SURFACES = ("responses", "chat")
+
+#: ``surface`` is an **SDK-scoped** concept: each SDK adapter declares its own allowed
+#: ``SURFACES`` and ``DEFAULT_SURFACE`` (so the *next* multi-surface SDK follows the same
+#: contract without re-litigation), keyed by the ``AI_SDK`` package name. ``AI_SDK_SURFACE``
+#: selects among the active adapter's surfaces; a single-surface SDK simply isn't listed here
+#: (no surfaces to pick from) and never sets the var. v0 ships only the ``openai`` adapter.
+_SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
+    "openai": (OPENAI_SURFACES, OPENAI_DEFAULT_SURFACE),
+}
+
+
+def _resolve_surface(sdk: str) -> str:
+    """Resolve ``AI_SDK_SURFACE`` against the active SDK adapter's declared surfaces.
+
+    The uniform, SDK-scoped contract (issue #163): the active adapter owns its surface set, so
+    the openai-shaped default no longer lives in this generic reader. The single rule —
+
+    - ``AI_SDK_SURFACE`` **omitted/empty** → the adapter's ``DEFAULT_SURFACE``.
+    - **provided** → validated against the adapter's ``SURFACES``; anything not in the set is a
+      **hard fail** with a clear message.
+
+    catches both a typo (``responsess``) and a surface set on a single-surface SDK (one whose
+    adapter declares no surface set here — e.g. a future native ``xai-sdk`` or ``anthropic``).
+    For an SDK with no surface declaration, an *unset* var resolves to ``""`` and the precise
+    "no adapter yet" error is left to the provider build; a *set* var is the clear error above.
+    """
+    raw = (os.environ.get("AI_SDK_SURFACE") or "").strip().lower()
+    spec = _SDK_SURFACES.get(sdk)
+    if spec is None:
+        if raw:
+            raise ValueError(
+                f"AI_SDK_SURFACE={raw!r} is set, but AI_SDK={sdk!r} declares no surfaces "
+                "(it is single-surface, or ships no adapter yet). Unset AI_SDK_SURFACE."
+            )
+        return ""
+    surfaces, default = spec
+    if not raw:
+        return default
+    if raw not in surfaces:
+        raise ValueError(
+            f"Unknown AI_SDK_SURFACE {raw!r} for AI_SDK={sdk!r}; expected one of {surfaces}."
+        )
+    return raw
 
 
 def _config_from_env() -> tuple[str, str, str]:
     """The ``(provider, sdk, surface)`` config triple from the environment, validated.
 
     Read in one place so the provider build and the plugin activation context agree on every
-    axis. ``AI_PROVIDER`` and the openai adapter's internal ``AI_OPENAI_SURFACE`` are
-    validated here; an unrecognized value is a clear error, never a silent fall-through. The
-    SDK name is not constrained here — whether an adapter exists for it is decided when the
-    provider is built (`_provider_from_config`), so the error names the missing adapter.
+    axis. ``AI_PROVIDER`` is validated here against the known providers; ``AI_SDK_SURFACE`` is
+    resolved **SDK-scoped** (`_resolve_surface`) — an unrecognized value is a clear error, never
+    a silent fall-through. The SDK name is not constrained here — whether an adapter exists for
+    it is decided when the provider is built (`_provider_from_config`), so the error names the
+    missing adapter.
     """
     provider = (os.environ.get("AI_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
     if provider not in _PROVIDERS:
         raise ValueError(f"Unknown AI_PROVIDER {provider!r}; expected one of {_PROVIDERS}.")
     sdk = (os.environ.get("AI_SDK") or DEFAULT_SDK).strip().lower()
-    surface = (os.environ.get("AI_OPENAI_SURFACE") or DEFAULT_OPENAI_SURFACE).strip().lower()
-    if surface not in _SURFACES:
-        raise ValueError(
-            f"Unknown AI_OPENAI_SURFACE {surface!r}; expected 'responses' (default) or 'chat'."
-        )
+    surface = _resolve_surface(sdk)
     return provider, sdk, surface
+
+
+#: A provider's canonical endpoint, supplied as the **default** ``base_url`` so a persona's
+#: ``.env`` needn't hardcode it (``AI_BASE_URL`` always overrides for a proxy/gateway/self-host).
+#: ``openai`` is absent → the SDK targets OpenAI's own default. xAI's compat endpoint speaks the
+#: Responses **and** Chat wire, so the ``openai`` SDK reaches grok here over either surface.
+_PROVIDER_BASE_URLS = {"xai": "https://api.x.ai/v1"}
+
+#: xAI Live-Search sources, keyed by the built-in tool name the plugins activate.
+_XAI_SEARCH_SOURCES = {"web_search": "web", "x_search": "x"}
+
+
+def _xai_search_parameters(builtins: Sequence[str]) -> dict[str, Any] | None:
+    """The active search built-ins → xAI's ``search_parameters`` Live-Search body field.
+
+    The web_search wiring **diverges by endpoint vendor** (issue #163, verified against
+    docs.x.ai): OpenAI's Responses runs web search from a ``tools:[{"type":"web_search"}]``
+    entry, but xAI's endpoint runs Live Search from a top-level ``search_parameters`` object on
+    **both** its Responses and Chat surfaces — it does *not* accept the OpenAI tools entry. So a
+    Grok-via-``openai``-SDK persona's ``web_search``/``x_search`` built-ins are translated here
+    into ``search_parameters`` and forwarded through the SDK's ``extra_body`` (see
+    `_provider_from_config`), rather than offered as tools. Returns ``None`` when no search
+    built-in is active, so nothing is sent.
+
+    NOTE: the harness asserts *what it sends*; the exact ``search_parameters`` sub-shape is
+    xAI's and is ground-truthed by the capital's live verification on the Grok persona.
+    """
+    sources = [src for name in builtins if (src := _XAI_SEARCH_SOURCES.get(name)) is not None]
+    # De-dup while preserving order (web before x), in case a built-in is listed twice.
+    sources = list(dict.fromkeys(sources))
+    if not sources:
+        return None
+    return {"mode": "on", "sources": sources, "return_citations": True}
 
 
 def _provider_from_config(
@@ -435,45 +520,45 @@ def _provider_from_config(
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
-    The harness reaches an LLM **only** through a vendor SDK. ``AI_PROVIDER`` (and, for
-    OpenAI, ``AI_SDK`` + ``AI_OPENAI_SURFACE``) pick the adapter:
+    The harness reaches an LLM **only** through a vendor SDK, so the **SDK picks the adapter**
+    and the **provider picks the endpoint** (its default ``base_url`` + key). v0 ships exactly
+    one adapter, ``openai`` (`OpenAIProvider`); any other ``AI_SDK`` is a clear "no adapter yet"
+    error rather than a silent fallback.
 
-    - ``openai`` (default) → `OpenAIProvider`, the official ``openai`` SDK adapter. Milestone 1
-      ships only ``AI_SDK=openai``; any other SDK name is a clear "no adapter yet" error rather
-      than a silent fallback. ``builtins`` (the resolved server-side built-ins, e.g.
-      ``web_search``) are passed through as ``builtin_tools`` and apply on the Responses
-      surface — they follow the same overlay/activation rules as every other tool.
-    - ``xai`` → `OpenAIResponsesProvider`, the **interim httpx** Responses adapter pointed at
-      ``api.x.ai`` (death row until the native ``xai-sdk`` adapter lands — issue #158, Q3). Its
-      resolved built-ins are xAI's ``web_search`` / ``x_search`` (Live Search).
-    - ``openrouter`` → not built yet (a later milestone); a clear error.
+    - ``AI_SDK=openai`` → `OpenAIProvider`, the official ``openai`` SDK. It serves **both**
+      wired providers, differing only by endpoint and how the search built-in is wired:
+      - ``AI_PROVIDER=openai`` (default) → OpenAI's own endpoint; ``builtins`` (e.g.
+        ``web_search``) pass through as ``builtin_tools`` and apply on the Responses surface.
+      - ``AI_PROVIDER=xai`` → the same ``openai`` client pointed at ``api.x.ai`` (issue #163;
+        ``grok-4.3`` over the ``responses`` *or* ``chat`` surface). xAI's Live-Search built-ins
+        (``web_search`` / ``x_search``) are translated to a ``search_parameters`` body field
+        (`_xai_search_parameters`) sent via ``extra_body`` — xAI's wiring, not OpenAI's.
+    - ``AI_PROVIDER=openrouter`` → not built yet (a later milestone); a clear error.
 
-    All read ``AI_MODEL`` and the optional ``AI_BASE_URL``, and fall back to ``AI_API_KEY`` for
-    the key.
+    All read ``AI_MODEL`` and fall back to ``AI_API_KEY`` for the key. ``base_url`` is
+    ``AI_BASE_URL`` if set, else the provider's canonical default (`_PROVIDER_BASE_URLS`).
     """
     model = os.environ.get("AI_MODEL")
     if not model:
         raise ValueError("AI_MODEL is required — the model id to run (e.g. gpt-5.4-mini).")
-    base_url = os.environ.get("AI_BASE_URL")
-
-    if provider == "xai":
-        kwargs: dict[str, str] = {"model": model}
-        if base_url:
-            kwargs["base_url"] = base_url
-        return OpenAIResponsesProvider(**kwargs, builtin_tools=list(builtins))
-    if provider == "openai":
-        if sdk != "openai":
-            raise ValueError(
-                f"AI_SDK={sdk!r} has no adapter yet — Milestone 1 implements only the "
-                "'openai' vendor SDK. Set AI_SDK=openai (or wait for a later milestone)."
-            )
-        return OpenAIProvider(
-            model, base_url=base_url, surface=surface, builtin_tools=list(builtins)
+    if sdk != "openai":
+        raise ValueError(
+            f"AI_SDK={sdk!r} has no adapter yet — v0 implements only the 'openai' vendor SDK. "
+            "Set AI_SDK=openai (the native 'xai-sdk' adapter is a later milestone)."
         )
-    raise ValueError(
-        f"AI_PROVIDER={provider!r} has no adapter yet — Milestone 1 implements 'openai' "
-        "(and keeps 'xai' on its interim path). 'openrouter' is a later milestone."
-    )
+    if provider not in ("openai", "xai"):
+        raise ValueError(
+            f"AI_PROVIDER={provider!r} has no adapter via the openai SDK — 'openai' and 'xai' "
+            "are wired (xAI over the openai SDK at api.x.ai). 'openrouter' is a later milestone."
+        )
+    base_url = os.environ.get("AI_BASE_URL") or _PROVIDER_BASE_URLS.get(provider)
+    if provider == "xai":
+        # xAI's search built-ins ride `search_parameters`, not OpenAI tools entries — so they
+        # go through `extra_body`, and nothing is offered as a `builtin_tools` tool here.
+        search_parameters = _xai_search_parameters(builtins)
+        extra_body = {"search_parameters": search_parameters} if search_parameters else None
+        return OpenAIProvider(model, base_url=base_url, surface=surface, extra_body=extra_body)
+    return OpenAIProvider(model, base_url=base_url, surface=surface, builtin_tools=list(builtins))
 
 
 def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvider]:

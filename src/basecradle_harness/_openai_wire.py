@@ -1,11 +1,11 @@
 """The OpenAI wire format, as pure functions — independent of *how* it is transported.
 
-xAI's API and OpenAI's API both speak the OpenAI wire (Chat Completions and Responses),
-and the harness reaches them two ways: through the official ``openai`` SDK (the M1 adapter,
-`basecradle_harness._openai`) and — for the xAI profile only, on death row until the native
-``xai-sdk`` adapter lands — through hand-rolled httpx (`basecradle_harness._responses`). The
-translation between the harness's provider-agnostic `Message`/`ToolSpec`/`ToolCall` vocabulary
-and the wire is identical for both, so it lives here once, as transport-free functions:
+xAI's API and OpenAI's API both speak the OpenAI wire (Chat Completions and Responses), and the
+harness reaches both through the official ``openai`` SDK (`basecradle_harness._openai`) — for
+OpenAI directly, and for the xAI profile by pointing that same SDK at ``api.x.ai`` (issue #163).
+The translation between the harness's provider-agnostic `Message`/`ToolSpec`/`ToolCall`
+vocabulary and the wire lives here once, as transport-free functions, so it is independent of
+which client carries it:
 
 - **Chat Completions** — `chat_message_to_wire` / `chat_tool_to_wire` (request) and
   `message_from_chat` (response).
@@ -13,9 +13,9 @@ and the wire is identical for both, so it lives here once, as transport-free fun
   (request) and `message_from_responses` (response).
 
 Every function takes and returns plain dicts (the JSON the wire carries) and harness
-dataclasses — never an httpx or an ``openai`` object — so the same code serializes a request
-whether the SDK or httpx sends it, and parses a response whether it arrives as a parsed SDK
-model's ``model_dump()`` or an httpx ``response.json()``.
+dataclasses — never an httpx or an ``openai`` object — so the same code serializes a request and
+parses a response whether it arrives as a parsed SDK model's ``model_dump()`` or a raw
+``response.json()``.
 """
 
 from __future__ import annotations

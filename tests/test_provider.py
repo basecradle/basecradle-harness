@@ -260,6 +260,52 @@ def test_web_search_builtin_is_offered_alongside_function_tools(router):
     provider.close()
 
 
+def test_extra_body_is_sent_on_the_responses_surface(router):
+    """A vendor-specific body field (xAI's ``search_parameters``) rides the SDK's ``extra_body``.
+
+    This is how the ``openai`` SDK pointed at ``api.x.ai`` wires Live Search — the field the
+    typed SDK params don't cover lands in the request body, on the Responses surface.
+    """
+    provider = OpenAIProvider(
+        model="grok-4.3",
+        api_key=FAKE_KEY,
+        base_url=BASE_URL,
+        surface="responses",
+        max_retries=0,
+        extra_body={"search_parameters": {"mode": "on", "sources": ["web", "x"]}},
+    )
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("ok")))
+    )
+
+    provider.chat([Message.user("news?")])
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["search_parameters"] == {"mode": "on", "sources": ["web", "x"]}
+    provider.close()
+
+
+def test_extra_body_is_sent_on_the_chat_surface(router):
+    """``extra_body`` applies on **both** surfaces — xAI Live Search works over Chat too."""
+    provider = OpenAIProvider(
+        model="grok-4.3",
+        api_key=FAKE_KEY,
+        base_url=BASE_URL,
+        surface="chat",
+        max_retries=0,
+        extra_body={"search_parameters": {"mode": "on", "sources": ["web"]}},
+    )
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="ok"))
+    )
+
+    provider.chat([Message.user("news?")])
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["search_parameters"] == {"mode": "on", "sources": ["web"]}
+    provider.close()
+
+
 def test_responses_function_call_becomes_a_tool_call(router, responses_provider):
     router.post(RESPONSES_URL).mock(
         return_value=httpx.Response(
