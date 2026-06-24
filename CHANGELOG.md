@@ -7,6 +7,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-06-24
+
+**Powerful tools are opt-in everywhere — provider-agnostic, capability-based gating (issue
+#168).** A persona must *fail closed* on dangerous capability: media generation (image, video,
+audio), web/X search, and code execution no longer auto-activate from provider/SDK — they are
+off by default on every provider and granted only via the persona's `tools/` overlay. This makes
+adversarial-by-design personas tool-less **by construction**, not by "remember to prune."
+
+### Changed
+
+- **Powerful tools default OFF on every provider — breaking.** The seven powerful default
+  plugins (`generate_image`, `edit_image`, `hear_audio`, the OpenAI `web_search` built-in, the
+  xAI `web_search`/`x_search` built-ins, `grok_generate_image`, `grok_generate_video`) carry the
+  new `ToolPlugin.opt_in=True` flag. The packaged-default fallback drops them and the installer
+  does not scaffold them; a default-riding agent comes up with the **benign/platform** tools
+  only. The provider requirement (`Vendor`/`OpenAIKey`) now gates **availability**, never the
+  safety default — no "default on OpenAI, opt-in on xAI" split. **Existing agents:** a power tool
+  must be opted into the persona's overlay to stay active (see below).
+
+### Added
+
+- **`ToolPlugin.opt_in`** + the AST detector `_install.plugin_opts_in` (the no-import discipline
+  shared with provider affinity), so the loader and installer agree on a plugin's bucket without
+  importing it.
+- **`basecradle-harness-install --opt-in <stems>`** (and `install(..., opt_in=[...])`) — scaffold
+  named powerful defaults into the overlay. The explicit per-persona grant.
+- **Grandfather-on-upgrade, loud.** A powerful tool a *prior* version had already scaffolded into
+  an existing config home is **kept, never silently stripped** (the founder's "tools stay the
+  same" rule), reported in `InstallReport.grandfathered` → the CLI summary and a `WARNING`. New
+  installs get the opt-in (off) default.
+
 ## [0.35.0] - 2026-06-23
 
 **`AI_SDK_SURFACE`: `surface` becomes a first-class, SDK-scoped concept; xAI runs through the

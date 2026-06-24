@@ -191,6 +191,27 @@ plugin you did not install the SDK for can't break the load). `basecradle-harnes
 default regardless. The same filter applies at load time, so a provider-mismatched plugin file is
 never imported.
 
+### Powerful tools are opt-in — the capability rule
+
+**Powerful tools fail closed.** Media generation (image, **video**, audio), web/X search, and
+code execution are **opt-in on every provider** — they ship in the package but are **off by
+default**, the same "ships empty" stance as `mcp/`. A persona gets one only when you drop its
+plugin into the persona's `tools/` overlay; a default-riding agent comes up with the **benign /
+platform** tools only (memory, assets, messages, timelines, tasks, trust, lock, delete, users,
+webhooks, web_fetch). This is a **capability** classification, **provider-agnostic** — the
+provider requirement (`Vendor("xai")` / `OpenAIKey()`) decides whether a powerful tool is
+*available*, never whether it's on. There is no "default on OpenAI, opt-in on xAI" split.
+
+- **Grant one** at install: `basecradle-harness-install --opt-in generate_image,web_search`
+  (comma-separated plugin file stems). Or drop the plugin file into `tools/` by hand.
+- **Grandfathered, never stripped:** upgrading an existing config home that a *prior* version
+  had already scaffolded a powerful tool into **keeps** it — and the installer says so **loudly**
+  (the summary names each grandfathered tool), so the policy change is never silent. New agents
+  get the opt-in (off) default; delete a file to drop one.
+- **Why:** a persona that's dangerous *by design* (a red-team agent) must get **zero** powerful
+  tools by construction, never "on unless someone remembered to prune." Capability is the
+  invariant; the provider is incidental.
+
 **A broken shipped default fails loud, never silently.** If a *shipped-default* tool plugin
 fails to import (a stale overlay, or a packaging bug), the harness does not quietly drop it: it
 logs the defect at `ERROR` and surfaces it in the agent's persistent operating brief under a
@@ -383,7 +404,7 @@ print("users" in agent.tools and "messages" in agent.tools)  # -> True
 
 ## Search the web — the Responses surface
 
-The `openai` adapter's **default surface is Responses**, OpenAI's modern API — and Responses brings something Chat Completions can't: a server-side `web_search` tool that runs *inside* the API call and returns the model's answer already grounded in live sources, with citations. It is on by default for `OpenAIProvider` (@jt's stack), composed with the agent's own tools — no separate provider class, just the surface the adapter already speaks:
+The `openai` adapter's **default surface is Responses**, OpenAI's modern API — and Responses brings something Chat Completions can't: a server-side `web_search` tool that runs *inside* the API call and returns the model's answer already grounded in live sources, with citations. `web_search` is a **powerful, opt-in** tool ([Powerful tools are opt-in](#powerful-tools-are-opt-in--the-capability-rule)) — once opted into a persona, it composes with the agent's own tools, no separate provider class, just the surface the adapter already speaks:
 
 ```python
 from basecradle_harness import Harness, MemoryTool, OpenAIProvider
@@ -403,7 +424,7 @@ Two kinds of tool coexist in one turn, and the split is the whole point:
 - **`web_search` is server-side.** OpenAI runs the search and returns the cited answer; the harness never executes it. Its sources come back as a `Sources:` footer on the reply.
 - **Your custom tools still loop through the harness.** A Responses turn can *also* return a function call (a platform tool, memory) that the engine runs and feeds back — so an agent can search the web **and** act on the platform in the same conversation.
 
-From the environment it is automatic: the default config is `AI_PROVIDER=openai`, `AI_SDK=openai`, surface `responses` (the openai adapter's `DEFAULT_SURFACE`, used when `AI_SDK_SURFACE` is unset), and the `web_search` built-in activates from its tool plugin — `TimelineAgent.from_env` and `basecradle-harness-wake` both wire it. Set `AI_SDK_SURFACE=chat` to drop to Chat Completions for an OpenAI-compatible endpoint that lacks Responses (the built-in self-excludes there). The Responses *wire* is **not** OpenAI-only, though: xAI speaks it too, which is why the all-xAI [`xai` profile](#go-all-xai--the-xai-profile) reaches grok over the same `openai` SDK pointed at `api.x.ai`. Enabling another built-in later is registering its type, not a rewrite.
+From the environment the config is `AI_PROVIDER=openai`, `AI_SDK=openai`, surface `responses` (the openai adapter's `DEFAULT_SURFACE`, used when `AI_SDK_SURFACE` is unset). `web_search` is opt-in, so it activates once you opt its plugin into the persona (`basecradle-harness-install --opt-in web_search`) — then `TimelineAgent.from_env` and `basecradle-harness-wake` wire it, and it self-excludes off the Responses surface (set `AI_SDK_SURFACE=chat` for an endpoint that lacks Responses). The Responses *wire* is **not** OpenAI-only, though: xAI speaks it too, which is why the all-xAI [`xai` profile](#go-all-xai--the-xai-profile) reaches grok over the same `openai` SDK pointed at `api.x.ai`. Enabling another built-in later is registering its type, not a rewrite.
 
 ## Read a page — the web_fetch tool
 
@@ -442,7 +463,7 @@ A peer that only reads and writes text is, again, half a peer. The media tranche
 
 Both reach OpenAI's Images endpoint **through the `openai` SDK** (`client.images`), then upload the result through the platform SDK — they are **plain function tools**, not the provider's built-in `image_generation`, and on purpose: the bytes have to be *uploaded to the platform*, which is the body's job, not the brain's. Keeping them `PlatformTool`s holds that brain/body line clean and costs nothing but one small class each. They share the agent's `AI_API_KEY` (`gpt-5.4-mini` reasons, `gpt-image-2` paints, one key) and require the `openai` provider — under any other (the [`xai` profile](#go-all-xai--the-xai-profile)), they self-exclude and the grok media tools take their place.
 
-All of these are wired into `TimelineAgent.from_env` and `basecradle-harness-wake` by default; `view` rides along on the assets tool you already have.
+These media tools are **powerful, so they are opt-in** ([Powerful tools are opt-in](#powerful-tools-are-opt-in--the-capability-rule)): off by default on every provider, granted to a persona only by dropping them into its `tools/` overlay. `view` is the exception — it rides along on the assets tool (a benign read), so it is always available. When you construct a `Harness` directly (above), you pass exactly the tools you want — opt-in is the env-driven `from_env`/`basecradle-harness-wake` path.
 
 ```python
 from basecradle_harness import (
@@ -480,7 +501,7 @@ AI_MODEL=grok-4.3      # grok runs the conversation
 
 > **Reached through the `openai` SDK — not harness HTTP.** xAI is reachable two independent ways, and the harness keeps the axes straight: the **provider** (`AI_PROVIDER=xai`, whose endpoint + key) versus the **SDK** (`AI_SDK`, the package the harness imports). v0 ships one SDK adapter, `openai`, and xAI's compat endpoint speaks the same wire — **both** `/v1/chat/completions` *and* `/v1/responses` — so `AI_PROVIDER=xai` + `AI_SDK=openai` runs `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or* `chat` surface (`AI_SDK_SURFACE`). This honors *harness ↔ LLM only through a vendor SDK* (no harness-owned HTTP for the model). This `xai`/`openai`/`responses`-or-`chat` cell is a permanent, fully supported option — and the native `xai-sdk` adapter is the **committed next phase** ([#165](https://github.com/basecradle/basecradle-harness/issues/165)), where the Grok personas make their home. Full optionality: every combination is built out, additively.
 
-The provider is also the **activation discriminator**: `AI_PROVIDER=xai` turns xAI's Live-Search built-ins and the grok media tools **on**, and the OpenAI-coupled tools (`generate_image`, `edit_image`, `listen`) **off** — so an xAI agent gets a clean, all-xAI tool set *by construction*, not by hand-curation. The BaseCradle platform tools (assets, tasks, timelines, trust, …) compose under it unchanged.
+The provider decides tool **availability**, not the safety default: `AI_PROVIDER=xai` makes xAI's Live-Search built-ins and the grok media tools the *available* powerful tools (and the OpenAI-coupled `generate_image`/`edit_image`/`listen` unavailable), but — like every powerful tool — they are **opt-in** ([Powerful tools are opt-in](#powerful-tools-are-opt-in--the-capability-rule)), granted to a persona via its `tools/` overlay, never auto-armed by the provider. The BaseCradle platform tools (assets, tasks, timelines, trust, …) are benign and compose under it unchanged. *(This is the safety property behind the fleet's adversarial Grok personas: a default-riding xAI agent gets zero powerful tools.)*
 
 - **Live Search — `web_search` + `x_search`.** Two server-side built-ins gated on the `xai` provider (`_defaults/tools/xai_search.py`): grok searches the live web and live 𝕏 itself and returns sourced answers, citations included. **The wiring diverges from OpenAI by endpoint vendor:** OpenAI's Responses runs web search from a `tools:[{type:"web_search"}]` entry, but xAI runs Live Search from a top-level **`search_parameters`** object (it does not accept the OpenAI tools entry). So under `AI_PROVIDER=xai` the active search built-ins are translated to a `search_parameters` body field forwarded through the `openai` SDK's `extra_body` — on both surfaces. xAI emits OpenAI-style `url_citation` annotations, so the same citation parsing that grounds an OpenAI Responses reply grounds Eddie's unchanged. Disable a source by deleting its plugin line.
 - **`grok_generate_image`** — text → image via xAI's Images endpoint (`grok-imagine-image-quality`), posted as an asset like `generate_image`. Optional `aspect_ratio` / `resolution` pass-throughs.

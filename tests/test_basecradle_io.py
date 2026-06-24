@@ -7,6 +7,7 @@ fictional cast: Nova Digital (handle ``nova``, AI) is the agent; John Doe
 """
 
 import json
+import os
 
 import httpx
 import pytest
@@ -485,23 +486,28 @@ def test_from_env_wires_a_full_agent(platform, monkeypatch):
     assert tasks.bound is True
     assert tasks.context.timeline == TIMELINE_UUID
     assert tasks.context.client is agent.client
-    # And the governance tools (timelines + trust), the image generator, and the
-    # audio listener, bound the same way — the media tranche ships generate_image
-    # and listen on by default.
-    for name in ("timelines", "trust", "generate_image", "listen"):
+    # And the governance tools (timelines + trust), bound the same way.
+    for name in ("timelines", "trust"):
         assert name in agent.harness.tools
         tool = agent.harness.tools.get(name)
         assert tool.bound is True
         assert tool.context.timeline == TIMELINE_UUID
         assert tool.context.client is agent.client
+    # The powerful media tools (generate_image, listen) are opt-in everywhere (issue #168), so a
+    # default-riding agent does NOT come up with them — they activate only via the tools/ overlay.
+    assert "generate_image" not in agent.harness.tools
+    assert "listen" not in agent.harness.tools
 
 
 def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatch):
     # The tool set + provider built-ins are plugin-resolved, so flipping the openai adapter's
     # surface changes the active set: web_search (a Responses-only built-in) is on under
     # `responses` and gone under `chat`. The function tools stay the same — behavior-preserving.
+    # web_search and generate_image are powerful → opt-in (issue #168), so this opts them into the
+    # persona's overlay to exercise the wiring.
     monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
     monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    install(os.environ["BASECRADLE_CONFIG_HOME"], opt_in=["web_search", "generate_image"])
 
     # Default config: openai provider, openai SDK, responses surface → web_search active.
     provider, resolved, _memory = _resolve_tools_and_provider()
@@ -512,7 +518,7 @@ def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatc
     # …but it is never a function tool the engine runs.
     names = {t.name for t in resolved.tools}
     assert "web_search" not in names
-    assert "generate_image" in names  # OpenAI-coupled tool, key present → on
+    assert "generate_image" in names  # opted-in OpenAI power tool, key present → on
     # Memory is wired from the provider now, not a plugin, but still lands in the resolved set.
     assert "memory" in names
     # The manifest names the active tools — including the server-side built-in, which is not
@@ -758,13 +764,22 @@ def test_provider_from_config_xai_honors_an_explicit_base_url(monkeypatch):
 
 
 def test_from_env_wires_the_xai_profile_with_live_search_builtins(platform, monkeypatch):
-    """End to end: AI_PROVIDER=xai gives Eddie the openai-SDK brain at xAI + Live Search."""
+    """End to end: AI_PROVIDER=xai gives Eddie the openai-SDK brain at xAI + Live Search.
+
+    Eddie's powerful tools (Live Search + grok media) are opt-in (issue #168), so this opts them
+    into his overlay — exactly how the capital provisions Eddie's tool-set after the migration.
+    """
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
     monkeypatch.setenv("AI_PROVIDER", "xai")
     monkeypatch.setenv("AI_MODEL", "grok-4.3")
     monkeypatch.setenv("AI_API_KEY", "xai-test-key")
     monkeypatch.delenv("AI_BASE_URL", raising=False)
+    install(
+        os.environ["BASECRADLE_CONFIG_HOME"],
+        provider="xai",
+        opt_in=["xai_search", "grok_generate_image", "grok_generate_video"],
+    )
     wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
 
     agent = TimelineAgent.from_env()
