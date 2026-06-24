@@ -17,8 +17,9 @@ Two surfaces, one adapter
   an OpenAI-compatible endpoint (a later milestone's OpenRouter) that lacks Responses.
 
 The wire translation for both is the shared, transport-free `basecradle_harness._openai_wire`
-— the same functions the xAI interim httpx adapter uses — so this class is just *SDK
-plumbing*: build the request dict, call the SDK, parse ``response.model_dump()`` back. The
+— so this class is just *SDK plumbing*: build the request dict, call the SDK, parse
+``response.model_dump()`` back. This one adapter also serves the **xAI profile**, by pointing
+the same ``openai`` client at ``api.x.ai`` (issue #163) — see `basecradle_harness._basecradle`. The
 ``openai`` package is an **optional extra** (``pip install basecradle-harness[openai]``); with
 it absent, constructing this adapter raises a clear "no LLM, by design" error rather than a
 bare ``ModuleNotFoundError`` deep in a wake.
@@ -54,8 +55,12 @@ from basecradle_harness._openai_wire import (
 #: OpenAI's default API root — what the SDK targets when no ``base_url`` is given.
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_TIMEOUT = 60.0
-#: This adapter's two surfaces (see the module docstring); ``responses`` is @jt's default.
+#: This adapter's surfaces (see the module docstring), as an **SDK-scoped** declaration: the
+#: harness reads ``AI_SDK_SURFACE`` against the *active SDK adapter's* ``SURFACES`` (omitted →
+#: ``DEFAULT_SURFACE``; provided-but-unlisted → hard fail). ``responses`` is @jt's default.
 SURFACES = ("responses", "chat")
+#: The surface used when ``AI_SDK_SURFACE`` is unset — this adapter's default wire surface.
+DEFAULT_SURFACE = "responses"
 
 
 def require_openai_sdk():
@@ -96,6 +101,11 @@ class OpenAIProvider:
         builtin_tools: The server-side built-ins to enable on the Responses surface, as type
             names (``"web_search"``) or full tool dicts. Resolved from the active tool plugins
             and merged with the custom function tools each turn. Ignored on the chat surface.
+        extra_body: Non-standard top-level body fields forwarded as-is on **every** call (both
+            surfaces) through the SDK's own ``extra_body`` passthrough. The adapter stays
+            vendor-neutral — this is the seam for a provider-specific field the typed SDK params
+            don't cover, e.g. xAI's ``search_parameters`` Live-Search object when the ``openai``
+            SDK is pointed at ``api.x.ai`` (see `basecradle_harness._basecradle`).
         default_params: Extra body parameters sent on every call (e.g. ``temperature=0.2``).
             ``model``, the input/messages, and ``tools`` always take precedence.
     """
@@ -106,10 +116,11 @@ class OpenAIProvider:
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        surface: str = "responses",
+        surface: str = DEFAULT_SURFACE,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = 2,
         builtin_tools: Sequence[str | Mapping[str, Any]] = (),
+        extra_body: Mapping[str, Any] | None = None,
         **default_params: Any,
     ) -> None:
         if surface not in SURFACES:
@@ -124,6 +135,7 @@ class OpenAIProvider:
         self.surface = surface
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._builtin_tools = [builtin_to_responses(spec) for spec in builtin_tools]
+        self._extra_body = dict(extra_body) if extra_body else None
         self._default_params = default_params
         self._openai = openai
         self._client = openai.OpenAI(
@@ -152,6 +164,8 @@ class OpenAIProvider:
             wire_tools.extend(function_tool_to_responses(t) for t in tools)
         if wire_tools:
             payload["tools"] = wire_tools
+        if self._extra_body:
+            payload["extra_body"] = dict(self._extra_body)
         with self._mapped_errors():
             response = self._client.responses.create(**payload)
         return message_from_responses(response.model_dump())
@@ -162,6 +176,8 @@ class OpenAIProvider:
         payload["messages"] = [chat_message_to_wire(m) for m in messages]
         if tools:
             payload["tools"] = [chat_tool_to_wire(t) for t in tools]
+        if self._extra_body:
+            payload["extra_body"] = dict(self._extra_body)
         with self._mapped_errors():
             response = self._client.chat.completions.create(**payload)
         return message_from_chat(response.model_dump())

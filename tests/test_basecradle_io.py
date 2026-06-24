@@ -18,7 +18,6 @@ from basecradle_harness import (
     MemoryTool,
     Message,
     OpenAIProvider,
-    OpenAIResponsesProvider,
     TimelineAgent,
     config_home,
     install,
@@ -522,7 +521,7 @@ def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatc
     assert {"web_search", "generate_image", "memory"} <= manifest_names
     provider.close()
 
-    monkeypatch.setenv("AI_OPENAI_SURFACE", "chat")
+    monkeypatch.setenv("AI_SDK_SURFACE", "chat")
     chat_provider, chat_resolved, _chat_memory = _resolve_tools_and_provider()
     assert isinstance(chat_provider, OpenAIProvider)
     assert chat_provider.surface == "chat"
@@ -606,7 +605,7 @@ def test_context_messages_from_env_parses_int_all_and_default(monkeypatch):
     assert _context_messages_from_env() == 7
 
 
-# --- config + provider selection (AI_PROVIDER / AI_SDK / AI_OPENAI_SURFACE) ---
+# --- config + provider selection (AI_PROVIDER / AI_SDK / AI_SDK_SURFACE) ---
 
 
 def _set_model_key(monkeypatch):
@@ -615,14 +614,14 @@ def _set_model_key(monkeypatch):
 
 
 def test_config_from_env_defaults_to_the_openai_sdk_responses_stack(monkeypatch):
-    for var in ("AI_PROVIDER", "AI_SDK", "AI_OPENAI_SURFACE"):
+    for var in ("AI_PROVIDER", "AI_SDK", "AI_SDK_SURFACE"):
         monkeypatch.delenv(var, raising=False)
     assert _config_from_env() == ("openai", "openai", "responses")
 
 
 def test_config_from_env_is_case_insensitive(monkeypatch):
     monkeypatch.setenv("AI_PROVIDER", "XAI")
-    monkeypatch.setenv("AI_OPENAI_SURFACE", "Chat")
+    monkeypatch.setenv("AI_SDK_SURFACE", "Chat")
     provider, _sdk, surface = _config_from_env()
     assert provider == "xai"
     assert surface == "chat"
@@ -634,9 +633,27 @@ def test_config_from_env_rejects_an_unknown_provider(monkeypatch):
         _config_from_env()
 
 
+def test_config_from_env_omitted_surface_uses_the_adapter_default(monkeypatch):
+    # Omitted → the active SDK adapter's DEFAULT_SURFACE (openai → responses), not a global one.
+    for var in ("AI_SDK", "AI_SDK_SURFACE"):
+        monkeypatch.delenv(var, raising=False)
+    _provider, _sdk, surface = _config_from_env()
+    assert surface == "responses"
+
+
 def test_config_from_env_rejects_an_unknown_surface(monkeypatch):
-    monkeypatch.setenv("AI_OPENAI_SURFACE", "interpretive-dance")
-    with pytest.raises(ValueError, match="AI_OPENAI_SURFACE"):
+    # A typo is caught by validating against the active adapter's SURFACES (the hard-fail path).
+    monkeypatch.setenv("AI_SDK_SURFACE", "interpretive-dance")
+    with pytest.raises(ValueError, match="AI_SDK_SURFACE"):
+        _config_from_env()
+
+
+def test_config_from_env_rejects_a_surface_on_a_surfaceless_sdk(monkeypatch):
+    # The single rule also catches a surface set on an SDK that declares none (single-surface or
+    # not-yet-built) — here a hypothetical native xai-sdk.
+    monkeypatch.setenv("AI_SDK", "xai-sdk")
+    monkeypatch.setenv("AI_SDK_SURFACE", "responses")
+    with pytest.raises(ValueError, match="AI_SDK_SURFACE"):
         _config_from_env()
 
 
@@ -684,8 +701,8 @@ def test_provider_from_config_passes_base_url_through(monkeypatch):
     provider.close()
 
 
-def test_provider_from_config_xai_builds_the_interim_adapter_at_api_x_ai(monkeypatch):
-    # xAI's death-row path: the interim httpx Responses adapter, defaulted to api.x.ai.
+def test_provider_from_config_xai_builds_the_openai_sdk_at_api_x_ai(monkeypatch):
+    # xAI via the real openai SDK (issue #163): OpenAIProvider, base_url defaulted to api.x.ai.
     monkeypatch.setenv("AI_MODEL", "grok-4.3")
     monkeypatch.setenv("AI_API_KEY", "xai-test-key")
     monkeypatch.delenv("AI_BASE_URL", raising=False)
@@ -694,8 +711,35 @@ def test_provider_from_config_xai_builds_the_interim_adapter_at_api_x_ai(monkeyp
         "xai", "openai", "responses", builtins=["web_search", "x_search"]
     )
 
-    assert isinstance(provider, OpenAIResponsesProvider)
+    assert isinstance(provider, OpenAIProvider)
     assert provider.base_url == "https://api.x.ai/v1"
+    # xAI's Live Search rides search_parameters (extra_body), not OpenAI tools entries.
+    assert provider._builtin_tools == []
+    assert provider._extra_body == {
+        "search_parameters": {
+            "mode": "on",
+            "sources": ["web", "x"],
+            "return_citations": True,
+        }
+    }
+    provider.close()
+
+
+def test_provider_from_config_xai_honors_the_chat_surface(monkeypatch):
+    # The xAI matrix: AI_SDK=openai + chat surface is valid (xAI's compat endpoint speaks both),
+    # and Live Search still rides search_parameters (it works on chat too).
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    monkeypatch.delenv("AI_BASE_URL", raising=False)
+
+    provider = _provider_from_config("xai", "openai", "chat", builtins=["web_search"])
+
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.surface == "chat"
+    assert provider.base_url == "https://api.x.ai/v1"
+    assert provider._extra_body == {
+        "search_parameters": {"mode": "on", "sources": ["web"], "return_citations": True}
+    }
     provider.close()
 
 
@@ -706,24 +750,36 @@ def test_provider_from_config_xai_honors_an_explicit_base_url(monkeypatch):
 
     provider = _provider_from_config("xai", "openai", "responses")
 
+    assert isinstance(provider, OpenAIProvider)
     assert provider.base_url == "https://xai-proxy.internal/v1"
+    # No search built-ins active → no search_parameters sent.
+    assert provider._extra_body is None
     provider.close()
 
 
 def test_from_env_wires_the_xai_profile_with_live_search_builtins(platform, monkeypatch):
-    """End to end: AI_PROVIDER=xai gives Eddie the interim Responses brain at xAI + Live Search."""
+    """End to end: AI_PROVIDER=xai gives Eddie the openai-SDK brain at xAI + Live Search."""
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
     monkeypatch.setenv("AI_PROVIDER", "xai")
     monkeypatch.setenv("AI_MODEL", "grok-4.3")
     monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    monkeypatch.delenv("AI_BASE_URL", raising=False)
     wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
 
     agent = TimelineAgent.from_env()
 
-    assert isinstance(agent.harness.provider, OpenAIResponsesProvider)
+    assert isinstance(agent.harness.provider, OpenAIProvider)
     assert agent.harness.provider.base_url == "https://api.x.ai/v1"
-    # The grok media tools are active; the OpenAI image tools are not (no OpenAI surface).
+    # xAI Live Search is wired via search_parameters (web + x), not OpenAI tools entries.
+    assert agent.harness.provider._extra_body == {
+        "search_parameters": {
+            "mode": "on",
+            "sources": ["web", "x"],
+            "return_citations": True,
+        }
+    }
+    # The grok media tools are active; the OpenAI image tools are not (no OpenAI key/provider).
     names = {t.name for t in agent.harness.tools}
     assert {"grok_generate_image", "grok_generate_video"} <= names
     assert not ({"generate_image", "edit_image", "listen"} & names)
