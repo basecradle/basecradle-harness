@@ -27,6 +27,7 @@ from basecradle_harness._install import (
     charter_from_config,
     charter_from_env,
     main,
+    plugin_opts_in,
     plugin_relevant_to,
     plugin_source_providers,
     prompt_text,
@@ -114,6 +115,32 @@ def test_upgrade_grandfathers_a_previously_scaffolded_power_tool_loudly(tmp_path
 def test_a_fresh_install_does_not_grandfather_anything(tmp_path):
     report = install(tmp_path / "cfg")
     assert report.grandfathered == []
+
+
+def test_a_deleted_grandfathered_power_tool_is_not_reported_as_kept(tmp_path):
+    # An operator who DELETES a grandfathered power tool must not be told it was "kept" — the
+    # report is gated on the file actually existing on disk, not on the reconcile action (a
+    # deleted-but-source-unchanged file reconciles as UNCHANGED, not KEPT_DELETED).
+    home = tmp_path / "cfg"
+    install(home, opt_in=["generate_image"])  # a prior install scaffolded it
+    (home / "tools" / "generate_image.py").unlink()  # operator drops the capability
+
+    report = install(home)  # same-source upgrade
+
+    assert not (home / "tools" / "generate_image.py").exists()  # stays deleted, never resurrected
+    assert "tools/generate_image.py" not in report.grandfathered  # and NOT reported as kept
+
+
+def test_opt_in_with_an_unknown_stem_warns_loudly(tmp_path, caplog):
+    # The stem-vs-name trap: --opt-in listen (the tool name, not the file stem hear_audio) matches
+    # nothing and would scaffold silently — so it warns, naming the known opt-in tools.
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        install(tmp_path / "cfg", opt_in=["listen", "generate_image"])
+
+    assert "listen" in caplog.text and "hear_audio" in caplog.text
+    assert (tmp_path / "cfg" / "tools" / "generate_image.py").exists()  # the valid one still lands
 
 
 def test_install_records_every_shipped_default_hash_in_the_manifest(tmp_path):
@@ -339,6 +366,47 @@ def test_plugin_source_providers_treats_broken_source_as_universal():
     # Unparseable source → None (universal), so the loader still attempts it and the broken
     # default surfaces as a defect rather than being hidden by the affinity check.
     assert plugin_source_providers("this is not valid python :(") is None
+
+
+# --- the opt-in capability classifier (issue #168) ---------------------------
+
+_OPT_IN_SRC = "from basecradle_harness import GenerateImageTool, OpenAIKey, ToolPlugin\nPLUGIN = ToolPlugin(impl=GenerateImageTool, requires=(OpenAIKey(),), opt_in=True)\n"
+
+
+def test_plugin_opts_in_detects_the_flag_without_importing():
+    # The safety classifier: opt_in=True → powerful; absent or not-the-True-constant → benign.
+    assert plugin_opts_in(_OPT_IN_SRC) is True
+    assert plugin_opts_in(_OPENAI_KEY_SRC) is False  # no opt_in keyword → benign
+    assert plugin_opts_in(_UNIVERSAL_SRC) is False
+    # A non-`True` value must NOT read as opt-in (so a refactor to truthiness can't mis-bucket).
+    assert plugin_opts_in("PLUGIN = ToolPlugin(impl=X, opt_in=False)\n") is False
+    assert plugin_opts_in("PLUGIN = ToolPlugin(impl=X, opt_in=1)\n") is False
+    assert (
+        plugin_opts_in("flag = True  # opt_in=True only in a comment\nP = ToolPlugin(impl=X)")
+        is False
+    )
+    # Unparseable source → benign (fail-open to a defect the loader surfaces, never silently power).
+    assert plugin_opts_in("this is not valid python :(") is False
+
+
+def test_every_shipped_power_tool_default_is_classified_opt_in():
+    # The whole safety guarantee rests on these seven being flagged — pin it against the package.
+    from importlib.resources import files
+
+    power_stems = set()
+    root = files("basecradle_harness").joinpath("_defaults", "tools")
+    for child in root.iterdir():
+        if child.name.endswith(".py") and plugin_opts_in(child.read_text()):
+            power_stems.add(child.name[: -len(".py")])
+    assert power_stems == {
+        "generate_image",
+        "edit_image",
+        "hear_audio",
+        "web_search",
+        "xai_search",  # declares both web_search + x_search built-ins, both opt_in
+        "grok_generate_image",
+        "grok_generate_video",
+    }
 
 
 def test_plugin_relevant_to_gates_on_the_active_provider():

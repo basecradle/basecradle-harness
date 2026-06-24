@@ -352,14 +352,20 @@ def install(
     # filter so the provider-prune below still keys on `shipped_provider`, unchanged.
     shipped, grandfathered_rels = _opt_in_scaffold_set(shipped_provider, recorded, opt_in)
 
+    # A typo in --opt-in (the stem-vs-name trap, e.g. "listen" for the file "hear_audio") would
+    # otherwise scaffold nothing, silently — so name any opt-in that matched no powerful default.
+    _warn_unmatched_opt_in(opt_in, shipped_all)
+
     for rel in sorted(shipped):
         action = _reconcile(root, rel, shipped[rel], recorded, updated, report)
         report.actions[rel] = action
 
     # A grandfathered power tool is one we kept because it was already on disk — so report only
-    # those whose reconcile actually kept them present (a respected deletion is not "kept").
+    # those that are *actually present* after the reconcile. This catches every "not kept" case,
+    # not just KEPT_DELETED: a file the operator deleted whose source did not change this release
+    # reconciles as UNCHANGED (no write, still absent), and must not be reported as kept either.
     report.grandfathered = [
-        rel for rel in grandfathered_rels if report.actions.get(rel) != KEPT_DELETED
+        rel for rel in grandfathered_rels if root.joinpath(*rel.split("/")).exists()
     ]
     if report.grandfathered:
         _log.warning(
@@ -400,6 +406,35 @@ def _relevant_defaults(shipped: dict[str, str], provider: str | None) -> dict[st
 def _is_tool_plugin(rel: str) -> bool:
     """Whether a config-home-relative path is a tool-plugin file (the only provider-affine kind)."""
     return rel.startswith("tools/") and rel.endswith(".py")
+
+
+def _power_tool_stems(shipped: dict[str, str]) -> set[str]:
+    """The file stems of every powerful (`opt_in`) tool-plugin default in `shipped`."""
+    return {
+        rel[len("tools/") : -len(".py")]
+        for rel, text in shipped.items()
+        if _is_tool_plugin(rel) and plugin_opts_in(text)
+    }
+
+
+def _warn_unmatched_opt_in(opt_in: Sequence[str], shipped_all: dict[str, str]) -> None:
+    """Warn (loudly, never silently) for any ``--opt-in`` name that matches no powerful default.
+
+    Catches the stem-vs-name trap (issue #168): ``--opt-in listen`` names the *tool* but the file
+    stem is ``hear_audio``, so it would otherwise scaffold nothing with no diagnostic — the
+    operator thinks they granted a tool that is silently absent. A name that matches a power tool
+    which is merely provider-mismatched is *not* flagged here (it is a real tool, just unavailable
+    for this provider); only a name matching no power tool at all is a likely typo.
+    """
+    known = _power_tool_stems(shipped_all)
+    unknown = sorted({name.removesuffix(".py") for name in opt_in} - known)
+    if unknown:
+        _log.warning(
+            "--opt-in named no powerful tool default and scaffolded nothing for: %s. The known "
+            "opt-in tools are: %s. (Pass the plugin *file stem*, e.g. 'hear_audio', not 'listen'.)",
+            ", ".join(unknown),
+            ", ".join(sorted(known)),
+        )
 
 
 def _opt_in_scaffold_set(

@@ -356,6 +356,19 @@ def test_default_riding_xai_agent_is_benign_only_no_grok_tools_auto_armed():
     assert resolved.builtins == []  # no web_search / x_search auto-armed
 
 
+def test_a_freshly_installed_home_loads_benign_tools_only_end_to_end(tmp_path):
+    # The headline safety property, end-to-end through install() + load(): a persona the installer
+    # scaffolded (overlay authoritative) comes up with the benign/platform set and ZERO powerful
+    # tools — no opt-in → none on disk → none loaded (the adversarial-persona guarantee).
+    home = tmp_path / "cfg"
+    install(home)  # no opt_in → benign defaults only on disk
+
+    plugins = load_plugins(home)
+    names = {p.resolved_name for p in plugins}
+    assert names == _DEFAULT_TOOLS
+    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS) & names)
+
+
 def test_opting_a_power_tool_into_the_overlay_activates_it_subject_to_availability(tmp_path):
     # The opt-in path: a powerful tool present in the persona's overlay activates — gated only by
     # its `requires` (availability). The grok tool runs under xai and self-excludes under openai.
