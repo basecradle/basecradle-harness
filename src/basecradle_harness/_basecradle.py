@@ -546,7 +546,8 @@ def _provider_from_config(
         (`_xai_search_parameters`) sent via ``extra_body`` — xAI's wiring, not OpenAI's.
     - ``AI_SDK=xai-sdk`` → `XaiSdkProvider`, the **native** xAI SDK (gRPC), the Grok personas'
       end-state brain (issue #165). It talks **only** to ``AI_PROVIDER=xai``; the opted-in search
-      built-ins become a native `SearchParameters` object inside the adapter. Its single native
+      built-ins become xAI **Agent Tool** entries on the chat ``tools`` list inside the adapter
+      (issue #171 — the native ``SearchParameters`` object is deprecated). Its single native
       surface means ``AI_SDK_SURFACE`` is unset.
     - Any other ``AI_SDK`` is a clear "no adapter yet" error; ``AI_PROVIDER=openrouter`` is a
       later milestone.

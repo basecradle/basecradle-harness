@@ -17,8 +17,11 @@ Brain only — tools are per-persona
 ----------------------------------
 This adapter is the **chat brain** (the `Provider` contract: chat + tool calling). Live Search is
 wired here, server-side, when the persona has opted its search built-ins in (issue #168): the
-``web_search`` / ``x_search`` built-in names become a native `SearchParameters` object on the
-request, and grok runs the search itself and returns sourced answers with citations. The grok
+``web_search`` / ``x_search`` built-in names become xAI **Agent Tool** entries
+(`xai_sdk.tools.web_search()` / `x_search()`) appended to the request's ``tools`` list, and grok
+autonomously runs the search server-side and returns sourced answers with citations. (This replaced
+the deprecated native ``SearchParameters`` path — the live gRPC endpoint now rejects it with
+``UNIMPLEMENTED: Live search is deprecated`` — issue #171.) The grok
 **media** tools (`grok_generate_image` / `grok_generate_video`) stay their own per-persona
 `PlatformTool`s over httpx (`basecradle_harness._grok`) — independent of the chat SDK, and granted
 only by opt-in. Exposing a capability is never granting it to a persona.
@@ -58,6 +61,7 @@ def require_xai_sdk():
     """
     try:
         import xai_sdk  # noqa: PLC0415 - lazy: the core must import without the vendor SDK
+        import xai_sdk.tools  # noqa: PLC0415 - submodule (Agent Tools) is not auto-imported by __init__
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised via monkeypatched import
         raise ProviderError(
             "The 'xai-sdk' SDK is not installed, so the harness has no way to reach a model "
@@ -79,8 +83,9 @@ class XaiSdkProvider:
         api_host: The gRPC host. Defaults to the SDK's own (``api.x.ai``).
         timeout: Per-request timeout in seconds (passed to the SDK client).
         builtin_tools: The server-side built-ins a persona has opted in — ``"web_search"`` /
-            ``"x_search"`` (issue #168). They are translated to a native `SearchParameters`
-            object so grok runs Live Search itself; a name that maps to no source is ignored.
+            ``"x_search"`` (issue #168). They are translated to xAI **Agent Tool** entries
+            (`xai_sdk.tools`) appended to the request's ``tools`` list so grok runs the search
+            itself; a name that maps to no Agent Tool is ignored.
         client: An already-built ``xai_sdk.Client`` (or compatible). The seam tests inject a fake
             through, so the gRPC client is never constructed — and built when omitted.
         default_params: Extra keyword parameters passed to ``chat.create`` on every call (e.g.
@@ -123,11 +128,12 @@ class XaiSdkProvider:
         payload: dict[str, Any] = dict(self._default_params)
         payload["model"] = self.model
         payload["messages"] = [self._to_wire(m, chat_mod) for m in messages]
-        if tools:
-            payload["tools"] = [chat_mod.tool(t.name, t.description, t.parameters) for t in tools]
-        search = self._search_parameters()
-        if search is not None:
-            payload["search_parameters"] = search
+        # Function tools and the opted-in server-side search built-ins share one ``tools`` list:
+        # both are native ``chat_pb2.Tool`` protos (issue #171 — the Agent Tools API).
+        wire_tools = [chat_mod.tool(t.name, t.description, t.parameters) for t in tools or ()]
+        wire_tools.extend(self._search_tools())
+        if wire_tools:
+            payload["tools"] = wire_tools
         with self._mapped_errors():
             conversation = self._client.chat.create(**payload)
             response = conversation.sample()
@@ -189,23 +195,20 @@ class XaiSdkProvider:
             content = f"{content}\n\n{footer}" if content else footer
         return Message.assistant(content=content, tool_calls=tool_calls)
 
-    def _search_parameters(self) -> Any | None:
-        """The opted-in search built-ins as a native ``SearchParameters``, or ``None``.
+    def _search_tools(self) -> list[Any]:
+        """The opted-in search built-ins as xAI **Agent Tool** entries (`chat_pb2.Tool`).
 
-        ``web_search`` → a web source, ``x_search`` → an 𝕏 source (`xai_sdk.search`). With no
-        search built-in opted in, returns ``None`` so the request carries no search config and grok
-        does not search.
+        ``web_search`` → `xai_sdk.tools.web_search()`, ``x_search`` → `xai_sdk.tools.x_search()`
+        (`x_search` is the single, unified 𝕏 tool — posts, users, and threads). grok runs the
+        search server-side and returns sourced answers with citations. With no search built-in
+        opted in, returns ``[]`` so the request carries no search tool and grok does not search.
+
+        This is the issue #171 fix: the native ``SearchParameters`` path it replaced is deprecated
+        and now rejected by the live gRPC endpoint (``UNIMPLEMENTED: Live search is deprecated``).
         """
-        search = self._xai.search
-        sources = []
-        for name in self._builtin_tools:
-            if name == "web_search":
-                sources.append(search.web_source())
-            elif name == "x_search":
-                sources.append(search.x_source())
-        if not sources:
-            return None
-        return search.SearchParameters(mode="on", sources=sources, return_citations=True)
+        tools_mod = self._xai.tools
+        builders = {"web_search": tools_mod.web_search, "x_search": tools_mod.x_search}
+        return [builders[name]() for name in self._builtin_tools if name in builders]
 
     # --- gRPC errors -> the harness provider error hierarchy ------------------
 
