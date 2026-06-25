@@ -7,6 +7,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-06-25
+
+**`basecradle-harness-wake --resolved-config` — ground-truth introspection for fleet drift
+(issue #174).** A deterministic, read-only command that prints an agent's *live, resolved*
+configuration and active capability set as JSON, so the fleet deployer (the NOC) can verify a
+deploy converged by **ground truth, never self-report** — the basecradle#307 failure class where a
+capability is a corpse while every version/health signal still reads green. The linchpin of the
+NOC's `fleet-drift` check: `--version` already reported the harness + vendor-SDK versions, but the
+*resolved tool set* axis was unverifiable without this.
+
+### Added
+
+- **`basecradle-harness-wake --resolved-config`** — prints, as stable pretty-printed JSON:
+  `harness_version`; the validated config triple `ai_provider` / `ai_sdk` / `ai_sdk_surface`;
+  `ai_sdk_version` (the installed vendor-SDK version, or `null`); `ai_model`; `tools` (the resolved
+  active function tools); `builtins` (the resolved active server-side built-ins); and `skipped`
+  (plugins that did not activate). The field set is an **additive contract**. Resolves through the
+  **same code paths a wake uses** (`_config_from_env` + the new `_resolve_tools` seam), so the
+  output is what the agent *would actually do*, not a declared list.
+- **`resolved_config()`** (`basecradle_harness._wake`) — the function behind the flag, importable
+  for in-process introspection.
+
+### Changed
+
+- **Side-effect-free by construction.** `--resolved-config` builds **no** model provider (needs no
+  `AI_API_KEY`; reports an unset `AI_MODEL` as `null` rather than raising) and runs **no**
+  config-home upgrade reconcile (no writes) — so it is safe to run repeatedly over SSH against a
+  live agent home, reporting the overlay as it is on disk. A resolution error (an unknown
+  `AI_PROVIDER`, an SDK-mismatched `AI_SDK_SURFACE`) exits non-zero with the reason on stderr — the
+  verifier's honest "misconfigured" signal — never a raw traceback.
+- **`_resolve_tools`** factored out of `_resolve_tools_and_provider` (`basecradle_harness._basecradle`)
+  — the shared, reconcile-free, provider-free tool-resolution core both the wake and the
+  introspection use, so they can never disagree on the active tool set.
+
 ## [0.37.0] - 2026-06-24
 
 **The native xAI adapter — grok over the official `xai-sdk` (gRPC), issue #165.** The second

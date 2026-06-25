@@ -60,6 +60,7 @@ asset, or task to be acted on.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -78,11 +79,13 @@ from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
     _client_from_env,
+    _config_from_env,
     _context_messages_from_env,
     _incoming_text,
     _messages_since,
     _onboard_from_env,
     _recent,
+    _resolve_tools,
     _resolve_tools_and_provider,
 )
 from basecradle_harness._brief import (
@@ -1515,6 +1518,58 @@ def _version_string() -> str:
     return f"basecradle-harness-wake {__version__} · {sdk_note}"
 
 
+def resolved_config() -> dict[str, object]:
+    """The agent's live, *resolved* configuration + active tool set, as machine-readable ground truth.
+
+    The introspection the fleet deployer (the NOC) reads to verify a deploy converged — by
+    **ground truth, never self-report** (the basecradle#307 failure class, where a capability is a
+    corpse while every version/health signal still reads green). It resolves through the **same
+    code paths the running agent uses**: the validated ``(provider, sdk, surface)`` triple
+    (`_config_from_env`, which hard-fails an unknown provider or an SDK-mismatched surface) and the
+    active tool set after the full plugin/memory/MCP/locked-policy resolution (`_resolve_tools`) —
+    so the output is what the agent would actually do, not a declared list.
+
+    **Side-effect-free**, so it is safe to run repeatedly over SSH against a live agent home:
+
+    - It does **not** build the model provider (no ``AI_API_KEY`` required, no client constructed),
+      so ``ai_model`` is reported as the raw ``AI_MODEL`` env value (``None`` if unset) rather than
+      raising the "AI_MODEL is required" the provider build would.
+    - It does **not** run the config-home upgrade reconcile (which *writes* refreshed defaults), so
+      it reports the overlay **as it is on disk**. The deploy order is install (which reconciles)
+      then verify, so a verifier reads the post-install state.
+    - Loading MCP drop-ins briefly starts each *configured* server to ``tools/list`` it (read-only
+      at the protocol level — no ``tools/call`` — the same connection a wake makes, with failed
+      servers self-excluding); with the default empty ``mcp/`` dir this is a no-op.
+
+    The returned field set is an **additive contract** a downstream tool can depend on:
+
+    - ``harness_version`` — the installed ``basecradle-harness`` version.
+    - ``ai_provider`` / ``ai_sdk`` / ``ai_sdk_surface`` — the validated config triple (``surface``
+      is ``""`` for a single-surface SDK that declares none).
+    - ``ai_sdk_version`` — the installed version of the vendor SDK named by ``AI_SDK``, or ``None``
+      if that SDK is not installed.
+    - ``ai_model`` — the ``AI_MODEL`` env value, or ``None`` if unset.
+    - ``tools`` — the resolved active **function** tool names, sorted.
+    - ``builtins`` — the resolved active server-side **built-in** wire names, sorted (e.g. the
+      Responses ``web_search``); a live capability the tool-set axis must count.
+    - ``skipped`` — the names of plugins that did **not** activate, sorted — the auditable "why
+      isn't this tool here?" trail (a diagnostic, not part of the active set).
+    """
+    provider_name, sdk, surface = _config_from_env()
+    resolved, _memory = _resolve_tools(provider_name, sdk, surface)
+    return {
+        "harness_version": __version__,
+        "ai_provider": provider_name,
+        "ai_sdk": sdk,
+        "ai_sdk_surface": surface,
+        "ai_sdk_version": _sdk_version(sdk),
+        "ai_model": os.environ.get("AI_MODEL") or None,
+        "tools": sorted(tool.name for tool in resolved.tools),
+        "builtins": sorted(resolved.builtins),
+        "skipped": sorted(name for name, _reason in resolved.skipped),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     """The `basecradle-harness-wake` entrypoint: one wake, then exit.
 
@@ -1537,6 +1592,19 @@ def main(argv: list[str] | None = None) -> int:
         action="version",
         version=_version_string(),
         help="print the installed basecradle-harness and vendor-SDK versions, then exit.",
+    )
+    # The deploy verifier's ground-truth probe (issue #174): print the live, *resolved* config +
+    # active tool set as machine-readable JSON, then exit — no timeline, no model call, no writes.
+    # The NOC's `fleet-drift` check reads this to verify a converged deploy by ground truth rather
+    # than self-report (the basecradle#307 failure class). JSON (pretty-printed, stable key order)
+    # is both what a verifier parses and human-readable enough on its own, so it is the one format.
+    parser.add_argument(
+        "--resolved-config",
+        action="store_true",
+        help=(
+            "print the resolved config + active tool set as JSON (ground truth for fleet drift), "
+            "then exit. Read-only and timeline-free."
+        ),
     )
     parser.add_argument(
         "--timeline",
@@ -1565,6 +1633,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
+
+    if args.resolved_config:
+        # A read-only introspection — resolve the config + tool set (no model call, no writes) and
+        # emit it as stable, pretty-printed JSON. A resolution error (an unknown AI_PROVIDER, an
+        # SDK-mismatched AI_SDK_SURFACE) is the verifier's honest signal that the agent is
+        # misconfigured, so it surfaces as a clean non-zero exit, never a raw traceback.
+        try:
+            print(json.dumps(resolved_config(), indent=2, sort_keys=True))
+        except (HarnessError, ProviderError, BaseCradleError, ValueError, KeyError) as error:
+            print(f"basecradle-harness-wake: {error}", file=sys.stderr)
+            return 1
+        return 0
+
     if not args.timeline:
         parser.error("a timeline uuid is required (--timeline or BASECRADLE_TIMELINE)")
 
