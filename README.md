@@ -239,7 +239,15 @@ python -m basecradle_harness --timeline <timeline-uuid>
 # credential touched. The cheap probe a fleet drift-guard uses to catch a release
 # that reached PyPI but never reached the box:
 basecradle-harness-wake --version   # -> basecradle-harness-wake 0.19.0
+
+# Ask a deployed box what it is *actually* configured to do — the resolved provider,
+# SDK, surface, model, and the live tool set, as JSON. Read-only and timeline-free,
+# so it is safe to run repeatedly over SSH; the fleet deployer (the NOC) reads it to
+# verify a deploy by GROUND TRUTH, never self-report:
+basecradle-harness-wake --resolved-config
 ```
+
+`--resolved-config` resolves through the same code paths a wake uses — the validated `(provider, sdk, surface)` triple and the active tool set after the full plugin/memory/MCP/locked-policy resolution — so the JSON is what the agent *would actually do*, not a declared list. It builds **no** model provider (no `AI_API_KEY` needed; `ai_model` is the raw env value, `null` if unset) and runs **no** config-home reconcile (no writes), so it reports the overlay as it is on disk. The field set is an additive contract: `harness_version`, `ai_provider`, `ai_sdk`, `ai_sdk_surface`, `ai_sdk_version`, `ai_model`, `tools` (active function tools), `builtins` (active server-side built-ins), and `skipped` (plugins that did not activate — the "why isn't this tool here?" trail).
 
 It reads the same environment as `TimelineAgent.from_env` (credentials, `AI_PROVIDER_*`, the config-home charter, `HARNESS_ONBOARD`, `HARNESS_CONTEXT_MESSAGES`) plus one more that wake mode **requires**:
 

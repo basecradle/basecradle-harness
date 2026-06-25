@@ -624,6 +624,24 @@ def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvid
     # loaded broken (issue #160). A no-op for a never-installed deployment (@jt) and for an
     # already-current one; guarded so a reconcile hiccup never blocks startup.
     _reconcile_config_on_upgrade(provider_name)
+    resolved, memory = _resolve_tools(provider_name, sdk, surface)
+    provider = _provider_from_config(provider_name, sdk, surface, builtins=resolved.builtins)
+    return provider, resolved, memory
+
+
+def _resolve_tools(
+    provider_name: str, sdk: str, surface: str
+) -> tuple[ResolvedTools, MemoryProvider]:
+    """Settle the active tool set for a validated config triple — without building the provider.
+
+    The shared tool-resolution core of `_resolve_tools_and_provider`, factored out so the
+    read-only introspection path (`resolved_config`) can settle the **exact same** active tool
+    set the running agent would — same plugin overlay, memory provider, MCP drop-ins, and locked
+    policy — without constructing the model provider (which needs ``AI_API_KEY``). The caller
+    owns the *reconcile* decision: a wake reconciles a `pip install -U` overlay first because it
+    is about to act; the side-effect-free introspection deliberately does not (it must not write
+    to the config home).
+    """
     ctx = ActivationContext(
         provider=provider_name,
         sdk=sdk,
@@ -643,8 +661,7 @@ def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvid
     # Surface any broken *shipped-default* plugin loudly in the Turn-0 brief — a defect, never
     # a silent swallow (issue #160). Last, so it rides whatever the merges/policy produced.
     resolved = _surface_broken_defaults(resolved, loaded.broken_defaults)
-    provider = _provider_from_config(provider_name, sdk, surface, builtins=resolved.builtins)
-    return provider, resolved, memory
+    return resolved, memory
 
 
 def _reconcile_config_on_upgrade(provider: str) -> None:

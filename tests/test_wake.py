@@ -44,6 +44,7 @@ from basecradle_harness._wake import (
     _incoming_event_text,
     _now_line,
     main,
+    resolved_config,
 )
 
 BC_URL = "https://basecradle.com"
@@ -1330,6 +1331,56 @@ def test_main_version_flag_prints_harness_and_sdk_versions_and_exits_zero(capsys
     assert exit_info.value.code == 0
     out = capsys.readouterr().out.strip()
     assert out == f"basecradle-harness-wake {__version__} · openai SDK {openai.__version__}"
+
+
+def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, capsys):
+    """`--resolved-config` is the NOC's ground-truth deploy probe (issue #174): print the live,
+    *resolved* config + active tool set as stable JSON, exit 0, and need no timeline, model call,
+    or platform network (no `platform` respx mock here — it must not hit the API)."""
+    from basecradle_harness import __version__
+
+    assert main(["--resolved-config"]) == 0  # no --timeline; introspection is timeline-free
+    report = json.loads(capsys.readouterr().out)
+
+    # The additive contract: every documented field is present and is ground truth, not a declaration.
+    assert report["harness_version"] == __version__
+    assert report["ai_provider"] == "openai"
+    assert report["ai_sdk"] == "openai"
+    assert report["ai_sdk_surface"] == "responses"  # the openai adapter's default surface
+    assert report["ai_model"] == "gpt-4o"  # the wake_env AI_MODEL, reported verbatim
+    import openai
+
+    assert report["ai_sdk_version"] == openai.__version__
+    # The resolved active tool set — the platform tools that actually activate under the locked
+    # policy, not a shipped-default list. The benign platform reads/writes are always present.
+    assert {"memory", "users", "messages", "timelines", "lock", "delete"} <= set(report["tools"])
+    # Powerful tools are opt-in (issue #168), so none activate in a default config.
+    assert "generate_image" not in report["tools"]
+    assert "web_search" not in report["builtins"]
+
+
+def test_resolved_config_is_side_effect_free_without_a_model_or_key(wake_env, monkeypatch):
+    """It resolves through the live code paths but builds **no** model provider, so it works with
+    no `AI_API_KEY` and reports an unset `AI_MODEL` as `None` rather than raising the provider
+    build's "AI_MODEL is required" — safe to run repeatedly over SSH against a live agent home."""
+    monkeypatch.delenv("AI_API_KEY", raising=False)
+    monkeypatch.delenv("AI_MODEL", raising=False)
+
+    report = resolved_config()
+
+    assert report["ai_model"] is None  # unset → None, never a raise
+    assert report["tools"]  # the tool set still resolves with no key / no model
+
+
+def test_main_resolved_config_exits_nonzero_on_a_misconfigured_provider(
+    wake_env, monkeypatch, capsys
+):
+    """A resolution error (an unknown AI_PROVIDER) is the verifier's honest "misconfigured" signal:
+    a clean non-zero exit with the reason on stderr, never a raw traceback."""
+    monkeypatch.setenv("AI_PROVIDER", "bogus")
+
+    assert main(["--resolved-config"]) == 1
+    assert "Unknown AI_PROVIDER 'bogus'" in capsys.readouterr().err
 
 
 def test_main_returns_nonzero_when_home_is_missing(platform, wake_env, monkeypatch):
