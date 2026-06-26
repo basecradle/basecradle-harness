@@ -260,6 +260,93 @@ def test_web_search_builtin_is_offered_alongside_function_tools(router):
     provider.close()
 
 
+def test_code_interpreter_builtin_carries_an_auto_container_by_default(router):
+    """The ``code_interpreter`` built-in is offered with an auto container when no bridge wires one."""
+    provider = OpenAIProvider(
+        model="gpt-5.4-mini",
+        api_key=FAKE_KEY,
+        base_url=BASE_URL,
+        surface="responses",
+        max_retries=0,
+        builtin_tools=["code_interpreter"],
+    )
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("ok")))
+    )
+
+    provider.chat([Message.user("compute something")])
+
+    tools = json.loads(route.calls.last.request.content)["tools"]
+    assert {"type": "code_interpreter", "container": {"type": "auto"}} in tools
+    provider.close()
+
+
+def test_code_interpreter_container_comes_from_the_callback_per_turn(router):
+    """The Asset bridge supplies the live container per turn (a pinned id once it knows one)."""
+    container_id = "cntr_pinned_42"
+    provider = OpenAIProvider(
+        model="gpt-5.4-mini",
+        api_key=FAKE_KEY,
+        base_url=BASE_URL,
+        surface="responses",
+        max_retries=0,
+        builtin_tools=["code_interpreter"],
+        code_container=lambda: container_id,
+    )
+    route = router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("ok")))
+    )
+
+    provider.chat([Message.user("read my file")])
+
+    tools = json.loads(route.calls.last.request.content)["tools"]
+    assert {"type": "code_interpreter", "container": container_id} in tools
+    provider.close()
+
+
+def test_code_interpreter_call_surfaces_source_and_output_files(router, responses_provider):
+    """A code_interpreter_call + container_file_citation become the Message's CodeExecutionTrace."""
+    from tests.conftest import container_file_citation, out_code_interpreter_call
+
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=responses_body(
+                out_code_interpreter_call(code="print(sum(range(10)))", container_id="cntr_x"),
+                out_message(
+                    "Done — see the chart.",
+                    annotations=[
+                        container_file_citation(
+                            file_id="cfile_1", filename="chart.png", container_id="cntr_x"
+                        )
+                    ],
+                ),
+            ),
+        )
+    )
+
+    reply = responses_provider.chat([Message.user("plot it")])
+
+    assert reply.content == "Done — see the chart."
+    trace = reply.code_execution
+    assert trace is not None
+    assert trace.container == "cntr_x"
+    assert trace.code == ["print(sum(range(10)))"]
+    assert [(f.file_id, f.filename) for f in trace.output_files] == [("cfile_1", "chart.png")]
+
+
+def test_a_turn_without_code_execution_has_no_trace(router, responses_provider):
+    """A plain reply (no code run) carries ``code_execution=None`` — nothing else changes."""
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("hi")))
+    )
+
+    reply = responses_provider.chat([Message.user("hello")])
+
+    assert reply.content == "hi"
+    assert reply.code_execution is None
+
+
 def test_extra_body_is_sent_on_the_responses_surface(router):
     """A vendor-specific body field (xAI's ``search_parameters``) rides the SDK's ``extra_body``.
 

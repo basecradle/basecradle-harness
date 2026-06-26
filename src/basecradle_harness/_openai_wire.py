@@ -25,7 +25,13 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from basecradle_harness._exceptions import ProviderError
-from basecradle_harness._messages import Message, ToolCall, ToolSpec
+from basecradle_harness._messages import (
+    CodeExecutionFile,
+    CodeExecutionTrace,
+    Message,
+    ToolCall,
+    ToolSpec,
+)
 
 # === Chat Completions =========================================================
 
@@ -186,10 +192,16 @@ def builtin_to_responses(spec: str | Mapping[str, Any]) -> dict[str, Any]:
 def message_from_responses(data: Mapping[str, Any]) -> Message:
     """Parse a Responses payload into the assistant's `Message`.
 
-    Walks the ``output`` items by type: ``message`` items contribute reply text and any
-    ``url_citation`` annotations; ``function_call`` items become `ToolCall`s for the engine to
-    run. Every other item type (``web_search_call``, ``reasoning``, and future built-ins) is
-    resolved server-side and intentionally skipped here.
+    Walks the ``output`` items by type: ``message`` items contribute reply text, any
+    ``url_citation`` annotations, and any ``container_file_citation`` annotations (files the
+    Code Interpreter wrote); ``function_call`` items become `ToolCall`s for the engine to run;
+    ``code_interpreter_call`` items contribute their executed source and container id. Every
+    other item type (``web_search_call``, ``reasoning``, and future built-ins) is resolved
+    server-side and intentionally skipped here.
+
+    When the turn ran code, the executed source + output-file handles are surfaced on the
+    `Message` as a `CodeExecutionTrace` (transient) so the Asset bridge can store them; with no
+    code execution the field stays ``None`` and nothing else changes.
     """
     output = data.get("output")
     if not isinstance(output, list):
@@ -198,6 +210,10 @@ def message_from_responses(data: Mapping[str, Any]) -> Message:
     text_parts: list[str] = []
     citations: list[dict[str, Any]] = []
     tool_calls: list[ToolCall] = []
+    code_blocks: list[str] = []
+    code_container: str | None = None
+    output_files: list[CodeExecutionFile] = []
+    seen_file_ids: set[str] = set()
 
     for item in output:
         kind = item.get("type")
@@ -206,13 +222,26 @@ def message_from_responses(data: Mapping[str, Any]) -> Message:
                 if part.get("type") == "output_text":
                     if part.get("text"):
                         text_parts.append(part["text"])
-                    citations.extend(
-                        ann
-                        for ann in part.get("annotations") or []
-                        if ann.get("type") == "url_citation"
-                    )
+                    for ann in part.get("annotations") or []:
+                        if ann.get("type") == "url_citation":
+                            citations.append(ann)
+                        elif ann.get("type") == "container_file_citation":
+                            file_id = ann.get("file_id")
+                            if file_id and file_id not in seen_file_ids:
+                                seen_file_ids.add(file_id)
+                                output_files.append(
+                                    CodeExecutionFile(
+                                        file_id=file_id,
+                                        filename=ann.get("filename") or file_id,
+                                    )
+                                )
+                            code_container = code_container or ann.get("container_id")
         elif kind == "function_call":
             tool_calls.append(_tool_call_from_responses(item))
+        elif kind == "code_interpreter_call":
+            if item.get("code"):
+                code_blocks.append(item["code"])
+            code_container = code_container or item.get("container_id")
         # Any other item type is a server-side built-in result — already resolved by the
         # provider, nothing for the engine to do. Skip it.
 
@@ -221,7 +250,12 @@ def message_from_responses(data: Mapping[str, Any]) -> Message:
         text += format_citations(citations)
     # Mirror Chat Completions: a pure tool-call turn carries no text.
     content = text if text else None
-    return Message(role="assistant", content=content, tool_calls=tool_calls)
+    trace = (
+        CodeExecutionTrace(container=code_container, code=code_blocks, output_files=output_files)
+        if (code_blocks or output_files)
+        else None
+    )
+    return Message(role="assistant", content=content, tool_calls=tool_calls, code_execution=trace)
 
 
 def _tool_call_from_responses(item: Mapping[str, Any]) -> ToolCall:

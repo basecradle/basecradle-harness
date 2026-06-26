@@ -95,6 +95,7 @@ from basecradle_harness._brief import (
     render_manifest,
     render_safety,
 )
+from basecradle_harness._code import CodeExecutionBridge
 from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
@@ -507,6 +508,7 @@ class WakeAgent:
         safety_notices: list[str] | None = None,
         defect_notices: list[str] | None = None,
         breaker: WakeBreaker | None = None,
+        code_bridge: CodeExecutionBridge | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -557,13 +559,19 @@ class WakeAgent:
 
         # Bind the live platform handle into every platform-aware tool — the same
         # seam the poll loop uses, so a router-woken peer can act on the timeline
-        # exactly as a polling one. One wake serves one timeline; bind once.
-        bind_platform_tools(
-            self.harness.tools,
-            PlatformContext(
-                client=self.client, timeline=self.timeline_uuid, home=self.harness.home
-            ),
+        # exactly as a polling one. One wake serves one timeline; bind once. The
+        # code-execution bridge (when active) is bound the same way, and rides the
+        # context so the `code_attach` tool can reach it.
+        self.code_bridge = code_bridge
+        context = PlatformContext(
+            client=self.client,
+            timeline=self.timeline_uuid,
+            home=self.harness.home,
+            code_bridge=code_bridge,
         )
+        bind_platform_tools(self.harness.tools, context)
+        if code_bridge is not None:
+            code_bridge.bind(context)
 
         # One Dashboard read answers "who am I?" — the identity uuid the actor self-filter
         # tests every item against. (The brief's orientation is the *live* `dashboard.md`
@@ -603,12 +611,16 @@ class WakeAgent:
                 "Wake mode requires HARNESS_HOME — the directory where the agent's "
                 "transcript and high-water mark persist across wakes."
             )
-        provider, resolved, memory = _resolve_tools_and_provider()
+        provider, resolved, memory, bridge = _resolve_tools_and_provider()
         harness = Harness(
             provider,
             system_prompt=charter_from_env(),
             tools=resolved.tools,
             home=home,
+            # The code-execution Asset bridge (when active) harvests a run's output files +
+            # source into Assets after each code-exec turn, then feeds their uuids back. None
+            # when code execution isn't opted in → the engine loop is unchanged.
+            turn_hook=bridge.on_reply if bridge is not None else None,
         )
         return cls(
             harness,
@@ -616,6 +628,7 @@ class WakeAgent:
             client=_client_from_env(),
             context_messages=_context_messages_from_env(),
             onboard=_onboard_from_env(),
+            code_bridge=bridge,
             # `or None` so a set-but-blank NOC_PROBE_SECRET (an exported-but-unfilled
             # secret) reads as *off*, not as "enabled with an empty HMAC key".
             probe_secret=os.environ.get("NOC_PROBE_SECRET") or None,

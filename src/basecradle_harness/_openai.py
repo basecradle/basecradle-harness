@@ -31,7 +31,7 @@ harness owns history, so Responses' server-side state (``previous_response_id``)
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from basecradle_harness._exceptions import (
@@ -106,6 +106,12 @@ class OpenAIProvider:
             vendor-neutral — this is the seam for a provider-specific field the typed SDK params
             don't cover, e.g. xAI's ``search_parameters`` Live-Search object when the ``openai``
             SDK is pointed at ``api.x.ai`` (see `basecradle_harness._basecradle`).
+        code_container: An optional callback supplying the ``container`` config for the
+            ``code_interpreter`` built-in, evaluated **per turn** (the container handle changes
+            as the Asset bridge stages files / pins a session — see `_code.py`). Returns a
+            container id string, a container dict, or ``None``. When absent (or it returns
+            ``None``) the built-in falls back to ``{"type": "auto"}``. The adapter stays
+            BaseCradle-agnostic — it just asks "what container?"; the bridge answers.
         default_params: Extra body parameters sent on every call (e.g. ``temperature=0.2``).
             ``model``, the input/messages, and ``tools`` always take precedence.
     """
@@ -121,6 +127,7 @@ class OpenAIProvider:
         max_retries: int = 2,
         builtin_tools: Sequence[str | Mapping[str, Any]] = (),
         extra_body: Mapping[str, Any] | None = None,
+        code_container: Callable[[], dict[str, Any] | str | None] | None = None,
         **default_params: Any,
     ) -> None:
         if surface not in SURFACES:
@@ -135,6 +142,7 @@ class OpenAIProvider:
         self.surface = surface
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._builtin_tools = [builtin_to_responses(spec) for spec in builtin_tools]
+        self._code_container = code_container
         self._extra_body = dict(extra_body) if extra_body else None
         self._default_params = default_params
         self._openai = openai
@@ -159,7 +167,7 @@ class OpenAIProvider:
         payload: dict[str, Any] = dict(self._default_params)
         payload["model"] = self.model
         payload["input"] = [item for m in messages for item in message_to_input(m)]
-        wire_tools = list(self._builtin_tools)
+        wire_tools = [self._with_code_container(spec) for spec in self._builtin_tools]
         if tools:
             wire_tools.extend(function_tool_to_responses(t) for t in tools)
         if wire_tools:
@@ -169,6 +177,20 @@ class OpenAIProvider:
         with self._mapped_errors():
             response = self._client.responses.create(**payload)
         return message_from_responses(response.model_dump())
+
+    def _with_code_container(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """Inject the live ``container`` into the ``code_interpreter`` built-in, per turn.
+
+        The Code Interpreter built-in needs a container (auto-created, or a pinned session id
+        once the Asset bridge knows one), and that handle changes during a wake — so it cannot
+        be baked in at construction. Every other built-in passes through untouched. With no
+        `code_container` callback (or it returns ``None``) the built-in falls back to an
+        auto-created container, exactly as the bare built-in would.
+        """
+        if spec.get("type") != "code_interpreter":
+            return spec
+        container = self._code_container() if self._code_container is not None else None
+        return {**spec, "container": container if container is not None else {"type": "auto"}}
 
     def _chat_turn(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None) -> Message:
         payload: dict[str, Any] = dict(self._default_params)

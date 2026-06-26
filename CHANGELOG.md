@@ -7,6 +7,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-06-26
+
+**Code execution — a standalone, opt-in tool with vendor parity, bridged to the Asset system
+(issue #172).** An agent can be given code execution that runs **server-side in the vendor's own
+sandbox** — OpenAI's Responses-API Code Interpreter, xAI's Agent-Tools code execution. The harness
+**never** runs model-authored code on its own boxes; like `web_search`, it is a hosted-tool toggle.
+Off by default on every provider, opt-in (issue #168). On OpenAI it is bridged to the BaseCradle
+**Asset system** in both directions: feed an existing Asset in as an input file, and every file a
+run produces — plus the executed Python source — is stored back as an Asset on the timeline, with
+the new Asset uuids fed back so the model can reference them. Building block for a future tooled-up
+revenue persona ("Orion Rigel").
+
+### Added
+
+- **`code_execution` built-in (both vendors).** A default opt-in plugin
+  (`_defaults/tools/code_execution.py`) resolving to OpenAI's `code_interpreter` (needs the
+  `responses` surface) or xAI's native `code_execution` Agent Tool (`AI_PROVIDER=xai`) — exactly
+  one per config, the `web_search` discriminator pattern. Grant it with
+  `basecradle-harness-install --opt-in code_execution`.
+- **The Asset bridge (`basecradle_harness._code`, OpenAI only).** `CodeExecutionBridge` supplies the
+  Code Interpreter `container` per turn, stages a BaseCradle Asset into the container as an input
+  file (the `code_attach` tool, the IN direction), and after each code-exec turn harvests the run's
+  output files (discovered by listing the container — `source == "assistant"` — so an *uncited* file
+  is still captured) and its executed source back into Assets (the OUT direction, automatic),
+  feeding their uuids into the conversation. Reuses the existing `_assets`/`_media` Asset seam; a
+  failure degrades gracefully and never breaks the wake.
+- **`CodeExecutionTrace` / `CodeExecutionFile`** (`basecradle_harness._messages`) — the transient,
+  provider-neutral carrier the Responses adapter surfaces a code-exec turn on (container, executed
+  source, cited output files), used by the bridge within the wake and never serialized.
+- **Engine `turn_hook`** (`basecradle_harness._engine` / `Harness`) — a minimal, generic post-turn
+  hook (the bridge's `on_reply`) that may append follow-up turns and ask the loop to continue;
+  `None` (the default) is byte-identical to the prior loop, bounded by `max_steps`.
+
+### Changed
+
+- **`OpenAIProvider`** accepts a `code_container` callback (the live container for the
+  `code_interpreter` built-in, evaluated per turn; falls back to `{"type": "auto"}`), and
+  `message_from_responses` now surfaces `code_interpreter_call` source + `container_file_citation`
+  output files as a `CodeExecutionTrace`. **`XaiSdkProvider`** maps the `code_execution` built-in to
+  its native Agent Tool.
+
+### Notes
+
+- **gpt-5.4-mini supports `code_interpreter`** — verified live, so **JT needs no model bump**.
+- **Documented vendor asymmetry.** xAI's `code_execution` tool exposes **no input-file binding**
+  (its proto carries no file config), so the Asset bridge is **OpenAI-only**; on xAI grok can
+  compute but not exchange files with the Asset system. (xAI's *response* proto does carry an
+  `output_files` field, but whether `code_execution` populates it is unverified against the live
+  endpoint — the capital's to confirm on Eddie.) Reality over faked parity, per issue #172.
+
 ## [0.38.0] - 2026-06-25
 
 **`basecradle-harness-wake --resolved-config` — ground-truth introspection for fleet drift

@@ -512,7 +512,7 @@ def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatc
     install(os.environ["BASECRADLE_CONFIG_HOME"], opt_in=["web_search", "generate_image"])
 
     # Default config: openai provider, openai SDK, responses surface → web_search active.
-    provider, resolved, _memory = _resolve_tools_and_provider()
+    provider, resolved, _memory, _bridge = _resolve_tools_and_provider()
     assert isinstance(provider, OpenAIProvider)
     assert provider.surface == "responses"
     # web_search is enabled on the provider as a server-side built-in (driven by the plugin)…
@@ -530,7 +530,7 @@ def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatc
     provider.close()
 
     monkeypatch.setenv("AI_SDK_SURFACE", "chat")
-    chat_provider, chat_resolved, _chat_memory = _resolve_tools_and_provider()
+    chat_provider, chat_resolved, _chat_memory, _chat_bridge = _resolve_tools_and_provider()
     assert isinstance(chat_provider, OpenAIProvider)
     assert chat_provider.surface == "chat"
     assert chat_provider._builtin_tools == []  # web_search self-excludes off Responses
@@ -549,7 +549,7 @@ def test_resolve_surfaces_a_broken_shipped_default_not_silently(monkeypatch):
     install(home)  # stamps the current version, so the upgrade reconcile is a no-op here
     (home / "tools" / "web_fetch.py").write_text("import a_symbol_the_rebuild_removed_zzz\n")
 
-    provider, resolved, _memory = _resolve_tools_and_provider()
+    provider, resolved, _memory, _bridge = _resolve_tools_and_provider()
     try:
         assert any("web_fetch.py" in line for line in resolved.broken)  # surfaced as a defect
         assert "web_fetch" not in {t.name for t in resolved.tools}  # the broken tool is gone
@@ -572,7 +572,7 @@ def test_resolve_runs_the_upgrade_reconcile_before_loading_the_overlay(monkeypat
     (home / ".version").write_text("0.0.0\n")  # simulate a config home from an older harness
     assert installed_version(home) == "0.0.0"
 
-    provider, _resolved, _memory = _resolve_tools_and_provider()
+    provider, _resolved, _memory, _bridge = _resolve_tools_and_provider()
     try:
         assert installed_version(home) == __version__  # the reconcile ran and re-stamped
     finally:

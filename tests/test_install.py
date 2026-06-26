@@ -390,7 +390,7 @@ def test_plugin_opts_in_detects_the_flag_without_importing():
 
 
 def test_every_shipped_power_tool_default_is_classified_opt_in():
-    # The whole safety guarantee rests on these seven being flagged — pin it against the package.
+    # The whole safety guarantee rests on these being flagged — pin it against the package.
     from importlib.resources import files
 
     power_stems = set()
@@ -406,6 +406,7 @@ def test_every_shipped_power_tool_default_is_classified_opt_in():
         "xai_search",  # declares both web_search + x_search built-ins, both opt_in
         "grok_generate_image",
         "grok_generate_video",
+        "code_execution",  # OpenAI Code Interpreter + xAI code execution + code_attach (issue #172)
     }
 
 

@@ -128,10 +128,10 @@ class XaiSdkProvider:
         payload: dict[str, Any] = dict(self._default_params)
         payload["model"] = self.model
         payload["messages"] = [self._to_wire(m, chat_mod) for m in messages]
-        # Function tools and the opted-in server-side search built-ins share one ``tools`` list:
-        # both are native ``chat_pb2.Tool`` protos (issue #171 — the Agent Tools API).
+        # Function tools and the opted-in server-side built-ins (search, code execution) share
+        # one ``tools`` list: all are native ``chat_pb2.Tool`` protos (issue #171 — Agent Tools).
         wire_tools = [chat_mod.tool(t.name, t.description, t.parameters) for t in tools or ()]
-        wire_tools.extend(self._search_tools())
+        wire_tools.extend(self._agent_tools())
         if wire_tools:
             payload["tools"] = wire_tools
         with self._mapped_errors():
@@ -195,19 +195,34 @@ class XaiSdkProvider:
             content = f"{content}\n\n{footer}" if content else footer
         return Message.assistant(content=content, tool_calls=tool_calls)
 
-    def _search_tools(self) -> list[Any]:
-        """The opted-in search built-ins as xAI **Agent Tool** entries (`chat_pb2.Tool`).
+    def _agent_tools(self) -> list[Any]:
+        """The opted-in server-side built-ins as xAI **Agent Tool** entries (`chat_pb2.Tool`).
 
         ``web_search`` → `xai_sdk.tools.web_search()`, ``x_search`` → `xai_sdk.tools.x_search()`
-        (`x_search` is the single, unified 𝕏 tool — posts, users, and threads). grok runs the
-        search server-side and returns sourced answers with citations. With no search built-in
-        opted in, returns ``[]`` so the request carries no search tool and grok does not search.
+        (`x_search` is the single, unified 𝕏 tool — posts, users, and threads), and
+        ``code_execution`` → `xai_sdk.tools.code_execution()` (grok writes and runs Python in
+        xAI's sandbox — compute only; see the file-I/O note below). grok runs each tool
+        server-side and returns the result; the harness never executes it. With nothing opted
+        in, returns ``[]`` so the request carries no built-in.
 
         This is the issue #171 fix: the native ``SearchParameters`` path it replaced is deprecated
         and now rejected by the live gRPC endpoint (``UNIMPLEMENTED: Live search is deprecated``).
+
+        File-I/O asymmetry (issue #172): xAI's ``code_execution`` tool takes no parameters and
+        its proto carries no file-input binding — there is **no** input-file mechanism the way
+        OpenAI's Code Interpreter container has ``file_ids``. (xAI's *response* proto does carry
+        an ``output_files`` field, but whether ``code_execution`` populates it is unverified
+        against the live endpoint and is the capital's to confirm on Eddie.) So the Asset bridge
+        — `_code.py`, the input/output file round-trip — is **OpenAI-only**; on xAI grok can
+        compute but not exchange files with the BaseCradle Asset system. Documented gap, not a
+        faked parity.
         """
         tools_mod = self._xai.tools
-        builders = {"web_search": tools_mod.web_search, "x_search": tools_mod.x_search}
+        builders = {
+            "web_search": tools_mod.web_search,
+            "x_search": tools_mod.x_search,
+            "code_execution": tools_mod.code_execution,
+        }
         return [builders[name]() for name in self._builtin_tools if name in builders]
 
     # --- gRPC errors -> the harness provider error hierarchy ------------------

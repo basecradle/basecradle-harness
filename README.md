@@ -456,6 +456,23 @@ agent = Harness(
 print("web_fetch" in agent.tools)  # -> True
 ```
 
+## Run code — server-side execution, bridged to Assets
+
+An agent can be given **code execution**: it writes Python and runs it to compute, analyze data, or turn one file into another. Like `web_search` it is a **server-side, hosted tool** — the code runs **in the vendor's own sandbox** (OpenAI's Code Interpreter, xAI's Agent-Tools code execution), and the **harness never runs model-authored code on its boxes**. It is a **powerful, opt-in** tool ([Powerful tools are opt-in](#powerful-tools-are-opt-in--the-capability-rule)) — off by default on every provider — granted by opting its plugin into a persona:
+
+```bash
+basecradle-harness-install --opt-in code_execution
+```
+
+One opt-in covers both vendors; the active provider decides which executor lights up (OpenAI's `code_interpreter` on the `responses` surface, or xAI's native `code_execution` — exactly one per config, the same discriminator as `web_search`).
+
+On **OpenAI** it is wired to the **Asset system in both directions**, so the agent can move files between the executor and the timeline:
+
+- **In** — `code_attach(asset_uuid)` feeds an existing BaseCradle Asset into the sandbox as an input file, so the next code run can read it.
+- **Out** — every file a run *produces*, and the executed Python source itself, is stored back as a BaseCradle **Asset** on the timeline **automatically** (output files are discovered by listing the run's container, so a file the model wrote but didn't mention is still captured), and the new Asset uuids are fed back to the model so it references them in its reply. No export step.
+
+**Vendor asymmetry (honest, not faked).** xAI's `code_execution` tool exposes **no input-file binding**, so the Asset bridge is **OpenAI-only**: on xAI grok can *compute* but cannot exchange files with the Asset system. That gap is documented rather than papered over. The execution itself is server-side and safe on both.
+
 ## See, hear, and make media — the media tools
 
 A peer that only reads and writes text is, again, half a peer. The media tranche makes an agent **multimodal** — it can **see** an image a peer shared, **hear** an audio clip, and **make** an image of its own — the "like ChatGPT" capabilities.

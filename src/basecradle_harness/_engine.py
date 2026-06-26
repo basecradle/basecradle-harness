@@ -24,12 +24,21 @@ do again, never a standing cost.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from basecradle_harness._exceptions import EngineError
 from basecradle_harness._messages import ImageContent, Message, ToolResult
 from basecradle_harness._provider import Provider
 from basecradle_harness._tools import ToolRegistry
 
 DEFAULT_MAX_STEPS = 8
+
+#: A post-turn hook: given the assistant turn the provider just produced and the live
+#: transcript, it may append follow-up turns and returns whether the loop must continue even
+#: when the turn carried no tool calls. The engine stays ignorant of *why* — the one collaborator
+#: that knows (the code-execution Asset bridge: harvest the run's output files into Assets, then
+#: feed their uuids back so the model can cite them) is injected, like the provider and tools.
+TurnHook = Callable[[Message, "list[Message]"], bool]
 
 
 class Engine:
@@ -41,14 +50,24 @@ class Engine:
             already gated what could be registered; the engine just runs them.
         max_steps: The most provider calls one `run` may make before giving up.
             Bounds runaway tool loops.
+        turn_hook: An optional post-turn callback (see `TurnHook`). ``None`` (the
+            default) is byte-identical to the loop without it. It bounds itself the
+            same way tool calls do — `max_steps` caps the whole loop regardless of
+            what the hook requests, so a misbehaving hook cannot run away.
     """
 
     def __init__(
-        self, provider: Provider, tools: ToolRegistry, *, max_steps: int = DEFAULT_MAX_STEPS
+        self,
+        provider: Provider,
+        tools: ToolRegistry,
+        *,
+        max_steps: int = DEFAULT_MAX_STEPS,
+        turn_hook: TurnHook | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.max_steps = max_steps
+        self.turn_hook = turn_hook
 
     def run(self, messages: list[Message]) -> Message:
         """Drive the conversation to a final text reply.
@@ -66,8 +85,6 @@ class Engine:
             for _ in range(self.max_steps):
                 reply = self.provider.chat(messages, tools=specs)
                 messages.append(reply)
-                if not reply.tool_calls:
-                    return reply
                 for call in reply.tool_calls:
                     result = self._run_tool(call.name, call.arguments)
                     text, images = _split_result(result)
@@ -78,6 +95,15 @@ class Engine:
                         shown_turn = Message(role="user", content=_caption(images), images=images)
                         messages.append(shown_turn)
                         shown.append(shown_turn)
+                # A post-turn hook may append follow-up turns (e.g. the code-exec bridge
+                # storing output files as Assets and feeding their uuids back) and ask the loop
+                # to continue so the model can use them. It runs *after* any tool results, so a
+                # follow-up turn lands cleanly at the end of the transcript, and it bounds itself:
+                # `max_steps` still caps the whole loop, and the bridge dedups its harvest, so a
+                # settled run surfaces nothing new and the hook returns False on the next pass.
+                extend = bool(self.turn_hook(reply, messages)) if self.turn_hook else False
+                if not reply.tool_calls and not extend:
+                    return reply
             raise EngineError(
                 f"No final reply after {self.max_steps} steps; the model kept calling tools."
             )

@@ -16,6 +16,7 @@ from basecradle_harness._brief import (
     render_manifest,
     render_safety,
 )
+from basecradle_harness._code import CodeAttachTool, CodeExecutionBridge
 from basecradle_harness._confirmed import ConfirmedTimelineAction
 from basecradle_harness._delete import DeleteTool
 from basecradle_harness._engine import Engine
@@ -65,6 +66,8 @@ from basecradle_harness._memory_provider import (
     memory_provider_from_env,
 )
 from basecradle_harness._messages import (
+    CodeExecutionFile,
+    CodeExecutionTrace,
     ImageContent,
     Message,
     Role,
@@ -196,6 +199,8 @@ __all__ = [
     "MessagesTool",
     "GenerateImageTool",
     "EditImageTool",
+    "CodeExecutionBridge",
+    "CodeAttachTool",
     "GrokGenerateImageTool",
     "GrokGenerateVideoTool",
     "WebhookEndpointsTool",
@@ -208,6 +213,8 @@ __all__ = [
     "ToolResult",
     "ToolSpec",
     "ImageContent",
+    "CodeExecutionTrace",
+    "CodeExecutionFile",
     # Errors
     "HarnessError",
     "PolicyError",

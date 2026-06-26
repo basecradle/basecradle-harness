@@ -45,6 +45,8 @@ from basecradle_harness._tools import Tool
 if TYPE_CHECKING:
     from basecradle import BaseCradle, BaseCradleError
 
+    from basecradle_harness._code import CodeExecutionBridge
+
 
 @dataclass(frozen=True)
 class PlatformContext:
@@ -59,11 +61,16 @@ class PlatformContext:
         home: The directory under which a tool may stage temp files (uploads and
             downloads), or `None`. This is the agent's `HARNESS_HOME`; confining
             scratch under it keeps the safe profile's I/O bounded and cleanable.
+        code_bridge: The per-wake code-execution Asset bridge (`_code.py`), or
+            `None` when code execution is not active. The `code_attach` tool reaches
+            it here to stage a BaseCradle Asset into the executor; every other
+            platform tool ignores it.
     """
 
     client: BaseCradle
     timeline: str
     home: Path | None = None
+    code_bridge: CodeExecutionBridge | None = None
 
 
 class PlatformTool(Tool):

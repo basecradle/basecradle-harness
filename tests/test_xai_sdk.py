@@ -190,6 +190,21 @@ def test_opted_in_search_builtins_become_agent_tools():
     assert kinds == ["web_search", "x_search"]
 
 
+def test_code_execution_builtin_becomes_an_agent_tool():
+    # Issue #172: the code_execution built-in is an xAI Agent Tool on the chat `tools` list, the
+    # same shape as the search built-ins. grok runs Python server-side; the harness never does.
+    provider = XaiSdkProvider(
+        "grok-4.3",
+        api_key=FAKE_KEY,
+        client=_FakeClient(_response(content="42")),
+        builtin_tools=["code_execution"],
+    )
+    provider.chat([Message.user("sum of squares 1..100?")])
+
+    kinds = [t.WhichOneof("tool") for t in provider._client.chat.captured["tools"]]
+    assert kinds == ["code_execution"]
+
+
 def test_search_builtins_coexist_with_function_tools_in_one_list():
     # Function tools and search Agent Tools share the single native `tools` list (both are Tools).
     provider = XaiSdkProvider(

@@ -13,6 +13,9 @@ payload. A handful of small dataclasses are the whole vocabulary:
   can see a picture, not just read text about it.
 - `ToolResult` — a tool's richer return: text plus any images it wants shown to
   the model. A tool that only has text just returns a `str`, as before.
+- `CodeExecutionTrace` — what a server-side code-execution turn did: the source
+  it ran and the files it produced. Surfaced (transiently) on an assistant
+  `Message` so the Asset bridge can harvest it; see `_code.py`.
 """
 
 from __future__ import annotations
@@ -57,6 +60,46 @@ class ToolResult:
 
 
 @dataclass
+class CodeExecutionFile:
+    """One file a server-side code executor produced, as a vendor file handle.
+
+    `file_id` is the executor's own id for the file (e.g. an OpenAI container file
+    id); `filename` is the name it was written under. The Asset bridge fetches the
+    bytes by `file_id` and re-posts them as a BaseCradle Asset under `filename`.
+    """
+
+    file_id: str
+    filename: str
+
+
+@dataclass
+class CodeExecutionTrace:
+    """What a hosted code-execution turn did — provider-neutral, transient.
+
+    A server-side code tool (OpenAI Code Interpreter, xAI Agent-Tools code
+    execution) runs the model's Python in the vendor's sandbox; the harness never
+    executes it. The adapter that parses the turn fills this in so the Asset bridge
+    (`_code.py`) can store the artifacts back on the timeline:
+
+    - `container` — the executor's session/container handle, if any (OpenAI's
+      ``container_id``). Lets the bridge fetch output files and reuse the session.
+      ``None`` for an executor with no addressable container (xAI).
+    - `code` — the source blocks the executor ran, in order. Always capturable; the
+      bridge stores them as a ``.py`` Asset.
+    - `output_files` — files the run produced, as vendor file handles. Empty for an
+      executor with no file output (xAI — a documented asymmetry).
+
+    It is *transient*: carried on the assistant `Message` only within the wake that
+    produced it, and deliberately **not** serialized by `to_dict`/`from_dict` — the
+    bridge harvests it before the reply persists, so a stored transcript stays clean.
+    """
+
+    container: str | None = None
+    code: list[str] = field(default_factory=list)
+    output_files: list[CodeExecutionFile] = field(default_factory=list)
+
+
+@dataclass
 class ToolCall:
     """A model's request to invoke one tool.
 
@@ -79,6 +122,10 @@ class Message:
     `images` is populated only on the synthetic `user` turn the engine injects to
     *show* the model an image (vision); a provider that cannot render images
     simply ignores it, so a text-only adapter is unaffected.
+
+    `code_execution` is set only on an assistant turn whose adapter ran a hosted
+    code-execution tool; it is **transient** (used by the Asset bridge within the
+    wake, never serialized — see `CodeExecutionTrace`).
     """
 
     role: Role
@@ -86,6 +133,7 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     images: list[ImageContent] = field(default_factory=list)
+    code_execution: CodeExecutionTrace | None = None
 
     @classmethod
     def system(cls, content: str) -> Message:
