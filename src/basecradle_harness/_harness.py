@@ -44,7 +44,7 @@ from collections.abc import Iterable, Mapping
 from pathlib import Path
 from urllib.parse import quote
 
-from basecradle_harness._engine import DEFAULT_MAX_STEPS, Engine
+from basecradle_harness._engine import DEFAULT_MAX_STEPS, Engine, TurnHook
 from basecradle_harness._messages import Message
 from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
@@ -75,6 +75,9 @@ class Harness:
             readable across restarts. `None` (the default) keeps sessions in
             memory only — still readable across sessions of the one running
             instance via `transcript`, just not across a restart.
+        turn_hook: An optional engine post-turn hook (see `Engine`). Used to wire
+            the code-execution Asset bridge; ``None`` (the default) leaves the loop
+            unchanged.
     """
 
     def __init__(
@@ -86,12 +89,13 @@ class Harness:
         policy: Policy | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
         home: str | Path | None = None,
+        turn_hook: TurnHook | None = None,
     ) -> None:
         self.provider = provider
         self.tools = ToolRegistry(policy=policy or Policy.locked())
         for tool in tools or ():
             self.tools.register(tool)
-        self.engine = Engine(provider, self.tools, max_steps=max_steps)
+        self.engine = Engine(provider, self.tools, max_steps=max_steps, turn_hook=turn_hook)
         self.system_prompt = system_prompt
         self.home = Path(home) if home is not None else None
         self._sessions: dict[str, Session] = {}

@@ -67,6 +67,7 @@ from typing import Any
 
 from basecradle import BaseCradle
 
+from basecradle_harness._code import CODE_EXECUTION_BUILTIN, CodeExecutionBridge
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
 from basecradle_harness._mcp import McpResolution, load_mcp_tools
@@ -158,6 +159,7 @@ class TimelineAgent:
         client: BaseCradle | None = None,
         context_messages: int | None = DEFAULT_CONTEXT_MESSAGES,
         onboard: bool = True,
+        code_bridge: CodeExecutionBridge | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -165,17 +167,21 @@ class TimelineAgent:
         self.client = client or BaseCradle()
         self.timeline_uuid = timeline
         self.timeline = self.client.timelines.get(timeline)
+        self.code_bridge = code_bridge
 
         # Wire the live platform handle into every platform-aware tool now that the
         # client and current timeline are resolved. This is the seam every Phase-2
         # tool reuses; a plain tool (memory) is skipped. One timeline per agent, so
         # binding once is correct — cross-timeline use is an explicit op argument.
-        bind_platform_tools(
-            self.harness.tools,
-            PlatformContext(
-                client=self.client, timeline=self.timeline_uuid, home=self.harness.home
-            ),
+        context = PlatformContext(
+            client=self.client,
+            timeline=self.timeline_uuid,
+            home=self.harness.home,
+            code_bridge=code_bridge,
         )
+        bind_platform_tools(self.harness.tools, context)
+        if code_bridge is not None:
+            code_bridge.bind(context)
 
         # One Dashboard read answers "who am I?" and, when onboarding, "what is this
         # place?" The Dashboard is the literal page a fresh peer wakes on; reading
@@ -213,11 +219,12 @@ class TimelineAgent:
         of this group), so the poll loop does not fire them — the provider object is built
         but not held here.
         """
-        provider, resolved, _memory = _resolve_tools_and_provider()
+        provider, resolved, _memory, bridge = _resolve_tools_and_provider()
         harness = Harness(
             provider,
             system_prompt=charter_from_env(),
             tools=resolved.tools,
+            turn_hook=bridge.on_reply if bridge is not None else None,
         )
         return cls(
             harness,
@@ -225,6 +232,7 @@ class TimelineAgent:
             client=_client_from_env(),
             context_messages=_context_messages_from_env(),
             onboard=_onboard_from_env(),
+            code_bridge=bridge,
         )
 
     def poll_once(self) -> list[object]:
@@ -529,7 +537,12 @@ def _xai_search_parameters(builtins: Sequence[str]) -> dict[str, Any] | None:
 
 
 def _provider_from_config(
-    provider: str, sdk: str, surface: str, *, builtins: Sequence[str] = ()
+    provider: str,
+    sdk: str,
+    surface: str,
+    *,
+    builtins: Sequence[str] = (),
+    code_bridge: CodeExecutionBridge | None = None,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -585,10 +598,43 @@ def _provider_from_config(
         search_parameters = _xai_search_parameters(builtins)
         extra_body = {"search_parameters": search_parameters} if search_parameters else None
         return OpenAIProvider(model, base_url=base_url, surface=surface, extra_body=extra_body)
-    return OpenAIProvider(model, base_url=base_url, surface=surface, builtin_tools=list(builtins))
+    # The code-execution Asset bridge supplies the live ``container`` for the code_interpreter
+    # built-in per turn (`_code.py`); absent it, the built-in falls back to an auto container.
+    code_container = code_bridge.container_spec if code_bridge is not None else None
+    return OpenAIProvider(
+        model,
+        base_url=base_url,
+        surface=surface,
+        builtin_tools=list(builtins),
+        code_container=code_container,
+    )
 
 
-def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvider]:
+def _maybe_code_bridge(
+    provider_name: str, surface: str, builtins: Sequence[str]
+) -> CodeExecutionBridge | None:
+    """The code-execution Asset bridge, when (and only when) it applies — else ``None``.
+
+    The bridge is **OpenAI-only** (issue #172): it needs OpenAI's Code Interpreter container file
+    API, which lives on the Responses surface. So it is built only for ``AI_PROVIDER=openai`` on
+    the ``responses`` surface with the ``code_interpreter`` built-in opted in. On xAI (no
+    input-file mechanism) or the chat surface (no Code Interpreter) there is no bridge — grok can
+    still *run* code via its own built-in, it just cannot exchange files with the Asset system.
+    The bridge reuses the same key/base_url the OpenAI provider uses.
+    """
+    if (
+        provider_name != "openai"
+        or surface != "responses"
+        or CODE_EXECUTION_BUILTIN not in builtins
+    ):
+        return None
+    base_url = os.environ.get("AI_BASE_URL") or None
+    return CodeExecutionBridge(base_url=base_url)
+
+
+def _resolve_tools_and_provider() -> tuple[
+    Provider, ResolvedTools, MemoryProvider, CodeExecutionBridge | None
+]:
     """Resolve the active tools, the model provider, and the memory provider from config + env.
 
     The single seam both `TimelineAgent.from_env` and `WakeAgent.from_env` use to wire their
@@ -611,8 +657,10 @@ def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvid
     forbidden capability is dropped and surfaced rather than crashing `Harness` construction,
     so the safe boundary degrades gracefully. Returns the model provider, the merged
     `ResolvedTools` (``.tools`` → `Harness`, where the policy gate still applies as
-    defense-in-depth; ``.manifest``/``.notices`` → the persistent Turn-0 brief), and the
-    memory provider itself, which the wake holds to fire its `observe`/`context` hooks.
+    defense-in-depth; ``.manifest``/``.notices`` → the persistent Turn-0 brief), the
+    memory provider itself, which the wake holds to fire its `observe`/`context` hooks, and the
+    code-execution Asset bridge (`_maybe_code_bridge`) when code execution is active — ``None``
+    otherwise — which the hosting agent binds to its platform context and the engine turn hook.
     """
     # Parse + validate the config first, then drive both the upgrade reconcile and the load with
     # the *one* validated provider string — so an invalid AI_PROVIDER fails fast (before the
@@ -625,8 +673,11 @@ def _resolve_tools_and_provider() -> tuple[Provider, ResolvedTools, MemoryProvid
     # already-current one; guarded so a reconcile hiccup never blocks startup.
     _reconcile_config_on_upgrade(provider_name)
     resolved, memory = _resolve_tools(provider_name, sdk, surface)
-    provider = _provider_from_config(provider_name, sdk, surface, builtins=resolved.builtins)
-    return provider, resolved, memory
+    bridge = _maybe_code_bridge(provider_name, surface, resolved.builtins)
+    provider = _provider_from_config(
+        provider_name, sdk, surface, builtins=resolved.builtins, code_bridge=bridge
+    )
+    return provider, resolved, memory, bridge
 
 
 def _resolve_tools(

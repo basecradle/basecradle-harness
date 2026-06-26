@@ -159,3 +159,27 @@ def url_citation(*, url, title, start_index=0, end_index=1):
         "url": url,
         "title": title,
     }
+
+
+def out_code_interpreter_call(*, code, container_id="cntr_fake0001"):
+    """A Responses `code_interpreter_call` output item — code run server-side (issue #172)."""
+    return {
+        "id": "ci-fake0001",
+        "type": "code_interpreter_call",
+        "status": "completed",
+        "container_id": container_id,
+        "code": code,
+        "outputs": [],
+    }
+
+
+def container_file_citation(*, file_id, filename, container_id="cntr_fake0001"):
+    """A `container_file_citation` annotation — a file the Code Interpreter produced."""
+    return {
+        "type": "container_file_citation",
+        "container_id": container_id,
+        "file_id": file_id,
+        "filename": filename,
+        "start_index": 0,
+        "end_index": 1,
+    }
