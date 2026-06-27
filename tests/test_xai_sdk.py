@@ -15,6 +15,7 @@ import json
 from types import SimpleNamespace
 
 import pytest
+from xai_sdk.chat import chat_pb2  # the real SDK enum the adapter tags server-side calls with
 
 from basecradle_harness import (
     ImageContent,
@@ -27,6 +28,8 @@ from basecradle_harness import (
     ToolSpec,
     XaiSdkProvider,
 )
+
+_TYPE = chat_pb2.ToolCallType
 
 FAKE_KEY = "xai-test-0123456789abcdef"
 
@@ -70,14 +73,21 @@ class _FakeClient:
 
 
 def _response(*, content="", tool_calls=(), citations=()):
-    """A duck-typed xai_sdk `Response` — only the fields the adapter reads."""
-    calls = [
-        SimpleNamespace(
+    """A duck-typed xai_sdk `Response` — only the fields the adapter reads.
+
+    A tool_call dict may carry an optional ``"type"`` (a ``chat_pb2.ToolCallType`` int); omitted,
+    the call carries no ``type`` attribute at all — the unset/legacy shape the adapter treats as a
+    client-side call.
+    """
+    calls = []
+    for c in tool_calls:
+        call = SimpleNamespace(
             id=c["id"],
             function=SimpleNamespace(name=c["name"], arguments=json.dumps(c["arguments"])),
         )
-        for c in tool_calls
-    ]
+        if "type" in c:
+            call.type = c["type"]
+        calls.append(call)
     return SimpleNamespace(content=content, tool_calls=calls, citations=list(citations))
 
 
@@ -136,6 +146,87 @@ def test_a_tool_spec_becomes_a_wire_tool_and_a_tool_call_round_trips():
     assert reply.tool_calls == [
         ToolCall(id="call_9", name="get_weather", arguments={"city": "Dallas"})
     ]
+
+
+def test_server_side_tool_calls_are_not_surfaced_for_dispatch():
+    # Issue #183: grok runs Live Search server-side inside one gRPC turn, then surfaces every tool
+    # call it made — the already-executed server-side ones — in Response.tool_calls, each tagged by
+    # a ToolCallType. Re-dispatching those to the harness function registry bounces "no tool named
+    # web_search" and the model confabulates. The grounded answer + citations are the real output;
+    # the server-side tool calls must be dropped, never surfaced. (x_semantic_search is x_search's
+    # internal X sub-operation — the exact name grok "guessed" in the live forensics.)
+    provider = _provider(
+        _response(
+            content="One recent AI headline …",
+            tool_calls=[
+                {
+                    "id": "c1",
+                    "name": "web_search",
+                    "arguments": {},
+                    "type": _TYPE.TOOL_CALL_TYPE_WEB_SEARCH_TOOL,
+                },
+                {
+                    "id": "c2",
+                    "name": "x_semantic_search",
+                    "arguments": {},
+                    "type": _TYPE.TOOL_CALL_TYPE_X_SEARCH_TOOL,
+                },
+            ],
+            citations=["https://ex.com/a"],
+        )
+    )
+    reply = provider.chat([Message.user("news?")])
+
+    assert reply.tool_calls == []  # nothing bounces to the function dispatcher
+    assert "One recent AI headline" in reply.content
+    assert "Sources:" in reply.content  # the grounded answer survives intact
+
+
+def test_a_client_call_survives_among_server_side_calls():
+    # Mixed turn: grok ran web_search server-side *and* wants a real client function tool. Only the
+    # client-side call is the harness's to run — the server-side one is dropped (issue #183).
+    provider = _provider(
+        _response(
+            tool_calls=[
+                {
+                    "id": "s1",
+                    "name": "web_search",
+                    "arguments": {},
+                    "type": _TYPE.TOOL_CALL_TYPE_WEB_SEARCH_TOOL,
+                },
+                {
+                    "id": "f1",
+                    "name": "get_weather",
+                    "arguments": {"city": "Dallas"},
+                    "type": _TYPE.TOOL_CALL_TYPE_CLIENT_SIDE_TOOL,
+                },
+            ]
+        )
+    )
+    reply = provider.chat([Message.user("weather?")], tools=[WEATHER_TOOL])
+
+    assert reply.tool_calls == [ToolCall(id="f1", name="get_weather", arguments={"city": "Dallas"})]
+
+
+def test_code_execution_server_side_call_is_not_surfaced():
+    # Same #183 contract for the code_execution built-in: grok runs Python in xAI's sandbox
+    # server-side; that call must not reach the harness function registry.
+    provider = _provider(
+        _response(
+            content="42",
+            tool_calls=[
+                {
+                    "id": "x1",
+                    "name": "code_execution",
+                    "arguments": {},
+                    "type": _TYPE.TOOL_CALL_TYPE_CODE_EXECUTION_TOOL,
+                }
+            ],
+        )
+    )
+    reply = provider.chat([Message.user("compute 6*7")])
+    assert reply.tool_calls == []
+    assert reply.content == "42"
 
 
 def test_an_assistant_tool_call_and_its_result_round_trip_in_history():
