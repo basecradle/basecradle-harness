@@ -381,6 +381,49 @@ def test_opting_a_power_tool_into_the_overlay_activates_it_subject_to_availabili
     assert "grok_generate_image" not in {t.name for t in under_openai.tools}  # availability gate
 
 
+# --- active opt-in stems (issue #181, the fleet-drift inventory key) ---------
+
+
+def test_resolve_reports_the_active_opt_in_stems_deduped_and_sorted():
+    # The reported unit is the source-file STEM, not the resolved name: a benign plugin is never
+    # listed; an opt-in plugin with no stem (built via the API, never loaded from a file) has no
+    # inventory key so it is omitted; and two opt-in plugins sharing a stem list that stem once.
+    plugins = [
+        ToolPlugin(impl=_Echo, stem="echo"),  # benign → not an opt-in stem
+        ToolPlugin(impl=_Other, name="zeb", opt_in=True, stem="zebra"),
+        ToolPlugin(builtin="alpha", opt_in=True, stem="alpha_pack"),
+        ToolPlugin(builtin="beta", opt_in=True, stem="alpha_pack"),  # same stem, fans out
+        ToolPlugin(builtin="ghost", opt_in=True),  # opt-in but stem-less → omitted
+    ]
+    resolved = resolve_plugins(plugins, _ctx())
+    assert resolved.opt_in_stems == ["alpha_pack", "zebra"]  # deduped, sorted, no benign/stem-less
+
+
+def test_an_inactive_opt_in_plugin_is_not_a_reported_stem():
+    # opt_in_stems tracks what ACTUALLY activated, not what is present: an opt-in plugin whose
+    # `requires` aren't met self-excludes and its stem is not reported.
+    plugins = [ToolPlugin(impl=_Other, opt_in=True, stem="needs_key", requires=(OpenAIKey(),))]
+    assert resolve_plugins(plugins, _ctx()).opt_in_stems == []  # no key → inactive → unreported
+    active = resolve_plugins(plugins, _ctx(AI_API_KEY="sk")).opt_in_stems
+    assert active == ["needs_key"]  # key present → active → reported
+
+
+def test_the_loader_stamps_each_plugin_with_its_source_file_stem(tmp_path):
+    # The stem is the FILENAME, stamped by the loader (not authored in the file) — so a plugin
+    # whose model-facing name differs from its file (or fans out to several) still reports the
+    # one inventory key. code_execution.py is the headline case: one stem, multiple names.
+    home = tmp_path / "cfg"
+    install(home, provider="openai", opt_in=["code_execution", "generate_image"])
+
+    resolved = resolve_plugins(load_plugins(home, provider="openai"), _ctx(AI_API_KEY="sk"))
+    # code_execution fans out (the code_interpreter built-in + the code_attach tool) yet its
+    # one stem lists once; generate_image's stem matches its name. Both are real file stems.
+    assert resolved.opt_in_stems == ["code_execution", "generate_image"]
+    # Ground-truth cross-check: the fan-out really did produce more than one active name.
+    assert "code_attach" in {t.name for t in resolved.tools}
+    assert "code_interpreter" in resolved.builtins
+
+
 # --- provider-aware loading (issue #160, scope expansion) --------------------
 
 

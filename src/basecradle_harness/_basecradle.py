@@ -759,6 +759,7 @@ def _surface_broken_defaults(
         manifest=resolved.manifest,
         notices=resolved.notices,
         broken=resolved.broken + broken_lines,
+        opt_in_stems=resolved.opt_in_stems,
     )
 
 
@@ -783,6 +784,7 @@ def _merge_memory_tools(resolved: ResolvedTools, memory: MemoryProvider) -> Reso
         manifest=resolved.manifest + [(tool.name, None) for tool in added],
         notices=resolved.notices,
         broken=resolved.broken,
+        opt_in_stems=resolved.opt_in_stems,
     )
 
 
@@ -808,6 +810,7 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
         manifest=resolved.manifest + added_manifest,
         notices=resolved.notices + mcp.notices,
         broken=resolved.broken,
+        opt_in_stems=resolved.opt_in_stems,
     )
 
 
@@ -850,6 +853,7 @@ def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) ->
         manifest=manifest,
         notices=notices,
         broken=resolved.broken,
+        opt_in_stems=resolved.opt_in_stems,
     )
 
 
