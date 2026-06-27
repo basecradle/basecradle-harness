@@ -33,6 +33,7 @@ from basecradle_harness import (
     SeenStore,
     WakeAgent,
     WakeBreaker,
+    install,
 )
 from basecradle_harness._basecradle import _incoming_text
 from basecradle_harness._messages import ToolCall
@@ -1357,6 +1358,8 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     # Powerful tools are opt-in (issue #168), so none activate in a default config.
     assert "generate_image" not in report["tools"]
     assert "web_search" not in report["builtins"]
+    # And the opt-in manifest (issue #181) is empty for that safe default — nothing opted in.
+    assert report["opt_in_tools"] == []
 
 
 def test_resolved_config_is_side_effect_free_without_a_model_or_key(wake_env, monkeypatch):
@@ -1370,6 +1373,24 @@ def test_resolved_config_is_side_effect_free_without_a_model_or_key(wake_env, mo
 
     assert report["ai_model"] is None  # unset → None, never a raise
     assert report["tools"]  # the tool set still resolves with no key / no model
+
+
+def test_resolved_config_reports_active_opt_in_stems(wake_env, monkeypatch, tmp_path):
+    """The opt-in manifest (issue #181) the NOC's fleet-drift audit keys on: an agent with
+    powerful tools opted into its overlay reports their source-file **stems** (the inventory
+    key), like-for-like — even when a stem fans out to several names (``code_execution``)."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    install(cfg, provider="openai", opt_in=["generate_image", "code_execution"])
+
+    report = resolved_config()
+
+    # Stems, not resolved names: code_execution fans out (the code_interpreter built-in + the
+    # code_attach tool) yet lists once; generate_image's stem matches its name.
+    assert report["opt_in_tools"] == ["code_execution", "generate_image"]
+    # Cross-check the fan-out is real in the resolved active set (built-in + tool both present).
+    assert "code_interpreter" in report["builtins"]
+    assert "code_attach" in report["tools"]
 
 
 def test_main_resolved_config_exits_nonzero_on_a_misconfigured_provider(

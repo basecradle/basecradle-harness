@@ -1567,6 +1567,13 @@ def resolved_config() -> dict[str, object]:
       Responses ``web_search``); a live capability the tool-set axis must count.
     - ``skipped`` — the names of plugins that did **not** activate, sorted — the auditable "why
       isn't this tool here?" trail (a diagnostic, not part of the active set).
+    - ``opt_in_tools`` — the active **opt-in** (powerful) tools' source-file **stems**, sorted
+      (issue #181). The stem is the unit the fleet inventory keys a powerful tool on, and is
+      **not** 1:1 with the resolved ``tools``/``builtins`` names (one stem can fan out — e.g.
+      ``code_execution`` → the ``code_interpreter`` built-in **+** the ``code_attach`` tool —
+      and a name can differ from its stem — ``hear_audio`` → ``listen``). Reporting the stems
+      lets the NOC's fleet-drift audit compare declared-vs-active inventory like-for-like,
+      holding no stem→name map of its own. ``[]`` for a safe default config (no opt-in tool).
     """
     provider_name, sdk, surface = _config_from_env()
     resolved, _memory = _resolve_tools(provider_name, sdk, surface)
@@ -1580,6 +1587,7 @@ def resolved_config() -> dict[str, object]:
         "tools": sorted(tool.name for tool in resolved.tools),
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),
+        "opt_in_tools": list(resolved.opt_in_stems),
     }
 
 

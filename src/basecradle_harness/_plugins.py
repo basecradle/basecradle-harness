@@ -42,7 +42,7 @@ import logging
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from basecradle_harness._install import _read_manifest, config_home, plugin_relevant_to
@@ -222,6 +222,16 @@ class ToolPlugin:
     name: str | None = None
     note: str | None = None
     opt_in: bool = False
+    stem: str | None = None
+    """The source file's stem (``code_execution.py`` → ``code_execution``), stamped by the
+    loader (`_plugins_in_file`) — **not** authored in the plugin file. It is the unit the
+    fleet inventory keys an opt-in tool on, and is **not** the same as `resolved_name`: one
+    stem can fan out to several names (``code_execution`` → the ``code_interpreter`` built-in
+    **+** the ``code_attach`` tool) and a name can differ from its stem (``hear_audio`` →
+    ``listen``). Reported (for active opt-in plugins) by `resolved_config` so the NOC's
+    fleet-drift audit compares declared inventory stems like-for-like, holding no local
+    stem→name map of its own (issue #181). ``None`` for a plugin built directly via the API
+    (a test), never loaded from a file."""
 
     def __post_init__(self) -> None:
         if (self.impl is None) == (self.builtin is None):
@@ -280,6 +290,20 @@ class ResolvedTools:
             expected activation miss). A broken default is a defect: the brief renders these
             under their own loud heading so a silently-disabled capability is impossible to
             miss. Empty when every shipped default loaded.
+        opt_in_stems: The sorted source-file **stems** of the **active opt-in** plugins (issue
+            #181) — the unit the fleet inventory keys a powerful tool on. "Active" here is the
+            *activation* gate (the plugin's `requires`: provider/key/surface), which is the axis
+            the inventory keys on; it is deliberately **not** narrowed by the locked **policy**
+            gate, the separate safety axis surfaced in `notices`. (A shipped opt-in tool declares
+            only activation requirements, never a policy-forbidden capability, so the two never
+            diverge in practice; a contrived custom ``opt_in`` + ``SHELL`` overlay tool would be
+            policy-refused yet still list its stem here — correctly, as an opted-in inventory
+            item — while its refusal shows up in `notices`.) One stem appears once even when it
+            fans out to several active names (``code_execution`` → the ``code_interpreter``
+            built-in **+** the ``code_attach`` tool). `resolved_config` surfaces this so the
+            NOC's fleet-drift audit compares declared-vs-active stems like-for-like, holding no
+            stem→name map of its own. Empty for a config with no opt-in tool active (the safe
+            default).
     """
 
     tools: list[Tool] = field(default_factory=list)
@@ -288,6 +312,7 @@ class ResolvedTools:
     manifest: list[tuple[str, str | None]] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     broken: list[str] = field(default_factory=list)
+    opt_in_stems: list[str] = field(default_factory=list)
 
 
 def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> ResolvedTools:
@@ -327,7 +352,20 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
         else:
             assert plugin.impl is not None
             tools.append(plugin.impl())
-    return ResolvedTools(tools=tools, builtins=builtins, skipped=skipped, manifest=manifest)
+    # The active opt-in *stems* (issue #181): one per file-loaded opt-in plugin that activated,
+    # deduped (a stem fanning out to several active names lists once) and sorted. A stem-less
+    # opt-in plugin (built directly via the API, never loaded from a file) has no inventory key
+    # to report, so it is omitted rather than guessed from its name.
+    opt_in_stems = sorted(
+        {plugin.stem for plugin in claimed.values() if plugin.opt_in and plugin.stem}
+    )
+    return ResolvedTools(
+        tools=tools,
+        builtins=builtins,
+        skipped=skipped,
+        manifest=manifest,
+        opt_in_stems=opt_in_stems,
+    )
 
 
 # --- loading plugin files -----------------------------------------------------
@@ -506,7 +544,10 @@ def _plugins_in_file(path: Path) -> list[ToolPlugin]:
     for item in found:
         if not isinstance(item, ToolPlugin):
             raise TypeError(f"PLUGIN/PLUGINS must be ToolPlugin, got {type(item).__name__}")
-    return found
+    # Stamp the source-file stem onto each plugin (the file is ground truth, overriding any
+    # value an author set), so resolution can report the active opt-in *stems* — the unit the
+    # fleet inventory keys on — without the loader's filename being lost downstream (issue #181).
+    return [replace(item, stem=path.stem) for item in found]
 
 
 def _import_file(path: Path):

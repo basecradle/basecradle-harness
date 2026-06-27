@@ -7,6 +7,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.40.0] - 2026-06-27
+
+**`--resolved-config` reports the active opt-in stems (issue #181).** The ground-truth deploy probe
+now exposes which **powerful (opt-in) tools** are active, keyed by their **source-file stem** — the
+unit the NOC's fleet-drift audit pins each agent's inventory on. The stem is reported because it is
+**not** 1:1 with the resolved tool/built-in names (`code_execution` → the `code_interpreter`
+built-in **+** the `code_attach` tool; `hear_audio` → `listen`; `xai_search` → `x_search`), so the
+NOC can compare declared-vs-active inventory like-for-like without holding a local stem→name map
+that would rot on every new opt-in tool. Closes the audit in both directions (a declared tool
+missing on the box, and an undeclared opt-in tool enabled on the box — basecradle-noc#62 / #59).
+
+### Added
+
+- **`opt_in_tools` in `--resolved-config`** (`resolved_config`, `_wake.py`) — the sorted source-file
+  stems of the active opt-in plugins; `[]` for a safe default config (no opt-in tool active). Purely
+  additive to the documented `--resolved-config` contract, so no consumer breaks.
+- **`ToolPlugin.stem`** (`_plugins.py`) — the source file's stem, stamped by the loader
+  (`_plugins_in_file`), `None` for a plugin built directly via the API. The basis for reporting the
+  inventory key without re-deriving it from a name.
+- **`ResolvedTools.opt_in_stems`** (`_plugins.py`) — the active opt-in stems, deduped (a stem that
+  fans out to several active names lists once) and sorted, threaded through the resolution merges.
+
 ## [0.39.0] - 2026-06-26
 
 **Code execution — a standalone, opt-in tool with vendor parity, bridged to the Asset system
