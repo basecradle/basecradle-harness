@@ -7,6 +7,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.40.1] - 2026-06-27
+
+**xAI Live Search is functional at runtime again — drop the already-executed server-side tool calls
+grok surfaces (issue #183).** An `AI_SDK=xai-sdk`/native grok agent with `web_search` / `x_search`
+opted in could not actually search: every search call bounced `Error: no tool named 'web_search'`
+and the model confabulated a result — surfaced live by `@orion-rigel` on his first revenue-research
+task. Root cause was on the **response** side, not the request: grok runs its whole agentic loop
+(Live Search, X search, code execution) server-side inside the one gRPC turn `sample()` makes, then
+returns **every** tool call it made — the already-executed server-side ones included — in
+`Response.tool_calls`, each tagged by a `ToolCallType`. `XaiSdkProvider._from_wire` re-dispatched
+all of them to the harness function registry, so the server-side calls (and `x_search`'s internal
+`x_semantic_search` / `x_keyword_search` sub-operations, the names the model appeared to "guess")
+bounced as unknown functions. The #171 request-side wiring was correct all along; the mocked suite
+and the search-only live test both structurally missed this mixed-tool path.
+
+This also resolves the `--resolved-config` **false-green** (the second defect): the report listed
+`web_search` / `x_search` as active built-ins while they were non-functional — the basecradle#307
+"capability is a corpse while every signal reads green" class. The fix takes the issue's "the
+runtime must make the listed builtin usable" path: the built-ins now genuinely work, so the
+ground-truth report is accurate, with no live model call added to the side-effect-free
+`--resolved-config`.
+
+### Fixed
+
+- **`XaiSdkProvider._is_client_side`** (`_xai_sdk.py`) — `_from_wire` now surfaces only client-side
+  function calls (`ToolCallType` `CLIENT_SIDE_TOOL`, plus the unset/`INVALID` default for the
+  offline fakes and as a belt-and-suspenders); every explicit server-side type — named or not — is
+  dropped, so a server-side type xAI adds later is handled the same way without a code change. The
+  server-side results are already folded into `Response.content` + `citations`.
+- **Live test for the real condition** (`tests/test_xai_sdk_live.py`) — a `@pytest.mark.live` probe
+  that offers the search built-ins **with** a function tool present (Orion's exact setup) and
+  asserts no search built-in / X sub-op leaks back as a bouncing function call. The check the
+  mocked suite and the #171 search-only live test both miss.
+
 ## [0.40.0] - 2026-06-27
 
 **`--resolved-config` reports the active opt-in stems (issue #181).** The ground-truth deploy probe

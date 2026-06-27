@@ -21,7 +21,11 @@ wired here, server-side, when the persona has opted its search built-ins in (iss
 (`xai_sdk.tools.web_search()` / `x_search()`) appended to the request's ``tools`` list, and grok
 autonomously runs the search server-side and returns sourced answers with citations. (This replaced
 the deprecated native ``SearchParameters`` path — the live gRPC endpoint now rejects it with
-``UNIMPLEMENTED: Live search is deprecated`` — issue #171.) The grok
+``UNIMPLEMENTED: Live search is deprecated`` — issue #171.) grok runs that whole agentic loop
+*inside one gRPC turn* and then surfaces **every** tool call it made — the already-executed
+server-side ones included — in ``Response.tool_calls``, each tagged by a ``ToolCallType``; the
+adapter drops the server-side calls (`_is_client_side`) so they are never re-dispatched to the
+harness function registry as bogus ``no tool named`` bounces (issue #183). The grok
 **media** tools (`grok_generate_image` / `grok_generate_video`) stay their own per-persona
 `PlatformTool`s over httpx (`basecradle_harness._grok`) — independent of the chat SDK, and granted
 only by opt-in. Exposing a capability is never granting it to a persona.
@@ -185,6 +189,7 @@ class XaiSdkProvider:
                 arguments=json.loads(tc.function.arguments) if tc.function.arguments else {},
             )
             for tc in response.tool_calls
+            if self._is_client_side(tc)
         ]
         content = response.content or None
         # Live-Search citations are plain URL strings (xai_sdk Response.citations); footer them
@@ -194,6 +199,29 @@ class XaiSdkProvider:
         if footer:
             content = f"{content}\n\n{footer}" if content else footer
         return Message.assistant(content=content, tool_calls=tool_calls)
+
+    def _is_client_side(self, tool_call: Any) -> bool:
+        """True unless xAI already ran this tool call **server-side** (issue #183).
+
+        grok runs its whole agentic loop — Live Search (``web_search`` / ``x_search``, with the
+        latter's internal X sub-operations), ``code_execution``, and the rest — inside the single
+        gRPC turn ``sample()`` makes, then surfaces **every** tool call it made in
+        ``Response.tool_calls``, each tagged with a ``ToolCallType``: the already-executed
+        server-side ones *and* any genuine client-side function call. Those server-side calls are
+        not the harness's to run — re-dispatching one to the function `ToolRegistry` bounces an
+        ``Error: no tool named '<x>'`` (the search built-ins read as non-functional, then the model
+        confabulates a result). So only a **client-side** call is surfaced; the server-side ones
+        are dropped, their results already folded into ``Response.content`` + ``citations``.
+
+        Kept: ``CLIENT_SIDE_TOOL`` (what the SDK tags a real client function call) and the
+        unset/``INVALID`` default — the latter both for the offline fakes (which carry no ``type``)
+        and as a belt-and-suspenders for an untyped live call. A genuine client call therefore
+        always survives. Dropped: every explicit server-side type, named or not, so a server-side
+        type xAI adds later is handled the same way without a code change.
+        """
+        types = self._xai.chat.chat_pb2.ToolCallType
+        keep = {types.TOOL_CALL_TYPE_INVALID, types.TOOL_CALL_TYPE_CLIENT_SIDE_TOOL}
+        return getattr(tool_call, "type", types.TOOL_CALL_TYPE_INVALID) in keep
 
     def _agent_tools(self) -> list[Any]:
         """The opted-in server-side built-ins as xAI **Agent Tool** entries (`chat_pb2.Tool`).

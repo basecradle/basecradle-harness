@@ -21,7 +21,7 @@ import os
 
 import pytest
 
-from basecradle_harness import Message, XaiSdkProvider
+from basecradle_harness import Message, ToolSpec, XaiSdkProvider
 
 pytestmark = pytest.mark.live
 
@@ -49,3 +49,43 @@ def test_native_live_search_returns_a_grounded_answer_with_citations():
     assert reply.role == "assistant"
     assert reply.content  # a real, non-empty grounded answer
     assert "Sources:" in reply.content  # Live Search returned citations
+
+
+@pytest.mark.skipif(not KEY, reason="set XAI_API_KEY to run the live xAI Agent Tools probe")
+def test_live_search_works_alongside_function_tools_without_bouncing():
+    """Orion's exact runtime condition (#183): search built-ins **and** function tools in one turn.
+
+    The #171 live test above offers search built-ins *only*. Orion (xai-sdk/native, a full BaseCradle
+    tool-set) hit the real bug only with **both** present: grok ran the search server-side, then
+    surfaced its server-side ``web_search`` / ``x_search`` tool calls in ``Response.tool_calls``
+    mixed with any function call — the adapter re-dispatched them, the harness bounced
+    ``Error: no tool named 'web_search'``, and the model confabulated a result. With the
+    `_is_client_side` filter the server-side calls are dropped, so a research turn returns the
+    grounded answer with **no** spurious surfaced tool call. This is the check the mocked suite and
+    the search-only live test both structurally miss.
+    """
+    a_function_tool = ToolSpec(
+        name="post_message",
+        description="Post a message to the timeline.",
+        parameters={"type": "object", "properties": {"text": {"type": "string"}}},
+    )
+    provider = XaiSdkProvider(
+        model="grok-4.3",
+        api_key=KEY,
+        builtin_tools=["web_search", "x_search"],
+    )
+    try:
+        reply = provider.chat(
+            [Message.user("Research one recent AI headline and give me the source URL.")],
+            tools=[a_function_tool],
+        )
+    finally:
+        provider.close()
+
+    assert reply.role == "assistant"
+    # No server-side search call leaks back as a function call to bounce. grok may legitimately ask
+    # for the one *function* tool, but never a search built-in (web_search/x_search) or an X
+    # sub-op (x_semantic_search/x_keyword_search) — those are the #183 bounce.
+    bounced = {"web_search", "x_search", "x_semantic_search", "x_keyword_search"}
+    assert not any(call.name in bounced for call in reply.tool_calls)
+    assert reply.content  # a real grounded answer, not a confabulated empty turn
