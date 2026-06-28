@@ -2102,13 +2102,20 @@ TS = "2026-06-04T00:00:00.000Z"
 
 
 def test_now_line_is_the_titlecased_utc_anchor():
-    # `Current Time: 2026-06-21 17:09:49 UTC (Sunday)` — Title Case label, absolute UTC,
-    # day-of-week, no trailing period (it's a label, not a sentence).
+    # `Current Time: 2026-06-21 17:09:49 UTC (+00:00, Sunday)` — Title Case label, absolute
+    # UTC with an explicit offset, day-of-week, no trailing period (the anchor is a label, not
+    # a sentence) — followed by a one-line UTC-conversion instruction (issue #180).
     line = _now_line()
+    anchor, instruction = line.split("\n", 1)
     assert re.fullmatch(
-        r"Current Time: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \([A-Z][a-z]+day\)", line
+        r"Current Time: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC \(\+00:00, [A-Z][a-z]+day\)",
+        anchor,
     )
-    assert not line.endswith(".")
+    assert not anchor.endswith(".")
+    # The instruction labels the clock UTC and tells the model to convert for a named locale,
+    # so a bare UTC day/date is no longer parroted as if it were local (issue #180).
+    assert "UTC" in instruction
+    assert "convert" in instruction.lower()
 
 
 def test_incoming_message_is_timestamped():

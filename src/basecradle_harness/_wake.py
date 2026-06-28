@@ -1421,15 +1421,27 @@ def _asset_marker_carrier(asset: object) -> str:
 def _now_line() -> str:
     """The current-time anchor injected at the head of every wake's brief.
 
-    Renders ``Current Time: 2026-06-21 17:09:49 UTC (Sunday)`` — Title Case label, absolute
-    UTC, and the day-of-week, with no trailing period (it's a label, not a sentence). The
-    brief is re-composed and re-injected on every wake, so this is always current; it is the
-    reference every inbound item's ``[created_at]`` stamp is reasoned against. Accuracy rides
-    on the host clock's NTP sync. UTC-only by design — the model converts to a local zone when
-    a peer names one.
+    Renders the anchor line ``Current Time: 2026-06-21 17:09:49 UTC (+00:00, Sunday)`` —
+    Title Case label, absolute UTC with an explicit ``+00:00`` offset, and the day-of-week,
+    with no trailing period (it's a label, not a sentence) — **followed by** a one-line
+    conversion instruction. The brief is re-composed and re-injected on every wake, so this is
+    always current; the anchor is the reference every inbound item's ``[created_at]`` stamp is
+    reasoned against. Accuracy rides on the host clock's NTP sync.
+
+    The clock is UTC by design (every agent runs UTC on the box), but a bare UTC day/date was
+    being parroted as if it were local — wrong whenever UTC has rolled to the next day but the
+    asked-about locale hasn't (issue #180, live-confirmed on @jt). So the offset is now
+    explicit and a conversion instruction rides with the anchor: when a peer names a locale,
+    convert from UTC to that timezone first, because the local day can differ from the UTC day.
     """
     n = datetime.now(timezone.utc)
-    return f"Current Time: {n:%Y-%m-%d %H:%M:%S} UTC ({n:%A})"
+    anchor = f"Current Time: {n:%Y-%m-%d %H:%M:%S} UTC (+00:00, {n:%A})"
+    instruction = (
+        "This clock is UTC. For a question about a specific locale's date or time, convert "
+        "from UTC to that timezone first — the local day can differ from the UTC day (e.g. "
+        "US Central is UTC-5 in summer / UTC-6 in winter)."
+    )
+    return f"{anchor}\n{instruction}"
 
 
 def _incoming_asset_text(asset: object) -> str:
