@@ -94,6 +94,21 @@ def dashboard():
     }
 
 
+def timeline_envelope(uuid=TIMELINE_UUID):
+    """A GET /timelines/{uuid} envelope (the SDK merges its two keys into one Timeline)."""
+    return {"timeline": {"uuid": uuid}, "items": []}
+
+
+def problem(*, code, detail, status):
+    """An RFC 9457 problem document (the SDK needs a `code` to map it to a typed error)."""
+    return {
+        "code": code,
+        "title": code.replace("_", " ").title(),
+        "detail": detail,
+        "status": status,
+    }
+
+
 def message(*, uuid=MESSAGE_UUID, body="Heads up: the deploy is live.", handle="john"):
     """A message item envelope (Item shape: type, created_at, user, timeline, content)."""
     return {
@@ -275,6 +290,102 @@ def test_messages_read_returns_one_message_in_full(messages):
 
 def test_messages_read_without_a_uuid_is_a_friendly_error(messages):
     assert "needs the message's uuid" in messages.run(action="read")
+
+
+# --- messages: create --------------------------------------------------------
+
+
+def test_messages_create_posts_to_the_current_timeline_and_returns_the_uuid(messages):
+    """Omitting `timeline` posts to the wake-timeline; the new uuid comes back."""
+    new_uuid = "019e7755-aaaa-7bbb-8ccc-ddddeeee0001"
+    captured = {}
+
+    def capture(request):
+        captured["url"] = str(request.url)
+        captured["body"] = request.content
+        return httpx.Response(201, json={"message": message(uuid=new_uuid, handle="nova")})
+
+    with respx.mock(assert_all_called=True) as mock:
+        # The SDK's nested creator resolves the timeline (a GET) then POSTs the message.
+        mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
+            return_value=httpx.Response(200, json=timeline_envelope())
+        )
+        mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/messages").mock(side_effect=capture)
+        result = messages.run(action="create", body="Heads up: I hit a bug on the build.")
+
+    assert f"/timelines/{TIMELINE_UUID}/messages" in captured["url"]  # the current timeline
+    assert b"Heads up: I hit a bug on the build." in captured["body"]
+    assert new_uuid in result  # the created message's uuid, for the model to relay
+
+
+def test_messages_create_posts_cross_timeline_by_uuid(messages):
+    """An explicit `timeline` posts to a *different* viewable timeline — the support pattern."""
+    support = "019e7760-bbbb-7ccc-8ddd-eeeeffff0002"
+    new_uuid = "019e7755-aaaa-7bbb-8ccc-ddddeeee0003"
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/timelines/{support}").mock(
+            return_value=httpx.Response(200, json=timeline_envelope(support))
+        )
+        mock.post(f"{BC_URL}/timelines/{support}/messages").mock(
+            return_value=httpx.Response(
+                201, json={"message": message(uuid=new_uuid, handle="nova")}
+            )
+        )
+        result = messages.run(
+            action="create", body="Escalating from the project room.", timeline=support
+        )
+
+    assert new_uuid in result  # posted to the support timeline, not the current one
+
+
+def test_messages_create_relays_a_locked_timeline_refusal_without_retrying(messages):
+    """A locked timeline rejects the post — relayed cleanly, and the POST is made exactly once."""
+    posts = {"count": 0}
+
+    def refuse(request):
+        posts["count"] += 1
+        return httpx.Response(
+            403,
+            json=problem(code="timeline_locked", detail="This timeline is locked.", status=403),
+        )
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
+            return_value=httpx.Response(200, json=timeline_envelope())
+        )
+        mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/messages").mock(side_effect=refuse)
+        result = messages.run(action="create", body="Anyone there?")
+
+    assert "This timeline is locked." in result  # the platform's actual reason, relayed
+    assert "Couldn't create a message" in result
+    assert posts["count"] == 1  # no blind retry — a double-post would wake the recipient twice
+
+
+def test_messages_create_relays_a_not_a_viewer_refusal(messages):
+    """Posting to a timeline you can't view is refused server-side — relayed, not crashed."""
+    other = "019e7761-cccc-7ddd-8eee-ffff00000004"
+
+    with respx.mock(assert_all_called=True) as mock:
+        # The timeline resolve itself is refused — you are not a viewer.
+        mock.get(f"{BC_URL}/timelines/{other}").mock(
+            return_value=httpx.Response(
+                403,
+                json=problem(
+                    code="not_a_viewer",
+                    detail="You are not a viewer of this timeline.",
+                    status=403,
+                ),
+            )
+        )
+        result = messages.run(action="create", body="Hello?", timeline=other)
+
+    assert "You are not a viewer of this timeline." in result
+    assert "Couldn't create a message" in result
+
+
+def test_messages_create_without_a_body_is_a_friendly_error(messages):
+    assert "needs a 'body'" in messages.run(action="create")
 
 
 def test_messages_unknown_action_is_reported(messages):
