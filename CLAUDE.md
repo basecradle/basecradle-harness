@@ -116,12 +116,14 @@ Mirror the Python SDK's pipeline (`../sdks/python/.github/workflows/release.yml`
 
 **Do not put `Closes #N` on a release PR.** A merged PR auto-closes its issue on merge — before the publish is approved and confirmed live — and an issue that closed before its work was proven on PyPI is a lie. Close the release issue **by hand, only after the package is verified live on PyPI**, recording the verification (version + URL) in the closing comment.
 
-**A release is not done at PyPI — it is done on @jt's box.** PyPI publish is the *middle* of a release, not the end: the fleet's reference agent **@jt** (`/home/jt/venv` on `ai.basecradle.com`) runs a *deployed* venv that PyPI publication does **not** touch, and a release that stops at PyPI silently leaves @jt behind — the recurring **released ≠ deployed** failure class. So the release procedure ends only after:
+**A release is not done at PyPI — it is not done until the fleet is deployed AND verified.** PyPI publish is the *middle* of a release, not the end: the fleet's reference agent **@jt** (`/home/jt/venv` on `ai.basecradle.com`) runs a *deployed* venv that PyPI publication does **not** touch, and a release that stops at PyPI silently leaves @jt behind — the recurring **released ≠ deployed** failure class. Closing that gap is a **four-owner flow**; keep the owners separate (constitution baselines **`basecradle#362`** — "one deployer for the fleet's machines: the NOC" — and **`basecradle#363`** — "a captain *builds* software but never *deploys* it"; the `basecradle-noc` CLAUDE.md frames the NOC as the fleet's single deployer of harness/agent software):
 
-1. **Deploy to @jt.** Upgrade @jt's venv to the just-published version (`/home/jt/venv/bin/pip install -U basecradle-harness`). No long-running service to restart — the router spawns `basecradle-harness-wake` fresh per event — but apply whatever migration/config the new version needs. (SDK schema is forward-only/additive, so a wake self-migrates its own DB.)
-2. **Verify on-box, not inferred from PyPI.** `/home/jt/venv/bin/basecradle-harness-wake --version` reports the new version, and a token-free synthetic-probe wake still acks sub-second (the duration check from the box docs). `--version` is the cheap, model-free, credential-free probe added for exactly this — it is also what the fleet's standing **drift alarm** (in the NOC, which probes @jt on a cadence) runs to fail loud when @jt's running version drifts from PyPI latest.
+1. **Build — the harness captain (you).** Implement the change, bump the version, update the changelog. **Your release responsibility ends at the version bump** — you do **not** publish, deploy, or verify on a box.
+2. **Publish to PyPI — the capital.** Owns the `pypi` env-gate (above).
+3. **Deploy / converge to the fleet (incl. @jt) — the NOC, the fleet's sole deployer.** The NOC reads each box's running version, compares it to the git-tracked desired state, and converges any off-target box via its `fleet-upgrade-campaign` (triggered by its release-drift detection). **No one hand-runs `pip install -U` on `/home/jt/venv` — or any agent box — anymore; that verb belongs to the NOC.** No long-running service to restart — the router spawns `basecradle-harness-wake` fresh per event — and a wake self-migrates its own DB (SDK schema is forward-only/additive), so the converge needs no manual migration step.
+4. **Verify live on @jt + close the handoff — the capital.** After the NOC converges, the capital confirms on-box, **not inferred from PyPI**: `/home/jt/venv/bin/basecradle-harness-wake --version` reports the new version, and a token-free synthetic-probe wake still acks sub-second (the duration check from the box docs). `--version` is the cheap, model-free, credential-free probe added for exactly this — it is also what the NOC's standing **release-drift detection** (which probes @jt on a cadence) runs to fail loud when @jt's running version drifts from PyPI latest.
 
-The drift alarm is the backstop; this documented step is the primary fix. Neither replaces the other — the step keeps a release honest, the alarm catches the release that skipped the step.
+The NOC's drift detection is the backstop; this documented flow is the primary fix. Neither replaces the other — the flow keeps a release honest, the drift alarm catches the release whose deploy step was skipped.
 
 ## First Milestone — Reserve the Name Professionally
 
@@ -346,9 +348,10 @@ register** — the model never sees a present-but-broken tool.
   defaults load directly — the same files-or-fallback precedent as the charter.
 
 **Boundary:** this group is the plugin **mechanism** only — behavior-preserving over the
-existing tools. Deployment proper — provisioning a venv, wiring the router/service on the
-home server — remains the home server's and [`basecradle-router`](https://github.com/basecradle/basecradle-router)'s
-concern, not the installer's (per the spine: harness owns the agent runtime, not the box).
+existing tools. Deployment proper — provisioning a venv and converging an agent box, wiring the
+[`basecradle-router`](https://github.com/basecradle/basecradle-router) daemon/service on the
+home server — is the **NOC's** job (the fleet's sole deployer), not the installer's (per the
+spine: harness owns the agent runtime, not the box).
 
 ### Powerful Tools Are Opt-In — the capability rule (issue #168)
 
@@ -378,12 +381,15 @@ see [[classify-safety-by-capability-not-provider]].)*
 - **Why it's a hard requirement.** Adversarial-by-design personas (the fleet's `pinky`/`the-brain`)
   must be tool-less **by construction**, never "on unless someone remembered to prune." Any
   provider/SDK-based default would silently arm whoever moves onto that provider next — the exact
-  safety violation this rule forecloses. *(The capital provisions those personas explicitly
-  tool-less at cutover; the loud grandfather report is what lets it confirm what to prune.)*
+  safety violation this rule forecloses. *(The capital specifies those personas as explicitly
+  tool-less and the NOC provisions them so at cutover; the loud grandfather report is what lets
+  the capital confirm what to prune.)*
 
-**Boundary:** persona provisioning (cutting each agent's overlay to its target tool-set,
-re-provisioning `jt`/`eddie` in lockstep with the release) is the **capital's** on-box job; the
-harness ships the mechanism + the `--opt-in`/grandfather affordances and proves them with tests.
+**Boundary:** deciding each persona's target tool-set (cutting its overlay to spec) is the
+**capital's** governance call; applying it on a box — provisioning/re-provisioning `jt`/`eddie`
+in lockstep with a release — is the **NOC's** deploy (it converges each box to the git-tracked
+desired config; no one hand-provisions a box). The harness ships the mechanism + the
+`--opt-in`/grandfather affordances and proves them with tests.
 
 ### Read Tools + Standalone Lock (Phase 2 · Group 2b)
 
@@ -484,8 +490,9 @@ reference adapter to prove it end-to-end, **without changing the default's behav
   model-facing tool** (memory is automatic), so a MemPalace agent runs with BaseCradle-only
   tools.
 
-**Boundary:** the circuit-breaker is Group 6. The "Memory Prince" agent provisioning + the
-cross-timeline proof are the **capital's** job, post-ship.
+**Boundary:** the circuit-breaker is Group 6. The "Memory Prince" agent is provisioned on-box by
+the **NOC** (the fleet's sole deployer); the cross-timeline proof is the **capital's** live
+verification, post-ship.
 
 ### MCP Drop-In + Safe-by-Default (Phase 2 · Group 5)
 
@@ -698,9 +705,9 @@ phase delivered the openai-SDK-at-xAI cell first, and the native `xai-sdk` adapt
 **Boundary:** offline tests assert the harness's half (params sent, the async poll loop, the
 legible error relay, the sniffed extension). The ground-truth — a real measured-dimension video,
 the posted Asset's actual pixels/content-type, Live Search returning real citations — is **the
-capital's live verification on Eddie**: it provisions Eddie (xai profile, grok media tools,
-BaseCradle tools, **no** OpenAI tools), runs the full matrix, and **closes the handoff issue by
-hand** after that live verify.
+capital's live verification on Eddie**: the NOC provisions Eddie (xai profile, grok media tools,
+BaseCradle tools, **no** OpenAI tools), then the capital runs the full matrix and **closes the
+handoff issue by hand** after that live verify.
 
 ## Development Commands
 
