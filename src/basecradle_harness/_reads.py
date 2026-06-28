@@ -1,4 +1,4 @@
-"""Give the agent eyes on the platform: read users, the message backlog, and itself.
+"""Give the agent eyes on the platform — and a voice in the conversation.
 
 The cure for **the blind peer** (finding B5 from the capital's @jt test): an agent
 that could *act* on the platform — trust, participate, schedule — but could not
@@ -8,15 +8,22 @@ latest turn; everything behind that was invisible. These are the reads that clos
 that gap — and the direct answer to the three questions every freshly-woken peer
 asks: *what's my trust level, who do I trust (and who trusts me), who is even here?*
 
-Two read tools, each a plain `PlatformTool` (the seam from `_assets.py`, reused with
-no new foundation — they reach the SDK client and current timeline through the bound
+`MessagesTool` also closes the *other* half of the gap: a peer could only post to its
+own wake-timeline (the auto-reply), never *choose* where to speak. Its **create**
+action lets the agent post to any timeline it can view — the working→support pattern
+(keep a project's timeline clean; escalate by posting into a separate support
+timeline), and how a peer reaches a human help channel it isn't currently woken on.
+
+Two tools, each a plain `PlatformTool` (the seam from `_assets.py`, reused with no
+new foundation — they reach the SDK client and current timeline through the bound
 `PlatformContext`):
 
-- `UsersTool` — the directory and the self. **list** the platform's users with your
-  trust state per user; **read** one user (by handle or uuid) in full; **me**, your
-  own dashboard — who you are here, what this place is, and your surfaces.
-- `MessagesTool` — the backlog. **list** recent messages on a timeline (newest
-  first) with the uuids to read them; **read** one message in full by uuid.
+- `UsersTool` — the directory and the self (read-only). **list** the platform's users
+  with your trust state per user; **read** one user (by handle or uuid) in full;
+  **me**, your own dashboard — who you are here, what this place is, and your surfaces.
+- `MessagesTool` — the conversation. **list** recent messages on a timeline (newest
+  first) with the uuids to read them; **read** one message in full by uuid; **create**
+  a message — to the current timeline by default, or cross-timeline by uuid.
 
 **Access tiers are the platform's job, not ours.** A `read` surfaces exactly what
 the API returned for the viewer — base identity always, the richer profile only when
@@ -155,7 +162,7 @@ class UsersTool(PlatformTool):
 
 
 class MessagesTool(PlatformTool):
-    """Read the message backlog the wake didn't hand the agent.
+    """Read the message backlog the wake didn't hand the agent, and post messages.
 
     A `PlatformTool`: bound to the live client and current timeline by the hosting
     agent before the loop.
@@ -163,36 +170,51 @@ class MessagesTool(PlatformTool):
 
     name = "messages"
     description = (
-        "Read the message backlog — what was said before you woke (the wake hands you only "
-        "the latest turn). action='list' shows recent messages on a timeline, newest "
-        "first, each with its uuid, author, time, and a preview; action='read' returns one "
-        "message in full by uuid. Operations use the current timeline unless you pass a "
-        "timeline uuid."
+        "Read and post messages on a timeline. action='list' shows recent messages on a "
+        "timeline, newest first, each with its uuid, author, time, and a preview "
+        "(what was said before you woke — the wake hands you only the latest turn); "
+        "action='read' returns one message in full by uuid; action='create' posts a new "
+        "message and returns its uuid. A 'create' posts to the current timeline by default; "
+        "pass a 'timeline' uuid to post to another timeline you can view (find it with the "
+        "'timelines' tool's list). Cross-timeline posting is how you escalate: keep a "
+        "project's working timeline clean, and when you hit a bug, need a tool built, or "
+        "need human help, post from the working timeline into a separate support timeline. "
+        "Operations use the current timeline unless you pass a timeline uuid."
     )
     parameters = {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "read"],
+                "enum": ["list", "read", "create"],
                 "description": "What to do.",
             },
             "uuid": {
                 "type": "string",
                 "description": "The message's uuid (read only). Get it from 'list'.",
             },
+            "body": {
+                "type": "string",
+                "description": "The text of the message to post (create only).",
+            },
             "timeline": {
                 "type": "string",
                 "description": (
-                    "Optional timeline uuid to read instead of the current one (list only). "
-                    "Omit to use the timeline you are engaged on."
+                    "Optional timeline uuid to act on instead of the current one "
+                    "(list and create). Omit to use the timeline you are engaged on."
                 ),
             },
         },
         "required": ["action"],
     }
 
-    def run(self, action: str, uuid: str | None = None, timeline: str | None = None) -> str:
+    def run(
+        self,
+        action: str,
+        uuid: str | None = None,
+        body: str | None = None,
+        timeline: str | None = None,
+    ) -> str:
         """Dispatch on `action`. Returns a message written for the model to read."""
         try:
             if action == "list":
@@ -201,9 +223,13 @@ class MessagesTool(PlatformTool):
                 if not uuid:
                     return "Error: 'read' needs the message's uuid. Use 'list' to find it."
                 return self._read(uuid)
+            if action == "create":
+                if not body:
+                    return "Error: 'create' needs a 'body' — the text of the message to post."
+                return self._create(timeline or self.context.timeline, body)
         except BaseCradleError as error:
-            return f"Couldn't read messages: {explain(error)}"
-        return f"Error: unknown action {action!r}. Use 'list' or 'read'."
+            return f"Couldn't {action} {'a message' if action == 'create' else 'messages'}: {explain(error)}"
+        return f"Error: unknown action {action!r}. Use 'list', 'read', or 'create'."
 
     # --- list ----------------------------------------------------------------
 
@@ -226,6 +252,26 @@ class MessagesTool(PlatformTool):
     def _read(self, uuid: str) -> str:
         message = self.context.client.messages.get(uuid)
         return _message_line(message, preview=False)
+
+    # --- create --------------------------------------------------------------
+
+    def _create(self, timeline: str, body: str) -> str:
+        """Post a message to a timeline and return the new message's uuid.
+
+        Built on the SDK's timeline-scoped creator (`POST /timelines/{uuid}/messages`),
+        so it posts to **any** timeline the agent can view, not just the current one —
+        the cross-timeline working→support path. Posting carries no new safety surface:
+        the platform authorizes it server-side (you can only post to a timeline you can
+        *view*; a locked timeline rejects the content; mutual trust already gates who is
+        on a timeline at all), so an unviewable or locked target surfaces as a clean
+        relayed refusal from `run`, never a crash.
+
+        **One call, never a blind retry.** A refusal is relayed for the model to act on
+        (it can re-check via `read`/`list` and decide) — it is not re-attempted here,
+        because a double-post on an ambiguous failure would wake the recipient twice.
+        """
+        message = self.context.client.timelines.get(timeline).messages.create(body=body)
+        return f"Posted to timeline {timeline}. The new message's uuid is {message.content.uuid}."
 
 
 # --- shared rendering helpers ------------------------------------------------

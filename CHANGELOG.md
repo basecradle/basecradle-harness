@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.41.0] - 2026-06-28
+
+**The `messages` tool can now *post*, not just read — including cross-timeline (issue #190).** A
+harnessed peer could only post to its own wake-timeline (the auto-reply); it had no tool to *create*
+a message on a timeline of its choosing. That broke the core autonomous-agent pattern: keep one
+timeline clean as a **working timeline** for a project, and when the agent finds a bug, needs a tool
+built, or needs human support, **post from the working timeline into a separate support timeline**.
+This is a committed requirement and a revenue gate (capital + founder, 2026-06-28). The read side
+(`list`/`read` with an optional `timeline` uuid) and timeline discovery (`timelines list`) already
+worked cross-timeline, and the SDK's `timelines.get(uuid).messages.create(body=...)` already posts
+to any timeline by uuid — so the single missing piece was a write action.
+
+### Added
+
+- **`messages` `create` action** (`MessagesTool`, `_reads.py`) — posts a message and returns the new
+  message's uuid. `timeline` omitted → the current wake-timeline; a `timeline` uuid → that timeline,
+  if the agent can view it (the working→support path). **Default-on, not opt-in:** posting carries no
+  new safety surface — the platform authorizes every post server-side (you can only post to a timeline
+  you can *view*; a locked timeline rejects the content; mutual trust already gates who is on a
+  timeline). Built on the SDK's existing timeline-scoped creator — **no SDK change.**
+- A refusal (locked timeline, not-a-viewer, validation) is **relayed cleanly for the model to act on,
+  never blind-retried** — a double-post on an ambiguous failure would wake the recipient twice.
+  (Idempotency via an `Idempotency-Key` is the proper fix and a separate fast-follow; the
+  no-blind-retry discipline is the mitigation until then.)
+
 ## [0.40.2] - 2026-06-28
 
 **The injected current-time anchor now labels itself UTC with an offset and instructs conversion,
