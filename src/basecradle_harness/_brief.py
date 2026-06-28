@@ -8,10 +8,12 @@ the conversation, not buried at turn 1.
 
 The brief is composed, in order, of a current-time anchor followed by four parts:
 
-0. **The current-time anchor** — `Current Time: <UTC> (<weekday>)`, composed in
-   `_wake.py::_now_line` and passed in fresh on every wake. It grounds the model in the
-   absolute "now" (the brief is re-composed and re-injected each wake, so it is always
-   current) and is the reference every inbound item's `[created_at]` stamp is read against.
+0. **The current-time anchor** — `Current Time: <UTC> (+00:00, <weekday>)` plus a one-line
+   UTC-conversion instruction, composed in `_wake.py::_now_line` and passed in fresh on every
+   wake. It grounds the model in the absolute "now" (the brief is re-composed and re-injected
+   each wake, so it is always current), is the reference every inbound item's `[created_at]`
+   stamp is read against, and tells the model to convert UTC → a named locale before answering
+   a local-time question (issue #180).
 1. **`initialize.md`** — the framework's authored operating guidance: how to behave
    here, plus the cross-cutting gotchas the function schemas can't convey. Provider-
    independent (identical on every install).

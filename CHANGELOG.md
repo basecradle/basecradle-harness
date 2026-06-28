@@ -7,6 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.40.2] - 2026-06-28
+
+**The injected current-time anchor now labels itself UTC with an offset and instructs conversion,
+so agents stop parroting the UTC day/date as if it were local (issue #180).** Every agent runs UTC
+on the box, and the Turn-0 brief's time anchor gave a bare day/date — so when asked a *local-time*
+question (any timezone ≠ UTC) the model returned the UTC figure verbatim, wrong whenever UTC had
+rolled to the next day but the asked-about locale hadn't. Live-confirmed on @jt: at 02:35 UTC on
+2026-06-27 (Friday 21:35 CDT in Dallas), asked the day/date in US Central, he answered "Saturday,
+June 27" — the UTC day, not the local Friday, June 26. The anchor (`_wake.py::_now_line`) now
+renders `Current Time: 2026-06-21 17:09:49 UTC (+00:00, Sunday)` with an explicit offset, followed
+by a one-line instruction: the clock is UTC, and for a question about a specific locale's date or
+time the model must convert from UTC to that timezone first (the local day can differ from the UTC
+day). Provider-agnostic — this is the brief injection, not a vendor concern.
+
 ## [0.40.1] - 2026-06-27
 
 **xAI Live Search is functional at runtime again — drop the already-executed server-side tool calls
