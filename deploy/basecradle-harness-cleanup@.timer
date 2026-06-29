@@ -1,0 +1,24 @@
+# BaseCradle Harness — orphan-artifact sweep schedule (per-agent template timer).
+#
+# Drives `basecradle-harness-cleanup@%i.service` on a modest cadence. Authored by the harness
+# captain; the **NOC owns the final cadence** (suggested every 30 min — frequent enough that a
+# deleted timeline's content does not linger long, cheap enough that it costs one
+# `timelines.get` per referenced timeline and zero model tokens). Enable per agent with:
+#   systemctl enable --now basecradle-harness-cleanup@jt.timer
+
+[Unit]
+Description=Run the BaseCradle Harness orphan-artifact sweep for agent %i (every 30 min)
+Documentation=https://github.com/basecradle/basecradle-harness/issues/192
+
+[Timer]
+# Give the box a moment after boot before the first sweep, then run every 30 minutes.
+OnBootSec=10min
+OnUnitActiveSec=30min
+# Catch up one missed run after downtime rather than waiting a full interval.
+Persistent=true
+# Stagger agents that share a box so they don't all hit the platform API at the same instant
+# (the shared-IP rate-limit-floor discipline).
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target

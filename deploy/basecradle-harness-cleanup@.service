@@ -1,0 +1,46 @@
+# BaseCradle Harness — orphan-artifact sweep (per-agent template unit).
+#
+# Authored here by the harness captain; **deployed and finalized by the NOC** (the fleet's
+# sole deployer — paths, the venv location, hardening, and the cadence in the .timer are the
+# NOC's to tune). One instance per agent OS user: `%i` is the agent slug, which is also its
+# OS user and home (`/home/%i`) per the universal-identity rule. Enable e.g. with
+#   systemctl enable --now basecradle-harness-cleanup@jt.timer
+#
+# What it does: `--sweep` enumerates the per-timeline artifacts under this agent's
+# $HARNESS_HOME, asks the platform about each timeline once (one cheap `timelines.get`, no
+# model call), and purges only those the platform 404s (confirmed deleted). The first run on
+# a box is the backfill. Memory (memory.db + the MemPalace palace) is never touched.
+#
+# Per-agent, because each agent's BASECRADLE_TOKEN scopes `timelines.get` to its own
+# visibility — exactly the timelines whose artifacts it holds.
+
+[Unit]
+Description=BaseCradle Harness — GC deleted-timeline artifacts for agent %i
+Documentation=https://github.com/basecradle/basecradle-harness/issues/192
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=%i
+Group=%i
+
+# The agent's env file supplies BASECRADLE_TOKEN (scopes the platform reads to this agent)
+# and HARNESS_HOME (where the artifacts live). Same file the wake/install use; the NOC owns
+# its final path. Secrets are read literally by systemd — never shell-sourced.
+EnvironmentFile=/home/%i/.config/basecradle/agent.env
+
+# The installed console-script in the agent's venv (e.g. /home/jt/venv). NOC-tunable.
+ExecStart=/home/%i/venv/bin/basecradle-harness-cleanup --sweep
+
+# Sandboxing — the sweep only reads the BaseCradle API and deletes files under $HARNESS_HOME.
+# It needs no new privileges, no shell, and writes nowhere outside the agent's home. The NOC
+# narrows ReadWritePaths to the exact $HARNESS_HOME if it lives outside /home/%i.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/%i
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictRealtime=true
