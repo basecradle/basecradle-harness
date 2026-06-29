@@ -709,6 +709,39 @@ capital's live verification on Eddie**: the NOC provisions Eddie (xai profile, g
 BaseCradle tools, **no** OpenAI tools), then the capital runs the full matrix and **closes the
 handoff issue by hand** after that live verify.
 
+### Orphan-Artifact Sweep — GC deleted timelines' on-box state (issue #192)
+
+When a Timeline is destroyed on the platform, **nothing on the fleet server is cleaned up by
+itself.** The harness persists per-timeline state under `$HARNESS_HOME` — chiefly the session
+transcript (the full conversation), plus marks/seen/claims/breaker index files — and had no
+deletion handler, so a destroyed timeline's content would survive on the box indefinitely. The
+`basecradle-harness-cleanup` entrypoint (`_cleanup.py`) is the periodic **orphan sweep** that
+GCs it. **Sweep-only by design (founder-settled):** the platform's `timeline.deleted` event is
+best-effort/droppable, so an event-driven cleanup can't be trusted alone; a periodic sweep is
+mandatory regardless, and the *same* sweep backfills already-deleted timelines for free (the
+first run on a box is the backfill — past and future deletions are one code path). No router or
+Rails change; we don't consume `timeline.deleted`.
+
+- **The classify switch is the whole safety.** Each referenced UUID is checked with one cheap
+  `client.timelines.get(uuid)` (no model call): **only a clean `NotFoundError` (404) purges.**
+  Success (200) keeps; `ForbiddenError`/`NotAViewerError` (403 — exists, agent not a viewer)
+  keeps + logs; **any** transient error (connection / rate-limit / 5xx / generic
+  `BaseCradleError`) keeps and retries next run. *A platform outage must never read as
+  "everything deleted" and trigger a mass purge — default to keep on anything but a 404.*
+- **The invariant — memory deliberately persists across timeline deletion and is never swept.**
+  The sweep operates *only* on the five artifact dirs (`sessions/`, `marks/`, `seen/`, `claims/`,
+  `breaker/`) and **never touches** `memory.db` (+ `-wal`/`-shm`) or the MemPalace palace dir. If
+  a peer told the agent its birthday on a since-deleted timeline, the agent must still remember
+  it. (By construction: memory is never enumerated, so a purge can't reach it.)
+- Idempotent + crash-safe (re-derives the set from disk each run; a half-done purge finishes
+  next run); reuses `_client_from_env` and the stores' `quote(..., safe='')` filename
+  convention. `--timeline <uuid>` is a manual unconditional ops purge.
+
+**Boundary:** the schedule unit lives in `deploy/` (captain authors it); the **NOC deploys it**
+(sole deployer) per agent, scoped to that agent's `$HARNESS_HOME` + `BASECRADLE_TOKEN`. Live
+verification (drive a wake, delete the timeline, sweep, confirm the five artifacts go and memory
+stays) is **the capital's** job, post-ship.
+
 ## Development Commands
 
 ```bash

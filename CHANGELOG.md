@@ -7,6 +7,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.42.0] - 2026-06-28
+
+**Deleted timelines' on-box artifacts are now garbage-collected — memory is not (issue #192).**
+When a Timeline is destroyed on the platform, nothing on the fleet server was cleaned up: the
+harness persists per-timeline state under `$HARNESS_HOME` — chiefly the session transcript, which
+holds the full conversation — and had no deletion handler, so a destroyed timeline's content
+survived on the box indefinitely. The new `basecradle-harness-cleanup` entrypoint is the periodic
+**orphan sweep** that GCs those artifacts. **Sweep-only by design (founder-settled):** the
+platform's `timeline.deleted` event is best-effort/droppable, so an event-driven cleanup can't be
+trusted alone; a periodic sweep is mandatory regardless, and the *same* sweep backfills
+already-deleted timelines for free (the first run on a box is the backfill).
+
+### Added
+
+- **`basecradle-harness-cleanup` console script** (`_cleanup.py`) — `--sweep` enumerates the
+  per-timeline artifacts under `$HARNESS_HOME` (`sessions/`, `marks/`, `seen/`, `claims/`,
+  `breaker/`), classifies each referenced timeline with one cheap `client.timelines.get(uuid)`
+  (**no model call**), and purges only those the platform 404s (confirmed deleted). Success keeps;
+  403 (exists, agent not a viewer) keeps + logs; **any** transient error (connection / rate-limit /
+  5xx / generic `BaseCradleError`) keeps and retries next run — *a platform outage must never read
+  as "everything deleted" and trigger a mass purge.* `--timeline <uuid>` is a manual unconditional
+  ops purge. Idempotent and crash-safe; reuses `_client_from_env` and the stores'
+  `quote(..., safe='')` filename convention.
+- **`deploy/` systemd units** — a per-agent template timer + oneshot service
+  (`basecradle-harness-cleanup@.timer`/`.service`, suggested every 30 min) for the **NOC** to
+  install, scoped to each agent's `$HARNESS_HOME` + `BASECRADLE_TOKEN`, plus a `deploy/README.md`.
+
+### Invariant
+
+- **Memory deliberately persists across timeline deletion and is never swept.** The sweep operates
+  *only* on the five artifact dirs above and **never touches** `memory.db` (+ `-wal`/`-shm`) or the
+  MemPalace palace dir — by construction, since memory is never enumerated. If a peer told the agent
+  its birthday on a since-deleted timeline, the agent still remembers it.
+
 ## [0.41.0] - 2026-06-28
 
 **The `messages` tool can now *post*, not just read — including cross-timeline (issue #190).** A

@@ -51,6 +51,9 @@ basecradle-harness-wake = "basecradle_harness._wake:main"
 # Scaffold (and upgrade) the operator's config home: prompts/, tools/, mcp/, and the shipped
 # charter defaults. Idempotent — a fleet rollout re-runs it per agent over a pinned version.
 basecradle-harness-install = "basecradle_harness._install:main"
+# GC the on-box artifacts of deleted timelines: the NOC schedules `--sweep` per agent on a
+# cadence (deploy/). Sweep-only; memory (memory.db + the MemPalace palace) is never touched.
+basecradle-harness-cleanup = "basecradle_harness._cleanup:main"
 
 [project.urls]
 Homepage = "https://basecradle.com"
