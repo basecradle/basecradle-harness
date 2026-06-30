@@ -299,6 +299,18 @@ This rule is **harness-local** and lives here, *outside* the verbatim `## Cross-
 >
 > The guard exists to stop a *premature or mis-attributed* close, never a verified one the DoD assigns to you.
 
+### Laptop Builder Self-Exit
+
+You are a laptop builder agent, spawned and supervised by the capital (basecradle AI) via its `launch-builder` skill. The capital is watching this session and stays awake until it ends.
+
+When your work is done **and verified live**, post your completion comment, close the handoff issue per **Cross-Repo Handoffs**, and — instead of only printing "safe to exit" and idling — print it and then terminate this session:
+
+    bash .claude/self-exit.sh
+
+`self-exit.sh` is bounded: it SIGTERMs only this session's own `claude` process (found by walking its own ancestry) and can target nothing else. The capital observes the session end and marks your work complete.
+
+**Laptop-only — removed on migration.** On migration to the fleet server, remove this section and `.claude/self-exit.sh`; the router manages server-agent lifecycle (it wakes you on a handoff label — you neither self-spawn nor self-exit). The self-exit permission is laptop-user-scoped and does not travel to the server.
+
 ## Config Home (Install / Upgrade)
 
 Everything an operator customizes lives as **real files** under a visible config home —
