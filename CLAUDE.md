@@ -290,6 +290,14 @@ This rule is **harness-local** and lives here, *outside* the verbatim `## Cross-
 > - **not by hand** — no manual close in the GitHub UI or via `gh issue close`, however "done" the work looks.
 >
 > Your PR merging is *not* the finish line for a capital-originated handoff; the capital's live verify is. Closing it early — by keyword or by hand — lies to everyone watching the issue, exactly as it would for a release issue before PyPI is confirmed live. **Done means: PR merged, completion comment posted, issue left open for the capital.** Only close a handoff yourself when its DoD explicitly names *you* as the closer.
+>
+> #### ✅ Read the `CLOSER:` line — it tells you whose close this is.
+>
+> The capital now stamps every handoff DoD with an explicit **`CLOSER:` line**, so which case you are in is no longer a judgment call — read the line:
+> - **`CLOSER: you`** (the harness captain) → the issue is **yours to close.** Once you have met *and verified* the DoD, closing it by hand (`gh issue close`) is the correct, expected final step — the don't-close-by-hand guard above is scoped to handoffs the capital closes and does **not** apply here. This is routine in-repo action the captain is already authorized to take, so do it rather than pausing to surface a non-conflict (the over-cautious stall that prompted basecradle-harness#196, where a correct `CLOSER: you` re-sync close was held back and the capital had to step in).
+> - **`CLOSER: capital`** (or any actor other than you, or **no `CLOSER:` line at all** → default to the capital) → **leave it OPEN**; the don't-close-by-hand guard above stands in full. This is still the norm: nearly every handoff is capital-originated and the capital live-verifies on @jt before closing.
+>
+> The guard exists to stop a *premature or mis-attributed* close, never a verified one the DoD assigns to you.
 
 ## Config Home (Install / Upgrade)
 
