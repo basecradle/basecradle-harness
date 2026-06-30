@@ -583,6 +583,18 @@ def test_prompt_text_falls_back_to_the_packaged_default_when_not_installed(tmp_p
     assert "<!--" not in text  # the operator-note comment is stripped before composition
 
 
+def test_initialize_brief_steers_code_exec_replies_to_report_the_result(tmp_path):
+    # Issue #178: the code-exec guidance over-corrected into reporting only the saved-source
+    # artifact, dropping the computed result the peer asked for. The brief must steer the
+    # reply to surface the result, with the Asset uuid as an *addition*, not a substitute.
+    text = prompt_text("initialize.md", tmp_path / "absent")
+    assert "Result first, artifact also" in text
+    # The result-first instruction comes before the artifact-reference instruction.
+    assert text.index("goes in your reply") < text.index("reference them by **Asset uuid**")
+    # Sandbox paths are still steered against, but only as the artifact-reference caveat.
+    assert "/mnt/data" in text
+
+
 def test_prompt_text_prefers_the_installed_file_and_strips_comments(tmp_path):
     home = tmp_path / "cfg"
     install(home)

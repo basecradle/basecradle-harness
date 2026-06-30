@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.42.1] - 2026-06-29
+
+**A code-execution reply now reports the computed result, not just the saved-source artifact
+(issue #178).** During the #172 live-verify, @jt ran a CSV round-trip correctly — computed the
+row sums and grand total inside the turn — but the message it posted to the peer reported only
+that the executed source was saved as an Asset, dropping the numbers the peer asked for. The
+cause was a brief line steering the final reply toward *"reference those Asset uuids, not
+sandbox `/mnt/data` paths"* that over-corrected the model into reporting the **artifact instead
+of the result**. The two are not mutually exclusive.
+
+### Changed
+
+- **`prompts/initialize.md` code-exec guidance is now result-first, artifact-also.** The brief
+  tells the agent plainly that whatever the peer asked for — the sum, the answer, the computed
+  result — goes in the reply, and that a produced file's Asset uuid is referenced *in addition
+  to* the result (never `/mnt/data` sandbox paths), not in place of it. Behavior-preserving for
+  every other path; this only retunes the standing operating brief. An agent with no config
+  home (like @jt) composes the brief from this packaged default, so it picks up the retune on
+  the next deploy with no migration.
+
+### Fixed
+
+- README's code-execution "Out" bullet no longer implies the reply is *about* the Asset uuids —
+  it now states the uuids are referenced alongside the computed result, matching the retuned
+  brief.
+
 ## [0.42.0] - 2026-06-28
 
 **Deleted timelines' on-box artifacts are now garbage-collected — memory is not (issue #192).**
