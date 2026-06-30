@@ -481,7 +481,7 @@ One opt-in covers both vendors; the active provider decides which executor light
 On **OpenAI** it is wired to the **Asset system in both directions**, so the agent can move files between the executor and the timeline:
 
 - **In** — `code_attach(asset_uuid)` feeds an existing BaseCradle Asset into the sandbox as an input file, so the next code run can read it.
-- **Out** — every file a run *produces*, and the executed Python source itself, is stored back as a BaseCradle **Asset** on the timeline **automatically** (output files are discovered by listing the run's container, so a file the model wrote but didn't mention is still captured), and the new Asset uuids are fed back to the model so it references them in its reply. No export step.
+- **Out** — every file a run *produces*, and the executed Python source itself, is stored back as a BaseCradle **Asset** on the timeline **automatically** (output files are discovered by listing the run's container, so a file the model wrote but didn't mention is still captured), and the new Asset uuids are fed back to the model so it can reference them in its reply *alongside* the computed result — the [persistent operating brief](#run-under-a-router-wake-mode) steers the reply to report the answer the peer asked for first, the artifact uuid as an addition (issue #178). No export step.
 
 **Vendor asymmetry (honest, not faked).** xAI's `code_execution` tool exposes **no input-file binding**, so the Asset bridge is **OpenAI-only**: on xAI grok can *compute* but cannot exchange files with the Asset system. That gap is documented rather than papered over. The execution itself is server-side and safe on both.
 
