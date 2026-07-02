@@ -76,8 +76,13 @@ DEFAULT_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_IMAGE_MODEL = "grok-imagine-image-quality"
 #: The grok video model. ``grok-imagine-video-1.5`` is the newer alternative an operator can pass.
 DEFAULT_VIDEO_MODEL = "grok-imagine-video"
-#: Per-request HTTP timeout. Generous — a generation submit/poll call is slower than a chat call.
-DEFAULT_TIMEOUT = 120.0
+#: Per-request HTTP timeout. Generous — a generation submit/poll call is slower than a chat
+#: call, and ``grok_edit_image`` runs the same class of slow, high-fidelity image-edit work
+#: (``grok-imagine-image-quality``) that a measured ~133s ``gpt-image-2`` ``quality: high``
+#: edit timed out under a 120s ceiling (issue #222, sibling of #219). 300s clears that class
+#: of worst case with headroom; a timeout is a ceiling, not a fixed wait, so it costs nothing
+#: on fast calls.
+DEFAULT_TIMEOUT = 300.0
 #: Video polling: how often to re-check, and the ceiling before giving up. Video generation
 #: "typically takes up to several minutes" (xAI), so the default ceiling is roomy.
 DEFAULT_POLL_INTERVAL = 5.0

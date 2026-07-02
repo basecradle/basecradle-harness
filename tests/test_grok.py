@@ -420,3 +420,47 @@ def test_video_relays_a_submit_error(video_tool):
 
 def test_video_needs_a_prompt(video_tool):
     assert "needs a 'prompt'" in video_tool.run(prompt="")
+
+
+# --- the request timeout (issue #222, sibling of #219) -----------------------
+
+
+def test_default_timeout_clears_the_grok_high_quality_edit_latency():
+    # `grok_edit_image` runs the same class of slow, high-fidelity edit as gpt-image-2's
+    # `quality: high`, which was measured at ~133s live (#219). The ceiling must clear that
+    # worst case with headroom (issue #222); mirrors #219's 300s.
+    from basecradle_harness._grok import DEFAULT_TIMEOUT
+
+    assert DEFAULT_TIMEOUT >= 133.0
+    assert DEFAULT_TIMEOUT == 300.0
+
+
+def test_the_timeout_reaches_the_grok_http_client(edit_tool, monkeypatch):
+    # Whatever timeout the tool carries is the one handed to the httpx client at call time,
+    # so the ceiling bump actually takes effect rather than being decorative.
+    import basecradle_harness._grok as grok
+
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return image_b64()
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def request(self, *args, **kwargs):
+            return _FakeResponse()
+
+    monkeypatch.setattr(grok.httpx, "Client", _FakeClient)
+    edit_tool._request(FAKE_KEY, "POST", "images/edits", json={})
+    assert captured["timeout"] == grok.DEFAULT_TIMEOUT
