@@ -332,7 +332,13 @@ def test_removing_the_whole_tools_dir_once_installed_yields_no_tools(tmp_path):
 
 # The powerful xAI-affine defaults — opt-in everywhere (issue #168), so absent from a default
 # load; available only under provider="xai" (their `requires`) once opted into an overlay.
-_XAI_DEFAULTS = {"web_search", "x_search", "grok_generate_image", "grok_generate_video"}
+_XAI_DEFAULTS = {
+    "web_search",
+    "x_search",
+    "grok_generate_image",
+    "grok_edit_image",
+    "grok_generate_video",
+}
 
 
 def test_a_never_installed_config_home_falls_back_to_benign_defaults_only(tmp_path):

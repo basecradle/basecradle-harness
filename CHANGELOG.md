@@ -7,6 +7,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.43.0] - 2026-07-02
+
+**xAI can now edit images, not just generate them — the new `grok_edit_image` tool (issue
+#176).** The premise this issue was filed under went stale: xAI shipped an image-edit endpoint
+(`POST /v1/images/edits`, `grok-imagine-image-quality`) on 2026-05-06, so the "parity is
+impossible, accept the gap" branch no longer applies. `grok_edit_image` is the xAI-native
+counterpart to the existing OpenAI `edit_image`: it takes one or more source image Assets (by
+uuid) plus a prompt and posts the edited result as a new Asset on the timeline. (The OpenAI
+`edit_image` tool already shipped in #141 and is unchanged; the only OpenAI item left on #176 is
+the capital's live @jt verification.)
+
+### Added
+
+- **`GrokEditImageTool` (`grok_edit_image`)** — a new default tool plugin
+  (`_defaults/tools/grok_edit_image.py`), `requires=(Vendor("xai"),)`, `opt_in=True` (off by
+  default on every provider, overlay opt-in only — the capability rule, issue #168). It mirrors
+  `GrokGenerateImageTool`'s transport (direct JSON over the shared grok HTTP, independent of
+  `AI_SDK`) and the UX of OpenAI's `edit_image`. **Two deliberate, documented asymmetries vs
+  OpenAI's `edit_image`:** (1) xAI's edit endpoint requires `application/json` — the OpenAI SDK's
+  multipart `images.edit()` is explicitly unsupported — so each source image is resolved to its
+  bytes and sent as a **base64 data URI** (the signed Asset URL is not assumed publicly fetchable
+  by xAI), one source riding the `image` object and a composite (up to 3) riding the `images`
+  array; (2) xAI edits by **natural language** with **no `mask`** (no mask-based inpainting), so
+  the tool has no `mask` parameter. The posted Asset's filename extension follows the *real*
+  (sniffed) bytes, and an API failure relays xAI's actual message rather than a generic HTTP
+  status.
+
+### Changed
+
+- **`_media.uuid_list`** now centralizes the "normalize the `image` arg (bare string or array)
+  to a clean uuid list" logic shared by both edit tools; `_images.EditImageTool` reuses it in
+  place of its former private `_as_uuid_list` (behavior-preserving).
+
 ## [0.42.1] - 2026-06-29
 
 **A code-execution reply now reports the computed result, not just the saved-source artifact

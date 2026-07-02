@@ -405,6 +405,7 @@ def test_every_shipped_power_tool_default_is_classified_opt_in():
         "web_search",
         "xai_search",  # declares both web_search + x_search built-ins, both opt_in
         "grok_generate_image",
+        "grok_edit_image",
         "grok_generate_video",
         "code_execution",  # OpenAI Code Interpreter + xAI code execution + code_attach (issue #172)
     }
@@ -422,7 +423,12 @@ def test_plugin_relevant_to_gates_on_the_active_provider():
 # --- provider-aware install + prune (issue #160, scope expansion) ------------
 
 # The shipped tool defaults, by provider affinity (mirrors the real `_defaults/tools/`).
-_XAI_DEFAULTS = {"grok_generate_image.py", "grok_generate_video.py", "xai_search.py"}
+_XAI_DEFAULTS = {
+    "grok_generate_image.py",
+    "grok_edit_image.py",
+    "grok_generate_video.py",
+    "xai_search.py",
+}
 _OPENAI_DEFAULTS = {"generate_image.py", "edit_image.py", "hear_audio.py", "web_search.py"}
 # Every provider-affine default is now a powerful, opt-in tool (issue #168), so provider
 # affinity is observable at scaffold time only when the tool is explicitly opted in.

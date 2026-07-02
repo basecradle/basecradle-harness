@@ -107,6 +107,21 @@ def sniff_media_ext(data: bytes, default: str) -> str:
     return default
 
 
+def uuid_list(value: list[str] | str | None) -> list[str]:
+    """Normalize an ``image`` arg to a clean list of asset uuids, for the edit tools.
+
+    The schema declares an array of source uuids, but a model may pass a bare string for a
+    single source; accept both, and drop any blank entries so an empty/whitespace value
+    surfaces the friendly "needs a source" error rather than a 400 deep in the API. Shared by
+    the OpenAI (`_images.EditImageTool`) and xAI (`_grok.GrokEditImageTool`) edit tools so the
+    two normalize an identical arg identically.
+    """
+    if value is None:
+        return []
+    items = [value] if isinstance(value, str) else list(value)
+    return [u.strip() for u in items if isinstance(u, str) and u.strip()]
+
+
 def slugify(text: str) -> str:
     """A short, filename-safe slug: lowercased words joined by hyphens, capped at 48 chars."""
     words = re.findall(r"[a-z0-9]+", text.lower())

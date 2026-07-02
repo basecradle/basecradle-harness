@@ -58,7 +58,12 @@ from basecradle_harness._exceptions import (
     ProviderConnectionError,
     ProviderError,
 )
-from basecradle_harness._media import decode_image_payload, provider_error_message, slugify
+from basecradle_harness._media import (
+    decode_image_payload,
+    provider_error_message,
+    slugify,
+    uuid_list,
+)
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._platform import PlatformTool, explain
 
@@ -407,7 +412,7 @@ class EditImageTool(_ImageTool):
         """Edit the source image(s), upload the result, and report the new asset."""
         if not prompt or not prompt.strip():
             return "Error: 'edit_image' needs a 'prompt' describing the change to make."
-        uuids = _as_uuid_list(image)
+        uuids = uuid_list(image)
         if not uuids:
             return (
                 "Error: 'edit_image' needs at least one source 'image' asset uuid. "
@@ -477,19 +482,6 @@ class EditImageTool(_ImageTool):
 
 class _SourceError(Exception):
     """A model-readable failure resolving a source/mask asset for an edit."""
-
-
-def _as_uuid_list(image: list[str] | str | None) -> list[str]:
-    """Normalize the ``image`` arg to a clean list of uuids.
-
-    The schema declares an array, but a model may pass a bare string for a single
-    source; accept both, and drop any blank entries so an empty/whitespace value
-    surfaces the friendly "needs a source" error rather than a 400 deep in the API.
-    """
-    if image is None:
-        return []
-    items = [image] if isinstance(image, str) else list(image)
-    return [u.strip() for u in items if isinstance(u, str) and u.strip()]
 
 
 def _provider_message(exc: ProviderError) -> str:
