@@ -7,6 +7,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.43.2] - 2026-07-02
+
+**The grok media tools inherit the same timeout fix — the request ceiling is raised from 120s
+to 300s (issue #222, sibling of #219).** `grok_edit_image` (shipped in 0.43.0) runs the same
+class of slow, high-fidelity image-edit work (`grok-imagine-image-quality`) that motivated #219
+for OpenAI's `edit_image`, and the grok media tools carry their own `DEFAULT_TIMEOUT` in
+`_grok.py` (independent of `_images.py`), so #219's bump did not reach them. A high-quality
+`grok_edit_image` edit that runs ~130s+ would have timed out exactly the way OpenAI's
+`edit_image` did before the fix.
+
+### Changed
+
+- **`_grok.py`'s `DEFAULT_TIMEOUT` raised `120.0` → `300.0`.** Purely a ceiling bump — no
+  behavior change otherwise. A timeout is a ceiling, not a fixed wait, so 300s costs nothing on
+  fast calls and clears the slow high-fidelity edit class with headroom. It backs all three
+  grok media tools (`grok_generate_image`, `grok_edit_image`, `grok_generate_video`).
+  (`_audio.py` also carries `120.0`, but audio latency is unrelated and left out of scope.)
+
 ## [0.43.1] - 2026-07-02
 
 **Image tools no longer time out on the quality the model naturally picks — the request
