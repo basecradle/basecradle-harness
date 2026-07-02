@@ -76,7 +76,11 @@ DEFAULT_MODEL = "gpt-image-2"
 #: Default canvas. Square is universally supported; the model may pass another.
 DEFAULT_SIZE = "1024x1024"
 #: Generation/editing is slow next to a chat call — give it room before giving up.
-DEFAULT_TIMEOUT = 120.0
+#: A ``gpt-image-2`` ``quality: high`` edit was measured at ~133s live (issue #219), which
+#: agents pick naturally for fidelity work, so the old 120s ceiling timed the common case
+#: out. 300s clears the measured worst case with headroom for larger sizes; the constraint
+#: is only that a normal ``quality: high`` request must not hit the ceiling.
+DEFAULT_TIMEOUT = 300.0
 
 #: ``output_format`` → filename extension. The Asset's content-type is inferred from
 #: the filename (the SDK upload carries no explicit type), so the extension is how the

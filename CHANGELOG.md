@@ -7,7 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.43.0] - 2026-07-02
+## [0.43.1] - 2026-07-02
+
+**Image tools no longer time out on the quality the model naturally picks — the request
+ceiling is raised from 120s to 300s (issue #219).** A `gpt-image-2` `quality: high` edit was
+measured at ~133s live, and agents select `quality: high` on their own for fidelity work — so
+the old 120s `DEFAULT_TIMEOUT` timed the common case out (`edit_image` failed twice at high
+before a nudge to `medium` succeeded). The ceiling backs both `generate_image` and
+`edit_image`, so high-quality generations were equally exposed.
+
+### Changed
+
+- **`_ImageTool.DEFAULT_TIMEOUT` raised `120.0` → `300.0`** (`_images.py`). Purely a ceiling
+  bump — no behavior change otherwise. 300s clears the measured 133s worst case with headroom
+  for larger sizes; a normal `quality: high` edit/generation now completes within the timeout.
 
 **xAI can now edit images, not just generate them — the new `grok_edit_image` tool (issue
 #176).** The premise this issue was filed under went stale: xAI shipped an image-edit endpoint

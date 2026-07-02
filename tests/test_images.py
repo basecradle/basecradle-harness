@@ -325,6 +325,38 @@ def test_a_transport_failure_is_relayed_to_the_model(tool):
     assert "could not reach the image API" in result
 
 
+# --- the request timeout (issue #219) ----------------------------------------
+
+
+def test_default_timeout_clears_the_measured_high_quality_latency():
+    # A `gpt-image-2` `quality: high` edit was measured at ~133s live; agents pick high
+    # naturally for fidelity work, so the ceiling must clear it with headroom (issue #219).
+    from basecradle_harness._images import DEFAULT_TIMEOUT
+
+    assert DEFAULT_TIMEOUT >= 133.0
+    assert DEFAULT_TIMEOUT == 300.0
+
+
+def test_the_timeout_reaches_the_openai_client(client, monkeypatch):
+    # Whatever timeout the tool carries is the one handed to the SDK client, so the ceiling
+    # bump actually takes effect at call time rather than being decorative.
+    import basecradle_harness._images as images
+
+    captured = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    class _FakeOpenAI:
+        OpenAI = _FakeClient
+
+    monkeypatch.setattr(images, "require_openai_sdk", lambda: _FakeOpenAI)
+    t = GenerateImageTool(api_key=FAKE_KEY, base_url=IMAGES_BASE)
+    t._client(FAKE_KEY)
+    assert captured["timeout"] == images.DEFAULT_TIMEOUT
+
+
 # --- binding -----------------------------------------------------------------
 
 
