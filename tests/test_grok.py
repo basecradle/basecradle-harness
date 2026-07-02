@@ -20,6 +20,7 @@ import respx
 from basecradle import BaseCradle
 
 from basecradle_harness import (
+    GrokEditImageTool,
     GrokGenerateImageTool,
     GrokGenerateVideoTool,
     PlatformContext,
@@ -28,6 +29,7 @@ from basecradle_harness import (
 BC_URL = "https://basecradle.com"
 XAI_BASE = "https://api.x.ai.test/v1"
 IMAGES_URL = f"{XAI_BASE}/images/generations"
+EDITS_URL = f"{XAI_BASE}/images/edits"
 VIDEOS_URL = f"{XAI_BASE}/videos/generations"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
 FAKE_KEY = "xai-test-0123456789abcdefghijklmnop"
@@ -56,6 +58,13 @@ def client():
 @pytest.fixture
 def image_tool(client):
     t = GrokGenerateImageTool(api_key=FAKE_KEY, base_url=XAI_BASE)
+    t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
+    return t
+
+
+@pytest.fixture
+def edit_tool(client):
+    t = GrokEditImageTool(api_key=FAKE_KEY, base_url=XAI_BASE)
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     return t
 
@@ -115,7 +124,7 @@ def _timeline_envelope():
     }
 
 
-def source_asset_response(uuid):
+def source_asset_response(uuid, content_type="image/png"):
     return {
         "asset": {
             "type": "asset",
@@ -128,7 +137,7 @@ def source_asset_response(uuid):
                 "file": {
                     "filename": "source.png",
                     "byte_size": 32,
-                    "content_type": "image/png",
+                    "content_type": content_type,
                     "checksum": "Yp9p9C8m6Xv2qS1nKQ0r3w==",
                     "url": f"{BC_URL}/blobs/{uuid}",
                 },
@@ -220,6 +229,103 @@ def test_image_relays_the_real_xai_error_not_a_generic_400(image_tool):
 
 def test_image_needs_a_prompt(image_tool):
     assert "needs a 'prompt'" in image_tool.run(prompt="   ")
+
+
+# --- grok_edit_image ---------------------------------------------------------
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n source pixels"
+SOURCE_UUID_2 = "019e7754-7d4e-7f50-8162-ddddeeeeffff"
+
+
+def _mock_source(mock, uuid, data=PNG_BYTES, content_type="image/png"):
+    """Mock resolving a source Asset (assets.get) and downloading its blob bytes."""
+    mock.get(f"{BC_URL}/assets/{uuid}").mock(
+        return_value=httpx.Response(200, json=source_asset_response(uuid, content_type))
+    )
+    mock.get(f"{BC_URL}/blobs/{uuid}").mock(return_value=httpx.Response(200, content=data))
+
+
+def test_edit_single_source_sends_image_object_as_base64_data_uri(edit_tool):
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID)
+        edit = mock.post(EDITS_URL).mock(return_value=httpx.Response(200, json=image_b64()))
+        _mock_upload(mock, captured)
+        result = edit_tool.run(image=SOURCE_UUID, prompt="recolor the car red")
+
+    sent = json.loads(edit.calls.last.request.content)
+    assert sent["model"] == "grok-imagine-image-quality"
+    assert sent["prompt"] == "recolor the car red"
+    assert sent["response_format"] == "b64_json"  # we ask for bytes inline
+    # A single source rides the ``image`` object (not the ``images`` array), as a data URI —
+    # the source bytes inlined, not the (not-assumed-public) signed Asset URL.
+    expected = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+    assert sent["image"] == {"type": "image_url", "url": expected}
+    assert "images" not in sent
+    assert JPEG_BYTES in captured["upload"]
+    assert captured["filename"].endswith(".jpg")  # extension follows the real (JPEG) bytes
+    assert "Edited and posted" in result and A_MEDIA in result
+
+
+def test_edit_multiple_sources_composite_into_the_images_array(edit_tool):
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID)
+        _mock_source(mock, SOURCE_UUID_2)
+        edit = mock.post(EDITS_URL).mock(return_value=httpx.Response(200, json=image_b64()))
+        _mock_upload(mock, captured)
+        edit_tool.run(image=[SOURCE_UUID, SOURCE_UUID_2], prompt="composite these two")
+
+    sent = json.loads(edit.calls.last.request.content)
+    # Two-plus sources ride the ``images`` array (the multi-image composite shape), not ``image``.
+    assert "image" not in sent
+    assert [obj["type"] for obj in sent["images"]] == ["image_url", "image_url"]
+    assert len(sent["images"]) == 2
+    assert all(obj["url"].startswith("data:image/png;base64,") for obj in sent["images"])
+
+
+def test_edit_relays_the_real_xai_error_not_a_generic_400(edit_tool):
+    body = {"error": {"message": "unsupported image format"}}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID)
+        mock.post(EDITS_URL).mock(return_value=httpx.Response(400, json=body))
+        result = edit_tool.run(image=SOURCE_UUID, prompt="x")
+
+    assert "the xAI image API rejected the request" in result
+    assert "unsupported image format" in result  # the true cause, relayed
+
+
+def test_edit_relays_an_unreadable_source_asset_legibly(edit_tool):
+    with respx.mock(assert_all_called=True) as mock:
+        # The source uuid resolves to a 404 — a legible "couldn't read source" relay, no API call.
+        mock.get(f"{BC_URL}/assets/{SOURCE_UUID}").mock(return_value=httpx.Response(404, json={}))
+        result = edit_tool.run(image=SOURCE_UUID, prompt="recolor")
+
+    assert "Error editing image" in result
+    assert SOURCE_UUID in result  # names which source couldn't be read
+
+
+def test_edit_survives_a_source_asset_with_no_content_type(edit_tool):
+    # A malformed source blob (null content-type) must not crash `_data_url` with an
+    # AttributeError — it falls back to a generic type so the edit still proceeds legibly.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID, content_type=None)
+        edit = mock.post(EDITS_URL).mock(return_value=httpx.Response(200, json=image_b64()))
+        _mock_upload(mock, captured)
+        result = edit_tool.run(image=SOURCE_UUID, prompt="recolor")
+
+    sent = json.loads(edit.calls.last.request.content)
+    assert sent["image"]["url"].startswith("data:application/octet-stream;base64,")
+    assert "Edited and posted" in result
+
+
+def test_edit_needs_a_prompt(edit_tool):
+    assert "needs a 'prompt'" in edit_tool.run(image=SOURCE_UUID, prompt="  ")
+
+
+def test_edit_needs_a_source_image(edit_tool):
+    assert "needs at least one source" in edit_tool.run(image="", prompt="recolor")
 
 
 # --- grok_generate_video (async submit + poll) -------------------------------

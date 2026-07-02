@@ -8,6 +8,18 @@ split by operation → every option tested):
 
 - `GrokGenerateImageTool` (``grok_generate_image``) — text → image, via xAI's OpenAI-shaped
   Images endpoint (``POST /v1/images/generations``, ``grok-imagine-image-quality``).
+- `GrokEditImageTool` (``grok_edit_image``) — image(s) → image, via xAI's image-edit endpoint
+  (``POST /v1/images/edits``, ``grok-imagine-image-quality``). The xAI-native counterpart to
+  the OpenAI `edit_image` (``_images.py``). Two asymmetries vs OpenAI, both deliberate and
+  documented: (1) the OpenAI SDK's ``images.edit()`` is **not** usable — it sends
+  ``multipart/form-data`` and xAI requires ``application/json`` (xAI's docs say so explicitly),
+  so this tool posts JSON over the shared grok transport, sending each source image as a
+  **base64 data URI** (the signed Asset URL is not assumed publicly fetchable by xAI); (2) xAI
+  does **natural-language** editing with **no mask** (no mask-based inpainting), so — unlike
+  OpenAI `edit_image` — there is no ``mask`` parameter. xAI composites up to **3** source
+  images. The request shape is ``image`` (a single ``{"type":"image_url","url":…}`` object) for
+  one source, or ``images`` (an array of them) for a composite (docs.x.ai images/editing +
+  multi-image-editing).
 - `GrokGenerateVideoTool` (``grok_generate_video``) — text → video **or** image → video, via
   xAI's **asynchronous** video endpoint (``POST /v1/videos/generations``, ``grok-imagine-video``).
   This is the harness's first video capability. Generation takes minutes: the call returns a
@@ -26,7 +38,10 @@ Coverage (audited to grok-imagine's surface)
 Image: ``aspect_ratio`` and ``resolution`` are exposed as optional pass-throughs; the default
 call sends only ``model`` + ``prompt`` (+ ``response_format=b64_json`` so we get bytes), which
 is the always-valid core. ``n>1`` is deliberately skipped — multiple-images-per-call is niche
-for a conversational agent (founder decision, consistent with the OpenAI image tool). Video:
+for a conversational agent (founder decision, consistent with the OpenAI image tool). Edit:
+just ``model`` + ``prompt`` + the source ``image``/``images`` (+ ``response_format=b64_json``);
+no ``aspect_ratio``/``resolution`` (an edit follows the source's dimensions) and no ``mask``
+(xAI edits by natural language, not a mask region) — the documented asymmetries vs OpenAI. Video:
 ``duration``, ``aspect_ratio``, ``resolution`` are exposed, plus ``image`` (a source Asset
 uuid) for image-to-video. xAI enforces the enum/range constraints, so they are documented in
 the schema rather than re-validated here — coverage never drifts as the model's surface
@@ -42,7 +57,7 @@ from typing import Any
 import httpx
 from basecradle import BaseCradleError
 
-from basecradle_harness._assets import _describe, _download, _upload
+from basecradle_harness._assets import _data_url, _describe, _download, _upload
 from basecradle_harness._exceptions import ProviderConnectionError, ProviderError
 from basecradle_harness._http import raise_for_status
 from basecradle_harness._media import (
@@ -50,6 +65,7 @@ from basecradle_harness._media import (
     media_filename,
     provider_error_message,
     sniff_media_ext,
+    uuid_list,
 )
 from basecradle_harness._platform import PlatformTool, explain
 
@@ -123,6 +139,20 @@ class _GrokMediaTool(PlatformTool):
         """Upload the produced bytes as an Asset and report it for the model to read."""
         asset = _upload(self.context.client, timeline, data, name, description)
         return f"{verb} {name!r} ({len(data)} bytes). {_describe(asset)}"
+
+    def _source_file(self, uuid: str) -> Any:
+        """Resolve a source Asset uuid to its file object, relaying a bad uuid legibly.
+
+        Shared by the tools that take a source image (edit → data URI, image-to-video → blob
+        URL): both need the same `assets.get` and the same ``BaseCradleError → ProviderError``
+        relay, so the AI learns *why* a source couldn't be read rather than seeing a crash.
+        """
+        try:
+            return self.context.client.assets.get(uuid).content.file
+        except BaseCradleError as error:
+            raise ProviderError(
+                f"couldn't read source image asset {uuid!r}: {explain(error)}"
+            ) from error
 
 
 class GrokGenerateImageTool(_GrokMediaTool):
@@ -219,6 +249,138 @@ class GrokGenerateImageTool(_GrokMediaTool):
             description or f"Generated image: {prompt}",
             "Generated and posted",
         )
+
+
+class GrokEditImageTool(_GrokMediaTool):
+    """``grok_edit_image`` — edit one or more existing image assets with a prompt and post it.
+
+    The xAI-native counterpart to the OpenAI `EditImageTool`. Where OpenAI's edit endpoint takes
+    raw multipart bytes, xAI's takes **JSON** with each source as a base64 **data URI** — so the
+    tool resolves each source Asset by uuid, downloads its bytes through the bound SDK client's
+    signed blob URL, and inlines them as ``data:<type>;base64,…``. A single source rides the
+    ``image`` object; two or three composite via the ``images`` array. There is **no mask** —
+    xAI edits by natural language, not a mask-based region (documented asymmetry vs OpenAI).
+    """
+
+    name = "grok_edit_image"
+    description = (
+        "Edit an image that already exists on the timeline with xAI's grok image model and post "
+        "the result as a new file, the way a peer marks up or restyles a picture. Give one or "
+        "more source asset uuids in 'image' (find them with the assets tool's 'list') and "
+        "describe the change in 'prompt' (e.g. 'recolor the car red', or composite several "
+        "sources — up to 3). Unlike editing with a mask, grok edits by natural language, so "
+        "there is no mask region. To make a brand-new image from text instead, use "
+        "'grok_generate_image'. Returns the new asset's uuid."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "image": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "One or more source image asset uuids to edit. Get them from the assets "
+                    "tool's 'list'. Pass several (up to 3) to composite them into one image."
+                ),
+            },
+            "prompt": {
+                "type": "string",
+                "description": "How to change the image — describe the edit you want.",
+            },
+            "filename": {
+                "type": "string",
+                "description": "Optional filename for the posted image (extension follows the real format).",
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional human-readable description stored with the asset.",
+            },
+            "timeline": {
+                "type": "string",
+                "description": "Optional timeline uuid to post to. Defaults to the current timeline.",
+            },
+        },
+        "required": ["image", "prompt"],
+    }
+
+    default_model = DEFAULT_IMAGE_MODEL
+
+    def run(
+        self,
+        image: list[str] | str | None = None,
+        prompt: str | None = None,
+        filename: str | None = None,
+        description: str | None = None,
+        timeline: str | None = None,
+    ) -> str:
+        """Edit the source image(s), upload the result, and report the new asset for the model."""
+        if not prompt or not prompt.strip():
+            return "Error: 'grok_edit_image' needs a 'prompt' describing the change to make."
+        uuids = uuid_list(image)
+        if not uuids:
+            return (
+                "Error: 'grok_edit_image' needs at least one source 'image' asset uuid. "
+                "Use the assets tool's 'list' to find one."
+            )
+        key = self._key()
+        if not key:
+            return "Error: no API key for image editing. Set AI_API_KEY to the agent's xAI key."
+
+        # response_format=b64_json so the edited image comes back inline (no second fetch);
+        # decode_image_payload handles a url response too, so a vendor default never drops it.
+        payload: dict[str, Any] = {
+            "model": self._model,
+            "prompt": prompt,
+            "n": 1,
+            "response_format": "b64_json",
+        }
+        try:
+            sources = [self._source_image(uuid) for uuid in uuids]
+            # One source rides the ``image`` object; a composite (2-3) rides the ``images`` array
+            # — the two request shapes xAI's single- and multi-image edit endpoints document.
+            if len(sources) == 1:
+                payload["image"] = sources[0]
+            else:
+                payload["images"] = sources
+            body = self._request(key, "POST", "images/edits", json=payload)
+            image_bytes = decode_image_payload(
+                body, download=_download, subject="the xAI image API"
+            )
+        except ProviderConnectionError as exc:
+            return f"Error editing image: could not reach the xAI image API: {exc}"
+        except ProviderError as exc:
+            return f"Error editing image: {provider_error_message(exc, 'the xAI image API')}"
+
+        target = timeline or self.context.timeline
+        ext = sniff_media_ext(image_bytes, "jpg")
+        name = media_filename(filename, prompt, ext)
+        return self._post_asset(
+            target,
+            image_bytes,
+            name,
+            description or f"Edited image: {prompt}",
+            "Edited and posted",
+        )
+
+    def _source_image(self, uuid: str) -> dict[str, str]:
+        """Resolve a source image Asset uuid to an xAI ``image_url`` object (a base64 data URI).
+
+        xAI's edit endpoint takes the image inline as a data URI rather than a fetchable URL — the
+        signed Asset URL is not assumed publicly reachable by xAI's servers — so the bytes are
+        downloaded and base64-encoded. A bad uuid (or a download failure) raises a legible
+        `ProviderError` the caller relays, so the AI learns *why* the source couldn't be read.
+        """
+        file = self._source_file(uuid)
+        try:
+            data = _download(file.url)
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"couldn't download source image asset {uuid!r}: {exc}") from exc
+        # A blob missing its content-type would crash `_data_url` (it splits the string) — fall
+        # back to a generic type so a malformed asset still relays legibly, never AttributeErrors.
+        return {
+            "type": "image_url",
+            "url": _data_url(file.content_type or "application/octet-stream", data),
+        }
 
 
 class GrokGenerateVideoTool(_GrokMediaTool):
@@ -354,13 +516,7 @@ class GrokGenerateVideoTool(_GrokMediaTool):
         already authorized, so xAI's servers can fetch it. A bad uuid raises a legible
         `ProviderError` the caller relays — the AI learns *why* the source couldn't be read.
         """
-        try:
-            asset = self.context.client.assets.get(uuid)
-            return asset.content.file.url
-        except BaseCradleError as error:
-            raise ProviderError(
-                f"couldn't read source image asset {uuid!r}: {explain(error)}"
-            ) from error
+        return self._source_file(uuid).url
 
     def _submit(self, key: str, payload: dict[str, Any]) -> str:
         """Submit the generation job and return its ``request_id``."""
