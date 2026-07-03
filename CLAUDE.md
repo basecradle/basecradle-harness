@@ -34,16 +34,11 @@ These are settled. Seven decisions, in dependency order of importance:
 
 2. **One core, two profiles.** A provider-agnostic **agent engine** that knows nothing about "safe." Harness = engine + a **locked policy** (no shell/exec, curated tools). Cradle (later) = the *same engine* + an **unlocked policy** (shell, sudo, self-modification). We do **not** extract a separate `core` package yet — it lives here until Cradle proves it needs its own distribution. This is why "a Cradle AI spawns Harness sub-agents" comes for free: same engine, different policy.
 
-3. **Provider abstraction — *vendor-SDK only* (corrected, issue #158).** A thin `Provider` protocol — chat + tool-calling, nothing more — but the harness reaches an LLM **only through a vendor's official SDK, 100% of the time**: it ships **zero** of its own code to hit a model endpoint; no SDK installed → it cannot reach a model, by design. The config is **three independent axes** — `AI_PROVIDER` (whose endpoint + key), `AI_SDK` (the PyPI package the harness imports), `AI_MODEL` — and each agent installs only its SDK as an *extra* (`pip install 'basecradle-harness[openai]'`, which pins the SDK version). The **SDK picks the adapter; the provider picks the endpoint** (its default `base_url` + key, `_PROVIDER_BASE_URLS`, overridable by `AI_BASE_URL`). **Two adapters ship:** `openai` (`OpenAIProvider`, both the Responses and Chat Completions surfaces via the `openai` package) and the native **`xai-sdk`** (`XaiSdkProvider`, xAI's first-party gRPC SDK — issue #165); OpenRouter / Anthropic follow. **BaseCradle is a research lab: the harness supports the *full* provider × SDK × surface matrix — full optionality, built out completely and additively, in phases.** Nothing here is "only when forced"; each adapter slots in without touching the engine. **Adding a provider = one thin adapter wrapping the real SDK.**
+3. **Provider abstraction — *vendor-SDK only* (issue #158).** A thin `Provider` protocol — chat + tool-calling, nothing more — but the harness reaches an LLM **only through a vendor's official SDK, 100% of the time**: it ships **zero** of its own code to hit a model endpoint; no SDK installed → it cannot reach a model, by design. The config is **three independent axes** — `AI_PROVIDER` (whose endpoint + key), `AI_SDK` (the PyPI package the harness imports — its **library name**, `openai` / `xai-sdk`), `AI_MODEL` — each agent installing only its SDK as a version-pinned *extra*. The **SDK picks the adapter; the provider picks the endpoint** (its default `base_url` + key, overridable by `AI_BASE_URL`). **Two adapters ship:** `openai` (`OpenAIProvider`, both the Responses and Chat Completions surfaces) and the native **`xai-sdk`** (`XaiSdkProvider`, xAI's first-party gRPC SDK — #165); OpenRouter / Anthropic follow. The harness supports the *full* provider × SDK × surface matrix, built out additively in phases; **adding a provider = one thin adapter wrapping the real SDK**, never touching the engine.
 
-   **`AI_SDK` token convention.** The value is the SDK's **library/package name** (`openai`, `xai-sdk`) — what you'd `pip install` and `import`. This also disambiguates the SDK token from the provider token: `AI_PROVIDER=xai` selects xAI's *endpoint*; `AI_SDK=xai-sdk` selects xAI's *native SDK* (issue #165).
+   **The surface contract** (issue #163) — one SDK can speak a provider in more than one wire surface, so each adapter declares its own `SURFACES` + `DEFAULT_SURFACE` (`openai` → `("responses","chat")`/`responses`; `xai-sdk` → `("native",)`/`native`). `AI_SDK_SURFACE` **omitted → the active adapter's `DEFAULT_SURFACE`**; **provided → validated against its `SURFACES`, hard-fail otherwise** (`_resolve_surface`) — one rule catching both a typo and a surface set on a single-surface SDK. Single-surface SDKs never set it.
 
-   **`surface` is a first-class, SDK-scoped concept with a uniform contract** (issue #163). A single SDK can speak a provider in more than one wire surface; the contract that governs *every* multi-surface SDK, so the next one needs no re-litigation:
-   - Each SDK adapter declares its own `SURFACES` (allowed set) and `DEFAULT_SURFACE`. The `openai` adapter declares `("responses", "chat")` / `responses`; the native `xai-sdk` declares its single `("native",)` / `native` (so a non-`native` `AI_SDK_SURFACE` fails clearly).
-   - `AI_SDK_SURFACE` selects among the **active** adapter's surfaces: **omitted → that adapter's `DEFAULT_SURFACE`**; **provided → validated against its `SURFACES`, hard-fail otherwise** (`_resolve_surface`). The one rule catches both a typo and a surface set on a single-surface SDK. The openai-shaped default does **not** live in the generic config reader.
-   - `AI_SDK_SURFACE` is optional globally; single-surface SDKs never set it.
-
-   **xAI is reached through the `openai` SDK (issue #163), retiring the hand-rolled httpx path.** xAI's compat endpoint speaks the same wire as OpenAI — **both** `/v1/chat/completions` and `/v1/responses` — so `AI_PROVIDER=xai` + `AI_SDK=openai` runs `grok-4.3` through the real `openai` SDK pointed at `api.x.ai` (default `base_url`), over the `responses` *or* `chat` surface. This brings xAI under the "vendor-SDK only" spine; the earlier hand-rolled `httpx` "OpenAI-compatible" adapter (`OpenAIResponsesProvider`) that issue #158 began eliminating is now **deleted**, not merely on death row. **The web_search wiring diverges by endpoint vendor:** OpenAI's Responses runs web search from a `tools:[{type:"web_search"}]` entry; xAI runs Live Search from a top-level **`search_parameters`** body field (docs.x.ai) and does *not* accept the OpenAI entry — so under `AI_PROVIDER=xai` the active `web_search`/`x_search` built-ins are translated to `search_parameters` (`_xai_search_parameters`) and forwarded through the SDK's vendor-neutral `extra_body`, on both surfaces. This `xai`/`openai`/`responses`-or-`chat` cell is a fully supported, permanent matrix option — **not** thrown away by the native path: the native **`xai-sdk`** adapter (issue #165, `XaiSdkProvider`) now ships as the Grok personas' (eddie/pinky/the-brain) end-state brain, and this openai-at-xAI cell stays available to any AI that wants it. *(History: the Phase-2 sections below — the Eddie Murphy profile especially — predate this #163 correction and describe the earlier `httpx`/`OpenAIResponsesProvider`/`AI_PROVIDER_API` era; that whole section is now superseded by the reconciled note in its own header.)*
+   **xAI has two supported cells.** `AI_PROVIDER=xai` + `AI_SDK=xai-sdk` is the native gRPC path (the Grok personas' end-state brain — eddie/pinky/the-brain). `AI_PROVIDER=xai` + `AI_SDK=openai` reaches `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or* `chat` surface — a permanent matrix option, not a shim (the old hand-rolled `httpx` `OpenAIResponsesProvider` is **deleted**). **web_search wiring diverges by endpoint vendor:** OpenAI's Responses runs it from a `tools:[{type:"web_search"}]` entry; xAI runs Live Search from a top-level **`search_parameters`** body field and rejects the OpenAI entry — so under `AI_PROVIDER=xai` the active `web_search`/`x_search` built-ins translate to `search_parameters` (native → a proto; openai-at-xAI → `extra_body`). Build history: `docs/harness-internals.md`.
 
 4. **Tool interface + policy layer.** A tool is a small class with a `name`, JSON-schema parameters, and a `run()` method, registered in a `ToolRegistry`. A **policy layer** gates which tools a profile may load — Harness denies shell/exec **by construction, not by convention**. A contributor adds a capability by writing one tool class. **Memory** is the single shipped example tool: file/SQLite-backed, deliberately simple and swappable (Letta/MemGPT is reference reading, not something to clone).
 
@@ -112,26 +107,14 @@ Runtime dependencies start at `basecradle` (the SDK; brings httpx) and **no mode
 
 ## Releasing
 
-Mirror the Python SDK's pipeline (`../sdks/python/.github/workflows/release.yml` is the template): pushing a `v*` tag → build → TestPyPI rehearsal → the capital approves the `pypi` env-gate → PyPI, all via OIDC Trusted Publishing (zero stored credentials). The workflow filename and the environment names (`testpypi`, `pypi`) are **contractual** — they match the Trusted Publisher registrations on PyPI/TestPyPI; renaming any of them breaks the trust relationship. The `pypi` environment's required reviewer is `drawkkwast` as a *config* fact, but that is the credential the capital operates via local `gh` — **the capital approves the gate, not the founder** (`constitution.md` → Earned Autonomy, "Publishing is the capital's, not the founder's"; the four-owner flow below, step 2). The founder is out of the publish loop.
+Publishing is via PyPI **Trusted Publishing** (GitHub Actions OIDC, zero stored credentials) on a `v*` tag. The workflow filename and the environment names `testpypi` / `pypi` are **contractual** — they match the Trusted Publisher registrations; renaming any breaks the trust relationship. **The capital, not the founder, actuates publish** — it approves the `pypi` env-gate via its operator credential; the founder is out of the publish loop (`constitution.md` → Earned Autonomy).
 
-**Do not put `Closes #N` on a release PR.** A merged PR auto-closes its issue on merge — before the publish is approved and confirmed live — and an issue that closed before its work was proven on PyPI is a lie. Close the release issue **by hand, only after the package is verified live on PyPI**, recording the verification (version + URL) in the closing comment.
+Two standing invariants:
 
-**A release is not done at PyPI — it is not done until the fleet is deployed AND verified.** PyPI publish is the *middle* of a release, not the end: the fleet's reference agent **@jt** (`/home/jt/venv` on `ai.basecradle.com`) runs a *deployed* venv that PyPI publication does **not** touch, and a release that stops at PyPI silently leaves @jt behind — the recurring **released ≠ deployed** failure class. Closing that gap is a **four-owner flow**; keep the owners separate (constitution baselines **`basecradle#362`** — "one deployer for the fleet's machines: the NOC" — and **`basecradle#363`** — "a captain *builds* software but never *deploys* it"; the `basecradle-noc` CLAUDE.md frames the NOC as the fleet's single deployer of harness/agent software):
+- **A release is not done at PyPI — it is not done until the fleet is deployed AND verified live.** PyPI publish is the *middle* of a release: the reference agent **@jt** runs a *deployed* venv that PyPI publication does not touch, and a release that stops at PyPI silently leaves @jt behind — the recurring **released ≠ deployed** failure class. The captain *builds* (and bumps the version) but never *deploys*; the **NOC** is the fleet's sole deployer; the **capital** verifies live and closes.
+- **No closing keyword on a release PR.** Auto-close fires on merge, before the publish is approved and confirmed live; an issue closed before its work is proven on PyPI is a lie. Close the release issue **by hand, only after it is verified live on PyPI**, recording version + URL in the closing comment.
 
-1. **Build — the harness captain (you).** Implement the change, bump the version, update the changelog. **Your release responsibility ends at the version bump** — you do **not** publish, deploy, or verify on a box.
-2. **Publish to PyPI — the capital.** Owns the `pypi` env-gate (above).
-3. **Deploy / converge to the fleet (incl. @jt) — the NOC, the fleet's sole deployer.** The NOC reads each box's running version, compares it to the git-tracked desired state, and converges any off-target box via its `fleet-upgrade-campaign` (triggered by its release-drift detection). **No one hand-runs `pip install -U` on `/home/jt/venv` — or any agent box — anymore; that verb belongs to the NOC.** No long-running service to restart — the router spawns `basecradle-harness-wake` fresh per event — and a wake self-migrates its own DB (SDK schema is forward-only/additive), so the converge needs no manual migration step.
-4. **Verify live on @jt + close the handoff — the capital.** After the NOC converges, the capital confirms on-box, **not inferred from PyPI**: `/home/jt/venv/bin/basecradle-harness-wake --version` reports the new version, and a token-free synthetic-probe wake still acks sub-second (the duration check from the box docs). `--version` is the cheap, model-free, credential-free probe added for exactly this — it is also what the NOC's standing **release-drift detection** (which probes @jt on a cadence) runs to fail loud when @jt's running version drifts from PyPI latest.
-
-The NOC's drift detection is the backstop; this documented flow is the primary fix. Neither replaces the other — the flow keeps a release honest, the drift alarm catches the release whose deploy step was skipped.
-
-## First Milestone — Reserve the Name Professionally
-
-Before building any engine code, ship a real, metadata-complete **`0.0.1`** placeholder to PyPI through the Trusted Publishing pipeline. This claims `basecradle-harness` (a legitimate early release under our own brand — not squatting) *and* proves the entire release machine end-to-end before real code exists.
-
-This ends at the **`pypi` env-gate**, which the **capital** approves via its operator credential and confirms live — the founder is out of the publish loop (`constitution.md` → Earned Autonomy, "Publishing is the capital's, not the founder's"; the four-owner flow above). Not a human gate.
-
-**The release close-discipline applies here too:** do **not** put `Closes #N` on the name-reservation PR — that would close this milestone issue on merge, *before* the capital approves the publish and the package is confirmed live. Close it manually once `basecradle-harness 0.0.1` is verified on PyPI, with the verification recorded in the closing comment.
+The full four-owner pipeline (build → capital publishes → NOC converges → capital verifies on @jt), the contractual workflow/env names, and the on-box verify commands live in the **`harness-release-deploy` skill**.
 
 ## Where to Start
 
@@ -143,7 +126,7 @@ gh issue list --repo basecradle/basecradle-harness --state open
 
 ## Fleet Bot Identity / Auth Routing
 
-This repo's builder agent — **basecradle-harness AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-harness-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to the shared human account (`drawkkwast`). The shared "Cross-Repo Handoffs" block carries the *principle* ("post under your own bot identity"); this section carries the concrete *how*, so the agent never falls through to the ambient `gh` login and posts in agent voice as the founder (the constitution's *"never anonymously behind the founder's account"*).
+This repo's builder agent — **basecradle-harness AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-harness-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to the shared human account (`drawkkwast`). The invariant: **post/commit/push under your own bot identity — never fall through to the ambient `gh` login and speak in agent voice as the founder** (the constitution's *"never anonymously behind the founder's account"*). Bot commits carry **no** `Co-Authored-By` trailer — the author field already *is* the attribution.
 
 | Field | Value |
 |---|---|
@@ -152,24 +135,7 @@ This repo's builder agent — **basecradle-harness AI** — acts on GitHub under
 | Bot user ID | `290979505` |
 | Commit-author | `basecradle-harness-ai[bot] <290979505+basecradle-harness-ai[bot]@users.noreply.github.com>` |
 
-Operational setup for a session that will push or post as the bot:
-
-- **Git author (local, never committed).** This clone's `.git/config` is set to the bot — set it explicitly after a fresh clone, since `.git/config` does not travel with the repo:
-  ```bash
-  git config --local user.name "basecradle-harness-ai[bot]"
-  git config --local user.email "290979505+basecradle-harness-ai[bot]@users.noreply.github.com"
-  ```
-- **Auth routing.** Mint a short-lived (~1h) installation token with the shared fleet helper and route **both** `gh` and `git push` through it — otherwise `gh` falls through to the ambient login (the founder's), and the write lands as `drawkkwast` instead of the bot:
-  ```bash
-  export GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-harness-ai)"
-  # With GH_TOKEN exported, `gh issue comment` / `gh pr create` / `gh pr merge` all act as the bot.
-  # Push over HTTPS with the token in the URL (the `origin` remote is SSH-as-Drawk; what
-  # decides the GitHub actor is the API token, not the push transport):
-  git push "https://x-access-token:${GH_TOKEN}@github.com/basecradle/basecradle-harness.git" <branch>
-  ```
-  The helper (`gh-app-token`) and registry (`fleet-apps.json`) live in the founder's Claude workspace on the laptop; on the fleet server each agent's own provisioned credentials serve this role (basecradle#277, the router, has shipped). `--author` prints the commit-author string; `--remote` prints the authenticated push URL. (The installation token cannot hit user-only endpoints — `gh api user` returns `403`; check it against the repo, e.g. `gh api repos/basecradle/basecradle-harness`.)
-- **No `Co-Authored-By` trailer on bot commits.** A fleet commit authored by `basecradle-harness-ai[bot]` carries **no** `Co-Authored-By` trailer — the commit author already *is* the agent, so a co-author line would be redundant and wrong (this restates the Conventions bullet, here in operational context).
-- **CI and bot PRs.** This repo's CI uses **no** Actions secrets (lint + tests on public inputs), so a bot-authored PR runs CI normally and needs no actor guard. (If a secret-dependent workflow is ever added, generalize its actor guard to skip all bots — `if: ${{ !endsWith(github.actor, '[bot]') }}` — because bot-triggered PRs run in a restricted context where Actions secrets resolve empty.)
+The operational setup for a session that will push or post as the bot — the local `git config`, minting a short-lived installation token with the `gh-app-token` fleet helper, and routing both `gh` and `git push` through it — lives in the **`bot-auth-setup` skill**. Invoke it at the start of any session that will write to GitHub as the bot.
 
 ## Polling GitHub (or any shared external API) — rate-limit floor
 
@@ -247,26 +213,11 @@ Four shared artifacts are carried verbatim in every BaseCradle repo, anchored at
 
 ## Closing Capital-Originated Handoffs (Harness-Local)
 
-This rule is **harness-local** and lives here, *outside* the verbatim `## Cross-Repo Handoffs` block above, on purpose: that block is shared law carried byte-for-byte across the fleet, so a future re-sync must be able to overwrite it from the capital without clobbering anything repo-specific. This refines, for this repo, the shared "Receiving work from another repo" rule on *who closes a handoff issue*.
+The shared `## Cross-Repo Handoffs` block (and the `cross-repo-handoffs` skill) carry the generic `CLOSER:`-line law: read the line, close only when it names *you*, never guess a missing stamp. This section adds the one **harness-local** fact that shifts the default — and lives *outside* the verbatim block so a re-sync can overwrite that block without clobbering it.
 
-> #### ⚠️ The capital closes capital-originated handoffs — not you.
->
-> The shared rule above says *leave a handoff issue open when its definition of done names someone other than you as the closer.* **For this repo that is the norm, not the exception.** Nearly every handoff harness receives is **capital-originated**, and the capital **live-verifies harness work on @jt** before closing — so the DoD names *the capital* as the closer. The default, therefore, is: **post your completion comment and leave the issue OPEN for the capital.**
->
-> When a handoff's DoD names the capital (or anyone other than you) as the closer, you **must not close it yourself — by any mechanism:**
-> - not with a closing keyword (`Closes`/`Fixes`/`Resolves #N`) in the PR title, body, *or* the squashed commit message, **and**
-> - **not by hand** — no manual close in the GitHub UI or via `gh issue close`, however "done" the work looks.
->
-> Your PR merging is *not* the finish line for a capital-originated handoff; the capital's live verify is. Closing it early — by keyword or by hand — lies to everyone watching the issue, exactly as it would for a release issue before PyPI is confirmed live. **Done means: PR merged, completion comment posted, issue left open for the capital.** Only close a handoff yourself when its DoD explicitly names *you* as the closer.
->
-> #### ✅ Read the `CLOSER:` line — it tells you whose close this is.
->
-> The capital now stamps every handoff DoD with an explicit **`CLOSER:` line**, so which case you are in is no longer a judgment call — read the line:
-> - **`CLOSER: you`** (the harness captain) → the issue is **yours to close.** Once you have met *and verified* the DoD, closing it by hand (`gh issue close`) is the correct, expected final step — the don't-close-by-hand guard above is scoped to handoffs the capital closes and does **not** apply here. This is routine in-repo action the captain is already authorized to take, so do it rather than pausing to surface a non-conflict (the over-cautious stall that prompted basecradle-harness#196, where a correct `CLOSER: you` re-sync close was held back and the capital had to step in).
-> - **`CLOSER: capital`** (or any actor other than you) → **leave it OPEN**; the don't-close-by-hand guard above stands in full. This is still the norm: nearly every handoff is capital-originated and the capital live-verifies on @jt before closing.
-> - **No `CLOSER:` line at all** → **do not guess, and do not silently default either way** — a missing stamp is a **capital stamping error**, because the stamp is now mandatory on every handoff the capital sends. Post a `needs-capital` comment asking the capital to stamp the DoD with the correct `CLOSER:` line, and act on the stamp once it lands. Guessing a default here is exactly what the mandatory stamp exists to prevent, and it is what let basecradle-harness#215/#216 self-contradict.
->
-> The guard exists to stop a *premature or mis-attributed* close, never a verified one the DoD assigns to you.
+**The default here is leave-it-open, because nearly every handoff harness receives is capital-originated, and the capital live-verifies harness work on @jt before closing.** So unless the DoD's `CLOSER:` line names you, the finish line is: **PR merged, completion comment posted, issue left OPEN for the capital** — your PR merging is not the finish line; the capital's live verify is. Closing a capital-closed handoff early — by a closing keyword in the PR/commit *or* by hand (`gh issue close`) — lies to everyone watching it, exactly as closing a release issue before PyPI is confirmed live would.
+
+The mirror case is just as real: when the DoD says **`CLOSER: you`**, the issue *is* yours to close — meet and verify the DoD, then close by hand as the expected final step, without pausing to surface a non-conflict (the over-cautious stall of basecradle-harness#196). A missing `CLOSER:` line on a capital handoff is a capital stamping error — ask via `needs-capital`, never guess (what let basecradle-harness#215/#216 self-contradict).
 
 ## Laptop Builder Self-Exit
 
@@ -292,9 +243,9 @@ for the location: `--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.conf
   agent.env            # the operator's env (token, keys) — never created or touched by the installer
   prompts/
     system-prompt.md   # shipped default — composed into Turn 0 first
-    initialize.md      # shipped default — provider-independent operating guidance (Group 3)
-  tools/               # tool-plugin overlay (drop-in *.py); add/override/disable (Group 2)
-  mcp/                 # MCP server configs (drop-in *.json); empty by default = safe (Group 5)
+    initialize.md      # shipped default — provider-independent operating guidance (persistent Turn-0 brief)
+  tools/               # tool-plugin overlay (drop-in *.py); add/override/disable
+  mcp/                 # MCP server configs (drop-in *.json); empty by default = safe
   .manifest.json       # bookkeeping: the hash of every shipped default as installed
 ```
 
@@ -314,424 +265,50 @@ for the location: `--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.conf
   consulted when the config home was never installed. Onboarding (the Dashboard
   orientation) still composes on top — the *source* changed, not the composition.
 
-### Tool Plugins (Phase 2 · Group 2)
+The install/upgrade **procedure** — the installer's per-file conffile-upgrade logic, granting
+powerful tools with `--opt-in`, the loud grandfather report, and the per-agent fleet rollout —
+lives in the **`config-home-install` skill**. The Phase-2 build history (the tool-plugin
+mechanism, read tools, persistent Turn 0, pluggable memory, the MCP client, the cross-wake
+circuit-breaker, image tools, the native xAI adapter, the Eddie profile, and the orphan-artifact
+sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not the charter.
 
-Tools are **drop-in plugins**, not a hardcoded list. Each is a `ToolPlugin` declaring
-`(name + requires + impl)`: `impl` is the `Tool` class (or a `builtin` wire name for a
-server-side tool the provider runs), and `requires` is what the **active config** must
-provide for the tool to be usable. A plugin whose `requires` aren't met **does not
-register** — the model never sees a present-but-broken tool.
+### Security invariants (never relaxed, never moved to a skill)
 
-- **Two gates, kept apart.** *Activation* (`ToolPlugin.requires`: a provider API, an API
-  key — `ProviderAPI`, `EnvSet`, `OpenAIKey`, checked against an `ActivationContext`) is
-  distinct from the *policy/safety* gate (`Tool.requires` capabilities like `SHELL`, refused
-  at `ToolRegistry.register`). A plugin can be active yet still policy-refused; both apply.
-- **Provider-aware.** `web_search` requires the Responses API and drops on Chat Completions;
-  `generate_image`/`listen` require an OpenAI key. When two plugins share a `name` with
-  different `requires`, **exactly one activates per config**. The Responses provider's
-  built-ins are plugin-driven, not a constructor default.
-- **The `tools/` overlay.** The installer copies the default tool plugins (`*.py` files
-  shipped under `_defaults/tools/`) into the config home's `tools/`, which is the operator's
-  overlay: **add** a file (new tool), **override** a default by reusing its `name`,
-  **disable** a default by **deleting** its file (the conffile upgrader's no-resurrect rule
-  respects the deletion). `tools/` is authoritative once the installer has populated it;
-  until then (never-installed, or a config home predating tool defaults) the packaged
-  defaults load directly — the same files-or-fallback precedent as the charter.
-
-**Boundary:** this group is the plugin **mechanism** only — behavior-preserving over the
-existing tools. Deployment proper — provisioning a venv and converging an agent box, wiring the
-[`basecradle-router`](https://github.com/basecradle/basecradle-router) daemon/service on the
-home server — is the **NOC's** job (the fleet's sole deployer), not the installer's (per the
-spine: harness owns the agent runtime, not the box).
-
-### Powerful Tools Are Opt-In — the capability rule (issue #168)
-
-**Tool assignment is a per-persona axis, classified by *capability*, not by provider.** A
-powerful/dangerous tool — media generation (image, **video**, audio), web/X search, code
-execution — **fails closed**: it is **off by default on every provider** and activates **only**
-when explicitly dropped into a persona's `tools/` overlay (the same "ships empty" stance as
-`mcp/`). A benign/platform tool (memory, assets, messages, timelines, tasks, trust, lock,
-delete, users, webhooks, web_fetch) keeps the normal shipped-default → install-then-prune
-behavior. This is **provider-agnostic**: the `requires` gate (`Vendor`/`OpenAIKey`) decides a
-powerful tool's *availability/wiring*, **never** the safety default — there is no "default on
-OpenAI, opt-in on xAI" split. *(Decided by the capital + founder, applying Option 1 uniformly;
-see [[classify-safety-by-capability-not-provider]].)*
-
-- **The flag.** A `ToolPlugin` marks itself `opt_in=True` (the seven powerful defaults:
+- **Powerful tools fail closed — opt-in on every provider (issue #168).** A powerful/dangerous
+  tool — media generation (image, **video**, audio), web/X search, code execution — is **off by
+  default on every provider** and activates **only** when explicitly dropped into a persona's
+  `tools/` overlay (the same "ships empty" stance as `mcp/`). The seven powerful defaults:
   `generate_image`, `edit_image`, `hear_audio`, OpenAI `web_search`, xAI `web_search`/`x_search`,
-  `grok_generate_image`, `grok_generate_video`). The packaged-default fallback **drops** opt-in
-  plugins; the installer **does not scaffold** them; both detect the flag from source via AST
-  (`_install.plugin_opts_in`, the no-import discipline shared with provider affinity).
-- **Granting one.** `basecradle-harness-install --opt-in <stems>` scaffolds the named powerful
-  defaults into the overlay (or drop the file in by hand). An opt-in plugin *present* in the
-  overlay activates, gated only by its `requires`.
-- **Grandfather, loudly.** On upgrade, a powerful tool a *prior* version had already scaffolded
-  into an existing config home is **kept, never silently stripped** (the founder's "tools stay
-  the same" migration rule) and **reported loudly** (`InstallReport.grandfathered` →
-  the CLI summary + a `WARNING`). New installs get the opt-in (off) default.
-- **Why it's a hard requirement.** Adversarial-by-design personas (the fleet's `pinky`/`the-brain`)
-  must be tool-less **by construction**, never "on unless someone remembered to prune." Any
-  provider/SDK-based default would silently arm whoever moves onto that provider next — the exact
-  safety violation this rule forecloses. *(The capital specifies those personas as explicitly
-  tool-less and the NOC provisions them so at cutover; the loud grandfather report is what lets
-  the capital confirm what to prune.)*
+  `grok_generate_image`, `grok_generate_video`. Benign/platform tools (memory, assets, messages,
+  timelines, tasks, trust, lock, delete, users, webhooks, web_fetch) keep the normal
+  shipped-default → install-then-prune behavior. This is **provider-agnostic**: the `requires`
+  gate (`Vendor`/`OpenAIKey`) decides a powerful tool's *availability*, **never** the safety
+  default — there is no "default on OpenAI, opt-in on xAI" split. Why it is a hard requirement:
+  adversarial-by-design personas (the fleet's `pinky`/`the-brain`) must be tool-less **by
+  construction**, never "on unless someone remembered to prune"; any provider/SDK-based default
+  would silently arm whoever moves onto that provider next. On upgrade, a powerful tool a prior
+  version already scaffolded is **kept, never silently stripped, and reported loudly**. *(Decided
+  by the capital + founder; see [[classify-safety-by-capability-not-provider]]. Granting/pruning
+  mechanics: the `config-home-install` skill.)*
+- **MCP is safe-by-default.** `mcp/` ships **empty** and the locked `Policy` denies shell/exec, so
+  a fresh install is safe by construction. Loading an MCP server — **or** a drop-in `tools/` tool
+  that needs a policy-denied capability — is the operator *knowingly leaving the safe zone*, so the
+  harness **surfaces** it (a log line + an opt-out notice rendered into the persistent Turn-0
+  brief), never hides it: "all bets off" is a stated, auditable transition. The
+  **activation-vs-policy split** is never bypassed: an MCP proxy carries no in-process capability
+  so it registers under the locked policy (the opt-out is *surfaced*, not refused), while a `tools/`
+  tool that declares `SHELL` is **filtered out and surfaced** (`_apply_safe_policy`), never crashing
+  and never running. Secrets in an MCP server's `env` are passed to the subprocess **literally** via
+  `Popen(env=…)` — never shell-sourced (`shell=False` always; the basecradle-router#109 lesson).
+- **Memory persists across timeline deletion; the orphan sweep purges only on a clean 404.** The
+  `basecradle-harness-cleanup` sweep GCs a deleted timeline's on-box artifacts (`sessions/`,
+  `marks/`, `seen/`, `claims/`, `breaker/`) but **never touches** `memory.db` (+ `-wal`/`-shm`) or
+  the MemPalace palace dir — memory is the agent's durable mind and outlives any timeline. The
+  classify switch is the whole safety: **only a clean `NotFoundError` (404) purges**; success (200)
+  and `Forbidden`/`NotAViewer` (403) keep, and **any** transient error (connection / rate-limit /
+  5xx) keeps and retries next run. A platform outage must never read as "everything deleted" and
+  trigger a mass purge — default to keep on anything but a 404. *(Mechanics: `docs/harness-internals.md`.)*
 
-**Boundary:** deciding each persona's target tool-set (cutting its overlay to spec) is the
-**capital's** governance call; applying it on a box — provisioning/re-provisioning `jt`/`eddie`
-in lockstep with a release — is the **NOC's** deploy (it converges each box to the git-tracked
-desired config; no one hand-provisions a box). The harness ships the mechanism + the
-`--opt-in`/grandfather affordances and proves them with tests.
-
-### Read Tools + Standalone Lock (Phase 2 · Group 2b)
-
-The first new tools built on the Group 2 framework — the two headline findings from the
-capital's exhaustive @jt test, each a default plugin under `_defaults/tools/` with
-`requires=()` (provider-agnostic platform reads + the lock):
-
-- **The read tools (B5, the "blind peer").** An agent could *act* on the platform but not
-  *look*. `users` (`_reads.py`) — `list` the directory with your trust state per user,
-  `read` one user by handle-or-uuid, `me` your own dashboard; this is the direct cure for the
-  three opening questions (*my trust / who's here / who am I*) and lands B4's read-trust.
-  `messages` (`_reads.py`) — `list`/`read` the message backlog the wake doesn't hand over.
-  `timelines` also gains `read` + `list`. Access tiers are **API-enforced** — a read surfaces
-  only what the viewer is entitled to, and never invents a withheld field.
-- **Lock-as-its-own-guarded-tool (B1).** `lock` (`_lock.py`) is pulled out of `timelines`
-  into its own structurally-isolated tool, guarded so a bare call is refused and changes
-  nothing. (Its gate was later re-unified with `delete`'s behind the shared
-  `ConfirmedTimelineAction` uuid-confirm + preview convention — issue #156; the original B1
-  fix used a boolean `confirm=true`.) `timelines` becomes pure benign management + reads
-  (`create`, `read`, `list`, `add_participant`, `remove_participant`) — no irreversible
-  action.
-
-**Boundary:** MCP loading from `mcp/` lands in Group 5 (below); the circuit-breaker is
-Group 6. The `MemoryProvider` lands in Group 4 (below). The **knowledge fixes** (B6/C1/B7),
-the generated tool manifest, and the persistent Turn 0 land in Group 3, below.
-
-### Persistent Turn 0: the operating brief (Phase 2 · Group 3)
-
-Turn 0 stops being a one-time onboarding seed (Group 1's `_orientation` field-scrape, which
-ages into the distant past of a long transcript) and becomes a brief **re-asserted on every
-wake**. A `WakeAgent` injects it at the head of each wake's work — **lazily, just before the
-model is first engaged**, so an idle or probe-only wake neither bloats the transcript nor
-fetches the live dashboard. Composed, in order, of four parts (`_brief.py`):
-
-1. **`initialize.md`** (`prompts/`, authored framework default) — lean, high-signal,
-   **provider-independent** operating guidance: the cross-cutting gotchas the function
-   schemas can't convey (trust is **directional in storage, mutual at the gate** — B6;
-   locking is **one-way and irreversible** — B1; **if you lack a tool, say so** — B7; don't
-   reflexively refuse on trigger words like "secret"). This is where the knowledge findings
-   are taught — in Turn 0, *without* a read.
-2. **Generated tool manifest** — "Your active tools right now: …" from Group 2's resolution
-   (`ResolvedTools.manifest`), each tool with its optional one-line `note`. Always matches
-   the active provider + drop-ins, so it can never drift from what the model can call.
-3. **Live `dashboard.md`** — the platform's *maintained* primer, fetched fresh from
-   `/users/dashboard.md` over the SDK client's authenticated transport (the SDK has no typed
-   markdown accessor yet). **A fetch failure degrades gracefully** — the brief is composed
-   from the rest and the wake never breaks. Replaces Group 1's structured field-scrape.
-4. **`system-prompt.md`** (`prompts/`, personality) — `HARNESS_SYSTEM_PROMPT` remains the
-   legacy fallback for an un-migrated agent.
-
-**The optional per-tool `note`** is additive to the Group 2 plugin contract: a `ToolPlugin`
-may carry a one-line gotcha (the shipped `lock` plugin does), rendered into the manifest; a
-plugin without one just lists its name.
-
-**@jt needs no migration** — with no config home it composes the brief from the packaged
-`initialize.md` + its `HARNESS_SYSTEM_PROMPT` personality + the live dashboard + the
-generated manifest (behavior-preserving, and it gains the persistent brief).
-
-**Boundary:** the **poll-loop `TimelineAgent`** keeps its Group-1 startup onboarding — a
-single long-lived process has no per-wake re-assertion to make; the persistent brief is a
-wake-mode property.
-
-### Pluggable Memory (Phase 2 · Group 4)
-
-The leading memory systems (Mem0/Zep/MemPalace/Letta) are **middleware**, not a key-value
-box: they *observe* the conversation to auto-capture facts and *inject* prompt-ready context
-before the model runs — not just `write(key, value)`. The shipped default (a `MemoryTool`
-fused to SQLite) had no seam for that. This group builds the seam and ships a real MemPalace
-reference adapter to prove it end-to-end, **without changing the default's behavior**.
-
-- **The `MemoryProvider` interface** (`_memory_provider.py`) — four *optional* surfaces:
-  **tools** (model-facing ops, default the `MemoryTool`), **store** (the durable engine),
-  **`observe(exchange)`** (a wake-loop hook fired after each exchange, for auto-capture), and
-  **`context(scope)`** (a Turn-0 hook returning prompt-ready memory to inject into the
-  persistent brief). `observe`/`context` **default to no-ops**. **Scope is the agent
-  identity** (timeline as metadata): memory is the agent's *one private mind spanning all its
-  timelines* — the basis for cross-timeline recall.
-- **The default, split (`_memory.py`).** The fused `MemoryTool` is split into
-  `SqliteMemoryStore` (the five-op engine) + `MemoryTool` (a thin surface dispatching onto a
-  store). The default `SqliteMemoryProvider` wires the tool over a private host-local store
-  with **no-op hooks** — explicit, write-it-yourself memory exactly as before (**@jt
-  unchanged**). `MemoryTool(path=…)` still works standalone; `MemoryTool(store=…)` shares a
-  provider's store.
-- **The wake hooks.** A `WakeAgent` fires `observe` after each real exchange (never on a
-  probe ack or a self-skip) and injects `context` into Turn 0 — relevant to the turn, since
-  the incoming text is the retrieval query. **A hook failure degrades gracefully and never
-  breaks the wake** (the dashboard-fetch invariant). Hooks are a wake-mode property: the
-  poll-loop `TimelineAgent` keeps the memory tool but does not fire them.
-- **Provider selection.** `HARNESS_MEMORY_PROVIDER` — `sqlite` (default), `mempalace`, or a
-  dotted `module:Class` path to any custom `MemoryProvider`. One provider per agent. Memory
-  graduated from a tool plugin (`_defaults/tools/memory.py` removed) to its own subsystem;
-  its tools fold into the resolved set (deduped by name), so the brief manifest is unchanged.
-- **The MemPalace reference adapter** (`_mempalace.py`) — an **optional extra**
-  (`pip install basecradle-harness[mempalace]`). A real `MemoryProvider` over MemPalace's
-  local **library** API (not its MCP tools — that is the separate MCP path, Group 5 below):
-  `observe` mines each exchange (`convo_miner.mine_convos`), `context` retrieves top-K
-  relevant chunks across all timelines (`searcher.search_memories`). Supplies **no
-  model-facing tool** (memory is automatic), so a MemPalace agent runs with BaseCradle-only
-  tools.
-
-**Boundary:** the circuit-breaker is Group 6. The "Memory Prince" agent is provisioned on-box by
-the **NOC** (the fleet's sole deployer); the cross-timeline proof is the **capital's** live
-verification, post-ship.
-
-### MCP Drop-In + Safe-by-Default (Phase 2 · Group 5)
-
-**MCP is supported.** The harness is an [MCP](https://modelcontextprotocol.io) **client**
-(`_mcp.py`): drop a server config into the config home's `mcp/` dir and that server's tools
-become part of the agent's active tool set on the next wake — no code change, the same
-"everything in the folder is active" model as the `tools/` overlay (Group 2). *(This
-reverses the earlier "MCP is out of scope / deferred" stance — a founder decision.)*
-
-- **The `mcp/` overlay.** One server per `mcp/<name>.json`, following the **standard MCP
-  config shape** so a published server's snippet drops in unmodified — stdio
-  (`{"command", "args", "env"}`) or Streamable HTTP (`{"url", "headers"}`); a single-entry
-  `{"mcpServers": {…}}` wrapper is unwrapped. Drop-to-add / delete-to-disable. `mcp/` ships
-  **empty**, so there is nothing for the conffile upgrader to reconcile and an
-  operator-added file is never touched. Secrets in `env` are passed to the subprocess
-  **literally** via `Popen(env=…)` — never shell-sourced (`shell=False` always; the
-  basecradle-router#109 lesson).
-- **Client + activation.** A small synchronous JSON-RPC client (stdio subprocess or HTTP)
-  handshakes, `tools/list`s, and proxies `tools/call`. Each discovered tool becomes a plain
-  function `Tool` (namespaced `<server>__<tool>`), so it composes under **both** the Chat
-  and Responses providers and appears in the generated Turn-0 manifest like any other tool.
-  A server that fails to start/handshake/list **self-excludes** — its tools drop and the
-  failure lands in `skipped` with a reason — exactly the Group-2 activation robustness bar;
-  a flaky server **never crashes the wake**. (Per-wake startup latency is the trade for the
-  process-per-event model; documented in `_mcp.py`.)
-- **Safe-by-default, made explicit.** A fresh install is safe by construction: empty `mcp/`,
-  and the locked `Policy` denies shell/exec. Loading an MCP server — **or** a drop-in
-  `tools/` tool that needs a policy-denied capability — is the operator *knowingly leaving
-  the safe zone*, so the harness **surfaces** it rather than hiding it: a clear **log line**
-  and an **opt-out notice** rendered into the persistent Turn-0 brief (`ResolvedTools.notices`
-  → `render_safety` → `compose_brief`). "All bets off" is a stated, auditable transition,
-  never silent. The **activation-vs-policy split** is preserved: an MCP proxy carries no
-  in-process capability so it registers under the locked policy (the opt-out is *surfaced*,
-  not refused), while a `tools/` tool that declares `SHELL` is **filtered out and surfaced**
-  (`_apply_safe_policy`) rather than crashing — the policy is never bypassed by activation.
-- **First consumer.** MemPalace's MCP server (its *tools* path, distinct from Group 4's
-  *library* path) is the validation target.
-
-**Boundary:** the cross-wake **circuit-breaker is Group 6** (below). MCP **media** results
-(image / embedded-resource content blocks) render as a text marker, not model vision input — a
-documented bound. Live @jt verification (drop a server in, confirm tools activate + a call
-works, confirm safe-by-default with empty `mcp/`) is the **capital's** job, post-ship.
-
-### Cross-Wake Circuit-Breaker (Phase 2 · Group 6)
-
-**The last group.** A two-repo, two-layer breaker for an *unknown* cross-wake runaway loop —
-the agent is woken, a side effect posts, the post fires a platform event, the router wakes it
-again → a tight cycle burning provider tokens and box resources. This is the **harness layer**
-(a per-timeline self-breaker); [`basecradle-router`](https://github.com/basecradle/basecradle-router)
-carries the sibling **cross-agent** breaker. The two are **independent** — no shared protocol,
-each trips on its own view, together defense-in-depth. It backstops what the existing guards
-miss: `max_steps` bounds an *intra*-wake tool loop, the **actor self-filter** stops the
-simplest self-post→self-wake loop, and B3/B8 fixed the *known* cross-wake loops — Group 6 is
-the generic backstop for a *novel* one, most plausibly from a custom `tools/` plugin (Group 2)
-or a drop-in MCP server (Group 5).
-
-- **`WakeBreaker`** (`_wake.py`) — a rolling-window rate limiter on **wakes per timeline**,
-  persisted under `$HARNESS_HOME` beside the `marks/`/`seen/`/`claims/` stores so it survives
-  the process-per-wake model: `breaker/<timeline>.wakes` holds the windowed wake timestamps
-  (pruned each wake, so the file stays bounded even under a fast runaway) and
-  `breaker/<timeline>.tripped` is the **durable trip marker**. `record_and_check` records each
-  wake and returns a `BreakerDecision`; `WakeAgent.wake` calls it **first**, before the session
-  is loaded or the model is ever engaged.
-- **Trip → self-decline, token-free.** Over the cap within the window the wake **self-declines**
-  — **no provider call**, acts on nothing (the whole point is to stop the burn, the same
-  token-free discipline as the NOC probe short-circuit) — writes the trip marker, logs at
-  `WARNING`, and posts **one** loud alert to the timeline. The alert fires only on the trip
-  *transition* (the durable marker is the one-time guard, so it never per-tripped-wake loops;
-  the actor self-filter keeps the agent from waking on its own alert). Every later wake for a
-  tripped timeline keeps short-circuiting.
-- **Reset = auto-cooldown (the stated choice).** Once the burst subsides — the window clears
-  back under the cap **and** the cooldown has elapsed since the trip — the breaker clears the
-  marker, restarts the window, posts a recovery note, and resumes normal operation, with
-  trip+reset logged. A transient burst self-heals while the loud alert still leaves a human a
-  breadcrumb; clearing the trip marker by hand is the equivalent operator reset. A dropped
-  wake is recoverable — the cursor-paginated read API is the source of truth, so the next
-  healthy wake reconciles anything missed (the best-effort-push principle).
-- **Generous, tunable defaults.** **10 wakes / 60 s** per timeline by default — generous so
-  legitimate multi-peer activity never trips it (a genuine runaway fires continuously and blows
-  past the cap; the agent's own posts are self-filtered and never wake it, so only inbound
-  items count). Tunable via `HARNESS_WAKE_BREAKER_MAX` / `HARNESS_WAKE_BREAKER_WINDOW` /
-  `HARNESS_WAKE_BREAKER_COOLDOWN` (cooldown defaults to the window); a cap of `0` (or below)
-  disables it (the operator escape hatch).
-
-**Boundary:** the breaker is a **wake-mode property** — the poll-loop `TimelineAgent` (one
-long-lived process) has no per-wake re-entry to rate-limit and is unaffected. It builds **no**
-harness↔router protocol: the harness trips on its own per-timeline view; if it self-declines,
-the router still counts the wake and trips its own backstop. **The capital verifies live on
-@jt** (drive a synthetic runaway, confirm the breaker trips + alerts once + makes no provider
-call, confirm reset) and **closes the handoff issue by hand** after that live verify.
-
-### Image Tools — full gpt-image-2 coverage
-
-The media tranche, brought to the full ``gpt-image-2`` surface and built under the
-**tool-building discipline** (learn the full surface → decide coverage deliberately → split
-by operation → test every built option). Two tools, split by operation, both default plugins
-under `_defaults/tools/` requiring `OpenAIKey()` (they self-exclude with no OpenAI key), both
-`PlatformTool`s that own the OpenAI Images HTTP and upload the result through the bound SDK
-client — never the provider built-in, keeping the brain/body boundary clean (`_images.py`):
-
-- **`generate_image`** — text → image (`/v1/images/generations`, JSON body).
-- **`edit_image`** — image(s) → image (`/v1/images/edits`, **multipart**). It resolves each
-  source Asset by uuid and sends its **bytes, not a URL** (the endpoint rejects URLs), plus
-  an optional `mask` Asset (alpha channel marks the region to change). One or more sources —
-  multi-source composites.
-
-- **Shared coverage** (both tools): `size`, `quality` (low/medium/high/auto), `background`
-  (**opaque/auto only — gpt-image-2 has no transparent**), `output_format` (png/jpeg/webp),
-  `output_compression` (0–100, jpeg/webp only). The posted Asset's **filename extension
-  follows `output_format`** so its content-type does too (the server infers type from the
-  name) — this fixed the old hard-coded `.png` bug. Enum/range constraints are documented in
-  the schema and **enforced by the API, not re-validated here**, so coverage never drifts as
-  the model's surface evolves. **`output_compression` is dropped for png** (the default
-  format): OpenAI hard-400s it there and the model fills the field in freely, so dropping it
-  where the API ignores it anyway keeps png from failing in practice (capital live-verify).
-  Image-API failures relay the **provider's actual message** (dug out of the response body),
-  not a generic `HTTP 400`, so the AI passes the true cause to the user (Principle 5).
-- **`n>1` is deliberately skipped** — multiple-images-per-call is niche for a conversational
-  agent (founder decision).
-
-**Boundary:** offline tests assert the harness's half (params sent, filename extension). The
-ground-truth checks — the posted Asset's actual pixels / content-type / file magic, the full
-matrix in the handoff issue — are **the capital's live @jt verification** (it re-runs the
-matrix and **closes the handoff issue by hand** after that live verify).
-
-### Native xAI Adapter — grok over `xai-sdk` (gRPC, issue #165)
-
-The **second `Provider` adapter** (`_xai_sdk.py`, `XaiSdkProvider`) and the first that is **not**
-OpenAI-wire: `AI_SDK=xai-sdk` reaches grok through xAI's own first-party SDK (`xai-sdk`, gRPC),
-no OpenAI-compat shim — the vendor-SDK spine for xAI's *native* path. It is the Grok personas'
-end-state brain; `AI_SDK=openai` at `api.x.ai` (issue #163) stays a supported alternative cell.
-
-- **Brain only; tools stay per-persona.** The adapter is the chat `Provider` (chat + tool calling
-  + vision). It maps the harness `Message`/`ToolSpec`/`ToolCall` vocabulary onto the SDK's own
-  helpers (`system`/`user`/`assistant`/`tool_result`/`tool`, real `chat_pb2` protos) and parses
-  the `Response` back (text, tool calls, citation footer). Live Search is wired here when the
-  persona has **opted its `web_search`/`x_search` built-ins in** (issue #168): they become a native
-  `SearchParameters` object (`web_source`/`x_source`), and grok searches itself. The grok **media**
-  tools stay their own httpx `PlatformTool`s (`_grok.py`), independent of the chat SDK, per-persona.
-- **Single native surface.** Declares `SURFACES=("native",)` / `DEFAULT_SURFACE="native"`, so
-  `AI_SDK_SURFACE` is unset and any other value fails clearly (the issue #163 surface contract).
-- **Routing.** `AI_SDK=xai-sdk` builds it (requires `AI_PROVIDER=xai` — the native endpoint);
-  shipped as the optional extra `[xai-sdk]` (pins `xai-sdk>=1.17,<2`). gRPC errors map onto the
-  provider hierarchy (auth / rate-limit / connection).
-- **Tested against the real SDK, offline.** No httpx transport to respx-mock, so tests build
-  **real** protos and inject a **fake client** (no socket) — the openai adapter's "real SDK,
-  mocked transport" discipline, gRPC-shaped. The tool-neutral migration is proven: an `xai-sdk`
-  persona with opted-in grok tools keeps them; an empty-overlay (adversarial) persona resolves
-  with **no** powerful and **no** platform tools — the SDK arms nothing.
-
-**Boundary:** live verification on the real grok endpoint (a measured chat turn, Live Search
-returning real citations, a tool round-trip) is **the capital's** job on the migrated personas;
-the offline tests assert the harness's half (the wire it sends, the response it parses).
-
-### Eddie Murphy — the xAI-native profile (Live Search + grok media)
-
-> **Superseded by issues #163 and #165 (see spine point 3) — read this banner, not the dated
-> narrative below it.** Two corrections to the original Eddie work, both now authoritative:
->
-> 1. **The chat model path changed (#163).** The `xai` profile no longer uses the hand-rolled
->    httpx `OpenAIResponsesProvider` (now **deleted**). `AI_PROVIDER=xai` + `AI_SDK=openai` reaches
->    `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or*
->    `chat` surface (`AI_SDK_SURFACE`). The selector env var is `AI_PROVIDER` (not the historical
->    `AI_PROVIDER_API`).
-> 2. **`search_parameters` was never deprecated** — that earlier claim was simply **wrong**. xAI
->    runs Live Search from a top-level `search_parameters` body field on *both* its chat and
->    responses surfaces, and does **not** accept OpenAI's `tools:[{type:web_search}]` entry. So
->    under `AI_PROVIDER=xai` the harness translates the active `web_search`/`x_search` built-ins
->    to `search_parameters`, forwarded through the SDK's `extra_body`.
->
-> And the original "no new adapter class" premise is also reversed: the native **`xai-sdk`**
-> adapter **is** the committed next phase (issue #165), where eddie/pinky/the-brain make their
-> home. The **grok media tools** (`_grok.py`, `grok_generate_*`) are unchanged — they hit xAI's
-> Images/Video endpoints directly over httpx, independent of the chat SDK.
-
-The harness's **"done-bar" acceptance work**: a fully-xAI persona. Two axes, kept straight (the
-founder was emphatic): the **provider adapter** (harness code / wire format) vs. the **endpoint
-vendor** (`base_url`). The original handoff anticipated a brand-new native xAI adapter; the #163
-phase delivered the openai-SDK-at-xAI cell first, and the native `xai-sdk` adapter follows in
-#165 (so the once-"no new adapter class" framing no longer holds).
-
-- **The profile selector** (`_provider_from_env`, now keyed on `AI_PROVIDER=xai`) builds the chat
-  provider defaulted to `https://api.x.ai/v1` (`AI_BASE_URL` overrides), runs **grok-4.3** chat,
-  and is the **activation discriminator**: it turns xAI's Live-Search built-ins and the grok media
-  tools **on** and the OpenAI-coupled tools **off**, so the all-xAI stack is correct **by
-  construction**, not by operator curation. BaseCradle tools compose under it unchanged. *(Tool
-  gating moves to per-persona in #165 — provider-based gating would silently arm the adversarial
-  tool-less personas; see #165.)*
-- **Live Search = server-side built-ins, not a function tool** (`_defaults/tools/xai_search.py`):
-  `web_search` (live web) + `x_search` (live 𝕏), gated on the `xai` profile. grok runs the search
-  itself and returns sourced answers; xAI's Responses API emits OpenAI-style `url_citation`
-  annotations, so the **existing** citation parsing grounds the reply unchanged. Delete a plugin
-  line to disable a source. `web_search` coexists with OpenAI's Responses built-in (different
-  `requires` → exactly one activates per config).
-- **`grok_generate_image`** (`_grok.py`) — text → image (`grok-imagine-image-quality`). Optional
-  `aspect_ratio`/`resolution` pass-throughs; the always-valid core is `model` + `prompt` +
-  `response_format=b64_json` (with a `url`-encoded fallback). `n>1` skipped (founder decision).
-- **`grok_generate_video`** (`_grok.py`) — the harness's **first video capability**. Text→video
-  **and** image→video (`image` = a source Asset uuid → resolved to a blob URL for xAI's
-  `image_url`). xAI's video endpoint is **asynchronous**: submit → poll `GET /v1/videos/{id}`
-  until `done` → download the clip → upload as an Asset that renders inline. Full
-  `duration`/`aspect_ratio`/`resolution` coverage; failures (and the no-finish timeout) relay
-  xAI's **actual** message (Principle 5).
-- **Shared, vendor-neutral plumbing in `_media.py`** — the legible error relay, magic-byte format
-  **sniffing** (the uploaded Asset's extension follows the *real* bytes — the hard-coded-`.png`
-  bug generalized away), and safe-filename building, used by both the OpenAI image tools and the
-  grok media tools. Enum/range constraints are **API-enforced, not re-validated here**, so
-  coverage never drifts.
-
-**Boundary:** offline tests assert the harness's half (params sent, the async poll loop, the
-legible error relay, the sniffed extension). The ground-truth — a real measured-dimension video,
-the posted Asset's actual pixels/content-type, Live Search returning real citations — is **the
-capital's live verification on Eddie**: the NOC provisions Eddie (xai profile, grok media tools,
-BaseCradle tools, **no** OpenAI tools), then the capital runs the full matrix and **closes the
-handoff issue by hand** after that live verify.
-
-### Orphan-Artifact Sweep — GC deleted timelines' on-box state (issue #192)
-
-When a Timeline is destroyed on the platform, **nothing on the fleet server is cleaned up by
-itself.** The harness persists per-timeline state under `$HARNESS_HOME` — chiefly the session
-transcript (the full conversation), plus marks/seen/claims/breaker index files — and had no
-deletion handler, so a destroyed timeline's content would survive on the box indefinitely. The
-`basecradle-harness-cleanup` entrypoint (`_cleanup.py`) is the periodic **orphan sweep** that
-GCs it. **Sweep-only by design (founder-settled):** the platform's `timeline.deleted` event is
-best-effort/droppable, so an event-driven cleanup can't be trusted alone; a periodic sweep is
-mandatory regardless, and the *same* sweep backfills already-deleted timelines for free (the
-first run on a box is the backfill — past and future deletions are one code path). No router or
-Rails change; we don't consume `timeline.deleted`.
-
-- **The classify switch is the whole safety.** Each referenced UUID is checked with one cheap
-  `client.timelines.get(uuid)` (no model call): **only a clean `NotFoundError` (404) purges.**
-  Success (200) keeps; `ForbiddenError`/`NotAViewerError` (403 — exists, agent not a viewer)
-  keeps + logs; **any** transient error (connection / rate-limit / 5xx / generic
-  `BaseCradleError`) keeps and retries next run. *A platform outage must never read as
-  "everything deleted" and trigger a mass purge — default to keep on anything but a 404.*
-- **The invariant — memory deliberately persists across timeline deletion and is never swept.**
-  The sweep operates *only* on the five artifact dirs (`sessions/`, `marks/`, `seen/`, `claims/`,
-  `breaker/`) and **never touches** `memory.db` (+ `-wal`/`-shm`) or the MemPalace palace dir. If
-  a peer told the agent its birthday on a since-deleted timeline, the agent must still remember
-  it. (By construction: memory is never enumerated, so a purge can't reach it.)
-- Idempotent + crash-safe (re-derives the set from disk each run; a half-done purge finishes
-  next run); reuses `_client_from_env` and the stores' `quote(..., safe='')` filename
-  convention. `--timeline <uuid>` is a manual unconditional ops purge.
-
-**Boundary:** the schedule unit lives in `deploy/` (captain authors it); the **NOC deploys it**
-(sole deployer) per agent, scoped to that agent's `$HARNESS_HOME` + `BASECRADLE_TOKEN`. Live
-verification (drive a wake, delete the timeline, sweep, confirm the five artifacts go and memory
-stays) is **the capital's** job, post-ship.
 
 ## Development Commands
 
