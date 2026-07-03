@@ -84,6 +84,7 @@ from basecradle_harness._basecradle import (
     _incoming_text,
     _messages_since,
     _onboard_from_env,
+    _parse_created_at,
     _recent,
     _resolve_tools,
     _resolve_tools_and_provider,
@@ -449,6 +450,139 @@ def _breaker_cooldown_from_env() -> float | None:
     return float(raw)
 
 
+# Read-speed pacing (issue #224, tracks basecradle#334). Simulate a human reading a peer
+# AI's message before replying, so an AI↔AI exchange is watchable and stays well under the
+# wake-breaker's trip line instead of slamming into it. ~1,200 chars/min ≈ 20 chars/s is
+# an unhurried silent-reading pace; the 15 s floor keeps even a one-word "ok" from replying
+# in a blink. Both env-tunable; the defaults are the real production values.
+_DEFAULT_PACE_CHARS_PER_SEC = 20.0
+_DEFAULT_PACE_FLOOR_SECONDS = 15.0
+
+
+class ReadPacer:
+    """Receiver-side read-speed pacing for AI↔AI conversations — the pacing layer, not a backstop.
+
+    The fleet's runaway guards (this repo's `WakeBreaker`, the router's `WakeRateBreaker`, the
+    engine's `max_steps`) *trip and halt*; none of them **pace**. Two AIs in a timeline can
+    cross-wake each other into a runaway (the 2026-06-18 Pinky × The Brain run: ~16 messages in
+    ~16 s). This is the missing pacing layer: before a wake answers a **peer AI's** message it
+    sleeps to *simulate a human reading that message*, which makes the exchange watchable and
+    keeps it well under the breaker's trip line. It is entirely receiver-side and *derived* — no
+    platform change, no per-timeline flag; the behavior falls out of data the wake already
+    fetches (the newest message's author `kind`, its `body` length, and its `created_at`).
+
+    **Human messages are unaffected** — the ``kind == "ai"`` gate is the whole opt-in, so a human
+    peer gets an instant reply exactly as before. **Own messages never reach here** (the actor
+    self-filter excludes them upstream). **A wake with no message to answer** (asset/task/webhook
+    only) never calls `pace`.
+
+    The delay for a peer-AI message is::
+
+        target = max(FLOOR_SECONDS, len(body) / CHARS_PER_SEC)   # a human's read-time for it
+        delay  = max(0.0, target - age)                         # only wait the *remainder*
+
+    The ``- age`` subtraction is load-bearing, not optional: it makes the delay a true "time
+    since the message appeared" simulation (the message kept aging while this process did other
+    work), smooths what would otherwise be a lumpy cadence, and gives the "quicker across
+    timelines" behavior — time spent handling *another* timeline counts against what is owed
+    here. Without it, half the intended behavior is gone.
+
+    Mirrors `WakeBreaker`'s injectable-seams shape: an injectable `clock` (default UTC now) and
+    `sleep` (default `time.sleep`), so a test asserts the *computed* delay against a fake clock
+    with a recording no-op sleep and never actually waits.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool = True,
+        chars_per_sec: float = _DEFAULT_PACE_CHARS_PER_SEC,
+        floor_seconds: float = _DEFAULT_PACE_FLOOR_SECONDS,
+        clock=None,
+        sleep=None,
+    ) -> None:
+        self.enabled = enabled
+        self.chars_per_sec = float(chars_per_sec)
+        self.floor_seconds = float(floor_seconds)
+        # Injectable seams (mirror `WakeBreaker.now`): production uses the wall clock and a real
+        # sleep; a test drives `clock` directly and records `sleep` so it asserts without waiting.
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._sleep = sleep or time.sleep
+
+    @classmethod
+    def from_env(cls, *, clock=None, sleep=None) -> ReadPacer:
+        """Build a pacer from `HARNESS_PACE_ENABLED`/`_CHARS_PER_SEC`/`_FLOOR_SECONDS` (real defaults)."""
+        return cls(
+            enabled=_pace_enabled_from_env(),
+            chars_per_sec=_pace_chars_per_sec_from_env(),
+            floor_seconds=_pace_floor_seconds_from_env(),
+            clock=clock,
+            sleep=sleep,
+        )
+
+    def pace(self, message: object | None) -> float:
+        """Simulate reading `message` (the newest peer message this wake will answer); return seconds slept.
+
+        A no-op returning ``0.0`` — no sleep — when: pacing is disabled (the kill switch); there
+        is no message (asset/task/webhook-only wake); or the author is **not** an AI peer (a
+        human gets an instant reply). The caller passes the newest *non-self* message and has
+        already excluded a recognized NOC probe (which must stay a sub-second token-free ack), so
+        `pace` need only apply the ``kind == "ai"`` gate and the read-time math.
+
+        Otherwise it sleeps the *remainder* of the message's human read-time (``target - age``,
+        clamped at 0) and returns the seconds slept, so a message already older than its read-time
+        adds no delay.
+        """
+        if not self.enabled or message is None:
+            return 0.0
+        if getattr(message.user, "kind", None) != "ai":
+            return 0.0
+        chars = len(message.content.body or "")
+        # A non-positive rate (an operator setting the env to 0) can't divide; fall back to the
+        # floor rather than raising, so a misconfigured rate degrades to "always the floor".
+        read_time = chars / self.chars_per_sec if self.chars_per_sec > 0 else 0.0
+        target = max(self.floor_seconds, read_time)
+        # `age` is clamped non-negative before it is subtracted, so the delay is bounded to
+        # `[0, target]`. A future-dated `created_at` or a lagging box clock yields a *negative*
+        # age, and an unclamped `target - age` would then *inflate* the wait past `target`
+        # (e.g. a 5-min clock skew → a 5-min sleep holding the router lock). Clamping treats a
+        # not-yet-aged message as "just appeared" — it owes the full read-time, never more.
+        age = (self._clock() - _parse_created_at(message.created_at)).total_seconds()
+        delay = max(0.0, target - max(0.0, age))
+        if delay > 0:
+            self._sleep(delay)
+        return delay
+
+
+def _pace_enabled_from_env() -> bool:
+    """`HARNESS_PACE_ENABLED` → the read-pacing kill switch — on unless explicitly off.
+
+    On by default (pacing an AI↔AI exchange is the point); set an explicit off token
+    (`0`/`false`/`no`/`off`) to disable it. Unset — or any other value, blank included — leaves
+    it on: off only when explicitly turned off (mirrors `_onboard_from_env`).
+    """
+    raw = os.environ.get("HARNESS_PACE_ENABLED")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _pace_chars_per_sec_from_env() -> float:
+    """`HARNESS_PACE_CHARS_PER_SEC` → the simulated reading rate; unset/blank → the default."""
+    raw = os.environ.get("HARNESS_PACE_CHARS_PER_SEC")
+    if raw is None or not raw.strip():
+        return _DEFAULT_PACE_CHARS_PER_SEC
+    return float(raw)
+
+
+def _pace_floor_seconds_from_env() -> float:
+    """`HARNESS_PACE_FLOOR_SECONDS` → the minimum read-delay seconds; unset/blank → the default."""
+    raw = os.environ.get("HARNESS_PACE_FLOOR_SECONDS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_PACE_FLOOR_SECONDS
+    return float(raw)
+
+
 class WakeAgent:
     """Answers one timeline's unseen messages in a single process, then is done.
 
@@ -491,6 +625,10 @@ class WakeAgent:
         breaker: The cross-wake circuit-breaker (see `WakeBreaker`). ``None`` (the default)
             constructs one over the harness's home with the generous default cap; `from_env`
             threads the env-tuned breaker (`HARNESS_WAKE_BREAKER_MAX`/`_WINDOW`/`_COOLDOWN`).
+        pacer: The AI↔AI read-speed pacer (see `ReadPacer`). ``None`` (the default) constructs
+            one with the real defaults; `from_env` threads the env-tuned pacer
+            (`HARNESS_PACE_ENABLED`/`_CHARS_PER_SEC`/`_FLOOR_SECONDS`). Only the message path
+            uses it (`_respond`); a human peer and a non-message wake are unaffected.
     """
 
     def __init__(
@@ -508,6 +646,7 @@ class WakeAgent:
         safety_notices: list[str] | None = None,
         defect_notices: list[str] | None = None,
         breaker: WakeBreaker | None = None,
+        pacer: ReadPacer | None = None,
         code_bridge: CodeExecutionBridge | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
@@ -555,6 +694,11 @@ class WakeAgent:
         # cap. Lives beside the other stores, under the same home root. A directly-constructed
         # wake gets the generous defaults; `from_env` threads the env-tuned breaker.
         self.breaker = breaker or WakeBreaker(self.marks.root)
+        # Read-speed pacing (see `ReadPacer`): before answering a peer AI's message, sleep to
+        # simulate a human reading it, so an AI↔AI exchange is watchable and stays under the
+        # breaker's trip line. A directly-constructed wake gets the real defaults; `from_env`
+        # threads the env-tuned pacer. It holds no state, so nothing persists under home.
+        self.pacer = pacer or ReadPacer()
         self.timeline = self.client.timelines.get(timeline)
 
         # Bind the live platform handle into every platform-aware tool — the same
@@ -648,6 +792,10 @@ class WakeAgent:
             # the marks/seen/claims stores. Generous defaults; off only if explicitly capped
             # to 0. The router's cross-agent breaker is the complementary layer.
             breaker=WakeBreaker.from_env(home),
+            # The env-tuned AI↔AI read-speed pacer (issue #224). On by default with the real
+            # reading-rate/floor defaults; a human peer is never paced, so replies to humans
+            # are instant exactly as before.
+            pacer=ReadPacer.from_env(),
         )
 
     def wake(
@@ -1380,7 +1528,15 @@ class WakeAgent:
         their own carrier fields, so the short-circuit spans all three seams. Delegates to
         the shared `_act_on` loop — see it for the crash-safe, at-least-once ordering that
         every reconciler shares.
+
+        **Read-speed pacing runs first** (issue #224). This is the single choke point for the
+        message reply path — both the incremental (`_messages_since`) and bootstrap
+        (`_bootstrap`) branches funnel their reply set through here — so the read-pace gate
+        lives here, before the model is engaged. Only the message reconcile is paced; the
+        asset/task/webhook reconcilers call `_act_on` directly and are deliberately out of
+        scope (rare, naturally time-separated, or externally-sourced).
         """
+        self._pace(messages)
         return self._act_on(
             session,
             messages,
@@ -1390,6 +1546,50 @@ class WakeAgent:
             skip=self._is_own,
             probe=lambda message: self._probe_nonce(message.content.body),
         )
+
+    def _pace(self, messages: list[object]) -> None:
+        """Read-pace the reply set: simulate a human reading the newest peer AI's message.
+
+        The pacing input is the **newest non-self** message this wake will answer — the one
+        it is reacting to. The actor self-filter (`_is_own`) is applied here, before the
+        pacer, because the agent is *itself* an ``ai``-kind account: a self-authored newest
+        message would otherwise satisfy the pacer's ``kind == "ai"`` gate and be paced against.
+
+        **A recognized NOC probe anywhere in the batch skips pacing entirely.** The message-seam
+        heartbeat is acked token-free and must stay sub-second (the box docs' `--version`/
+        synthetic-probe verify, the NOC's release-drift detection). A probe flows through this
+        reply path, and the NOC prober may be an ``ai``-kind account, so a pacing sleep would
+        delay its ack past the heartbeat window. Crucially the sleep here precedes `_act_on`,
+        which acks *every* message in the batch — so a probe that is *not* the newest item (a
+        real peer-AI message arrived after it, before the wake fired) would still have its ack
+        delayed by pacing the newer message. So the whole batch is scanned and *any* probe
+        short-circuits pacing this wake, before the sleep. (With no `NOC_PROBE_SECRET`
+        provisioned `_probe_nonce` is always ``None`` and cheap, so an ordinary message is never
+        mistaken for one and a normal conversation pays nothing.)
+
+        **Never crash the wake (B2).** Pacing is a best-effort nicety; a bad `created_at` (an
+        access-gated/omitted field → `AttributeError`, an unparseable stamp → `ValueError`) or
+        any other hiccup must degrade to *no delay*, never propagate — this runs *before*
+        `_act_on`'s own degradation and is the first step of `wake()`, so an uncaught raise here
+        would kill the whole wake, including the asset/event/task reconciles that follow. So the
+        whole thing is guarded, the same invariant the brief/dashboard/memory hooks are held to.
+
+        Delegates the ``kind == "ai"`` gate and the read-time math to `ReadPacer.pace`; a human
+        newest, a disabled pacer, or an empty reply set (no non-self message) is a no-op.
+        """
+        try:
+            newest = None
+            for message in reversed(messages):  # chronological in, so reversed → newest-first
+                if self._is_own(message):
+                    continue
+                if self._probe_nonce(message.content.body) is not None:
+                    return  # a NOC probe in the batch: keep its ack sub-second, don't pace
+                if newest is None:
+                    newest = message  # the newest non-self, non-probe message: the pace target
+            if newest is not None:
+                self.pacer.pace(newest)
+        except Exception:  # noqa: BLE001 - pacing must never break the wake; degrade to no delay
+            _log.warning("Read-pacing failed; answering without a delay.", exc_info=True)
 
 
 def _has_conversation(session: Session) -> bool:

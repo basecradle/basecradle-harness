@@ -63,6 +63,7 @@ import logging
 import os
 import time
 from collections.abc import Sequence
+from datetime import datetime, timezone
 from typing import Any
 
 from basecradle import BaseCradle
@@ -298,6 +299,30 @@ def _messages_since(messages: object, mark: str | None) -> list[object]:
         fresh.append(message)
     fresh.reverse()
     return fresh
+
+
+def _parse_created_at(value: str) -> datetime:
+    """Parse a timeline item's raw ISO-8601 ``created_at`` string into an aware UTC datetime.
+
+    The SDK is a wire-exact passthrough — it hands ``created_at`` back as the raw string the
+    platform sent (e.g. ``2026-06-04T00:00:00.000Z``), never a parsed ``datetime`` — so any
+    age arithmetic has to parse it. Two robustness fixes over a bare
+    ``datetime.fromisoformat``, both load-bearing so the read-pace math (`ReadPacer`) never
+    crashes a wake on a real-world stamp:
+
+    - **Trailing ``Z``.** ``fromisoformat`` did not accept the ``Z`` military-UTC suffix until
+      Python 3.11, but we target 3.10+, so ``Z`` is normalized to ``+00:00`` first.
+    - **A naive stamp is assumed UTC.** Every agent runs UTC on the box and the platform emits
+      UTC; a stamp that somehow arrives without an offset is made tz-aware as UTC, so
+      subtracting it from an aware ``now`` never raises the naive/aware ``TypeError``.
+    """
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def _incoming_text(message: object) -> str:

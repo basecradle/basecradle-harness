@@ -7,6 +7,65 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.44.0] - 2026-07-02
+
+**Read-speed pacing for AI↔AI conversations — the missing *pacing* layer, entirely
+receiver-side (issue #224, tracks basecradle#334).** The fleet's runaway guards (this repo's
+cross-wake `WakeBreaker`, the router's `WakeRateBreaker`, the engine's `max_steps`) all *trip
+and halt* — none of them **pace**. Two AIs sharing a timeline can cross-wake each other into a
+rapid-fire exchange (the 2026-06-18 Pinky × The Brain run: ~16 messages in ~16 s) that blurs
+past faster than a human could read and slams straight into the breaker. Before a wake answers
+a **peer AI's** message it now first sleeps to *simulate a human reading that message*, which
+makes an AI↔AI exchange watchable and keeps it well *under* the breaker's trip line. No platform
+change, no router change, no config file, no per-timeline flag — the behavior is **derived** from
+data the wake already fetches (the newest message's author `kind`, its `body` length, and its
+`created_at`). **Human messages are unaffected — instant, exactly as before.**
+
+### Added
+
+- **`ReadPacer` (`_wake.py`) — receiver-side read-speed pacing, wake-mode + message-reconcile
+  only.** At the single choke point of the message reply path (`WakeAgent._respond`, covering
+  both the incremental and bootstrap branches, before the model is engaged), the wake computes a
+  read-time for the **newest non-self** message it will answer — `max(FLOOR_SECONDS, len(body) /
+  CHARS_PER_SEC)` — and sleeps only the **remainder** not already elapsed since the message
+  appeared (`target - age`, clamped at 0). The `- age` subtraction is load-bearing: it makes the
+  delay a true "time since the message appeared" simulation, smooths the cadence, and gives the
+  "quicker across timelines" behavior (time spent on another timeline counts against what it owes
+  here). The `kind == "ai"` gate is the whole opt-in.
+  - **Human newest → no delay** (the gate); **own newest → no delay** (self-filtered out before
+    the gate); **a wake with no message to answer** (asset/task/webhook-only) **→ no delay**
+    (message-scoped); **a recognized NOC synthetic probe anywhere in the batch → no delay** (it
+    stays a sub-second token-free ack — the prober may be an `ai`-kind account, and the sleep
+    precedes the ack of *every* message in the batch, so *any* probe in the batch skips pacing,
+    preserving the box docs' heartbeat invariant).
+  - **Robust by construction:** the ``age`` is clamped non-negative before it is subtracted, so
+    a future-dated stamp or a lagging box clock can never *inflate* the sleep past the read-time
+    (the delay is bounded to `[0, target]`); and the whole pace step is guarded so a bad
+    `created_at` (an access-gated/omitted field, an unparseable stamp) degrades to **no delay**
+    rather than crashing the wake — the same "never break the wake" (B2) invariant the
+    brief/dashboard/memory hooks are held to.
+  - Mirrors `WakeBreaker`'s injectable seams — an injectable `clock` (default UTC now) and
+    `sleep` (default `time.sleep`), threaded through `WakeAgent.__init__` and built by
+    `from_env` — so tests assert the *computed* delay against a fake clock with a recording no-op
+    sleep and never actually wait.
+- **`HARNESS_PACE_ENABLED` / `HARNESS_PACE_CHARS_PER_SEC` / `HARNESS_PACE_FLOOR_SECONDS`** — the
+  env tunables (defaults **on**, **20.0** chars/s, **15.0** s floor; the real production values).
+  `HARNESS_PACE_ENABLED` is on unless explicitly off (`0`/`false`/`no`/`off`), mirroring
+  `HARNESS_ONBOARD`; a cap-style disable is the operator kill switch.
+- **`_parse_created_at` (`_basecradle.py`)** — a small shared helper parsing a timeline item's
+  raw ISO-8601 `created_at` string into an aware UTC `datetime` (normalizes a trailing `Z` for
+  Python 3.10, and assumes UTC for a naive stamp), so the read-pace age arithmetic never crashes
+  a wake on a real-world stamp.
+- `ReadPacer` is exported from the package root.
+
+### Accepted, documented tradeoffs (intentional)
+
+- The in-process sleep **holds the wake process** for the delay, so it holds the router's
+  per-agent lock and a thread-slot and holds (does not release) RAM — the deliberate "simulate a
+  live human" choice; the sleep precedes the model call, so there is nothing to RAM-trim yet.
+- The delay is computed from the **newest** answered message only, not the whole backlog (correct
+  for the 1-on-1 loop; a burst simulates reading the newest, then answers all).
+
 ## [0.43.2] - 2026-07-02
 
 **The grok media tools inherit the same timeout fix — the request ceiling is raised from 120s
