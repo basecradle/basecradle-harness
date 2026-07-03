@@ -450,13 +450,20 @@ def _breaker_cooldown_from_env() -> float | None:
     return float(raw)
 
 
-# Read-speed pacing (issue #224, tracks basecradle#334). Simulate a human reading a peer
-# AI's message before replying, so an AI↔AI exchange is watchable and stays well under the
-# wake-breaker's trip line instead of slamming into it. ~1,200 chars/min ≈ 20 chars/s is
-# an unhurried silent-reading pace; the 15 s floor keeps even a one-word "ok" from replying
-# in a blink. Both env-tunable; the defaults are the real production values.
-_DEFAULT_PACE_CHARS_PER_SEC = 20.0
-_DEFAULT_PACE_FLOOR_SECONDS = 15.0
+# Read-speed pacing (issue #224, reworked in #226; tracks basecradle#334). Simulate a human
+# reading a peer AI's message before replying, so an AI↔AI exchange is watchable and stays
+# well under the wake-breaker's trip line instead of slamming into it. ~1,020 chars/min ≈ 17
+# chars/s is an unhurried silent-reading pace; the 20 s floor keeps even a one-word "ok" from
+# replying in a blink. All env-tunable; the defaults are the real production values.
+#
+# The #226 rework tuned these *slower* (chars/s 20→17, floor 15→20) after a live Pinky × The
+# Brain run read too fast, and added `MAX_BUILDS` — the Loop-2 mid-generation staleness cap:
+# a reply is generated against a snapshot, and if messages land *during* generation the batch
+# is rebuilt (at most `MAX_BUILDS` model calls; the Nth build posts unconditionally). See
+# `WakeAgent._pace_and_settle` (Loop 1) and `WakeAgent._generate_settled` (Loop 2).
+_DEFAULT_PACE_CHARS_PER_SEC = 17.0
+_DEFAULT_PACE_FLOOR_SECONDS = 20.0
+_DEFAULT_PACE_MAX_BUILDS = 3
 
 
 class ReadPacer:
@@ -583,6 +590,20 @@ def _pace_floor_seconds_from_env() -> float:
     return float(raw)
 
 
+def _pace_max_builds_from_env() -> int:
+    """`HARNESS_PACE_MAX_BUILDS` → the Loop-2 rebuild cap; unset/blank → the default (3).
+
+    The most times a batch reply is regenerated when messages land mid-generation (issue #226).
+    The Nth build is posted unconditionally (no staleness check after it), so a value of 1
+    means "never rebuild — generate once and post" (the pre-#226 single-shot behavior). A
+    non-positive value is floored to 1 so the generate loop always runs at least once.
+    """
+    raw = os.environ.get("HARNESS_PACE_MAX_BUILDS")
+    if raw is None or not raw.strip():
+        return _DEFAULT_PACE_MAX_BUILDS
+    return max(1, int(raw))
+
+
 class WakeAgent:
     """Answers one timeline's unseen messages in a single process, then is done.
 
@@ -647,6 +668,7 @@ class WakeAgent:
         defect_notices: list[str] | None = None,
         breaker: WakeBreaker | None = None,
         pacer: ReadPacer | None = None,
+        max_builds: int = _DEFAULT_PACE_MAX_BUILDS,
         code_bridge: CodeExecutionBridge | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
@@ -699,6 +721,13 @@ class WakeAgent:
         # breaker's trip line. A directly-constructed wake gets the real defaults; `from_env`
         # threads the env-tuned pacer. It holds no state, so nothing persists under home.
         self.pacer = pacer or ReadPacer()
+        # Loop-2 (mid-generation staleness) rebuild cap (issue #226): the most times a batch
+        # reply is regenerated when messages land during generation; the Nth build is posted
+        # unconditionally. Floored to 1 so the generate loop always runs. It is a wake property
+        # (Loop 2 re-reads the timeline through `self.client`), distinct from the pacer's
+        # Loop-1 read-time seams — but shares the `HARNESS_PACE_ENABLED` kill switch: with
+        # pacing off, Loop 2 does a single build and posts (see `_generate_settled`).
+        self.max_builds = max(1, max_builds)
         self.timeline = self.client.timelines.get(timeline)
 
         # Bind the live platform handle into every platform-aware tool — the same
@@ -792,10 +821,13 @@ class WakeAgent:
             # the marks/seen/claims stores. Generous defaults; off only if explicitly capped
             # to 0. The router's cross-agent breaker is the complementary layer.
             breaker=WakeBreaker.from_env(home),
-            # The env-tuned AI↔AI read-speed pacer (issue #224). On by default with the real
-            # reading-rate/floor defaults; a human peer is never paced, so replies to humans
-            # are instant exactly as before.
+            # The env-tuned AI↔AI read-speed pacer (issue #224, reworked #226). On by default
+            # with the real reading-rate/floor defaults; a human peer is never paced, so replies
+            # to humans are instant exactly as before.
             pacer=ReadPacer.from_env(),
+            # The Loop-2 mid-generation staleness rebuild cap (issue #226). Env-tuned; the Nth
+            # build posts unconditionally. Shares the pacer's `HARNESS_PACE_ENABLED` kill switch.
+            max_builds=_pace_max_builds_from_env(),
         )
 
     def wake(
@@ -1485,9 +1517,21 @@ class WakeAgent:
             for message in reversed(context):  # oldest-first into history
                 session.history.append(_as_turn(message, self.me_uuid))
         posted = self._respond(session, to_reply)
-        # Everything up to the newest message is now seen (replied to or seeded as
-        # context), so the mark is the true newest — even if `to_reply` was empty.
-        self.marks.set(self.timeline_uuid, recent[0].content.uuid)
+        # Close out the first wake by baselining the mark to `recent[0]` — but only when `_respond`
+        # did *not* already advance it past `recent[0]` via a mid-wake arrival (issue #226). The
+        # signal is exact and order-free: after `_respond`, the mark is either
+        #   - a message that was in the initial `recent` read (a `to_reply` item, or None when every
+        #     claim was lost to a concurrent/crashed wake or `to_reply` was empty), OR
+        #   - a *later* arrival Loop 1/Loop 2 folded in and marked (never in `recent`).
+        # So `mark is None or mark in recent` means "no arrival advanced it" → baseline to
+        # `recent[0]`. This restores the old unconditional baseline for the empty/partial-claim
+        # cases (without it a first wake whose only message's claim is orphaned by a crashed prior
+        # wake would re-bootstrap forever, never advancing) while never regressing past a genuine
+        # mid-wake arrival.
+        recent_uuids = {message.content.uuid for message in recent}
+        mark = self.marks.get(self.timeline_uuid)
+        if mark is None or mark in recent_uuids:
+            self.marks.set(self.timeline_uuid, recent[0].content.uuid)
         return posted
 
     def _bootstrap_split(self, recent: list[object], trigger: str | None) -> int:
@@ -1520,76 +1564,235 @@ class WakeAgent:
     # --- replying ------------------------------------------------------------
 
     def _respond(self, session: Session, messages: list[object]) -> list[object]:
-        """Reply to each message in chronological order, advancing the mark per reply.
+        """Reply to a wake's unseen messages as **one batched turn** — the #226 message path.
 
-        Our own posts are skipped (the actor self-filter) but still advance the mark, and a
-        recognized NOC probe — read from the message **body** — is acked token-free before
-        the model (`probe=`). The task and webhook reconcilers pass the same `probe=` over
-        their own carrier fields, so the short-circuit spans all three seams. Delegates to
-        the shared `_act_on` loop — see it for the crash-safe, at-least-once ordering that
-        every reconciler shares.
+        This is the single choke point for the message reply path — both the incremental
+        (`_messages_since`) and bootstrap (`_bootstrap`) branches funnel their unseen set
+        through here. Where the pre-#226 path looped `_act_on` per message (N unseen → N
+        replies), it now gathers **all** unseen peer messages, seeds them as one turn, and
+        emits **one** reply to the batch (issue #226). Three coupled behaviors:
 
-        **Read-speed pacing runs first** (issue #224). This is the single choke point for the
-        message reply path — both the incremental (`_messages_since`) and bootstrap
-        (`_bootstrap`) branches funnel their reply set through here — so the read-pace gate
-        lives here, before the model is engaged. Only the message reconcile is paced; the
-        asset/task/webhook reconcilers call `_act_on` directly and are deliberately out of
-        scope (rare, naturally time-separated, or externally-sourced).
+        1. **Many-to-one batch reply (`_absorb`).** Own posts are self-filtered (marked, not
+           acted on); a recognized NOC probe — read from the message **body** — is acked
+           token-free before the model; every remaining peer message is atomically claimed,
+           marked, and collected into the reply batch. So the exactly-once machinery
+           (`ClaimStore`/`MarkStore`, `kind=_MESSAGES`) moves to batch semantics: claim every
+           message in the batch, advance the mark past the newest — but a *single* model reply
+           answers them all.
+        2. **Loop 1 — pace + settle (`_pace_and_settle`, AI-sender only).** Simulate a human
+           reading the newest peer *AI* message; if a newer peer-AI message lands during that
+           read, restart the wait on it and fold it in, so the reply reacts to the settled
+           newest rather than a stale snapshot (the pre-#226 doublet defect). A human newest is
+           never paced — an instant reply, exactly as before.
+        3. **Loop 2 — mid-generation staleness (`_generate_settled`, all senders).** Generate
+           against the batch; if any message (human or AI) arrives *during* generation, fold it
+           in and rebuild, up to `max_builds` times — so the agent never posts a reply that was
+           made stale by a message it hadn't yet seen.
+
+        Only the message reconcile batches + paces; the asset/task/webhook reconcilers call
+        `_act_on` directly and are deliberately out of scope (rare, naturally time-separated,
+        or externally-sourced).
         """
-        self._pace(messages)
-        return self._act_on(
-            session,
-            messages,
-            _incoming_text,
-            lambda message: self.marks.set(self.timeline_uuid, message.content.uuid),
-            kind=_MESSAGES,
-            skip=self._is_own,
-            probe=lambda message: self._probe_nonce(message.content.body),
-        )
+        posted: list[object] = []
+        batch, probe_seen = self._absorb(session, messages, posted)
+        if not batch:
+            # Self-only / probe-only / empty: marks already advanced, any probe acked. No peer
+            # message to answer, so the model is never engaged (and the brief never fetched).
+            return posted
+        self._pace_and_settle(session, batch, posted, probe_seen)
+        reply = self._generate_settled(session, batch, posted)
+        if reply.strip():
+            sent = self._post(session, reply)
+            if sent is not None:
+                posted.append(sent)
+            # One exchange for the whole batch — hand the rendered batch + reply to the memory
+            # provider, whether or not the *post* landed (a locked timeline still produced a real
+            # exchange). Guarded by `reply.strip()` exactly as the per-message `_act_on` was, so an
+            # empty/whitespace model turn (nothing posted) never records a junk empty-assistant
+            # exchange into memory.
+            self._observe(_render_batch(batch), reply)
+        return posted
 
-    def _pace(self, messages: list[object]) -> None:
-        """Read-pace the reply set: simulate a human reading the newest peer AI's message.
+    def _absorb(
+        self, session: Session, items: list[object], posted: list[object]
+    ) -> tuple[list[object], bool]:
+        """Fold a freshly-read chronological set into the reply batch, exactly once.
 
-        The pacing input is the **newest non-self** message this wake will answer — the one
-        it is reacting to. The actor self-filter (`_is_own`) is applied here, before the
-        pacer, because the agent is *itself* an ``ai``-kind account: a self-authored newest
-        message would otherwise satisfy the pacer's ``kind == "ai"`` gate and be paced against.
+        Walks the items oldest→newest, applying the same per-item disposition `_act_on` does —
+        just deferring the *model* engagement to a single batched reply:
 
-        **A recognized NOC probe anywhere in the batch skips pacing entirely.** The message-seam
-        heartbeat is acked token-free and must stay sub-second (the box docs' `--version`/
-        synthetic-probe verify, the NOC's release-drift detection). A probe flows through this
-        reply path, and the NOC prober may be an ``ai``-kind account, so a pacing sleep would
-        delay its ack past the heartbeat window. Crucially the sleep here precedes `_act_on`,
-        which acks *every* message in the batch — so a probe that is *not* the newest item (a
-        real peer-AI message arrived after it, before the wake fired) would still have its ack
-        delayed by pacing the newer message. So the whole batch is scanned and *any* probe
-        short-circuits pacing this wake, before the sleep. (With no `NOC_PROBE_SECRET`
-        provisioned `_probe_nonce` is always ``None`` and cheap, so an ordinary message is never
-        mistaken for one and a normal conversation pays nothing.)
+        - **Own post** (the actor self-filter) → mark seen, never acted on (no claim needed —
+          there is nothing to make exclusive).
+        - **NOC probe** (a valid signed marker in the body) → ack token-free (no model call),
+          record only on a successful ack (at-least-once, never claimed), and set `probe_seen`.
+          The ack posts *here*, before any pacing sleep, so a probe's heartbeat stays sub-second
+          even when a real peer message is paced alongside it.
+        - **Peer message** → atomically claim it (a concurrent/crashed prior wake that already
+          owns it → skip), mark seen (claim-first: record before acting, so a failed wake won't
+          reprocess), and collect it into the returned batch.
 
-        **Never crash the wake (B2).** Pacing is a best-effort nicety; a bad `created_at` (an
-        access-gated/omitted field → `AttributeError`, an unparseable stamp → `ValueError`) or
-        any other hiccup must degrade to *no delay*, never propagate — this runs *before*
-        `_act_on`'s own degradation and is the first step of `wake()`, so an uncaught raise here
-        would kill the whole wake, including the asset/event/task reconciles that follow. So the
-        whole thing is guarded, the same invariant the brief/dashboard/memory hooks are held to.
+        Returns `(peers, probe_seen)`. Reused by the initial gather and by every re-read
+        (`_fetch_fresh`) during Loop 1 settle and Loop 2 rebuild, so the marking/claiming/acking
+        invariants are identical on every read.
+        """
+        peers: list[object] = []
+        probe_seen = False
+        for item in items:
+            if self._is_own(item):
+                self.marks.set(self.timeline_uuid, item.content.uuid)
+                continue
+            nonce = self._probe_nonce(item.content.body)
+            if nonce is not None:
+                probe_seen = True
+                ack = self._post(session, ack_line(nonce), note=False)
+                if ack is not None:
+                    posted.append(ack)
+                    self.marks.set(self.timeline_uuid, item.content.uuid)
+                continue
+            if not self.claims.claim(self.timeline_uuid, item.content.uuid, kind=_MESSAGES):
+                continue  # a concurrent (or crashed prior) wake already owns this message
+            self.marks.set(self.timeline_uuid, item.content.uuid)
+            peers.append(item)
+        return peers, probe_seen
 
-        Delegates the ``kind == "ai"`` gate and the read-time math to `ReadPacer.pace`; a human
-        newest, a disabled pacer, or an empty reply set (no non-self message) is a no-op.
+    def _fetch_fresh(self) -> list[object]:
+        """Re-read the unseen messages past the current mark, chronological (may include self/probes).
+
+        The mark is the cursor: `_absorb` advances it past every message it folds in, so a
+        re-read after absorbing returns only what has *since* arrived. This is how Loop 1
+        detects a message that landed during the read-pace and Loop 2 detects one that landed
+        during generation — the timeline read is the source of truth, re-run against the moved
+        mark.
+        """
+        mark = self.marks.get(self.timeline_uuid)
+        return _messages_since(self.client.messages.filter(timeline=self.timeline_uuid), mark)
+
+    def _pace_and_settle(
+        self, session: Session, batch: list[object], posted: list[object], probe_seen: bool
+    ) -> None:
+        """Loop 1 — read-pace the newest peer AI message, settling if a newer one lands mid-read.
+
+        Simulate a human reading the newest peer *AI* message before replying, so an AI↔AI
+        exchange is watchable and stays under the wake-breaker's trip line. Then re-read: if a
+        newer peer message arrived *during* the sleep, fold it into the batch; if that newest
+        arrival is itself a peer AI, restart the wait on it (a settling loop) — otherwise break
+        (a human arrival means "respond now"). This is what stops the pre-#226 doublet: the
+        reply reacts to the settled newest, not a snapshot taken before the sleep.
+
+        Skipped entirely — an instant reply, exactly as before — when: pacing is disabled (the
+        kill switch); a NOC probe was in the batch (its heartbeat must stay sub-second, and it
+        was already acked in `_absorb`); or the newest peer message is a **human** (the
+        ``kind == "ai"`` gate is the whole opt-in). New peer messages folded in here are marked
+        and claimed by `_absorb`, so they are answered by this wake, not dropped.
+
+        **Bounded by `max_builds` restarts.** In a 1-on-1 the settle converges in a step or two
+        (the peer waits for this agent's reply). But with 3+ AI peers — or a peer whose own pacing
+        is disabled — a new peer-AI message can land during *every* read window, so an uncapped
+        settle would hold the wake (and the router's per-agent lock) indefinitely. The restart
+        count is capped at `max_builds` (the same worst-case bound Loop 2 uses); once hit, the
+        wake stops settling and proceeds to generate against the batch it has, folding any later
+        arrivals through Loop 2 instead (and the rest drive the next wake). A WARNING is logged so
+        a genuinely runaway room is visible.
+
+        **Never crash the wake (B2).** A bad `created_at` or any hiccup in the pacer degrades to
+        *no further delay* and proceeds with the current batch, never propagating — the same
+        invariant the brief/dashboard/memory hooks are held to.
+        """
+        if probe_seen or not self.pacer.enabled:
+            return
+        newest = batch[-1]
+        if getattr(newest.user, "kind", None) != "ai":
+            return  # a human (or non-AI) newest → respond now, no read-pace
+        try:
+            restarts = 0
+            while True:
+                self.pacer.pace(newest)
+                new_peers, _ = self._absorb(session, self._fetch_fresh(), posted)
+                batch.extend(new_peers)
+                if not (new_peers and getattr(new_peers[-1].user, "kind", None) == "ai"):
+                    break  # settled: the newest is stable (or the latest arrival is a human)
+                restarts += 1
+                if restarts >= self.max_builds:
+                    _log.warning(
+                        "Read-pace settle hit the %d-restart cap for timeline %s (a runaway "
+                        "multi-peer room?); proceeding to generate against the current batch.",
+                        self.max_builds,
+                        self.timeline_uuid,
+                    )
+                    break
+                newest = new_peers[-1]  # a newer peer AI landed: restart the read on it
+        except Exception:  # noqa: BLE001 - pacing must never break the wake; degrade to no delay
+            _log.warning("Read-pacing failed; answering without further delay.", exc_info=True)
+
+    def _generate_settled(self, session: Session, batch: list[object], posted: list[object]) -> str:
+        """Loop 2 — generate one reply to the batch, rebuilding if a message lands mid-generation.
+
+        Optimistic concurrency (compare-and-swap) around the model call: generate against the
+        batch snapshot, then re-read; if a peer message (human *or* AI — all senders count) has
+        arrived *since* the batch's newest, fold it in and regenerate, up to `max_builds` times.
+        The `max_builds`-th build is posted **unconditionally** (no staleness check after it);
+        messages that land during that final build are left **unseen** — not marked or claimed —
+        so they drive the *next* wake rather than being lost.
+
+        **A build that ran tools is never rolled back.** The model call executes its tool calls
+        *with real, irreversible side effects* (an image posted, a message sent, code run). The
+        `del session.history[...]` rollback erases only the transcript, not those effects — so
+        rebuilding a tool-using build would fire them again (two images for one request). A build
+        whose transcript span contains any tool turn is therefore **committed**: it posts as-is,
+        never rebuilds. Only a pure-text build — the common case, and the one the staleness guard
+        is really for — is eligible for a compare-and-swap rebuild.
+
+        The brief is re-asserted once, ahead of the first model call. Intermediate (stale) pure-text
+        builds are rolled back out of the transcript so only the posted reply's turn persists. Loop
+        2 does **not** re-pace — Loop 1 already simulated the read, and re-pacing could stall a reply
+        indefinitely in a chatty room. With pacing disabled it collapses to a single build (the
+        pre-#226 single-shot behavior).
+        """
+        self._reassert_brief(session, query=_incoming_text(batch[-1]))
+        base_len = len(session.history)  # rollback point: after the brief, before any build
+        builds = 0
+        while True:
+            reply = self._send_batch(session, _render_batch(batch))
+            builds += 1
+            # A build that engaged tools has committed irreversible side effects; posting it as-is
+            # (never rebuilding) is the only safe move — a rollback+rebuild would re-fire them.
+            used_tools = any(turn.role == "tool" for turn in session.history[base_len:])
+            if not self.pacer.enabled or builds >= self.max_builds or used_tools:
+                return reply  # pacing off → one build; the cap or a tool-using build → post as-is
+            # Absorb the fresh read regardless — this marks any self post and, crucially, keeps a
+            # NOC probe's ack sub-second even when it lands mid-generation (it is acked here, not
+            # deferred to the next wake). Only peer messages fold in and trigger a rebuild.
+            new_peers, _ = self._absorb(session, self._fetch_fresh(), posted)
+            if not new_peers:
+                return reply  # snapshot still current (any probe/self just handled) — post it
+            # Stale: a peer message landed during generation. Fold it in, roll the stale build out
+            # of the transcript, and regenerate against the current batch.
+            batch.extend(new_peers)
+            del session.history[base_len:]
+
+    def _send_batch(self, session: Session, text: str) -> str:
+        """Send the batch as one user turn, degrading the engine's step-cap to a graceful reply.
+
+        The batch counterpart of `_engage`'s model call, minus the brief re-assertion (Loop 2
+        asserts the brief once, ahead of the loop). Messages carry no images, so this is
+        text-only. `EngineError` (the `max_steps` cap) degrades to a short, honest note the peer
+        can read; other failures propagate to the entrypoint, which reports them cleanly.
         """
         try:
-            newest = None
-            for message in reversed(messages):  # chronological in, so reversed → newest-first
-                if self._is_own(message):
-                    continue
-                if self._probe_nonce(message.content.body) is not None:
-                    return  # a NOC probe in the batch: keep its ack sub-second, don't pace
-                if newest is None:
-                    newest = message  # the newest non-self, non-probe message: the pace target
-            if newest is not None:
-                self.pacer.pace(newest)
-        except Exception:  # noqa: BLE001 - pacing must never break the wake; degrade to no delay
-            _log.warning("Read-pacing failed; answering without a delay.", exc_info=True)
+            return session.send(text)
+        except EngineError:
+            return "I got stuck working through that and stopped before reaching an answer."
+
+
+def _render_batch(messages: list[object]) -> str:
+    """Render a batch of unseen messages as one turn's text — the many-to-one reply input.
+
+    Each message keeps its own `[created_at] handle: body` line (the same `_incoming_text`
+    shape a single message got pre-#226), joined newest-last by newlines, so the model reads
+    the batch as one contiguous stretch of conversation and answers all of it in one reply.
+    A single-message batch renders identically to the pre-#226 per-message text.
+    """
+    return "\n".join(_incoming_text(message) for message in messages)
 
 
 def _has_conversation(session: Session) -> bool:

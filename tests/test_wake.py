@@ -33,6 +33,7 @@ from basecradle_harness import (
     Message,
     ReadPacer,
     SeenStore,
+    Tool,
     WakeAgent,
     WakeBreaker,
     install,
@@ -49,6 +50,7 @@ from basecradle_harness._wake import (
     _pace_chars_per_sec_from_env,
     _pace_enabled_from_env,
     _pace_floor_seconds_from_env,
+    _pace_max_builds_from_env,
     main,
     resolved_config,
 )
@@ -247,8 +249,23 @@ def platform():
 
 
 def serve_messages(platform, *pages):
-    """Drive the (newest-first) message list endpoint; one page per read."""
-    platform.get("/messages").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
+    """Drive the (newest-first) message list endpoint; the LAST page repeats for every read.
+
+    A #226 message wake reads the list several times per turn — the initial gather, then the
+    Loop-1 settle re-check and the Loop-2 staleness re-check(s) — so a single fixed list must
+    satisfy an unbounded number of reads. Each given page is served once in order, then the
+    **last** page repeats forever; a re-read after the mark advanced simply yields nothing
+    newer (`_messages_since` filters past the mark). Pass one page for a steady list; the
+    multi-page form scripts an early read differently from the settled tail. For a mid-wake
+    *change* (a message landing during pacing/generation) use `ScriptedMessages`, which mutates
+    a single served list so the exact read count never has to be counted.
+    """
+    queue = [httpx.Response(200, json=p) for p in pages]
+
+    def _serve(request):
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    platform.get("/messages").mock(side_effect=_serve)
 
 
 def serve_events(platform, *pages):
@@ -343,7 +360,12 @@ def test_new_message_after_a_mark_is_answered(platform, tmp_path):
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # mark advanced
 
 
-def test_multiple_unseen_messages_answered_oldest_first(platform, tmp_path):
+def test_multiple_unseen_messages_get_one_batched_reply_oldest_first(platform, tmp_path):
+    """#226 many-to-one: N unseen peer messages → ONE reply, seeded oldest-first as one turn.
+
+    The pre-#226 path looped a reply per message (N → N); the batch reply gathers them all,
+    renders them oldest-first into a single turn, and answers once. The mark still advances past
+    the newest, and every message in the batch is claimed."""
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
     serve_messages(
         platform,
@@ -357,26 +379,27 @@ def test_multiple_unseen_messages_answered_oldest_first(platform, tmp_path):
 
     posted = agent.wake()
 
-    assert len(posted) == 2
+    assert len(posted) == 1  # ONE batched reply to both, not one-per-message
     assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] john: first",
-        "[2026-06-04T00:00:00.000Z] john: second",
-    ]  # chronological
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
+        "[2026-06-04T00:00:00.000Z] john: first\n[2026-06-04T00:00:00.000Z] john: second"
+    ]  # both messages, oldest-first, in one turn
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2  # mark past the newest
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is False  # both claimed
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M2, kind="messages") is False
 
 
 # --- idempotency across a crash / retry mid-batch ----------------------------
 
 
-def test_a_mid_batch_crash_does_not_reprocess_the_crashed_message(platform, tmp_path):
-    """B3: claim-first — a forced mid-wake failure advances the mark over the crashed
-    message, so it is never reprocessed (no model turn re-burned, no tool action re-fired).
+def test_a_batch_generation_crash_does_not_reprocess_the_batch(platform, tmp_path):
+    """B3, batch form: the whole batch is claimed and marked *before* the model call, so a hard
+    crash during generation advances the mark over it and it is never reprocessed.
 
-    The provider raises on the *second* message, mimicking a process that dies mid-batch.
-    Because each message is claimed and marked seen *before* it is acted on, both the
-    answered first message and the crashed second leave the mark at the true newest — a
-    retry replies to nothing rather than re-answering M2 on every later wake (the live
-    reprocess loop). At-most-once: a one-time dropped reply beats a backlog re-answered.
+    The provider raises (a non-EngineError, mimicking a process that dies mid-generation).
+    Because `_absorb` claims and marks every batch message before `_generate_settled` engages
+    the model, the mark is already the true newest when the crash hits — a retry replies to
+    nothing rather than re-answering the batch on every later wake (the live reprocess loop).
+    At-most-once: a one-time dropped reply beats a backlog re-answered.
     """
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
     serve_messages(
@@ -388,24 +411,19 @@ def test_a_mid_batch_crash_does_not_reprocess_the_crashed_message(platform, tmp_
         ),
     )
 
-    class DiesOnSecond:
-        def __init__(self):
-            self.calls = 0
-
+    class DiesGenerating:
         def chat(self, messages, tools=None):
-            self.calls += 1
-            if self.calls == 2:
-                raise RuntimeError("boom mid-batch")
-            return Message.assistant(content="ok")
+            raise RuntimeError("boom mid-generation")
 
-    agent, _ = build_wake(tmp_path, DiesOnSecond())
+    agent, _ = build_wake(tmp_path, DiesGenerating())
     with pytest.raises(RuntimeError):
         agent.wake()
 
-    # Both messages were claimed and marked seen before acting, so the mark is the newest —
-    # the crashed M2 will not be re-answered on the next wake.
+    # Both messages were claimed and marked seen before the model was engaged, so the mark is
+    # the newest — the batch will not be re-answered on the next wake.
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
     assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M2, kind="messages") is False  # M2 was claimed
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is False  # M1 too
 
     # A retry (fresh process, same home) sees the advanced mark and replies to nothing.
     serve_messages(platform, page(message(uuid=M2, body="second"), message(uuid=M1, body="first")))
@@ -569,10 +587,9 @@ def test_bootstrap_replies_to_everything_since_our_last_post(platform, tmp_path)
 
     posted = agent.wake()
 
-    assert len(posted) == 2
+    assert len(posted) == 1  # one batched reply to everything since our last post
     assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] john: a follow-up",
-        "[2026-06-04T00:00:00.000Z] john: and another",
+        "[2026-06-04T00:00:00.000Z] john: a follow-up\n[2026-06-04T00:00:00.000Z] john: and another"
     ]
     # M0 and our own M1 are context, not replied to; the mark is the true newest.
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M3
@@ -593,9 +610,8 @@ def test_bootstrap_with_trigger_replies_from_the_trigger_forward(platform, tmp_p
     agent.wake(trigger=M1)
 
     assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] john: the trigger",
-        "[2026-06-04T00:00:00.000Z] john: newest",
-    ]  # M1 forward
+        "[2026-06-04T00:00:00.000Z] john: the trigger\n[2026-06-04T00:00:00.000Z] john: newest"
+    ]  # M1 forward, batched into one turn
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
 
 
@@ -2233,21 +2249,21 @@ def peer_ai_message(*, uuid, body, created_at="2026-06-04T00:00:00.000Z"):
 
 
 def test_peer_ai_message_is_paced_for_its_read_time():
-    """A peer AI's message → sleep(max(floor, chars/rate) - age); here age 0, 400 chars → 20s."""
+    """A peer AI's message → sleep(max(floor, chars/rate) - age); here age 0, 510 chars → 30s."""
     pacer, sleep = _pacer()
-    slept = pacer.pace(_pace_msg("x" * 400))  # 400 / 20 chars-per-sec = 20s, above the 15s floor
+    slept = pacer.pace(_pace_msg("x" * 510))  # 510 / 17 chars-per-sec = 30s, above the 20s floor
 
-    assert slept == 20.0
-    assert sleep.calls == [20.0]
+    assert slept == 30.0
+    assert sleep.calls == [30.0]
 
 
 def test_the_floor_applies_to_a_very_short_message():
-    """A one-word peer-AI reply reads in a blink, but the 15s floor keeps it human-paced."""
+    """A one-word peer-AI reply reads in a blink, but the 20s floor keeps it human-paced."""
     pacer, sleep = _pacer()
-    slept = pacer.pace(_pace_msg("ok"))  # 2 / 20 = 0.1s → clamped up to the 15s floor
+    slept = pacer.pace(_pace_msg("ok"))  # 2 / 17 = 0.1s → clamped up to the 20s floor
 
-    assert slept == 15.0
-    assert sleep.calls == [15.0]
+    assert slept == 20.0
+    assert sleep.calls == [20.0]
 
 
 def test_delay_scales_with_message_length():
@@ -2255,19 +2271,19 @@ def test_delay_scales_with_message_length():
     short, short_sleep = _pacer()
     long, long_sleep = _pacer()
 
-    assert short.pace(_pace_msg("x" * 400)) == 20.0  # 400 / 20
-    assert long.pace(_pace_msg("x" * 800)) == 40.0  # 800 / 20 — proportionally longer
-    assert short_sleep.calls == [20.0]
-    assert long_sleep.calls == [40.0]
+    assert short.pace(_pace_msg("x" * 510)) == 30.0  # 510 / 17
+    assert long.pace(_pace_msg("x" * 1020)) == 60.0  # 1020 / 17 — proportionally longer
+    assert short_sleep.calls == [30.0]
+    assert long_sleep.calls == [60.0]
 
 
 def test_age_is_subtracted_so_only_the_remainder_is_waited():
-    """LOAD-BEARING `- age`: a message already 5s old owes only the remaining 15s of its 20s read."""
+    """LOAD-BEARING `- age`: a message already 5s old owes only the remaining 25s of its 30s read."""
     pacer, sleep = _pacer(now=PACE_CREATED.replace(second=5))  # message aged 5s since it appeared
-    slept = pacer.pace(_pace_msg("x" * 400))  # target 20s, age 5s → wait 15s
+    slept = pacer.pace(_pace_msg("x" * 510))  # target 30s, age 5s → wait 25s
 
-    assert slept == 15.0
-    assert sleep.calls == [15.0]
+    assert slept == 25.0
+    assert sleep.calls == [25.0]
 
 
 def test_a_message_older_than_its_read_time_is_not_paced():
@@ -2282,12 +2298,12 @@ def test_a_message_older_than_its_read_time_is_not_paced():
 def test_a_negative_age_is_clamped_so_the_delay_never_exceeds_the_read_time():
     """LOAD-BEARING clamp: a future-dated stamp / lagging box clock must not inflate the sleep."""
     # The box clock is 5 minutes behind the message's `created_at` → age is -300s. Unclamped,
-    # `target - age` would be 320s; clamped, the message owes only its full 20s read-time.
+    # `target - age` would be 330s; clamped, the message owes only its full 30s read-time.
     pacer, sleep = _pacer(now=PACE_CREATED - timedelta(minutes=5))
-    slept = pacer.pace(_pace_msg("x" * 400))
+    slept = pacer.pace(_pace_msg("x" * 510))
 
-    assert slept == 20.0  # target, never target + skew
-    assert sleep.calls == [20.0]
+    assert slept == 30.0  # target, never target + skew
+    assert sleep.calls == [30.0]
 
 
 def test_a_human_message_is_never_paced():
@@ -2319,8 +2335,8 @@ def test_a_nonpositive_rate_degrades_to_the_floor():
     """A misconfigured rate of 0 can't divide; it degrades to 'always the floor', never a crash."""
     pacer, sleep = _pacer(chars_per_sec=0)
 
-    assert pacer.pace(_pace_msg("x" * 400)) == 15.0  # falls back to the floor, no ZeroDivisionError
-    assert sleep.calls == [15.0]
+    assert pacer.pace(_pace_msg("x" * 400)) == 20.0  # falls back to the floor, no ZeroDivisionError
+    assert sleep.calls == [20.0]
 
 
 # --- pacing wired through a real wake (the reply path) ------------------------
@@ -2328,13 +2344,13 @@ def test_a_nonpositive_rate_degrades_to_the_floor():
 
 def test_a_wake_paces_before_answering_a_peer_ai(platform, tmp_path):
     """End-to-end: a peer AI's message is read-paced, then answered exactly as today."""
-    serve_messages(platform, page(peer_ai_message(uuid=M0, body="x" * 400)))
+    serve_messages(platform, page(peer_ai_message(uuid=M0, body="x" * 510)))
     pacer, sleep = _pacer()
     agent, provider = build_wake(tmp_path, pacer=pacer)
 
     posted = agent.wake()
 
-    assert sleep.calls == [20.0]  # paced the peer AI's 400-char message
+    assert sleep.calls == [30.0]  # paced the peer AI's 510-char message (510 / 17)
     assert len(posted) == 1  # then replied as normal
     assert len(provider.prompts) == 1
 
@@ -2456,8 +2472,8 @@ def test_pace_env_tunables_override_the_defaults(monkeypatch):
     """`HARNESS_PACE_CHARS_PER_SEC`/`_FLOOR_SECONDS` override the real defaults; blank → default."""
     monkeypatch.delenv("HARNESS_PACE_CHARS_PER_SEC", raising=False)
     monkeypatch.delenv("HARNESS_PACE_FLOOR_SECONDS", raising=False)
-    assert _pace_chars_per_sec_from_env() == 20.0  # the real default
-    assert _pace_floor_seconds_from_env() == 15.0
+    assert _pace_chars_per_sec_from_env() == 17.0  # the real default (issue #226)
+    assert _pace_floor_seconds_from_env() == 20.0
 
     monkeypatch.setenv("HARNESS_PACE_CHARS_PER_SEC", "50")
     monkeypatch.setenv("HARNESS_PACE_FLOOR_SECONDS", "3")
@@ -2478,6 +2494,403 @@ def test_a_disabled_env_makes_from_env_pace_nothing(monkeypatch):
 
     assert pacer.pace(_pace_msg("x" * 400)) == 0.0
     assert sleep.calls == []
+
+
+# --- the settle loop + mid-generation staleness guard (issue #226) ------------
+#
+# The 0.44.0 pacer took a snapshot, slept, then replied to the snapshot — so a message that
+# landed during the sleep (Loop 1) or during generation (Loop 2) made the reply stale. The
+# rework closes both windows. These tests drive a SCRIPTABLE platform whose message list can
+# change mid-wake: a `RecordingSleep` hook makes a message "arrive" during the read (Loop 1),
+# and a provider hook makes one "arrive" during the model call (Loop 2). Deterministic — the
+# clock and sleep are injected, so nothing actually waits.
+
+
+class ScriptedMessages:
+    """A mutable newest-first message list served at `/messages`, re-read live on every call.
+
+    Every `/messages` read returns the *current* list, so a message inserted mid-wake (by a
+    sleep hook in Loop 1, or a provider hook in Loop 2) is seen by the next re-read exactly as
+    a real arrival would be. `arrive` prepends (newest-first); the harness's mark filters what
+    is genuinely new.
+    """
+
+    def __init__(self, platform, *initial):
+        self._messages = list(initial)
+        platform.get("/messages").mock(
+            side_effect=lambda request: httpx.Response(200, json=page(*self._messages))
+        )
+
+    def arrive(self, wire_message):
+        self._messages.insert(0, wire_message)  # newest-first
+
+
+class HookedProvider:
+    """A canned brain that runs `on_chat(call_index)` before each reply — the Loop-2 seam.
+
+    The hook lets a test make a message "arrive" during a specific generation (e.g. only the
+    first), so the post-generation staleness re-check sees it and rebuilds. Records every
+    prompt so build count and batch contents are assertable.
+    """
+
+    def __init__(self, text="Hello, John.", on_chat=None):
+        self.text = text
+        self.on_chat = on_chat
+        self.prompts: list[str] = []
+
+    def chat(self, messages, tools=None):
+        self.prompts.append(messages[-1].content)
+        if self.on_chat is not None:
+            self.on_chat(len(self.prompts))
+        return Message.assistant(content=self.text)
+
+
+# --- Loop 1: the settle loop --------------------------------------------------
+
+
+def test_a_newer_ai_message_during_the_read_restarts_the_settle(platform, tmp_path):
+    """A newer peer-AI message landing during the read-pace folds in and restarts the wait.
+
+    The 0.44.0 doublet defect: pace message N, and while sleeping message N+1 lands → a
+    separate wake replies to N+1, one turn behind. The settle loop re-reads after the sleep;
+    a newer peer AI restarts the pace on it, so this one wake reacts to the settled newest.
+    """
+    scripted = ScriptedMessages(platform, peer_ai_message(uuid=M0, body="first from Brain"))
+    sleep = RecordingSleep()
+
+    # Brain's second message lands during the FIRST read-pace; the second read-pace is quiet.
+    def recording_then_arrive(seconds):
+        sleep(seconds)
+        if len(sleep.calls) == 1:
+            scripted.arrive(peer_ai_message(uuid=M1, body="and a follow-up from Brain"))
+
+    pacer = ReadPacer(clock=lambda: PACE_CREATED, sleep=recording_then_arrive)
+    agent, provider = build_wake(tmp_path, HookedProvider(), pacer=pacer)
+
+    posted = agent.wake()
+
+    assert len(sleep.calls) == 2  # paced M0, a newer AI landed → restarted, paced M1, then settled
+    # One batched reply to BOTH of Brain's messages — not a doublet.
+    assert len(posted) == 1
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] briggs: first from Brain\n"
+        "[2026-06-04T00:00:00.000Z] briggs: and a follow-up from Brain"
+    ]
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # mark past the newest arrival
+
+
+def test_a_human_arriving_during_the_read_settles_immediately(platform, tmp_path):
+    """A human message landing during the read-pace ends the settle at once — respond now.
+
+    The settle only restarts for a newer *AI*; a human arrival breaks the loop (folded into the
+    batch), so a human "STOP!" during an AI read is answered without another read-delay.
+    """
+    scripted = ScriptedMessages(platform, peer_ai_message(uuid=M0, body="a long AI message"))
+    sleep = RecordingSleep()
+
+    def recording_then_arrive(seconds):
+        sleep(seconds)
+        if len(sleep.calls) == 1:
+            scripted.arrive(message(uuid=M1, body="STOP!"))  # john, human
+
+    pacer = ReadPacer(clock=lambda: PACE_CREATED, sleep=recording_then_arrive)
+    agent, provider = build_wake(tmp_path, HookedProvider(), pacer=pacer)
+
+    posted = agent.wake()
+
+    assert len(sleep.calls) == 1  # the human arrival settled it — no second read-pace
+    assert len(posted) == 1
+    assert provider.prompts == [
+        "[2026-06-04T00:00:00.000Z] briggs: a long AI message\n"
+        "[2026-06-04T00:00:00.000Z] john: STOP!"
+    ]
+
+
+# --- Loop 2: the mid-generation staleness guard -------------------------------
+
+
+def test_a_message_arriving_during_generation_triggers_a_rebuild(platform, tmp_path):
+    """A message landing *during* the model call folds into the batch and the reply regenerates.
+
+    The generation window: the LLM call itself takes seconds, and a message that lands while it
+    runs would otherwise be answered-over. Loop 2 re-reads after generating; a fresh message
+    triggers a rebuild that seeds it before the reply posts.
+    """
+    scripted = ScriptedMessages(platform, message(uuid=M0, body="original question"))
+
+    def on_chat(call_index):
+        if call_index == 1:  # a message lands during the first generation
+            scripted.arrive(message(uuid=M1, body="wait, also this"))
+
+    agent, provider = build_wake(tmp_path, HookedProvider(on_chat=on_chat))
+
+    posted = agent.wake()
+
+    assert len(provider.prompts) == 2  # generated once, saw the new message, rebuilt once
+    assert provider.prompts[1] == (
+        "[2026-06-04T00:00:00.000Z] john: original question\n"
+        "[2026-06-04T00:00:00.000Z] john: wait, also this"
+    )  # the rebuild folded the mid-generation arrival in
+    assert len(posted) == 1  # still ONE post — the settled reply
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+
+
+def test_no_mid_generation_arrival_is_a_single_build(platform, tmp_path):
+    """The steady case: nothing arrives during generation → one build, one post, no rebuild."""
+    ScriptedMessages(platform, message(uuid=M0, body="just this"))
+    agent, provider = build_wake(tmp_path, HookedProvider())
+
+    posted = agent.wake()
+
+    assert len(provider.prompts) == 1  # no rebuild
+    assert len(posted) == 1
+
+
+def test_the_max_builds_cap_posts_unconditionally_and_leaves_the_last_arrival_unseen(
+    platform, tmp_path
+):
+    """A message on *every* build would rebuild forever; `MAX_BUILDS` caps it and posts as-is.
+
+    The Nth build is posted with no staleness check after it, so the burst can't stall the
+    reply. The message that lands during that final build is left **unseen** (mark not advanced
+    past it, not claimed), so it drives the next wake rather than being lost.
+    """
+    scripted = ScriptedMessages(platform, message(uuid=M0, body="q0"))
+    arrivals = [M1, M2, M3]
+
+    def on_chat(call_index):
+        # A new message lands during every generation, so staleness never clears on its own.
+        scripted.arrive(message(uuid=arrivals[call_index - 1], body=f"q{call_index}"))
+
+    agent, provider = build_wake(tmp_path, HookedProvider(on_chat=on_chat))  # default max_builds=3
+
+    posted = agent.wake()
+
+    assert len(provider.prompts) == 3  # capped at MAX_BUILDS, not spinning
+    assert len(posted) == 1  # the 3rd build posted unconditionally
+    # M1 and M2 (arrived during builds 1 and 2) were folded and marked; M3 (during build 3)
+    # was left unseen for the next wake.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M3, kind="messages") is True  # M3 unclaimed
+
+
+def test_a_human_message_during_generation_triggers_a_rebuild_all_senders(platform, tmp_path):
+    """Loop 2 counts ALL senders: a human interjection mid-generation rebuilds too (not AI-only).
+
+    Loop 1 is AI-only (watchability); Loop 2 is correctness, so a human message landing during
+    generation must be seen before the agent answers — the "human posts STOP! mid-reply" case.
+    """
+    scripted = ScriptedMessages(platform, message(uuid=M0, body="a human question"))  # john
+
+    def on_chat(call_index):
+        if call_index == 1:
+            scripted.arrive(message(uuid=M1, body="actually, never mind"))  # another human
+
+    agent, provider = build_wake(tmp_path, HookedProvider(on_chat=on_chat))
+
+    agent.wake()
+
+    assert len(provider.prompts) == 2  # the human arrival triggered a rebuild
+    assert "actually, never mind" in provider.prompts[1]
+
+
+def test_disabling_pacing_skips_both_loops(platform, tmp_path):
+    """`HARNESS_PACE_ENABLED=false` disables all of it: no read-pace, no staleness rebuild.
+
+    The batch reply (the substrate) still stands, but Loop 1 never sleeps and Loop 2 does a
+    single build even if a message lands during generation.
+    """
+    scripted = ScriptedMessages(platform, peer_ai_message(uuid=M0, body="x" * 510))
+
+    def on_chat(call_index):
+        scripted.arrive(peer_ai_message(uuid=M1, body="landed during generation"))
+
+    sleep = RecordingSleep()
+    disabled = ReadPacer(enabled=False, clock=lambda: PACE_CREATED, sleep=sleep)
+    agent, provider = build_wake(tmp_path, HookedProvider(on_chat=on_chat), pacer=disabled)
+
+    posted = agent.wake()
+
+    assert sleep.calls == []  # Loop 1 skipped — no read-pace
+    assert len(provider.prompts) == 1  # Loop 2 collapsed to a single build — no rebuild
+    assert len(posted) == 1
+    # The message that arrived during the one build is left unseen for the next wake.
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is True
+
+
+def test_max_builds_of_one_never_rebuilds(platform, tmp_path):
+    """`max_builds=1` collapses Loop 2 to the pre-#226 single-shot even with pacing enabled."""
+    scripted = ScriptedMessages(platform, message(uuid=M0, body="q0"))
+
+    def on_chat(call_index):
+        scripted.arrive(message(uuid=M1, body="q1"))
+
+    agent, provider = build_wake(tmp_path, HookedProvider(on_chat=on_chat), max_builds=1)
+
+    posted = agent.wake()
+
+    assert len(provider.prompts) == 1  # one build, posted unconditionally
+    assert len(posted) == 1
+
+
+# --- review hardening: tool side effects, probe acks, settle cap, orphan claims ---
+
+
+class _ArrivingTool(Tool):
+    """A tool that makes a message 'arrive' when it runs — to prove a tool-using build is not
+    rolled back and re-fired by the Loop-2 staleness rebuild."""
+
+    name = "poke"
+    description = "A no-op tool used only to prove a tool-using build isn't rolled back."
+
+    def __init__(self, scripted, wire_message):
+        self.scripted = scripted
+        self.wire_message = wire_message
+        self.runs = 0
+
+    def run(self, **kwargs):
+        self.runs += 1
+        self.scripted.arrive(self.wire_message)  # a message lands during the tool-using build
+        return "poked"
+
+
+class _ToolThenReplyProvider:
+    """First chat of a build → a tool call; the next → the final text. So one build runs a tool."""
+
+    def __init__(self, tool_name):
+        self.tool_name = tool_name
+        self.chats = 0
+
+    def chat(self, messages, tools=None):
+        self.chats += 1
+        if self.chats == 1:
+            return Message.assistant(
+                tool_calls=[ToolCall(id="c1", name=self.tool_name, arguments={})]
+            )
+        return Message.assistant(content="done")
+
+
+def test_a_tool_using_build_is_not_rolled_back_when_a_message_arrives(platform, tmp_path):
+    """A build that ran a tool has committed irreversible side effects → it is posted, never rebuilt.
+
+    The Loop-2 rollback erases only the transcript, not a tool's real effects (a posted image, a
+    sent message). So a build whose span contains a tool turn must NOT be rolled back and
+    regenerated — otherwise the tool fires twice for one request. Here the tool itself makes a
+    message arrive mid-build; the wake must still run it exactly once.
+    """
+    scripted = ScriptedMessages(platform, message(uuid=M0, body="do a thing"))
+    tool = _ArrivingTool(scripted, message(uuid=M1, body="landed during the tool call"))
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(_ToolThenReplyProvider("poke"), tools=[tool], home=tmp_path)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+
+    posted = agent.wake()
+
+    assert tool.runs == 1  # the tool fired exactly once — no rollback+rebuild re-fired it
+    assert len(posted) == 1  # the single reply posted
+    # M1 arrived during the tool-using build → left unseen for the next wake (not folded/rebuilt).
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is True
+
+
+def test_a_probe_arriving_during_generation_is_acked_this_wake(platform, tmp_path):
+    """A NOC probe landing mid-generation is acked THIS wake — its heartbeat stays sub-second.
+
+    Loop 2 re-reads after generating; even when the only fresh item is a probe (not a peer, so
+    no rebuild), it is absorbed and acked here rather than deferred to a later wake that may be
+    serialized behind this one.
+    """
+    scripted = ScriptedMessages(platform, message(uuid=M0, body="a question"))  # human
+
+    def on_chat(call_index):
+        if call_index == 1:
+            body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
+            scripted.arrive(peer_ai_message(uuid=M1, body=body))
+
+    agent, provider = build_wake(
+        tmp_path, HookedProvider(on_chat=on_chat), probe_secret=PROBE_SECRET
+    )
+
+    agent.wake()
+
+    assert len(provider.prompts) == 1  # a lone probe is not a peer → no rebuild
+    bodies = [
+        json.loads(call.request.content)["message"]["body"]
+        for call in platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls
+    ]
+    assert f"BCNOC1-ACK {PROBE_NONCE}" in bodies  # the probe was acked, not deferred
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # and marked, so it is not re-acked
+
+
+def test_the_settle_loop_is_bounded_by_max_builds(platform, tmp_path):
+    """Loop 1 cannot hold the wake forever: a peer AI posting on every read caps at max_builds.
+
+    With 3+ AI peers (or a peer whose own pacing is off) a newer AI message can land during
+    every read window; an uncapped settle would hold the router lock indefinitely. The restart
+    count is bounded by max_builds, after which the wake proceeds to generate.
+    """
+    counter = {"n": 0}
+    scripted = ScriptedMessages(platform, peer_ai_message(uuid=M0, body="msg 0"))
+    later = [M1, M2, M3, REPLY, "019e7756-aaaa-7aaa-8aaa-aaaaaaaaaaaa"]
+
+    def recording_then_arrive(seconds):
+        sleep(seconds)
+        counter["n"] += 1
+        # A newer peer AI lands during EVERY read window — the settle would never converge.
+        if counter["n"] <= len(later):
+            scripted.arrive(
+                peer_ai_message(uuid=later[counter["n"] - 1], body=f"msg {counter['n']}")
+            )
+
+    sleep = RecordingSleep()
+    pacer = ReadPacer(clock=lambda: PACE_CREATED, sleep=recording_then_arrive)
+    agent, provider = build_wake(tmp_path, HookedProvider(on_chat=None), pacer=pacer, max_builds=3)
+
+    posted = agent.wake()
+
+    # The settle read-paces at most `max_builds` (3) times, then the cap stops it — a runaway
+    # room can no longer hold the wake forever (without the cap this would loop indefinitely).
+    assert len(sleep.calls) == 3
+    assert len(posted) == 1  # it still posts one batched reply
+
+
+def test_bootstrap_does_not_livelock_on_an_orphaned_claim(platform, tmp_path):
+    """A first-wake message whose claim was orphaned by a crashed prior wake must not re-bootstrap
+    forever: the mark baselines to the newest so the timeline moves on (#226 regression guard).
+
+    Simulate the orphan by pre-claiming M0 with a separate ClaimStore (a dead wake that claimed
+    but crashed before marking). This wake finds no mark (still bootstrap), loses the claim, and
+    must still baseline the mark rather than leave it None and re-bootstrap on every future wake.
+    """
+    ClaimStore(tmp_path).claim(TIMELINE_UUID, M0, kind="messages")  # a dead wake's orphaned claim
+    serve_messages(platform, page(message(uuid=M0, body="unanswerable — claim is orphaned")))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake()
+
+    assert posted == []  # the claim is lost, so nothing is answered this wake
+    assert provider.prompts == []  # the model was never engaged
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # BUT the mark baselined → no re-bootstrap
+
+    # A second wake is now a normal incremental one (mark present) and cleanly does nothing.
+    serve_messages(platform, page(message(uuid=M0, body="unanswerable — claim is orphaned")))
+    second, second_provider = build_wake(tmp_path)
+    assert second.wake() == []
+    assert second_provider.prompts == []
+
+
+def test_pace_max_builds_env_tunable(monkeypatch):
+    """`HARNESS_PACE_MAX_BUILDS` overrides the default (3); blank → default; non-positive → 1."""
+    monkeypatch.delenv("HARNESS_PACE_MAX_BUILDS", raising=False)
+    assert _pace_max_builds_from_env() == 3  # the real default
+
+    monkeypatch.setenv("HARNESS_PACE_MAX_BUILDS", "5")
+    assert _pace_max_builds_from_env() == 5
+
+    monkeypatch.setenv("HARNESS_PACE_MAX_BUILDS", "")  # blank → default
+    assert _pace_max_builds_from_env() == 3
+
+    monkeypatch.setenv("HARNESS_PACE_MAX_BUILDS", "0")  # floored to 1 (the loop always runs once)
+    assert _pace_max_builds_from_env() == 1
 
 
 def test_parse_created_at_handles_z_suffix_and_naive_stamps():

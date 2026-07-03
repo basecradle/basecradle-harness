@@ -224,7 +224,18 @@ def platform():
 
 
 def _serve_messages(platform, *pages):
-    platform.get("/messages").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
+    """Serve the newest-first message list; the LAST page repeats for every read.
+
+    A #226 message wake reads the list several times per turn (initial gather + Loop-1 settle +
+    Loop-2 staleness re-checks), so the given pages are served once in order and the last one
+    repeats — a re-read after the mark advanced yields nothing newer.
+    """
+    queue = [httpx.Response(200, json=p) for p in pages]
+
+    def _serve(request):
+        return queue.pop(0) if len(queue) > 1 else queue[0]
+
+    platform.get("/messages").mock(side_effect=_serve)
 
 
 def _wake(home, memory_provider):
@@ -239,11 +250,13 @@ def _wake(home, memory_provider):
     )
 
 
-def test_observe_fires_after_each_exchange(platform, tmp_path):
-    """Two unseen peer messages → the provider observes two exchanges, user + reply intact.
+def test_observe_fires_once_for_a_batched_exchange(platform, tmp_path):
+    """Two unseen peer messages → ONE batched exchange → the provider observes it once (#226).
 
     A prior self-post is the oldest message, so the first-wake split replies to *everything*
-    after it (both peer messages), not just the newest — exercising observe across a batch.
+    after it (both peer messages). Under the #226 many-to-one batch reply that is a single
+    exchange — both incoming messages seeded as one turn, one reply — so `observe` fires once,
+    with both messages in `user` and the single reply in `assistant`.
     """
     _serve_messages(
         platform,
@@ -261,13 +274,13 @@ def test_observe_fires_after_each_exchange(platform, tmp_path):
 
     agent.wake()
 
-    assert len(provider.observed) == 2
-    first, second = provider.observed
-    assert "First?" in first.user and first.assistant == "Hello, John."
-    assert "Second?" in second.user
+    assert len(provider.observed) == 1  # one exchange for the whole batch
+    (exchange,) = provider.observed
+    assert "First?" in exchange.user and "Second?" in exchange.user  # both, oldest-first
+    assert exchange.assistant == "Hello, John."  # the single batched reply
     # Scope is the agent identity, with the timeline as metadata (cross-timeline memory).
-    assert first.scope.agent == NOVA_UUID
-    assert first.scope.timeline == TIMELINE_UUID
+    assert exchange.scope.agent == NOVA_UUID
+    assert exchange.scope.timeline == TIMELINE_UUID
 
 
 def test_context_is_injected_into_the_turn0_brief(platform, tmp_path):
@@ -304,6 +317,26 @@ def test_a_self_skip_does_not_observe(platform, tmp_path):
     agent.wake()
 
     assert provider.observed == []
+
+
+def test_an_empty_model_reply_does_not_observe(platform, tmp_path):
+    """A whitespace-only model reply posts nothing, so observe records no junk exchange (#226).
+
+    The batch reply guards `_observe` behind `reply.strip()` exactly as the pre-#226 per-message
+    path did — otherwise a no-op model turn would write an empty-`assistant` exchange into memory
+    that then rides back into recall through the provider's `context` hook.
+    """
+    _serve_messages(platform, {"messages": [_message(uuid=M0, body="hi")], "next_cursor": None})
+    provider = RecordingProvider()
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(_CannedModel(text="   "), home=tmp_path)  # whitespace-only reply
+    agent = WakeAgent(
+        harness, timeline=TIMELINE_UUID, client=client, onboard=True, memory_provider=provider
+    )
+
+    agent.wake()
+
+    assert provider.observed == []  # no post, no observed exchange
 
 
 def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):

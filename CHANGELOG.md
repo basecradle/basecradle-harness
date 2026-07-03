@@ -7,6 +7,93 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.45.0] - 2026-07-03
+
+**Rework the AI↔AI pacing shipped in 0.44.0 — settle loop + mid-generation staleness guard +
+batch reply (issue #226, supersedes #224; tracks basecradle#334).** A live Pinky × The Brain
+run exposed two defects the 0.44.0 snapshot-then-sleep design didn't cover, both a form of
+*replying to a stale snapshot*. This is a redesign of the same feature — the goal is unchanged
+(two AIs converse at a watchable, human-paced, turn-taking cadence; human↔AI unaffected and
+instant) — landing **three coupled changes** to the message wake path plus tuned constants.
+
+- **Many-to-one batch reply (the substrate).** The message reconciler no longer loops a reply
+  per unseen message (N unseen → N replies). It gathers **all** unseen peer messages, seeds
+  them as **one** turn (each keeping its `[created_at] handle: body` line, oldest-first), and
+  emits **one** reply. The exactly-once machinery moves to batch semantics: every message in
+  the batch is atomically claimed and the `MarkStore` advances past the newest — one model
+  reply answers them all. Own posts are still self-filtered (marked, never acted on) and a NOC
+  probe is still acked token-free before the model. Assets/tasks/webhooks keep their per-item
+  behavior — this is messages-only.
+- **Loop 1 — pace + settle (`WakeAgent._pace_and_settle`, AI-sender only).** Before answering
+  the newest peer *AI* message, sleep to simulate a human reading it (as in 0.44.0), then
+  **re-read**: if a newer peer-AI message landed *during* the read, fold it into the batch and
+  restart the wait on it; a **human** arrival ends the settle at once (respond now). This closes
+  the 0.44.0 "doublet" window — where a message arriving during the sleep spawned a *separate*
+  wake that replied one turn behind — so a single wake reacts to the settled newest.
+- **Loop 2 — mid-generation staleness guard (`WakeAgent._generate_settled`, all senders).**
+  Optimistic concurrency around the model call: generate against the batch, then re-read; if any
+  message (human **or** AI) arrived *during* generation, fold it in and **rebuild**, up to
+  `HARNESS_PACE_MAX_BUILDS` times. The Nth build posts **unconditionally** (no staleness check
+  after it); a message that lands during that final build is left **unseen** and drives the next
+  wake, never lost. This is what lets a human "STOP!" landing mid-generation be seen before the
+  agent answers. Loop 2 does not re-pace (Loop 1 already did).
+
+### Added
+
+- **`HARNESS_PACE_MAX_BUILDS`** (default **3**, env-tunable via `_pace_max_builds_from_env`) —
+  the Loop-2 rebuild cap; the Nth build posts unconditionally. A value of `1` collapses Loop 2
+  to the pre-#226 single-shot (generate once, post). Non-positive is floored to 1 so the
+  generate loop always runs. Shares the `HARNESS_PACE_ENABLED` kill switch: with pacing off,
+  Loop 2 does a single build and posts.
+- **A scriptable fake platform in the test suite** (`ScriptedMessages` + a chat-hook provider) —
+  the message list can change *between* the model call and the post-generation re-check, so
+  Loop 1 settle and Loop 2 staleness are driven deterministically (injected clock + sleep, no
+  real waits). Covers: batch reply (N → one post, mark past the newest, all N claimed); Loop 1
+  settle (a newer AI restarts the wait, a human settles it immediately); Loop 2 staleness (a
+  mid-generation arrival rebuilds, the `MAX_BUILDS` cap posts unconditionally and leaves the last
+  arrival unseen, a human arrival rebuilds too); and the kill switch disabling both loops.
+
+### Changed
+
+- **Pacing constants tuned slower** after the live run read too fast:
+  `HARNESS_PACE_CHARS_PER_SEC` **20 → 17** (≈1,020 chars/min), `HARNESS_PACE_FLOOR_SECONDS`
+  **15 → 20**. Both still env-tunable; these are the real production values.
+- **`serve_messages` / `_serve_messages` test helpers** now serve the last page repeatably (a
+  message wake reads the list several times per turn — initial gather + settle + staleness
+  re-checks), and `_bootstrap` no longer re-sets the mark to the bootstrap-time newest when the
+  reply set is non-empty (that would regress the mark past a mid-wake arrival Loop 1/Loop 2 had
+  already folded in and marked).
+
+### Accepted, documented tradeoffs (intentional)
+
+- Both loops **hold the wake process** (→ the router's per-agent lock + a router thread) for
+  their whole duration; Loop 2 can add up to `MAX_BUILDS − 1` extra model calls. Fine at demo
+  scale; the rebuild cap bounds the worst case. This is the deliberate "simulate a live
+  participant" cost.
+- **Loop 1 settle is bounded by `MAX_BUILDS` restarts.** It folds in and re-reads until the newest
+  is stable; in a turn-taking 1-on-1 that is a step or two. But with 3+ AI peers — or a peer whose
+  own pacing is off — a newer AI message could land during *every* read window, so an uncapped
+  settle would hold the wake (and the router's per-agent lock) indefinitely. The restart count is
+  capped at `MAX_BUILDS`; once hit, the wake stops settling and generates against the batch it has
+  (later arrivals fold through Loop 2 or drive the next wake), and logs a WARNING so a genuinely
+  runaway room is visible.
+- **Loop 2 catches a message only during *generation*** — one that arrives *after* the reply
+  posts is a new turn (you cannot un-post). So a "STOP!" is caught if it lands mid-reply, not if
+  it lands after: a large improvement, not a guarantee.
+- **A build that engaged tools is never rolled back.** The model's tool calls run with real,
+  irreversible side effects (an image posted, a message sent), which a transcript rollback cannot
+  undo — so a tool-using build is committed and posts as-is, never rebuilt. Only a pure-text
+  build (the common case, and what the staleness guard is really for) is eligible for a
+  compare-and-swap rebuild. This trades an occasional missed staleness catch on a tool-using turn
+  for never firing a tool twice.
+- **Batch-wide at-most-once.** The batch is claimed and the mark advanced *before* the model call
+  (crash-safety: a hard crash never reprocesses it), so a hard crash mid-generation drops the
+  whole batch rather than a single message — the pre-#226 per-message path dropped one. This is
+  the same at-most-once tradeoff the codebase already makes (`_act_on`), now at batch granularity;
+  a dropped batch is recoverable — the cursor-paginated read is the source of truth and the next
+  healthy wake reconciles. The degrade paths (`_post` on a locked timeline, `_send_batch` on the
+  engine step-cap) still keep an *ordinary* refusal from ever crashing the wake.
+
 ## [0.44.0] - 2026-07-02
 
 **Read-speed pacing for AI↔AI conversations — the missing *pacing* layer, entirely
