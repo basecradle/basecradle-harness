@@ -16,6 +16,7 @@ import base64
 import hmac
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from types import SimpleNamespace
 
@@ -30,12 +31,13 @@ from basecradle_harness import (
     Harness,
     MarkStore,
     Message,
+    ReadPacer,
     SeenStore,
     WakeAgent,
     WakeBreaker,
     install,
 )
-from basecradle_harness._basecradle import _incoming_text
+from basecradle_harness._basecradle import _incoming_text, _parse_created_at
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._wake import (
     _BREAKER_RESET_ALERT,
@@ -44,6 +46,9 @@ from basecradle_harness._wake import (
     _incoming_asset_text,
     _incoming_event_text,
     _now_line,
+    _pace_chars_per_sec_from_env,
+    _pace_enabled_from_env,
+    _pace_floor_seconds_from_env,
     main,
     resolved_config,
 )
@@ -2169,3 +2174,319 @@ def test_activated_task_is_timestamped():
     text = _activated_task_text(task)
     assert text.startswith(f"[{TS}] A task you scheduled has activated")
     assert "scheduled for 2026-06-11T06:00:00+00:00" in text  # complementary, retained
+
+
+# --- read-speed pacing for AI↔AI conversations (issue #224) ------------------
+#
+# Before a wake answers a PEER AI's message it sleeps to simulate a human reading
+# that message (`ReadPacer`), so an AI↔AI exchange is watchable and stays under the
+# wake-breaker's trip line. Entirely receiver-side and derived from data the wake
+# already fetches (the newest message's author `kind`, `body` length, `created_at`).
+# Human messages are unaffected (instant). These tests inject a fake clock and a
+# recording no-op sleep, so they assert the COMPUTED delay and never actually wait.
+
+# A distinct peer AI (not the agent, not the human) — pacing's one target kind.
+PEER_AI_UUID = "019e7756-9f60-7a80-93a4-6f7081920314"
+
+# The fixtures' `created_at` is `2026-06-04T00:00:00.000Z`; a clock pinned to that same
+# instant makes a message's age exactly 0, so the paced delay is the full read-time.
+PACE_CREATED = datetime(2026, 6, 4, 0, 0, 0, tzinfo=timezone.utc)
+
+
+class RecordingSleep:
+    """A no-op stand-in for `time.sleep` that records every requested duration."""
+
+    def __init__(self):
+        self.calls: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.calls.append(seconds)
+
+
+def _pace_msg(body, *, kind="ai", created_at="2026-06-04T00:00:00.000Z"):
+    """A minimal message object with the three fields the pacer reads."""
+    return SimpleNamespace(
+        user=SimpleNamespace(kind=kind),
+        content=SimpleNamespace(body=body),
+        created_at=created_at,
+    )
+
+
+def _pacer(*, now=PACE_CREATED, **kwargs):
+    """A `ReadPacer` with a fixed clock and a recording sleep; returns (pacer, sleep)."""
+    sleep = RecordingSleep()
+    return ReadPacer(clock=lambda: now, sleep=sleep, **kwargs), sleep
+
+
+def peer_ai_message(*, uuid, body, created_at="2026-06-04T00:00:00.000Z"):
+    """A wire message authored by a *different* AI peer — the kind pacing acts on."""
+    return {
+        "type": "message",
+        "created_at": created_at,
+        "user": {"uuid": PEER_AI_UUID, "handle": "briggs", "name": "Briggs", "kind": "ai"},
+        "timeline": {"uuid": TIMELINE_UUID},
+        "content": {"uuid": uuid, "body": body},
+    }
+
+
+# --- the ReadPacer math, in isolation (fake clock + recording sleep) ----------
+
+
+def test_peer_ai_message_is_paced_for_its_read_time():
+    """A peer AI's message → sleep(max(floor, chars/rate) - age); here age 0, 400 chars → 20s."""
+    pacer, sleep = _pacer()
+    slept = pacer.pace(_pace_msg("x" * 400))  # 400 / 20 chars-per-sec = 20s, above the 15s floor
+
+    assert slept == 20.0
+    assert sleep.calls == [20.0]
+
+
+def test_the_floor_applies_to_a_very_short_message():
+    """A one-word peer-AI reply reads in a blink, but the 15s floor keeps it human-paced."""
+    pacer, sleep = _pacer()
+    slept = pacer.pace(_pace_msg("ok"))  # 2 / 20 = 0.1s → clamped up to the 15s floor
+
+    assert slept == 15.0
+    assert sleep.calls == [15.0]
+
+
+def test_delay_scales_with_message_length():
+    """Twice the characters → twice the read-time (above the floor), a true length scaling."""
+    short, short_sleep = _pacer()
+    long, long_sleep = _pacer()
+
+    assert short.pace(_pace_msg("x" * 400)) == 20.0  # 400 / 20
+    assert long.pace(_pace_msg("x" * 800)) == 40.0  # 800 / 20 — proportionally longer
+    assert short_sleep.calls == [20.0]
+    assert long_sleep.calls == [40.0]
+
+
+def test_age_is_subtracted_so_only_the_remainder_is_waited():
+    """LOAD-BEARING `- age`: a message already 5s old owes only the remaining 15s of its 20s read."""
+    pacer, sleep = _pacer(now=PACE_CREATED.replace(second=5))  # message aged 5s since it appeared
+    slept = pacer.pace(_pace_msg("x" * 400))  # target 20s, age 5s → wait 15s
+
+    assert slept == 15.0
+    assert sleep.calls == [15.0]
+
+
+def test_a_message_older_than_its_read_time_is_not_paced():
+    """When age >= target the remainder clamps to 0 — no sleep (the 'quicker across timelines' case)."""
+    pacer, sleep = _pacer(now=PACE_CREATED.replace(minute=5))  # 300s old, far past a 20s read
+    slept = pacer.pace(_pace_msg("x" * 400))
+
+    assert slept == 0.0
+    assert sleep.calls == []  # never slept
+
+
+def test_a_negative_age_is_clamped_so_the_delay_never_exceeds_the_read_time():
+    """LOAD-BEARING clamp: a future-dated stamp / lagging box clock must not inflate the sleep."""
+    # The box clock is 5 minutes behind the message's `created_at` → age is -300s. Unclamped,
+    # `target - age` would be 320s; clamped, the message owes only its full 20s read-time.
+    pacer, sleep = _pacer(now=PACE_CREATED - timedelta(minutes=5))
+    slept = pacer.pace(_pace_msg("x" * 400))
+
+    assert slept == 20.0  # target, never target + skew
+    assert sleep.calls == [20.0]
+
+
+def test_a_human_message_is_never_paced():
+    """The `kind == 'ai'` gate is the whole opt-in: a human peer gets an instant reply."""
+    pacer, sleep = _pacer()
+    slept = pacer.pace(_pace_msg("What's the status?", kind="human"))
+
+    assert slept == 0.0
+    assert sleep.calls == []
+
+
+def test_no_message_is_never_paced():
+    """A wake with no message to answer (asset/task/webhook only) passes None → no sleep."""
+    pacer, sleep = _pacer()
+
+    assert pacer.pace(None) == 0.0
+    assert sleep.calls == []
+
+
+def test_a_disabled_pacer_never_sleeps():
+    """`enabled=False` (the kill switch) short-circuits even a long peer-AI message."""
+    pacer, sleep = _pacer(enabled=False)
+
+    assert pacer.pace(_pace_msg("x" * 400)) == 0.0
+    assert sleep.calls == []
+
+
+def test_a_nonpositive_rate_degrades_to_the_floor():
+    """A misconfigured rate of 0 can't divide; it degrades to 'always the floor', never a crash."""
+    pacer, sleep = _pacer(chars_per_sec=0)
+
+    assert pacer.pace(_pace_msg("x" * 400)) == 15.0  # falls back to the floor, no ZeroDivisionError
+    assert sleep.calls == [15.0]
+
+
+# --- pacing wired through a real wake (the reply path) ------------------------
+
+
+def test_a_wake_paces_before_answering_a_peer_ai(platform, tmp_path):
+    """End-to-end: a peer AI's message is read-paced, then answered exactly as today."""
+    serve_messages(platform, page(peer_ai_message(uuid=M0, body="x" * 400)))
+    pacer, sleep = _pacer()
+    agent, provider = build_wake(tmp_path, pacer=pacer)
+
+    posted = agent.wake()
+
+    assert sleep.calls == [20.0]  # paced the peer AI's 400-char message
+    assert len(posted) == 1  # then replied as normal
+    assert len(provider.prompts) == 1
+
+
+def test_a_wake_answering_a_human_does_not_pace(platform, tmp_path):
+    """The existing human path is byte-for-byte unchanged — no sleep, instant reply."""
+    serve_messages(platform, page(message(uuid=M0, body="What's the status?")))  # john, human
+    pacer, sleep = _pacer()
+    agent, provider = build_wake(tmp_path, pacer=pacer)
+
+    agent.wake()
+
+    assert sleep.calls == []
+
+
+def test_own_newest_message_is_not_paced(platform, tmp_path):
+    """If the newest answered message is the agent's own, it self-filters out → no pacing."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    # Newer than the mark, but authored by the agent (mine=True) — self-filtered before the gate.
+    serve_messages(
+        platform, page(message(uuid=M1, body="x" * 400, mine=True), message(uuid=M0, body="old"))
+    )
+    pacer, sleep = _pacer()
+    agent, provider = build_wake(tmp_path, pacer=pacer)
+
+    agent.wake()
+
+    assert sleep.calls == []  # nothing non-self to react to → no read-pace
+    assert provider.prompts == []  # and the own message is self-skipped, not answered
+
+
+def test_a_task_only_wake_does_not_pace(platform, tmp_path):
+    """Pacing is message-scoped: an asset/task/webhook-only wake never sleeps."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)  # messages already caught up → nothing to answer
+    serve_messages(platform, page(message(uuid=M0, body="old")))
+    serve_tasks(platform, task_page(task(uuid=T0, instructions="post the daily summary")))
+    pacer, sleep = _pacer()
+    agent, provider = build_wake(tmp_path, pacer=pacer)
+
+    agent.wake()
+
+    assert sleep.calls == []  # the task path never routes through the paced message reply
+
+
+def test_a_signed_probe_is_not_paced(platform, tmp_path):
+    """A NOC probe must stay a sub-second token-free ack — pacing is skipped even from an AI peer."""
+    body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
+    serve_messages(platform, page(peer_ai_message(uuid=M0, body=body)))  # AI-authored probe
+    pacer, sleep = _pacer()
+    agent, provider = build_wake(tmp_path, pacer=pacer, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert sleep.calls == []  # the heartbeat is never delayed by the read-pace
+    assert len(posted) == 1  # the ack still went out
+    assert provider.prompts == []  # still token-free — the model never ran
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert json.loads(sent.content) == {"message": {"body": f"BCNOC1-ACK {PROBE_NONCE}"}}
+
+
+def test_a_probe_earlier_in_the_batch_still_skips_pacing(platform, tmp_path):
+    """A probe that is NOT the newest item still skips pacing — its ack must stay sub-second.
+
+    The sleep precedes `_act_on`, which acks every message in the batch; a probe older than a
+    real peer-AI message would otherwise have its ack delayed by pacing the newer message. So
+    *any* probe in the batch short-circuits pacing for the wake.
+    """
+    # A mark older than both served messages, so the batch is [probe (older), peer-AI (newer)].
+    MarkStore(tmp_path).set(TIMELINE_UUID, "019e7740-0000-7000-8000-000000000000")
+    body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
+    serve_messages(
+        platform,
+        page(
+            peer_ai_message(uuid=M1, body="a real reply that would otherwise be paced"),
+            peer_ai_message(uuid=M0, body=body),  # older — the probe, not the newest item
+        ),
+    )
+    pacer, sleep = _pacer()
+    agent, provider = build_wake(tmp_path, pacer=pacer, probe_secret=PROBE_SECRET)
+
+    agent.wake()
+
+    assert sleep.calls == []  # a probe anywhere in the batch → no pacing, heartbeat preserved
+
+
+def test_pacing_never_crashes_the_wake_on_a_bad_timestamp(platform, tmp_path):
+    """A malformed `created_at` degrades pacing to no delay — it must never kill the wake (B2)."""
+    serve_messages(
+        platform, page(peer_ai_message(uuid=M0, body="x" * 400, created_at="not-a-timestamp"))
+    )
+    pacer, sleep = _pacer()
+    agent, provider = build_wake(tmp_path, pacer=pacer)
+
+    posted = agent.wake()  # must not raise despite the unparseable stamp
+
+    assert sleep.calls == []  # pacing degraded to no delay
+    assert len(posted) == 1  # the wake still answered the message normally
+
+
+# --- env tunables and the parse helper ---------------------------------------
+
+
+def test_pace_is_enabled_by_default_and_env_can_disable_it(monkeypatch):
+    """`HARNESS_PACE_ENABLED` is on unless explicitly off (mirrors HARNESS_ONBOARD)."""
+    monkeypatch.delenv("HARNESS_PACE_ENABLED", raising=False)
+    assert _pace_enabled_from_env() is True  # unset → on
+
+    monkeypatch.setenv("HARNESS_PACE_ENABLED", "false")
+    assert _pace_enabled_from_env() is False
+
+    monkeypatch.setenv("HARNESS_PACE_ENABLED", "off")
+    assert _pace_enabled_from_env() is False
+
+    monkeypatch.setenv("HARNESS_PACE_ENABLED", "")  # blank → still on (only explicit off disables)
+    assert _pace_enabled_from_env() is True
+
+
+def test_pace_env_tunables_override_the_defaults(monkeypatch):
+    """`HARNESS_PACE_CHARS_PER_SEC`/`_FLOOR_SECONDS` override the real defaults; blank → default."""
+    monkeypatch.delenv("HARNESS_PACE_CHARS_PER_SEC", raising=False)
+    monkeypatch.delenv("HARNESS_PACE_FLOOR_SECONDS", raising=False)
+    assert _pace_chars_per_sec_from_env() == 20.0  # the real default
+    assert _pace_floor_seconds_from_env() == 15.0
+
+    monkeypatch.setenv("HARNESS_PACE_CHARS_PER_SEC", "50")
+    monkeypatch.setenv("HARNESS_PACE_FLOOR_SECONDS", "3")
+    assert _pace_chars_per_sec_from_env() == 50.0
+    assert _pace_floor_seconds_from_env() == 3.0
+
+    # from_env threads them into a live pacer.
+    pacer = ReadPacer.from_env(clock=lambda: PACE_CREATED, sleep=RecordingSleep())
+    assert pacer.chars_per_sec == 50.0
+    assert pacer.floor_seconds == 3.0
+
+
+def test_a_disabled_env_makes_from_env_pace_nothing(monkeypatch):
+    """`HARNESS_PACE_ENABLED=false` → `from_env` builds a pacer that never sleeps."""
+    monkeypatch.setenv("HARNESS_PACE_ENABLED", "false")
+    sleep = RecordingSleep()
+    pacer = ReadPacer.from_env(clock=lambda: PACE_CREATED, sleep=sleep)
+
+    assert pacer.pace(_pace_msg("x" * 400)) == 0.0
+    assert sleep.calls == []
+
+
+def test_parse_created_at_handles_z_suffix_and_naive_stamps():
+    """The ISO parse normalizes a `Z` suffix (3.10-safe) and assumes UTC for a naive stamp."""
+    z = _parse_created_at("2026-06-04T00:00:00.000Z")
+    assert z == PACE_CREATED and z.tzinfo is not None
+
+    offset = _parse_created_at("2026-06-04T00:00:00+00:00")
+    assert offset == PACE_CREATED
+
+    naive = _parse_created_at("2026-06-04T00:00:00")  # no offset → assumed UTC, aware
+    assert naive == PACE_CREATED and naive.tzinfo is timezone.utc

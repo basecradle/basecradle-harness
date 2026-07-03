@@ -110,6 +110,7 @@ from basecradle_harness._wake import (
     BreakerDecision,
     ClaimStore,
     MarkStore,
+    ReadPacer,
     SeenStore,
     WakeAgent,
     WakeBreaker,
@@ -140,6 +141,7 @@ __all__ = [
     "ClaimStore",
     "WakeBreaker",
     "BreakerDecision",
+    "ReadPacer",
     # The persistent Turn-0 operating brief
     "compose_brief",
     "render_manifest",
