@@ -275,11 +275,15 @@ sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not 
 ### Security invariants (never relaxed, never moved to a skill)
 
 - **Powerful tools fail closed — opt-in on every provider (issue #168).** A powerful/dangerous
-  tool — media generation (image, **video**, audio), web/X search, code execution — is **off by
+  tool — media generation (image, **video**, audio), web/X search, code execution, and
+  **self-authorship** (an agent editing its own `system-prompt.md`, issue #241) — is **off by
   default on every provider** and activates **only** when explicitly dropped into a persona's
-  `tools/` overlay (the same "ships empty" stance as `mcp/`). The seven powerful defaults:
-  `generate_image`, `edit_image`, `hear_audio`, OpenAI `web_search`, xAI `web_search`/`x_search`,
-  `grok_generate_image`, `grok_generate_video`. Benign/platform tools (memory, assets, messages,
+  `tools/` overlay (the same "ships empty" stance as `mcp/`). The powerful defaults (by plugin
+  stem): `generate_image`, `edit_image`, `hear_audio`, `web_search` (OpenAI), `xai_search`
+  (xAI `web_search`/`x_search`), `openrouter_search`, `code_execution`, `grok_generate_image`,
+  `grok_edit_image`, `grok_generate_video`, and `system_prompt` (the read+edit self-authorship
+  pair — the most powerful, and as of #241 enabled on **no** agent; enablement is a per-agent
+  founder decision). Benign/platform tools (memory, assets, messages,
   timelines, tasks, trust, lock, delete, users, webhooks, web_fetch) keep the normal
   shipped-default → install-then-prune behavior. This is **provider-agnostic**: the `requires`
   gate (`Vendor`/`OpenAIKey`) decides a powerful tool's *availability*, **never** the safety

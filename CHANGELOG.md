@@ -7,6 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.49.0] - 2026-07-04
+
+**Self-authorship tool — an AI reads and edits its OWN system prompt; built, enabled on no one
+(issue #241).** Adds `system_prompt_read` and `system_prompt_edit`: an agent can read and rewrite
+its own personality charter, `prompts/system-prompt.md`. This is the most powerful tool in the
+kit, so it ships **build-and-release only** — opt-in like every powerful tool (issue #168) and
+**enabled on zero agents**. Whether any agent ever gets it is a founder decision, made per-agent,
+later. Built now, gated off, so the capability is ready the day an agent earns it and its security
+shape is designed calmly rather than under demand pressure.
+
+### Added
+
+- **`system_prompt_read` / `system_prompt_edit`** (`_system_prompt.py`, plugin
+  `_defaults/tools/system_prompt.py`, stem `system_prompt`). Read returns the charter verbatim
+  (comments and formatting the brief strips out) plus an edit token; edit replaces it in full
+  behind a confirm gate. Both are `opt_in=True`, universal (no provider affinity), and plain
+  `Tool`s (no SDK client, no bound context). Six security invariants, enforced structurally:
+  1. **Own prompt only, by construction** — neither tool takes a path/agent argument; the target
+     resolves internally from the agent's own config home (`config_home()`), the same file the
+     wake brief reads. Nothing for a prompt-injected argument to redirect.
+  2. **`system-prompt.md` only — never `initialize.md`** — no file selector exists, so the
+     fleet-wide input-security floor (issue #239, in `initialize.md`) stays above self-authorship
+     and cannot be edited away.
+  3. **Opt-in, off by default on every provider** — never auto-scaffolded, never loaded from the
+     packaged defaults; activates only when dropped into a persona's `tools/` overlay. No overlay
+     scaffolded anywhere; no agent opted in.
+  4. **Guarded confirm = compare-and-swap** — `system_prompt_edit` writes only when `confirm`
+     equals a hash of the current content; a bare or mismatched confirm previews and writes
+     nothing, and a stale token (file changed since the read) is refused, not clobbered.
+  5. **Versioned history** — every successful edit snapshots the old file as a timestamped
+     `system-prompt.md.<utc-timestamp>.bak` beside it.
+  6. **Takes effect next wake** — the brief is re-composed per wake, so a self-edit lands on the
+     next wake, not the current turn; both tool descriptions state this.
+
+### Notes
+
+- **Enablement is founder-gated and per-agent.** As of this release no agent has the tool
+  opted in, and no overlay is scaffolded. Granting it to a persona is
+  `basecradle-harness-install --opt-in system_prompt` — a deliberate, per-agent founder decision.
+
 ## [0.48.0] - 2026-07-04
 
 **Input-security floor in the default Turn-0 brief — every persona, default-on (issue #239).**
