@@ -405,3 +405,50 @@ Rails change; we don't consume `timeline.deleted`.
 (sole deployer) per agent, scoped to that agent's `$HARNESS_HOME` + `BASECRADLE_TOKEN`. Live
 verification (drive a wake, delete the timeline, sweep, confirm the five artifacts go and memory
 stays) is **the capital's** job, post-ship.
+
+### Native OpenRouter Adapter + `model_params.json` passthrough (issue #234)
+
+The **third `Provider` adapter** (`_openrouter.py`, `OpenRouterProvider`) plus the first config-layer
+source for optional model-call parameters. Both are additive: they bring up the `@glm-5.2` peer
+(`z-ai/glm-5.2`) without touching the engine.
+
+- **The adapter reuses `_openai_wire`, never duplicates it.** OpenRouter speaks the OpenAI chat wire,
+  so `AI_SDK=openrouter` reaches a model through OpenRouter's first-party `openrouter` SDK (Speakeasy-
+  generated, httpx-backed) but translates messages/tools with the *same* shared, transport-free
+  `_openai_wire` the openai adapter's chat surface uses. `chat()` builds `payload = dict(default_params)`,
+  overwrites `model`/`messages`/`tools`, calls `client.chat.send(**payload)`, and parses
+  `response.model_dump()`. It never sets `stream` — the adapter is non-streaming by contract (a truthy
+  `stream` changes `chat.send`'s return type). The full round-trip (an assistant `content: None`
+  tool-call turn + a `tool` result back over the wire) is tested against the **real** SDK offline via
+  respx, proving its client-side Pydantic marshalling accepts the wire dicts.
+- **Single chat surface.** `SURFACES=("chat",)` / `DEFAULT_SURFACE="chat"` — OpenRouter's Responses API
+  is beta upstream. The **openrouter-via-openai-SDK** cell (a permanent matrix option) is likewise gated
+  **chat-only** in `_provider_from_config`, with an error naming the fix (`AI_SDK_SURFACE=chat`) — and
+  because the openai adapter defaults to `responses`, that error is the first thing an operator hits.
+- **Typed `chat.send`, no `**kwargs`, no `extra_body`.** Unlike the openai SDK, an unknown keyword raises
+  `TypeError` at call time. The error mapper turns that into an actionable `ProviderError` naming
+  `model_params.json`, and maps `openrouter.errors.OpenRouterError` (by `.status_code`) + `NoResponseError`
+  + raw httpx transport errors onto the `Provider*Error` hierarchy (401/403 → auth, 429 → rate-limit with
+  `Retry-After`, else API error keeping the body). The SDK's default 5xx retry (backoff up to an hour)
+  means error tests inject a client with `retry_config=None`.
+- **`model_params.json` — the generic parameter source** (`_model_params.py`, `load_model_params`). An
+  operator-owned JSON object in the config home, read **once** at provider build (`_provider_from_config`),
+  threaded into every adapter as `**default_params`. Operator-owned like `agent.env` (installer never
+  touches it — proven by lock-in tests); a malformed file is a hard `ValueError` at build, so it fails the
+  wake loudly (the read-only introspection paths never build a provider, so they never touch it).
+- **Collision policy — strip + WARN, never crash (`_split_model_params`).** Splatting `**params` into a
+  constructor that already receives `model` positionally would be `TypeError: got multiple values` — so
+  each build path's harness-owned keys (constructor args ∪ per-call args) are popped with a WARNING before
+  the splat; `model` gets dedicated wording (identity is `AI_MODEL`). `extra_body` is *lifted* separately
+  (`_merge_extra_body`): on the openai SDK it merges under a harness-composed one (xAI's `search_parameters`
+  wins overlapping keys, with a warning); on the xai-sdk and openrouter branches — where it is not a legal
+  concept — it is warned-and-dropped.
+- **No plugin/installer changes — lock-in tests only.** Every provider-coupled powerful tool gates on
+  `Vendor("openai")`/`Vendor("xai")`/`OpenAIKey`, so under `provider=openrouter` the whole media/search/code
+  surface self-excludes; `install(provider="openrouter")` lays down only universal defaults and prunes a
+  mismatched previously-installed default. Both are pinned by tests, not new code.
+
+**Boundary:** live verification on the real OpenRouter endpoint (a measured chat turn, a `model_params`
+key the live API accepts) is **the capital's** job on the migrated `@glm-5.2` peer, via the live-gated
+`test_openrouter_live.py`; the offline suite asserts the harness's half (the wire it sends, the response
+it parses, the collision policy).

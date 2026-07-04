@@ -20,6 +20,7 @@ from basecradle_harness import (
     MemoryTool,
     Message,
     OpenAIProvider,
+    OpenRouterProvider,
     TimelineAgent,
     XaiSdkProvider,
     config_home,
@@ -36,6 +37,7 @@ from basecradle_harness._basecradle import (
     _provider_from_config,
     _resolve_tools_and_provider,
 )
+from basecradle_harness._model_params import MODEL_PARAMS_NAME
 from basecradle_harness._version import __version__
 
 BC_URL = "https://basecradle.com"
@@ -709,12 +711,6 @@ def test_provider_from_config_rejects_an_unimplemented_sdk(monkeypatch):
         _provider_from_config("openai", "anthropic", "responses")
 
 
-def test_provider_from_config_rejects_openrouter_for_now(monkeypatch):
-    _set_model_key(monkeypatch)
-    with pytest.raises(ValueError, match="openrouter"):
-        _provider_from_config("openrouter", "openai", "responses")
-
-
 def test_provider_from_config_requires_a_model(monkeypatch):
     monkeypatch.delenv("AI_MODEL", raising=False)
     monkeypatch.setenv("AI_API_KEY", "sk-test-key")
@@ -783,6 +779,264 @@ def test_provider_from_config_xai_honors_an_explicit_base_url(monkeypatch):
     assert provider.base_url == "https://xai-proxy.internal/v1"
     # No search built-ins active → no search_parameters sent.
     assert provider._extra_body is None
+    provider.close()
+
+
+# --- OpenRouter: the provider × SDK × surface matrix (issue #234) -------------
+
+
+def _set_openrouter_model_key(monkeypatch):
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("AI_API_KEY", "sk-or-test-key")
+    monkeypatch.delenv("AI_BASE_URL", raising=False)
+
+
+def test_provider_from_config_openrouter_native_builds_the_adapter(monkeypatch):
+    # AI_SDK=openrouter + AI_PROVIDER=openrouter → the native OpenRouter adapter, chat surface.
+    _set_openrouter_model_key(monkeypatch)
+    provider = _provider_from_config("openrouter", "openrouter", "chat")
+    assert isinstance(provider, OpenRouterProvider)
+    assert provider.model == "z-ai/glm-5.2"
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+    provider.close()
+
+
+def test_provider_from_config_openrouter_sdk_requires_the_openrouter_provider(monkeypatch):
+    # The native SDK only reaches OpenRouter's endpoint — pairing it with another provider fails.
+    _set_openrouter_model_key(monkeypatch)
+    with pytest.raises(ValueError, match="AI_PROVIDER=openrouter"):
+        _provider_from_config("openai", "openrouter", "chat")
+
+
+def test_provider_from_config_openrouter_native_honors_an_explicit_base_url(monkeypatch):
+    _set_openrouter_model_key(monkeypatch)
+    monkeypatch.setenv("AI_BASE_URL", "https://or-proxy.internal/api/v1")
+    provider = _provider_from_config("openrouter", "openrouter", "chat")
+    assert isinstance(provider, OpenRouterProvider)
+    assert provider.base_url == "https://or-proxy.internal/api/v1"
+    provider.close()
+
+
+def test_provider_from_config_openrouter_via_openai_sdk_chat(monkeypatch):
+    # AI_PROVIDER=openrouter + AI_SDK=openai (chat) → OpenAIProvider at openrouter.ai (issue #234).
+    _set_openrouter_model_key(monkeypatch)
+    provider = _provider_from_config("openrouter", "openai", "chat")
+    assert isinstance(provider, OpenAIProvider)
+    assert provider.surface == "chat"
+    assert provider.base_url == "https://openrouter.ai/api/v1"
+    # No server-side built-ins are wired on the OpenRouter-via-openai cell.
+    assert provider._builtin_tools == []
+    provider.close()
+
+
+def test_provider_from_config_openrouter_via_openai_sdk_rejects_responses(monkeypatch):
+    # OpenRouter's Responses API is beta upstream — the openai-SDK cell is chat-only, and the
+    # openai SDK's own default surface is `responses`, so the error must name the fix.
+    _set_openrouter_model_key(monkeypatch)
+    with pytest.raises(ValueError, match="AI_SDK_SURFACE=chat"):
+        _provider_from_config("openrouter", "openai", "responses")
+
+
+def test_config_from_env_openrouter_sdk_single_chat_surface(monkeypatch):
+    # AI_SDK=openrouter declares one surface ("chat"); AI_SDK_SURFACE is left unset → it resolves
+    # to that default, and any *other* value (e.g. responses) fails clearly.
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")
+    monkeypatch.setenv("AI_SDK", "openrouter")
+    monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
+    assert _config_from_env() == ("openrouter", "openrouter", "chat")
+
+    monkeypatch.setenv("AI_SDK_SURFACE", "responses")
+    with pytest.raises(ValueError, match="AI_SDK_SURFACE"):
+        _config_from_env()
+
+
+# --- model_params.json: the operator-owned parameter passthrough (issue #234) ---
+
+
+def _write_model_params(obj):
+    """Write ``obj`` as ``model_params.json`` into the (isolated) config home."""
+    path = config_home() / MODEL_PARAMS_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj), encoding="utf-8")
+
+
+def test_model_params_reach_the_openai_responses_build(monkeypatch):
+    _set_model_key(monkeypatch)
+    _write_model_params({"temperature": 0.7, "max_tokens": 4096})
+    provider = _provider_from_config("openai", "openai", "responses")
+    assert provider._default_params == {"temperature": 0.7, "max_tokens": 4096}
+    provider.close()
+
+
+def test_model_params_reach_the_openai_chat_build(monkeypatch):
+    _set_model_key(monkeypatch)
+    _write_model_params({"top_p": 0.9})
+    provider = _provider_from_config("openai", "openai", "chat")
+    assert provider._default_params == {"top_p": 0.9}
+    provider.close()
+
+
+def test_model_params_reach_the_xai_sdk_build(monkeypatch):
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    _write_model_params({"reasoning": {"effort": "high"}})
+    provider = _provider_from_config("xai", "xai-sdk", "native")
+    assert provider._default_params == {"reasoning": {"effort": "high"}}
+    provider.close()
+
+
+def test_model_params_reach_the_openrouter_build(monkeypatch):
+    _set_openrouter_model_key(monkeypatch)
+    _write_model_params({"reasoning_effort": "high", "temperature": 0.2})
+    provider = _provider_from_config("openrouter", "openrouter", "chat")
+    assert provider._default_params == {"reasoning_effort": "high", "temperature": 0.2}
+    provider.close()
+
+
+def test_model_params_reserved_keys_are_stripped_with_warnings(monkeypatch, caplog):
+    # Harness-owned keys never override wiring — they are popped with a WARNING (D3).
+    _set_model_key(monkeypatch)
+    _write_model_params(
+        {"model": "hacker/override", "messages": ["nope"], "tools": ["nope"], "temperature": 0.3}
+    )
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("openai", "openai", "responses")
+    # Only the genuine tuning key survives.
+    assert provider._default_params == {"temperature": 0.3}
+    assert provider.model == "gpt-5.4-mini"  # AI_MODEL wins, not the params 'model'
+    text = caplog.text
+    assert "model identity is AI_MODEL" in text
+    assert "'messages'" in text
+    assert "'tools'" in text
+    provider.close()
+
+
+def test_model_params_stream_is_stripped_on_the_openai_build(monkeypatch, caplog):
+    # All adapters are non-streaming by contract; a params `stream` would crash the turn
+    # (a streaming iterator has no `.model_dump()`), so it is stripped everywhere — not just on
+    # the openrouter branch. Regression guard for the owned-set omission.
+    _set_model_key(monkeypatch)
+    _write_model_params({"stream": True, "temperature": 0.3})
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("openai", "openai", "responses")
+    assert provider._default_params == {"temperature": 0.3}
+    assert "'stream'" in caplog.text
+    provider.close()
+
+
+def test_model_params_stream_is_stripped_on_the_xai_sdk_build(monkeypatch, caplog):
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    _write_model_params({"stream": True, "temperature": 0.3})
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("xai", "xai-sdk", "native")
+    assert provider._default_params == {"temperature": 0.3}
+    assert "'stream'" in caplog.text
+    provider.close()
+
+
+def test_model_params_timeout_is_stripped_on_the_openrouter_build(monkeypatch, caplog):
+    # `timeout` is a harness-owned constructor arg — stripped like on the xai-sdk branch, so a
+    # non-numeric value can never reach `int(timeout * 1000)`. Regression guard for the owned-set.
+    _set_openrouter_model_key(monkeypatch)
+    _write_model_params({"timeout": "30s", "temperature": 0.2})
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("openrouter", "openrouter", "chat")
+    assert provider._default_params == {"temperature": 0.2}
+    assert "'timeout'" in caplog.text
+    provider.close()
+
+
+def test_malformed_model_params_does_not_mask_a_config_mismatch(monkeypatch):
+    # A config-shape error must win over a malformed model_params.json: the wake should point at
+    # the real problem (the sdk/provider mismatch), not at a tuning file it would never use.
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("AI_API_KEY", "sk-or-test-key")
+    (config_home() / MODEL_PARAMS_NAME).write_text("{not json", encoding="utf-8")
+    # xai-sdk + openrouter is a config mismatch — that error must surface, not the JSON error.
+    with pytest.raises(ValueError, match="AI_PROVIDER=xai"):
+        _provider_from_config("openrouter", "xai-sdk", "native")
+
+
+def test_model_params_extra_body_reaches_the_openai_build(monkeypatch):
+    # On the openai SDK, extra_body is a real passthrough — an operator's extra_body arrives intact.
+    _set_model_key(monkeypatch)
+    _write_model_params({"extra_body": {"custom_field": 1}, "temperature": 0.5})
+    provider = _provider_from_config("openai", "openai", "responses")
+    assert provider._extra_body == {"custom_field": 1}
+    assert provider._default_params == {"temperature": 0.5}
+    provider.close()
+
+
+def test_model_params_extra_body_merges_with_xai_search_parameters(monkeypatch, caplog):
+    # xai + a search built-in composes search_parameters; an operator extra_body merges under it,
+    # the harness value winning any overlapping key, with a WARNING on the overlap (D4).
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    monkeypatch.delenv("AI_BASE_URL", raising=False)
+    _write_model_params(
+        {"extra_body": {"search_parameters": {"mode": "off"}, "other": 2}, "temperature": 0.1}
+    )
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("xai", "openai", "chat", builtins=["web_search"])
+    # The harness's search_parameters wins the overlap; the operator's non-overlapping key stays.
+    assert provider._extra_body == {
+        "search_parameters": {"mode": "on", "sources": ["web"], "return_citations": True},
+        "other": 2,
+    }
+    assert provider._default_params == {"temperature": 0.1}
+    assert "search_parameters" in caplog.text
+    provider.close()
+
+
+def test_model_params_extra_body_dropped_on_openrouter_with_warning(monkeypatch, caplog):
+    # The openrouter SDK has no extra_body concept — an operator's extra_body is dropped + warned.
+    _set_openrouter_model_key(monkeypatch)
+    _write_model_params({"extra_body": {"x": 1}, "temperature": 0.4})
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("openrouter", "openrouter", "chat")
+    assert provider._default_params == {"temperature": 0.4}
+    assert "extra_body" in caplog.text
+    provider.close()
+
+
+def test_model_params_malformed_file_fails_the_build(monkeypatch):
+    # A present-but-malformed model_params.json is a hard error at build — the wake fails loudly.
+    _set_model_key(monkeypatch)
+    (config_home() / MODEL_PARAMS_NAME).write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match=MODEL_PARAMS_NAME):
+        _provider_from_config("openai", "openai", "responses")
+
+
+def test_model_params_land_in_the_request_body_end_to_end(monkeypatch):
+    # The whole chain: model_params.json → _provider_from_config → the SDK's actual request body.
+    _set_model_key(monkeypatch)
+    monkeypatch.setenv("AI_BASE_URL", "https://openai.test/v1")
+    _write_model_params({"temperature": 0.7, "max_tokens": 4096})
+    provider = _provider_from_config("openai", "openai", "chat")
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post("https://openai.test/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "gpt-5.4-mini",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {"role": "assistant", "content": "ok"},
+                        }
+                    ],
+                },
+            )
+        )
+        provider.chat([Message.user("Hi")])
+    body = json.loads(route.calls.last.request.content)
+    assert body["temperature"] == 0.7
+    assert body["max_tokens"] == 4096
     provider.close()
 
 

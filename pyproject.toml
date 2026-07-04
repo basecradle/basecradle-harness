@@ -40,6 +40,13 @@ openai = ["openai>=2.43,<3"]
 # the version this adapter was built against (1.17); major-capped so a breaking 2.0 never
 # auto-upgrades. Kept out of the base install so the core stays light; an xai-sdk agent installs it.
 xai-sdk = ["xai-sdk>=1.17,<2"]
+# The OpenRouter SDK (AI_SDK=openrouter): a first-class native adapter over OpenRouter's own
+# first-party Python SDK — the brain for the @glm-5.2 peer (z-ai/glm-5.2) and any OpenRouter
+# model. Floor is the version this adapter was built against (0.11.3). This is a 0.x
+# Speakeasy-generated SDK: its *minor* is the breaking axis (typed signatures and `components`
+# names can drift on a minor bump), so it is minor-capped (`<0.12`) — bump the cap deliberately,
+# never blindly. Kept out of the base install so the core stays light; an openrouter agent installs it.
+openrouter = ["openrouter>=0.11.3,<0.12"]
 # The MemPalace memory provider (a reference `MemoryProvider`): a local-first OSS memory
 # system (ChromaDB + SQLite). Kept out of the base install so the core stays light — the
 # adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace.
@@ -68,7 +75,16 @@ Issues = "https://github.com/basecradle/basecradle-harness/issues"
 # openai's httpx transport is respx-mocked; the xai-sdk (gRPC) adapter builds real protos and
 # runs against an injected fake client, so neither ever touches the network. In production each
 # ships only via its optional extra.
-dev = ["pytest>=8", "respx>=0.22", "ruff>=0.9", "openai>=2.43,<3", "xai-sdk>=1.17,<2"]
+# `openrouter` is likewise a dev dep so the suite exercises the real OpenRouter SDK adapter
+# offline — the SDK's httpx transport is respx-mocked, so it never touches the network.
+dev = [
+    "pytest>=8",
+    "respx>=0.22",
+    "ruff>=0.9",
+    "openai>=2.43,<3",
+    "xai-sdk>=1.17,<2",
+    "openrouter>=0.11.3,<0.12",
+]
 
 [build-system]
 requires = ["hatchling>=1.27"]

@@ -11,6 +11,7 @@ The layout the installer scaffolds::
 
     <agent-home>/.config/basecradle/
       agent.env            # the operator's env (token, keys) — never created or touched here
+      model_params.json    # optional model-call params (temperature, reasoning, …) — operator-owned, never touched here
       prompts/
         system-prompt.md   # shipped default
         initialize.md      # shipped default (starter; the richer default is a later group)

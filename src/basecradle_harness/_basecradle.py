@@ -62,7 +62,7 @@ import itertools
 import logging
 import os
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -74,6 +74,7 @@ from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
 from basecradle_harness._mcp import McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
+from basecradle_harness._model_params import load_model_params
 from basecradle_harness._openai import (
     DEFAULT_SURFACE as OPENAI_DEFAULT_SURFACE,
 )
@@ -82,6 +83,15 @@ from basecradle_harness._openai import (
 )
 from basecradle_harness._openai import (
     OpenAIProvider,
+)
+from basecradle_harness._openrouter import (
+    DEFAULT_SURFACE as OPENROUTER_DEFAULT_SURFACE,
+)
+from basecradle_harness._openrouter import (
+    SURFACES as OPENROUTER_SURFACES,
+)
+from basecradle_harness._openrouter import (
+    OpenRouterProvider,
 )
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
 from basecradle_harness._plugins import (
@@ -473,6 +483,9 @@ _SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
     # The native xai-sdk speaks a single (gRPC) surface; `AI_SDK_SURFACE` is left unset for it,
     # and any other value fails clearly against this one-element set (issue #165).
     "xai-sdk": (XAI_SDK_SURFACES, XAI_SDK_DEFAULT_SURFACE),
+    # The native openrouter SDK ships the OpenAI-compatible chat wire only (its Responses API is
+    # beta upstream), so it too declares a single surface and leaves `AI_SDK_SURFACE` unset.
+    "openrouter": (OPENROUTER_SURFACES, OPENROUTER_DEFAULT_SURFACE),
 }
 
 
@@ -532,7 +545,12 @@ def _config_from_env() -> tuple[str, str, str]:
 #: ``.env`` needn't hardcode it (``AI_BASE_URL`` always overrides for a proxy/gateway/self-host).
 #: ``openai`` is absent → the SDK targets OpenAI's own default. xAI's compat endpoint speaks the
 #: Responses **and** Chat wire, so the ``openai`` SDK reaches grok here over either surface.
-_PROVIDER_BASE_URLS = {"xai": "https://api.x.ai/v1"}
+_PROVIDER_BASE_URLS = {
+    "xai": "https://api.x.ai/v1",
+    # OpenRouter's OpenAI-compatible chat endpoint — the default base_url whether reached through
+    # the native openrouter SDK or the openai SDK pointed here (both speak its chat wire).
+    "openrouter": "https://openrouter.ai/api/v1",
+}
 
 #: xAI Live-Search sources, keyed by the built-in tool name the plugins activate.
 _XAI_SEARCH_SOURCES = {"web_search": "web", "x_search": "x"}
@@ -561,6 +579,105 @@ def _xai_search_parameters(builtins: Sequence[str]) -> dict[str, Any] | None:
     return {"mode": "on", "sources": sources, "return_citations": True}
 
 
+# The keys the harness sets itself on each build path — every one of these present in the
+# operator's ``model_params.json`` is stripped with a WARNING (D3): a tuning file must never
+# override the harness's own wiring. Each set unions the branch's constructor args (``model``,
+# ``base_url``/``api_host``, ``timeout``, …) with the per-call args the adapter fills
+# (``messages``/``input``/``tools``). ``model`` is in every set — model identity is ``AI_MODEL``,
+# and it gets dedicated warning wording. ``stream`` is in every set too: all three adapters are
+# **non-streaming by contract** (they call ``.model_dump()`` on a single response), so a
+# ``stream: true`` would not just override wiring but crash the turn — strip it everywhere.
+# ``extra_body`` is *not* listed here: it is lifted out separately (D4) — merged on the openai
+# SDK, warned-and-dropped on the SDKs where it is not a legal concept.
+_OWNED_OPENAI = frozenset(
+    {
+        "model",
+        "api_key",
+        "base_url",
+        "surface",
+        "timeout",
+        "max_retries",
+        "builtin_tools",
+        "code_container",
+        "messages",
+        "input",
+        "tools",
+        "stream",
+    }
+)
+_OWNED_XAI_SDK = frozenset(
+    {
+        "model",
+        "api_key",
+        "api_host",
+        "timeout",
+        "builtin_tools",
+        "client",
+        "messages",
+        "tools",
+        "stream",
+    }
+)
+_OWNED_OPENROUTER = frozenset(
+    {"model", "api_key", "base_url", "timeout", "client", "messages", "tools", "stream"}
+)
+
+
+def _split_model_params(
+    raw: Mapping[str, Any], *, owned: frozenset[str], sdk_label: str
+) -> tuple[dict[str, Any], Any]:
+    """Strip harness-owned keys from the operator's model params, returning ``(tuning, extra_body)``.
+
+    Implements the collision policy (D3): every key in ``owned`` that the operator set in
+    ``model_params.json`` is popped with a WARNING and never reaches the SDK call — the harness's
+    own value stands, because this file is call *tuning*, not a way to override wiring. ``model``
+    gets dedicated wording (model identity is ``AI_MODEL``). Splatting a params ``model`` into a
+    constructor that already receives ``model`` positionally would be a hard ``TypeError: got
+    multiple values`` — so the strip is what keeps the "warn and win" promise from becoming a crash.
+
+    ``extra_body`` is *lifted* out (D4) rather than plain-stripped: it is returned separately so the
+    caller can merge it (the openai SDK, whose ``extra_body`` is a real passthrough) or warn-and-drop
+    it (an SDK where it is not a legal concept). ``sdk_label`` names the active SDK in the warnings.
+    """
+    params = dict(raw)
+    extra_body = params.pop("extra_body", None)
+    for key in sorted(set(params) & owned):
+        if key == "model":
+            _log.warning(
+                "model_params.json sets 'model', but the model identity is AI_MODEL, not a "
+                "model_params.json key — ignoring it. model_params.json is call tuning only."
+            )
+        else:
+            _log.warning(
+                "model_params.json sets %r, which the harness controls for %s — ignoring it "
+                "(harness-owned keys always win).",
+                key,
+                sdk_label,
+            )
+        params.pop(key)
+    return params, extra_body
+
+
+def _merge_extra_body(params_extra_body: Any, harness_extra_body: Any) -> Any:
+    """Combine the operator's ``extra_body`` with one the harness composes (D4) — harness wins.
+
+    When both are present (an ``model_params.json`` ``extra_body`` *and* a harness-built one — e.g.
+    xAI's ``search_parameters`` when a Grok-via-openai persona has search opted in), they merge
+    key-by-key with the **harness value winning** any overlapping key, and each overlap logs a
+    WARNING. When only one exists, it is used as-is; when neither, the result is ``None`` so nothing
+    is sent.
+    """
+    if params_extra_body and harness_extra_body:
+        for key in sorted(set(params_extra_body) & set(harness_extra_body)):
+            _log.warning(
+                "model_params.json extra_body sets %r, which the harness sets itself for this "
+                "provider (e.g. xAI search_parameters) — the harness value wins.",
+                key,
+            )
+        return {**params_extra_body, **harness_extra_body}
+    return harness_extra_body or params_extra_body or None
+
+
 def _provider_from_config(
     provider: str,
     sdk: str,
@@ -587,16 +704,31 @@ def _provider_from_config(
       built-ins become xAI **Agent Tool** entries on the chat ``tools`` list inside the adapter
       (issue #171 — the native ``SearchParameters`` object is deprecated). Its single native
       surface means ``AI_SDK_SURFACE`` is unset.
-    - Any other ``AI_SDK`` is a clear "no adapter yet" error; ``AI_PROVIDER=openrouter`` is a
-      later milestone.
+    - ``AI_SDK=openrouter`` → `OpenRouterProvider`, OpenRouter's **native** first-party SDK, the
+      @glm-5.2 peer's brain. It talks **only** to ``AI_PROVIDER=openrouter``; it speaks a single
+      ``chat`` surface (OpenRouter's Responses API is beta upstream), so ``AI_SDK_SURFACE`` is unset.
+      OpenRouter is *also* reachable through the ``openai`` SDK pointed at ``openrouter.ai`` — a
+      permanent matrix cell — but **chat-only**, gated below with a clear error naming the fix.
+    - Any other ``AI_SDK`` is a clear "no adapter yet" error.
 
-    All read ``AI_MODEL`` and fall back to ``AI_API_KEY`` for the key. For the openai SDK,
-    ``base_url`` is ``AI_BASE_URL`` if set, else the provider's canonical default
+    All read ``AI_MODEL`` and fall back to ``AI_API_KEY`` for the key. For the openai/openrouter
+    SDKs, ``base_url`` is ``AI_BASE_URL`` if set, else the provider's canonical default
     (`_PROVIDER_BASE_URLS`); the native xai-sdk uses its own endpoint (``api.x.ai``).
+
+    Optional SDK call parameters come from the operator's ``model_params.json``
+    (`load_model_params`), read once here and threaded into the adapter as ``**default_params``.
+    Harness-owned keys are stripped with a WARNING (`_split_model_params`) so tuning never
+    overrides wiring; a malformed file raises here, failing the wake loudly at startup (the
+    read-only introspection paths never build a provider, so they never touch it).
     """
     model = os.environ.get("AI_MODEL")
     if not model:
         raise ValueError("AI_MODEL is required — the model id to run (e.g. gpt-5.4-mini).")
+
+    # ``model_params.json`` is read *after* each branch's config-shape guards (below), never here:
+    # a config mismatch (e.g. AI_SDK=xai-sdk + AI_PROVIDER=openrouter) must surface its own
+    # actionable error, not be masked by a malformed model_params file the wake would never even
+    # use. So the read sits at the point of use in each branch, past its guard.
 
     if sdk == "xai-sdk":
         if provider != "xai":
@@ -604,25 +736,76 @@ def _provider_from_config(
                 f"AI_SDK=xai-sdk reaches xAI's native endpoint, so it requires AI_PROVIDER=xai "
                 f"(got {provider!r}). Use AI_SDK=openai for a non-xAI provider."
             )
-        return XaiSdkProvider(model, builtin_tools=list(builtins))
+        params, extra_body = _split_model_params(
+            load_model_params(), owned=_OWNED_XAI_SDK, sdk_label="the native xai-sdk"
+        )
+        if extra_body is not None:
+            _log.warning(
+                "model_params.json sets 'extra_body', which the native xai-sdk does not support "
+                "(it is an openai-SDK concept) — ignoring it."
+            )
+        return XaiSdkProvider(model, builtin_tools=list(builtins), **params)
+
+    if sdk == "openrouter":
+        if provider != "openrouter":
+            raise ValueError(
+                f"AI_SDK=openrouter reaches OpenRouter's native endpoint, so it requires "
+                f"AI_PROVIDER=openrouter (got {provider!r}). Use AI_SDK=openai for a non-OpenRouter "
+                "provider, or set AI_PROVIDER=openrouter."
+            )
+        params, extra_body = _split_model_params(
+            load_model_params(), owned=_OWNED_OPENROUTER, sdk_label="the openrouter SDK"
+        )
+        if extra_body is not None:
+            _log.warning(
+                "model_params.json sets 'extra_body', which the openrouter SDK does not support "
+                "(its chat.send is typed with no extra_body) — ignoring it. On the openrouter SDK, "
+                "pass only keys chat.send names; use the openai-SDK path for the extra_body escape "
+                "hatch."
+            )
+        base_url = os.environ.get("AI_BASE_URL") or _PROVIDER_BASE_URLS.get(provider)
+        return OpenRouterProvider(model, base_url=base_url, **params)
 
     if sdk != "openai":
         raise ValueError(
             f"AI_SDK={sdk!r} has no adapter — the harness ships 'openai' (the OpenAI-wire SDK, "
-            "also xAI over api.x.ai) and 'xai-sdk' (native xAI). Set one of those."
+            "also xAI over api.x.ai and OpenRouter over openrouter.ai), 'xai-sdk' (native xAI), "
+            "and 'openrouter' (native OpenRouter). Set one of those."
         )
-    if provider not in ("openai", "xai"):
+    if provider not in ("openai", "xai", "openrouter"):
         raise ValueError(
-            f"AI_PROVIDER={provider!r} has no adapter via the openai SDK — 'openai' and 'xai' "
-            "are wired (xAI over the openai SDK at api.x.ai). 'openrouter' is a later milestone."
+            f"AI_PROVIDER={provider!r} has no adapter via the openai SDK — 'openai', 'xai', and "
+            "'openrouter' are wired (xAI over api.x.ai, OpenRouter over openrouter.ai)."
+        )
+    if provider == "openrouter" and surface != "chat":
+        # OpenRouter's Responses API is beta upstream, so the openai-SDK-at-OpenRouter cell is
+        # chat-only. The openai SDK's own default surface is `responses`, so this is the FIRST
+        # thing an operator hits — the message carries the fix.
+        raise ValueError(
+            f"AI_PROVIDER=openrouter over the openai SDK is chat-only (its Responses API is beta "
+            f"upstream), but AI_SDK_SURFACE resolved to {surface!r}. Set AI_SDK_SURFACE=chat (or "
+            "use AI_SDK=openrouter for the native adapter, which is chat-only by design)."
         )
     base_url = os.environ.get("AI_BASE_URL") or _PROVIDER_BASE_URLS.get(provider)
+    params, params_extra_body = _split_model_params(
+        load_model_params(), owned=_OWNED_OPENAI, sdk_label="the openai SDK"
+    )
     if provider == "xai":
         # xAI's search built-ins ride `search_parameters`, not OpenAI tools entries — so they
         # go through `extra_body`, and nothing is offered as a `builtin_tools` tool here.
         search_parameters = _xai_search_parameters(builtins)
-        extra_body = {"search_parameters": search_parameters} if search_parameters else None
-        return OpenAIProvider(model, base_url=base_url, surface=surface, extra_body=extra_body)
+        harness_extra_body = {"search_parameters": search_parameters} if search_parameters else None
+        extra_body = _merge_extra_body(params_extra_body, harness_extra_body)
+        return OpenAIProvider(
+            model, base_url=base_url, surface=surface, extra_body=extra_body, **params
+        )
+    if provider == "openrouter":
+        # OpenRouter over the openai SDK: chat wire only, no server-side built-ins and no code
+        # bridge (`_maybe_code_bridge` already excludes it). The operator's `extra_body` (if any)
+        # is the escape hatch and passes straight through.
+        return OpenAIProvider(
+            model, base_url=base_url, surface=surface, extra_body=params_extra_body, **params
+        )
     # The code-execution Asset bridge supplies the live ``container`` for the code_interpreter
     # built-in per turn (`_code.py`); absent it, the built-in falls back to an auto container.
     code_container = code_bridge.container_spec if code_bridge is not None else None
@@ -632,6 +815,8 @@ def _provider_from_config(
         surface=surface,
         builtin_tools=list(builtins),
         code_container=code_container,
+        extra_body=params_extra_body,
+        **params,
     )
 
 
