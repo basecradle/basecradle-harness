@@ -7,6 +7,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.46.0] - 2026-07-03
+
+**Add the OpenRouter SDK adapter and a generic `model_params.json` parameter passthrough
+(issue #234).** Two additive capabilities the fleet needs to bring up the `@glm-5.2` peer
+(`z-ai/glm-5.2` via OpenRouter): first-class OpenRouter support across the full provider × SDK
+matrix, and an operator-owned way to pass optional model-call parameters that until now no config
+source fed.
+
+### Added
+
+- **`OpenRouterProvider` — a native OpenRouter adapter** (`_openrouter.py`), the third `Provider`
+  adapter, reached through OpenRouter's own first-party `openrouter` SDK (`AI_SDK=openrouter`).
+  OpenRouter speaks the OpenAI chat wire, so it reuses the shared, transport-free `_openai_wire`
+  translation. It declares a single `chat` surface (OpenRouter's Responses API is beta upstream),
+  maps the SDK's error hierarchy onto the harness `Provider*Error` types, and turns an
+  unaccepted `model_params.json` key (the SDK's `chat.send` is typed with no `**kwargs`) into an
+  actionable error naming the file. Exported from the package root.
+- **`AI_PROVIDER=openrouter` across the matrix.** Beyond the native SDK, OpenRouter is also
+  reachable through the `openai` SDK pointed at `openrouter.ai` — a permanent matrix cell, gated
+  **chat-only** with a clear error naming the fix (`AI_SDK_SURFACE=chat`), since the openai SDK's
+  own default surface is `responses`.
+- **`model_params.json` — operator-owned model-call parameters** (`_model_params.py`). A single
+  JSON object in the config home (`temperature`, `max_tokens`, `reasoning`, `reasoning_effort`,
+  …), read once at provider build and threaded into every adapter as `**default_params`.
+  Operator-owned like `agent.env` (the installer never touches it); harness-owned keys always win
+  (stripped with a WARNING); `extra_body` merges under a harness-composed one on the openai SDK
+  (harness wins overlapping keys) and is warned-and-dropped where the SDK has no such concept; a
+  malformed file is a hard failure at wake, not a silent skip.
+- **`[openrouter]` optional extra** (`openrouter>=0.11.3,<0.12`, minor-capped — the Speakeasy 0.x
+  breaking axis is the minor). Added to the dev group so the suite exercises the real SDK offline
+  via respx; `uv.lock` regenerated.
+
+### Changed
+
+- The unknown-`AI_SDK` error text now names all three shipped adapters (`openai`, `xai-sdk`,
+  `openrouter`); the previous "openrouter is a later milestone" rejection is removed.
+
 ## [0.45.0] - 2026-07-03
 
 **Rework the AI↔AI pacing shipped in 0.44.0 — settle loop + mid-generation staleness guard +

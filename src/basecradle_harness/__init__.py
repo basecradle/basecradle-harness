@@ -80,6 +80,7 @@ from basecradle_harness._messages import (
     ToolSpec,
 )
 from basecradle_harness._openai import OpenAIProvider
+from basecradle_harness._openrouter import OpenRouterProvider
 from basecradle_harness._platform import (
     PlatformContext,
     PlatformTool,
@@ -152,6 +153,7 @@ __all__ = [
     "Provider",
     "OpenAIProvider",
     "XaiSdkProvider",
+    "OpenRouterProvider",
     # Tools, registry, and the safety boundary
     "Tool",
     "ToolRegistry",

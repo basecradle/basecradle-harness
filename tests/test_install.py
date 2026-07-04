@@ -468,6 +468,48 @@ def test_install_without_opt_in_lays_down_no_power_tools_on_any_provider(tmp_pat
     assert "assets.py" in files  # benign defaults still present
 
 
+def test_install_for_openrouter_lays_down_only_universal_defaults(tmp_path):
+    # OpenRouter has no provider-affine power tools of its own (issue #234): even opting in every
+    # power stem lays down NONE of them (all are openai/xai-coupled → mismatched), just the benign
+    # universal defaults. @glm-5.2 comes up tool-lean by construction.
+    home = tmp_path / "cfg"
+    install(home, provider="openrouter", opt_in=_ALL_POWER_STEMS)
+    files = _tool_files(home)
+    assert (_XAI_DEFAULTS | _OPENAI_DEFAULTS).isdisjoint(files)
+    assert "assets.py" in files  # benign universal defaults are always present
+
+
+def test_a_switch_to_openrouter_prunes_a_mismatched_opted_in_default(tmp_path):
+    # Switching an agent to provider=openrouter prunes a previously-installed vendor-affine default
+    # (it belongs to no OpenRouter tool-set), exactly as a switch between openai/xai does.
+    home = tmp_path / "cfg"
+    install(home, provider="openai", opt_in=_ALL_POWER_STEMS)
+    assert _OPENAI_DEFAULTS <= _tool_files(home)
+
+    report = install(home, provider="openrouter")
+
+    assert (_XAI_DEFAULTS | _OPENAI_DEFAULTS).isdisjoint(_tool_files(home))  # pruned off disk
+    for name in _OPENAI_DEFAULTS:
+        assert report.actions[f"tools/{name}"] == PRUNED
+
+
+def test_operator_model_params_survives_install_untouched(tmp_path):
+    # model_params.json is operator-owned (like agent.env): the installer walks only _defaults/ +
+    # manifest-recorded files, so it never writes, refreshes, prunes, or reconciles this file.
+    home = tmp_path / "cfg"
+    install(home, provider="openai")
+    params = config_home(home) / "model_params.json"
+    params.write_text('{"temperature": 0.42}', encoding="utf-8")
+
+    # A re-run (upgrade/reconcile) must leave the operator's file byte-for-byte untouched, and it
+    # must never appear in the manifest of shipped defaults.
+    report = install(home, provider="openrouter")
+    assert params.read_text(encoding="utf-8") == '{"temperature": 0.42}'
+    assert "model_params.json" not in report.actions
+    manifest = json.loads((home / _MANIFEST_NAME).read_text())
+    assert not any("model_params.json" in key for key in manifest)
+
+
 def test_a_provider_switch_prunes_a_pristine_mismatched_opted_in_default(tmp_path):
     # A power tool opted in under one provider is pruned by a switch to a mismatched provider —
     # the @jt de-clutter, now on the opt-in path (provider mismatch wins over grandfather).

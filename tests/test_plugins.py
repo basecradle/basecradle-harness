@@ -387,6 +387,42 @@ def test_opting_a_power_tool_into_the_overlay_activates_it_subject_to_availabili
     assert "grok_generate_image" not in {t.name for t in under_openai.tools}  # availability gate
 
 
+# --- OpenRouter provider lock-in (issue #234) --------------------------------
+
+
+def _openrouter_ctx(**env):
+    return _ctx(provider="openrouter", sdk="openrouter", surface="chat", **env)
+
+
+def test_default_riding_openrouter_agent_is_benign_only(monkeypatch):
+    # A default-riding @glm-5.2-style agent (provider=openrouter, no overlay) gets the benign/
+    # platform set only — no media gen, no Live Search, no code execution auto-armed. Every
+    # provider-coupled power tool self-excludes because its `requires` names openai/xai, not
+    # openrouter, so the whole media/search/code surface is off by construction.
+    resolved = resolve_plugins(load_plugins(), _openrouter_ctx(AI_API_KEY="sk-or-key"))
+    names = {t.name for t in resolved.tools}
+    assert names == _DEFAULT_TOOLS
+    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS) & names)
+    assert resolved.builtins == []  # no web_search / x_search / code_execution armed
+
+
+def test_opted_in_power_tools_self_exclude_under_openrouter(tmp_path):
+    # Even a persona that explicitly opted powerful tools into its overlay gets none of them under
+    # provider=openrouter: each `requires` gate (Vendor("openai")/Vendor("xai")/OpenAIKey) fails,
+    # so the media/search/grok tools all deactivate while the universal tools stay.
+    home = tmp_path / "cfg"
+    install(
+        home,
+        provider="openai",
+        opt_in=["generate_image", "edit_image", "listen", "web_search"],
+    )
+    resolved = resolve_plugins(load_plugins(home), _openrouter_ctx(AI_API_KEY="sk-or-key"))
+    names = {t.name for t in resolved.tools}
+    assert not (_OPENAI_POWER_TOOLS & names)  # generate_image / edit_image / listen all gone
+    assert resolved.builtins == []  # web_search does not arm on openrouter
+    assert _DEFAULT_TOOLS <= names  # the universal/platform tools still stand
+
+
 # --- active opt-in stems (issue #181, the fleet-drift inventory key) ---------
 
 
