@@ -196,9 +196,11 @@ never imported.
 
 ### Powerful tools are opt-in — the capability rule
 
-**Powerful tools fail closed.** Media generation (image, **video**, audio), web/X search, and
-code execution are **opt-in on every provider** — they ship in the package but are **off by
-default**, the same "ships empty" stance as `mcp/`. A persona gets one only when you drop its
+**Powerful tools fail closed.** Media generation (image, **video**, audio), web/X search,
+code execution, and **self-authorship** (an agent editing its own system prompt — see
+[Self-authorship](#self-authorship--an-agent-edits-its-own-system-prompt)) are **opt-in on every
+provider** — they ship in the package but are **off by default**, the same "ships empty" stance
+as `mcp/`. A persona gets one only when you drop its
 plugin into the persona's `tools/` overlay; a default-riding agent comes up with the **benign /
 platform** tools only (memory, assets, messages, timelines, tasks, trust, lock, delete, users,
 webhooks, web_fetch). This is a **capability** classification, **provider-agnostic** — the
@@ -214,6 +216,33 @@ provider requirement (`Vendor("xai")` / `OpenAIKey()`) decides whether a powerfu
 - **Why:** a persona that's dangerous *by design* (a red-team agent) must get **zero** powerful
   tools by construction, never "on unless someone remembered to prune." Capability is the
   invariant; the provider is incidental.
+
+### Self-authorship — an agent edits its own system prompt
+
+The most powerful tool in the kit: **`system_prompt_read`** and **`system_prompt_edit`** let an
+agent read and rewrite its **own** personality charter, `prompts/system-prompt.md` — direct
+self-authorship of its own persona. It is opt-in like every powerful tool (its plugin file's
+stem is `system_prompt`), and by design it is **enabled on no one**: whether any agent ever gets
+it is a **founder decision, made per-agent, later** — it is not on for anyone as it ships. It was
+built now, gated off, so the capability is ready the day an agent earns it and its security shape
+could be designed calmly.
+
+The safety is **structural**, not validated-away:
+
+- **Own prompt only, by construction.** Neither tool takes a path or agent argument. The target
+  resolves internally from the agent's own config home — the *same* `system-prompt.md` the next
+  wake will read — so there is nothing for a prompt-injected argument to redirect.
+- **`system-prompt.md` only — never `initialize.md`.** With no file selector, the fleet-wide
+  input-security floor (which lives in `initialize.md`) sits **above** self-authorship: a
+  manipulated or misguided agent cannot edit away its own injection hardening.
+- **Guarded confirm = compare-and-swap.** `system_prompt_edit` writes only when `confirm` equals
+  a hash of the *current* content (from `system_prompt_read`, or the tool's own preview). A bare
+  or mismatched confirm changes nothing and previews instead — and because the token is
+  content-derived, a stale edit (the file changed since you read it) is refused, not clobbered.
+- **Versioned history.** Every successful edit first snapshots the old file as a timestamped
+  `.bak` beside it, so an operator can audit and roll back.
+- **Takes effect next wake.** The brief is re-composed each wake, so a self-edit lands on the
+  *next* wake, not the current turn — the tool descriptions say so.
 
 **A broken shipped default fails loud, never silently.** If a *shipped-default* tool plugin
 fails to import (a stale overlay, or a packaging bug), the harness does not quietly drop it: it

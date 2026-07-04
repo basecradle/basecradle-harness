@@ -105,6 +105,10 @@ from basecradle_harness._policy import BASECRADLE, SHELL, Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._reads import MessagesTool, UsersTool
 from basecradle_harness._session import Session
+from basecradle_harness._system_prompt import (
+    SystemPromptEditTool,
+    SystemPromptReadTool,
+)
 from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._version import __version__
@@ -216,6 +220,8 @@ __all__ = [
     "GrokGenerateVideoTool",
     "WebhookEndpointsTool",
     "WebhookEventsTool",
+    "SystemPromptReadTool",
+    "SystemPromptEditTool",
     "bind_platform_tools",
     # Message vocabulary
     "Message",
