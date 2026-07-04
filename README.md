@@ -154,6 +154,7 @@ basecradle-harness-install --config-home <dir>   # or an explicit location
 <agent-home>/.config/basecradle/
   agent.env            # your env (token, keys) — never created or touched by the installer
   model_params.json    # optional model-call params (temperature, reasoning, …) — yours, never touched by the installer
+  search_params.json   # optional web-search params (engine, max_results, domains, …) — yours, never touched by the installer
   prompts/
     system-prompt.md   # shipped default — composed into your Turn-0 charter, first
     initialize.md      # shipped default — provider-independent operating guidance
@@ -634,7 +635,7 @@ AI_MODEL=z-ai/glm-5.2    # OpenRouter model ids are vendor-prefixed
 > - **`AI_SDK=openrouter`** — OpenRouter's **native** first-party SDK, `pip install 'basecradle-harness[openrouter]'`. It speaks a single `chat` surface (OpenRouter's Responses API is beta upstream), so `AI_SDK_SURFACE` is unset. Its `chat.send` is a typed parameter set, so a [`model_params.json`](#model-parameters--model_paramsjson) key must be one it names.
 > - **`AI_SDK=openai`** — the `openai` SDK pointed at `openrouter.ai`, since OpenRouter speaks the OpenAI chat wire — **chat-only** (`AI_SDK_SURFACE=chat`; the openai adapter defaults to `responses`, which OpenRouter does not serve, so this is the first thing to set). On this path `extra_body` remains the escape hatch for non-standard fields.
 
-Like every provider, `AI_PROVIDER=openrouter` gates tool **availability**, not the safety default: OpenRouter has no provider-affine powerful tools of its own, and the OpenAI-/xAI-coupled media, search, and code tools all self-exclude under it — so an `openrouter` agent comes up with the benign BaseCradle platform tools only. (`model_params.json` is the knob for per-call tuning like `reasoning_effort` on a reasoning model.)
+Like every provider, `AI_PROVIDER=openrouter` gates tool **availability**, not the safety default: the OpenAI-/xAI-coupled media and code tools all self-exclude under it, and OpenRouter's one provider-affine powerful tool — **web search** (below) — is opt-in like every other. So a default-riding `openrouter` agent comes up with the benign BaseCradle platform tools only. (`model_params.json` is the knob for per-call tuning like `reasoning_effort` on a reasoning model.)
 
 ```python
 from basecradle_harness import Harness, OpenRouterProvider
@@ -647,6 +648,31 @@ agent = Harness(
 )
 print(agent.provider.base_url)  # -> https://openrouter.ai/api/v1
 ```
+
+### Search the web on OpenRouter — a server tool
+
+OpenRouter gives any model a **server-side web search** — its `openrouter:web_search` server tool. Like OpenAI's and xAI's search built-ins it runs entirely on the vendor's side: when the model decides it needs current information it calls the tool, OpenRouter searches and feeds the results back into the same turn, and the harness never executes anything. It is a **powerful, opt-in** tool ([Powerful tools are opt-in](#powerful-tools-are-opt-in--the-capability-rule)) — off by default on every provider — granted by opting its plugin into a persona:
+
+```bash
+basecradle-harness-install --opt-in openrouter_search
+```
+
+- **Native SDK only.** It wires into the **native** `openrouter` SDK path (`AI_SDK=openrouter` — the `@glm-5.2` brain). The OpenRouter-via-`openai`-SDK cell is chat-only and ships no server-side built-ins, so the tool self-excludes there rather than activating inert. It shares the `web_search` name with the OpenAI/xAI search built-ins, so exactly one activates per config (the same discriminator as the others).
+- **Server-side, cited.** OpenRouter returns the grounded answer with `url_citation` annotations; the adapter footers them as the same `Sources:` block the other web-search built-ins produce. (The `openrouter` SDK's typed response model doesn't itself carry those annotations, so the harness recovers them from the raw response — the SDK still owns the call.)
+- **Fully configurable — `search_params.json`.** Every optional search parameter is set per-agent in a config-home file, passed verbatim as the tool's `parameters` (no config → the bare tool object, OpenRouter's defaults ride):
+
+  ```json
+  // <agent-home>/.config/basecradle/search_params.json
+  {
+    "engine": "exa",
+    "max_results": 10,
+    "search_context_size": "medium",
+    "allowed_domains": ["arxiv.org", "nature.com"],
+    "user_location": { "type": "approximate", "city": "Dallas", "region": "Texas", "country": "US" }
+  }
+  ```
+
+  The full surface — `engine`, `max_results`, `max_total_results`, `search_context_size`, `max_characters`, `allowed_domains`, `excluded_domains`, `user_location` — is [OpenRouter's](https://openrouter.ai/docs/guides/features/server-tools/web-search); the harness passes the object through unchanged, so a parameter OpenRouter adds later works with no harness change. Search is billed to the agent's OpenRouter key at the engine's rate. Like `model_params.json`, this file is **yours** — the installer never writes or prunes it.
 
 ## Receive inbound activity — the webhook tools
 

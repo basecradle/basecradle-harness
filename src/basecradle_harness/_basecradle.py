@@ -91,6 +91,7 @@ from basecradle_harness._openrouter import (
     SURFACES as OPENROUTER_SURFACES,
 )
 from basecradle_harness._openrouter import (
+    WEB_SEARCH_BUILTIN,
     OpenRouterProvider,
 )
 from basecradle_harness._platform import PlatformContext, bind_platform_tools
@@ -102,6 +103,7 @@ from basecradle_harness._plugins import (
 )
 from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
+from basecradle_harness._search_params import load_search_params
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._tools import Tool
 from basecradle_harness._xai_sdk import (
@@ -619,7 +621,18 @@ _OWNED_XAI_SDK = frozenset(
     }
 )
 _OWNED_OPENROUTER = frozenset(
-    {"model", "api_key", "base_url", "timeout", "client", "messages", "tools", "stream"}
+    {
+        "model",
+        "api_key",
+        "base_url",
+        "timeout",
+        "client",
+        "builtin_tools",
+        "web_search_params",
+        "messages",
+        "tools",
+        "stream",
+    }
 )
 
 
@@ -707,8 +720,12 @@ def _provider_from_config(
     - ``AI_SDK=openrouter`` → `OpenRouterProvider`, OpenRouter's **native** first-party SDK, the
       @glm-5.2 peer's brain. It talks **only** to ``AI_PROVIDER=openrouter``; it speaks a single
       ``chat`` surface (OpenRouter's Responses API is beta upstream), so ``AI_SDK_SURFACE`` is unset.
-      OpenRouter is *also* reachable through the ``openai`` SDK pointed at ``openrouter.ai`` — a
-      permanent matrix cell — but **chat-only**, gated below with a clear error naming the fix.
+      The opted-in ``web_search`` built-in becomes OpenRouter's ``openrouter:web_search`` **server
+      tool** on the chat ``tools`` array (issue #237), tuned by ``search_params.json``; OpenRouter
+      runs it server-side and returns a grounded, cited answer. OpenRouter is *also* reachable
+      through the ``openai`` SDK pointed at ``openrouter.ai`` — a permanent matrix cell — but
+      **chat-only and server-built-in-free** (that cell ships no server tools), gated below with a
+      clear error naming the fix.
     - Any other ``AI_SDK`` is a clear "no adapter yet" error.
 
     All read ``AI_MODEL`` and fall back to ``AI_API_KEY`` for the key. For the openai/openrouter
@@ -764,7 +781,23 @@ def _provider_from_config(
                 "hatch."
             )
         base_url = os.environ.get("AI_BASE_URL") or _PROVIDER_BASE_URLS.get(provider)
-        return OpenRouterProvider(model, base_url=base_url, **params)
+        # The opted-in web_search built-in rides the chat `tools` array as OpenRouter's
+        # `openrouter:web_search` server tool (the adapter maps the name → wire type); its optional
+        # `parameters` come from the operator's search_params.json. Read that file **only when web
+        # search is actually active** — a malformed search_params.json must not fail the wake of a
+        # default-riding agent that never opted the tool in (unlike model_params.json, which is
+        # always relevant). Empty builtins/params → nothing extra is sent.
+        builtin_list = list(builtins)
+        web_search_params = (
+            load_search_params() or None if WEB_SEARCH_BUILTIN in builtin_list else None
+        )
+        return OpenRouterProvider(
+            model,
+            base_url=base_url,
+            builtin_tools=builtin_list,
+            web_search_params=web_search_params,
+            **params,
+        )
 
     if sdk != "openai":
         raise ValueError(

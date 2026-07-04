@@ -38,6 +38,7 @@ from basecradle_harness._basecradle import (
     _resolve_tools_and_provider,
 )
 from basecradle_harness._model_params import MODEL_PARAMS_NAME
+from basecradle_harness._search_params import SEARCH_PARAMS_NAME
 from basecradle_harness._version import __version__
 
 BC_URL = "https://basecradle.com"
@@ -814,6 +815,39 @@ def test_provider_from_config_openrouter_native_honors_an_explicit_base_url(monk
     provider = _provider_from_config("openrouter", "openrouter", "chat")
     assert isinstance(provider, OpenRouterProvider)
     assert provider.base_url == "https://or-proxy.internal/api/v1"
+    provider.close()
+
+
+def test_provider_from_config_openrouter_wires_web_search_and_search_params(monkeypatch):
+    # The builder threads the opted-in `web_search` built-in + the operator's search_params.json
+    # into the native adapter as the OpenRouter server tool (issue #237).
+    _set_openrouter_model_key(monkeypatch)
+    (config_home() / SEARCH_PARAMS_NAME).write_text(
+        json.dumps({"engine": "exa", "max_results": 8}), encoding="utf-8"
+    )
+    provider = _provider_from_config("openrouter", "openrouter", "chat", builtins=["web_search"])
+    assert provider._server_tools == [
+        {"type": "openrouter:web_search", "parameters": {"engine": "exa", "max_results": 8}}
+    ]
+    provider.close()
+
+
+def test_provider_from_config_openrouter_bare_web_search_without_params(monkeypatch):
+    # No search_params.json → the bare server-tool object (OpenRouter's defaults ride).
+    _set_openrouter_model_key(monkeypatch)
+    provider = _provider_from_config("openrouter", "openrouter", "chat", builtins=["web_search"])
+    assert provider._server_tools == [{"type": "openrouter:web_search"}]
+    provider.close()
+
+
+def test_provider_from_config_openrouter_ignores_search_params_when_web_search_off(monkeypatch):
+    # search_params.json is read ONLY when web search is active: a malformed file must not fail the
+    # wake of a default-riding agent that never opted the tool in (unlike model_params.json, which
+    # is always relevant to the model call). This guards the coupling the self-review flagged.
+    _set_openrouter_model_key(monkeypatch)
+    (config_home() / SEARCH_PARAMS_NAME).write_text("[not, an, object]", encoding="utf-8")
+    provider = _provider_from_config("openrouter", "openrouter", "chat")  # no web_search builtin
+    assert provider._server_tools == []  # no server tool, and the malformed file was never read
     provider.close()
 
 

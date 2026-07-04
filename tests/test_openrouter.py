@@ -208,6 +208,142 @@ def test_default_params_pass_through(router):
     provider.close()
 
 
+# === Web search (server tool, issue #237) =====================================
+
+
+def completion_with_annotations(*, content, annotations, server_tool_use=None):
+    """A chat-completions body carrying nested ``url_citation`` annotations on the message.
+
+    On the Chat Completions surface OpenRouter nests each citation under ``url_citation`` (unlike
+    the flat Responses shape). ``server_tool_use`` on ``usage`` is what the vendor reports for the
+    search count; both are fields the SDK's typed model does not keep, so this exercises the raw-body
+    recovery, not the model_dump.
+    """
+    body = completion(content=content)
+    body["choices"][0]["message"]["annotations"] = annotations
+    if server_tool_use is not None:
+        body["usage"]["server_tool_use"] = server_tool_use
+    return body
+
+
+def test_web_search_builtin_emits_the_openrouter_server_tool(router):
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="ok"))
+    )
+    provider = _provider(builtin_tools=["web_search"])
+    provider.chat([Message.user("news?")])
+    tools = json.loads(route.calls.last.request.content)["tools"]
+    assert tools == [{"type": "openrouter:web_search"}]  # bare object when no params configured
+    provider.close()
+
+
+def test_web_search_params_ride_the_parameters_block(router):
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="ok"))
+    )
+    params = {"engine": "exa", "max_results": 10, "allowed_domains": ["arxiv.org"]}
+    provider = _provider(builtin_tools=["web_search"], web_search_params=params)
+    provider.chat([Message.user("news?")])
+    tools = json.loads(route.calls.last.request.content)["tools"]
+    assert tools == [{"type": "openrouter:web_search", "parameters": params}]  # verbatim
+    provider.close()
+
+
+def test_server_tools_lead_the_function_tools(router):
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="ok"))
+    )
+    provider = _provider(builtin_tools=["web_search"])
+    provider.chat([Message.user("weather + news?")], tools=[WEATHER_TOOL])
+    tools = json.loads(route.calls.last.request.content)["tools"]
+    assert tools[0]["type"] == "openrouter:web_search"  # the server tool leads
+    assert tools[1]["type"] == "function"  # then the custom function tool
+    assert tools[1]["function"]["name"] == "get_weather"
+    provider.close()
+
+
+def test_no_builtins_sends_no_server_tool(router):
+    # The default openrouter agent (no opted-in web search) sends no tools at all — the safe,
+    # benign-only baseline.
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="ok"))
+    )
+    provider = _provider()
+    provider.chat([Message.user("Hi")])
+    assert "tools" not in json.loads(route.calls.last.request.content)
+    provider.close()
+
+
+def test_an_unknown_builtin_is_skipped_not_sent(router):
+    # A name that is not a known OpenRouter server tool is dropped, never forwarded as an unknown
+    # tool object the endpoint would reject. (In practice the resolver only feeds claimed names.)
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="ok"))
+    )
+    provider = _provider(builtin_tools=["not_a_server_tool"])
+    provider.chat([Message.user("Hi")])
+    assert "tools" not in json.loads(route.calls.last.request.content)
+    provider.close()
+
+
+def test_url_citation_annotations_are_footered_as_sources(router):
+    # The response-side contract: the SDK's typed model drops `annotations`, so the adapter recovers
+    # them from the raw body (a response event hook on its own httpx client) and footers them as the
+    # same `Sources:` block the other web-search built-ins produce. Built without an injected client
+    # so the capture hook is live; respx still mocks the transport.
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=completion_with_annotations(
+                content="Bitcoin is up.",
+                annotations=[
+                    {
+                        "type": "url_citation",
+                        "url_citation": {"url": "https://ex.com/btc", "title": "BTC News"},
+                    }
+                ],
+                server_tool_use={"web_search_requests": 2},
+            ),
+        )
+    )
+    provider = OpenRouterProvider(
+        MODEL, api_key=FAKE_KEY, base_url=BASE_URL, builtin_tools=["web_search"]
+    )
+    reply = provider.chat([Message.user("btc price?")])
+    assert "Bitcoin is up." in reply.content
+    assert "Sources:" in reply.content
+    assert "https://ex.com/btc" in reply.content
+    assert "BTC News" in reply.content
+    provider.close()
+
+
+def test_the_capture_hook_is_installed_only_when_a_server_tool_is_active(monkeypatch):
+    # The response-capture httpx client exists solely to recover web-search citations, so a
+    # default agent with no server tool pays no capture/extra-parse overhead — no capture, and the
+    # SDK builds its own client. With web search opted in, the capture is present.
+    monkeypatch.setenv("AI_API_KEY", "sk-or-env-key")
+    without = OpenRouterProvider(MODEL, base_url=BASE_URL)
+    assert without._capture is None
+    without.close()
+    with_search = OpenRouterProvider(MODEL, base_url=BASE_URL, builtin_tools=["web_search"])
+    assert with_search._capture is not None
+    with_search.close()
+
+
+def test_a_plain_answer_without_annotations_is_unchanged(router):
+    # No annotations → no footer, exactly as before web search. Guards against the recovery path
+    # mangling an ordinary reply.
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="Just a plain answer."))
+    )
+    provider = OpenRouterProvider(
+        MODEL, api_key=FAKE_KEY, base_url=BASE_URL, builtin_tools=["web_search"]
+    )
+    reply = provider.chat([Message.user("hi")])
+    assert reply.content == "Just a plain answer."
+    provider.close()
+
+
 # === Errors ===================================================================
 
 
