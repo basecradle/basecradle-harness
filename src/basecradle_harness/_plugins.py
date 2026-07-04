@@ -126,6 +126,31 @@ class Vendor(Requirement):
 
 
 @dataclass(frozen=True)
+class Sdk(Requirement):
+    """Met iff the active vendor SDK equals `name` (``AI_SDK`` — the package the harness imports).
+
+    The `Vendor`/`OpenAISurface` pair gate on *whose endpoint* and *which wire surface*; this
+    gates on *which SDK adapter* is actually running — the axis `ActivationContext.sdk` was
+    reserved for. It is what a built-in whose wiring lives in one specific adapter declares, so it
+    stays inert on a sibling cell that reaches the same provider through a different SDK. The
+    OpenRouter ``web_search`` server tool is the shipped case: its request wiring lives in the
+    native `OpenRouterProvider` (``AI_SDK=openrouter``), so it requires ``Sdk("openrouter")`` on
+    top of ``Vendor("openrouter")`` — under the openai-SDK-at-OpenRouter cell (chat-only, which
+    ships no server-side built-ins) it self-excludes rather than activating as a present-but-inert
+    tool the model would see but nothing would wire.
+    """
+
+    name: str
+
+    def met(self, ctx: ActivationContext) -> bool:
+        return ctx.sdk == self.name
+
+    @property
+    def reason(self) -> str:
+        return f"needs the {self.name!r} SDK (AI_SDK={self.name})"
+
+
+@dataclass(frozen=True)
 class OpenAISurface(Requirement):
     """Met iff the OpenAI adapter's wire surface equals `surface` (``"responses"`` | ``"chat"``).
 

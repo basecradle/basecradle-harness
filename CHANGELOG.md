@@ -7,6 +7,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.47.0] - 2026-07-04
+
+**Add OpenRouter web search as an opt-in server-tool built-in (issue #237).** Gives `@glm-5.2` —
+and every native-SDK OpenRouter agent — the server-side web search OpenRouter now offers as a
+`openrouter:web_search` server tool: the OpenRouter counterpart of the vendor-native web-search
+built-ins the harness already carries for OpenAI and xAI. Server-side and safe by construction
+(the harness never executes anything), off by default, fully configurable.
+
+### Added
+
+- **`openrouter_search` built-in** (`_defaults/tools/openrouter_search.py`) — a default plugin
+  gated to the native OpenRouter SDK, claiming the shared `web_search` name so exactly one search
+  built-in activates per config. **Opt-in, off by default on every provider** (issue #168): grant
+  it with `basecradle-harness-install --opt-in openrouter_search`. When active, the adapter puts
+  `{"type": "openrouter:web_search", "parameters": …}` on the chat `tools` array; OpenRouter runs
+  the search server-side and returns a grounded, cited answer.
+- **`search_params.json` — operator-owned web-search parameters** (`_search_params.py`). A single
+  JSON object in the config home, passed **verbatim** as the server tool's `parameters` — the full
+  OpenRouter surface (`engine`, `max_results`, `max_total_results`, `search_context_size`,
+  `max_characters`, `allowed_domains`, `excluded_domains`, `user_location`), so a parameter
+  OpenRouter adds later needs no harness change. Operator-owned like `model_params.json` (the
+  installer never touches it); absent/empty → the bare tool object and OpenRouter's defaults ride;
+  a malformed file is a hard failure at wake, not a silent skip.
+- **`Sdk` activation requirement** (`_plugins.py`, exported from the package root) — gates a plugin
+  on `AI_SDK` (the axis `ActivationContext.sdk` reserved). It scopes the OpenRouter web-search
+  built-in to the native SDK so it self-excludes on the openai-SDK-at-OpenRouter cell (chat-only,
+  no server-side built-ins) rather than activating as a present-but-inert tool.
+
+### Changed
+
+- **`message_from_chat` footers `url_citation` annotations** (`_openai_wire.py`) — a Chat
+  Completions turn grounded by web search now surfaces its sources as the same `Sources:` footer
+  the Responses surface produces, on every SDK that speaks the chat wire. The `openrouter` SDK's
+  typed response model does not carry those annotations, so `OpenRouterProvider` recovers them from
+  the raw response body via a response event hook (the SDK still owns the call — no harness-owned
+  HTTP) and grafts them onto the model dump before parsing.
+
 ## [0.46.0] - 2026-07-03
 
 **Add the OpenRouter SDK adapter and a generic `model_params.json` parameter passthrough

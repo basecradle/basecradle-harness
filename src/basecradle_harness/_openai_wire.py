@@ -76,7 +76,14 @@ def chat_tool_to_wire(tool: ToolSpec) -> dict[str, Any]:
 
 
 def message_from_chat(data: Mapping[str, Any]) -> Message:
-    """Parse a Chat Completions response into the assistant's `Message`."""
+    """Parse a Chat Completions response into the assistant's `Message`.
+
+    When a server-side web search grounded the turn (OpenRouter's ``openrouter:web_search``, or
+    any Chat-Completions endpoint's native search), the sources ride ``message.annotations`` as
+    ``url_citation`` entries — surfaced here as the same ``Sources:`` footer the Responses surface
+    appends, so a searched answer is cited on every surface. A turn without annotations is
+    unchanged.
+    """
     try:
         message = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError) as exc:
@@ -94,7 +101,31 @@ def message_from_chat(data: Mapping[str, Any]) -> Message:
             ) from exc
         tool_calls.append(ToolCall(id=raw["id"], name=function["name"], arguments=arguments))
 
-    return Message(role="assistant", content=message.get("content"), tool_calls=tool_calls)
+    content = message.get("content")
+    citations = _chat_url_citations(message.get("annotations"))
+    if citations:
+        content = (content or "") + format_citations(citations)
+    return Message(role="assistant", content=content, tool_calls=tool_calls)
+
+
+def _chat_url_citations(annotations: Any) -> list[Mapping[str, Any]]:
+    """The flat ``url_citation`` dicts from a Chat Completions ``message.annotations`` list.
+
+    Chat Completions nests the citation one level down —
+    ``{"type": "url_citation", "url_citation": {"url", "title", …}}`` — whereas `format_citations`
+    reads ``url``/``title`` off the top level (the Responses shape). So each entry is unwrapped to
+    its inner ``url_citation`` object; a defensively-flat entry (no inner object) passes through as
+    itself. A non-list ``annotations`` (absent, or an unexpected shape) yields no citations.
+    """
+    out: list[Mapping[str, Any]] = []
+    if not isinstance(annotations, Sequence) or isinstance(annotations, (str, bytes)):
+        return out
+    for ann in annotations:
+        if not isinstance(ann, Mapping) or ann.get("type") != "url_citation":
+            continue
+        inner = ann.get("url_citation")
+        out.append(inner if isinstance(inner, Mapping) else ann)
+    return out
 
 
 # === Responses ================================================================

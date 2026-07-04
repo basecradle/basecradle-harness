@@ -404,6 +404,7 @@ def test_every_shipped_power_tool_default_is_classified_opt_in():
         "hear_audio",
         "web_search",
         "xai_search",  # declares both web_search + x_search built-ins, both opt_in
+        "openrouter_search",  # OpenRouter web_search server tool (issue #237)
         "grok_generate_image",
         "grok_edit_image",
         "grok_generate_video",

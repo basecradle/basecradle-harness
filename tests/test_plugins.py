@@ -15,6 +15,7 @@ from basecradle_harness import (
     EnvSet,
     OpenAIKey,
     OpenAISurface,
+    Sdk,
     Tool,
     ToolPlugin,
     Vendor,
@@ -75,6 +76,16 @@ def test_openai_surface_requirement_matches_the_active_surface():
     req = OpenAISurface("responses")
     assert req.met(_ctx(surface="responses"))
     assert not req.met(_ctx(surface="chat"))
+
+
+def test_sdk_requirement_matches_the_active_sdk():
+    # Sdk gates on AI_SDK (the package the harness imports), the axis distinct from provider — so a
+    # tool whose wiring lives in one adapter self-excludes on a sibling cell reaching the same
+    # provider through a different SDK. This is what scopes OpenRouter web search to the native SDK.
+    req = Sdk("openrouter")
+    assert req.met(_ctx(provider="openrouter", sdk="openrouter"))
+    assert not req.met(_ctx(provider="openrouter", sdk="openai"))  # same provider, other SDK
+    assert "AI_SDK=openrouter" in req.reason
 
 
 def test_env_and_openai_key_requirements_read_the_context_env():
@@ -421,6 +432,40 @@ def test_opted_in_power_tools_self_exclude_under_openrouter(tmp_path):
     assert not (_OPENAI_POWER_TOOLS & names)  # generate_image / edit_image / listen all gone
     assert resolved.builtins == []  # web_search does not arm on openrouter
     assert _DEFAULT_TOOLS <= names  # the universal/platform tools still stand
+
+
+# --- OpenRouter web search (issue #237) --------------------------------------
+
+
+def test_openrouter_web_search_opts_in_under_the_native_sdk(tmp_path):
+    # Opted into the persona, the openrouter web_search built-in activates under the native SDK
+    # (provider=openrouter, sdk=openrouter) — claiming the shared `web_search` name — so the
+    # resolver hands it to the provider as a builtin.
+    home = tmp_path / "cfg"
+    install(home, provider="openrouter", opt_in=["openrouter_search"])
+    assert (home / "tools" / "openrouter_search.py").exists()  # scaffolded on explicit opt-in
+    resolved = resolve_plugins(load_plugins(home), _openrouter_ctx(AI_API_KEY="sk-or-key"))
+    assert resolved.builtins == ["web_search"]
+    assert "openrouter_search" in resolved.opt_in_stems
+
+
+def test_openrouter_web_search_self_excludes_on_the_openai_at_openrouter_cell(tmp_path):
+    # The Sdk("openrouter") gate is the point: reaching OpenRouter through the *openai* SDK (a
+    # chat-only cell that ships no server-side built-ins) must NOT activate the built-in as a
+    # present-but-inert tool. Same provider, different SDK → the plugin self-excludes.
+    home = tmp_path / "cfg"
+    install(home, provider="openrouter", opt_in=["openrouter_search"])
+    ctx = _ctx(provider="openrouter", sdk="openai", surface="chat", AI_API_KEY="sk-or-key")
+    resolved = resolve_plugins(load_plugins(home), ctx)
+    assert resolved.builtins == []  # not armed on the openai-SDK-at-OpenRouter cell
+
+
+def test_openrouter_web_search_is_off_by_default_even_under_the_native_sdk():
+    # Powerful → opt-in (issue #168): a default-riding native-SDK openrouter agent gets no web
+    # search. (Complements test_default_riding_openrouter_agent_is_benign_only, which asserts the
+    # whole benign-only set; this pins the new built-in specifically.)
+    resolved = resolve_plugins(load_plugins(), _openrouter_ctx(AI_API_KEY="sk-or-key"))
+    assert "web_search" not in resolved.builtins
 
 
 # --- active opt-in stems (issue #181, the fleet-drift inventory key) ---------
