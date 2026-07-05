@@ -12,6 +12,7 @@ from basecradle_harness._basecradle import TimelineAgent
 from basecradle_harness._brief import (
     compose_brief,
     fetch_dashboard_md,
+    render_budget,
     render_defects,
     render_manifest,
     render_safety,
@@ -153,6 +154,7 @@ __all__ = [
     "render_manifest",
     "render_safety",
     "render_defects",
+    "render_budget",
     "fetch_dashboard_md",
     # Provider contract + adapters
     "Provider",

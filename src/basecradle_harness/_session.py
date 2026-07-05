@@ -84,13 +84,22 @@ class Session:
         self.history.append(turn)
         try:
             reply = self.engine.run(self.history)
+        except Exception as exc:
+            # A failed run — most pointedly the engine's reserve-summary fallback erroring —
+            # still leaves its work in `history` (the engine mutates it in place: the counter
+            # notes, every assistant tool-call turn, every tool result). Mark the tail so a later
+            # reader knows the turn failed, then let the `finally` persist the partial transcript
+            # rather than discarding the whole ledger the way a save-only-on-success path did
+            # (issue #244).
+            self.history.append(Message.system(_failure_note(exc)))
+            raise
         finally:
-            # Evict the pixels however the loop ends — including the error path — so a
-            # failed turn cannot leave base64 in `history` to be re-sent (or persisted) on
-            # a later `send`. Mirrors the engine's own finally-based image eviction. The
-            # text stays as a breadcrumb; `_save` below only runs when the turn succeeded.
+            # Evict the pixels however the loop ends — success or failure — so a presented
+            # picture is never re-sent (or persisted as base64) on a later turn; the text caption
+            # stays as the breadcrumb. Then persist: the success reply, or the marked partial
+            # transcript on the failure path. Mirrors the engine's own finally-based eviction.
             turn.images = []
-        self._save()
+            self._save()
         return reply.content or ""
 
     def note(self, text: str) -> None:
@@ -117,3 +126,13 @@ class Session:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps([m.to_dict() for m in self.history], indent=2))
+
+
+def _failure_note(exc: BaseException) -> str:
+    """The trailing marker for a partial transcript persisted after `engine.run` raised.
+
+    Names the exception type and message so a later reader — or the operator diagnosing a
+    step-cap — can tell the turn failed and why, rather than the transcript ending on a
+    dangling tool call with no explanation (issue #244).
+    """
+    return f"[turn failed: {type(exc).__name__} — {exc}]"

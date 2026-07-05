@@ -14,6 +14,10 @@ The brief is composed, in order, of a current-time anchor followed by four parts
    each wake, so it is always current), is the reference every inbound item's `[created_at]`
    stamp is read against, and tells the model to convert UTC → a named locale before answering
    a local-time question (issue #180).
+0b. **The step-budget statement** (`render_budget`) — the one-time "this turn has a budget of
+   N steps, a live counter follows each step, per-turn and resets each wake" rule (issue #243),
+   so the live per-step counter the engine injects can stay terse. Omitted when there is no
+   budget to announce.
 1. **`initialize.md`** — the framework's authored operating guidance: how to behave
    here, plus the cross-cutting gotchas the function schemas can't convey. Provider-
    independent (identical on every install).
@@ -88,9 +92,30 @@ def render_defects(notices: Sequence[str] | None) -> str | None:
     return "\n".join([header, *(f"- {line}" for line in lines)])
 
 
+def render_budget(max_steps: int | None) -> str | None:
+    """The one-time step-budget statement for the persistent brief, or ``None``.
+
+    States the rule once per wake — the turn has a budget of N steps, a live counter follows
+    every step, and the budget is per-turn and resets each wake — so the per-step counter note
+    can stay terse (issue #243). ``None``/non-positive → omitted (a caller with no budget to
+    announce composes exactly the brief it did before). A sentence, so sentence case.
+    """
+    if max_steps is None or max_steps <= 0:
+        return None
+    return (
+        f"Step budget: this turn runs for up to {max_steps} steps (one step = one of your "
+        f"model turns, whether it calls tools or replies). A live counter — 'Step N of "
+        f"{max_steps}' — is appended right before each step, so you always know where you "
+        "stand. The budget is per-turn and resets on your next wake. Treat it as a hard "
+        "constraint: end with a text reply before it runs out, and if work remains, schedule a "
+        "follow-up task so the next turn continues it."
+    )
+
+
 def compose_brief(
     *,
     now: str | None = None,
+    budget: str | None = None,
     initialize: str | None,
     manifest: str | None,
     defects: str | None = None,
@@ -114,13 +139,25 @@ def compose_brief(
     an operator who blanked their charter — and the brief is composed from whatever remains.
     With nothing at all, returns ``None``.
 
-    ``now``, ``defects``, ``safety``, and ``memory`` default to ``None`` so a caller with none
-    of them (a test exercising composition, or the common no-MCP / default-SQLite-provider
-    case) composes exactly the brief it did before these seams existed.
+    ``now``, ``budget``, ``defects``, ``safety``, and ``memory`` default to ``None`` so a caller
+    with none of them (a test exercising composition, or the common no-MCP / default-SQLite-
+    provider case) composes exactly the brief it did before these seams existed. The **step
+    budget** rides right after the time anchor and before the operating guidance — it is a
+    standing fact about how the turn is bounded, so the model reads it up front (issue #243).
     """
     parts = [
         part
-        for part in (now, initialize, manifest, defects, safety, dashboard, memory, system_prompt)
+        for part in (
+            now,
+            budget,
+            initialize,
+            manifest,
+            defects,
+            safety,
+            dashboard,
+            memory,
+            system_prompt,
+        )
         if part and part.strip()
     ]
     return "\n\n".join(parts) if parts else None

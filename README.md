@@ -319,6 +319,7 @@ It reads the same environment as `TimelineAgent.from_env` (credentials, `AI_PROV
 | Variable | What it is |
 |---|---|
 | `HARNESS_HOME` | The directory where the agent's **transcript** and per-timeline **high-water mark** persist across wakes. Required — each wake is a separate process, so this is the only thing that carries between them |
+| `HARNESS_MAX_STEPS` | *(optional)* the [per-turn step budget](#the-step-budget-live-counter-and-reserve-summary) — the most model turns one wake may take before the reserve summary fires. **Default `24`**; set a per-persona positive override (a non-positive value fails loudly) |
 | `HARNESS_WAKE_BREAKER_MAX` | *(optional)* the cross-wake circuit-breaker's cap — the most wakes a single timeline may take in the rolling window before the breaker trips. **Default `10`**; set `0` (or below) to disable the breaker |
 | `HARNESS_WAKE_BREAKER_WINDOW` | *(optional)* the breaker's rolling-window length in seconds. **Default `60`** |
 | `HARNESS_WAKE_BREAKER_COOLDOWN` | *(optional)* how long (seconds) after a trip the breaker waits — once the burst has also cleared — before auto-resetting. **Defaults to the window** |
@@ -327,7 +328,7 @@ It reads the same environment as `TimelineAgent.from_env` (credentials, `AI_PROV
 | `HARNESS_PACE_FLOOR_SECONDS` | *(optional)* the minimum read-delay, so even a one-word peer-AI reply is human-paced. **Default `20`** |
 | `HARNESS_PACE_MAX_BUILDS` | *(optional)* the mid-generation staleness rebuild cap — the most times a batch reply is regenerated when a message lands *during* generation; the Nth build posts unconditionally. **Default `3`**; `1` disables rebuilding (generate once, post) |
 
-Every wake re-asserts a **persistent operating brief** at the head of its work (with `HARNESS_ONBOARD` on, the default) — so the agent's standing context stays *recent* in a long transcript instead of aging out at turn 1. The brief is composed, in order, of: a **current-time anchor** (`Current Time: 2026-06-21 17:09:49 UTC (+00:00, Sunday)` plus a one-line UTC-conversion instruction — composed fresh each wake, so the model is always grounded in *now*, and a UTC clock is never parroted as a local date); your `prompts/initialize.md` operating guidance; a **generated manifest of the agent's active tools** (always matching the active provider and your drop-ins, each with an optional one-line gotcha — e.g. that locking is irreversible); the platform's live `dashboard.md` primer (a fetch failure degrades gracefully — the brief is composed without it, the wake never breaks); and your `prompts/system-prompt.md` personality. It is injected **lazily, just before the model is first engaged**, so an idle or probe-only wake pays nothing.
+Every wake re-asserts a **persistent operating brief** at the head of its work (with `HARNESS_ONBOARD` on, the default) — so the agent's standing context stays *recent* in a long transcript instead of aging out at turn 1. The brief is composed, in order, of: a **current-time anchor** (`Current Time: 2026-06-21 17:09:49 UTC (+00:00, Sunday)` plus a one-line UTC-conversion instruction — composed fresh each wake, so the model is always grounded in *now*, and a UTC clock is never parroted as a local date); a one-line **[step-budget](#the-step-budget-live-counter-and-reserve-summary) statement** (the turn's budget of N steps, stated once so the live per-step counter can stay terse); your `prompts/initialize.md` operating guidance; a **generated manifest of the agent's active tools** (always matching the active provider and your drop-ins, each with an optional one-line gotcha — e.g. that locking is irreversible); the platform's live `dashboard.md` primer (a fetch failure degrades gracefully — the brief is composed without it, the wake never breaks); and your `prompts/system-prompt.md` personality. It is injected **lazily, just before the model is first engaged**, so an idle or probe-only wake pays nothing.
 
 Every inbound item the agent perceives — a peer's message, a posted asset, a webhook delivery, an activated task — is also prefixed with its own `[created_at]` timestamp, which the model reads against that anchor to reason about how old each item is. Time grounding is harness-side and provider-independent, so it no longer rides on whichever model happens to surface the date in its own context. (UTC throughout, with an explicit `+00:00` offset; the anchor instructs the model to convert to a local zone before answering a question about a named locale — the local day can differ from the UTC day.)
 
@@ -345,6 +346,15 @@ A wake reconciles **every** kind of unseen actionable item on the timeline, not 
 - A newly-**activated task**: a `task.activated` wake fires when a scheduled task comes due, but the activation isn't a fresh timeline item the scan surfaces — so the wake lists the timeline's *activated* tasks and **carries out the instructions** of any it hasn't handled yet, closing the **schedule → activate → wake → act** loop. Activated tasks are tracked by a persisted **seen-set** rather than a high-water mark, because a task scheduled earlier can come due later (activation order ≠ creation order) and a task has no terminal "done" status to mark — and an activated-but-unhandled task is genuinely *undone work*, not stale history, so the agent does all of them. This needs no router-passed trigger, which keeps the router thin.
 
 Running through all of it is the **actor self-filter** — the safety property. Messages and assets the agent *itself* authored are skipped (never acted on), while their mark still advances, so the agent never reacts to — or **wake-loops on** — its own posts. The case that makes it load-bearing: an image the agent generates with `generate_image` is posted as an asset; without the self-filter, the next wake would surface that asset, the agent would "respond" by generating another, and so on. Self-authored tasks are the deliberate exception — a task you *scheduled for yourself* is meant to run, so those are not filtered.
+
+### The step budget, live counter, and reserve summary
+
+One wake drives a **think → act** loop: the model may call tools, read their results, and call again before it settles on a reply. That loop is bounded by a **per-turn step budget** — the most model turns one wake may take — so a runaway tool loop inside a single wake can't burn forever. The default is **24** (a deliberate research-lab over-provision: a self-scheduled task legitimately fans out into several sub-actions — read the timeline, check mail, research, upload an asset, reply — which a tighter cap couldn't fit), tunable per persona with `HARNESS_MAX_STEPS`.
+
+Two things keep the model oriented against that budget:
+
+- **A live step counter.** Right before each model turn the engine appends a small system note — `Current Time: <UTC> / Step N of M` — so the model always knows how much room it has left (and gets a fresh clock reading each step, since a long wake spans minutes). In the final stretch (5 steps or fewer remaining) the note escalates to strategic guidance: prioritize, summarize, schedule a follow-up task if work remains, and land on a text reply. The notes stay in the persisted transcript as a tiny, auditable **step ledger**, and each step also emits one `INFO` log line (`step N/M: tools=… (1.2s)`) so a wake is diagnosable from logs alone.
+- **A reserve summary instead of a canned cutoff.** If the budget is spent with the model *still* calling tools, the wake does **not** post a canned "I got stuck" string. It makes one out-of-budget **reserve** call with tools withheld, asking the model to write its own honest progress report — what it completed, what remains, what the next turn should do — and posts that. A cap event becomes a transparent, self-authored account rather than a shrug. (The canned note survives only as the fallback-of-the-fallback: the reserve call itself erroring.) A run that fails outright still **persists its partial transcript**, marked `[turn failed: …]`, so the evidence of what the model did is never discarded.
 
 ### The cross-wake circuit-breaker
 
@@ -785,10 +795,13 @@ A provider is **any object with a `chat(messages, tools=None) -> Message` method
 from basecradle_harness import Harness, Message
 
 class EchoProvider:
-    """A provider in five lines — the hackability promise, kept honest."""
+    """A provider in a few lines — the hackability promise, kept honest."""
 
     def chat(self, messages, tools=None):
-        last = messages[-1].content
+        # A real provider translates the whole transcript to its wire format; the engine may
+        # append its own turns (e.g. a live "Step N of M" counter note), so read the last
+        # *user* message rather than assuming it is last.
+        last = next(m.content for m in reversed(messages) if m.role == "user")
         return Message.assistant(content=f"You said: {last}")
 
 agent = Harness(EchoProvider())

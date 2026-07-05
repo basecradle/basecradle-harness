@@ -7,6 +7,8 @@ model *input* on the next turn, then the pixels are evicted from the transcript
 once the model has answered, so a viewed image is never re-sent.
 """
 
+import re
+
 import pytest
 
 from basecradle_harness import (
@@ -127,24 +129,110 @@ def test_the_tool_result_text_is_the_tool_message():
 
 
 class AlwaysViewProvider:
-    """A provider that never stops calling the view tool — drives the loop to max_steps."""
+    """Calls the view tool while tools are offered; answers in text once they're withheld.
+
+    Drives the loop to the budget, then settles on the engine's out-of-budget reserve call
+    (``tools=None``) so a viewed image is exercised on the reserve path too.
+    """
 
     def chat(self, messages, tools=None):
+        if tools is None:
+            return Message.assistant(content="Out of steps; here's the summary.")
         return Message.assistant(tool_calls=[ToolCall(id="c", name="view", arguments={})])
 
 
+def _is_counter(m: Message) -> bool:
+    return m.role == "system" and bool(m.content) and bool(re.search(r"Step \d+ of \d+", m.content))
+
+
 def test_images_are_evicted_even_when_the_step_limit_is_hit():
-    """The eviction guarantee holds on the error path too (try/finally), not just success."""
+    """The eviction guarantee holds when the budget is spent (try/finally), not just on success."""
     registry = ToolRegistry()
     registry.register(ViewTool())
     engine = Engine(AlwaysViewProvider(), registry, max_steps=2)
     history = [Message.user("look")]
 
+    reply = engine.run(history)  # the reserve summary, not an EngineError
+
+    assert reply.content == "Out of steps; here's the summary."
+    # No base64 lingers in the mutated-in-place transcript to be re-sent next turn.
+    assert not any(m.images for m in history)
+
+
+class ReserveBlowsUpProvider:
+    """Calls the view tool while budgeted; the out-of-budget reserve call itself raises."""
+
+    def chat(self, messages, tools=None):
+        if tools is None:
+            raise RuntimeError("reserve call blew up")
+        return Message.assistant(tool_calls=[ToolCall(id="c", name="view", arguments={})])
+
+
+def test_reserve_failure_still_evicts_images_and_raises():
+    """When the reserve call itself errors, EngineError raises and images still evict (finally)."""
+    registry = ToolRegistry()
+    registry.register(ViewTool())
+    engine = Engine(ReserveBlowsUpProvider(), registry, max_steps=2)
+    history = [Message.user("look")]
+
     with pytest.raises(EngineError):
         engine.run(history)
 
-    # No base64 lingers in the mutated-in-place transcript to be re-sent next turn.
     assert not any(m.images for m in history)
+
+
+class ReserveReturnsToolCallProvider:
+    """Never stops calling a tool — even the reserve call answers with a lone tool call, no text.
+
+    Models a server-tool persona: `tools=None` withholds the harness's function tools but a
+    server-side built-in can still resolve, and the model can come back with no usable text.
+    """
+
+    def chat(self, messages, tools=None):
+        return Message.assistant(tool_calls=[ToolCall(id="c", name="echo", arguments={})])
+
+
+def test_reserve_reply_with_no_text_raises_and_persists_no_dangling_tool_call():
+    """A textless reserve reply (a lone tool call) falls back to EngineError, and its dangling
+    assistant tool-call turn is NOT persisted — else the next wake's transcript is malformed."""
+    engine = _engine(ReserveReturnsToolCallProvider(), EchoTool())
+    engine.max_steps = 2
+    history = [Message.user("go")]
+
+    with pytest.raises(EngineError, match="produced no text"):
+        engine.run(history)
+
+    # The transcript must not end on an assistant turn with tool_calls and no following tool
+    # result — every persisted assistant tool-call turn is answered by a tool turn.
+    for i, m in enumerate(history):
+        if m.role == "assistant" and m.tool_calls:
+            assert i + 1 < len(history) and history[i + 1].role == "tool"
+
+
+class ReserveTextPlusToolCallProvider:
+    """Budgeted turns call a tool; the reserve turn answers with text AND a stray tool call."""
+
+    def chat(self, messages, tools=None):
+        if tools is None:
+            return Message.assistant(
+                content="Here's my progress.",
+                tool_calls=[ToolCall(id="stray", name="echo", arguments={})],
+            )
+        return Message.assistant(tool_calls=[ToolCall(id="c", name="echo", arguments={})])
+
+
+def test_reserve_summary_persists_text_only_dropping_stray_tool_calls():
+    """A reserve reply with text keeps the text but drops any stray tool calls, so the persisted
+    turn is a clean assistant text turn (no dangling tool-call to poison the next wake)."""
+    engine = _engine(ReserveTextPlusToolCallProvider(), EchoTool())
+    engine.max_steps = 2
+    history = [Message.user("go")]
+
+    reply = engine.run(history)
+
+    assert reply.content == "Here's my progress."
+    assert reply.tool_calls == []  # the stray call was dropped
+    assert history[-1] is reply and history[-1].tool_calls == []
 
 
 def test_a_plain_string_tool_injects_no_image_turn():
@@ -159,4 +247,151 @@ def test_a_plain_string_tool_injects_no_image_turn():
 
     # No image turns at all — a str tool result behaves exactly as it always has.
     assert not any(m.images for m in history)
-    assert [m.role for m in history] == ["user", "assistant", "tool", "assistant"]
+    # The step-counter notes are filtered out; the underlying flow is unchanged.
+    assert [m.role for m in history if not _is_counter(m)] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+
+
+# --- the live step counter (issue #243) --------------------------------------
+
+
+def _counters(history):
+    return [m for m in history if _is_counter(m)]
+
+
+def test_a_step_counter_note_precedes_every_provider_call():
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="echo", arguments={})]),
+        Message.assistant(content="done"),
+    )
+    engine = _engine(provider, EchoTool())
+    history = [Message.user("go")]
+
+    engine.run(history)
+
+    # Two provider calls → two counter notes, and each lands immediately before its call.
+    counters = _counters(history)
+    assert [c.content.splitlines()[-1] for c in counters] == ["Step 1 of 24.", "Step 2 of 24."]
+    # The note is a trailing system turn: the assistant reply follows right after it.
+    idx = history.index(counters[0])
+    assert history[idx + 1].role == "assistant"
+
+
+def test_the_counter_note_carries_a_fresh_timestamp():
+    from datetime import datetime, timezone
+
+    stamp = datetime(2026, 7, 4, 20, 4, 12, tzinfo=timezone.utc)
+    provider = ScriptedProvider(Message.assistant(content="done"))
+    engine = Engine(provider, ToolRegistry(), clock=lambda: stamp)
+    history = [Message.user("go")]
+
+    engine.run(history)
+
+    note = _counters(history)[0].content
+    assert note.startswith("Current Time: 2026-07-04 20:04:12 UTC")
+    assert note.endswith("Step 1 of 24.")
+
+
+def test_the_counter_escalates_in_the_final_stretch():
+    # With a budget of 3, every step is within the last 5 → the escalation guidance shows.
+    provider = ScriptedProvider(Message.assistant(content="done"))
+    engine = Engine(provider, ToolRegistry(), max_steps=3)
+    history = [Message.user("go")]
+
+    engine.run(history)
+
+    note = _counters(history)[0].content
+    assert "Step 1 of 3." in note
+    assert "running low" in note
+    assert "final action step" in note  # tells it to land with a text reply
+
+
+def test_counter_notes_persist_as_a_ledger_and_are_not_evicted():
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="view", arguments={})]),
+        Message.assistant(content="done"),
+    )
+    engine = _engine(provider, ViewTool())
+    history = [Message.user("look")]
+
+    engine.run(history)
+
+    # The image pixels are evicted, but the (tiny) counter notes stay as the step ledger.
+    assert not any(m.images for m in history)
+    assert len(_counters(history)) == 2
+
+
+# --- per-step logging (issue #244) -------------------------------------------
+
+
+def test_each_step_logs_its_tools_and_a_final_summary_line(caplog):
+    import logging
+
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="echo", arguments={})]),
+        Message.assistant(content="done"),
+    )
+    engine = _engine(provider, EchoTool())
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        engine.run([Message.user("go")])
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert any("step 1/24: tools=echo" in m for m in messages)
+    assert any("step 2/24: final reply" in m for m in messages)
+    assert any("wake used 2/24 steps" in m for m in messages)
+
+
+def test_a_capped_wake_logs_the_reserve_summary_marker(caplog):
+    import logging
+
+    class Loops:
+        def chat(self, messages, tools=None):
+            if tools is None:
+                return Message.assistant(content="summary")
+            return Message.assistant(tool_calls=[ToolCall(id="c", name="echo", arguments={})])
+
+    engine = _engine(Loops(), EchoTool())
+    engine.max_steps = 2
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        engine.run([Message.user("go")])
+
+    assert any("wake used 2/2 steps + reserve summary" in r.getMessage() for r in caplog.records)
+
+
+# --- server-side built-in called as a function (issue #245) ------------------
+
+
+def test_a_server_builtin_called_as_a_function_gets_targeted_guidance():
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="web_search", arguments={})]),
+        Message.assistant(content="ok"),
+    )
+    engine = Engine(provider, ToolRegistry(), server_builtins=["web_search"])
+    history = [Message.user("look it up")]
+
+    engine.run(history)
+
+    result = next(m for m in history if m.role == "tool")
+    assert "runs server-side" in result.content
+    assert "Do not retry" in result.content
+    assert "no tool named" not in result.content  # not the generic error
+
+
+def test_an_unknown_tool_still_gets_the_generic_error():
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="nonesuch", arguments={})]),
+        Message.assistant(content="ok"),
+    )
+    engine = Engine(provider, ToolRegistry(), server_builtins=["web_search"])
+    history = [Message.user("go")]
+
+    engine.run(history)
+
+    result = next(m for m in history if m.role == "tool")
+    assert "no tool named 'nonesuch'" in result.content

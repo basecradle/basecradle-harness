@@ -8,6 +8,8 @@ As elsewhere, a `ScriptedProvider` replays prepared assistant turns, so the loop
 runs with no model and no network.
 """
 
+import re
+
 import pytest
 
 from basecradle_harness import (
@@ -42,6 +44,24 @@ def calls_tool(call_id: str, name: str, **arguments) -> Message:
     return Message.assistant(tool_calls=[ToolCall(id=call_id, name=name, arguments=arguments)])
 
 
+def _is_counter(m: Message) -> bool:
+    """A live step-counter note the engine injects before each provider call (issue #243).
+
+    Matched by its `Step N of M` line — never the brief's `Current Time:` anchor or its
+    `Step budget:` statement, whose wording is deliberately close but carries no `N of M`.
+    """
+    return m.role == "system" and bool(m.content) and bool(re.search(r"Step \d+ of \d+", m.content))
+
+
+def convo(history: list[Message]) -> list[Message]:
+    """The transcript with the injected step-counter notes removed.
+
+    These tests pin the conversation shape (separate transcripts, shared memory), not the
+    per-step ledger the counter notes form — so they read the transcript without them.
+    """
+    return [m for m in history if not _is_counter(m)]
+
+
 # --- Channels share memory, not conversation ---------------------------------
 
 
@@ -54,8 +74,8 @@ def test_sessions_keep_separate_transcripts():
 
     a = agent.session("github:pr-1").history
     b = agent.session("timeline:x").history
-    assert [m.content for m in a] == ["from A", "a1"]
-    assert [m.content for m in b] == ["from B", "b1"]
+    assert [m.content for m in convo(a)] == ["from A", "a1"]
+    assert [m.content for m in convo(b)] == ["from B", "b1"]
 
 
 def test_every_session_starts_from_the_shared_charter():
@@ -88,11 +108,11 @@ def test_memory_written_on_one_channel_is_read_on_another(tmp_path):
     reply = agent.send("Why did you change PR #123?", source="timeline:abc")
 
     assert reply == "Because the retry was flaky."
-    # The two channels never shared a transcript…
+    # The two channels never shared a transcript… (counter notes filtered out)
     assert (
-        len(agent.session("github:pr-123").history) == 4
+        len(convo(agent.session("github:pr-123").history)) == 4
     )  # user, assistant(call), tool, assistant
-    assert len(agent.session("timeline:abc").history) == 4
+    assert len(convo(agent.session("timeline:abc").history)) == 4
     # …but the fact crossed between them through the one memory store.
 
 
@@ -105,10 +125,10 @@ def test_transcript_reads_another_live_sessions_history():
 
     seen = agent.transcript("github:pr-123")
 
-    assert [m.content for m in seen] == ["status?", "I shipped the retry fix."]
+    assert [m.content for m in convo(seen)] == ["status?", "I shipped the retry fix."]
     # It is a copy: mutating the returned list does not touch the session.
     seen.clear()
-    assert len(agent.session("github:pr-123").history) == 2
+    assert len(convo(agent.session("github:pr-123").history)) == 2
 
 
 def test_transcript_of_unknown_source_is_empty():
@@ -128,11 +148,14 @@ def test_transcripts_persist_and_reload_across_instances(tmp_path):
     # A fresh agent over the same home — a restart — can still read the old session.
     second = Harness(ScriptedProvider(), home=tmp_path)
     reloaded = second.transcript("github:pr-9")
-    assert [m.content for m in reloaded] == ["do the thing", "Did the thing because X."]
+    assert [m.content for m in convo(reloaded)] == ["do the thing", "Did the thing because X."]
 
     # And re-opening the session resumes its transcript rather than starting fresh.
     resumed = second.session("github:pr-9")
-    assert [m.content for m in resumed.history] == ["do the thing", "Did the thing because X."]
+    assert [m.content for m in convo(resumed.history)] == [
+        "do the thing",
+        "Did the thing because X.",
+    ]
 
 
 def test_no_home_means_no_transcript_files_are_written(tmp_path):
@@ -156,7 +179,7 @@ def test_default_send_and_explicit_default_source_are_the_same_session():
     agent = Harness(ScriptedProvider(text("a"), text("b")))
     agent.send("one")  # default source
     agent.send("two", source="default")  # explicitly the same one
-    assert [m.content for m in agent.history] == ["one", "a", "two", "b"]
+    assert [m.content for m in convo(agent.history)] == ["one", "a", "two", "b"]
 
 
 # --- Message persistence round-trip ------------------------------------------
@@ -192,7 +215,9 @@ def test_send_presents_images_then_evicts_the_pixels():
             self.seen = None
 
         def chat(self, messages, tools=None):
-            self.seen = list(messages[-1].images)
+            # The engine appends a step-counter note as the last turn, so the image no longer
+            # rides messages[-1]; a real adapter renders images wherever they sit, so scan all.
+            self.seen = [img for m in messages for img in m.images]
             return text("I see a cat.")
 
     provider = CapturesImages()
@@ -222,7 +247,31 @@ def test_presented_images_are_evicted_even_when_the_turn_fails():
     with pytest.raises(RuntimeError):
         session.send("look at this", images=[image])
 
-    assert session.history[-1].images == []  # evicted on the error path too
+    # No base64 anywhere in the persisted-on-failure transcript (the user turn's pixels
+    # are evicted before the failure marker is appended).
+    assert not any(m.images for m in session.history)
+
+
+def test_partial_transcript_persists_on_engine_failure(tmp_path):
+    """Issue #244: a failed run still writes its partial transcript to disk, marked failed,
+    rather than discarding the whole ledger the way a save-only-on-success path did."""
+
+    class Boom:
+        def chat(self, messages, tools=None):
+            raise RuntimeError("model exploded")
+
+    path = tmp_path / "transcript.json"
+    session = Session("timeline:x", Harness(Boom(), max_steps=2).engine, path=path)
+
+    with pytest.raises(RuntimeError):
+        session.send("do the thing")
+
+    # The turns accumulated before the failure are on disk, with a failure marker at the tail.
+    reloaded = Session("timeline:x", Harness(Boom(), max_steps=2).engine, path=path)
+    assert any(t.content == "do the thing" for t in reloaded.history)  # the user turn survived
+    marker = reloaded.history[-1]
+    assert marker.role == "system"
+    assert "turn failed" in marker.content and "RuntimeError" in marker.content
 
 
 def test_note_records_a_system_turn_without_calling_the_model(tmp_path):
