@@ -55,8 +55,10 @@ def load_model_params(home: str | os.PathLike[str] | None = None) -> dict[str, A
       file should be) → `ValueError` naming the full path and the cause, so a typo or a misplaced
       path fails the wake loudly at provider build rather than running silently with no tuning.
 
-    The read is side-effect-free — the read-only introspection paths that never build a provider
-    do not call it, so a malformed file surfaces only on an actual wake.
+    The read is side-effect-free (a file read, no logging, no provider built), so besides the
+    wake's provider build (`_provider_from_config`) the read-only ``--resolved-config``
+    introspection also loads it (`resolved_model_params`, issue #236) to report the tuning — there
+    a malformed file surfaces at verify time as a clean non-zero exit, the same failure a wake hits.
     """
     path = config_home(home) / MODEL_PARAMS_NAME
     try:

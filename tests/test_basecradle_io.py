@@ -39,6 +39,7 @@ from basecradle_harness._basecradle import (
     _orientation,
     _provider_from_config,
     _resolve_tools_and_provider,
+    resolved_model_params,
 )
 from basecradle_harness._model_params import MODEL_PARAMS_NAME
 from basecradle_harness._search_params import SEARCH_PARAMS_NAME
@@ -1073,6 +1074,57 @@ def test_model_params_malformed_file_fails_the_build(monkeypatch):
     (config_home() / MODEL_PARAMS_NAME).write_text("{not json", encoding="utf-8")
     with pytest.raises(ValueError, match=MODEL_PARAMS_NAME):
         _provider_from_config("openai", "openai", "responses")
+
+
+# --- resolved_model_params: the read-only introspection twin of the collision policy (issue #236) ---
+
+
+def test_resolved_model_params_absent_file_is_empty_with_no_collisions():
+    # No file → the feature is off: an empty object and nothing stripped, for every SDK.
+    assert resolved_model_params("openai") == ({}, [])
+    assert resolved_model_params("xai-sdk") == ({}, [])
+    assert resolved_model_params("openrouter") == ({}, [])
+
+
+def test_resolved_model_params_reports_loaded_object_verbatim_and_openai_collisions():
+    # The loaded object is returned exactly as written (harness-owned keys included — reporting is
+    # honest); `stripped` names the owned collisions the openai build would drop. `reasoning`/
+    # `temperature` are genuine tuning and never collide.
+    _write_model_params({"reasoning": {"effort": "high"}, "temperature": 0.2, "model": "sneaky"})
+    loaded, stripped = resolved_model_params("openai")
+    assert loaded == {"reasoning": {"effort": "high"}, "temperature": 0.2, "model": "sneaky"}
+    assert stripped == ["model"]
+
+
+def test_resolved_model_params_keys_off_the_sdk_not_the_provider():
+    # The openai SDK serves openai/xai/openrouter alike, so its owned set applies whenever
+    # AI_SDK=openai — `web_search_params` is owned only on the *native* openrouter SDK, so under
+    # the openai SDK it is treated as ordinary tuning (no collision).
+    _write_model_params({"web_search_params": {"q": "x"}, "temperature": 0.1})
+    _loaded, stripped = resolved_model_params("openai")
+    assert stripped == []
+    # On the native openrouter SDK the same key is harness-owned and reported stripped.
+    _loaded, stripped = resolved_model_params("openrouter")
+    assert stripped == ["web_search_params"]
+
+
+def test_resolved_model_params_extra_body_stripped_only_where_the_sdk_drops_it():
+    # extra_body is a real passthrough on the openai SDK (not stripped), but the native xai-sdk and
+    # openrouter builds warn-and-drop it — so introspection counts it stripped exactly there.
+    _write_model_params({"extra_body": {"x": 1}, "temperature": 0.5})
+    assert resolved_model_params("openai") == (
+        {"extra_body": {"x": 1}, "temperature": 0.5},
+        [],
+    )
+    assert resolved_model_params("xai-sdk")[1] == ["extra_body"]
+    assert resolved_model_params("openrouter")[1] == ["extra_body"]
+
+
+def test_resolved_model_params_malformed_file_raises_naming_the_file():
+    # Same failure a wake hits, surfaced at verify time: a malformed file is a loud ValueError.
+    (config_home() / MODEL_PARAMS_NAME).write_text("{not json", encoding="utf-8")
+    with pytest.raises(ValueError, match=MODEL_PARAMS_NAME):
+        resolved_model_params("openai")
 
 
 def test_model_params_land_in_the_request_body_end_to_end(monkeypatch):

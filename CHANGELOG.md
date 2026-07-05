@@ -7,6 +7,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.51.0] - 2026-07-04
+
+**Expose `model_params` in `--resolved-config` introspection (issue #236).** `model_params.json`
+was applied at provider build but invisible to introspection — `--resolved-config` reported
+provider/sdk/surface/model and the tool set, but not the loaded call tuning, so the only
+wire-level proof that a setting like `reasoning: {effort: high}` reached the SDK was the offline
+test suite. This adds the missing observability: the NOC's drift audit and the capital's
+live-verify can now read the loaded params by ground truth. Additive and non-secret (secrets live
+in `agent.env`).
+
+### Added
+
+- **`model_params` and `model_params_stripped` in `--resolved-config` (issue #236).** The
+  ground-truth deploy probe now emits two additive fields: `model_params` — the operator's
+  `model_params.json` object **verbatim** (`{}` when absent) — and `model_params_stripped` — the
+  keys the active SDK's build drops as harness-owned collisions (plus `extra_body` on the SDKs
+  that do not support it), so the effective tuning is `model_params` minus these. Reported by a
+  new pure, log-free `resolved_model_params(sdk)` — the read-only twin of the build-time collision
+  policy. A malformed `model_params.json` now makes `--resolved-config` exit non-zero with the
+  reason, catching at verify time the same failure a wake would hit.
+
 ## [0.50.0] - 2026-07-04
 
 **Step budget 24 + live counter + reserve summary; persist-on-failure + per-step logging;
