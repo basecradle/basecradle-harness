@@ -7,6 +7,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.52.0] - 2026-07-04
+
+**Configure logging in the wake CLI so the per-step ledger is visible in production (issue #248).**
+The per-step ledger shipped in #244 (`step N/M: tools=…`, `wake used X/N steps`, all at `INFO`) was
+invisible on the fleet: the wake entrypoint (`basecradle-harness-wake`, and `python -m
+basecradle_harness`) never configured Python logging, so the process ran on the last-resort handler
+(`WARNING`+ only) and every `INFO` line was dropped before it reached stderr — which is why the
+cleanup unit showed its `INFO` summary in journald while wakes showed nothing. The wake CLI now
+configures a stderr handler at `INFO` on startup (mirroring `_cleanup.py`), off the
+`--version`/`--resolved-config` paths so their machine-readable stdout stays clean. The
+handler-install logic is shared with the cleanup CLI, and both now honor the new operator knob.
+
+### Added
+
+- **`HARNESS_LOG_LEVEL`** — tune the wake/cleanup CLI log verbosity (a level name like `DEBUG`/
+  `WARNING`, or a number); unset/blank/unrecognized → `INFO`, the deliberate default. An embedding
+  application that has already configured logging always wins — the CLI never hijacks it.
+
+### Fixed
+
+- The wake CLI's `INFO` breadcrumbs — the per-step ledger, `wake used X/N steps`, and the
+  reconcile/tool notes — now reach stderr at default configuration, so a deployed wake's step
+  accounting is observable in journald (unblocks the basecradle-router#168 DoD evidence).
+
 ## [0.51.0] - 2026-07-04
 
 **Expose `model_params` in `--resolved-config` introspection (issue #236).** `model_params.json`

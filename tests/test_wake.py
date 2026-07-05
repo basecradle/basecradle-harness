@@ -13,8 +13,11 @@ fixed fiction: Nova Digital (``nova``, AI) is the agent; John Doe (``john``).
 """
 
 import base64
+import contextlib
 import hmac
+import io
 import json
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -1413,6 +1416,74 @@ def test_main_without_a_timeline_errors(wake_env):
     with pytest.raises(SystemExit) as exit_info:
         main([])
     assert exit_info.value.code != 0
+
+
+@contextlib.contextmanager
+def _isolated_root_logging():
+    """Run with the root logger reset (no handlers) and restore it afterward.
+
+    `_configure_logging` only installs a handler when the root logger has none — but under
+    pytest the logging plugin keeps a capture handler on root, which would make the CLI's
+    `logging.basicConfig` a silent no-op. Clearing root here reproduces the *production*
+    starting state (a fresh process on Python's last-resort handler), so the test proves the
+    real behavior, then restores pytest's handlers so log capture keeps working.
+    """
+    root = logging.getLogger()
+    saved_handlers, saved_level = root.handlers[:], root.level
+    root.handlers = []
+    try:
+        yield root
+    finally:
+        root.handlers, root.level = saved_handlers, saved_level
+
+
+def test_configure_logging_installs_an_info_handler_when_unconfigured(monkeypatch):
+    """The fix (issue #248): an unconfigured process gets an INFO stderr handler by default."""
+    from basecradle_harness._basecradle import _configure_logging
+
+    monkeypatch.delenv("HARNESS_LOG_LEVEL", raising=False)
+    with _isolated_root_logging() as root:
+        _configure_logging()
+        assert root.handlers  # a handler was installed where there was none
+        assert root.level == logging.INFO  # …at INFO, so the ledger's INFO lines pass
+
+
+def test_configure_logging_honors_the_log_level_env_override(monkeypatch):
+    """`HARNESS_LOG_LEVEL` tunes verbosity (name or number); the INFO default is only a default."""
+    from basecradle_harness._basecradle import _configure_logging
+
+    monkeypatch.setenv("HARNESS_LOG_LEVEL", "warning")
+    with _isolated_root_logging() as root:
+        _configure_logging()
+        assert root.level == logging.WARNING
+
+
+def test_configure_logging_leaves_an_already_configured_root_untouched():
+    """An embedding application's own logging setup wins — the CLI never hijacks it."""
+    from basecradle_harness._basecradle import _configure_logging
+
+    with _isolated_root_logging() as root:
+        sentinel = logging.NullHandler()
+        root.handlers = [sentinel]
+        _configure_logging()
+        assert root.handlers == [sentinel]  # not replaced, not appended to
+
+
+def test_main_emits_the_per_step_ledger_to_stderr_at_default_config(
+    platform, wake_env, monkeypatch
+):
+    """The DoD (issue #248): a real wake's per-step ledger reaches stderr at default config —
+    what was invisible in production because the wake CLI never configured logging."""
+    monkeypatch.delenv("HARNESS_LOG_LEVEL", raising=False)
+    _serve_openai_and_messages(platform, page(message(uuid=M0, body="status?")))
+
+    stderr = io.StringIO()
+    with _isolated_root_logging(), contextlib.redirect_stderr(stderr):
+        assert main(["--timeline", TIMELINE_UUID]) == 0
+
+    captured = stderr.getvalue()
+    assert "wake used" in captured  # the reserve/step-count ledger line reached stderr
+    assert re.search(r"step \d+/\d+", captured)  # …and the per-step ledger lines
 
 
 def test_main_version_flag_prints_harness_and_sdk_versions_and_exits_zero(capsys):

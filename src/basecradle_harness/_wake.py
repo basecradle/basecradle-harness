@@ -80,6 +80,7 @@ from basecradle_harness._basecradle import (
     _as_turn,
     _client_from_env,
     _config_from_env,
+    _configure_logging,
     _context_messages_from_env,
     _incoming_text,
     _max_steps_from_env,
@@ -2112,6 +2113,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.timeline:
         parser.error("a timeline uuid is required (--timeline or BASECRADLE_TIMELINE)")
+
+    # Configure logging before the engine runs so the per-step ledger and the other INFO
+    # breadcrumbs reach stderr (issue #248). Kept off the --version/--resolved-config paths
+    # above: those exit before here, so their machine-readable stdout stays uncontaminated.
+    _configure_logging()
 
     try:
         agent = WakeAgent.from_env(timeline=args.timeline)
