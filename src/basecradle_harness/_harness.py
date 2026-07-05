@@ -40,7 +40,7 @@ from another, and a past session's transcript stays readable from any other:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from urllib.parse import quote
 
@@ -70,6 +70,10 @@ class Harness:
         policy: The profile. Defaults to `Policy.locked()` — the safe Harness
             profile. Pass `Policy.unlocked()` only with intent.
         max_steps: The engine's per-turn provider-call budget.
+        server_builtins: The active server-side built-in names (e.g. ``web_search``)
+            the provider runs itself. Passed to the engine so a model that mistakenly
+            calls one as a function gets targeted guidance rather than a generic error
+            (issue #245). Empty by default (a config with no server-side built-ins).
         home: An optional directory under which session transcripts persist
             (`<home>/sessions/<source>.json`), making a past session's reasoning
             readable across restarts. `None` (the default) keeps sessions in
@@ -88,6 +92,7 @@ class Harness:
         tools: Iterable[Tool] | None = None,
         policy: Policy | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
+        server_builtins: Sequence[str] = (),
         home: str | Path | None = None,
         turn_hook: TurnHook | None = None,
     ) -> None:
@@ -95,7 +100,13 @@ class Harness:
         self.tools = ToolRegistry(policy=policy or Policy.locked())
         for tool in tools or ():
             self.tools.register(tool)
-        self.engine = Engine(provider, self.tools, max_steps=max_steps, turn_hook=turn_hook)
+        self.engine = Engine(
+            provider,
+            self.tools,
+            max_steps=max_steps,
+            turn_hook=turn_hook,
+            server_builtins=server_builtins,
+        )
         self.system_prompt = system_prompt
         self.home = Path(home) if home is not None else None
         self._sessions: dict[str, Session] = {}

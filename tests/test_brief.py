@@ -14,6 +14,7 @@ from basecradle import BaseCradle
 from basecradle_harness import (
     compose_brief,
     fetch_dashboard_md,
+    render_budget,
     render_defects,
     render_manifest,
 )
@@ -57,7 +58,45 @@ def test_render_defects_is_none_when_healthy():
     assert render_defects(None) is None
 
 
+# --- render_budget (issue #243) ----------------------------------------------
+
+
+def test_render_budget_states_the_number_and_the_reset_rule():
+    text = render_budget(24)
+    assert "24 steps" in text
+    assert "Step N of 24" in text  # names the live counter shape the model will see
+    assert "resets" in text  # the per-turn reset rule
+
+
+def test_render_budget_is_none_without_a_budget():
+    # None / non-positive → omitted, so a caller with no budget composes exactly as before.
+    assert render_budget(None) is None
+    assert render_budget(0) is None
+
+
 # --- compose_brief ------------------------------------------------------------
+
+
+def test_compose_brief_places_the_budget_after_the_now_anchor():
+    # The step budget is a standing fact about the turn, so it rides right after the time
+    # anchor and before the operating guidance (issue #243).
+    brief = compose_brief(
+        now="NOW",
+        budget="BUDGET",
+        initialize="INIT",
+        manifest="MANIFEST",
+        dashboard="DASH",
+        system_prompt="CHARTER",
+    )
+    assert brief == "NOW\n\nBUDGET\n\nINIT\n\nMANIFEST\n\nDASH\n\nCHARTER"
+
+
+def test_compose_brief_omits_the_budget_when_absent():
+    # `budget` defaults to None, so a caller that passes none composes exactly as before.
+    brief = compose_brief(
+        initialize="INIT", manifest="MANIFEST", dashboard="DASH", system_prompt="CHARTER"
+    )
+    assert brief == "INIT\n\nMANIFEST\n\nDASH\n\nCHARTER"
 
 
 def test_compose_brief_orders_the_four_parts():

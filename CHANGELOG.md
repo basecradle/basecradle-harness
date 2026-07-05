@@ -7,6 +7,63 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.50.0] - 2026-07-04
+
+**Step budget 24 + live counter + reserve summary; persist-on-failure + per-step logging;
+server-builtin-as-function shim (issues #243, #244, #245).** Diagnosing @glm-5.2's two 2026-07-04
+step-cap events, the capital found three coupled engine gaps: the 8-step budget was too small for
+a persona's legitimately multi-action self-scheduled tasks; a step-capped wake discarded its own
+evidence (no failure-path save, no per-step log); and a server-side built-in (`web_search`)
+mistakenly called as a function got a generic "no tool" error that spiralled the model. This
+release fixes all three, in the shared engine so both profiles benefit.
+
+### Added
+
+- **Live step counter (issue #243).** The engine appends a small system note —
+  `Current Time: <UTC> / Step N of M` — before every model turn, so the model paces itself
+  against the budget; the note escalates to strategic guidance (prioritize, summarize,
+  self-schedule, land on text) in the final 5 steps. The notes stay in the persisted transcript
+  as an auditable step ledger. A one-time step-budget statement (`render_budget`) rides the
+  persistent brief right after the time anchor, so the per-step note can stay terse.
+- **Reserve summary call (issue #243).** When the budget is spent with the model still calling
+  tools, the engine makes **one** out-of-budget provider call with the harness's function tools
+  withheld (`tools=None`) and a nudge asking for an honest progress report, and posts the model's
+  own reply — replacing the canned "I got stuck" string as the primary path. `tools=None` does not
+  stop a server-side built-in (`web_search`) an adapter offers from resolving *in-call* on some
+  surfaces, but that still returns the model's text, so the report lands. The documented fallback
+  (per the issue's "where a surface can't force text" clause): a reserve reply carrying **no text**
+  (a lone tool call) is treated as a reserve failure and its dangling turn is not persisted —
+  degrading to the short canned note, the fallback-of-the-fallback, which also covers the reserve
+  call itself erroring.
+- **Configurable step budget (issue #243).** `DEFAULT_MAX_STEPS` 8 → **24** (a deliberate
+  research-lab over-provision), with a per-persona `HARNESS_MAX_STEPS` override (positive int; a
+  non-positive value fails loudly). Threaded through `Harness(max_steps=…)` into both
+  `TimelineAgent.from_env` and `WakeAgent.from_env`.
+- **Per-step + per-wake logging (issues #243, #244).** One `INFO` line per step
+  (`step N/M: tools=… (1.2s)` or `final reply`) and one summary line per run
+  (`wake used X/N steps`, plus `+ reserve summary` when the reserve call fired) — the journald
+  ledger that survives even a lost transcript, and the data source for tuning the 24 default.
+- **Persist the transcript on engine failure (issue #244).** `Session.send` now saves the
+  partial transcript when `engine.run` raises, appending a `[turn failed: <type> — <msg>]` marker,
+  rather than discarding every turn from the failed run. Image eviction still holds on the failure
+  path (no base64 persisted).
+- **Server-side-builtin shim (issue #245).** When the model calls a configured server-side
+  built-in (e.g. `web_search`) *as a function*, the engine returns targeted guidance — "it runs
+  server-side; state what you want in your reply and it runs automatically; do not retry" —
+  instead of the generic "no tool named X" error that sent the model into a retry spiral. A
+  genuinely unknown name still gets the generic error. The active `builtins` set is threaded via
+  `Harness(server_builtins=…)`. `initialize.md` also notes that server-side search is never
+  called as a function.
+
+### Changed
+
+- The engine no longer raises `EngineError` on a spent step budget in the normal case — it
+  returns the reserve summary. `EngineError` is now the fallback-of-the-fallback (the reserve
+  call failing). The wake still degrades that to the short canned note and marks the item seen.
+- The persisted transcript now contains the per-step counter notes (a tiny step ledger). A custom
+  provider should read the last *user* turn rather than assuming the incoming message is last —
+  the engine may append its own turns (the README example is updated to match).
+
 ## [0.49.0] - 2026-07-04
 
 **Self-authorship tool — an AI reads and edits its OWN system prompt; built, enabled on no one

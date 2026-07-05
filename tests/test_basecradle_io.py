@@ -8,6 +8,7 @@ fictional cast: Nova Digital (handle ``nova``, AI) is the agent; John Doe
 
 import json
 import os
+import re
 from pathlib import Path
 
 import httpx
@@ -28,10 +29,12 @@ from basecradle_harness import (
 )
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
+    DEFAULT_MAX_STEPS,
     _client_from_env,
     _compose_prompt,
     _config_from_env,
     _context_messages_from_env,
+    _max_steps_from_env,
     _onboard_from_env,
     _orientation,
     _provider_from_config,
@@ -124,6 +127,20 @@ def timeline():
 # --- a canned provider, so the agent has a brain without a model -------------
 
 
+def _is_counter(m) -> bool:
+    """A live step-counter note the engine injects before each provider call (issue #243).
+
+    Matched by its `Step N of M` line — never the brief's `Current Time:` anchor or its
+    `Step budget:` statement, whose wording is deliberately close but carries no `N of M`.
+    """
+    return m.role == "system" and bool(m.content) and bool(re.search(r"Step \d+ of \d+", m.content))
+
+
+def _convo(messages: list) -> list:
+    """The turns the model saw with the injected step-counter notes filtered out."""
+    return [m for m in messages if not _is_counter(m)]
+
+
 class CannedProvider:
     def __init__(self, text="Hello, John."):
         self.text = text
@@ -132,7 +149,8 @@ class CannedProvider:
 
     def chat(self, messages, tools=None):
         self.last_messages = list(messages)
-        self.prompts.append(messages[-1].content)
+        # Record the last real turn's text, skipping the engine's step-counter note (issue #243).
+        self.prompts.append(_convo(messages)[-1].content)
         return Message.assistant(content=self.text)
 
 
@@ -227,7 +245,7 @@ def test_reply_sees_the_backlog_before_the_new_message(platform):
 
     agent.poll_once()
 
-    context = [(m.role, m.content) for m in provider.last_messages]
+    context = [(m.role, m.content) for m in _convo(provider.last_messages)]
     assert context == [
         ("user", "[2026-06-04T00:00:00.000Z] john: we were discussing Ruby"),  # the backlog, seeded
         (
@@ -614,6 +632,21 @@ def test_context_messages_from_env_parses_int_all_and_default(monkeypatch):
 
     monkeypatch.setenv("HARNESS_CONTEXT_MESSAGES", "7")
     assert _context_messages_from_env() == 7
+
+
+def test_max_steps_from_env_parses_default_override_and_rejects_non_positive(monkeypatch):
+    monkeypatch.delenv("HARNESS_MAX_STEPS", raising=False)
+    assert _max_steps_from_env() == DEFAULT_MAX_STEPS  # unset → the shipped budget (24)
+
+    monkeypatch.setenv("HARNESS_MAX_STEPS", "  ")
+    assert _max_steps_from_env() == DEFAULT_MAX_STEPS  # blank → default too
+
+    monkeypatch.setenv("HARNESS_MAX_STEPS", "40")
+    assert _max_steps_from_env() == 40  # the operator's per-persona override
+
+    monkeypatch.setenv("HARNESS_MAX_STEPS", "0")
+    with pytest.raises(ValueError, match="positive integer"):
+        _max_steps_from_env()  # a budget of 0 could never make a call — fail loudly
 
 
 # --- config + provider selection (AI_PROVIDER / AI_SDK / AI_SDK_SURFACE) ---

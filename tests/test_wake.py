@@ -202,6 +202,55 @@ def timeline():
     }
 
 
+def _is_counter(m) -> bool:
+    """A live step-counter note the engine injects before each provider call (issue #243).
+
+    Matched by its `Step N of M` line — never the brief's own `Current Time:` anchor or its
+    `Step budget:` statement, whose wording is deliberately close but carries no `N of M` (so a
+    `\\n\\nStep ` substring check would wrongly swallow the whole onboarding brief).
+    """
+    return m.role == "system" and bool(m.content) and bool(re.search(r"Step \d+ of \d+", m.content))
+
+
+def _convo(messages: list) -> list:
+    """The turns the model saw with the injected step-counter notes filtered out."""
+    return [m for m in messages if not _is_counter(m)]
+
+
+def test_is_counter_does_not_swallow_the_onboarding_brief():
+    """Guard: the brief starts with `Current Time:` and now carries a `Step budget:` line, so a
+    naive `\\n\\nStep ` check would misclassify the whole brief as a counter note and filter it
+    out — weakening every wake assertion. The `Step N of M` discriminator must not match it."""
+    from basecradle_harness import compose_brief, render_budget
+
+    brief = compose_brief(
+        now=_now_line(),
+        budget=render_budget(24),
+        initialize="How to operate here.",
+        manifest="Your active tools right now:\n- memory",
+        dashboard="DASH",
+        system_prompt="You are Nova.",
+    )
+    assert "Step budget:" in brief  # the collision-prone content is actually present
+    assert not _is_counter(Message(role="system", content=brief))  # …yet the brief is not filtered
+    # A real counter note, by contrast, IS matched.
+    assert _is_counter(Message(role="system", content="Current Time: X\n\nStep 3 of 24."))
+
+
+class _NoopTool(Tool):
+    """A trivial tool, registered so the engine offers a non-empty tool set (`specs` non-None).
+
+    A provider that keys its reserve behavior on ``tools is None`` needs the budgeted loop to
+    pass a real tool set, which only happens when the registry is non-empty (issue #243 tests).
+    """
+
+    name = "noop"
+    description = "Does nothing."
+
+    def run(self, **kwargs) -> str:
+        return "ok"
+
+
 class CountingProvider:
     """A canned brain that records every call, so we can assert when it is (not) used."""
 
@@ -216,8 +265,11 @@ class CountingProvider:
 
     def chat(self, messages, tools=None):
         self.last_messages = list(messages)
-        self.last_images = list(messages[-1].images)
-        self.prompts.append(messages[-1].content)
+        # The engine appends a step-counter note as the last turn, so an asset's image no longer
+        # rides messages[-1]; scan all turns for the pixels, and record the last real (non-
+        # counter) turn's text as the prompt the model was answering.
+        self.last_images = [img for m in messages for img in m.images]
+        self.prompts.append(_convo(messages)[-1].content)
         return Message.assistant(content=self.text)
 
 
@@ -479,26 +531,49 @@ def test_main_returns_zero_on_a_locked_timeline(platform, wake_env):
     assert main(["--timeline", TIMELINE_UUID]) == 0
 
 
-def test_max_steps_degrades_to_a_graceful_reply(platform, tmp_path):
-    """B2: the engine's step cap (EngineError) degrades to a short "I got stuck" reply that
-    is posted, rather than crashing the wake. The message is still marked seen."""
+def test_step_cap_posts_the_models_own_reserve_summary(platform, tmp_path):
+    """The step cap posts the model's own honest progress report (the reserve summary call,
+    tools withheld), not a canned string — the primary path now (issue #243)."""
     serve_messages(platform, page(message(uuid=M0, body="do something complicated")))
 
-    class LoopingProvider:
-        """A brain that always asks for a tool, so the loop never settles → max_steps."""
-
-        def __init__(self):
-            self.prompts = []
+    class LoopingThenSummary:
+        """Calls a tool while budgeted; writes a progress report once tools are withheld."""
 
         def chat(self, messages, tools=None):
-            self.prompts.append(messages[-1].content)
-            return Message.assistant(
-                content=None,
-                tool_calls=[ToolCall(id="call_1", name="memory", arguments={"action": "list"})],
-            )
+            if tools is None:  # the out-of-budget reserve call
+                return Message.assistant(content="I researched the topic but ran out of steps.")
+            return Message.assistant(tool_calls=[ToolCall(id="call_1", name="noop", arguments={})])
 
     client = BaseCradle(token=FAKE_TOKEN)
-    harness = Harness(LoopingProvider(), home=tmp_path, max_steps=2)
+    harness = Harness(LoopingThenSummary(), tools=[_NoopTool()], home=tmp_path, max_steps=2)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+
+    posted = agent.wake()  # must not raise
+
+    assert len(posted) == 1
+    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
+    assert (
+        json.loads(sent.content)["message"]["body"]
+        == "I researched the topic but ran out of steps."
+    )
+    assert agent.marks.get(TIMELINE_UUID) == M0  # still marked seen — no reprocess
+
+
+def test_reserve_call_failure_degrades_to_the_canned_note(platform, tmp_path):
+    """The canned "I got stuck" note survives only as the fallback-of-the-fallback: the
+    reserve summary call itself erroring (issue #243). The wake still posts, marks seen."""
+    serve_messages(platform, page(message(uuid=M0, body="do something complicated")))
+
+    class LoopingThenBoom:
+        """Never settles, and the out-of-budget reserve call blows up too."""
+
+        def chat(self, messages, tools=None):
+            if tools is None:
+                raise RuntimeError("reserve model call failed")
+            return Message.assistant(tool_calls=[ToolCall(id="call_1", name="noop", arguments={})])
+
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(LoopingThenBoom(), tools=[_NoopTool()], home=tmp_path, max_steps=2)
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
 
     posted = agent.wake()  # must not raise
@@ -563,7 +638,7 @@ def test_transcript_persists_across_wakes(platform, tmp_path):
     second.wake()
 
     # The model saw the earlier exchange (loaded from disk) in front of the new turn.
-    roles_and_text = [(m.role, m.content) for m in provider.last_messages]
+    roles_and_text = [(m.role, m.content) for m in _convo(provider.last_messages)]
     assert ("user", "[2026-06-04T00:00:00.000Z] john: remember Ruby") in roles_and_text
     assert ("assistant", "Hello, John.") in roles_and_text
     assert roles_and_text[-1] == ("user", "[2026-06-04T00:00:00.000Z] john: what did I say?")
@@ -646,7 +721,7 @@ def test_bootstrap_seeds_history_as_context_before_replying(platform, tmp_path):
 
     agent.wake()
 
-    context = [(m.role, m.content) for m in provider.last_messages]
+    context = [(m.role, m.content) for m in _convo(provider.last_messages)]
     assert context == [
         ("user", "[2026-06-04T00:00:00.000Z] john: we chose Ruby"),  # seeded backlog
         (
@@ -2539,7 +2614,8 @@ class HookedProvider:
         self.prompts: list[str] = []
 
     def chat(self, messages, tools=None):
-        self.prompts.append(messages[-1].content)
+        # Record the last real turn's text, skipping the engine's step-counter note (issue #243).
+        self.prompts.append(_convo(messages)[-1].content)
         if self.on_chat is not None:
             self.on_chat(len(self.prompts))
         return Message.assistant(content=self.text)

@@ -69,6 +69,7 @@ from typing import Any
 from basecradle import BaseCradle
 
 from basecradle_harness._code import CODE_EXECUTION_BUILTIN, CodeExecutionBridge
+from basecradle_harness._engine import DEFAULT_MAX_STEPS
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
 from basecradle_harness._mcp import McpResolution, load_mcp_tools
@@ -237,6 +238,8 @@ class TimelineAgent:
             provider,
             system_prompt=charter_from_env(),
             tools=resolved.tools,
+            max_steps=_max_steps_from_env(),
+            server_builtins=resolved.builtins,
             turn_hook=bridge.on_reply if bridge is not None else None,
         )
         return cls(
@@ -1126,3 +1129,22 @@ def _context_messages_from_env() -> int | None:
     if raw.strip().lower() == "all":
         return None
     return int(raw)
+
+
+def _max_steps_from_env() -> int:
+    """Read ``HARNESS_MAX_STEPS`` into the engine's per-turn step budget.
+
+    Unset or blank → `DEFAULT_MAX_STEPS` (the shipped 24 — a deliberate research-lab
+    over-provision, see `basecradle_harness._engine`). Set → the operator's per-persona
+    override, parsed as an int; a positive value is the budget, and a non-positive value
+    fails loudly here rather than producing an engine that can never make a call. This is
+    the single-integer operational knob (like ``HARNESS_WAKE_BREAKER_MAX``), not a
+    ``model_params.json`` tuning key — the model id is env, and so is its step budget.
+    """
+    raw = os.environ.get("HARNESS_MAX_STEPS")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_STEPS
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"HARNESS_MAX_STEPS must be a positive integer, got {value}.")
+    return value

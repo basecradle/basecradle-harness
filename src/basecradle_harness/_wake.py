@@ -82,6 +82,7 @@ from basecradle_harness._basecradle import (
     _config_from_env,
     _context_messages_from_env,
     _incoming_text,
+    _max_steps_from_env,
     _messages_since,
     _onboard_from_env,
     _parse_created_at,
@@ -92,6 +93,7 @@ from basecradle_harness._basecradle import (
 from basecradle_harness._brief import (
     compose_brief,
     fetch_dashboard_md,
+    render_budget,
     render_defects,
     render_manifest,
     render_safety,
@@ -789,6 +791,13 @@ class WakeAgent:
             provider,
             system_prompt=charter_from_env(),
             tools=resolved.tools,
+            # The per-turn step budget (default 24, `HARNESS_MAX_STEPS` overrides). The engine
+            # injects a live counter against it and, when spent with tools still pending, makes
+            # the reserve summary call rather than cutting off with a canned string (issue #243).
+            max_steps=_max_steps_from_env(),
+            # The active server-side built-ins (e.g. web_search), so a model that calls one as a
+            # function gets targeted guidance instead of the generic error (issue #245).
+            server_builtins=resolved.builtins,
             home=home,
             # The code-execution Asset bridge (when active) harvests a run's output files +
             # source into Assets after each code-exec turn, then feeds their uuids back. None
@@ -1360,8 +1369,9 @@ class WakeAgent:
 
         The parts, in order (see `basecradle_harness._brief`): the **current-time anchor**
         (`_now_line` — the absolute "now" the model reasons every item's age against, fresh
-        each wake since the brief is re-composed per wake), the provider-independent
-        `initialize.md` operating guidance, the generated manifest of the agent's *active*
+        each wake since the brief is re-composed per wake), the **step-budget statement**
+        (`render_budget` — the engine's per-turn budget N, stated once so the live per-step
+        counter can stay terse), the provider-independent `initialize.md` operating guidance, the generated manifest of the agent's *active*
         tools, the **safe-by-default opt-out notice** (active MCP servers / policy-refused
         drop-ins — omitted when there are none), the live `dashboard.md` primer (fetched
         fresh each wake; a fetch failure degrades to omitting it, never breaking the wake),
@@ -1379,6 +1389,7 @@ class WakeAgent:
         try:
             return compose_brief(
                 now=_now_line(),
+                budget=render_budget(self.harness.engine.max_steps),
                 initialize=prompt_text("initialize.md"),
                 manifest=render_manifest(self._manifest_entries()),
                 defects=render_defects(self.defect_notices),
