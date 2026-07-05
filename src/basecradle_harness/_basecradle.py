@@ -694,6 +694,37 @@ def _merge_extra_body(params_extra_body: Any, harness_extra_body: Any) -> Any:
     return harness_extra_body or params_extra_body or None
 
 
+def resolved_model_params(sdk: str) -> tuple[dict[str, Any], list[str]]:
+    """The operator's ``model_params.json`` as loaded, plus the keys the active SDK's build drops.
+
+    The read-only introspection twin of the collision policy `_provider_from_config` enforces at
+    build (via `_split_model_params`) — but **pure**: it logs nothing and builds no provider, so
+    ``--resolved-config`` can report the loaded tuning without a WARNING storm or a model call.
+    Params are non-secret by contract (secrets live in ``agent.env``), so emitting them is safe.
+
+    Returns ``(model_params, stripped)``:
+
+    - ``model_params`` — the ``model_params.json`` object **verbatim** (``{}`` when the file is
+      absent), so a verifier sees exactly what the operator wrote.
+    - ``stripped`` — the sorted keys that would **not** reach the SDK call: the harness-owned
+      collisions for this SDK's build path (`_OWNED_OPENAI`/`_OWNED_XAI_SDK`/`_OWNED_OPENROUTER`,
+      keyed on the SDK, since the openai adapter serves openai/xai/openrouter alike), **plus**
+      ``extra_body`` on the SDKs whose build warns-and-drops it (``xai-sdk``, ``openrouter``; the
+      openai SDK passes ``extra_body`` through, so it is not counted there). The effective tuning
+      the SDK receives is thus ``model_params`` minus ``stripped``.
+
+    A malformed ``model_params.json`` raises `ValueError` here (from `load_model_params`) — the
+    same failure a wake would hit, surfaced at verify time instead: `resolved_config`'s caller
+    turns it into a clean non-zero exit, so the NOC catches the misconfiguration before it goes live.
+    """
+    loaded = load_model_params()
+    owned = {"xai-sdk": _OWNED_XAI_SDK, "openrouter": _OWNED_OPENROUTER}.get(sdk, _OWNED_OPENAI)
+    stripped = set(loaded) & owned
+    if sdk in ("xai-sdk", "openrouter") and "extra_body" in loaded:
+        stripped.add("extra_body")
+    return loaded, sorted(stripped)
+
+
 def _provider_from_config(
     provider: str,
     sdk: str,

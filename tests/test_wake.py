@@ -1456,6 +1456,39 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     assert "web_search" not in report["builtins"]
     # And the opt-in manifest (issue #181) is empty for that safe default — nothing opted in.
     assert report["opt_in_tools"] == []
+    # Model params (issue #236): absent file → an empty object and no collisions, present in the
+    # additive contract so a verifier can rely on the keys existing.
+    assert report["model_params"] == {}
+    assert report["model_params_stripped"] == []
+
+
+def test_resolved_config_reports_loaded_model_params_and_collisions(
+    wake_env, monkeypatch, tmp_path
+):
+    """`--resolved-config` emits the operator's `model_params.json` verbatim plus the keys the
+    active SDK's build drops as harness-owned collisions (issue #236) — the wire-level proof a
+    tuning like `reasoning: {effort: high}` is loaded, which no other field ever showed. The
+    default @jt stack is the `openai` SDK, so `model` collides (identity is AI_MODEL) while
+    `reasoning` passes through untouched."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    cfg.mkdir()
+    (cfg / "model_params.json").write_text(
+        json.dumps({"reasoning": {"effort": "high"}, "temperature": 0.2, "model": "sneaky"}),
+        encoding="utf-8",
+    )
+
+    report = resolved_config()
+
+    # Verbatim: exactly what the operator wrote, harness-owned key included (reporting is honest;
+    # the build strips it at call time).
+    assert report["model_params"] == {
+        "reasoning": {"effort": "high"},
+        "temperature": 0.2,
+        "model": "sneaky",
+    }
+    # Only `model` collides on the openai SDK; the genuine tuning keys reach the call.
+    assert report["model_params_stripped"] == ["model"]
 
 
 def test_resolved_config_is_side_effect_free_without_a_model_or_key(wake_env, monkeypatch):

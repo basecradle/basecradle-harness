@@ -89,6 +89,7 @@ from basecradle_harness._basecradle import (
     _recent,
     _resolve_tools,
     _resolve_tools_and_provider,
+    resolved_model_params,
 )
 from basecradle_harness._brief import (
     compose_brief,
@@ -2000,9 +2001,23 @@ def resolved_config() -> dict[str, object]:
       and a name can differ from its stem — ``hear_audio`` → ``listen``). Reporting the stems
       lets the NOC's fleet-drift audit compare declared-vs-active inventory like-for-like,
       holding no stem→name map of its own. ``[]`` for a safe default config (no opt-in tool).
+    - ``model_params`` — the operator's ``model_params.json`` object **verbatim** (``{}`` when the
+      file is absent), the optional SDK call tuning (``reasoning``, ``temperature``, …) that
+      `_provider_from_config` threads into every model call but nothing else introspects (issue
+      #236). Non-secret by contract (secrets live in ``agent.env``), so emitting it is safe — it
+      gives the NOC's drift audit and the capital's live-verify the wire-level proof that a tuning
+      like ``reasoning: {effort: high}`` is actually loaded, which the other fields never showed.
+    - ``model_params_stripped`` — the sorted keys in ``model_params`` that the active SDK's build
+      **drops** as harness-owned collisions (plus ``extra_body`` on the SDKs that do not support
+      it): the "warn and win" set (`resolved_model_params`). ``[]`` when nothing collides; the
+      effective tuning the SDK receives is ``model_params`` minus these.
+
+    A malformed ``model_params.json`` makes this raise `ValueError` — the same failure a wake would
+    hit, surfaced here at verify time (the caller turns it into a clean non-zero exit).
     """
     provider_name, sdk, surface = _config_from_env()
     resolved, _memory = _resolve_tools(provider_name, sdk, surface)
+    model_params, stripped = resolved_model_params(sdk)
     return {
         "harness_version": __version__,
         "ai_provider": provider_name,
@@ -2014,6 +2029,8 @@ def resolved_config() -> dict[str, object]:
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),
         "opt_in_tools": list(resolved.opt_in_stems),
+        "model_params": model_params,
+        "model_params_stripped": stripped,
     }
 
 
