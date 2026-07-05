@@ -62,7 +62,7 @@ from urllib.parse import unquote
 
 from basecradle._exceptions import BaseCradleError, ForbiddenError, NotFoundError
 
-from basecradle_harness._basecradle import _client_from_env
+from basecradle_harness._basecradle import _client_from_env, _configure_logging
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -300,9 +300,10 @@ def main(argv: list[str] | None = None) -> int:
     if not args.sweep and not args.timeline:
         parser.error("one of --sweep or --timeline <uuid> is required")
 
-    # Emit the summary to stderr (systemd captures it) when nothing has configured logging.
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    # Configure a stderr handler (systemd captures it) so the INFO summary is visible,
+    # unless an embedding app already configured logging. Shared with the wake CLI, so both
+    # default to INFO and honor HARNESS_LOG_LEVEL (raising it past INFO quiets the summary).
+    _configure_logging()
 
     try:
         home = _resolve_home()

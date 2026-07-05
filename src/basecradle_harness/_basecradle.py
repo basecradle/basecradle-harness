@@ -1179,3 +1179,38 @@ def _max_steps_from_env() -> int:
     if value <= 0:
         raise ValueError(f"HARNESS_MAX_STEPS must be a positive integer, got {value}.")
     return value
+
+
+def _log_level_from_env() -> int:
+    """Read ``HARNESS_LOG_LEVEL`` into a logging level; unset/blank/garbage → ``INFO``.
+
+    Accepts a level name (case-insensitive — ``DEBUG``/``info``/``WARNING``) or a numeric
+    level (``10``). Anything unrecognized degrades to ``INFO`` rather than raising: a
+    misconfigured verbosity knob must never take down a wake. ``INFO`` is the deliberate
+    default — the per-step ledger (issue #248) exists to be seen.
+    """
+    raw = os.environ.get("HARNESS_LOG_LEVEL")
+    if raw is None or not raw.strip():
+        return logging.INFO
+    raw = raw.strip()
+    if raw.isdigit():
+        return int(raw)
+    level = logging.getLevelName(raw.upper())
+    return level if isinstance(level, int) else logging.INFO
+
+
+def _configure_logging() -> None:
+    """Install a stderr log handler at ``HARNESS_LOG_LEVEL`` (default ``INFO``) for a CLI entrypoint.
+
+    A console-script process that never configures logging runs on Python's last-resort
+    handler (``WARNING`` and above only), so every ``INFO`` breadcrumb — the per-step ledger,
+    ``wake used X/N steps``, the reconcile/tool notes — is dropped before it reaches stderr
+    (issue #248: the ledger shipped in #244 was invisible in production for exactly this
+    reason). Mirror ``_cleanup.py``: configure a stderr handler at ``INFO``, but **only when
+    nothing else has** (``root.handlers`` empty), so an embedding application's own logging
+    setup always wins and a library import never hijacks logging. ``HARNESS_LOG_LEVEL`` tunes
+    the level for a noisier or quieter run; the ``INFO`` default is the point.
+    """
+    if logging.getLogger().handlers:
+        return
+    logging.basicConfig(level=_log_level_from_env(), format="%(levelname)s %(message)s")
