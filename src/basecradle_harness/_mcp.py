@@ -6,8 +6,8 @@ drop a server config into the config home's ``mcp/`` dir and that server's tools
 part of the agent's active tool set on the next wake — no code change, the same
 "everything in the folder is active" model as the ``tools/`` overlay (Group 2).
 
-Safe by construction, opt-out made explicit
---------------------------------------------
+Safe by default, opt-out made explicit
+--------------------------------------
 The harness ships **safe**: ``mcp/`` is empty, so a fresh install talks to no MCP server
 and runs with BaseCradle-only tools. Dropping a server config in is the operator
 *knowingly leaving the safe zone* — an MCP server is external code the harness cannot

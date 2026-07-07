@@ -186,7 +186,7 @@ founder-approved persona-level block the capital deployed to `@glm-5.2` on 2026-
 **Add OpenRouter web search as an opt-in server-tool built-in (issue #237).** Gives `@glm-5.2` —
 and every native-SDK OpenRouter agent — the server-side web search OpenRouter now offers as a
 `openrouter:web_search` server tool: the OpenRouter counterpart of the vendor-native web-search
-built-ins the harness already carries for OpenAI and xAI. Server-side and safe by construction
+built-ins the harness already carries for OpenAI and xAI. Server-side and structurally safe
 (the harness never executes anything), off by default, fully configurable.
 
 ### Added
@@ -1153,7 +1153,7 @@ founder decision).
 
 ### Changed
 
-- **Safe by construction stays a policy property.** An MCP proxy tool carries no in-process
+- **Safe by default stays a policy property.** An MCP proxy tool carries no in-process
   capability, so it registers under the locked policy (the opt-out is *surfaced*, not
   refused); a `tools/` tool that declares `SHELL` is still denied — the activation-vs-policy
   split is preserved, and the policy is never bypassed by mere activation.
@@ -2045,7 +2045,7 @@ Hardening from the first live run against the real BaseCradle platform.
 ## [0.1.0] - 2026-06-04
 
 The first working agent: a provider-agnostic engine that reads a BaseCradle
-timeline, thinks with a model, uses tools, and replies — safe by construction.
+timeline, thinks with a model, uses tools, and replies — safe by default.
 
 ### Added
 
@@ -2058,14 +2058,14 @@ timeline, thinks with a model, uses tools, and replies — safe by construction.
 - **`Tool` + `ToolRegistry` + `Policy`** — the extension surface and the safety
   boundary. A tool is one small class; the registry gates each tool through a
   policy at registration. `Policy.locked()` (the default) forbids the shell
-  capability; `Policy.unlocked()` is the Cradle seam. Safe by construction: the
-  package ships no shell/exec primitive.
+  capability; `Policy.unlocked()` is the unlocked profile — an operator opting
+  out of the safe default. The shipped package contains no shell/exec primitive.
 - **`MemoryTool`** — the shipped example tool: write/read/list, JSON-file
   persistence, a clean template to copy.
 - **`Engine` + `Harness`** — the `receive → think → act → respond` loop and the
   public front door. `Harness.send(text)` runs a turn and keeps history;
-  the engine is policy-neutral, so the same loop is Cradle on an unlocked
-  policy. Safe by default — a shell tool is refused at construction.
+  the engine is policy-neutral, so the same loop runs the unlocked profile when
+  handed an unlocked policy. Safe by default — a shell tool is refused at construction.
 - **`TimelineAgent`** — lives on a BaseCradle timeline via the SDK: polls for
   new messages, replies through the engine, posts back. `from_env()` wiring;
   `poll_once()` / `run()`.

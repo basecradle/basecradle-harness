@@ -144,7 +144,7 @@ def test_default_registry_is_locked_by_default():
 
 
 def test_unlocked_profile_loads_and_runs_the_shell_tool():
-    """The Cradle seam: the same engine, an unlocked policy, the tool loads."""
+    """The unlocked profile: the same engine, an unlocked policy, the tool loads."""
     registry = ToolRegistry(policy=Policy.unlocked())
     registry.register(ShellTool())
     assert registry.run("shell", command="ls") == "pretended to run: ls"

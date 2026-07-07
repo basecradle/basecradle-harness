@@ -258,7 +258,7 @@ def test_a_shell_tool_is_refused_at_construction():
 
 
 def test_unlocked_profile_admits_the_shell_tool():
-    """The Cradle seam: same Harness, unlocked policy, the tool loads."""
+    """The unlocked profile: same Harness, unlocked policy, the tool loads."""
     agent = Harness(ScriptedProvider(text("ok")), tools=[ShellTool()], policy=Policy.unlocked())
     assert "shell" in agent.tools
 
