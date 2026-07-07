@@ -1092,7 +1092,7 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
 
 
 def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) -> ResolvedTools:
-    """Drop any resolved tool the locked policy forbids, surfacing the refusal in the brief.
+    """Drop any resolved tool the policy forbids or that vetoes its runtime, surfacing it.
 
     `Harness` already gates tools through the policy at registration — but it does so by
     *raising* `PolicyError`, which on the env-resolution path would crash the whole wake the
@@ -1104,6 +1104,11 @@ def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) ->
     policy gate (Part B). The policy is **not** bypassed: the tool never reaches the
     registry, and the locked `Harness` re-checks the survivors as defense-in-depth. Safe by
     default stays a policy property; activation never overrides it.
+
+    The same filter also honors a tool's own runtime veto (`Tool.load_refusal` — e.g. the
+    shell tool refusing to run as root, issue #253): registration would *raise* on it just
+    as it does a policy refusal, so it is dropped and surfaced here in the identical shape,
+    keeping the wake graceful whichever gate a tool trips.
     """
     policy = policy or Policy.locked()
     permitted: list[Tool] = []
@@ -1111,11 +1116,14 @@ def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) ->
     notices = list(resolved.notices)
     skipped = list(resolved.skipped)
     for tool in resolved.tools:
-        if policy.permits(tool):
+        if not policy.permits(tool):
+            blocked = ", ".join(sorted(tool.requires & policy.forbidden))
+            reason = f"refused by the safe-by-default policy: needs {blocked}"
+        elif runtime_refusal := tool.load_refusal():
+            reason = f"refuses to load in this runtime: {runtime_refusal}"
+        else:
             permitted.append(tool)
             continue
-        blocked = ", ".join(sorted(tool.requires & policy.forbidden))
-        reason = f"refused by the safe-by-default policy: needs {blocked}"
         refused[tool.name] = reason
         skipped.append((tool.name, reason))
         notices.append(f"Tool {tool.name!r} {reason}; not loaded.")

@@ -40,6 +40,24 @@ class PingTool(Tool):
         return "pong"
 
 
+class RuntimeVetoTool(Tool):
+    """A tool that vetoes its own runtime via `load_refusal`.
+
+    Exercises the registry's runtime-refusal gate generically, apart from the shell
+    tool's `euid == 0` specifics (those live in test_shell.py). It needs no forbidden
+    capability, so the *policy* would admit it — only its own veto keeps it out.
+    """
+
+    name = "veto"
+    description = "Refuses to load in this runtime."
+
+    def run(self) -> str:
+        return ""
+
+    def load_refusal(self) -> str | None:
+        return "this runtime is not supported"
+
+
 # `ShellTool` is the real, shipped tool (imported above): it declares
 # `requires = frozenset({SHELL})`, so it is exactly what the locked profile forbids and
 # the unlocked profile admits. The policy-boundary tests below exercise the genuine tool;
@@ -62,6 +80,12 @@ def test_tool_defaults_to_no_parameters_and_no_requirements():
     ping = PingTool()
     assert ping.parameters == NO_PARAMETERS
     assert ping.requires == frozenset()
+
+
+def test_tool_load_refusal_defaults_to_none():
+    """A plain tool has no runtime veto — the third gate is opt-in, off by default."""
+    assert EchoTool().load_refusal() is None
+    assert PingTool().load_refusal() is None
 
 
 # --- The registry ------------------------------------------------------------
@@ -140,6 +164,22 @@ def test_unlocked_profile_loads_and_runs_the_shell_tool():
     result = registry.run("shell", command="echo hello")
     assert "hello" in result
     assert "[exit code: 0]" in result
+
+
+def test_register_refuses_a_tool_that_vetoes_its_runtime():
+    """The runtime-refusal gate: a tool's own `load_refusal` keeps it out even when the
+    policy would admit it — the generic shape behind the shell tool's root backstop."""
+    registry = ToolRegistry(policy=Policy.unlocked())  # policy admits; only the veto blocks
+    with pytest.raises(PolicyError, match="refuses to load"):
+        registry.register(RuntimeVetoTool())
+    assert "veto" not in registry
+
+
+def test_a_tool_with_no_runtime_veto_still_registers():
+    """The gate is inert when `load_refusal` returns None — no regression for normal tools."""
+    registry = ToolRegistry(policy=Policy.unlocked())
+    registry.register(EchoTool())
+    assert "echo" in registry
 
 
 def test_safe_tools_load_under_the_locked_profile():

@@ -7,6 +7,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.54.0] - 2026-07-06
+
+**The `shell` tool refuses to run as `root` — an in-process privilege backstop (issue #253).** The
+shell tool's entire safety model is that the OS user is unprivileged, so as `root` (`euid == 0`)
+that boundary bounds nothing: a root shell is the whole machine, not one account. The tool now
+**refuses to load or run as root**, fail-closed and surfaced. It self-excludes at registration
+(`ToolRegistry.register` raises) and on the env-resolution path (`_apply_safe_policy` drops it and
+surfaces the refusal in the Turn-0 brief, never crashing the wake), with an independent guard in
+`run()` for a tool constructed and called directly. The NOC's enablement preflight — which checks
+the account with the box context the process lacks — stays the *primary* guard; this is the
+last-ditch, deliberately narrow (euid 0 only) backstop the constitution mandates (Operational
+Baselines, basecradle#404). Purely additive: no behavior change for the normal, unprivileged case.
+
+### Added
+
+- **`Tool.load_refusal()`** — an optional extension hook a tool overrides to veto its own load
+  under an unsafe *runtime environment*, orthogonal to the policy/profile gate (`requires` +
+  `Policy`) and the activation/config gate. It returns a reason string to refuse (surfaced, never a
+  silent pass) or `None` to load; the base `Tool` returns `None`, so existing tools are unaffected.
+  `ToolRegistry.register` (raises) and `_apply_safe_policy` (drops-and-surfaces) both consult it.
+
+### Security
+
+- **`shell` refuses `root` (`euid == 0`)** — a shell mistakenly wired onto a privileged account
+  never hands the model a root shell (issue #253). The narrower sudo/group checks stay at the NOC
+  preflight, which has the box context the tool lacks.
+
 ## [0.53.0] - 2026-07-06
 
 **Add the `shell` tool — full command-line access, opt-in, off by default (issue #252).** The
