@@ -11,7 +11,6 @@ import re
 import pytest
 
 from basecradle_harness import (
-    SHELL,
     Engine,
     EngineError,
     Harness,
@@ -19,6 +18,7 @@ from basecradle_harness import (
     Message,
     Policy,
     PolicyError,
+    ShellTool,
     Tool,
     ToolCall,
     ToolRegistry,
@@ -243,13 +243,9 @@ def test_reserve_call_failure_is_the_fallback_of_the_fallback(tmp_path):
 # --- Safe by default ---------------------------------------------------------
 
 
-class ShellTool(Tool):
-    name = "shell"
-    description = "Run a command."
-    requires = frozenset({SHELL})
-
-    def run(self, **kwargs) -> str:  # pragma: no cover - never loads under locked
-        return "ran"
+# `ShellTool` is the real, shipped tool (imported above): it declares `requires = {SHELL}`,
+# so a default (locked) `Harness` refuses it at construction and only the unlocked profile
+# admits it. Its own behavior lives in test_shell.py.
 
 
 def test_a_shell_tool_is_refused_at_construction():

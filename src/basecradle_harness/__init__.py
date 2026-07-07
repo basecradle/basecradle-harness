@@ -106,6 +106,7 @@ from basecradle_harness._policy import BASECRADLE, SHELL, Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._reads import MessagesTool, UsersTool
 from basecradle_harness._session import Session
+from basecradle_harness._shell import ShellTool
 from basecradle_harness._system_prompt import (
     SystemPromptEditTool,
     SystemPromptReadTool,
@@ -166,6 +167,7 @@ __all__ = [
     "ToolRegistry",
     "MemoryTool",
     "WebFetchTool",
+    "ShellTool",
     "Policy",
     # Pluggable memory: the provider seam (tools + store + observe/context hooks)
     "MemoryProvider",

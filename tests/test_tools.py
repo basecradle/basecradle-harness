@@ -7,10 +7,10 @@ needs a shell. That is asserted directly here.
 import pytest
 
 from basecradle_harness import (
-    SHELL,
     Message,
     Policy,
     PolicyError,
+    ShellTool,
     Tool,
     ToolRegistry,
     ToolSpec,
@@ -40,20 +40,10 @@ class PingTool(Tool):
         return "pong"
 
 
-class ShellTool(Tool):
-    """A tool that needs to run commands — exactly what the safe profile forbids."""
-
-    name = "shell"
-    description = "Run a shell command."
-    parameters = {
-        "type": "object",
-        "properties": {"command": {"type": "string"}},
-        "required": ["command"],
-    }
-    requires = frozenset({SHELL})
-
-    def run(self, command: str) -> str:  # pragma: no cover - never loads under locked
-        return f"pretended to run: {command}"
+# `ShellTool` is the real, shipped tool (imported above): it declares
+# `requires = frozenset({SHELL})`, so it is exactly what the locked profile forbids and
+# the unlocked profile admits. The policy-boundary tests below exercise the genuine tool;
+# its own behavior (running commands, timeouts, truncation) lives in test_shell.py.
 
 
 # --- The Tool contract -------------------------------------------------------
@@ -144,10 +134,12 @@ def test_default_registry_is_locked_by_default():
 
 
 def test_unlocked_profile_loads_and_runs_the_shell_tool():
-    """The unlocked profile: the same engine, an unlocked policy, the tool loads."""
+    """The unlocked profile: the same engine, an unlocked policy, the real tool loads and runs."""
     registry = ToolRegistry(policy=Policy.unlocked())
     registry.register(ShellTool())
-    assert registry.run("shell", command="ls") == "pretended to run: ls"
+    result = registry.run("shell", command="echo hello")
+    assert "hello" in result
+    assert "[exit code: 0]" in result
 
 
 def test_safe_tools_load_under_the_locked_profile():
