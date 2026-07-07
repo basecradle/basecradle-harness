@@ -7,6 +7,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-07-06
+
+**Deploy-controllable unlocked profile — `HARNESS_PROFILE` + `--resolved-config` reports it (issue
+#256).** The `shell` tool (#252) and its root backstop (#253) shipped, but there was **no
+deploy-controllable way to select the `unlocked` profile at wake** — the router's wake path always
+built `Harness` on the locked default, so a shell-class tool could never be turned on for a deployed
+agent, and `--resolved-config` always reported it `skipped` regardless of intent (the enablement was
+*unverifiable*). This adds the env-driven lever. A new **`HARNESS_PROFILE`** env var (delivered
+per-agent via `agent.env`, the same channel every per-agent knob uses) selects the profile at wake:
+`unlocked` → `Policy.unlocked()`; **anything else — unset, empty, or unrecognized → `Policy.locked()`**
+(fail-closed, so the shipped default is unchanged and a typo can never silently unlock a box). The
+one decision (`_profile_from_env`) is threaded into **both** the registry (`Harness(policy=…)`, on the
+wake *and* poll paths) and the env-resolution filter (`_apply_safe_policy`), so the two always agree on
+one profile. Purely additive: absent/`locked`/unset/garbage behaves exactly as before. Safety is
+enforced *around* the lever, not by it — the NOC sets `HARNESS_PROFILE=unlocked` only after its
+`verify_unprivileged` preflight passes, and the shell tool's own root-refusal backstop still fires
+regardless. Unblocks the fleet-side enablement (basecradle-noc#174).
+
+### Added
+
+- **`HARNESS_PROFILE` env var** — the deploy lever for the unlocked profile (`locked` | `unlocked`,
+  fail-closed to `locked`). Read at wake by `_profile_from_env` and threaded into both the registry
+  and the tool-resolution policy filter so the registry and the resolved/skipped computation agree.
+- **`active_profile` field on `--resolved-config`** — `"locked"` or `"unlocked"`, the ground truth
+  that lets fleet-drift audit and the capital's live-verify confirm a shell-class enablement's profile
+  actually landed. Under `unlocked` an opted-in `shell` appears in `tools`; under `locked`, `skipped`.
+
 ## [0.54.0] - 2026-07-06
 
 **The `shell` tool refuses to run as `root` — an in-process privilege backstop (issue #253).** The

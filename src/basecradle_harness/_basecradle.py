@@ -234,10 +234,15 @@ class TimelineAgent:
         but not held here.
         """
         provider, resolved, _memory, bridge = _resolve_tools_and_provider()
+        # The deploy-selected profile (issue #256): the same `_profile_from_env` read that gated
+        # tool resolution builds the registry, so a policy-forbidden opted-in tool never reaches
+        # `Harness` construction under `unlocked` only to raise on the locked default.
+        _, policy = _profile_from_env()
         harness = Harness(
             provider,
             system_prompt=charter_from_env(),
             tools=resolved.tools,
+            policy=policy,
             max_steps=_max_steps_from_env(),
             server_builtins=resolved.builtins,
             turn_hook=bridge.on_reply if bridge is not None else None,
@@ -985,7 +990,11 @@ def _resolve_tools(
     memory = memory_provider_from_env()
     resolved = _merge_memory_tools(resolved, memory)
     resolved = _merge_mcp_tools(resolved, load_mcp_tools())
-    resolved = _apply_safe_policy(resolved)
+    # The deploy-selected profile (issue #256) gates this env-resolution filter, so the
+    # resolved/skipped split matches the profile the registry is built with — one env read
+    # (`_profile_from_env`) drives both. Absent/`locked`/unrecognized → locked, exactly as before.
+    _, policy = _profile_from_env()
+    resolved = _apply_safe_policy(resolved, policy)
     # Surface any broken *shipped-default* plugin loudly in the Turn-0 brief — a defect, never
     # a silent swallow (issue #160). Last, so it rides whatever the merges/policy produced.
     resolved = _surface_broken_defaults(resolved, loaded.broken_defaults)
@@ -1140,6 +1149,35 @@ def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) ->
         broken=resolved.broken,
         opt_in_stems=resolved.opt_in_stems,
     )
+
+
+# The env var that selects the deploy profile (issue #256). Delivered per-agent through
+# ``agent.env`` — the channel every per-agent knob uses — so the router carries no profile
+# logic; the NOC sets it (via `provision-config`) only after its unprivileged-account preflight
+# passes. ``locked`` | ``unlocked``, extensible to future profiles.
+HARNESS_PROFILE_ENV = "HARNESS_PROFILE"
+
+
+def _profile_from_env() -> tuple[str, Policy]:
+    """Resolve the active Harness profile from ``HARNESS_PROFILE`` — fail-closed to locked.
+
+    The single deploy lever for the unlocked profile (issue #256): ``HARNESS_PROFILE=unlocked``
+    (trimmed, case-insensitive) selects `Policy.unlocked()`; **anything else — unset, empty, or
+    unrecognized — selects `Policy.locked()`**, so the shipped default is unchanged and a typo
+    can never silently unlock a box. Returns ``(name, policy)`` — the name so ``--resolved-config``
+    can report the active profile, the policy so the *same* decision drives both the registry
+    (`Harness(policy=…)`) and the env-resolution filter (`_apply_safe_policy`); reading this one
+    pure function of the env at each site is what keeps the two in lockstep.
+
+    Selecting ``unlocked`` is *only* the deploy lever, and it never weakens the safety enforced
+    around it: the NOC sets the var only after its unprivileged-account preflight passes
+    (constitution Operational Baselines), the shell tool's own in-process root-refusal backstop
+    still fires (issue #253), and a powerful tool like ``shell`` is still opt-in per persona.
+    """
+    raw = (os.environ.get(HARNESS_PROFILE_ENV) or "").strip().lower()
+    if raw == "unlocked":
+        return "unlocked", Policy.unlocked()
+    return "locked", Policy.locked()
 
 
 def _onboard_from_env() -> bool:

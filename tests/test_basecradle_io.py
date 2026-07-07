@@ -1262,6 +1262,41 @@ def test_from_env_wires_the_openai_sdk_provider_by_default(platform, monkeypatch
     assert agent.harness.provider.surface == "responses"
 
 
+def test_from_env_unlocked_profile_admits_the_opted_in_shell(platform, monkeypatch):
+    """End to end (issue #256): `HARNESS_PROFILE=unlocked` builds the registry on the unlocked
+    profile, so a persona's opted-in shell actually loads — the poll path wires the same
+    `_profile_from_env` decision into `Harness(policy=…)` that the wake path does."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)  # deterministic non-root
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    monkeypatch.setenv("HARNESS_PROFILE", "unlocked")
+    install(os.environ["BASECRADLE_CONFIG_HOME"], provider="openai", opt_in=["shell"])
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+
+    agent = TimelineAgent.from_env()
+
+    assert "shell" in {t.name for t in agent.harness.tools}
+
+
+def test_from_env_locked_profile_filters_the_opted_in_shell(platform, monkeypatch):
+    """The safe default holds: the same opted-in shell but no `HARNESS_PROFILE` (locked) never
+    reaches the registry — it self-excludes at the policy filter rather than crashing construction."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("HARNESS_PROFILE", raising=False)
+    install(os.environ["BASECRADLE_CONFIG_HOME"], provider="openai", opt_in=["shell"])
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+
+    agent = TimelineAgent.from_env()
+
+    assert "shell" not in {t.name for t in agent.harness.tools}
+
+
 # --- credential bootstrap (mint a token from email + password) ---------------
 
 

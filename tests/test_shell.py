@@ -31,7 +31,7 @@ from basecradle_harness import (
     load_plugins,
     resolve_plugins,
 )
-from basecradle_harness._basecradle import _apply_safe_policy
+from basecradle_harness._basecradle import _apply_safe_policy, _profile_from_env
 from basecradle_harness._install import plugin_opts_in, plugin_source_providers
 from basecradle_harness._shell import _ROOT_REFUSAL, _running_as_root
 
@@ -107,6 +107,43 @@ def test_env_path_keeps_shell_under_unlocked():
     filtered = _apply_safe_policy(resolved, Policy.unlocked())
 
     assert any(tool.name == "shell" for tool in filtered.tools)
+
+
+# --- The deploy profile selector: HARNESS_PROFILE (issue #256) ----------------
+#
+# The one deploy lever that reaches `Policy.unlocked()` at wake, delivered per-agent via
+# `agent.env`. Fail-closed to locked so a typo, an empty value, or an unset var never silently
+# unlocks a box; the same pure decision drives both the registry and the env-resolution filter.
+
+
+def test_profile_unlocked_selects_the_unlocked_policy(monkeypatch):
+    monkeypatch.setenv("HARNESS_PROFILE", "unlocked")
+    name, policy = _profile_from_env()
+    assert name == "unlocked"
+    assert policy.forbidden == frozenset()  # nothing forbidden — the shell is admitted
+    assert policy.permits(ShellTool()) is True
+
+
+def test_profile_unlocked_is_trimmed_and_case_insensitive(monkeypatch):
+    monkeypatch.setenv("HARNESS_PROFILE", "  UnLocked  ")
+    name, policy = _profile_from_env()
+    assert name == "unlocked"
+    assert policy.permits(ShellTool()) is True
+
+
+@pytest.mark.parametrize(
+    "value", [None, "", "   ", "locked", "LOCKED", "on", "unlock", "true", "1"]
+)
+def test_profile_fails_closed_to_locked(monkeypatch, value):
+    """Unset, empty, the explicit `locked`, or any unrecognized token → the safe locked default."""
+    if value is None:
+        monkeypatch.delenv("HARNESS_PROFILE", raising=False)
+    else:
+        monkeypatch.setenv("HARNESS_PROFILE", value)
+    name, policy = _profile_from_env()
+    assert name == "locked"
+    assert policy.forbidden == frozenset({SHELL})
+    assert policy.permits(ShellTool()) is False
 
 
 # --- The root backstop: refuse to run as root (issue #253) -------------------
