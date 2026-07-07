@@ -14,6 +14,7 @@ harmless (``echo``, ``pwd``, ``ls``, ``exit``, ``sleep``, ``yes``, ``head``); th
 tests pin ``workdir`` to a temp dir so they never depend on a valid ``$HOME``.
 """
 
+import os
 from importlib.resources import files
 
 import pytest
@@ -32,6 +33,7 @@ from basecradle_harness import (
 )
 from basecradle_harness._basecradle import _apply_safe_policy
 from basecradle_harness._install import plugin_opts_in, plugin_source_providers
+from basecradle_harness._shell import _ROOT_REFUSAL, _running_as_root
 
 
 @pytest.fixture
@@ -105,6 +107,83 @@ def test_env_path_keeps_shell_under_unlocked():
     filtered = _apply_safe_policy(resolved, Policy.unlocked())
 
     assert any(tool.name == "shell" for tool in filtered.tools)
+
+
+# --- The root backstop: refuse to run as root (issue #253) -------------------
+#
+# The constitution's in-process privilege guard (basecradle#404): the tool's whole safety
+# model is the unprivileged OS user, so as root it refuses — fail-closed at load *and* run.
+# The euid is injected via `os.geteuid` so these are deterministic regardless of the uid
+# the test process actually runs as (CI and dev are both non-root, so the behavior tests
+# above already cover the unprivileged case; here we drive both sides explicitly).
+
+
+def test_running_as_root_reads_the_effective_uid(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    assert _running_as_root() is True
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    assert _running_as_root() is False
+
+
+def test_running_as_root_is_false_without_geteuid(monkeypatch):
+    """A host without ``os.geteuid`` (Windows) has no Unix root to detect — reads not-root."""
+    monkeypatch.delattr(os, "geteuid", raising=False)
+    assert _running_as_root() is False
+
+
+def test_load_refusal_fires_only_as_root(monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    refusal = ShellTool().load_refusal()
+    assert refusal is not None
+    assert "root" in refusal
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    assert ShellTool().load_refusal() is None
+
+
+def test_register_refuses_shell_as_root_even_under_the_unlocked_profile(monkeypatch):
+    """The backstop is independent of the policy gate: the unlocked profile normally admits
+    shell, but at root the tool refuses to load — a root-run agent never even sees it."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    registry = ToolRegistry(policy=Policy.unlocked())
+    with pytest.raises(PolicyError, match="root"):
+        registry.register(ShellTool())
+    assert "shell" not in registry
+
+
+def test_run_refuses_as_root_instead_of_executing(monkeypatch, tmp_path):
+    """Defense-in-depth: a tool constructed and called directly (bypassing the registry)
+    still refuses at root — it returns the refusal rather than running the command."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    result = ShellTool(workdir=str(tmp_path)).run(command="echo hello")
+    assert _ROOT_REFUSAL in result
+    assert "hello" not in result
+    assert "[exit code:" not in result
+
+
+def test_env_path_drops_shell_as_root_and_surfaces_it(monkeypatch):
+    """On the env-resolution path the root refusal self-excludes and surfaces — never crashes
+    the wake — even under the unlocked profile the policy would otherwise admit it under."""
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    resolved = ResolvedTools(tools=[ShellTool()], manifest=[("shell", "note")])
+
+    filtered = _apply_safe_policy(resolved, Policy.unlocked())
+
+    assert all(tool.name != "shell" for tool in filtered.tools)
+    assert all(name != "shell" for name, _ in filtered.manifest)
+    assert any(name == "shell" for name, _ in filtered.skipped)
+    assert any("shell" in notice and "root" in notice for notice in filtered.notices)
+
+
+def test_load_and_run_are_normal_as_an_unprivileged_user(monkeypatch, shell):
+    """The paired normal case, pinned deterministically: at a non-root euid the tool loads
+    under the unlocked profile and runs commands exactly as before."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    assert shell.load_refusal() is None
+    registry = ToolRegistry(policy=Policy.unlocked())
+    registry.register(shell)  # the fixture's ShellTool has a temp-dir workdir
+    result = registry.run("shell", command="echo hello")
+    assert "hello" in result
+    assert "[exit code: 0]" in result
 
 
 # --- Behavior ----------------------------------------------------------------

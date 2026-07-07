@@ -63,6 +63,22 @@ class Tool(ABC):
         tools only ever return a `str`.
         """
 
+    def load_refusal(self) -> str | None:
+        """A reason this tool refuses to load in the *current runtime*, or ``None``.
+
+        A third gate, orthogonal to the other two: `requires` + `Policy` ask whether
+        the *profile* allows a capability, and plugin activation asks whether the
+        *config* supplies what a tool needs — this asks whether the tool considers the
+        *runtime environment itself* safe to load into. It is an in-process veto a tool
+        casts on *itself*, checked at `ToolRegistry.register` (which raises) and on the
+        env-resolution path (`_basecradle._apply_safe_policy`, which drops and surfaces
+        it), so a refusing tool self-excludes and is never handed to the model — never a
+        silent pass, never a crash. The base tool has no such condition and returns
+        ``None``; `ShellTool` overrides it to refuse to run as ``root`` — the
+        constitution's in-process privilege backstop (basecradle#404, issue #253).
+        """
+        return None
+
     def to_spec(self) -> ToolSpec:
         """The provider-neutral schema the model is shown."""
         return ToolSpec(name=self.name, description=self.description, parameters=self.parameters)
@@ -81,7 +97,13 @@ class ToolRegistry:
         self._tools: dict[str, Tool] = {}
 
     def register(self, tool: Tool) -> Tool:
-        """Add a tool, after the policy permits it. Returns the tool for chaining."""
+        """Add a tool, after the policy permits it and the tool admits its runtime.
+
+        Returns the tool for chaining. Refuses (raising `PolicyError`) both when the
+        policy forbids the tool's capabilities and when the tool itself vetoes the
+        current runtime (`Tool.load_refusal` — e.g. the shell tool run as root); either
+        way you never get a registry holding a tool that should not have loaded.
+        """
         if not getattr(tool, "name", None):
             raise ValueError(f"{type(tool).__name__} must set a non-empty `name`.")
         if not self.policy.permits(tool):
@@ -90,6 +112,9 @@ class ToolRegistry:
                 f"Policy forbids tool {tool.name!r}: it requires {blocked}, "
                 f"which this profile does not allow."
             )
+        refusal = tool.load_refusal()
+        if refusal:
+            raise PolicyError(f"Tool {tool.name!r} refuses to load: {refusal}")
         if tool.name in self._tools:
             raise ValueError(f"A tool named {tool.name!r} is already registered.")
         self._tools[tool.name] = tool

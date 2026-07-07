@@ -289,7 +289,13 @@ sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not 
   founder decision), and `shell` (issue #252 — full command-line access; **doubly gated**, the
   only opt-in default that *also* declares the `SHELL` policy capability, so it loads only for an
   agent that opts it in **and** runs `Policy.unlocked()`; every other powerful tool loads under
-  the locked profile once opted in). Benign/platform tools (memory, assets, messages,
+  the locked profile once opted in). `shell` additionally carries an **in-process root backstop**
+  (issue #253, constitution Operational Baselines / basecradle#404): it **refuses to load or run
+  as `root`** (`euid == 0`) — fail-closed and surfaced through the same gate machinery
+  (`Tool.load_refusal` → `ToolRegistry.register` raises, `_apply_safe_policy` drops-and-surfaces),
+  so even if it is ever wired onto a privileged account it never hands the model a root shell. It
+  is deliberately narrow (euid 0 only); the fuller sudo/group check stays at the NOC enablement
+  preflight, which has the box context the tool lacks. Benign/platform tools (memory, assets, messages,
   timelines, tasks, trust, lock, delete, users, webhooks, web_fetch) keep the normal
   shipped-default → install-then-prune behavior. This is **provider-agnostic**: the `requires`
   gate (`Vendor`/`OpenAIKey`) decides a powerful tool's *availability*, **never** the safety

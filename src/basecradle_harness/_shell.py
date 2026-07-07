@@ -23,8 +23,13 @@ human peer would. The consequences, all intended and accepted:
   own; the OS-user boundary *is* the fence.
 - **This tool's safety rests entirely on the OS user being unprivileged** — no ``sudo``,
   not in ``docker``/``wheel``, not root. That is a *provisioning/deploy* invariant the
-  box and the NOC verify before this tool is enabled, **not** something this tool
-  enforces. **Never wire this onto a privileged account.**
+  box and the NOC verify before this tool is enabled, **not** something this tool can
+  fully enforce. **Never wire this onto a privileged account.** As an in-process backstop
+  for the catastrophic case (constitution Operational Baselines, basecradle#404), the
+  tool *does* self-defend against the worst of these: it **refuses to load or run as
+  root** (``euid == 0``) — fail-closed and surfaced (`load_refusal`, `_running_as_root`,
+  issue #253). The narrower sudo/group checks stay at the NOC preflight, which has the
+  box context; this is euid 0 only.
 - It runs **model-authored commands locally on the box** — a deliberate opt-out of the
   safe-default property that the shipped Harness executes no model code on its boxes
   (issue #172). That property is a safe-*default* (the locked profile), not an absolute;
@@ -83,6 +88,34 @@ MAX_OUTPUT = 30_000
 # output / reaping it. Bounds the rare case of a detached grandchild that escaped the
 # group and still holds the stdout pipe open, so nothing can hang the agent's turn.
 DRAIN_TIMEOUT = 10
+
+# The in-process privilege backstop (constitution Operational Baselines, basecradle#404;
+# issue #253). This tool's *entire* safety model is that the OS user is unprivileged (see
+# the module docstring): as root, "the OS user's Unix permissions are the sandbox" ceases
+# to bound anything — a root shell is the whole machine, not one account. The primary guard
+# is the NOC's enablement preflight, which checks the account (sudo, group membership, root)
+# with the box context this process lacks *before* activation; this is the last-ditch, fail-
+# closed backstop for the catastrophic case that the tool is ever wired onto a privileged
+# account anyway. Deliberately narrow — **euid 0 only**: reliable in-process sudo/group
+# detection is not worth the complexity, and that fuller check stays at the preflight layer.
+_ROOT_REFUSAL = (
+    "the shell tool refuses to run as root — it is designed for an unprivileged OS user, and "
+    "a root shell would expose the whole machine rather than one account. Run the agent as a "
+    "non-root user (see the constitution's Operational Baselines)."
+)
+
+
+def _running_as_root() -> bool:
+    """True iff this process's effective UID is 0 (root), on a host that has the concept.
+
+    ``os.geteuid`` is POSIX-only (it does not exist on Windows), so it is probed with
+    ``hasattr`` first: a host with no ``geteuid`` has no Unix root to detect and reads as
+    not-root — the shell tool runs ``/bin/bash`` and is POSIX-oriented anyway, so the
+    backstop it guards is a POSIX concept. The check is cheap, so it is re-read at each
+    load and each call rather than cached — euid does not change under us, but a fresh read
+    costs nothing and keeps the two enforcement points honest.
+    """
+    return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
 class ShellTool(Tool):
@@ -158,6 +191,17 @@ class ShellTool(Tool):
         self._max_output = max(1, max_output)
         self._drain_timeout = max(1, drain_timeout)
 
+    def load_refusal(self) -> str | None:
+        """Refuse to load when running as root — the in-process privilege backstop.
+
+        Reporting a reason here makes `ToolRegistry.register` refuse the tool (raising)
+        and the env-resolution path (`_apply_safe_policy`) drop and surface it, so a
+        root-run agent never even sees a shell — fail-closed, consistent with the policy
+        gate (issue #253). `run` re-checks the same condition as defense-in-depth for a
+        tool constructed and called directly, bypassing the registry. See `_ROOT_REFUSAL`.
+        """
+        return _ROOT_REFUSAL if _running_as_root() else None
+
     def run(
         self,
         command: str | None = None,
@@ -171,6 +215,11 @@ class ShellTool(Tool):
         error. A command that outruns its timeout, or floods more than the output cap, is
         killed by its process group (children included) and reported as such.
         """
+        # Defense-in-depth privilege backstop: even a tool constructed and invoked
+        # directly (bypassing the registry's load-time refusal) must never hand the
+        # model a root shell. See `load_refusal` / `_ROOT_REFUSAL` (issue #253).
+        if _running_as_root():
+            return f"Error: {_ROOT_REFUSAL}"
         if not command or not command.strip():
             return "Error: 'shell' needs a 'command' to run."
 
