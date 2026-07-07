@@ -24,6 +24,7 @@ from basecradle_harness import (
     ProviderConnectionError,
     ProviderError,
     ProviderRateLimitError,
+    ProviderResponseError,
     ToolCall,
     ToolSpec,
 )
@@ -508,12 +509,63 @@ def test_transport_failure_raises_connection_error(router, provider):
         provider.chat([Message.user("Hi")])
 
 
-def test_malformed_response_raises_provider_error(router, provider):
-    """The SDK leniently constructs the model; an empty `choices` surfaces as ProviderError."""
+def test_malformed_response_raises_the_retryable_response_error(router, provider):
+    """The SDK leniently constructs the model; an empty `choices` (the shape a truncated body
+    leaves behind) surfaces as the *retryable* ProviderResponseError, so the engine re-requests it
+    rather than aborting the wake (issue #259)."""
     router.post(CHAT_URL).mock(return_value=httpx.Response(200, json={"unexpected": True}))
 
-    with pytest.raises(ProviderError):
+    with pytest.raises(ProviderResponseError):
         provider.chat([Message.user("Hi")])
+
+
+def test_a_non_json_body_raises_the_retryable_response_error(router, provider):
+    """A 200 whose body is truncated / not JSON (the SDK cannot parse it — the observed
+    EOF-mid-JSON class) surfaces as the retryable ProviderResponseError, not a permanent one."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, headers={"content-type": "application/json"}, text="{trunc"
+        )
+    )
+
+    with pytest.raises(ProviderResponseError):
+        provider.chat([Message.user("Hi")])
+
+
+def test_truncated_tool_call_arguments_raise_the_retryable_response_error(router, provider):
+    """A well-formed envelope whose tool-call `arguments` string is cut off mid-JSON (a very common
+    truncation locus — args are often the largest/last part) is the same transient class: retryable
+    ProviderResponseError, not a permanent drop (issue #259)."""
+    tool_call = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "get_weather", "arguments": '{"city": "Dal'},  # truncated JSON
+    }
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, json=completion(tool_calls=[tool_call], finish_reason="tool_calls")
+        )
+    )
+
+    with pytest.raises(ProviderResponseError):
+        provider.chat([Message.user("weather?")], tools=[WEATHER_TOOL])
+
+
+def test_truncated_tool_call_arguments_on_the_responses_surface_are_retryable(
+    router, responses_provider
+):
+    """Same truncated-args locus on the Responses surface → the retryable ProviderResponseError."""
+    bad_call = {
+        "id": "fc-1",
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "get_weather",
+        "arguments": '{"city": "Dal',  # truncated JSON
+    }
+    router.post(RESPONSES_URL).mock(return_value=httpx.Response(200, json=responses_body(bad_call)))
+
+    with pytest.raises(ProviderResponseError):
+        responses_provider.chat([Message.user("weather?")], tools=[WEATHER_TOOL])
 
 
 # === Construction & configuration ===========================================

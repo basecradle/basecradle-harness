@@ -62,6 +62,7 @@ from basecradle_harness._exceptions import (
     ProviderConnectionError,
     ProviderError,
     ProviderRateLimitError,
+    ProviderResponseError,
 )
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._openai_wire import (
@@ -361,6 +362,13 @@ class _ErrorMapper:
         if exc is None:
             return False
         errors = self._openrouter.errors
+        if isinstance(exc, errors.ResponseValidationError):
+            # A 200 whose body the SDK's typed ChatResult could not parse — the truncated /
+            # EOF-mid-JSON class (issue #259). It is a `ResponseValidationError` (an
+            # OpenRouterError subclass) but *transient*, so it maps to the retryable
+            # `ProviderResponseError`, not a permanent one; the engine re-requests it. Checked
+            # before the generic OpenRouterError branch below, which it subclasses.
+            raise ProviderResponseError(str(exc)) from exc
         if isinstance(exc, errors.OpenRouterError):
             raise _from_status_error(exc) from exc
         if isinstance(exc, errors.NoResponseError):
@@ -384,11 +392,11 @@ def _from_status_error(exc) -> ProviderError:
     """An ``openrouter.errors.OpenRouterError`` mapped to the right typed `ProviderError`.
 
     Most subclasses carry a real HTTP error status (401/403/429/5xx) → the matching
-    `ProviderAPIError`. But `ResponseValidationError` also subclasses `OpenRouterError` while
-    carrying the *success* status of the response whose body failed to parse (e.g. 200) — a
-    non-HTTP-error status. Rather than stamp a `ProviderAPIError` with a misleading `status_code`
-    like 200 (or a fabricated 0 for a status-less error), a status below 400 is surfaced as a plain
-    `ProviderError`: it *is* a provider failure, just not an HTTP-status one.
+    `ProviderAPIError`. The `ResponseValidationError` case (a 200 whose body failed to parse) is
+    intercepted earlier by `_ErrorMapper` and mapped to the retryable `ProviderResponseError`, so
+    it never reaches here. Any *other* status-less or sub-400 OpenRouterError is still surfaced as
+    a plain `ProviderError` rather than a `ProviderAPIError` stamped with a misleading status like
+    200 (or a fabricated 0): it *is* a provider failure, just not an HTTP-status one.
     """
     status = getattr(exc, "status_code", None) or 0
     body = getattr(exc, "body", "") or ""

@@ -30,6 +30,7 @@ from basecradle_harness import (
     ProviderConnectionError,
     ProviderError,
     ProviderRateLimitError,
+    ProviderResponseError,
     ToolCall,
     ToolSpec,
 )
@@ -373,15 +374,16 @@ def test_internal_typeerror_is_not_misattributed_to_model_params():
     provider.close()
 
 
-def test_response_validation_error_maps_to_provider_error_not_a_fake_status(router):
+def test_response_validation_error_maps_to_the_retryable_response_error(router):
     # A 200 whose body fails the SDK's ChatResult validation raises ResponseValidationError (an
-    # OpenRouterError subclass carrying no HTTP-error status). It must surface as a plain
-    # ProviderError, never a ProviderAPIError stamped with a misleading status_code like 200.
+    # OpenRouterError subclass carrying no HTTP-error status) — the truncated / EOF-mid-JSON class
+    # (issue #259). It must surface as the *retryable* ProviderResponseError (so the engine
+    # re-requests it), never a ProviderAPIError stamped with a misleading status_code like 200.
     router.post(CHAT_URL).mock(
         return_value=httpx.Response(200, json={"id": "gen-x", "object": "chat.completion"})
     )
     provider = _provider(retries_disabled=True)
-    with pytest.raises(ProviderError) as exc:
+    with pytest.raises(ProviderResponseError) as exc:
         provider.chat([Message.user("Hi")])
     assert not isinstance(exc.value, ProviderAPIError)
     provider.close()

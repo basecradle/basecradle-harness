@@ -23,7 +23,9 @@ from basecradle_harness import (
     Provider,
     ProviderAuthError,
     ProviderConnectionError,
+    ProviderError,
     ProviderRateLimitError,
+    ProviderResponseError,
     ToolCall,
     ToolSpec,
     XaiSdkProvider,
@@ -393,3 +395,20 @@ def test_grpc_resource_exhausted_maps_to_rate_limit():
 def test_grpc_unavailable_maps_to_connection_error():
     with pytest.raises(ProviderConnectionError):
         _provider_raising(grpc.StatusCode.UNAVAILABLE).chat([Message.user("hi")])
+
+
+def test_grpc_internal_maps_to_the_retryable_response_error():
+    # INTERNAL / DATA_LOSS are gRPC's broken/undecodable-payload codes — the native analogue of a
+    # truncated JSON body (issue #259). They map to the retryable ProviderResponseError so the
+    # engine re-requests, not the generic (non-retried) ProviderError.
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.DATA_LOSS):
+        with pytest.raises(ProviderResponseError):
+            _provider_raising(code).chat([Message.user("hi")])
+
+
+def test_an_unclassified_grpc_error_stays_a_plain_provider_error():
+    # A code that is neither transient-response nor connection/auth/rate-limit stays a plain
+    # ProviderError (not retried) — so the response-retry never fires on an unrelated fault.
+    with pytest.raises(ProviderError) as exc:
+        _provider_raising(grpc.StatusCode.INVALID_ARGUMENT).chat([Message.user("hi")])
+    assert not isinstance(exc.value, ProviderResponseError)

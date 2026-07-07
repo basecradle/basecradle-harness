@@ -7,6 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.56.0] - 2026-07-07
+
+**Bounded retry of a truncated / unparseable provider response — a wake no longer silently drops a
+message on a one-off parse flake (issue #259).** Observed live on @glm-5.2 (OpenRouter GLM-5.2): a
+wake made its completion (HTTP 200), then aborted parsing the body — `Response validation failed:
+EOF while parsing a value` — and exited **without replying**; a re-trigger minutes later succeeded
+cleanly, so the fault is *intermittent*, not systematic. It was worse than a lost turn: a wake marks
+each item **seen before** the model runs, so the aborting wake dropped the peer's message with no
+later wake to retry it. The engine now treats that one failure class as **transient and retryable**
+— it re-requests the completion up to `HARNESS_RESPONSE_RETRIES` times (**default 2**, up to 3
+attempts) with a short backoff before giving up, so the common case never surfaces. The
+classification is **capability-based, not provider-specific**: a new `ProviderResponseError` is the
+one class the engine retries, and every adapter maps its own SDK's parse/validation failure to it
+(OpenAI's non-status `APIError` / raw `JSONDecodeError`, OpenRouter's `ResponseValidationError`, the
+native xAI gRPC `INTERNAL`/`DATA_LOSS`, and the shared wire translator's "malformed payload") — so
+the retry fires identically on every provider, never a GLM-5.2/OpenRouter special case. Only that
+class retries; a connection, auth, rate-limit, or permanent config error is never re-tried. When the
+retries *are* exhausted the wake still aborts — but only after a `WARNING` per attempt and a final
+`ERROR` naming the failure class and the attempt count, so a genuinely-wedged provider is
+diagnosable from the logs instead of a silent drop. Purely additive and fail-safe: with the default
+in place a single flake self-heals, and `HARNESS_RESPONSE_RETRIES=0` restores the prior
+single-attempt behavior.
+
+### Added
+
+- **`ProviderResponseError`** — a new `ProviderError` subclass meaning "the provider *answered* but
+  the SDK could not parse the body" (truncated / malformed / schema-mismatched). Exported from the
+  package; the one provider-failure class the engine retries. Adapters map their SDK's
+  response-parse/validation failure to it, so the retry is provider-agnostic.
+- **`HARNESS_RESPONSE_RETRIES` env var** — the per-persona bound on how many extra times the engine
+  re-requests an unparseable response before the wake gives up. **Default `2`** (up to 3 attempts);
+  `0` disables the retry; a negative value fails loudly. Also surfaced as `Engine`/`Harness`
+  constructor arg `response_retries`.
+
+### Changed
+
+- **The engine retries an unparseable provider response** (`Engine._chat`) instead of aborting the
+  wake on the first `ProviderResponseError`, with a short per-attempt backoff and a log trail on
+  exhaustion. Every other failure class propagates on the first raise, exactly as before.
+
 ## [0.55.0] - 2026-07-06
 
 **Deploy-controllable unlocked profile — `HARNESS_PROFILE` + `--resolved-config` reports it (issue

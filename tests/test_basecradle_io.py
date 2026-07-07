@@ -30,6 +30,7 @@ from basecradle_harness import (
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     DEFAULT_MAX_STEPS,
+    DEFAULT_RESPONSE_RETRIES,
     _client_from_env,
     _compose_prompt,
     _config_from_env,
@@ -39,6 +40,7 @@ from basecradle_harness._basecradle import (
     _orientation,
     _provider_from_config,
     _resolve_tools_and_provider,
+    _response_retries_from_env,
     resolved_model_params,
 )
 from basecradle_harness._model_params import MODEL_PARAMS_NAME
@@ -648,6 +650,24 @@ def test_max_steps_from_env_parses_default_override_and_rejects_non_positive(mon
     monkeypatch.setenv("HARNESS_MAX_STEPS", "0")
     with pytest.raises(ValueError, match="positive integer"):
         _max_steps_from_env()  # a budget of 0 could never make a call — fail loudly
+
+
+def test_response_retries_from_env_parses_default_override_zero_and_rejects_negative(monkeypatch):
+    monkeypatch.delenv("HARNESS_RESPONSE_RETRIES", raising=False)
+    assert _response_retries_from_env() == DEFAULT_RESPONSE_RETRIES  # unset → the shipped 2
+
+    monkeypatch.setenv("HARNESS_RESPONSE_RETRIES", "  ")
+    assert _response_retries_from_env() == DEFAULT_RESPONSE_RETRIES  # blank → default too
+
+    monkeypatch.setenv("HARNESS_RESPONSE_RETRIES", "5")
+    assert _response_retries_from_env() == 5  # the operator's per-persona override
+
+    monkeypatch.setenv("HARNESS_RESPONSE_RETRIES", "0")
+    assert _response_retries_from_env() == 0  # zero is valid — disable the retry (a single attempt)
+
+    monkeypatch.setenv("HARNESS_RESPONSE_RETRIES", "-1")
+    with pytest.raises(ValueError, match="non-negative integer"):
+        _response_retries_from_env()  # a negative would silently mean "no attempts" — fail loudly
 
 
 # --- config + provider selection (AI_PROVIDER / AI_SDK / AI_SDK_SURFACE) ---

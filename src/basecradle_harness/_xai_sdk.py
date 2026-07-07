@@ -45,6 +45,7 @@ from basecradle_harness._exceptions import (
     ProviderConnectionError,
     ProviderError,
     ProviderRateLimitError,
+    ProviderResponseError,
 )
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
 from basecradle_harness._openai_wire import format_citations
@@ -300,4 +301,10 @@ class _grpc_error_context:
             raise ProviderRateLimitError(message, status_code=429) from exc
         if code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
             raise ProviderConnectionError(message) from exc
+        if code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.DATA_LOSS):
+            # A broken/undecodable response payload — gRPC's analogue of the truncated-JSON class
+            # (issue #259): the call reached the endpoint and came back corrupt. Map it to the
+            # retryable `ProviderResponseError` so the engine re-requests it, the same capability
+            # class as the OpenAI/OpenRouter parse failures — a dropped wake, not a config bug.
+            raise ProviderResponseError(message) from exc
         raise ProviderError(message) from exc
