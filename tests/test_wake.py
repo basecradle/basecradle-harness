@@ -1528,6 +1528,8 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     assert "web_search" not in report["builtins"]
     # And the opt-in manifest (issue #181) is empty for that safe default — nothing opted in.
     assert report["opt_in_tools"] == []
+    # The MCP manifest (issue #261) is empty too — the default `mcp/` dir ships empty.
+    assert report["mcp_servers"] == []
     # Model params (issue #236): absent file → an empty object and no collisions, present in the
     # additive contract so a verifier can rely on the keys existing.
     assert report["model_params"] == {}
@@ -1592,6 +1594,38 @@ def test_resolved_config_reports_active_opt_in_stems(wake_env, monkeypatch, tmp_
     # Cross-check the fan-out is real in the resolved active set (built-in + tool both present).
     assert "code_interpreter" in report["builtins"]
     assert "code_attach" in report["tools"]
+
+
+def test_resolved_config_reports_configured_mcp_servers_regardless_of_load(
+    wake_env, monkeypatch, tmp_path
+):
+    """The MCP manifest (issue #261) the NOC's MCP-overlay drift audit keys on: the sorted
+    **names** of the configured `mcp/<name>.json` drop-ins, reported from the on-disk config
+    (`load_mcp_configs`) — so a server that fails to connect this run still appears, and a
+    transient upstream blip never reads as desired-state drift. The default empty dir → `[]`."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    cfg.mkdir()
+    assert resolved_config()["mcp_servers"] == []  # no mcp/ dir → empty manifest
+
+    # Two configured servers, one of which cannot possibly connect (a bogus stdio command that
+    # fails fast). Both are *configured* on disk, so both name the manifest — independent of load.
+    mcp_dir = cfg / "mcp"
+    mcp_dir.mkdir()
+    (mcp_dir / "workmail.json").write_text(
+        json.dumps({"command": "/nonexistent-mcp-binary"}), encoding="utf-8"
+    )
+    (mcp_dir / "notes.json").write_text(
+        json.dumps({"command": "/also-nonexistent"}), encoding="utf-8"
+    )
+
+    report = resolved_config()
+
+    # Sorted configured names — the ground-truth signal — regardless of connect success.
+    assert report["mcp_servers"] == ["notes", "workmail"]
+    # And the failed load is honestly recorded in `skipped` (the loaded set diverges from the
+    # configured set) — proving `mcp_servers` reports configuration, not liveness.
+    assert "workmail" in report["skipped"]
 
 
 def test_resolved_config_reports_the_active_profile_locked_by_default(wake_env):

@@ -7,6 +7,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.57.0] - 2026-07-07
+
+**`--resolved-config` emits an `mcp_servers` manifest — the ground-truth signal the NOC's
+MCP-overlay drift audit needs (issue #261).** The NOC audits every deploy axis by ground truth off
+the box (`--resolved-config`, "never self-report"), and after the `opt_in_tools` (#181) and
+`active_profile` (#256) manifests, **MCP server overlays** (`mcp/<name>.json` drop-ins) were the one
+applied-but-unauditable axis left — MCP tools surface only *folded into* `tools` as
+`<server>__<tool>` names, with no explicit list of the box's configured servers, so an
+inventory-vs-reality mismatch on this axis was invisible (@glm-5.2 runs a `workmail` server the
+inventory does not declare; basecradle-noc#178). The NOC could not derive server names itself
+without re-implementing the harness's `<server>__<tool>` naming internals (`_SEP`, `_sanitize`, the
+64-char truncation, the first-`__` split) — exactly the parallel-model anti-pattern the opt-in
+manifest was created to retire — and a tool-derived check would also *flap*: `resolved_config()`
+reports **loaded** servers (a failed one self-excludes into `skipped`), so a transient upstream blip
+would read as desired-state drift. This adds an additive `mcp_servers` field: the sorted **names**
+of the **configured** servers (`load_mcp_configs`, the on-disk `mcp/*.json`), independent of whether
+each one loaded this run — the direct analogue of `opt_in_tools`. **Names only, never a server's
+`env`/`headers`** (non-secret by contract, like the opt-in stems), and the *configured* (on-disk)
+set — not the *loaded* set — is the desired-state-comparable, flap-free signal. Purely additive: an
+absent field means a pre-manifest harness, so a consumer treats the MCP axis as unauditable
+(three-valued, exactly like `opt_in_tools` / `active_profile`) and every existing deploy stays
+byte-safe.
+
+### Added
+
+- **`mcp_servers` field on `--resolved-config`** (`resolved_config`, `_wake.py`) — the sorted names
+  of the configured `mcp/*.json` drop-ins, reported from the on-disk config (`load_mcp_configs`)
+  independent of load success; `[]` for the default empty `mcp/` dir. Documented in the
+  `resolved_config()` additive-contract docstring alongside `opt_in_tools` / `active_profile`, and
+  in the README's `--resolved-config` field list.
+
 ## [0.56.0] - 2026-07-07
 
 **Bounded retry of a truncated / unparseable provider response — a wake no longer silently drops a

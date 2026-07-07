@@ -106,6 +106,7 @@ from basecradle_harness._code import CodeExecutionBridge
 from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
+from basecradle_harness._mcp import load_mcp_configs
 from basecradle_harness._memory_provider import MemoryExchange, MemoryProvider, MemoryScope
 from basecradle_harness._messages import ImageContent
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
@@ -2020,6 +2021,16 @@ def resolved_config() -> dict[str, object]:
       and a name can differ from its stem — ``hear_audio`` → ``listen``). Reporting the stems
       lets the NOC's fleet-drift audit compare declared-vs-active inventory like-for-like,
       holding no stem→name map of its own. ``[]`` for a safe default config (no opt-in tool).
+    - ``mcp_servers`` — the sorted **names** of the **configured** MCP servers, one per
+      ``mcp/<name>.json`` drop-in (`load_mcp_configs`), independent of whether each one loaded
+      this run (issue #261). The MCP-overlay analogue of ``opt_in_tools`` / ``active_profile``:
+      the NOC's fleet-drift audit compares inventory-declared-vs-configured on this axis, both
+      directions, holding **no** model of the harness's ``<server>__<tool>`` naming internals —
+      the parallel-model anti-pattern the opt-in manifest retired. It reports the **configured**
+      (on-disk) set, *not* the loaded set folded into ``tools``, so a transient upstream blip that
+      self-excludes a server into ``skipped`` this run never reads as desired-state drift. Names
+      only, never a server's ``env``/``headers`` (non-secret by contract, like the opt-in stems).
+      ``[]`` for the default empty ``mcp/`` dir.
     - ``model_params`` — the operator's ``model_params.json`` object **verbatim** (``{}`` when the
       file is absent), the optional SDK call tuning (``reasoning``, ``temperature``, …) that
       `_provider_from_config` threads into every model call but nothing else introspects (issue
@@ -2050,6 +2061,7 @@ def resolved_config() -> dict[str, object]:
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),
         "opt_in_tools": list(resolved.opt_in_stems),
+        "mcp_servers": sorted({config.name for config in load_mcp_configs()}),
         "model_params": model_params,
         "model_params_stripped": stripped,
     }
