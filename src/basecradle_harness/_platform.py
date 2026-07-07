@@ -11,9 +11,9 @@ participants, trust, lock, webhooks) needs two things a plain `Tool` never had:
 Neither exists when the `Harness` is built — they belong to the hosting agent
 (`TimelineAgent`/`WakeAgent`), which is constructed *after* the harness and its
 tools. And the engine is deliberately platform-ignorant (it is the same loop for
-Harness and Cradle), so context cannot be threaded through `Engine.run`. The seam
-resolves both: context is **bound onto the tool instance**, out of band, once,
-before the loop runs.
+the locked and unlocked profiles), so context cannot be threaded through
+`Engine.run`. The seam resolves both: context is **bound onto the tool instance**,
+out of band, once, before the loop runs.
 
 The contract is small, to match the rest of the kit:
 

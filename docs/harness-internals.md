@@ -211,7 +211,7 @@ reverses the earlier "MCP is out of scope / deferred" stance — a founder decis
   failure lands in `skipped` with a reason — exactly the Group-2 activation robustness bar;
   a flaky server **never crashes the wake**. (Per-wake startup latency is the trade for the
   process-per-event model; documented in `_mcp.py`.)
-- **Safe-by-default, made explicit.** A fresh install is safe by construction: empty `mcp/`,
+- **Safe-by-default, made explicit.** A fresh install is safe by default: empty `mcp/`,
   and the locked `Policy` denies shell/exec. Loading an MCP server — **or** a drop-in
   `tools/` tool that needs a policy-denied capability — is the operator *knowingly leaving
   the safe zone*, so the harness **surfaces** it rather than hiding it: a clear **log line**

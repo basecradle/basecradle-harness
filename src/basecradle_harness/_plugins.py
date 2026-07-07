@@ -20,7 +20,7 @@ This is *activation*, and it is **not** the policy/safety gate. They are orthogo
   under the locked profile. Enforced later, at `ToolRegistry.register`.
 
 A plugin can be active yet still policy-refused; both gates apply, activation first. Keeping
-them apart is what lets a locked Harness and an unlocked Cradle share this exact resolver.
+them apart is what lets a locked and an unlocked Harness profile share this exact resolver.
 
 Sources: package defaults + the ``/tools`` overlay
 --------------------------------------------------

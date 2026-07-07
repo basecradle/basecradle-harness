@@ -6,15 +6,19 @@ registration time and refuses any tool that needs something forbidden — so the
 boundary is enforced where tools enter the system, not left to a tool author's
 good behavior.
 
-Two profiles bracket the design (CLAUDE.md spine #2, "one core, two profiles"):
+Two Harness profiles bracket the design (CLAUDE.md spine #2). Both are Harness;
+the engine is policy-neutral and the policy is the only difference between them:
 
 - `Policy.locked()` — what Harness ships. Forbids `SHELL` (subprocess / arbitrary
   command execution). Combined with the fact that Harness ships **no** shell or
-  exec tool and **no** primitive to spawn a subprocess, the safe profile has no
-  path to a shell. This is the default; you opt out deliberately.
-- `Policy.unlocked()` — forbids nothing. The seam Cradle (the dangerous sibling)
-  will use to grant shell, sudo, and self-modification. Present here only as the
-  other end of the same dial; Harness never selects it for you.
+  exec tool and **no** primitive to spawn a subprocess, the shipped default
+  forbids the shell capability outright. This is safe by *default*, not a standing
+  guarantee: an operator opts out deliberately — by passing `unlocked()`, or by
+  dropping a `tools/` tool or MCP server that reaches a denied capability into the
+  config home. Leaving the safe zone is a deliberate, auditable operator act.
+- `Policy.unlocked()` — forbids nothing. The unlocked profile an operator selects
+  to grant shell, sudo, and self-modification. Present here only as the other end
+  of the same dial; the shipped Harness never selects it for you.
 
 Capabilities are plain strings so a tool author can invent new ones and a future
 policy can forbid them. `SHELL` is the one the shipped boundary cares about.
@@ -29,7 +33,8 @@ if TYPE_CHECKING:
     from basecradle_harness._tools import Tool
 
 # The capability to run a subprocess or otherwise execute arbitrary commands.
-# The locked profile forbids it; this is the line between Harness and Cradle.
+# The locked profile forbids it; this is the line between the safe default and
+# the unlocked profile — both of them Harness.
 SHELL = "shell"
 
 # The capability to act on the BaseCradle platform through the SDK — what every
@@ -66,5 +71,5 @@ class Policy:
 
     @classmethod
     def unlocked(cls) -> Policy:
-        """Forbids nothing — the Cradle seam. Never selected for you by Harness."""
+        """Forbids nothing — the unlocked profile. Never selected for you by the shipped Harness."""
         return cls(forbidden=frozenset())

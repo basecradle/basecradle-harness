@@ -3,9 +3,10 @@
 The engine is the nervous system, and it is deliberately ignorant of "safe". It
 holds no policy of its own: it runs whatever tools its `ToolRegistry` contains,
 and that registry is what a policy gated at registration time. Hand it a locked
-registry and it is Harness; hand it an unlocked one and the very same loop is
-Cradle. That is the whole "one core, two profiles" design, and it is why there
-is not a single Harness-specific assumption in this file.
+registry and it runs the safe Harness default; hand it an unlocked one and the
+very same loop runs the unlocked profile. That is the whole "one engine, two
+Harness profiles" design, and it is why there is not a single profile-specific
+assumption in this file.
 
 One turn (`run`) is: ask the provider for the next message; if it is plain text,
 that is the reply; if it carries tool calls, run each through the registry,
