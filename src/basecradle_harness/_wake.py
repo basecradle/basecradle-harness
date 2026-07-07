@@ -91,6 +91,7 @@ from basecradle_harness._basecradle import (
     _recent,
     _resolve_tools,
     _resolve_tools_and_provider,
+    _response_retries_from_env,
     resolved_model_params,
 )
 from basecradle_harness._brief import (
@@ -803,6 +804,12 @@ class WakeAgent:
             # injects a live counter against it and, when spent with tools still pending, makes
             # the reserve summary call rather than cutting off with a canned string (issue #243).
             max_steps=_max_steps_from_env(),
+            # How many extra times a truncated/unparseable provider response is re-requested
+            # before the wake gives up (default 2, `HARNESS_RESPONSE_RETRIES` overrides). Without
+            # it, a single EOF-mid-JSON flake aborted the wake and silently dropped the peer's
+            # message — the item is marked seen before the model runs, so no later wake retried it
+            # (issue #259).
+            response_retries=_response_retries_from_env(),
             # The active server-side built-ins (e.g. web_search), so a model that calls one as a
             # function gets targeted guidance instead of the generic error (issue #245).
             server_builtins=resolved.builtins,

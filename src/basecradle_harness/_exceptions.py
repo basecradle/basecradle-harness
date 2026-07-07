@@ -33,6 +33,20 @@ class ProviderError(HarnessError):
     """A model provider call failed."""
 
 
+class ProviderResponseError(ProviderError):
+    """The provider *answered*, but with a response the SDK could not parse.
+
+    A truncated body, malformed JSON, or a schema mismatch (the "EOF while parsing a
+    value" class observed on GLM-5.2/OpenRouter, issue #259). The response arrived — so
+    this is not a `ProviderConnectionError` — but could not be turned into a turn. It is
+    the one provider failure the engine **retries**: it is transient (the same call
+    re-issued usually succeeds), and deliberately distinct from a *permanent*
+    `ProviderError` (a bad `model_params.json` key, a missing SDK) that retrying would
+    only repeat. Adapters map their SDK's response-parse/validation failure to this so the
+    retry is provider-agnostic — classified by the *nature of the fault*, never the vendor.
+    """
+
+
 class ProviderConnectionError(ProviderError):
     """The provider could not be reached (DNS, TCP, TLS, timeout)."""
 

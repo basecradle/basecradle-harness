@@ -16,6 +16,8 @@ from basecradle_harness import (
     EngineError,
     ImageContent,
     Message,
+    ProviderAuthError,
+    ProviderResponseError,
     Tool,
     ToolCall,
     ToolRegistry,
@@ -395,3 +397,129 @@ def test_an_unknown_tool_still_gets_the_generic_error():
 
     result = next(m for m in history if m.role == "tool")
     assert "no tool named 'nonesuch'" in result.content
+
+
+# --- bounded retry of a truncated / unparseable provider response (issue #259) ---
+
+
+class FlakyProvider:
+    """Raises `ProviderResponseError` on its first `fails` calls, then returns `reply`.
+
+    Models the observed GLM-5.2 flake: a provider call that comes back unparseable (a truncated
+    body / EOF-mid-JSON) and then, re-issued, succeeds. Records how many times it was called.
+    """
+
+    def __init__(self, fails: int, reply: Message) -> None:
+        self._fails = fails
+        self._reply = reply
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.calls <= self._fails:
+            raise ProviderResponseError(f"EOF while parsing a value (call {self.calls})")
+        return self._reply
+
+
+class AlwaysTruncatedProvider:
+    """Every call comes back unparseable — the wedged case the retry must still bound."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        raise ProviderResponseError(f"EOF while parsing a value (call {self.calls})")
+
+
+class AuthFailingProvider:
+    """Raises a *permanent* provider error — the class the retry must NOT re-attempt."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        raise ProviderAuthError("bad key", status_code=401)
+
+
+def _no_sleep():
+    """A sleep spy: records the backoff delays it was asked to wait, and never actually sleeps."""
+    delays: list[float] = []
+    return delays, delays.append
+
+
+def test_a_truncated_response_is_retried_then_succeeds():
+    """The first attempt fails validation, the retry succeeds — the engine returns the reply
+    instead of aborting the wake (issue #259, definition-of-done point 1)."""
+    provider = FlakyProvider(fails=1, reply=Message.assistant(content="the real answer"))
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), sleep=spy)
+    history = [Message.user("hi")]
+
+    reply = engine.run(history)
+
+    assert reply.content == "the real answer"
+    assert provider.calls == 2  # one failure, one success
+    assert delays == [0.5]  # exactly one backoff, at the base delay
+
+
+def test_retries_are_bounded_and_the_last_error_propagates():
+    """When every attempt fails, the engine gives up after response_retries+1 tries and re-raises
+    the ProviderResponseError — the wake then aborts cleanly (definition-of-done point 1/2)."""
+    provider = AlwaysTruncatedProvider()
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), response_retries=2, sleep=spy)
+
+    with pytest.raises(ProviderResponseError):
+        engine.run([Message.user("hi")])
+
+    assert provider.calls == 3  # 1 initial + 2 retries
+    assert delays == [0.5, 1.0]  # a backoff before each retry, scaled by attempt
+
+
+def test_the_give_up_leaves_a_diagnosable_log_trail(caplog):
+    """On exhaustion the engine logs a WARNING per retry and an ERROR naming the attempt count, so
+    a dropped wake is diagnosable from logs alone (definition-of-done point 2)."""
+    provider = AlwaysTruncatedProvider()
+    _delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), response_retries=2, sleep=spy)
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        with pytest.raises(ProviderResponseError):
+            engine.run([Message.user("hi")])
+
+    warnings = [
+        r for r in caplog.records if r.levelname == "WARNING" and "unparseable" in r.message
+    ]
+    errors = [r for r in caplog.records if r.levelname == "ERROR" and "unparseable" in r.message]
+    assert len(warnings) == 2  # one per retry attempt
+    assert len(errors) == 1  # the final give-up
+    assert "all 3 attempt(s)" in errors[0].message  # names the attempt count
+
+
+def test_a_permanent_provider_error_is_not_retried():
+    """A permanent failure (auth) is never re-attempted — retrying it only repeats it, so it
+    propagates on the first raise with no backoff (definition-of-done: only the response class)."""
+    provider = AuthFailingProvider()
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), response_retries=5, sleep=spy)
+
+    with pytest.raises(ProviderAuthError):
+        engine.run([Message.user("hi")])
+
+    assert provider.calls == 1  # not retried
+    assert delays == []  # no backoff
+
+
+def test_response_retries_zero_disables_the_retry():
+    """response_retries=0 → a single attempt, no retry — the pre-issue behavior, opt-in."""
+    provider = AlwaysTruncatedProvider()
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), response_retries=0, sleep=spy)
+
+    with pytest.raises(ProviderResponseError):
+        engine.run([Message.user("hi")])
+
+    assert provider.calls == 1
+    assert delays == []

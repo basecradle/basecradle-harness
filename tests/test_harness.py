@@ -220,6 +220,15 @@ def test_budget_spent_returns_the_reserve_summary(tmp_path):
     assert all(c is not None for c in provider.calls[:3])  # the budgeted calls offered tools
 
 
+def test_response_retries_threads_from_harness_to_the_engine():
+    from basecradle_harness._engine import DEFAULT_RESPONSE_RETRIES
+
+    provider = ScriptedProvider(Message.assistant(content="ok"))
+    # Default → the shipped bound; an explicit value → the engine's bound (issue #259).
+    assert Harness(provider).engine.response_retries == DEFAULT_RESPONSE_RETRIES
+    assert Harness(provider, response_retries=7).engine.response_retries == 7
+
+
 class NeverSettlesProvider:
     """Always calls a tool, even when tools are withheld — so the reserve call fails to settle."""
 

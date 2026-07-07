@@ -30,15 +30,29 @@ do again, never a standing cost.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 
-from basecradle_harness._exceptions import EngineError
-from basecradle_harness._messages import ImageContent, Message, ToolResult
+from basecradle_harness._exceptions import EngineError, ProviderResponseError
+from basecradle_harness._messages import ImageContent, Message, ToolResult, ToolSpec
 from basecradle_harness._provider import Provider
 from basecradle_harness._tools import ToolRegistry
 
 _log = logging.getLogger("basecradle_harness")
+
+#: How many **extra** times the engine re-requests a provider call that came back unparseable —
+#: the truncated / EOF-mid-JSON class (`ProviderResponseError`, issue #259) — before giving up.
+#: 2 → up to 3 total attempts. The fault is a transient flake (the same call re-issued usually
+#: succeeds, as the GLM-5.2 re-trigger did), so a small bound recovers the common case while a wake
+#: that is genuinely wedged still fails fast. 0 disables the retry (a single attempt). Per-persona
+#: override rides `HARNESS_RESPONSE_RETRIES` (see `_response_retries_from_env`).
+DEFAULT_RESPONSE_RETRIES = 2
+
+#: The backoff before an unparseable-response retry, in seconds, scaled by attempt number (0.5s,
+#: then 1.0s, …). Deliberately sub-second-to-low: a truncated body is a momentary server hiccup, so
+#: the retry should add a beat, not the SDK's old up-to-an-hour backoff (which would hang the wake).
+_RETRY_BACKOFF_BASE = 0.5
 
 #: The per-turn provider-call budget. A deliberate research-lab over-provision: a persona's
 #: self-scheduled task legitimately fans out into several sub-actions (read the timeline, check
@@ -87,9 +101,16 @@ class Engine:
             only to answer a model that mistakenly *calls one as a function* with targeted
             guidance instead of the generic "no tool named X" error (issue #245); the
             generic error still stands for a genuinely unknown name. Empty by default.
+        response_retries: How many extra times a provider call that returns an unparseable
+            response (`ProviderResponseError` — the truncated/EOF-mid-JSON class, issue #259)
+            is re-requested before the failure propagates. Defaults to
+            `DEFAULT_RESPONSE_RETRIES`; 0 disables the retry. Only that transient class is
+            retried — a connection, auth, rate-limit, or permanent error is never re-tried here.
         clock: Injectable source of the current UTC time, used to stamp each step-counter
             note and to measure per-step elapsed time. Defaults to the wall clock; a test
             drives it to assert the counter and timing deterministically.
+        sleep: Injectable sleep used only for the response-retry backoff. Defaults to
+            `time.sleep`; a test passes a no-op so the retry path runs without real delay.
     """
 
     def __init__(
@@ -100,14 +121,18 @@ class Engine:
         max_steps: int = DEFAULT_MAX_STEPS,
         turn_hook: TurnHook | None = None,
         server_builtins: Sequence[str] = (),
+        response_retries: int = DEFAULT_RESPONSE_RETRIES,
         clock: Callable[[], datetime] | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.provider = provider
         self.tools = tools
         self.max_steps = max_steps
         self.turn_hook = turn_hook
         self.server_builtins = frozenset(server_builtins)
+        self.response_retries = response_retries
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._sleep = sleep or time.sleep
 
     def run(self, messages: list[Message]) -> Message:
         """Drive the conversation to a final text reply.
@@ -142,7 +167,7 @@ class Engine:
                 # provider's prompt cache hot — so the counter rides a *trailing* system turn,
                 # re-appended each step, never a mutation of the head of the context.
                 messages.append(Message.system(_step_note(step, self.max_steps, started)))
-                reply = self.provider.chat(messages, tools=specs)
+                reply = self._chat(messages, specs)
                 messages.append(reply)
                 for call in reply.tool_calls:
                     result = self._run_tool(call.name, call.arguments)
@@ -171,6 +196,52 @@ class Engine:
             return self._reserve_summary(messages)
         finally:
             _evict_images(shown)
+
+    def _chat(self, messages: list[Message], tools: Sequence[ToolSpec] | None) -> Message:
+        """One provider call, retrying only a *truncated / unparseable* response (issue #259).
+
+        A `ProviderResponseError` means the provider **answered** but the SDK could not parse the
+        body — the "EOF while parsing a value" class first seen on GLM-5.2/OpenRouter. It is
+        transient (the same call re-issued usually succeeds), and before this the wake simply
+        aborted on it: because the item is marked *seen* before the model runs, that silently
+        **dropped the peer's message** — no reply, and no future wake to retry. So the engine
+        re-requests it up to `response_retries` times with a short backoff, provider-agnostically
+        (every adapter maps its own parse failure to this one capability class).
+
+        Only that class is retried. A connection, auth, rate-limit, permanent `ProviderError`
+        (a bad `model_params.json` key), or any non-provider error propagates on the first raise —
+        retrying a permanent fault only repeats it, and connection/5xx retries are the SDKs' own.
+
+        On exhaustion the last error is re-raised (the wake aborts with a clean non-zero exit, the
+        prior behavior) — but every attempt logs a WARNING and the final give-up logs an ERROR
+        naming the failure class and the attempt count, so a dropped wake is diagnosable from the
+        logs alone (issue #259, definition-of-done point 2).
+        """
+        attempts = max(1, self.response_retries + 1)
+        last_exc: ProviderResponseError | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self.provider.chat(messages, tools=tools)
+            except ProviderResponseError as exc:
+                last_exc = exc
+                if attempt < attempts:
+                    delay = _RETRY_BACKOFF_BASE * attempt
+                    _log.warning(
+                        "Provider returned an unparseable response (attempt %d/%d): %s "
+                        "— retrying in %.1fs",
+                        attempt,
+                        attempts,
+                        exc,
+                        delay,
+                    )
+                    self._sleep(delay)
+        _log.error(
+            "Provider returned an unparseable response on all %d attempt(s); giving up: %s",
+            attempts,
+            last_exc,
+        )
+        assert last_exc is not None  # the loop only exits here after catching at least once
+        raise last_exc
 
     def _log_step(self, step: int, reply: Message, extend: bool, started: datetime) -> None:
         """One INFO line per engine step — the journald ledger that survives a lost transcript.
@@ -211,7 +282,7 @@ class Engine:
         """
         messages.append(Message.system(_RESERVE_NUDGE))
         try:
-            reply = self.provider.chat(messages, tools=None)
+            reply = self._chat(messages, None)
         except Exception as exc:  # noqa: BLE001 - surface as EngineError; the wake posts the canned note
             _log.warning("Reserve summary call failed after the step budget was spent: %s", exc)
             raise EngineError(

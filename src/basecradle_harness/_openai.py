@@ -30,6 +30,7 @@ harness owns history, so Responses' server-side state (``previous_response_id``)
 
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
@@ -40,6 +41,7 @@ from basecradle_harness._exceptions import (
     ProviderConnectionError,
     ProviderError,
     ProviderRateLimitError,
+    ProviderResponseError,
 )
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._openai_wire import (
@@ -254,8 +256,19 @@ class _ErrorMapper:
         if isinstance(exc, openai.APIStatusError):
             raise _from_status_error(exc) from exc
         if isinstance(exc, openai.APIError):
-            # A non-status SDK error (e.g. a malformed stream) — still a provider failure.
-            raise ProviderError(str(exc)) from exc
+            # A non-status SDK error: the response arrived but could not be parsed — a truncated
+            # body, malformed JSON, or a schema mismatch (`openai.APIResponseValidationError` lands
+            # here — it is an APIError, not an APIStatusError). This is the transient
+            # unparseable-response class (issue #259), so it maps to the retryable
+            # `ProviderResponseError`; the engine re-requests it before giving up.
+            raise ProviderResponseError(str(exc)) from exc
+        if isinstance(exc, json.JSONDecodeError):
+            # httpx's ``response.json()`` raises this on a truncated / non-JSON 200 body, and the
+            # SDK lets it propagate raw — it is exactly the "EOF while parsing a value" fault this
+            # issue names, so it too maps to the retryable `ProviderResponseError` (issue #259).
+            raise ProviderResponseError(
+                f"Provider returned an unparseable response body: {exc}"
+            ) from exc
         return False  # not an SDK error — let it propagate unchanged
 
 

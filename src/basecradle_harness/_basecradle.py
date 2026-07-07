@@ -69,7 +69,7 @@ from typing import Any
 from basecradle import BaseCradle
 
 from basecradle_harness._code import CODE_EXECUTION_BUILTIN, CodeExecutionBridge
-from basecradle_harness._engine import DEFAULT_MAX_STEPS
+from basecradle_harness._engine import DEFAULT_MAX_STEPS, DEFAULT_RESPONSE_RETRIES
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
 from basecradle_harness._mcp import McpResolution, load_mcp_tools
@@ -244,6 +244,7 @@ class TimelineAgent:
             tools=resolved.tools,
             policy=policy,
             max_steps=_max_steps_from_env(),
+            response_retries=_response_retries_from_env(),
             server_builtins=resolved.builtins,
             turn_hook=bridge.on_reply if bridge is not None else None,
         )
@@ -1224,6 +1225,24 @@ def _max_steps_from_env() -> int:
     value = int(raw)
     if value <= 0:
         raise ValueError(f"HARNESS_MAX_STEPS must be a positive integer, got {value}.")
+    return value
+
+
+def _response_retries_from_env() -> int:
+    """Read ``HARNESS_RESPONSE_RETRIES`` into the engine's unparseable-response retry bound.
+
+    Unset or blank → `DEFAULT_RESPONSE_RETRIES` (the shipped 2 — up to 3 total attempts on the
+    truncated / EOF-mid-JSON class, issue #259). Set → the operator's per-persona override, parsed
+    as an int; **zero is valid** (disable the retry — a single attempt), so the floor is 0, not 1,
+    and a negative value fails loudly here rather than silently meaning "no attempts". This is a
+    single-integer operational knob (like ``HARNESS_MAX_STEPS``), not a ``model_params.json`` key.
+    """
+    raw = os.environ.get("HARNESS_RESPONSE_RETRIES")
+    if raw is None or not raw.strip():
+        return DEFAULT_RESPONSE_RETRIES
+    value = int(raw)
+    if value < 0:
+        raise ValueError(f"HARNESS_RESPONSE_RETRIES must be a non-negative integer, got {value}.")
     return value
 
 

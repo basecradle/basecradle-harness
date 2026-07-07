@@ -24,7 +24,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from basecradle_harness._exceptions import ProviderError
+from basecradle_harness._exceptions import ProviderResponseError
 from basecradle_harness._messages import (
     CodeExecutionFile,
     CodeExecutionTrace,
@@ -87,7 +87,10 @@ def message_from_chat(data: Mapping[str, Any]) -> Message:
     try:
         message = data["choices"][0]["message"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise ProviderError(f"Malformed chat completion response: {data!r}") from exc
+        # A parsed-but-structurally-broken envelope (no ``choices`` — the shape a truncated body
+        # leaves behind). Same transient class as an unparseable body, so it is the *retryable*
+        # `ProviderResponseError` the engine re-requests (issue #259), not a permanent failure.
+        raise ProviderResponseError(f"Malformed chat completion response: {data!r}") from exc
 
     tool_calls: list[ToolCall] = []
     for raw in message.get("tool_calls") or []:
@@ -96,7 +99,11 @@ def message_from_chat(data: Mapping[str, Any]) -> Message:
         try:
             arguments = json.loads(raw_args)
         except json.JSONDecodeError as exc:
-            raise ProviderError(
+            # Undecodable tool-call arguments are the *other* truncation locus — args are often the
+            # largest/last part of a completion, so a body cut short lands here as readily as at the
+            # missing-``choices`` check above. Retryable (`ProviderResponseError`, issue #259), so
+            # this locus doesn't silently drop the message the envelope check now saves.
+            raise ProviderResponseError(
                 f"Could not decode tool-call arguments {raw_args!r}: {exc}"
             ) from exc
         tool_calls.append(ToolCall(id=raw["id"], name=function["name"], arguments=arguments))
@@ -236,7 +243,10 @@ def message_from_responses(data: Mapping[str, Any]) -> Message:
     """
     output = data.get("output")
     if not isinstance(output, list):
-        raise ProviderError(f"Malformed Responses payload: {data!r}")
+        # No ``output`` array — the same parsed-but-broken/truncated envelope as the chat surface's
+        # missing ``choices``. Retryable (`ProviderResponseError`), so the engine re-requests it
+        # rather than aborting the wake (issue #259).
+        raise ProviderResponseError(f"Malformed Responses payload: {data!r}")
 
     text_parts: list[str] = []
     citations: list[dict[str, Any]] = []
@@ -295,7 +305,10 @@ def _tool_call_from_responses(item: Mapping[str, Any]) -> ToolCall:
     try:
         arguments = json.loads(raw_args)
     except json.JSONDecodeError as exc:
-        raise ProviderError(f"Could not decode tool-call arguments {raw_args!r}: {exc}") from exc
+        # Same truncation locus as the chat surface's tool-call args: retryable, not a silent drop.
+        raise ProviderResponseError(
+            f"Could not decode tool-call arguments {raw_args!r}: {exc}"
+        ) from exc
     return ToolCall(id=item["call_id"], name=item["name"], arguments=arguments)
 
 

@@ -44,7 +44,12 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from urllib.parse import quote
 
-from basecradle_harness._engine import DEFAULT_MAX_STEPS, Engine, TurnHook
+from basecradle_harness._engine import (
+    DEFAULT_MAX_STEPS,
+    DEFAULT_RESPONSE_RETRIES,
+    Engine,
+    TurnHook,
+)
 from basecradle_harness._messages import Message
 from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
@@ -70,6 +75,10 @@ class Harness:
         policy: The profile. Defaults to `Policy.locked()` — the safe Harness
             profile. Pass `Policy.unlocked()` only with intent.
         max_steps: The engine's per-turn provider-call budget.
+        response_retries: How many extra times the engine re-requests a provider call that
+            returns an unparseable response (the truncated/EOF-mid-JSON class, issue #259)
+            before the failure propagates. Passed straight to the `Engine`; defaults to
+            `DEFAULT_RESPONSE_RETRIES`.
         server_builtins: The active server-side built-in names (e.g. ``web_search``)
             the provider runs itself. Passed to the engine so a model that mistakenly
             calls one as a function gets targeted guidance rather than a generic error
@@ -92,6 +101,7 @@ class Harness:
         tools: Iterable[Tool] | None = None,
         policy: Policy | None = None,
         max_steps: int = DEFAULT_MAX_STEPS,
+        response_retries: int = DEFAULT_RESPONSE_RETRIES,
         server_builtins: Sequence[str] = (),
         home: str | Path | None = None,
         turn_hook: TurnHook | None = None,
@@ -104,6 +114,7 @@ class Harness:
             provider,
             self.tools,
             max_steps=max_steps,
+            response_retries=response_retries,
             turn_hook=turn_hook,
             server_builtins=server_builtins,
         )
