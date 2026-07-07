@@ -289,7 +289,17 @@ sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not 
   founder decision), and `shell` (issue #252 — full command-line access; **doubly gated**, the
   only opt-in default that *also* declares the `SHELL` policy capability, so it loads only for an
   agent that opts it in **and** runs `Policy.unlocked()`; every other powerful tool loads under
-  the locked profile once opted in). `shell` additionally carries an **in-process root backstop**
+  the locked profile once opted in). **The `unlocked()` profile is selected at deploy time by
+  `HARNESS_PROFILE=unlocked`** in the agent's `agent.env` (issue #256, founder-approved 2026-07-06):
+  read once at wake (`_profile_from_env`) and threaded into **both** the registry (`Harness(policy=…)`)
+  and the env-resolution filter (`_apply_safe_policy`) so the two always agree, it is the env-driven
+  counterpart to passing `Policy.unlocked()` in the library API — how gate 2 is delivered in a
+  deployment (the router carries no profile logic). It is **fail-closed**: unset, empty, `locked`, or
+  any unrecognized value → `Policy.locked()`, the shipped default unchanged, so a typo can never
+  silently unlock a box. It is *only* the deploy lever — the safety stays enforced around it (the NOC
+  sets it only after its `verify_unprivileged` preflight passes; the root backstop below still fires) —
+  and `--resolved-config` reports the resulting **`active_profile`** so a shell-class enablement is
+  verifiable on-box, not assumed. `shell` additionally carries an **in-process root backstop**
   (issue #253, constitution Operational Baselines / basecradle#404): it **refuses to load or run
   as `root`** (`euid == 0`) — fail-closed and surfaced through the same gate machinery
   (`Tool.load_refusal` → `ToolRegistry.register` raises, `_apply_safe_policy` drops-and-surfaces),

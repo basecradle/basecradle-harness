@@ -87,6 +87,7 @@ from basecradle_harness._basecradle import (
     _messages_since,
     _onboard_from_env,
     _parse_created_at,
+    _profile_from_env,
     _recent,
     _resolve_tools,
     _resolve_tools_and_provider,
@@ -789,10 +790,15 @@ class WakeAgent:
                 "transcript and high-water mark persist across wakes."
             )
         provider, resolved, memory, bridge = _resolve_tools_and_provider()
+        # The deploy-selected profile (issue #256): the same `_profile_from_env` read that gated
+        # tool resolution now builds the registry, so an `unlocked` deploy admits its opted-in
+        # shell-class tool rather than the locked default filtering it straight back out.
+        _, policy = _profile_from_env()
         harness = Harness(
             provider,
             system_prompt=charter_from_env(),
             tools=resolved.tools,
+            policy=policy,
             # The per-turn step budget (default 24, `HARNESS_MAX_STEPS` overrides). The engine
             # injects a live counter against it and, when spent with tools still pending, makes
             # the reserve summary call rather than cutting off with a canned string (issue #243).
@@ -1990,6 +1996,11 @@ def resolved_config() -> dict[str, object]:
     - ``ai_sdk_version`` — the installed version of the vendor SDK named by ``AI_SDK``, or ``None``
       if that SDK is not installed.
     - ``ai_model`` — the ``AI_MODEL`` env value, or ``None`` if unset.
+    - ``active_profile`` — the deploy-selected policy profile, ``"locked"`` or ``"unlocked"``
+      (`HARNESS_PROFILE`, fail-closed to ``"locked"``; issue #256). It governs the tool set below:
+      under ``"unlocked"`` a policy-forbidden opted-in tool (e.g. ``shell``) appears in ``tools``;
+      under ``"locked"`` the same tool appears in ``skipped``. Without it no automated surface
+      could confirm a shell-class enablement's profile actually landed.
     - ``tools`` — the resolved active **function** tool names, sorted.
     - ``builtins`` — the resolved active server-side **built-in** wire names, sorted (e.g. the
       Responses ``web_search``); a live capability the tool-set axis must count.
@@ -2017,6 +2028,7 @@ def resolved_config() -> dict[str, object]:
     hit, surfaced here at verify time (the caller turns it into a clean non-zero exit).
     """
     provider_name, sdk, surface = _config_from_env()
+    profile_name, _policy = _profile_from_env()
     resolved, _memory = _resolve_tools(provider_name, sdk, surface)
     model_params, stripped = resolved_model_params(sdk)
     return {
@@ -2026,6 +2038,7 @@ def resolved_config() -> dict[str, object]:
         "ai_sdk_surface": surface,
         "ai_sdk_version": _sdk_version(sdk),
         "ai_model": os.environ.get("AI_MODEL") or None,
+        "active_profile": profile_name,
         "tools": sorted(tool.name for tool in resolved.tools),
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),

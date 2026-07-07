@@ -18,6 +18,7 @@ import hmac
 import io
 import json
 import logging
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -1591,6 +1592,59 @@ def test_resolved_config_reports_active_opt_in_stems(wake_env, monkeypatch, tmp_
     # Cross-check the fan-out is real in the resolved active set (built-in + tool both present).
     assert "code_interpreter" in report["builtins"]
     assert "code_attach" in report["tools"]
+
+
+def test_resolved_config_reports_the_active_profile_locked_by_default(wake_env):
+    """The `active_profile` field (issue #256): a default deploy sets no HARNESS_PROFILE, so it
+    reports `locked` — the ground truth a shell-class enablement's live-verify reads."""
+    assert resolved_config()["active_profile"] == "locked"
+
+
+def test_resolved_config_unlocked_lists_an_opted_in_shell_under_tools(wake_env, monkeypatch):
+    """Under `HARNESS_PROFILE=unlocked` the opted-in shell resolves into the active `tools` set
+    (not `skipped`) and `active_profile` reads `unlocked`, so `--resolved-config` can confirm a
+    shell-class enablement actually landed — unverifiable before this (issue #256)."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)  # deterministic non-root
+    install(os.environ["BASECRADLE_CONFIG_HOME"], provider="openai", opt_in=["shell"])
+    monkeypatch.setenv("HARNESS_PROFILE", "unlocked")
+
+    report = resolved_config()
+
+    assert report["active_profile"] == "unlocked"
+    assert "shell" in report["tools"]
+    assert "shell" not in report["skipped"]
+    assert "shell" in report["opt_in_tools"]  # still an opt-in (powerful) tool
+
+
+def test_resolved_config_locked_skips_an_opted_in_shell(wake_env, monkeypatch):
+    """The safe default is unchanged: with the same opted-in shell but no HARNESS_PROFILE (locked),
+    the policy filters shell to `skipped` and it never reaches the active `tools` set."""
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    install(os.environ["BASECRADLE_CONFIG_HOME"], provider="openai", opt_in=["shell"])
+    monkeypatch.delenv("HARNESS_PROFILE", raising=False)
+
+    report = resolved_config()
+
+    assert report["active_profile"] == "locked"
+    assert "shell" not in report["tools"]
+    assert "shell" in report["skipped"]
+
+
+def test_main_wake_admits_an_opted_in_shell_under_the_unlocked_profile(
+    platform, wake_env, monkeypatch
+):
+    """The wake path builds the registry from the deploy-selected profile (issue #256): with the
+    shell opted in AND `HARNESS_PROFILE=unlocked`, the unlocked registry admits it and the wake
+    runs clean. Were the profile threaded into resolution but not into `Harness(policy=…)`, the
+    kept-but-forbidden shell would raise `PolicyError` at registration and this would exit non-zero.
+    """
+    monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)
+    install(os.environ["BASECRADLE_CONFIG_HOME"], provider="openai", opt_in=["shell"])
+    monkeypatch.setenv("HARNESS_PROFILE", "unlocked")
+    _serve_openai_and_messages(platform, page(message(uuid=M0, body="run something")))
+
+    assert main(["--timeline", TIMELINE_UUID]) == 0
+    assert platform.post(f"/timelines/{TIMELINE_UUID}/messages").called  # the unlocked wake replied
 
 
 def test_main_resolved_config_exits_nonzero_on_a_misconfigured_provider(
