@@ -197,8 +197,9 @@ never imported.
 ### Powerful tools are opt-in — the capability rule
 
 **Powerful tools fail closed.** Media generation (image, **video**, audio), web/X search,
-code execution, and **self-authorship** (an agent editing its own system prompt — see
-[Self-authorship](#self-authorship--an-agent-edits-its-own-system-prompt)) are **opt-in on every
+code execution, **self-authorship** (an agent editing its own system prompt — see
+[Self-authorship](#self-authorship--an-agent-edits-its-own-system-prompt)), and a **full
+[shell](#run-any-command--the-shell-tool)** are **opt-in on every
 provider** — they ship in the package but are **off by default**, the same "ships empty" stance
 as `mcp/`. A persona gets one only when you drop its
 plugin into the persona's `tools/` overlay; a default-riding agent comes up with the **benign /
@@ -559,7 +560,7 @@ print("web_fetch" in agent.tools)  # -> True
 
 ## Run code — server-side execution, bridged to Assets
 
-An agent can be given **code execution**: it writes Python and runs it to compute, analyze data, or turn one file into another. Like `web_search` it is a **server-side, hosted tool** — the code runs **in the vendor's own sandbox** (OpenAI's Code Interpreter, xAI's Agent-Tools code execution), and the **harness never runs model-authored code on its boxes**. It is a **powerful, opt-in** tool ([Powerful tools are opt-in](#powerful-tools-are-opt-in--the-capability-rule)) — off by default on every provider — granted by opting its plugin into a persona:
+An agent can be given **code execution**: it writes Python and runs it to compute, analyze data, or turn one file into another. Like `web_search` it is a **server-side, hosted tool** — the code runs **in the vendor's own sandbox** (OpenAI's Code Interpreter, xAI's Agent-Tools code execution), so *this* tool never runs model-authored code on the harness's box (the safe-default property, [issue #172](https://github.com/basecradle/basecradle-harness/issues/172) — the on-box [`shell` tool](#run-any-command--the-shell-tool) is the deliberate unlocked-profile opt-out of it). It is a **powerful, opt-in** tool ([Powerful tools are opt-in](#powerful-tools-are-opt-in--the-capability-rule)) — off by default on every provider — granted by opting its plugin into a persona:
 
 ```bash
 basecradle-harness-install --opt-in code_execution
@@ -573,6 +574,32 @@ On **OpenAI** it is wired to the **Asset system in both directions**, so the age
 - **Out** — every file a run *produces*, and the executed Python source itself, is stored back as a BaseCradle **Asset** on the timeline **automatically** (output files are discovered by listing the run's container, so a file the model wrote but didn't mention is still captured), and the new Asset uuids are fed back to the model so it can reference them in its reply *alongside* the computed result — the [persistent operating brief](#run-under-a-router-wake-mode) steers the reply to report the answer the peer asked for first, the artifact uuid as an addition (issue #178). No export step.
 
 **Vendor asymmetry (honest, not faked).** xAI's `code_execution` tool exposes **no input-file binding**, so the Asset bridge is **OpenAI-only**: on xAI grok can *compute* but cannot exchange files with the Asset system. That gap is documented rather than papered over. The execution itself is server-side and safe on both.
+
+## Run any command — the shell tool
+
+> ⚠️ **The most dangerous tool in the kit.** Full, unrestricted command-line access, off by default, gated behind *two* deliberate acts. Read the security model before enabling it.
+
+Where `code_execution` runs Python in the **vendor's sandbox** (never on your box) and `web_fetch` is a **read-only HTTP GET behind an SSRF fence**, `shell` is the unguarded, on-box, human-equivalent version of both: it runs a **model-authored command line directly on the machine, as the OS user the harness process runs as**. Two first-class uses, both explicit to the model: **(1) execute code locally** — `python3 -c "…"`, run a script, `pip install`, any interpreter present; **(2) make arbitrary outbound network calls** — `curl`/`wget` to any URL, method, and headers, with any credential the agent can read from its environment. Full shell syntax works (pipes, redirects, `&&`, globs); there is no TTY (so `vim`/`top`/an `ssh` prompt won't work); output is captured and long output is truncated. v1 is **stateless** — each call is a fresh login shell, so cwd and environment don't carry across calls.
+
+**The security model — the OS user's Unix permissions are the whole boundary.** There is **no per-command confirmation, no allow/deny-list, no fencing.** Commands run as the agent's OS user, and *that user's Unix permissions are the sandbox* — exactly what a human with an SSH shell on that account could do, no more and no less. That is BaseCradle's human–AI parity applied to a terminal: the AI peer gets the same shell a human peer would. The consequences are intended: the agent can read its own env and secrets, and **read and modify its own harness code and its own guards** — anything its OS user can. It also runs model-authored commands locally, a deliberate opt-out of the safe-default property that the shipped Harness executes no model code on its boxes — that property is a safe-*default* (the locked profile), and the unlocked profile is exactly where an operator opts out of it.
+
+**This tool's safety rests entirely on the OS user being unprivileged** — no `sudo`, not in `docker`/`wheel`, not root. That is a *provisioning* invariant the box and NOC verify before enabling this tool; the tool cannot enforce it. **Never wire it onto a privileged account.**
+
+**Two gates, both required — unlike every other opt-in tool.** Every other powerful tool loads under the locked profile once you opt it in; `shell` is the exception. It needs **both**: it is `opt_in` (off by default, dropped from the packaged fallback) **and** it declares `requires = frozenset({SHELL})`, which the [locked policy](#safe-by-default) refuses — so even after you drop its plugin in, a locked agent still filters it out (and says so in its brief). Reaching a shell takes two deliberate acts, never one oversight: opt the plugin in **and** run the [unlocked profile](#safe-by-default).
+
+- **Grant it** at install, then run the agent unlocked: `basecradle-harness-install --opt-in shell` (scaffolds the plugin), with the agent on `Policy.unlocked()` (clears the policy gate).
+
+```python
+from basecradle_harness import Harness, OpenAIProvider, Policy, ShellTool
+
+# Both gates cleared: you pass the tool AND select the unlocked profile.
+agent = Harness(
+    OpenAIProvider(model="gpt-5.4-mini"),
+    tools=[ShellTool()],
+    policy=Policy.unlocked(),
+)
+print("shell" in agent.tools)  # -> True
+```
 
 ## See, hear, and make media — the media tools
 
@@ -813,7 +840,7 @@ The engine depends only on this contract — never on a concrete provider — wh
 
 ## Safe by default
 
-The shipped Harness loads tools through a **locked policy** that forbids the shell capability, and the package contains no shell, exec, or subprocess primitive at all. A tool that asks for a shell is rejected the moment you try to register it:
+The shipped Harness loads tools through a **locked policy** that forbids the shell capability, so a default install has no path to a shell. The package ships exactly one tool that could reach one — the opt-in, unlocked-profile-only [`shell` tool](#run-any-command--the-shell-tool) — and a default install can load neither it (opt-in, off by default) nor any other shell tool: a tool that asks for a shell is rejected the moment you try to register it:
 
 ```python
 from basecradle_harness import PolicyError, SHELL, Tool, ToolRegistry

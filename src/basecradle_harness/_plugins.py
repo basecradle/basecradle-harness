@@ -319,11 +319,11 @@ class ResolvedTools:
             #181) — the unit the fleet inventory keys a powerful tool on. "Active" here is the
             *activation* gate (the plugin's `requires`: provider/key/surface), which is the axis
             the inventory keys on; it is deliberately **not** narrowed by the locked **policy**
-            gate, the separate safety axis surfaced in `notices`. (A shipped opt-in tool declares
-            only activation requirements, never a policy-forbidden capability, so the two never
-            diverge in practice; a contrived custom ``opt_in`` + ``SHELL`` overlay tool would be
-            policy-refused yet still list its stem here — correctly, as an opted-in inventory
-            item — while its refusal shows up in `notices`.) One stem appears once even when it
+            gate, the separate safety axis surfaced in `notices`. (Most shipped opt-in tools
+            declare only activation requirements; ``shell`` is the exception — opt-in **and**
+            ``requires={SHELL}``, so on a locked agent that dropped it in it lists its stem here —
+            correctly, as an opted-in inventory item — while its policy refusal shows up in
+            `notices`; on the intended unlocked agent both gates pass.) One stem appears once even when it
             fans out to several active names (``code_execution`` → the ``code_interpreter``
             built-in **+** the ``code_attach`` tool). `resolved_config` surfaces this so the
             NOC's fleet-drift audit compares declared-vs-active stems like-for-like, holding no

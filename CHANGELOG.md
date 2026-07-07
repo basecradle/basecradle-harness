@@ -7,6 +7,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.53.0] - 2026-07-06
+
+**Add the `shell` tool — full command-line access, opt-in, off by default (issue #252).** The
+`SHELL` policy machinery has existed since the start but no tool ever used it; this ships the
+capability it was built for. `ShellTool` runs a model-authored command line **directly on the
+box, as the OS user the harness process runs as** — the unguarded, on-box counterpart to the
+sandboxed `code_execution` built-in and the SSRF-fenced `web_fetch` tool. It makes both of the
+model's on-box powers first-class and explicit: **executing code locally** (`python3 -c "…"`, a
+script, `pip install`, any interpreter present) and **arbitrary outbound network** (`curl`/`wget`
+to any URL, method, and headers, with any credential the agent can read from its env).
+
+**The security model is the OS user's own Unix permissions — no more, no less than a human with
+an SSH shell on that account.** There is no per-command confirmation, allow/deny-list, or fencing
+(BaseCradle's human–AI parity applied to a terminal). Its safety rests entirely on the OS user
+being **unprivileged** — a provisioning invariant the box/NOC verify, called out in the tool's own
+docstring; never wire it onto a privileged account. It runs model-authored commands locally, a
+deliberate opt-out of the safe-default "the shipped Harness executes no model code on its boxes"
+(issue #172) — that property is a safe-*default* (the locked profile), not an absolute, and the
+unlocked profile is exactly where an operator opts out of it.
+
+**Doubly gated — the only opt-in tool that also needs the unlocked profile.** It is `opt_in`
+(off by default, dropped from the packaged fallback) **and** declares `requires = {SHELL}`, so the
+shipped locked policy refuses it even when dropped in. Reaching a shell takes two deliberate acts —
+opting the plugin in **and** running `Policy.unlocked()` — never one oversight. Every other
+powerful tool loads under the locked profile once opted in; `shell` does not.
+
+Purely additive: a new opt-in tool, no behavior change to any existing profile or tool. This
+ships the tool in the package; enabling it for any agent is a separate downstream deploy step.
+
+### Added
+
+- **The `shell` tool** (`ShellTool`, plugin stem `shell`) — full command-line access as the
+  agent's OS user, behind the double gate above. Params: `command` (required), `timeout`
+  (seconds, default 120, hard max 600 — a command past it is killed with its process group, so
+  children die too), `workdir` (default the OS user's home). Returns combined stdout+stderr plus
+  the exit code; a non-zero exit is reported, never raised; large output is truncated with an
+  explicit marker; v1 is stateless (a fresh login shell per call, no cwd/env carry-over). Grant
+  with `basecradle-harness-install --opt-in shell`, then run the agent on `Policy.unlocked()`.
+
 ## [0.52.0] - 2026-07-04
 
 **Configure logging in the wake CLI so the per-step ledger is visible in production (issue #248).**

@@ -10,12 +10,16 @@ Two Harness profiles bracket the design (CLAUDE.md spine #2). Both are Harness;
 the engine is policy-neutral and the policy is the only difference between them:
 
 - `Policy.locked()` — what Harness ships. Forbids `SHELL` (subprocess / arbitrary
-  command execution). Combined with the fact that Harness ships **no** shell or
-  exec tool and **no** primitive to spawn a subprocess, the shipped default
-  forbids the shell capability outright. This is safe by *default*, not a standing
-  guarantee: an operator opts out deliberately — by passing `unlocked()`, or by
-  dropping a `tools/` tool or MCP server that reaches a denied capability into the
-  config home. Leaving the safe zone is a deliberate, auditable operator act.
+  command execution), so the shipped default forbids the shell capability outright.
+  The package *does* ship one `SHELL` tool — `ShellTool` (`_shell.py`) — but it is
+  doubly gated: its plugin is opt-in (off by default, dropped from the packaged
+  fallback) **and** it declares `SHELL`, so this locked policy refuses it even when
+  an operator drops it in. Reaching a shell therefore takes two deliberate acts —
+  opting the plugin in *and* selecting `unlocked()` — never one oversight. This is
+  safe by *default*, not a standing guarantee: an operator opts out deliberately —
+  by passing `unlocked()`, or by dropping a `tools/` tool or MCP server that reaches
+  a denied capability into the config home. Leaving the safe zone is a deliberate,
+  auditable operator act.
 - `Policy.unlocked()` — forbids nothing. The unlocked profile an operator selects
   to grant shell, sudo, and self-modification. Present here only as the other end
   of the same dial; the shipped Harness never selects it for you.
