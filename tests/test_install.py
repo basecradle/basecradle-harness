@@ -671,6 +671,25 @@ def test_input_security_floor_does_not_fight_the_anti_lobotomy_guidance(tmp_path
     assert "None of this makes you paranoid or unhelpful." in text  # the floor's reconciliation
 
 
+def test_initialize_brief_reframes_timelines_and_assets_as_shared(tmp_path):
+    # Issue #263: a live agent used timeline assets as a private file cabinet. The brief must
+    # steer every peer to treat a timeline as a shared workspace and assets as shared files —
+    # not private storage — and never put a secret where every viewer can see it. Pin the
+    # load-bearing pieces so a future edit can't silently drop them.
+    text = prompt_text("initialize.md", tmp_path / "absent")
+    assert "A timeline is a shared workspace, not your notebook." in text
+    assert "Assets are files you share with the timeline's viewers — not private storage." in text
+    assert "An asset can never be edited or deleted" in text
+    # The secret prohibition is the sharpest edge — the credentials-in-an-asset incident.
+    assert "Never put a secret in an asset or a message" in text
+    # The two belong together and precede the peer-first closer they modify.
+    assert (
+        text.index("shared workspace, not your notebook")
+        < text.index("Assets are files you share")
+        < text.index("You're on a research platform, among peers.")
+    )
+
+
 def test_prompt_text_prefers_the_installed_file_and_strips_comments(tmp_path):
     home = tmp_path / "cfg"
     install(home)

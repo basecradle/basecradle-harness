@@ -61,6 +61,29 @@ def test_name_and_required_parameter():
     assert set(tool.parameters["properties"]) == {"command", "timeout", "workdir"}
 
 
+def _shipped_shell_plugin():
+    """The shipped `_defaults/tools/shell.py` PLUGIN object, loaded from the package data file."""
+    import importlib.util
+    from importlib.resources import as_file, files
+
+    src = files("basecradle_harness").joinpath("_defaults", "tools", "shell.py")
+    with as_file(src) as path:
+        spec = importlib.util.spec_from_file_location("_shipped_shell_plugin", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+    return mod.PLUGIN
+
+
+def test_the_note_steers_to_scratch_and_workspace_over_assets():
+    # Issue #263: a shell-equipped agent should keep working files in its own home, not on a
+    # shared timeline. The note the model reads points it at ~/scratch and ~/workspace and
+    # away from assets — pin it so a future edit can't silently drop the steer.
+    note = _shipped_shell_plugin().note
+    assert "~/scratch" in note
+    assert "~/workspace" in note
+    assert "Prefer them over timeline assets for anything not meant to be shared." in note
+
+
 # --- The policy boundary (the real, shipped tool) ----------------------------
 
 

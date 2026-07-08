@@ -104,7 +104,9 @@ class AssetsTool(PlatformTool):
         "about it; action='create' "
         "uploads a new file from the text content you provide, with a filename and an "
         "optional description. Operations use the current timeline unless you pass a "
-        "timeline uuid."
+        "timeline uuid. "
+        "Assets are shared with every viewer and can never be edited or deleted — prefer "
+        "your own storage for private or working files; upload what is meant for the peers here."
     )
     parameters = {
         "type": "object",

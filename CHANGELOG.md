@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+**Standing guidance reframes timelines as shared workspaces and Assets as shared files — not
+private storage (issue #263).** A live fleet agent used timeline Assets as a private file cabinet:
+18 uploads of working notes/research/status dashboards, duplicate uploads as an edit workaround
+(an asset can never be edited or deleted), and one asset holding live third-party credentials
+visible to every viewer. The fix routes each kind of content to its proper home by making the
+sharing model explicit in the three places the model actually reads: the persistent operating
+brief, the Assets tool's own description, and the shell plugin's note. Founder-approved verbatim
+wording; a cross-repo change paired with the same reframing in the platform's public docs and
+standing `~/scratch` + `~/workspace` folders on the fleet box. **No release is cut here** — the
+shell note references box folders that must be provisioned first; the capital actuates the release
+after that retrofit is verified.
+
+### Changed
+
+- **`initialize.md` — two new operating bullets** (`_defaults/prompts/initialize.md`): a timeline
+  is a shared workspace, not a notebook (post to communicate; don't journal or keep a running log
+  into it), and Assets are files shared with every viewer, not private storage (an asset can never
+  be edited or deleted; keep working files in your own storage; **never put a secret in an asset or
+  a message**). Delivered to a pristine installed `initialize.md` on the next wake by the
+  conffile-upgrade path (`REFRESHED`), and straight from the packaged default for a never-installed
+  agent; an operator-edited copy is kept and the new default written beside it as `initialize.md.new`.
+- **`AssetsTool.description` — one added sentence** (`_assets.py`): assets are shared with every
+  viewer and can never be edited or deleted; prefer your own storage for private or working files.
+- **Shell plugin `note` — one added clause** (`_defaults/tools/shell.py`): points a shell-equipped
+  agent at `~/scratch` and `~/workspace` over timeline assets for anything not meant to be shared.
+
 ## [0.57.0] - 2026-07-07
 
 **`--resolved-config` emits an `mcp_servers` manifest — the ground-truth signal the NOC's
