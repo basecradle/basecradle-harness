@@ -20,6 +20,9 @@ PLUGIN = ToolPlugin(
     opt_in=True,
     note=(
         "Full shell as your OS user — unlocked-profile only. Runs arbitrary commands, code, "
-        "and network calls with no sandbox beyond your Unix permissions."
+        "and network calls with no sandbox beyond your Unix permissions. "
+        "Your home directory has `~/scratch` (temporary — files untouched for 3 days are "
+        "deleted automatically) and `~/workspace` (durable, private — see its README). Prefer "
+        "them over timeline assets for anything not meant to be shared."
     ),
 )

@@ -118,6 +118,19 @@ def tool(client):
     return t
 
 
+# --- tool description (issue #263) -------------------------------------------
+
+
+def test_description_warns_assets_are_shared_and_never_editable():
+    # A live agent used assets as a private file cabinet (18 uploads, duplicate-as-edit
+    # workaround, one with live credentials visible to every viewer). The tool the model reads
+    # must say plainly that assets are shared and permanent, and steer private/working files to
+    # the agent's own storage — so the guidance rides with the tool, not only the brief.
+    description = AssetsTool.description
+    assert "shared with every viewer and can never be edited or deleted" in description
+    assert "prefer your own storage for private or working files" in description
+
+
 # --- list --------------------------------------------------------------------
 
 
