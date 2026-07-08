@@ -5,7 +5,7 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.58.0] - 2026-07-08
 
 **Standing guidance reframes timelines as shared workspaces and Assets as shared files — not
 private storage (issue #263).** A live fleet agent used timeline Assets as a private file cabinet:
@@ -15,9 +15,10 @@ visible to every viewer. The fix routes each kind of content to its proper home 
 sharing model explicit in the three places the model actually reads: the persistent operating
 brief, the Assets tool's own description, and the shell plugin's note. Founder-approved verbatim
 wording; a cross-repo change paired with the same reframing in the platform's public docs and
-standing `~/scratch` + `~/workspace` folders on the fleet box. **No release is cut here** — the
-shell note references box folders that must be provisioned first; the capital actuates the release
-after that retrofit is verified.
+standing `~/scratch` + `~/workspace` folders on the fleet box. **Released now that those box
+folders stand fleet-wide** (basecradle-noc#185, closed and live-verified): every agent home carries
+`~/scratch` + `~/workspace` and the scratch-cleanup sweeper is armed on ai.basecradle.com, so the
+shell note's guidance now points at folders that exist.
 
 ### Changed
 
