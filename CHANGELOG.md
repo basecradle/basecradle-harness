@@ -5,6 +5,37 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.59.0] - 2026-07-10
+
+**The MemPalace adapter widens its rerank pool with `candidate_strategy="union"` — retrieval
+stops missing the exact-token memories agents live on (issue #266).** MemPalace's default,
+`"vector"`, seeds the hybrid BM25 rerank pool from the top vector hits *alone*, so a chunk whose
+embedding sits far from the query is never reranked however overwhelming its lexical signal —
+upstream's own docstring names the failure. Agent memory is made of precisely those chunks:
+handles, UUIDs, error strings, project names, the exact tokens embeddings rank worst. `"union"`
+additionally pulls the top lexical (FTS BM25) candidates into the pool and merges them, for the
+cost of one extra local FTS query per retrieval. Verified against the upstream code installed on
+the fleet box: the ChromaDB backend every palace uses implements the `lexical_search` capability
+union needs in both fleet-installed versions (3.4.1 and 3.5.0), and `candidate_strategy` is in both
+signatures — so the existing `mempalace>=3.4` extra pin is unchanged. A backend without
+`lexical_search` degrades gracefully (an error dict with no `results` key, which `context` already
+reads as "no hits").
+
+### Changed
+
+- **`MemPalaceMemoryProvider.context` searches with `candidate_strategy="union"`** (`_mempalace.py`)
+  — lexical candidates now enter the rerank pool alongside vector hits, not vector hits alone.
+
+### Added
+
+- **A tripwire test that the adapter never sets `max_distance`** (`test_mempalace.py`). Upstream's
+  union merge opens with `if max_distance > 0.0: return` — BM25-only candidates carry no vector
+  distance, so *any* nonzero distance threshold silently drops the lexical half of the pool and
+  quietly reduces `candidate_strategy="union"` to a no-op. A distance filter and union recall are
+  mutually exclusive upstream; the test fails loudly if a future filter is added without knowing
+  that. The fake `search_memories` also now rejects any kwarg outside MemPalace's real signature,
+  and a new test pins the no-`lexical_search` degradation path.
+
 ## [0.58.0] - 2026-07-08
 
 **Standing guidance reframes timelines as shared workspaces and Assets as shared files — not

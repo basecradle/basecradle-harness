@@ -16,13 +16,20 @@ import pytest
 from basecradle_harness._memory_provider import MemoryExchange, MemoryScope
 from basecradle_harness._mempalace import MemPalaceMemoryProvider
 
+# The keyword arguments MemPalace's `search_memories` actually accepts. The fake rejects
+# anything outside this set, so a kwarg the adapter invents (or one upstream renames) fails
+# the suite here rather than raising a TypeError against the real library in production.
+_SEARCH_KWARGS = {"n_results", "candidate_strategy", "max_distance"}
+
 
 @pytest.fixture
 def fake_mempalace(monkeypatch):
     """Install fake ``mempalace.convo_miner`` / ``mempalace.searcher`` modules.
 
     Returns the two fakes so a test can assert how the adapter called them. ``mine_convos``
-    records its args; ``search_memories`` returns whatever the test stashes on it.
+    records its args; ``search_memories`` records the kwargs it was *passed* (not their
+    defaults — the `max_distance` guard below turns on that distinction) and returns
+    whatever the test stashes on it.
     """
     convo_miner = types.ModuleType("mempalace.convo_miner")
     convo_miner.calls = []
@@ -36,8 +43,10 @@ def fake_mempalace(monkeypatch):
     searcher.result = {"results": []}
     searcher.queries = []
 
-    def search_memories(query, palace_path, n_results=5):
-        searcher.queries.append((query, palace_path, n_results))
+    def search_memories(query, palace_path, **kwargs):
+        unknown = set(kwargs) - _SEARCH_KWARGS
+        assert not unknown, f"MemPalace's search_memories takes no {sorted(unknown)} kwarg"
+        searcher.queries.append((query, palace_path, kwargs))
         return searcher.result
 
     searcher.search_memories = search_memories
@@ -112,8 +121,58 @@ def test_context_renders_top_k_hits_into_a_block(fake_mempalace, tmp_path):
     assert "Relevant memories" in block
     assert "- John lives in Dallas." in block
     assert "- John uses Rails." in block
-    # The query and bound were passed through to MemPalace.
-    assert searcher.queries == [("where does john live", str(palace), 3)]
+    # The query and bound were passed through to MemPalace — in exactly one search per turn
+    # (retrieval is on the wake path; a second search would double the vector + FTS work).
+    assert len(searcher.queries) == 1
+    query, palace_path, kwargs = searcher.queries[0]
+    assert (query, palace_path, kwargs["n_results"]) == ("where does john live", str(palace), 3)
+
+
+def test_context_widens_the_rerank_pool_with_the_union_candidate_strategy(fake_mempalace, tmp_path):
+    """Retrieval is hybrid: lexical (BM25) candidates enter the pool, not vector hits alone.
+
+    MemPalace's default ("vector") seeds the rerank pool from the top vector hits only, so a
+    chunk whose embedding sits far from the query is never reranked however strong its exact-
+    token match — the miss that matters most for agent memory (handles, UUIDs, error strings).
+    """
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    MemPalaceMemoryProvider(palace).context(_scope(query="019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"))
+
+    assert searcher.queries[0][2]["candidate_strategy"] == "union"
+
+
+def test_context_never_sets_max_distance(fake_mempalace, tmp_path):
+    """A distance filter would silently kill the union merge — so the adapter must never set one.
+
+    Upstream's `_merge_bm25_union_candidates` opens with `if max_distance > 0.0: return`:
+    BM25-only candidates carry no vector distance, so *any* nonzero threshold drops the
+    lexical half of the pool and quietly reduces `candidate_strategy="union"` to a no-op.
+    This is the tripwire for a future distance filter added without knowing that.
+    """
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    MemPalaceMemoryProvider(palace).context(_scope(query="anything"))
+
+    assert "max_distance" not in searcher.queries[0][2]
+
+
+def test_context_is_none_when_the_backend_cannot_do_lexical_search(fake_mempalace, tmp_path):
+    """Graceful degradation: a backend without `lexical_search` errors, and we simply skip.
+
+    `search_memories` answers a union request it cannot serve with an error dict carrying no
+    ``results`` key. Turn-0 composition just omits the memory section — never a crash.
+    """
+    _, searcher = fake_mempalace
+    searcher.result = {"error": "backend does not support lexical_search"}
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    assert MemPalaceMemoryProvider(palace).context(_scope(query="anything")) is None
 
 
 def test_context_is_none_without_a_query(fake_mempalace, tmp_path):
