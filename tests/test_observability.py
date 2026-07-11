@@ -157,3 +157,64 @@ def test_a_third_party_adapter_without_the_labels_still_runs():
 
     # Observability never breaks a turn: an unlabeled adapter logs `unknown`, not a crash.
     assert describe_provider(BareAdapter()) == ("unknown", "unknown")
+
+
+# --- foreign text is rendered, never interpolated (issue #272 review) ---------
+
+
+def test_a_newline_in_an_error_cannot_split_the_record():
+    """A multi-line exception (an MCP server relaying stderr, a subprocess error) would otherwise
+    become several journald lines — and the continuation lines carry no level, so a WARNING filter
+    would show a decapitated fragment."""
+    line = kv(name="shell", error="boom\nTraceback (most recent call last):\n  File ...")
+
+    assert "\n" not in line
+    assert line.startswith("name=shell error=")
+
+
+def test_an_error_cannot_forge_a_field():
+    """A tool's exception text is not the harness's text. Unquoted, a message containing
+    `outcome=ok` would parse as a field the harness never wrote."""
+    line = kv(name="evil", error="failed outcome=ok duration=0.00s")
+
+    # The whole message is one quoted value — a key=value parser sees `error`, not `outcome`.
+    assert line == 'name=evil error="failed outcome=ok duration=0.00s"'
+
+
+def test_a_credential_shape_is_scrubbed_before_it_reaches_the_journal():
+    """Defense at the source: an exception from a drop-in tool can embed the request URL or an
+    Authorization header, and a provider's 4xx can echo the key it rejected."""
+    line = kv(
+        error="401 from https://api.x.ai/v1?api_key=xai-abcd1234efgh5678 (Bearer sk-live-abcd1234efgh)"
+    )
+
+    assert "xai-abcd1234efgh5678" not in line
+    assert "sk-live-abcd1234efgh" not in line
+    assert line.count("[redacted]") == 2
+
+
+def test_the_platform_token_shape_is_scrubbed_too():
+    assert "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa" not in kv(
+        error="rejected token bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
+    )
+
+
+def test_a_long_value_is_bounded():
+    """A log line is a breadcrumb to the failure, not a copy of it — the model already got the
+    full error as its tool result."""
+    line = kv(error="x" * 5000)
+
+    assert len(line) < 300
+    assert line.endswith("…")  # a bare (space-free) value needs no quoting — just the ellipsis
+
+    # A prose error — the realistic case — is bounded *and* quoted, so the truncation can never
+    # leave a dangling half-field for a parser to trip on.
+    prose = kv(error="the tool exploded " * 100)
+    assert len(prose) < 300
+    assert prose.endswith('…"')
+
+
+def test_a_bare_token_value_stays_unquoted_so_the_common_line_greps_cleanly():
+    assert kv(timeline="019e7750-66ee-7f53-829f-13a8a710b6da", posted=3, duration="1.20s") == (
+        "timeline=019e7750-66ee-7f53-829f-13a8a710b6da posted=3 duration=1.20s"
+    )

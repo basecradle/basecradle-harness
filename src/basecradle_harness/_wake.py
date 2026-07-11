@@ -934,10 +934,12 @@ class WakeAgent:
             outcome = "ok"
             return posted
         finally:
-            # `max_steps` is a **per-turn** budget and a wake may take several turns (one per
-            # activated task, posted asset, or webhook delivery — messages batch into one), so the
-            # turn count rides alongside: without it a legitimate 3-turn wake reading `steps=30/24`
-            # would look like a blown budget rather than three turns of ten.
+            # `max_steps` is a **per-turn** budget and a wake may take several turns — one per
+            # activated task, posted asset, or webhook delivery (unseen messages batch into a
+            # single turn), *plus* one for every mid-generation rebuild the staleness guard makes
+            # (`_generate_settled`). So the turn count rides alongside the step total: without it
+            # a legitimate 3-turn wake reading `steps=30/24` would look like a blown budget rather
+            # than three turns of ten.
             engine = self.harness.engine
             _log.info(
                 "wake end %s",
@@ -996,22 +998,19 @@ class WakeAgent:
         return decision.short_circuit
 
     def _breaker_alert(self, body: str) -> None:
-        """Post the breaker's loud alert straight to the timeline, degrading on refusal.
+        """Post the breaker's loud alert to the timeline, degrading on refusal.
 
         Fired once per transition (trip or reset), so the alert never loops — and the actor
-        self-filter keeps the agent from waking on its own alert post. There is no session
-        and no model call: a tripped wake is model-free by definition, so the alert goes
-        directly through the timeline client. A refused post (a locked timeline) is logged
-        and swallowed — the breaker's job, stopping the burn, is already done.
+        self-filter keeps the agent from waking on its own alert post. There is no session and
+        no model call: a tripped wake is model-free by definition, so the alert posts with no
+        transcript (`session=None`), and a refusal is swallowed — the breaker's job, stopping
+        the burn, is already done.
+
+        It goes through `_post` like every other post rather than reaching for the client
+        itself, so it earns the same ERROR-on-refusal and the same posted-message line. A post
+        path that skips the seam is a post the journal never sees.
         """
-        try:
-            self.timeline.messages.create(body=body)
-        except BaseCradleError:
-            _log.warning(
-                "Couldn't post the wake-breaker alert to timeline %s (continuing).",
-                self.timeline_uuid,
-                exc_info=True,
-            )
+        self._post(None, body, note=False, kind="breaker-alert")
 
     # --- messages ------------------------------------------------------------
 
@@ -1365,7 +1364,7 @@ class WakeAgent:
                 # degrades *silently* (`note=False` keeps the probe seam trace-free) and
                 # leaves the item unrecorded, so the next wake re-acks rather than marking it
                 # seen with no ack ever posted (a false monitor FAIL — task-seam.md §4).
-                ack = self._post(session, ack_line(nonce), note=False)
+                ack = self._post(session, ack_line(nonce), note=False, kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
                     record(item)
@@ -1533,8 +1532,15 @@ class WakeAgent:
             return list(self.tool_manifest)
         return [(tool.name, None) for tool in self.harness.tools]
 
-    def _post(self, session: Session, body: str, *, note: bool = True) -> object | None:
-        """Post a reply to the timeline, degrading any SDK refusal instead of crashing.
+    def _post(
+        self,
+        session: Session | None,
+        body: str,
+        *,
+        note: bool = True,
+        kind: str = "reply",
+    ) -> object | None:
+        """Post to the timeline, degrading any SDK refusal instead of crashing.
 
         The reply-post is the line that crashed the live wake: a locked timeline (even one
         self-locked earlier in the same turn) raises `TimelineLockedError`, and with no
@@ -1547,28 +1553,37 @@ class WakeAgent:
         transcript, so the agent's own record stays honest. A NOC probe ack passes
         `note=False`: the probe seam is deliberately trace-free (model-free, nothing into the
         transcript), so a refused ack must degrade *silently* — a note would both break that
-        invariant and mislabel the heartbeat ack as a "reply".
+        invariant and mislabel the heartbeat ack as a "reply". The breaker's alert passes
+        `session=None` for the same reason from the other direction: a tripped wake is model-free,
+        so there is no transcript to note into.
 
-        **Both outcomes are logged**, because degrading gracefully is precisely what makes this
-        failure invisible: a refused post left the wake exiting ``0`` with nothing in the journal
-        but a transcript note only the agent could read. A refusal is now an **ERROR** (the agent
-        thought, spent tokens, and could not speak — the loudest routine failure it has), and a
-        successful post an INFO intent line naming the message it created. "Silently" above is
-        about the *transcript*, never the log: a refused probe ack is logged like any other.
+        **Every post goes through here, and both outcomes are logged.** Degrading gracefully is
+        precisely what made this failure invisible: a refused post left the wake exiting ``0``
+        with nothing in the journal but a transcript note only the agent could read. A refusal is
+        an **ERROR** (the agent thought, spent tokens, and could not speak — the loudest routine
+        failure it has); a success is an INFO line naming the message it created. `kind`
+        distinguishes them in the journal (a reply, a probe ack, a breaker alert), so a heartbeat
+        ack never reads as the agent talking. "Silently" above is about the *transcript*, never
+        the log.
         """
         try:
             sent = self.timeline.messages.create(body=body)
         except BaseCradleError as error:
             _log.error(
                 "post failed %s",
-                kv(timeline=self.timeline_uuid, error=explain(error)),
+                kv(timeline=self.timeline_uuid, kind=kind, error=explain(error)),
             )
-            if note:
+            if note and session is not None:
                 session.note(f"(Couldn't post that reply to the timeline: {explain(error)})")
             return None
         _log.info(
             "posted %s",
-            kv(message=_uuid_of(sent), timeline=self.timeline_uuid, chars=len(body)),
+            kv(
+                message=_uuid_of(sent),
+                timeline=self.timeline_uuid,
+                kind=kind,
+                chars=len(body),
+            ),
         )
         return sent
 
@@ -1744,7 +1759,7 @@ class WakeAgent:
             nonce = self._probe_nonce(item.content.body)
             if nonce is not None:
                 probe_seen = True
-                ack = self._post(session, ack_line(nonce), note=False)
+                ack = self._post(session, ack_line(nonce), note=False, kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
                     self.marks.set(self.timeline_uuid, item.content.uuid)

@@ -24,9 +24,10 @@ What ships:
 - **Wake bookends.** One `INFO` line naming what a wake is about to run (timeline, trigger,
   provider, model) and one naming what came of it (`outcome=ok|declined|error`, model turns, steps
   against the budget, messages posted, wall-clock). The end line rides a `finally`, so a wake that
-  *crashes* still reports what it had done. `max_steps` is a *per-turn* budget and a wake takes a
-  turn per item, so the turn count rides alongside the step total — otherwise a legitimate 3-turn
-  wake reading `steps=30/24` would look like a blown budget rather than three turns of ten.
+  *crashes* still reports what it had done. `max_steps` is a *per-turn* budget and a wake can take
+  several turns (one per item, plus one per mid-generation rebuild), so the turn count rides
+  alongside the step total — otherwise a legitimate 3-turn wake reading `steps=30/24` would look
+  like a blown budget rather than three turns of ten.
 - **One line per model call, on every provider** — provider, model, duration, and token counts
   when the SDK returns them. Each vendor's usage shape (Responses' `input_tokens`, the Chat wire's
   `prompt_tokens`, the xAI protos' attributes) normalizes to the same fields, and `provider=` names
@@ -37,10 +38,17 @@ What ships:
   worked.
 - **One line per media generation** (`image.generate` / `image.edit` / `video.generate` /
   `audio.transcribe`), timing the vendor call rather than the Asset upload that follows it.
-- **Leveled failure paths**: a refused post → `ERROR`; a step-cap degradation → `WARNING`; a hard
-  startup/config failure → `ERROR` (as well as the stderr line it always printed).
+- **Leveled failure paths**: a refused post → `ERROR`; hitting the step cap → `WARNING` (both the
+  ordinary cap event and the canned-note fallback when the reserve summary itself fails); a hard
+  startup/config failure in the wake **or cleanup** CLI → `ERROR` (as well as the stderr line each
+  always printed).
 - **A posted-message intent line** — which message, on which timeline — which is what says the
-  agent *spoke*, as opposed to an HTTP call having gone out.
+  agent *spoke*, as opposed to an HTTP call having gone out. **Every** post now goes through the
+  one seam that logs it: a reply, a NOC probe ack, the circuit-breaker's alert (which posted
+  through the client directly, so a tripped wake reported `posted=0` while having actually spoken),
+  and the messages tool's cross-timeline post (the agent speaking on a timeline it did not wake
+  for — the post hardest to trace, and the only kind that left no trace at all). A `kind=` field
+  keeps a heartbeat ack from reading as the agent talking.
 - **`httpx` demoted to `WARNING`** (at `INFO` and below): its per-request line fired once per
   platform read, model call, and blob fetch — the loudest thing in the journal, and pure
   duplication of the lines above, which carry the context it never had. `HARNESS_LOG_LEVEL=DEBUG`
@@ -50,8 +58,19 @@ What ships:
   both bookends as `delivery=<id>` so a router-side and a harness-side line join up in Live Tail.
   Optional-when-absent, so the harness and the router ship in either order.
 
-Prompts, request/response bodies, and keys are **never** logged: a line names the shape of a call,
-never its content.
+Prompts, request bodies, response bodies, and keys are **never** logged: a line names the shape of
+a call, never its content. Error *messages* do appear (a tool's exception, an SDK refusal) — and
+because that text is **not the harness's**, the `key=value` formatter renders every value rather
+than interpolating it: flattened to one line, scrubbed of credential shapes, length-bounded, and
+quoted. Without that, a tool could split a leveled log record in half with a newline (leaving a
+severity filter showing a decapitated fragment), forge a field by putting `outcome=ok` in its
+exception text, or leak a key its own error message had picked up from a request URL.
+
+One note for the `openai`-SDK path: `provider` is now a (keyword-only) constructor arg on
+`OpenAIProvider`, carrying the `AI_PROVIDER` label into the log line, and is therefore
+harness-owned — a `provider` key in `model_params.json` is stripped with a `WARNING` like any
+other collision (it would have been a `TypeError` before, since the `openai` SDK does not take
+one; OpenRouter's routing block still rides `extra_body`).
 
 ## [0.60.0] - 2026-07-11
 

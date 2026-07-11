@@ -12,20 +12,46 @@ tool), and the ``kv`` formatter they share. The other lines — the wake bookend
 ledger, the per-tool line — are written where the fact is known (`_wake`, `_engine`) but format
 through `kv` all the same, so one grep syntax reads the whole stream.
 
-What is deliberately *not* logged: request or response bodies, prompts, and API keys. A log
+What is deliberately *not* logged: prompts, request bodies, response bodies, and API keys. A log
 line names the shape of a call — provider, model, duration, token counts — never its content.
+
+The one place foreign text does enter the stream is an **error message** (a tool's exception, an
+SDK refusal), and that is why `kv` *renders* values rather than interpolating them: the text is
+not the harness's, so it is flattened to one line, scrubbed of credential shapes, bounded, and
+quoted before it goes near a record. An error message is a breadcrumb *to* the failure — the
+model still receives the full text as its tool result, and the transcript keeps it.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
 _log = logging.getLogger("basecradle_harness")
+
+#: The cap on one field's rendered length. The values that need it are the error texts — a tool's
+#: exception, an SDK refusal — which can run to a whole response body. A log line is a *breadcrumb*
+#: to the failure, not a copy of it: the model already received the full error as its tool result,
+#: and the transcript keeps it.
+MAX_VALUE = 240
+
+#: Credential shapes scrubbed out of any logged value — defense in depth at the *source*, so a
+#: secret never enters the journal in the first place rather than relying on the shipping layer to
+#: catch it later. An error text is the realistic carrier: an exception from a drop-in tool or MCP
+#: server can embed the request URL (``…?api_key=…``) or an ``Authorization`` header, and a
+#: provider's own 4xx body can echo the key it rejected. Covers the fleet's key shapes (OpenAI
+#: ``sk-``/OpenRouter ``sk-or-``, xAI ``xai-``, BaseCradle ``bc_uat_``) plus the generic
+#: bearer-token and key-in-query-string forms.
+_SECRETS = re.compile(
+    r"(?:sk-or-|sk-|xai-|bc_[a-z]{3}_)[A-Za-z0-9_-]{8,}"
+    r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
+    r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)[^&\s]+"
+)
 
 #: The env var the router's wake-runner exports so a wake can echo the delivery that spawned it
 #: (basecradle-router#170). Optional by contract: absent → the correlation field is simply
@@ -48,8 +74,34 @@ def kv(**fields: Any) -> str:
 
     ``None`` and ``""`` are omitted — an absent delivery id or trigger leaves no empty
     ``delivery=`` behind — while ``0`` is kept, because "posted nothing" is a fact worth logging.
+
+    Values are rendered by `_value`, never interpolated raw, because **some of them are not the
+    harness's text**: a tool's exception message, an SDK refusal, a provider's error body. Left
+    raw, such a value could put a newline in the middle of a record (splitting one leveled line
+    into unleveled fragments a severity filter shows decapitated), forge a field by containing
+    ``outcome=ok``, run to the length of a whole response body, or carry a credential. A parser
+    reading this stream must be able to trust that the fields it sees are the fields the harness
+    wrote.
     """
-    return " ".join(f"{key}={value}" for key, value in fields.items() if value not in (None, ""))
+    rendered = ((key, _value(value)) for key, value in fields.items() if value is not None)
+    return " ".join(f"{key}={value}" for key, value in rendered if value != "")
+
+
+def _value(value: Any) -> str:
+    """One field's value: single-line, redacted, bounded, and quoted when it isn't a bare token.
+
+    Four jobs, in order — flatten (a record is one line), scrub (`_SECRETS`), truncate
+    (`MAX_VALUE`), then quote anything holding a space or an ``=`` so it reads as *one* value
+    rather than as extra fields. A plain uuid, duration, or count passes through untouched, which
+    is what keeps the common line greppable.
+    """
+    text = " ".join(str(value).split())  # collapse newlines/tabs/runs — one record, one line
+    text = _SECRETS.sub("[redacted]", text)
+    if len(text) > MAX_VALUE:
+        text = text[: MAX_VALUE - 1].rstrip() + "…"
+    if text and (" " in text or "=" in text or '"' in text):
+        return '"' + text.replace('"', "'") + '"'
+    return text
 
 
 def delivery_id() -> str | None:

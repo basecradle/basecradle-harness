@@ -3452,3 +3452,58 @@ def test_a_multi_item_wake_reports_its_turn_count_alongside_the_step_total(
     assert "turns=2" in end
     assert "steps=2/24" in end  # one step each, summed — and the turn count explains the sum
     assert "posted=2" in end
+
+
+def test_a_crashing_wake_still_reports_what_it_had_done(platform, tmp_path, caplog):
+    """The end line rides a `finally` — a wake that dies mid-reconcile is the one whose outcome
+    matters most, and it must not vanish from the journal."""
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+
+    class Exploding:
+        provider, model = "openai", "gpt-4o"
+
+        def chat(self, messages, tools=None):
+            raise RuntimeError("the brain caught fire")
+
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(Exploding(), home=tmp_path)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        with pytest.raises(RuntimeError):  # the failure still propagates — nothing is swallowed
+            agent.wake()
+
+    end = _line(caplog, "wake end")
+    assert "outcome=error" in end
+    assert "posted=0" in end
+
+
+def test_the_breaker_alert_is_logged_like_any_other_post(platform, tmp_path, caplog):
+    """The breaker's trip alert is a real message on the timeline. It used to post through the
+    client directly, so a tripped wake logged `posted=0` while having actually spoken."""
+    clock = FakeClock()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    for _ in range(2):  # burn the cap so the next wake trips
+        _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2).wake()
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2).wake()
+
+    posted = _line(caplog, "posted")
+    assert "kind=breaker-alert" in posted  # …and never mistaken for the agent replying
+    assert f"message={REPLY}" in posted
+
+
+def test_a_probe_ack_is_logged_as_an_ack_not_as_the_agent_speaking(platform, tmp_path, caplog):
+    """The probe seam is trace-free in the *transcript*, never in the log — but a heartbeat ack
+    must not read as the agent talking, so it carries its own kind."""
+    body = f"NOC message-seam probe — please disregard.\n{probe_marker()}"
+    serve_messages(platform, page(message(uuid=M0, body=body)))
+    agent, provider = build_wake(tmp_path, probe_secret=PROBE_SECRET)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert provider.prompts == []  # token-free: the model was never engaged
+    assert "kind=probe-ack" in _line(caplog, "posted")

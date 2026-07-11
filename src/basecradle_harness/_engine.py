@@ -204,7 +204,12 @@ class Engine:
                     return reply
             # Budget spent with the model still working: the reserve summary is the harness's,
             # never a step the model was promised — it is not counted or announced as one.
-            _log.info("wake used %d/%d steps + reserve summary", self.max_steps, self.max_steps)
+            #
+            # WARNING, not INFO: spending the whole budget without settling *is* the step-cap
+            # degradation. The turn still produces a good reply (the model's own progress report),
+            # so nothing downstream looks wrong — which is exactly why the cap event has to be
+            # findable by a severity filter rather than buried in the INFO stream.
+            _log.warning("wake used %d/%d steps + reserve summary", self.max_steps, self.max_steps)
             return self._reserve_summary(messages)
         finally:
             _evict_images(shown)
