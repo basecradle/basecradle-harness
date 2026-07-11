@@ -7,7 +7,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.60.0] - 2026-07-11
 
-**`--resolved-config` emits the memory axis: `memory_provider` + `memory_provider_version`
+Two changes to the memory axis: it becomes **visible** off-box, and — on MemPalace — **reachable**
+after Turn 0.
+
+**1. `--resolved-config` emits the memory axis: `memory_provider` + `memory_provider_version`
 (issue #269).** The manifest reported everything about an agent *except* which mind it was
 running: `_resolve_tools()` built the memory provider and threw it away, and an automatic-only
 provider (MemPalace) contributes no tool — so a MemPalace agent was byte-indistinguishable, in
@@ -18,8 +21,32 @@ read green. A silent-death seam, now visible. Consumed by basecradle-noc#195's
 `pinned_extra_versions` drift axis; the fourth manifest field of its shape, after `opt_in_tools`
 (0.40.1), `active_profile` (0.55.0), and `mcp_servers` (0.57.0).
 
+**2. The MemPalace provider gains a model-facing `memory_search` tool — recall is no longer frozen
+at Turn 0 (issue #267).** MemPalace memory was automatic-*only*: `context` retrieved exactly once
+per wake, with the incoming turn's text as the sole query, and `tools()` deliberately returned
+none. So a memory the agent needed *mid-task* — one the Turn-0 top-K happened not to surface —
+was unreachable for the rest of that wake; the model had no way back to the palace with a refined
+query ("what was that endpoint we discussed in March?"). It has one now, and it is purely
+additive: `observe`/`context` are unchanged, so ambient memory works exactly as before and the
+tool is the *deliberate* half beside it. **Not** MemPalace's own `mempalace-mcp` server, which the
+`mcp/` overlay could have loaded instead: that pays a chromadb import on every wake (the harness
+is process-per-event), and its per-palace writer lease arbitrates only between MCP server
+processes — not against this adapter's library-path writes in `observe`. An in-process, read-only
+tool has neither problem, and the read path is all the agent needs. The MCP drop-in stays
+available for its own purposes (external clients, curation tooling).
+
 ### Added
 
+- **`MemPalaceSearchTool`** (`memory_search`, `_mempalace.py`) — **read-only** search over the
+  agent's palace: a required `query` and an optional `n_results` (default 5, clamped to 20 — the
+  schema's bound is advisory to the model, so the tool enforces it, and a malformed argument costs
+  a tool call rather than the wake). No write and no delete surface, on purpose: `observe` remains
+  the palace's sole writer, so the concurrent-writer question never arises. A pure tool
+  (`requires` is empty), so it loads under the locked policy exactly like the SQLite `memory`
+  tool, and it reaches the model through the existing `MemoryProvider.tools()` seam — provider
+  tools fold into the resolved set deduped by name, so the Turn-0 manifest machinery needed no
+  change. It shows up in `--resolved-config`'s `tools` for a MemPalace agent, which is also the
+  live proof of the field above.
 - **`memory_provider`** in `--resolved-config` — the **bound** backend (`sqlite`, `mempalace`, or
   a custom `module:Class`), read off the provider object `memory_provider_from_env` actually
   returned rather than a re-read of the env var (`describe_memory_provider`, `_memory_provider.py`).
@@ -35,8 +62,16 @@ read green. A silent-death seam, now visible. Consumed by basecradle-noc#195's
   the first `observe`/`context`), so an agent can bind a palace whose package is absent and lose
   its memory at the first wake — now catchable off-box.
 - **A README section on the memory provider seam** (`README.md`) — `HARNESS_MEMORY_PROVIDER`, the
-  three backends, the `observe`/`context` middleware hooks, and how to write your own. The seam
-  shipped without user-facing docs; the manifest field made the gap load-bearing.
+  three backends, the `observe`/`context` middleware hooks, `memory_search`, and how to write your
+  own. The seam shipped without user-facing docs; the manifest field made the gap load-bearing.
+
+### Changed
+
+- **`MemPalaceMemoryProvider.search()`** (`_mempalace.py`) — the one retrieval call `context` and
+  the `memory_search` tool now share (extracted from `context`), so the union pool, the never-set
+  `max_distance`, and the result bound live in one place and the automatic and deliberate halves
+  can never drift apart on *how* the palace is searched. `context`'s behavior is unchanged, and
+  the tool inherits `candidate_strategy="union"` (0.59.0) for free.
 
 ## [0.59.0] - 2026-07-10
 

@@ -4,8 +4,8 @@ MemPalace is an optional extra and not installed in the test env, so its library
 faked at the ``sys.modules`` boundary (the adapter imports ``mempalace.convo_miner`` /
 ``mempalace.searcher`` lazily). These pin the contract the adapter relies on: `observe`
 mines a quote-formatted exchange file, `context` retrieves and renders top-K hits, the
-provider exposes no model-facing tool, and a genuinely missing package degrades to an
-actionable "install the extra" error.
+provider exposes one **read-only** `memory_search` tool over that same retrieval call, and a
+genuinely missing package degrades to an actionable "install the extra" error.
 """
 
 import sys
@@ -14,7 +14,7 @@ import types
 import pytest
 
 from basecradle_harness._memory_provider import MemoryExchange, MemoryScope
-from basecradle_harness._mempalace import MemPalaceMemoryProvider
+from basecradle_harness._mempalace import MemPalaceMemoryProvider, MemPalaceSearchTool
 
 # The keyword arguments MemPalace's `search_memories` actually accepts. The fake rejects
 # anything outside this set, so a kwarg the adapter invents (or one upstream renames) fails
@@ -199,20 +199,134 @@ def test_context_is_none_when_there_are_no_hits(fake_mempalace, tmp_path):
     assert provider.context(_scope(query="nothing matches")) is None
 
 
+# --- the memory_search tool: deliberate recall (issue #267) -------------------
+#
+# `context` retrieves once per wake, against the incoming turn's text. What these pin is the
+# way *back* to the palace mid-task — a read-only tool, over the same search call, so recall is
+# not frozen at Turn 0 and `observe` stays the palace's only writer.
+
+
+def _search_tool(palace, **kwargs):
+    (tool,) = MemPalaceMemoryProvider(palace, **kwargs).tools()
+    return tool
+
+
+def test_provider_supplies_one_read_only_search_tool(tmp_path):
+    """One tool, and it is search-only: no write/delete surface for the model to reach for.
+
+    The read-only shape is the whole reason there is no concurrent-writer question — `observe`
+    remains the sole writer — so a future write action added here would be a real regression,
+    not a feature. That is what this asserts.
+    """
+    tools = MemPalaceMemoryProvider(tmp_path / "palace").tools()
+
+    assert [type(tool) for tool in tools] == [MemPalaceSearchTool]
+    assert tools[0].name == "memory_search"
+    # The schema exposes a query and a bound — and nothing that writes.
+    assert set(tools[0].parameters["properties"]) == {"query", "n_results"}
+    assert tools[0].parameters["required"] == ["query"]
+    assert tools[0].requires == frozenset()  # a pure tool: loads under the locked policy
+
+
+def test_search_tool_recalls_through_the_same_union_search_as_context(fake_mempalace, tmp_path):
+    """The tool's retrieval *is* `context`'s: same in-process call, same union pool, so what the
+    agent can reach by asking is what the palace would have injected — only with its own query."""
+    _, searcher = fake_mempalace
+    searcher.result = {"results": [{"text": "The staging endpoint is api.staging.example.com."}]}
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    answer = _search_tool(palace).run(query="that endpoint we discussed in March")
+
+    assert "Memories matching" in answer
+    assert "- The staging endpoint is api.staging.example.com." in answer
+    query, palace_path, kwargs = searcher.queries[0]
+    assert (query, palace_path) == ("that endpoint we discussed in March", str(palace))
+    assert kwargs["candidate_strategy"] == "union"  # inherited from #266 — never vector-only
+    assert "max_distance" not in kwargs  # which would silently kill the union pool
+    assert kwargs["n_results"] == 5  # the provider's default when the model names no count
+
+
+def test_search_tool_clamps_a_model_chosen_bound(fake_mempalace, tmp_path):
+    """The schema's minimum/maximum are advisory to the model, so the bound is *enforced* here.
+
+    A model that asks for 10,000 memories would otherwise flood the very context window the
+    recall is meant to serve; one that asks for 0 (or sends a string) would get nothing or an
+    upstream error. A malformed argument costs a tool call, never the wake.
+    """
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    tool = _search_tool(palace)
+
+    tool.run(query="anything", n_results=10_000)
+    tool.run(query="anything", n_results=0)
+    tool.run(query="anything", n_results="3")  # a model can send a string
+    tool.run(query="anything", n_results=8)
+
+    assert [kwargs["n_results"] for _q, _p, kwargs in searcher.queries] == [20, 1, 5, 8]
+
+
+def test_search_tool_reports_a_miss_so_the_model_can_refine(fake_mempalace, tmp_path):
+    """A miss says so plainly (the SQLite memory tool's phrasing), rather than returning silence
+    the model would read as "I know nothing" — it can narrow the query and ask again."""
+    _, searcher = fake_mempalace
+    searcher.result = {"results": []}
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    assert (
+        _search_tool(palace).run(query="nothing matches") == "No memories match 'nothing matches'."
+    )
+
+
+def test_search_tool_needs_a_query(fake_mempalace, tmp_path):
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    assert "needs a query" in _search_tool(palace).run(query="   ")
+    assert searcher.queries == []  # never reached MemPalace
+
+
+def test_search_tool_before_the_palace_exists_reports_a_miss(fake_mempalace, tmp_path):
+    """Nothing observed yet → no palace dir → a clean miss, short-circuited before MemPalace."""
+    _, searcher = fake_mempalace
+
+    assert "No memories match" in _search_tool(tmp_path / "palace").run(query="anything")
+    assert searcher.queries == []
+
+
+def test_search_tool_degrades_when_the_backend_cannot_do_lexical_search(fake_mempalace, tmp_path):
+    """A backend that can't serve the union request answers with an error dict and no `results`
+    key — which reads as a miss, exactly as it does for `context`. Memory degrades; nothing raises.
+    """
+    _, searcher = fake_mempalace
+    searcher.result = {"error": "backend does not support lexical_search"}
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    assert "No memories match" in _search_tool(palace).run(query="anything")
+
+
 # --- shape + the missing-extra error -----------------------------------------
 
 
-def test_provider_supplies_no_model_facing_tool(tmp_path):
-    """Memory is automatic here — a MemPalace agent runs with BaseCradle-only tools."""
-    assert MemPalaceMemoryProvider(tmp_path / "palace").tools() == []
-
-
 def test_missing_mempalace_degrades_to_an_actionable_error(tmp_path, monkeypatch):
-    """With the extra not installed, observe surfaces a clear "install it" ImportError."""
+    """With the extra not installed, both surfaces surface a clear "install it" ImportError.
+
+    The tool's raise is safe: the engine turns any tool failure into model-readable text
+    (`_run_tool`), so a missing extra costs the call, never the wake — and what the model then
+    reads names the extra to install rather than a raw "No module named" trace.
+    """
     # Ensure no fake is present and the real package is absent.
     for name in ("mempalace", "mempalace.convo_miner", "mempalace.searcher"):
         monkeypatch.delitem(sys.modules, name, raising=False)
-    provider = MemPalaceMemoryProvider(tmp_path / "palace")
+    palace = tmp_path / "palace"
+    palace.mkdir()  # exists, so search reaches the lazy import rather than short-circuiting
+    provider = MemPalaceMemoryProvider(palace)
 
     with pytest.raises(ImportError, match=r"basecradle-harness\[mempalace\]"):
         provider.observe(MemoryExchange(user="hi", assistant="ok", scope=_scope()))
+    with pytest.raises(ImportError, match=r"basecradle-harness\[mempalace\]"):
+        provider.tools()[0].run(query="anything")
