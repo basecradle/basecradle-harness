@@ -64,6 +64,7 @@ from basecradle_harness._media import (
     slugify,
     uuid_list,
 )
+from basecradle_harness._observability import media_timer
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._platform import PlatformTool, explain
 
@@ -312,7 +313,10 @@ class GenerateImageTool(_ImageTool):
         )
         try:
             openai, client = self._client(key)
-            with sdk_error_context(openai):
+            with (
+                media_timer(provider="openai", kind="image.generate", model=self._model),
+                sdk_error_context(openai),
+            ):
                 response = client.images.generate(model=self._model, prompt=prompt, n=1, **coverage)
             image_bytes = self._decode(response)
         except ProviderConnectionError as exc:
@@ -448,7 +452,10 @@ class EditImageTool(_ImageTool):
         extra: dict[str, Any] = {"mask": mask_part} if mask_part is not None else {}
         try:
             openai, client = self._client(key)
-            with sdk_error_context(openai):
+            with (
+                media_timer(provider="openai", kind="image.edit", model=self._model),
+                sdk_error_context(openai),
+            ):
                 response = client.images.edit(
                     model=self._model, image=sources, prompt=prompt, n=1, **extra, **coverage
                 )

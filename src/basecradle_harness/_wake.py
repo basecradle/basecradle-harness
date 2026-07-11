@@ -114,6 +114,7 @@ from basecradle_harness._memory_provider import (
     describe_memory_provider,
 )
 from basecradle_harness._messages import ImageContent
+from basecradle_harness._observability import delivery_id, describe_provider, kv
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import Session
@@ -896,16 +897,62 @@ class WakeAgent:
         and is ignored once that kind's record exists), but nothing depends on them. Task
         activations never used a trigger — the reconcile finds every activated-but-unhandled
         task, keeping the router thin.
+
+        **Bookended in the log.** A wake is the harness's unit of work, so it opens with one
+        INFO line naming what it is about to run with (timeline, trigger, provider, model, and
+        the router's delivery id when it exported one) and closes with one naming what came of
+        it (outcome, steps spent against the budget, messages posted, wall-clock). Between them
+        sit the LLM, tool, and posted-message lines — so a wake reads end-to-end in the journal
+        without the transcript. The end line rides a ``finally``: a wake that *crashes* is the
+        one whose outcome matters most, and it still reports what it had done by then.
         """
-        if self._breaker_short_circuits():
-            return []  # a tripped timeline self-declines: no session, no provider call
-        session = self.harness.session(self.source)
-        self._brief_asserted = False  # re-assert the brief once this wake, before the model
-        posted = self._wake_messages(session, trigger)
-        posted += self._wake_assets(session, asset_trigger)
-        posted += self._wake_events(session, event_trigger)
-        posted += self._wake_tasks(session)
-        return posted
+        started = time.monotonic()
+        delivery = delivery_id()
+        provider, model = describe_provider(self.harness.provider)
+        _log.info(
+            "wake start %s",
+            kv(
+                timeline=self.timeline_uuid,
+                trigger=_trigger_label(trigger, event_trigger, asset_trigger),
+                provider=provider,
+                model=model,
+                delivery=delivery,
+            ),
+        )
+        posted: list[object] = []
+        outcome = "error"  # only a clean return past the reconciles earns another verdict
+        try:
+            if self._breaker_short_circuits():
+                outcome = "declined"
+                return []  # a tripped timeline self-declines: no session, no provider call
+            session = self.harness.session(self.source)
+            self._brief_asserted = False  # re-assert the brief once this wake, before the model
+            posted += self._wake_messages(session, trigger)
+            posted += self._wake_assets(session, asset_trigger)
+            posted += self._wake_events(session, event_trigger)
+            posted += self._wake_tasks(session)
+            outcome = "ok"
+            return posted
+        finally:
+            # `max_steps` is a **per-turn** budget and a wake may take several turns — one per
+            # activated task, posted asset, or webhook delivery (unseen messages batch into a
+            # single turn), *plus* one for every mid-generation rebuild the staleness guard makes
+            # (`_generate_settled`). So the turn count rides alongside the step total: without it
+            # a legitimate 3-turn wake reading `steps=30/24` would look like a blown budget rather
+            # than three turns of ten.
+            engine = self.harness.engine
+            _log.info(
+                "wake end %s",
+                kv(
+                    timeline=self.timeline_uuid,
+                    outcome=outcome,
+                    turns=engine.turns_run,
+                    steps=f"{engine.steps_used}/{engine.max_steps}",
+                    posted=len(posted),
+                    duration=f"{time.monotonic() - started:.2f}s",
+                    delivery=delivery,
+                ),
+            )
 
     # --- the cross-wake circuit-breaker --------------------------------------
 
@@ -951,22 +998,19 @@ class WakeAgent:
         return decision.short_circuit
 
     def _breaker_alert(self, body: str) -> None:
-        """Post the breaker's loud alert straight to the timeline, degrading on refusal.
+        """Post the breaker's loud alert to the timeline, degrading on refusal.
 
         Fired once per transition (trip or reset), so the alert never loops — and the actor
-        self-filter keeps the agent from waking on its own alert post. There is no session
-        and no model call: a tripped wake is model-free by definition, so the alert goes
-        directly through the timeline client. A refused post (a locked timeline) is logged
-        and swallowed — the breaker's job, stopping the burn, is already done.
+        self-filter keeps the agent from waking on its own alert post. There is no session and
+        no model call: a tripped wake is model-free by definition, so the alert posts with no
+        transcript (`session=None`), and a refusal is swallowed — the breaker's job, stopping
+        the burn, is already done.
+
+        It goes through `_post` like every other post rather than reaching for the client
+        itself, so it earns the same ERROR-on-refusal and the same posted-message line. A post
+        path that skips the seam is a post the journal never sees.
         """
-        try:
-            self.timeline.messages.create(body=body)
-        except BaseCradleError:
-            _log.warning(
-                "Couldn't post the wake-breaker alert to timeline %s (continuing).",
-                self.timeline_uuid,
-                exc_info=True,
-            )
+        self._post(None, body, note=False, kind="breaker-alert")
 
     # --- messages ------------------------------------------------------------
 
@@ -1320,7 +1364,7 @@ class WakeAgent:
                 # degrades *silently* (`note=False` keeps the probe seam trace-free) and
                 # leaves the item unrecorded, so the next wake re-acks rather than marking it
                 # seen with no ack ever posted (a false monitor FAIL — task-seam.md §4).
-                ack = self._post(session, ack_line(nonce), note=False)
+                ack = self._post(session, ack_line(nonce), note=False, kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
                     record(item)
@@ -1361,8 +1405,8 @@ class WakeAgent:
         self._reassert_brief(session, query=text)
         try:
             return session.send(text, images=images)
-        except EngineError:
-            return "I got stuck working through that and stopped before reaching an answer."
+        except EngineError as error:
+            return self._stuck_note(error)
 
     def _reassert_brief(self, session: Session, *, query: str | None = None) -> None:
         """Inject the persistent operating brief as a system turn — once per wake, when onboarding.
@@ -1438,7 +1482,7 @@ class WakeAgent:
         if self.memory_provider is None:
             return None
         try:
-            return self.memory_provider.context(
+            recalled = self.memory_provider.context(
                 MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid, query=query)
             )
         except Exception:  # noqa: BLE001 - a memory hook must never break the brief; degrade to none
@@ -1446,6 +1490,11 @@ class WakeAgent:
                 "Memory provider context() failed; omitting recalled memory.", exc_info=True
             )
             return None
+        # DEBUG, never INFO: recall runs on every engaged wake, and a routine line per wake per
+        # memory op would drown the signal the rest of this stream exists to carry. It is here
+        # for the operator who turns HARNESS_LOG_LEVEL up to chase a memory question.
+        _log.debug("memory %s", kv(op="recall", chars=len(recalled or "")))
+        return recalled
 
     def _observe(self, user: str, assistant: str) -> None:
         """Hand a completed exchange to the memory provider's `observe` hook, guarded.
@@ -1468,6 +1517,8 @@ class WakeAgent:
             )
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake; swallow it
             _log.warning("Memory provider observe() failed; continuing.", exc_info=True)
+            return
+        _log.debug("memory %s", kv(op="observe", chars=len(user) + len(assistant)))
 
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
         """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.
@@ -1481,8 +1532,15 @@ class WakeAgent:
             return list(self.tool_manifest)
         return [(tool.name, None) for tool in self.harness.tools]
 
-    def _post(self, session: Session, body: str, *, note: bool = True) -> object | None:
-        """Post a reply to the timeline, degrading any SDK refusal instead of crashing.
+    def _post(
+        self,
+        session: Session | None,
+        body: str,
+        *,
+        note: bool = True,
+        kind: str = "reply",
+    ) -> object | None:
+        """Post to the timeline, degrading any SDK refusal instead of crashing.
 
         The reply-post is the line that crashed the live wake: a locked timeline (even one
         self-locked earlier in the same turn) raises `TimelineLockedError`, and with no
@@ -1495,14 +1553,39 @@ class WakeAgent:
         transcript, so the agent's own record stays honest. A NOC probe ack passes
         `note=False`: the probe seam is deliberately trace-free (model-free, nothing into the
         transcript), so a refused ack must degrade *silently* — a note would both break that
-        invariant and mislabel the heartbeat ack as a "reply".
+        invariant and mislabel the heartbeat ack as a "reply". The breaker's alert passes
+        `session=None` for the same reason from the other direction: a tripped wake is model-free,
+        so there is no transcript to note into.
+
+        **Every post goes through here, and both outcomes are logged.** Degrading gracefully is
+        precisely what made this failure invisible: a refused post left the wake exiting ``0``
+        with nothing in the journal but a transcript note only the agent could read. A refusal is
+        an **ERROR** (the agent thought, spent tokens, and could not speak — the loudest routine
+        failure it has); a success is an INFO line naming the message it created. `kind`
+        distinguishes them in the journal (a reply, a probe ack, a breaker alert), so a heartbeat
+        ack never reads as the agent talking. "Silently" above is about the *transcript*, never
+        the log.
         """
         try:
-            return self.timeline.messages.create(body=body)
+            sent = self.timeline.messages.create(body=body)
         except BaseCradleError as error:
-            if note:
+            _log.error(
+                "post failed %s",
+                kv(timeline=self.timeline_uuid, kind=kind, error=explain(error)),
+            )
+            if note and session is not None:
                 session.note(f"(Couldn't post that reply to the timeline: {explain(error)})")
             return None
+        _log.info(
+            "posted %s",
+            kv(
+                message=_uuid_of(sent),
+                timeline=self.timeline_uuid,
+                kind=kind,
+                chars=len(body),
+            ),
+        )
+        return sent
 
     def _is_own(self, item: object) -> bool:
         """Whether an item was authored by this agent — the actor self-filter's test."""
@@ -1676,7 +1759,7 @@ class WakeAgent:
             nonce = self._probe_nonce(item.content.body)
             if nonce is not None:
                 probe_seen = True
-                ack = self._post(session, ack_line(nonce), note=False)
+                ack = self._post(session, ack_line(nonce), note=False, kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
                     self.marks.set(self.timeline_uuid, item.content.uuid)
@@ -1812,8 +1895,45 @@ class WakeAgent:
         """
         try:
             return session.send(text)
-        except EngineError:
-            return "I got stuck working through that and stopped before reaching an answer."
+        except EngineError as error:
+            return self._stuck_note(error)
+
+    def _stuck_note(self, error: EngineError) -> str:
+        """The canned reply for a degraded turn — and the WARNING that says one happened.
+
+        `EngineError` reaches a wake only as the fallback-of-the-fallback: the step budget was
+        spent *and* the engine's reserve summary (the self-authored progress report) failed or
+        came back empty. The peer sees a short honest note, which is right for the peer — and
+        for the operator it looked like a perfectly ordinary wake, because the note posts, the
+        item is marked seen, and the process exits ``0``. So the degradation is logged at
+        WARNING, carrying the engine's own reason, wherever a wake catches it.
+        """
+        _log.warning("degraded %s", kv(timeline=self.timeline_uuid, reason=str(error)))
+        return "I got stuck working through that and stopped before reaching an answer."
+
+
+def _uuid_of(item: object) -> str | None:
+    """A posted item's uuid for its log line, or ``None`` if the object carries none.
+
+    Reached for through `getattr` rather than `item.content.uuid` because this is *only* a log
+    line: an SDK whose create-response ever changed shape must not take the wake down over a
+    breadcrumb. Missing → the field is simply omitted (`kv` drops it).
+    """
+    return getattr(getattr(item, "content", None), "uuid", None)
+
+
+def _trigger_label(trigger: str | None, event: str | None, asset: str | None) -> str | None:
+    """What fired this wake, as ``<kind>:<uuid>`` — or ``None`` when the router named nothing.
+
+    The router wakes an agent with the timeline alone (each reconcile finds its own unseen
+    items), so the usual answer *is* ``None`` and the field is simply omitted from the start
+    line. When an invocation does name an item, the log says which kind it was — the same
+    distinction the three optional args carry.
+    """
+    for kind, uuid in (("message", trigger), ("event", event), ("asset", asset)):
+        if uuid:
+            return f"{kind}:{uuid}"
+    return None
 
 
 def _render_batch(messages: list[object]) -> str:
@@ -2182,6 +2302,15 @@ def main(argv: list[str] | None = None) -> int:
         # step cap) in flight, so a wake reaching a locked timeline still exits 0. A
         # BaseCradleError caught here is a harder failure — setup, an unreadable timeline —
         # which the router should see as a clean non-zero exit, never a raw traceback.
+        #
+        # It goes through the logger as an **ERROR** as well as to stderr: the bare print was
+        # unleveled and unfilterable, so the harness's hardest failure — the wake that never ran
+        # at all — was the one line a journald/Live-Tail severity filter could not find. The
+        # print stays for a terminal run (where logging may be quieter than the operator's eyes).
+        _log.error(
+            "wake failed %s",
+            kv(timeline=args.timeline, error=str(error), delivery=delivery_id()),
+        )
         print(f"basecradle-harness-wake: {error}", file=sys.stderr)
         return 1
     return 0

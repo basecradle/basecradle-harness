@@ -67,6 +67,7 @@ from basecradle_harness._media import (
     sniff_media_ext,
     uuid_list,
 )
+from basecradle_harness._observability import media_timer
 from basecradle_harness._platform import PlatformTool, explain
 
 #: xAI's API root. These tools are xAI-native; this changes only for a proxy, never to reach
@@ -235,7 +236,8 @@ class GrokGenerateImageTool(_GrokMediaTool):
             payload["resolution"] = resolution
 
         try:
-            body = self._request(key, "POST", "images/generations", json=payload)
+            with media_timer(provider="xai", kind="image.generate", model=self._model):
+                body = self._request(key, "POST", "images/generations", json=payload)
             image_bytes = decode_image_payload(
                 body, download=_download, subject="the xAI image API"
             )
@@ -347,7 +349,8 @@ class GrokEditImageTool(_GrokMediaTool):
                 payload["image"] = sources[0]
             else:
                 payload["images"] = sources
-            body = self._request(key, "POST", "images/edits", json=payload)
+            with media_timer(provider="xai", kind="image.edit", model=self._model):
+                body = self._request(key, "POST", "images/edits", json=payload)
             image_bytes = decode_image_payload(
                 body, download=_download, subject="the xAI image API"
             )
@@ -493,8 +496,11 @@ class GrokGenerateVideoTool(_GrokMediaTool):
         try:
             if image:
                 payload["image_url"] = self._source_image_url(image)
-            request_id = self._submit(key, payload)
-            video_url = self._await_video(key, request_id)
+            # The timed span is submit → done (the poll loop *is* the generation on this
+            # endpoint); the clip download that follows is transfer, not model time.
+            with media_timer(provider="xai", kind="video.generate", model=self._model):
+                request_id = self._submit(key, payload)
+                video_url = self._await_video(key, request_id)
             video_bytes = _download(video_url)
         except ProviderConnectionError as exc:
             return f"Error generating video: could not reach the xAI video API: {exc}"

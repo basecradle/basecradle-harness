@@ -271,3 +271,22 @@ def test_listen_loads_under_the_locked_profile(client):
     registry = ToolRegistry(policy=Policy.locked())
     registry.register(HearAudioTool())
     assert "listen" in registry
+
+
+# --- the media log line (issue #272) -----------------------------------------
+
+
+def test_a_transcription_logs_one_media_line(tool, caplog):
+    import logging
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_AUDIO}").mock(
+            return_value=httpx.Response(200, json={"asset": audio_asset()})
+        )
+        mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
+        mock.post(AUDIO_URL).mock(return_value=httpx.Response(200, json={"text": TRANSCRIPT}))
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            tool.run(uuid=A_AUDIO)
+
+    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    assert "provider=openai" in line and "kind=audio.transcribe" in line

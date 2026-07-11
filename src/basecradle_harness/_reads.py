@@ -42,11 +42,15 @@ touches the filesystem.
 from __future__ import annotations
 
 import itertools
+import logging
 
 from basecradle import BaseCradleError
 
 from basecradle_harness._governance import _resolve_user, _UserNotFound
+from basecradle_harness._observability import kv
 from basecradle_harness._platform import PlatformTool, explain
+
+_log = logging.getLogger("basecradle_harness")
 
 # How many rows one `list` returns. The cap keeps a pathological directory or a busy
 # timeline from flooding the model's context; when it bites, the reply says there may
@@ -269,8 +273,22 @@ class MessagesTool(PlatformTool):
         **One call, never a blind retry.** A refusal is relayed for the model to act on
         (it can re-check via `read`/`list` and decide) — it is not re-attempted here,
         because a double-post on an ambiguous failure would wake the recipient twice.
+
+        The post is logged with the same intent line a wake's own reply gets (issue #272). This
+        is the one path by which the agent speaks on a timeline **other than the one it woke
+        for**, so without it a cross-timeline post — the very thing hardest to trace back — was
+        the only kind of speech that left no trace in the journal.
         """
         message = self.context.client.timelines.get(timeline).messages.create(body=body)
+        _log.info(
+            "posted %s",
+            kv(
+                message=message.content.uuid,
+                timeline=timeline,
+                kind="tool",
+                chars=len(body),
+            ),
+        )
         return f"Posted to timeline {timeline}. The new message's uuid is {message.content.uuid}."
 
 

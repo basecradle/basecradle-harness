@@ -366,6 +366,98 @@ def test_a_capped_wake_logs_the_reserve_summary_marker(caplog):
     assert any("wake used 2/2 steps + reserve summary" in r.getMessage() for r in caplog.records)
 
 
+# --- per-tool logging (issue #272) -------------------------------------------
+
+
+class BoomTool(Tool):
+    """A fake tool that always fails — the failure the model reads, and the operator never saw."""
+
+    name = "boom"
+    description = "Fail."
+
+    def run(self, **kwargs):
+        raise RuntimeError("the kettle exploded")
+
+
+def test_a_tool_run_logs_one_info_line_naming_it_and_its_outcome(caplog):
+    import logging
+
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="echo", arguments={})]),
+        Message.assistant(content="done"),
+    )
+    engine = _engine(provider, EchoTool())
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        engine.run([Message.user("go")])
+
+    line = next(m for m in _messages(caplog) if m.startswith("tool "))
+    assert "name=echo" in line
+    assert "outcome=ok" in line
+    assert re.search(r"duration=\d+\.\d\ds", line)
+
+
+def test_a_failing_tool_logs_the_error_at_warning_and_still_answers_the_model(caplog):
+    import logging
+
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="boom", arguments={})]),
+        Message.assistant(content="recovered"),
+    )
+    engine = _engine(provider, BoomTool())
+    history = [Message.user("go")]
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        engine.run(history)
+
+    assert any("outcome=error" in m for m in _messages(caplog))
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("name=boom" in m and "the kettle exploded" in m for m in warnings)
+    # The model still reads the failure as the tool's result — the log is additive, not a swap.
+    result = next(m for m in history if m.role == "tool")
+    assert "the kettle exploded" in result.content
+
+
+def test_an_unknown_tool_call_is_logged_as_a_failed_tool_run(caplog):
+    import logging
+
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="nonesuch", arguments={})]),
+        Message.assistant(content="ok"),
+    )
+    engine = Engine(provider, ToolRegistry())
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        engine.run([Message.user("go")])
+
+    assert any("name=nonesuch" in m and "outcome=error" in m for m in _messages(caplog))
+
+
+def test_the_engine_counts_the_steps_and_turns_it_spent_for_the_wakes_end_line():
+    provider = ScriptedProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="echo", arguments={})]),
+        Message.assistant(content="done"),
+        Message.assistant(content="done again"),
+    )
+    engine = _engine(provider, EchoTool())
+
+    assert (engine.steps_used, engine.turns_run) == (0, 0)
+    engine.run([Message.user("go")])
+
+    # Two provider calls → two steps, one turn.
+    assert (engine.steps_used, engine.turns_run) == (2, 1)
+
+    # Both counters are cumulative across a process's runs, which is what makes them the *wake's*
+    # usage (one wake, one engine). A wake takes a turn per item, so the turn count is what keeps
+    # a legitimate multi-item wake's step total from reading as a blown per-turn budget.
+    engine.run([Message.user("again")])
+    assert (engine.steps_used, engine.turns_run) == (3, 2)
+
+
+def _messages(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records]
+
+
 # --- server-side built-in called as a function (issue #245) ------------------
 
 

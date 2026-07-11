@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -48,12 +49,17 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
 )
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
+from basecradle_harness._observability import log_llm_call
 from basecradle_harness._openai_wire import format_citations
 
 #: This adapter's single native (gRPC) surface — declared for the SDK-scoped surface contract
 #: (issue #163); ``AI_SDK_SURFACE`` is left unset for a single-surface SDK.
 SURFACES = ("native",)
 DEFAULT_SURFACE = "native"
+#: The endpoint vendor this adapter reaches — the native SDK talks only to xAI, so unlike the
+#: `openai` adapter (which serves three) it is a class constant, not a constructor arg. It rides
+#: the per-call log line as ``provider=xai``.
+PROVIDER = "xai"
 
 
 def require_xai_sdk():
@@ -109,6 +115,7 @@ class XaiSdkProvider:
         **default_params: Any,
     ) -> None:
         self.model = model
+        self.provider = PROVIDER
         self._builtin_tools = list(builtin_tools)
         self._default_params = default_params
         self._xai = require_xai_sdk()
@@ -139,9 +146,19 @@ class XaiSdkProvider:
         wire_tools.extend(self._agent_tools())
         if wire_tools:
             payload["tools"] = wire_tools
+        started = time.monotonic()
         with self._mapped_errors():
             conversation = self._client.chat.create(**payload)
             response = conversation.sample()
+        # The native response carries usage as a proto (attributes, not keys); `log_llm_call`
+        # reads either shape, so the gRPC path logs the same line as the HTTP ones. A fake client
+        # (the seam tests) whose response has no `usage` simply logs no token fields.
+        log_llm_call(
+            provider=self.provider,
+            model=self.model,
+            seconds=time.monotonic() - started,
+            usage=getattr(response, "usage", None),
+        )
         return self._from_wire(response)
 
     # --- wire translation (harness <-> xai_sdk helpers) ----------------------

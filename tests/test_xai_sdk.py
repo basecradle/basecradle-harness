@@ -412,3 +412,22 @@ def test_an_unclassified_grpc_error_stays_a_plain_provider_error():
     with pytest.raises(ProviderError) as exc:
         _provider_raising(grpc.StatusCode.INVALID_ARGUMENT).chat([Message.user("hi")])
     assert not isinstance(exc.value, ProviderResponseError)
+
+
+# --- the per-call log line (issue #272) --------------------------------------
+
+
+def test_a_native_call_logs_the_line_reading_usage_off_the_proto(caplog):
+    """The gRPC response carries usage as proto *attributes*, not dict keys — the shared reader
+    handles both, so the native path logs exactly what the HTTP adapters do."""
+    import logging
+
+    response = _response(content="Hi.")
+    response.usage = SimpleNamespace(prompt_tokens=42, completion_tokens=6, total_tokens=48)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider(response).chat([Message.user("hello")])
+
+    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
+    assert "provider=xai" in line and "model=grok-4.3" in line
+    assert "tokens_in=42 tokens_out=6 tokens_total=48" in line

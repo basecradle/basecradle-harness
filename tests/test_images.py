@@ -549,3 +549,28 @@ def test_edit_relays_an_images_api_error(edit_tool):
 
     assert "Error editing image" in result
     assert "bad mask" in result  # the provider's reason reaches the model, not "HTTP 400"
+
+
+# --- the media log line (issue #272) -----------------------------------------
+
+
+def test_a_generation_logs_one_media_line(tool, caplog):
+    """Image work is slow and expensive, so the journal names the vendor, the kind, and the
+    time the *generation* took (not the Asset upload that follows it)."""
+    import logging
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(IMAGES_URL).mock(return_value=httpx.Response(200, json=images_response()))
+        mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
+            return_value=httpx.Response(200, json=_timeline_envelope())
+        )
+        mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/assets").mock(
+            return_value=httpx.Response(201, json=asset_response())
+        )
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            tool.run(prompt="a red cube on a white table")
+
+    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    assert "provider=openai" in line
+    assert "kind=image.generate" in line
+    assert "model=gpt-image-2" in line
