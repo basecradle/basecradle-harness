@@ -5,6 +5,39 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.60.0] - 2026-07-11
+
+**`--resolved-config` emits the memory axis: `memory_provider` + `memory_provider_version`
+(issue #269).** The manifest reported everything about an agent *except* which mind it was
+running: `_resolve_tools()` built the memory provider and threw it away, and an automatic-only
+provider (MemPalace) contributes no tool — so a MemPalace agent was byte-indistinguishable, in
+every off-box signal, from an agent with no memory provider at all. Drop
+`HARNESS_MEMORY_PROVIDER` from an `agent.env` and the harness would fall back to the default
+SQLite store, the agent would quietly abandon its palace, and every NOC drift check would still
+read green. A silent-death seam, now visible. Consumed by basecradle-noc#195's
+`pinned_extra_versions` drift axis; the fourth manifest field of its shape, after `opt_in_tools`
+(0.40.1), `active_profile` (0.55.0), and `mcp_servers` (0.57.0).
+
+### Added
+
+- **`memory_provider`** in `--resolved-config` — the **bound** backend (`sqlite`, `mempalace`, or
+  a custom `module:Class`), read off the provider object `memory_provider_from_env` actually
+  returned rather than a re-read of the env var (`describe_memory_provider`, `_memory_provider.py`).
+  Only the harness knows which store it binds (installed ≠ bound), and an env re-read would report
+  what the *introspecting shell* was told, not what the agent did — the `--resolved-config` env-gap
+  class (basecradle-noc#62). Because the class is the truth, a dotted path naming a built-in
+  normalizes to its alias, and a *subclass* of a built-in reports as the custom provider it is.
+- **`memory_provider_version`** in `--resolved-config` — the installed version of the package
+  backing that provider (the `mempalace` extra today). `null` for the built-in `sqlite` store,
+  which ships *inside* the harness and has no separate pin (its version is `harness_version`), and
+  `null` for a custom provider, whose distribution the harness cannot honestly name. `mempalace`
+  with `null` is a **defect signal**, not a shrug: binding is lazy (the extra is imported only on
+  the first `observe`/`context`), so an agent can bind a palace whose package is absent and lose
+  its memory at the first wake — now catchable off-box.
+- **A README section on the memory provider seam** (`README.md`) — `HARNESS_MEMORY_PROVIDER`, the
+  three backends, the `observe`/`context` middleware hooks, and how to write your own. The seam
+  shipped without user-facing docs; the manifest field made the gap load-bearing.
+
 ## [0.59.0] - 2026-07-10
 
 **The MemPalace adapter widens its rerank pool with `candidate_strategy="union"` — retrieval

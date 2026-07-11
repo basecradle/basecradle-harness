@@ -12,6 +12,8 @@ Two layers are pinned here:
    Doe (`john`).
 """
 
+from importlib import metadata
+
 import httpx
 import pytest
 import respx
@@ -28,6 +30,8 @@ from basecradle_harness import (
     WakeAgent,
     memory_provider_from_env,
 )
+from basecradle_harness._memory_provider import describe_memory_provider
+from basecradle_harness._mempalace import MemPalaceMemoryProvider
 from basecradle_harness._messages import Message
 
 # --- the default SQLite provider: tools + store, no-op hooks ------------------
@@ -120,6 +124,83 @@ def test_from_env_reports_an_unimportable_path(monkeypatch):
     monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "no_such_module:Thing")
     with pytest.raises(ValueError, match="Could not import"):
         memory_provider_from_env()
+
+
+# --- the bound provider's manifest identity (issue #269) ----------------------
+#
+# `--resolved-config` reports the memory axis off these, so what they pin is that the answer
+# comes from the provider **object that was bound**, never from a re-read of the env var — the
+# whole point being that a dropped `HARNESS_MEMORY_PROVIDER` must be *visible* as a silent
+# fallback to SQLite, not reported as whatever the introspecting shell happened to be told.
+
+
+class _CustomProvider(MemoryProvider):
+    """A custom provider: not a built-in, so it names itself by import path."""
+
+
+class _TunedSqliteProvider(SqliteMemoryProvider):
+    """A *subclass* of a built-in — a custom provider, and reported as one."""
+
+
+def test_describe_names_the_default_sqlite_provider_with_no_backing_package(tmp_path):
+    """`sqlite` ships inside the harness (stdlib sqlite3), so it has no separately-pinned
+    package: the version is `None`, not a second copy of `harness_version`."""
+    assert describe_memory_provider(SqliteMemoryProvider(tmp_path / "memory.db")) == (
+        "sqlite",
+        None,
+    )
+
+
+def test_describe_names_a_bound_mempalace_provider_whose_extra_is_missing(tmp_path):
+    """Bound to MemPalace with the extra *not installed* → `("mempalace", None)`.
+
+    A real, reachable state: binding is lazy (the adapter imports MemPalace only on the first
+    `observe`/`context`), so an agent selects the provider fine and then loses its memory at the
+    first wake. `None` on the version of a *named* backing package is the defect signal that
+    catches it off-box — the case the test env genuinely reproduces, since MemPalace is an
+    optional extra this suite never installs.
+    """
+    assert describe_memory_provider(MemPalaceMemoryProvider(tmp_path / "palace")) == (
+        "mempalace",
+        None,
+    )
+
+
+def test_describe_reports_the_mempalace_extras_installed_version(tmp_path, monkeypatch):
+    """With the extra installed, the version is ground truth read off its distribution — the
+    field basecradle-noc#195's `pinned_extra_versions` drift axis compares against the pin.
+    MemPalace is not installed here, so its distribution metadata is the one thing faked."""
+    monkeypatch.setattr(metadata, "version", lambda dist: {"mempalace": "3.5.0"}[dist])
+
+    assert describe_memory_provider(MemPalaceMemoryProvider(tmp_path / "palace")) == (
+        "mempalace",
+        "3.5.0",
+    )
+
+
+def test_describe_reads_the_bound_class_not_the_env_var(monkeypatch):
+    """A dotted path naming a *built-in* class reports the built-in's alias: the bound object is
+    the truth, so the two spellings of one provider can never report as two different ones."""
+    monkeypatch.setenv(
+        "HARNESS_MEMORY_PROVIDER", "basecradle_harness._memory_provider:SqliteMemoryProvider"
+    )
+    assert describe_memory_provider(memory_provider_from_env())[0] == "sqlite"
+
+
+def test_describe_names_a_custom_provider_by_its_import_path():
+    """A custom provider reports the `module:Class` actually bound — including a subclass of a
+    built-in, which *is* a custom provider and must not hide behind the built-in's alias.
+
+    Its version is `None`: the harness pins no package for someone else's class, and a module's
+    name is not its distribution's — so there is nothing here it can honestly report.
+    """
+    assert describe_memory_provider(_CustomProvider()) == (
+        "tests.test_memory_provider:_CustomProvider",
+        None,
+    )
+    assert describe_memory_provider(_TunedSqliteProvider())[0] == (
+        "tests.test_memory_provider:_TunedSqliteProvider"
+    )
 
 
 # --- a stub provider, wired through a real wake -------------------------------

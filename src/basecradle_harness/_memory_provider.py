@@ -40,6 +40,7 @@ import importlib
 import os
 from abc import ABC
 from dataclasses import dataclass
+from importlib import metadata
 from pathlib import Path
 
 from basecradle_harness._memory import MemoryTool, SqliteMemoryStore, _default_path
@@ -152,6 +153,15 @@ _PROVIDER_VAR = "HARNESS_MEMORY_PROVIDER"
 _SQLITE = "sqlite"
 _MEMPALACE = "mempalace"
 
+# The MemPalace adapter's class, by import path — so `describe_memory_provider` can *name* a
+# bound MemPalace provider without importing the optional-extra module to do it.
+_MEMPALACE_CLASS = "basecradle_harness._mempalace.MemPalaceMemoryProvider"
+
+# The PyPI distribution backing each built-in alias, for the manifest's version field. Only
+# `mempalace` has one (the harness's `[mempalace]` extra); `sqlite` is absent on purpose — see
+# `describe_memory_provider`.
+_PROVIDER_DISTRIBUTIONS = {_MEMPALACE: "mempalace"}
+
 
 def memory_provider_from_env(home: str | os.PathLike[str] | None = None) -> MemoryProvider:
     """Build the agent's one memory provider from ``HARNESS_MEMORY_PROVIDER``.
@@ -179,6 +189,65 @@ def memory_provider_from_env(home: str | os.PathLike[str] | None = None) -> Memo
 
         return MemPalaceMemoryProvider(palace_path=_palace_path(home))
     return _load_custom_provider(raw)
+
+
+def describe_memory_provider(provider: MemoryProvider) -> tuple[str, str | None]:
+    """The **bound** provider's manifest identity: ``(name, backing-package version)``.
+
+    Read off the provider object `memory_provider_from_env` actually returned, never off
+    `_PROVIDER_VAR` — an env re-read would report what the *introspecting* shell was told,
+    not what the agent bound (the `--resolved-config` env-gap class, basecradle-noc#62), and
+    a dotted path naming a built-in class would report as "custom" when it is not.
+
+    - **name** — ``sqlite`` or ``mempalace`` for the built-ins (whichever alias *or* dotted
+      path selected them: the class is the truth, so both spellings normalize to the alias),
+      else ``module:Class`` — the import path of the custom provider actually bound. A
+      *subclass* of a built-in is a custom provider and reports its own path, not the alias.
+    - **version** — the installed version of the **backing distribution** the harness pins for
+      that provider — today that means the ``mempalace`` extra — else ``None``. ``None`` for the
+      built-in ``sqlite`` store, which ships *inside the harness* (its engine is stdlib
+      ``sqlite3``): it has no separately-pinned package, its version already *is* the manifest's
+      ``harness_version``, and a second copy would imply a pin that does not exist. ``None`` for
+      a custom provider too — the harness does not know which distribution ships someone else's
+      class (a module's name is not its distribution's, and the stdlib's index of the two is
+      incomplete on Python 3.10), and inventing a guess is worse than a null in a field a drift
+      audit reads. ``mempalace`` with ``None``, though, is not a shrug but a **defect signal**:
+      the provider bound (binding is lazy — the extra is imported only on the first
+      `observe`/`context`) while its package is absent, so the agent will lose its palace at the
+      first wake.
+    """
+    name = _provider_name(type(provider))
+    return name, _provider_version(name)
+
+
+def _provider_name(cls: type[MemoryProvider]) -> str:
+    """The bound provider class's manifest name (see `describe_memory_provider`)."""
+    if cls is SqliteMemoryProvider:
+        return _SQLITE
+    # Compare by import path, not `isinstance`: the MemPalace adapter is an optional-extra
+    # module we must not import just to name a provider that isn't it (the same laziness the
+    # adapter itself keeps around chromadb), and an exact-class check is what makes a
+    # *subclass* correctly report as the custom provider it is.
+    if f"{cls.__module__}.{cls.__qualname__}" == _MEMPALACE_CLASS:
+        return _MEMPALACE
+    return f"{cls.__module__}:{cls.__qualname__}"
+
+
+def _provider_version(name: str) -> str | None:
+    """The installed version of the distribution the harness pins for `name`, else ``None``.
+
+    A provider with no *harness-pinned* backing package — the built-in sqlite store, any custom
+    class — has no version the harness can honestly report (see `describe_memory_provider`), so
+    it is ``None`` rather than a guess. A pinned package that is *not installed* is ``None`` too:
+    that is the state worth catching, and the provider name beside it says which case it is.
+    """
+    dist = _PROVIDER_DISTRIBUTIONS.get(name)
+    if dist is None:
+        return None
+    try:
+        return metadata.version(dist)
+    except metadata.PackageNotFoundError:
+        return None
 
 
 def _store_path(home: str | os.PathLike[str] | None) -> Path | None:

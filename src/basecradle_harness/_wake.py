@@ -107,7 +107,12 @@ from basecradle_harness._exceptions import EngineError, HarnessError, ProviderEr
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
 from basecradle_harness._mcp import load_mcp_configs
-from basecradle_harness._memory_provider import MemoryExchange, MemoryProvider, MemoryScope
+from basecradle_harness._memory_provider import (
+    MemoryExchange,
+    MemoryProvider,
+    MemoryScope,
+    describe_memory_provider,
+)
 from basecradle_harness._messages import ImageContent
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
@@ -2009,6 +2014,21 @@ def resolved_config() -> dict[str, object]:
       under ``"unlocked"`` a policy-forbidden opted-in tool (e.g. ``shell``) appears in ``tools``;
       under ``"locked"`` the same tool appears in ``skipped``. Without it no automated surface
       could confirm a shell-class enablement's profile actually landed.
+    - ``memory_provider`` — the **bound** memory backend (issue #269): ``sqlite`` (the default),
+      ``mempalace``, or the ``module:Class`` path of a custom provider — read off the provider
+      object `memory_provider_from_env` actually returned, **not** a re-read of
+      ``HARNESS_MEMORY_PROVIDER`` (`describe_memory_provider`). Only the harness knows which store
+      it binds (installed ≠ bound), and without this field the memory axis is invisible off-box: a
+      MemPalace agent whose ``HARNESS_MEMORY_PROVIDER`` fell out of its ``agent.env`` would
+      silently fall back to the default SQLite store — losing its palace — while every drift check
+      still read green. The field makes the fallback *visible*.
+    - ``memory_provider_version`` — the installed version of the package the harness *pins* for
+      that provider (the ``mempalace`` extra today), else ``None``. ``None`` for the built-in
+      ``sqlite`` store, which ships *inside* the harness (stdlib ``sqlite3``) and so has no
+      separate pin — its version is ``harness_version`` above — and ``None`` for a custom
+      provider, whose distribution the harness cannot honestly name (see
+      `describe_memory_provider`). ``mempalace`` with ``None`` is a **defect signal**, not a
+      shrug: bound (binding is lazy) while its extra is not installed.
     - ``tools`` — the resolved active **function** tool names, sorted.
     - ``builtins`` — the resolved active server-side **built-in** wire names, sorted (e.g. the
       Responses ``web_search``); a live capability the tool-set axis must count.
@@ -2047,7 +2067,8 @@ def resolved_config() -> dict[str, object]:
     """
     provider_name, sdk, surface = _config_from_env()
     profile_name, _policy = _profile_from_env()
-    resolved, _memory = _resolve_tools(provider_name, sdk, surface)
+    resolved, memory = _resolve_tools(provider_name, sdk, surface)
+    memory_name, memory_version = describe_memory_provider(memory)
     model_params, stripped = resolved_model_params(sdk)
     return {
         "harness_version": __version__,
@@ -2057,6 +2078,8 @@ def resolved_config() -> dict[str, object]:
         "ai_sdk_version": _sdk_version(sdk),
         "ai_model": os.environ.get("AI_MODEL") or None,
         "active_profile": profile_name,
+        "memory_provider": memory_name,
+        "memory_provider_version": memory_version,
         "tools": sorted(tool.name for tool in resolved.tools),
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),
