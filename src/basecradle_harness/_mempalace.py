@@ -26,6 +26,12 @@ retrieve) — *not* its MCP tools, which are a later group (Group 5). MemPalace 
 **optional extra** (``pip install basecradle-harness[mempalace]``) so the base package
 stays light; the import is lazy and a clear error names the extra when it is missing.
 
+**Retrieval model.** `context` searches with ``candidate_strategy="union"``, so the hybrid
+rerank pool is seeded from the top *lexical* (BM25) hits as well as the top vector hits —
+not vectors alone (MemPalace's default). Agent memory turns on exact tokens (handles,
+UUIDs, error strings, project names) that embeddings rank poorly, which is precisely the
+recall gap union closes. See `_CANDIDATE_STRATEGY`.
+
 **Storage model.** MemPalace mines *files*: `observe` writes each exchange as a tiny
 quote-formatted markdown file under ``<palace>/conversations/`` and mines that directory
 (MemPalace skips already-mined files, so re-mining the dir only processes the new one).
@@ -46,6 +52,18 @@ _log = logging.getLogger("basecradle_harness")
 # How many relevant chunks `context` retrieves to inject at Turn 0. Bounded so a large
 # palace can't flood the model's context window.
 DEFAULT_N_RESULTS = 5
+
+# How the hybrid (vector + BM25) rerank pool is built. MemPalace's default, "vector",
+# seeds the pool from the top vector hits *alone* — so a chunk whose embedding sits far
+# from the query never gets reranked, however strong its lexical signal (upstream's own
+# docstring names the failure). Agent memory is made of exactly those: handles, UUIDs,
+# error strings, project names — exact tokens embeddings rank poorly. "union" additionally
+# pulls the top lexical (FTS BM25) candidates into the pool and merges them, for the cost
+# of one extra local FTS query per retrieval. The ChromaDB backend every palace uses
+# implements the `lexical_search` capability union needs; a backend that doesn't degrades
+# gracefully (`search_memories` returns an error dict with no "results" key, which
+# `context` already reads as "no hits").
+_CANDIDATE_STRATEGY = "union"
 
 # The wing the mined exchanges are filed under. A single wing per agent keeps every
 # timeline's conversation in one searchable space, so retrieval spans them all
@@ -125,7 +143,17 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not query or not self.palace_path.exists():
             return None
         searcher = _import("searcher")
-        result = searcher.search_memories(query, str(self.palace_path), n_results=self.n_results)
+        # Never pass `max_distance`: upstream's union merge opens with
+        # `if max_distance > 0.0: return`, so *any* distance threshold silently disables
+        # the BM25 half of the pool (lexical-only candidates carry no vector distance) and
+        # `candidate_strategy` above becomes a no-op. A distance filter and union recall
+        # are mutually exclusive upstream; we keep the recall. Pinned by test.
+        result = searcher.search_memories(
+            query,
+            str(self.palace_path),
+            n_results=self.n_results,
+            candidate_strategy=_CANDIDATE_STRATEGY,
+        )
         hits = result.get("results") if isinstance(result, dict) else None
         return _render_memories(hits or [])
 
