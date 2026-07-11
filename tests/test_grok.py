@@ -464,3 +464,49 @@ def test_the_timeout_reaches_the_grok_http_client(edit_tool, monkeypatch):
     monkeypatch.setattr(grok.httpx, "Client", _FakeClient)
     edit_tool._request(FAKE_KEY, "POST", "images/edits", json={})
     assert captured["timeout"] == grok.DEFAULT_TIMEOUT
+
+
+# --- the media log line (issue #272) -----------------------------------------
+
+
+def test_a_grok_generation_logs_one_media_line(image_tool, caplog):
+    import logging
+
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(IMAGES_URL).mock(return_value=httpx.Response(200, json=image_b64()))
+        _mock_upload(mock, captured)
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            image_tool.run(prompt="a neon skyline")
+
+    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    assert "provider=xai" in line
+    assert "kind=image.generate" in line
+    assert "model=grok-imagine-image-quality" in line
+
+
+def test_a_video_generation_times_the_submit_and_poll_span(video_tool, caplog):
+    """The poll loop *is* the generation on this endpoint — a video that took four minutes to
+    render must say four minutes, not the millisecond the submit call returned in."""
+    import logging
+
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(VIDEOS_URL).mock(
+            return_value=httpx.Response(200, json={"request_id": REQUEST_ID})
+        )
+        mock.get(f"{XAI_BASE}/videos/{REQUEST_ID}").mock(
+            return_value=httpx.Response(
+                200,
+                json={"status": "done", "video": {"url": f"{XAI_BASE}/clips/out.mp4"}},
+            )
+        )
+        mock.get(f"{XAI_BASE}/clips/out.mp4").mock(
+            return_value=httpx.Response(200, content=MP4_BYTES)
+        )
+        _mock_upload(mock, captured)
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            video_tool.run(prompt="a drone shot over the ocean")
+
+    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    assert "kind=video.generate" in line and "provider=xai" in line

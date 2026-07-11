@@ -605,6 +605,10 @@ _OWNED_OPENAI = frozenset(
         "model",
         "api_key",
         "base_url",
+        # The endpoint-vendor label the adapter logs (AI_PROVIDER decides it, never a tuning file);
+        # it is also a real constructor arg, so leaving it unowned would make a `"provider"` key
+        # in model_params.json a hard TypeError rather than a warned-and-dropped collision.
+        "provider",
         "surface",
         "timeout",
         "max_retries",
@@ -870,14 +874,24 @@ def _provider_from_config(
         harness_extra_body = {"search_parameters": search_parameters} if search_parameters else None
         extra_body = _merge_extra_body(params_extra_body, harness_extra_body)
         return OpenAIProvider(
-            model, base_url=base_url, surface=surface, extra_body=extra_body, **params
+            model,
+            base_url=base_url,
+            provider=provider,
+            surface=surface,
+            extra_body=extra_body,
+            **params,
         )
     if provider == "openrouter":
         # OpenRouter over the openai SDK: chat wire only, no server-side built-ins and no code
         # bridge (`_maybe_code_bridge` already excludes it). The operator's `extra_body` (if any)
         # is the escape hatch and passes straight through.
         return OpenAIProvider(
-            model, base_url=base_url, surface=surface, extra_body=params_extra_body, **params
+            model,
+            base_url=base_url,
+            provider=provider,
+            surface=surface,
+            extra_body=params_extra_body,
+            **params,
         )
     # The code-execution Asset bridge supplies the live ``container`` for the code_interpreter
     # built-in per turn (`_code.py`); absent it, the built-in falls back to an auto container.
@@ -885,6 +899,7 @@ def _provider_from_config(
     return OpenAIProvider(
         model,
         base_url=base_url,
+        provider=provider,
         surface=surface,
         builtin_tools=list(builtins),
         code_container=code_container,
@@ -1276,7 +1291,31 @@ def _configure_logging() -> None:
     nothing else has** (``root.handlers`` empty), so an embedding application's own logging
     setup always wins and a library import never hijacks logging. ``HARNESS_LOG_LEVEL`` tunes
     the level for a noisier or quieter run; the ``INFO`` default is the point.
+
+    ``httpx`` is demoted to ``WARNING`` on the way (`_quiet_transport_logs`) — at ``INFO`` it
+    narrates every HTTP call the platform SDK and the model SDKs make, which was the single
+    loudest thing in the journal and said nothing the harness's own lines don't say better.
     """
     if logging.getLogger().handlers:
         return
-    logging.basicConfig(level=_log_level_from_env(), format="%(levelname)s %(message)s")
+    level = _log_level_from_env()
+    logging.basicConfig(level=level, format="%(levelname)s %(message)s")
+    _quiet_transport_logs(level)
+
+
+def _quiet_transport_logs(level: int) -> None:
+    """Demote ``httpx``'s per-request chatter to ``WARNING`` — the harness's own lines replace it.
+
+    ``INFO HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"`` fired once
+    per platform read, model call, and asset fetch: the dominant noise in Live Tail, and pure
+    duplication now that the wake logs its own LLM, tool, and posted-message lines with the
+    context (provider, model, tokens, duration) the transport line never had.
+
+    A run explicitly turned up to ``DEBUG`` is the one exception — an operator debugging a wake
+    at ``DEBUG`` is asking for the wire, so ``httpx`` is left alone there. Only *this* CLI's own
+    logging setup does the demotion: it is skipped entirely when an embedding application already
+    configured logging (see `_configure_logging`), so importing the harness as a library never
+    silences a host application's transport logs.
+    """
+    if level > logging.DEBUG:
+        logging.getLogger("httpx").setLevel(logging.WARNING)

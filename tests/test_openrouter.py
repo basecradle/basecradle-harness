@@ -482,3 +482,19 @@ def test_satisfies_the_provider_protocol():
     provider = _provider()
     assert isinstance(provider, Provider)
     provider.close()
+
+
+# --- the per-call log line (issue #272) --------------------------------------
+
+
+def test_a_call_logs_the_line_with_the_openrouter_vendor_and_model(router, caplog):
+    import logging
+
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(content="Hi.")))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider().chat([Message.user("hello")])
+
+    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
+    assert "provider=openrouter" in line and f"model={MODEL}" in line
+    assert "tokens_in=1 tokens_out=2 tokens_total=3" in line  # the builder's usage block

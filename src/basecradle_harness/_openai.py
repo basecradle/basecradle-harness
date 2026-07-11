@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
@@ -44,6 +45,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
 )
 from basecradle_harness._messages import Message, ToolSpec
+from basecradle_harness._observability import log_llm_call
 from basecradle_harness._openai_wire import (
     builtin_to_responses,
     chat_message_to_wire,
@@ -94,6 +96,10 @@ class OpenAIProvider:
         model: The model id (e.g. ``"gpt-5.4-mini"``).
         api_key: The OpenAI bearer token. Falls back to ``AI_API_KEY`` when omitted.
         base_url: The API root. Defaults to OpenAI; set it for an OpenAI-compatible endpoint.
+        provider: The endpoint's vendor (``AI_PROVIDER``) — a **label**, not wiring: this one
+            adapter serves OpenAI, xAI, and OpenRouter alike, and only `_provider_from_config`
+            knows which endpoint it aimed the client at. It rides the per-call log line so a
+            grok-through-the-openai-SDK wake reads ``provider=xai``, not ``provider=openai``.
         surface: ``"responses"`` (default) or ``"chat"`` — this adapter's internal wire
             surface (see the module docstring). Server-side built-ins and vision require
             ``"responses"``.
@@ -124,6 +130,7 @@ class OpenAIProvider:
         *,
         api_key: str | None = None,
         base_url: str | None = None,
+        provider: str = "openai",
         surface: str = DEFAULT_SURFACE,
         timeout: float = DEFAULT_TIMEOUT,
         max_retries: int = 2,
@@ -141,6 +148,7 @@ class OpenAIProvider:
             )
         openai = require_openai_sdk()
         self.model = model
+        self.provider = provider
         self.surface = surface
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._builtin_tools = [builtin_to_responses(spec) for spec in builtin_tools]
@@ -176,9 +184,12 @@ class OpenAIProvider:
             payload["tools"] = wire_tools
         if self._extra_body:
             payload["extra_body"] = dict(self._extra_body)
+        started = time.monotonic()
         with self._mapped_errors():
             response = self._client.responses.create(**payload)
-        return message_from_responses(response.model_dump())
+        data = response.model_dump()
+        self._log_call(started, data)
+        return message_from_responses(data)
 
     def _with_code_container(self, spec: dict[str, Any]) -> dict[str, Any]:
         """Inject the live ``container`` into the ``code_interpreter`` built-in, per turn.
@@ -202,9 +213,28 @@ class OpenAIProvider:
             payload["tools"] = [chat_tool_to_wire(t) for t in tools]
         if self._extra_body:
             payload["extra_body"] = dict(self._extra_body)
+        started = time.monotonic()
         with self._mapped_errors():
             response = self._client.chat.completions.create(**payload)
-        return message_from_chat(response.model_dump())
+        data = response.model_dump()
+        self._log_call(started, data)
+        return message_from_chat(data)
+
+    def _log_call(self, started: float, data: Mapping[str, Any]) -> None:
+        """The one INFO line this call earns: provider, model, duration, tokens.
+
+        Both surfaces report usage, under different names (Responses ``input_tokens`` vs Chat
+        ``prompt_tokens``) — `log_llm_call` reads either, so this one call site serves both. Only
+        a call that *returned* is logged; a call that raised is the error path's story to tell
+        (the engine logs the retry/give-up), and timing a failure as if it were a completion
+        would be a lie.
+        """
+        log_llm_call(
+            provider=self.provider,
+            model=self.model,
+            seconds=time.monotonic() - started,
+            usage=data.get("usage"),
+        )
 
     # --- SDK exceptions → the harness provider error hierarchy ----------------
 

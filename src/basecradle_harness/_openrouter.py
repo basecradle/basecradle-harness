@@ -51,6 +51,7 @@ harness owns history — this adapter never sets ``stream`` (it is non-streaming
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -65,6 +66,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
 )
 from basecradle_harness._messages import Message, ToolSpec
+from basecradle_harness._observability import log_llm_call
 from basecradle_harness._openai_wire import (
     chat_message_to_wire,
     chat_tool_to_wire,
@@ -80,6 +82,10 @@ DEFAULT_TIMEOUT = 60.0
 #: ``AI_SDK_SURFACE`` is left unset for it.
 SURFACES = ("chat",)
 DEFAULT_SURFACE = "chat"
+#: The endpoint vendor this adapter reaches — the native SDK talks only to OpenRouter, so it is a
+#: class constant rather than a constructor arg. It rides the per-call log line as
+#: ``provider=openrouter``.
+PROVIDER = "openrouter"
 
 #: The model-facing name of the web-search built-in — the one server tool that ships (issue #237)
 #: and the only one that consumes ``search_params.json``. Named so the config layer can gate the
@@ -210,6 +216,7 @@ class OpenRouterProvider:
         **default_params: Any,
     ) -> None:
         self.model = model
+        self.provider = PROVIDER
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._default_params = default_params
         # Server-tool objects are config-time constant (they don't vary per turn), so build them
@@ -273,9 +280,16 @@ class OpenRouterProvider:
             payload["tools"] = wire_tools
         # Never set ``stream``: this adapter is non-streaming by contract, and a truthy ``stream``
         # would change ``chat.send``'s return type from ``ChatResult`` to an event stream.
+        started = time.monotonic()
         with self._mapped_errors():
             response = self._client.chat.send(**payload)
         data = response.model_dump()
+        log_llm_call(
+            provider=self.provider,
+            model=self.model,
+            seconds=time.monotonic() - started,
+            usage=data.get("usage"),
+        )
         self._restore_annotations(data)
         return message_from_chat(data)
 

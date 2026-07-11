@@ -33,6 +33,7 @@ import os
 
 from basecradle_harness._assets import _describe, _download, _is_audio
 from basecradle_harness._exceptions import ProviderConnectionError, ProviderError
+from basecradle_harness._observability import media_timer
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._platform import PlatformTool
 
@@ -149,7 +150,10 @@ class HearAudioTool(PlatformTool):
         """
         openai = require_openai_sdk()
         client = openai.OpenAI(api_key=key, base_url=self._base_url, timeout=self._timeout)
-        with sdk_error_context(openai):
+        with (
+            media_timer(provider="openai", kind="audio.transcribe", model=self._model),
+            sdk_error_context(openai),
+        ):
             response = client.audio.transcriptions.create(
                 model=self._model, file=(filename, data, content_type)
             )

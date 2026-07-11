@@ -258,6 +258,11 @@ class _NoopTool(Tool):
 class CountingProvider:
     """A canned brain that records every call, so we can assert when it is (not) used."""
 
+    # The labels every shipped adapter carries (`describe_provider`), so a wake's bookend lines
+    # name a provider and a model here exactly as they do in production.
+    provider = "openai"
+    model = "gpt-4o"
+
     def __init__(self, text="Hello, John."):
         self.text = text
         self.prompts: list[str] = []
@@ -3212,3 +3217,238 @@ def test_parse_created_at_handles_z_suffix_and_naive_stamps():
 
     naive = _parse_created_at("2026-06-04T00:00:00")  # no offset → assumed UTC, aware
     assert naive == PACE_CREATED and naive.tzinfo is timezone.utc
+
+
+# --- the wake's log trail (issue #272) ----------------------------------------
+#
+# A deployed wake's only witness is its journal, so these pin the lines an operator (and Better
+# Stack's Live Tail) actually reads: the bookends around every wake, the delivery-id correlation
+# the router threads through, and the three failure classes that used to pass in silence — a
+# refused post, a step-cap degradation, and a wake that never ran at all.
+
+
+def _lines(caplog, level=None) -> list[str]:
+    return [r.getMessage() for r in caplog.records if level is None or r.levelname == level]
+
+
+def _line(caplog, prefix: str) -> str:
+    return next(m for m in _lines(caplog) if m.startswith(prefix))
+
+
+def test_a_wake_is_bookended_by_a_start_and_an_end_line(platform, tmp_path, caplog):
+    """The two lines a wake always leaves: what it is about to run, and what came of it."""
+    serve_messages(platform, page(message(uuid=M0, body="What's the status?")))
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    start = _line(caplog, "wake start")
+    assert f"timeline={TIMELINE_UUID}" in start
+    assert "provider=openai" in start and "model=gpt-4o" in start
+
+    end = _line(caplog, "wake end")
+    assert "outcome=ok" in end
+    assert "turns=1" in end  # one model turn — the whole unseen batch, answered once
+    assert "steps=1/24" in end  # the engine's own count, against the per-turn budget
+    assert "posted=1" in end
+    assert re.search(r"duration=\d+\.\d\ds", end)
+
+
+def test_a_named_trigger_rides_the_start_line(platform, tmp_path, caplog):
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake(trigger=M0)
+
+    assert f"trigger=message:{M0}" in _line(caplog, "wake start")
+
+
+def test_the_bookends_carry_the_routers_delivery_id_when_it_exports_one(
+    platform, tmp_path, caplog, monkeypatch
+):
+    """The correlation field (basecradle-router#170): both bookends echo the delivery that
+    spawned the wake, so a router-side line and a harness-side line join in Live Tail."""
+    monkeypatch.setenv("BASECRADLE_DELIVERY_ID", "01996f0e-3d2b-7a41-9c5f-2e6a7b8c9d0e")
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    for line in (_line(caplog, "wake start"), _line(caplog, "wake end")):
+        assert "delivery=01996f0e-3d2b-7a41-9c5f-2e6a7b8c9d0e" in line
+
+
+def test_without_the_delivery_var_the_field_is_simply_absent(
+    platform, tmp_path, caplog, monkeypatch
+):
+    """Optional-when-absent: the harness and the router ship in either order, and a hand-run
+    wake logs a clean line rather than an empty `delivery=`."""
+    monkeypatch.delenv("BASECRADLE_DELIVERY_ID", raising=False)
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert "delivery=" not in _line(caplog, "wake start")
+
+
+def test_a_quiet_wake_reports_ok_with_nothing_posted(platform, tmp_path, caplog):
+    serve_messages(platform, page(message(uuid=M0, body="hi", mine=True)))  # only its own post
+    agent, provider = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert provider.prompts == []  # no model call…
+    end = _line(caplog, "wake end")
+    assert "outcome=ok" in end and "posted=0" in end
+    assert "turns=0" in end and "steps=0/24" in end  # the model was never engaged
+
+
+def test_a_breaker_declined_wake_says_so_in_its_end_line(platform, tmp_path, caplog):
+    """A self-declining wake is not a healthy one — the end line must not read `ok`."""
+    clock = FakeClock()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    for _ in range(2):  # burn the cap so the next wake trips
+        _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2).wake()
+
+    agent = _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2)
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    end = _line(caplog, "wake end")
+    assert "outcome=declined" in end
+    assert "steps=0/24" in end  # no provider call was made
+
+
+def test_a_successful_post_logs_the_message_it_created(platform, tmp_path, caplog):
+    """The intent line that replaces httpx's transport chatter: which message, on which
+    timeline. It is what says the agent *spoke*, not merely that an HTTP call went out."""
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    posted = _line(caplog, "posted")
+    assert f"message={REPLY}" in posted
+    assert f"timeline={TIMELINE_UUID}" in posted
+
+
+def test_a_refused_post_is_logged_at_error(platform, tmp_path, caplog):
+    """A locked timeline: the agent thought, spent tokens, and could not speak. It degrades
+    (exit 0, a transcript note) — which is exactly why the *log* has to be loud."""
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
+        return_value=httpx.Response(403, json=_locked_problem())
+    )
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    errors = _lines(caplog, "ERROR")
+    assert any(m.startswith("post failed") and TIMELINE_UUID in m for m in errors)
+    assert "outcome=ok" in _line(caplog, "wake end")  # the wake itself still completed
+    assert "posted=0" in _line(caplog, "wake end")  # …having delivered nothing
+
+
+def test_the_step_cap_degradation_is_logged_at_warning(platform, tmp_path, caplog):
+    """The canned "I got stuck" note posts, the item is marked seen, the process exits 0 — so
+    without this WARNING a degraded wake was indistinguishable from a healthy one."""
+    serve_messages(platform, page(message(uuid=M0, body="do something complicated")))
+
+    class LoopingThenBoom:
+        provider, model = "openai", "gpt-4o"
+
+        def chat(self, messages, tools=None):
+            if tools is None:  # the out-of-budget reserve call fails too
+                raise RuntimeError("reserve model call failed")
+            return Message.assistant(tool_calls=[ToolCall(id="call_1", name="noop", arguments={})])
+
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(LoopingThenBoom(), tools=[_NoopTool()], home=tmp_path, max_steps=2)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    warnings = _lines(caplog, "WARNING")
+    assert any(m.startswith("degraded") and "reserve summary" in m for m in warnings)
+    assert "steps=2/2" in _line(caplog, "wake end")  # the budget was genuinely spent
+
+
+def test_main_logs_a_hard_startup_failure_at_error(platform, wake_env, monkeypatch, caplog):
+    """The wake that never ran at all — previously a bare, unleveled `print` no severity filter
+    could find. It still prints; it now also passes through the logger as an ERROR."""
+    monkeypatch.delenv("AI_MODEL", raising=False)  # a hard config failure at provider build
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        assert main(["--timeline", TIMELINE_UUID]) == 1
+
+    errors = _lines(caplog, "ERROR")
+    assert any(m.startswith("wake failed") and "AI_MODEL" in m for m in errors)
+
+
+def test_httpx_is_demoted_so_its_transport_chatter_leaves_the_journal(monkeypatch):
+    """The noise this replaces: one `INFO HTTP Request: …` per platform read, model call, and
+    blob fetch. The harness's own lines say the same thing with the context that line lacked."""
+    from basecradle_harness._basecradle import _configure_logging
+
+    httpx_logger = logging.getLogger("httpx")
+    saved = httpx_logger.level
+    monkeypatch.delenv("HARNESS_LOG_LEVEL", raising=False)
+    try:
+        httpx_logger.setLevel(logging.NOTSET)
+        with _isolated_root_logging():
+            _configure_logging()
+            assert httpx_logger.level == logging.WARNING
+    finally:
+        httpx_logger.setLevel(saved)
+
+
+def test_a_debug_run_keeps_the_transport_lines(monkeypatch):
+    """An operator who turned the level down to DEBUG is asking for the wire — leave httpx be."""
+    from basecradle_harness._basecradle import _configure_logging
+
+    httpx_logger = logging.getLogger("httpx")
+    saved = httpx_logger.level
+    monkeypatch.setenv("HARNESS_LOG_LEVEL", "DEBUG")
+    try:
+        httpx_logger.setLevel(logging.NOTSET)
+        with _isolated_root_logging():
+            _configure_logging()
+            assert httpx_logger.level == logging.NOTSET  # untouched
+    finally:
+        httpx_logger.setLevel(saved)
+
+
+def test_a_multi_item_wake_reports_its_turn_count_alongside_the_step_total(
+    platform, tmp_path, caplog
+):
+    """`max_steps` is a *per-turn* budget, and a wake takes one turn per activated task — so the
+    end line carries the turn count. Without it, a legitimate multi-item wake's cumulative step
+    total would read as a blown budget."""
+    serve_messages(platform, page())  # no messages — the tasks are the work
+    serve_tasks(
+        platform,
+        task_page(
+            task(uuid=T0, instructions="draft the release notes"),
+            task(uuid=T1, instructions="check the mail"),
+        ),
+    )
+    agent, provider = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert len(provider.prompts) == 2  # two tasks → two model turns
+    end = _line(caplog, "wake end")
+    assert "turns=2" in end
+    assert "steps=2/24" in end  # one step each, summed — and the turn count explains the sum
+    assert "posted=2" in end

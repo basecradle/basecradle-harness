@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 
 from basecradle_harness._exceptions import EngineError, ProviderResponseError
 from basecradle_harness._messages import ImageContent, Message, ToolResult, ToolSpec
+from basecradle_harness._observability import kv
 from basecradle_harness._provider import Provider
 from basecradle_harness._tools import ToolRegistry
 
@@ -131,6 +132,15 @@ class Engine:
         self.turn_hook = turn_hook
         self.server_builtins = frozenset(server_builtins)
         self.response_retries = response_retries
+        #: Steps spent across every `run` this engine has driven, and how many runs that was. A
+        #: wake process runs one engine, so together these *are* the wake's model usage — what its
+        #: end-of-wake log line reports. `max_steps` is a **per-run** budget, so `steps_used` may
+        #: exceed it across a multi-item wake (one run per activated task / posted asset / webhook
+        #: delivery); `turns_run` is what says so, and is why the end line carries both. The
+        #: out-of-budget reserve call is deliberately not counted as a step: it is the harness's
+        #: call, never a step the model was promised.
+        self.steps_used = 0
+        self.turns_run = 0
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep or time.sleep
 
@@ -156,6 +166,7 @@ class Engine:
         the reserve call itself failing.
         """
         specs = self.tools.specs() or None
+        self.turns_run += 1
         shown: list[Message] = []  # image turns injected this run, evicted before returning
         # The eviction must happen however the loop ends — including the reserve/error
         # path — or a viewed image's base64 lingers in the (mutated-in-place) transcript
@@ -163,6 +174,7 @@ class Engine:
         try:
             for step in range(1, self.max_steps + 1):
                 started = self._clock()
+                self.steps_used += 1
                 # Recency beats primacy for a changing value, and a stable prefix keeps the
                 # provider's prompt cache hot — so the counter rides a *trailing* system turn,
                 # re-appended each step, never a mutation of the head of the context.
@@ -309,7 +321,13 @@ class Engine:
         Errors are fed back as the tool's output rather than raised: a model that
         called a missing tool or passed bad arguments can see what went wrong and
         try again, which is how a real agent recovers.
+
+        Every outcome also leaves a log line (`_log_tool`), because feeding a failure back to
+        the model makes it *invisible to the operator*: before this, a tool that failed on
+        every call looked, in the journal, exactly like one that worked — the step ledger
+        names which tools a step called, never whether they succeeded.
         """
+        started = self._clock()
         try:
             tool = self.tools.get(name)
         except KeyError:
@@ -319,12 +337,30 @@ class Engine:
             # configured built-in gets targeted guidance back to its working (automatic) path;
             # a genuinely unknown name still gets the generic error below.
             if name in self.server_builtins:
+                self._log_tool(name, started, error=f"{name!r} is server-side, not a function")
                 return _server_builtin_guidance(name)
+            self._log_tool(name, started, error=f"no tool named {name!r}")
             return f"Error: no tool named {name!r}."
         try:
-            return tool.run(**arguments)
+            result = tool.run(**arguments)
         except Exception as exc:  # noqa: BLE001 - any tool failure becomes model-readable
+            self._log_tool(name, started, error=str(exc))
             return f"Error running {name!r}: {exc}"
+        self._log_tool(name, started)
+        return result
+
+    def _log_tool(self, name: str, started: datetime, *, error: str | None = None) -> None:
+        """One INFO line per tool run — plus a WARNING carrying the error text when it failed.
+
+        The INFO line is the ledger entry (name, duration, outcome) that says a tool ran at all;
+        the WARNING is what a log filter set to `WARNING` and above still sees, so a tool failing
+        in production surfaces without anyone having to trawl `INFO`. The error text goes only
+        into the WARNING — the model still receives it as the tool's result, exactly as before.
+        """
+        elapsed = (self._clock() - started).total_seconds()
+        _log.info("tool %s", kv(name=name, duration=f"{elapsed:.2f}s", outcome=_outcome(error)))
+        if error is not None:
+            _log.warning("tool %s", kv(name=name, error=error))
 
 
 def _step_note(step: int, max_steps: int, now: datetime) -> str:
@@ -361,6 +397,11 @@ def _step_action(reply: Message, extend: bool) -> str:
     if reply.tool_calls:
         return "tools=" + ",".join(call.name for call in reply.tool_calls)
     return "hook continue" if extend else "final reply"
+
+
+def _outcome(error: str | None) -> str:
+    """``ok`` or ``error`` — the one word a tool line's outcome field can carry."""
+    return "ok" if error is None else "error"
 
 
 def _server_builtin_guidance(name: str) -> str:

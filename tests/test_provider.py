@@ -9,6 +9,7 @@ API, with the server-side ``web_search`` built-in and vision).
 """
 
 import json
+import logging
 
 import httpx
 import pytest
@@ -662,3 +663,70 @@ def test_any_class_with_chat_satisfies_the_protocol(provider):
 def test_a_handwritten_provider_works_through_the_interface():
     p: Provider = EchoProvider()
     assert p.chat([Message.user("ping")]).content == "ping"
+
+
+# --- the per-call log line (issue #272) --------------------------------------
+
+
+def _llm_line(caplog) -> str:
+    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
+
+
+def test_a_responses_call_logs_one_line_with_the_provider_model_and_tokens(
+    router, responses_provider, caplog
+):
+    body = responses_body(out_message("Hi."))
+    body["usage"] = {"input_tokens": 120, "output_tokens": 8, "total_tokens": 128}
+    router.post(RESPONSES_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        responses_provider.chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert "provider=openai" in line and "model=gpt-5.4-mini" in line
+    assert "tokens_in=120 tokens_out=8 tokens_total=128" in line
+
+
+def test_the_chat_surface_logs_the_same_line_from_its_own_usage_shape(router, provider, caplog):
+    """Responses reports ``input_tokens``, Chat reports ``prompt_tokens`` — one line, either way."""
+    body = completion(content="Hi.")
+    body["usage"] = {"prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100}
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("hello")])
+
+    assert "tokens_in=90 tokens_out=10 tokens_total=100" in _llm_line(caplog)
+
+
+def test_the_provider_label_names_the_endpoint_vendor_not_the_sdk(router, caplog):
+    """One adapter serves three vendors, so grok-through-the-openai-SDK must not log as OpenAI —
+    the label is what makes the line true (`_provider_from_config` passes AI_PROVIDER through)."""
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("Hi.")))
+    )
+    grok = OpenAIProvider(
+        model="grok-4.3",
+        api_key=FAKE_KEY,
+        base_url=BASE_URL,
+        provider="xai",
+        surface="responses",
+        max_retries=0,
+    )
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        grok.chat([Message.user("hello")])
+
+    assert "provider=xai" in _llm_line(caplog)
+
+
+def test_a_call_that_never_returned_logs_no_llm_line(router, provider, caplog):
+    """A duration is only honest for a call that completed; the failure path is the engine's
+    retry/give-up story to tell."""
+    router.post(CHAT_URL).mock(return_value=httpx.Response(500, json={"error": {"message": "no"}}))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        with pytest.raises(ProviderAPIError):
+            provider.chat([Message.user("hello")])
+
+    assert not any(m.startswith("llm ") for m in (r.getMessage() for r in caplog.records))
