@@ -1530,6 +1530,10 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     assert report["opt_in_tools"] == []
     # The MCP manifest (issue #261) is empty too — the default `mcp/` dir ships empty.
     assert report["mcp_servers"] == []
+    # The memory axis (issue #269): the *bound* store, and the version of the package backing it
+    # (none for the built-in sqlite store — it ships inside the harness).
+    assert report["memory_provider"] == "sqlite"
+    assert report["memory_provider_version"] is None
     # Model params (issue #236): absent file → an empty object and no collisions, present in the
     # additive contract so a verifier can rely on the keys existing.
     assert report["model_params"] == {}
@@ -1626,6 +1630,40 @@ def test_resolved_config_reports_configured_mcp_servers_regardless_of_load(
     # And the failed load is honestly recorded in `skipped` (the loaded set diverges from the
     # configured set) — proving `mcp_servers` reports configuration, not liveness.
     assert "workmail" in report["skipped"]
+
+
+def test_resolved_config_reports_the_default_memory_provider_so_a_silent_fallback_is_visible(
+    wake_env, monkeypatch
+):
+    """The memory axis (issue #269). With no `HARNESS_MEMORY_PROVIDER` the harness binds the
+    default SQLite store — and *says so*. That is the whole point: before this field, an agent
+    that lost the var from its `agent.env` fell back to SQLite, quietly abandoned its palace, and
+    stayed byte-indistinguishable from a MemPalace agent in every off-box signal. `sqlite` carries
+    no version — its store ships inside the harness, whose version is `harness_version`."""
+    monkeypatch.delenv("HARNESS_MEMORY_PROVIDER", raising=False)
+
+    report = resolved_config()
+
+    assert report["memory_provider"] == "sqlite"
+    assert report["memory_provider_version"] is None
+
+
+def test_resolved_config_reports_a_bound_mempalace_provider(wake_env, monkeypatch):
+    """Env var set → the *bound* provider is reported, read off the object `_resolve_tools`
+    actually built (not a re-read of the var — the `--resolved-config` env-gap class,
+    basecradle-noc#62). The version is `None` here because MemPalace is an optional extra this
+    suite never installs — which is exactly the off-box defect signal it exists to give: bound to
+    a palace whose package is absent (binding is lazy), so the agent loses its memory at the first
+    wake while every other signal reads green."""
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+
+    report = resolved_config()
+
+    assert report["memory_provider"] == "mempalace"
+    assert report["memory_provider_version"] is None
+    # An automatic-only provider contributes no memory tool, so the tool axis alone could never
+    # have distinguished this agent from a memory-less one — the reason the field is needed.
+    assert "memory" not in report["tools"]
 
 
 def test_resolved_config_reports_the_active_profile_locked_by_default(wake_env):
