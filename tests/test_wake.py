@@ -1661,8 +1661,11 @@ def test_resolved_config_reports_a_bound_mempalace_provider(wake_env, monkeypatc
 
     assert report["memory_provider"] == "mempalace"
     assert report["memory_provider_version"] is None
-    # An automatic-only provider contributes no memory tool, so the tool axis alone could never
-    # have distinguished this agent from a memory-less one — the reason the field is needed.
+    # The provider's own tools fold into the resolved set, so a MemPalace agent carries its
+    # read-only `memory_search` (issue #267) and *not* the SQLite `memory` tool. The tool axis
+    # is still no substitute for the field, though: a provider may contribute no tool at all, so
+    # only `memory_provider` names the bound store.
+    assert "memory_search" in report["tools"]
     assert "memory" not in report["tools"]
 
 

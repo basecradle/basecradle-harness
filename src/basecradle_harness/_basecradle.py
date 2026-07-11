@@ -931,8 +931,9 @@ def _resolve_tools_and_provider() -> tuple[
     resolved built-ins.
 
     Memory is a provider now, not a hardcoded plugin — so the memory tool comes from
-    ``memory.tools()`` (the default SQLite provider supplies the `MemoryTool`; an
-    automatic-only provider like MemPalace supplies none). **MCP drop-ins** (Group 5) fold
+    ``memory.tools()`` (the default SQLite provider supplies the `MemoryTool`; the MemPalace
+    adapter supplies its read-only `memory_search`; a provider that wants purely automatic
+    memory supplies none). **MCP drop-ins** (Group 5) fold
     in next: every server configured under the config home's ``mcp/`` dir is connected, its
     tools proxied into the set, and its safe-by-default opt-out surfaced in ``.notices``
     (`_merge_mcp_tools`) — with ``mcp/`` empty (the default) this is a no-op. Finally the
