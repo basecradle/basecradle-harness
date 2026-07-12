@@ -90,6 +90,9 @@ from basecradle_harness._openrouter import (
     DEFAULT_SURFACE as OPENROUTER_DEFAULT_SURFACE,
 )
 from basecradle_harness._openrouter import (
+    ROUTING_METADATA_HEADER as OPENROUTER_ROUTING_METADATA_HEADER,
+)
+from basecradle_harness._openrouter import (
     SURFACES as OPENROUTER_SURFACES,
 )
 from basecradle_harness._openrouter import (
@@ -649,6 +652,11 @@ _OWNED_OPENROUTER = frozenset(
         "messages",
         "tools",
         "stream",
+        # The harness passes this to ``chat.send`` itself (the routing-metadata header, issue #280).
+        # Left un-owned, an operator key of the same name would arrive as a *second* value for the
+        # same keyword — ``TypeError: got multiple values for keyword argument`` — which is not the
+        # "unexpected keyword" shape `_ErrorMapper` reframes, so it would crash a wake raw.
+        "http_headers",
     }
 )
 
@@ -889,12 +897,20 @@ def _provider_from_config(
         # OpenRouter over the openai SDK: chat wire only, no server-side built-ins and no code
         # bridge (`_maybe_code_bridge` already excludes it). The operator's `extra_body` (if any)
         # is the escape hatch and passes straight through.
+        #
+        # The routing-metadata header goes on for the same reason the native adapter sends it: a
+        # router must be asked to say which endpoint it routed to, and unasked it says nothing
+        # trustworthy (issue #280). Set *here* rather than in the adapter, because this one adapter
+        # also serves OpenAI and xAI, where the header would be meaningless — which endpoint we are
+        # aimed at is this layer's knowledge, and keeping it here is what keeps the adapter free of
+        # a vendor branch.
         return OpenAIProvider(
             model,
             base_url=base_url,
             provider=provider,
             surface=surface,
             extra_body=params_extra_body,
+            extra_headers=OPENROUTER_ROUTING_METADATA_HEADER,
             **params,
         )
     # The code-execution Asset bridge supplies the live ``container`` for the code_interpreter

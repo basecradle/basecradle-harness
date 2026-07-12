@@ -132,12 +132,54 @@ def test_a_non_numeric_cost_is_left_out_rather_than_guessed_at():
 # --- the serving endpoint: a capability, not a vendor branch ------------------
 
 
-def test_the_serving_endpoint_is_read_where_the_provider_names_one():
-    """OpenRouter is a *router*: one model id fans out to endpoints differing 10× in context
-    ceiling and 5.4× in price, so `provider=openrouter` alone cannot say what a call ran against."""
-    body = {"id": "gen-1", "model": "z-ai/glm-5.2", "provider": "StreamLake"}
+def _routed(selected: str, *considered: str, provider: str | None = None) -> dict:
+    """A response carrying OpenRouter's routing metadata — the endpoints it weighed, and its pick.
+
+    `provider` sets the response's **top-level** `provider` field, which is the one that must never
+    be read (issue #280); the tests pass a *wrong* value there on purpose.
+    """
+    available = [{"provider": name, "selected": False} for name in considered]
+    available.append({"provider": selected, "selected": True})
+    body = {
+        "id": "gen-1",
+        "model": "z-ai/glm-5.2",
+        "openrouter_metadata": {"endpoints": {"available": available, "total": len(available)}},
+    }
+    if provider is not None:
+        body["provider"] = provider
+    return body
+
+
+def test_the_serving_endpoint_is_the_one_the_router_says_it_selected():
+    """OpenRouter is a *router*: one model id fans out to endpoints differing 10× in context ceiling
+    and 5.4× in price, so `provider=openrouter` alone cannot say what a call ran against. The answer
+    is the endpoint the router flags `selected` in its routing metadata."""
+    assert serving_endpoint(_routed("StreamLake", "Novita", "Together")) == "StreamLake"
+
+
+def test_the_top_level_provider_field_is_never_read():
+    """The defect of issue #280, pinned so it cannot come back.
+
+    The response's top-level `provider` is undocumented and does **not** mean the serving endpoint:
+    it names the last upstream OpenRouter spoke to, which — whenever a server-side tool ran — is the
+    tool's provider, not the model's. Live, with `openrouter:web_search` active, a `z-ai/glm-5.2`
+    call really does return `"provider": "OpenAI"` while the routing metadata correctly reports
+    `StreamLake`. Reading it fabricated a routing distribution that never happened.
+    """
+    body = _routed("StreamLake", "Novita", provider="OpenAI")
 
     assert serving_endpoint(body) == "StreamLake"
+
+
+def test_an_unselected_pool_names_no_endpoint_rather_than_guessing():
+    """The router listed what it *could* have used but flagged none as used — so we know the pool,
+    not the pick. Omit the field; never fall back to the top-level `provider` that produced #280."""
+    body = {
+        "provider": "OpenAI",
+        "openrouter_metadata": {"endpoints": {"available": [{"provider": "Novita"}]}},
+    }
+
+    assert serving_endpoint(body) is None
 
 
 def test_a_direct_to_vendor_response_names_no_endpoint_and_the_field_is_omitted():

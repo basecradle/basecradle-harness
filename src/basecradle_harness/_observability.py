@@ -93,11 +93,25 @@ _COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost",),)
 #: OpenRouter fronts ~27 distinct endpoints for a single model id, and they differ by up to 10× in
 #: context ceiling and 5.4× in prompt price — so ``provider=openrouter`` alone cannot say what a
 #: call ran against, or why two identical-looking calls cost different money (issue #274).
-#: OpenRouter names the server in the response's top-level ``provider`` field (``"StreamLake"``).
+#:
+#: This is the response's **routing metadata**: the endpoint list OpenRouter routed over, with the
+#: one it picked flagged ``selected``. It is the *documented* answer, and it is opt-in — it appears
+#: only when the request asks for it (``X-OpenRouter-Metadata: enabled``), which the OpenRouter
+#: cells send on every call.
+#:
+#: **What is deliberately NOT read: the response's top-level ``provider`` field** (issue #280). It is
+#: undocumented — absent from OpenRouter's own OpenAPI schema — and it does not mean what its name
+#: suggests. It names *the last upstream OpenRouter spoke to*, which is **not** the serving endpoint
+#: whenever a server-side tool ran: with the ``openrouter:web_search`` built-in active, a live
+#: ``z-ai/glm-5.2`` call returns ``"provider": "OpenAI"`` — a vendor that serves no endpoint in that
+#: model's pool — while the routing metadata correctly reports ``StreamLake``. Reading it did not
+#: merely lose data, it **fabricated a distribution**: @glm-5.2 logged ``endpoint=OpenAI`` on every
+#: search-enabled wake. Better to omit the field than to log a wrong one — the same rule cost obeys.
+#:
 #: Read as a **capability, not a vendor branch**: every adapter asks this of whatever its SDK
 #: returned, and a direct-to-vendor SDK — where the vendor *is* the endpoint — finds nothing here
 #: and the field is simply omitted.
-_ENDPOINT_FIELDS: tuple[tuple[str, ...], ...] = (("provider",),)
+_ROUTING_METADATA: tuple[str, ...] = ("openrouter_metadata", "endpoints", "available")
 
 
 def kv(**fields: Any) -> str:
@@ -242,16 +256,32 @@ def reported_cost(usage: Any) -> float | None:
 
 
 def serving_endpoint(response: Any) -> str | None:
-    """The upstream that actually served this call, when the provider names one (`_ENDPOINT_FIELDS`).
+    """The upstream that actually served this call, per the response's routing metadata.
 
-    Given whatever the adapter's SDK handed back — a response mapping or a proto — so one reader
-    serves every adapter. ``None`` when the provider has no such concept, which is the honest
-    answer for a direct-to-vendor SDK: there, the vendor *is* the endpoint.
+    Given whatever the adapter's SDK handed back — a response mapping, a typed model, a proto — so
+    one reader serves every adapter (`_read` handles all three). The router lists every endpoint it
+    considered and flags the one it **picked**; that flag is the whole answer, and it stays right
+    even when a server-side tool ran, which is exactly where the old read went wrong (`_ROUTING_METADATA`,
+    issue #280).
+
+    ``None`` — the field omitted — whenever the response names no selected endpoint: a
+    direct-to-vendor SDK (there, the vendor *is* the endpoint), or a router that was not asked for
+    its metadata. **Omitting is the correct failure.** The predecessor of this function reached for a
+    plausible-looking field instead, and a wrong endpoint is worse than an absent one: it does not
+    leave a gap in the routing review, it invents a distribution that never happened.
     """
-    value = _first(response, _ENDPOINT_FIELDS) if response is not None else None
-    if not isinstance(value, str):
+    if response is None:
         return None
-    return value.strip() or None
+    available = _first(response, (_ROUTING_METADATA,))
+    if not isinstance(available, (list, tuple)):
+        return None
+    for endpoint in available:
+        if not _read(endpoint, "selected"):
+            continue
+        name = _read(endpoint, "provider")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
 
 
 def describe_provider(provider: object) -> tuple[str, str]:

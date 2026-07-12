@@ -522,16 +522,30 @@ def _llm_line(caplog) -> str:
     return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
 
 
+def _routing_metadata(selected: str, *considered: str) -> dict:
+    """OpenRouter's `openrouter_metadata` block: the endpoints it weighed, and the one it picked."""
+    available = [{"model": MODEL, "provider": name, "selected": False} for name in considered]
+    available.append({"model": MODEL, "provider": selected, "selected": True})
+    return {
+        "attempt": 1,
+        "endpoints": {"available": available, "total": len(available)},
+        "is_byok": False,
+        "region": None,
+        "requested": MODEL,
+        "strategy": "direct",
+        "summary": f"routed to {selected}",
+    }
+
+
 def test_the_line_names_the_upstream_that_actually_served_the_call(router, caplog):
     """`provider=openrouter` names who *dispatched* the call. OpenRouter fans one model id out to
     ~27 endpoints spanning 10× in context ceiling and 5.4× in price, so the line has to say who
-    *served* it — and that fact reaches the harness only through the raw body: the SDK's typed
-    ``ChatResult`` does not model the top-level ``provider`` field, so ``model_dump()`` has already
-    lost it. This is the test that fails the moment the capture hook stops being installed."""
+    *served* it — and the answer is the endpoint the router flags `selected` in the routing metadata
+    the request asked for (issue #280)."""
     import logging
 
     body = completion(content="Hi.")
-    body["provider"] = "StreamLake"
+    body["openrouter_metadata"] = _routing_metadata("StreamLake", "Novita")
     body["usage"] |= {"cost": 0.0445, "prompt_tokens_details": {"cached_tokens": 238277}}
     router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
 
@@ -542,6 +556,39 @@ def test_the_line_names_the_upstream_that_actually_served_the_call(router, caplo
     assert "endpoint=StreamLake" in line
     assert "cached_tokens=238277" in line  # the cache is working, or it isn't — no more inferring
     assert "cost=0.0445" in line  # OpenRouter's own figure, not harness arithmetic
+
+
+def test_the_call_asks_openrouter_which_endpoint_it_routed_to(router, caplog):
+    """The metadata is **opt-in**: unasked, OpenRouter says nothing trustworthy about routing. So
+    every call sends the header — without it the `endpoint=` field silently disappears."""
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="Hi."))
+    )
+
+    _provider().chat([Message.user("hello")])
+
+    assert route.calls.last.request.headers["X-OpenRouter-Metadata"] == "enabled"
+
+
+def test_the_top_level_provider_field_is_never_read(router, caplog):
+    """The #280 defect, pinned at the adapter: with `openrouter:web_search` active, OpenRouter's
+    undocumented top-level `provider` reports **the search tool's** upstream (`OpenAI`) — a vendor
+    that serves no endpoint in `z-ai/glm-5.2`'s pool — while the routing metadata correctly names
+    the model's. Reading the former logged a routing distribution that never happened.
+    """
+    import logging
+
+    body = completion(content="Hi.")
+    body["provider"] = "OpenAI"  # what the live wake actually returned, and must never be believed
+    body["openrouter_metadata"] = _routing_metadata("StreamLake", "Novita")
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider().chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert "endpoint=StreamLake" in line
+    assert "OpenAI" not in line
 
 
 def test_a_body_that_names_no_endpoint_omits_the_field_rather_than_faking_one(router, caplog):

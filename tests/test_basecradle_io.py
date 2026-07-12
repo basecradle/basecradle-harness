@@ -1035,6 +1035,21 @@ def test_model_params_timeout_is_stripped_on_the_openrouter_build(monkeypatch, c
     provider.close()
 
 
+def test_model_params_http_headers_is_stripped_on_the_openrouter_build(monkeypatch, caplog):
+    # `http_headers` is harness-owned: the adapter passes it to `chat.send` itself, carrying the
+    # routing-metadata header (issue #280). Un-owned, an operator key of the same name would arrive
+    # as a *second* value for that keyword — `TypeError: got multiple values for keyword argument` —
+    # which is not the "unexpected keyword" shape the error mapper reframes, so it would crash the
+    # wake raw rather than producing an actionable message.
+    _set_openrouter_model_key(monkeypatch)
+    _write_model_params({"http_headers": {"X-Mine": "1"}, "temperature": 0.2})
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("openrouter", "openrouter", "chat")
+    assert provider._default_params == {"temperature": 0.2}
+    assert "'http_headers'" in caplog.text
+    provider.close()
+
+
 def test_malformed_model_params_does_not_mask_a_config_mismatch(monkeypatch):
     # A config-shape error must win over a malformed model_params.json: the wake should point at
     # the real problem (the sdk/provider mismatch), not at a tuning file it would never use.
