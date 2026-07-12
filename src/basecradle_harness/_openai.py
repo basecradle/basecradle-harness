@@ -37,6 +37,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAPIError,
@@ -133,6 +134,18 @@ class OpenAIProvider:
         default_params: Extra body parameters sent on every call (e.g. ``temperature=0.2``).
             ``model``, the input/messages, and ``tools`` always take precedence.
     """
+
+    #: How this adapter's endpoints reach their prompt cache (issue #277). Every endpoint this one
+    #: adapter is aimed at — OpenAI, xAI, and OpenRouter's GLM endpoints — caches a repeated prefix
+    #: **automatically**, with nothing on the wire, so the engine places no breakpoint and the
+    #: caching that already works (verified live: a `cached_tokens: 238277` hit) is untouched.
+    #:
+    #: The stated exception, so it is not a silent trap: pointed at an **explicit-cache model
+    #: through a router** (``anthropic/claude-*`` via OpenRouter), this declaration is wrong — that
+    #: agent would cache nothing and pay full freight. It is not a live cell (no fleet agent runs
+    #: one) and closing it means resolving the mode from the *routed* model rather than the adapter,
+    #: which is the natural shape of the native Anthropic adapter this capability exists to unblock.
+    cache_mode = AUTOMATIC
 
     def __init__(
         self,

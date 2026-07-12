@@ -58,6 +58,7 @@ from typing import Any
 
 import httpx
 
+from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAPIError,
@@ -240,6 +241,18 @@ class OpenRouterProvider:
             precedence. Because ``chat.send`` is typed with no ``**kwargs``, a key it does not name
             raises a ``TypeError`` mapped to an actionable `ProviderError` (see `_ErrorMapper`).
     """
+
+    #: How this adapter's endpoints reach their prompt cache (issue #277). OpenRouter passes caching
+    #: through to whichever upstream serves the call, and every endpoint the fleet routes to caches
+    #: **automatically** — verified live rather than trusted: a `z-ai/glm-5.2` probe returned
+    #: ``cached_tokens: 238277`` billed at the cache-read rate while OpenRouter's own
+    #: ``supports_implicit_caching`` metadata read ``false`` on every one of that model's endpoints.
+    #: That is exactly why the mode is *declared* here and never inferred from provider metadata.
+    #:
+    #: Same stated exception as the `openai` adapter: routed at an explicit-cache model
+    #: (``anthropic/claude-*``), a pass-through router needs breakpoints and this declaration would
+    #: be wrong. Not a live cell; closing it means answering from the routed model, not the adapter.
+    cache_mode = AUTOMATIC
 
     def __init__(
         self,
