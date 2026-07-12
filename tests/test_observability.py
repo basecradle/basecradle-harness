@@ -15,6 +15,8 @@ from basecradle_harness._observability import (
     log_llm_call,
     log_media_call,
     media_timer,
+    reported_cost,
+    serving_endpoint,
     token_counts,
 )
 
@@ -64,6 +66,92 @@ def test_a_non_integer_token_field_is_left_out_rather_than_guessed_at():
     assert token_counts({"input_tokens": "lots", "output_tokens": 5}) == {"tokens_out": 5}
 
 
+# --- the cached-prompt count (issue #274) ------------------------------------
+#
+# Whether prompt caching is doing anything at all was, until this field, only inferable — and the
+# inference was wrong: OpenRouter's own `supports_implicit_caching` reads false on endpoints where
+# caching demonstrably works. The reported count is the only trustworthy witness.
+
+
+def test_the_chat_wire_reports_cached_tokens_under_a_details_block():
+    usage = {
+        "prompt_tokens": 300020,
+        "completion_tokens": 236,
+        "total_tokens": 300256,
+        "prompt_tokens_details": {"cached_tokens": 238277},
+    }
+
+    assert token_counts(usage)["cached_tokens"] == 238277
+
+
+def test_the_responses_wire_reports_it_under_its_own_details_block():
+    usage = {
+        "input_tokens": 1200,
+        "output_tokens": 64,
+        "input_tokens_details": {"cached_tokens": 1024},
+    }
+
+    assert token_counts(usage)["cached_tokens"] == 1024
+
+
+def test_the_xai_proto_reports_it_flat_under_its_own_name():
+    class Usage:  # the xAI gRPC shape: attributes, and its own spelling
+        prompt_tokens = 7
+        completion_tokens = 3
+        total_tokens = 10
+        cached_prompt_text_tokens = 4
+
+    assert token_counts(Usage())["cached_tokens"] == 4
+
+
+def test_a_provider_that_reports_no_cached_count_logs_no_cached_field():
+    assert "cached_tokens" not in token_counts({"prompt_tokens": 90, "completion_tokens": 10})
+    # A details block the vendor sent but left empty is the same story: nothing to report.
+    assert "cached_tokens" not in token_counts({"prompt_tokens": 90, "prompt_tokens_details": None})
+
+
+# --- the cost, where the provider states one ---------------------------------
+
+
+def test_the_cost_is_read_where_the_provider_reports_dollars():
+    assert reported_cost({"prompt_tokens": 1, "cost": 0.0445}) == 0.0445
+
+
+def test_a_provider_that_reports_tokens_but_no_dollars_gets_no_cost():
+    """The harness ships no price table — a stale one is worse than an absent field, and the
+    dollar math for a token-only provider belongs at the dashboard layer."""
+    assert reported_cost({"prompt_tokens": 90, "completion_tokens": 10}) is None
+    assert reported_cost(None) is None
+
+
+def test_a_non_numeric_cost_is_left_out_rather_than_guessed_at():
+    assert reported_cost({"cost": "cheap"}) is None
+    assert reported_cost({"cost": True}) is None  # a bool is not a dollar figure
+
+
+# --- the serving endpoint: a capability, not a vendor branch ------------------
+
+
+def test_the_serving_endpoint_is_read_where_the_provider_names_one():
+    """OpenRouter is a *router*: one model id fans out to endpoints differing 10× in context
+    ceiling and 5.4× in price, so `provider=openrouter` alone cannot say what a call ran against."""
+    body = {"id": "gen-1", "model": "z-ai/glm-5.2", "provider": "StreamLake"}
+
+    assert serving_endpoint(body) == "StreamLake"
+
+
+def test_a_direct_to_vendor_response_names_no_endpoint_and_the_field_is_omitted():
+    """Where the SDK talks straight to the vendor, the vendor *is* the endpoint — the honest
+    answer is nothing, not a restatement of the provider."""
+    assert serving_endpoint({"id": "resp_1", "model": "gpt-5.4-mini"}) is None
+    assert serving_endpoint(None) is None
+
+    class Proto:  # the xAI gRPC response: no such concept
+        content = "Hi."
+
+    assert serving_endpoint(Proto()) is None
+
+
 # --- the LLM line ------------------------------------------------------------
 
 
@@ -88,6 +176,55 @@ def test_the_llm_line_still_lands_when_the_sdk_reports_no_usage(caplog):
     assert caplog.records[0].getMessage() == (
         "llm provider=openai model=gpt-5.4-mini duration=0.40s"
     )
+
+
+def test_the_llm_line_names_the_serving_endpoint_the_cache_hit_and_the_cost(caplog):
+    """The full line a router's call earns (issue #274): who dispatched it, who *served* it, what
+    it cost, and how much of the prompt was a cache hit rather than full freight."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(
+            provider="openrouter",
+            model="z-ai/glm-5.2",
+            seconds=42.96,
+            usage={
+                "prompt_tokens": 764942,
+                "completion_tokens": 236,
+                "total_tokens": 765178,
+                "prompt_tokens_details": {"cached_tokens": 238277},
+                "cost": 0.0445,
+            },
+            endpoint="StreamLake",
+            cost=0.0445,
+        )
+
+    assert caplog.records[0].getMessage() == (
+        "llm provider=openrouter endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s "
+        "tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445"
+    )
+
+
+def test_a_free_call_reports_a_zero_cost_rather_than_dropping_the_field(caplog):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(provider="openrouter", model="free/model", seconds=1, cost=0.0)
+
+    assert "cost=0" in caplog.records[0].getMessage()
+
+
+def test_a_sub_cent_cost_is_plain_fixed_point_not_scientific_notation(caplog):
+    """`str(4.4e-05)` is what a grep of this stream cannot read as money."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=0.000044)
+
+    assert "cost=0.000044" in caplog.records[0].getMessage()
+
+
+def test_a_cost_that_is_not_a_number_is_dropped_rather_than_crashing_the_wake(caplog):
+    """The figure comes straight off a vendor object, so a surprise there must cost the *field*,
+    never the turn — the log seam is the last place that should raise."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost="free")  # type: ignore[arg-type]
+
+    assert "cost=" not in caplog.records[0].getMessage()
 
 
 # --- the media line ----------------------------------------------------------

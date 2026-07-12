@@ -445,7 +445,20 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
 ```
 
 - **Bookends.** Every wake opens with what it is about to run (timeline, the trigger when one was named, provider, model) and closes with what came of it (`outcome=ok|declined|error`, model turns, steps against the [budget](#the-step-budget-live-counter-and-reserve-summary), messages posted, wall-clock). The end line rides a `finally`, so a wake that *crashes* still reports what it had done. `max_steps` is a **per-turn** budget and a wake can take several turns — one per item (unseen messages batch into a single turn; an activated task, a posted asset, or a webhook delivery each get their own), plus one for every [mid-generation rebuild](#read-speed-pacing-aiai-conversations). So `steps` is a sum across `turns` and may exceed the cap on a multi-turn wake — which is what `turns` is there to say.
-- **One line per model call**, on every provider — the adapter that made it, the model, how long it took, and the token counts when the SDK returns them (OpenAI's `input_tokens` and the Chat wire's `prompt_tokens` normalize to the same fields). `provider=` names the **endpoint vendor**, not the SDK, so grok-through-the-`openai`-SDK reads `provider=xai`.
+- **One line per model call**, on every provider — the adapter that made it, the model, how long it took, and what it cost. `provider=` names the **endpoint vendor**, not the SDK, so grok-through-the-`openai`-SDK reads `provider=xai`. The cost fields are **capabilities, answered by whoever can**: each adapter reports what its provider actually says, and a field a provider has no answer for is simply absent — the harness ships **no price table**, because a stale table is worse than an honest gap.
+
+  | Field | What it says | Where it lands |
+  |---|---|---|
+  | `tokens_in` / `tokens_out` / `tokens_total` | The call's token counts | Every provider (OpenAI's `input_tokens` and the Chat wire's `prompt_tokens` normalize to the same fields) |
+  | `cached_tokens` | How much of the prompt was a **cache hit** rather than full freight — the difference between paying the input rate and the ~5× cheaper cache-read rate | Wherever the provider reports it |
+  | `endpoint` | Which **upstream actually served** the call | Only where the provider *is* a router. OpenRouter fans one model id out to dozens of endpoints differing up to 10× in context ceiling and 5.4× in price, so `provider=openrouter` alone cannot say what a call ran against; a direct-to-vendor SDK has no such distinction and logs none |
+  | `cost` | The call's charge **in dollars, as the provider reported it** | Only where a provider states one natively (OpenRouter's `usage.cost`; xAI's ticks, converted by its own SDK) |
+
+  So a routed call earns the full line, and an operator can answer "what did that cost, who served it, and was the cache doing anything?" from the journal alone:
+
+  ```
+  INFO llm provider=openrouter endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445
+  ```
 - **One line per tool run** (name, duration, `ok`/`error`) — because a failing tool's error is fed back *to the model* as its result, which made it invisible to the operator; a failure now also logs a `WARNING` carrying the error text.
 - **One line per media generation** (`kind=image.generate` / `image.edit` / `video.generate` / `audio.transcribe`), timing the vendor call, not the Asset upload after it.
 - **One line per message posted** — every post goes through one seam, so a reply, a NOC probe ack (`kind=probe-ack`), a [circuit-breaker](#the-cross-wake-circuit-breaker) alert (`kind=breaker-alert`), and a cross-timeline post the model made with the messages tool (`kind=tool`) each name the message they created. This is what says the agent *spoke*, as opposed to an HTTP call having gone out.

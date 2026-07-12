@@ -5,6 +5,47 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.63.0] - 2026-07-12
+
+**The per-call line now says who *served* the call, what it cost, and whether the cache did anything
+(issue #274).** `provider=openrouter` names a **router**, not a server: a single model id
+(`z-ai/glm-5.2`) is served by ~27 distinct upstreams that differ by **10× in context ceiling**
+(101k–1M tokens) and **5.4× in prompt price**. Two calls logging identically could have run against
+endpoints with nothing in common, and nothing in the journal could tell them apart. The same line
+also settles, permanently, a question that could previously only be *inferred*: whether prompt
+caching is doing anything at all — OpenRouter's own `supports_implicit_caching` metadata reads
+`false` on every glm-5.2 endpoint while caching demonstrably works (a live probe: `cached_tokens:
+238277` on a 300k prompt, billed at the cache-read rate).
+
+### Added
+
+- **`endpoint=` — the upstream that actually served the call.** Modeled as a **uniform adapter
+  capability**, never a vendor branch: every adapter asks the same question of whatever its SDK
+  returned, and a direct-to-vendor SDK — where the vendor *is* the endpoint — answers nothing and
+  the field is cleanly omitted. OpenRouter names it in the response's top-level `provider` field
+  (`endpoint=StreamLake`). On the **native** OpenRouter SDK that fact reaches the harness only
+  through the raw body: the SDK's typed `ChatResult` does not model the field, so `model_dump()` has
+  already lost it — the response-capture hook (which already recovered web-search citations for the
+  same reason) is now installed on **every** call, and attaches to the httpx client the *SDK* owns
+  rather than one the harness builds.
+- **`cached_tokens=` — how much of the prompt was a cache hit** rather than full freight (~5× cheaper
+  at the cache-read rate). Read wherever the provider reports it, under whichever name it uses:
+  `prompt_tokens_details.cached_tokens` (the Chat wire), `input_tokens_details.cached_tokens`
+  (OpenAI Responses), `cached_prompt_text_tokens` (the xAI proto).
+- **`cost=` — the call's charge in dollars, *as the provider reported it*.** OpenRouter returns it on
+  every response (`usage.cost`); xAI reports it natively in ticks and its own SDK converts them
+  (`xai_sdk.cost`, 1 tick = 1e-10 USD). A provider that reports tokens but no dollars (OpenAI,
+  Anthropic) logs **no** `cost=` field — the harness ships **no price table**, because a stale table
+  is worse than an honest gap, and dollar math for a token-only provider belongs at the dashboard
+  layer where staleness is visible. An *unreported* cost logs nothing rather than a fabricated
+  `cost=0`.
+
+The full line a routed call now earns:
+
+```
+INFO llm provider=openrouter endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445
+```
+
 ## [0.62.0] - 2026-07-12
 
 **The transcript now grows with the conversation, not with the mechanism (issue #275).** The whole

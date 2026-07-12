@@ -431,3 +431,66 @@ def test_a_native_call_logs_the_line_reading_usage_off_the_proto(caplog):
     line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
     assert "provider=xai" in line and "model=grok-4.3" in line
     assert "tokens_in=42 tokens_out=6 tokens_total=48" in line
+
+
+# --- the cached count, the cost, and the absent endpoint (issue #274) ---------
+
+
+def _llm_line(caplog) -> str:
+    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
+
+
+def test_the_cached_count_is_read_off_the_real_usage_proto(caplog):
+    """xAI spells the cache hit ``cached_prompt_text_tokens`` and reports it flat on the proto, not
+    under a details block like the HTTP wires — driven through the **real** ``SamplingUsage`` here,
+    because the field name is exactly what the shared reader has to get right."""
+    import logging
+
+    from xai_sdk.proto import usage_pb2
+
+    response = _response(content="Hi.")
+    response.usage = usage_pb2.SamplingUsage(
+        prompt_tokens=42,
+        completion_tokens=6,
+        total_tokens=48,
+        cached_prompt_text_tokens=32,
+    )
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider(response).chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert "tokens_in=42 tokens_out=6 tokens_total=48 cached_tokens=32" in line
+    # The native SDK reaches xAI directly: the vendor *is* the endpoint, so there is no upstream to
+    # name and the field is omitted rather than restating `provider=xai`.
+    assert "endpoint=" not in line
+
+
+def test_the_cost_is_the_sdks_own_dollar_figure_not_harness_arithmetic(caplog):
+    """xAI reports the charge in *ticks* (1e-10 USD); ``Response.cost_usd`` is the SDK's own
+    accessor for the converted dollars, so the adapter passes it through and never owns the
+    constant. Rendered fixed-point — ``4.45e-05`` is not money a log reader can grep."""
+    import logging
+
+    response = _response(content="Hi.")
+    response.cost_usd = 4.45e-05
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider(response).chat([Message.user("hello")])
+
+    assert "cost=0.0000445" in _llm_line(caplog)
+
+
+def test_an_unreported_cost_logs_nothing_rather_than_a_fabricated_zero(caplog):
+    """The SDK distinguishes "xAI named no cost" (``None``) from "the call was free" — so must the
+    line. This is also the shape of an SDK too old to carry the property at all."""
+    import logging
+
+    response = _response(content="Hi.")
+    response.cost_usd = None
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        reply = _provider(response).chat([Message.user("hello")])
+
+    assert reply.content == "Hi."
+    assert "cost=" not in _llm_line(caplog)
