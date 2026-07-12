@@ -31,21 +31,29 @@ harness owns history, so Responses' server-side state (``previous_response_id``)
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
     ProviderConnectionError,
+    ProviderContextLengthError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
 )
 from basecradle_harness._messages import Message, ToolSpec
-from basecradle_harness._observability import log_llm_call, reported_cost, serving_endpoint
+from basecradle_harness._observability import (
+    log_llm_call,
+    reported_cost,
+    serving_endpoint,
+    token_counts,
+)
 from basecradle_harness._openai_wire import (
     builtin_to_responses,
     chat_message_to_wire,
@@ -55,6 +63,8 @@ from basecradle_harness._openai_wire import (
     message_from_responses,
     message_to_input,
 )
+
+_log = logging.getLogger("basecradle_harness")
 
 #: OpenAI's default API root — what the SDK targets when no ``base_url`` is given.
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -149,6 +159,10 @@ class OpenAIProvider:
         openai = require_openai_sdk()
         self.model = model
         self.provider = provider
+        #: The input-token count the endpoint reported for this adapter's most recent call — the
+        #: exact, free, tokenizer-free trigger the context budget compacts on (issue #276). ``None``
+        #: until the first call answers.
+        self.last_tokens_in: int | None = None
         self.surface = surface
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._builtin_tools = [builtin_to_responses(spec) for spec in builtin_tools]
@@ -236,6 +250,10 @@ class OpenAIProvider:
         `model_dump`); pointed at OpenAI or xAI it says neither, and the fields are simply absent.
         """
         usage = data.get("usage")
+        # Remember what we just logged: the context budget triggers on the *provider's* count, so
+        # the same usage read that writes the log line feeds the compaction decision (issue #276).
+        # Both surfaces are covered for free — `token_counts` already knows every spelling.
+        self.last_tokens_in = token_counts(usage).get("tokens_in")
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -244,6 +262,38 @@ class OpenAIProvider:
             endpoint=serving_endpoint(data),
             cost=reported_cost(usage),
         )
+
+    def context_limit(self) -> int | None:
+        """This model's context ceiling, if the endpoint this adapter is aimed at states one (#276).
+
+        A **capability read, not a vendor branch** — this one adapter serves three endpoints and the
+        *endpoint* is what decides whether the fact exists:
+
+        - Pointed at **OpenRouter**, the models API states a context length, and the `openai` SDK's
+          models keep unmodeled fields through `model_dump()`, so it survives and is read here.
+        - Pointed at **OpenAI**, the models API states id/created/owned_by and *nothing about
+          context*. So this honestly returns ``None`` and the budget falls to its conservative floor.
+          That is the deliberate cost of refusing a static model→limit table (issue #276,
+          requirement 2): a table would answer today and lie after the next model launch, silently.
+          An OpenAI agent that wants its real 400 K window sets `HARNESS_MAX_CONTEXT_TOKENS`.
+
+        Never fatal: any failure degrades to ``None``, and the wake runs exactly as before.
+        """
+        try:
+            model = self._client.models.retrieve(self.model)
+        except Exception as exc:  # noqa: BLE001 - degrade to the floor; never break a wake
+            _log.warning("Could not read %s's context limit from the provider: %s", self.model, exc)
+            return None
+        data = model.model_dump() if hasattr(model, "model_dump") else {}
+        if not isinstance(data, Mapping):
+            return None
+        # The spellings an OpenAI-compatible endpoint uses for the same fact. OpenAI itself uses
+        # none of them, which is the honest answer, not a gap to paper over.
+        for key in ("context_length", "context_window", "max_context_length"):
+            value = data.get(key)
+            if not isinstance(value, bool) and isinstance(value, int) and value > 0:
+                return value
+        return None
 
     # --- SDK exceptions → the harness provider error hierarchy ----------------
 
@@ -316,6 +366,11 @@ def _from_status_error(exc) -> ProviderError:
     status = exc.status_code
     body = _body_text(exc)
     message = getattr(exc, "message", None) or str(exc)
+    if status in (400, 413) and is_context_overflow(f"{message} {body}"):
+        # The wall (issue #276): the transcript outgrew the model's context window. Deterministic —
+        # every later wake would rebuild the same over-long request and fail identically — so it is
+        # classed apart from every other 400 and the session compacts and retries the turn once.
+        return ProviderContextLengthError(message, status_code=status, body=body)
     if status in (401, 403):
         return ProviderAuthError(
             f"Provider rejected the API key (HTTP {status}).", status_code=status, body=body

@@ -23,6 +23,7 @@ from basecradle_harness import (
     Provider,
     ProviderAuthError,
     ProviderConnectionError,
+    ProviderContextLengthError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
@@ -494,3 +495,87 @@ def test_an_unreported_cost_logs_nothing_rather_than_a_fabricated_zero(caplog):
 
     assert reply.content == "Hi."
     assert "cost=" not in _llm_line(caplog)
+
+
+# === The context-limit capability + the wall (issue #276) ====================
+#
+# The cleanest of the three adapters: xAI's own model metadata carries the number
+# (`LanguageModel.max_prompt_length`), so there is nothing to infer and no table to rot.
+
+
+class _FakeModelsClient:
+    """Stands in for ``client.models``: returns a canned language-model description."""
+
+    def __init__(self, model):
+        self._model = model
+        self.asked = []
+
+    def get_language_model(self, name):
+        self.asked.append(name)
+        if isinstance(self._model, Exception):
+            raise self._model
+        return self._model
+
+
+def _provider_with_models(model):
+    client = _FakeClient(_response(content="hi"))
+    client.models = _FakeModelsClient(model)
+    return XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=client)
+
+
+def test_the_context_limit_comes_from_xais_own_model_metadata():
+    provider = _provider_with_models(SimpleNamespace(max_prompt_length=2_000_000))
+
+    assert provider.context_limit() == 2_000_000
+    assert provider._client.models.asked == ["grok-4.3"]
+
+
+def test_a_model_that_reports_no_length_yields_no_answer():
+    provider = _provider_with_models(SimpleNamespace(max_prompt_length=0))
+
+    # No answer → the budget falls to its conservative floor, rather than trusting a zero.
+    assert provider.context_limit() is None
+
+
+def test_an_unreachable_models_endpoint_degrades_to_no_answer():
+    provider = _provider_with_models(RuntimeError("grpc: deadline exceeded"))
+
+    # A metadata read must never break a wake.
+    assert provider.context_limit() is None
+
+
+def test_the_last_reported_input_tokens_are_remembered_for_the_context_budget():
+    response = _response(content="hi")
+    # `prompt_tokens` is the whole prompt (xAI's proto also carries the text-only subset,
+    # `prompt_text_tokens`) — the budget must trigger on the total, images included.
+    response.usage = SimpleNamespace(
+        prompt_tokens=41_000, prompt_text_tokens=38_000, completion_tokens=12
+    )
+    provider = XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=_FakeClient(response))
+
+    assert provider.last_tokens_in is None  # nothing to report before the first call
+    provider.chat([Message.user("hi")])
+
+    # The same usage read that writes the log line feeds the compaction decision — the trigger is
+    # the provider's *own* count, exact and free, never a client-side estimate.
+    assert provider.last_tokens_in == 41_000
+
+
+def test_an_over_length_invalid_argument_maps_to_the_context_length_error():
+    error = _FakeRpcError(
+        grpc.StatusCode.INVALID_ARGUMENT,
+        details="prompt is too long: 300000 tokens > 256000 maximum context length",
+    )
+    provider = XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=_RaisingClient(error))
+
+    with pytest.raises(ProviderContextLengthError):
+        provider.chat([Message.user("hi")])
+
+
+def test_an_ordinary_invalid_argument_is_not_mistaken_for_the_wall():
+    provider = _provider_raising(grpc.StatusCode.INVALID_ARGUMENT)
+
+    with pytest.raises(ProviderError) as exc:
+        provider.chat([Message.user("hi")])
+
+    assert not isinstance(exc.value, ProviderContextLengthError)

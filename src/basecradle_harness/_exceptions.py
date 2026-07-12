@@ -68,6 +68,20 @@ class ProviderAuthError(ProviderAPIError):
     """The provider rejected the API key (HTTP 401/403)."""
 
 
+class ProviderContextLengthError(ProviderAPIError):
+    """The request exceeded the model's context window — the wall (issue #276).
+
+    Deterministic, not transient: the same transcript re-sent produces the same 400 forever, so
+    retrying it unchanged only repeats it. It is separated from every other status error precisely
+    *because* the harness can do something about it — `Session.send` catches it, compacts the
+    transcript hard, and re-runs the turn once, so an agent that has already grown past its ceiling
+    **self-heals on its next wake** instead of needing a human to edit its session file by hand.
+
+    Adapters map their own over-length status error to this (see `is_context_overflow`), so the
+    recovery is provider-agnostic — classified by the nature of the fault, never by the vendor.
+    """
+
+
 class ProviderRateLimitError(ProviderAPIError):
     """The provider rate-limited the request (HTTP 429).
 

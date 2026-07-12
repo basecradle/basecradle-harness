@@ -50,6 +50,7 @@ harness owns history — this adapter never sets ``stream`` (it is non-streaming
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from collections.abc import Mapping, Sequence
@@ -57,21 +58,30 @@ from typing import Any
 
 import httpx
 
+from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
     ProviderConnectionError,
+    ProviderContextLengthError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
 )
 from basecradle_harness._messages import Message, ToolSpec
-from basecradle_harness._observability import log_llm_call, reported_cost, serving_endpoint
+from basecradle_harness._observability import (
+    log_llm_call,
+    reported_cost,
+    serving_endpoint,
+    token_counts,
+)
 from basecradle_harness._openai_wire import (
     chat_message_to_wire,
     chat_tool_to_wire,
     message_from_chat,
 )
+
+_log = logging.getLogger("basecradle_harness")
 
 #: OpenRouter's API root — supplied as the SDK ``server_url`` (its own default is the same host,
 #: but the harness passes it explicitly so the config layer's ``AI_BASE_URL`` override flows here).
@@ -245,6 +255,11 @@ class OpenRouterProvider:
     ) -> None:
         self.model = model
         self.provider = PROVIDER
+        #: The input-token count OpenRouter reported for this adapter's most recent call — the
+        #: exact, free, tokenizer-free trigger the context budget compacts on (issue #276). It
+        #: matters most here: GLM publishes no tokenizer, so a client-side count could not even be
+        #: honest. ``None`` until the first call answers.
+        self.last_tokens_in: int | None = None
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._default_params = default_params
         # Server-tool objects are config-time constant (they don't vary per turn), so build them
@@ -298,6 +313,9 @@ class OpenRouterProvider:
             response = self._client.chat.send(**payload)
         data = response.model_dump()
         usage = data.get("usage")
+        # Remember what we just logged: the context budget triggers on the *provider's* count, so
+        # the same usage read that writes the log line feeds the compaction decision (issue #276).
+        self.last_tokens_in = token_counts(usage).get("tokens_in")
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -313,6 +331,56 @@ class OpenRouterProvider:
         )
         self._restore_annotations(data)
         return message_from_chat(data)
+
+    def context_limit(self) -> int | None:
+        """The **honest** context ceiling behind a router — not the model object's best case (#276).
+
+        A router is not a server, and this is where that distinction has teeth. OpenRouter's *model*
+        object advertises the best case across every endpoint it fronts: it says ``z-ai/glm-5.2`` has
+        1,048,576 tokens while its endpoints actually range **101,376 → 1,048,576** (verified live).
+        Reporting that number bare would be reporting a ceiling no individual request is promised.
+
+        So the limit is computed from the live per-endpoint data, and three facts decide it:
+
+        - **OpenRouter filters endpoints by required context at routing time** (verified empirically),
+          so a request too large for the small endpoints is never dispatched to one. The wall a
+          request actually meets is therefore the *largest* endpoint that can serve it — which is why
+          taking the maximum is the honest answer here and would be a lie without that routing
+          behavior. This reasoning is the reason the number is trustworthy; do not delete it.
+        - **A dead endpoint's ceiling is not a ceiling.** ``status`` is not decorative: in today's
+          live pool two endpoints sit at ``status: -5`` with 0% uptime. Only endpoints OpenRouter
+          will actually route to are counted.
+        - **``max_prompt_tokens`` beats ``context_length`` where an endpoint sets it** — it is the
+          tighter promise about the *prompt* specifically, which is the half we are budgeting.
+
+        **The bound worth knowing:** if an operator pins routing to one provider (via
+        ``model_params.json``), the effective ceiling is *that* endpoint's, not the pool's best. The
+        harness does not parse routing preferences, so `HARNESS_MAX_CONTEXT_TOKENS` is the answer
+        there — as it is for an operator who wants a *tighter* budget than the ceiling for cost
+        reasons, which is a policy choice and deliberately not the framework's to make.
+
+        ``None`` on any failure (or a model id without the ``author/slug`` shape the endpoints API
+        needs) — the budget then falls to its conservative floor.
+        """
+        author, _, slug = self.model.partition("/")
+        # An OpenRouter model id may carry a routing **variant** — ``z-ai/glm-5.2:free``,
+        # ``:nitro``, ``:floor`` — which selects how the request is routed, not a different model.
+        # The endpoints API keys on the bare slug, so the suffix must come off or the lookup 404s and
+        # a 1 M-context model silently falls back to the 128 K floor, compacting ~8× too early.
+        slug = slug.partition(":")[0]
+        if not author or not slug:
+            return None
+        try:
+            response = self._client.endpoints.list(author=author, slug=slug)
+        except Exception as exc:  # noqa: BLE001 - degrade to the floor; never break a wake
+            _log.warning("Could not read %s's context limit from OpenRouter: %s", self.model, exc)
+            return None
+        best = 0
+        for endpoint in getattr(getattr(response, "data", None), "endpoints", None) or ():
+            ceiling = _endpoint_ceiling(endpoint)
+            if ceiling is not None:
+                best = max(best, ceiling)
+        return best or None
 
     def _restore_annotations(self, data: dict[str, Any]) -> None:
         """Graft the web-search ``url_citation`` annotations back onto the SDK's model_dump.
@@ -423,6 +491,26 @@ class _ErrorMapper:
         return False  # not an SDK/transport error — let it propagate unchanged
 
 
+def _endpoint_ceiling(endpoint: Any) -> int | None:
+    """One serving endpoint's real prompt ceiling, or ``None`` if it cannot serve a request at all.
+
+    A **negative ``status``** means OpenRouter has taken the endpoint out of rotation (deprioritized
+    or dead — the live pool has some at ``-5``, sitting at 0% uptime), so its ceiling is not one any
+    request can reach and it must not raise the number we report. ``max_prompt_tokens``, where it is
+    set, is a tighter promise about the prompt than ``context_length`` and wins.
+    """
+    status = getattr(endpoint, "status", 0)
+    if isinstance(status, (int, float)) and not isinstance(status, bool) and status < 0:
+        return None
+    ceiling = getattr(endpoint, "context_length", None)
+    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling <= 0:
+        return None
+    prompt_cap = getattr(endpoint, "max_prompt_tokens", None)
+    if not isinstance(prompt_cap, bool) and isinstance(prompt_cap, int) and prompt_cap > 0:
+        return min(ceiling, prompt_cap)
+    return ceiling
+
+
 def _from_status_error(exc) -> ProviderError:
     """An ``openrouter.errors.OpenRouterError`` mapped to the right typed `ProviderError`.
 
@@ -438,6 +526,11 @@ def _from_status_error(exc) -> ProviderError:
     message = getattr(exc, "message", None) or str(exc)
     if status < 400:
         return ProviderError(message)
+    if status in (400, 413) and is_context_overflow(f"{message} {body}"):
+        # The wall (issue #276): the transcript outgrew the serving endpoint's context window.
+        # Deterministic, so it is classed apart from every other 400 — the session compacts and
+        # retries the turn once instead of failing identically on every wake until a human intervenes.
+        return ProviderContextLengthError(message, status_code=status, body=body)
     if status in (401, 403):
         return ProviderAuthError(
             f"OpenRouter rejected the API key (HTTP {status}).", status_code=status, body=body

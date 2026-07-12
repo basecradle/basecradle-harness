@@ -36,21 +36,26 @@ Stateless per turn: the full conversation is sent every call and the harness own
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Sequence
 from typing import Any
 
+from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAuthError,
     ProviderConnectionError,
+    ProviderContextLengthError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
 )
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
-from basecradle_harness._observability import log_llm_call, serving_endpoint
+from basecradle_harness._observability import log_llm_call, serving_endpoint, token_counts
 from basecradle_harness._openai_wire import format_citations
+
+_log = logging.getLogger("basecradle_harness")
 
 #: This adapter's single native (gRPC) surface — declared for the SDK-scoped surface contract
 #: (issue #163); ``AI_SDK_SURFACE`` is left unset for a single-surface SDK.
@@ -116,6 +121,10 @@ class XaiSdkProvider:
     ) -> None:
         self.model = model
         self.provider = PROVIDER
+        #: The input-token count xAI reported for this adapter's most recent call — the exact,
+        #: free, tokenizer-free trigger the context budget compacts on (issue #276). ``None``
+        #: until the first call answers.
+        self.last_tokens_in: int | None = None
         self._builtin_tools = list(builtin_tools)
         self._default_params = default_params
         self._xai = require_xai_sdk()
@@ -154,11 +163,15 @@ class XaiSdkProvider:
         # reads either shape, so the gRPC path logs the same line as the HTTP ones — token counts
         # and the cached-prompt count (xAI spells it `cached_prompt_text_tokens`). A fake client
         # (the seam tests) whose response has no `usage` simply logs no usage fields.
+        usage = getattr(response, "usage", None)
+        # Remember what we just logged: the context budget triggers on the *provider's* count, so
+        # the same read that writes the log line feeds the compaction decision (issue #276).
+        self.last_tokens_in = token_counts(usage).get("tokens_in")
         log_llm_call(
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
-            usage=getattr(response, "usage", None),
+            usage=usage,
             # Asked of every adapter, answered by the ones that can: this SDK reaches xAI directly,
             # so the vendor *is* the endpoint — there is no upstream to name, and the field is
             # omitted rather than faked with a restatement of `provider=xai`.
@@ -171,6 +184,26 @@ class XaiSdkProvider:
             cost=getattr(response, "cost_usd", None),
         )
         return self._from_wire(response)
+
+    def context_limit(self) -> int | None:
+        """This model's context ceiling, straight from xAI — the `ContextBudget` capability (#276).
+
+        The cleanest answer of the three adapters: xAI's own model metadata carries the number
+        (``LanguageModel.max_prompt_length`` on the gRPC proto), so there is nothing to infer and no
+        table to rot. One cheap gRPC call, made lazily and at most once per process.
+
+        ``None`` on any failure or a model that reports no length — the budget then falls to its
+        conservative floor. A metadata read must never break a wake.
+        """
+        try:
+            model = self._client.models.get_language_model(self.model)
+        except Exception as exc:  # noqa: BLE001 - degrade to the floor; never break a wake
+            _log.warning("Could not read %s's context limit from xAI: %s", self.model, exc)
+            return None
+        length = getattr(model, "max_prompt_length", None)
+        if isinstance(length, bool) or not isinstance(length, int) or length <= 0:
+            return None
+        return length
 
     # --- wire translation (harness <-> xai_sdk helpers) ----------------------
 
@@ -323,6 +356,11 @@ class _grpc_error_context:
         code = exc.code() if callable(getattr(exc, "code", None)) else None
         detail = exc.details() if callable(getattr(exc, "details", None)) else str(exc)
         message = f"xAI gRPC error ({getattr(code, 'name', code)}): {detail}"
+        if is_context_overflow(detail or ""):
+            # The wall (issue #276): the prompt was over grok's context window — gRPC's
+            # INVALID_ARGUMENT, the HTTP 400's analogue. Deterministic, so the session compacts and
+            # retries the turn once rather than re-sending a request that fails identically forever.
+            raise ProviderContextLengthError(message, status_code=400, body=detail or "") from exc
         if code == grpc.StatusCode.UNAUTHENTICATED:
             raise ProviderAuthError(message, status_code=401) from exc
         if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
