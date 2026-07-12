@@ -716,6 +716,32 @@ def _merge_extra_body(params_extra_body: Any, harness_extra_body: Any) -> Any:
     return harness_extra_body or params_extra_body or None
 
 
+def _merge_extra_headers(params_headers: Any, harness_headers: Any) -> Any:
+    """Combine the operator's ``extra_headers`` with one the harness composes — harness wins.
+
+    The header-side twin of `_merge_extra_body`, and it exists for the same two reasons. **Merging
+    rather than owning**: an operator's ``extra_headers`` works today on this adapter's OpenAI and
+    xAI endpoints (the ``openai`` SDK takes it per call), so confiscating the key would break a
+    working setup to fix a collision that only exists on the OpenRouter one. **Harness wins on
+    overlap**: the routing-metadata header is what makes ``endpoint=`` truthful (issue #280), and an
+    operator who unsets it would silently blind the fleet's routing review rather than break
+    anything visible — the failure mode this whole issue is about.
+
+    ``None`` when neither side has headers, so nothing is sent and the SDK client is built exactly
+    as it was before.
+    """
+    if params_headers and harness_headers:
+        for key in sorted(set(params_headers) & set(harness_headers)):
+            _log.warning(
+                "model_params.json extra_headers sets %r, which the harness sets itself for this "
+                "provider (the routing-metadata header that makes endpoint= truthful) — the "
+                "harness value wins.",
+                key,
+            )
+        return {**params_headers, **harness_headers}
+    return harness_headers or params_headers or None
+
+
 def resolved_model_params(sdk: str) -> tuple[dict[str, Any], list[str]]:
     """The operator's ``model_params.json`` as loaded, plus the keys the active SDK's build drops.
 
@@ -879,6 +905,13 @@ def _provider_from_config(
     params, params_extra_body = _split_model_params(
         load_model_params(), owned=_OWNED_OPENAI, sdk_label="the openai SDK"
     )
+    # `extra_headers` is now harness wiring on one of this adapter's three endpoints (the routing
+    # header, below), so it is **lifted out** of the operator's tuning rather than splatted with it —
+    # exactly as `extra_body` is, and for the same reason. Left in `params` it would arrive as a
+    # *second* value for the same keyword (`TypeError: got multiple values for keyword argument`),
+    # which is a raw crash, not the warned-and-dropped collision policy. Lifting keeps the operator's
+    # headers working (they merge, below) instead of silently confiscating a key that works today.
+    params_extra_headers = params.pop("extra_headers", None)
     if provider == "xai":
         # xAI's search built-ins ride `search_parameters`, not OpenAI tools entries — so they
         # go through `extra_body`, and nothing is offered as a `builtin_tools` tool here.
@@ -891,6 +924,7 @@ def _provider_from_config(
             provider=provider,
             surface=surface,
             extra_body=extra_body,
+            extra_headers=params_extra_headers,
             **params,
         )
     if provider == "openrouter":
@@ -910,7 +944,9 @@ def _provider_from_config(
             provider=provider,
             surface=surface,
             extra_body=params_extra_body,
-            extra_headers=OPENROUTER_ROUTING_METADATA_HEADER,
+            extra_headers=_merge_extra_headers(
+                params_extra_headers, OPENROUTER_ROUTING_METADATA_HEADER
+            ),
             **params,
         )
     # The code-execution Asset bridge supplies the live ``container`` for the code_interpreter
@@ -924,6 +960,7 @@ def _provider_from_config(
         builtin_tools=list(builtins),
         code_container=code_container,
         extra_body=params_extra_body,
+        extra_headers=params_extra_headers,
         **params,
     )
 

@@ -1050,6 +1050,40 @@ def test_model_params_http_headers_is_stripped_on_the_openrouter_build(monkeypat
     provider.close()
 
 
+def test_model_params_extra_headers_does_not_collide_with_the_routing_header(monkeypatch, caplog):
+    # The crash this forecloses: `extra_headers` is harness wiring on the openai-SDK-at-OpenRouter
+    # cell (the routing-metadata header, issue #280). Left splatted in with the operator's tuning it
+    # would arrive as a *second* value for the same keyword — `TypeError: got multiple values for
+    # keyword argument 'extra_headers'` — a raw crash at provider construction, not the
+    # warned-and-dropped collision policy. It is lifted out and *merged* instead of confiscated,
+    # because an operator's own headers still work on this adapter's other two endpoints.
+    _set_openrouter_model_key(monkeypatch)
+    _write_model_params({"extra_headers": {"X-Mine": "1"}, "temperature": 0.2})
+
+    provider = _provider_from_config("openrouter", "openai", "chat")
+
+    assert provider._default_params == {"temperature": 0.2}
+    # Both headers ride: the operator's is kept, the harness's routing header is added.
+    assert provider._client.default_headers["X-Mine"] == "1"
+    assert provider._client.default_headers["X-OpenRouter-Metadata"] == "enabled"
+    provider.close()
+
+
+def test_model_params_cannot_unset_the_routing_header(monkeypatch, caplog):
+    # An operator who overrode it would not break anything *visible* — they would silently blind the
+    # fleet's routing review, which is the exact failure class issue #280 is about. Harness wins,
+    # loudly.
+    _set_openrouter_model_key(monkeypatch)
+    _write_model_params({"extra_headers": {"X-OpenRouter-Metadata": "disabled"}})
+
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("openrouter", "openai", "chat")
+
+    assert provider._client.default_headers["X-OpenRouter-Metadata"] == "enabled"
+    assert "'X-OpenRouter-Metadata'" in caplog.text
+    provider.close()
+
+
 def test_malformed_model_params_does_not_mask_a_config_mismatch(monkeypatch):
     # A config-shape error must win over a malformed model_params.json: the wake should point at
     # the real problem (the sdk/provider mismatch), not at a tuning file it would never use.
