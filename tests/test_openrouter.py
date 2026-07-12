@@ -318,17 +318,31 @@ def test_url_citation_annotations_are_footered_as_sources(router):
     provider.close()
 
 
-def test_the_capture_hook_is_installed_only_when_a_server_tool_is_active(monkeypatch):
-    # The response-capture httpx client exists solely to recover web-search citations, so a
-    # default agent with no server tool pays no capture/extra-parse overhead — no capture, and the
-    # SDK builds its own client. With web search opted in, the capture is present.
+def test_the_capture_hook_watches_the_sdks_own_client_on_every_call(monkeypatch):
+    """The hook is on every call, web search or not (issue #274): the raw body is the only place
+    the **serving endpoint** lives, and every call has one. It is attached to the httpx client the
+    *SDK* built and owns — the harness constructs no client of its own to hand in."""
     monkeypatch.setenv("AI_API_KEY", "sk-or-env-key")
-    without = OpenRouterProvider(MODEL, base_url=BASE_URL)
-    assert without._capture is None
-    without.close()
-    with_search = OpenRouterProvider(MODEL, base_url=BASE_URL, builtin_tools=["web_search"])
-    assert with_search._capture is not None
-    with_search.close()
+
+    for provider in (
+        OpenRouterProvider(MODEL, base_url=BASE_URL),
+        OpenRouterProvider(MODEL, base_url=BASE_URL, builtin_tools=["web_search"]),
+    ):
+        hooks = provider._client.sdk_configuration.client.event_hooks["response"]
+        assert provider._capture in hooks
+        provider.close()
+
+
+def test_a_client_double_without_an_httpx_client_underneath_is_simply_unwatched():
+    """Observability never breaks a turn: an unwatchable client leaves the capture empty, so the
+    endpoint field is omitted and the reply is unaffected."""
+
+    class Double:  # no `sdk_configuration` — nothing to hook
+        pass
+
+    provider = OpenRouterProvider(MODEL, client=Double())
+
+    assert provider._capture.last is None
 
 
 def test_a_plain_answer_without_annotations_is_unchanged(router):
@@ -498,3 +512,44 @@ def test_a_call_logs_the_line_with_the_openrouter_vendor_and_model(router, caplo
     line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
     assert "provider=openrouter" in line and f"model={MODEL}" in line
     assert "tokens_in=1 tokens_out=2 tokens_total=3" in line  # the builder's usage block
+
+
+# --- the serving endpoint, cache hit, and cost (issue #274) -------------------
+
+
+def _llm_line(caplog) -> str:
+    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
+
+
+def test_the_line_names_the_upstream_that_actually_served_the_call(router, caplog):
+    """`provider=openrouter` names who *dispatched* the call. OpenRouter fans one model id out to
+    ~27 endpoints spanning 10× in context ceiling and 5.4× in price, so the line has to say who
+    *served* it — and that fact reaches the harness only through the raw body: the SDK's typed
+    ``ChatResult`` does not model the top-level ``provider`` field, so ``model_dump()`` has already
+    lost it. This is the test that fails the moment the capture hook stops being installed."""
+    import logging
+
+    body = completion(content="Hi.")
+    body["provider"] = "StreamLake"
+    body["usage"] |= {"cost": 0.0445, "prompt_tokens_details": {"cached_tokens": 238277}}
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider().chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert "endpoint=StreamLake" in line
+    assert "cached_tokens=238277" in line  # the cache is working, or it isn't — no more inferring
+    assert "cost=0.0445" in line  # OpenRouter's own figure, not harness arithmetic
+
+
+def test_a_body_that_names_no_endpoint_omits_the_field_rather_than_faking_one(router, caplog):
+    import logging
+
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(content="Hi.")))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider().chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert "endpoint=" not in line and "cost=" not in line and "cached_tokens=" not in line

@@ -66,7 +66,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
 )
 from basecradle_harness._messages import Message, ToolSpec
-from basecradle_harness._observability import log_llm_call
+from basecradle_harness._observability import log_llm_call, reported_cost, serving_endpoint
 from basecradle_harness._openai_wire import (
     chat_message_to_wire,
     chat_tool_to_wire,
@@ -104,17 +104,23 @@ class _ResponseCapture:
     """An httpx ``response`` event hook that stashes the last response's parsed JSON body.
 
     Why the harness reads the raw body at all: the ``openrouter`` SDK's typed ``ChatResult`` only
-    keeps the fields it models, and it does **not** model web-search ``url_citation`` annotations
-    (v0.11.3 has no ``annotations`` field) — so ``response.model_dump()`` has already lost them by
-    the time the adapter runs. This hook captures the raw body the SDK *received*, letting the
-    adapter graft the citations back (`OpenRouterProvider._restore_annotations`) and footer them
-    like every other web-search built-in. The SDK still owns the request/response cycle; this only
+    keeps the fields it models, and **two things it does not model matter here** —
+
+    - the web-search ``url_citation`` annotations (v0.11.3 has no ``annotations`` field), which the
+      adapter grafts back so they footer like every other web-search built-in
+      (`OpenRouterProvider._restore_annotations`); and
+    - the top-level ``provider`` field naming the **upstream that actually served the call**
+      (``"StreamLake"``) — the field that turns ``provider=openrouter`` from a router's name into
+      an answer about what a call actually ran against (issue #274).
+
+    Both are gone by the time ``response.model_dump()`` reaches the adapter, so the hook captures
+    the raw body the SDK *received*. The SDK still owns the request/response cycle; this only
     observes its result, so the "reach a model only through the vendor SDK" contract holds.
 
     Single-threaded by contract — one provider per agent, one wake at a time — so "last response"
     is unambiguous: the hook writes `last` during ``chat.send`` and the adapter reads it on the
-    same thread immediately after. A non-JSON or error body just yields ``None`` (no annotations to
-    restore); the adapter only consults `last` on the success path.
+    same thread immediately after. A non-JSON or error body just yields ``None`` (nothing to
+    recover); the adapter only consults `last` on the success path.
     """
 
     def __init__(self) -> None:
@@ -128,6 +134,28 @@ class _ResponseCapture:
             self.last = response.json()
         except Exception:  # noqa: BLE001 - observation is best-effort; never disturb the SDK call
             self.last = None
+
+
+def _watch_responses(client: Any, capture: _ResponseCapture) -> None:
+    """Attach the response capture to whichever ``httpx`` client the SDK is driving.
+
+    The SDK builds and owns its own client, reachable at ``sdk_configuration.client`` (the same
+    handle `OpenRouterProvider.close` uses) — so the hook goes *there*, rather than the harness
+    constructing an httpx client of its own to hand in. Same observation, one less moving part, and
+    it works identically for an injected client (the seam tests) as for the one the SDK built.
+
+    A client double without an httpx client underneath simply goes unwatched: `capture.last` stays
+    ``None``, the endpoint field is omitted, citations go un-footered, and the reply is unaffected.
+    Observability never breaks a turn.
+    """
+    http_client = getattr(getattr(client, "sdk_configuration", None), "client", None)
+    hooks = getattr(http_client, "event_hooks", None)
+    if isinstance(hooks, Mapping):
+        # Through the property setter, which httpx normalizes — never by mutating its internals.
+        http_client.event_hooks = {
+            "request": list(hooks.get("request", ())),
+            "response": [*hooks.get("response", ()), capture],
+        }
 
 
 def _server_tool_objects(
@@ -224,37 +252,16 @@ class OpenRouterProvider:
         self._server_tools = _server_tool_objects(builtin_tools, web_search_params)
         self._openrouter = require_openrouter_sdk()
         if client is not None:
-            # An injected client (the seam tests) carries no capture hook: web-search citations,
-            # which are recovered from the raw body, are simply not restored on this path — the
-            # answer is still correct, just un-footered. Production always builds its own client.
             self._client = client
-            self._capture: _ResponseCapture | None = None
         else:
             key = api_key or os.environ.get("AI_API_KEY")
             if not key:
                 raise ValueError(
                     "No API key: pass api_key=... or set the AI_API_KEY environment variable."
                 )
-            # Install the response-capturing httpx client **only when a server tool is active** —
-            # its sole purpose is recovering web-search `url_citation` annotations, so a default
-            # agent with no web search pays no capture or extra-parse overhead and lets the SDK
-            # build its own default client. When present, the SDK still makes and parses every
-            # call; the hook only *observes* the response the SDK already fetched, to recover the
-            # annotations the SDK's typed ChatResult drops (it has no annotations field; see
-            # `_restore_annotations`). This is not harness-owned HTTP: the SDK owns the
-            # request/response cycle; the hook reads its result.
-            http_client: Any | None = None
-            if self._server_tools:
-                self._capture = _ResponseCapture()
-                http_client = httpx.Client(
-                    timeout=timeout, event_hooks={"response": [self._capture]}
-                )
-            else:
-                self._capture = None
             self._client = self._openrouter.OpenRouter(
                 api_key=key,
                 server_url=base_url or None,
-                client=http_client,
                 timeout_ms=int(timeout * 1000),
                 # Disable the SDK's default 5xx retry. Its Speakeasy default backs off up to
                 # ~1 hour (BackoffStrategy max_elapsed 3_600_000ms) on a persistent 5xx, which
@@ -264,6 +271,12 @@ class OpenRouterProvider:
                 # xAI gRPC deadline). This also makes production match what the tests exercise.
                 retry_config=None,
             )
+        # Watch every response, not just the web-search ones: the raw body is now the only place
+        # two facts live — the citations the typed ChatResult drops, *and* the serving endpoint
+        # (issue #274), which every call has. The cost is one extra parse of a small completion
+        # body against a model call measured in seconds.
+        self._capture = _ResponseCapture()
+        _watch_responses(self._client, self._capture)
 
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:
         """Run one model turn through the SDK and return the assistant's reply."""
@@ -284,11 +297,19 @@ class OpenRouterProvider:
         with self._mapped_errors():
             response = self._client.chat.send(**payload)
         data = response.model_dump()
+        usage = data.get("usage")
         log_llm_call(
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
-            usage=data.get("usage"),
+            usage=usage,
+            # OpenRouter is a router, so ``provider=openrouter`` names who *dispatched* the call,
+            # never who *served* it — and the two matter differently (a model id fans out to
+            # endpoints spanning 10× in context ceiling and 5.4× in price). The serving endpoint
+            # rides the raw body only: the SDK's typed ChatResult does not model it.
+            endpoint=serving_endpoint(self._capture.last),
+            # The dollar figure is OpenRouter's own (``usage.cost``), not harness arithmetic.
+            cost=reported_cost(usage),
         )
         self._restore_annotations(data)
         return message_from_chat(data)
@@ -300,10 +321,10 @@ class OpenRouterProvider:
         web-search citations from the body before the harness sees them. `message_from_chat`
         footers ``url_citation`` annotations exactly as the Responses surface does — so, keyed by
         choice index, this copies the annotations from the captured *raw* body onto each dumped
-        message, lighting up that one shared citation path. No capture (an injected client), no raw
-        body, or no annotations → ``data`` is untouched and the reply is un-footered but correct.
+        message, lighting up that one shared citation path. No raw body (an unwatchable client
+        double) or no annotations → ``data`` is untouched and the reply is un-footered but correct.
         """
-        raw = self._capture.last if self._capture is not None else None
+        raw = self._capture.last
         if not isinstance(raw, Mapping):
             return
         raw_choices = raw.get("choices")

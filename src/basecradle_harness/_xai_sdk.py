@@ -49,7 +49,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
 )
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
-from basecradle_harness._observability import log_llm_call
+from basecradle_harness._observability import log_llm_call, serving_endpoint
 from basecradle_harness._openai_wire import format_citations
 
 #: This adapter's single native (gRPC) surface — declared for the SDK-scoped surface contract
@@ -151,13 +151,24 @@ class XaiSdkProvider:
             conversation = self._client.chat.create(**payload)
             response = conversation.sample()
         # The native response carries usage as a proto (attributes, not keys); `log_llm_call`
-        # reads either shape, so the gRPC path logs the same line as the HTTP ones. A fake client
-        # (the seam tests) whose response has no `usage` simply logs no token fields.
+        # reads either shape, so the gRPC path logs the same line as the HTTP ones — token counts
+        # and the cached-prompt count (xAI spells it `cached_prompt_text_tokens`). A fake client
+        # (the seam tests) whose response has no `usage` simply logs no usage fields.
         log_llm_call(
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
             usage=getattr(response, "usage", None),
+            # Asked of every adapter, answered by the ones that can: this SDK reaches xAI directly,
+            # so the vendor *is* the endpoint — there is no upstream to name, and the field is
+            # omitted rather than faked with a restatement of `provider=xai`.
+            endpoint=serving_endpoint(response),
+            # xAI states the charge natively, but in *ticks* (1 tick = 1e-10 USD) — so the dollars
+            # come from the SDK's own accessor, never harness arithmetic and never a price table:
+            # the constant is xAI's to change. It reports ``None`` when the server named no cost, so
+            # an unreported call logs nothing rather than a fabricated ``cost=0``; an SDK too old to
+            # carry the property does the same.
+            cost=getattr(response, "cost_usd", None),
         )
         return self._from_wire(response)
 

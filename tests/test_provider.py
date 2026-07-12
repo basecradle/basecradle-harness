@@ -720,6 +720,47 @@ def test_the_provider_label_names_the_endpoint_vendor_not_the_sdk(router, caplog
     assert "provider=xai" in _llm_line(caplog)
 
 
+def test_the_same_adapter_reports_the_endpoint_and_cost_when_the_response_carries_them(
+    router, provider, caplog
+):
+    """One adapter, three endpoint vendors — so whether a call *has* a serving endpoint or a cost
+    is a fact about the **response**, never a vendor branch in the code. Pointed at OpenRouter
+    (issue #274) the body names both, and the ``openai`` SDK keeps the fields it doesn't model, so
+    the same reader that finds nothing on an OpenAI response finds them here."""
+    body = completion(content="Hi.")
+    body["provider"] = "Novita"
+    body["usage"] = {
+        "prompt_tokens": 90,
+        "completion_tokens": 10,
+        "total_tokens": 100,
+        "prompt_tokens_details": {"cached_tokens": 64},
+        "cost": 0.0445,
+    }
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert "endpoint=Novita" in line and "cached_tokens=64" in line and "cost=0.0445" in line
+
+
+def test_an_openai_response_names_no_endpoint_or_cost_and_the_fields_are_omitted(
+    router, responses_provider, caplog
+):
+    """OpenAI is not a router and reports no dollars — the honest line says neither, rather than
+    restating `provider=openai` as an endpoint or pricing the call from a table of our own."""
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("Hi.")))
+    )
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        responses_provider.chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert "endpoint=" not in line and "cost=" not in line
+
+
 def test_a_call_that_never_returned_logs_no_llm_line(router, provider, caplog):
     """A duration is only honest for a call that completed; the failure path is the engine's
     retry/give-up story to tell."""

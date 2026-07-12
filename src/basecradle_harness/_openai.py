@@ -45,7 +45,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
 )
 from basecradle_harness._messages import Message, ToolSpec
-from basecradle_harness._observability import log_llm_call
+from basecradle_harness._observability import log_llm_call, reported_cost, serving_endpoint
 from basecradle_harness._openai_wire import (
     builtin_to_responses,
     chat_message_to_wire,
@@ -221,19 +221,28 @@ class OpenAIProvider:
         return message_from_chat(data)
 
     def _log_call(self, started: float, data: Mapping[str, Any]) -> None:
-        """The one INFO line this call earns: provider, model, duration, tokens.
+        """The one INFO line this call earns: provider, endpoint, model, duration, tokens, cost.
 
         Both surfaces report usage, under different names (Responses ``input_tokens`` vs Chat
         ``prompt_tokens``) — `log_llm_call` reads either, so this one call site serves both. Only
         a call that *returned* is logged; a call that raised is the error path's story to tell
         (the engine logs the retry/give-up), and timing a failure as if it were a completion
         would be a lie.
+
+        The serving **endpoint** and the **cost** are capability reads, not vendor branches: this
+        one adapter is aimed at three endpoints, and the *response* is what says whether either
+        fact exists. Pointed at OpenRouter it comes back naming the upstream that served the call
+        and what it charged (the ``openai`` SDK's models keep unmodeled fields, so both survive
+        `model_dump`); pointed at OpenAI or xAI it says neither, and the fields are simply absent.
         """
+        usage = data.get("usage")
         log_llm_call(
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
-            usage=data.get("usage"),
+            usage=usage,
+            endpoint=serving_endpoint(data),
+            cost=reported_cost(usage),
         )
 
     # --- SDK exceptions → the harness provider error hierarchy ----------------

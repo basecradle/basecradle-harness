@@ -60,13 +60,44 @@ DELIVERY_ID_ENV = "BASECRADLE_DELIVERY_ID"
 
 #: The token-count fields, mapped from every shape a vendor SDK reports them in — OpenAI
 #: Responses (``input_tokens``/``output_tokens``), the Chat wire and OpenRouter
-#: (``prompt_tokens``/``completion_tokens``), and the xAI protos (both, as attributes). First
-#: hit wins, so one reader serves every adapter and a provider that reports nothing logs nothing.
-_TOKEN_FIELDS = {
-    "tokens_in": ("input_tokens", "prompt_tokens"),
-    "tokens_out": ("output_tokens", "completion_tokens"),
-    "tokens_total": ("total_tokens",),
+#: (``prompt_tokens``/``completion_tokens``), and the xAI protos (both, as attributes). Each
+#: candidate is a *path* — one hop for a flat field, two for a nested one (the cached count lives
+#: under a details block on the HTTP wires and flat on the xAI proto). First hit wins, so one
+#: reader serves every adapter and a provider that reports nothing logs nothing.
+_TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "tokens_in": (("input_tokens",), ("prompt_tokens",)),
+    "tokens_out": (("output_tokens",), ("completion_tokens",)),
+    "tokens_total": (("total_tokens",),),
+    # Prompt caching is the difference between paying full freight on a 750k-token prefix and
+    # paying the cache-read rate for it (~5.4× cheaper, measured live) — and until it is on the
+    # line, whether caching is working at all can only be *inferred*. OpenRouter's own
+    # ``supports_implicit_caching`` metadata reads ``false`` on endpoints where caching
+    # demonstrably works, so the reported count is the only trustworthy witness (issue #274).
+    "cached_tokens": (
+        ("prompt_tokens_details", "cached_tokens"),  # the Chat wire: OpenAI, OpenRouter
+        ("input_tokens_details", "cached_tokens"),  # OpenAI Responses
+        ("cached_prompt_text_tokens",),  # the xAI gRPC proto
+    ),
 }
+
+#: Where a provider states the call's **dollar cost**, when it states one at all. OpenRouter
+#: returns it on every response (``usage.cost``, already in USD); the xAI SDK reports it in
+#: ``ticks`` and converts it with its own helper, so that adapter passes the figure to
+#: `log_llm_call` directly rather than through this reader. What the harness will **never** do is
+#: derive a cost from a price table of its own: a stale table is worse than an absent field, so a
+#: provider that reports tokens but no dollars simply logs no ``cost=`` and the money math stays at
+#: the dashboard layer, where staleness is visible.
+_COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost",),)
+
+#: Where a provider names the **upstream that actually served the call**. A router is not a server:
+#: OpenRouter fronts ~27 distinct endpoints for a single model id, and they differ by up to 10× in
+#: context ceiling and 5.4× in prompt price — so ``provider=openrouter`` alone cannot say what a
+#: call ran against, or why two identical-looking calls cost different money (issue #274).
+#: OpenRouter names the server in the response's top-level ``provider`` field (``"StreamLake"``).
+#: Read as a **capability, not a vendor branch**: every adapter asks this of whatever its SDK
+#: returned, and a direct-to-vendor SDK — where the vendor *is* the endpoint — finds nothing here
+#: and the field is simply omitted.
+_ENDPOINT_FIELDS: tuple[tuple[str, ...], ...] = (("provider",),)
 
 
 def kv(**fields: Any) -> str:
@@ -114,18 +145,39 @@ def delivery_id() -> str | None:
     return (os.environ.get(DELIVERY_ID_ENV) or "").strip() or None
 
 
-def log_llm_call(*, provider: str, model: str, seconds: float, usage: Any = None) -> None:
+def log_llm_call(
+    *,
+    provider: str,
+    model: str,
+    seconds: float,
+    usage: Any = None,
+    endpoint: str | None = None,
+    cost: float | None = None,
+) -> None:
     """One INFO line per model call: who answered, how long it took, what it cost.
 
     Every provider adapter calls this around its own SDK call, so the LLM leg of a wake is
-    visible on every provider rather than only where someone remembered to instrument it. Token
-    counts ride along **when the SDK returns them** (`token_counts`) and are silently omitted
-    when it does not — a provider that reports no usage still gets its provider/model/duration
-    line, which is the part that is always true.
+    visible on every provider rather than only where someone remembered to instrument it.
+
+    Four of the fields are **capabilities, answered by whoever can**: token counts
+    (`token_counts`), the cached-prompt count that says whether caching is doing anything, the
+    ``endpoint`` that names the upstream a router actually dispatched to (`serving_endpoint`), and
+    the ``cost`` in dollars *as the provider reported it* (`reported_cost`, or the vendor SDK's own
+    converter). Each is omitted, cleanly, by a provider with no answer — a direct-to-vendor SDK has
+    no serving endpoint distinct from itself, and most vendors report tokens but never dollars. A
+    provider that reports none of them still gets its provider/model/duration line, which is the
+    part that is always true.
     """
     _log.info(
         "llm %s",
-        kv(provider=provider, model=model, duration=_secs(seconds), **token_counts(usage)),
+        kv(
+            provider=provider,
+            endpoint=endpoint,
+            model=model,
+            duration=_secs(seconds),
+            **token_counts(usage),
+            cost=_money(cost),
+        ),
     )
 
 
@@ -156,7 +208,7 @@ def media_timer(*, provider: str, kind: str, model: str) -> Iterator[None]:
 
 
 def token_counts(usage: Any) -> dict[str, int]:
-    """The usage object a vendor SDK returned, normalized to ``tokens_in``/``_out``/``_total``.
+    """The usage object a vendor SDK returned, normalized to the token fields the line carries.
 
     Reads a mapping (the ``model_dump()`` of an OpenAI/OpenRouter response) or an object with
     attributes (the xAI gRPC protos) with the same code, tries each vendor's spelling in turn
@@ -167,14 +219,39 @@ def token_counts(usage: Any) -> dict[str, int]:
     if usage is None:
         return {}
     counts: dict[str, int] = {}
-    for field, names in _TOKEN_FIELDS.items():
-        for name in names:
-            value = _read(usage, name)
-            if isinstance(value, bool) or not isinstance(value, int):
-                continue
-            counts[field] = value
-            break
+    for field, paths in _TOKEN_FIELDS.items():
+        value = _first(usage, paths)
+        if isinstance(value, bool) or not isinstance(value, int):
+            continue
+        counts[field] = value
     return counts
+
+
+def reported_cost(usage: Any) -> float | None:
+    """The call's cost in dollars **as the provider reported it**, or ``None`` when it didn't.
+
+    Only OpenRouter states a figure on the wire today (``usage.cost``) — reachable through the
+    native SDK *and* through the ``openai`` SDK pointed at ``openrouter.ai``, which keeps the
+    field. Every other endpoint reports tokens and no dollars, and gets no ``cost=``: see
+    `_COST_FIELDS` for why the harness will not fill that gap with a price table of its own.
+    """
+    value = _first(usage, _COST_FIELDS) if usage is not None else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def serving_endpoint(response: Any) -> str | None:
+    """The upstream that actually served this call, when the provider names one (`_ENDPOINT_FIELDS`).
+
+    Given whatever the adapter's SDK handed back — a response mapping or a proto — so one reader
+    serves every adapter. ``None`` when the provider has no such concept, which is the honest
+    answer for a direct-to-vendor SDK: there, the vendor *is* the endpoint.
+    """
+    value = _first(response, _ENDPOINT_FIELDS) if response is not None else None
+    if not isinstance(value, str):
+        return None
+    return value.strip() or None
 
 
 def describe_provider(provider: object) -> tuple[str, str]:
@@ -191,11 +268,46 @@ def describe_provider(provider: object) -> tuple[str, str]:
     )
 
 
-def _read(usage: Any, name: str) -> Any:
-    """One usage field, whether the SDK handed back a mapping or an object."""
-    if isinstance(usage, Mapping):
-        return usage.get(name)
-    return getattr(usage, name, None)
+def _first(payload: Any, paths: tuple[tuple[str, ...], ...]) -> Any:
+    """The first of several candidate paths that resolves to something, or ``None``.
+
+    Each vendor spells the same fact differently, so a field is declared as an ordered list of
+    where it *might* live and the first hit wins — which is what keeps every adapter reading
+    through one code path instead of a branch per vendor.
+    """
+    for path in paths:
+        value: Any = payload
+        for name in path:
+            if value is None:
+                break
+            value = _read(value, name)
+        if value is not None:
+            return value
+    return None
+
+
+def _read(payload: Any, name: str) -> Any:
+    """One field, whether the SDK handed back a mapping or an object."""
+    if isinstance(payload, Mapping):
+        return payload.get(name)
+    return getattr(payload, name, None)
+
+
+def _money(cost: Any) -> str | None:
+    """A dollar cost as plain fixed-point — ``0.0445``, never ``4.45e-02``.
+
+    Scientific notation is what a naive ``str(float)`` produces for a sub-cent call, and nothing
+    grepping this stream would read it as money. Trailing zeros are trimmed so the common line
+    stays short; a genuine zero renders as ``0`` rather than vanishing, because "this call was
+    free" is a fact worth logging.
+
+    Typed loosely on purpose: the figure comes straight off a vendor object (`Response.cost_usd`),
+    so anything that is not a real number — ``None``, a string, a bool — is dropped rather than
+    formatted, and observability never breaks a turn over a vendor's surprise.
+    """
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    return f"{cost:.8f}".rstrip("0").rstrip(".")
 
 
 def _secs(seconds: float) -> str:
