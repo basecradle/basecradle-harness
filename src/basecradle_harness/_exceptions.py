@@ -64,6 +64,29 @@ class ProviderAPIError(ProviderError):
         self.body = body
 
 
+class ProviderServerError(ProviderAPIError):
+    """The provider failed on *its own side* (HTTP 5xx) — transient, and therefore retried.
+
+    The second member of the engine's retryable class, alongside `ProviderResponseError`. A 5xx is
+    the provider saying *"my fault, not yours"*: the request was well-formed, nothing about it will
+    be improved by changing it, and re-issuing the identical call is exactly the right response.
+    That is the opposite of a 4xx, where repeating the request only repeats the rejection.
+
+    **Why this is a decision and not a detail.** Before it existed, whether a 5xx was retried was an
+    accident of which SDK an agent happened to run: the ``openai`` SDK retries 5xx internally
+    (``max_retries``), while the native ``openrouter`` adapter disables its SDK's retry outright (its
+    Speakeasy default backs off for up to an hour, which would hang a wake) — so the *same* transient
+    fault was silently retried on one provider and fatal on another, decided by nobody. Mapping it to
+    a shared class moves the policy up into the engine, where it is uniform, bounded
+    (`HARNESS_RESPONSE_RETRIES` + backoff), and stated.
+
+    **What it costs to get wrong.** A wake marks each item *seen* **before** it calls the model, so a
+    hard-failed wake does not merely fail — it **drops the peer's message permanently**: no reply,
+    and no later wake to retry it. Against that, a bounded retry costs cents. (The retry narrows that
+    window; it does not close it — see the `seen`-ordering defect tracked separately.)
+    """
+
+
 class ProviderAuthError(ProviderAPIError):
     """The provider rejected the API key (HTTP 401/403)."""
 

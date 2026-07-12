@@ -34,7 +34,11 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 
-from basecradle_harness._exceptions import EngineError, ProviderResponseError
+from basecradle_harness._exceptions import (
+    EngineError,
+    ProviderResponseError,
+    ProviderServerError,
+)
 from basecradle_harness._messages import ImageContent, Message, ToolResult, ToolSpec
 from basecradle_harness._observability import kv
 from basecradle_harness._provider import Provider
@@ -42,18 +46,51 @@ from basecradle_harness._tools import ToolRegistry
 
 _log = logging.getLogger("basecradle_harness")
 
-#: How many **extra** times the engine re-requests a provider call that came back unparseable —
-#: the truncated / EOF-mid-JSON class (`ProviderResponseError`, issue #259) — before giving up.
-#: 2 → up to 3 total attempts. The fault is a transient flake (the same call re-issued usually
-#: succeeds, as the GLM-5.2 re-trigger did), so a small bound recovers the common case while a wake
-#: that is genuinely wedged still fails fast. 0 disables the retry (a single attempt). Per-persona
-#: override rides `HARNESS_RESPONSE_RETRIES` (see `_response_retries_from_env`).
+#: How many **extra** times the engine re-requests a provider call that failed *transiently* — an
+#: unparseable body (`ProviderResponseError`, issue #259) or the provider's own 5xx
+#: (`ProviderServerError`, issue #284) — before giving up. 2 → up to 3 total attempts. Both faults
+#: are momentary (the same call re-issued usually succeeds), so a small bound recovers the common
+#: case while a wake that is genuinely wedged still fails fast. 0 disables the retry (a single
+#: attempt). Per-persona override rides `HARNESS_RESPONSE_RETRIES` (see `_response_retries_from_env`).
 DEFAULT_RESPONSE_RETRIES = 2
 
-#: The backoff before an unparseable-response retry, in seconds, scaled by attempt number (0.5s,
-#: then 1.0s, …). Deliberately sub-second-to-low: a truncated body is a momentary server hiccup, so
-#: the retry should add a beat, not the SDK's old up-to-an-hour backoff (which would hang the wake).
+#: The provider faults worth trying again, and the *only* ones. Both mean "the request was fine;
+#: something momentary went wrong" — a body that arrived mangled, or a provider that fell over on its
+#: own side. Everything else (auth, rate-limit, context overflow, a bad model_params key) is either
+#: permanent or has its own handling, and re-issuing it would merely repeat it. Classified by the
+#: **nature of the fault**, never the vendor: each adapter maps its own SDK's failures onto these
+#: two, so one rule in one place governs every provider.
+#:
+#: **What is uniform here is the policy, not the attempt count — stated, because the last time this
+#: was left implicit it became issue #284.** Some vendor SDKs retry a 5xx themselves and some do not,
+#: so the retries *compose*: the `openai` SDK carries ``max_retries=2``, giving a 5xx up to 3 × 3 = 9
+#: HTTP attempts there, while the native `openrouter` adapter disables its SDK's retry (its default
+#: backs off for up to an hour and would hang a wake) and so takes exactly 3. The SDK's retry is
+#: deliberately left on where it exists, because it also covers connection errors and 429s — which
+#: the engine pointedly does **not** retry — and removing it to equalize a count would cost real
+#: resilience to buy a symmetry nobody benefits from.
+#:
+#: **The bound worth knowing is wall-clock, not attempts.** A 5xx normally returns *fast*, so 9
+#: attempts is ~6s of backoff and irrelevant. The pathological shape is a **slow** 5xx — a gateway
+#: that burns the client timeout (``DEFAULT_TIMEOUT``, 60s) before answering — where the compounding
+#: is 9 × 60s rather than 9 × nothing. That is a genuinely-down provider, and the wake fails either
+#: way; but it fails *slowly*, which cuts against this repo's own "fail the wake fast and let the
+#: router re-wake" stance. It is bounded and it is known, not an accident — and if it ever bites, the
+#: fix is a total-time deadline on the retry loop, not a smaller attempt count.
+_TRANSIENT = (ProviderResponseError, ProviderServerError)
+
+#: The backoff before a transient retry, in seconds, scaled by attempt number (0.5s, then 1.0s, …).
+#: Deliberately sub-second-to-low: these are momentary server hiccups, so the retry should add a
+#: beat, not the SDK's old up-to-an-hour backoff (which would hang the wake).
 _RETRY_BACKOFF_BASE = 0.5
+
+
+def _fault(exc: object) -> str:
+    """How the retry lines name the failure — so a journal says *which* transient fault it hit."""
+    if isinstance(exc, ProviderServerError):
+        return f"Provider failed on its own side (HTTP {exc.status_code})"
+    return "Provider returned an unparseable response"
+
 
 #: The per-turn provider-call budget. A deliberate research-lab over-provision: a persona's
 #: self-scheduled task legitimately fans out into several sub-actions (read the timeline, check
@@ -102,11 +139,13 @@ class Engine:
             only to answer a model that mistakenly *calls one as a function* with targeted
             guidance instead of the generic "no tool named X" error (issue #245); the
             generic error still stands for a genuinely unknown name. Empty by default.
-        response_retries: How many extra times a provider call that returns an unparseable
-            response (`ProviderResponseError` — the truncated/EOF-mid-JSON class, issue #259)
-            is re-requested before the failure propagates. Defaults to
-            `DEFAULT_RESPONSE_RETRIES`; 0 disables the retry. Only that transient class is
-            retried — a connection, auth, rate-limit, or permanent error is never re-tried here.
+        response_retries: How many extra times a provider call that failed **transiently** is
+            re-requested before the failure propagates — an unparseable response
+            (`ProviderResponseError`, the truncated/EOF-mid-JSON class, issue #259) or the
+            provider's own 5xx (`ProviderServerError`, issue #284). Defaults to
+            `DEFAULT_RESPONSE_RETRIES`; 0 disables the retry. Only those two classes are retried
+            (`_TRANSIENT`) — a connection, auth, rate-limit, or permanent error is never re-tried
+            here, because re-issuing it would only repeat it.
         clock: Injectable source of the current UTC time, used to stamp each step-counter
             note and to measure per-step elapsed time. Defaults to the wall clock; a test
             drives it to assert the counter and timing deterministically.
@@ -215,37 +254,52 @@ class Engine:
             _evict_images(shown)
 
     def _chat(self, messages: list[Message], tools: Sequence[ToolSpec] | None) -> Message:
-        """One provider call, retrying only a *truncated / unparseable* response (issue #259).
+        """One provider call, retrying the **transient** provider faults (issues #259, #284).
 
-        A `ProviderResponseError` means the provider **answered** but the SDK could not parse the
-        body — the "EOF while parsing a value" class first seen on GLM-5.2/OpenRouter. It is
-        transient (the same call re-issued usually succeeds), and before this the wake simply
-        aborted on it: because the item is marked *seen* before the model runs, that silently
-        **dropped the peer's message** — no reply, and no future wake to retry. So the engine
-        re-requests it up to `response_retries` times with a short backoff, provider-agnostically
-        (every adapter maps its own parse failure to this one capability class).
+        Two failures are transient — the same call, re-issued unchanged, usually succeeds — and both
+        are retried here, bounded by `response_retries` and a short backoff:
 
-        Only that class is retried. A connection, auth, rate-limit, permanent `ProviderError`
-        (a bad `model_params.json` key), or any non-provider error propagates on the first raise —
-        retrying a permanent fault only repeats it, and connection/5xx retries are the SDKs' own.
+        - **`ProviderResponseError`** — the provider *answered* but the SDK could not parse the body
+          (the "EOF while parsing a value" class first seen on GLM-5.2/OpenRouter, issue #259).
+        - **`ProviderServerError`** — the provider failed on its own side (HTTP 5xx). It is the
+          provider saying *"my fault, not yours"*: nothing about the request will be improved by
+          changing it (issue #284).
 
-        On exhaustion the last error is re-raised (the wake aborts with a clean non-zero exit, the
-        prior behavior) — but every attempt logs a WARNING and the final give-up logs an ERROR
-        naming the failure class and the attempt count, so a dropped wake is diagnosable from the
-        logs alone (issue #259, definition-of-done point 2).
+        **Why retrying matters more than it looks.** A wake marks each item *seen* **before** it calls
+        the model, so a wake that aborts does not merely fail — it silently **drops the peer's
+        message**: no reply, and no later wake to retry it. A bounded retry costs cents; a dropped
+        message is the worst failure class this platform has. (It *narrows* that window rather than
+        closing it — only `seen`-after-success ordering would close it, tracked separately.)
+
+        **Both are classified by the nature of the fault, never by vendor** — every adapter maps its
+        own SDK's parse failure and its own 5xx onto these two shared classes, so the policy is one
+        rule in one place. That uniformity is the point: before it, whether a 5xx was retried was an
+        accident of which SDK an agent ran (the ``openai`` SDK retries 5xx internally; the native
+        ``openrouter`` adapter disables its SDK's retry, since that one backs off for up to an hour
+        and would hang a wake) — the same fault, silently fatal on one provider and survivable on
+        another, decided by nobody.
+
+        Everything else propagates on the first raise: a connection drop, an auth or rate-limit
+        error, a context-length overflow (the session compacts and retries *that* its own way), or a
+        permanent `ProviderError` such as a bad `model_params.json` key. Retrying a permanent fault
+        only repeats it.
+
+        On exhaustion the last error is re-raised (the wake aborts with a clean non-zero exit) — but
+        every attempt logs a WARNING and the final give-up logs an ERROR naming the failure and the
+        attempt count, so a dropped wake stays diagnosable from the logs alone.
         """
         attempts = max(1, self.response_retries + 1)
-        last_exc: ProviderResponseError | None = None
+        last_exc: ProviderResponseError | ProviderServerError | None = None
         for attempt in range(1, attempts + 1):
             try:
                 return self.provider.chat(messages, tools=tools)
-            except ProviderResponseError as exc:
+            except _TRANSIENT as exc:
                 last_exc = exc
                 if attempt < attempts:
                     delay = _RETRY_BACKOFF_BASE * attempt
                     _log.warning(
-                        "Provider returned an unparseable response (attempt %d/%d): %s "
-                        "— retrying in %.1fs",
+                        "%s (attempt %d/%d): %s — retrying in %.1fs",
+                        _fault(exc),
                         attempt,
                         attempts,
                         exc,
@@ -253,7 +307,8 @@ class Engine:
                     )
                     self._sleep(delay)
         _log.error(
-            "Provider returned an unparseable response on all %d attempt(s); giving up: %s",
+            "%s on all %d attempt(s); giving up: %s",
+            _fault(last_exc),
             attempts,
             last_exc,
         )

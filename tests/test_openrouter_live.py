@@ -25,7 +25,6 @@ import os
 import pytest
 
 from basecradle_harness import Message, OpenRouterProvider
-from basecradle_harness._exceptions import ProviderAPIError
 
 pytestmark = pytest.mark.live
 
@@ -128,26 +127,20 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
     OpenRouter's wire, so only a live call can pin it: a mocked body proves we read the fields we
     told ourselves to expect, never that they still mean what we thought.
 
-    OpenRouter's web-search plugin returns intermittent 5xx (measured ~2-in-5, present *before* this
-    change and unrelated to it), so an upstream outage must not read as our regression: the probe
-    retries, and skips only when every attempt fails upstream.
+    **No ``max_tokens`` here, and that is load-bearing** (issue #284). A server-side search has to
+    *summarize* what it found, and it draws that from the same completion budget — starve it and
+    OpenRouter's search pipeline 500s instead of answering (measured: at ``max_tokens=16``, 6 of 8
+    calls fail; unset, 8 of 8 succeed). The first cut of this test pinned 16 and then wrapped itself
+    in a retry loop to survive the failures it was causing. A test that needs retries to pass is
+    telling you something; listen to it rather than muffling it.
     """
     import logging
 
-    provider = OpenRouterProvider(
-        model=MODEL, api_key=KEY, builtin_tools=("web_search",), max_tokens=16
-    )
+    provider = OpenRouterProvider(model=MODEL, api_key=KEY, builtin_tools=("web_search",))
     try:
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            provider.chat([Message.user("What is the capital of France? One word.")])
         pool = _live_pool(provider)
-        for attempt in range(4):
-            caplog.clear()
-            try:
-                with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-                    provider.chat([Message.user("What is the capital of France? One word.")])
-                break
-            except ProviderAPIError:  # OpenRouter's own 5xx on its search plugin — not ours
-                if attempt == 3:
-                    pytest.skip("openrouter:web_search is 5xx-ing upstream; nothing to prove")
     finally:
         provider.close()
 

@@ -27,6 +27,7 @@ from basecradle_harness import (
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderServerError,
     ToolCall,
     ToolSpec,
 )
@@ -480,14 +481,17 @@ def test_429_raises_rate_limit_with_retry_after(router, provider):
     assert exc.value.retry_after == 30.0
 
 
-def test_500_raises_provider_api_error_keeping_the_body(router, provider):
+def test_500_raises_the_retryable_server_error_keeping_the_body(router, provider):
+    """A 5xx maps to the transient class the engine re-requests (issue #284) — and still carries the
+    body, so a media tool can relay the provider's true cause rather than an opaque status."""
     router.post(CHAT_URL).mock(return_value=httpx.Response(500, text="boom"))
 
-    with pytest.raises(ProviderAPIError) as exc:
+    with pytest.raises(ProviderServerError) as exc:
         provider.chat([Message.user("Hi")])
 
     assert exc.value.status_code == 500
     assert exc.value.body == "boom"
+    assert isinstance(exc.value, ProviderAPIError)  # the error relay gates on this
     assert not isinstance(exc.value, (ProviderAuthError, ProviderRateLimitError))
 
 

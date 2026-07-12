@@ -47,6 +47,7 @@ from basecradle_harness._exceptions import (
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderServerError,
 )
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
@@ -404,6 +405,13 @@ def _from_status_error(exc) -> ProviderError:
             status_code=status,
             body=body,
             retry_after=_retry_after(exc),
+        )
+    if status >= 500:
+        # The provider fell over on its own side — transient, so the engine re-requests it
+        # (issue #284). The SDK also retries 5xx internally; this class is what makes the policy
+        # *uniform* across adapters instead of a property of whichever SDK an agent happens to run.
+        return ProviderServerError(
+            f"Provider failed on its own side (HTTP {status}).", status_code=status, body=body
         )
     # Carry the provider's own message so the image/audio tools can relay the true cause.
     return ProviderAPIError(message, status_code=status, body=body)

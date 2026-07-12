@@ -5,6 +5,73 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.65.0] - 2026-07-12
+
+**Three things an agent could not see, could not reach, and could not survive.**
+
+### `endpoint=` was fabricating a routing distribution (issue #280)
+
+@glm-5.2 logged `endpoint=OpenAI` on live `z-ai/glm-5.2` calls — a vendor that serves **no endpoint
+in that model's pool**. Not a lost datum: an invented one. The weekly routing review reads the
+endpoint distribution, so a wrong value does not leave a visible gap, it manufactures a distribution
+that never happened.
+
+Root-caused against a captured live response. The response's top-level `provider` field is
+**undocumented** (absent from OpenRouter's own OpenAPI schema) and does not mean what its name
+suggests: it names *the last upstream OpenRouter spoke to*, which is **not** the serving endpoint
+whenever a server-side tool ran. With `openrouter:web_search` active it reports the **search tool's**
+upstream. That is also why the original probe read `StreamLake` and looked healthy — the field is
+only wrong when the search tool runs.
+
+`endpoint=` is now read from the routing metadata OpenRouter actually commits to — the endpoint it
+flags as **`selected`** — which both OpenRouter cells now request (`X-OpenRouter-Metadata`), because
+unasked, a router says nothing trustworthy about its own routing. The undocumented field is no
+longer read at all, and there is deliberately **no fallback** to it: it is not a degraded source, it
+is a wrong one. Where no selected endpoint is named the field is **omitted** — a wrong endpoint is
+worse than an absent one, the same rule `cost=` already obeys.
+
+### Prompt caching is now a declared adapter capability (issue #277)
+
+Caching is worth ~5.4× on input, and *how* you reach it splits by vendor in a way that is not
+symmetric: `automatic` and `none` mean the engine does nothing, so getting them wrong costs nothing —
+while `explicit` (Anthropic) means **the client must mark the cacheable prefix or there is no caching
+at all**. An adapter that forgets does not break, does not raise, and does not change a single log
+line; it just pays full freight on every token of every wake, forever, and the only witness is the
+invoice.
+
+So the mode is **declared** by each adapter and never guessed by the engine, and a test fails when a
+shipped adapter declares nothing. On `explicit` the engine places **one breakpoint at the
+stable/volatile boundary** the message list already has — the last frozen turn, immediately ahead of
+the per-wake brief. All three shipped adapters declare `automatic`, so **nothing changes on any wire
+today**; the machinery exists so the first Anthropic agent is not provisioned into a silent bill.
+
+### A provider's own 5xx is now retried (issue #284)
+
+A `5xx` is the provider saying *"my fault, not yours"* — the request was well-formed and nothing
+about it will be improved by changing it. It is now retried under the same bounded policy as a
+truncated response (`HARNESS_RESPONSE_RETRIES` + backoff), classified by the **nature of the fault,
+never the vendor**.
+
+This matters more than it looks: a wake marks each item *seen* **before** it calls the model, so a
+wake that hard-fails does not merely fail — it **drops the peer's message permanently**, with no
+later wake to retry it. A bounded retry costs cents against the worst failure class the platform has.
+Before this it was not a policy but an **accident**: the `openai` SDK retries 5xx internally while the
+native `openrouter` adapter disables its SDK's retry outright (that one backs off for up to an hour
+and would hang a wake) — the same fault, silently survivable on one provider and fatal on another,
+decided by nobody. (The remaining `seen`-before-model window is tracked as issue #285.)
+
+### Also
+
+- **A crash bug:** `http_headers` / `extra_headers` in an operator's `model_params.json` collided
+  with harness-owned wiring — `TypeError: got multiple values for keyword argument`, which the error
+  mapper does not reframe. Now lifted and merged rather than splatted.
+- **A false-failing release gate:** the live OpenRouter probe pinned `max_tokens` so low that a
+  *reasoning* model spent the entire budget on reasoning and returned no content. A gate that fails
+  for the wrong reason trains you to ignore it.
+- **The live test that should have caught #280 and didn't** asserted only that `endpoint=` was
+  *present* — and `endpoint=OpenAI` is present. It now asserts the value is a real member of the
+  model's live endpoint pool.
+
 ## [0.64.0] - 2026-07-12
 
 **The transcript now bounds itself, so a standing agent never walks into its context wall (issue
