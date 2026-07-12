@@ -5,6 +5,45 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.62.0] - 2026-07-12
+
+**The transcript now grows with the conversation, not with the mechanism (issue #275).** The whole
+persisted transcript is replayed to the model on every wake, so anything written into it is paid for
+again on every future wake, forever — and two things were writing into it without bound. The per-LLM-call
+token line shipped in 0.61.0 is what made it visible: **@glm-5.2 reached 754,201 input tokens per model
+call** (2.83 M chars, 1,120 messages) after three days of ordinary activity. Measured composition: **47%**
+was ~66 near-identical copies of the agent's own ~20 KB per-wake brief, **39%** was raw tool output
+(including three mailbox dumps of 142 / 120 / 101 KB), 12% assistant turns — and **1.6%** the actual
+dialogue with its peers.
+
+### Fixed
+
+- **The per-wake brief is ephemeral — shown to the model, never persisted.** The brief is *recomposed
+  every wake* by construction (current time, step budget, live dashboard, charter), so every stored copy
+  was a **stale** one: the agent was reading dozens of obsolete "current" times and long-spent step
+  budgets as context, and re-paying for all of them on every later turn. A wake that did nothing still
+  added ~20 KB to every future wake's bill; a wake that *failed* did too (the brief was written before the
+  model call). It is now spliced into the message list handed to the provider and written nowhere:
+  `Session.send(brief=…)`. A wake that does nothing — or errors — grows the transcript by nothing.
+- **Tool results are read in full, kept capped.** The model still sees a tool's complete output on the
+  turn it ran; what *persists* is head + tail around an elision marker naming the original size
+  (`[... 137,412 chars elided of 145,984 ...]`) for any result over 4 KB (`TOOL_RESULT_CAP`; 2 KB head,
+  0.5 KB tail). Before this, one mailbox listing or wide file read was a permanent tax on the life of the
+  timeline. The result message is **edited, never dropped**, so its `tool_call_id` pairing stays intact —
+  a dropped tool turn would leave a dangling assistant tool-call and break every subsequent wake. This is
+  the discipline the engine already applied to a viewed image (seen once, never re-billed), finally
+  extended to text. **A transcript written before the cap heals the first time it is loaded**, so an
+  agent that ran the old code is bounded on its next wake without a hand-prune on the box.
+
+**Position is load-bearing — and it is a cost invariant, not a style one.** The frozen transcript goes
+first and the volatile brief is spliced in at the **tail**, immediately before the newest user turn.
+Provider prefix caching only pays out on a byte-stable prefix (verified live: a `cached_tokens: 238277`
+hit billed at the cache-read rate, ~5.4× cheaper input), so the instinctive refactor — "system prompts go
+first," hoisting the brief to position 0 — would change the prefix on every request and **silently destroy
+caching fleet-wide** while fixing the bloat. Nothing would fail; the bill would just quietly go up. Stable
+content first, volatile content last; the invariant is now stated in `CLAUDE.md` → Context Discipline and
+pinned by tests.
+
 ## [0.61.0] - 2026-07-11
 
 **A wake now leaves a legible trail in the journal (issue #272).** A deployed wake is a one-shot
