@@ -125,6 +125,11 @@ class OpenAIProvider:
             vendor-neutral — this is the seam for a provider-specific field the typed SDK params
             don't cover, e.g. xAI's ``search_parameters`` Live-Search object when the ``openai``
             SDK is pointed at ``api.x.ai`` (see `basecradle_harness._basecradle`).
+        extra_headers: Headers sent on **every** request, as the SDK client's ``default_headers``.
+            The header-side twin of ``extra_body``, and for the same reason: an endpoint may put a
+            fact behind a request header rather than a body field. Today's use is OpenRouter's
+            ``X-OpenRouter-Metadata``, which is what makes it state the endpoint it actually routed
+            to (issue #280). The config layer decides what to send; the adapter just carries it.
         code_container: An optional callback supplying the ``container`` config for the
             ``code_interpreter`` built-in, evaluated **per turn** (the container handle changes
             as the Asset bridge stages files / pins a session — see `_code.py`). Returns a
@@ -159,6 +164,7 @@ class OpenAIProvider:
         max_retries: int = 2,
         builtin_tools: Sequence[str | Mapping[str, Any]] = (),
         extra_body: Mapping[str, Any] | None = None,
+        extra_headers: Mapping[str, str] | None = None,
         code_container: Callable[[], dict[str, Any] | str | None] | None = None,
         **default_params: Any,
     ) -> None:
@@ -188,6 +194,10 @@ class OpenAIProvider:
             base_url=base_url or None,
             timeout=timeout,
             max_retries=max_retries,
+            # Sent on every request the client makes. The endpoint this one adapter is aimed at
+            # decides whether there is anything to send — the config layer answers that, so the
+            # adapter stays vendor-neutral (the header seam, exactly as `extra_body` is the body one).
+            default_headers=dict(extra_headers) if extra_headers else None,
         )
 
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:

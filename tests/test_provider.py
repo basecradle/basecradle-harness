@@ -727,9 +727,24 @@ def test_the_same_adapter_reports_the_endpoint_and_cost_when_the_response_carrie
     """One adapter, three endpoint vendors — so whether a call *has* a serving endpoint or a cost
     is a fact about the **response**, never a vendor branch in the code. Pointed at OpenRouter
     (issue #274) the body names both, and the ``openai`` SDK keeps the fields it doesn't model, so
-    the same reader that finds nothing on an OpenAI response finds them here."""
+    the same reader that finds nothing on an OpenAI response finds them here.
+
+    The endpoint is the one the router flags ``selected`` in its routing metadata — never the
+    response's top-level ``provider``, which names the last upstream OpenRouter spoke to and reads
+    ``OpenAI`` on a GLM call whenever a server-side search ran (issue #280). It is set to that wrong
+    value here on purpose: the line must not repeat it.
+    """
     body = completion(content="Hi.")
-    body["provider"] = "Novita"
+    body["provider"] = "OpenAI"  # the undocumented field — wrong, and never to be believed
+    body["openrouter_metadata"] = {
+        "endpoints": {
+            "available": [
+                {"provider": "Together", "selected": False},
+                {"provider": "Novita", "selected": True},
+            ],
+            "total": 2,
+        }
+    }
     body["usage"] = {
         "prompt_tokens": 90,
         "completion_tokens": 10,
@@ -744,6 +759,7 @@ def test_the_same_adapter_reports_the_endpoint_and_cost_when_the_response_carrie
 
     line = _llm_line(caplog)
     assert "endpoint=Novita" in line and "cached_tokens=64" in line and "cost=0.0445" in line
+    assert "OpenAI" not in line
 
 
 def test_an_openai_response_names_no_endpoint_or_cost_and_the_fields_are_omitted(

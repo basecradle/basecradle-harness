@@ -98,6 +98,13 @@ DEFAULT_SURFACE = "chat"
 #: ``provider=openrouter``.
 PROVIDER = "openrouter"
 
+#: Asks OpenRouter to state, on every response, **which endpoint it actually routed to** — the
+#: ``openrouter_metadata`` block, which is opt-in and absent unless requested (issue #280). Sent on
+#: every call: the fact it carries is not decoration but the difference between a routing review
+#: reading a real distribution and reading a fabricated one. It is metadata only — it changes
+#: nothing about how the call is served, billed, or answered.
+ROUTING_METADATA_HEADER = {"X-OpenRouter-Metadata": "enabled"}
+
 #: The model-facing name of the web-search built-in — the one server tool that ships (issue #237)
 #: and the only one that consumes ``search_params.json``. Named so the config layer can gate the
 #: search-params read on it without hardcoding the string.
@@ -115,18 +122,17 @@ class _ResponseCapture:
     """An httpx ``response`` event hook that stashes the last response's parsed JSON body.
 
     Why the harness reads the raw body at all: the ``openrouter`` SDK's typed ``ChatResult`` only
-    keeps the fields it models, and **two things it does not model matter here** —
+    keeps the fields it models, and the web-search ``url_citation`` annotations are not among them
+    (v0.11.3 has no ``annotations`` field) — so the adapter grafts them back from the raw body and
+    they footer like every other web-search built-in (`OpenRouterProvider._restore_annotations`).
 
-    - the web-search ``url_citation`` annotations (v0.11.3 has no ``annotations`` field), which the
-      adapter grafts back so they footer like every other web-search built-in
-      (`OpenRouterProvider._restore_annotations`); and
-    - the top-level ``provider`` field naming the **upstream that actually served the call**
-      (``"StreamLake"``) — the field that turns ``provider=openrouter`` from a router's name into
-      an answer about what a call actually ran against (issue #274).
+    That is now the *only* reason this exists. The serving endpoint used to be recovered here too,
+    from the raw body's top-level ``provider`` — until that field turned out not to mean the serving
+    endpoint at all (issue #280). Its replacement, the ``openrouter_metadata`` block, **is** modeled
+    by ``ChatResult``, so it survives ``model_dump()`` and the adapter reads it there.
 
-    Both are gone by the time ``response.model_dump()`` reaches the adapter, so the hook captures
-    the raw body the SDK *received*. The SDK still owns the request/response cycle; this only
-    observes its result, so the "reach a model only through the vendor SDK" contract holds.
+    The SDK still owns the request/response cycle; this only observes its result, so the "reach a
+    model only through the vendor SDK" contract holds.
 
     Single-threaded by contract — one provider per agent, one wake at a time — so "last response"
     is unambiguous: the hook writes `last` during ``chat.send`` and the adapter reads it on the
@@ -299,10 +305,9 @@ class OpenRouterProvider:
                 # xAI gRPC deadline). This also makes production match what the tests exercise.
                 retry_config=None,
             )
-        # Watch every response, not just the web-search ones: the raw body is now the only place
-        # two facts live — the citations the typed ChatResult drops, *and* the serving endpoint
-        # (issue #274), which every call has. The cost is one extra parse of a small completion
-        # body against a model call measured in seconds.
+        # Watch every response: the raw body is the only place the web-search citations live (the
+        # typed ChatResult drops them). The cost is one extra parse of a small completion body
+        # against a model call measured in seconds.
         self._capture = _ResponseCapture()
         _watch_responses(self._client, self._capture)
 
@@ -323,7 +328,7 @@ class OpenRouterProvider:
         # would change ``chat.send``'s return type from ``ChatResult`` to an event stream.
         started = time.monotonic()
         with self._mapped_errors():
-            response = self._client.chat.send(**payload)
+            response = self._client.chat.send(http_headers=ROUTING_METADATA_HEADER, **payload)
         data = response.model_dump()
         usage = data.get("usage")
         # Remember what we just logged: the context budget triggers on the *provider's* count, so
@@ -336,9 +341,10 @@ class OpenRouterProvider:
             usage=usage,
             # OpenRouter is a router, so ``provider=openrouter`` names who *dispatched* the call,
             # never who *served* it — and the two matter differently (a model id fans out to
-            # endpoints spanning 10× in context ceiling and 5.4× in price). The serving endpoint
-            # rides the raw body only: the SDK's typed ChatResult does not model it.
-            endpoint=serving_endpoint(self._capture.last),
+            # endpoints spanning 10× in context ceiling and 5.4× in price). The serving endpoint is
+            # read from the routing metadata this call asked for, which the typed ``ChatResult``
+            # *does* model — so, unlike the citations, it needs no raw body (issue #280).
+            endpoint=serving_endpoint(data),
             # The dollar figure is OpenRouter's own (``usage.cost``), not harness arithmetic.
             cost=reported_cost(usage),
         )
