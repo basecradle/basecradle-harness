@@ -47,7 +47,7 @@ def chat_message_to_wire(message: Message) -> dict[str, Any]:
 
     wire: dict[str, Any] = {"role": message.role}
     if message.content is not None:
-        wire["content"] = message.content
+        wire["content"] = _cached(message.content) if message.cache_anchor else message.content
     if message.tool_calls:
         wire["tool_calls"] = [
             {
@@ -61,6 +61,22 @@ def chat_message_to_wire(message: Message) -> dict[str, Any]:
     if message.role == "assistant" and "content" not in wire:
         wire["content"] = None
     return wire
+
+
+def _cached(text: str) -> list[dict[str, Any]]:
+    """One text block carrying the cache breakpoint — how an `EXPLICIT` provider is told to cache.
+
+    A breakpoint rides a *content block*, so a turn the engine anchored (`_caching`) is emitted as a
+    one-element block list instead of a bare string; everything through this block becomes the
+    cacheable prefix. Only ever reached for an adapter that **declared** ``cache_mode = "explicit"``
+    — no shipped adapter does, so nothing puts this on an endpoint that never asked for it.
+
+    ``ephemeral`` is the only breakpoint type Anthropic defines. The TTL is left unset, taking the
+    vendor default (5 minutes): the 1-hour option bills the *write* at 2× and only pays off for an
+    agent whose wakes are reliably further apart than five minutes, which is a per-agent economics
+    call the framework has no business making for everyone.
+    """
+    return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
 def chat_tool_to_wire(tool: ToolSpec) -> dict[str, Any]:

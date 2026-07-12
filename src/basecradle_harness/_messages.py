@@ -126,6 +126,13 @@ class Message:
     `code_execution` is set only on an assistant turn whose adapter ran a hosted
     code-execution tool; it is **transient** (used by the Asset bridge within the
     wake, never serialized — see `CodeExecutionTrace`).
+
+    `cache_anchor` marks this turn as the **end of the cacheable prefix** for a
+    provider whose prompt cache is `explicit` (`_caching`). Like `code_execution`
+    it is transient — a property of the *request*, never of the conversation — so
+    it is deliberately not serialized: it is stamped onto a copy of the turn at
+    call time and the stored transcript never carries it. An adapter whose cache is
+    automatic (every one that ships today) ignores it entirely.
     """
 
     role: Role
@@ -134,6 +141,7 @@ class Message:
     tool_call_id: str | None = None
     images: list[ImageContent] = field(default_factory=list)
     code_execution: CodeExecutionTrace | None = None
+    cache_anchor: bool = False
 
     @classmethod
     def system(cls, content: str) -> Message:

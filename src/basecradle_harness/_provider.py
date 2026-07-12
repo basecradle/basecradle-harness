@@ -22,8 +22,27 @@ vendor branch, and never fatally. Two belong to the context budget (issue #276):
   window anywhere and so answers ``None``. There is deliberately **no static model→limit table** —
   it cannot express a router's reality and it rots silently.
 
-An adapter that implements neither still works: the budget falls back to a conservative floor and,
-with no usage to read, simply never triggers compaction. A capability is a question, not a contract.
+A third belongs to prompt caching (issue #277):
+
+- **`cache_mode: "automatic" | "explicit" | "none"`** — how this adapter's endpoint reaches its
+  prompt cache (`_caching`). ``automatic`` (OpenAI, xAI, OpenRouter today) and ``none`` mean the
+  engine does nothing; ``explicit`` (Anthropic) means the client must *mark* the cacheable prefix or
+  there is no caching **at all**, and the engine places one breakpoint at the stable/volatile
+  boundary of the message list it already maintains. An adapter that declares nothing resolves to
+  ``automatic`` — the do-nothing default — so an adapter written before this capability existed is
+  unaffected.
+
+  **This one is a standing rule, not just a capability: no new provider adapter ships without
+  declaring its `cache_mode`** (`CLAUDE.md` → Provider Capabilities). The other capabilities fail
+  *safe* when unanswered — a missing `context_limit` costs a conservative floor, and a missing
+  `last_tokens_in` costs a compaction that never fires. A missing `cache_mode` on an explicit-cache
+  vendor fails **expensive and silent**: nothing errors, no log line changes, and the agent simply
+  pays full freight on every token of every wake, forever. That asymmetry is why this question must
+  be answered *before* the first agent on a new provider is provisioned, not after its first bill.
+
+An adapter that implements none of them still works: the budget falls back to a conservative floor,
+with no usage to read it never triggers compaction, and nothing is placed on the wire. A capability
+is a question, not a contract.
 """
 
 from __future__ import annotations

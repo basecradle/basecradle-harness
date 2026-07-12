@@ -418,6 +418,22 @@ Set `HARNESS_MAX_CONTEXT_TOKENS` to override the ceiling for any reason — a mo
 
 Each compaction rewrites the prefix and so invalidates the provider's prompt cache **once** — accepted, and bounded by design: compaction retains ~20% of the budget and fires at 50%, so the context must roughly double before the next one, and the new prefix is byte-stable from the moment it is written.
 
+### Prompt caching — automatic, or explicit
+
+Caching a standing agent's transcript is the difference between paying full price for it on every wake and paying the cache-read rate (**~5.4× cheaper**, measured live). *How* you reach that cache differs by vendor, and the difference is not cosmetic — so each adapter **declares** a `cache_mode` and the engine does exactly one thing with the answer:
+
+| `cache_mode` | Who | What the engine does |
+|---|---|---|
+| `automatic` | OpenAI, xAI, OpenRouter *(every adapter that ships today)* | **Nothing.** The endpoint caches a repeated prefix by itself, with nothing on the wire. |
+| `explicit` | Anthropic | Places **one breakpoint** at the [stable/volatile boundary](#what-the-transcript-keeps) — the last frozen turn, just ahead of the per-wake brief. |
+| `none` | — | Nothing. The endpoint has no prompt cache. |
+
+The asymmetry is the whole reason this is *declared* rather than guessed: `automatic` and `none` fail **safe** (do nothing, lose nothing), while `explicit` fails **expensive and invisible** — an Anthropic agent with no breakpoints returns perfectly good answers and simply pays full freight on every token of every wake. Nothing raises; no log line changes; the bill just arrives. So the standing rule is that **no new provider adapter ships without declaring its `cache_mode`**, and a test fails if one doesn't.
+
+Two things follow, and both are deliberate. The breakpoint lands on the **frozen transcript only** — never through the brief, which is a snapshot of a moment and would buy a cache write that can never be read. And on an agent's very first wake it lands on the **charter**, the largest byte-stable block an agent has: caching it on wake one is what makes wake two a cache *read*.
+
+Whether it is working is never inferred — it is **read off the response**: `cached_tokens=` rides [the per-call log line](#what-a-wake-logs) on every provider that reports it. That matters, because a provider's own metadata can lie: OpenRouter advertises `supports_implicit_caching: false` on every `z-ai/glm-5.2` endpoint while caching demonstrably works (a live probe returned `cached_tokens: 238277`, billed at the cache-read rate). **Trust the count, never the claim.**
+
 ### The step budget, live counter, and reserve summary
 
 One wake drives a **think → act** loop: the model may call tools, read their results, and call again before it settles on a reply. That loop is bounded by a **per-turn step budget** — the most model turns one wake may take — so a runaway tool loop inside a single wake can't burn forever. The default is **24** (a deliberate research-lab over-provision: a self-scheduled task legitimately fans out into several sub-actions — read the timeline, check mail, research, upload an asset, reply — which a tighter cap couldn't fit), tunable per persona with `HARNESS_MAX_STEPS`.
@@ -961,6 +977,14 @@ print(agent.send("Hello!"))  # -> You said: Hello!
 ```
 
 The engine depends only on this contract — never on a concrete provider — which is why each shipped adapter (OpenAI, native xAI, native OpenRouter) is one small class, and adding a local model or the next vendor is one more, not a fork.
+
+Beyond `chat`, an adapter may answer a few optional **capabilities**. Each is a question, not a contract: leave one out and the harness degrades honestly rather than breaking.
+
+- **`context_limit()`** — this model's context ceiling, however the adapter can honestly answer it. Unanswered → the [context budget](#the-context-budget--the-transcript-compacts-itself) falls to a conservative floor.
+- **`last_tokens_in`** — the input-token count the endpoint reported for the most recent call. Unanswered → compaction never triggers.
+- **`cache_mode`** — `automatic`, `explicit`, or `none` ([prompt caching](#prompt-caching--automatic-or-explicit)). Unanswered → reads as `automatic`, which is the same *do nothing* the engine would have done anyway.
+
+The first two fail safe when unanswered. **`cache_mode` is the one to answer deliberately**: on a vendor whose cache is explicit, leaving it out costs real money and says nothing — so declare it when you write the adapter, not after the first bill.
 
 ## Safe by default
 

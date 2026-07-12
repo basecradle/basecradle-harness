@@ -59,6 +59,7 @@ import json
 import logging
 from pathlib import Path
 
+from basecradle_harness._caching import anchor_cacheable_prefix, cache_mode
 from basecradle_harness._context import Compactor
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
@@ -187,8 +188,17 @@ class Session:
         # begins — everything past it is the conversation and belongs in `history`; the brief,
         # sitting before it, never is.
         convo = list(self.history)
+        # The frozen transcript: everything the *previous* wake already sent, byte for byte. It is
+        # `history` minus the turn just appended — and it is both the cacheable prefix and the
+        # splice point for the brief, which is not a coincidence: they are the same
+        # stable/volatile boundary, named once here.
+        stable = len(self.history) - 1
         if brief:
             convo.insert(len(convo) - 1, Message.system(brief))
+        # Tell an explicit-cache provider (Anthropic) where that prefix ends; a provider that
+        # caches automatically — every one that ships — is unaffected and this is a no-op. The
+        # anchor is stamped on a copy, so it never reaches `history` (see `_caching`).
+        convo = anchor_cacheable_prefix(convo, stable=stable, mode=cache_mode(self.engine.provider))
         adopted = len(convo)
         try:
             reply = self.engine.run(convo)

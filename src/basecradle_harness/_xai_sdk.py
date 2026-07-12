@@ -42,6 +42,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAuthError,
@@ -107,6 +108,13 @@ class XaiSdkProvider:
         default_params: Extra keyword parameters passed to ``chat.create`` on every call (e.g.
             ``temperature=0.2``). ``model``, ``messages``, ``tools`` always take precedence.
     """
+
+    #: How xAI reaches its prompt cache (issue #277): **automatically**, with nothing on the wire —
+    #: the proto reports the hit back as ``cached_prompt_text_tokens``, which is already on the
+    #: per-call log line. The engine places no breakpoint. This adapter is direct-to-vendor, so
+    #: unlike the router-fronting adapters it carries no routed-model caveat: xAI is the only
+    #: endpoint it can reach, and grok's cache is automatic.
+    cache_mode = AUTOMATIC
 
     def __init__(
         self,
