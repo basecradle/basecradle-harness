@@ -32,6 +32,7 @@ from basecradle_harness import (
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderServerError,
     ToolCall,
     ToolSpec,
 )
@@ -431,15 +432,19 @@ def test_429_maps_to_rate_limit_with_retry_after(router):
     provider.close()
 
 
-def test_500_maps_to_api_error_keeping_the_body(router):
+def test_500_maps_to_the_retryable_server_error_keeping_the_body(router):
+    """A 5xx is the provider's *own* fault — mapped to the transient class the engine re-requests
+    (issue #284), not the generic API error it used to be. It matters most on this adapter: the SDK's
+    own retry is disabled here, so before the shared class existed a 5xx was simply fatal on
+    OpenRouter while the `openai` SDK quietly retried the identical fault."""
     router.post(CHAT_URL).mock(
         return_value=httpx.Response(500, json={"error": {"message": "boom", "code": 500}})
     )
     provider = _provider(retries_disabled=True)
-    with pytest.raises(ProviderAPIError) as exc:
+    with pytest.raises(ProviderServerError) as exc:
         provider.chat([Message.user("Hi")])
     assert exc.value.status_code == 500
-    assert "boom" in exc.value.body
+    assert "boom" in exc.value.body  # the body survives, so a tool can still relay the true cause
     provider.close()
 
 

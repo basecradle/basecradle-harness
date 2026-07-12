@@ -65,11 +65,18 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: was left implicit it became issue #284.** Some vendor SDKs retry a 5xx themselves and some do not,
 #: so the retries *compose*: the `openai` SDK carries ``max_retries=2``, giving a 5xx up to 3 × 3 = 9
 #: HTTP attempts there, while the native `openrouter` adapter disables its SDK's retry (its default
-#: backs off for up to an hour and would hang a wake) and so takes exactly 3. Both are bounded and
-#: both fail fast; the difference is a *cushion*, not a divergence in what gets retried. The SDK's
-#: retry is deliberately left on where it exists, because it also covers connection errors and 429s
-#: — which the engine pointedly does **not** retry — and removing it to equalize a count would cost
-#: real resilience to buy a symmetry nobody benefits from.
+#: backs off for up to an hour and would hang a wake) and so takes exactly 3. The SDK's retry is
+#: deliberately left on where it exists, because it also covers connection errors and 429s — which
+#: the engine pointedly does **not** retry — and removing it to equalize a count would cost real
+#: resilience to buy a symmetry nobody benefits from.
+#:
+#: **The bound worth knowing is wall-clock, not attempts.** A 5xx normally returns *fast*, so 9
+#: attempts is ~6s of backoff and irrelevant. The pathological shape is a **slow** 5xx — a gateway
+#: that burns the client timeout (``DEFAULT_TIMEOUT``, 60s) before answering — where the compounding
+#: is 9 × 60s rather than 9 × nothing. That is a genuinely-down provider, and the wake fails either
+#: way; but it fails *slowly*, which cuts against this repo's own "fail the wake fast and let the
+#: router re-wake" stance. It is bounded and it is known, not an accident — and if it ever bites, the
+#: fix is a total-time deadline on the retry loop, not a smaller attempt count.
 _TRANSIENT = (ProviderResponseError, ProviderServerError)
 
 #: The backoff before a transient retry, in seconds, scaled by attempt number (0.5s, then 1.0s, …).
