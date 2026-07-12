@@ -23,6 +23,7 @@ from basecradle_harness import (
     ProviderAPIError,
     ProviderAuthError,
     ProviderConnectionError,
+    ProviderContextLengthError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
@@ -771,3 +772,109 @@ def test_a_call_that_never_returned_logs_no_llm_line(router, provider, caplog):
             provider.chat([Message.user("hello")])
 
     assert not any(m.startswith("llm ") for m in (r.getMessage() for r in caplog.records))
+
+
+# === The context-limit capability + the wall (issue #276) ====================
+#
+# This one adapter is aimed at three endpoints, so `context_limit` is a **capability read, not a
+# vendor branch**: the endpoint decides whether the fact exists at all.
+
+MODELS_URL = f"{BASE_URL}/models/gpt-4o"
+
+
+def test_openai_honestly_answers_nothing_rather_than_guessing(router, provider):
+    # OpenAI's models API states id/created/owned_by and *nothing about context*.
+    router.get(MODELS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"id": "gpt-4o", "object": "model", "created": 1715367049, "owned_by": "system"},
+        )
+    )
+
+    # So the budget falls to its conservative floor. This is the deliberate cost of refusing a
+    # static model→limit table: a table would answer today and lie silently after the next launch.
+    assert provider.context_limit() is None
+
+
+def test_an_openai_compatible_endpoint_that_states_a_context_length_is_read(router, provider):
+    # The same adapter pointed at OpenRouter: its models API *does* state one, and the openai SDK's
+    # models keep unmodeled fields, so it survives `model_dump()` and is read here.
+    router.get(MODELS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "id": "gpt-4o",
+                "object": "model",
+                "created": 1715367049,
+                "owned_by": "system",
+                "context_length": 400_000,
+            },
+        )
+    )
+
+    assert provider.context_limit() == 400_000
+
+
+def test_an_unreachable_models_endpoint_degrades_to_no_answer(router, provider):
+    router.get(MODELS_URL).mock(return_value=httpx.Response(500, text="boom"))
+
+    # A metadata read must never break a wake.
+    assert provider.context_limit() is None
+
+
+def test_the_last_reported_input_tokens_are_remembered_for_the_context_budget(router, provider):
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                **completion(content="Hi."),
+                "usage": {"prompt_tokens": 96_500, "completion_tokens": 12, "total_tokens": 96_512},
+            },
+        )
+    )
+
+    assert provider.last_tokens_in is None  # nothing to report before the first call
+    provider.chat([Message.user("Hi")])
+
+    # The trigger the context budget compacts on: the provider's *own* count, exact and free.
+    assert provider.last_tokens_in == 96_500
+
+
+def test_an_over_length_400_raises_the_context_length_error(router, provider):
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": (
+                        "This model's maximum context length is 128000 tokens. However, your "
+                        "messages resulted in 200000 tokens."
+                    ),
+                    "type": "invalid_request_error",
+                    "code": "context_length_exceeded",
+                }
+            },
+        )
+    )
+
+    with pytest.raises(ProviderContextLengthError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    # Deterministic, so it is classed apart from every other 400: the session compacts and retries
+    # once, instead of the agent failing identically on every wake until a human intervenes.
+    assert exc.value.status_code == 400
+    assert isinstance(exc.value, ProviderAPIError)
+
+
+def test_an_ordinary_400_is_not_mistaken_for_the_wall(router, provider):
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            400, json={"error": {"message": "Unsupported parameter: 'foo'", "code": None}}
+        )
+    )
+
+    with pytest.raises(ProviderAPIError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    # Fails safe in the other direction too: an unrelated 400 keeps behaving exactly as before.
+    assert not isinstance(exc.value, ProviderContextLengthError)

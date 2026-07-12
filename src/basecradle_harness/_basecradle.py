@@ -69,6 +69,7 @@ from typing import Any
 from basecradle import BaseCradle
 
 from basecradle_harness._code import CODE_EXECUTION_BUILTIN, CodeExecutionBridge
+from basecradle_harness._context import Compactor, ContextBudget
 from basecradle_harness._engine import DEFAULT_MAX_STEPS, DEFAULT_RESPONSE_RETRIES
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
@@ -247,6 +248,9 @@ class TimelineAgent:
             response_retries=_response_retries_from_env(),
             server_builtins=resolved.builtins,
             turn_hook=bridge.on_reply if bridge is not None else None,
+            # The context budget (issue #276): the poll loop's session is as long-lived as a
+            # wake-mode one — it is the same transcript — so it is bounded the same way.
+            compactor=_compactor_from_env(provider),
         )
         return cls(
             harness,
@@ -1260,6 +1264,42 @@ def _response_retries_from_env() -> int:
     if value < 0:
         raise ValueError(f"HARNESS_RESPONSE_RETRIES must be a non-negative integer, got {value}.")
     return value
+
+
+def _max_context_tokens_from_env() -> int | None:
+    """Read ``HARNESS_MAX_CONTEXT_TOKENS`` into the context budget's operator override (issue #276).
+
+    Unset or blank → ``None``: the budget resolves the ceiling itself (the adapter's `context_limit`
+    capability, else the conservative floor). Set → the operator's number, which **always wins** —
+    it is the 2 a.m. escape hatch, the only correct answer for a model whose window is below the
+    floor or whose routing an operator has pinned, and the knob for anyone who wants a *tighter*
+    budget than the ceiling for cost reasons. **Zero is valid** and disables compaction outright —
+    the pre-#276 behavior, and that includes the over-length self-heal: "off" means off, and an
+    escape hatch that rewrites the operator's transcript anyway, at exactly the moment they would
+    least expect it, is not an escape hatch. So the floor is 0; a negative value fails loudly rather
+    than quietly meaning something no one intended.
+    """
+    raw = os.environ.get("HARNESS_MAX_CONTEXT_TOKENS")
+    if raw is None or not raw.strip():
+        return None
+    value = int(raw)
+    if value < 0:
+        raise ValueError(
+            f"HARNESS_MAX_CONTEXT_TOKENS must be a non-negative integer (0 disables "
+            f"compaction), got {value}."
+        )
+    return value
+
+
+def _compactor_from_env(provider: Provider) -> Compactor:
+    """The agent's context budget + compactor, wired to the model it will run against.
+
+    Built for every deployed agent — this is the invariant, not a per-persona feature: *nothing
+    replayed per wake may be unbounded*. It costs a quiet agent nothing (no extra API call is ever
+    made until a call's reported usage is large enough that some ceiling could be in play), and it
+    is what keeps a standing agent from walking into its context wall.
+    """
+    return Compactor(provider, ContextBudget(provider, override=_max_context_tokens_from_env()))
 
 
 def _log_level_from_env() -> int:

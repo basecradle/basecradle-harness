@@ -28,6 +28,7 @@ from basecradle_harness import (
     ProviderAPIError,
     ProviderAuthError,
     ProviderConnectionError,
+    ProviderContextLengthError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
@@ -553,3 +554,158 @@ def test_a_body_that_names_no_endpoint_omits_the_field_rather_than_faking_one(ro
 
     line = _llm_line(caplog)
     assert "endpoint=" not in line and "cost=" not in line and "cached_tokens=" not in line
+
+
+# === The context-limit capability (issue #276) ===============================
+#
+# The honest ceiling behind a *router*. OpenRouter's model object advertises the best case across
+# every endpoint it fronts (`z-ai/glm-5.2` says 1,048,576) while the endpoints actually range
+# 101,376–1,048,576 — so the number must come from the live per-endpoint data, and must count only
+# the endpoints a request could actually be routed to.
+
+ENDPOINTS_URL = f"{BASE_URL}/models/z-ai/glm-5.2/endpoints"
+
+
+def _endpoint(*, name, context_length, status=0, max_prompt_tokens=None):
+    """One entry of the live `/endpoints` payload, shaped as the SDK's typed model requires.
+
+    The values mirror a real `z-ai/glm-5.2` endpoints response — including the `status: -5`,
+    zero-uptime entries the live pool actually carries, which is the case the capability must not
+    count (see the test below).
+    """
+    return {
+        "name": f"{name} | z-ai/glm-5.2-20260616",
+        "provider_name": name,
+        "model_id": MODEL,
+        "model_name": "Z.ai: GLM 5.2",
+        "context_length": context_length,
+        "max_completion_tokens": 131072,
+        "max_prompt_tokens": max_prompt_tokens,
+        "pricing": {"prompt": "0.00000042", "completion": "0.00000132", "discount": 0},
+        "supported_parameters": ["tools", "tool_choice", "reasoning"],
+        "quantization": "fp8",
+        "tag": f"{name.lower()}/fp8",
+        "status": status,
+        "uptime_last_5m": 99.7,
+        "uptime_last_30m": 99.0,
+        "uptime_last_1d": 99.5,
+        "latency_last_30m": None,
+        "throughput_last_30m": None,
+        "supports_implicit_caching": False,
+    }
+
+
+def _endpoints_body(*endpoints):
+    return {
+        "data": {
+            "id": MODEL,
+            "name": "Z.ai: GLM 5.2",
+            "created": 1781631930,
+            "description": "GLM 5.2.",
+            "architecture": {
+                "tokenizer": "Other",
+                "instruct_type": None,
+                "modality": "text->text",
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+            },
+            "endpoints": list(endpoints),
+        }
+    }
+
+
+def test_the_context_limit_is_the_largest_endpoint_a_request_could_route_to(router):
+    router.get(ENDPOINTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=_endpoints_body(
+                _endpoint(name="Ambient", context_length=101_376),
+                _endpoint(name="StreamLake", context_length=1_024_000),
+                _endpoint(name="Novita", context_length=1_048_576),
+            ),
+        )
+    )
+
+    # OpenRouter filters endpoints by required context at routing time, so a large request is never
+    # dispatched to the small endpoint — the wall it actually meets is the largest that can serve it.
+    assert _provider().context_limit() == 1_048_576
+
+
+def test_a_dead_endpoints_ceiling_is_not_a_ceiling(router):
+    """`status` is not decorative: the live pool really does carry endpoints at -5, 0% uptime."""
+    router.get(ENDPOINTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=_endpoints_body(
+                _endpoint(name="Ambient", context_length=262_144),
+                _endpoint(name="AkashML", context_length=1_048_576, status=-5),
+            ),
+        )
+    )
+
+    # Counting the dead endpoint would report a ceiling no request can reach — and the agent would
+    # then compact too late, which is the whole failure this exists to prevent.
+    assert _provider().context_limit() == 262_144
+
+
+def test_max_prompt_tokens_beats_context_length_where_an_endpoint_sets_it(router):
+    router.get(ENDPOINTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=_endpoints_body(
+                _endpoint(name="Alibaba", context_length=1_048_576, max_prompt_tokens=200_000),
+            ),
+        )
+    )
+
+    # The tighter promise about the *prompt* is the half we are budgeting.
+    assert _provider().context_limit() == 200_000
+
+
+def test_an_unreachable_endpoints_api_degrades_to_no_answer(router):
+    router.get(ENDPOINTS_URL).mock(side_effect=httpx.ConnectError("no route to host"))
+
+    # `retries_disabled` for the same reason the production adapter passes `retry_config=None`: the
+    # SDK's Speakeasy default backs off for up to an hour on a transport failure, which would hang
+    # a wake (and, here, the test run) far past its timeout.
+    # No answer → the budget falls to its conservative floor. A metadata read never breaks a wake.
+    assert _provider(retries_disabled=True).context_limit() is None
+
+
+def test_an_over_length_400_maps_to_the_context_length_error(router):
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            400,
+            json={
+                "error": {
+                    "message": "This endpoint's maximum context length is 101376 tokens.",
+                    "code": 400,
+                }
+            },
+        )
+    )
+    provider = _provider(retries_disabled=True)
+
+    with pytest.raises(ProviderContextLengthError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    # Deterministic, not transient: it is classed apart so the session compacts and retries once,
+    # rather than re-sending the same doomed request on every wake forever.
+    assert exc.value.status_code == 400
+    assert isinstance(exc.value, ProviderAPIError)
+    provider.close()
+
+
+def test_an_ordinary_400_is_not_mistaken_for_the_wall(router):
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            400, json={"error": {"message": "Invalid tool schema", "code": 400}}
+        )
+    )
+    provider = _provider(retries_disabled=True)
+
+    with pytest.raises(ProviderAPIError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert not isinstance(exc.value, ProviderContextLengthError)
+    provider.close()

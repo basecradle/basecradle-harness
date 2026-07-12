@@ -44,6 +44,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from urllib.parse import quote
 
+from basecradle_harness._context import Compactor
 from basecradle_harness._engine import (
     DEFAULT_MAX_STEPS,
     DEFAULT_RESPONSE_RETRIES,
@@ -91,6 +92,11 @@ class Harness:
         turn_hook: An optional engine post-turn hook (see `Engine`). Used to wire
             the code-execution Asset bridge; ``None`` (the default) leaves the loop
             unchanged.
+        compactor: The context budget (`basecradle_harness._context`), handed to every
+            session this agent creates, so each channel's transcript stays inside the
+            model's context window (issue #276). Shared like the engine and the memory:
+            one budget, one ceiling, every conversation. ``None`` (the default) leaves
+            transcripts unbounded — fine for a short-lived agent, not for a standing one.
     """
 
     def __init__(
@@ -105,6 +111,7 @@ class Harness:
         server_builtins: Sequence[str] = (),
         home: str | Path | None = None,
         turn_hook: TurnHook | None = None,
+        compactor: Compactor | None = None,
     ) -> None:
         self.provider = provider
         self.tools = ToolRegistry(policy=policy or Policy.locked())
@@ -120,6 +127,7 @@ class Harness:
         )
         self.system_prompt = system_prompt
         self.home = Path(home) if home is not None else None
+        self.compactor = compactor
         self._sessions: dict[str, Session] = {}
 
     def session(self, source: str = DEFAULT_SOURCE) -> Session:
@@ -138,6 +146,7 @@ class Harness:
             self.engine,
             system_prompt=self.system_prompt,
             path=self._transcript_path(source),
+            compactor=self.compactor,
         )
         self._sessions[source] = session
         return session

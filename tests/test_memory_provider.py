@@ -440,3 +440,59 @@ def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):
     posted = agent.wake()  # must not raise
 
     assert len(posted) == 1  # the reply landed despite both hooks raising
+
+
+# === Compaction summaries reach durable memory (issue #276, requirement 7) ===
+#
+# `observe` is handed the *dialogue* only — which is right, and is what keeps the palace worth
+# searching. But it means tool-driven work leaves no durable trace unless the agent narrated it.
+# That is harmless while the turns are still in the transcript, and stops being harmless the moment
+# compaction drops them. So the boundary is where the work is captured.
+
+
+def test_a_compaction_summary_is_written_to_a_providers_store(platform, tmp_path):
+    """The default SQLite provider: `observe` is a no-op, so the summary goes to the store."""
+    memory = SqliteMemoryProvider(tmp_path / "memory.db")
+    agent = _wake(tmp_path, memory)
+
+    agent._remember_compaction("WORK DONE: I posted the weekly report, asset 0198…")
+
+    stored = memory.store.list()
+    assert "compaction/timeline:" in stored
+    # The agent can read its own past back — nothing is dropped from a transcript without a record.
+    key = next(k for k in stored.splitlines() if "compaction/" in k).strip("- ").strip()
+    assert "I posted the weekly report" in memory.store.read(key)
+    memory.close()
+
+
+def test_a_storeless_provider_gets_the_summary_through_observe(platform, tmp_path):
+    """MemPalace is a pure middleware: its `store` is None by design, so `observe` is the surface."""
+    memory = RecordingProvider()
+    memory.store = None
+    agent = _wake(tmp_path, memory)
+
+    agent._remember_compaction("WORK DONE: I filed the issue.")
+
+    assert len(memory.observed) == 1
+    exchange = memory.observed[0]
+    assert exchange.assistant == "WORK DONE: I filed the issue."
+    assert "compaction" in exchange.user.lower()  # framed as the agent's own notes, not a peer's
+    # Scoped to the *agent*, never partitioned by timeline — memory is one mind across every channel.
+    assert exchange.scope.agent == agent.me_uuid
+
+
+def test_a_memory_failure_never_undoes_a_compaction(platform, tmp_path):
+    class Exploding(RecordingProvider):
+        store = None
+
+        def observe(self, exchange):
+            raise RuntimeError("the palace is on fire")
+
+    agent = _wake(tmp_path, Exploding())
+    compactor = agent.harness.compactor
+
+    # The wake wires the hook; the compactor guards it. Memory is best-effort — the transcript
+    # bound is not, and a failed write must never leave a transcript uncompacted.
+    if compactor is not None:
+        compactor.on_summary = agent._remember_compaction
+        compactor._remember("SUMMARY")  # must not raise

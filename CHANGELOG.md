@@ -5,6 +5,71 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.64.0] - 2026-07-12
+
+**The transcript now bounds itself, so a standing agent never walks into its context wall (issue
+#276).** The bloat fixes in 0.62 slowed the growth; nothing stopped it. A continuous agent's
+conversation still grew monotonically toward its model's **context ceiling** — and that is not a
+slow bleed but a wall: the provider returns a deterministic `400`, and because the transcript
+persists, *every* later wake rebuilds the same over-long request and fails identically. The agent is
+bricked on that timeline until a human edits its session file by hand. (@glm-5.2 came within ~25% of
+that wall in three days.) This release is the structural fix: past **half** the model's ceiling, a
+session compacts itself — a recent window kept verbatim, everything older replaced by one summary
+the model writes, with the summary also written to durable memory so tool-driven work never vanishes
+with the turns that carried it.
+
+The invariant it establishes, now stated in `CLAUDE.md`: **nothing replayed per wake may be
+unbounded.**
+
+### Added
+
+- **The context budget (`_context.py`) — `ContextBudget` + `Compactor`.** The trigger is the
+  **provider's own reported usage** (the exact `tokens_in` every endpoint returns and the harness
+  already logs), never a client-side count — which would need a tokenizer per model, and GLM
+  publishes none, so a local count could not even be *honest*, let alone free. It is read the moment
+  a turn settles, so no state has to survive the process: the compacted transcript on disk *is* the
+  record of the decision.
+- **`context_limit()` — a provider-adapter capability**, resolved **`HARNESS_MAX_CONTEXT_TOKENS` →
+  adapter → a conservative 128,000 floor**, and *never* a static model→limit table (which cannot
+  express a router's reality and rots silently on the next model launch). Each adapter answers
+  however it honestly can: `xai-sdk` reads its SDK's `max_prompt_length`; `openrouter` computes the
+  real ceiling of the endpoints it would actually route to — counting only those still in rotation,
+  since the live pool carries endpoints at `status: -5` with 0% uptime whose ceiling no request can
+  reach; the `openai` SDK reads a `context_length` when the endpoint states one, and **OpenAI itself
+  states none**, so an OpenAI-direct agent honestly falls to the floor. The lookup is lazy, cached,
+  guarded, and **never made at all** by an agent whose calls are small.
+- **`ProviderContextLengthError` — the wall, as its own error class**, mapped by every adapter from
+  its own over-length response. Deterministic, not transient, so it is the one failure the session
+  can *fix*: it compacts hard and re-runs the turn **once**. An agent that has already grown past its
+  ceiling **self-heals on its next wake** instead of needing session-file surgery. The one overflow
+  it does *not* re-run is one that struck **after a tool had already executed** — a re-run there
+  could post the same message or create the same task twice (`ClaimStore` makes each *item*
+  exactly-once; nothing makes a *turn* replay-safe), so the work stays in the transcript, the error
+  stands, and the compaction still lands so the next wake comes in under the ceiling.
+- **Compaction summaries reach durable memory.** The `observe` seam is handed dialogue only (which is
+  what keeps a memory palace worth searching), so tool-driven work left no durable trace unless the
+  agent narrated it — harmless while the turns are live, and *not* harmless the moment compaction
+  drops them. The summarizer is now instructed to record the **work** (tool actions, artifacts,
+  uuids, outcomes, open threads) and the summary is written to the bound provider's store (SQLite) or
+  its `observe` hook (MemPalace, which has no store by design).
+- **`HARNESS_MAX_CONTEXT_TOKENS`** — the operator's override; always wins. Also the knob for a
+  *tighter* budget than the ceiling (compact earlier, replay fewer tokens per wake) and **required**
+  for any model whose window is below the 128 K floor. `0` disables compaction entirely — the
+  self-heal included, because an escape hatch that rewrites the operator's transcript anyway, at
+  exactly the moment they would least expect it, is not an escape hatch.
+- **`max_context_tokens` in `--resolved-config`**, and two new log lines: the resolved limit with its
+  source (`context limit limit=1048576 source=adapter`) and every compaction (`context compact
+  tokens_in=… messages=486→94 chars=…`). A declined or failed compaction is a `WARNING`.
+
+### Fixed
+
+- Nothing regressed here — but two invariants are now pinned by tests, because breaking either is
+  silent: **a cut may land only immediately before a `user` turn** (cutting mid-tool-chain strands a
+  tool result from its call, and a dangling `tool_call_id` is malformed *permanently*, breaking every
+  later wake — so when no safe cut exists the compactor declines and says so), and **the tool-result
+  cap is a prerequisite of the 50% threshold**, not a neighbor of it (compaction fires *between*
+  turns, so the threshold is only a safe distance because one turn's persisted growth is bounded).
+
 ## [0.63.0] - 2026-07-12
 
 **The per-call line now says who *served* the call, what it cost, and whether the cache did anything

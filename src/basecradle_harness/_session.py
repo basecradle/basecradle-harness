@@ -38,6 +38,13 @@ here:
   (see `TOOL_RESULT_CAP`). This is the same cost discipline the engine already applies
   to a viewed image — seen once, never re-billed — extended to the text that a single
   mailbox listing or wide file read would otherwise tax every future wake with.
+- **The conversation itself is bounded.** Capping each turn only slows the growth; it does not
+  stop it, and a long-lived agent would still walk into its model's context ceiling — where the
+  provider 400s deterministically and every later wake rebuilds the same doomed request. So a
+  session given a `compactor` (`basecradle_harness._context`) watches the provider's *own*
+  reported usage and, past half the ceiling, replaces everything but a recent window with a
+  model-written summary (issue #276). That is the third discipline, and the invariant behind all
+  three: **nothing replayed per wake may be unbounded.**
 
 **Position is load-bearing.** The provider's prefix cache only pays out on a
 byte-stable prefix, so volatile content goes at the *tail*: the frozen history first,
@@ -49,10 +56,15 @@ destroy caching — an invariant stated in this repo's CLAUDE.md → Context Dis
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
+from basecradle_harness._context import Compactor
 from basecradle_harness._engine import Engine
+from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._messages import ImageContent, Message
+
+_log = logging.getLogger("basecradle_harness")
 
 #: The most characters of one tool result that persist into the transcript. Above it, the
 #: result is elided to head + tail around a marker naming the original size (`_elide`). The
@@ -87,6 +99,12 @@ class Session:
         path: Where to persist this session's transcript. `None` (the default)
             keeps it in memory only. A path enables across-restart durability;
             its parent directory is created on first write.
+        compactor: The context budget's rewriter (`basecradle_harness._context`). Given one,
+            the session bounds its own transcript: after a settled turn it asks whether the
+            provider's own reported usage crossed the compaction threshold, and if so replaces
+            everything but a recent window with a model-written summary. `None` (the default)
+            leaves the transcript to grow — the pre-#276 behavior, still correct for a
+            short-lived or hand-managed session.
     """
 
     def __init__(
@@ -96,10 +114,12 @@ class Session:
         *,
         system_prompt: str | None = None,
         path: str | Path | None = None,
+        compactor: Compactor | None = None,
     ) -> None:
         self.source = source
         self.engine = engine
         self.path = Path(path) if path is not None else None
+        self.compactor = compactor
         self.history: list[Message] = self._load()
         if not self.history and system_prompt:
             self.history.append(Message.system(system_prompt))
@@ -132,9 +152,36 @@ class Session:
         stays hot) and never enters `history`: it is a snapshot of a *moment*, and a persisted
         copy is a stale duplicate the model would re-read — and re-pay for — on every later
         turn (issue #275).
+
+        Two things bound the transcript around this call, and both are the same discipline —
+        *nothing replayed per wake may be unbounded* (issue #276). **Before** it: an
+        over-length failure (`ProviderContextLengthError` — the transcript has outgrown the
+        model's context window) is caught, the transcript is compacted hard, and the turn is
+        re-run **once**, so an agent already at the wall self-heals instead of failing
+        identically on every wake until a human edits its session file. **After** it: if the
+        provider's own reported usage for this turn crossed the compaction threshold, the
+        transcript is compacted for the *next* one.
         """
-        turn = Message(role="user", content=text, images=list(images) if images else [])
+        pixels = list(images) if images else []
+        turn = Message(role="user", content=text, images=list(pixels))
         self.history.append(turn)
+        mark = len(self.history)  # everything past here is this turn's work — what a retry rewinds
+        try:
+            reply = self._exchange(turn, brief)
+        except ProviderContextLengthError as error:
+            if not self._recover_from_overflow(mark, turn, pixels):
+                raise  # nothing could be compacted: the same request would fail the same way
+            _log.warning("Retrying the turn once against the compacted transcript: %s", error)
+            reply = self._exchange(turn, brief)
+        self._compact_if_needed()
+        return reply.content or ""
+
+    def _exchange(self, turn: Message, brief: str | None) -> Message:
+        """One engine run against the current history, adopting and persisting whatever it produced.
+
+        `turn` must be the last message in `history` — the brief is spliced in just ahead of it, so
+        the volatile content sits at the tail and the cacheable prefix stays byte-stable.
+        """
         # What the provider sees: the durable transcript, then the ephemeral brief, then this
         # turn. The engine appends its work onto this list, so `adopted` marks where that work
         # begins — everything past it is the conversation and belongs in `history`; the brief,
@@ -163,7 +210,69 @@ class Session:
             turn.images = []
             _cap_tool_results(self.history)
             self._save()
-        return reply.content or ""
+        return reply
+
+    def _recover_from_overflow(self, mark: int, turn: Message, pixels: list[ImageContent]) -> bool:
+        """Rewind the failed turn, compact hard, and report whether a retry is worth making.
+
+        Rewinding drops the failed run's residue so `turn` is once more the tail of `history`, which
+        is what the retry (and the brief's splice position) require. The pixels are restored with it:
+        an image a peer posted must still be *seen* on the retry, not silently dropped by the rescue.
+
+        **A retry is only safe when the failed run ran no tools.** The overflow usually strikes the
+        run's *first* call — the transcript was already too long before the model did anything — and
+        then the residue is inert (a step-counter note, the failure marker) and re-running the turn
+        repeats nothing. But a run can also cross the ceiling *mid-flight*, after tool calls have
+        already executed; rewinding there would erase the record that they ran, and the re-run would
+        very likely call them again — posting the same message twice, creating the same task twice.
+        The `ClaimStore` makes each *item* exactly-once, but nothing makes a *turn* replay-safe. So a
+        run that got as far as executing a tool is **not** retried: its work stays in the transcript,
+        the error propagates (the wake degrades as it always did), and the compaction below still
+        shrinks the transcript so the *next* wake comes in under the ceiling. Self-healing, one wake
+        later, and never at the price of a duplicated side effect.
+
+        Returns False when there is no compactor, when the run already fired tools, or when
+        compaction could not free anything — the caller then lets the original error propagate.
+        """
+        if self.compactor is None:
+            return False
+        ran = sum(1 for message in self.history[mark:] if message.role == "tool")
+        if ran:
+            # Tools already ran. Keep their record, compact anyway (we *know* the transcript is over
+            # the ceiling — the provider just said so, which no reported usage would tell us, since
+            # the call that would have reported it never completed), and do not re-run the turn.
+            _log.warning(
+                "Context overflow after %d tool call(s) had already run: the turn is NOT retried "
+                "(a re-run could repeat their side effects). Compacting for the next wake.",
+                ran,
+            )
+            if self.compactor.emergency_compact(self.history):
+                self._save()
+            return False
+        del self.history[mark:]
+        turn.images = list(pixels)
+        if not self.compactor.emergency_compact(self.history):
+            return False
+        self._save()
+        return True
+
+    def _compact_if_needed(self) -> None:
+        """Bound the transcript for the *next* turn, on what the provider said about this one.
+
+        Read the usage **here**, immediately after the run that produced it: one provider instance is
+        shared by every session of an agent, so `last_tokens_in` means "the last call anyone made" —
+        unambiguous on this single-threaded path, where the last call is always this session's own.
+
+        A compaction failure is never a turn failure: the reply is already in hand and the peer is
+        owed it. The worst case is a transcript that stays too long and tries again next turn.
+        """
+        if self.compactor is None:
+            return
+        try:
+            if self.compactor.maybe_compact(self.history):
+                self._save()
+        except Exception as exc:  # noqa: BLE001 - a failed compaction degrades; it never breaks a turn
+            _log.warning("Context compaction failed; the transcript is unchanged: %s", exc)
 
     def note(self, text: str) -> None:
         """Record an out-of-band system note in the transcript — no model call.

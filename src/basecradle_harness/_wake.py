@@ -79,10 +79,12 @@ from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
     _client_from_env,
+    _compactor_from_env,
     _config_from_env,
     _configure_logging,
     _context_messages_from_env,
     _incoming_text,
+    _max_context_tokens_from_env,
     _max_steps_from_env,
     _messages_since,
     _onboard_from_env,
@@ -261,6 +263,15 @@ _DEFAULT_BREAKER_WINDOW = 60.0
 # The breaker's loud alert text. Full sentences, so sentence case with terminal punctuation
 # (the Title-Case exception). The trip alert is posted once on the trip transition (the
 # durable marker is the one-time guard) and the reset alert once on auto-reset.
+#: The "user" side of the exchange a compaction summary is `observe`d as, on a memory provider with
+#: no store of its own (MemPalace). Its miner reads dialogue, so the summary needs a prompt to be the
+#: answer *to* — and this states plainly what it is, so a later search hit reads as the agent's own
+#: notes-to-self rather than as something a peer said (issue #276).
+_COMPACTION_OBSERVE_NOTE = (
+    "[Context compaction] Summarize the work and conversation about to be dropped from my "
+    "transcript, so it survives in memory."
+)
+
 _BREAKER_TRIP_ALERT = (
     "I appear to be in a wake loop here, so I'm pausing to avoid a runaway. "
     "I'll resume automatically once the burst clears; an operator can also reset me."
@@ -699,6 +710,12 @@ class WakeAgent:
         self.onboard = onboard
         self.tool_manifest = tool_manifest
         self.memory_provider = memory_provider
+        # Route every compaction summary into durable memory (issue #276, requirement 7). The
+        # compactor is built with the provider, before there is a memory provider to hand it, so
+        # the two are joined here — the one place that holds both. Without this the agent's
+        # tool-driven work would vanish with the turns compaction drops (see `_remember_compaction`).
+        if harness.compactor is not None:
+            harness.compactor.on_summary = self._remember_compaction
         # Safe-by-default opt-out notices (active MCP servers, policy-refused drop-in tools)
         # surfaced into the persistent brief, so "all bets off" is stated and auditable —
         # empty for a pure-Harness config.
@@ -829,6 +846,12 @@ class WakeAgent:
             # source into Assets after each code-exec turn, then feeds their uuids back. None
             # when code execution isn't opted in → the engine loop is unchanged.
             turn_hook=bridge.on_reply if bridge is not None else None,
+            # The context budget (issue #276). A wake replays the *whole* persisted transcript, so
+            # without this a standing agent grows monotonically into its model's context ceiling and
+            # bricks. `HARNESS_MAX_CONTEXT_TOKENS` overrides the ceiling (0 disables compaction);
+            # otherwise the adapter is asked and, failing that, a conservative floor is assumed. The
+            # summary's route into durable memory is wired below, once the memory provider is bound.
+            compactor=_compactor_from_env(provider),
         )
         return cls(
             harness,
@@ -1533,6 +1556,46 @@ class WakeAgent:
             return
         _log.debug("memory %s", kv(op="observe", chars=len(user) + len(assistant)))
 
+    def _remember_compaction(self, summary: str) -> None:
+        """Write a compaction summary to durable memory — the answer to issue #276's requirement 7.
+
+        **The gap this closes.** The memory seam's `observe` hook is handed the *dialogue* only
+        (user text + the agent's reply — no briefs, no tool dumps), which is right: it is what keeps
+        MemPalace's palace worth searching. But it means tool-driven work leaves no durable trace
+        unless the agent happened to narrate it. Before compaction that is harmless — the tool
+        results are still in the live transcript. At compaction it stops being harmless: the turns
+        go, and with them any record that the work ever happened.
+
+        So the boundary is where it is captured, because the boundary is where it would be lost. The
+        summarizer is instructed to record the work first (`_context._SUMMARIZE_INSTRUCTION`), and
+        that summary is written **here**, to whichever durable surface the bound provider has:
+
+        - a provider with a `store` (the default SQLite one, whose `observe` is a no-op) → a write
+          under an append-only, timestamped key, readable by the agent's own memory tool;
+        - a provider without one (MemPalace, a pure middleware whose `store` is `None` by design) →
+          its `observe` hook, which is what it durably keeps.
+
+        What is *not* written is raw tool output: the point is a record of what was done, not a
+        second copy of the bytes being dropped — that would re-create this very bloat inside memory.
+
+        Its caller (`Compactor._remember`) guards it, like every memory hook: a failure here logs
+        and the compaction still stands. Memory is best-effort; the transcript bound is not.
+        """
+        if self.memory_provider is None:
+            return
+        scope = MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid)
+        store = getattr(self.memory_provider, "store", None)
+        write = getattr(store, "write", None)
+        if callable(write):
+            key = f"compaction/{self.source}/{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}"
+            write(key, summary)
+            _log.info("memory %s", kv(op="write", key=key, chars=len(summary)))
+            return
+        self.memory_provider.observe(
+            MemoryExchange(user=_COMPACTION_OBSERVE_NOTE, assistant=summary, scope=scope)
+        )
+        _log.info("memory %s", kv(op="observe", source="compaction", chars=len(summary)))
+
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
         """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.
 
@@ -2196,6 +2259,14 @@ def resolved_config() -> dict[str, object]:
       **drops** as harness-owned collisions (plus ``extra_body`` on the SDKs that do not support
       it): the "warn and win" set (`resolved_model_params`). ``[]`` when nothing collides; the
       effective tuning the SDK receives is ``model_params`` minus these.
+    - ``max_context_tokens`` — the operator's context-budget override (`HARNESS_MAX_CONTEXT_TOKENS`;
+      issue #276), or ``null`` when unset. ``0`` means compaction is **disabled** on this agent, and
+      that is the state worth being able to see from outside. The *resolved* ceiling is deliberately
+      **not** reported: below the override it comes from the adapter's live `context_limit` capability
+      (an API call against a provider this path never builds and holds no key for), so a number here
+      would be a guess — and a guessed field in the file the drift audit trusts is worse than an
+      absent one. The wake logs the resolved limit and its source (``context limit limit=… source=…``)
+      on the run that actually resolves it.
 
     A malformed ``model_params.json`` makes this raise `ValueError` — the same failure a wake would
     hit, surfaced here at verify time (the caller turns it into a clean non-zero exit).
@@ -2213,6 +2284,7 @@ def resolved_config() -> dict[str, object]:
         "ai_sdk_version": _sdk_version(sdk),
         "ai_model": os.environ.get("AI_MODEL") or None,
         "active_profile": profile_name,
+        "max_context_tokens": _max_context_tokens_from_env(),
         "memory_provider": memory_name,
         "memory_provider_version": memory_version,
         "tools": sorted(tool.name for tool in resolved.tools),

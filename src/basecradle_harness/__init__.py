@@ -19,6 +19,7 @@ from basecradle_harness._brief import (
 )
 from basecradle_harness._code import CodeAttachTool, CodeExecutionBridge
 from basecradle_harness._confirmed import ConfirmedTimelineAction
+from basecradle_harness._context import Compactor, ContextBudget
 from basecradle_harness._delete import DeleteTool
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
@@ -29,6 +30,7 @@ from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
     ProviderConnectionError,
+    ProviderContextLengthError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
@@ -136,6 +138,9 @@ __all__ = [
     "Engine",
     "TimelineAgent",
     "WakeAgent",
+    # The context budget: bound the transcript (issue #276)
+    "ContextBudget",
+    "Compactor",
     # Config home: installer + conffile upgrader
     "install",
     "reconcile_on_upgrade",
@@ -244,6 +249,7 @@ __all__ = [
     "EngineError",
     "ProviderError",
     "ProviderResponseError",
+    "ProviderContextLengthError",
     "ProviderConnectionError",
     "ProviderAPIError",
     "ProviderAuthError",
