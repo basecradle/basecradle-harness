@@ -7,6 +7,7 @@ model *input* on the next turn, then the pixels are evicted from the transcript
 once the model has answered, so a viewed image is never re-sent.
 """
 
+import logging
 import re
 
 import pytest
@@ -17,7 +18,9 @@ from basecradle_harness import (
     ImageContent,
     Message,
     ProviderAuthError,
+    ProviderRateLimitError,
     ProviderResponseError,
+    ProviderServerError,
     Tool,
     ToolCall,
     ToolRegistry,
@@ -535,6 +538,17 @@ class AuthFailingProvider:
         raise ProviderAuthError("bad key", status_code=401)
 
 
+class RateLimitedProvider:
+    """Raises 429 — an API error that is *not* in the transient set, and must not be retried."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        raise ProviderRateLimitError("slow down", status_code=429)
+
+
 def _no_sleep():
     """A sleep spy: records the backoff delays it was asked to wait, and never actually sleeps."""
     delays: list[float] = []
@@ -588,6 +602,99 @@ def test_the_give_up_leaves_a_diagnosable_log_trail(caplog):
     assert len(warnings) == 2  # one per retry attempt
     assert len(errors) == 1  # the final give-up
     assert "all 3 attempt(s)" in errors[0].message  # names the attempt count
+
+
+class ServerErrorProvider:
+    """Raises a 5xx on its first `fails` calls, then returns `reply` (issue #284).
+
+    The provider failing on *its own side*: the request was well-formed and nothing about it will
+    be improved by changing it, so re-issuing the identical call is exactly right.
+    """
+
+    def __init__(self, fails: int, reply: Message, status: int = 500) -> None:
+        self._fails = fails
+        self._reply = reply
+        self._status = status
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.calls <= self._fails:
+            raise ProviderServerError(f"boom (call {self.calls})", status_code=self._status)
+        return self._reply
+
+
+def test_a_provider_5xx_is_retried_then_succeeds():
+    """A 5xx is the provider saying "my fault, not yours" — transient, so the engine re-requests it
+    rather than aborting the wake (issue #284).
+
+    This is what the retry is *for*: a wake marks each item **seen before** it calls the model, so an
+    aborted wake does not merely fail — it drops the peer's message permanently, with no later wake
+    to retry it. A bounded retry costs cents against the worst failure class the platform has.
+    """
+    provider = ServerErrorProvider(fails=1, reply=Message.assistant(content="the real answer"))
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), sleep=spy)
+
+    reply = engine.run([Message.user("hi")])
+
+    assert reply.content == "the real answer"
+    assert provider.calls == 2  # failed once, retried, succeeded
+    assert delays == [0.5]  # one backoff
+
+
+@pytest.mark.parametrize("status", [500, 502, 503, 529])
+def test_every_5xx_is_transient_whatever_the_status(status):
+    """The whole 5xx range is the server's own fault — not a curated list of statuses someone
+    remembered. Anthropic's 529 (overloaded) is in here precisely because a hand-kept list would
+    have missed it."""
+    provider = ServerErrorProvider(fails=1, reply=Message.assistant(content="ok"), status=status)
+    _, spy = _no_sleep()
+
+    assert Engine(provider, ToolRegistry(), sleep=spy).run([Message.user("hi")]).content == "ok"
+    assert provider.calls == 2
+
+
+def test_a_5xx_that_never_clears_is_still_bounded():
+    """A genuinely-down provider must not be retried forever — the bound holds, and the wake aborts
+    cleanly with the 5xx rather than hanging."""
+    provider = ServerErrorProvider(fails=99, reply=Message.assistant(content="never"))
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), response_retries=2, sleep=spy)
+
+    with pytest.raises(ProviderServerError):
+        engine.run([Message.user("hi")])
+
+    assert provider.calls == 3  # response_retries + 1
+    assert delays == [0.5, 1.0]
+
+
+def test_the_5xx_retry_says_which_fault_it_hit(caplog):
+    """A journal must distinguish the two transient faults — "unparseable body" and "the provider
+    fell over" are different operational problems, and a single generic line would conflate them."""
+    provider = ServerErrorProvider(fails=1, reply=Message.assistant(content="ok"), status=503)
+    _, spy = _no_sleep()
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        Engine(provider, ToolRegistry(), sleep=spy).run([Message.user("hi")])
+
+    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("own side (HTTP 503)" in m for m in warnings)
+
+
+def test_a_rate_limit_is_not_retried_even_though_it_is_an_api_error():
+    """429 shares a base class with 5xx but is *not* transient in the same way — hammering a
+    rate-limited endpoint only deepens the hole. The retryable set is chosen by the nature of the
+    fault, not by "is it a ProviderAPIError"."""
+    provider = RateLimitedProvider()
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), response_retries=5, sleep=spy)
+
+    with pytest.raises(ProviderRateLimitError):
+        engine.run([Message.user("hi")])
+
+    assert provider.calls == 1
+    assert delays == []
 
 
 def test_a_permanent_provider_error_is_not_retried():

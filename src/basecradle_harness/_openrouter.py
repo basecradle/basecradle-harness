@@ -68,6 +68,7 @@ from basecradle_harness._exceptions import (
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderServerError,
 )
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
@@ -560,6 +561,15 @@ def _from_status_error(exc) -> ProviderError:
             status_code=status,
             body=body,
             retry_after=_retry_after(exc),
+        )
+    if status >= 500:
+        # OpenRouter (or the upstream it routed to) fell over on its own side — transient, so the
+        # engine re-requests it (issue #284). It matters *most* here: this adapter disables the SDK's
+        # own retry (its Speakeasy default backs off for up to an hour and would hang a wake), so
+        # before this class existed a 5xx was simply fatal on OpenRouter while the `openai` SDK
+        # quietly retried the identical fault. Same failure, opposite outcome, decided by nobody.
+        return ProviderServerError(
+            f"OpenRouter failed on its own side (HTTP {status}).", status_code=status, body=body
         )
     # Carry OpenRouter's own message + body so a caller can relay the true cause.
     return ProviderAPIError(message, status_code=status, body=body)
