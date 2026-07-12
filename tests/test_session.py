@@ -8,6 +8,7 @@ As elsewhere, a `ScriptedProvider` replays prepared assistant turns, so the loop
 runs with no model and no network.
 """
 
+import json
 import re
 
 import pytest
@@ -18,8 +19,10 @@ from basecradle_harness import (
     MemoryTool,
     Message,
     Session,
+    Tool,
     ToolCall,
 )
+from basecradle_harness._session import TOOL_RESULT_CAP
 
 
 class ScriptedProvider:
@@ -28,9 +31,15 @@ class ScriptedProvider:
     def __init__(self, *replies: Message) -> None:
         self._replies = list(replies)
         self.calls: list[tuple[list[Message], object]] = []
+        #: `(role, content)` per turn, snapshotted at *chat time*. `calls` holds the live
+        #: `Message` objects, which the session later mutates in place (evicting pixels,
+        #: capping tool results) — so only a snapshot can answer "what did the model actually
+        #: read on this call?", which is the whole question issue #275 turns on.
+        self.snapshots: list[list[tuple[str, str | None]]] = []
 
     def chat(self, messages, tools=None):
         self.calls.append((list(messages), tools))
+        self.snapshots.append([(m.role, m.content) for m in messages])
         if not self._replies:
             raise AssertionError("ScriptedProvider ran out of replies")
         return self._replies.pop(0)
@@ -272,6 +281,158 @@ def test_partial_transcript_persists_on_engine_failure(tmp_path):
     marker = reloaded.history[-1]
     assert marker.role == "system"
     assert "turn failed" in marker.content and "RuntimeError" in marker.content
+
+
+# --- The ephemeral brief: shown to the model, never persisted (issue #275) ----
+
+
+def test_brief_is_shown_to_the_model_but_never_persisted():
+    """The brief reaches the provider on this turn and leaves no trace in the transcript.
+
+    It is recomposed fresh every wake (current time, step budget, live dashboard), so a
+    persisted copy is a stale duplicate the model would re-read — and re-pay for — on every
+    later turn. That is the bloat #275 exists to end.
+    """
+    provider = ScriptedProvider(text("Understood."))
+    session = Session("timeline:x", Harness(provider).engine)
+
+    session.send("what's up?", brief="Current Time: 2026-07-12. You are Nova.")
+
+    read = [content for _, content in provider.snapshots[0]]
+    assert any("You are Nova." in (c or "") for c in read)  # the model saw it…
+    assert not any("You are Nova." in (m.content or "") for m in session.history)  # …not stored
+
+
+def test_brief_rides_at_the_tail_immediately_before_the_newest_user_turn():
+    """CACHE INVARIANT: stable content first, volatile content last.
+
+    Provider prefix caching only pays out on a byte-stable prefix. The frozen transcript comes
+    first and the per-wake brief is spliced in at the tail, just ahead of the newest user turn —
+    so the cacheable prefix is the whole prior conversation. Hoisting the brief to position 0
+    ("system prompts go first") would change the prefix on every request and silently destroy
+    caching fleet-wide, while fixing nothing.
+    """
+    provider = ScriptedProvider(text("one"), text("two"))
+    session = Session("timeline:x", Harness(provider).engine)
+
+    session.send("first", brief="BRIEF-A")
+    frozen = [m.content for m in session.history]  # the transcript the next call must not disturb
+    session.send("second", brief="BRIEF-B")
+
+    read = [content for _, content in provider.snapshots[1]]
+    brief_idx = read.index("BRIEF-B")
+    assert read[brief_idx + 1] == "second"  # brief, then the turn it governs
+    # Everything ahead of the brief is exactly the frozen transcript — the stable, cacheable
+    # prefix — and last wake's BRIEF-A is nowhere in it.
+    assert read[:brief_idx] == frozen
+    assert "BRIEF-A" not in read
+
+
+def test_a_failed_turn_persists_no_brief():
+    """A wake that errors must not grow the transcript by a brief it never got value from."""
+
+    class Boom:
+        def chat(self, messages, tools=None):
+            raise RuntimeError("model exploded")
+
+    session = Session("timeline:x", Harness(Boom()).engine)
+
+    with pytest.raises(RuntimeError):
+        session.send("do the thing", brief="EPHEMERAL BRIEF")
+
+    assert not any("EPHEMERAL BRIEF" in (m.content or "") for m in session.history)
+    assert "turn failed" in session.history[-1].content  # the failure ledger still persists
+
+
+# --- Tool results: read in full, persisted capped (issue #275) ----------------
+
+
+def test_an_oversized_tool_result_is_shown_whole_then_persisted_capped(tmp_path):
+    """The model reads the full result on the turn it ran; what *persists* is head + tail.
+
+    One mailbox listing (142 KB, live) otherwise taxes every future wake for the life of the
+    timeline — the same permanent-cost trap the engine already closed for images. Text gets the
+    same discipline: seen once in full, never re-billed in full.
+    """
+    dump = "MAILBOX\n" + ("x" * 60_000) + "\nEND-OF-MAILBOX"
+
+    class Dumps(Tool):
+        name = "mailbox"
+        description = "list the mailbox"
+
+        def run(self, **kwargs):
+            return dump
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(calls_tool("c1", "mailbox"), text("You have mail."))
+    session = Session("timeline:x", Harness(provider, tools=[Dumps()]).engine, path=path)
+
+    session.send("check my mail")
+
+    # The model read the whole thing on the turn the tool ran…
+    assert ("tool", dump) in provider.snapshots[1]
+    # …but what persisted is the capped excerpt: head, an honest marker, tail.
+    stored = next(m for m in session.history if m.role == "tool")
+    assert len(stored.content) < TOOL_RESULT_CAP
+    assert stored.content.startswith("MAILBOX")  # the head survives…
+    assert stored.content.endswith("END-OF-MAILBOX")  # …and so does the tail
+    assert f"of {len(dump)}" in stored.content  # the marker names the original size
+    assert "elided" in stored.content
+    # Pairing is intact — the content was edited, never the message dropped (a dangling
+    # assistant tool-call would make the next wake's transcript malformed).
+    assert stored.tool_call_id == "c1"
+    assert any(m.role == "assistant" and m.tool_calls for m in session.history)
+    # And it is what reloads from disk, so the next wake pays the capped price, not the raw one.
+    reloaded = Session("timeline:x", Harness(ScriptedProvider()).engine, path=path)
+    assert next(m for m in reloaded.history if m.role == "tool").content == stored.content
+
+
+def test_a_normal_tool_result_is_persisted_untouched():
+    """The cap is a bound, not a haircut: an ordinary tool answer persists byte for byte."""
+    answer = "Dallas, Texas."
+
+    class Small(Tool):
+        name = "lookup"
+        description = "look something up"
+
+        def run(self, **kwargs):
+            return answer
+
+    provider = ScriptedProvider(calls_tool("c1", "lookup"), text("You're in Dallas."))
+    session = Session("timeline:x", Harness(provider, tools=[Small()]).engine)
+
+    session.send("where am I?")
+
+    assert next(m for m in session.history if m.role == "tool").content == answer
+
+
+def test_a_pre_cap_transcript_heals_on_load(tmp_path):
+    """A transcript written before the cap existed is bounded the moment it is read.
+
+    Otherwise an agent that ran the old code keeps paying for its old mailbox dumps forever,
+    and only a hand-prune on the box could save it.
+    """
+    path = tmp_path / "t.json"
+    bloat = "y" * 50_000
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "check my mail"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [{"id": "c1", "name": "mailbox", "arguments": {}}],
+                },
+                {"role": "tool", "tool_call_id": "c1", "content": bloat},
+            ]
+        )
+    )
+
+    session = Session("timeline:x", Harness(ScriptedProvider()).engine, path=path)
+
+    stored = next(m for m in session.history if m.role == "tool")
+    assert len(stored.content) < TOOL_RESULT_CAP
+    assert f"of {len(bloat)}" in stored.content
+    assert stored.tool_call_id == "c1"  # pairing survives the heal
 
 
 def test_note_records_a_system_turn_without_calling_the_model(tmp_path):

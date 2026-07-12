@@ -638,8 +638,8 @@ class WakeAgent:
         context_messages: How many backlog messages to seed as context on the
             first wake (see `_bootstrap`). The default bounds token cost; `None`
             seeds the whole backlog.
-        onboard: Re-assert the persistent operating brief on every wake (see
-            `_reassert_brief`). On by default. When on, the brief — `initialize.md`
+        onboard: Show the persistent operating brief on every wake (see
+            `_wake_brief`). On by default. When on, the brief — `initialize.md`
             + the live tool manifest + the live `dashboard.md` + `system-prompt.md`
             — supersedes a static turn-0 charter, so the agent's standing context
             stays recent in a long transcript rather than aging out at turn 1. Off
@@ -707,10 +707,13 @@ class WakeAgent:
         # heading (issue #160), so a capability silently disabled by a stale overlay or a
         # packaging bug is impossible to miss — empty when every shipped default loaded.
         self.defect_notices = defect_notices
-        # The persistent brief is composed and injected at most once per `wake()` — lazily,
-        # right before the first time the model is actually engaged — so an idle or probe-only
-        # wake neither fetches the live dashboard nor bloats the transcript. Reset each wake.
-        self._brief_asserted = False
+        # The persistent brief is composed at most once per `wake()` — lazily, right before the
+        # first time the model is actually engaged — so an idle or probe-only wake never fetches
+        # the live dashboard. It is then handed to every model call this wake makes as *ephemeral*
+        # context (`Session.send(brief=…)`): the model reads it, and nothing brief-shaped is
+        # written to the transcript (issue #275). Reset each wake.
+        self._brief: str | None = None
+        self._brief_composed = False
         # The shared HMAC key for the NOC synthetic-probe marker (see `_probe`). Set → the
         # message, webhook, and task reconciles each recognize a signed probe in their own
         # carrier field and ack it token-free, before the model. Unset → the short-circuit
@@ -761,13 +764,14 @@ class WakeAgent:
 
         # One Dashboard read answers "who am I?" — the identity uuid the actor self-filter
         # tests every item against. (The brief's orientation is the *live* `dashboard.md`
-        # primer, fetched per wake in `_reassert_brief`, not this structured read.)
+        # primer, fetched per wake in `_wake_brief`, not this structured read.)
         self.me_uuid = self.client.me.identity.uuid
         if onboard:
-            # The persistent brief is re-asserted on every wake (see `_reassert_brief`) and
-            # carries the personality charter (`system-prompt.md`) itself, so a static turn-0
-            # seed would only duplicate it. Clear it; the brief is the charter now. With
-            # onboarding off the operator's turn-0 charter stands as before.
+            # The persistent brief rides every model call (see `_wake_brief`) and carries the
+            # personality charter (`system-prompt.md`) itself, so a static turn-0 seed would
+            # only duplicate it — and unlike the brief, a seeded charter *persists*. Clear it;
+            # the brief is the charter now. With onboarding off the operator's turn-0 charter
+            # stands as before.
             self.harness.system_prompt = None
 
     @classmethod
@@ -926,7 +930,8 @@ class WakeAgent:
                 outcome = "declined"
                 return []  # a tripped timeline self-declines: no session, no provider call
             session = self.harness.session(self.source)
-            self._brief_asserted = False  # re-assert the brief once this wake, before the model
+            self._brief = None  # compose the brief once this wake, lazily, before the model
+            self._brief_composed = False
             posted += self._wake_messages(session, trigger)
             posted += self._wake_assets(session, asset_trigger)
             posted += self._wake_events(session, event_trigger)
@@ -1396,38 +1401,46 @@ class WakeAgent:
         carries on. Other failures still propagate (the entrypoint reports them cleanly);
         this catches only the step-cap, the one the issue names.
 
-        The persistent brief is re-asserted here, just before the user turn — so it is
-        present and recent for *this* model call. It fires at most once per wake (lazily, so
-        a probe-only or self-skip-only wake never pays the live dashboard fetch) and lands
-        ahead of the item it should govern. The item's text is the retrieval query the memory
-        provider's `context` hook ranks against, so recalled memory is relevant to this turn.
+        The persistent brief rides *with* this call — spliced in just ahead of the user turn,
+        so it is present and recent for the item it governs, and never persisted (see
+        `_wake_brief`). The item's text is the retrieval query the memory provider's `context`
+        hook ranks against, so recalled memory is relevant to this turn.
         """
-        self._reassert_brief(session, query=text)
         try:
-            return session.send(text, images=images)
+            return session.send(text, images=images, brief=self._wake_brief(query=text))
         except EngineError as error:
             return self._stuck_note(error)
 
-    def _reassert_brief(self, session: Session, *, query: str | None = None) -> None:
-        """Inject the persistent operating brief as a system turn — once per wake, when onboarding.
+    def _wake_brief(self, *, query: str | None = None) -> str | None:
+        """This wake's persistent operating brief — composed once, handed to every model call.
 
-        This is what makes Turn 0 *persistent*: rather than a one-time onboarding seed that
-        ages into the distant past of a long transcript, the brief is re-asserted at the head
-        of every wake's work, so the agent's standing context (how to operate, what tools it
-        has, where it is, who it is) is always recent in the conversation. Composed lazily and
-        injected at most once per wake — a no-op when onboarding is off or already asserted.
+        This is what makes Turn 0 *persistent*: rather than a one-time onboarding seed that ages
+        into the distant past of a long transcript, the brief rides ahead of the newest user turn
+        on **every** model call, so the agent's standing context (how to operate, what tools it
+        has, where it is, who it is) is always recent in the conversation.
+
+        It is **ephemeral** (issue #275). The brief is a snapshot of a moment — the current time,
+        this turn's step budget, the live dashboard — so writing it into the transcript stored a
+        stale copy per wake: an agent read dozens of obsolete "current" times and spent step
+        budgets as context, and paid for all of them on every later turn (47% of one agent's
+        754 K-token context was ~66 near-identical briefs). So it is composed here and handed to
+        `Session.send(brief=…)`, which shows it to the model and persists none of it.
+
+        Composed lazily and at most once per wake — so a probe-only or idle wake never pays the
+        live dashboard fetch — and `None` when onboarding is off.
         """
-        if not self.onboard or self._brief_asserted:
-            return
-        self._brief_asserted = True  # set first: a failed compose/note still won't retry-loop
-        brief = self._compose_brief(query)
-        if brief:
-            session.note(brief)
-        else:
+        if not self.onboard:
+            return None
+        if self._brief_composed:
+            return self._brief
+        self._brief_composed = True  # set first: a failed compose still won't retry-loop
+        self._brief = self._compose_brief(query)
+        if not self._brief:
             # Onboarding is on yet the brief composed empty (every part absent — deleted
             # prompts, a failed dashboard, no tools). Not an error, but log it: an agent
             # waking with no standing context is worth a breadcrumb, not a silent gap.
             _log.info("Persistent brief composed empty this wake; proceeding without it.")
+        return self._brief
 
     def _compose_brief(self, query: str | None = None) -> str | None:
         """Compose the persistent brief: now + initialize + manifest + defects + safety + dashboard + memory + charter.
@@ -1857,17 +1870,18 @@ class WakeAgent:
         never rebuilds. Only a pure-text build — the common case, and the one the staleness guard
         is really for — is eligible for a compare-and-swap rebuild.
 
-        The brief is re-asserted once, ahead of the first model call. Intermediate (stale) pure-text
-        builds are rolled back out of the transcript so only the posted reply's turn persists. Loop
-        2 does **not** re-pace — Loop 1 already simulated the read, and re-pacing could stall a reply
-        indefinitely in a chatty room. With pacing disabled it collapses to a single build (the
+        The brief rides ephemerally with every build (composed once — see `_wake_brief`), so it
+        never lands in the transcript and never needs rolling back. Intermediate (stale) pure-text
+        builds *are* rolled back out of the transcript so only the posted reply's turn persists.
+        Loop 2 does **not** re-pace — Loop 1 already simulated the read, and re-pacing could stall a
+        reply indefinitely in a chatty room. With pacing disabled it collapses to a single build (the
         pre-#226 single-shot behavior).
         """
-        self._reassert_brief(session, query=_incoming_text(batch[-1]))
-        base_len = len(session.history)  # rollback point: after the brief, before any build
+        brief = self._wake_brief(query=_incoming_text(batch[-1]))
+        base_len = len(session.history)  # rollback point: before any build
         builds = 0
         while True:
-            reply = self._send_batch(session, _render_batch(batch))
+            reply = self._send_batch(session, _render_batch(batch), brief)
             builds += 1
             # A build that engaged tools has committed irreversible side effects; posting it as-is
             # (never rebuilding) is the only safe move — a rollback+rebuild would re-fire them.
@@ -1885,16 +1899,17 @@ class WakeAgent:
             batch.extend(new_peers)
             del session.history[base_len:]
 
-    def _send_batch(self, session: Session, text: str) -> str:
+    def _send_batch(self, session: Session, text: str, brief: str | None) -> str:
         """Send the batch as one user turn, degrading the engine's step-cap to a graceful reply.
 
-        The batch counterpart of `_engage`'s model call, minus the brief re-assertion (Loop 2
-        asserts the brief once, ahead of the loop). Messages carry no images, so this is
-        text-only. `EngineError` (the `max_steps` cap) degrades to a short, honest note the peer
-        can read; other failures propagate to the entrypoint, which reports them cleanly.
+        The batch counterpart of `_engage`'s model call; Loop 2 composes the brief once and passes
+        it down, so a rebuild re-shows the same brief rather than re-composing (and re-fetching the
+        live dashboard) per build. Messages carry no images, so this is text-only. `EngineError`
+        (the `max_steps` cap) degrades to a short, honest note the peer can read; other failures
+        propagate to the entrypoint, which reports them cleanly.
         """
         try:
-            return session.send(text)
+            return session.send(text, brief=brief)
         except EngineError as error:
             return self._stuck_note(error)
 

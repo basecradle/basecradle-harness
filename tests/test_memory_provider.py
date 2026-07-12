@@ -272,8 +272,12 @@ class RecordingProvider(MemoryProvider):
 class _CannedModel:
     def __init__(self, text="Hello, John."):
         self.text = text
+        #: The turns the model was shown on its last call — the only place the ephemeral
+        #: per-wake brief is observable, since it is never written to the transcript (#275).
+        self.shown: list[Message] = []
 
     def chat(self, messages, tools=None):
+        self.shown = list(messages)
         return Message.assistant(content=self.text)
 
 
@@ -365,6 +369,9 @@ def test_observe_fires_once_for_a_batched_exchange(platform, tmp_path):
 
 
 def test_context_is_injected_into_the_turn0_brief(platform, tmp_path):
+    """Recalled memory reaches the *model* inside the per-wake brief — and, like the rest of
+    the brief, is never written to the transcript (issue #275): it is a fresh retrieval each
+    wake, so a persisted copy would be a stale answer to an old question, re-billed forever."""
     _serve_messages(
         platform, {"messages": [_message(uuid=M0, body="Where do I live?")], "next_cursor": None}
     )
@@ -373,14 +380,11 @@ def test_context_is_injected_into_the_turn0_brief(platform, tmp_path):
 
     agent.wake()
 
-    # The recalled context rode into the persistent brief as a system turn.
+    model = agent.harness.provider
+    shown = [m for m in model.shown if RecordingProvider.INJECTED in (m.content or "")]
+    assert shown, "the provider's context() output should ride the brief the model was shown"
     history = agent.harness.session(agent.source).history
-    briefs = [
-        m.content
-        for m in history
-        if m.role == "system" and RecordingProvider.INJECTED in (m.content or "")
-    ]
-    assert briefs, "the provider's context() output should be in the Turn-0 brief"
+    assert not [m for m in history if RecordingProvider.INJECTED in (m.content or "")]
     # The hook was scoped to the agent and handed the incoming turn as the retrieval query.
     assert provider.context_scopes[0].agent == NOVA_UUID
     assert provider.context_scopes[0].query == "[2026-06-04T00:00:00.000Z] john: Where do I live?"

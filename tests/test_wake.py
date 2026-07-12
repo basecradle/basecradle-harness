@@ -349,10 +349,30 @@ def serve_dashboard_md(platform, text="# Dashboard\n\nTrust is mutual at the gat
     return platform.get("/users/dashboard.md").mock(return_value=httpx.Response(200, text=text))
 
 
+def _is_brief(m) -> bool:
+    """A persistent-brief system turn, recognized by `initialize.md`'s heading."""
+    return m.role == "system" and "How to operate here" in (m.content or "")
+
+
+def _brief_shown(provider):
+    """The brief turns the model was shown on its last call.
+
+    The only place the brief is observable: it is **ephemeral** (issue #275) — spliced into the
+    message list handed to the provider and never written to the transcript — so a test that
+    looks for it in `history` is asserting the bug, not the contract.
+    """
+    return [m for m in provider.last_messages if _is_brief(m)]
+
+
 def _brief_turns(agent):
-    """The persistent-brief system turns in the agent's live transcript (by their header)."""
+    """Brief-shaped system turns *persisted* in the transcript — always empty (issue #275).
+
+    The per-wake brief is a snapshot of a moment (current time, step budget, live dashboard), so
+    a persisted copy is a stale duplicate the model re-reads — and re-pays for — on every later
+    turn. Kept as a named helper because "this stays zero" is the invariant worth asserting.
+    """
     history = agent.harness.session(agent.source).history
-    return [m for m in history if m.role == "system" and "How to operate here" in (m.content or "")]
+    return [m for m in history if _is_brief(m)]
 
 
 def build_wake(home, provider=None, *, system_prompt=None, onboard=False, **kwargs):
@@ -2089,36 +2109,89 @@ def test_a_self_authored_probe_asset_is_filtered_not_acked(platform, tmp_path):
 # --- the persistent Turn-0 brief (Phase 2 · Group 3) -------------------------
 
 
-def test_the_brief_is_reasserted_on_every_wake(platform, tmp_path):
-    """Turn 0 is persistent: the brief lands again each wake, not just at turn 1.
+def test_the_brief_is_shown_on_every_wake(platform, tmp_path):
+    """Turn 0 is persistent: the model is shown a fresh brief on every wake, not just turn 1.
 
     Two wakes over one home (two router-spawned processes). Each engages the model, so each
-    injects a fresh brief — the transcript carries it twice, recent in the conversation
-    rather than aging out at the top.
+    composes and shows a fresh brief — standing context that is always *recent* in the
+    conversation rather than aging out at the top.
     """
     serve_dashboard_md(platform)
     manifest = [("memory", None), ("lock", "one-way and irreversible.")]
 
     serve_messages(platform, page(message(uuid=M0, body="What's the status?")))
-    agent1, _ = build_wake(tmp_path, onboard=True, tool_manifest=manifest)
+    agent1, model1 = build_wake(tmp_path, onboard=True, tool_manifest=manifest)
     agent1.wake()
-    assert len(_brief_turns(agent1)) == 1
+    assert len(_brief_shown(model1)) == 1
 
     # A fresh process: the mark is now M0, so wake 2 replies only to the newer M1.
     serve_messages(
         platform, page(message(uuid=M1, body="any update?"), message(uuid=M0, body="hi"))
     )
-    agent2, _ = build_wake(tmp_path, onboard=True, tool_manifest=manifest)
+    agent2, model2 = build_wake(tmp_path, onboard=True, tool_manifest=manifest)
     agent2.wake()
 
-    assert len(_brief_turns(agent2)) == 2  # re-asserted, persisted across the two processes
+    assert len(_brief_shown(model2)) == 1  # wake 2's own brief — exactly one, never a stack
+
+
+def test_a_wake_persists_no_brief(platform, tmp_path):
+    """ISSUE #275 — the whole point: the brief is ephemeral, and the transcript proves it.
+
+    The brief is recomposed every wake (current time, step budget, live dashboard), so a persisted
+    copy is a stale duplicate the model re-reads and re-pays for on every later turn — 47% of one
+    agent's 754 K-token context was ~66 such copies. Two wakes here: the model sees the brief both
+    times, and the stored transcript carries not one byte of it, across processes.
+    """
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="What's the status?")))
+    agent1, model1 = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
+    agent1.wake()
+
+    serve_messages(
+        platform, page(message(uuid=M1, body="any update?"), message(uuid=M0, body="hi"))
+    )
+    agent2, model2 = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
+    agent2.wake()
+
+    assert _brief_shown(model1) and _brief_shown(model2)  # both wakes showed the model a brief…
+    assert _brief_turns(agent2) == []  # …and neither wrote one to the transcript
+    # Belt and braces: nothing brief-shaped survives on disk either (a fresh reader sees none).
+    stored = json.loads((tmp_path / "sessions" / f"timeline%3A{TIMELINE_UUID}.json").read_text())
+    assert not [t for t in stored if "How to operate here" in (t.get("content") or "")]
+
+
+def test_a_failed_wake_persists_no_brief(platform, tmp_path):
+    """A wake whose model call *fails* must not grow the transcript by a brief either.
+
+    The pre-#275 bug wrote the brief before `engine.run`, so even an erroring wake — one that
+    accomplished nothing — added ~20 KB to every future wake's bill. Now the brief only ever
+    rides the message list handed to the provider, so a failure leaves the partial transcript
+    (issue #244's ledger) without it.
+    """
+
+    class Boom:
+        provider, model = "openai", "gpt-4o"
+
+        def chat(self, messages, tools=None):
+            raise RuntimeError("model exploded mid-wake")
+
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path, provider=Boom(), onboard=True, tool_manifest=[("memory", None)])
+
+    with pytest.raises(RuntimeError):
+        agent.wake()
+
+    assert _brief_turns(agent) == []  # no brief…
+    history = agent.harness.session(agent.source).history
+    assert any("turn failed" in (m.content or "") for m in history)  # …but the ledger is intact
 
 
 def test_the_brief_composes_all_four_parts(platform, tmp_path):
     """The brief is initialize.md + the live tool manifest + the live dashboard + personality."""
     serve_dashboard_md(platform, text="# Live Dashboard\n\nWho you are, where everything is.\n")
     serve_messages(platform, page(message(uuid=M0, body="hi")))
-    agent, _ = build_wake(
+    agent, model = build_wake(
         tmp_path,
         onboard=True,
         tool_manifest=[("memory", None), ("lock", "one-way and irreversible.")],
@@ -2126,7 +2199,7 @@ def test_the_brief_composes_all_four_parts(platform, tmp_path):
 
     agent.wake()
 
-    brief = _brief_turns(agent)[0].content
+    brief = _brief_shown(model)[0].content
     assert "How to operate here" in brief  # 1. initialize.md (provider-independent guidance)
     assert "Trust is directional in storage, mutual at the gate." in brief  # the B6 trust note
     assert "Your active tools right now:" in brief  # 2. generated manifest…
@@ -2139,32 +2212,32 @@ def test_a_dashboard_fetch_failure_does_not_break_the_wake(platform, tmp_path):
     """A failed dashboard fetch degrades gracefully — the brief is composed from the rest."""
     platform.get("/users/dashboard.md").mock(return_value=httpx.Response(503))
     serve_messages(platform, page(message(uuid=M0, body="hi")))
-    agent, _ = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
+    agent, model = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
 
     posted = agent.wake()
 
     assert len(posted) == 1  # the wake still replied — the fetch failure never broke it
-    brief = _brief_turns(agent)[0].content
+    brief = _brief_shown(model)[0].content
     assert "How to operate here" in brief  # initialize.md present…
     assert "Your active tools right now:" in brief  # …and the manifest…
     assert "You are a helpful peer on BaseCradle." in brief  # …and the personality, sans dashboard
 
 
-def test_onboarding_off_asserts_no_brief(platform, tmp_path):
+def test_onboarding_off_shows_no_brief(platform, tmp_path):
     """`onboard=False` wakes with only the operator's charter — no persistent brief."""
     serve_messages(platform, page(message(uuid=M0, body="hi")))
-    agent, _ = build_wake(tmp_path, onboard=False)
+    agent, model = build_wake(tmp_path, onboard=False)
 
     agent.wake()
 
-    assert _brief_turns(agent) == []
+    assert _brief_shown(model) == []
 
 
-def test_an_idle_wake_asserts_no_brief_and_skips_the_dashboard_fetch(platform, tmp_path):
+def test_an_idle_wake_shows_no_brief_and_skips_the_dashboard_fetch(platform, tmp_path):
     """Nothing unseen → the model is never engaged → no brief, and no live dashboard fetch.
 
-    The lazy, once-per-wake assertion means an idle (or probe-only) wake pays nothing: it
-    neither bloats the transcript with a brief nor fetches the live dashboard.
+    The lazy, once-per-wake composition means an idle (or probe-only) wake pays nothing: no
+    model call, and no live dashboard fetch to compose a brief nobody will read.
     """
     route = serve_dashboard_md(platform)
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)  # caught up → nothing new this wake
@@ -2175,24 +2248,33 @@ def test_an_idle_wake_asserts_no_brief_and_skips_the_dashboard_fetch(platform, t
 
     assert posted == []
     assert provider.prompts == []  # the model was never engaged
-    assert _brief_turns(agent) == []
+    assert _brief_shown(provider) == []
     assert not route.called  # lazy: no engagement → the live dashboard was never fetched
 
 
 def test_the_brief_precedes_the_item_it_governs(platform, tmp_path):
-    """The brief lands just *ahead* of the user turn it should govern — order is load-bearing."""
+    """The brief sits just *ahead* of the user turn it governs, at the tail of the message list.
+
+    Position is load-bearing twice over. Ahead of the item, so it contextualizes the thing being
+    answered. And at the **tail** — after the whole frozen transcript — because provider prefix
+    caching only pays out on a byte-stable prefix: moving this volatile block to position 0
+    ("system prompts go first") would change the prefix on every request and silently destroy
+    caching fleet-wide. Stable content first, volatile content last (issue #275).
+    """
     serve_dashboard_md(platform)
     serve_messages(platform, page(message(uuid=M0, body="What's the status?")))
-    agent, _ = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
+    agent, model = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
 
     agent.wake()
 
-    history = agent.harness.session(agent.source).history
-    roles = [m.role for m in history]
-    brief_idx = next(i for i, m in enumerate(history) if m in _brief_turns(agent))
-    user_idx = next(i for i, m in enumerate(history) if m.role == "user")
-    assert brief_idx < user_idx  # brief first, then the message it contextualizes
-    assert "assistant" in roles  # and the reply followed
+    shown = model.last_messages
+    brief_idx = next(i for i, m in enumerate(shown) if _is_brief(m))
+    user_idx = next(i for i, m in enumerate(shown) if m.role == "user")
+    assert brief_idx == user_idx - 1  # …immediately ahead of the message it contextualizes…
+    # …and nothing volatile sits ahead of it: the brief and the turn it governs are the tail,
+    # trailed only by the engine's step-counter note. Everything before is frozen transcript.
+    assert [m.role for m in shown[brief_idx:]] == ["system", "user", "system"]
+    assert "assistant" in [m.role for m in agent.harness.session(agent.source).history]
 
 
 def test_a_brief_composition_failure_does_not_break_the_wake(platform, tmp_path, monkeypatch):
@@ -2206,12 +2288,97 @@ def test_a_brief_composition_failure_does_not_break_the_wake(platform, tmp_path,
     monkeypatch.setattr(wake_mod, "prompt_text", boom)
     serve_dashboard_md(platform)
     serve_messages(platform, page(message(uuid=M0, body="hi")))
-    agent, _ = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
+    agent, model = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
 
     posted = agent.wake()
 
     assert len(posted) == 1  # the wake still replied despite the compose failure
-    assert _brief_turns(agent) == []  # …with no brief, rather than crashing
+    assert _brief_shown(model) == []  # …with no brief, rather than crashing
+
+
+class _DumpingTool(Tool):
+    """A tool whose result is huge — the mailbox listing that drove issue #275 (142 KB, live)."""
+
+    name = "mailbox"
+    description = "List the mailbox."
+    DUMP = "MAILBOX\n" + ("x" * 100_000) + "\nEND-OF-MAILBOX"
+
+    def run(self, **kwargs) -> str:
+        return self.DUMP
+
+
+class _ToolThenText:
+    """Calls the tool on its first turn of a wake, then settles to text."""
+
+    provider, model = "openai", "gpt-4o"
+
+    def __init__(self) -> None:
+        self.read: list[list[tuple[str, str | None]]] = []  # (role, content) per call, at call time
+
+    def chat(self, messages, tools=None):
+        self.read.append([(m.role, m.content) for m in messages])
+        if not any(m.role == "tool" for m in messages):
+            return Message.assistant(tool_calls=[ToolCall(id="c1", name="mailbox", arguments={})])
+        return Message.assistant(content="You have mail.")
+
+
+def test_a_huge_tool_result_does_not_tax_the_next_wake(platform, tmp_path):
+    """ISSUE #275, end to end on the deployed path: the wake that ran the tool reads it whole;
+    the wake *after* it pays a bounded price.
+
+    This is the failure this issue exists to end — 39% of one agent's 754 K-token context was raw
+    tool output, three mailbox dumps of 142/120/101 KB among it, re-sent on every wake for the life
+    of the timeline. Two router-spawned processes over one home: wake 1 runs the tool, wake 2
+    inherits the transcript.
+    """
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="check my mail")))
+    model1 = _ToolThenText()
+    harness1 = Harness(model1, tools=[_DumpingTool()], home=tmp_path)
+    agent1 = WakeAgent(harness1, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+    agent1.wake()
+
+    # Wake 1 read the dump in full — the model is never handed a truncated tool result on the
+    # turn it asked for it.
+    assert ("tool", _DumpingTool.DUMP) in model1.read[1]
+
+    # A fresh process over the same home: the transcript it inherits is bounded.
+    serve_messages(
+        platform, page(message(uuid=M1, body="anything else?"), message(uuid=M0, body="hi"))
+    )
+    model2 = _ToolThenText()
+    harness2 = Harness(model2, tools=[_DumpingTool()], home=tmp_path)
+    agent2 = WakeAgent(harness2, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+    agent2.wake()
+
+    inherited = next(c for role, c in model2.read[0] if role == "tool")
+    assert len(inherited) < 5_000  # the dump was 100 KB; the next wake re-reads ~2.5 KB of it
+    assert "elided" in inherited and f"of {len(_DumpingTool.DUMP)}" in inherited
+    # …and the transcript is still well-formed: the elided result still answers its call, so the
+    # assistant tool-call turn is not left dangling (which would break every wake after it).
+    stored = json.loads((tmp_path / "sessions" / f"timeline%3A{TIMELINE_UUID}.json").read_text())
+    call_ids = [c["id"] for t in stored for c in t.get("tool_calls", [])]
+    assert call_ids and call_ids == [t["tool_call_id"] for t in stored if t["role"] == "tool"]
+
+
+def test_the_brief_is_composed_once_per_wake_across_many_items(platform, tmp_path):
+    """A multi-item wake composes the brief once (one dashboard fetch) and shows it every call.
+
+    Two model calls this wake (a message batch, then an activated task). Each is shown the brief
+    ahead of its own user turn — standing context is never stale by an item — yet the live
+    dashboard is fetched exactly once, and nothing lands in the transcript.
+    """
+    route = serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    serve_tasks(platform, task_page(task(uuid=T0, instructions="Post the daily summary.")))
+    agent, model = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
+
+    agent.wake()
+
+    assert len(model.prompts) == 2  # the message batch, then the activated task
+    assert len(_brief_shown(model)) == 1  # the task call, too, was shown the brief…
+    assert route.call_count == 1  # …composed once — the live dashboard was fetched once
+    assert _brief_turns(agent) == []  # …and neither call persisted it
 
 
 # --- Group 6: the cross-wake circuit-breaker ---------------------------------
