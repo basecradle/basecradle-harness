@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ from basecradle import BaseCradle
 
 from basecradle_harness import (
     BreakerDecision,
+    Claim,
     ClaimStore,
     Harness,
     MarkStore,
@@ -329,6 +331,20 @@ def serve_messages(platform, *pages):
     platform.get("/messages").mock(side_effect=_serve)
 
 
+def _posts(platform):
+    """Every message body this agent POSTed, in order — read from the router's global call log.
+
+    Deliberately **not** `platform.post(...).calls`: calling `router.post(...)` mid-test registers
+    a *fresh, unmocked* route that then swallows the next real POST (it cost an hour). Reading the
+    call log is inert — it registers nothing and can be asserted before and after a wake alike.
+    """
+    return [
+        json.loads(call.request.content)["message"]["body"]
+        for call in platform.calls
+        if call.request.method == "POST" and call.request.url.path.endswith("/messages")
+    ]
+
+
 def serve_events(platform, *pages):
     """Drive the (newest-first) webhook-event list endpoint; one page per read."""
     platform.get("/webhook_events").mock(side_effect=[httpx.Response(200, json=p) for p in pages])
@@ -472,15 +488,18 @@ def test_multiple_unseen_messages_get_one_batched_reply_oldest_first(platform, t
 # --- idempotency across a crash / retry mid-batch ----------------------------
 
 
-def test_a_batch_generation_crash_does_not_reprocess_the_batch(platform, tmp_path):
-    """B3, batch form: the whole batch is claimed and marked *before* the model call, so a hard
-    crash during generation advances the mark over it and it is never reprocessed.
+def test_a_batch_generation_crash_is_re_driven_and_the_peers_are_answered(platform, tmp_path):
+    """Issue #285: a wake that dies **inside the model call** no longer drops the peers' messages.
 
-    The provider raises (a non-EngineError, mimicking a process that dies mid-generation).
-    Because `_absorb` claims and marks every batch message before `_generate_settled` engages
-    the model, the mark is already the true newest when the crash hits — a retry replies to
-    nothing rather than re-answering the batch on every later wake (the live reprocess loop).
-    At-most-once: a one-time dropped reply beats a backlog re-answered.
+    This test used to pin the opposite, and its old name said so — *"does not reprocess the
+    batch"*. The batch was claimed **and marked seen** before the model call, so a crash during
+    generation advanced the mark over messages that were never answered, and **no future wake
+    would ever look at them again**. That was a deliberate at-most-once trade (a dropped reply
+    beats a backlog re-answered with side effects), and #285 retires it: the trade is unnecessary,
+    because the transcript says which of the two actually happened.
+
+    The provider raises a non-`EngineError` — a process dying mid-generation. Nothing ran and
+    nothing posted, so the crash is *provably side-effect-free* and the messages are re-driven.
     """
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
     serve_messages(
@@ -500,17 +519,26 @@ def test_a_batch_generation_crash_does_not_reprocess_the_batch(platform, tmp_pat
     with pytest.raises(RuntimeError):
         agent.wake()
 
-    # Both messages were claimed and marked seen before the model was engaged, so the mark is
-    # the newest — the batch will not be re-answered on the next wake.
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
-    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M2, kind="messages") is False  # M2 was claimed
-    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is False  # M1 too
+    # The mark did NOT advance over the unanswered messages — this is the whole fix. It still
+    # sits where it started, so the next wake reads them again instead of never seeing them.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
+    # And they are left `in-flight` — claimed, but not settled: the record that says a wake took
+    # them and never finished, which is what makes them recoverable rather than lost.
+    claims = ClaimStore(tmp_path)
+    assert claims.read(TIMELINE_UUID, M1, kind="messages").phase == "in-flight"
+    assert claims.read(TIMELINE_UUID, M2, kind="messages").phase == "in-flight"
 
-    # A retry (fresh process, same home) sees the advanced mark and replies to nothing.
+    # A retry (fresh process, same home) re-drives them: the dead wake's pid is gone, its
+    # transcript shows no tool ran and no reply was produced, so answering is safe.
     serve_messages(platform, page(message(uuid=M2, body="second"), message(uuid=M1, body="first")))
     retry, retry_provider = build_wake(tmp_path)
-    assert retry.wake() == []
-    assert retry_provider.prompts == []
+    posted = retry.wake()
+
+    assert retry_provider.prompts, "the re-driving wake must actually engage the model"
+    assert len(posted) == 1  # one batched reply answering both, exactly as a healthy wake would
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2  # now settled, the mark may pass
+    assert claims.read(TIMELINE_UUID, M1, kind="messages").phase == "done"
+    assert claims.read(TIMELINE_UUID, M2, kind="messages").phase == "done"
 
 
 # --- B2: a wake never crashes on an SDK / engine error -----------------------
@@ -3334,29 +3362,35 @@ def test_the_settle_loop_is_bounded_by_max_builds(platform, tmp_path):
     assert len(posted) == 1  # it still posts one batched reply
 
 
-def test_bootstrap_does_not_livelock_on_an_orphaned_claim(platform, tmp_path):
-    """A first-wake message whose claim was orphaned by a crashed prior wake must not re-bootstrap
-    forever: the mark baselines to the newest so the timeline moves on (#226 regression guard).
+def test_bootstrap_recovers_an_orphaned_claim_instead_of_stranding_it(platform, tmp_path):
+    """A first-wake message orphaned by a crashed prior wake is **answered**, not written off.
 
-    Simulate the orphan by pre-claiming M0 with a separate ClaimStore (a dead wake that claimed
-    but crashed before marking). This wake finds no mark (still bootstrap), loses the claim, and
-    must still baseline the mark rather than leave it None and re-bootstrap on every future wake.
+    This test used to assert the opposite, and its own fixture said so out loud — the message body
+    was `"unanswerable — claim is orphaned"` and it pinned `posted == []`. The peer was never
+    answered; the mark simply baselined past them so the agent would not re-bootstrap forever. The
+    livelock guard was right; treating the message as unanswerable was the #285 defect in miniature.
+
+    Now the orphan is recovered: the dead wake left no transcript turn for M0 (it died before the
+    model ever saw it), so nothing ran and nothing posted, and re-driving is provably safe. The
+    livelock guard still holds — the mark advances — but it advances because the message was
+    *answered*, not because it was abandoned.
     """
     ClaimStore(tmp_path).claim(TIMELINE_UUID, M0, kind="messages")  # a dead wake's orphaned claim
-    serve_messages(platform, page(message(uuid=M0, body="unanswerable — claim is orphaned")))
+    serve_messages(platform, page(message(uuid=M0, body="a peer's message the dead wake took")))
     agent, provider = build_wake(tmp_path)
 
     posted = agent.wake()
 
-    assert posted == []  # the claim is lost, so nothing is answered this wake
-    assert provider.prompts == []  # the model was never engaged
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # BUT the mark baselined → no re-bootstrap
+    assert len(posted) == 1  # the peer IS answered — the whole point of #285
+    assert provider.prompts, "the orphan must be re-driven through the model, not written off"
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # and the mark advances → no re-bootstrap
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
 
-    # A second wake is now a normal incremental one (mark present) and cleanly does nothing.
-    serve_messages(platform, page(message(uuid=M0, body="unanswerable — claim is orphaned")))
+    # A second wake is now a normal incremental one (mark present, claim settled) and does nothing.
+    serve_messages(platform, page(message(uuid=M0, body="a peer's message the dead wake took")))
     second, second_provider = build_wake(tmp_path)
     assert second.wake() == []
-    assert second_provider.prompts == []
+    assert second_provider.prompts == []  # settled: never answered twice
 
 
 def test_pace_max_builds_env_tunable(monkeypatch):
@@ -3674,3 +3708,416 @@ def test_a_probe_ack_is_logged_as_an_ack_not_as_the_agent_speaking(platform, tmp
 
     assert provider.prompts == []  # token-free: the model was never engaged
     assert "kind=probe-ack" in _line(caplog, "posted")
+
+
+# --- issue #285: a hard-failed wake no longer drops the peer's message -------
+#
+# The guarantee: **at-least-once for the read, at-most-once for every side effect, exactly-once
+# for the reply.** A message is re-driven only when the dead wake is *provably* side-effect-free;
+# where it is not, the drop is loud. These are the contract — one per outcome of the classifier,
+# plus the two the mechanism could plausibly get wrong (a live concurrent wake; a legacy claim).
+
+
+def crashed_wake_owning(home, *uuids, phase="in-flight"):
+    """A claim left behind by a wake that died: in-flight, owned by a process that is gone.
+
+    pid 1 is never this test process, and `_orphaned` reads a claim whose pid is not ours and
+    whose owner it can still see as alive only against the age backstop — so the record is stamped
+    ancient. Together: unambiguously orphaned, without spawning and killing a real process.
+    """
+    store = ClaimStore(home)
+    for uuid in uuids:
+        store.claim(TIMELINE_UUID, uuid, kind="messages")
+        store._write(
+            store._path(TIMELINE_UUID, "messages", uuid),
+            Claim(phase=phase, pid=1, wake="a-wake-that-died", at=0.0),
+        )
+    return store
+
+
+def test_a_wake_that_died_after_a_tool_ran_abandons_the_message_loudly(platform, tmp_path, caplog):
+    """Outcome 3: tools fired, no reply. Re-driving would re-fire them — so it does NOT.
+
+    This is the residual at-most-once case, and the *only* one. It is what the pre-#285 ordering
+    bought at the price of dropping every message; now it is the rare, named exception rather than
+    the routine, invisible rule. The drop must be **loud** (issue #285, option 4): an ERROR naming
+    the message uuid, and a note in the agent's own transcript so it knows it left a peer hanging.
+    """
+    serve_messages(platform, page(message(uuid=M0, body="generate me an image")))
+
+    class RunsAToolThenDies:
+        provider, model = "openai", "gpt-4o"
+
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return Message.assistant(
+                    tool_calls=[ToolCall(id="call_1", name="noop", arguments={})]
+                )
+            raise RuntimeError("killed after the tool had already run")
+
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(RunsAToolThenDies(), tools=[_NoopTool()], home=tmp_path)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+    with pytest.raises(RuntimeError):
+        agent.wake()
+
+    # The next wake finds an orphaned claim whose transcript shows a tool ran and no reply landed.
+    serve_messages(platform, page(message(uuid=M0, body="generate me an image")))
+    second, second_provider = build_wake(tmp_path)
+    with caplog.at_level(logging.ERROR):
+        posted = second.wake()
+
+    assert second_provider.prompts == []  # NOT re-run: the tool's side effects are real
+    assert posted == []
+    dropped = next(r.message for r in caplog.records if r.message.startswith("dropped"))
+    assert M0 in dropped  # loud, and it names the message
+    claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
+    assert claim.phase == "abandoned" and "tool" in claim.reason
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # abandoned is final: the mark may pass
+
+
+def test_a_wake_that_died_before_posting_reposts_its_reply_without_a_model_call(platform, tmp_path):
+    """Outcome 2a: the model *finished*, the post never landed. Finish the wake — don't re-run it.
+
+    The reply is on disk (`Session._exchange` persists the turn), so there is nothing to
+    regenerate: the recovering wake posts the saved text verbatim. Zero tokens, exactly one reply.
+    """
+    serve_messages(platform, page(message(uuid=M0, body="what's the status?")))
+    agent, provider = build_wake(tmp_path)
+    agent._post = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("killed before the post"))
+    with pytest.raises(RuntimeError):
+        agent.wake()
+
+    assert provider.prompts  # it did generate...
+    assert not _posts(platform)  # ...but the process died before it could say a word
+
+    serve_messages(platform, page(message(uuid=M0, body="what's the status?")))
+    second, second_provider = build_wake(tmp_path)
+    posted = second.wake()
+
+    assert second_provider.prompts == []  # NO model call — the reply already existed
+    assert len(posted) == 1
+    assert _posts(platform) == ["Hello, John."]  # posted verbatim, exactly once
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+
+
+def test_a_wake_that_died_after_posting_does_not_double_post(platform, tmp_path, caplog):
+    """Outcome 2b — **the case the issue demands.** The reply landed; the wake died before commit.
+
+    The naive two-phase claim would re-drive here and reply twice. The timeline is the durable
+    record both wakes share, so the recovering wake asks it: is one of my own posts, *newer than
+    this message*, carrying exactly this body? It is. Commit; post nothing.
+
+    Per the capital's requirement, the body-match commit is **never silent** — an INFO names both
+    the claimed message and the matched post, so the one residual false-match (two coincidentally
+    identical bodies) leaves an audit trail instead of an invisible mis-commit.
+    """
+    crashed_wake_owning(tmp_path, M0)
+    # The dead wake's transcript: it generated "Hello, John." for M0...
+    session = Harness(CountingProvider(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
+    session.history.append(Message.user(content="[2026-06-04T00:00:00.000Z] john: what's up?"))
+    session.history.append(Message.assistant(content="Hello, John."))
+    session._save()
+    # ...and the timeline shows that reply DID land, newer than M0.
+    serve_messages(
+        platform,
+        page(
+            message(uuid=REPLY, body="Hello, John.", mine=True),
+            message(uuid=M0, body="what's up?"),
+        ),
+    )
+    MarkStore(tmp_path).set(TIMELINE_UUID, M1)  # a mark older than M0, so M0 is re-read
+
+    agent, provider = build_wake(tmp_path)
+    with caplog.at_level(logging.INFO):
+        posted = agent.wake()
+
+    assert provider.prompts == []  # not re-run
+    assert posted == []  # and above all: NOT re-posted
+    assert _posts(platform) == []  # the timeline already had the reply; nothing new was said
+    recovered = next(r.message for r in caplog.records if r.message.startswith("recovered"))
+    assert M0 in recovered and REPLY in recovered  # both uuids — the required audit trail
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+
+
+def test_the_landed_reply_search_is_bounded_to_posts_newer_than_the_message(platform, tmp_path):
+    """Capital requirement 1: an own post *older* than the message can never be its reply.
+
+    Here the agent said "Hello, John." **before** M0 arrived. A recovering wake that searched the
+    whole timeline would match it, conclude M0 was answered, and drop the peer. Bounding the window
+    to posts newer than M0 is what makes that impossible — so M0's reply is genuinely re-posted.
+    """
+    crashed_wake_owning(tmp_path, M0)
+    session = Harness(CountingProvider(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
+    session.history.append(Message.user(content="[2026-06-04T00:00:00.000Z] john: what's up?"))
+    session.history.append(Message.assistant(content="Hello, John."))
+    session._save()
+    serve_messages(
+        platform,
+        page(
+            message(uuid=M0, body="what's up?"),  # newest
+            message(uuid=REPLY, body="Hello, John.", mine=True),  # OLDER than M0 — not its reply
+        ),
+    )
+    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+
+    agent, provider = build_wake(tmp_path)
+    posted = agent.wake()
+
+    assert provider.prompts == []  # the reply existed; no regeneration
+    assert len(posted) == 1  # but it was never actually said to M0 — so say it now
+    assert _posts(platform) == ["Hello, John."]
+
+
+def test_a_probe_ack_before_the_crash_does_not_look_like_a_reply(platform, tmp_path):
+    """The counterexample that killed the cheap test — and why body-equality is the sound one.
+
+    `_absorb` posts a NOC probe ack *before* the model call. So a wake that acked a probe, claimed
+    a peer message, and then died leaves an own post **newer than** that message which is not its
+    reply. The tempting cheap test — "is there any own post newer than X?" — would read that ack as
+    the reply, mark X delivered, and drop the peer silently. Body-equality has no such hole.
+    """
+    crashed_wake_owning(tmp_path, M0)
+    # The dead wake never got to the model: no transcript turn for M0. But it DID ack a probe,
+    # which sits on the timeline newer than M0.
+    serve_messages(
+        platform,
+        page(
+            message(uuid=REPLY, body="ack: some-nonce", mine=True),  # the probe ack — not a reply
+            message(uuid=M0, body="a peer's real question"),
+        ),
+    )
+    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+
+    agent, provider = build_wake(tmp_path)
+    posted = agent.wake()
+
+    assert provider.prompts, "the peer's message must still be re-driven despite the newer ack"
+    assert len(posted) == 1
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+
+
+def test_a_live_concurrent_wake_still_owns_its_claim(platform, tmp_path):
+    """Unchanged from before #285: a claim held by a *live* wake is skipped, never stolen.
+
+    This is the race the `ClaimStore` has always closed, and recovery must not reopen it — a false
+    "orphaned" would re-drive a message another wake is mid-way through answering, and post it
+    twice. The claim is stamped with a **live pid that is not this process** (our parent) and a
+    wake id that is not ours: a genuinely concurrent wake, by every test `_orphaned` applies.
+    """
+    store = ClaimStore(tmp_path)
+    store.claim(TIMELINE_UUID, M0, kind="messages")
+    store._write(
+        store._path(TIMELINE_UUID, "messages", M0),
+        Claim(phase="in-flight", pid=os.getppid(), wake="a-live-wake", at=time.time()),
+    )
+    serve_messages(platform, page(message(uuid=M0, body="mine, hands off")))
+    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+
+    agent, provider = build_wake(tmp_path)
+    posted = agent.wake()
+
+    assert provider.prompts == []  # skipped: another wake owns it
+    assert posted == []
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "in-flight"
+    # And the mark must NOT pass it. If that wake dies, the message has to stay findable — a mark
+    # that sailed past an in-flight item would hide it forever, which is the bug #285 exists to fix.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+
+
+def test_a_legacy_empty_claim_reads_as_done_and_is_never_re_driven(platform, tmp_path):
+    """The fleet-upgrade case: @jt and @glm-5.2 have live claim dirs full of *empty* files.
+
+    The pre-#285 code only ever created a claim for an item it was about to mark seen, so an empty
+    claim means "the old code handled this" — final by construction. Reading it as `done`
+    reproduces the old behavior exactly. Reading it as in-flight-and-orphaned would re-answer every
+    message in every deployed agent's history on the first wake after the upgrade.
+    """
+    path = ClaimStore(tmp_path)._path(TIMELINE_UUID, "messages", M0)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("")  # exactly what the old code left behind
+
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+
+    serve_messages(platform, page(message(uuid=M0, body="answered long ago")))
+    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+    agent, provider = build_wake(tmp_path)
+
+    assert agent.wake() == []
+    assert provider.prompts == []  # never re-answered
+
+
+def test_the_bootstrap_baseline_never_sails_past_a_live_wakes_claim(platform, tmp_path):
+    """The #285 bug's last hiding place: the *bootstrap* mark baseline.
+
+    `_settle` holds the mark back from any message a live concurrent wake is still holding. But the
+    first wake also **baselines** the mark to the newest message so it does not re-bootstrap forever
+    — and an unconditional baseline steps straight over that held-back message, hiding it from every
+    future wake if its owner then dies. Same defect, different door.
+
+    Here a live wake owns M0 while this one bootstraps with M1 newer. The mark must **not** reach
+    M1: doing so would put M0 permanently behind the cursor.
+    """
+    store = ClaimStore(tmp_path)
+    store.claim(TIMELINE_UUID, M0, kind="messages")
+    store._write(
+        store._path(TIMELINE_UUID, "messages", M0),
+        Claim(phase="in-flight", pid=os.getppid(), wake="a-live-wake", at=time.time()),
+    )
+    serve_messages(
+        platform,
+        page(message(uuid=M1, body="newer"), message(uuid=M0, body="held by a live wake")),
+    )
+
+    agent, _ = build_wake(tmp_path)  # no mark yet → the bootstrap path
+    agent.wake()
+
+    # The baseline declined: the mark never passed M0, so M0 survives its owner's death.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) != M1
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "in-flight"
+
+    # And it converges rather than livelocking: once the owner settles M0, the mark moves on.
+    ClaimStore(tmp_path).commit(TIMELINE_UUID, M0, kind="messages")
+    serve_messages(
+        platform,
+        page(message(uuid=M1, body="newer"), message(uuid=M0, body="held by a live wake")),
+    )
+    second, _ = build_wake(tmp_path)
+    second.wake()
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+
+
+def test_the_bootstrap_recovers_a_dead_wakes_message_that_is_no_longer_the_newest(
+    platform, tmp_path
+):
+    """The reachable, lossy variant: a dead wake's message is no longer the newest when we bootstrap.
+
+    A wake claims M0 and dies. A new message M1 lands. The next wake has no mark, so it *bootstraps*
+    — and `_bootstrap_split` answers "what is unseen?" by recency: never having spoken, it replies to
+    the newest message only. M0 is seeded as *context* and the mark baselines past it. M0 is then
+    behind the cursor, unanswered, and unreachable by every future wake: the exact #285 drop, walking
+    in through the one door where the mark *jumps* instead of stepping.
+
+    An unsettled claim is unfinished work, not history, so the reply set stretches back to cover it.
+    """
+    crashed_wake_owning(tmp_path, M0)  # a wake took M0 and died before answering it
+    serve_messages(
+        platform,
+        page(message(uuid=M1, body="a newer question"), message(uuid=M0, body="the lost question")),
+    )
+
+    agent, provider = build_wake(tmp_path)  # no mark → bootstrap
+    posted = agent.wake()
+
+    # Both are answered — M0 is not written off as backlog just because M1 arrived after it.
+    assert len(posted) == 1  # one batched reply covering both
+    assert "the lost question" in provider.prompts[0]
+    assert "a newer question" in provider.prompts[0]
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+
+
+# --- the concurrency bugs the adversarial self-review found (issue #285) ------
+
+
+def test_two_wakes_recovering_the_same_orphan_cannot_both_win_it(tmp_path):
+    """`reclaim` must be atomic: an unlink-then-create take-over lets BOTH wakes win.
+
+    The broken form is `unlink()` then exclusive-`claim()`, and it is safe only if *both* unlinks
+    happen before *either* create. Interleaved, they do not: wake A unlinks, A creates (wins,
+    writing a live claim) — then wake B unlinks, **destroying A's brand-new live claim**, and B
+    creates and "wins" too. Both would drive the same message through the model and post it twice.
+
+    The rename is the mutex: only one caller can move a given path away, so only one take-over can
+    ever succeed. This drives the exact interleaving rather than hoping a scheduler produces it.
+    """
+    crashed_wake_owning(tmp_path, M0)
+    a, b = ClaimStore(tmp_path), ClaimStore(tmp_path)
+
+    dead = "a-wake-that-died"  # the owner both wakes judged orphaned
+    won_a = a.reclaim(TIMELINE_UUID, M0, kind="messages", owner=dead)  # A takes it over...
+    won_b = b.reclaim(TIMELINE_UUID, M0, kind="messages", owner=dead)  # ...then B tries the same
+
+    assert won_a is True
+    assert won_b is False, "B must not be able to steal A's live claim by deleting it"
+    # And the surviving claim is A's — B did not overwrite it.
+    assert a.read(TIMELINE_UUID, M0, kind="messages").wake == a.wake
+
+
+def test_a_claim_is_never_observable_empty_and_so_never_misread_as_legacy_done(tmp_path):
+    """A live in-flight claim must never be readable as the legacy `done` sentinel.
+
+    `claim()` used to win the race with an exclusive create and write the record *after*, leaving a
+    window where the path existed and the file was **zero bytes**. An empty claim is this store's
+    legacy sentinel and reads as `done` — so a concurrent wake landing in that window would read a
+    live, in-flight claim as *settled*, let the high-water mark pass it, and lose the peer's message
+    forever if its owner then died. The file is now linked into place already carrying its record.
+    """
+    store = ClaimStore(tmp_path)
+    assert store.claim(TIMELINE_UUID, M0, kind="messages") is True
+
+    path = store._path(TIMELINE_UUID, "messages", M0)
+    assert path.read_text().strip(), "the claim file must never be empty the instant it exists"
+    claim = store.read(TIMELINE_UUID, M0, kind="messages")
+    assert claim.phase == "in-flight" and claim.settled is False
+    # No temp litter left behind by the link dance.
+    assert [p.name for p in path.parent.iterdir() if p.name.startswith(".")] == []
+
+
+def test_a_compaction_during_a_build_never_lets_its_tools_re_fire(platform, tmp_path):
+    """A mid-build compaction invalidates the rollback point — so the build must be committed.
+
+    `Session.send` may compact, and a compaction rewrites `history` **in place and shorter**. After
+    it, `base_len` no longer points at the build's start: `history[base_len:]` comes back empty (so
+    `used_tools` reads False even though a tool ran) and `del history[base_len:]` is a no-op (so the
+    "rolled back" build is still there). Together they rebuild a tool-using turn and **re-fire its
+    side effects** — a second image generated and posted for one request.
+
+    Here the tool runs, the transcript is compacted, and a new peer message lands mid-generation.
+    The tool must run exactly once.
+    """
+    tool_runs = []
+
+    class CountingTool(Tool):
+        name = "noop"
+        description = "does nothing, but expensively"
+        parameters = {"type": "object", "properties": {}}
+
+        def run(self, **kwargs):
+            tool_runs.append(1)
+            return "done"
+
+    class ToolThenReply:
+        provider, model = "openai", "gpt-4o"
+
+        def __init__(self):
+            self.calls = 0
+            self.last_tokens_in = None
+
+        def chat(self, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return Message.assistant(
+                    tool_calls=[ToolCall(id="call_1", name="noop", arguments={})]
+                )
+            # Report huge usage so the post-turn compaction fires and rewrites history shorter.
+            self.last_tokens_in = 900_000
+            return Message.assistant(content="Hello, John.")
+
+        def context_limit(self):
+            return 128_000
+
+    # A new peer message lands during generation → the staleness guard would want to rebuild.
+    messages = ScriptedMessages(platform, message(uuid=M0, body="make me an image"))
+    messages.arrive(message(uuid=M1, body="actually, wait"))
+
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(ToolThenReply(), tools=[CountingTool()], home=tmp_path)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+    agent.wake()
+
+    assert tool_runs == [1], "the tool must run exactly once — a rebuild would re-fire it"

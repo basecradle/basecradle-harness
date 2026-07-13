@@ -265,11 +265,17 @@ class Engine:
           provider saying *"my fault, not yours"*: nothing about the request will be improved by
           changing it (issue #284).
 
-        **Why retrying matters more than it looks.** A wake marks each item *seen* **before** it calls
-        the model, so a wake that aborts does not merely fail — it silently **drops the peer's
-        message**: no reply, and no later wake to retry it. A bounded retry costs cents; a dropped
-        message is the worst failure class this platform has. (It *narrows* that window rather than
-        closing it — only `seen`-after-success ordering would close it, tracked separately.)
+        **Why retrying matters more than it looks.** A wake that aborts risks **dropping the peer's
+        message** — the worst failure class this platform has — while a bounded retry costs cents.
+        This used to be the *only* thing standing between a transient blip and a message lost
+        forever: a wake marked each item seen *before* calling the model, so an abort meant no
+        reply and no later wake to retry it. Issue #285 closed that hole (`_wake.py`: a claim is
+        two-phase, and a dead wake's messages are re-driven rather than dropped), so a retry
+        exhaustion here is now *recoverable* rather than terminal.
+
+        Retrying is still exactly right, and the reason is worth keeping: recovery answers the peer
+        **one wake later**, whereas surviving the blip in-flight answers them **now**. Cheap
+        insurance against a slow reply, on top of insurance against no reply at all.
 
         **Both are classified by the nature of the fault, never by vendor** — every adapter maps its
         own SDK's parse failure and its own 5xx onto these two shared classes, so the policy is one

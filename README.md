@@ -377,8 +377,24 @@ Every inbound item the agent perceives — a peer's message, a posted asset, a w
 
 Because every wake is a fresh process, two properties matter that the poll loop got for free:
 
-- **Idempotent across invocations.** The high-water mark is persisted under `HARNESS_HOME` (one file per timeline) and advanced after every reply, so two events arriving close together — or a router retry — never produce a duplicate reply. If nothing is new, the wake makes **no model call** and exits `0`.
+- **Idempotent across invocations.** The high-water mark is persisted under `HARNESS_HOME` (one file per timeline) and advanced once a message is answered, so two events arriving close together — or a router retry — never produce a duplicate reply. If nothing is new, the wake makes **no model call** and exits `0`.
+- **A crashed wake does not lose the message.** The delivery guarantee is **at-least-once for the read, at-most-once for every side effect, exactly-once for the reply** — see below.
 - **The conversation persists.** Each wake runs the `timeline:<uuid>` session, reloading the prior transcript from `HARNESS_HOME` rather than re-seeding the backlog every time — one identity and one memory across every wake, per channel.
+
+#### If a wake dies mid-answer, the peer still gets an answer
+
+A wake can die *after* it has taken a message but *before* it has replied — the provider is down, the retries run out, the box is killed. The message must not simply vanish, and it must not be answered twice. So each message is **claimed in two phases**: a wake takes it `in-flight`, and only marks it `done` once the reply has actually gone out. Nothing is marked seen until then, so a wake that dies leaves its messages exactly where the next wake will find them.
+
+What the next wake does with them is decided from **evidence**, never from a timer — the transcript on disk says how far the dead wake got, and the timeline says whether its reply landed:
+
+| The dead wake… | What happens | Why |
+|---|---|---|
+| died **inside the model call** | **re-driven** — answered normally | Nothing ran, nothing posted. This is the common case. |
+| had already **generated a reply** | that reply is **posted verbatim** — no model call, no tool re-run | The answer already exists. Finish the wake; don't re-run it. |
+| already **posted** the reply | **committed**, nothing re-posted | The reply is on the timeline. Found by matching the body against the agent's own posts *newer than that message*. |
+| died **mid-tool-chain** (a tool had run) | **abandoned**, and logged as an `ERROR` naming the message | Re-running would fire those side effects again — two images for one request. A known drop beats an invisible one. |
+
+The line that is never crossed: **a tool's side effects are never repeated.** A turn that already ran tools is never regenerated — at worst its finished reply is posted, at worst-worst it is abandoned loudly. And a claim held by a *live* concurrent wake is never stolen, so two wakes firing at once still answer exactly once between them.
 
 On the **first** wake for a timeline (no mark yet), the agent infers where to start: from an optional `--message <uuid>` (the triggering message, if the router passes one), else from its own latest post on the timeline (so a cutover from poll mode is lossless), else — if it has never spoken there — it answers just the newest message without flooding history. Exit code is `0` on success (including "nothing to do") and non-zero on a hard config/credential failure, so the router can report it.
 

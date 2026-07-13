@@ -120,6 +120,7 @@ from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._version import __version__
 from basecradle_harness._wake import (
     BreakerDecision,
+    Claim,
     ClaimStore,
     MarkStore,
     ReadPacer,
@@ -153,6 +154,7 @@ __all__ = [
     "InstallReport",
     "MarkStore",
     "SeenStore",
+    "Claim",
     "ClaimStore",
     "WakeBreaker",
     "BreakerDecision",

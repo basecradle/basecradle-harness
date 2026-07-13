@@ -7,6 +7,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### A hard-failed wake dropped the peer's message, permanently and silently (issue #285)
+
+A wake claimed and marked each message **seen before it called the model**. So any hard failure in
+between — the provider down, the retries exhausted, the process killed — meant the message was
+marked seen, no reply was ever posted, and **no future wake would ever look at it again.** The
+peer's message was gone. From their side, the AI simply ignored them. The retry shipped in #284
+narrowed that window; it did not close it.
+
+This was not a mistake so much as a **trade**: seen-before bought at-most-once, because the
+alternative — mark seen *after* the reply — makes a wake that dies just after posting reply *twice*,
+and a turn that already ran tools cannot be safely replayed at all.
+
+**The trade turned out to be unnecessary, because "a drop vs. a duplicate" is the wrong axis.**
+There are three outcomes: a silent drop (undetectable, unbounded in consequence — and on a platform
+built on human–AI *parity*, an AI that silently ignores you falsifies the premise), a duplicate
+*reply* (visible, self-correcting, annoying), and a duplicate *side effect* (an image generated
+twice, money spent twice — the harm that actually matters). The real question is whether the drop can
+be fixed **without** buying the side effect, and it can: **they live on opposite sides of the model
+call, and the harness already writes down which side it died on.**
+
+The guarantee is now **at-least-once for the read, at-most-once for every side effect, exactly-once
+for the reply.** A claim is two-phase (`in-flight` → `done`/`abandoned`), nothing is marked seen
+until the reply is out, and a dead wake's messages are classified from **evidence** — the persisted
+transcript (which survives a failed turn since #244) says how far it got; the timeline says whether
+its reply landed:
+
+- died **inside the model call** → **re-driven** (nothing ran, nothing posted — the common case);
+- already **generated a reply** → that reply is **posted verbatim**: no model call, no tool re-run.
+  The answer exists; finish the wake rather than re-run it;
+- already **posted** → **committed, not re-posted**, found by matching the body against own posts
+  *newer than that message* (byte-equality — **verified**, not assumed: 16/16 adversarial bodies read
+  back codepoint-identical from PROD; the platform normalizes nothing);
+- died **mid-tool-chain** → **abandoned**, with an ERROR naming the message. Re-running would re-fire
+  the side effects. This residual at-most-once case is now the rare, *named* exception rather than the
+  routine, invisible rule.
+
+Two things that look like details and are not. **The high-water mark is a cursor, not a set**, so it
+may never pass an item whose fate is undecided — including an item a *concurrent* wake is still
+holding, and including when the tempting fix ("just mark it after the reply") would let a newer own
+post or probe ack sail the cursor straight past an older in-flight message. And **the post-landed
+test must be body-equality**, not "is there any own post newer than this?" — the wake acks a NOC
+probe *before* the model call, so that cheaper test would read an ack as a reply and drop the peer.
+
+Legacy empty claim files (every deployed agent has them) read as `done`, so the upgrade wake never
+re-answers history. Scope is the **message** path; assets, webhook events, and tasks carry the same
+latent drop and are tracked in **#289** — stated, not silently omitted.
+
 ### The 50% compaction proof had an unstated precondition (issue #287)
 
 `_context.py` argues that compacting at **half** the ceiling is safe because *no single turn can
