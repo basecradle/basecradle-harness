@@ -4019,3 +4019,105 @@ def test_the_bootstrap_recovers_a_dead_wakes_message_that_is_no_longer_the_newes
     assert "a newer question" in provider.prompts[0]
     assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+
+
+# --- the concurrency bugs the adversarial self-review found (issue #285) ------
+
+
+def test_two_wakes_recovering_the_same_orphan_cannot_both_win_it(tmp_path):
+    """`reclaim` must be atomic: an unlink-then-create take-over lets BOTH wakes win.
+
+    The broken form is `unlink()` then exclusive-`claim()`, and it is safe only if *both* unlinks
+    happen before *either* create. Interleaved, they do not: wake A unlinks, A creates (wins,
+    writing a live claim) — then wake B unlinks, **destroying A's brand-new live claim**, and B
+    creates and "wins" too. Both would drive the same message through the model and post it twice.
+
+    The rename is the mutex: only one caller can move a given path away, so only one take-over can
+    ever succeed. This drives the exact interleaving rather than hoping a scheduler produces it.
+    """
+    crashed_wake_owning(tmp_path, M0)
+    a, b = ClaimStore(tmp_path), ClaimStore(tmp_path)
+
+    dead = "a-wake-that-died"  # the owner both wakes judged orphaned
+    won_a = a.reclaim(TIMELINE_UUID, M0, kind="messages", owner=dead)  # A takes it over...
+    won_b = b.reclaim(TIMELINE_UUID, M0, kind="messages", owner=dead)  # ...then B tries the same
+
+    assert won_a is True
+    assert won_b is False, "B must not be able to steal A's live claim by deleting it"
+    # And the surviving claim is A's — B did not overwrite it.
+    assert a.read(TIMELINE_UUID, M0, kind="messages").wake == a.wake
+
+
+def test_a_claim_is_never_observable_empty_and_so_never_misread_as_legacy_done(tmp_path):
+    """A live in-flight claim must never be readable as the legacy `done` sentinel.
+
+    `claim()` used to win the race with an exclusive create and write the record *after*, leaving a
+    window where the path existed and the file was **zero bytes**. An empty claim is this store's
+    legacy sentinel and reads as `done` — so a concurrent wake landing in that window would read a
+    live, in-flight claim as *settled*, let the high-water mark pass it, and lose the peer's message
+    forever if its owner then died. The file is now linked into place already carrying its record.
+    """
+    store = ClaimStore(tmp_path)
+    assert store.claim(TIMELINE_UUID, M0, kind="messages") is True
+
+    path = store._path(TIMELINE_UUID, "messages", M0)
+    assert path.read_text().strip(), "the claim file must never be empty the instant it exists"
+    claim = store.read(TIMELINE_UUID, M0, kind="messages")
+    assert claim.phase == "in-flight" and claim.settled is False
+    # No temp litter left behind by the link dance.
+    assert [p.name for p in path.parent.iterdir() if p.name.startswith(".")] == []
+
+
+def test_a_compaction_during_a_build_never_lets_its_tools_re_fire(platform, tmp_path):
+    """A mid-build compaction invalidates the rollback point — so the build must be committed.
+
+    `Session.send` may compact, and a compaction rewrites `history` **in place and shorter**. After
+    it, `base_len` no longer points at the build's start: `history[base_len:]` comes back empty (so
+    `used_tools` reads False even though a tool ran) and `del history[base_len:]` is a no-op (so the
+    "rolled back" build is still there). Together they rebuild a tool-using turn and **re-fire its
+    side effects** — a second image generated and posted for one request.
+
+    Here the tool runs, the transcript is compacted, and a new peer message lands mid-generation.
+    The tool must run exactly once.
+    """
+    tool_runs = []
+
+    class CountingTool(Tool):
+        name = "noop"
+        description = "does nothing, but expensively"
+        parameters = {"type": "object", "properties": {}}
+
+        def run(self, **kwargs):
+            tool_runs.append(1)
+            return "done"
+
+    class ToolThenReply:
+        provider, model = "openai", "gpt-4o"
+
+        def __init__(self):
+            self.calls = 0
+            self.last_tokens_in = None
+
+        def chat(self, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return Message.assistant(
+                    tool_calls=[ToolCall(id="call_1", name="noop", arguments={})]
+                )
+            # Report huge usage so the post-turn compaction fires and rewrites history shorter.
+            self.last_tokens_in = 900_000
+            return Message.assistant(content="Hello, John.")
+
+        def context_limit(self):
+            return 128_000
+
+    # A new peer message lands during generation → the staleness guard would want to rebuild.
+    messages = ScriptedMessages(platform, message(uuid=M0, body="make me an image"))
+    messages.arrive(message(uuid=M1, body="actually, wait"))
+
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(ToolThenReply(), tools=[CountingTool()], home=tmp_path)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+    agent.wake()
+
+    assert tool_runs == [1], "the tool must run exactly once — a rebuild would re-fire it"

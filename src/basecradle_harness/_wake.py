@@ -312,6 +312,19 @@ def _orphaned(claim: Claim, *, pid: int, wake: str, now: float | None = None) ->
     return age > _CLAIM_STALE_AFTER
 
 
+def _payload(claim: Claim) -> dict[str, object]:
+    """A claim as the JSON it persists as. One shape, so a `claim()` and a `commit()` cannot drift."""
+    payload: dict[str, object] = {
+        "phase": claim.phase,
+        "pid": claim.pid,
+        "wake": claim.wake,
+        "at": claim.at,
+    }
+    if claim.reason is not None:
+        payload["reason"] = claim.reason
+    return payload
+
+
 class ClaimStore:
     """Per-item atomic claims, so concurrent wakes handle each item exactly once — and so a
     **crashed** wake's item can be re-driven instead of silently dropped (issue #285).
@@ -361,45 +374,73 @@ class ClaimStore:
     def claim(self, timeline: str, uuid: str, *, kind: str) -> bool:
         """Atomically claim `(kind, timeline, uuid)` as **in-flight**. True if this wake won it.
 
-        Wins by exclusively creating the claim file: the first caller succeeds, any
-        concurrent (or later) caller gets `FileExistsError` and is told the item is already
-        owned. The create is the whole synchronization — no lock, no read-modify-write race.
-        The phase record is written *after* the create has already decided the winner, so it
-        never enters the race it is recording.
+        Wins by atomically **linking the claim file into place already carrying its record**. The
+        link is the whole synchronization — it fails `EEXIST` if anyone already holds the claim —
+        and because the file is written *before* it is published, the claim path is never
+        observable in an empty state.
+
+        That last property is load-bearing, not tidiness. The obvious form — `O_CREAT|O_EXCL` to
+        win the race, *then* write the record — leaves a window in which the path exists and the
+        file is zero bytes. An empty claim is this store's **legacy sentinel** and reads as `done`
+        (see `read`), so a concurrent wake landing in that window would read a live, `in-flight`
+        claim as **settled**, let the high-water mark pass it, and — if its owner then died — lose
+        the peer's message forever. The bug this file exists to fix, reintroduced by the mechanism
+        meant to fix it.
         """
         path = self._path(timeline, kind, uuid)
         path.parent.mkdir(parents=True, exist_ok=True)
+        record = Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time())
+        temp = path.parent / f".{quote(uuid, safe='')}.{self.wake}.new"
+        temp.write_text(json.dumps(_payload(record)))
         try:
-            handle = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.link(temp, path)  # atomic create-if-absent, published already populated
         except FileExistsError:
             return False
-        os.close(handle)
-        self._write(path, Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time()))
+        finally:
+            temp.unlink(missing_ok=True)
         return True
 
     def orphaned(self, claim: Claim) -> bool:
         """Is `claim` held by a wake that died? (`_orphaned`, bound to this store's identity.)"""
         return _orphaned(claim, pid=os.getpid(), wake=self.wake)
 
-    def reclaim(self, timeline: str, uuid: str, *, kind: str) -> bool:
-        """Take over an **orphaned** claim: unlink it, then win it fresh. True if this wake won.
+    def reclaim(self, timeline: str, uuid: str, *, kind: str, owner: str | None) -> bool:
+        """Take over the orphaned claim **held by `owner`**. True if this wake won the take-over.
 
-        Unlink-then-exclusive-create keeps the take-over atomic *using the primitive that is
-        already the synchronization*, rather than inventing a second one. Two wakes both
-        recovering the same orphan is safe by construction: their unlinks are idempotent (the
-        loser's raises `FileNotFoundError`, which means "already gone" — the outcome it wanted),
-        and then exactly one of them wins the exclusive create. The loser skips, exactly as it
-        would against any live claim.
+        A take-over is a **compare-and-swap**, not an overwrite: it must succeed only if the claim
+        is still the very one the caller judged orphaned. The swap is decided by an exclusive
+        create on a token path that names the dead owner — `.<uuid>.takeover.<owner>` — so exactly
+        one wake can ever take this message *from this owner*, and the winner then overwrites the
+        claim with its own record.
 
-        A wake that unlinks and then dies before re-creating leaves no claim at all — the next
-        wake sees an unclaimed message and drives it normally. That is the correct outcome: the
-        message was never answered.
+        Two simpler forms are **both broken**, and it is worth naming them, because each looks
+        obviously fine:
+
+        - **`unlink()` then exclusive-`claim()`.** Safe only if *both* unlinks happen before
+          *either* create. Interleaved they do not: A unlinks, A creates (wins, writing a live
+          claim) — then B unlinks, **destroying A's brand-new live claim**, and B creates and
+          "wins" too. Both drive the message through the model and post it twice.
+        - **`rename()` as a mutex.** Fails the same way for the same reason: after A's take-over a
+          file *is* present at the path — A's fresh, live claim — so B's rename happily moves *that*
+          aside and B wins as well. A rename can tell "something is there" from "nothing is there";
+          it cannot tell the stale orphan from the live claim that replaced it. That distinction is
+          the entire job, which is why the token names the owner it is taking over *from*.
+
+        Keying the token to the owner also keeps recovery **repeatable**: if the wake that takes the
+        message over then dies too, *its* wake id becomes the new owner, and the next recovery
+        competes on a different token path. A single non-generational token would let a message be
+        recovered exactly once, ever, and strand it in-flight forever afterwards.
         """
+        path = self._path(timeline, kind, uuid)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        token = path.parent / f".{quote(uuid, safe='')}.takeover.{quote(str(owner), safe='')}"
         try:
-            self._path(timeline, kind, uuid).unlink()
-        except FileNotFoundError:
-            pass  # another recovering wake got there first; the exclusive create below decides
-        return self.claim(timeline, uuid, kind=kind)
+            handle = os.open(token, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return False  # another wake already took this orphan over — it owns it now
+        os.close(handle)
+        self._write(path, Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time()))
+        return True
 
     def read(self, timeline: str, uuid: str, *, kind: str) -> Claim | None:
         """The claim on `(kind, timeline, uuid)`, or ``None`` if the item was never claimed.
@@ -456,19 +497,20 @@ class ClaimStore:
         )
 
     def _write(self, path: Path, claim: Claim) -> None:
-        """Write a claim record **atomically** — a torn record is a record that cannot be read.
+        """Overwrite an existing claim record **atomically** — a torn record cannot be read.
 
         Write-to-temp + `os.replace` (atomic on POSIX), so a crash mid-write can only ever leave
-        the *previous* record intact, never a half-written one. Without this the crash window
-        this whole file is about would have a new failure mode of its own: a wake killed while
-        committing, leaving a claim that parses as neither phase.
+        the *previous* record intact, never a half-written one. Without this, the crash window this
+        whole file is about would gain a failure mode of its own: a wake killed while committing,
+        leaving a claim that parses as neither phase.
+
+        This is for *transitions* (`commit` / `abandon`), where the path already exists. The first
+        publication of a claim is `claim()`'s `os.link`, which must also win a race — a plain
+        replace would happily clobber a rival's live claim.
         """
-        payload = {"phase": claim.phase, "pid": claim.pid, "wake": claim.wake, "at": claim.at}
-        if claim.reason is not None:
-            payload["reason"] = claim.reason
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-        temp.write_text(json.dumps(payload))
+        temp.write_text(json.dumps(_payload(claim)))
         os.replace(temp, path)
 
     def _path(self, timeline: str, kind: str, uuid: str) -> Path:
@@ -1189,6 +1231,9 @@ class WakeAgent:
             self._ledger: list[tuple[str, str]] = []
             self._cursor: str | None = None
             self._finished: set[int] = set()
+            # Has this wake called the model yet? Recovery is only sound before it has — see
+            # `_readmit`. Set by `_send_batch`, the message path's only model call.
+            self._sent = False
             # A fresh identity per *wake*, not per process: an agent that wakes twice in one
             # process must see its own earlier wake's abandoned claims as orphaned, not as "mine".
             self.claims.wake = uuid4().hex
@@ -2208,10 +2253,25 @@ class WakeAgent:
             return _FINAL
         if not self.claims.orphaned(claim):
             return _PENDING
-        return self._recover_orphan(session, item, later, posted)
+        if self._sent:
+            # **Recovery reads the transcript as evidence, so it only runs while that evidence is
+            # pristine — i.e. before this wake has called the model itself.** After a build, two
+            # things stop being true: a compaction may have summarized the dead wake's turn away
+            # (so `_turn_of` would report "never sent" for a turn that ran tools, and re-drive it),
+            # and a stale-build rollback can delete a note we just appended. Deferring costs the
+            # peer one wake — the claim stays in-flight, the mark stays behind it, and the *next*
+            # wake recovers it against a freshly-loaded transcript. Losing the message costs
+            # everything, so the trade is not close.
+            return _PENDING
+        return self._recover_orphan(session, item, later, posted, claim)
 
     def _recover_orphan(
-        self, session: Session, item: object, later: list[object], posted: list[object]
+        self,
+        session: Session,
+        item: object,
+        later: list[object],
+        posted: list[object],
+        claim: Claim,
     ) -> str:
         """A message a dead wake was holding. Decide from **evidence** what may safely happen to it.
 
@@ -2250,7 +2310,7 @@ class WakeAgent:
         uuid = item.content.uuid
         turn = _turn_of(session.history, _incoming_text(item))
         if turn is None:
-            return self._redrive(item, "the wake died before the model ever saw it")
+            return self._redrive(item, claim, "the wake died before the model ever saw it")
 
         work = _turn_work(session.history, turn)
         reply = _turn_reply(work)
@@ -2279,12 +2339,17 @@ class WakeAgent:
             )
             return _FINAL
 
-        return self._redrive(item, "the wake died inside the model call")
+        return self._redrive(item, claim, "the wake died inside the model call")
 
-    def _redrive(self, item: object, why: str) -> str:
-        """Take over an orphaned claim so this wake answers the message. `_PENDING` if we lose it."""
+    def _redrive(self, item: object, claim: Claim, why: str) -> str:
+        """Take over an orphaned claim so this wake answers the message. `_PENDING` if we lose it.
+
+        The take-over is a compare-and-swap against the **owner we judged orphaned** (`claim.wake`),
+        so a wake that lost the race — because a rival recovered it first, or because the "dead"
+        owner was not the one still holding it — steps aside instead of answering in parallel.
+        """
         uuid = item.content.uuid
-        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=_MESSAGES):
+        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=_MESSAGES, owner=claim.wake):
             return _PENDING  # another recovering wake won the take-over; let it answer
         _log.warning(
             "re-driving %s",
@@ -2481,11 +2546,25 @@ class WakeAgent:
         while True:
             reply = self._send_batch(session, _render_batch(batch), brief)
             builds += 1
+            # **A compaction during the build invalidates `base_len`, so the build is committed.**
+            # `Session.send` may compact (`_compact_if_needed`, and the over-length rescue), and a
+            # compaction rewrites `history` *in place and shorter* — after which `base_len` no
+            # longer points at this build's start, and both lines below quietly lie:
+            # `history[base_len:]` comes back **empty**, so `used_tools` reads False even when the
+            # build ran tools, and `del history[base_len:]` becomes a **no-op**, so the "rolled
+            # back" build is still in the transcript when the next one is appended. Together they
+            # rebuild a tool-using turn and **re-fire its side effects** — a second image generated
+            # and posted for one request — which is the one thing this loop promises never to do.
+            # There is no index into a list that a rewrite of that list preserves, so the honest
+            # move is not to compute a cleverer index: it is to stop rebuilding. The build is
+            # posted as-is (never rolled back, never re-run), and anything that landed during it
+            # simply drives the next wake, exactly as the `max_builds` cap already does.
+            compacted = len(session.history) < base_len
             # A build that engaged tools has committed irreversible side effects; posting it as-is
             # (never rebuilding) is the only safe move — a rollback+rebuild would re-fire them.
             used_tools = any(turn.role == "tool" for turn in session.history[base_len:])
-            if not self.pacer.enabled or builds >= self.max_builds or used_tools:
-                return reply  # pacing off → one build; the cap or a tool-using build → post as-is
+            if not self.pacer.enabled or builds >= self.max_builds or used_tools or compacted:
+                return reply  # pacing off → one build; the cap, tools, or a compaction → post as-is
             # Absorb the fresh read regardless — this marks any self post and, crucially, keeps a
             # NOC probe's ack sub-second even when it lands mid-generation (it is acked here, not
             # deferred to the next wake). Only peer messages fold in and trigger a rebuild.
@@ -2506,6 +2585,7 @@ class WakeAgent:
         (the `max_steps` cap) degrades to a short, honest note the peer can read; other failures
         propagate to the entrypoint, which reports them cleanly.
         """
+        self._sent = True  # the transcript is no longer pristine evidence (see `_readmit`)
         try:
             return session.send(text, brief=brief)
         except EngineError as error:
@@ -2535,17 +2615,26 @@ def _turn_of(history: list[Message], rendered: str) -> int | None:
 
     The recovery classifier's first question (issue #285): *did the dead wake ever actually put
     this message in front of the model?* `_render_batch` joins each message's `_incoming_text`
-    line verbatim, so a message's exact rendered line is a durable signature of the turn that
-    carried it — and a message is only ever batched once, so at most one turn can hold it.
+    line with newlines, so a message's exact rendered line is a durable signature of the turn that
+    carried it — and a message is only ever batched once, so at most one turn genuinely holds it.
 
-    **The whole history is searched, newest-first, not just the tail.** Two dead wakes in a row
-    would leave the *older* one's message behind an intervening user turn, and a tail-only test
-    would report "never sent" for a message that was in fact sent, generated for, and possibly
-    answered — re-driving it into a double reply. Newest-first because the common case is recent.
+    **The whole history is searched, not just the tail.** Two dead wakes in a row would leave the
+    *older* one's message behind an intervening user turn, and a tail-only test would report "never
+    sent" for a message that was in fact sent, generated for, and possibly answered — re-driving it
+    into a double reply.
+
+    Two details keep the match honest, and both guard the same failure — matching a turn that
+    merely *mentions* the message rather than the turn that *carried* it, which would hand the
+    orphan some other turn's reply:
+
+    - **A whole line, never a substring.** A peer can quote an earlier message inside their own
+      body; a substring test would match the quoting turn.
+    - **Oldest-first.** A quote is necessarily *newer* than the message it quotes, so scanning
+      forward reaches the turn that really carried the message before it reaches any turn that
+      merely repeats its text.
     """
-    for index in range(len(history) - 1, -1, -1):
-        message = history[index]
-        if message.role == "user" and rendered in (message.content or ""):
+    for index, message in enumerate(history):
+        if message.role == "user" and rendered in (message.content or "").split("\n"):
             return index
     return None
 
