@@ -5,7 +5,13 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.66.0] - 2026-07-13
+
+**Two silent failures in the machinery that is supposed to keep a peer's message safe.** A wake that
+died between marking a message `seen` and posting its reply dropped that message forever, and nobody
+— not the peer, not the agent, not the NOC — was ever told. A context budget too small to sustain its
+own 50% compaction proof forfeited the guarantee just as quietly. Neither failed loudly, neither
+failed a test, and both are now impossible to hit without hearing about it.
 
 ### A hard-failed wake dropped the peer's message, permanently and silently (issue #285)
 
