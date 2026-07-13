@@ -37,7 +37,10 @@ here:
   what *persists* is head + tail around an elision marker naming the original size
   (see `TOOL_RESULT_CAP`). This is the same cost discipline the engine already applies
   to a viewed image — seen once, never re-billed — extended to the text that a single
-  mailbox listing or wide file read would otherwise tax every future wake with.
+  mailbox listing or wide file read would otherwise tax every future wake with. The cap
+  is *enforced* here but **defined in `_context`**, because the compaction threshold's
+  safety proof is computed from it: it is a load-bearing input to that arithmetic, not a
+  neighbor of it, and the two must never drift apart in separate files.
 - **The conversation itself is bounded.** Capping each turn only slows the growth; it does not
   stop it, and a long-lived agent would still walk into its model's context ceiling — where the
   provider 400s deterministically and every later wake rebuilds the same doomed request. So a
@@ -60,20 +63,12 @@ import logging
 from pathlib import Path
 
 from basecradle_harness._caching import anchor_cacheable_prefix, cache_mode
-from basecradle_harness._context import Compactor
+from basecradle_harness._context import TOOL_RESULT_CAP, Compactor
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._messages import ImageContent, Message
 
 _log = logging.getLogger("basecradle_harness")
-
-#: The most characters of one tool result that persist into the transcript. Above it, the
-#: result is elided to head + tail around a marker naming the original size (`_elide`). The
-#: model still saw the *whole* result on the turn the tool ran — this bounds only what every
-#: *future* turn re-reads and re-pays for. 4 KB is what the live containment prune used on
-#: @glm-5.2's transcripts (issue #275): comfortably more than a normal tool answer, far below
-#: the 142 KB mailbox dumps that drove one agent's context to 754 K input tokens per call.
-TOOL_RESULT_CAP = 4096
 
 #: How the elided result is split around the marker: enough head to keep the shape and the
 #: first rows of a listing, and a short tail so a result whose payload lands at the end (a

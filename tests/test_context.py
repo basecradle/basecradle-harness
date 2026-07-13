@@ -31,10 +31,16 @@ from basecradle_harness import (
 from basecradle_harness._context import (
     COMPACT_AT,
     DEFAULT_CONTEXT_LIMIT,
+    TOOL_RESULT_CAP,
+    WORST_CASE_CHARS_PER_TOKEN,
     Compactor,
     ContextBudget,
     is_context_overflow,
+    max_safe_steps,
+    min_safe_limit,
+    worst_case_turn_tokens,
 )
+from basecradle_harness._engine import DEFAULT_MAX_STEPS
 from basecradle_harness._exceptions import ProviderContextLengthError
 
 # The fabricated cast, per repo convention.
@@ -78,8 +84,8 @@ class ScriptedProvider:
         return self.limit
 
 
-def budget(provider, *, override=None) -> ContextBudget:
-    return ContextBudget(provider, override=override)
+def budget(provider, *, override=None, max_steps=DEFAULT_MAX_STEPS) -> ContextBudget:
+    return ContextBudget(provider, override=override, max_steps=max_steps)
 
 
 def compactor(provider, *, override=None, on_summary=None) -> Compactor:
@@ -654,3 +660,163 @@ def test_an_unrelated_exceeds_the_maximum_is_not_the_wall(text):
     # "exceeds the maximum size" 400 is an ordinary file-too-big error. A false positive there
     # would compact a transcript that was never too long; a false negative only costs one wake.
     assert is_context_overflow(text) is False
+
+
+# --- the 50% proof has a precondition, and the harness says so (issue #287) ---
+#
+# The threshold is only a *safe* distance while one turn's worst-case growth fits in the headroom
+# above it: `limit x (1 - COMPACT_AT) > TOOL_RESULT_CAP x max_steps / chars-per-token`. Two operator
+# knobs move those terms — `HARNESS_MAX_CONTEXT_TOKENS` shrinks the left, `HARNESS_MAX_STEPS` grows
+# the right — and either can walk an agent out of the guarantee silently. These pin that it warns,
+# that it warns from the *arithmetic* rather than a magic number, and that it never refuses.
+
+
+def test_the_worst_case_is_derived_from_the_constants_not_hardcoded():
+    # The whole point of deriving it: tune the cap or the step budget and the guarantee's arithmetic
+    # follows automatically. A literal 30_000 here would rot the day either constant moved.
+    assert worst_case_turn_tokens(DEFAULT_MAX_STEPS) == int(
+        TOOL_RESULT_CAP * DEFAULT_MAX_STEPS / WORST_CASE_CHARS_PER_TOKEN
+    )
+    assert worst_case_turn_tokens(2 * DEFAULT_MAX_STEPS) == 2 * worst_case_turn_tokens(
+        DEFAULT_MAX_STEPS
+    )
+    # `min_safe_limit` is that same inequality solved for the ceiling.
+    assert min_safe_limit(DEFAULT_MAX_STEPS) * (1 - COMPACT_AT) >= worst_case_turn_tokens(
+        DEFAULT_MAX_STEPS
+    )
+
+
+def test_an_env_budget_too_small_for_the_guarantee_warns_and_names_the_numbers(caplog):
+    # The live case, exactly: basecradle-noc#218 set HARNESS_MAX_CONTEXT_TOKENS=20000 on @pinky to
+    # force a compaction, leaving 10_000 tokens of headroom against a ~32_768 worst-case turn — and
+    # the harness said nothing about the guarantee it had just dropped.
+    provider = ScriptedProvider()
+
+    with caplog.at_level(logging.WARNING):
+        resolved = budget(provider, override=20_000).limit()
+
+    warning = next(r.message for r in caplog.records if r.message.startswith("context budget"))
+    assert "20000" in warning and "source=env" in warning
+    assert str(worst_case_turn_tokens(DEFAULT_MAX_STEPS)) in warning  # what a turn can add
+    assert "10000 tokens of headroom" in warning  # what it actually has
+    assert f"at least {min_safe_limit(DEFAULT_MAX_STEPS)}" in warning  # how to restore it
+    assert "emergency compaction + retry" in warning  # what still protects them
+    # Warn, never refuse: the operator's number stands, untouched. The escape hatch always wins.
+    assert (resolved.tokens, resolved.source) == (20_000, "env")
+
+
+def test_the_shipped_floor_satisfies_the_guarantee_and_says_nothing(caplog):
+    # The default install must never emit this warning — the 128 K floor clears the bar by
+    # construction (64_000 of headroom against a ~32_768 turn). A warning that cried wolf on every
+    # stock agent would be trained away within a week.
+    provider = ScriptedProvider()
+    provider.limit = None
+
+    with caplog.at_level(logging.WARNING):
+        resolved = budget(provider).limit()
+
+    assert (resolved.tokens, resolved.source) == (DEFAULT_CONTEXT_LIMIT, "default")
+    assert "context budget" not in caplog.text
+
+
+def test_an_adapter_ceiling_that_clears_the_bar_says_nothing(caplog):
+    provider = ScriptedProvider()
+    provider.limit = 1_048_576  # every model the fleet runs today
+
+    with caplog.at_level(logging.WARNING):
+        budget(provider).limit()
+
+    assert "context budget" not in caplog.text
+
+
+def test_a_small_adapter_ceiling_warns_but_never_tells_you_to_raise_it_past_the_wall(caplog):
+    # A genuinely small-context model (a local model, a budget endpoint) forfeits the guarantee too,
+    # and the operator did not even choose it. But the remedy MUST NOT be "raise the budget": that
+    # ceiling is the model's real window, and moving the threshold above it would push compaction
+    # *past the wall* — never firing in time — which is strictly worse than the problem. The only
+    # honest fix at a fixed ceiling is to spend fewer steps per turn.
+    provider = ScriptedProvider()
+    provider.limit = 32_000
+
+    with caplog.at_level(logging.WARNING):
+        budget(provider).limit()
+
+    warning = next(r.message for r in caplog.records if r.message.startswith("context budget"))
+    assert "source=adapter" in warning
+    assert f"Lower HARNESS_MAX_STEPS to {max_safe_steps(32_000)}" in warning
+    # The env path's remedy sentence must never appear here. An operator skimming the journal for an
+    # actionable number would otherwise raise the budget past the model's real ceiling — turning the
+    # warning into the outage it exists to prevent.
+    assert "raise HARNESS_MAX_CONTEXT_TOKENS to at least" not in warning
+    assert "Do not raise HARNESS_MAX_CONTEXT_TOKENS" in warning
+
+
+def test_a_raised_step_budget_forfeits_the_guarantee_from_the_other_side(caplog):
+    # The inequality has two operator-tunable terms. A budget that is perfectly safe at the shipped
+    # 24 steps stops being safe when HARNESS_MAX_STEPS is raised far enough, because the worst-case
+    # turn grows with it. A guard that watched only the context knob would be half a guard.
+    provider = ScriptedProvider()
+
+    with caplog.at_level(logging.WARNING):
+        budget(provider, override=DEFAULT_CONTEXT_LIMIT, max_steps=24).limit()
+    assert "context budget" not in caplog.text  # safe at the shipped step budget
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        budget(provider, override=DEFAULT_CONTEXT_LIMIT, max_steps=64).limit()
+
+    warning = next(r.message for r in caplog.records if r.message.startswith("context budget"))
+    assert f"x {64} steps" in warning
+    assert str(worst_case_turn_tokens(64)) in warning
+
+
+def test_a_budget_at_the_minimum_safe_limit_is_silent(caplog):
+    provider = ScriptedProvider()
+
+    with caplog.at_level(logging.WARNING):
+        budget(provider, override=min_safe_limit(DEFAULT_MAX_STEPS)).limit()
+
+    assert "context budget" not in caplog.text
+
+
+def test_compaction_switched_off_entirely_is_not_nagged_about_the_guarantee(caplog):
+    # `0` is the operator saying "I manage this agent's context myself." There is no compaction
+    # threshold to prove anything about, so a warning framed around one would be noise — and it
+    # would repeat, since a disabled budget resolves no cached limit.
+    provider = ScriptedProvider()
+
+    with caplog.at_level(logging.WARNING):
+        budget(provider, override=0).limit()
+
+    assert "context budget" not in caplog.text
+
+
+def test_the_warning_fires_once_not_on_every_wake(caplog):
+    provider = ScriptedProvider()
+    live = budget(provider, override=20_000)
+
+    with caplog.at_level(logging.WARNING):
+        live.limit()
+        live.limit()
+        live.limit()
+
+    # The limit resolves once and caches; the warning rides with it. A per-call warning would bury
+    # the journal of an agent that is otherwise working fine.
+    assert sum(1 for r in caplog.records if r.message.startswith("context budget")) == 1
+
+
+def test_the_remedy_the_warning_quotes_actually_clears_the_warning():
+    # A warning that hands the operator a number which does not fix the problem is worse than
+    # silence — they change the setting, the warning persists, and they stop believing it. Both
+    # remedies are exact inverses of the trigger, so this sweeps them against the real condition.
+    def warns(limit: int, steps: int) -> bool:
+        return (limit - int(limit * COMPACT_AT)) < worst_case_turn_tokens(steps)
+
+    for limit in range(1_000, 300_000, 337):
+        steps = max_safe_steps(limit)
+        if steps >= 1:
+            assert not warns(limit, steps)  # the quoted step budget clears it...
+            assert warns(limit, steps + 1)  # ...and is the largest that does
+
+    for steps in range(1, 200):
+        assert not warns(min_safe_limit(steps), steps)  # the quoted budget clears it

@@ -356,9 +356,9 @@ It reads the same environment as `TimelineAgent.from_env` (credentials, `AI_PROV
 | Variable | What it is |
 |---|---|
 | `HARNESS_HOME` | The directory where the agent's **transcript** and per-timeline **high-water mark** persist across wakes. Required — each wake is a separate process, so this is the only thing that carries between them |
-| `HARNESS_MAX_STEPS` | *(optional)* the [per-turn step budget](#the-step-budget-live-counter-and-reserve-summary) — the most model turns one wake may take before the reserve summary fires. **Default `24`**; set a per-persona positive override (a non-positive value fails loudly) |
+| `HARNESS_MAX_STEPS` | *(optional)* the [per-turn step budget](#the-step-budget-live-counter-and-reserve-summary) — the most model turns one wake may take before the reserve summary fires. **Default `24`**; set a per-persona positive override (a non-positive value fails loudly). Raising it far enough forfeits the [compaction safety guarantee](#set-the-budget-too-low-and-you-lose-a-guarantee--the-harness-will-tell-you) — a bigger turn needs more headroom — and the harness warns when it does |
 | `HARNESS_RESPONSE_RETRIES` | *(optional)* how many **extra** times the engine re-requests a provider call that failed [**transiently**](#retrying-a-transient-provider-failure) — a truncated / unparseable response (the "EOF while parsing a value" class), or the provider's own **5xx** — before the wake gives up. **Default `2`** (up to 3 total attempts); `0` disables the retry. Only those two classes are retried — a connection, auth, rate-limit, or config error is never re-tried |
-| `HARNESS_MAX_CONTEXT_TOKENS` | *(optional)* the [context budget](#the-context-budget--the-transcript-compacts-itself) — the model's context ceiling, in tokens. The transcript compacts itself once a call's reported input crosses **half** of it. Unset → the adapter is asked (`xai-sdk` and `openrouter` can answer; OpenAI cannot), and failing that a conservative **128,000** floor is assumed — so **set this if your model's window is below 128 K**, where the floor would sit above the real ceiling. Set it *lower* than the ceiling to compact earlier and replay fewer tokens per wake. `0` disables compaction entirely, self-heal included |
+| `HARNESS_MAX_CONTEXT_TOKENS` | *(optional)* the [context budget](#the-context-budget--the-transcript-compacts-itself) — the model's context ceiling, in tokens. The transcript compacts itself once a call's reported input crosses **half** of it. Unset → the adapter is asked (`xai-sdk` and `openrouter` can answer; OpenAI cannot), and failing that a conservative **128,000** floor is assumed — so **set this if your model's window is below 128 K**, where the floor would sit above the real ceiling. Set it *lower* than the ceiling to compact earlier and replay fewer tokens per wake. `0` disables compaction entirely, self-heal included. Below ~**65,536** it forfeits the [single-turn safety guarantee](#set-the-budget-too-low-and-you-lose-a-guarantee--the-harness-will-tell-you) and the harness logs a WARNING saying so |
 | `HARNESS_WAKE_BREAKER_MAX` | *(optional)* the cross-wake circuit-breaker's cap — the most wakes a single timeline may take in the rolling window before the breaker trips. **Default `10`**; set `0` (or below) to disable the breaker |
 | `HARNESS_WAKE_BREAKER_WINDOW` | *(optional)* the breaker's rolling-window length in seconds. **Default `60`** |
 | `HARNESS_WAKE_BREAKER_COOLDOWN` | *(optional)* how long (seconds) after a trip the breaker waits — once the burst has also cleared — before auto-resetting. **Defaults to the window** |
@@ -415,6 +415,24 @@ The ceiling itself resolves in one order — **`HARNESS_MAX_CONTEXT_TOKENS` → 
 > **If your model's context window is below 128 K, `HARNESS_MAX_CONTEXT_TOKENS` is not optional.** The floor is *conservative* only for models at or above it (true of everything the majors currently ship). Below it, the assumed ceiling sits *above* the real one and compaction would never fire in time.
 
 Set `HARNESS_MAX_CONTEXT_TOKENS` to override the ceiling for any reason — a model the adapter can't read, routing you have pinned, or simply a **tighter budget than the ceiling** because you would rather compact early than replay half a million tokens per wake. It always wins; `0` disables compaction entirely — including the self-heal above, because "off" means off, and an agent whose context you manage yourself is one whose transcript the harness will not rewrite behind your back. `basecradle-harness-wake --resolved-config` reports it, and the wake logs the limit it actually resolved (`context limit limit=1048576 source=adapter`) and every compaction it performs.
+
+#### Set the budget too low and you lose a guarantee — the harness will tell you
+
+Compacting at **half** the ceiling is only safe because **no single turn can leap the gap**: every step of a turn may run a tool, each tool result persists capped at 4 KB, so one turn adds at most `4096 × HARNESS_MAX_STEPS` characters — about **32,768 tokens** at the shipped 24-step budget. That has to fit in the headroom *above* the threshold, which makes the guarantee an inequality with **two knobs that break it from opposite sides**:
+
+> `limit × 0.5` **>** `4096 × max_steps ÷ 3.0`  → at the shipped defaults the guarantee needs a ceiling of about **65,536**.
+
+Lower `HARNESS_MAX_CONTEXT_TOKENS` under that, *or* raise `HARNESS_MAX_STEPS` far enough, and a tool-heavy turn can cross from under-threshold to over-ceiling in **one step** — compaction runs only *between* turns, so it never gets a chance, and the agent silently falls back on the over-length rescue above. The rescue works. Not knowing you are relying on it is the problem, so the harness logs a **WARNING** at budget resolution naming the numbers and what still protects you:
+
+```text
+WARNING context budget 20000 (source=env) leaves 10000 tokens of headroom above the compaction
+threshold, below the 32768 a single tool-heavy turn can add (4096 chars x 24 steps at 3.0
+chars/token): a turn may overshoot the ceiling before compaction, which runs only *between* turns,
+can fire. The over-length rescue (emergency compaction + retry) still applies. To restore the
+guarantee, raise HARNESS_MAX_CONTEXT_TOKENS to at least 65536 or lower HARNESS_MAX_STEPS to 7.
+```
+
+It **warns, never refuses** — the override is the escape hatch and always wins. The stock 128 K floor clears the bar by construction, so a default install never sees this. And when the *ceiling itself* is small (a local model, a budget endpoint), the warning does **not** tell you to raise the budget — that would push the threshold past the model's real wall, where compaction could never fire in time — it tells you to lower `HARNESS_MAX_STEPS` instead.
 
 Each compaction rewrites the prefix and so invalidates the provider's prompt cache **once** — accepted, and bounded by design: compaction retains ~20% of the budget and fires at 50%, so the context must roughly double before the next one, and the new prefix is byte-stable from the moment it is written.
 

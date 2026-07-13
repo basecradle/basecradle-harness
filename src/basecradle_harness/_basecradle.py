@@ -1351,8 +1351,22 @@ def _compactor_from_env(provider: Provider) -> Compactor:
     replayed per wake may be unbounded*. It costs a quiet agent nothing (no extra API call is ever
     made until a call's reported usage is large enough that some ceiling could be in play), and it
     is what keeps a standing agent from walking into its context wall.
+
+    The **step budget** is read here too, and handed to the budget for one purpose: the 50%
+    compaction threshold is only safe while one turn's worst-case growth fits in the headroom above
+    it, and that growth scales with the steps a turn may take (issue #287). Both terms of that
+    inequality are operator-tunable — `HARNESS_MAX_CONTEXT_TOKENS` shrinks the headroom,
+    `HARNESS_MAX_STEPS` grows the turn — so the budget is given the *effective* step count rather
+    than the shipped default, and warns when the pair of them no longer clears the bar.
     """
-    return Compactor(provider, ContextBudget(provider, override=_max_context_tokens_from_env()))
+    return Compactor(
+        provider,
+        ContextBudget(
+            provider,
+            override=_max_context_tokens_from_env(),
+            max_steps=_max_steps_from_env(),
+        ),
+    )
 
 
 def _log_level_from_env() -> int:
