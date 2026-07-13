@@ -31,7 +31,21 @@ summarization call itself, and for estimate error. That threshold is only safe b
 turn can leap over it*: the persisted growth of one turn is bounded by `TOOL_RESULT_CAP` (4 KB) ×
 `DEFAULT_MAX_STEPS` (24) ≈ 30 K tokens, which cannot cross from under-half to over-full on any
 budget at or above the floor. **The tool-result cap (issue #275) is a prerequisite of this file**,
-not a neighbor of it: relax it and the 50% threshold stops being a safe distance.
+not a neighbor of it: relax it and the 50% threshold stops being a safe distance. That is why the
+cap is *defined* here and merely *enforced* in `_session` — the proof and its inputs live together,
+where they cannot drift apart.
+
+**And the proof has a precondition, so the harness states it out loud (issue #287).** Written as an
+inequality, the guarantee is `limit × (1 - COMPACT_AT) > TOOL_RESULT_CAP × max_steps ÷ chars-per-token`
+— headroom above the threshold must exceed what one tool-heavy turn can add. Two operator knobs move
+those terms: `HARNESS_MAX_CONTEXT_TOKENS` shrinks the left side, `HARNESS_MAX_STEPS` grows the right.
+Either can walk an agent out of the guarantee, and **nothing about that is visible** — compaction runs
+only *between* turns, so a turn under a too-small budget can cross from under-threshold to over-ceiling
+in one step, and the agent simply falls back on the over-length rescue (`emergency_compact` + retry)
+without anyone being told it left the primary mechanism. The escape hatch must always win (`0` still
+means "compaction off"), so `_warn_if_unguaranteed` **warns and never refuses** — the defect was the
+silence, not the setting. It is derived from the constants above, never hardcoded, so it cannot rot
+when one of them is tuned.
 
 **A cut may land only immediately before a `user` turn.** This is the correctness constraint the
 whole rewrite turns on. Tool results follow the assistant turn that called them, so cutting
@@ -52,15 +66,30 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
+from basecradle_harness._engine import DEFAULT_MAX_STEPS
 from basecradle_harness._messages import Message
 from basecradle_harness._observability import kv
 from basecradle_harness._provider import Provider
 
 _log = logging.getLogger("basecradle_harness")
+
+#: The most characters of one tool result that persist into the transcript. Above it, the result is
+#: elided to head + tail around a marker naming the original size (`_session._elide`). The model
+#: still saw the *whole* result on the turn the tool ran — this bounds only what every *future* turn
+#: re-reads and re-pays for. 4 KB is what the live containment prune used on @glm-5.2's transcripts
+#: (issue #275): comfortably more than a normal tool answer, far below the 142 KB mailbox dumps that
+#: drove one agent's context to 754 K input tokens per call.
+#:
+#: **It lives here, not in `_session` where it is enforced**, because the compaction threshold's
+#: safety proof is computed from it (see the module docstring): it is an *input to the arithmetic*,
+#: and a number the proof depends on must not sit in another file where it can be tuned without the
+#: proof noticing.
+TOOL_RESULT_CAP = 4096
 
 #: The ceiling assumed when the operator names none and the adapter cannot answer one. It is a
 #: *floor on plausible ceilings*, not a guess at the real one: every model the fleet runs, and
@@ -98,6 +127,16 @@ SUMMARY_INPUT_FRACTION = 0.5
 #: assuming 2 keeps roughly half of what the calibrated ratio would — the right instinct when the
 #: transcript has already proven it is over the ceiling.
 PESSIMISTIC_CHARS_PER_TOKEN = 2.0
+
+#: The chars-per-token assumed when sizing the **worst case** a single turn can add to the
+#: transcript (`worst_case_turn_tokens`). It is deliberately *not* the ~4 chars/token that ordinary
+#: prose runs at, because the content being sized is not prose: it is **tool output** — JSON, uuids,
+#: file paths, log lines, base64-adjacent junk — which every tokenizer splits far more finely than
+#: English. 3.0 is the conservative middle between prose (~4) and the emergency path's deliberately
+#: pessimistic 2.0, and conservative is the correct direction here: assuming *fewer* chars per token
+#: makes the estimated worst case *larger*, so the harness warns early rather than late. A too-loud
+#: warning costs a log line; a too-quiet one costs the guarantee it exists to protect.
+WORST_CASE_CHARS_PER_TOKEN = 3.0
 
 #: The most of an over-ceiling transcript the emergency path may retain, as a fraction of what is
 #: actually there. The provider has just *refused* this transcript, so any conclusion our token
@@ -154,6 +193,46 @@ excerpt is gone. Do not speculate, do not pad, and do not address anyone: these 
 not a message. Everything you leave out is forgotten."""
 
 
+def worst_case_turn_tokens(max_steps: int) -> int:
+    """The most one turn can add to the persisted transcript, in tokens — the proof's right-hand side.
+
+    Every step of the think→act loop may run a tool, and each tool result persists capped at
+    `TOOL_RESULT_CAP` characters. So one turn's worst-case persisted growth is the cap times the step
+    budget, converted at `WORST_CASE_CHARS_PER_TOKEN`. **Derived, never hardcoded** — the whole point
+    is that tuning `TOOL_RESULT_CAP` or the step budget moves this number automatically, so the
+    compaction threshold's safety argument can never quietly go stale behind a literal.
+    """
+    return math.ceil(TOOL_RESULT_CAP * max_steps / WORST_CASE_CHARS_PER_TOKEN)
+
+
+def min_safe_limit(max_steps: int) -> int:
+    """The smallest context budget that still guarantees no single turn can leap the threshold.
+
+    Solve `limit × (1 - COMPACT_AT) >= worst_case_turn_tokens(max_steps)` for `limit`. At the shipped
+    constants (4 KB cap, 24 steps, half-ceiling trigger) this is ~65 K — comfortably under the 128 K
+    floor, which is why an agent that never touches the knobs is safe by construction and never hears
+    a word about any of this.
+
+    **This budget is itself safe** — it is the smallest value that *clears* the bar, not the largest
+    that fails it. So the warning quotes it as "to at least N", never "above N": `threshold()` floors
+    with `int()`, which hands a token back, so N (and in fact N-1) is already silent. Telling an
+    operator to exceed a number that already works is the kind of small dishonesty that erodes trust
+    in the whole warning.
+    """
+    return math.ceil(worst_case_turn_tokens(max_steps) / (1.0 - COMPACT_AT))
+
+
+def max_safe_steps(limit: int) -> int:
+    """The largest step budget a given ceiling can sustain — the same inequality solved the other way.
+
+    The remedy for a *small* ceiling is not "raise the ceiling": for an adapter-reported or floor
+    ceiling that is the model's real window, raising `HARNESS_MAX_CONTEXT_TOKENS` above it would move
+    the threshold past the wall and compaction would never fire in time — strictly worse. There the
+    honest fix is to spend fewer steps per turn, so the warning quotes this number instead.
+    """
+    return int(limit * (1.0 - COMPACT_AT) * WORST_CASE_CHARS_PER_TOKEN / TOOL_RESULT_CAP)
+
+
 def is_context_overflow(text: str) -> bool:
     """Does this provider error text say the request exceeded the model's context window?
 
@@ -208,11 +287,24 @@ class ContextBudget:
     Args:
         provider: The model adapter. Only its optional `context_limit` capability is used.
         override: `HARNESS_MAX_CONTEXT_TOKENS`, or ``None`` when unset. ``0`` disables compaction.
+        max_steps: The engine's **effective** per-turn step budget (`HARNESS_MAX_STEPS`, else
+            `DEFAULT_MAX_STEPS`). Used for one thing: sizing the worst-case single-turn growth the
+            50% threshold is proved against (`_warn_if_unguaranteed`). It is the *effective* budget
+            deliberately — an operator who raises `HARNESS_MAX_STEPS` erodes the very same guarantee
+            that lowering `HARNESS_MAX_CONTEXT_TOKENS` erodes, from the other side of the
+            inequality, and a warning that only watched one of the two terms would be half a guard.
     """
 
-    def __init__(self, provider: Provider, *, override: int | None = None) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        *,
+        override: int | None = None,
+        max_steps: int = DEFAULT_MAX_STEPS,
+    ) -> None:
         self._provider = provider
         self._override = override
+        self._max_steps = max_steps
         self._limit: Limit | None = None
 
     @property
@@ -250,7 +342,81 @@ class ContextBudget:
             "context limit %s",
             kv(limit=self._limit.tokens, source=self._limit.source, compact_at=self.threshold()),
         )
+        self._warn_if_unguaranteed(self._limit)
         return self._limit
+
+    def _warn_if_unguaranteed(self, limit: Limit) -> None:
+        """Say so, once, when this budget cannot sustain the no-single-turn-can-leap guarantee.
+
+        The 50% threshold is only a *safe* distance while one turn's worst-case growth fits in the
+        headroom above it (see the module docstring). Below that, a tool-heavy turn can cross from
+        under-threshold to over-ceiling in one step — compaction runs only *between* turns and never
+        gets a chance — and the agent lands on the over-length rescue (`emergency_compact` + retry)
+        instead. The rescue works. The defect is that the operator was **never told** they had
+        dropped from the primary mechanism to the safety net (issue #287: we did this to @pinky
+        ourselves, at `HARNESS_MAX_CONTEXT_TOKENS=20000`, and the harness said nothing).
+
+        **Warn, never refuse.** The override is the 2 a.m. escape hatch and must always win — the
+        same reason `0` is honored as "compaction off". This only makes the cost audible.
+
+        Keyed on the **arithmetic, not the source**, and the remedy is keyed on the source:
+
+        - **`env`** — the operator picked this number, so raising it is a real option, and the
+          minimum that restores the guarantee is quoted.
+        - **`adapter` / `default`** — that ceiling is the model's actual window (or a conservative
+          floor below it). Raising `HARNESS_MAX_CONTEXT_TOKENS` past a real ceiling would push the
+          threshold *beyond the wall* and compaction would never fire in time — strictly worse than
+          the problem. So the remedy quoted there is the step budget instead.
+
+        The floor (128 K) satisfies the inequality by construction and is silent, always. An adapter
+        is silent whenever it reports a ceiling that clears the bar — which every model the fleet
+        runs today does. It is **not** silent for a genuinely small-context model (a local model, a
+        budget endpoint), and that is deliberate: an operator who *did not choose* the dangerous
+        budget has even less reason to guess they are running without the guarantee than one who did.
+        """
+        worst_case = worst_case_turn_tokens(self._max_steps)
+        headroom = limit.tokens - self.threshold()
+        if headroom >= worst_case:
+            return
+        steps = max_safe_steps(limit.tokens)
+        if limit.source == "env":
+            # "to at least N", never "above N": N itself clears the bar (`min_safe_limit` is the
+            # smallest budget that satisfies the inequality, and the test pins that it is silent
+            # there). "Above" would send an operator chasing a number one higher than they need.
+            fixes = [
+                f"raise HARNESS_MAX_CONTEXT_TOKENS to at least {min_safe_limit(self._max_steps)}"
+            ]
+            if steps >= 1:
+                fixes.append(f"lower HARNESS_MAX_STEPS to {steps}")
+            remedy = f"To restore the guarantee, {' or '.join(fixes)}."
+        else:
+            # Deliberately never phrased as "raise the budget above N". This ceiling is the model's
+            # real window, and an operator skimming a log for an actionable number could act on that
+            # phrasing and push the threshold *past the wall* — turning a warning into the outage it
+            # exists to prevent. The only actionable number offered here is the step budget.
+            remedy = (
+                f"Lower HARNESS_MAX_STEPS to {steps} to restore the guarantee. (Do not raise "
+                f"HARNESS_MAX_CONTEXT_TOKENS to clear this warning: it is the model's own ceiling, "
+                f"and a budget above it would move the threshold past the wall — compaction would "
+                f"then never fire in time, which is worse than the warning.)"
+                if steps >= 1
+                else "No step budget satisfies the guarantee at this ceiling."
+            )
+        _log.warning(
+            "context budget %d (source=%s) leaves %d tokens of headroom above the compaction "
+            "threshold, below the %d a single tool-heavy turn can add (%d chars x %d steps at "
+            "%.1f chars/token): a turn may overshoot the ceiling before compaction, which runs only "
+            "*between* turns, can fire. The over-length rescue (emergency compaction + retry) still "
+            "applies. %s",
+            limit.tokens,
+            limit.source,
+            headroom,
+            worst_case,
+            TOOL_RESULT_CAP,
+            self._max_steps,
+            WORST_CASE_CHARS_PER_TOKEN,
+            remedy,
+        )
 
     def _from_adapter(self) -> tuple[int, str] | None:
         """The adapter's own answer, or ``None`` if it has none (or could not get one)."""

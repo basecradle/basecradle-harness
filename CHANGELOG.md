@@ -5,6 +5,46 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### The 50% compaction proof had an unstated precondition (issue #287)
+
+`_context.py` argues that compacting at **half** the ceiling is safe because *no single turn can
+leap the gap*: one turn's persisted growth is bounded by `TOOL_RESULT_CAP` × `DEFAULT_MAX_STEPS`.
+True — but only above a certain budget, and the module never said which. Solved as an inequality,
+the guarantee needs `limit × (1 - COMPACT_AT)` to exceed what one tool-heavy turn can add
+(≈ **32,768 tokens** at the shipped constants), so a ceiling below ~**65,536** silently forfeits it.
+
+**We did this to ourselves.** basecradle-noc#218 set `HARNESS_MAX_CONTEXT_TOKENS=20000` on @pinky to
+force a live compaction for #276's verification — 10,000 tokens of headroom against a ~32,768
+worst-case turn. Nothing was at risk that night, but the harness said **nothing** about the
+guarantee it had just dropped: a tool-heavy turn could have crossed from under-threshold to
+over-ceiling in one step (compaction runs only *between* turns), silently falling back on the
+over-length rescue — the safety net, not the primary mechanism — with no one told.
+
+`ContextBudget` now **warns at budget resolution** when the resolved budget cannot sustain the
+guarantee, naming the numbers, what is forfeited, and what still protects the operator. Three
+properties are deliberate:
+
+- **Derived from the constants, never hardcoded.** `worst_case_turn_tokens` / `min_safe_limit` /
+  `max_safe_steps` compute it from `TOOL_RESULT_CAP` × `max_steps` ÷ `WORST_CASE_CHARS_PER_TOKEN`
+  (3.0 — tool output is JSON, uuids and paths, which tokenize far worse than prose, so the estimate
+  errs *large* and warns early). Tune a constant and the arithmetic follows; a literal `30_000`
+  would have rotted the day either moved.
+- **Warn, never refuse.** The override is the 2 a.m. escape hatch and must always win — the same
+  reason `0` is honored as "compaction off". The defect was the silence, not the setting.
+- **Keyed on the arithmetic; the remedy keyed on the source.** The shipped 128 K floor clears the
+  bar by construction, so a default install never hears a word. **`HARNESS_MAX_STEPS` is watched
+  too** — it grows the *other* side of the same inequality, so a guard that watched only the
+  context knob would be half a guard. And where the ceiling is the model's own (a small-context
+  adapter), the warning pointedly does **not** offer "raise the budget": that would push the
+  threshold *past the wall*, where compaction could never fire in time. It offers a lower step
+  budget instead.
+
+`TOOL_RESULT_CAP` moves from `_session` to `_context` — still *enforced* where tool results are
+persisted, but *defined* beside the proof that depends on it, so an input to the arithmetic can no
+longer be tuned in another file without the proof noticing.
+
 ## [0.65.0] - 2026-07-12
 
 **Three things an agent could not see, could not reach, and could not survive.**
