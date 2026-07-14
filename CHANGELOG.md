@@ -7,6 +7,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.75.0] - 2026-07-14
+
+### Fixed: the Chat Completions surface sends image input too (issue #313)
+
+The Chat Completions serializer (`chat_message_to_wire`) did not serialize `message.images` at all —
+an image on a turn was silently dropped and the model received text only. Only the **Responses**
+surface (`message_to_input`/`_input_content`) and the native **xai-sdk** adapter serialized images,
+so a **vision-capable** model reached over Chat Completions (any `AI_PROVIDER=openrouter`, or the
+`openai` adapter's `chat` surface) could not see a posted or `view`ed image even though the model
+could: the perception seam fetched the pixels, attached them, said *"Looking at it now,"* and they
+were dropped on the wire. This is the orthogonal half of #228 — that issue's gate handles the
+*model-can't-see* case (a text-only model gets a clean logged text fallback); this closes the
+*surface-can't-send* case.
+
+`chat_message_to_wire` now serializes images into the Chat Completions content-part shape
+(`{"type": "image_url", "image_url": {"url": <data URL>}}`), bringing the `chat` surface to parity
+with Responses. The vision **gate stays a single, loud chokepoint** upstream at the asset-wake
+(`model_sees_images`, #228): a definitely-text-only model still has a posted image swapped for its
+text description *before* one is ever attached, so the serializer never re-decides vision — exactly
+as the Responses surface has always worked. It was latent, not a live outage: every vision-capable
+fleet agent perceives over a serializing surface today (grok on xai-native, gpt on Responses), and
+the only Chat-Completions agent is text-only — so this became a live capability/parity gap the
+moment a vision model was provisioned on a Chat-Completions surface.
+
 ## [0.74.0] - 2026-07-14
 
 ### Fixed: a posted image to a non-vision model degrades to text, loudly (issue #228)

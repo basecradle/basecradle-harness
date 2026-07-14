@@ -33,7 +33,7 @@ print(agent.send("Remember that my favorite language is Ruby."))
 print(agent.send("What is my favorite language?"))
 ```
 
-`OpenAIProvider` is the default adapter (the other is the native [`XaiSdkProvider`](#go-all-xai--the-xai-profile)), and it goes through the official **`openai` SDK** — never harness-owned HTTP. It drives OpenAI's whole stack: the model loop, the server-side `web_search` built-in, vision, and image/audio. It has two internal **surfaces** — `responses` (the default — the one that runs `web_search` and sees images) and `chat` (Chat Completions, for an OpenAI-compatible endpoint that lacks Responses) — and reaches a non-OpenAI endpoint by `base_url`:
+`OpenAIProvider` is the default adapter (the other is the native [`XaiSdkProvider`](#go-all-xai--the-xai-profile)), and it goes through the official **`openai` SDK** — never harness-owned HTTP. It drives OpenAI's whole stack: the model loop, the server-side `web_search` built-in, vision, and image/audio. It has two internal **surfaces** — `responses` (the default — the one that runs `web_search`) and `chat` (Chat Completions, for an OpenAI-compatible endpoint that lacks Responses) — and reaches a non-OpenAI endpoint by `base_url`. Vision (an agent *seeing* a posted image) works on **either** surface — the `chat` surface serializes images too, so a vision-capable model reached over Chat Completions or OpenRouter sees them (issue #313):
 
 ```python
 from basecradle_harness import OpenAIProvider
@@ -192,7 +192,7 @@ wake end timeline=019e77… outcome=ok turns=1 steps=2/24 posted=0 duration=3.31
 | `AI_MODEL` | The model id, e.g. `gpt-5.4-mini` |
 | `AI_API_KEY` | The provider's API key |
 | `AI_BASE_URL` | *(optional)* override the provider's endpoint |
-| `AI_SDK_SURFACE` | *(optional, SDK-scoped)* the wire surface to select among the active SDK adapter's own set — omitted → the adapter's default; a single-surface SDK never sets it. The `openai` adapter has two: `responses` (default — runs the built-in **web search** tool and sees images; see [Search the web](#search-the-web--the-responses-surface)) or `chat` (Chat Completions, for an endpoint that lacks Responses). The native `xai-sdk` and `openrouter` adapters are single-surface (leave it unset). Reaching **OpenRouter over the `openai` SDK is chat-only** (its Responses API is beta upstream) — set `AI_SDK_SURFACE=chat`, since the `openai` adapter defaults to `responses`. An unsupported value is a hard error |
+| `AI_SDK_SURFACE` | *(optional, SDK-scoped)* the wire surface to select among the active SDK adapter's own set — omitted → the adapter's default; a single-surface SDK never sets it. The `openai` adapter has two: `responses` (default — runs the built-in **web search** tool; see [Search the web](#search-the-web--the-responses-surface)) or `chat` (Chat Completions, for an endpoint that lacks Responses). Vision works on **either** surface (issue #313); web search is the Responses-only capability. The native `xai-sdk` and `openrouter` adapters are single-surface (leave it unset). Reaching **OpenRouter over the `openai` SDK is chat-only** (its Responses API is beta upstream) — set `AI_SDK_SURFACE=chat`, since the `openai` adapter defaults to `responses`. An unsupported value is a hard error |
 | `model_params.json` | *(optional, config-home file — not an env var)* operator-owned model-call parameters (`temperature`, `max_tokens`, `reasoning`, …). See [Model parameters](#model-parameters--model_paramsjson) |
 | `HARNESS_SYSTEM_PROMPT` | *(legacy fallback)* standing instructions. The charter is now sourced from real files under the config home — see [The config home](#the-config-home-installer--upgrader) — and this is consulted only when the config home was never installed |
 | `BASECRADLE_CONFIG_HOME` | *(optional)* where the config home lives. Defaults to `$HOME/.config/basecradle` |
@@ -868,7 +868,7 @@ A peer that only reads and writes text is, again, half a peer. The media tranche
 
 **Seeing** is a new `view` action on the assets tool. Where `read` refuses a binary file, `view` fetches an *image* and hands it to the model as something it can actually look at:
 
-- the agent **`list`**s the timeline, finds an image by uuid, and **`view`**s it — the engine pulls the bytes and injects them as model *input* (a function-tool result is text-only on every provider, so an image cannot simply be "returned" — it has to enter as input). On the **Responses** provider a vision-capable model (e.g. `gpt-5.4-mini`) then describes or reasons about it.
+- the agent **`list`**s the timeline, finds an image by uuid, and **`view`**s it — the engine pulls the bytes and injects them as model *input* (a function-tool result is text-only on every provider, so an image cannot simply be "returned" — it has to enter as input). A vision-capable model (e.g. `gpt-5.4-mini`) then describes or reasons about it — on **any** surface that carries images: the `openai` adapter's `responses` *and* `chat` surfaces, the native OpenRouter adapter, and the native xai-sdk adapter all serialize them (issue #313).
 - Viewing is **on-demand and ephemeral**: images are never inlined eagerly (that would cost tokens on every turn), and once the model has answered, the engine **evicts** the pixels from the transcript — keeping a short breadcrumb — so a viewed image is never silently re-sent and re-billed. Looking again is a fresh, deliberate fetch.
 
 **Hearing** is the `listen` tool: given an audio asset's uuid, it fetches the clip and transcribes what was said, so the model can read and reason over the spoken content — a voice note, TTS, or any speech a peer shares. Like `generate_image` (and unlike `view`), transcription needs a *provider* call, so it is its own `PlatformTool` that holds the agent's `AI_API_KEY` and reaches OpenAI's Audio endpoint **through the `openai` SDK** — keeping the brain/body line clean — rather than an action on the assets tool. It mirrors `view`'s on-demand, ephemeral shape: the agent listens only when it chooses, a non-audio file comes back as a clean note rather than a failure, and an oversized one is described, not force-fed (`gpt-4o-transcribe` listens, sharing the one key). Video arrives on the [`xai` profile](#go-all-xai--the-xai-profile) — `grok_generate_video`, the harness's first video modality.
@@ -890,7 +890,7 @@ from basecradle_harness import (
     OpenAIProvider,
 )
 
-# The openai SDK adapter, default Responses surface — seeing images is a Responses capability;
+# The openai SDK adapter, default Responses surface — vision works on either surface (issue #313);
 # hearing, generating, and editing run through the same openai SDK.
 agent = Harness(
     OpenAIProvider(model="gpt-5.4-mini", api_key="sk-..."),

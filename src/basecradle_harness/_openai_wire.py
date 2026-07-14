@@ -46,7 +46,14 @@ def chat_message_to_wire(message: Message) -> dict[str, Any]:
         }
 
     wire: dict[str, Any] = {"role": message.role}
-    if message.content is not None:
+    if message.images:
+        # A turn carrying images (the synthetic vision turn the engine injects) becomes a parts
+        # list, so a vision-capable model reached over Chat Completions actually sees the picture.
+        # Before this the images were dropped on the wire and the model read only the text caption
+        # (issue #313) — the Responses surface (`_input_content`) and the native xai-sdk adapter
+        # already serialized them, so this closes the one surface that silently didn't.
+        wire["content"] = _chat_content_parts(message)
+    elif message.content is not None:
         wire["content"] = _cached(message.content) if message.cache_anchor else message.content
     if message.tool_calls:
         wire["tool_calls"] = [
@@ -77,6 +84,36 @@ def _cached(text: str) -> list[dict[str, Any]]:
     call the framework has no business making for everyone.
     """
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
+
+
+def _chat_content_parts(message: Message) -> list[dict[str, Any]]:
+    """The Chat Completions multimodal ``content`` for a turn carrying images (issue #313).
+
+    The text (if any) leads as a ``text`` part, then one ``image_url`` part per image. Chat
+    Completions nests the reference under an ``image_url`` object —
+    ``{"type": "image_url", "image_url": {"url": <data URL>}}`` — whereas the Responses surface
+    (`_input_content`) uses ``input_image`` with ``image_url`` as the bare string. That nesting is
+    the whole wire difference between the two surfaces for an image.
+
+    A vision-capable model is what makes this meaningful: the asset-wake's `model_sees_images` gate
+    (issue #228) already swaps a posted image for its text description *before* an image reaches a
+    turn on a definitely-text-only model — and does so loudly (issue #293) — so, exactly as on the
+    Responses surface, this serializer stays a pure translator and never re-decides vision here.
+
+    A cache breakpoint (`cache_anchor` — an ``explicit``-cache vendor only; no shipped adapter is
+    one) rides the leading text part, so a multimodal turn can still close the cacheable prefix. In
+    practice the two never coincide (an anchored turn is a frozen one, and a frozen turn's pixels
+    are long evicted), but handling it keeps the breakpoint from being silently dropped if they do.
+    """
+    parts: list[dict[str, Any]] = []
+    if message.content:
+        text: dict[str, Any] = {"type": "text", "text": message.content}
+        if message.cache_anchor:
+            text["cache_control"] = {"type": "ephemeral"}
+        parts.append(text)
+    for image in message.images:
+        parts.append({"type": "image_url", "image_url": {"url": image.url}})
+    return parts
 
 
 def chat_tool_to_wire(tool: ToolSpec) -> dict[str, Any]:
