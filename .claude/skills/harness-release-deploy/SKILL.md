@@ -19,10 +19,29 @@ This skill is the step-by-step pipeline behind them.
 Mirror the Python SDK's pipeline — `../sdks/python/.github/workflows/release.yml` is the template:
 
 1. Push a `v*` git tag →
-2. build →
-3. **TestPyPI** rehearsal →
-4. the **capital** approves the `pypi` env-gate →
-5. **PyPI**.
+2. **preflight** (the coherence gate — see below) →
+3. build →
+4. **TestPyPI** rehearsal →
+5. the **capital** approves the `pypi` env-gate →
+6. **PyPI**.
+
+### Preflight — the tag cannot lie (issue #308)
+
+Nothing is built or published until `scripts/check_release.py preflight <tag>` passes. It asserts
+three things, each of which has actually gone wrong here:
+
+- **The tag matches `_version.py`.** Hatchling reads the version from the *code*, never from the
+  tag — so a `v0.72.0` tag on a commit that still says `0.71.0` publishes a **0.71.0 wheel**,
+  silently and under the wrong number.
+- **That version has a `## [x.y.z]` section in the CHANGELOG.** No undocumented releases.
+- **`[Unreleased]` is empty.** It is a legitimate staging area — a PR may land content there
+  without bumping, and a release commit promotes it — right up until a tag claims otherwise.
+  Tagging over staged changes publishes a version whose own changelog calls its headline fix
+  unreleased. That was issue #308's exact state, and it now cannot ship.
+
+**If preflight fails, do not force the tag.** Fix `main` (promote `[Unreleased]` into the release's
+section, bump `_version.py`), delete and re-push the tag. The same script runs on every PR as the
+`changelog` CI job, in `repo` mode, so `main` should already be coherent when you tag.
 
 **Contractual names — never rename:** the workflow filename and the environment names
 `testpypi` / `pypi` match the Trusted Publisher registrations on PyPI/TestPyPI. Renaming any of
@@ -36,8 +55,12 @@ Constitution baselines: **basecradle#362** (one deployer for the fleet's machine
 **basecradle#363** (a captain *builds* software but never *deploys* it).
 
 1. **Build — the harness captain (you).** Implement the change, bump the version, update the
-   changelog. **Your release responsibility ends at the version bump** — you do not publish,
-   deploy, or verify on a box.
+   changelog — and leave `[Unreleased]` **empty**, its content promoted into the version's own
+   section (`## [x.y.z] - <date>`). Never fold a change into an already-dated section: that is the
+   move that erased v0.43.0 and v0.47.0 from the changelog. `python3 scripts/check_release.py repo`
+   answers whether `main` is releasable; preflight will refuse the tag if it is not.
+   **Your release responsibility ends at the version bump** — you do not publish, deploy, or
+   verify on a box.
 2. **Publish to PyPI — the capital.** Owns the `pypi` env-gate.
 3. **Deploy / converge the fleet (incl. @jt) — the NOC, the fleet's sole deployer.** The NOC reads
    each box's running version, compares it to the git-tracked desired state, and converges any

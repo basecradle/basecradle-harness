@@ -14,9 +14,30 @@ permissions:
   contents: read
 
 jobs:
+  # The tag is the first moment release coherence actually matters, and the last moment it is
+  # cheap to fix. Two things can only be wrong here (issue #308):
+  #
+  #   * The build reads the version from the *code*, never from the tag — so a v0.72.0 tag on a
+  #     commit whose _version.py still says 0.71.0 publishes a 0.71.0 wheel, silently.
+  #   * [Unreleased] is a legal staging area right up until a release claims otherwise. Tagging
+  #     over staged changes publishes a version whose own changelog calls its headline fix
+  #     unreleased.
+  #
+  # Nothing is built or published until this passes.
+  preflight:
+    name: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check the tag, the version, and the CHANGELOG tell one story
+        run: python3 scripts/check_release.py preflight "$GITHUB_REF_NAME"
+
   build:
     name: build
     runs-on: ubuntu-latest
+    needs: preflight
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v8.1.0
@@ -45,8 +66,9 @@ jobs:
         with:
           repository-url: https://test.pypi.org/legacy/
 
-  # The real publish. The pypi environment requires a human approval (Drawk) —
-  # the one place in this repository where a manual gate is correct.
+  # The real publish. The pypi environment is gated on an approval actuated by the capital
+  # (basecradle AI) via its operator credential — not by the founder, who is out of the publish
+  # loop (constitution.md → Earned Autonomy). The one place a manual gate is correct.
   publish-pypi:
     name: publish to PyPI
     runs-on: ubuntu-latest
