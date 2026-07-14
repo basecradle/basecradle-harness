@@ -50,6 +50,13 @@ of them passes through this file:
   create keeps its arguments whole** — its healed "outcome unknown" result is the flag — and the cap
   falls on it the moment the resume replaces that marker with a real result. Everything the recovery
   will never replay is bounded from the first save.
+- **Both caps are per *step*, not per call** (issue #304). A model may emit several tool calls in one
+  assistant turn, and the engine's step budget bounds the model's *calls*, never the tools it
+  dispatched — so a per-call cap let a step's persisted growth scale with a fan-out nothing bounds,
+  and the compaction proof (`_context.worst_case_turn_tokens`) understated the worst case by that
+  factor. A step's results share one `TOOL_RESULT_CAP` and its calls' arguments share one
+  `TOOL_ARGS_CAP`, water-filled (`_fill`), so the small ones survive whole and only the fat ones pay.
+  A lone call — the ordinary shape — gets the whole budget and is untouched by any of this.
 - **The conversation itself is bounded.** Capping each turn only slows the growth; it does not
   stop it, and a long-lived agent would still walk into its model's context ceiling — where the
   provider 400s deterministically and every later wake rebuilds the same doomed request. So a
@@ -72,7 +79,7 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from basecradle_harness._caching import anchor_cacheable_prefix, cache_mode
@@ -83,6 +90,12 @@ from basecradle_harness._idempotency import create_kind
 from basecradle_harness._messages import ImageContent, Message, ToolCall
 
 _log = logging.getLogger("basecradle_harness")
+
+#: What `_fill` allocates: a tool result (a `str`), a call's arguments (a `dict`), or one argument's
+#: value (anything a model emitted). It needs only to measure an item and to cut one down to a size.
+_T = TypeVar("_T")
+_Size = Callable[[_T], int]
+_Elide = Callable[[_T, int], _T]
 
 #: The result a killed wake's unanswered tool call is given on load (`heal_interrupted_calls`).
 #: It is written for the model that will read it, and it says the two things that are true and
@@ -107,13 +120,14 @@ _ELISION_TAIL = 512
 #: How a cut argument is split: the head takes whatever its share of the cap allows (the opening of
 #: the document it was posting, the first lines of the body it wrote) and the tail takes a fifth of it
 #: — capped here, because a tail is a coda, not half the excerpt — so a value whose point lands at the
-#: end is not lost. Unlike a tool result's fixed split, an argument's is *proportional*: how much room
-#: it gets depends on how many siblings it is sharing the call with (`_fit`).
+#: end is not lost. How much room it gets depends on how many siblings it is sharing the call with,
+#: and how many calls its step is sharing the budget with (`_fit`, `_calls_payload`).
 _ARG_ELISION_TAIL = 128
 
 #: Below this much room, an "excerpt" is a few words torn out of context — worse than the marker alone,
-#: which at least reports honestly that the value is gone.
-_ARG_MIN_EXCERPT = 64
+#: which at least reports honestly that the value is gone. Shared by both caps: a result's share of its
+#: step can be squeezed to the same point an argument's can (`_elide`, `_elide_argument`).
+_MIN_EXCERPT = 64
 
 #: The longest `action` the stub will carry back. No `CREATE_CALLS` action is longer than a word, so a
 #: longer one cannot be a create and dropping it leaves `create_kind` answering ``None`` either way —
@@ -749,12 +763,13 @@ def _payload(messages: list[Message]) -> str:
     and, worse, into the arguments a resume replays a create from. The capped copy goes into the
     payload and nowhere else.
     """
+    capped = _capped_results(messages)
     payload: list[dict] = []
     for index, message in enumerate(messages):
         data = message.to_dict()
         data.pop("images", None)  # a viewed image is seen once; base64 never lands in a transcript
-        if message.role == "tool" and message.content:
-            data["content"] = _elide(message.content)
+        if index in capped:
+            data["content"] = capped[index]
         if message.tool_calls:
             data["tool_calls"] = _calls_payload(message.tool_calls, _results(messages, index))
         payload.append(data)
@@ -762,16 +777,33 @@ def _payload(messages: list[Message]) -> str:
 
 
 def _calls_payload(calls: list[ToolCall], results: dict[str, Message]) -> list[dict]:
-    """The `tool_calls` a turn persists: each call's arguments bounded, unless it is still replayable."""
+    """The `tool_calls` a turn persists — **the step's calls share one argument budget** (issue #304).
+
+    The same unit change the results got, for the same reason: `max_steps` bounds the model's calls,
+    not the tools it dispatched, so granting each call of a fanned-out step its own `TOOL_ARGS_CAP`
+    would leave a step's persisted arguments scaling with a fan-out nothing bounds. They are
+    water-filled (`_fill`), so a lone call still gets the whole budget, and a step whose calls are all
+    ordinary keeps every one of them byte for byte.
+
+    **A replayable call is outside the pool, not merely exempt from the cap.** Its arguments persist
+    whole because the recovery re-issues the create from them (`_replayable`), and charging that
+    against the step's budget would starve its siblings to buy nothing: the 200 KB body is in the
+    transcript either way. The exception stays exactly as bounded as issue #301 left it — one dead
+    turn's creates, until the re-issue writes a real result over the marker.
+    """
+    bounded = [
+        index for index, call in enumerate(calls) if not _replayable(call, results.get(call.id))
+    ]
+    fitted = _fill(
+        [calls[index].arguments for index in bounded],
+        TOOL_ARGS_CAP,
+        size=_json_size,
+        elide=_cap_arguments,
+    )
+    capped = dict(zip(bounded, fitted))
     return [
-        {
-            "id": call.id,
-            "name": call.name,
-            "arguments": call.arguments
-            if _replayable(call, results.get(call.id))
-            else _cap_arguments(call.arguments),
-        }
-        for call in calls
+        {"id": call.id, "name": call.name, "arguments": capped.get(index, call.arguments)}
+        for index, call in enumerate(calls)
     ]
 
 
@@ -934,7 +966,7 @@ def _run_end(history: list[Message], assistant: int) -> int:
 
 
 def _cap_tool_results(history: list[Message]) -> None:
-    """Elide any over-long tool result in place, so the transcript stays bounded (issue #275).
+    """Elide the over-long tool results in place, so the transcript stays bounded (issue #275).
 
     Only `tool` turns are touched, and only their `content` — the `tool_call_id` that pairs a
     result to the call it answers is untouched, and no message is ever dropped. A dropped tool
@@ -944,14 +976,114 @@ def _cap_tool_results(history: list[Message]) -> None:
     The model already read the full result on the turn the tool ran. This governs only what
     every *future* turn re-reads: one mailbox listing or wide file read is otherwise a
     permanent tax on the life of the timeline.
+
+    It reads its answer from `_capped_results`, the same function `_payload` writes the disk from, so
+    the live transcript and the file can never disagree about what a step's results cost.
     """
-    for turn in history:
-        if turn.role == "tool" and turn.content:
-            turn.content = _elide(turn.content)
+    for index, content in _capped_results(history).items():
+        history[index].content = content
 
 
-def _elide(text: str) -> str:
+def _capped_results(messages: list[Message]) -> dict[int, str]:
+    """Each tool result's persisted content, by index — **one step's results share one cap** (#304).
+
+    The unit is the step, not the call, and that is the whole fix. A model may emit several tool calls
+    in one assistant turn, and `max_steps` bounds the model's *calls*, never the tools dispatched — so
+    a per-call cap let a step's persisted growth scale with a fan-out nothing bounds, and the
+    compaction threshold's safety proof (`_context.worst_case_turn_tokens`) understated the worst case
+    by exactly that factor. Sharing the budget makes the proof's arithmetic true instead of nearly true.
+
+    It costs the ordinary step nothing. A lone call gets the whole `TOOL_RESULT_CAP` and is elided
+    exactly as it always was, byte for byte; and because the share is *water-filled* (`_fill`), a step
+    that fans out into ten small results keeps all ten of them whole. Only a fan-out that is also
+    **fat** pays — which is precisely the shape that has to be bounded.
+
+    **An interrupted result is outside the pool — never charged, never elided — and that is not a
+    nicety.** `INTERRUPTED` is a *sentinel the recovery reads*, by exact match: `_replayable` keeps an
+    interrupted create's arguments whole because of it, and `_idempotency.interrupted` finds the calls
+    to re-issue by it. A shared budget is the first thing that could ever cut it — at a fan-out of ~14
+    a share falls below its ~300 characters — and eliding it would be silent and severe: the create's
+    arguments would be capped and then re-posted with the peer's message body cut out, and the recovery
+    would no longer recognize the call as one to re-issue at all. It is the mirror of the exception
+    `_replayable` already makes on the arguments side, and for the same reason: **the recovery's
+    evidence is never bounded away.** It is bounded in count (one dead turn's calls) and in duration
+    (the resume writes a real result over it, and that result is capped like any other).
+
+    A `tool` turn answering no assistant turn cannot occur in a transcript this harness wrote, but a
+    transcript is a file and a file can be anything: one is capped on its own rather than waved through
+    the single gate that exists to bound it.
+    """
+    capped: dict[int, str] = {}
+    for index, message in enumerate(messages):
+        if message.role != "assistant" or not message.tool_calls:
+            continue
+        step = [
+            i
+            for i in range(index + 1, _run_end(messages, index))
+            if messages[i].role == "tool"
+            and messages[i].content
+            and not _is_interrupted(messages[i])
+        ]
+        results = [messages[i].content or "" for i in step]
+        capped.update(zip(step, _fill(results, TOOL_RESULT_CAP, size=len, elide=_elide)))
+    for index, message in enumerate(messages):
+        if index in capped or message.role != "tool" or not message.content:
+            continue
+        if not _is_interrupted(message):
+            capped[index] = _elide(message.content, TOOL_RESULT_CAP)
+    return capped
+
+
+def _is_interrupted(message: Message) -> bool:
+    """Is this the healed "outcome unknown" result a killed wake left behind (`INTERRUPTED`)?
+
+    The recovery reads it by exact match, so nothing may rewrite it — see `_capped_results`.
+    """
+    return message.content == INTERRUPTED
+
+
+def _fill(items: list[_T], budget: int, *, size: _Size[_T], elide: _Elide[_T]) -> list[_T]:
+    """Water-filling: hand every item an equal share of `budget`, smallest first.
+
+    The one allocator behind all three caps — a step's results, a step's calls, and one call's
+    arguments — because they are the same problem three times: several things, one budget, and no
+    reason for the small ones to pay for the big one.
+
+    Take the items in *ascending* size and give each an equal share of what is left. An item that fits
+    under its share is kept byte for byte and rolls its surplus over to the ones above it; only an item
+    over its share is cut, and only to the share it actually got.
+
+    Two properties follow, and they are why this is worth a function rather than a loop of `min()`:
+
+    - **If the whole set fits the budget, every item is kept whole.** The smallest of the remaining
+      items is never larger than their mean, and its share *is* their mean — so it is kept, and by
+      induction so is every item after it. This is what makes a wide fan-out of *small* results free,
+      and it is what makes the cap a **fixed point**: a set that has already been capped fits, so
+      re-saving it every turn for the life of the timeline never grinds an excerpt into an excerpt of
+      an excerpt.
+    - **It always makes progress.** The obvious alternative — cut the biggest item until the set fits —
+      has a cliff: an excerpt costs a marker, so an item can be *too small to be worth eliding and
+      still too big to keep*, and a set made of several of those can never be brought under the budget
+      at all (issue #301's `tasks create` with three 700-character fields, which fell through to the
+      total-loss stub). Water-filling takes the room from where the room actually is.
+    """
+    kept = list(items)
+    room = budget
+    for spent, index in enumerate(sorted(range(len(items)), key=lambda i: size(items[i]))):
+        share = room // (len(items) - spent)
+        item = items[index]
+        kept[index] = item if size(item) <= share else elide(item, share)
+        room -= size(kept[index])
+    return kept
+
+
+def _elide(text: str, budget: int) -> str:
     """`text` unchanged, or its head and tail around a marker naming what was cut.
+
+    `budget` is this result's **share of its step** (`_capped_results`) — the whole `TOOL_RESULT_CAP`
+    when the step made a single call, which is the ordinary case and where this is byte for byte what
+    it has always been. A step that fans out shrinks the excerpt proportionally rather than granting
+    each of its calls a full cap.
 
     The marker states the original size, so the model (and a human reading the transcript)
     knows it is looking at an excerpt and how much is missing — a silent truncation would let
@@ -959,18 +1091,61 @@ def _elide(text: str) -> str:
     *conditionally* ("if you need it in full"), never as an instruction: a marker that reads
     like a directive would invite the model to re-run tools it has no present use for.
     """
-    if len(text) <= TOOL_RESULT_CAP:
+    if len(text) <= max(budget, _MIN_EXCERPT):
+        # Under its share, or too small for cutting to be worth the marker that says so. The second
+        # is also what makes this a **fixed point**: `_gone` is well under `_MIN_EXCERPT`, so a value
+        # already at the floor is never elided again — no marker of a marker, each naming a size that
+        # is no longer true, on every save for the life of the timeline.
         return text
-    cut = len(text) - _ELISION_HEAD - _ELISION_TAIL
-    marker = (
-        f"\n\n[... {cut} chars elided of {len(text)} — this is an archived excerpt; the full "
+    # Size the marker against the widest cut it could ever name — the whole text. The real cut is
+    # smaller, so the real marker is never longer than this one, and the excerpt below therefore
+    # cannot overrun the share. (The marker's length depends on the numbers printed in it, which
+    # depend on the excerpt, which depends on the marker: measuring the worst case breaks the circle.)
+    room = budget - len(_result_marker(len(text), len(text)))
+    if room < _MIN_EXCERPT:
+        return _gone(len(text))  # no room for an excerpt worth reading; the floor is all that fits
+    room = min(room, _ELISION_HEAD + _ELISION_TAIL)  # a share may shrink the excerpt, never grow it
+    tail = room * _ELISION_TAIL // (_ELISION_HEAD + _ELISION_TAIL)
+    head = room - tail
+    cut = len(text) - head - tail
+    return text[:head] + _result_marker(cut, len(text)) + (text[-tail:] if tail else "")
+
+
+def _gone(size: int) -> str:
+    """What an elision says when there is no room even for an excerpt: how much there was, and nothing.
+
+    **The floor of the whole cap, and the one place the bound stops being hard** — so it is worth
+    saying exactly what it is. A tool result cannot be *dropped* (its call would dangle, and a dangling
+    `tool_call_id` is malformed permanently) and neither can a call's arguments (`create_kind` reads
+    them, and a create the recovery cannot count is a message posted twice). A thing that cannot be
+    dropped must be allowed to say that it is gone — so a step that fans out wider than its budget has
+    characters for pays one of these per call, and the total creeps past `TOOL_RESULT_CAP` at a fan-out
+    of ~140 (or `TOOL_ARGS_CAP` at ~50).
+
+    That residue is bounded by **what the model emitted, never by what its tools returned** — one
+    short record per call it chose to make, of the same order as the `id`+`name` envelope the transcript
+    must keep for that call anyway, and bounded the same way (the provider's max-output-tokens). It is
+    the excerpt *markers* that are chatty, and deliberately: they accompany content worth reading. Here
+    there is none, and their prose ("re-run it if you need it in full") would cost five times the fact
+    it decorates — per call, on the one shape where every call is already down to its last few dozen
+    characters.
+    """
+    return f"[... {size} chars elided ...]"
+
+
+def _result_marker(cut: int, total: int) -> str:
+    """What stands in for the elided middle of a tool result."""
+    return (
+        f"\n\n[... {cut} chars elided of {total} — this is an archived excerpt; the full "
         f"result was shown when the tool ran. Re-run it if you need it in full. ...]\n\n"
     )
-    return text[:_ELISION_HEAD] + marker + text[-_ELISION_TAIL:]
 
 
-def _cap_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
-    """`arguments`, bounded to `TOOL_ARGS_CAP` — a **new dict**, never an edit of the live one.
+def _cap_arguments(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
+    """`arguments`, bounded to `budget` — a **new dict**, never an edit of the live one.
+
+    `budget` is this call's **share of its step's** `TOOL_ARGS_CAP` (`_calls_payload`) — the whole cap
+    when the step made one call, which is the ordinary case.
 
     **Capping may never change what `create_kind` reads off a call**, and that is a correctness
     requirement, not a nicety: the idempotency ordinal is "the nth create of this kind in this turn",
@@ -990,14 +1165,14 @@ def _cap_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
     lie about the result; the alternative — assuming a worst-case escape factor — would cut every
     ordinary argument to a fraction of the budget it is actually entitled to.
     """
-    if _json_size(arguments) <= TOOL_ARGS_CAP:
+    if _json_size(arguments) <= budget:
         return arguments
-    budget = TOOL_ARGS_CAP
+    attempt = budget
     for _ in range(_ARG_FIT_ATTEMPTS):
-        capped = _fit(arguments, budget)
-        if _json_size(capped) <= TOOL_ARGS_CAP:
+        capped = _fit(arguments, attempt)
+        if _json_size(capped) <= budget:
             return capped
-        budget //= 2
+        attempt //= 2
     # Not the size of any one argument but the *number* of them — hundreds of fields, or names longer
     # than their values, so there is no share left to give anybody. Rare to the point of pathological,
     # but "rare" is not a bound, and an unbounded fallback would be the very defect this exists to
@@ -1008,30 +1183,17 @@ def _cap_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
 def _fit(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
     """Every argument gets a **fair share** of `budget`, so the small ones survive whole.
 
-    Water-filling, and it is the whole reason a capped call is still worth reading. Take each argument
-    in *ascending* size and hand it an equal share of what is left: one that fits under its share is
-    kept byte for byte and rolls its surplus over to the ones above it, so a `messages create` with a
-    200 KB body still persists its `action`, its `timeline` and its `subject` in full, and spends the
-    entire remaining budget on an excerpt of the body.
-
-    The obvious alternative — elide the biggest arguments until the call fits — reads the same and is
-    not: an excerpt costs a marker, so an argument can be *too small to be worth eliding and still too
-    big to keep*, and a call made of several such arguments (a `tasks create` with three 700-character
-    fields) can never be brought under the cap at all. It falls through to the stub, and **every**
-    argument is lost to save the few hundred characters that were over. Water-filling has no such
-    cliff: it always makes progress, and it takes the space it needs from where the space actually is.
+    Water-filling (`_fill`), and it is the whole reason a capped call is still worth reading: a
+    `messages create` with a 200 KB body still persists its `action`, its `timeline` and its `subject`
+    in full, and spends the entire remaining budget on an excerpt of the body. The keys are charged
+    first — they are not optional, and a share handed out of money that was already spent is not a share.
     """
     room = budget - _json_size(dict.fromkeys(arguments, ""))  # what the keys themselves cost
-    capped: dict[str, Any] = {}
-    ascending = sorted(arguments, key=lambda name: _json_size(arguments[name]))
-    for spent, name in enumerate(ascending):
-        share = room // (len(ascending) - spent)
-        value = arguments[name]
-        capped[name] = value if _json_size(value) <= share else _elide_argument(value, share)
-        room -= _json_size(capped[name])
-    return {
-        name: capped[name] for name in arguments
-    }  # the model reads them in the order it wrote them
+    names = list(arguments)  # the model reads them in the order it wrote them
+    values = _fill(
+        [arguments[name] for name in names], room, size=_json_size, elide=_elide_argument
+    )
+    return dict(zip(names, values))
 
 
 def _elide_argument(value: Any, budget: int) -> Any:
@@ -1043,14 +1205,20 @@ def _elide_argument(value: Any, budget: int) -> Any:
 
     **The shrink check is a guard, not a flourish.** The marker costs ~120 characters, so "eliding" a
     200-character value would *grow* it — and a cap that can make a transcript bigger is not a cap.
-    Comparing the two sizes states that in the one place it cannot be forgotten.
+    Comparing the two sizes states that in the one place it cannot be forgotten. It is also what keeps
+    the cap a **fixed point** when a value is already down at the marker's own size: without it, a
+    transcript re-saved every turn would grind a marker into a marker of a marker, each one naming a
+    size that is no longer true.
     """
     size = _json_size(value)
+    if size <= _MIN_EXCERPT:
+        # Too small for cutting to be worth the marker that says so — and the fixed point that keeps a
+        # floor marker (`_gone`, well under this) from being ground into a shorter one on every save.
+        return value
     if not isinstance(value, str):
-        elided: Any = (
-            f"[... {size} chars elided — this argument was archived out of the transcript; the full "
-            f"value was sent when the call ran. ...]"
-        )
+        # A structure has no honest head-and-tail, so there is nothing to excerpt: it is the floor or
+        # it is whole.
+        elided: Any = _gone(size)
         return elided if _json_size(elided) < size else value
 
     marker = (
@@ -1058,12 +1226,12 @@ def _elide_argument(value: Any, budget: int) -> Any:
         f"value was sent when the call ran. ...]\n\n"
     )
     room = budget - _json_size(marker)
-    if room < _ARG_MIN_EXCERPT:
-        elided = marker.strip()  # no room for an excerpt worth reading; say so and keep nothing
-    else:
-        tail = min(room // 5, _ARG_ELISION_TAIL)
-        head = room - tail
-        elided = value[:head] + marker + (value[-tail:] if tail else "")
+    if room < _MIN_EXCERPT:
+        elided = _gone(size)  # no room for an excerpt worth reading; the floor is all that fits
+        return elided if _json_size(elided) < size else value
+    tail = min(room // 5, _ARG_ELISION_TAIL)
+    head = room - tail
+    elided = value[:head] + marker + (value[-tail:] if tail else "")
     return elided if _json_size(elided) < size else value
 
 
@@ -1079,10 +1247,7 @@ def _arguments_stub(arguments: dict[str, Any]) -> dict[str, Any]:
     action = arguments.get("action")
     if isinstance(action, str) and len(action) <= _ARG_ACTION_MAX:
         stub["action"] = action
-    stub["[elided]"] = (
-        f"[... the {len(arguments)} arguments of this call ({_json_size(arguments)} chars) were "
-        f"archived out of the transcript; they were sent in full when the call ran. ...]"
-    )
+    stub["[elided]"] = _gone(_json_size(arguments))
     return stub
 
 
