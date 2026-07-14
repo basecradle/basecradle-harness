@@ -2972,7 +2972,17 @@ class WakeAgent:
         or two of the compaction that filled it, leaving the handful of items genuinely in flight.
 
         A uuid with **no claim in any kind** is not evidence either and is dropped: the recovery only
-        ever asks about claimed items, so nothing can come looking for it.
+        ever asks about claimed items (`_recover` skips a claim of ``None``), so nothing can come
+        looking for it.
+
+        **This mutates `history` in place, which the persistence caps deliberately do not** — so the
+        difference is worth naming rather than leaving as an apparent inconsistency. Those cap the
+        payloads a *turn* is producing, and a save can land **mid-turn**, while the engine is still
+        holding the very list they would reach into (Context Discipline). This runs after all four
+        reconciles have returned: no turn is in flight, nothing is holding the list, and what it
+        edits is a summary's `items` — which the model never reads, because `items` is persisted and
+        never sent to a provider. Moving it inside a turn would make it exactly the hazard the caps
+        are written to avoid.
         """
         changed = False
         for message in session.history:
