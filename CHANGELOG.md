@@ -5,6 +5,41 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.71.0] - 2026-07-14
+
+**The one dependency the harness cannot run without was the one nothing reported.** An agent whose
+venv sat on an old `basecradle` SDK read **green on every fleet drift axis** and `TypeError`d the
+first time it tried to speak.
+
+### Added: `platform_sdk_version` in `--resolved-config` (issue #303)
+
+`--resolved-config` reported the installed **vendor** SDK (`ai_sdk_version`) and the installed
+**memory** package (`memory_provider_version`) — but nothing named the installed **platform** SDK,
+the `basecradle` package that is the harness's one hard runtime dependency and its only way to reach
+the platform at all. Of the three version-bearing dependencies, the load-bearing one was the odd one
+out.
+
+That gap is not cosmetic. The harness now hard-depends on `basecradle>=0.6`: every idempotent create
+the [delivery guarantee](https://github.com/basecradle/basecradle-harness#if-a-wake-dies-mid-turn-the-peers-message-is-not-lost)
+rests on passes `idempotency_key=` into the message, asset, and task creates. But the SDK import is
+lazy and `--resolved-config` builds **no** platform client — so an agent left behind on 0.5.x by an
+incomplete deploy passed every off-box check and then died on the comms path, the first time a peer
+spoke to it. **Silent death, and every signal green** — the same shape as the memory axis
+(basecradle-noc#195) and the Turn-0 brief (basecradle-noc#235), and it blocked the NOC from building
+the drift guard at all (basecradle-noc#253: a check that silently passes because it cannot find its
+input is a no-op guard).
+
+- **`platform_sdk_version`** in `--resolved-config` (`resolved_config`, `_wake.py`) — the installed
+  version of the `basecradle` distribution, read from **installed metadata**, exactly as
+  `ai_sdk_version` and `memory_provider_version` are. Never from the `basecradle>=0.6` pin in
+  `pyproject`: a pin is what the harness *declares about itself* and would read green on the very
+  venv that never got the upgrade. Additive to the documented contract, so no consumer breaks.
+- **`null`, never `""`, when the distribution is absent** — a *defect signal*, not a shrug (an agent
+  with no platform SDK has no body), and deliberately not an empty string, which prints as nothing
+  and reads as "fine" to a check written against a truthy value. The consumer's other half is the
+  **missing key**: a harness too old to carry the field emits no key at all, which the NOC treats as
+  an ERROR rather than a silent skip. Present-and-null and absent stay distinguishable.
+
 ## [0.70.0] - 2026-07-14
 
 **The last unbounded thing in the transcript is bounded.** A tool call's *arguments* persisted whole,

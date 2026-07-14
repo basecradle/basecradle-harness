@@ -3204,13 +3204,40 @@ def _activated_task_text(task: object) -> str:
 _SDK_DISTRIBUTIONS = {"openai": "openai", "xai-sdk": "xai-sdk", "anthropic": "anthropic"}
 
 
-def _sdk_version(sdk: str) -> str | None:
-    """The installed version of the vendor SDK named by ``AI_SDK``, or ``None`` if absent."""
-    dist = _SDK_DISTRIBUTIONS.get(sdk, sdk)
+# The PyPI distribution of the BaseCradle *platform* SDK — the harness's one hard runtime
+# dependency, the body's senses and voice. Unlike the vendor SDK it is not selected by any env
+# var, so the name is a constant.
+_PLATFORM_DISTRIBUTION = "basecradle"
+
+
+def _dist_version(dist: str) -> str | None:
+    """The **installed** version of a distribution, or ``None`` if it is not installed.
+
+    Every version this module reports is read this way — from installed metadata, what the venv
+    actually has — never from a pin in `pyproject`, which is what the harness *declares about
+    itself* and would read green on the very venv that never got the upgrade. ``None`` (never
+    ``""``, which prints as nothing and reads as "fine" to a check testing truthiness) says the
+    distribution is absent, and the caller's field name says what that absence costs.
+    """
     try:
         return metadata.version(dist)
     except metadata.PackageNotFoundError:
         return None
+
+
+def _sdk_version(sdk: str) -> str | None:
+    """The installed version of the vendor SDK named by ``AI_SDK``, or ``None`` if absent."""
+    return _dist_version(_SDK_DISTRIBUTIONS.get(sdk, sdk))
+
+
+def _platform_sdk_version() -> str | None:
+    """The installed version of the ``basecradle`` platform SDK, or ``None`` if it is absent.
+
+    ``None`` is a **defect signal**, not a shrug, and it is the one this function exists to make
+    visible: the harness *cannot run at all* without this SDK — it is the only thing that speaks
+    to the platform. An agent that reports ``None`` here has no body (issue #303).
+    """
+    return _dist_version(_PLATFORM_DISTRIBUTION)
 
 
 def _version_string() -> str:
@@ -3257,6 +3284,16 @@ def resolved_config() -> dict[str, object]:
       is ``""`` for a single-surface SDK that declares none).
     - ``ai_sdk_version`` — the installed version of the vendor SDK named by ``AI_SDK``, or ``None``
       if that SDK is not installed.
+    - ``platform_sdk_version`` — the installed version of the ``basecradle`` **platform** SDK
+      (issue #303), read from installed metadata like the two version fields above — never from
+      the ``basecradle>=0.6`` pin in `pyproject`, which is what the harness *declares*, not what
+      the venv *has*. It is the third version-bearing dependency and was the odd one out: the
+      harness hard-depends on it (every timeline read, and every ``idempotency_key=`` create the
+      delivery guarantee rests on, needs ``basecradle>=0.6``), yet nothing named it, so an agent
+      whose venv sat on 0.5.x read **green on every drift axis and ``TypeError``d the first time
+      it spoke** — silent death on the comms path. This path builds no client, so the version is
+      the only honest signal available off-box. ``None`` (never ``""``) if the distribution is
+      not installed at all: a defect, not a shrug — an agent with no platform SDK has no body.
     - ``ai_model`` — the ``AI_MODEL`` env value, or ``None`` if unset.
     - ``active_profile`` — the deploy-selected policy profile, ``"locked"`` or ``"unlocked"``
       (`HARNESS_PROFILE`, fail-closed to ``"locked"``; issue #256). It governs the tool set below:
@@ -3333,6 +3370,7 @@ def resolved_config() -> dict[str, object]:
         "ai_sdk": sdk,
         "ai_sdk_surface": surface,
         "ai_sdk_version": _sdk_version(sdk),
+        "platform_sdk_version": _platform_sdk_version(),
         "ai_model": os.environ.get("AI_MODEL") or None,
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
