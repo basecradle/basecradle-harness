@@ -113,11 +113,17 @@ _ESCALATION_THRESHOLD = 5
 #: The nudge that rides the one out-of-budget **reserve** call (tools withheld) when the model is
 #: still calling tools at step N. It asks for an honest, self-authored progress report — the
 #: primary path that replaces the old canned "I got stuck" string (issue #243).
+#:
+#: It names the `messages` tool (issue #295) for the same reason the mention nudge does: a model
+#: that does not connect "a tool" to *which* tool learns nothing from being told its last text is
+#: unspoken. Past tense on purpose — the reserve call withholds tools, so this is the epitaph of a
+#: missed post, not an instruction to make one now.
 _RESERVE_NUDGE = (
     "You've reached the step limit for this turn. Write an honest progress report: what you "
     "completed, what remains, and what the next turn should do. This is your last text of the "
     "turn and it is unspoken — it goes to your log and your memory, not to any timeline — so if "
-    "a peer is waiting on something, that had to be posted with a tool. Wrap up in plain text."
+    "a peer is waiting on something, that had to be posted with the `messages` tool. Wrap up in "
+    "plain text."
 )
 
 #: A post-turn hook: given the assistant turn the provider just produced and the live
@@ -492,6 +498,10 @@ def _step_note(step: int, max_steps: int, now: datetime) -> str:
     room it is terse — `Step N of M.`; in the final stretch (`_ESCALATION_THRESHOLD` steps or
     fewer remaining, counting the current one) it escalates to strategic guidance so the model
     lands cleanly instead of being cut off mid-tool.
+
+    The escalation names the `messages` tool (issue #295). "Which takes a tool call" is a reminder
+    only to a model that already knows *which* tool; to the one that does not, it is a riddle posed
+    at the exact moment its steps are running out.
     """
     header = f"Current Time: {now:%Y-%m-%d %H:%M:%S} UTC"
     remaining = max_steps - step + 1  # steps left, counting this one
@@ -499,10 +509,10 @@ def _step_note(step: int, max_steps: int, now: datetime) -> str:
         body = (
             f"Step {step} of {max_steps}. Steps are running low. Prioritize the most important "
             "remaining actions — including anything you still mean to say on a timeline, which "
-            "takes a tool call — summarize progress cleanly, and if work remains, schedule a "
-            f"follow-up task before you run out. Step {max_steps} is your final action step — "
-            "end it with plain text to finish cleanly. Never ignore the step counter; treat it "
-            "as a hard constraint."
+            "means calling the `messages` tool — summarize progress cleanly, and if work remains, "
+            f"schedule a follow-up task before you run out. Step {max_steps} is your final action "
+            "step — end it with plain text to finish cleanly. Never ignore the step counter; "
+            "treat it as a hard constraint."
         )
     else:
         body = f"Step {step} of {max_steps}."

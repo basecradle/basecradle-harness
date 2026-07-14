@@ -184,6 +184,28 @@ def test_the_nudge_never_commands_and_never_invents_a_reader():
     assert "operator" not in MENTION_NUDGE.lower()  # the frame that must never come back
 
 
+def test_the_nudge_names_the_verb_it_asks_for():
+    """ "Act now" is not an instruction to a model that cannot see the channel (issue #295).
+
+    The evidence is @jt (gpt-5.4-mini) on the 0.67.0 rollout: @-mentioned and asked outright what
+    version it was running, it composed the correct answer and *narrated* it — `posted=0`,
+    `text="I'm running 0.67.0."` The nudge fired; its reply to the nudge was more narration. It was
+    not refusing and it did not misunderstand the question. It believed it had answered.
+
+    So the nudge names the mechanism **and its absence** in one breath — call the tool; text here
+    reaches no one — because either half alone leaves the gap: naming the tool without saying the
+    narration goes nowhere lets the model think it has two channels, and saying the text goes
+    nowhere without naming the tool leaves it with no channel at all.
+
+    What must *not* come back with the mechanism is the command. "Speaking means calling the
+    `messages` tool" describes the world; "reply to them" would decide for the agent, and a harness
+    that decides when an agent speaks is the defect this whole design removed.
+    """
+    assert "calling the `messages` tool" in MENTION_NUDGE  # the verb, named
+    assert "reaches no one" in MENTION_NUDGE  # and why it is the only one
+    assert "no one will force you" in MENTION_NUDGE  # still not a command
+
+
 # === the standing guard: nothing the model reads may invent a supervisor =======
 
 
@@ -257,6 +279,37 @@ def test_no_model_facing_string_invents_a_supervisor():
     assert offenders == {}, (
         f"model-facing text implies a supervising human: {offenders}. "
         "Reword it — the agent is its own operator, and nobody reads its log."
+    )
+
+
+#: Every model-facing string whose whole job is to tell the agent that reaching a peer takes an
+#: act — and which is therefore useless to a model that cannot name the act. Each one carried a
+#: generic "with a tool" / "takes a tool call" before issue #295, and each one is read at exactly
+#: the moment the gap costs a peer their answer: addressed and about to fall silent (the mention
+#: nudge), out of steps with something still unsaid (the escalation and the reserve report), and
+#: the once-per-wake statement of the rule (the brief's budget line).
+_SPEECH_INSTRUCTIONS = ("mention nudge", "reserve nudge", "step note (escalated)", "step budget")
+
+
+def test_every_string_that_asks_for_speech_names_the_tool():
+    """A generic "post it with a tool" is one inference away from the act — and small models miss it.
+
+    A standing guard, and it is the *same* guard as the supervisor one, aimed the other way: that
+    one bans a channel the model believes in and does not have, this one bans a channel the model
+    has and cannot see. Both end identically — the agent finishes a turn believing it communicated,
+    and nobody heard anything.
+
+    This is not a style rule about tool names. These four strings exist *only* to close the gap
+    between "I have something to say" and "the platform has it", so a version of one that stops at
+    "a tool call" has stopped one step short of its own purpose. New guidance in this class joins
+    the list; a rewrite that drops the tool name fails here.
+    """
+    strings = _model_facing_strings()
+    silent = [name for name in _SPEECH_INSTRUCTIONS if "`messages`" not in strings[name]]
+
+    assert silent == [], (
+        f"guidance about reaching a peer that never names the mechanism: {silent}. "
+        "Say `messages` — 'act' and 'a tool call' are riddles to the models that need this most."
     )
 
 
