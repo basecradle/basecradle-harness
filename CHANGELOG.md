@@ -42,6 +42,29 @@ passes over all of them.
 
 **No config change, no migration, no fleet campaign** — it rides the next roll.
 
+### Fixed: a killed wake could tear its own transcript in half (issue #297)
+
+`Session._save` wrote the transcript with a bare `write_text` — truncate, then write. A signal
+landing between those two (`SIGKILL`, the default disposition of `SIGTERM`, the OOM killer, a box
+reset) left **half a file**, and half a transcript is not a degraded transcript: it is invalid JSON.
+`_load` raises on it, so the wake dies on load — and so does the next one, and every one after that.
+The agent is **bricked on that timeline** and its memory of the conversation is gone, until a human
+deletes the file. The window was open on every turn of every agent.
+
+The transcript is now published atomically: write to a temp file, `fsync`, `os.replace`. A crash can
+leave the *previous* transcript intact or the *new* one complete — never a splice of the two, and
+never an empty file with a valid name. (The `fsync` is what makes that hold against a power loss and
+not only against a signal.)
+
+This is not a new idea in this codebase; it is an old one that skipped a file. `ClaimStore._write`
+already wrote its records this way, for this reason, and said so in its docstring. The claim file is
+a few bytes of bookkeeping; the session transcript is the agent's mind, and it was the one being
+written non-atomically.
+
+Found while designing the keyed-resume follow-up (#297), which needs this as a prerequisite —
+incremental persistence multiplies the write windows per turn, so it must not be built over a
+non-atomic write.
+
 ## [0.67.0] - 2026-07-14
 
 **The Unspoken Channel: an agent now speaks only when it decides to.** By default, nothing an agent

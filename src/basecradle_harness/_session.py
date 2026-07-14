@@ -60,6 +60,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 from basecradle_harness._caching import anchor_cacheable_prefix, cache_mode
@@ -304,10 +305,47 @@ class Session:
         return history
 
     def _save(self) -> None:
+        """Write the transcript **atomically** — a killed wake can never leave a torn one.
+
+        The obvious form, and the one this replaces, is `path.write_text(...)`: truncate, then
+        write. A signal landing between those two — `SIGKILL`, the default disposition of
+        `SIGTERM`, the OOM killer, a box reset — leaves a **half-written file**, and a half-written
+        transcript is not a degraded transcript. It is invalid JSON, so `_load` raises on it; the
+        wake dies on load, and so does the next one, and every one after that. The agent is bricked
+        on that timeline and its memory of the conversation is gone, until a human deletes the file.
+        The window is small (one write per turn) and it is open on every turn of every agent.
+
+        Write-to-temp + `fsync` + `os.replace` (atomic on POSIX) closes it: a crash can leave the
+        *previous* transcript intact or the *new* one complete, never a splice of the two. The
+        `fsync` is what makes that true against a power loss rather than only against a signal —
+        without it `os.replace` can publish a file whose bytes never reached the platter.
+
+        This is not a new idea in this codebase; it is an old one that skipped a file.
+        `ClaimStore._write` (`_wake.py`) already does exactly this, for exactly this reason, and
+        says so. The claim file is a few bytes of bookkeeping. The session is the agent's mind, and
+        it was the one being written non-atomically. (Issue #297, finding 4.)
+
+        A `.tmp` suffixed with the pid, so two processes saving the same session cannot collide on
+        the temp path — the same guard `ClaimStore._write` uses. The name ends `.json.<pid>.tmp`,
+        which the cleanup sweep's `sessions/*.json` glob does not match, so a temp left behind by a
+        process killed inside this window is inert: never loaded, never mistaken for a transcript.
+
+        **The bound, stated rather than implied:** the *directory* entry is not fsynced, so a power
+        loss immediately after `os.replace` may leave the previous transcript in place. That costs
+        the newest turn — it does not tear the file, which is the invariant this method exists to
+        hold. Losing a turn is recoverable (the mark never advanced, so the item is re-driven);
+        an unparseable transcript is not.
+        """
         if self.path is None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps([m.to_dict() for m in self.history], indent=2))
+        payload = json.dumps([m.to_dict() for m in self.history], indent=2)
+        temp = self.path.with_suffix(self.path.suffix + f".{os.getpid()}.tmp")
+        with open(temp, "w") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())  # the bytes are on disk *before* the name points at them
+        os.replace(temp, self.path)
 
 
 def _cap_tool_results(history: list[Message]) -> None:
