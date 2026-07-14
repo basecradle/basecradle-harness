@@ -101,6 +101,9 @@ def render_budget(max_steps: int | None) -> str | None:
     every step, and the budget is per-turn and resets each wake — so the per-step counter note
     can stay terse (issue #243). ``None``/non-positive → omitted (a caller with no budget to
     announce composes exactly the brief it did before). A sentence, so sentence case.
+
+    It names the `messages` tool (issue #295). "Posted with a tool" leaves the model one inference
+    short of the thing it must actually do, and the small-model cohort does not make it.
     """
     if max_steps is None or max_steps <= 0:
         return None
@@ -110,8 +113,9 @@ def render_budget(max_steps: int | None) -> str | None:
         f"{max_steps}' — is appended right before each step, so you always know where you "
         "stand. The budget is per-turn and resets on your next wake. Treat it as a hard "
         "constraint: end with plain text before it runs out — and remember that anything you "
-        "mean a peer to see must be posted with a tool *before* then, since your closing text "
-        "is unspoken. If work remains, schedule a follow-up task so the next turn continues it."
+        "mean a peer to see must be posted with the `messages` tool *before* then, since your "
+        "closing text is unspoken. If work remains, schedule a follow-up task so the next turn "
+        "continues it."
     )
 
 
