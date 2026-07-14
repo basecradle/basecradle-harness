@@ -44,6 +44,7 @@ import itertools
 import re
 from datetime import datetime, timedelta, timezone
 
+from basecradle_harness._idempotency import TASK
 from basecradle_harness._platform import PlatformTool
 
 # How many tasks one `list` returns. The cap keeps a pathological timeline from
@@ -124,9 +125,12 @@ class TasksTool(PlatformTool):
         """Dispatch on `action`. Returns a message written for the model to read."""
         target = timeline or self.context.timeline
         if action == "create":
+            # Minted before the validation, never after: the ordinal is counted off the
+            # transcript, which records this call either way (issue #297 — see `PlatformTool.key`).
+            key = self.key(TASK)
             if not instructions or not activate_at:
                 return "Error: 'create' needs both 'instructions' and 'activate_at'."
-            return self._create(target, instructions, activate_at)
+            return self._create(target, instructions, activate_at, key)
         if action == "list":
             return self._list(target)
         if action == "read":
@@ -137,14 +141,26 @@ class TasksTool(PlatformTool):
 
     # --- create --------------------------------------------------------------
 
-    def _create(self, timeline: str, instructions: str, activate_at: str) -> str:
+    def _create(
+        self, timeline: str, instructions: str, activate_at: str, key: str | None = None
+    ) -> str:
+        """Schedule a task. `key` is the deterministic Idempotency-Key (issue #297).
+
+        **A relative `activate_at` resolves against *now*, so a re-issue after a killed wake is not
+        byte-identical** — `+90m` recovered forty minutes later means a different absolute time. The
+        key still does its job, and its job is the one that matters: if the dead wake's create
+        landed, the platform returns *that* task (the same key with a different body returns the
+        first record), so the schedule the agent actually made is the one that stands and nothing is
+        scheduled twice. Only if the create never landed does the re-issue schedule from the
+        recovery's clock — later than intended, and visible in the task the tool reports back.
+        """
         try:
             when = _normalize_activate_at(activate_at)
         except ValueError as error:
             return f"Error: {error}"
         client = self.context.client
         task = client.timelines.get(timeline).tasks.create(
-            instructions=instructions, activate_at=when
+            instructions=instructions, activate_at=when, idempotency_key=key
         )
         self.acted("task", task.content.uuid)  # scheduled work is a visible act (#293)
         return f"Scheduled a task. {_describe(task)}"

@@ -683,17 +683,32 @@ def _cut_index(history: list[Message], head: int, keep_chars: int) -> int | None
     as the budget allows. If even the newest user turn overruns `keep_chars` it is kept anyway — the
     current turn is not optional — and if there is nothing before the cut to drop, ``None`` says so
     and the caller declines.
+
+    **An `injected` turn is not a boundary** (issue #297), and that is a correctness rule, not a
+    tidiness one. The engine and the code bridge both append `user`-role turns that are a turn's own
+    *work* — an image for the model to look at, a note naming the Assets a code run produced. Both
+    are eligible cut points if you go by role alone, and the newest one can therefore become the
+    "newest user turn always survives" **floor** — at which point the compaction keeps the caption
+    and summarizes the peer's actual message away. That leaves a valid transcript (the assistant
+    turn and its tool results are dropped together, so nothing dangles) and a *broken agent*: the
+    recovery classifier can no longer find the turn that carried a message, so a wake killed while
+    holding it re-drives a turn that already posted, and the peer is answered twice.
     """
-    boundaries = [i for i in range(head, len(history)) if history[i].role == "user"]
+    boundaries = [i for i in range(head, len(history)) if _is_boundary(history[i])]
     if not boundaries:
         return None
-    chosen = boundaries[-1]  # the floor: the newest user turn always survives
+    chosen = boundaries[-1]  # the floor: the newest real user turn always survives
     tail = 0
     for index in reversed(range(head, len(history))):
         tail += _size(history[index])
-        if history[index].role == "user" and tail <= keep_chars:
+        if _is_boundary(history[index]) and tail <= keep_chars:
             chosen = index
     return chosen if chosen > head else None
+
+
+def _is_boundary(message: Message) -> bool:
+    """May the retained tail begin here? Only at a **real** user turn — see `_cut_index`."""
+    return message.role == "user" and not message.injected
 
 
 def _render(messages: Sequence[Message]) -> str:

@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from basecradle_harness._exceptions import PlatformError
+from basecradle_harness._idempotency import IdempotencyKeys
 from basecradle_harness._policy import BASECRADLE
 from basecradle_harness._tools import Tool
 from basecradle_harness._unspoken import SpeechLedger
@@ -75,6 +76,14 @@ class PlatformContext:
             and "did it act at all this turn?" (what the mention informer turns on).
             Recording is a two-line courtesy in the tool that already knows; inferring
             it later would mean parsing tool arguments to tell a `create` from a `list`.
+        keys: The wake's `IdempotencyKeys` minter (`_idempotency.py`), or `None` outside
+            a wake (the poll loop, the library API, a test). **A create tool asks it for a
+            key and passes that to the SDK** — and that key is what makes a killed wake's
+            create safe to re-issue: the wake that recovers it mints the *same* key, so the
+            platform returns the original record instead of creating a second one (issue
+            #297). `None` → no key → the SDK sends no `Idempotency-Key` header and the
+            create behaves exactly as it did before any of this existed, which is what keeps
+            the seam free for every caller that has no recovery to do.
     """
 
     client: BaseCradle
@@ -82,6 +91,7 @@ class PlatformContext:
     home: Path | None = None
     code_bridge: CodeExecutionBridge | None = None
     speech: SpeechLedger | None = None
+    keys: IdempotencyKeys | None = None
 
 
 class PlatformTool(Tool):
@@ -124,6 +134,23 @@ class PlatformTool(Tool):
                 "bound) before it can act on BaseCradle."
             )
         return self._context
+
+    # --- idempotency: a create a killed wake can safely re-issue (issue #297) ---
+
+    def key(self, kind: str) -> str | None:
+        """The `Idempotency-Key` for the platform create this tool is about to make.
+
+        ``None`` when no minter is bound (the poll loop, the library API) — which the SDK reads as
+        "send no header", so the create is exactly what it always was.
+
+        **Ask for it once, at the top of the create branch, before validating anything.** The
+        ordinal it encodes is counted off the transcript, and the transcript records the *call*, so
+        a call that mints no key where the recovery expects one would shift every later ordinal in
+        the turn by one — and an ordinal that is off by one is a key the platform has never seen,
+        which is a message posted twice.
+        """
+        keys = self.context.keys
+        return keys.mint(kind) if keys is not None else None
 
     # --- the speech ledger: say what you did, so the wake need not guess (issue #293) ---
 

@@ -47,6 +47,7 @@ import logging
 from basecradle import BaseCradleError
 
 from basecradle_harness._governance import _resolve_user, _UserNotFound
+from basecradle_harness._idempotency import MESSAGE
 from basecradle_harness._observability import kv
 from basecradle_harness._platform import PlatformTool, explain
 
@@ -228,9 +229,15 @@ class MessagesTool(PlatformTool):
                     return "Error: 'read' needs the message's uuid. Use 'list' to find it."
                 return self._read(uuid)
             if action == "create":
+                # The key is minted **before** the validation below, not after, and the order is
+                # the contract (issue #297). Its ordinal is counted off the transcript, and the
+                # transcript records this call whether or not it turns out to carry a body — so a
+                # create that mints no key still consumes its place in the count, and skipping the
+                # mint here would silently shift every later ordinal in the turn.
+                key = self.key(MESSAGE)
                 if not body:
                     return "Error: 'create' needs a 'body' — the text of the message to post."
-                return self._create(timeline or self.context.timeline, body)
+                return self._create(timeline or self.context.timeline, body, key)
         except BaseCradleError as error:
             if action == "create":
                 # **A refused post is an ERROR, and it has to be logged here** (issue #293). The
@@ -274,7 +281,7 @@ class MessagesTool(PlatformTool):
 
     # --- create --------------------------------------------------------------
 
-    def _create(self, timeline: str, body: str) -> str:
+    def _create(self, timeline: str, body: str, key: str | None = None) -> str:
         """Post a message to a timeline and return the new message's uuid.
 
         Built on the SDK's timeline-scoped creator (`POST /timelines/{uuid}/messages`),
@@ -293,8 +300,17 @@ class MessagesTool(PlatformTool):
         is the one path by which the agent speaks on a timeline **other than the one it woke
         for**, so without it a cross-timeline post — the very thing hardest to trace back — was
         the only kind of speech that left no trace in the journal.
+
+        `key` is the deterministic `Idempotency-Key` (issue #297). It carries the whole recovery
+        guarantee for speech: a wake killed between this POST and the write that records it is
+        *resumed* rather than re-driven, and the resume re-issues this exact call under this exact
+        key — so the platform returns the message the dead wake already posted instead of posting a
+        second one. It is the difference between a peer being answered once and being answered
+        twice by an agent that cannot remember doing it.
         """
-        message = self.context.client.timelines.get(timeline).messages.create(body=body)
+        message = self.context.client.timelines.get(timeline).messages.create(
+            body=body, idempotency_key=key
+        )
         # The agent just spoke — and since the final-text auto-post was removed (issue #293), this
         # is the *only* way it can. Tell the wake, which reports it (`posted=`) and reads it to know
         # the turn was not silent.

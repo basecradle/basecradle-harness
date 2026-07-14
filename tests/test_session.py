@@ -14,6 +14,7 @@ import re
 import pytest
 
 from basecradle_harness import (
+    Engine,
     Harness,
     ImageContent,
     MemoryTool,
@@ -21,8 +22,9 @@ from basecradle_harness import (
     Session,
     Tool,
     ToolCall,
+    ToolRegistry,
 )
-from basecradle_harness._session import TOOL_RESULT_CAP
+from basecradle_harness._session import TOOL_RESULT_CAP, turn_work
 
 
 class ScriptedProvider:
@@ -510,3 +512,77 @@ def test_note_records_a_system_turn_without_calling_the_model(tmp_path):
     # Persisted: a fresh session over the same path reloads the note.
     reloaded = Session("timeline:x", Harness(NeverCalled()).engine, path=path)
     assert any("Couldn't post" in t.content for t in reloaded.history)
+
+
+# --- issue #297: the turn persists as it runs, and a killed one still loads ---
+
+
+def test_the_rolled_back_build_is_removed_from_the_file_not_just_from_memory(tmp_path):
+    """`rollback` rewrites the transcript. Incremental persistence changed the premise (#297).
+
+    The staleness guard discards a stale (tool-free, so speechless) build and regenerates. That used
+    to be a purely in-memory `del`, because nothing had been written yet. Now the build being thrown
+    away is **already on disk**, so an in-memory-only rollback would leave it there — and a wake
+    killed before the replacement build persisted would come back to a transcript carrying a turn
+    that was deliberately unmade.
+    """
+    provider = ScriptedProvider(Message.assistant(content="a stale answer"))
+    session = Session("timeline:t1", Engine(provider, ToolRegistry()), path=tmp_path / "s.json")
+    base = len(session.history)
+
+    session.send("what do you think?")
+    assert any(
+        t["content"] == "a stale answer" for t in json.loads((tmp_path / "s.json").read_text())
+    )
+
+    session.rollback(base)
+
+    on_disk = json.loads((tmp_path / "s.json").read_text())
+    assert on_disk == [], "the unmade build is still on disk; a killed wake would read it as real"
+    assert session.history == []
+
+
+def test_turn_work_does_not_stop_at_an_injected_turn(tmp_path):
+    """A turn's *work* runs past the turns the engine injects into it (issue #297).
+
+    The engine appends a `user`-role turn to show the model an image; the code bridge appends one
+    naming the Assets a run produced. Neither is a new turn of the conversation. Stopping at one
+    would cut the turn in half — the narration behind it would vanish, and a turn that **finished**
+    would read as one that was **interrupted**, which is a re-run of everything it already did.
+    """
+    turn = Message(role="user", content="look at this", items=["m-1"])
+    history = [
+        Message.system("charter"),
+        turn,
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="assets", arguments={})]),
+        Message.tool(tool_call_id="c1", content="here"),
+        Message(role="user", content="(Showing image: owl.png)", injected=True),
+        Message.assistant(content="A barn owl."),
+        Message(
+            role="user", content="and this?", items=["m-2"]
+        ),  # the next real turn: the boundary
+        Message.assistant(content="A tawny."),
+    ]
+
+    work = turn_work(history, turn)
+
+    assert [m.role for m in work] == ["assistant", "tool", "user", "assistant"]
+    assert work[-1].content == "A barn owl."  # the narration is inside the turn, not behind it
+
+
+def test_the_turn_is_located_by_identity_so_a_compaction_cannot_misplace_it(tmp_path):
+    """Two turns with identical text are equal but not the same turn.
+
+    `list.index` compares with `==`, and `Message` is a dataclass — so a peer who asks the same
+    question twice would have the *first* turn found for the second one. Identity is also what
+    survives a compaction, which rewrites the list by moving objects rather than copying them.
+    """
+    # A transcript written before #297 carries no uuids, so two identical questions really are
+    # `==` — which is exactly when an equality-based lookup silently returns the wrong turn.
+    first = Message(role="user", content="are you there?")
+    second = Message(role="user", content="are you there?")
+    history = [first, Message.assistant(content="yes"), second, Message.assistant(content="still")]
+
+    assert first == second  # equal...
+    assert turn_work(history, second) == [history[-1]]  # ...but the right one is found anyway
+    assert turn_work(history, first) == [history[1]]

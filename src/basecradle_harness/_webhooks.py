@@ -49,6 +49,7 @@ import itertools
 
 from basecradle import BaseCradleError
 
+from basecradle_harness._idempotency import WEBHOOK_ENDPOINT
 from basecradle_harness._platform import PlatformTool, explain
 
 # How many endpoints/events one `list` returns. The cap keeps a pathological
@@ -138,9 +139,12 @@ class WebhookEndpointsTool(PlatformTool):
             )
         try:
             if action == "create":
+                # Minted before the validation, never after: the ordinal is counted off the
+                # transcript, which records this call either way (#297 — see `PlatformTool.key`).
+                key = self.key(WEBHOOK_ENDPOINT)
                 if not description:
                     return "Error: 'create' needs a 'description' for the endpoint."
-                return self._create(timeline or self.context.timeline, description)
+                return self._create(timeline or self.context.timeline, description, key)
             if action == "list":
                 return self._list(timeline or self.context.timeline)
             # enable / disable / rotate — keyed off the endpoint's own uuid.
@@ -156,9 +160,14 @@ class WebhookEndpointsTool(PlatformTool):
 
     # --- actions -------------------------------------------------------------
 
-    def _create(self, timeline: str, description: str) -> str:
+    def _create(self, timeline: str, description: str, key: str | None = None) -> str:
+        """Create an ingest endpoint. `key` is the deterministic Idempotency-Key (issue #297).
+
+        The one create whose duplicate would be quietly expensive rather than merely noisy: a second
+        endpoint means a second secret ingest URL, and the sender only ever holds the first.
+        """
         endpoint = self.context.client.timelines.get(timeline).webhook_endpoints.create(
-            description=description
+            description=description, idempotency_key=key
         )
         content = endpoint.content
         return (

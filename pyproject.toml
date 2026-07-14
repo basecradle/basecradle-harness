@@ -20,7 +20,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
-dependencies = ["basecradle>=0.5"]
+dependencies = ["basecradle>=0.6"]
 
 # The harness reaches an LLM only through a vendor's official SDK — never hand-rolled HTTP.
 # The core depends on NO vendor SDK; each agent installs only the extra its AI_SDK names, so
