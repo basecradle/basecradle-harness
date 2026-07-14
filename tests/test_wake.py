@@ -23,6 +23,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
+from importlib import metadata
 from types import SimpleNamespace
 
 import httpx
@@ -43,6 +44,7 @@ from basecradle_harness import (
     Tool,
     WakeAgent,
     WakeBreaker,
+    _wake,
     install,
 )
 from basecradle_harness._basecradle import _incoming_text, _parse_created_at
@@ -1665,6 +1667,12 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     import openai
 
     assert report["ai_sdk_version"] == openai.__version__
+    # The platform SDK (issue #303): the harness's one hard dependency, and the third
+    # version-bearing one — cross-checked against the module's own `__version__`, an independent
+    # source from the installed metadata the field reads.
+    import basecradle
+
+    assert report["platform_sdk_version"] == basecradle.__version__
     # The resolved active tool set — the platform tools that actually activate under the locked
     # policy, not a shipped-default list. The benign platform reads/writes are always present.
     assert {"memory", "users", "messages", "timelines", "lock", "delete"} <= set(report["tools"])
@@ -1812,6 +1820,48 @@ def test_resolved_config_reports_a_bound_mempalace_provider(wake_env, monkeypatc
     # only `memory_provider` names the bound store.
     assert "memory_search" in report["tools"]
     assert "memory" not in report["tools"]
+
+
+def test_resolved_config_reports_the_installed_platform_sdk_not_the_declared_pin(wake_env):
+    """The platform-SDK axis (issue #303). The version is read from the *installed* distribution —
+    what this venv can actually import — never from `pyproject`'s `basecradle>=0.6` pin, which is
+    what the harness declares about itself and would read green on a venv that never got the
+    upgrade. That gap is the whole defect: a `--resolved-config` builds no platform client, so an
+    agent sitting on `basecradle` 0.5.x passed every drift axis and `TypeError`d on
+    `idempotency_key=` the first time it spoke."""
+    import basecradle
+
+    report = resolved_config()
+
+    assert report["platform_sdk_version"] == basecradle.__version__
+    assert report["platform_sdk_version"] == metadata.version("basecradle")
+    # Never an empty string: `""` is falsy, prints as nothing, and reads as "fine" to a drift
+    # check written against a truthy value. Absent → `None` (the test below), present → a version.
+    assert report["platform_sdk_version"] != ""
+
+
+def test_resolved_config_reports_a_missing_platform_sdk_as_null_never_empty(wake_env, monkeypatch):
+    """An uninstalled platform SDK is `None` — a defect signal, not a shrug (issue #303): the
+    harness's one hard dependency is gone, so the agent has no way to reach the platform at all.
+    It must not degrade into `""`, which a drift check reading truthiness would pass. (The
+    consumer's other half: a harness too old to *have* the field is a **missing key**, which the
+    NOC treats as an error rather than a silent skip — the two states stay distinguishable.)"""
+
+    def missing(dist: str) -> str:
+        if dist == "basecradle":
+            raise metadata.PackageNotFoundError(dist)
+        return metadata.version(dist)
+
+    monkeypatch.setattr(
+        _wake,
+        "metadata",
+        SimpleNamespace(version=missing, PackageNotFoundError=metadata.PackageNotFoundError),
+    )
+
+    report = resolved_config()
+
+    assert report["platform_sdk_version"] is None
+    assert "platform_sdk_version" in report  # present-and-null ≠ absent; the NOC reads both
 
 
 def test_resolved_config_reports_the_active_profile_locked_by_default(wake_env):
