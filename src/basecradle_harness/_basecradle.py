@@ -70,13 +70,18 @@ from basecradle import BaseCradle
 
 from basecradle_harness._code import CODE_EXECUTION_BUILTIN, CodeExecutionBridge
 from basecradle_harness._context import Compactor, ContextBudget
-from basecradle_harness._engine import DEFAULT_MAX_STEPS, DEFAULT_RESPONSE_RETRIES
+from basecradle_harness._engine import (
+    DEFAULT_MAX_STEPS,
+    DEFAULT_RESPONSE_RETRIES,
+    compose_hooks,
+)
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
 from basecradle_harness._mcp import McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
 from basecradle_harness._model_params import load_model_params
+from basecradle_harness._observability import log_unspoken
 from basecradle_harness._openai import (
     DEFAULT_SURFACE as OPENAI_DEFAULT_SURFACE,
 )
@@ -111,6 +116,7 @@ from basecradle_harness._provider import Provider
 from basecradle_harness._search_params import load_search_params
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._tools import Tool
+from basecradle_harness._unspoken import MentionInformer, SpeechLedger
 from basecradle_harness._xai_sdk import (
     DEFAULT_SURFACE as XAI_SDK_DEFAULT_SURFACE,
 )
@@ -184,8 +190,15 @@ class TimelineAgent:
         self.harness = harness
         self.client = client or BaseCradle()
         self.timeline_uuid = timeline
-        self.timeline = self.client.timelines.get(timeline)
         self.code_bridge = code_bridge
+        # No `self.timeline` handle: it existed solely to auto-post the model's final text
+        # (`timeline.messages.create`), and nothing posts on the agent's behalf any more (issue
+        # #293). Keeping it would be a `GET /timelines/{uuid}` on every startup for a value nobody
+        # reads. The agent reaches the timeline through its tools, which bind their own client.
+
+        # What this agent has put on the timeline — the ledger its tools record into, and the only
+        # truthful answer to "did it speak?" now that nothing posts on its behalf (issue #293).
+        self.speech = SpeechLedger()
 
         # Wire the live platform handle into every platform-aware tool now that the
         # client and current timeline are resolved. This is the seam every Phase-2
@@ -196,6 +209,7 @@ class TimelineAgent:
             timeline=self.timeline_uuid,
             home=self.harness.home,
             code_bridge=code_bridge,
+            speech=self.speech,
         )
         bind_platform_tools(self.harness.tools, context)
         if code_bridge is not None:
@@ -206,6 +220,17 @@ class TimelineAgent:
         # `bc.me` once serves both — `me` is uncached, so we never fetch it twice.
         dashboard = self.client.me
         self.me_uuid = dashboard.identity.uuid
+
+        # The mention informer (issue #293), composed onto whatever turn hook is already wired —
+        # the poll loop gets the identical behavior the wake path does, because there is one
+        # framework here, not two. See `WakeAgent.__init__` for why it composes rather than replaces.
+        self.informer = MentionInformer(
+            handle=getattr(dashboard.identity, "handle", None), speech=self.speech
+        )
+        # Composed onto the engine's **base** hook, never its live one — chaining accretes, and a
+        # second agent over the same `Harness` would stack a second informer holding a dead ledger.
+        engine = self.harness.engine
+        engine.turn_hook = compose_hooks(engine.base_turn_hook, self.informer.on_turn)
         if onboard:
             # Prepend the Dashboard orientation to the operator's charter (orientation
             # first — the standing instructions speak to an agent that already knows
@@ -265,14 +290,37 @@ class TimelineAgent:
         )
 
     def poll_once(self) -> list[object]:
-        """Handle every new message once: think, reply, post. Returns posted messages."""
-        posted = []
+        """Handle every new message once: think, and act if the agent decides to. Returns its posts.
+
+        **The agent speaks by calling the `messages` tool — nothing here posts for it** (the
+        Unspoken Channel, issue #293). This loop used to auto-post the model's final text as the
+        reply, which is the defect that inversion removes: the harness owned an implicit reply
+        channel the model could not see, so a model that spoke through the tool *and* ended with
+        its usual narration said everything twice. The turn's final text is now **unspoken** —
+        journaled for the operator, never posted.
+
+        The consequence is worth stating plainly, because it changes what a hand-built agent needs:
+        an agent with no `messages` tool **cannot speak**. `from_env` wires it (it is a shipped
+        default), so the fleet path is unaffected; a `Harness` assembled by hand must register
+        `MessagesTool` to give its agent a voice. That is the kit's contract now — a capability is
+        a tool you hand it, and speech is no longer the one exception.
+
+        Returns the messages the agent posted *through its tools* this poll (empty when it chose
+        silence, which is a legitimate outcome, not a failure).
+        """
+        posted: list[object] = []
         for message in self._new_messages():
             if message.user.uuid == self.me_uuid:
-                continue  # never reply to ourselves
-            reply = self.harness.send(_incoming_text(message))
-            if reply.strip():
-                posted.append(self.timeline.messages.create(body=reply))
+                continue  # never engage with ourselves
+            text = _incoming_text(message)
+            # Per *message*, not per poll: each is its own turn, with its own answer to "was I
+            # addressed, and did I act?" The ledger is what the informer reads, so it cycles with it.
+            self.speech.reset()
+            self.informer.arm(text)
+            narration = self.harness.send(text)
+            kind = "reserve" if self.harness.engine.reserve_used else "narration"
+            log_unspoken(narration, timeline=self.timeline_uuid, kind=kind)
+            posted.extend(self.speech.posts)
         return posted
 
     def run(self, *, interval: float = DEFAULT_POLL_INTERVAL, max_polls: int | None = None) -> None:

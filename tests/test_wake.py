@@ -37,6 +37,7 @@ from basecradle_harness import (
     Harness,
     MarkStore,
     Message,
+    MessagesTool,
     ReadPacer,
     SeenStore,
     Tool,
@@ -47,8 +48,6 @@ from basecradle_harness import (
 from basecradle_harness._basecradle import _incoming_text, _parse_created_at
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._wake import (
-    _BREAKER_RESET_ALERT,
-    _BREAKER_TRIP_ALERT,
     _activated_task_text,
     _incoming_asset_text,
     _incoming_event_text,
@@ -258,30 +257,61 @@ class _NoopTool(Tool):
 
 
 class CountingProvider:
-    """A canned brain that records every call, so we can assert when it is (not) used."""
+    """A canned brain that records every call, so we can assert when it is (not) used.
+
+    **It speaks the way every agent speaks now** (the Unspoken Channel, issue #293): it calls the
+    `messages` tool with its canned text, and then ends the turn with a narration nobody posts.
+    That is deliberate and it is the point — the harness posts nothing of its own any more, so a
+    canned brain that only *returns text* is a canned brain that says nothing at all. Wiring the
+    default this way means the whole reconcile suite (messages, assets, tasks, webhook deliveries)
+    exercises the real production path: engage → tool call → post → narrate.
+
+    `speak=False` gives the other shape: a model that thinks and stays silent. Two kinds of test
+    need it — the ones pinning that silence posts nothing, and the pacing/rebuild ones, where a
+    build that ran a tool is (correctly) never rolled back.
+    """
 
     # The labels every shipped adapter carries (`describe_provider`), so a wake's bookend lines
     # name a provider and a model here exactly as they do in production.
     provider = "openai"
     model = "gpt-4o"
 
-    def __init__(self, text="Hello, John."):
+    def __init__(self, text="Hello, John.", *, speak=True, narration="Answered him."):
         self.text = text
+        self.speak = speak
+        self.narration = narration
         self.prompts: list[str] = []
         self.last_messages: list = []
         # A snapshot of the images on the last turn at *chat time* — captured before the
         # session evicts the pixels, so a test can assert an asset image was actually
         # presented to the model (the live object's `.images` is emptied after the turn).
         self.last_images: list = []
+        self._calls = 0
 
     def chat(self, messages, tools=None):
+        self._calls += 1
         self.last_messages = list(messages)
         # The engine appends a step-counter note as the last turn, so an asset's image no longer
-        # rides messages[-1]; scan all turns for the pixels, and record the last real (non-
-        # counter) turn's text as the prompt the model was answering.
+        # rides messages[-1]; scan all turns for the pixels.
         self.last_images = [img for m in messages for img in m.images]
-        self.prompts.append(_convo(messages)[-1].content)
-        return Message.assistant(content=self.text)
+        last = _convo(messages)[-1]
+        if last.role != "user":
+            # The tool result is back — settle the turn with the (unspoken) narration. Only the
+            # *first* call of a turn is a prompt the wake engaged us on, which is why `prompts`
+            # is appended above and not here: it stays "the items the model was shown".
+            return Message.assistant(content=self.narration)
+        self.prompts.append(last.content)
+        if not self.speak:
+            return Message.assistant(content=self.text)  # a silent turn: thought, said nothing
+        return Message.assistant(
+            tool_calls=[
+                ToolCall(
+                    id=f"call-{self._calls}",
+                    name="messages",
+                    arguments={"action": "create", "body": self.text},
+                )
+            ]
+        )
 
 
 @pytest.fixture
@@ -391,11 +421,22 @@ def _brief_turns(agent):
     return [m for m in history if _is_brief(m)]
 
 
-def build_wake(home, provider=None, *, system_prompt=None, onboard=False, **kwargs):
-    """A fresh WakeAgent over `home` — a stand-in for one router-spawned process."""
+def build_wake(home, provider=None, *, system_prompt=None, onboard=False, tools=None, **kwargs):
+    """A fresh WakeAgent over `home` — a stand-in for one router-spawned process.
+
+    The agent gets a `MessagesTool` by default, because since issue #293 that is the **only** way
+    an agent can speak: a harness with no messages tool is a mute agent, and every test that
+    asserts a post would be asserting the absence of a tool rather than the presence of a
+    decision. `tools=[]` builds the mute agent deliberately.
+    """
     provider = provider or CountingProvider()
     client = BaseCradle(token=FAKE_TOKEN)
-    harness = Harness(provider, system_prompt=system_prompt, home=home)
+    harness = Harness(
+        provider,
+        system_prompt=system_prompt,
+        home=home,
+        tools=[MessagesTool()] if tools is None else tools,
+    )
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=onboard, **kwargs)
     return agent, provider
 
@@ -554,10 +595,14 @@ def _locked_problem():
     }
 
 
-def test_a_locked_timeline_post_degrades_instead_of_crashing(platform, tmp_path):
-    """B2: a reply refused by a locked timeline degrades to an in-conversation note, never
-    a crash. The model still ran, the message is still marked seen (no reprocess loop), and
-    the wake completes cleanly (exit 0)."""
+def test_a_locked_timeline_refusal_reaches_the_model_instead_of_crashing(platform, tmp_path):
+    """B2: a post refused by a locked timeline degrades — and now the *model* is the one told.
+
+    The refusal used to land on the harness (which posted the reply) and was recorded as a note in
+    the transcript. Since the agent speaks for itself (issue #293), the refusal comes back as the
+    result of its own `messages` tool call: it learns, mid-turn, that it cannot speak here and can
+    act on that. Still no crash, still marked seen (no reprocess loop), still exit 0.
+    """
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
     serve_messages(platform, page(message(uuid=M1, body="hi"), message(uuid=M0, body="old")))
     platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
@@ -567,12 +612,12 @@ def test_a_locked_timeline_post_degrades_instead_of_crashing(platform, tmp_path)
 
     posted = agent.wake()  # must not raise
 
-    assert posted == []  # the reply could not be delivered
+    assert posted == []  # the agent tried to speak; the platform refused
     assert provider.prompts == ["[2026-06-04T00:00:00.000Z] john: hi"]  # the model still ran
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # marked seen despite the failed post
-    # The failed delivery is recorded as a note in the transcript, so the record stays honest.
-    notes = [t.content for t in agent.harness.session(agent.source).history if t.role == "system"]
-    assert any("Couldn't post that reply" in n for n in notes)
+    # The refusal reached the model as its tool result, in words it can act on.
+    results = [t.content for t in agent.harness.session(agent.source).history if t.role == "tool"]
+    assert any("Couldn't create a message" in r for r in results)
 
 
 def test_main_returns_zero_on_a_locked_timeline(platform, wake_env):
@@ -588,9 +633,14 @@ def test_main_returns_zero_on_a_locked_timeline(platform, wake_env):
     assert main(["--timeline", TIMELINE_UUID]) == 0
 
 
-def test_step_cap_posts_the_models_own_reserve_summary(platform, tmp_path):
-    """The step cap posts the model's own honest progress report (the reserve summary call,
-    tools withheld), not a canned string — the primary path now (issue #243)."""
+def test_the_reserve_summary_is_unspoken_not_posted(platform, tmp_path, caplog):
+    """The step-cap report goes to the **operator**, never to the peers (issues #243, #293).
+
+    The reserve summary is the model's own honest progress report — "what I completed, what
+    remains, what the next turn should do". That is a note addressed to the operator and to its own
+    next turn; it was never something a peer asked to read, and it used to be posted to them
+    anyway. It is now unspoken: journaled (`kind=reserve`), and nothing reaches the timeline.
+    """
     serve_messages(platform, page(message(uuid=M0, body="do something complicated")))
 
     class LoopingThenSummary:
@@ -605,20 +655,20 @@ def test_step_cap_posts_the_models_own_reserve_summary(platform, tmp_path):
     harness = Harness(LoopingThenSummary(), tools=[_NoopTool()], home=tmp_path, max_steps=2)
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
 
-    posted = agent.wake()  # must not raise
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        posted = agent.wake()  # must not raise
 
-    assert len(posted) == 1
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert (
-        json.loads(sent.content)["message"]["body"]
-        == "I researched the topic but ran out of steps."
-    )
+    assert posted == []
+    assert _posts(platform) == []  # the peers were told nothing — it was not for them
+    unspoken = _line(caplog, "unspoken")
+    assert "I researched the topic but ran out of steps." in unspoken  # the operator has it, whole
     assert agent.marks.get(TIMELINE_UUID) == M0  # still marked seen — no reprocess
 
 
-def test_reserve_call_failure_degrades_to_the_canned_note(platform, tmp_path):
+def test_reserve_call_failure_degrades_to_the_canned_note(platform, tmp_path, caplog):
     """The canned "I got stuck" note survives only as the fallback-of-the-fallback: the
-    reserve summary call itself erroring (issue #243). The wake still posts, marks seen."""
+    reserve summary call itself erroring (issue #243). It is unspoken too (#293) — a fact about
+    the machinery giving up, which is the operator's business and nobody else's."""
     serve_messages(platform, page(message(uuid=M0, body="do something complicated")))
 
     class LoopingThenBoom:
@@ -633,11 +683,12 @@ def test_reserve_call_failure_degrades_to_the_canned_note(platform, tmp_path):
     harness = Harness(LoopingThenBoom(), tools=[_NoopTool()], home=tmp_path, max_steps=2)
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
 
-    posted = agent.wake()  # must not raise
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        posted = agent.wake()  # must not raise
 
-    assert len(posted) == 1
-    sent = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls.last.request
-    assert "got stuck" in json.loads(sent.content)["message"]["body"]
+    assert posted == []
+    assert _posts(platform) == []
+    assert "got stuck" in _line(caplog, "unspoken")
     assert agent.marks.get(TIMELINE_UUID) == M0  # still marked seen — no reprocess
 
 
@@ -684,14 +735,14 @@ def test_claim_store_is_atomic_exactly_once(tmp_path):
 def test_transcript_persists_across_wakes(platform, tmp_path):
     """A second wake reloads the first's transcript instead of starting blank."""
     serve_messages(platform, page(message(uuid=M0, body="remember Ruby")))
-    first, _ = build_wake(tmp_path)
+    first, _ = build_wake(tmp_path, CountingProvider(speak=False))  # silent: a clean text turn
     first.wake()
 
     serve_messages(
         platform,
         page(message(uuid=M1, body="what did I say?"), message(uuid=M0, body="remember Ruby")),
     )
-    second, provider = build_wake(tmp_path)
+    second, provider = build_wake(tmp_path, CountingProvider(speak=False))
     second.wake()
 
     # The model saw the earlier exchange (loaded from disk) in front of the new turn.
@@ -774,7 +825,7 @@ def test_bootstrap_seeds_history_as_context_before_replying(platform, tmp_path):
         platform,
         page(message(uuid=M1, body="what did we decide?"), message(uuid=M0, body="we chose Ruby")),
     )
-    agent, provider = build_wake(tmp_path)
+    agent, provider = build_wake(tmp_path, CountingProvider(speak=False))
 
     agent.wake()
 
@@ -1390,35 +1441,68 @@ def wake_env(monkeypatch, tmp_path):
     return tmp_path
 
 
-def _serve_openai_and_messages(platform, *pages):
-    """A plain-text model reply plus the message pages — enough for `main` to run live.
+def _responses_payload(output):
+    """One `/responses` body carrying `output` — the Responses surface's reply envelope."""
+    return {
+        "id": "resp-wake",
+        "object": "response",
+        "created_at": 0,
+        "model": "gpt-4o",
+        "output": output,
+        "parallel_tool_calls": False,
+        "tool_choice": "auto",
+        "tools": [],
+    }
 
-    Wake mode runs the default @jt stack — the ``openai`` SDK on the **Responses** surface — so
-    the model call lands on ``/responses`` (SDK-validated body), not ``/chat/completions``.
+
+def _serve_openai_and_messages(platform, *pages, speak=True, body="On it."):
+    """The model's wire replies plus the message pages — enough for `main` to run live.
+
+    Wake mode runs the default @jt stack — the ``openai`` SDK on the **Responses** surface — so the
+    model call lands on ``/responses`` (SDK-validated body), not ``/chat/completions``.
+
+    **It speaks the way a real agent speaks** (issue #293): the first call returns a `function_call`
+    item for the `messages` tool, the second settles on plain text. So these end-to-end tests drive
+    the whole production stack — env → resolved tools → the Responses wire → tool dispatch → the
+    post — rather than a plain-text turn that, since the inversion, would reach nobody. `speak=False`
+    returns text on the first call: an agent that read, thought, and chose silence.
     """
-    platform.post("https://api.openai.com/v1/responses").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "id": "resp-wake",
-                "object": "response",
-                "created_at": 0,
-                "model": "gpt-4o",
-                "output": [
-                    {
-                        "id": "msg-wake",
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": "On it.", "annotations": []}],
-                    }
-                ],
-                "parallel_tool_calls": False,
-                "tool_choice": "auto",
-                "tools": [],
-            },
+    settle = [
+        {
+            "id": "msg-wake",
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Answered him.", "annotations": []}],
+        }
+    ]
+    if not speak:
+        platform.post("https://api.openai.com/v1/responses").mock(
+            return_value=httpx.Response(200, json=_responses_payload(settle))
         )
-    )
+        serve_messages(platform, *pages)
+        return
+    call = [
+        {
+            "id": "fc-wake",
+            "type": "function_call",
+            "status": "completed",
+            "call_id": "call-wake-1",
+            "name": "messages",
+            "arguments": json.dumps({"action": "create", "body": body}),
+        }
+    ]
+    # The queue is per-call: the tool call first, then the settling narration — and the settle
+    # repeats, so a wake with several turns (a task plus a message, say) never runs out of replies.
+    replies = [
+        httpx.Response(200, json=_responses_payload(call)),
+        httpx.Response(200, json=_responses_payload(settle)),
+    ]
+
+    def _serve(request):
+        return replies.pop(0) if len(replies) > 1 else replies[0]
+
+    platform.post("https://api.openai.com/v1/responses").mock(side_effect=_serve)
     serve_messages(platform, *pages)
 
 
@@ -2291,7 +2375,14 @@ def test_the_brief_precedes_the_item_it_governs(platform, tmp_path):
     """
     serve_dashboard_md(platform)
     serve_messages(platform, page(message(uuid=M0, body="What's the status?")))
-    agent, model = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
+    # A silent brain: one provider call, so `last_messages` *is* the turn's opening call, which is
+    # where the brief's position is decided. (A speaking turn's last call trails a tool result.)
+    agent, model = build_wake(
+        tmp_path,
+        CountingProvider(speak=False),
+        onboard=True,
+        tool_manifest=[("memory", None)],
+    )
 
     agent.wake()
 
@@ -2553,13 +2644,17 @@ def test_a_wake_burst_trips_self_declines_and_alerts_exactly_once(platform, tmp_
         "[2026-06-04T00:00:00.000Z] john: two",
     ]
 
-    # Exactly one loud trip alert across the whole burst (the trip transition only).
-    assert _alert_bodies(platform).count(_BREAKER_TRIP_ALERT) == 1
+    # **The alert is a log line, never a post** (issue #293). The harness does not speak for the
+    # agent, and the breaker alert was the one message it still wrote in the agent's own voice. The
+    # operator's breadcrumb is the WARNING (which is exactly what the NOC alerts on); the peers see
+    # what actually happened — an agent that went quiet. So the *only* bodies on this timeline are
+    # the two replies the agent itself chose to send, before the burst tripped it.
+    assert _alert_bodies(platform) == ["Hello, John.", "Hello, John."]
 
 
-def test_the_breaker_auto_resets_and_resumes_after_the_burst_clears(platform, tmp_path):
-    """Once the burst clears past the cooldown, the next wake auto-resets: it posts the recovery
-    alert and resumes normal operation (answers the message it had been declining)."""
+def test_the_breaker_auto_resets_and_resumes_after_the_burst_clears(platform, tmp_path, caplog):
+    """Once the burst clears past the cooldown, the next wake auto-resets: it logs the recovery
+    alert and resumes normal operation (engages the message it had been declining)."""
     clock = FakeClock()
     provider = CountingProvider()
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
@@ -2580,36 +2675,44 @@ def test_the_breaker_auto_resets_and_resumes_after_the_burst_clears(platform, tm
     # The burst stops; time passes past the window + cooldown. The next wake auto-resets and
     # answers M3, the message it had been declining.
     clock.advance(200)
-    posted = wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two"))
-    assert len(posted) == 1
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        posted = wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two"))
+    assert len(posted) == 1  # the agent spoke — through its tool, as it now always does
     assert provider.prompts == [
         "[2026-06-04T00:00:00.000Z] john: one",
         "[2026-06-04T00:00:00.000Z] john: two",
         "[2026-06-04T00:00:00.000Z] john: three",
     ]  # resumed
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M3
-    assert _alert_bodies(platform).count(_BREAKER_RESET_ALERT) == 1  # recovery alert posted once
+    # The recovery alert is a WARNING, not a post (issue #293). The only bodies on this timeline are
+    # the three replies the agent itself chose to send — the two healthy wakes before the trip, and
+    # this one, resumed. No alert, no harness-authored word in the agent's voice.
+    resets = [r.getMessage() for r in caplog.records if "Wake breaker RESET" in r.getMessage()]
+    assert len(resets) == 1
+    assert _alert_bodies(platform) == ["Hello, John."] * 3
 
 
-def test_a_tripped_wake_alert_degrades_on_a_locked_timeline(platform, tmp_path):
-    """The breaker's own alert post is best-effort: a locked timeline refusing it is swallowed,
-    the wake still self-declines cleanly (no crash, no provider call)."""
+def test_a_tripped_wake_never_touches_the_timeline(platform, tmp_path):
+    """A tripped wake is inert: no provider call, and **no post of any kind** (issue #293).
+
+    This once tested that the breaker's alert post degraded gracefully on a locked timeline. There
+    is no alert post any more — the breaker speaks to the operator, in the journal — so what is
+    worth pinning is the stronger property that replaced it: a tripped wake writes *nothing* to the
+    timeline, which is why a locked timeline can no longer refuse anything it does.
+    """
     clock = FakeClock()
     provider = CountingProvider()
     # Pre-fill the window so the very next wake trips (cap 1; two recorded wakes already in window).
     pre = WakeBreaker(tmp_path, max_wakes=1, window=60.0, now=clock)
     pre.record_and_check(TIMELINE_UUID)
     pre.record_and_check(TIMELINE_UUID)  # now tripped on disk
-    # The timeline refuses every post (locked).
-    platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
-        return_value=httpx.Response(403, json=_locked_problem())
-    )
     serve_messages(platform, page(message(uuid=M0, body="hi")))
 
     posted = _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()  # must not raise
 
     assert posted == []
     assert provider.prompts == []  # tripped → no provider call
+    assert _alert_bodies(platform) == []  # …and nothing reached the timeline
 
 
 def test_a_directly_constructed_wake_gets_a_default_breaker(platform, tmp_path):
@@ -3079,8 +3182,10 @@ def test_a_newer_ai_message_during_the_read_restarts_the_settle(platform, tmp_pa
     posted = agent.wake()
 
     assert len(sleep.calls) == 2  # paced M0, a newer AI landed → restarted, paced M1, then settled
-    # One batched reply to BOTH of Brain's messages — not a doublet.
-    assert len(posted) == 1
+    # ONE batched turn covering BOTH of Brain's messages — not a doublet. The build count is what
+    # says so now: this brain is silent (it calls no tool), so nothing reaches the timeline (#293).
+    assert len(provider.prompts) == 1
+    assert posted == []
     assert provider.prompts == [
         "[2026-06-04T00:00:00.000Z] briggs: first from Brain\n"
         "[2026-06-04T00:00:00.000Z] briggs: and a follow-up from Brain"
@@ -3108,7 +3213,8 @@ def test_a_human_arriving_during_the_read_settles_immediately(platform, tmp_path
     posted = agent.wake()
 
     assert len(sleep.calls) == 1  # the human arrival settled it — no second read-pace
-    assert len(posted) == 1
+    assert len(provider.prompts) == 1  # one batched turn over both messages
+    assert posted == []  # a silent brain: it thought, and said nothing
     assert provider.prompts == [
         "[2026-06-04T00:00:00.000Z] briggs: a long AI message\n"
         "[2026-06-04T00:00:00.000Z] john: STOP!"
@@ -3140,7 +3246,7 @@ def test_a_message_arriving_during_generation_triggers_a_rebuild(platform, tmp_p
         "[2026-06-04T00:00:00.000Z] john: original question\n"
         "[2026-06-04T00:00:00.000Z] john: wait, also this"
     )  # the rebuild folded the mid-generation arrival in
-    assert len(posted) == 1  # still ONE post — the settled reply
+    assert posted == []  # the rebuilt turn is silent; only the batch it saw was under test
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
 
 
@@ -3152,17 +3258,17 @@ def test_no_mid_generation_arrival_is_a_single_build(platform, tmp_path):
     posted = agent.wake()
 
     assert len(provider.prompts) == 1  # no rebuild
-    assert len(posted) == 1
+    assert posted == []  # silent brain
 
 
-def test_the_max_builds_cap_posts_unconditionally_and_leaves_the_last_arrival_unseen(
+def test_the_max_builds_cap_stands_unconditionally_and_leaves_the_last_arrival_unseen(
     platform, tmp_path
 ):
-    """A message on *every* build would rebuild forever; `MAX_BUILDS` caps it and posts as-is.
+    """A message on *every* build would rebuild forever; `MAX_BUILDS` caps it and the build stands.
 
-    The Nth build is posted with no staleness check after it, so the burst can't stall the
-    reply. The message that lands during that final build is left **unseen** (mark not advanced
-    past it, not claimed), so it drives the next wake rather than being lost.
+    The Nth build stands with no staleness check after it, so the burst can't stall the turn. The
+    message that lands during that final build is left **unseen** (mark not advanced past it, not
+    claimed), so it drives the next wake rather than being lost.
     """
     scripted = ScriptedMessages(platform, message(uuid=M0, body="q0"))
     arrivals = [M1, M2, M3]
@@ -3176,7 +3282,7 @@ def test_the_max_builds_cap_posts_unconditionally_and_leaves_the_last_arrival_un
     posted = agent.wake()
 
     assert len(provider.prompts) == 3  # capped at MAX_BUILDS, not spinning
-    assert len(posted) == 1  # the 3rd build posted unconditionally
+    assert posted == []  # the 3rd build stands unconditionally (this brain says nothing)
     # M1 and M2 (arrived during builds 1 and 2) were folded and marked; M3 (during build 3)
     # was left unseen for the next wake.
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
@@ -3222,7 +3328,7 @@ def test_disabling_pacing_skips_both_loops(platform, tmp_path):
 
     assert sleep.calls == []  # Loop 1 skipped — no read-pace
     assert len(provider.prompts) == 1  # Loop 2 collapsed to a single build — no rebuild
-    assert len(posted) == 1
+    assert posted == []  # a silent brain
     # The message that arrived during the one build is left unseen for the next wake.
     assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is True
 
@@ -3238,8 +3344,8 @@ def test_max_builds_of_one_never_rebuilds(platform, tmp_path):
 
     posted = agent.wake()
 
-    assert len(provider.prompts) == 1  # one build, posted unconditionally
-    assert len(posted) == 1
+    assert len(provider.prompts) == 1  # one build, standing unconditionally
+    assert posted == []  # a silent brain (a build that *spoke* is never rebuilt — see below)
 
 
 # --- review hardening: tool side effects, probe acks, settle cap, orphan claims ---
@@ -3263,18 +3369,45 @@ class _ArrivingTool(Tool):
         return "poked"
 
 
+class _SpeakingArrivalTool(MessagesTool):
+    """The real `messages` tool — but a peer message lands *while the post is in flight*.
+
+    The sharpest form of the Loop-2 race now that speech is a tool call (issue #293): the agent
+    speaks, and a new message arrives during the very build that spoke. Rebuilding that build would
+    post the same body a second time, so it must not be rebuilt — this tool is how the test forces
+    the arrival to happen at exactly that instant.
+    """
+
+    def __init__(self, scripted, wire_message):
+        super().__init__()
+        self.scripted = scripted
+        self.wire_message = wire_message
+        self.runs = 0
+
+    def run(self, **kwargs):
+        self.runs += 1
+        result = super().run(**kwargs)
+        self.scripted.arrive(self.wire_message)  # a message lands during the speaking build
+        return result
+
+
 class _ToolThenReplyProvider:
     """First chat of a build → a tool call; the next → the final text. So one build runs a tool."""
 
-    def __init__(self, tool_name):
+    def __init__(self, tool_name, arguments=None):
         self.tool_name = tool_name
+        self.arguments = (
+            arguments
+            if arguments is not None
+            else ({"action": "create", "body": "Hello, John."} if tool_name == "messages" else {})
+        )
         self.chats = 0
 
     def chat(self, messages, tools=None):
         self.chats += 1
         if self.chats == 1:
             return Message.assistant(
-                tool_calls=[ToolCall(id="c1", name=self.tool_name, arguments={})]
+                tool_calls=[ToolCall(id="c1", name=self.tool_name, arguments=self.arguments)]
             )
         return Message.assistant(content="done")
 
@@ -3296,9 +3429,33 @@ def test_a_tool_using_build_is_not_rolled_back_when_a_message_arrives(platform, 
     posted = agent.wake()
 
     assert tool.runs == 1  # the tool fired exactly once — no rollback+rebuild re-fired it
-    assert len(posted) == 1  # the single reply posted
+    assert posted == []  # `poke` is not a message tool, so the agent said nothing
     # M1 arrived during the tool-using build → left unseen for the next wake (not folded/rebuilt).
     assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is True
+
+
+def test_a_build_that_spoke_is_never_rebuilt_so_the_agent_never_speaks_twice(platform, tmp_path):
+    """The same guard, now aimed at the thing that matters most: **speech is a side effect** (#293).
+
+    Since the agent speaks by calling a tool, a build that posted a message is a build with an
+    irreversible effect on the world. Loop 2's rollback erases the transcript, not the timeline —
+    so rebuilding a build that spoke would say it again, to the same peers, for one message. The
+    `used_tools` guard (written for images, long before this) is what makes that impossible, and
+    this pins it at the point of maximum consequence.
+    """
+    scripted = ScriptedMessages(platform, message(uuid=M0, body="what's the status?"))
+    # The *post itself* is what makes a message arrive mid-build — the tightest possible race.
+    speaking = _SpeakingArrivalTool(scripted, message(uuid=M1, body="landed mid-post"))
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(_ToolThenReplyProvider("messages"), tools=[speaking], home=tmp_path)
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
+
+    posted = agent.wake()
+
+    assert speaking.runs == 1  # said exactly once — the build was never rolled back and re-run
+    assert len(posted) == 1
+    assert _posts(platform) == ["Hello, John."]  # one body on the timeline, not two
+    assert ClaimStore(tmp_path).claim(TIMELINE_UUID, M1, kind="messages") is True  # M1 → next wake
 
 
 def test_a_probe_arriving_during_generation_is_acked_this_wake(platform, tmp_path):
@@ -3359,7 +3516,8 @@ def test_the_settle_loop_is_bounded_by_max_builds(platform, tmp_path):
     # The settle read-paces at most `max_builds` (3) times, then the cap stops it — a runaway
     # room can no longer hold the wake forever (without the cap this would loop indefinitely).
     assert len(sleep.calls) == 3
-    assert len(posted) == 1  # it still posts one batched reply
+    assert len(provider.prompts) == 1  # it still runs one batched turn
+    assert posted == []  # a silent brain
 
 
 def test_bootstrap_recovers_an_orphaned_claim_instead_of_stranding_it(platform, tmp_path):
@@ -3450,8 +3608,12 @@ def test_a_wake_is_bookended_by_a_start_and_an_end_line(platform, tmp_path, capl
 
     end = _line(caplog, "wake end")
     assert "outcome=ok" in end
-    assert "turns=1" in end  # one model turn — the whole unseen batch, answered once
-    assert "steps=1/24" in end  # the engine's own count, against the per-turn budget
+    assert "turns=1" in end  # one model turn — the whole unseen batch, engaged once
+    # Two steps: the model called the `messages` tool, then settled on its narration. That is what
+    # speaking costs since #293 — a reply is a tool call, and a tool call is a step.
+    assert "steps=2/24" in end
+    # `posted=1` counts what the agent *chose* to send, read off the speech ledger the tool records
+    # into. A silent wake reports `posted=0` — visibly, deliberately silent.
     assert "posted=1" in end
     assert re.search(r"duration=\d+\.\d\ds", end)
 
@@ -3651,7 +3813,7 @@ def test_a_multi_item_wake_reports_its_turn_count_alongside_the_step_total(
     assert len(provider.prompts) == 2  # two tasks → two model turns
     end = _line(caplog, "wake end")
     assert "turns=2" in end
-    assert "steps=2/24" in end  # one step each, summed — and the turn count explains the sum
+    assert "steps=4/24" in end  # two steps each (tool call + settle), summed across the two turns
     assert "posted=2" in end
 
 
@@ -3679,21 +3841,29 @@ def test_a_crashing_wake_still_reports_what_it_had_done(platform, tmp_path, capl
     assert "posted=0" in end
 
 
-def test_the_breaker_alert_is_logged_like_any_other_post(platform, tmp_path, caplog):
-    """The breaker's trip alert is a real message on the timeline. It used to post through the
-    client directly, so a tripped wake logged `posted=0` while having actually spoken."""
+def test_the_breaker_alert_is_a_log_line_not_a_post(platform, tmp_path, caplog):
+    """The breaker speaks to the **operator**, in the journal — never to the peers (issue #293).
+
+    Its trip alert used to be a message on the timeline, written in the agent's own voice ("I
+    appear to be in a wake loop here…") — words the agent never wrote and never chose to send. The
+    harness does not speak for the agent any more, so the alert is the WARNING it always also was.
+    Nothing is lost: the breadcrumb was always the operator's, and the NOC alerts on this exact
+    string (`Wake breaker TRIPPED`), never on the post.
+    """
     clock = FakeClock()
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
     serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
     for _ in range(2):  # burn the cap so the next wake trips
         _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2).wake()
+    said_before = _posts(platform)
 
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2).wake()
 
-    posted = _line(caplog, "posted")
-    assert "kind=breaker-alert" in posted  # …and never mistaken for the agent replying
-    assert f"message={REPLY}" in posted
+    assert "Wake breaker TRIPPED" in _line(caplog, "Wake breaker TRIPPED")  # the operator is told
+    assert _posts(platform) == said_before  # …and the tripped wake put nothing on the timeline
+    end = _line(caplog, "wake end")
+    assert "outcome=declined" in end and "posted=0" in end
 
 
 def test_a_probe_ack_is_logged_as_an_ack_not_as_the_agent_speaking(platform, tmp_path, caplog):
@@ -3780,49 +3950,35 @@ def test_a_wake_that_died_after_a_tool_ran_abandons_the_message_loudly(platform,
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # abandoned is final: the mark may pass
 
 
-def test_a_wake_that_died_before_posting_reposts_its_reply_without_a_model_call(platform, tmp_path):
-    """Outcome 2a: the model *finished*, the post never landed. Finish the wake — don't re-run it.
+def test_a_completed_turn_is_committed_never_re_driven(platform, tmp_path, caplog):
+    """Outcome 2 — **the turn-commit anchor** (issue #293). A turn that finished is simply done.
 
-    The reply is on disk (`Session._exchange` persists the turn), so there is nothing to
-    regenerate: the recovering wake posts the saved text verbatim. Zero tokens, exactly one reply.
-    """
-    serve_messages(platform, page(message(uuid=M0, body="what's the status?")))
-    agent, provider = build_wake(tmp_path)
-    agent._post = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("killed before the post"))
-    with pytest.raises(RuntimeError):
-        agent.wake()
+    The dead wake reached its terminal narration, so the model *finished*: everything it decided to
+    do on the timeline, it did (through its tools), and everything it decided not to do, it decided.
+    The recovering wake makes **no model call and no post** — it commits the claim and moves on.
 
-    assert provider.prompts  # it did generate...
-    assert not _posts(platform)  # ...but the process died before it could say a word
-
-    serve_messages(platform, page(message(uuid=M0, body="what's the status?")))
-    second, second_provider = build_wake(tmp_path)
-    posted = second.wake()
-
-    assert second_provider.prompts == []  # NO model call — the reply already existed
-    assert len(posted) == 1
-    assert _posts(platform) == ["Hello, John."]  # posted verbatim, exactly once
-    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
-
-
-def test_a_wake_that_died_after_posting_does_not_double_post(platform, tmp_path, caplog):
-    """Outcome 2b — **the case the issue demands.** The reply landed; the wake died before commit.
-
-    The naive two-phase claim would re-drive here and reply twice. The timeline is the durable
-    record both wakes share, so the recovering wake asks it: is one of my own posts, *newer than
-    this message*, carrying exactly this body? It is. Commit; post nothing.
-
-    Per the capital's requirement, the body-match commit is **never silent** — an INFO names both
-    the claimed message and the matched post, so the one residual false-match (two coincidentally
-    identical bodies) leaves an audit trail instead of an invisible mis-commit.
+    This replaces the body-matching reconciliation the old design needed ("is one of my own posts,
+    newer than this message, carrying exactly this body?"). That question only existed because the
+    harness held a generated reply it still had to deliver. It holds nothing now, so the question
+    is gone — along with its residual false-match between two identical bodies.
     """
     crashed_wake_owning(tmp_path, M0)
-    # The dead wake's transcript: it generated "Hello, John." for M0...
+    # The dead wake's transcript: it read M0, spoke through its tool, and settled on a narration —
+    # i.e. it *finished*, and only the claim-commit never happened.
     session = Harness(CountingProvider(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
     session.history.append(Message.user(content="[2026-06-04T00:00:00.000Z] john: what's up?"))
-    session.history.append(Message.assistant(content="Hello, John."))
+    session.history.append(
+        Message.assistant(
+            tool_calls=[
+                ToolCall(
+                    id="c1", name="messages", arguments={"action": "create", "body": "Hello, John."}
+                )
+            ]
+        )
+    )
+    session.history.append(Message.tool(tool_call_id="c1", content="Posted to timeline."))
+    session.history.append(Message.assistant(content="Answered him. Nothing further."))
     session._save()
-    # ...and the timeline shows that reply DID land, newer than M0.
     serve_messages(
         platform,
         page(
@@ -3836,58 +3992,61 @@ def test_a_wake_that_died_after_posting_does_not_double_post(platform, tmp_path,
     with caplog.at_level(logging.INFO):
         posted = agent.wake()
 
-    assert provider.prompts == []  # not re-run
-    assert posted == []  # and above all: NOT re-posted
-    assert _posts(platform) == []  # the timeline already had the reply; nothing new was said
+    assert provider.prompts == []  # not re-run: the turn had already finished
+    assert posted == []  # and above all: never said twice
+    assert _posts(platform) == []  # nothing new reached the timeline
     recovered = next(r.message for r in caplog.records if r.message.startswith("recovered"))
-    assert M0 in recovered and REPLY in recovered  # both uuids — the required audit trail
+    assert M0 in recovered and "turn-completed" in recovered  # the audit trail, by its real reason
     assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
 
 
-def test_the_landed_reply_search_is_bounded_to_posts_newer_than_the_message(platform, tmp_path):
-    """Capital requirement 1: an own post *older* than the message can never be its reply.
+def test_a_silent_completed_turn_is_committed_too(platform, tmp_path):
+    """The case the old design could not even represent: the dead wake finished, and said nothing.
 
-    Here the agent said "Hello, John." **before** M0 arrived. A recovering wake that searched the
-    whole timeline would match it, conclude M0 was answered, and drop the peer. Bounding the window
-    to posts newer than M0 is what makes that impossible — so M0's reply is genuinely re-posted.
+    Under the auto-post there was no such state — a completed turn always produced a reply, so
+    "finished" and "spoke" were the same fact, and recovery could look for the reply on the
+    timeline. Silence-default separates them, and the commit record follows the *turn*, not the
+    speech: a turn that ran to its narration is finished whether or not anyone heard it, and
+    re-driving it would put a message in front of the model that it has already, deliberately,
+    declined to answer.
     """
     crashed_wake_owning(tmp_path, M0)
     session = Harness(CountingProvider(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
     session.history.append(Message.user(content="[2026-06-04T00:00:00.000Z] john: what's up?"))
-    session.history.append(Message.assistant(content="Hello, John."))
+    session.history.append(Message.assistant(content="Small talk, wrapping up. No reply needed."))
     session._save()
-    serve_messages(
-        platform,
-        page(
-            message(uuid=M0, body="what's up?"),  # newest
-            message(uuid=REPLY, body="Hello, John.", mine=True),  # OLDER than M0 — not its reply
-        ),
-    )
+    serve_messages(platform, page(message(uuid=M0, body="what's up?")))
     MarkStore(tmp_path).set(TIMELINE_UUID, M1)
 
     agent, provider = build_wake(tmp_path)
     posted = agent.wake()
 
-    assert provider.prompts == []  # the reply existed; no regeneration
-    assert len(posted) == 1  # but it was never actually said to M0 — so say it now
-    assert _posts(platform) == ["Hello, John."]
+    assert provider.prompts == []  # no re-drive — its silence was a decision, not a gap
+    assert posted == []
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # settled: the mark may pass it
 
 
-def test_a_probe_ack_before_the_crash_does_not_look_like_a_reply(platform, tmp_path):
-    """The counterexample that killed the cheap test — and why body-equality is the sound one.
+def test_recovery_reads_the_transcript_never_the_timeline(platform, tmp_path):
+    """A newer own post on the timeline is now *irrelevant* to recovery — the transcript decides.
 
-    `_absorb` posts a NOC probe ack *before* the model call. So a wake that acked a probe, claimed
-    a peer message, and then died leaves an own post **newer than** that message which is not its
-    reply. The tempting cheap test — "is there any own post newer than X?" — would read that ack as
-    the reply, mark X delivered, and drop the peer silently. Body-equality has no such hole.
+    This was the sharpest edge of the old design. `_absorb` posts a NOC probe ack **before** the
+    model call, so a wake that acked a probe, claimed a peer message and then died leaves an own
+    post newer than a message it never answered; the cheap test ("any own post newer than X?")
+    would have read that ack as the reply and dropped the peer. Body-equality closed that hole at
+    the cost of comparing message bodies forever.
+
+    The turn-commit anchor removes the question entirely: the transcript holds no turn for M0, so
+    the model never saw it, so it is re-driven — and the ack sitting newer on the timeline can no
+    longer confuse anything, because nothing reads the timeline to make this decision.
     """
     crashed_wake_owning(tmp_path, M0)
-    # The dead wake never got to the model: no transcript turn for M0. But it DID ack a probe,
-    # which sits on the timeline newer than M0.
     serve_messages(
         platform,
         page(
-            message(uuid=REPLY, body="ack: some-nonce", mine=True),  # the probe ack — not a reply
+            message(
+                uuid=REPLY, body="ack: some-nonce", mine=True
+            ),  # a newer own post — not a reply
             message(uuid=M0, body="a peer's real question"),
         ),
     )
@@ -3896,8 +4055,8 @@ def test_a_probe_ack_before_the_crash_does_not_look_like_a_reply(platform, tmp_p
     agent, provider = build_wake(tmp_path)
     posted = agent.wake()
 
-    assert provider.prompts, "the peer's message must still be re-driven despite the newer ack"
-    assert len(posted) == 1
+    assert provider.prompts, "the peer's message must still be re-driven despite the newer own post"
+    assert len(posted) == 1  # re-driven, and this time the agent spoke
     assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
 
 

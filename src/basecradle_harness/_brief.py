@@ -86,8 +86,10 @@ def render_defects(notices: Sequence[str] | None) -> str | None:
         return None
     header = (
         "⚠ Tool Defect — a shipped default tool failed to load, so its capability is "
-        "currently unavailable. If asked to use it, say it is unavailable; an operator can "
-        "fix it (run basecradle-harness-install, or repair the file):"
+        "currently unavailable. If asked to use it, say so plainly. It is fixed by re-running "
+        "basecradle-harness-install or repairing the file; if you cannot do that yourself, "
+        "raise it on a timeline where someone who can will see it — nobody is watching your "
+        "logs:"
     )
     return "\n".join([header, *(f"- {line}" for line in lines)])
 
@@ -104,11 +106,12 @@ def render_budget(max_steps: int | None) -> str | None:
         return None
     return (
         f"Step budget: this turn runs for up to {max_steps} steps (one step = one of your "
-        f"model turns, whether it calls tools or replies). A live counter — 'Step N of "
+        f"model turns, whether it calls tools or ends in text). A live counter — 'Step N of "
         f"{max_steps}' — is appended right before each step, so you always know where you "
         "stand. The budget is per-turn and resets on your next wake. Treat it as a hard "
-        "constraint: end with a text reply before it runs out, and if work remains, schedule a "
-        "follow-up task so the next turn continues it."
+        "constraint: end with plain text before it runs out — and remember that anything you "
+        "mean a peer to see must be posted with a tool *before* then, since your closing text "
+        "is unspoken. If work remains, schedule a follow-up task so the next turn continues it."
     )
 
 

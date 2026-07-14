@@ -20,9 +20,11 @@ from basecradle_harness import (
     Harness,
     MemoryTool,
     Message,
+    MessagesTool,
     OpenAIProvider,
     OpenRouterProvider,
     TimelineAgent,
+    ToolCall,
     XaiSdkProvider,
     config_home,
     install,
@@ -154,6 +156,28 @@ class CannedProvider:
         self.last_messages = list(messages)
         # Record the last real turn's text, skipping the engine's step-counter note (issue #243).
         self.prompts.append(_convo(messages)[-1].content)
+        return Message.assistant(content=self.text)
+
+
+class ToolCallingProvider:
+    """Calls one tool on its first turn, then settles on plain text — an agent that *speaks*.
+
+    The shape every real reply now takes (issue #293): the model acts through a tool call and then
+    ends its turn with narration nobody but its operator reads.
+    """
+
+    def __init__(self, *, tool, arguments, text="Done."):
+        self.tool = tool
+        self.arguments = arguments
+        self.text = text
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            return Message.assistant(
+                tool_calls=[ToolCall(id="call-1", name=self.tool, arguments=self.arguments)]
+            )
         return Message.assistant(content=self.text)
 
 
@@ -328,8 +352,8 @@ def test_context_cap_zero_seeds_nothing_but_keeps_high_water_mark(platform):
     assert provider.prompts == []
 
 
-def test_context_cap_does_not_change_which_messages_get_replies(platform):
-    """Capping the seed never makes the agent answer history it didn't seed."""
+def test_context_cap_does_not_change_which_messages_get_engaged(platform):
+    """Capping the seed never makes the agent engage on history it didn't seed."""
     wire(
         platform,
         message_pages=[
@@ -349,9 +373,8 @@ def test_context_cap_does_not_change_which_messages_get_replies(platform):
     provider = CannedProvider()
     agent, _ = build_agent(provider, context_messages=1)
 
-    posted = agent.poll_once()
+    agent.poll_once()
 
-    assert len(posted) == 1
     assert provider.prompts == [
         "[2026-06-04T00:00:00.000Z] john: brand new"
     ]  # only the new message, not the backlog
@@ -390,7 +413,14 @@ def test_negative_context_messages_is_rejected():
 # --- responding --------------------------------------------------------------
 
 
-def test_responds_to_a_new_message_end_to_end(platform):
+def test_a_turns_final_text_is_never_posted(platform):
+    """The Unspoken Channel (issue #293): the model's final text reaches no timeline, ever.
+
+    This is the inversion, pinned at its narrowest point. The agent is engaged on the message and
+    answers with plain text — the exact shape that used to auto-post — and **nothing** is sent to
+    the platform. That text is now unspoken: journaled for the operator, shown to the agent's own
+    next turn, seen by no peer.
+    """
     wire(
         platform,
         message_pages=[
@@ -403,14 +433,44 @@ def test_responds_to_a_new_message_end_to_end(platform):
 
     posted = agent.poll_once()
 
-    assert len(posted) == 1
+    assert posted == []  # the agent said nothing — it never called a tool
     assert provider.prompts == [
         "[2026-06-04T00:00:00.000Z] john: What's the status?"
-    ]  # tagged with the speaker
+    ]  # it *was* engaged on the message (tagged with the speaker) — it simply did not speak
+    assert not platform.post(f"/timelines/{TIMELINE_UUID}/messages").called
+
+
+def test_the_agent_speaks_by_calling_the_messages_tool(platform):
+    """The other half of the inversion: a deliberate `messages` create is what reaches a peer.
+
+    One speaking channel, and this is it. The body posted is the one the model passed to the tool
+    — nothing the harness composed on its behalf — and it lands exactly once, even though the turn
+    also ends with its usual narration (the double-post that started all this, issue #293).
+    """
+    wire(
+        platform,
+        message_pages=[
+            page(message(uuid=M0, body="old")),
+            page(message(uuid=M1, body="What's the status?"), message(uuid=M0, body="old")),
+        ],
+    )
+    provider = ToolCallingProvider(
+        tool="messages",
+        arguments={"action": "create", "body": "All clear, John."},
+        text="Answered him. Nothing further needed.",  # the narration — must NOT be posted
+    )
+    client = BaseCradle(token=FAKE_TOKEN)
+    harness = Harness(provider, tools=[MessagesTool()])
+    agent = TimelineAgent(harness, timeline=TIMELINE_UUID, client=client)
+
+    posted = agent.poll_once()
+
     post_route = platform.post(f"/timelines/{TIMELINE_UUID}/messages")
-    assert post_route.called
-    sent = post_route.calls.last.request
-    assert json.loads(sent.content) == {"message": {"body": "All clear, John."}}
+    assert post_route.call_count == 1  # exactly once — the narration did not double it
+    assert json.loads(post_route.calls.last.request.content) == {
+        "message": {"body": "All clear, John."}
+    }
+    assert len(posted) == 1  # and the agent's own post is what the poll reports
 
 
 def test_does_not_reply_to_its_own_messages(platform):
@@ -457,13 +517,12 @@ def test_multiple_new_messages_handled_oldest_first(platform):
     provider = CannedProvider()
     agent, _ = build_agent(provider)
 
-    posted = agent.poll_once()
+    agent.poll_once()
 
-    assert len(posted) == 2
     assert provider.prompts == [
         "[2026-06-04T00:00:00.000Z] john: first",
         "[2026-06-04T00:00:00.000Z] john: second",
-    ]  # chronological, speaker-tagged
+    ]  # chronological, speaker-tagged — one engaged turn each
 
 
 # --- the poll loop -----------------------------------------------------------

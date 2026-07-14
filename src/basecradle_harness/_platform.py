@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING
 from basecradle_harness._exceptions import PlatformError
 from basecradle_harness._policy import BASECRADLE
 from basecradle_harness._tools import Tool
+from basecradle_harness._unspoken import SpeechLedger
 
 if TYPE_CHECKING:
     from basecradle import BaseCradle, BaseCradleError
@@ -65,12 +66,22 @@ class PlatformContext:
             `None` when code execution is not active. The `code_attach` tool reaches
             it here to stage a BaseCradle Asset into the executor; every other
             platform tool ignores it.
+        speech: The wake's `SpeechLedger` (`_unspoken.py`), or `None` outside a wake.
+            **A tool that acts visibly on a timeline records it here** — a message
+            posted, an asset shared, a task made. It is not bookkeeping for its own
+            sake: since the final-text auto-post was removed (issue #293), a tool call
+            is the *only* way an agent speaks, so this ledger is the only truthful
+            answer to "did the agent say anything this wake?" (the bookend's `posted=`)
+            and "did it act at all this turn?" (what the mention informer turns on).
+            Recording is a two-line courtesy in the tool that already knows; inferring
+            it later would mean parsing tool arguments to tell a `create` from a `list`.
     """
 
     client: BaseCradle
     timeline: str
     home: Path | None = None
     code_bridge: CodeExecutionBridge | None = None
+    speech: SpeechLedger | None = None
 
 
 class PlatformTool(Tool):
@@ -113,6 +124,28 @@ class PlatformTool(Tool):
                 "bound) before it can act on BaseCradle."
             )
         return self._context
+
+    # --- the speech ledger: say what you did, so the wake need not guess (issue #293) ---
+
+    def spoke(self, message: object) -> None:
+        """Record a message this tool just posted. The agent's only way of speaking."""
+        self._record("spoke", message)
+
+    def acted(self, kind: str, uuid: str | None = None) -> None:
+        """Record a non-message action that lands visibly on a timeline (an asset, a task)."""
+        self._record("acted", kind, uuid)
+
+    def _record(self, method: str, *args: object) -> None:
+        """Write to the bound `SpeechLedger` if there is one — a no-op when there isn't.
+
+        Silently absent outside a wake (a bare `PlatformContext` in a test, a library embedder
+        wiring tools by hand), because the ledger answers a *wake's* questions. A tool must never
+        fail an action it already completed over a bookkeeping seam that isn't there, so this is
+        the one place the `None` is handled, rather than at four call sites.
+        """
+        speech = getattr(self._context, "speech", None)
+        if speech is not None:
+            getattr(speech, method)(*args)
 
 
 def explain(error: BaseCradleError) -> str:

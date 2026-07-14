@@ -202,6 +202,7 @@ class CodeExecutionBridge:
             name,
             "Python source executed by the code interpreter.",
         )
+        self._acted(asset)
         return [f"executed source → {_describe(asset)}"]
 
     def _store_output_files(self, trace: CodeExecutionTrace) -> list[str]:
@@ -241,8 +242,22 @@ class CodeExecutionBridge:
                 name,
                 "File produced by the code interpreter.",
             )
+            self._acted(asset)
             lines.append(f"output file → {_describe(asset)}")
         return lines
+
+    def _acted(self, asset: Any) -> None:
+        """Record a harvested Asset on the wake's `SpeechLedger` — a no-op when there is none.
+
+        The bridge is not a `PlatformTool` (it is the engine's turn hook), so it records by hand
+        rather than through `PlatformTool.acted`. It records at all because these uploads are *not*
+        bookkeeping-neutral: a harvested output file lands on the timeline where every viewer sees
+        it, so a turn that produced one is not a silent turn, and the mention informer (issue #293)
+        must not tell the model it did nothing.
+        """
+        speech = getattr(self._context, "speech", None)
+        if speech is not None:
+            speech.acted("asset", getattr(getattr(asset, "content", None), "uuid", None))
 
     def _output_files(self, container_id: str, trace: CodeExecutionTrace) -> list[tuple[str, str]]:
         """The ``(file_id, filename)`` of every file the executor wrote, by listing the container.
@@ -332,8 +347,10 @@ def _artifact_note(lines: list[str]) -> str:
     body = "\n".join(f"- {line}" for line in lines)
     return (
         "Your code execution produced artifacts, now stored as BaseCradle Assets on this "
-        f"timeline:\n{body}\n\nReference these Assets by their uuid in your reply to the user "
-        "(they render inline); do not point at sandbox /mnt/data paths, which are not reachable."
+        f"timeline:\n{body}\n\nIf a peer is waiting on this, post a message (the messages tool) "
+        "with the result and reference these Assets by uuid — they render inline. Naming them "
+        "only in your closing text tells nobody: that text is unspoken. Do not point at sandbox "
+        "/mnt/data paths, which are not reachable to anyone else."
     )
 
 

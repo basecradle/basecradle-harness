@@ -634,14 +634,19 @@ def test_prompt_text_falls_back_to_the_packaged_default_when_not_installed(tmp_p
     assert "<!--" not in text  # the operator-note comment is stripped before composition
 
 
-def test_initialize_brief_steers_code_exec_replies_to_report_the_result(tmp_path):
+def test_initialize_brief_steers_code_exec_results_to_be_posted(tmp_path):
     # Issue #178: the code-exec guidance over-corrected into reporting only the saved-source
-    # artifact, dropping the computed result the peer asked for. The brief must steer the
-    # reply to surface the result, with the Asset uuid as an *addition*, not a substitute.
+    # artifact, dropping the computed result the peer asked for. The brief must steer the agent
+    # to surface the result, with the Asset uuid as an *addition*, not a substitute.
+    #
+    # Issue #293 sharpened it: "state it in your reply" no longer reaches anyone, because the
+    # final text is unspoken. A computed result that is merely *narrated* is a result the peer
+    # never got — so the guidance now says **post it**.
     text = prompt_text("initialize.md", tmp_path / "absent")
     assert "Result first, artifact also" in text
     # The result-first instruction comes before the artifact-reference instruction.
-    assert text.index("goes in your reply") < text.index("reference them by **Asset uuid**")
+    assert text.index("post it") < text.index("reference them by **Asset uuid**")
+    assert "reached nobody" in text  # …and says plainly what happens if it is only narrated
     # Sandbox paths are still steered against, but only as the artifact-reference caveat.
     assert "/mnt/data" in text
 

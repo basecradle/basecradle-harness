@@ -9,13 +9,19 @@ Harness profiles" design, and it is why there is not a single profile-specific
 assumption in this file.
 
 One turn (`run`) is: ask the provider for the next message; if it is plain text,
-that is the reply; if it carries tool calls, run each through the registry,
-append the results, and ask again — until the model answers with no more calls
-or the step budget is spent. A live step-counter note rides ahead of every
-provider call so the model paces itself against the budget, and if the budget is
-spent with the model still calling tools the engine makes one out-of-budget
-**reserve** call (tools withheld) for a self-authored progress report rather than
-cutting off with a canned string (issue #243).
+the turn is over; if it carries tool calls, run each through the registry, append
+the results, and ask again — until the model answers with no more calls or the
+step budget is spent. A live step-counter note rides ahead of every provider call
+so the model paces itself against the budget, and if the budget is spent with the
+model still calling tools the engine makes one out-of-budget **reserve** call
+(tools withheld) for a self-authored progress report rather than cutting off with
+a canned string (issue #243).
+
+That final text is **not** a reply to anyone (issue #293). Speaking is a tool call
+like any other action; the text a turn ends on is the agent's *unspoken* narration —
+written to its log (a flight recorder nobody watches), fed to its own memory, and shown
+to its own next turn. The engine is as ignorant of that as it is of "safe": it returns
+the message; `_wake` decides (and it decides to post nothing).
 
 A tool may return more than text. When it returns a `ToolResult` carrying images
 (the assets tool's `view` action does, so a peer can *see* a picture), the engine
@@ -109,16 +115,45 @@ _ESCALATION_THRESHOLD = 5
 #: primary path that replaces the old canned "I got stuck" string (issue #243).
 _RESERVE_NUDGE = (
     "You've reached the step limit for this turn. Write an honest progress report: what you "
-    "completed, what remains, and what the next turn should do. This is your final message for "
-    "this turn — wrap up now in plain text."
+    "completed, what remains, and what the next turn should do. This is your last text of the "
+    "turn and it is unspoken — it goes to your log and your memory, not to any timeline — so if "
+    "a peer is waiting on something, that had to be posted with a tool. Wrap up in plain text."
 )
 
 #: A post-turn hook: given the assistant turn the provider just produced and the live
 #: transcript, it may append follow-up turns and returns whether the loop must continue even
-#: when the turn carried no tool calls. The engine stays ignorant of *why* — the one collaborator
-#: that knows (the code-execution Asset bridge: harvest the run's output files into Assets, then
-#: feed their uuids back so the model can cite them) is injected, like the provider and tools.
+#: when the turn carried no tool calls. The engine stays ignorant of *why* — the collaborators
+#: that know are injected, like the provider and tools. Two ship: the code-execution Asset bridge
+#: (harvest the run's output files into Assets, then feed their uuids back so the model can cite
+#: them) and the mention informer (`_unspoken.MentionInformer`: the agent was addressed and is
+#: ending its turn having done nothing — say why, or act). Compose several with `compose_hooks`.
 TurnHook = Callable[[Message, "list[Message]"], bool]
+
+
+def compose_hooks(first: TurnHook | None, second: TurnHook | None) -> TurnHook | None:
+    """Chain two `TurnHook`s into one, **order-sensitively** — first, then second.
+
+    Both shipped hooks want the same moment (the turn is ending), so they have to share it, and the
+    order is load-bearing rather than cosmetic: `first` runs, and if it asks the loop to continue,
+    `second` is not consulted at all. The turn is *not* ending — it was extended — and a hook that
+    fires on a turn still in flight fires on a false premise. Concretely: the code-execution bridge
+    harvests output files and feeds their uuids back, so the model can still act; the mention
+    informer must not conclude "ending with nothing done" in the middle of that.
+
+    ``None`` on either side collapses to the other (and to ``None`` when both are absent), so a
+    caller composes unconditionally without special-casing the common no-hook build.
+    """
+    if first is None:
+        return second
+    if second is None:
+        return first
+
+    def chained(reply: Message, messages: list[Message]) -> bool:
+        if first(reply, messages):
+            return True  # the turn was extended: it is not ending, so `second` has no premise yet
+        return bool(second(reply, messages))
+
+    return chained
 
 
 class Engine:
@@ -168,9 +203,21 @@ class Engine:
         self.provider = provider
         self.tools = tools
         self.max_steps = max_steps
+        #: The hook this engine was *built* with, kept alongside the live one so a hosting agent
+        #: can compose onto it **idempotently**. A `WakeAgent`/`TimelineAgent` attaches its mention
+        #: informer by composing (`compose_hooks(engine.base_turn_hook, …)`) rather than by chaining
+        #: onto whatever is already there — because chaining accretes: two agents built over one
+        #: `Harness` would stack two informers, each holding the *other's* dead `SpeechLedger`, and
+        #: a stale-armed one would then nudge on a turn it knows nothing about.
+        self.base_turn_hook = turn_hook
         self.turn_hook = turn_hook
         self.server_builtins = frozenset(server_builtins)
         self.response_retries = response_retries
+        #: Whether the **last** `run` ended in the out-of-budget reserve call rather than the model
+        #: settling on its own (`_reserve_summary`). Read by the wake to label that turn's unspoken
+        #: text `kind=reserve` — a step-capped turn and an ordinary one read very differently to
+        #: anyone reconstructing a failure, and the journal is where they will look.
+        self.reserve_used = False
         #: Steps spent across every `run` this engine has driven, and how many runs that was. A
         #: wake process runs one engine, so together these *are* the wake's model usage — what its
         #: end-of-wake log line reports. `max_steps` is a **per-run** budget, so `steps_used` may
@@ -206,6 +253,7 @@ class Engine:
         """
         specs = self.tools.specs() or None
         self.turns_run += 1
+        self.reserve_used = False  # this run's verdict, until the budget says otherwise
         shown: list[Message] = []  # image turns injected this run, evicted before returning
         # The eviction must happen however the loop ends — including the reserve/error
         # path — or a viewed image's base64 lingers in the (mutated-in-place) transcript
@@ -249,6 +297,7 @@ class Engine:
             # so nothing downstream looks wrong — which is exactly why the cap event has to be
             # findable by a severity filter rather than buried in the INFO stream.
             _log.warning("wake used %d/%d steps + reserve summary", self.max_steps, self.max_steps)
+            self.reserve_used = True
             return self._reserve_summary(messages)
         finally:
             _evict_images(shown)
@@ -340,8 +389,14 @@ class Engine:
         *harness's*, made only after step N completed with the model still emitting tool calls
         (the old `EngineError` condition, issue #243). ``tools=None`` withholds the harness's
         **function** tools, and the nudge asks the model to wrap up in plain text — what got done,
-        what remains, what the next turn should do. Its reply becomes the message posted to the
-        timeline, so a cap event produces a transparent research artifact instead of a canned shrug.
+        what remains, what the next turn should do.
+
+        **The report is unspoken** (issue #293). It once became the message posted to the timeline;
+        it is now journaled (`log_unspoken`, ``kind=reserve``) and shown to the model's own next
+        turn, never posted. That is what it was always *for* — it is addressed to the operator and
+        to the next turn ("what remains", "what the next turn should do"), which is not a thing a
+        peer asked to read. A cap event still produces the transparent research artifact; it just
+        stopped being other people's mail.
 
         Withholding is *not* uniform, and this method does not pretend it is: ``tools=None`` does
         not stop a server-side built-in (``web_search``, code execution) an adapter offers from
@@ -443,10 +498,11 @@ def _step_note(step: int, max_steps: int, now: datetime) -> str:
     if remaining <= _ESCALATION_THRESHOLD:
         body = (
             f"Step {step} of {max_steps}. Steps are running low. Prioritize the most important "
-            "remaining actions, summarize progress cleanly, and if work remains, schedule a "
+            "remaining actions — including anything you still mean to say on a timeline, which "
+            "takes a tool call — summarize progress cleanly, and if work remains, schedule a "
             f"follow-up task before you run out. Step {max_steps} is your final action step — "
-            "end it with a text reply to finish cleanly. Never ignore the step counter; treat "
-            "it as a hard constraint."
+            "end it with plain text to finish cleanly. Never ignore the step counter; treat it "
+            "as a hard constraint."
         )
     else:
         body = f"Step {step} of {max_steps}."
@@ -474,7 +530,7 @@ def _server_builtin_guidance(name: str) -> str:
     """The targeted message for a server-side built-in mistakenly called as a function (#245)."""
     return (
         f"{name} runs server-side — you don't call it as a function. State what you want to find "
-        "in your reply text and the search runs automatically. Do not retry this function call."
+        "in your text and the search runs automatically. Do not retry this function call."
     )
 
 

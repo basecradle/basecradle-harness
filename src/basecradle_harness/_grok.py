@@ -144,6 +144,7 @@ class _GrokMediaTool(PlatformTool):
     ) -> str:
         """Upload the produced bytes as an Asset and report it for the model to read."""
         asset = _upload(self.context.client, timeline, data, name, description)
+        self.acted("asset", asset.content.uuid)  # media on a timeline is a visible act (#293)
         return f"{verb} {name!r} ({len(data)} bytes). {_describe(asset)}"
 
     def _source_file(self, uuid: str) -> Any:

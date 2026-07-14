@@ -235,6 +235,7 @@ class _ImageTool(PlatformTool):
         so each tool's report reads naturally while the upload-and-describe lives once.
         """
         asset = _upload(self.context.client, timeline, image_bytes, name, description)
+        self.acted("asset", asset.content.uuid)  # an image on a timeline is a visible act (#293)
         return f"{verb} {name!r} ({len(image_bytes)} bytes). {_describe(asset)}"
 
 

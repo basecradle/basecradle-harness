@@ -276,6 +276,7 @@ class AssetsTool(PlatformTool):
         asset = _upload(
             self.context.client, timeline, content.encode("utf-8"), filename, description
         )
+        self.acted("asset", asset.content.uuid)  # a file on a timeline is a visible act (#293)
         return f"Uploaded {filename!r} ({asset.content.file.byte_size} bytes). {_describe(asset)}"
 
 
