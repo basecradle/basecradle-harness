@@ -85,7 +85,7 @@ from uuid import uuid4
 import httpx
 from basecradle import BaseCradle, BaseCradleError
 
-from basecradle_harness._assets import _describe, _is_image, image_input
+from basecradle_harness._assets import _describe, _is_image, image_input, model_sees_images
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
@@ -1563,9 +1563,21 @@ class WakeAgent:
         its type and points at the tools, so the seam is graceful, never an error. Audio/
         video perception *depth* is out of scope here (it rides the perception done-bar
         thread); this handles their seam by acknowledging the file rather than choking on it.
+
+        **A model with no vision input degrades the same way, but on purpose** (issue #228). A
+        text-only model (e.g. ``z-ai/glm-5.2``) cannot take an image, so blind-sending one either
+        has the endpoint 404 the wake or — worse, and what actually happened before this — the image
+        is silently dropped on the wire and the model reads a *"Looking at it now"* caption for a
+        picture it never received. So the vision gate runs first: no vision → the clean
+        `_incoming_asset_text` description and a **loud** degrade log line (`_log_image_degrade`),
+        never an image and never the misleading caption. The gate fails open (`model_sees_images`),
+        so a vision-capable agent, or one whose capability can't be read, is unaffected.
         """
         file = asset.content.file
         if _is_image(file.content_type):
+            if not model_sees_images(self.harness.provider):
+                self._log_image_degrade(asset)
+                return _incoming_asset_text(asset), []  # no vision: the description, said plainly
             try:
                 shown = image_input(file)
             except httpx.HTTPError:
@@ -1578,6 +1590,29 @@ class WakeAgent:
                 return f"{intro} Looking at it now.", [shown]
         # Non-image, unviewable/oversized image, or a failed fetch: describe, don't show.
         return _incoming_asset_text(asset), []
+
+    def _log_image_degrade(self, asset: object) -> None:
+        """The loud, greppable record that a posted image was swapped for its text description (#228).
+
+        A silent degrade is a defect (issue #293's visibility law) — an agent that can't see an image
+        should say so on the record, so this is a WARNING (it stands out under a severity filter in
+        the box's Live Tail) naming *which* asset and *which* model. The agent identifier is **not**
+        hand-prefixed here: the router's wake-runner stamps it into journald
+        (``SYSLOG_IDENTIFIER=basecradle-wake-<agent>``) and the shipping layer renders it, so every
+        line already carries ``[<agent>]`` in the tail — duplicating it in the message is exactly what
+        `_observability` forbids. This line's job is the *what*.
+        """
+        _, model = describe_provider(self.harness.provider)
+        _log.warning(
+            "image degraded to text %s",
+            kv(
+                timeline=self.timeline_uuid,
+                asset=asset.content.uuid,
+                filename=asset.content.file.filename,
+                model=model,
+                reason="model has no vision input",
+            ),
+        )
 
     # --- webhook events ------------------------------------------------------
 

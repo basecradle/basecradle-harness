@@ -40,9 +40,23 @@ A third belongs to prompt caching (issue #277):
   pays full freight on every token of every wake, forever. That asymmetry is why this question must
   be answered *before* the first agent on a new provider is provisioned, not after its first bill.
 
+A fourth belongs to perception (issue #228):
+
+- **`supports_vision() -> bool | None`** — whether the configured model accepts image input. The
+  asset-wake reads it before showing a peer's posted image to the model: ``True`` shows the image
+  as before, ``False`` swaps it for its text description (a text-only model would otherwise be shown
+  pixels it silently drops or an endpoint rejects), and ``None`` means *unknown*. Only OpenRouter
+  implements it today, from the model's own ``architecture.input_modalities``; the OpenAI and xAI
+  adapters answer nothing (every model they run is vision-capable, and per-model modality is not
+  cheaply readable there). The gate **fails open** — absent, ``None``, or a raise all read as "show
+  the image" — so a missing capability or a metadata hiccup never withholds an image from a
+  vision-capable agent; only a *definite* ``False`` degrades. A text-only model on an OpenAI/xAI
+  surface is thus the future gap that owns implementing this for its adapter, the same way an
+  explicit-cache vendor owns `cache_mode`.
+
 An adapter that implements none of them still works: the budget falls back to a conservative floor,
-with no usage to read it never triggers compaction, and nothing is placed on the wire. A capability
-is a question, not a contract.
+with no usage to read it never triggers compaction, nothing is placed on the wire, and every image
+is shown. A capability is a question, not a contract.
 """
 
 from __future__ import annotations

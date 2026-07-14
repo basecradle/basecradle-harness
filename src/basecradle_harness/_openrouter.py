@@ -280,6 +280,11 @@ class OpenRouterProvider:
         #: matters most here: GLM publishes no tokenizer, so a client-side count could not even be
         #: honest. ``None`` until the first call answers.
         self.last_tokens_in: int | None = None
+        #: Memoized answer to `supports_vision` (issue #228): a model's vision capability is a
+        #: property of the model, not the turn, so it is read from OpenRouter at most once. ``None``
+        #: means *not yet known* **or** last read was inconclusive — either way the next call retries,
+        #: so a one-time metadata hiccup never permanently disables the gate in a long-lived process.
+        self._sees_images: bool | None = None
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._default_params = default_params
         # Server-tool objects are config-time constant (they don't vary per turn), so build them
@@ -401,6 +406,50 @@ class OpenRouterProvider:
             if ceiling is not None:
                 best = max(best, ceiling)
         return best or None
+
+    def supports_vision(self) -> bool | None:
+        """Whether this model accepts image input — read from OpenRouter's own model metadata (#228).
+
+        The asset-wake reads this before showing a peer's posted image to the model: a text-only
+        model (e.g. ``z-ai/glm-5.2``, ``input_modalities: ["text"]``) has the image swapped for its
+        text description instead of being shipped pixels its endpoint would 404 on (*"No endpoints
+        found that support image input"*). The answer is authoritative and structured — the same
+        ``architecture.input_modalities`` field OpenRouter serves for every model — never a heuristic
+        on an error body.
+
+        ``None`` is *unknown* (a network/API failure, an unparseable response, or a model id without
+        the ``author/slug`` shape the models API needs), and the gate fails open on it — a metadata
+        hiccup shows the image rather than withholding it. Memoized once known, so a quiet or a
+        vision-capable agent pays for this at most once per process; an inconclusive read leaves the
+        memo ``None`` and simply retries next time.
+        """
+        if self._sees_images is None:
+            self._sees_images = self._read_vision()
+        return self._sees_images
+
+    def _read_vision(self) -> bool | None:
+        """One read of the model's ``input_modalities`` from OpenRouter, or ``None`` on any failure.
+
+        The routing ``:variant`` suffix is stripped exactly as `context_limit` does — the models API
+        keys on the bare ``author/slug`` and would 404 on ``z-ai/glm-5.2:free``, silently reading a
+        real model as unknown.
+        """
+        author, _, slug = self.model.partition("/")
+        slug = slug.partition(":")[0]
+        if not author or not slug:
+            return None
+        try:
+            response = self._client.models.get(author=author, slug=slug)
+        except Exception as exc:  # noqa: BLE001 - a metadata read must never break a wake
+            _log.warning(
+                "Could not read %s's vision capability from OpenRouter: %s", self.model, exc
+            )
+            return None
+        architecture = getattr(getattr(response, "data", None), "architecture", None)
+        modalities = getattr(architecture, "input_modalities", None)
+        if not modalities:
+            return None  # the field was absent or empty — treat as unknown, not "no vision"
+        return "image" in {str(m).lower() for m in modalities}
 
     def _restore_annotations(self, data: dict[str, Any]) -> None:
         """Graft the web-search ``url_citation`` annotations back onto the SDK's model_dump.

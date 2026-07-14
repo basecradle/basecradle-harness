@@ -724,6 +724,119 @@ def test_an_unreachable_endpoints_api_degrades_to_no_answer(router):
     assert _provider(retries_disabled=True).context_limit() is None
 
 
+# === supports_vision — the per-model vision gate the asset-wake reads (issue #228) ============
+#
+# OpenRouter serves a model's real ``architecture.input_modalities`` — the same authoritative field
+# that told us ``z-ai/glm-5.2`` is text-only. The adapter reads it (through the real SDK's
+# ``models.get``, path ``/model/{author}/{slug}``) so the wake can swap a posted image for its text
+# description instead of shipping pixels a text-only endpoint 404s on.
+
+MODEL_URL = f"{BASE_URL}/model/z-ai/glm-5.2"
+
+
+def _model_body(input_modalities):
+    """A `models.get` response body the real ``openrouter`` SDK's ``Model`` accepts.
+
+    Only ``architecture.input_modalities`` is under test; the rest are the SDK's required fields,
+    mirrored from a real ``z-ai/glm-5.2`` response so the test drives the actual SDK marshalling
+    (respx patches its transport) rather than a hand-rolled double.
+    """
+    return {
+        "data": {
+            "id": MODEL,
+            "canonical_slug": "z-ai/glm-5.2-20260616",
+            "name": "Z.ai: GLM 5.2",
+            "created": 1781631930,
+            "description": "GLM 5.2.",
+            "context_length": 1048576,
+            "architecture": {
+                "modality": "text->text",
+                "input_modalities": list(input_modalities),
+                "output_modalities": ["text"],
+                "tokenizer": "Other",
+                "instruct_type": None,
+            },
+            "pricing": {"prompt": "0.00000091", "completion": "0.00000286"},
+            "top_provider": {
+                "context_length": 1024000,
+                "max_completion_tokens": 128000,
+                "is_moderated": False,
+            },
+            "per_request_limits": None,
+            "supported_parameters": ["tools", "reasoning"],
+            "default_parameters": {"temperature": 1, "top_p": 0.95},
+            "supported_voices": None,
+            "links": {"details": "/api/v1/models/z-ai/glm-5.2-20260616/endpoints"},
+        }
+    }
+
+
+def test_supports_vision_is_true_for_a_model_that_takes_image_input(router):
+    router.get(MODEL_URL).mock(
+        return_value=httpx.Response(200, json=_model_body(["image", "text", "file"]))
+    )
+    assert _provider().supports_vision() is True
+
+
+def test_supports_vision_is_false_for_a_text_only_model(router):
+    """The reachable case: ``z-ai/glm-5.2`` is genuinely ``input_modalities: ["text"]``."""
+    router.get(MODEL_URL).mock(return_value=httpx.Response(200, json=_model_body(["text"])))
+    assert _provider().supports_vision() is False
+
+
+def test_supports_vision_is_none_when_the_metadata_is_unreadable(router):
+    """A metadata read never breaks a wake — an unreachable models API is *unknown*, not "no vision".
+
+    ``None`` is what makes the wake's gate fail *open* (`model_sees_images`), so a hiccup shows the
+    image rather than silently withholding it from a vision-capable agent.
+    """
+    router.get(MODEL_URL).mock(side_effect=httpx.ConnectError("no route to host"))
+    assert _provider(retries_disabled=True).supports_vision() is None
+
+
+def test_supports_vision_is_memoized_after_a_definite_answer(router):
+    """A model's modality doesn't change mid-process, so a known answer is read from OpenRouter once."""
+    route = router.get(MODEL_URL).mock(return_value=httpx.Response(200, json=_model_body(["text"])))
+    provider = _provider()
+    assert provider.supports_vision() is False
+    assert provider.supports_vision() is False
+    assert route.call_count == 1  # the second call is served from the memo, not a second HTTP read
+
+
+def test_supports_vision_retries_after_an_inconclusive_read(router):
+    """An inconclusive read leaves the memo ``None`` and retries — a one-time hiccup never sticks.
+
+    This is why the memo is keyed on ``None`` rather than a sentinel: a transient failure must not
+    permanently disable the gate in the router's long-lived per-agent process.
+    """
+    route = router.get(MODEL_URL).mock(
+        side_effect=[
+            httpx.Response(503, json={"error": {"message": "upstream", "code": 503}}),
+            httpx.Response(200, json=_model_body(["text"])),
+        ]
+    )
+    provider = _provider(retries_disabled=True)
+    assert provider.supports_vision() is None  # first read failed → unknown
+    assert provider.supports_vision() is False  # retried, and this one answered
+    assert route.call_count == 2
+
+
+def test_supports_vision_strips_the_routing_variant(router):
+    """``z-ai/glm-5.2:free`` selects routing, not a different model — the models API keys on the bare
+    slug and would 404 on the suffix, silently reading a real model as unknown (as `context_limit`)."""
+    router.get(MODEL_URL).mock(return_value=httpx.Response(200, json=_model_body(["text"])))
+    client = OpenRouter(api_key=FAKE_KEY, server_url=BASE_URL)
+    provider = OpenRouterProvider("z-ai/glm-5.2:free", client=client, base_url=BASE_URL)
+    assert provider.supports_vision() is False  # the ``:free`` suffix came off before the lookup
+
+
+def test_supports_vision_is_none_for_a_malformed_model_id():
+    """A model id without the ``author/slug`` shape can't be looked up — unknown, and no HTTP call."""
+    client = OpenRouter(api_key=FAKE_KEY, server_url=BASE_URL)
+    provider = OpenRouterProvider("just-a-name", client=client, base_url=BASE_URL)
+    assert provider.supports_vision() is None
+
+
 def test_an_over_length_400_maps_to_the_context_length_error(router):
     router.post(CHAT_URL).mock(
         return_value=httpx.Response(

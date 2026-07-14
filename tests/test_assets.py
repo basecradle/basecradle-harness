@@ -11,6 +11,7 @@ constitution asks (mock at the transport level, never the live API).
 """
 
 import base64
+import logging
 
 import httpx
 import pytest
@@ -18,6 +19,7 @@ import respx
 from basecradle import BaseCradle
 
 from basecradle_harness import AssetsTool, PlatformContext, PlatformError, ToolResult
+from basecradle_harness._assets import model_sees_images
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -485,6 +487,46 @@ def test_unknown_action_is_reported(tool):
 def test_an_unbound_tool_raises_platform_error():
     with pytest.raises(PlatformError):
         AssetsTool().run(action="list")
+
+
+# --- model_sees_images: the fail-open vision gate (issue #228) ----------------
+
+
+class _Provider:
+    """A provider stub whose ``supports_vision`` answer is whatever the test sets."""
+
+    def __init__(self, answer):
+        self._answer = answer
+
+    def supports_vision(self):
+        if isinstance(self._answer, Exception):
+            raise self._answer
+        return self._answer
+
+
+def test_a_definite_no_vision_answer_withholds_the_image():
+    assert model_sees_images(_Provider(False)) is False
+
+
+def test_a_yes_vision_answer_shows_the_image():
+    assert model_sees_images(_Provider(True)) is True
+
+
+def test_an_unknown_vision_answer_fails_open():
+    """``None`` is *unknown*, not "no vision" — the gate shows the image rather than withhold it."""
+    assert model_sees_images(_Provider(None)) is True
+
+
+def test_a_provider_without_the_capability_shows_the_image():
+    """Most adapters answer nothing (OpenAI, xAI): an absent capability is not a refusal."""
+    assert model_sees_images(object()) is True
+
+
+def test_a_raising_capability_fails_open_and_is_logged(caplog):
+    """A metadata read must never break a wake: a raising capability degrades to "show", loudly."""
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert model_sees_images(_Provider(RuntimeError("boom"))) is True
+    assert any("vision capability" in r.getMessage() for r in caplog.records)
 
 
 # --- shared wire helper ------------------------------------------------------

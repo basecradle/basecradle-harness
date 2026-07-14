@@ -1268,6 +1268,68 @@ def test_an_image_whose_download_fails_degrades_gracefully(platform, tmp_path):
     assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
 
 
+class _TextOnlyProvider(CountingProvider):
+    """A `CountingProvider` that answers the vision capability with a definite *no* (issue #228)."""
+
+    def supports_vision(self):
+        return False
+
+
+def test_a_posted_image_degrades_to_text_for_a_non_vision_model(platform, tmp_path, caplog):
+    """A model with no vision input is never blind-sent pixels: the image is swapped for its text
+    description, so a text-only model reads *what* was shared rather than a "Looking at it now"
+    caption for a picture it silently drops. This is the reachable @glm-5.2 case (issue #228)."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, provider = build_wake(tmp_path, provider=_TextOnlyProvider())
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        posted = agent.wake()
+
+    assert len(posted) == 1  # acted on, gracefully
+    assert provider.last_images == []  # NOT shown the pixels the model can't take
+    assert "diagram.png" in provider.prompts[0]  # the file is described instead
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
+
+
+def test_the_image_degrade_is_logged_loudly(platform, tmp_path, caplog):
+    """A silent degrade is a defect (issue #293): the swap leaves a WARNING naming the asset and the
+    model, greppable in the box's Live Tail (the agent identifier rides journald, not the message)."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, _ = build_wake(tmp_path, provider=_TextOnlyProvider())
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        agent.wake()
+
+    line = _line(caplog, "image degraded to text")
+    assert "diagram.png" in line
+    assert "model has no vision input" in line
+    assert TIMELINE_UUID in line
+
+
+def test_a_vision_capable_model_is_still_shown_the_image(platform, tmp_path, caplog):
+    """The gate fails toward perception: a model that answers vision=True keeps seeing the picture,
+    and no degrade line is logged — the change is confined to the definite no-vision case."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+
+    class _Sighted(CountingProvider):
+        def supports_vision(self):
+            return True
+
+    agent, provider = build_wake(tmp_path, provider=_Sighted())
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        agent.wake()
+
+    assert len(provider.last_images) == 1  # shown, exactly as before the gate existed
+    assert not [m for m in _lines(caplog) if m.startswith("image degraded to text")]
+
+
 def test_own_posted_asset_is_not_acted_on(platform, tmp_path):
     """THE SAFETY PROPERTY: the agent never acts on its own posted asset (e.g. an image
     it generated), so a generated image cannot wake it to generate another — no loop.
