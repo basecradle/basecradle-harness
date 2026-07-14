@@ -1312,6 +1312,8 @@ founder-approved persona-level block the capital deployed to `@glm-5.2` on 2026-
   those in by hand. `@glm-5.2` already carries the persona-level block (expected, harmless
   overlap); his persona copy can be slimmed once the floor lands in his brief.
 
+## [0.47.0] - 2026-07-04
+
 **Add OpenRouter web search as an opt-in server-tool built-in (issue #237).** Gives `@glm-5.2` —
 and every native-SDK OpenRouter agent — the server-side web search OpenRouter now offers as a
 `openrouter:web_search` server tool: the OpenRouter counterpart of the vendor-native web-search
@@ -1562,6 +1564,8 @@ before a nudge to `medium` succeeded). The ceiling backs both `generate_image` a
 - **`_ImageTool.DEFAULT_TIMEOUT` raised `120.0` → `300.0`** (`_images.py`). Purely a ceiling
   bump — no behavior change otherwise. 300s clears the measured 133s worst case with headroom
   for larger sizes; a normal `quality: high` edit/generation now completes within the timeout.
+
+## [0.43.0] - 2026-07-02
 
 **xAI can now edit images, not just generate them — the new `grok_edit_image` tool (issue
 #176).** The premise this issue was filed under went stale: xAI shipped an image-edit endpoint
