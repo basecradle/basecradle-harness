@@ -17,9 +17,10 @@ counting answered calls while the turn runs (`completed`) and counting positions
 
 from __future__ import annotations
 
+import json
 import uuid as uuidlib
 
-from basecradle_harness import Message, ToolCall
+from basecradle_harness import Harness, Message, Session, ToolCall
 from basecradle_harness._idempotency import (
     ASSET,
     MESSAGE,
@@ -34,6 +35,18 @@ from basecradle_harness._idempotency import (
 )
 
 INTERRUPTED = "[Interrupted: ...]"
+
+
+def _provider():
+    """A provider for the tests that only exercise persistence — the model is never called."""
+
+    class NeverCalled:
+        provider, model = "openai", "gpt-4o"
+
+        def chat(self, messages, tools=None):
+            raise AssertionError("these tests read the transcript; they never call the model")
+
+    return NeverCalled()
 
 
 def ordinal_of(work, call_id):
@@ -161,6 +174,58 @@ def test_a_create_call_that_never_reached_the_tool_still_consumes_its_ordinal():
 
     assert completed(work, MESSAGE) + 1 == 2  # the live mint for c2
     assert ordinal_of(work, "c2") == (MESSAGE, 2)  # and the replay agrees
+
+
+def test_the_ordinal_survives_the_transcript_being_capped(tmp_path):
+    """**Capping a call's arguments must never change what `create_kind` reads off it** (issue #301).
+
+    The two halves of the ordinal read two different copies of the same turn: the live mint counts off
+    the in-memory transcript, where arguments are whole, and the recovery counts off the one **reloaded
+    from disk**, where they are capped. `create_kind` answers from `arguments["action"]` — so a cap that
+    could elide an `action` would make a create *vanish* from the recovery's count, the next key would
+    be minted one short of the one the platform has already seen, and a key the platform has never seen
+    is a message posted twice.
+
+    Nothing in the cap can reach an `action`: it is a handful of characters, far below the size at which
+    eliding a value would even shrink it, and the stub for a call too big to bound any other way
+    re-states it verbatim. This pins that, through a real save and a real load, at sizes that trigger
+    every branch of the cap.
+    """
+    big = "x" * 200_000
+    session = Session("timeline:x", Harness(_provider()).engine, path=tmp_path / "t.json")
+    session.history.append(Message.user("do all of it"))
+    calls = [
+        ToolCall(id="c1", name="messages", arguments={"action": "create", "body": big}),
+        ToolCall(id="c2", name="assets", arguments={"action": "create", "content": big}),
+        # The stub branch: hundreds of medium fields, none of them individually elidable.
+        ToolCall(
+            id="c3",
+            name="messages",
+            arguments={"action": "create", **{f"f{i}": "y" * 100 for i in range(200)}},
+        ),
+    ]
+    for call in calls:
+        session.history.append(Message.assistant(tool_calls=[call]))
+        session.history.append(Message.tool(tool_call_id=call.id, content="done"))
+    session._save()
+
+    live = session.history[1:]
+    reloaded = Session("timeline:x", Harness(_provider()).engine, path=tmp_path / "t.json").history[
+        1:
+    ]
+
+    # The capped transcript is genuinely smaller — this is not a test that accidentally caps nothing.
+    assert len(json.dumps([m.to_dict() for m in reloaded])) < len(big)
+
+    # …and every create is still a create, in the same order, with the same ordinal.
+    assert [(c.kind, c.ordinal) for c in creates(reloaded)] == [
+        (c.kind, c.ordinal) for c in creates(live)
+    ]
+    assert [(c.kind, c.ordinal) for c in creates(live)] == [
+        (MESSAGE, 1),
+        (ASSET, 1),
+        (MESSAGE, 2),
+    ]
 
 
 def test_kinds_are_counted_separately():

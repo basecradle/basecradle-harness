@@ -22,10 +22,10 @@ restart, the durable half of cross-session answerability. With no `path`, a
 session is in-memory only (the default; transcripts of *live* sessions are still
 readable from the one running instance via `Harness.transcript`).
 
-**What persists is bounded, on purpose (issue #275).** The whole transcript is
+**What persists is bounded, on purpose (issues #275, #301).** The whole transcript is
 replayed to the model on every turn, so anything written into it is paid for again
-on every future turn, forever. Two disciplines keep that bill honest, and both live
-here:
+on every future turn, forever. Four disciplines keep that bill honest, and every one
+of them passes through this file:
 
 - **Ephemeral context never persists.** A caller may hand `send` a `brief` — standing
   context recomposed fresh for *this* call (the wake's operating brief: current time,
@@ -41,6 +41,15 @@ here:
   is *enforced* here but **defined in `_context`**, because the compaction threshold's
   safety proof is computed from it: it is a load-bearing input to that arithmetic, not a
   neighbor of it, and the two must never drift apart in separate files.
+- **A tool call's arguments are capped too** (`TOOL_ARGS_CAP`, issue #301) — the half of a call
+  nobody bounded. Capping the *result* and writing the *arguments* whole left an `assets create`
+  carrying a 200 KB document in the transcript forever, re-sent to the model on every wake for the
+  life of the timeline. **With one exception, and it is the whole design:** the recovery re-issues
+  an interrupted platform create *from exactly these arguments* (`_wake._reissue_interrupted_creates`),
+  so eliding them naively would re-post the peer's message with its body cut out. So an **interrupted
+  create keeps its arguments whole** — its healed "outcome unknown" result is the flag — and the cap
+  falls on it the moment the resume replaces that marker with a real result. Everything the recovery
+  will never replay is bounded from the first save.
 - **The conversation itself is bounded.** Capping each turn only slows the growth; it does not
   stop it, and a long-lived agent would still walk into its model's context ceiling — where the
   provider 400s deterministically and every later wake rebuilds the same doomed request. So a
@@ -63,13 +72,15 @@ import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from basecradle_harness._caching import anchor_cacheable_prefix, cache_mode
-from basecradle_harness._context import TOOL_RESULT_CAP, Compactor
+from basecradle_harness._context import TOOL_ARGS_CAP, TOOL_RESULT_CAP, Compactor
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
-from basecradle_harness._messages import ImageContent, Message
+from basecradle_harness._idempotency import create_kind
+from basecradle_harness._messages import ImageContent, Message, ToolCall
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -92,6 +103,27 @@ INTERRUPTED = (
 #: into something longer than it started.
 _ELISION_HEAD = 2048
 _ELISION_TAIL = 512
+
+#: How a cut argument is split: the head takes whatever its share of the cap allows (the opening of
+#: the document it was posting, the first lines of the body it wrote) and the tail takes a fifth of it
+#: — capped here, because a tail is a coda, not half the excerpt — so a value whose point lands at the
+#: end is not lost. Unlike a tool result's fixed split, an argument's is *proportional*: how much room
+#: it gets depends on how many siblings it is sharing the call with (`_fit`).
+_ARG_ELISION_TAIL = 128
+
+#: Below this much room, an "excerpt" is a few words torn out of context — worse than the marker alone,
+#: which at least reports honestly that the value is gone.
+_ARG_MIN_EXCERPT = 64
+
+#: The longest `action` the stub will carry back. No `CREATE_CALLS` action is longer than a word, so a
+#: longer one cannot be a create and dropping it leaves `create_kind` answering ``None`` either way —
+#: which is the property that keeps the idempotency ordinal identical across a crash.
+_ARG_ACTION_MAX = 128
+
+#: How many times the cap may halve its budget and re-measure before giving up on the fair share and
+#: falling back to the stub. Two would do for every shape we can construct; four is slack, and the loop
+#: is bounded either way — see `_cap_arguments` for why the fit has to be *measured* at all.
+_ARG_FIT_ATTEMPTS = 4
 
 
 class Session:
@@ -707,18 +739,88 @@ def _payload(messages: list[Message]) -> str:
     take things out of it.
 
     So the two jobs separate: `history` stays whole for as long as the turn needs it, and *this*
-    decides what reaches the disk. Both disciplines are unchanged (Context Discipline: a viewed
+    decides what reaches the disk. Three disciplines, all of them here (Context Discipline: a viewed
     image is seen once and never re-billed; a tool result persists head-and-tail around an elision
-    marker) — they just no longer have to be paid for by mutating the turn in flight.
+    marker; a tool call's arguments are bounded the same way) — none of them has to be paid for by
+    mutating the turn in flight.
+
+    **Never mutate `message.tool_calls`.** `to_dict` hands back the *live* `arguments` dict by
+    reference, so a cap written in place would reach into the call the engine is about to dispatch —
+    and, worse, into the arguments a resume replays a create from. The capped copy goes into the
+    payload and nowhere else.
     """
     payload: list[dict] = []
-    for message in messages:
+    for index, message in enumerate(messages):
         data = message.to_dict()
         data.pop("images", None)  # a viewed image is seen once; base64 never lands in a transcript
         if message.role == "tool" and message.content:
             data["content"] = _elide(message.content)
+        if message.tool_calls:
+            data["tool_calls"] = _calls_payload(message.tool_calls, _results(messages, index))
         payload.append(data)
     return json.dumps(payload, indent=2)
+
+
+def _calls_payload(calls: list[ToolCall], results: dict[str, Message]) -> list[dict]:
+    """The `tool_calls` a turn persists: each call's arguments bounded, unless it is still replayable."""
+    return [
+        {
+            "id": call.id,
+            "name": call.name,
+            "arguments": call.arguments
+            if _replayable(call, results.get(call.id))
+            else _cap_arguments(call.arguments),
+        }
+        for call in calls
+    ]
+
+
+def _results(messages: list[Message], assistant: int) -> dict[str, Message]:
+    """The results answering `messages[assistant]`'s calls — **from its own run, never globally.**
+
+    A `tool_call_id` is the provider's own string and nothing normalizes it: a model that numbers its
+    calls per response (`call_0`, `call_1` — what an OpenRouter-fronted model emits, and the fleet's
+    primary agent is one) reuses the same ids on every turn. A global lookup would hand this turn's
+    call the *previous* turn's result — declaring an interrupted create answered, capping the
+    arguments the recovery is about to replay it from, and posting the peer a message with its body
+    cut out. It is the same trap `heal_interrupted_calls` and `_idempotency.creates` each avoid, in
+    the same way, for the same reason.
+    """
+    end = _run_end(messages, assistant)
+    return {
+        result.tool_call_id: result
+        for result in messages[assistant + 1 : end]
+        if result.role == "tool" and result.tool_call_id is not None
+    }
+
+
+def _replayable(call: ToolCall, result: Message | None) -> bool:
+    """Might the recovery still re-issue this call **from these very arguments**? Then keep them whole.
+
+    The exception that the whole argument cap turns on (issue #301). `_wake._reissue_interrupted_creates`
+    re-runs an interrupted **platform create** under the deterministic key its dead wake minted — and
+    it re-runs it from the arguments *on disk*. Elide those and the recovery posts the peer's message
+    with its body cut out; if the original POST never landed, the elided body is what the timeline
+    keeps. That is worse than the cost it saves, which is exactly why #297 left the arguments alone.
+
+    Two states qualify, and no others:
+
+    - **No result yet** — the call is in flight (this is the pre-dispatch save, the one the delivery
+      guarantee rests on). A wake killed here leaves the call unanswered, and the next load heals it
+      into the case below.
+    - **The healed "outcome unknown" marker** — a wake *was* killed here, and the resume has not
+      re-issued it yet. The marker is the flag, and it is a *durable* one: the arguments stay whole
+      across as many failed wakes as it takes, and the cap falls the moment the re-issue writes a real
+      result over it.
+
+    **Only creates.** Every other interrupted call is surfaced to the model and never re-run — no
+    idempotency key can un-spend money at fal.ai — so its arguments are dead weight the instant it is
+    interrupted, and are bounded from the first save. That is what keeps the exception from becoming
+    the loophole: what persists whole is exactly what is load-bearing, and nothing else.
+    """
+    if create_kind(call) is None:
+        return False
+    return result is None or result.content == INTERRUPTED
 
 
 def turn_work(history: list[Message], turn: Message) -> list[Message]:
@@ -865,6 +967,143 @@ def _elide(text: str) -> str:
         f"result was shown when the tool ran. Re-run it if you need it in full. ...]\n\n"
     )
     return text[:_ELISION_HEAD] + marker + text[-_ELISION_TAIL:]
+
+
+def _cap_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+    """`arguments`, bounded to `TOOL_ARGS_CAP` — a **new dict**, never an edit of the live one.
+
+    **Capping may never change what `create_kind` reads off a call**, and that is a correctness
+    requirement, not a nicety: the idempotency ordinal is "the nth create of this kind in this turn",
+    counted once by the live mint over the in-memory transcript and again by the recovery over the
+    *reloaded* one (`_idempotency.creates`). The two counts must be identical. If capping could hide an
+    `action`, a create would vanish from the recovery's count, the next key would be minted one short of
+    the one the platform has already seen — and a key the platform has never seen is a message posted
+    twice. Two things make it safe: an `action` is a handful of characters, so it always fits inside its
+    share below and is never cut; and the stub re-states it verbatim. An `action` long enough to be
+    dropped is one no `CREATE_CALLS` entry could match anyway, so `create_kind` answers ``None`` before
+    the cap and ``None`` after it.
+
+    **The fit is measured, never computed**, and that is why this loop exists rather than one pass of
+    arithmetic: how many characters a string costs once serialized depends on the string (a quote or a
+    backslash escapes to two), so a budget that is exactly right on prose can be exceeded by the same
+    length of JSON or source code. Halving and re-measuring converges in one or two passes and cannot
+    lie about the result; the alternative — assuming a worst-case escape factor — would cut every
+    ordinary argument to a fraction of the budget it is actually entitled to.
+    """
+    if _json_size(arguments) <= TOOL_ARGS_CAP:
+        return arguments
+    budget = TOOL_ARGS_CAP
+    for _ in range(_ARG_FIT_ATTEMPTS):
+        capped = _fit(arguments, budget)
+        if _json_size(capped) <= TOOL_ARGS_CAP:
+            return capped
+        budget //= 2
+    # Not the size of any one argument but the *number* of them — hundreds of fields, or names longer
+    # than their values, so there is no share left to give anybody. Rare to the point of pathological,
+    # but "rare" is not a bound, and an unbounded fallback would be the very defect this exists to
+    # close, hiding behind a shape nobody expected.
+    return _arguments_stub(arguments)
+
+
+def _fit(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
+    """Every argument gets a **fair share** of `budget`, so the small ones survive whole.
+
+    Water-filling, and it is the whole reason a capped call is still worth reading. Take each argument
+    in *ascending* size and hand it an equal share of what is left: one that fits under its share is
+    kept byte for byte and rolls its surplus over to the ones above it, so a `messages create` with a
+    200 KB body still persists its `action`, its `timeline` and its `subject` in full, and spends the
+    entire remaining budget on an excerpt of the body.
+
+    The obvious alternative — elide the biggest arguments until the call fits — reads the same and is
+    not: an excerpt costs a marker, so an argument can be *too small to be worth eliding and still too
+    big to keep*, and a call made of several such arguments (a `tasks create` with three 700-character
+    fields) can never be brought under the cap at all. It falls through to the stub, and **every**
+    argument is lost to save the few hundred characters that were over. Water-filling has no such
+    cliff: it always makes progress, and it takes the space it needs from where the space actually is.
+    """
+    room = budget - _json_size(dict.fromkeys(arguments, ""))  # what the keys themselves cost
+    capped: dict[str, Any] = {}
+    ascending = sorted(arguments, key=lambda name: _json_size(arguments[name]))
+    for spent, name in enumerate(ascending):
+        share = room // (len(ascending) - spent)
+        value = arguments[name]
+        capped[name] = value if _json_size(value) <= share else _elide_argument(value, share)
+        room -= _json_size(capped[name])
+    return {
+        name: capped[name] for name in arguments
+    }  # the model reads them in the order it wrote them
+
+
+def _elide_argument(value: Any, budget: int) -> Any:
+    """One argument, cut to `budget` — or left alone, if cutting it would not make it smaller.
+
+    A string keeps a head and a tail around a marker naming what was lost, so the model still reads the
+    opening of what it wrote. Anything else (a large list or object) is replaced outright: there is no
+    honest head-and-tail of a structure, and a truncated one would read as complete.
+
+    **The shrink check is a guard, not a flourish.** The marker costs ~120 characters, so "eliding" a
+    200-character value would *grow* it — and a cap that can make a transcript bigger is not a cap.
+    Comparing the two sizes states that in the one place it cannot be forgotten.
+    """
+    size = _json_size(value)
+    if not isinstance(value, str):
+        elided: Any = (
+            f"[... {size} chars elided — this argument was archived out of the transcript; the full "
+            f"value was sent when the call ran. ...]"
+        )
+        return elided if _json_size(elided) < size else value
+
+    marker = (
+        f"\n\n[... elided from {len(value)} chars — this argument is an archived excerpt; the full "
+        f"value was sent when the call ran. ...]\n\n"
+    )
+    room = budget - _json_size(marker)
+    if room < _ARG_MIN_EXCERPT:
+        elided = marker.strip()  # no room for an excerpt worth reading; say so and keep nothing
+    else:
+        tail = min(room // 5, _ARG_ELISION_TAIL)
+        head = room - tail
+        elided = value[:head] + marker + (value[-tail:] if tail else "")
+    return elided if _json_size(elided) < size else value
+
+
+def _arguments_stub(arguments: dict[str, Any]) -> dict[str, Any]:
+    """The backstop for a call too big to bound by cutting its values — the hard end of the bound.
+
+    Keeps `action`, and only `action`, because `create_kind` reads it and the idempotency ordinal must
+    be the same number computed off the live transcript and the reloaded one (see `_cap_arguments`). A
+    long `action` is dropped with the rest: no create the platform keys has one, so `create_kind`
+    answers ``None`` either way and the count still agrees.
+    """
+    stub: dict[str, Any] = {}
+    action = arguments.get("action")
+    if isinstance(action, str) and len(action) <= _ARG_ACTION_MAX:
+        stub["action"] = action
+    stub["[elided]"] = (
+        f"[... the {len(arguments)} arguments of this call ({_json_size(arguments)} chars) were "
+        f"archived out of the transcript; they were sent in full when the call ran. ...]"
+    )
+    return stub
+
+
+def _json_size(value: Any) -> int:
+    """What `value` costs the model — in characters, **the way the model reads them, not the disk**.
+
+    `ensure_ascii=False`, and it is load-bearing rather than cosmetic. The default (`True`) escapes
+    every non-Latin character to a six-character `\\uXXXX`, so measuring with it prices one Japanese
+    character at six and a modest 500-character message body at 3,000 — six times the cap. The cap is a
+    bound on **context**, and context is billed in tokens, which are computed from the decoded string:
+    a character is a character, whatever script it is written in. Measuring the escaped form made the
+    cap bite ~6× harder on every non-Latin script — so a peer answered in Japanese kept nothing but its
+    `action` (issue #301 review), while the same message in English persisted whole. That is not a cost
+    bug; it is an agent that cannot remember what it said because of the language it said it in, on a
+    platform whose whole premise is that its peers are equals. The disk file still stores the escapes;
+    what it costs on disk is not what this bounds.
+
+    `default=str` because a tool call's arguments come off a provider's wire and may carry anything a
+    model emitted; a sizing helper that raised on an exotic value would take the whole save down.
+    """
+    return len(json.dumps(value, ensure_ascii=False, default=str))
 
 
 def _failure_note(exc: BaseException) -> str:
