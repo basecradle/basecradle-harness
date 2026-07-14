@@ -79,7 +79,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 from uuid import uuid4
 
 import httpx
@@ -152,6 +152,11 @@ _MESSAGES = "messages"
 _EVENTS = "webhook_events"
 _TASKS = "tasks"
 _ASSETS = "assets"
+
+#: The kinds whose idempotency record is a `SeenStore` **set** rather than a `MarkStore` cursor.
+#: The distinction is the one thing `_settle` branches on, and it is *only* about how the record
+#: refuses to pass an unsettled item — a cursor must stop dead at it, a set need only omit it.
+_SEEN_KINDS = frozenset({_TASKS})
 
 
 class MarkStore:
@@ -569,6 +574,32 @@ class ClaimStore:
             self._path(timeline, kind, uuid),
             Claim(phase=_ABANDONED, at=time.time(), reason=reason),
         )
+
+    def unsettled(self, timeline: str, *, kind: str) -> list[str]:
+        """The uuids of every item of `kind` on `timeline` whose claim is not yet final.
+
+        The **queue of unfinished work, read from the claims themselves** rather than inferred from
+        a scan of the platform — which is the only way a bootstrap can be sure it is not about to
+        baseline past an orphan it cannot see (issue #289). A bootstrap reads a *bounded* window of
+        the newest items (`context_messages`, 50), so an item a dead wake claimed can be pushed clean
+        out of it by a burst — 60 webhook deliveries land while the agent is down — and a window that
+        cannot see it cannot protect it: the mark would jump to the newest, and a cursor never looks
+        back. The claim knows, so ask the claim.
+
+        **Cheap exactly when it is called.** This walks one directory, and a bootstrap only runs when
+        the kind has *no record at all* — meaning this agent has never settled a single item of it on
+        this timeline, so there are at most a handful of claims to read. (Once the record exists the
+        scan is incremental and this is never needed: the mark itself is the guard.)
+        """
+        folder = self.root / "claims" / kind / quote(timeline, safe="")
+        if not folder.is_dir():
+            return []
+        found = []
+        for path in folder.glob("*.claim"):
+            claim = _read_claim(path)
+            if claim is not None and not claim.settled:
+                found.append(unquote(path.name[: -len(".claim")]))
+        return found
 
     def _write(self, path: Path, claim: Claim) -> None:
         """Overwrite an existing claim record **atomically** — a torn record cannot be read.
@@ -1339,12 +1370,16 @@ class WakeAgent:
             session = self.harness.session(self.source)
             self._brief = None  # compose the brief once this wake, lazily, before the model
             self._brief_composed = False
-            # The message path's per-wake bookkeeping (issue #285). `_ledger` is every message this
-            # wake looked at, in timeline order, with what it decided — `_settle` reads it to move
-            # the mark, and may never move it past an item that is not settled. `_cursor` is the
-            # in-wake read cursor (distinct from the persisted mark, which no longer advances at
-            # claim time).
-            self._ledger: list[tuple[str, str]] = []
+            # The per-wake bookkeeping, **per kind** (issues #285, #289). `_ledger[kind]` is every
+            # item of that kind this wake looked at, in timeline order, with what it decided —
+            # `_settle` reads it to move that kind's record, and may never move it past an item that
+            # is not settled. Keyed by kind because the four records are independent: a message a
+            # concurrent wake still holds must not pin the *asset* mark. `_cursor` is the message
+            # path's in-wake read cursor (distinct from the persisted mark, which no longer advances
+            # at claim time).
+            self._ledger: dict[str, list[tuple[str, str]]] = {
+                kind: [] for kind in (_MESSAGES, _ASSETS, _EVENTS, _TASKS)
+            }
             self._cursor: str | None = None
             # What `_recover` decided about each orphaned message, before this wake called the
             # model at all (issue #297). `_readmit` reads it rather than recomputing: recovery
@@ -1367,6 +1402,10 @@ class WakeAgent:
             posted += self._wake_assets(session, asset_trigger)
             posted += self._wake_events(session, event_trigger)
             posted += self._wake_tasks(session)
+            # Everything this wake could decide, it has decided — so release the recovery evidence
+            # a compaction is holding for items that are no longer in flight (issue #289). Last,
+            # because it reads the claims the four reconciles have just settled.
+            self._forget_settled(session)
             outcome = "ok"
             return posted + self.speech.posts
         finally:
@@ -1506,7 +1545,7 @@ class WakeAgent:
             session,
             assets,
             self._perceive_asset,
-            lambda asset: self.marks.set(self.timeline_uuid, asset.content.uuid, kind=_ASSETS),
+            _incoming_asset_text,
             kind=_ASSETS,
             skip=self._is_own,
             probe=lambda asset: self._probe_nonce(_asset_marker_carrier(asset)),
@@ -1593,11 +1632,21 @@ class WakeAgent:
         wake is incremental. `fetch_one` retrieves the trigger by uuid if a burst pushed it
         past the fetched window, so a named item is never silently dropped.
 
+        **The reply set is widened back over anything a dead wake never settled** (issue #289) —
+        `_extend_over_unfinished`, the same guard the message bootstrap has carried since #285, and
+        it is needed here for the same reason and *only* since #289. The mark now advances at
+        settle rather than at claim, so a wake that dies mid-turn on the very first asset of a
+        timeline leaves **no mark at all** — and this path then runs again, sees no mark, and
+        bootstraps. Acting on `recent[0]` alone would step straight over that orphan if anything
+        newer had landed in the meantime, and the baseline would then bury it forever: the drop
+        this issue exists to remove, sneaking back in through the one path that *jumps* the mark
+        instead of stepping it.
+
         **Known bound — newest-only acts on one item on a *cold* first wake.** This is the
-        first reconcile of this kind *ever* (no mark yet), so "newest only" is intentional:
-        it bounds a fresh agent to a single action instead of replaying a backlog. Two
-        edges fall out of it, both strictly better than the old baseline-silently behavior
-        (which acted on nothing) and both confined to the cold first wake — every wake
+        first reconcile of this kind *ever* (no mark yet, and nothing left unsettled), so "newest
+        only" is intentional: it bounds a fresh agent to a single action instead of replaying a
+        backlog. Two edges fall out of it, both strictly better than the old baseline-silently
+        behavior (which acted on nothing) and both confined to the cold first wake — every wake
         after the mark exists acts on **all** unseen items past it:
         - *Cold-start burst:* if several items of this kind predate the very first wake,
           only the newest is acted on and the rest are marked seen. In the live router flow
@@ -1612,32 +1661,94 @@ class WakeAgent:
         rather than `recent[0]`, accepting the join-time replay that trades against.
         """
         recent = _recent(items_filter, self.context_messages)
+        stranded = self._stranded(recent, kind, fetch_one)
         if trigger is None:
             if not recent:
-                return []
-            # Act on the newest unseen item; `respond` advances the mark to it. See the
-            # "Known bound" note above for why a cold first wake acts on only the newest.
-            return respond(session, [recent[0]])
-        to_act = self._from_trigger(recent, trigger, fetch_one)
-        if not to_act:
+                # The stream is empty *now*, but a dead wake may still have claimed something that
+                # has since aged out of it — that is work, and it is still owed.
+                return respond(session, stranded) if stranded else []
+            # Act on the newest unseen item — plus anything a dead wake left unsettled behind it;
+            # `respond` settles them and advances the mark. See the notes above.
+            split = self._extend_over_unfinished(recent, 0, kind)
+            return respond(session, stranded + list(reversed(recent[: split + 1])))
+        to_act = self._from_trigger(recent, trigger, fetch_one, kind)
+        if not (to_act or stranded):
             return []  # no such item and an empty stream: nothing to do, nothing to mark
-        posted = respond(session, to_act)
+        posted = respond(session, stranded + to_act)
+        # **The baseline may not sail past an undecided item** (issues #285, #289). `respond` has
+        # just held the mark back from anything still in flight — an item a live concurrent wake
+        # holds, a probe ack that failed to post — and jumping the mark to the true newest here
+        # would step straight over it, hiding it from every future wake if its owner then died.
+        # The bootstrap's baseline is a *jump*, not a step, so it is the one place the guard has to
+        # be restated.
+        #
+        # Declining is safe rather than a stall, but the reason has **two** branches, not one. An
+        # item held by a *claim* resolves itself: its owner either settles it (the next bootstrap
+        # reads a settled claim and the mark advances) or dies (the next bootstrap finds it orphaned
+        # and recovers it). A **probe whose ack was refused** has no owner at all — it is never
+        # claimed — so nothing settles it but a successful post, and until then the mark stays put
+        # and the window it re-reads grows. That is the correct trade and it is bounded by the thing
+        # causing it: a refused post means a locked (or unreachable) timeline, where the agent could
+        # not speak anyway, and the first ack that lands releases the mark past everything at once.
+        if any(disposition == _PENDING for _, disposition in self._ledger[kind]):
+            return posted
         newest = recent[0].content.uuid if recent else to_act[-1].content.uuid
         self.marks.set(self.timeline_uuid, newest, kind=kind)
         return posted
 
-    def _from_trigger(self, recent: list[object], trigger: str, fetch_one) -> list[object]:
+    def _stranded(self, recent: list[object], kind: str, fetch_one) -> list[object]:
+        """Items a dead wake left unsettled that the bootstrap's **window cannot see** (issue #289).
+
+        `_extend_over_unfinished` widens the act-set back over an orphan *inside* the window, and
+        that is all it can do — the window is bounded (`context_messages`, 50 items). A burst can
+        push an orphan clean out of it: a wake claims a webhook delivery and dies, sixty more land
+        before the next wake, and the orphan is now the 61st-newest. The bootstrap would act on the
+        newest, baseline the mark past everything, and a cursor never looks back — the delivery is
+        gone, silently and permanently, which is the exact bug this issue exists to remove, arriving
+        through the one path that *jumps* the cursor instead of stepping it.
+
+        So the unfinished work is read from the **claims**, which know what the window does not, and
+        each one the window missed is fetched by uuid. They are acted on **first** (they are older
+        than everything in the window, by construction — a claim exists because a previous wake saw
+        them), and the ledger therefore holds them in timeline order, which is what `_settle`'s
+        cursor requires.
+
+        This costs one directory read on a bootstrap, and a bootstrap only happens when this kind has
+        never settled an item on this timeline — so there is nothing much there to read. An item that
+        has since been deleted, or is unreadable, is skipped: the platform is the source of truth
+        about what still exists, and a claim on a vanished item is not work anyone can do.
+        """
+        known = {_uuid_of(item) for item in recent}
+        found = []
+        for uuid in sorted(self.claims.unsettled(self.timeline_uuid, kind=kind)):
+            if uuid in known:
+                continue  # inside the window: `_extend_over_unfinished` has it covered
+            try:
+                found.append(fetch_one(uuid))
+            except BaseCradleError:
+                _log.warning(
+                    "An unsettled %s (%s) is no longer readable on the platform; skipping it.",
+                    kind,
+                    uuid,
+                )
+        return found
+
+    def _from_trigger(
+        self, recent: list[object], trigger: str, fetch_one, kind: str
+    ) -> list[object]:
         """The items to act on for a named trigger, oldest-first.
 
-        Normally the trigger is in the fetched window: act on it and everything newer. If
-        a burst pushed it *past* the window (more than `context_messages` newer items
-        arrived before the wake fired), the windowed scan would miss it — so fetch the
-        named item directly and act on it together with the window, rather than silently
-        dropping the one item the router explicitly woke us for.
+        Normally the trigger is in the fetched window: act on it and everything newer — widened
+        back over anything a dead wake left unsettled, so a named trigger cannot bury an orphan the
+        baseline below would then jump past (issue #289). If a burst pushed the trigger *past* the
+        window (more than `context_messages` newer items arrived before the wake fired), the
+        windowed scan would miss it — so fetch the named item directly and act on it together with
+        the window, rather than silently dropping the one item the router explicitly woke us for.
         """
         for i, item in enumerate(recent):
             if item.content.uuid == trigger:
-                return list(reversed(recent[: i + 1]))  # trigger and newer, chronological
+                split = self._extend_over_unfinished(recent, i, kind)
+                return list(reversed(recent[: split + 1]))  # trigger and newer, chronological
         # Trigger not in the window: fetch it directly so it is never dropped, and act on
         # it before the window (it is older than everything fetched).
         try:
@@ -1661,7 +1772,7 @@ class WakeAgent:
             session,
             events,
             _incoming_event_text,
-            lambda event: self.marks.set(self.timeline_uuid, event.content.uuid, kind=_EVENTS),
+            _incoming_event_text,
             kind=_EVENTS,
             probe=lambda event: self._probe_nonce(event.content.payload),
         )
@@ -1676,15 +1787,29 @@ class WakeAgent:
         events, an activated task is not a creation-ordered stream a high-water mark can
         track (a task scheduled earlier can activate later) and carries no terminal
         status the agent could set, so idempotency is a persisted *seen-set* (see
-        `SeenStore`), now backed by an atomic per-task claim (`ClaimStore`) for safety across
-        concurrent wakes too: act on each activated task whose uuid is not yet recorded. The
-        task is recorded and claimed **before** it is acted on (claim-first), not after — a
-        task is at-most-once, so an action that re-wakes the agent (a generated image posts
-        an `asset.created`) cannot re-surface the still-`activated` task and re-run it. That
-        re-fire was the live monkey pile-up: the task stayed `activated`, its image-post
-        re-woke the agent, and an act-then-record order let the unrecorded task fire again
-        and again. An activated-but-unhandled task is genuinely undone work — not stale
-        history — so acting on all of them is correct, and needs no router-passed
+        `SeenStore`), backed by an atomic per-task claim (`ClaimStore`) for safety across
+        concurrent wakes: act on each activated task whose uuid is not yet recorded.
+
+        **What replaces "the un-advanced mark is the queue" here** (issue #289). The message
+        path's recovery is cheap because the mark is a cursor: refuse to advance it and the
+        unanswered message is still in the next wake's scan, by construction. A seen-set has no
+        cursor to hold back — but it does not need one, because the **platform** is the queue: an
+        activated task the agent never finished is still `status=activated`, so the scan below
+        re-lists it on every wake until this agent records it. Withholding the seen-set entry is
+        therefore exactly as strong as withholding the mark, and for a better reason — the queue is
+        the platform's own state, not a cursor we maintain. So the record moves in one place
+        (`_settle`), only over tasks whose fate is decided, and a wake that dies mid-turn leaves its
+        task activated-and-unrecorded for the next wake to recover.
+
+        **The claim, not the seen-set, is what stops the re-fire.** The task used to be *recorded*
+        before it was acted on, to stop the live monkey pile-up: the task stayed `activated`, an
+        action that re-woke the agent (a generated image posts an `asset.created`) re-surfaced it,
+        and an act-then-record order let it fire again and again. Claim-first still holds — the
+        claim lands before the turn — and the claim is the authoritative guard: a re-entrant wake
+        loses the exclusive create and skips the task, exactly as it did when the seen-set had
+        already been written. What the record-first order bought on *top* of that was nothing but
+        the silent drop this issue removes. An activated-but-unhandled task is genuinely undone
+        work — not stale history — so acting on all of them is correct, and needs no router-passed
         trigger, which keeps the router thin.
 
         The full activated list is drained (no `context_messages` window): a task is
@@ -1704,7 +1829,7 @@ class WakeAgent:
             session,
             unhandled,
             _activated_task_text,
-            lambda task: self.seen.add(self.timeline_uuid, task.content.uuid, kind=_TASKS),
+            _activated_task_text,
             kind=_TASKS,
             # A NOC probe task is recognized from its **instructions** and acked token-free.
             # `_act_on` checks `probe` *before* claiming, so the probe is acked at-least-once
@@ -1724,21 +1849,27 @@ class WakeAgent:
         session: Session,
         items,
         render,
-        record,
+        text,
         kind: str,
         skip=None,
         probe=None,
     ) -> list[object]:
-        """Engage the model on each item in order, recording it as handled.
+        """Engage the model on each item in order, recording it as handled **once it is settled**.
 
-        The one loop behind all four reconcilers — messages, webhook events, activated
-        tasks, and posted assets. `render` turns an item into the text the model reads, or
-        a `(text, images)` pair when the item carries pictures to *show* the model (the
-        asset-perception path); `record` marks it handled (a mark advance, or a seen-set
-        add); `kind` namespaces its atomic claim (see `ClaimStore`). **`kind` must match the
-        namespace `record` writes to** — they are the same per-reconciler constant
-        (`_MESSAGES`/`_ASSETS`/`_EVENTS`/`_TASKS`); if they ever diverge, claims land in one
-        namespace while marks land in another and the exactly-once guard silently goes dead.
+        The loop behind the three non-message reconcilers — posted assets, webhook deliveries,
+        activated tasks. `kind` selects both the item's atomic claim namespace and the record
+        `_settle` will advance (a mark for the two streams, the seen-set for tasks); the two used to
+        be separate arguments that a comment warned must agree, and they are one now, so they cannot
+        disagree.
+
+        **Two renderers, because recovery and perception want different things.** `render` is what
+        the *model* is shown — text, or a `(text, images)` pair when the item carries pictures to
+        look at, which for an asset means **downloading the file**. `text` is the item as plain
+        prose, and it is what the *recovery* uses: a resume needs the caption, never the pixels (the
+        model already saw them, and the session evicted them after that turn), and the classifier's
+        legacy fallback needs only something to compare against a turn's stored content. Handing
+        recovery the perception renderer would re-fetch a peer's file to answer a question about the
+        transcript.
 
         **It posts nothing** (issue #293). The turn's final text is the agent's *unspoken*
         narration: journaled, never posted. If the agent wants to say something about the file
@@ -1746,85 +1877,110 @@ class WakeAgent:
         here — by calling the `messages` tool, during the turn. So an activated task that ran
         quietly and told nobody is a *normal* outcome, not a lost reply.
 
-        **Exactly-once, claim-first (`ClaimStore`).** Before acting on an item, the loop
-        *atomically claims* it. The first wake to claim wins and acts; a concurrent wake
-        loses the claim and skips — so two near-simultaneous wakes (an upload firing
-        `asset.created` + `message.created` spawns two) handle the same message exactly
-        once instead of double-replying. Because the claim lands *before* the action, it
-        also makes a crashed or partial wake non-reprocessing: the claim persists, so the
-        retry skips the item rather than re-running its turn and re-firing its tool actions.
-        The `record` (mark/seen advance) likewise lands before the action. The **claim is the
-        authoritative exactly-once guard**; the high-water mark is a best-effort scan bound
-        that may briefly rewind under truly concurrent wakes (two wakes claiming adjacent
-        items in either order) — harmless, because a rewound mark only re-scans an item whose
-        claim then blocks the duplicate. This is at-most-once by design —
-        a one-time dropped reply on a hard crash beats a backlog re-answered, with side
-        effects, on every later wake (the live reprocess loop). Tasks gain the same
-        cross-process exclusivity their image-post re-fire never had.
+        **Nothing is recorded until `_settle`, and that is the whole of issue #289.** This loop
+        used to `record(item)` — advance the mark, add to the seen-set — *before* engaging the
+        model, so any hard failure in between (the provider is down, the box is killed) left the
+        item marked seen, never acted on, and **never looked at again by any future wake**. A
+        posted asset, an inbound webhook delivery, and an activated task each carried that silent
+        permanent drop, in exactly the shape #285 had already removed from the message path.
+        They are now on the one mechanism: **claim before acting, record only what is settled,
+        and recover what a dead wake left behind.** The claim still lands first and still decides
+        the race, so a concurrent (or re-entrant) wake still loses it and skips — nothing about
+        the exactly-once guard weakens. What changes is that a *crashed* wake's item is now
+        recoverable instead of gone.
+
+        **Recovery runs first, once, before this kind's first model call** — but that ordering is a
+        *narrowing*, not the guarantee, and it is worth being exact about which is which. The
+        transcript is the evidence, and this wake is a writer: an earlier kind's turn can compact it,
+        and a resume inside recovery itself can compact it. There is no ordering that makes the
+        evidence immutable, because **recovery is itself a writer**. What actually makes a destroyed
+        turn safe is that a compaction *says* what it destroyed (`_context._carried_items`), so a
+        missing turn is a **loud abandon** rather than a re-drive of a turn that may already have
+        spoken (`_evidence_lost`). Running the pass up front is what keeps that rare; the summary's
+        uuids are what keep it *correct*.
 
         `probe(item)` is the **NOC synthetic-probe short-circuit**, passed by all four
         reconcilers — messages, webhook events, activated tasks, and posted assets — each
         reading the marker from its own carrier field (a message body, a webhook payload, a
         task's instructions, an asset's description). When it returns a nonce (the item is a
-        valid signed probe — see `_probe`), the loop posts the deterministic ack and records
-        the item **without calling the model** — no provider request, no tokens, nothing
-        into the transcript — so the message-, webhook-, task-, and asset-seam heartbeats
-        all run token-free at rest (an asset probe is acked before its file is ever
-        fetched). It is checked *after* the self-filter (a probe is from a distinct peer,
-        never the agent's own) and **before the claim**, and follows an at-least-once order
-        (post the ack, *then* record), so a crash mid-batch re-acks. This probe-before-claim
-        order is **load-bearing for the task seam**: a probe is never claimed, so a crash
-        before recording re-acks (harmless — the prober matches the first ack carrying its
-        nonce) rather than leaving the item claimed-but-unacked, which would manufacture a
-        false monitor FAIL (task-seam.md §4).
+        valid signed probe — see `_probe`), the loop posts the deterministic ack **without calling
+        the model** — no provider request, no tokens, nothing into the transcript — so the
+        message-, webhook-, task-, and asset-seam heartbeats all run token-free at rest (an asset
+        probe is acked before its file is ever fetched). It is checked *after* the self-filter (a
+        probe is from a distinct peer, never the agent's own) and **before the claim**, and is
+        at-least-once: a failed ack lands `_PENDING` in the ledger, so the record does not pass it
+        and the next wake re-acks rather than recording it with no ack ever posted (a false monitor
+        FAIL — task-seam.md §4). This probe-before-claim order is **load-bearing for the task
+        seam**: a probe is never claimed, so a crash before settling re-acks (harmless — the prober
+        matches the first ack carrying its nonce).
 
         **Never crash the wake (B2).** Both platform-touching steps degrade instead of
         raising: a refused post (`self._post` — the probe ack) is logged and the loop carries
         on; an engine that hits its step cap (`self._engage`) becomes a short unspoken note. So
         a wake that hits a locked timeline or the step cap exits 0 — no unhandled exception
-        reaches the entrypoint, and the item is still recorded (no reprocess). A locked timeline
+        reaches the entrypoint, and the item still settles (no reprocess). A locked timeline
         now surfaces to the *model*, as the refusal its `messages` tool call returns, which is
         strictly better: the agent learns it cannot speak here and can act on that.
 
         `skip(item)` is the **actor self-filter** — the safety property. When it returns
         true (the item is the agent's *own* authored post — a message it sent, an image it
-        generated), the item is *not* acted on, but its record **still advances** (no claim
-        needed — there is no action to make exclusive), so the agent never reacts to its own
-        output and never wake-loops on it, while the skipped item is still marked seen so it
-        is not re-scanned forever.
+        generated), the item is *not* acted on, and its fate is final at once (no claim needed —
+        there is nothing to make exclusive), so the agent never reacts to its own output and never
+        wake-loops on it, while the skipped item is still recorded so it is not re-scanned forever.
         """
-        posted = []
+        posted: list[object] = []
+        ledger = self._ledger[kind]
+        self._recover(session, items, kind=kind, text=text)
         for item in items:
+            uuid = item.content.uuid
             if skip is not None and skip(item):
-                record(item)  # own post: never acted on, but marked so it is not re-scanned
+                ledger.append((uuid, _FINAL))  # own post: never acted on, but never re-scanned
                 continue
             if probe is not None and (nonce := probe(item)) is not None:
-                # A verified NOC probe: ack token-free (no model call), and record only
-                # *after* a successful ack — at-least-once, never claimed. A refused ack
-                # degrades *silently* (`note=False` keeps the probe seam trace-free) and
-                # leaves the item unrecorded, so the next wake re-acks rather than marking it
-                # seen with no ack ever posted (a false monitor FAIL — task-seam.md §4).
+                # A verified NOC probe: ack token-free (no model call), never claimed. A refused
+                # ack degrades *silently* (`note=False` keeps the probe seam trace-free) and stays
+                # undecided, so the next wake re-acks.
                 ack = self._post(ack_line(nonce), kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
-                    record(item)
+                ledger.append((uuid, _FINAL if ack is not None else _PENDING))
                 continue
-            if not self.claims.claim(self.timeline_uuid, item.content.uuid, kind=kind):
-                continue  # a concurrent (or crashed prior) wake already owns this item
-            record(item)  # claim-first: mark seen before acting, so a failed wake won't reprocess
+            if self.claims.claim(self.timeline_uuid, uuid, kind=kind):
+                disposition = _OURS
+            else:
+                # Already claimed: a live concurrent wake owns it, its fate is already settled, or
+                # the wake that took it **died** — in which case `_recover` above has already
+                # decided what to do about that, and this reads the verdict it reached.
+                disposition = self._readmit(item, kind=kind)
+            if disposition != _OURS:
+                ledger.append((uuid, disposition))
+                continue
             # `render` returns the text the model reads, or a (text, images) pair when the
             # item carries pictures to *show* the model (the asset-perception path). Images
             # ride into the model's input on this turn and are evicted after (see `Session`).
             rendered = render(item)
-            text, images = rendered if isinstance(rendered, tuple) else (rendered, [])
-            narration = self._engage(session, text, images, item)
+            shown, images = rendered if isinstance(rendered, tuple) else (rendered, [])
+            narration = self._engage(session, shown, images, item)
             self._unspoken(narration)
             # **Memory observes every engaged turn — posted or silent** (issue #293). It used to
             # fire only when a reply posted, which under silence-default would quietly drop facts
             # arriving in items the agent chose not to answer: a peer's birthday mentioned in a
             # message the agent had no reason to reply to must still be recallable, from any
             # timeline, later. The exchange is real whether or not anyone else heard it.
-            self._observe(text, narration)
+            self._observe(shown, narration)
+            # **The claim settles the instant its turn ends — not at `_settle`, and this is not
+            # tidiness.** `_act_on` runs one turn *per item*, and a later item's turn can compact the
+            # transcript (`Session.send` ends in `_compact_if_needed`, and an over-length rescue
+            # compacts hard). A compaction is destructive: it can summarize away *this* item's
+            # finished turn. If the claim were still `in-flight` when that happened, the next wake
+            # would find an orphan whose turn is gone, read that emptiness as "the model never saw
+            # it", and **re-drive a turn that already spoke** — re-firing its tools. Committing here
+            # means an item whose turn ended is never re-classified by anybody, whatever the items
+            # behind it do to the transcript. A dead wake therefore leaves exactly **one** in-flight
+            # claim per kind: the item it died on.
+            self.claims.commit(self.timeline_uuid, uuid, kind=kind)
+            ledger.append((uuid, _FINAL))
+        self._settle(kind)
         return posted
 
     def _engage(
@@ -1858,9 +2014,11 @@ class WakeAgent:
 
         `item` is the platform item this turn is answering — an asset, a webhook delivery, an
         activated task. It anchors the turn's idempotency keys and is recorded on the turn, exactly
-        as a message batch's uuids are (issue #297). These kinds do not yet *recover* (issue #289
-        owns that), but a create they make is keyed all the same: it costs nothing, and the day the
-        recovery reaches them the keys will already be right.
+        as a message batch's uuids are (issue #297). Both are what makes a wake killed *here*
+        recoverable: the uuid says which item the model was shown, and the anchor is what any create
+        in the turn keys against — identically on the wake that dies and the wake that finishes it.
+        The keys were minted for these kinds before their recovery existed, on the bet that the day
+        it landed they would already be right. It landed in issue #289, and they were.
         """
         self.informer.arm(text)
         self._degraded = False
@@ -2154,7 +2312,7 @@ class WakeAgent:
         if not recent:
             return []  # empty timeline: nothing to answer, nothing to mark
         split = self._bootstrap_split(recent, trigger)
-        split = self._extend_split_over_unfinished(recent, split)
+        split = self._extend_over_unfinished(recent, split, _MESSAGES)
         to_reply = list(reversed(recent[: split + 1]))  # chronological; empty when split is -1
         context = recent[split + 1 :]  # older than the reply set, still newest-first
         if not _has_conversation(session):
@@ -2182,7 +2340,7 @@ class WakeAgent:
         # settles it (the next bootstrap reads a settled claim, and the mark advances) or dies (the
         # next bootstrap finds it orphaned, recovers it, and the mark advances). Either way it
         # converges, and the cost of waiting is one more timeline read — never a model call.
-        if any(disposition == _PENDING for _, disposition in self._ledger):
+        if any(disposition == _PENDING for _, disposition in self._ledger[_MESSAGES]):
             return posted
         recent_uuids = {message.content.uuid for message in recent}
         mark = self.marks.get(self.timeline_uuid)
@@ -2190,30 +2348,33 @@ class WakeAgent:
             self.marks.set(self.timeline_uuid, recent[0].content.uuid)
         return posted
 
-    def _extend_split_over_unfinished(self, recent: list[object], split: int) -> int:
-        """Pull the bootstrap's reply set back to cover any message an earlier wake never settled.
+    def _extend_over_unfinished(self, recent: list[object], split: int, kind: str) -> int:
+        """Pull a bootstrap's act-set back to cover any item an earlier wake never settled.
 
-        **An unsettled claim is unfinished work, not history** (issue #285), and the bootstrap is
-        the one path that would otherwise walk right over it. `_bootstrap_split` answers "what
-        counts as unseen?" by *recency* — with no mark and nothing said yet, that means the newest
-        message only, and everything older is seeded as context and baselined past. But a message a
-        previous wake **claimed and never finished** is not old news: it is a peer waiting for an
-        answer that a dead wake was supposed to give.
+        **An unsettled claim is unfinished work, not history** (issue #285), and a bootstrap is the
+        one path that would otherwise walk right over it. A bootstrap answers "what counts as
+        unseen?" by *recency* — with no mark, that means the newest item only, and everything older
+        is baselined past. But an item a previous wake **claimed and never finished** is not old
+        news: it is a peer waiting for an answer that a dead wake was supposed to give.
 
         Concretely, and this is reachable rather than theoretical: a wake claims M0 and dies; a new
         message M1 lands; the next wake has no mark, so it bootstraps, replies to M1 alone, and
         baselines the mark to M1 — putting M0 **permanently behind the cursor**, unanswered and now
         unreachable. Every other path is protected by the mark never passing an unsettled item, but
-        the bootstrap's baseline is a *jump*, not a step, and it can leap the guard.
+        a bootstrap's baseline is a *jump*, not a step, and it can leap the guard.
 
-        So the reply set is extended to the oldest message in the window carrying an unsettled
-        claim. `_absorb` then puts it through `_readmit` like any other — recovered if its owner is
-        gone, skipped (and holding the mark) if its owner is alive. `recent` is newest-first, so a
-        *larger* index is older and `max` widens the window. Settled claims are ignored, so an
-        agent's answered history is never re-opened.
+        Shared by both bootstraps since issue #289 — the message one (`_bootstrap`) and the stream
+        one (`_bootstrap_stream`, for assets and webhook deliveries). It became load-bearing for the
+        streams in that same issue and not before: until then their mark advanced at *claim* time,
+        so a dead wake always left a mark behind and the bootstrap never ran twice. Now the mark
+        moves at settle, so a wake that dies on the very first item of a timeline leaves none — and
+        the next wake bootstraps straight over the orphan unless this widens it back.
+
+        `recent` is newest-first, so a *larger* index is older and `max` widens the window. Settled
+        claims are ignored, so an agent's answered history is never re-opened.
         """
-        for index, message in enumerate(recent):
-            claim = self.claims.read(self.timeline_uuid, message.content.uuid, kind=_MESSAGES)
+        for index, item in enumerate(recent):
+            claim = self.claims.read(self.timeline_uuid, item.content.uuid, kind=kind)
             if claim is not None and not claim.settled:
                 split = max(split, index)
         return split
@@ -2273,9 +2434,11 @@ class WakeAgent:
            in and rebuild, up to `max_builds` times — so the agent never posts a reply that was
            made stale by a message it hadn't yet seen.
 
-        Only the message reconcile batches + paces; the asset/task/webhook reconcilers call
-        `_act_on` directly and are deliberately out of scope (rare, naturally time-separated,
-        or externally-sourced) — issue #289 tracks extending this to them.
+        Only the message reconcile **batches + paces**; the asset/task/webhook reconcilers call
+        `_act_on`, one turn per item, and that stays deliberately out of scope (they are rare,
+        naturally time-separated, or externally-sourced). They are *not* out of scope for the
+        delivery guarantee — since issue #289 they run the same claim → recover → settle machinery
+        this method does, through `_act_on`.
 
         **Nothing here is marked seen until `_settle`** (issue #285). A wake that dies anywhere in
         this method leaves its messages `in-flight` and the mark unmoved, so the next wake finds
@@ -2294,13 +2457,13 @@ class WakeAgent:
         """
         posted: list[object] = []
         self._cursor = self.marks.get(self.timeline_uuid)
-        self._recover(session, messages)
+        self._recover(session, messages, kind=_MESSAGES, text=_incoming_text)
         batch, probe_seen = self._absorb(session, messages, posted)
         if not batch:
             # Self-only / probe-only / empty: any probe acked, nothing to engage on. The model is
             # never engaged (and the brief never fetched) — but the mark still advances, so these
             # are not re-read forever.
-            self._settle()
+            self._settle(_MESSAGES)
             return posted
         self._pace_and_settle(session, batch, posted, probe_seen)
         narration = self._generate_settled(session, batch, posted)
@@ -2317,7 +2480,7 @@ class WakeAgent:
         # The turn ran to completion, and its narration is journaled — which *is* the commit
         # record (issue #293). Commit the claims, then move the mark. A crash *before* this line
         # is the recoverable case, and the transcript says how far the turn got.
-        self._settle()
+        self._settle(_MESSAGES)
         return posted
 
     def _absorb(
@@ -2359,6 +2522,7 @@ class WakeAgent:
         """
         peers: list[object] = []
         probe_seen = False
+        ledger = self._ledger[_MESSAGES]
         for item in items:
             uuid = item.content.uuid
             # The in-wake read cursor. It advances over *everything we have looked at*, final or
@@ -2366,7 +2530,7 @@ class WakeAgent:
             # deliberately separate from the persisted mark, which may not move yet.
             self._cursor = uuid
             if self._is_own(item):
-                self._ledger.append((uuid, _FINAL))
+                ledger.append((uuid, _FINAL))
                 continue
             nonce = self._probe_nonce(item.content.body)
             if nonce is not None:
@@ -2374,14 +2538,14 @@ class WakeAgent:
                 ack = self._post(ack_line(nonce), kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
-                self._ledger.append((uuid, _FINAL if ack is not None else _PENDING))
+                ledger.append((uuid, _FINAL if ack is not None else _PENDING))
                 continue
             if self.claims.claim(self.timeline_uuid, uuid, kind=_MESSAGES):
-                self._ledger.append((uuid, _OURS))
+                ledger.append((uuid, _OURS))
                 peers.append(item)
                 continue
-            disposition = self._readmit(session, item)
-            self._ledger.append((uuid, disposition))
+            disposition = self._readmit(item, kind=_MESSAGES)
+            ledger.append((uuid, disposition))
             if disposition == _OURS:
                 peers.append(item)
         return peers, probe_seen
@@ -2405,8 +2569,8 @@ class WakeAgent:
             self.client.messages.filter(timeline=self.timeline_uuid), self._cursor
         )
 
-    def _readmit(self, session: Session, item: object) -> str:
-        """An already-claimed message: is it owned, settled, or held by a wake that **died**?
+    def _readmit(self, item: object, *, kind: str) -> str:
+        """An already-claimed item: is it owned, settled, or held by a wake that **died**?
 
         The claim's *phase* answers the first two, and it is why the record exists at all:
 
@@ -2432,31 +2596,29 @@ class WakeAgent:
             # **This wake's own verdict, and it is read before anything else.** `_recover` may have
             # *taken the claim over* — after which the claim file says `in-flight` owned by a wake
             # that is very much alive (us), and the orphan test below would correctly answer "not
-            # orphaned" and hand back `_PENDING`, quietly dropping a message we had already decided
-            # to answer. The claim is evidence about *other* wakes; it has nothing to tell us about
+            # orphaned" and hand back `_PENDING`, quietly dropping an item we had already decided
+            # to act on. The claim is evidence about *other* wakes; it has nothing to tell us about
             # our own.
             return recovered
-        claim = self.claims.read(self.timeline_uuid, uuid, kind=_MESSAGES)
+        claim = self.claims.read(self.timeline_uuid, uuid, kind=kind)
         if claim is None:
             # The record vanished between our failed create and this read. Race for it; loser skips.
-            return (
-                _OURS if self.claims.claim(self.timeline_uuid, uuid, kind=_MESSAGES) else _PENDING
-            )
+            return _OURS if self.claims.claim(self.timeline_uuid, uuid, kind=kind) else _PENDING
         if claim.settled:
             return _FINAL
         if not self.claims.orphaned(claim):
             return _PENDING
         # An orphan with no verdict: recovery declined it (a live wake is recovering it, or we lost
-        # the take-over race). Undecided, so the mark may not pass it; the next wake tries again.
+        # the take-over race). Undecided, so the record may not pass it; the next wake tries again.
         return _PENDING
 
     # --- recovery: one pass, before the model, against a pristine transcript ---
 
-    def _recover(self, session: Session, items: list[object]) -> None:
-        """Decide the fate of every orphaned message in this scan, **before the model runs.**
+    def _recover(self, session: Session, items: list[object], *, kind: str, text) -> None:
+        """Decide the fate of every orphaned item in this scan, **before the model runs.**
 
         The guarantee (issues #285, #293, #297): *at-least-once for the read, at-most-once for
-        every side effect. The turn is the unit of commit.* A dead wake's message is re-driven only
+        every side effect. The turn is the unit of commit.* A dead wake's item is re-driven only
         when the transcript **proves** nothing ran, and that proof is durable because the turn is
         persisted incrementally — most of all, the assistant turn naming a tool call reaches disk
         *before* that tool is dispatched (`_engine.run`). So:
@@ -2465,8 +2627,11 @@ class WakeAgent:
 
         Four outcomes, tested in this order:
 
-        1. **No turn carries this message** → the wake was killed after claiming it but before the
-           model ever saw it. Nothing ran. **Re-drive.**
+        1. **No turn carries this item** → the wake was killed after claiming it but before the
+           model ever saw it. Nothing ran. **Re-drive** — *unless a compaction destroyed the turn*,
+           in which case "no turn" proves nothing and the item is **abandoned, loudly**
+           (`_evidence_lost`). That distinction is the difference between a rare, visible drop and a
+           silent double-spend.
         2. **The turn reached its terminal narration** → the model *finished*. Everything it decided
            to say, it said itself, with its tools; everything it decided not to say was a decision.
            **Commit.** Tested before the tool check on purpose: a turn that ran tools *and* settled
@@ -2480,56 +2645,96 @@ class WakeAgent:
            down, the box was killed). Nothing ran. **Re-drive**, after excising the dead turn's
            inert residue, so the transcript does not accumulate a duplicate user turn per crash.
 
+        **The classifier is kind-agnostic, and that is the finding of issue #289.** The issue
+        anticipated a per-kind "post-landed test" — *did the asset's reply reach the timeline? did
+        the webhook's?* — because at the time it was filed the message path had one: the harness
+        held a reply it still had to deliver, so recovery had to reconcile it against the timeline
+        by body-equality. **The Unspoken Channel (#293) deleted the question, not just the answer.**
+        The harness holds no reply, for any kind: everything an agent says, it said itself, mid-turn,
+        through the `messages` tool, and the platform already has it. So the only question left is
+        the one above — *did the turn finish?* — and the transcript answers it identically for a
+        message, an asset, a webhook delivery, and an activated task. The four kinds differ in what
+        they are, not in what a dead wake left behind.
+
+        What *does* differ is spelled out where it lives: how the queue re-offers an unsettled item
+        (a held-back mark for the streams, the platform's own `activated` status for tasks —
+        `_wake_tasks`), and what a re-run of the turn's *tools* would cost, which is the one thing
+        the classifier never risks (it re-drives only on proof that none ran).
+
         Walking oldest-first is what makes a *batch* recover coherently: the dead wake's turn
         carried several messages, so the first of them resumes the turn, and the rest then find its
         narration and commit. The `_resumed` set is belt-and-braces on that — a turn is finished
-        once.
+        once. (The three `_act_on` kinds take one item per turn, so a batch is a message-path
+        shape; the machinery costs them nothing and is right for them anyway.)
         """
         for item in items:
             uuid = _uuid_of(item)
             if uuid is None:
                 continue
-            claim = self.claims.read(self.timeline_uuid, uuid, kind=_MESSAGES)
+            claim = self.claims.read(self.timeline_uuid, uuid, kind=kind)
             if claim is None or claim.settled or not self.claims.orphaned(claim):
                 continue  # never claimed (a peer's own post, a probe), already decided, or alive
             # A take-over that won its token and died before it could rewrite the claim leaves the
             # claim naming a wake that no longer holds the item. Judge the wake that really does.
-            claim = self.claims.effective_owner(
-                self.timeline_uuid, uuid, kind=_MESSAGES, claim=claim
-            )
+            claim = self.claims.effective_owner(self.timeline_uuid, uuid, kind=kind, claim=claim)
             if not self.claims.orphaned(claim):
                 continue  # a live wake is already recovering this one; leave it to them
-            self._recovered[uuid] = self._recover_orphan(session, item, claim)
+            self._recovered[uuid] = self._recover_orphan(session, item, claim, kind=kind, text=text)
 
-    def _recover_orphan(self, session: Session, item: object, claim: Claim) -> str:
+    def _recover_orphan(
+        self, session: Session, item: object, claim: Claim, *, kind: str, text
+    ) -> str:
         """One orphan, classified from the transcript. See `_recover` for the four outcomes."""
-        turn = _turn_of(session.history, item)
+        turn = _turn_of(session.history, item, text)
         if turn is None:
-            return self._redrive(item, claim, "the wake died before the model ever saw it")
+            if _evidence_lost(session.history, item):
+                # **A compaction destroyed the turn, so "no turn" is no longer proof of anything.**
+                # The classifier's whole licence to re-drive is *a tool call absent from the
+                # transcript is a tool call that never ran* — and a summarized-away turn is absent
+                # for a reason that has nothing to do with what it did. Re-driving here would re-fire
+                # whatever it fired (an image bought at fal.ai, a code run) and, because the keys are
+                # deterministic, would hand the model's *new* message the dead turn's key — so the
+                # platform returns the original record, the tool reports success, and the reply the
+                # model actually composed reaches nobody. A duplicate wearing a drop's clothes.
+                #
+                # So it is abandoned, loudly. This is the same residual at-most-once trade the
+                # over-the-ceiling resume makes below, and it is rare for the same reason: the
+                # summary carries the uuid, so the *only* way here is a compaction that landed
+                # between the wake that took the item and the wake that came to recover it.
+                return self._abandon(
+                    item,
+                    claim,
+                    kind,
+                    "the turn that carried it was compacted out of the transcript, so what it "
+                    "did — and whether it already spoke — cannot be known",
+                )
+            return self._redrive(item, claim, "the wake died before the model ever saw it", kind)
 
         work = _turn_work(session.history, turn)
         if _turn_narration(work) is not None:
-            return self._committed(item)
+            return self._committed(item, kind)
 
         if any(message.tool_calls for message in work):
             already = self._resumed_outcome(turn)
             if already is not None:
                 # This wake already finished (or failed to finish) this very turn for an older
                 # message of the same batch. Never run it twice.
-                return self._committed(item) if already == _FINAL else _PENDING
-            return self._resume_orphan(session, item, turn, claim)
+                return self._committed(item, kind) if already == _FINAL else _PENDING
+            return self._resume_orphan(session, item, turn, claim, kind=kind, text=text)
 
         # A turn with nothing in it: the model was called and never answered. Excise the residue
         # before re-driving — the user turn is on disk now (it was not, before incremental
         # persistence), so leaving it would stack a duplicate copy of the peer's message into the
         # transcript on every failed wake, forever. Safe precisely because we just proved the turn
         # issued no tool calls: there is nothing in it but a step note and a failure marker.
-        disposition = self._redrive(item, claim, "the wake died inside the model call")
+        disposition = self._redrive(item, claim, "the wake died inside the model call", kind)
         if disposition == _OURS:
             session.excise(turn)
         return disposition
 
-    def _resume_orphan(self, session: Session, item: object, turn: Message, claim: Claim) -> str:
+    def _resume_orphan(
+        self, session: Session, item: object, turn: Message, claim: Claim, *, kind: str, text
+    ) -> str:
         """The wake died mid-tool-chain. **Finish its turn** rather than re-running or dropping it.
 
         This is what replaced "abandon, loudly" (issue #297). The old code was right that a
@@ -2558,18 +2763,23 @@ class WakeAgent:
         a second time.
         """
         uuid = item.content.uuid
-        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=_MESSAGES, owner=claim.wake):
+        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=kind, owner=claim.wake):
             return _PENDING  # another recovering wake won the take-over; let it finish the turn
         _log.warning(
             "resuming %s",
             kv(
-                message=uuid,
+                item=uuid,
+                kind=kind,
                 timeline=self.timeline_uuid,
                 handle=_handle_of(item),
                 reason="the wake died mid-tool-chain; finishing the turn it started",
             ),
         )
-        rendered = turn.content or _incoming_text(item)
+        # The turn's own content, which the dead wake persisted before it ever called the model.
+        # The plain-text renderer is the fallback for a legacy turn that carries none — plain text,
+        # never the perception renderer, because a resume has no use for an asset's pixels (the
+        # model already saw them; the session evicted them after that turn).
+        rendered = turn.content or text(item)
         disposition = _FINAL
         try:
             self.keys.begin(session, timeline=self.timeline_uuid, anchor=_anchor_of(turn, item))
@@ -2582,32 +2792,27 @@ class WakeAgent:
                 narration = self._stuck_note(error)
             self._unspoken(narration)
             self._observe(rendered, narration)
-            self.claims.commit(self.timeline_uuid, uuid, kind=_MESSAGES)
+            self.claims.commit(self.timeline_uuid, uuid, kind=kind)
         except ProviderContextLengthError as error:
             # The transcript has outgrown the model's window and **cannot be compacted** — the
             # session already tried, and declined. Retrying next wake would fail identically, and
             # forever: a resume adds no new user turn, so it never gives the compactor the cut point
             # it lacked. That is not a delay, it is a permanent stall, with the mark pinned behind
-            # this message and the peer never answered. So this is the one place the residual
+            # this item and the peer never answered. So this is one of the two places the residual
             # at-most-once drop survives — rare, bounded, and **loud**, which is categorically
-            # better than an invisible one.
-            reason = f"the interrupted turn is over the model's context ceiling and cannot be compacted: {error}"
-            self.claims.abandon(self.timeline_uuid, uuid, kind=_MESSAGES, reason=reason)
-            _log.error(
-                "dropped %s",
-                kv(
-                    message=uuid,
-                    timeline=self.timeline_uuid,
-                    handle=_handle_of(item),
-                    reason=reason,
-                ),
+            # better than an invisible one. (The other is a turn a compaction destroyed; both go
+            # through `_drop`, so a lost item always reads the same way in the journal.)
+            disposition = self._drop(
+                item,
+                kind,
+                "the interrupted turn is over the model's context ceiling and cannot be "
+                f"compacted: {error}",
             )
-            disposition = _FINAL  # abandoned is *settled*: the mark may pass, so nothing stalls
         except Exception:
-            # Anything else — the provider is down, the box is unhappy. Not a message lost: this
-            # wake's claim on it is in-flight, so the next wake finds it orphaned again and resumes
+            # Anything else — the provider is down, the box is unhappy. Nothing lost: this wake's
+            # claim on the item is in-flight, so the next wake finds it orphaned again and resumes
             # against a transcript carrying whatever this attempt managed. Do not take the whole
-            # wake down over it; the other messages on this timeline still deserve an answer.
+            # wake down over it; the other items on this timeline still deserve an answer.
             _log.exception("Resuming the interrupted turn failed; the next wake will try again.")
             disposition = _PENDING
         self._resumed.append((turn, disposition))
@@ -2655,23 +2860,64 @@ class WakeAgent:
             )
         session.persist()
 
-    def _redrive(self, item: object, claim: Claim, why: str) -> str:
-        """Take over an orphaned claim so this wake answers the message. `_PENDING` if we lose it.
+    def _abandon(self, item: object, claim: Claim, kind: str, why: str) -> str:
+        """Take an orphan over in order to **drop** it — the at-most-once trade, made deliberately.
+
+        The compare-and-swap is not ceremony: a rival wake could be recovering this same orphan and
+        reaching a *different* verdict (its transcript is the same, but it may have won a resume we
+        lost). Losing the take-over means someone else owns the decision, so we step aside rather
+        than abandoning an item another wake is mid-way through answering.
+        """
+        uuid = item.content.uuid
+        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=kind, owner=claim.wake):
+            return _PENDING
+        return self._drop(item, kind, why)
+
+    def _drop(self, item: object, kind: str, why: str) -> str:
+        """Abandon this item, and say so at ERROR — **a drop is never silent, for any kind.**
+
+        The residual at-most-once case, reached from exactly two places (a resume that cannot fit in
+        the model's context window; a turn a compaction destroyed). `abandoned` is a *settled* phase,
+        so the record may pass the item and nothing stalls behind it: a loud drop, never a silent
+        pin. The caller must already own the claim.
+        """
+        uuid = item.content.uuid
+        self.claims.abandon(self.timeline_uuid, uuid, kind=kind, reason=why)
+        _log.error(
+            "dropped %s",
+            kv(
+                item=uuid,
+                kind=kind,
+                timeline=self.timeline_uuid,
+                handle=_handle_of(item),
+                reason=why,
+            ),
+        )
+        return _FINAL
+
+    def _redrive(self, item: object, claim: Claim, why: str, kind: str) -> str:
+        """Take over an orphaned claim so this wake acts on the item. `_PENDING` if we lose it.
 
         The take-over is a compare-and-swap against the **owner we judged orphaned** (`claim.wake`),
         so a wake that lost the race — because a rival recovered it first, or because the "dead"
-        owner was not the one still holding it — steps aside instead of answering in parallel.
+        owner was not the one still holding it — steps aside instead of acting in parallel.
         """
         uuid = item.content.uuid
-        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=_MESSAGES, owner=claim.wake):
+        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=kind, owner=claim.wake):
             return _PENDING  # another recovering wake won the take-over; let it answer
         _log.warning(
             "re-driving %s",
-            kv(message=uuid, timeline=self.timeline_uuid, handle=_handle_of(item), reason=why),
+            kv(
+                item=uuid,
+                kind=kind,
+                timeline=self.timeline_uuid,
+                handle=_handle_of(item),
+                reason=why,
+            ),
         )
         return _OURS
 
-    def _committed(self, item: object) -> str:
+    def _committed(self, item: object, kind: str) -> str:
         """The dead wake's turn **finished**. Commit its claim; there is nothing else to do.
 
         This is the Unspoken Channel's payoff in the recovery path (issue #293). The predecessor of
@@ -2700,42 +2946,103 @@ class WakeAgent:
         _log.info(
             "recovered %s",
             kv(
-                message=uuid,
+                item=uuid,
+                kind=kind,
                 timeline=self.timeline_uuid,
                 handle=_handle_of(item),
                 action="turn-completed",
             ),
         )
-        self.claims.commit(self.timeline_uuid, uuid, kind=_MESSAGES)
+        self.claims.commit(self.timeline_uuid, uuid, kind=kind)
         return _FINAL
 
-    def _settle(self) -> None:
-        """Commit this wake's claims, then advance the mark — **the only place the mark moves.**
+    def _forget_settled(self, session: Session) -> None:
+        """Drop every uuid a compaction summary is holding whose item's fate is now decided.
+
+        **This is what bounds the one thing issue #289 adds to the transcript.** A summary inherits
+        the uuids of the turns it destroyed (`_context._carried_items`) so the recovery can tell "the
+        model never saw this" from "the model saw it and the evidence is gone". Left alone, that list
+        would accumulate one uuid per item ever handled on the timeline, forever — which is precisely
+        the unbounded-content defect Context Discipline exists to forbid, even though these uuids cost
+        no tokens (`items` is persisted and never sent to a provider; the cost is disk and parse).
+
+        A uuid is evidence only while its item's disposition is *undecided* — the recovery reads it
+        only for an item whose claim is still `in-flight`. So once the claim reaches a final phase,
+        the uuid has no reader left, and it goes. In steady state that empties the list within a wake
+        or two of the compaction that filled it, leaving the handful of items genuinely in flight.
+
+        A uuid with **no claim in any kind** is not evidence either and is dropped: the recovery only
+        ever asks about claimed items, so nothing can come looking for it.
+        """
+        changed = False
+        for message in session.history:
+            if message.role != "system" or not message.items:
+                continue
+            keep = [uuid for uuid in message.items if self._undecided(uuid)]
+            if len(keep) != len(message.items):
+                message.items = keep
+                changed = True
+        if changed:
+            session.persist()
+
+    def _undecided(self, uuid: str) -> bool:
+        """Is this item still awaiting a disposition, in any kind? (i.e. is it still evidence?)
+
+        The kinds are searched rather than known because a summary carries bare uuids — the one
+        thing a turn records about the items it was answering. An item is claimed in exactly one
+        kind, so the first claim found is the answer.
+        """
+        for kind in (_MESSAGES, _ASSETS, _EVENTS, _TASKS):
+            claim = self.claims.read(self.timeline_uuid, uuid, kind=kind)
+            if claim is not None:
+                return not claim.settled
+        return False  # never claimed → nothing will ever come looking for it
+
+    def _settle(self, kind: str) -> None:
+        """Commit this wake's claims, then advance this kind's record — **the only place it moves.**
 
         Two steps, in this order, and the order is the guarantee:
 
-        1. **Commit every message this wake owns.** Until now they were `in-flight`; a crash before
-           this point leaves them that way, which is precisely what lets the next wake recover them
-           rather than lose them.
-        2. **Advance the high-water mark — but never past an item whose fate is undecided.** The
-           mark is a *cursor* (`_messages_since` stops at it), so passing an item hides it from
-           every future wake. Everything this wake handled is final by now, but an item owned by a
-           *concurrent* wake (`_PENDING`) is not: if that wake then died, a mark past it would
-           re-create the exact bug this fixes. So the mark stops at the newest item with an
-           unbroken run of settled items behind it, and a foreign item simply holds it back until
-           its owner settles it — after which a later wake sails past both. It converges, and the
-           re-read it costs in the meantime is a timeline read, not a model call.
+        1. **Commit every item of this kind this wake owns.** Until now they were `in-flight`; a
+           crash before this point leaves them that way, which is precisely what lets the next wake
+           recover them rather than lose them.
+        2. **Advance the record — but never past an item whose fate is undecided.** What "the
+           record" is depends on the kind, and so does what "past" means. Both rules refuse to pass
+           an unsettled item; they differ only because a cursor and a set fail differently.
+
+        **A mark-backed kind (messages, assets, webhook deliveries) is a *cursor*.** `_messages_since`
+        walks newest-first and stops at it, so passing an item hides it from every future wake.
+        Everything this wake handled is final by now, but an item owned by a *concurrent* wake
+        (`_PENDING`) is not: if that wake then died, a mark past it would re-create the exact bug
+        this fixes. So the mark stops at the newest item with an unbroken run of settled items
+        behind it, and a foreign item simply holds it back until its owner settles it — after which
+        a later wake sails past both. It converges, and the re-read it costs in the meantime is a
+        timeline read, not a model call.
+
+        **A seen-backed kind (tasks) is a *set*, so an undecided task holds back only itself.**
+        There is no cursor to pin: the queue is the platform's `activated` list (`_wake_tasks`), and
+        a task simply stays on it until this agent records it. So each settled task is recorded on
+        its own, and an unsettled one is left off the set — which re-offers exactly that task on the
+        next wake, and nothing else. Applying the cursor rule here would be strictly worse: one task
+        a concurrent wake happened to hold would suppress the record of every task behind it, and
+        those would then be re-driven — turns re-run, tools re-fired — for no reason at all.
         """
-        for uuid, disposition in self._ledger:
+        ledger = self._ledger[kind]
+        for uuid, disposition in ledger:
             if disposition == _OURS:
-                self.claims.commit(self.timeline_uuid, uuid, kind=_MESSAGES)
+                self.claims.commit(self.timeline_uuid, uuid, kind=kind)
+        if kind in _SEEN_KINDS:
+            for uuid, disposition in ledger:
+                if disposition != _PENDING:
+                    self.seen.add(self.timeline_uuid, uuid, kind=kind)
+            return
         newest = None
-        for uuid, disposition in self._ledger:
+        for uuid, disposition in ledger:
             if disposition == _PENDING:
                 break  # a live wake still owns this one; the mark may not pass it
             newest = uuid
         if newest is not None:
-            self.marks.set(self.timeline_uuid, newest)
+            self.marks.set(self.timeline_uuid, newest, kind=kind)
 
     def _pace_and_settle(
         self, session: Session, batch: list[object], posted: list[object], probe_seen: bool
@@ -2930,13 +3237,37 @@ def _handle_of(item: object) -> str | None:
     return getattr(getattr(item, "user", None), "handle", None)
 
 
-def _turn_of(history: list[Message], item: object) -> Message | None:
+def _evidence_lost(history: list[Message], item: object) -> bool:
+    """Did a **compaction** destroy the turn that carried this item? (issue #289)
+
+    The classifier's licence to re-drive is *no turn ⟹ the model never saw it*, and compaction is
+    the one thing that can falsify it: it replaces a whole region of `history` with a single summary,
+    so a turn that ran tools can simply cease to exist. The summary inherits the uuids of the turns
+    it dropped (`_context._carried_items`), which turns an unanswerable question into an answered
+    one — *this item was seen, and what its turn did is now unknowable* — and that is a drop we make
+    on purpose and loudly, rather than a duplicate we cause by accident.
+
+    A summary is the only `system` turn that ever carries `items`, so the role test is exact.
+    """
+    uuid = _uuid_of(item)
+    if uuid is None:
+        return False
+    return any(message.role == "system" and uuid in message.items for message in history)
+
+
+def _turn_of(history: list[Message], item: object, text) -> Message | None:
     """The user turn that carried `item` to the model, or ``None`` if none did.
 
     The recovery classifier's first question (issue #285): *did the dead wake ever actually put
-    this message in front of the model?* The turn **carries the uuids it rendered** (`Message.items`,
-    issue #297), so the answer is an exact lookup, and a message is only ever batched once, so at
+    this item in front of the model?* The turn **carries the uuids it rendered** (`Message.items`,
+    issue #297), so the answer is an exact lookup, and an item is only ever batched once, so at
     most one turn genuinely holds it.
+
+    `text` is that kind's **plain-text** renderer, used *only* by the legacy fallback below, and only
+    for a transcript written before uuids existed. It is the item's own — a message reads as a
+    message, an activated task as a task — because the fallback compares rendered text against the
+    turn's content, and rendering an asset as though it were a message would compare two strings that
+    could never match (issue #289).
 
     **It used to be a text match, and that was broken in two ways** — badly enough that the double
     post this whole issue is about was reachable in the field without any crash exotica. It compared
@@ -2961,9 +3292,12 @@ def _turn_of(history: list[Message], item: object) -> Message | None:
     for message in history:
         if message.role == "user" and uuid is not None and uuid in message.items:
             return message
-    rendered = _incoming_text(item)
-    for message in history:
-        if message.role == "user" and not message.items and _carries(message.content, rendered):
+    legacy = [m for m in history if m.role == "user" and not m.items]
+    if not legacy:
+        return None  # every turn here carries uuids: the exact lookup above was the whole answer
+    rendered = text(item)
+    for message in legacy:
+        if _carries(message.content, rendered):
             return message
     return None
 

@@ -974,3 +974,68 @@ def test_a_cut_never_lands_on_an_injected_turn(tmp_path):
     assert any(m.items == ["m-1"] for m in survivors), (
         "compaction summarized the peer's message away and kept the image caption"
     )
+
+
+def test_a_compaction_records_the_items_whose_turns_it_destroys():
+    """**Compaction summarizes the conversation away; it may never erase the recovery's evidence.**
+
+    Issue #289. The delivery guarantee's classifier reads one thing off the transcript — *is there a
+    turn carrying this item?* — and treats "no" as proof the dead wake never reached the model, which
+    licenses a **re-drive**. Compaction can make that a lie: it replaces a region of `history` with a
+    single summary, so a turn that ran tools — that posted, that bought an image at fal.ai — ceases
+    to exist while the item's claim is still in flight. The next wake re-drives a turn that already
+    spoke, and every tool in it fires again.
+
+    So the summary inherits the uuids of the turns it drops. That is what lets the recovery tell "the
+    model never saw this" (re-drive) from "the model saw it and the evidence is gone" (abandon, and
+    say so). `_cut_index`'s own docstring already named this outcome; this is what enforces it.
+    """
+    history = [
+        Message.system("charter"),
+        Message(role="user", content=f"[t] {JOHN}: one", items=["m-1"]),
+        Message.assistant(content="Answered one."),
+        Message(role="user", content=f"[t] {JOHN}: two", items=["m-2", "m-3"]),
+        Message.assistant(content="Answered two."),
+        *conversation(20),
+        Message(role="user", content=f"[t] {JOHN}: newest", items=["m-9"]),
+        Message.assistant(content="Answered newest."),
+    ]
+    provider = ScriptedProvider(Message.assistant(content="SUMMARY"), usage=[None])
+    compactor = Compactor(provider, ContextBudget(provider, override=1_000))
+
+    assert compactor.emergency_compact(history)
+
+    summary = next(m for m in history if m.role == "system" and m.items)
+    assert summary.items == ["m-1", "m-2", "m-3"]  # every item whose turn is now gone
+    # The newest turn survived the cut, so its uuid is *not* evidence of a destroyed turn.
+    assert "m-9" not in summary.items
+
+
+def test_a_later_compaction_carries_the_earlier_summarys_items_forward():
+    """The evidence must survive **repeated** compaction, or it only ever delays the double-post.
+
+    A previous summary sits inside the region the next compaction drops, so its uuids ride along
+    with the rest — otherwise the second compaction quietly erases what the first one preserved, and
+    an orphan from two compactions ago reads as "never seen" again.
+    """
+    history = [
+        Message.system("charter"),
+        Message.system("[Earlier conversation summarized] older stuff"),
+        Message(role="user", content=f"[t] {JOHN}: recent", items=["m-4"]),
+        Message.assistant(content="Answered."),
+        *conversation(20),
+        Message(role="user", content=f"[t] {JOHN}: newest", items=["m-9"]),
+        Message.assistant(content="Answered newest."),
+    ]
+    history[1].items = ["m-1", "m-2"]  # what the *first* compaction destroyed
+    provider = ScriptedProvider(Message.assistant(content="SUMMARY"), usage=[None])
+    compactor = Compactor(provider, ContextBudget(provider, override=1_000))
+
+    assert compactor.emergency_compact(history)
+
+    summary = next(m for m in history if m.role == "system" and m.items)
+    assert summary.items[:2] == ["m-1", "m-2"], (
+        "the earlier summary's evidence was dropped — the second compaction erased what the first "
+        "one preserved, and an orphan from two compactions ago reads as 'never seen' again"
+    )
+    assert "m-9" not in summary.items  # the newest turn survived the cut, so it is not evidence

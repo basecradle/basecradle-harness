@@ -7,6 +7,114 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.73.0] - 2026-07-14
+
+**A dead wake dropped a peer's file, a webhook delivery, and a task — silently, and forever.**
+
+### Fixed: an asset, a webhook delivery, and a task are not dropped by a dead wake either (issue #289)
+
+Issue #285 closed a silent, permanent drop on the **message** path: a wake claimed an item and
+marked it seen *before* it called the model, so any hard failure in between (the provider is down,
+the box is killed) left the item recorded, never acted on, and **never looked at again by any future
+wake**. `_act_on` — the one loop behind the other three reconcilers — had the identical shape, and
+so the identical drop. A peer's posted **asset**, an inbound **webhook delivery**, and an activated
+**task** each carried it. Messages were fixed first because a peer silently ignored is the highest
+harm, *not* because the other three were safe.
+
+All four kinds now run the one mechanism: **claim before acting, record only what is settled, and
+recover what a dead wake left behind.** A wake that dies mid-turn leaves its item exactly where the
+next wake finds it, and the next wake decides from the transcript — re-drive if nothing ran, resume
+if a tool already fired, commit if the turn finished. Zero tools re-fire; nothing is said twice.
+
+**The fix is small because the Unspoken Channel had already deleted the hard part.** The issue was
+filed expecting a per-kind *post-landed test* — did the asset's reply reach the timeline? did the
+webhook's? — because at that moment the message path had one: the harness held a reply it still had
+to deliver, so recovery reconciled it against the timeline by matching message bodies. Issue #293
+removed the auto-post, and with it the question: the harness holds no reply, for any kind, so the
+only thing left to ask is **did the turn finish?** — which the transcript answers identically for a
+message, an asset, a delivery, and a task. The idempotency keys these kinds' creates have carried
+since #297 turned out to be exactly right, as intended.
+
+What genuinely differs is **the queue an unsettled item comes back on**, and it is stated rather
+than assumed:
+
+- A **mark-backed** kind (messages, assets, deliveries) rides a cursor, so the mark stops dead at an
+  undecided item — passing it would hide it from every future wake.
+- An activated **task** has no cursor and needs none: the queue is the **platform's** `activated`
+  list, so a task stays on it until this agent records it. An undecided task holds back only itself,
+  where a cursor would have suppressed the record of every task behind it — re-driving turns and
+  re-firing tools for nothing.
+
+Two consequences worth naming, because both are invisible when broken:
+
+- **The claim, not the record, is what stops a task re-firing.** The seen-set entry used to land
+  before the model was called, to stop the live "monkey pile-up" (a task's own image-post re-woke
+  the agent and re-surfaced the still-`activated` task). The claim already prevented that — it lands
+  before the turn, it is an atomic exclusive create, and a re-entrant wake loses it and skips. What
+  the record-first order added on top was nothing but the drop.
+- **A bootstrap's baseline is a jump, not a step.** Now that a stream's mark moves at settle, a wake
+  that dies on the very first asset of a timeline leaves *no mark*, so the next wake bootstraps —
+  and a bootstrap acts on the newest item only. `_extend_over_unfinished` (the message bootstrap's
+  guard since #285) is now shared with the stream bootstrap, so an orphan is never baselined past.
+
+**A drop of an item a wake *took* is never silent, for any kind.** Both residual at-most-once cases
+(an interrupted turn over the model's context ceiling; a turn a compaction destroyed) go through one
+place and log an ERROR naming the item **and its kind**. The scope of that claim is deliberate and
+worth stating: a cold *first* wake for a stream still acts on the newest item only and baselines past
+older ones it never claimed — a documented bound of the bootstrap, not a lost claim.
+
+### Fixed: a compaction could erase the recovery's evidence and cause the double-spend it exists to prevent
+
+Found while extending the recovery to the other three kinds, and it is **pre-existing** — a live
+hazard on the message path since #297, not something the above introduced (though it made it easier
+to reach, which is how it surfaced).
+
+The classifier's licence to re-drive is one inference: *no turn carries this item ⟹ the model never
+saw it ⟹ nothing ran.* **Compaction falsifies it.** A compaction replaces a whole region of the
+transcript with a single summary, so a turn that ran tools — that posted, that bought an image at
+fal.ai — can simply cease to exist while its item's claim is still `in-flight`. The next wake reads
+the emptiness as "never seen" and re-drives it. `_cut_index`'s own docstring already named this
+outcome; nothing enforced it.
+
+What makes it worse than a plain double-post is the idempotency key: the re-driven turn mints the
+*same* key the dead turn used, so the platform returns the **original** record — the model's newly
+composed reply is silently swallowed, the tool reports success, and the peer is answered with the
+old message while the non-idempotent effects (fal.ai, code execution) fire a second time. A duplicate
+wearing a drop's clothes.
+
+Two changes close it:
+
+- **A compaction summary inherits the uuids of the turns it destroys** (`Message.items`). A missing
+  turn whose uuid the summary carries was *seen*, and what it did is now unknowable — so it is
+  abandoned, loudly, instead of re-driven. A missing turn whose uuid is nowhere was genuinely never
+  sent, and re-drives exactly as before.
+- **A claim settles the instant its turn ends**, not at the end of the reconcile — so an item whose
+  turn finished is never re-classified by anyone, whatever the items behind it do to the transcript.
+  A dead wake now leaves exactly one in-flight claim per kind: the item it died on.
+
+The uuids are bounded, per Context Discipline: they cost no tokens (`items` is persisted, never sent
+to a provider), and every wake prunes the ones whose claims have reached a final phase — which is
+all of them within a wake or two, leaving only the handful of items genuinely in flight.
+
+### Fixed: a bootstrap could baseline straight past an orphan its read window could not see
+
+The bootstrap reads a bounded window of the newest items (50). A burst can push an orphan clean out
+of it — a wake claims a webhook delivery and dies, sixty more land before the next wake — and a
+window that cannot see an orphan cannot protect it: the mark jumps to the newest, and a cursor never
+looks back. The unfinished work is now read from the **claims**, which know what the window does not,
+and anything the window missed is fetched by uuid and acted on first.
+
+### Fixed: a NOC probe whose ack failed is no longer marked seen by the item behind it
+
+Found while generalizing `_settle`, and it is the same cursor-versus-set confusion in miniature. A
+probe ack posts at-least-once: if the post is refused, the item is deliberately *not* recorded, so
+the next wake re-acks it. But `_act_on` recorded each item as it went, and for the two **mark**-backed
+kinds the record is a *cursor* — so the very next asset or webhook delivery in the batch advanced the
+mark straight past the un-acked probe, and it was never re-acked by anyone: a false monitor FAIL,
+which is precisely the outcome the code was written to prevent. (The reasoning was right for tasks,
+whose seen-set really is a set, and quietly wrong for the other two.) The mark now stops dead at any
+undecided item, a failed probe ack included.
+
 ## [0.72.0] - 2026-07-14
 
 **The compaction proof counted one tool call per step. Models emit several.**

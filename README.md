@@ -424,14 +424,16 @@ Every inbound item the agent perceives — a peer's message, a posted asset, a w
 Because every wake is a fresh process, two properties matter that the poll loop got for free:
 
 - **Idempotent across invocations.** The high-water mark is persisted under `HARNESS_HOME` (one file per timeline) and advanced once a message is answered, so two events arriving close together — or a router retry — never produce a duplicate reply. If nothing is new, the wake makes **no model call** and exits `0`.
-- **A crashed wake does not lose the message.** The delivery guarantee is **at-least-once for the read, at-most-once for every side effect, exactly-once for the reply** — see below.
+- **A crashed wake does not lose the work.** The delivery guarantee is **at-least-once for the read, at-most-once for every side effect, exactly-once for the reply** — and it covers *every* kind of item a wake acts on: a peer's message, a posted asset, an inbound webhook delivery, an activated task. See below.
 - **The conversation persists.** Each wake runs the `timeline:<uuid>` session, reloading the prior transcript from `HARNESS_HOME` rather than re-seeding the backlog every time — one identity and one memory across every wake, per channel.
 
-#### If a wake dies mid-turn, the peer's message is not lost
+#### If a wake dies mid-turn, the work is not lost
 
-A wake can die *after* it has taken a message but *before* it has finished — the provider is down, the retries run out, the box is killed, the OOM killer picks it. The message must not simply vanish, and its side effects must not be repeated. So each message is **claimed in two phases**: a wake takes it `in-flight`, and only marks it `done` once the turn has actually completed. Nothing is marked seen until then, so a wake that dies leaves its messages exactly where the next wake will find them.
+A wake can die *after* it has taken an item but *before* it has finished — the provider is down, the retries run out, the box is killed, the OOM killer picks it. The item must not simply vanish, and its side effects must not be repeated. So each item is **claimed in two phases**: a wake takes it `in-flight`, and only marks it `done` once the turn has actually completed. Nothing is recorded as seen until then, so a wake that dies leaves its work exactly where the next wake will find it.
 
-What the next wake does with them is decided from **evidence** — the transcript on disk, which says how far the dead wake got. And the transcript is written **as the turn runs**, not once at the end: most of all, the assistant turn naming a tool call reaches disk *before that tool is dispatched*. That ordering is what makes the whole table below true, because it licenses one inference — **a tool call absent from the transcript is a tool call that never ran**:
+This holds for **all four kinds** a wake acts on — a peer's message, a posted asset, an inbound webhook delivery, an activated task. They differ in what re-offers an unfinished item: the three that ride a high-water mark simply refuse to advance it past one, while an activated **task** needs no cursor at all, because the queue is the platform's own — a task stays `activated` until this agent records it as handled.
+
+What the next wake does with an unfinished item is decided from **evidence** — the transcript on disk, which says how far the dead wake got. And the transcript is written **as the turn runs**, not once at the end: most of all, the assistant turn naming a tool call reaches disk *before that tool is dispatched*. That ordering is what makes the whole table below true, because it licenses one inference — **a tool call absent from the transcript is a tool call that never ran**:
 
 | The dead wake… | What happens | Why |
 |---|---|---|
@@ -439,15 +441,20 @@ What the next wake does with them is decided from **evidence** — the transcrip
 | died **inside the model call** | **re-driven** — engaged normally | Nothing ran, nothing posted. This is the common case. |
 | **completed its turn** (reached its final text) | **committed** — no model call, nothing re-posted | The turn *finished*: whatever it decided to say, it already said, itself, with its tools. Whatever it decided not to say was a decision. |
 | died **mid-tool-chain** (a call was issued, no final text) | **resumed** — the model is handed the partial turn and finishes it | Its tool results are already on disk, so the turn needs neither re-running nor dropping. **Zero tools re-fire.** |
+| its turn was **destroyed by a compaction** | **abandoned** — dropped, with an ERROR naming it | "No turn" is only evidence while nothing *removes* turns. A compaction does, so a summary records the items whose turns it destroyed — and what that turn did is now unknowable. Rare, and never silent. |
 
 The line that is never crossed: **a tool's side effects are never repeated** — and since the Unspoken Channel, *speech is a side effect*, so this is what stops an agent ever saying the same thing twice. A claim held by a *live* concurrent wake is never stolen, so two wakes firing at once still engage exactly once between them.
 
+That last row is the price of the first: the whole table rests on the inference *no turn ⟹ nothing ran*, and the transcript's own compaction is the one thing that can make it false. Rather than let a re-drive re-buy an image at fal.ai, a compaction says what it destroyed — so the item is dropped **loudly** instead of duplicated silently.
+
 **Resuming needs an answer to one genuinely unknowable question**: the wake was killed between the platform `POST` and the write that would have recorded it, so did the message land or not? Two kinds of interrupted call, and they are not the same:
 
-- A **platform create** (`messages`, `assets`, `tasks`, `webhook_endpoints`) is **re-issued** under a deterministic `Idempotency-Key` — derived from the timeline, the message being answered, the kind of create, and its ordinal in the turn, so the wake that *died* and the wake that *recovers it* mint the identical key. If the create landed, the platform returns the original record; if it didn't, it lands now. Either way there is exactly one of it. (This is what `basecradle>=0.6` is for.)
+- A **platform create** (`messages`, `assets`, `tasks`, `webhook_endpoints`) is **re-issued** under a deterministic `Idempotency-Key` — derived from the timeline, the item being answered, the kind of create, and its ordinal in the turn, so the wake that *died* and the wake that *recovers it* mint the identical key. If the create landed, the platform returns the original record; if it didn't, it lands now. Either way there is exactly one of it. (This is what `basecradle>=0.6` is for.)
 - A **non-idempotent effect** (`generate_image` → fal.ai, code execution) is **never** re-run — no key can un-spend money. The model is told plainly that the outcome is unknown and left to decide; it can read the timeline and see for itself. Full visibility, never forcing.
 
 > This got **simpler** when the auto-post went away. The harness used to hold a generated reply it still had to deliver, so recovery had to ask the timeline *"did my reply land?"* and answer it by matching message bodies byte-for-byte — with a residual false-match between two coincidentally identical replies. It holds no reply now. The commit record is the turn's own final text, in the transcript, and the question is simply **"did the turn finish?"**
+>
+> That is also why one recovery serves all four kinds rather than four. "Did my reply land?" would have needed a different answer for an asset than for a message; **"did the turn finish?"** has the same answer for both — and the transcript gives it.
 
 On the **first** wake for a timeline (no mark yet), the agent infers where to start: from an optional `--message <uuid>` (the triggering message, if the router passes one), else from its own latest post on the timeline (so a cutover from poll mode is lossless), else — if it has never spoken there — it answers just the newest message without flooding history. Exit code is `0` on success (including "nothing to do") and non-zero on a hard config/credential failure, so the router can report it.
 
