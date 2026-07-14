@@ -98,11 +98,26 @@ all of them within a wake or two, leaving only the handful of items genuinely in
 
 ### Fixed: a bootstrap could baseline straight past an orphan its read window could not see
 
-The bootstrap reads a bounded window of the newest items (50). A burst can push an orphan clean out
-of it — a wake claims a webhook delivery and dies, sixty more land before the next wake — and a
-window that cannot see an orphan cannot protect it: the mark jumps to the newest, and a cursor never
-looks back. The unfinished work is now read from the **claims**, which know what the window does not,
-and anything the window missed is fetched by uuid and acted on first.
+A bootstrap reads a bounded window of the newest items (50). A burst can push an orphan clean out of
+it — a wake claims a message and dies, sixty more land before the next wake — and a window that
+cannot see an orphan cannot protect it: the mark jumps to the newest, and a cursor never looks back.
+The unfinished work is now read from the **claims**, which know what the window does not, and
+anything the window missed is fetched by uuid and acted on first.
+
+This applies to **both** bootstraps — the streams' and the **message** path's. The message one is the
+pre-existing half (the hole has been there since #285) and the one where a drop costs the most: a
+peer's message, unanswered, with nobody ever the wiser.
+
+### Fixed: a batch-mate of a turn *this wake just resumed* could be abandoned as lost
+
+`Session.resume` ends in a compaction, and the turn it just finished is not always the newest — so
+the compaction can summarize away the very turn the wake completed a moment ago. A dead wake's turn
+carried a *batch*, so its other messages reach the classifier next: they find no turn, find their
+uuid on the summary, and were abandoned — loudly declared lost, having in fact just been answered.
+
+The wake now reads its own `_resumed` record before it reads the transcript, on the same principle
+`_readmit` already runs on: **a record of what other wakes did is not evidence about what this one
+did.**
 
 ### Fixed: a NOC probe whose ack failed is no longer marked seen by the item behind it
 

@@ -45,6 +45,8 @@ from tests.test_wake import (
     BC_URL,
     E0,
     E1,
+    M0,
+    M1,
     PNG_BYTES,
     REPLY,
     T0,
@@ -792,3 +794,91 @@ def test_a_working_wake_records_and_commits_every_kind_it_handled(platform, tmp_
     for kind, uuid in ((ASSETS, A0), (EVENTS, E0), (TASKS, T0)):
         assert kind.handled(tmp_path, uuid)
         assert agent.claims.read(TIMELINE_UUID, uuid, kind=kind.kind).phase == "done"
+
+
+# --- the transcript cannot testify about work *this* wake did -----------------
+
+
+def test_a_batch_mate_of_a_turn_this_wake_resumed_is_committed_not_abandoned(platform, tmp_path):
+    """A resume ends in a compaction, and a compaction can drop **the turn it just finished**.
+
+    The cut's floor is the *newest* real user turn, and a resumed turn is not always the newest —
+    a resume can fail, the wake goes on to answer newer messages, and an older turn is left
+    unfinished behind a newer one. So `Session.resume`'s own `_compact_if_needed` can summarize away
+    the very turn it has this moment completed.
+
+    A dead wake's turn carried a **batch**, so its other messages arrive at the classifier next. They
+    find no turn (it is gone), find their uuid on the summary, and — without this guard — are
+    **abandoned**: loudly declared lost, having in fact just been answered a millisecond ago. The
+    fix is the same principle `_readmit` already runs on: a record of what *other* wakes did is not
+    evidence about what *this* one did, so this wake's own `_resumed` list is read first.
+    """
+    serve_messages(platform, page(message(uuid=M1, body="and this"), message(uuid=M0, body="this")))
+    crashed_wake_owning(tmp_path, M0, M1)  # one dead wake's turn carried both
+
+    # Its transcript: the batch turn, a tool call, no narration — an interrupted turn.
+    dead = Harness(Finishes(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
+    dead.history.append(Message(role="user", content="[t] john: this / and this", items=[M0, M1]))
+    dead.history.append(
+        Message.assistant(
+            tool_calls=[
+                ToolCall(id="c1", name="messages", arguments={"action": "create", "body": "ok"})
+            ]
+        )
+    )
+    dead._save()
+
+    agent, brain = build_wake(tmp_path, Finishes(), tools=[MessagesTool()])
+    session = agent.harness.session(agent.source)
+    real_resume = Session.resume
+
+    def resume_then_compact(self, turn, *, brief=None):
+        """Stand in for the compaction `Session.resume` really does at the end of a turn."""
+        reply = real_resume(self, turn, brief=brief)
+        erased = Message.system("[Earlier conversation summarized] ...")
+        erased.items = list(turn.items)
+        self.history[:] = [erased]  # exactly what a cut past the resumed turn leaves behind
+        self._save()
+        return reply
+
+    Session.resume = resume_then_compact
+    try:
+        agent.wake()
+    finally:
+        Session.resume = real_resume
+
+    for uuid in (M0, M1):
+        claim = agent.claims.read(TIMELINE_UUID, uuid, kind="messages")
+        assert claim is not None and claim.phase == "done", (
+            f"{uuid} was abandoned as lost evidence — but this very wake had just answered it"
+        )
+    assert session is not None
+
+
+def test_a_message_bootstrap_recovers_an_orphan_its_read_window_cannot_see(platform, tmp_path):
+    """The same out-of-window hole, on the kind where a drop costs the most: a peer's message.
+
+    A wake bootstraps a fresh timeline, claims its only message, and dies — so (since the mark now
+    moves at settle) **no mark is ever written**. A burst lands. The next wake bootstraps again, and
+    its backlog window cannot reach back to the orphan: it would answer the newest, baseline the mark
+    past everything, and a cursor never looks back. The peer is never answered, and nobody ever knows.
+
+    `_extend_over_unfinished` cannot help — it only widens *within* the window. The claims can, and do.
+    """
+    serve_messages(platform, page(message(uuid=M1, body="the burst that buried it")))
+    crashed_wake_owning(tmp_path, M0)  # claimed by a dead wake, now outside the window
+    platform.get(f"/messages/{M0}").mock(
+        return_value=httpx.Response(
+            200, json={"message": message(uuid=M0, body="the message that was buried")}
+        )
+    )
+
+    agent, brain = build_wake(tmp_path, context_messages=1)
+    agent.wake()
+
+    assert any("buried it" in p for p in brain.prompts)  # the newest, which the bootstrap came for
+    assert any("that was buried" in p for p in brain.prompts), (
+        "a peer's message was baselined past because the read window could not see it"
+    )
+    claim = agent.claims.read(TIMELINE_UUID, M0, kind="messages")
+    assert claim is not None and claim.settled

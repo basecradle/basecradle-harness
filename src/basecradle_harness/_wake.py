@@ -2309,11 +2309,20 @@ class WakeAgent:
         recent = _recent(
             self.client.messages.filter(timeline=self.timeline_uuid), self.context_messages
         )
+        # A message a dead wake claimed can be pushed clean out of the backlog window by a burst,
+        # and the window is the only thing `_extend_over_unfinished` can widen over — so the claims
+        # are asked directly (`_stranded`). This is the same hole the stream bootstrap has, on the
+        # kind where it matters most: a peer's message, dropped silently, forever.
+        stranded = self._stranded(recent, _MESSAGES, self.client.messages.get)
         if not recent:
-            return []  # empty timeline: nothing to answer, nothing to mark
+            # An empty window is not an empty backlog: a claim can outlive what the read returns.
+            return self._respond(session, stranded) if stranded else []
         split = self._bootstrap_split(recent, trigger)
         split = self._extend_over_unfinished(recent, split, _MESSAGES)
-        to_reply = list(reversed(recent[: split + 1]))  # chronological; empty when split is -1
+        # Stranded messages are older than everything the window holds (a claim exists because some
+        # earlier wake already saw them), so they lead the batch and the ledger stays in timeline
+        # order — which is what `_settle`'s cursor requires.
+        to_reply = stranded + list(reversed(recent[: split + 1]))  # chronological
         context = recent[split + 1 :]  # older than the reply set, still newest-first
         if not _has_conversation(session):
             for message in reversed(context):  # oldest-first into history
@@ -2685,6 +2694,20 @@ class WakeAgent:
         self, session: Session, item: object, claim: Claim, *, kind: str, text
     ) -> str:
         """One orphan, classified from the transcript. See `_recover` for the four outcomes."""
+        # **This wake's own work is read first, and the transcript cannot testify about it.** A
+        # dead wake's turn carried a *batch*, so several of its messages arrive here as orphans of
+        # the same turn: the first resumes it, and the rest must recognize that it is finished. The
+        # transcript usually says so by itself (the turn now has a narration) — but `Session.resume`
+        # ends in a compaction, and the turn it just finished is not always the newest, so the
+        # compaction can **summarize away the very turn this wake resumed a moment ago**. Its
+        # batch-mates would then find no turn, find their uuid on the summary, and be *abandoned* —
+        # loudly declared lost, having in fact just been answered. The same reason `_readmit` reads
+        # `self._recovered` before it reads the claim file: a record of what *other* wakes did is
+        # not evidence about what *this* one did.
+        already = self._resumed_carrying(item)
+        if already is not None:
+            return self._committed(item, kind) if already == _FINAL else _PENDING
+
         turn = _turn_of(session.history, item, text)
         if turn is None:
             if _evidence_lost(session.history, item):
@@ -2826,6 +2849,28 @@ class WakeAgent:
         """
         for resumed, outcome in self._resumed:
             if resumed is turn:
+                return outcome
+        return None
+
+    def _resumed_carrying(self, item: object) -> str | None:
+        """How this wake's resume of the turn carrying `item` went — by **uuid**, not by identity.
+
+        `_resumed_outcome` answers the same question about a turn we still have in hand, and it is
+        the right test *while the turn is in the transcript*. This is the one that survives the turn
+        leaving it: a resume ends in a compaction, and a compaction can drop the turn it just
+        finished (it is not necessarily the newest, which is the only one the cut protects). After
+        that the turn object still exists — we are holding it, in `_resumed` — but `_turn_of` can no
+        longer find it in `history`, so every other message of that batch would classify as evidence
+        that is *gone* rather than work that is *done*.
+
+        A legacy turn carries no uuids, so this finds nothing and the identity test still backs it up
+        inside the tool-call branch.
+        """
+        uuid = _uuid_of(item)
+        if uuid is None:
+            return None
+        for resumed, outcome in self._resumed:
+            if uuid in resumed.items:
                 return outcome
         return None
 
