@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.72.0] - 2026-07-14
+
 **The compaction proof counted one tool call per step. Models emit several.**
 
 ### Fixed: a step, not a call, is the unit of the persistence caps (issue #304)
