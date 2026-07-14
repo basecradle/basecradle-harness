@@ -1083,36 +1083,34 @@ def test_activated_task_is_idempotent_across_processes(platform, tmp_path):
     assert second_provider.prompts == []  # the model was never consulted
 
 
-def test_activated_task_is_claimed_before_acting_so_a_crash_cannot_refire(platform, tmp_path):
-    """THE BUG-1 REGRESSION: a task is recorded seen BEFORE its action runs, so an action
-    that fails part-way — most importantly one that already posted a side effect whose
-    `asset.created` re-wakes the agent — can never re-surface the still-`activated` task
-    and re-run it. That act-then-record gap was the live monkey pile-up. At-most-once."""
+def test_activated_task_is_claimed_before_acting_so_a_re_entrant_wake_cannot_refire(
+    platform, tmp_path
+):
+    """THE BUG-1 REGRESSION, on the guard that actually carries it: **the claim, not the record.**
+
+    The monkey pile-up was an *act-then-record* gap: the task stayed `activated`, an action that
+    re-woke the agent (a generated image posts an `asset.created`) re-surfaced it, and the
+    unrecorded task fired again, and again. The fix at the time recorded it seen *before* acting —
+    and that is what issue #289 removes, because the seen-set entry then landed before the model was
+    ever called, so a wake killed in between filed a task nobody ever ran as done, forever.
+
+    What stops the re-fire is the claim, and it always was: it lands before the turn, it is an
+    atomic exclusive create, and a re-entrant wake that finds it simply skips the task. This pins
+    exactly that — a second wake arriving *while the first still holds the task in flight* never
+    touches it — with no seen-set entry anywhere in sight.
+    """
     serve_messages(platform, page(), page())
     serve_tasks(
         platform,
         task_page(task(uuid=T0, instructions="generate a monkey and post it")),
         task_page(task(uuid=T0, instructions="generate a monkey and post it")),
     )
+    live_wake_owning(tmp_path, T0, kind="tasks")  # a concurrent wake is mid-turn on this task
 
-    class DiesOnTheTask:
-        """Stands in for an action that blows up after the task was claimed."""
-
-        prompts: list[str] = []
-
-        def chat(self, messages, tools=None):
-            raise RuntimeError("the action crashed mid-flight")
-
-    first, _ = build_wake(tmp_path, DiesOnTheTask())
-    with pytest.raises(RuntimeError):
-        first.wake()
-    # The crash propagated, but the task was already claimed — so it is recorded seen.
-    assert T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
-
-    # A later wake (working brain) does NOT re-run it: no re-fire, no monkey pile-up.
-    second, second_provider = build_wake(tmp_path)
-    assert second.wake() == []
-    assert second_provider.prompts == []  # the model was never consulted again
+    intruder, brain = build_wake(tmp_path)
+    assert intruder.wake() == []
+    assert brain.prompts == []  # the model was never consulted: the task is already owned
+    assert T0 not in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")  # and never recorded
 
 
 def test_already_handled_task_is_skipped_when_a_new_one_activates(platform, tmp_path):
@@ -3946,7 +3944,7 @@ def test_a_probe_ack_is_logged_as_an_ack_not_as_the_agent_speaking(platform, tmp
 # plus the two the mechanism could plausibly get wrong (a live concurrent wake; a legacy claim).
 
 
-def crashed_wake_owning(home, *uuids, phase="in-flight"):
+def crashed_wake_owning(home, *uuids, phase="in-flight", kind="messages"):
     """A claim left behind by a wake that died: in-flight, owned by a process that is gone.
 
     pid 1 is never this test process, and `_orphaned` reads a claim whose pid is not ours and
@@ -3955,10 +3953,28 @@ def crashed_wake_owning(home, *uuids, phase="in-flight"):
     """
     store = ClaimStore(home)
     for uuid in uuids:
-        store.claim(TIMELINE_UUID, uuid, kind="messages")
+        store.claim(TIMELINE_UUID, uuid, kind=kind)
         store._write(
-            store._path(TIMELINE_UUID, "messages", uuid),
+            store._path(TIMELINE_UUID, kind, uuid),
             Claim(phase=phase, pid=1, wake="a-wake-that-died", at=0.0),
+        )
+    return store
+
+
+def live_wake_owning(home, *uuids, kind="messages"):
+    """The mirror of `crashed_wake_owning`: a claim a **concurrent, still-running** wake holds.
+
+    The same pid-1 trick, stamped *now* rather than ancient — so the age backstop does not fire and
+    `_orphaned` answers no. It cannot be faked with this process's own pid: a claim from a
+    *different wake of the same process* is orphaned by definition (a process runs its wakes one at
+    a time, so that wake is over), which is exactly the case `_orphaned` is built to catch.
+    """
+    store = ClaimStore(home)
+    for uuid in uuids:
+        store.claim(TIMELINE_UUID, uuid, kind=kind)
+        store._write(
+            store._path(TIMELINE_UUID, kind, uuid),
+            Claim(phase="in-flight", pid=1, wake="a-wake-still-running", at=time.time()),
         )
     return store
 

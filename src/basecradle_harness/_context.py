@@ -645,7 +645,9 @@ class Compactor:
             return (
                 False  # the summarize call failed; _summarize logged it. Leave the transcript be.
             )
-        history[head:cut] = [Message.system(_summary_note(len(dropped), summary))]
+        note = Message.system(_summary_note(len(dropped), summary))
+        note.items = _carried_items(dropped)
+        history[head:cut] = [note]
         self._remember(summary)
         _log.info(
             "context compact %s",
@@ -793,6 +795,37 @@ def _cut_index(history: list[Message], head: int, keep_chars: int) -> int | None
 def _is_boundary(message: Message) -> bool:
     """May the retained tail begin here? Only at a **real** user turn — see `_cut_index`."""
     return message.role == "user" and not message.injected
+
+
+def _carried_items(dropped: Sequence[Message]) -> list[str]:
+    """Every platform item whose turn this compaction is about to destroy.
+
+    **Compaction summarizes the conversation away; it may never *erase the recovery's evidence*.**
+    The delivery guarantee's classifier reads one thing off the transcript — *is there a turn
+    carrying this item?* — and treats "no" as proof that the dead wake never reached the model, which
+    licenses a **re-drive**. Compaction can make that inference a lie: it replaces a whole region of
+    `history` with a single summary, so a turn that ran tools — that posted, that generated an image
+    at fal.ai — can simply cease to exist while the item's claim is still `in-flight`. The next wake
+    then re-drives a turn that already spoke, re-firing every tool in it. Nothing errors, and the
+    peer is answered twice (or, worse, the idempotency key hands back the *original* record, so the
+    model's new message is swallowed and nobody is answered at all).
+
+    So the summary **inherits the uuids of the turns it drops**, and the recovery reads them
+    (`_wake._evidence_lost`): a missing turn whose uuid is *here* was seen and its outcome is now
+    unknowable — a loud, rare abandon — while a missing turn whose uuid is nowhere was genuinely
+    never sent, and re-drives exactly as before. A previous summary sits inside the dropped region,
+    so its uuids carry forward with the rest; `dict` dedupes and keeps them in order.
+
+    **What bounds this** (Context Discipline): the uuids cost no tokens — `items` is persisted but
+    never sent to a provider — and `_wake._forget_settled` prunes every uuid whose claim has since
+    reached a final phase, which is all of them within a wake or two. What remains is the handful of
+    items genuinely still in flight, which is the only thing the recovery will ever ask about.
+    """
+    carried: dict[str, None] = {}
+    for message in dropped:
+        for uuid in message.items:
+            carried[uuid] = None
+    return list(carried)
 
 
 def _render(messages: Sequence[Message]) -> str:
