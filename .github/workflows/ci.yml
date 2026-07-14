@@ -43,12 +43,29 @@ jobs:
       - name: Test
         run: uv run pytest
 
+  # The CHANGELOG, _version.py, and the git tags must tell one story. This runs on every PR
+  # because the failure it catches is introduced by an ordinary-looking PR and only becomes
+  # visible later: a bump that renames the *previous* release's header instead of adding its
+  # own erases a published version from the record (it happened to v0.43.0 and v0.47.0).
+  #
+  # fetch-depth: 0 is load-bearing — the shallow default fetches no tags, and a check that
+  # cannot find its input would pass vacuously forever.
+  changelog:
+    name: changelog
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Check release coherence
+        run: python3 scripts/check_release.py repo
+
   # The gate: the single required status check in branch protection.
   # Adding or dropping Python versions never requires a ruleset change.
   ci:
     name: CI
     runs-on: ubuntu-latest
-    needs: [lint, test]
+    needs: [lint, test, changelog]
     if: always()
     steps:
       - name: Fail unless every required job succeeded
