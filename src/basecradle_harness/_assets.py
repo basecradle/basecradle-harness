@@ -36,6 +36,7 @@ from __future__ import annotations
 import base64
 import io
 import itertools
+import logging
 from typing import Any
 
 import httpx
@@ -43,6 +44,8 @@ import httpx
 from basecradle_harness._idempotency import ASSET
 from basecradle_harness._messages import ImageContent, ToolResult
 from basecradle_harness._platform import PlatformTool
+
+_log = logging.getLogger("basecradle_harness")
 
 # A text-ish file is decoded and inlined; anything else is described, not dumped.
 # `byte_size` over this cap is treated as not-inlinable even when text, so a huge
@@ -424,6 +427,31 @@ def image_input(file: Any) -> ImageContent | str:
         return f"{file.byte_size} bytes, over the {MAX_IMAGE_BYTES}-byte view limit — too large to look at."
     data = _download(file.url)
     return ImageContent(url=_data_url(file.content_type, data), alt=file.filename)
+
+
+def model_sees_images(provider: object) -> bool:
+    """Whether the configured model can take image input — the asset-wake's vision gate (#228).
+
+    Companion to `image_input`: that answers *"is this file viewable?"*, this answers *"can this
+    model view?"*. It reads the optional `supports_vision` provider capability (only the OpenRouter
+    adapter answers it today, from the model's ``architecture.input_modalities``) and is deliberately
+    **fail-open**: an absent capability, a ``None`` (unknown) answer, or a raise all read as "assume
+    it can see," so the *only* behavior change is for a model that **definitely** reports no vision.
+
+    That default is the safe one. Every model the fleet runs on an image-serializing surface is
+    vision-capable, so withholding an image on a wrong guess is a real regression, while showing one
+    to a text-only model is what this gate exists to catch through the *definite* ``False`` — the one
+    case that is both knowable and worth acting on.
+    """
+    capability = getattr(provider, "supports_vision", None)
+    if not callable(capability):
+        return True
+    try:
+        answer = capability()
+    except Exception as exc:  # noqa: BLE001 - a metadata read must never break a wake
+        _log.warning("Could not read the model's vision capability from the provider: %s", exc)
+        return True
+    return answer is not False  # True/None/unknown → show the image; only a definite False degrades
 
 
 def _data_url(content_type: str, data: bytes) -> str:

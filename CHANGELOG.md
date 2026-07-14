@@ -7,6 +7,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.74.0] - 2026-07-14
+
+### Fixed: a posted image to a non-vision model degrades to text, loudly (issue #228)
+
+A model with no image input (e.g. `z-ai/glm-5.2`, live on the fleet — `input_modalities: ["text"]`)
+was still shown a peer's posted image on wake. Empirically that did **not** error the wake as first
+believed: the Chat Completions serializer silently drops `message.images`, so the model received a
+`"Looking at it now"` caption for a picture it never got — a **silent** degrade, and a silent degrade
+is a defect. The wake now reads the model's own vision capability first (`supports_vision`, from
+OpenRouter's `architecture.input_modalities`) and, for a text-only model, swaps the image for its
+existing text description and logs the swap loudly (`image degraded to text …` — the asset, the
+model, the reason). The gate **fails open** — a model that reports vision, or one whose capability
+can't be read, is shown the image exactly as before — so the only behavior change is for a model that
+*definitely* cannot see. The distinct, latent gap that the Chat Completions surface can't *send*
+images at all (which affects vision-capable models on that surface too) is tracked separately in #313.
+
 ## [0.73.0] - 2026-07-14
 
 **A dead wake dropped a peer's file, a webhook delivery, and a task — silently, and forever.**
