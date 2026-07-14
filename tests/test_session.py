@@ -24,7 +24,17 @@ from basecradle_harness import (
     ToolCall,
     ToolRegistry,
 )
-from basecradle_harness._session import TOOL_RESULT_CAP, turn_work
+from basecradle_harness._session import (
+    TOOL_ARGS_CAP,
+    TOOL_RESULT_CAP,
+    _cap_arguments,
+    _elide_argument,
+    _json_size,
+    turn_work,
+)
+
+#: A real, well-formed UUIDv7, per the repo's test-data convention.
+TIMELINE = "0198e3f1-0000-7000-8000-000000000001"
 
 
 class ScriptedProvider:
@@ -492,6 +502,266 @@ def test_a_pre_cap_transcript_heals_on_load(tmp_path):
     assert len(stored.content) < TOOL_RESULT_CAP
     assert f"of {len(bloat)}" in stored.content
     assert stored.tool_call_id == "c1"  # pairing survives the heal
+
+
+# --- Tool call arguments: sent in full, persisted capped (issue #301) ---------
+#
+# The half of a call nobody bounded. `_payload` capped a tool *result* and wrote the *arguments*
+# whole, so an `assets create` carrying a 200 KB document sat in the transcript forever and was
+# replayed to the model on every wake for the life of the timeline — the one class of persisted
+# content with no bound at all, against Context Discipline's first invariant.
+
+
+def _stored_calls(path) -> list[dict]:
+    """Every tool call as it actually reached the disk — the only thing a later wake re-reads."""
+    return [call for m in json.loads(path.read_text()) for call in m.get("tool_calls", [])]
+
+
+def test_an_oversized_argument_is_sent_whole_then_persisted_capped(tmp_path):
+    """The tool runs with the whole document; what *persists* is head + tail around a marker.
+
+    Exactly the shape the result cap already had, applied to the other half of the call — and the
+    live offender from issue #301: an agent that posts a long document paid for it on every wake,
+    forever, because the transcript kept the document.
+    """
+    document = "REPORT\n" + ("x" * 200_000) + "\nEND-OF-REPORT"
+    posted: list[str] = []
+
+    class Assets(Tool):
+        name = "assets"
+        description = "store an asset"
+
+        def run(self, **kwargs):
+            posted.append(kwargs["content"])
+            return "asset 0198e3f1-0000-7000-8000-000000000001 created"
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(
+        calls_tool("c1", "assets", action="create", title="Q3 Report", content=document),
+        text("Posted the report."),
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Assets()]).engine, path=path)
+
+    session.send("write up Q3")
+
+    # The tool ran with the document intact: the cap bounds what is *kept*, never what is *sent*.
+    assert posted == [document]
+
+    (stored,) = _stored_calls(path)
+    assert _json_size(stored["arguments"]) <= TOOL_ARGS_CAP
+    # The blob is elided; the small arguments beside it survive whole, so the call is still legible.
+    assert stored["arguments"]["action"] == "create"
+    assert stored["arguments"]["title"] == "Q3 Report"
+    body = stored["arguments"]["content"]
+    assert body.startswith("REPORT")  # the head survives…
+    assert body.endswith("END-OF-REPORT")  # …and so does the tail
+    assert f"elided from {len(document)} chars" in body  # and the marker names what was cut
+    assert "elided" in body
+
+
+def test_ordinary_arguments_persist_byte_for_byte(tmp_path):
+    """The cap is a bound, not a haircut. A normal call — the overwhelming majority — is untouched.
+
+    A message body of a few hundred characters is an agent's own speech, and it keeps it verbatim.
+    """
+    body = "Dallas, Texas. " * 20
+
+    class Messages(Tool):
+        name = "messages"
+        description = "post a message"
+
+        def run(self, **kwargs):
+            return "posted"
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(
+        calls_tool("c1", "messages", action="create", body=body), text("Said it.")
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Messages()]).engine, path=path)
+
+    session.send("where am I?")
+
+    (stored,) = _stored_calls(path)
+    assert stored["arguments"] == {"action": "create", "body": body}
+
+
+def test_the_live_call_is_never_edited_only_what_reaches_the_disk(tmp_path):
+    """Bounding happens **on the way out**, never by mutating the call the engine is holding.
+
+    This is the guard against the tidy-up that would "simplify" `_payload` by capping `history` in
+    place, the way `_cap_tool_results` does. It cannot be done here, and the reason is not style: a
+    save lands **mid-turn** (the pre-dispatch write the whole delivery guarantee rests on), and the
+    recovery re-issues an interrupted platform create *from these very arguments*. An in-place cap
+    would reach into the call about to be dispatched — and into the body a resumed wake is about to
+    re-post — and cut it down. The transcript on disk is bounded; the conversation in hand is whole.
+    """
+    document = "x" * 200_000
+
+    class Assets(Tool):
+        name = "assets"
+        description = "store an asset"
+
+        def run(self, **kwargs):
+            return "stored"
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(
+        calls_tool("c1", "assets", action="create", content=document), text("Stored.")
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Assets()]).engine, path=path)
+
+    session.send("store this")
+
+    live = next(m for m in session.history if m.tool_calls).tool_calls[0]
+    assert live.arguments["content"] == document, "the cap edited the live call, not the payload"
+    assert _json_size(_stored_calls(path)[0]["arguments"]) <= TOOL_ARGS_CAP
+
+
+def test_a_call_too_big_to_bound_by_eliding_its_values_is_stubbed_and_still_classifiable(tmp_path):
+    """The backstop: hundreds of *medium* arguments, none of them individually elidable.
+
+    Rare to the point of pathological — but "rare" is not a bound, and an unbounded fallback would be
+    the very defect this cap exists to close, hiding behind a shape nobody expected. `action` survives
+    even here, because `create_kind` reads it and the idempotency ordinal must be the same number
+    counted off the live transcript and the reloaded one.
+    """
+    arguments = {"action": "create", **{f"field_{i}": "y" * 100 for i in range(200)}}
+
+    class Assets(Tool):
+        name = "assets"
+        description = "store an asset"
+
+        def run(self, **kwargs):
+            return "stored"
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(calls_tool("c1", "assets", **arguments), text("Stored."))
+    session = Session("timeline:x", Harness(provider, tools=[Assets()]).engine, path=path)
+
+    session.send("store this")
+
+    (stored,) = _stored_calls(path)
+    assert _json_size(stored["arguments"]) <= TOOL_ARGS_CAP
+    assert stored["arguments"]["action"] == "create"  # still a create, to anyone counting them
+    assert "elided" in json.dumps(stored["arguments"])
+
+
+def test_cutting_an_argument_never_makes_it_bigger():
+    """**A cap that can grow a transcript is not a cap** — the shrink check in `_elide_argument`.
+
+    The marker costs ~120 characters, so "eliding" a 200-character value would *add* to it. Water-
+    filling hands every argument a share and cuts the ones that overflow theirs, so it does reach
+    values in that band. Comparing the two sizes is what forecloses it, and this tests the guard
+    directly rather than through `_cap_arguments`, where the stub backstop can mask the difference.
+    """
+    for size in (40, 120, 200):  # the band where the marker costs more than it saves
+        assert _elide_argument("x" * size, budget=1024) == "x" * size
+
+    excerpt = _elide_argument("x" * 200_000, budget=1024)
+    assert _json_size(excerpt) <= 1024
+    assert "elided from 200000 chars" in excerpt  # and it says how much is gone
+
+    # A structure has no honest head-and-tail, so it is replaced outright — but only when that shrinks
+    # it. A tiny list would grow, and is left alone.
+    assert _elide_argument(["z" * 290], budget=512) != ["z" * 290]
+    assert _elide_argument([1, 2], budget=512) == [1, 2]
+
+
+def test_a_call_is_capped_by_the_language_it_is_written_in_never_by_the_script():
+    """**A character is a character, whatever script it is written in** (found in review of #301).
+
+    `json.dumps` defaults to `ensure_ascii=True`, which escapes every non-Latin character to a six-
+    character `\\uXXXX`. Sizing the cap with it priced one Japanese character at six, so an *ordinary*
+    500-character message body blew a 2,048-character cap — and the call collapsed to the stub, which
+    keeps nothing but `action`. A peer answered in Japanese lost its own words, its timeline uuid and
+    its subject from the transcript, while the identical message in English persisted whole.
+
+    That is not a cost bug. It is an agent that cannot remember what it said because of the language it
+    said it in, on a platform whose founding claim is that its peers are equals. The cap bounds
+    **context**, and context is billed on the decoded string.
+    """
+    body = "こんにちは、今日の状況を共有します。" * 28  # ~500 characters: an ordinary post
+    japanese = {"action": "create", "timeline": TIMELINE, "body": body}
+
+    assert _cap_arguments(japanese) == japanese, "an ordinary Japanese post did not survive the cap"
+
+    # The same post in English is likewise untouched — which is the entire point: same size, same fate.
+    english = {
+        "action": "create",
+        "timeline": TIMELINE,
+        "body": "Hello, here is today's status. " * 17,
+    }
+    assert _cap_arguments(english) == english
+
+    # And a Japanese body that *is* genuinely over the cap is excerpted like any other — in Japanese,
+    # with its siblings intact — never stubbed away.
+    long_form = {"action": "create", "timeline": TIMELINE, "body": "日本語の長い本文です。" * 800}
+    capped = _cap_arguments(long_form)
+    assert _json_size(capped) <= TOOL_ARGS_CAP
+    assert capped["action"] == "create" and capped["timeline"] == TIMELINE
+    assert capped["body"].startswith("日本語の長い本文です。")
+
+
+def test_a_call_of_several_medium_arguments_keeps_all_of_them(tmp_path):
+    """Water-filling, and why the cap does not simply elide the biggest argument until the call fits.
+
+    An excerpt costs a marker, so an argument can be **too small to be worth eliding and still too big
+    to keep** — and a call made of several of them (an ordinary `tasks create` with three 700-character
+    fields) could never be brought under the cap at all. It fell through to the stub, and *every*
+    argument was lost to save the 159 characters that were over. Giving each argument a fair share of
+    the budget has no such cliff: it always makes progress, and it takes the room from where the room is.
+    """
+    arguments = {
+        "action": "create",
+        "timeline": TIMELINE,
+        "title": "Ship the thing",
+        "description": "D" * 700,
+        "acceptance": "A" * 700,
+        "notes": "N" * 700,
+    }
+
+    capped = _cap_arguments(arguments)
+
+    assert _json_size(capped) <= TOOL_ARGS_CAP
+    assert list(capped) == list(arguments), (
+        "an argument was dropped to bring the call under the cap"
+    )
+    # The short ones are kept byte for byte — their surplus is what pays for the long ones' excerpts.
+    assert capped["action"] == "create"
+    assert capped["timeline"] == TIMELINE
+    assert capped["title"] == "Ship the thing"
+    for name in ("description", "acceptance", "notes"):
+        assert capped[name].startswith(arguments[name][:50])
+        assert "elided from 700 chars" in capped[name]
+
+
+def test_re_saving_a_capped_transcript_is_a_fixed_point(tmp_path):
+    """A transcript is re-saved on every turn for the life of the timeline, so the cap must not ratchet.
+
+    An already-capped call is *under* the cap, so it passes back through untouched — no marker of a
+    marker of a marker, each naming a size that is no longer true. The property is the point; the
+    mechanism (the early return in `_cap_arguments`) is what delivers it.
+    """
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(
+        calls_tool("c1", "assets", action="create", content="x" * 200_000), text("Stored.")
+    )
+
+    class Assets(Tool):
+        name = "assets"
+        description = "store an asset"
+
+        def run(self, **kwargs):
+            return "stored"
+
+    session = Session("timeline:x", Harness(provider, tools=[Assets()]).engine, path=path)
+    session.send("store this")
+    once = _stored_calls(path)
+
+    reloaded = Session("timeline:x", Harness(ScriptedProvider()).engine, path=path)
+    reloaded.note("a later turn re-saves the whole transcript")
+
+    assert _stored_calls(path) == once
 
 
 def test_note_records_a_system_turn_without_calling_the_model(tmp_path):

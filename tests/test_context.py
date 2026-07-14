@@ -31,6 +31,7 @@ from basecradle_harness import (
 from basecradle_harness._context import (
     COMPACT_AT,
     DEFAULT_CONTEXT_LIMIT,
+    TOOL_ARGS_CAP,
     TOOL_RESULT_CAP,
     WORST_CASE_CHARS_PER_TOKEN,
     Compactor,
@@ -38,6 +39,7 @@ from basecradle_harness._context import (
     is_context_overflow,
     max_safe_steps,
     min_safe_limit,
+    persisted_call_cap,
     worst_case_turn_tokens,
 )
 from basecradle_harness._engine import DEFAULT_MAX_STEPS
@@ -753,10 +755,10 @@ def test_an_unrelated_exceeds_the_maximum_is_not_the_wall(text):
 
 
 def test_the_worst_case_is_derived_from_the_constants_not_hardcoded():
-    # The whole point of deriving it: tune the cap or the step budget and the guarantee's arithmetic
+    # The whole point of deriving it: tune a cap or the step budget and the guarantee's arithmetic
     # follows automatically. A literal 30_000 here would rot the day either constant moved.
     assert worst_case_turn_tokens(DEFAULT_MAX_STEPS) == int(
-        TOOL_RESULT_CAP * DEFAULT_MAX_STEPS / WORST_CASE_CHARS_PER_TOKEN
+        (TOOL_RESULT_CAP + TOOL_ARGS_CAP) * DEFAULT_MAX_STEPS / WORST_CASE_CHARS_PER_TOKEN
     )
     assert worst_case_turn_tokens(2 * DEFAULT_MAX_STEPS) == 2 * worst_case_turn_tokens(
         DEFAULT_MAX_STEPS
@@ -765,6 +767,41 @@ def test_the_worst_case_is_derived_from_the_constants_not_hardcoded():
     assert min_safe_limit(DEFAULT_MAX_STEPS) * (1 - COMPACT_AT) >= worst_case_turn_tokens(
         DEFAULT_MAX_STEPS
     )
+
+
+def test_the_arguments_cap_is_an_input_to_the_proof_not_a_neighbor_of_it(monkeypatch):
+    """Both halves of a persisted tool call are in the arithmetic — its result *and* its arguments.
+
+    Until issue #301 only the result was, and the omitted term was not merely small: it was
+    **unbounded**, so the inequality this file is built on did not hold at all. A change that caps the
+    arguments without teaching the proof about them would leave exactly that gap, one size smaller and
+    just as silent — which is why `persisted_call_cap` exists and why this test watches it rather than
+    a literal.
+    """
+    assert persisted_call_cap() == TOOL_RESULT_CAP + TOOL_ARGS_CAP
+
+    worst_case = worst_case_turn_tokens(DEFAULT_MAX_STEPS)
+    needed = min_safe_limit(DEFAULT_MAX_STEPS)
+    affordable = max_safe_steps(DEFAULT_CONTEXT_LIMIT)
+
+    # Raise what one call may leave behind and *both* sides of the guarantee move with it: the ceiling
+    # it takes to stay safe goes up, and the step budget a given ceiling can afford comes down.
+    monkeypatch.setattr("basecradle_harness._context.TOOL_ARGS_CAP", 2 * TOOL_ARGS_CAP)
+    assert worst_case_turn_tokens(DEFAULT_MAX_STEPS) > worst_case
+    assert min_safe_limit(DEFAULT_MAX_STEPS) > needed
+    assert max_safe_steps(DEFAULT_CONTEXT_LIMIT) < affordable
+
+
+def test_the_shipped_caps_keep_the_default_install_inside_the_guarantee():
+    """The floor must clear the bar *with the arguments counted* — or every stock agent warns.
+
+    This is the constraint that sizes `TOOL_ARGS_CAP`. The 128 K floor leaves 64 K of headroom above
+    the threshold, and one turn can now add ~49 K of it (6 KB per call x 24 steps at 3 chars/token).
+    Raise the argument cap to the result cap's 4 KB and the minimum safe ceiling lands at 131_072 —
+    *above* the floor — and the default install starts warning about a guarantee it has not actually
+    lost. A warning that fires on every stock agent is a warning nobody reads.
+    """
+    assert min_safe_limit(DEFAULT_MAX_STEPS) < DEFAULT_CONTEXT_LIMIT
 
 
 def test_an_env_budget_too_small_for_the_guarantee_warns_and_names_the_numbers(caplog):

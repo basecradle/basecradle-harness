@@ -51,7 +51,7 @@ from basecradle_harness import (
     ToolCall,
 )
 from basecradle_harness._idempotency import MESSAGE, IdempotencyKeys, key
-from basecradle_harness._session import INTERRUPTED, turn_work
+from basecradle_harness._session import INTERRUPTED, TOOL_ARGS_CAP, _json_size, turn_work
 from basecradle_harness._wake import Claim, ClaimStore, _turn_narration
 from tests.test_wake import (
     BC_URL,
@@ -468,6 +468,154 @@ def test_a_non_idempotent_effect_is_surfaced_never_re_run(platform, tmp_path):
     shown = brain.seen[0]
     interrupted = next(m for m in shown if m.role == "tool" and m.tool_call_id == "c1")
     assert interrupted.content == INTERRUPTED
+
+
+# --- the arguments the recovery replays from (issue #301) ---------------------
+#
+# The transcript now caps a tool call's *arguments* as well as its result — everything replayed per
+# wake must be bounded. But the resume re-issues an interrupted platform create **from exactly those
+# arguments**, so the cap has one exception, and these pin both halves of it: the arguments the
+# recovery still needs survive whole, and they are bounded the moment it no longer needs them.
+
+
+def test_an_interrupted_creates_body_survives_the_cap_and_is_re_posted_whole(platform, tmp_path):
+    """**The trap the naive fix walks into.** A killed create is re-issued byte for byte, at any size.
+
+    Capping a call's arguments the obvious way — elide anything over the cap, like a tool result —
+    would truncate the body of the very message the recovery is about to re-post. Under the dead
+    wake's idempotency key that is harmless *if* the original POST landed (the platform hands back
+    the original record and the elided body is never used) — and if it did **not** land, the elided
+    body is what the peer reads, forever. That is worse than the cost it saves, and it is why issue
+    #297 left the arguments alone rather than capping them wrong.
+    """
+    body = "Here is the full report you asked for.\n\n" + ("x" * 200_000) + "\n\nEND-OF-REPORT"
+    serve_messages(platform, page(message(uuid=M0, body=MULTILINE)))
+
+    # The dead wake got as far as writing the call and no further: no result, so the POST may or may
+    # not have landed. The one genuinely unknowable state — and the arguments are the only record of
+    # what it was trying to say.
+    crashed_wake_owning(tmp_path, M0)
+    session = Harness(_Finishes(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
+    session.history.append(
+        Message(role="user", content=f"[2026-06-04T00:00:00.000Z] john: {MULTILINE}", items=[M0])
+    )
+    session.history.append(
+        Message.assistant(
+            tool_calls=[
+                ToolCall(id="c1", name="messages", arguments={"action": "create", "body": body})
+            ]
+        )
+    )
+    session._save()
+
+    # It is on disk **whole**, over the cap and unelided, because it is still load-bearing.
+    (call,) = [c for m in _transcript(tmp_path) for c in m.get("tool_calls", [])]
+    assert call["arguments"]["body"] == body
+
+    agent, _ = build_wake(tmp_path, _Finishes(), tools=[MessagesTool()])
+    agent.wake()
+
+    assert _posts(platform) == [body], "the recovery re-posted a body the cap had cut down"
+    assert _keys(platform) == [key(timeline=TIMELINE_UUID, anchor=M0, kind=MESSAGE, ordinal=1)]
+
+    # And now that the re-issue has settled it, the arguments stop being evidence and start being
+    # cost — so the very next save bounds them. The exception is *transient*, never a loophole.
+    (call,) = [c for m in _transcript(tmp_path) for c in m.get("tool_calls", [])]
+    assert _json_size(call["arguments"]) <= TOOL_ARGS_CAP
+    assert call["arguments"]["body"].startswith("Here is the full report")
+    assert f"elided from {len(body)} chars" in call["arguments"]["body"]
+
+
+def test_an_unsettled_create_keeps_its_arguments_across_every_save_until_it_is_re_issued(tmp_path):
+    """The "outcome unknown" marker is a **durable** flag, not a one-wake grace period.
+
+    A wake can load an interrupted turn, save the transcript for some other reason, and die again
+    before it re-issues anything — `Session.excise` and `Session.note` both write, and a resume can
+    lose its take-over race and never run at all. If any of those writes capped the arguments, the
+    *next* wake would replay a mangled create. So the cap keys on the marker, and the marker stands
+    until a real result replaces it.
+    """
+    body = "y" * 200_000
+    path = tmp_path / "t.json"
+    session = Session("timeline:x", Harness(_Finishes()).engine, path=path)
+    session.history.append(Message.user("say something long"))
+    session.history.append(
+        Message.assistant(
+            tool_calls=[
+                ToolCall(id="c1", name="messages", arguments={"action": "create", "body": body})
+            ]
+        )
+    )
+    session.history.append(Message.tool(tool_call_id="c1", content=INTERRUPTED))
+
+    session.note("some unrelated turn wrote the transcript again")
+
+    (call,) = [c for m in json.loads(path.read_text()) for c in m.get("tool_calls", [])]
+    assert call["arguments"]["body"] == body
+
+
+def test_a_reused_tool_call_id_never_makes_an_interrupted_create_look_settled(tmp_path):
+    """A call is paired with a result **from its own turn's run** — never by a global id lookup.
+
+    A `tool_call_id` is the provider's own string and nothing normalizes it: a model that numbers its
+    calls per response (`call_0`, `call_1` — what an OpenRouter-fronted model emits, and the fleet's
+    primary agent is one) reuses the same ids on every turn. Look a call's result up across the whole
+    transcript and an **interrupted** create finds the *previous* turn's "posted" — reads as settled,
+    has its arguments elided, and the resume then re-posts the peer's message with its body cut out.
+    The same trap `heal_interrupted_calls` and `_idempotency.creates` each avoid, in the same way.
+    """
+    body = "x" * 200_000
+    path = tmp_path / "t.json"
+    session = Session("timeline:x", Harness(_Finishes()).engine, path=path)
+    session.history += [
+        Message.user("first"),
+        Message.assistant(
+            tool_calls=[
+                ToolCall(id="call_0", name="messages", arguments={"action": "create", "body": body})
+            ]
+        ),
+        Message.tool(tool_call_id="call_0", content="posted"),  # settled
+        Message.assistant(content="Said it."),
+        Message.user("second"),
+        Message.assistant(  # the SAME id, a turn later — and this one was interrupted
+            tool_calls=[
+                ToolCall(id="call_0", name="messages", arguments={"action": "create", "body": body})
+            ]
+        ),
+        Message.tool(tool_call_id="call_0", content=INTERRUPTED),
+    ]
+
+    session._save()
+
+    settled, unsettled = [c for m in json.loads(path.read_text()) for c in m.get("tool_calls", [])]
+    assert _json_size(settled["arguments"]) <= TOOL_ARGS_CAP  # its fate is decided: bounded
+    assert unsettled["arguments"]["body"] == body  # still replayable: whole, at any size
+
+
+def test_an_interrupted_call_the_recovery_will_never_re_run_is_capped_from_the_first_save(tmp_path):
+    """The exception covers the four platform creates and **nothing else** — or it is a loophole.
+
+    A `generate_image` whose outcome is unknown is never re-run: no idempotency key can un-spend money
+    at fal.ai. So its arguments are dead weight the instant it is interrupted, and they are bounded
+    like any other call's. Keeping *every* interrupted call whole would have been the easy rule — and
+    it would have left an unbounded blob in the transcript forever, which is the bug, one size smaller.
+    """
+    prompt = "z" * 200_000
+    path = tmp_path / "t.json"
+    session = Session("timeline:x", Harness(_Finishes()).engine, path=path)
+    session.history.append(Message.user("draw me something"))
+    session.history.append(
+        Message.assistant(
+            tool_calls=[ToolCall(id="c1", name="generate_image", arguments={"prompt": prompt})]
+        )
+    )
+    session.history.append(Message.tool(tool_call_id="c1", content=INTERRUPTED))
+
+    session.note("a later turn writes the transcript")
+
+    (call,) = [c for m in json.loads(path.read_text()) for c in m.get("tool_calls", [])]
+    assert _json_size(call["arguments"]) <= TOOL_ARGS_CAP
+    assert f"elided from {len(prompt)} chars" in call["arguments"]["prompt"]
 
 
 # --- the live bug the review found -------------------------------------------

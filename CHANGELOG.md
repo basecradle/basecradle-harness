@@ -5,6 +5,80 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.70.0] - 2026-07-14
+
+**The last unbounded thing in the transcript is bounded.** A tool call's *arguments* persisted whole,
+forever — so an agent that posted one long document re-sent that document to the model on every wake
+for the life of the timeline.
+
+### Fixed: a tool call's arguments persisted whole, forever (issue #301)
+
+`Session._payload` capped a tool *result*'s content and wrote the `tool_calls` that asked for it
+**whole**. An `assets create` carrying a 200 KB document therefore put that document in the transcript
+permanently, and the transcript is replayed to the model on **every** wake. It was the one class of
+persisted content with no bound at all — the brief is never persisted, tool results are capped, images
+are evicted, the conversation is compacted — and a straight violation of Context Discipline's first
+invariant: *nothing replayed per wake may be unbounded*.
+
+**The naive cap is worse than the bug, which is why #297 left this alone.** The recovery re-issues an
+interrupted platform create *from exactly those arguments* (under the deterministic idempotency key the
+dead wake minted). Elide them and a resumed wake re-posts the peer's message with its body cut out —
+and if the original POST never landed, the elided body is what the timeline keeps forever.
+
+So the cap keys on **replayability, not size**:
+
+- An **interrupted platform create** — one a killed wake left with no result — keeps its arguments
+  whole. Its healed "outcome unknown" result is the flag, and it is a *durable* one: the arguments
+  survive every save until a re-issue writes a real result over the marker, after which they are capped
+  like everything else. The exception is bounded in count (one dead turn's creates) and in duration.
+- **Everything else is bounded from the first save**: every settled call, and every *interrupted*
+  call the recovery will never re-run (a `generate_image` whose outcome is unknown is not replayed —
+  no idempotency key can un-spend money at fal.ai — so its arguments are dead weight the moment it is
+  interrupted).
+
+A capped call stays **legible**. Every argument gets a **fair share** of the budget (water-filling), so
+the short ones (`action`, `timeline`, `title`) survive byte for byte and roll their surplus over to the
+long one, which keeps a head and a tail around a marker naming what was cut. Ordinary calls — the
+overwhelming majority — persist untouched. Capping happens **on the way out** (`_payload`, on dicts) and
+never in place: a save lands mid-turn, and an in-place cap would reach into the call the engine is
+dispatching.
+
+Two defects in the first draft of this fix, both caught in review before it shipped, both worth naming
+because each is invisible when it happens:
+
+- **A cap must be measured in the characters the model reads, not the bytes the disk escapes.**
+  `json.dumps` defaults to `ensure_ascii=True`, expanding every non-Latin character to a six-character
+  `\uXXXX`. Sizing the cap with it made it bite **six times harder on every non-Latin script**: an
+  ordinary 500-character Japanese message body measured 3,000, blew the cap, and collapsed the call — so
+  a peer answered in Japanese kept nothing but `{"action": "create"}`, losing its own words, its
+  timeline uuid and its subject, while the identical message in English persisted whole. The cap bounds
+  *context*, and context is billed on the decoded string. `_context._size` had the same split unit (text
+  raw, arguments escaped) and is fixed with it.
+- **A cap must degrade, never collapse.** Cutting the biggest argument until the call fits sounds
+  equivalent and is not: an excerpt costs a marker, so an argument can be too small to be worth eliding
+  and still too big to keep. A `tasks create` with three 700-character fields could not be brought under
+  the cap at all and fell through to the total-loss stub — every argument dropped to save the 159
+  characters that were over. Water-filling has no such cliff.
+
+### Changed: the compaction guarantee now counts both halves of a tool call
+
+`worst_case_turn_tokens` sized one turn's persisted growth from `TOOL_RESULT_CAP` alone. That was not a
+tight estimate but a wrong one — the term it omitted (the arguments) was *unbounded*, so the inequality
+the 50% compaction threshold rests on did not actually hold. It now reads
+`(TOOL_RESULT_CAP + TOOL_ARGS_CAP) × max_steps ÷ chars-per-token` (`persisted_call_cap`), which at the
+shipped constants is ~49 K tokens per turn and needs a ceiling of **98,304** — cleared by the 128 K
+floor by construction, so a default install stays silent.
+
+**One operator-visible consequence:** an agent with `HARNESS_MAX_CONTEXT_TOKENS` set between 65,536 and
+98,303 will now see the issue-#287 budget warning where it did not before. That is honest, not a
+regression — the guarantee genuinely requires the higher ceiling once the arguments are counted — and it
+warns, never refuses.
+
+Also stated rather than left silent (issue #304, filed): the arithmetic assumes **one tool call per
+step**. `max_steps` bounds the model calls, not the tools dispatched, so a model that emits parallel
+calls multiplies a step's growth by its fan-out. Pre-existing, unchanged here, and now named in
+`_context.py` and CLAUDE.md so the proof is not quietly untrue.
+
 ## [0.69.0] - 2026-07-14
 
 **A wake killed by a signal now finishes the turn it started, instead of saying it all again.** The
