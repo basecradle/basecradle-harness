@@ -15,7 +15,20 @@ through `kv` all the same, so one grep syntax reads the whole stream.
 What is deliberately *not* logged: prompts, request bodies, response bodies, and API keys. A log
 line names the shape of a call — provider, model, duration, token counts — never its content.
 
-The one place foreign text does enter the stream is an **error message** (a tool's exception, an
+**The one deliberate exception is the agent's own voice** (`log_unspoken`, issue #293). Since the
+final-text auto-post was removed, a turn's narration is *unspoken*: it reaches no timeline and no
+peer, so this stream is the only place it exists. That is the trade the Unspoken Channel is built
+on — *"we never force its action or inaction, but we do require full visibility, which is the price
+of that freedom"* — and it only holds if the record is really complete. A truncated narration would
+make the visibility partial and the trade a lie, so this one field is rendered in **full**
+(flattened, scrubbed, quoted — but never cut).
+
+It is a **flight recorder, not a control tower**: nobody watches it. The record exists so an agent's
+own memory can carry what it decided and why, and so the rare failure can be reconstructed after the
+fact. It is the agent's *own* words, not a provider's response body — which is why it is the one
+content the "never log content" rule yields to, and why it is never bounded.
+
+The other place foreign text enters the stream is an **error message** (a tool's exception, an
 SDK refusal), and that is why `kv` *renders* values rather than interpolating them: the text is
 not the harness's, so it is flattened to one line, scrubbed of credential shapes, bounded, and
 quoted before it goes near a record. An error message is a breadcrumb *to* the failure — the
@@ -147,6 +160,52 @@ def _value(value: Any) -> str:
     if text and (" " in text or "=" in text or '"' in text):
         return '"' + text.replace('"', "'") + '"'
     return text
+
+
+def log_unspoken(text: str | None, *, timeline: str | None = None, kind: str = "narration") -> None:
+    """Journal a turn's **unspoken** text — the agent's narration, which no peer will ever see.
+
+    The Unspoken Channel's whole delivery mechanism (issue #293), and its one line:
+
+        unspoken timeline=<uuid> kind=narration chars=412 text="…"
+
+    `kind` names *which* unspoken text this is, because they read very differently after the fact:
+    ``narration`` (the ordinary end of a turn), ``reserve`` (the step-cap progress report the model
+    writes for its own next turn), and ``stuck`` (the canned note when even the reserve call failed).
+
+    **Rendered in full, and that is the point.** Every other value in this stream is bounded by
+    `MAX_VALUE`, because every other value is a breadcrumb to something recoverable elsewhere — a
+    tool's error text is still in the transcript, a response body is still the provider's. This one
+    is not: an unspoken narration exists *only* here. Bounding it would quietly convert "full
+    visibility" into "the first 240 characters of visibility", which is not the trade the founder's
+    principle names. So it is flattened to one record (a severity filter must never see a decapitated
+    fragment), scrubbed of credential shapes (an agent can paste a key into its own prose), quoted so
+    it reads as one value — and never truncated.
+
+    **Nobody is watching this line, and the agent is told so.** It is a flight recorder: written
+    always, read rarely (a forensic dig), and fed to the agent's own memory, which is its real
+    reader. The harness must never imply otherwise to the model — an agent that thinks its log has an
+    audience will escalate *into* it, and an escalation nobody reads is a message to no one.
+    """
+    body = text or ""
+    _log.info(
+        "unspoken %s text=%s",
+        kv(timeline=timeline, kind=kind, chars=len(body)),
+        _full_value(body),
+    )
+
+
+def _full_value(value: str) -> str:
+    """`_value`'s rendering minus the cap: flattened, scrubbed, quoted — never truncated.
+
+    The three jobs that make a value *safe* in a log stream are kept (one record per line; no
+    credential; one field, not several). The fourth — bounding it — is deliberately dropped for the
+    one field that has nowhere else to live (see `log_unspoken`). Quoted unconditionally, because a
+    narration is prose: it will contain spaces, and it may well contain an ``=``.
+    """
+    text = " ".join(str(value).split())  # collapse newlines/tabs/runs — one record, one line
+    text = _SECRETS.sub("[redacted]", text)
+    return '"' + text.replace('"', "'") + '"'
 
 
 def delivery_id() -> str | None:

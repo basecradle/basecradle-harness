@@ -232,6 +232,21 @@ class MessagesTool(PlatformTool):
                     return "Error: 'create' needs a 'body' — the text of the message to post."
                 return self._create(timeline or self.context.timeline, body)
         except BaseCradleError as error:
+            if action == "create":
+                # **A refused post is an ERROR, and it has to be logged here** (issue #293). The
+                # agent thought, spent tokens, and could not speak — the loudest routine failure it
+                # has — and since the wake no longer posts anything of its own, this is the only
+                # place that failure is *observable* to an operator. The wake's `_post` carried this
+                # invariant when it owned the reply; the tool inherits it along with the channel.
+                # The model still gets the refusal back as its tool result (below), so it can react.
+                _log.error(
+                    "post failed %s",
+                    kv(
+                        timeline=timeline or self.context.timeline,
+                        kind="tool",
+                        error=explain(error),
+                    ),
+                )
             return f"Couldn't {action} {'a message' if action == 'create' else 'messages'}: {explain(error)}"
         return f"Error: unknown action {action!r}. Use 'list', 'read', or 'create'."
 
@@ -280,6 +295,10 @@ class MessagesTool(PlatformTool):
         the only kind of speech that left no trace in the journal.
         """
         message = self.context.client.timelines.get(timeline).messages.create(body=body)
+        # The agent just spoke — and since the final-text auto-post was removed (issue #293), this
+        # is the *only* way it can. Tell the wake, which reports it (`posted=`) and reads it to know
+        # the turn was not silent.
+        self.spoke(message)
         _log.info(
             "posted %s",
             kv(

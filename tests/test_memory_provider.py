@@ -404,28 +404,45 @@ def test_a_self_skip_does_not_observe(platform, tmp_path):
     assert provider.observed == []
 
 
-def test_an_empty_model_reply_does_not_observe(platform, tmp_path):
-    """A whitespace-only model reply posts nothing, so observe records no junk exchange (#226).
+def test_memory_observes_a_silent_turn(platform, tmp_path):
+    """A peer states a fact, the agent stays silent — and memory keeps it anyway (issue #293).
 
-    The batch reply guards `_observe` behind `reply.strip()` exactly as the pre-#226 per-message
-    path did — otherwise a no-op model turn would write an empty-`assistant` exchange into memory
-    that then rides back into recall through the provider's `context` hook.
+    **The founder's acceptance test for the Unspoken Channel**, and the reason `_observe` is now
+    unconditional. Under silence-default the agent posts nothing on most turns; the old guard
+    (`if reply.strip()` — observe only when a reply posted) would therefore have made memory *stop
+    seeing* the very messages the agent chose not to answer. That inverts what memory is for: "my
+    birthday is Feb. 16, 1977" is worth remembering precisely when nobody needed to reply to it.
+
+    So the trigger and the (unspoken) narration are handed to the provider on every **engaged**
+    turn, spoken or not — which is what makes the fact recallable from another timeline later.
     """
-    _serve_messages(platform, {"messages": [_message(uuid=M0, body="hi")], "next_cursor": None})
+    _serve_messages(
+        platform,
+        {
+            "messages": [_message(uuid=M0, body="My birthday is Feb. 16, 1977.")],
+            "next_cursor": None,
+        },
+    )
     provider = RecordingProvider()
     client = BaseCradle(token=FAKE_TOKEN)
-    harness = Harness(_CannedModel(text="   "), home=tmp_path)  # whitespace-only reply
+    # A model that says nothing to the timeline (no tools, so nothing *can* be posted) and ends its
+    # turn with a plain thought — the shape of an ordinary silent turn.
+    harness = Harness(_CannedModel(text="Noted — no reply needed."), home=tmp_path)
     agent = WakeAgent(
         harness, timeline=TIMELINE_UUID, client=client, onboard=True, memory_provider=provider
     )
 
-    agent.wake()
+    posted = agent.wake()
 
-    assert provider.observed == []  # no post, no observed exchange
+    assert posted == []  # silence: nothing reached the timeline
+    assert len(provider.observed) == 1  # but the exchange was still observed
+    exchange = provider.observed[0]
+    assert "My birthday is Feb. 16, 1977." in exchange.user
+    assert exchange.assistant == "Noted — no reply needed."  # the narration, not a posted reply
 
 
 def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):
-    """observe/context that raise degrade gracefully — the reply still posts."""
+    """observe/context that raise degrade gracefully — the wake still completes."""
 
     class BrokenProvider(MemoryProvider):
         def observe(self, exchange):
@@ -439,7 +456,10 @@ def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):
 
     posted = agent.wake()  # must not raise
 
-    assert len(posted) == 1  # the reply landed despite both hooks raising
+    assert posted == []  # the model called no tools, so it said nothing — and that is fine
+    # The wake ran to completion despite both hooks raising: the message is marked seen, so it is
+    # never re-read. (A memory backend hiccup must cost the memory, never the turn.)
+    assert agent.marks.get(TIMELINE_UUID) == M0
 
 
 # === Compaction summaries reach durable memory (issue #276, requirement 7) ===

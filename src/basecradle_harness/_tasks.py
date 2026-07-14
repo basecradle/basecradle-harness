@@ -146,6 +146,7 @@ class TasksTool(PlatformTool):
         task = client.timelines.get(timeline).tasks.create(
             instructions=instructions, activate_at=when
         )
+        self.acted("task", task.content.uuid)  # scheduled work is a visible act (#293)
         return f"Scheduled a task. {_describe(task)}"
 
     # --- list ----------------------------------------------------------------

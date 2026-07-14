@@ -42,6 +42,16 @@ message path has. **The actor self-filter is the safety property running through
 it:** messages and assets are skipped when the agent authored them, so it never reacts
 to — or wake-loops on — its own posts, most importantly an image it just generated.
 
+**A wake posts nothing of its own** (the Unspoken Channel, issue #293). It engages the
+model on what it found; whether anything reaches the timeline is the model's decision,
+taken by calling the `messages` tool. The turn's final text is *unspoken* — written to
+the agent's log (`log_unspoken`), handed to its memory, shown to its own next turn, and
+never posted.
+The only message this file still creates is the NOC probe ack, which is a machine
+contract (a signed nonce, model-free) rather than the agent talking. So a wake in which
+the agent chose silence posts nothing and says `posted=0` — and that is a *decision on
+the record*, not a failure: the reasoning behind it is in the journal.
+
 Everything else — identity, Dashboard onboarding, turning messages into turns,
 the newest-first scan up to the mark — is shared with `TimelineAgent`.
 
@@ -106,6 +116,7 @@ from basecradle_harness._brief import (
     render_safety,
 )
 from basecradle_harness._code import CodeExecutionBridge
+from basecradle_harness._engine import compose_hooks
 from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
@@ -117,10 +128,11 @@ from basecradle_harness._memory_provider import (
     describe_memory_provider,
 )
 from basecradle_harness._messages import ImageContent, Message
-from basecradle_harness._observability import delivery_id, describe_provider, kv
+from basecradle_harness._observability import delivery_id, describe_provider, kv, log_unspoken
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import Session
+from basecradle_harness._unspoken import MentionInformer, SpeechLedger
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -527,9 +539,6 @@ class ClaimStore:
 _DEFAULT_BREAKER_MAX = 10
 _DEFAULT_BREAKER_WINDOW = 60.0
 
-# The breaker's loud alert text. Full sentences, so sentence case with terminal punctuation
-# (the Title-Case exception). The trip alert is posted once on the trip transition (the
-# durable marker is the one-time guard) and the reset alert once on auto-reset.
 #: The "user" side of the exchange a compaction summary is `observe`d as, on a memory provider with
 #: no store of its own (MemPalace). Its miner reads dialogue, so the summary needs a prompt to be the
 #: answer *to* — and this states plainly what it is, so a later search hit reads as the agent's own
@@ -539,12 +548,6 @@ _COMPACTION_OBSERVE_NOTE = (
     "transcript, so it survives in memory."
 )
 
-_BREAKER_TRIP_ALERT = (
-    "I appear to be in a wake loop here, so I'm pausing to avoid a runaway. "
-    "I'll resume automatically once the burst clears; an operator can also reset me."
-)
-_BREAKER_RESET_ALERT = "The wake burst here has cleared, so I've resumed normal operation."
-
 
 @dataclass(frozen=True)
 class BreakerDecision:
@@ -553,8 +556,8 @@ class BreakerDecision:
     `short_circuit` is the load-bearing field — when True this wake **self-declines**: it
     makes no provider call and acts on nothing. `tripped` and `reset` flag the one-time
     state *transitions* (a trip or an auto-reset happened on *this* wake), so the caller
-    posts the loud alert exactly once per cycle rather than on every tripped wake. `count`
-    is the number of wakes counted in the rolling window, for the alert and the log line.
+    alerts exactly once per cycle rather than on every tripped wake. `count` is the number
+    of wakes counted in the rolling window, for the alert and the log line.
     """
 
     short_circuit: bool
@@ -592,9 +595,9 @@ class WakeBreaker:
     - **Auto-reset** (the preferred reset, stated in CLAUDE.md): once the burst subsides —
       the window clears back under the cap *and* the cooldown has elapsed since the trip —
       clear the marker, restart the window from now, and return `reset=True` (normal
-      operation resumes; the caller posts the recovery alert). A transient burst self-heals
-      while the loud alert still leaves a human a breadcrumb. Clearing the marker by hand is
-      the equivalent operator reset.
+      operation resumes; the caller logs the recovery alert). A transient burst self-heals
+      while the loud WARNING still leaves the operator a breadcrumb. Clearing the marker by
+      hand is the equivalent operator reset.
 
     Disabled by setting the cap to 0 (or below) — an operator escape hatch; the default is a
     generous always-on sanity cap.
@@ -1030,6 +1033,13 @@ class WakeAgent:
         self.max_builds = max(1, max_builds)
         self.timeline = self.client.timelines.get(timeline)
 
+        # What this wake actually put on a timeline (issue #293). Now that the final text is never
+        # auto-posted, the *only* messages that exist are the ones the model chose to create through
+        # a tool — so the tools record here as they act, and this ledger is what the bookend line
+        # counts (`posted=`) and what the mention informer reads to know whether a turn was silent.
+        # One object, bound into the tools once; its contents cycle per wake (`reset`).
+        self.speech = SpeechLedger()
+
         # Bind the live platform handle into every platform-aware tool — the same
         # seam the poll loop uses, so a router-woken peer can act on the timeline
         # exactly as a polling one. One wake serves one timeline; bind once. The
@@ -1041,15 +1051,40 @@ class WakeAgent:
             timeline=self.timeline_uuid,
             home=self.harness.home,
             code_bridge=code_bridge,
+            speech=self.speech,
         )
         bind_platform_tools(self.harness.tools, context)
         if code_bridge is not None:
             code_bridge.bind(context)
 
         # One Dashboard read answers "who am I?" — the identity uuid the actor self-filter
-        # tests every item against. (The brief's orientation is the *live* `dashboard.md`
-        # primer, fetched per wake in `_wake_brief`, not this structured read.)
-        self.me_uuid = self.client.me.identity.uuid
+        # tests every item against, and the **handle** the mention informer looks for. (The
+        # brief's orientation is the *live* `dashboard.md` primer, fetched per wake in
+        # `_wake_brief`, not this structured read.) Read once: `me` is uncached, so touching
+        # `self.client.me` twice would be a second HTTP round-trip on every wake.
+        identity = self.client.me.identity
+        self.me_uuid = identity.uuid
+        self.me_handle = getattr(identity, "handle", None)
+
+        # The deterministic mention informer (issue #293): when the agent is addressed by its own
+        # @handle and its turn is about to end having done nothing on the timeline, it is *told* —
+        # once, and never forced. It rides the engine's `TurnHook`, the seam that already exists for
+        # exactly this ("the turn is about to end; does anything want to extend it?"), so it is
+        # **composed** onto whatever hook is already wired (the code-execution Asset bridge) rather
+        # than replacing it — the bridge runs first, and while it is still extending the turn the
+        # informer stays quiet, because a turn being extended is not a turn that is ending.
+        #
+        # Composed onto the engine's **base** hook, never onto its live one: chaining would
+        # *accrete*. Two agents built over one `Harness` would stack two informers, each holding the
+        # other's dead `SpeechLedger` — and a stale-armed one would then nudge on a turn it knows
+        # nothing about, reading "did it act?" off a ledger nobody writes to any more.
+        self.informer = MentionInformer(handle=self.me_handle, speech=self.speech)
+        engine = self.harness.engine
+        engine.turn_hook = compose_hooks(engine.base_turn_hook, self.informer.on_turn)
+        # Whether *this* turn degraded to the canned note (the step budget spent **and** the reserve
+        # call failed). It labels the turn's unspoken text `kind=stuck`, so the journal tells the
+        # three endings apart: an ordinary one, a step-capped self-authored report, and a give-up.
+        self._degraded = False
         if onboard:
             # The persistent brief rides every model call (see `_wake_brief`) and carries the
             # personality charter (`system-prompt.md`) itself, so a static turn-0 seed would
@@ -1163,22 +1198,29 @@ class WakeAgent:
         asset_trigger: str | None = None,
     ) -> list[object]:
         """Reconcile this timeline once — unseen messages, posted assets, inbound webhook
-        deliveries, *and* newly-activated tasks — and return everything posted in response.
+        deliveries, *and* newly-activated tasks — and return every message that reached the
+        timeline (the agent's own, through its tools, plus any probe ack the harness sent).
 
         A wake surfaces every kind of unseen actionable item on the timeline, not just
         new messages, because each kind arrives by a different route: a message and an
         asset are read from the timeline, a webhook delivery and a task activation are not
         items the timeline scan would surface on their own. Each kind has its own
-        idempotency record so reconciling one never re-surfaces another, and all reply
+        idempotency record so reconciling one never re-surfaces another, and all engage
         through the one session, so the agent perceives them in a single coherent
         conversation. Messages and assets pass through the **actor self-filter**, so the
         agent never reacts to its own posts. If nothing is unseen, no provider call is
         made and nothing is posted.
 
+        **Engaging is not answering** (issue #293). The wake puts what it found in front of the
+        model; the model decides what — if anything — to say, by calling the `messages` tool. A
+        wake that returns `[]` may mean "nothing was unseen" *or* "the agent read it and chose
+        silence", and the two are told apart by the journal, not by this return value: the second
+        leaves an `unspoken` line carrying the reasoning.
+
         **The cross-wake circuit-breaker runs first.** Before any reconcile, this wake is
         recorded on the per-timeline `WakeBreaker`; if this timeline is in a runaway wake
         loop (too many wakes in the rolling window), the wake **self-declines** — it makes no
-        provider call, posts a single loud alert on the trip transition, and returns nothing.
+        provider call, logs a single loud WARNING on the trip transition, and returns nothing.
         It auto-resets once the burst clears. This is the backstop the in-wake `max_steps`
         cap and the actor self-filter don't cover: an *unknown* cross-wake loop.
 
@@ -1213,7 +1255,13 @@ class WakeAgent:
                 delivery=delivery,
             ),
         )
+        # `posted` is what the *harness* put on the timeline (today: NOC probe acks). What the
+        # *agent* said is in `self.speech` — it speaks only through its tools now — so the two are
+        # summed at the end rather than merged as they go, which is what keeps the bookend's count
+        # honest without double-counting. Reset before the breaker check, so a second wake in one
+        # process can never report the first one's posts.
         posted: list[object] = []
+        self.speech.reset()
         outcome = "error"  # only a clean return past the reconciles earns another verdict
         try:
             if self._breaker_short_circuits():
@@ -1226,11 +1274,9 @@ class WakeAgent:
             # wake looked at, in timeline order, with what it decided — `_settle` reads it to move
             # the mark, and may never move it past an item that is not settled. `_cursor` is the
             # in-wake read cursor (distinct from the persisted mark, which no longer advances at
-            # claim time). `_finished` is the dead turns whose reply this wake has already re-posted,
-            # so a dead *batch* — many messages, one reply — re-posts that reply exactly once.
+            # claim time).
             self._ledger: list[tuple[str, str]] = []
             self._cursor: str | None = None
-            self._finished: set[int] = set()
             # Has this wake called the model yet? Recovery is only sound before it has — see
             # `_readmit`. Set by `_send_batch`, the message path's only model call.
             self._sent = False
@@ -1242,7 +1288,7 @@ class WakeAgent:
             posted += self._wake_events(session, event_trigger)
             posted += self._wake_tasks(session)
             outcome = "ok"
-            return posted
+            return posted + self.speech.posts
         finally:
             # `max_steps` is a **per-turn** budget and a wake may take several turns — one per
             # activated task, posted asset, or webhook delivery (unseen messages batch into a
@@ -1258,7 +1304,12 @@ class WakeAgent:
                     outcome=outcome,
                     turns=engine.turns_run,
                     steps=f"{engine.steps_used}/{engine.max_steps}",
-                    posted=len(posted),
+                    # Everything that reached a timeline: the harness's own posts (probe acks) plus
+                    # every message the agent *chose* to send through its tools. `posted=0` is now a
+                    # real and legitimate outcome — the agent read, thought, and decided not to speak
+                    # — so this count is what makes a silent wake **visibly** silent rather than
+                    # indistinguishable from a broken one. Its reasoning is on the `unspoken` line.
+                    posted=len(posted) + len(self.speech.posts),
                     duration=f"{time.monotonic() - started:.2f}s",
                     delivery=delivery,
                 ),
@@ -1271,11 +1322,20 @@ class WakeAgent:
 
         The first thing a wake does — *before* the session is loaded or the model is ever
         engaged — so a tripped timeline self-declines token-free, exactly like the NOC probe
-        ack short-circuit. Posts the loud alert **once** on each state transition (the
-        durable trip marker is the one-time guard) with a WARNING log, then returns the
-        breaker's verdict: True → this wake makes no provider call. A reset transition does
-        *not* short-circuit — it alerts that the burst cleared, then the wake proceeds
-        normally (`record_and_check` already restarted the window).
+        ack short-circuit. Logs the loud WARNING **once** on each state transition (the
+        durable trip marker is the one-time guard), then returns the breaker's verdict: True →
+        this wake makes no provider call. A reset transition does *not* short-circuit — it
+        alerts that the burst cleared, then the wake proceeds normally (`record_and_check`
+        already restarted the window).
+
+        **The alert is a log line, not a timeline post** (issue #293). It used to be both: a
+        WARNING *and* a message posted in the agent's voice ("I appear to be in a wake loop
+        here…"), which the agent never wrote and never chose to send. Under the Unspoken Channel
+        the harness does not speak for the agent — every timeline message is an intentional tool
+        call — and this was the last place it did. Nothing is lost: the breadcrumb was always for
+        the **operator**, who reads the journal, and the NOC alerts on this exact WARNING string
+        (`Wake breaker TRIPPED`), never on the posted message. The peers, meanwhile, now see what
+        the mechanism actually means: an agent that has gone quiet.
 
         **Known bound — a tripped timeline also stops acking NOC probes.** The probe ack
         lives per-item inside `_act_on`, downstream of this early return, so a tripped wake
@@ -1297,30 +1357,13 @@ class WakeAgent:
                 self.breaker.window,
                 self.breaker.max_wakes,
             )
-            self._breaker_alert(_BREAKER_TRIP_ALERT)
         elif decision.reset:
             _log.warning(
                 "Wake breaker RESET for timeline %s: the wake burst cleared; resuming normal "
                 "operation.",
                 self.timeline_uuid,
             )
-            self._breaker_alert(_BREAKER_RESET_ALERT)
         return decision.short_circuit
-
-    def _breaker_alert(self, body: str) -> None:
-        """Post the breaker's loud alert to the timeline, degrading on refusal.
-
-        Fired once per transition (trip or reset), so the alert never loops — and the actor
-        self-filter keeps the agent from waking on its own alert post. There is no session and
-        no model call: a tripped wake is model-free by definition, so the alert posts with no
-        transcript (`session=None`), and a refusal is swallowed — the breaker's job, stopping
-        the burn, is already done.
-
-        It goes through `_post` like every other post rather than reaching for the client
-        itself, so it earns the same ERROR-on-refusal and the same posted-message line. A post
-        path that skips the seam is a post the journal never sees.
-        """
-        self._post(None, body, note=False, kind="breaker-alert")
 
     # --- messages ------------------------------------------------------------
 
@@ -1606,7 +1649,7 @@ class WakeAgent:
         skip=None,
         probe=None,
     ) -> list[object]:
-        """Engage the model on each item in order, posting any reply and recording it.
+        """Engage the model on each item in order, recording it as handled.
 
         The one loop behind all four reconcilers — messages, webhook events, activated
         tasks, and posted assets. `render` turns an item into the text the model reads, or
@@ -1616,6 +1659,12 @@ class WakeAgent:
         namespace `record` writes to** — they are the same per-reconciler constant
         (`_MESSAGES`/`_ASSETS`/`_EVENTS`/`_TASKS`); if they ever diverge, claims land in one
         namespace while marks land in another and the exactly-once guard silently goes dead.
+
+        **It posts nothing** (issue #293). The turn's final text is the agent's *unspoken*
+        narration: journaled, never posted. If the agent wants to say something about the file
+        it was shown or the task that came due, it says it the one way anything is ever said
+        here — by calling the `messages` tool, during the turn. So an activated task that ran
+        quietly and told nobody is a *normal* outcome, not a lost reply.
 
         **Exactly-once, claim-first (`ClaimStore`).** Before acting on an item, the loop
         *atomically claims* it. The first wake to claim wins and acts; a concurrent wake
@@ -1650,11 +1699,12 @@ class WakeAgent:
         false monitor FAIL (task-seam.md §4).
 
         **Never crash the wake (B2).** Both platform-touching steps degrade instead of
-        raising: a refused post (`self._post`, most pointedly a locked timeline) becomes an
-        in-conversation note and the loop carries on; an engine that hits its step cap
-        (`self._engage`) becomes a short "I got stuck" reply. So a wake that hits a locked
-        timeline or the step cap posts a graceful note and exits 0 — no unhandled exception
-        reaches the entrypoint, and the item is still recorded (no reprocess).
+        raising: a refused post (`self._post` — the probe ack) is logged and the loop carries
+        on; an engine that hits its step cap (`self._engage`) becomes a short unspoken note. So
+        a wake that hits a locked timeline or the step cap exits 0 — no unhandled exception
+        reaches the entrypoint, and the item is still recorded (no reprocess). A locked timeline
+        now surfaces to the *model*, as the refusal its `messages` tool call returns, which is
+        strictly better: the agent learns it cannot speak here and can act on that.
 
         `skip(item)` is the **actor self-filter** — the safety property. When it returns
         true (the item is the agent's *own* authored post — a message it sent, an image it
@@ -1674,7 +1724,7 @@ class WakeAgent:
                 # degrades *silently* (`note=False` keeps the probe seam trace-free) and
                 # leaves the item unrecorded, so the next wake re-acks rather than marking it
                 # seen with no ack ever posted (a false monitor FAIL — task-seam.md §4).
-                ack = self._post(session, ack_line(nonce), note=False, kind="probe-ack")
+                ack = self._post(ack_line(nonce), kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
                     record(item)
@@ -1687,34 +1737,65 @@ class WakeAgent:
             # ride into the model's input on this turn and are evicted after (see `Session`).
             rendered = render(item)
             text, images = rendered if isinstance(rendered, tuple) else (rendered, [])
-            reply = self._engage(session, text, images)
-            if reply.strip():
-                sent = self._post(session, reply)
-                if sent is not None:
-                    posted.append(sent)
-                # The exchange happened — hand it to the memory provider to capture, whether
-                # or not the post landed (a locked timeline still produced a real exchange).
-                self._observe(text, reply)
+            narration = self._engage(session, text, images)
+            self._unspoken(narration)
+            # **Memory observes every engaged turn — posted or silent** (issue #293). It used to
+            # fire only when a reply posted, which under silence-default would quietly drop facts
+            # arriving in items the agent chose not to answer: a peer's birthday mentioned in a
+            # message the agent had no reason to reply to must still be recallable, from any
+            # timeline, later. The exchange is real whether or not anyone else heard it.
+            self._observe(text, narration)
         return posted
 
     def _engage(self, session: Session, text: str, images: list[ImageContent]) -> str:
-        """Run the model on one item, degrading the engine's step-cap to a graceful reply.
+        """Run the model on one item, degrading the engine's step-cap to a graceful note.
+
+        Returns the turn's **unspoken narration** — the model's final text, which the caller
+        journals and never posts (issue #293). Anything the agent wanted the timeline to see, it
+        already sent itself, with the `messages` tool, during the turn.
 
         The think→act loop bounds runaway tool use with `max_steps` (`_engine`), raising
-        `EngineError` when the model never settles on a reply. A wake must not crash on
-        that — so it degrades to a short, honest note the peer can read, and the batch
-        carries on. Other failures still propagate (the entrypoint reports them cleanly);
-        this catches only the step-cap, the one the issue names.
+        `EngineError` when the model never settles. A wake must not crash on that — so it
+        degrades to a short, honest note (unspoken — for the record, not for the peer) and the
+        batch carries on.
+        Other failures still propagate (the entrypoint reports them cleanly); this catches only
+        the step-cap, the one the issue names.
+
+        The mention informer is armed here, on the text the model is about to read: this is the
+        one place that knows *what* the agent is being shown, and it is re-armed per model call
+        because "was I addressed, and did I act?" is a question about a turn, not about a wake.
 
         The persistent brief rides *with* this call — spliced in just ahead of the user turn,
         so it is present and recent for the item it governs, and never persisted (see
         `_wake_brief`). The item's text is the retrieval query the memory provider's `context`
         hook ranks against, so recalled memory is relevant to this turn.
         """
+        self.informer.arm(text)
+        self._degraded = False
         try:
             return session.send(text, images=images, brief=self._wake_brief(query=text))
         except EngineError as error:
             return self._stuck_note(error)
+
+    def _unspoken(self, text: str) -> None:
+        """Journal a turn's final text — the Unspoken Channel's one delivery point (issue #293).
+
+        This is where the auto-post used to be, and the swap is the whole design: what was
+        broadcast to every viewer of a timeline is now written to the agent's own log and its
+        memory. Nothing here reaches a peer, and **nothing is watching it** — it is a flight
+        recorder. The agent's *speech* left earlier, through a tool, because it decided to speak.
+
+        The three endings a turn can have are labelled, because they read nothing alike to whoever
+        (or whatever) reconstructs this later: an ordinary `narration`, the step-cap's self-authored
+        `reserve` report, and the `stuck` note when even that failed.
+        """
+        log_unspoken(text, timeline=self.timeline_uuid, kind=self._narration_kind())
+
+    def _narration_kind(self) -> str:
+        """Which of the three unspoken endings this turn produced (see `_unspoken`)."""
+        if self._degraded:
+            return "stuck"
+        return "reserve" if self.harness.engine.reserve_used else "narration"
 
     def _wake_brief(self, *, query: str | None = None) -> str | None:
         """This wake's persistent operating brief — composed once, handed to every model call.
@@ -1890,39 +1971,23 @@ class WakeAgent:
             return list(self.tool_manifest)
         return [(tool.name, None) for tool in self.harness.tools]
 
-    def _post(
-        self,
-        session: Session | None,
-        body: str,
-        *,
-        note: bool = True,
-        kind: str = "reply",
-    ) -> object | None:
-        """Post to the timeline, degrading any SDK refusal instead of crashing.
+    def _post(self, body: str, *, kind: str) -> object | None:
+        """The **harness's own** post — degrading any SDK refusal instead of crashing.
 
-        The reply-post is the line that crashed the live wake: a locked timeline (even one
-        self-locked earlier in the same turn) raises `TimelineLockedError`, and with no
-        guard the whole wake died (`exit 1`) — *before* the message was marked seen, so the
-        same prompt reprocessed on every later wake. Here any `basecradle` SDK error is
-        caught and `None` is returned so the caller carries on (the item is still marked
-        seen); the wake exits 0.
+        Since the Unspoken Channel (issue #293) there is exactly one caller: the NOC probe ack.
+        That is not the agent talking — it is a machine contract (a signed nonce, acked
+        model-free, so the fleet's seam heartbeats run token-free at rest), which is precisely
+        why it survived an inversion that removed every other harness-authored post. **The agent's
+        speech goes through the `messages` tool**, and nowhere else.
 
-        For a normal reply (`note=True`) the failure is also recorded as a note in the
-        transcript, so the agent's own record stays honest. A NOC probe ack passes
-        `note=False`: the probe seam is deliberately trace-free (model-free, nothing into the
-        transcript), so a refused ack must degrade *silently* — a note would both break that
-        invariant and mislabel the heartbeat ack as a "reply". The breaker's alert passes
-        `session=None` for the same reason from the other direction: a tripped wake is model-free,
-        so there is no transcript to note into.
+        Refusals still degrade rather than raise: a locked timeline raises `TimelineLockedError`
+        from the SDK and, unguarded, would kill the whole wake (`exit 1`) — the live failure this
+        guard was born from. Any `basecradle` error is caught, `None` is returned, and the caller
+        carries on; the wake exits 0.
 
-        **Every post goes through here, and both outcomes are logged.** Degrading gracefully is
-        precisely what made this failure invisible: a refused post left the wake exiting ``0``
-        with nothing in the journal but a transcript note only the agent could read. A refusal is
-        an **ERROR** (the agent thought, spent tokens, and could not speak — the loudest routine
-        failure it has); a success is an INFO line naming the message it created. `kind`
-        distinguishes them in the journal (a reply, a probe ack, a breaker alert), so a heartbeat
-        ack never reads as the agent talking. "Silently" above is about the *transcript*, never
-        the log.
+        **Both outcomes are logged**, because degrading gracefully is exactly what once made this
+        failure invisible. A refusal is an **ERROR**; a success is an INFO naming the message
+        created. `kind` says what it was, so a heartbeat ack never reads as the agent talking.
         """
         try:
             sent = self.timeline.messages.create(body=body)
@@ -1931,8 +1996,6 @@ class WakeAgent:
                 "post failed %s",
                 kv(timeline=self.timeline_uuid, kind=kind, error=explain(error)),
             )
-            if note and session is not None:
-                session.note(f"(Couldn't post that reply to the timeline: {explain(error)})")
             return None
         _log.info(
             "posted %s",
@@ -2078,21 +2141,21 @@ class WakeAgent:
     # --- replying ------------------------------------------------------------
 
     def _respond(self, session: Session, messages: list[object]) -> list[object]:
-        """Reply to a wake's unseen messages as **one batched turn** — the #226 message path.
+        """Engage the model on a wake's unseen messages as **one batched turn** — the #226 path.
 
-        This is the single choke point for the message reply path — both the incremental
+        This is the single choke point for the message path — both the incremental
         (`_messages_since`) and bootstrap (`_bootstrap`) branches funnel their unseen set
         through here. Where the pre-#226 path looped `_act_on` per message (N unseen → N
-        replies), it now gathers **all** unseen peer messages, seeds them as one turn, and
-        emits **one** reply to the batch (issue #226). Three coupled behaviors:
+        turns), it now gathers **all** unseen peer messages and seeds them as one turn (issue
+        #226). Three coupled behaviors:
 
-        1. **Many-to-one batch reply (`_absorb`).** Own posts are self-filtered (marked, not
+        1. **Many-to-one batch turn (`_absorb`).** Own posts are self-filtered (marked, not
            acted on); a recognized NOC probe — read from the message **body** — is acked
            token-free before the model; every remaining peer message is atomically claimed,
-           marked, and collected into the reply batch. So the exactly-once machinery
+           marked, and collected into the batch. So the exactly-once machinery
            (`ClaimStore`/`MarkStore`, `kind=_MESSAGES`) moves to batch semantics: claim every
-           message in the batch, advance the mark past the newest — but a *single* model reply
-           answers them all.
+           message in the batch, advance the mark past the newest — but a *single* model turn
+           reads them all.
         2. **Loop 1 — pace + settle (`_pace_and_settle`, AI-sender only).** Simulate a human
            reading the newest peer *AI* message; if a newer peer-AI message lands during that
            read, restart the wait on it and fold it in, so the reply reacts to the settled
@@ -2117,26 +2180,26 @@ class WakeAgent:
         self._cursor = self.marks.get(self.timeline_uuid)
         batch, probe_seen = self._absorb(session, messages, posted)
         if not batch:
-            # Self-only / probe-only / empty: any probe acked, nothing to answer. The model is
+            # Self-only / probe-only / empty: any probe acked, nothing to engage on. The model is
             # never engaged (and the brief never fetched) — but the mark still advances, so these
             # are not re-read forever.
             self._settle()
             return posted
         self._pace_and_settle(session, batch, posted, probe_seen)
-        reply = self._generate_settled(session, batch, posted)
-        if reply.strip():
-            sent = self._post(session, reply)
-            if sent is not None:
-                posted.append(sent)
-            # One exchange for the whole batch — hand the rendered batch + reply to the memory
-            # provider, whether or not the *post* landed (a locked timeline still produced a real
-            # exchange). Guarded by `reply.strip()` exactly as the per-message `_act_on` was, so an
-            # empty/whitespace model turn (nothing posted) never records a junk empty-assistant
-            # exchange into memory.
-            self._observe(_render_batch(batch), reply)
-        # The reply is posted (or was refused, which is just as decided an outcome — the item is
-        # answered as far as this wake can answer it, and re-driving a locked timeline would only
-        # spin). Commit, then move the mark. A crash *before* this line is the recoverable case.
+        narration = self._generate_settled(session, batch, posted)
+        # The turn is over. Whatever the agent wanted to say, it has already said — through the
+        # `messages` tool, mid-turn, because it chose to (issue #293). What is left is its final
+        # text, and that is **unspoken**: written to its log and its memory, never posted.
+        self._unspoken(narration)
+        # **Memory observes the turn unconditionally** — spoken or silent. The old guard
+        # (`if reply.strip()`) is not merely unnecessary now, it would be *wrong*: under
+        # silence-default the most valuable exchange to remember can be exactly the one that
+        # produced no reply — a peer states a fact in passing, the agent rightly says nothing, and
+        # the fact must still be recallable from another timeline a month later.
+        self._observe(_render_batch(batch), narration)
+        # The turn ran to completion, and its narration is journaled — which *is* the commit
+        # record (issue #293). Commit the claims, then move the mark. A crash *before* this line
+        # is the recoverable case, and the transcript says how far the turn got.
         self._settle()
         return posted
 
@@ -2179,7 +2242,7 @@ class WakeAgent:
         """
         peers: list[object] = []
         probe_seen = False
-        for index, item in enumerate(items):
+        for item in items:
             uuid = item.content.uuid
             # The in-wake read cursor. It advances over *everything we have looked at*, final or
             # not, so a re-read (`_fetch_fresh`) returns only what has since arrived. It is
@@ -2191,7 +2254,7 @@ class WakeAgent:
             nonce = self._probe_nonce(item.content.body)
             if nonce is not None:
                 probe_seen = True
-                ack = self._post(session, ack_line(nonce), note=False, kind="probe-ack")
+                ack = self._post(ack_line(nonce), kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
                 self._ledger.append((uuid, _FINAL if ack is not None else _PENDING))
@@ -2200,7 +2263,7 @@ class WakeAgent:
                 self._ledger.append((uuid, _OURS))
                 peers.append(item)
                 continue
-            disposition = self._readmit(session, item, items[index + 1 :], posted)
+            disposition = self._readmit(session, item)
             self._ledger.append((uuid, disposition))
             if disposition == _OURS:
                 peers.append(item)
@@ -2225,9 +2288,7 @@ class WakeAgent:
             self.client.messages.filter(timeline=self.timeline_uuid), self._cursor
         )
 
-    def _readmit(
-        self, session: Session, item: object, later: list[object], posted: list[object]
-    ) -> str:
+    def _readmit(self, session: Session, item: object) -> str:
         """An already-claimed message: is it owned, settled, or **orphaned by a dead wake**?
 
         The claim's *phase* answers the first two, and it is why the record exists at all:
@@ -2263,46 +2324,46 @@ class WakeAgent:
             # wake recovers it against a freshly-loaded transcript. Losing the message costs
             # everything, so the trade is not close.
             return _PENDING
-        return self._recover_orphan(session, item, later, posted, claim)
+        return self._recover_orphan(session, item, claim)
 
-    def _recover_orphan(
-        self,
-        session: Session,
-        item: object,
-        later: list[object],
-        posted: list[object],
-        claim: Claim,
-    ) -> str:
+    def _recover_orphan(self, session: Session, item: object, claim: Claim) -> str:
         """A message a dead wake was holding. Decide from **evidence** what may safely happen to it.
 
-        The guarantee (issue #285): *at-least-once for the read, at-most-once for every side
-        effect, exactly-once for the reply.* A message is re-driven only when the dead wake is
-        **provably side-effect-free**. Two durable records make that provable, and neither is a
-        guess:
+        The guarantee (issues #285, #293): *at-least-once for the read, at-most-once for every side
+        effect.* A message is re-driven only when the dead wake is **provably side-effect-free**,
+        and the proof is durable rather than inferred: `Session._exchange` persists the transcript
+        in a `finally` — *on the failure path too* (issue #244) — so a killed wake's partial turn,
+        tool results and all, is on disk. `_turn_of` finds the user turn that carried this message
+        (matched on its exact rendered line, so it is located even when a *later* dead wake has
+        since written its own turn), and `_turn_work` is what that turn produced.
 
-        - **The transcript** says how far the dead wake got. `Session._exchange` persists it in a
-          `finally` — *on the failure path too* (issue #244) — so a killed wake's partial turn,
-          tool results and all, is on disk. `_turn_of` finds the user turn that carried this
-          message (matched on its exact rendered line, so a message is located even when a *later*
-          dead wake has since written its own turn), and `_turn_work` is what that turn produced.
-        - **The timeline** says whether the reply landed. It is the durable record both wakes
-          share, and this wake reads it anyway.
+        **The commit record is the turn's own narration** (issue #293), and that is what the
+        Unspoken Channel changed here. It used to be the *reply on the timeline*: the harness held
+        the generated reply text, so recovery had to ask "did my reply land?" and answer it by
+        scanning the agent's own recent posts for a byte-identical body. That question no longer
+        exists. Speech is a tool call now, so anything the dead wake said, it said *itself*, and the
+        platform already has it. What is left to ask is only: **did the turn finish?** — and the
+        transcript answers that directly, with no timeline read, no body comparison, and no residual
+        false-match between two coincidentally identical bodies.
 
-        Four outcomes, in the order they are tested — and the order matters:
+        Three outcomes, in the order they are tested — and the order still matters:
 
         1. **Never sent** (no user turn carries it) → the wake was killed after claiming but
            *before* the model saw it. Nothing ran, nothing posted. **Re-drive.** (Testing the
            transcript's *tail* instead would misread this case: the tail would be some earlier
-           wake's completed turn, and its clean reply would be mistaken for this message's.)
-        2. **A reply was generated** → the model *finished*. Re-running it is never necessary and
-           never safe, so the reply is never regenerated — it is **finished**: if the body is
-           already on the timeline, commit; if not, post it verbatim, with **no model call and no
-           tool re-run**. This is deliberately tested *before* the tool check: a turn that ran
-           tools **and** produced a reply is safe to post, because posting spends nothing and
-           repeats nothing. Abandoning it there would throw away a finished answer.
-        3. **Tools ran, no reply** → the wake died mid-tool-chain. Its side effects are real and a
-           re-drive would fire them again (two images for one request). **Abandon, loudly.** This
-           is the residual at-most-once case, and it is now rare and *named* rather than silent.
+           wake's completed turn, and its narration mistaken for this message's.)
+        2. **The turn produced its terminal narration** → the model *finished*. Whatever it decided
+           to do on the timeline, it did — and whatever it decided not to do, it decided. There is
+           nothing to re-post (the harness holds no reply) and nothing to re-run. **Commit.** This
+           is deliberately tested before the tool check, because a turn that ran tools *and* settled
+           is a **completed** turn, not an interrupted one.
+        3. **Tools ran, no narration** → the wake died mid-tool-chain. Its side effects are real —
+           possibly including a message already posted — and a re-drive would fire them again (two
+           images for one request; the same answer sent twice). **Abandon, loudly.** This is the
+           residual at-most-once case: rare, and *named* rather than silent. (Closing it means
+           re-issuing the dead turn's platform calls under deterministic idempotency keys so the
+           platform dedupes them — the contract is live; the Python SDK's half is not yet. See
+           basecradle/basecradle-python#107.)
         4. **Neither** → it died inside the model call (the provider was down, the retries ran out,
            the box was killed). Nothing ran. **Re-drive** — this is the dominant case, and exactly
            the one #284's retry could not save.
@@ -2313,16 +2374,15 @@ class WakeAgent:
             return self._redrive(item, claim, "the wake died before the model ever saw it")
 
         work = _turn_work(session.history, turn)
-        reply = _turn_reply(work)
-        if reply is not None:
-            return self._finish(session, item, reply, turn, later, posted)
+        if _turn_narration(work) is not None:
+            return self._committed(item)
 
         if any(turn_.role == "tool" for turn_ in work):
             reason = "a tool had already run when the wake died — a re-drive would re-fire it"
             self.claims.abandon(self.timeline_uuid, uuid, kind=_MESSAGES, reason=reason)
-            # The loudest thing a wake can say: a peer spoke and will never be answered. Silence
-            # here is the original defect (issue #285, option 4) — a known drop is categorically
-            # better than an invisible one.
+            # The loudest thing a wake can say: a peer spoke and will never be engaged with again.
+            # Silence here is the original defect (issue #285, option 4) — a known drop is
+            # categorically better than an invisible one.
             _log.error(
                 "dropped %s",
                 kv(
@@ -2333,9 +2393,11 @@ class WakeAgent:
                 ),
             )
             session.note(
-                f"(A previous wake died partway through answering {_handle_of(item)}'s message "
-                f"after it had already run tools, so that message was never answered and cannot "
-                f"be safely retried. It is not in the conversation above.)"
+                f"(A previous wake died partway through working on {_handle_of(item)}'s message, "
+                f"after it had already run tools, so that message was never finished and cannot be "
+                f"safely retried — a re-run would repeat whatever those tools did. It is not in the "
+                f"conversation above. Some of its work may have landed; if that matters here, read "
+                f"the timeline and see.)"
             )
             return _FINAL
 
@@ -2357,76 +2419,36 @@ class WakeAgent:
         )
         return _OURS
 
-    def _finish(
-        self,
-        session: Session,
-        item: object,
-        reply: str,
-        turn: int,
-        later: list[object],
-        posted: list[object],
-    ) -> str:
-        """The dead wake generated a reply. Make sure it is on the timeline **exactly once**.
+    def _committed(self, item: object) -> str:
+        """The dead wake's turn **finished**. Commit its claim; there is nothing else to do.
 
-        The reply text is on disk; whether it *posted* is a question only the timeline answers, so
-        we ask it: is one of our own posts **newer than this message** carrying exactly this body?
+        This is the Unspoken Channel's payoff in the recovery path (issue #293). The predecessor of
+        this method held a saved reply and had to get it onto the timeline exactly once — which
+        meant asking the platform whether it was already there, which meant comparing message
+        bodies byte for byte, which meant a residual (small, real) false-match between two
+        coincidentally identical replies, and a re-post path that could double-speak if the
+        platform ever normalized a body.
 
-        - **Yes** → the post landed and the wake died before it could commit. Commit and move on.
-          **Never silent** (a capital requirement): an INFO names both uuids, so the one residual
-          false-match — two coincidentally identical bodies, most plausible for a short generic
-          reply — leaves an audit trail instead of an invisible mis-commit.
-        - **No** → the post never landed. Re-post the saved reply **verbatim**: no model call, no
-          tool re-run, no regeneration. Exactly-once, for free.
+        None of that survives the inversion, because the premise it rested on is gone: **the
+        harness no longer holds a reply, because the harness no longer posts one.** A turn that
+        reached its terminal narration is a turn the model finished — every message it decided to
+        send, it sent itself, mid-turn, through its tools, and the platform has them. Every message
+        it decided *not* to send is a decision, not a dropped write. So "did the reply land?" is not
+        a question with an answer to hunt for; it is not a question at all.
 
-        **The window is bounded to posts newer than the message** (a capital requirement). An own
-        post *older* than the message cannot be its reply, and the bound is what keeps the residual
-        false-match rare. The cheaper test — "is there *any* own post newer than it?" — is
-        **unsound** and was rejected: `_absorb` posts a NOC probe ack *before* the model call, so a
-        wake that acked a probe, claimed a message, and then died leaves an own post newer than a
-        message it never answered. That test would drop it and call it delivered.
-
-        A dead *batch* shares one reply across several messages, so the post fires once per dead
-        turn (`self._finished`) and the rest simply commit against it.
+        The one durable fact worth recording is that this happened, so an operator reading the
+        journal after a crash can see a claim settled by a *later* wake rather than by its owner.
         """
         uuid = item.content.uuid
-        # **Byte-equality, verified against the live platform — not assumed.** It is load-bearing
-        # (a body the platform silently normalized would compare unequal, read as "the reply never
-        # posted", and double-post), so it was proved before it was relied on: 16/16 adversarial
-        # bodies — multi-line, CRLF, lone CR, trailing/leading whitespace, tabs, NBSP, zero-width,
-        # combining-vs-precomposed accents, emoji ZWJ sequences, 5 KB — read back **codepoint-
-        # identical** from PROD. The platform stores the body verbatim and normalizes nothing;
-        # markdown is render-layer only. If that ever changes, this comparison must normalize
-        # identically, and this is the line to change.
-        # Verification record: basecradle-harness#285 (comment 4953752149).
-        landed = next(
-            (post for post in later if self._is_own(post) and post.content.body == reply), None
+        _log.info(
+            "recovered %s",
+            kv(
+                message=uuid,
+                timeline=self.timeline_uuid,
+                handle=_handle_of(item),
+                action="turn-completed",
+            ),
         )
-        if landed is not None:
-            _log.info(
-                "recovered %s",
-                kv(
-                    message=uuid,
-                    timeline=self.timeline_uuid,
-                    reply=_uuid_of(landed),
-                    action="reply-already-posted",
-                ),
-            )
-        elif turn in self._finished:
-            pass  # the same dead turn's reply was re-posted for an earlier message in its batch
-        else:
-            self._finished.add(turn)
-            sent = self._post(session, reply)
-            if sent is not None:
-                posted.append(sent)
-            _log.warning(
-                "recovered %s",
-                kv(
-                    message=uuid,
-                    timeline=self.timeline_uuid,
-                    reply=_uuid_of(sent),
-                    action="reply-reposted",
-                ),
-            )
         self.claims.commit(self.timeline_uuid, uuid, kind=_MESSAGES)
         return _FINAL
 
@@ -2516,35 +2538,45 @@ class WakeAgent:
             _log.warning("Read-pacing failed; answering without further delay.", exc_info=True)
 
     def _generate_settled(self, session: Session, batch: list[object], posted: list[object]) -> str:
-        """Loop 2 — generate one reply to the batch, rebuilding if a message lands mid-generation.
+        """Loop 2 — run the turn against the batch, rebuilding if a message lands mid-generation.
 
         Optimistic concurrency (compare-and-swap) around the model call: generate against the
         batch snapshot, then re-read; if a peer message (human *or* AI — all senders count) has
         arrived *since* the batch's newest, fold it in and regenerate, up to `max_builds` times.
-        The `max_builds`-th build is posted **unconditionally** (no staleness check after it);
+        The `max_builds`-th build stands **unconditionally** (no staleness check after it);
         messages that land during that final build are left **unseen** — not marked or claimed —
         so they drive the *next* wake rather than being lost.
 
-        **A build that ran tools is never rolled back.** The model call executes its tool calls
-        *with real, irreversible side effects* (an image posted, a message sent, code run). The
-        `del session.history[...]` rollback erases only the transcript, not those effects — so
-        rebuilding a tool-using build would fire them again (two images for one request). A build
-        whose transcript span contains any tool turn is therefore **committed**: it posts as-is,
-        never rebuilds. Only a pure-text build — the common case, and the one the staleness guard
-        is really for — is eligible for a compare-and-swap rebuild.
+        Returns the turn's **unspoken narration** — never a reply to post (issue #293).
+
+        **A build that ran tools is never rolled back, and that is what keeps the agent from
+        speaking twice.** The rollback (`del session.history[...]`) erases the transcript, not the
+        world: a tool call's effects are real and irreversible — an image generated, a task
+        scheduled, and now, most importantly, **a message posted**. Since speech is a tool call,
+        rebuilding a build that spoke would say it again. So a build whose transcript span contains
+        any tool turn is **committed**: it stands as-is and never rebuilds. Only a pure-text build —
+        an agent that has said nothing yet — is eligible for a compare-and-swap rebuild, and it is
+        free to rebuild precisely *because* it has said nothing. The guard predates the inversion
+        (it was written for images) and inherits its most important job from it.
 
         The brief rides ephemerally with every build (composed once — see `_wake_brief`), so it
         never lands in the transcript and never needs rolling back. Intermediate (stale) pure-text
-        builds *are* rolled back out of the transcript so only the posted reply's turn persists.
-        Loop 2 does **not** re-pace — Loop 1 already simulated the read, and re-pacing could stall a
-        reply indefinitely in a chatty room. With pacing disabled it collapses to a single build (the
+        builds *are* rolled back out of the transcript so only the surviving turn persists. Loop 2
+        does **not** re-pace — Loop 1 already simulated the read, and re-pacing could stall a reply
+        indefinitely in a chatty room. With pacing disabled it collapses to a single build (the
         pre-#226 single-shot behavior).
         """
         brief = self._wake_brief(query=_incoming_text(batch[-1]))
         base_len = len(session.history)  # rollback point: before any build
         builds = 0
         while True:
-            reply = self._send_batch(session, _render_batch(batch), brief)
+            rendered = _render_batch(batch)
+            # Re-arm per build, not per wake: a rebuild reads a *different* batch (a message landed
+            # mid-generation), so "was I addressed, and have I acted?" has to be re-asked of the
+            # text the model is actually about to read. Arming also resets the one-shot nudge, so a
+            # rolled-back build's nudge does not silence the informer on the build that replaces it.
+            self.informer.arm(rendered)
+            narration = self._send_batch(session, rendered, brief)
             builds += 1
             # **A compaction during the build invalidates `base_len`, so the build is committed.**
             # `Session.send` may compact (`_compact_if_needed`, and the over-length rescue), and a
@@ -2554,53 +2586,59 @@ class WakeAgent:
             # build ran tools, and `del history[base_len:]` becomes a **no-op**, so the "rolled
             # back" build is still in the transcript when the next one is appended. Together they
             # rebuild a tool-using turn and **re-fire its side effects** — a second image generated
-            # and posted for one request — which is the one thing this loop promises never to do.
-            # There is no index into a list that a rewrite of that list preserves, so the honest
-            # move is not to compute a cleverer index: it is to stop rebuilding. The build is
-            # posted as-is (never rolled back, never re-run), and anything that landed during it
-            # simply drives the next wake, exactly as the `max_builds` cap already does.
+            # and posted for one request, or the same answer said twice — which is the one thing
+            # this loop promises never to do. There is no index into a list that a rewrite of that
+            # list preserves, so the honest move is not to compute a cleverer index: it is to stop
+            # rebuilding. The build stands as-is (never rolled back, never re-run), and anything
+            # that landed during it simply drives the next wake, exactly as `max_builds` already does.
             compacted = len(session.history) < base_len
-            # A build that engaged tools has committed irreversible side effects; posting it as-is
-            # (never rebuilding) is the only safe move — a rollback+rebuild would re-fire them.
+            # A build that engaged tools has committed irreversible side effects — including,
+            # since #293, anything it *said*. Standing on it (never rebuilding) is the only safe
+            # move: a rollback+rebuild would re-fire them.
             used_tools = any(turn.role == "tool" for turn in session.history[base_len:])
             if not self.pacer.enabled or builds >= self.max_builds or used_tools or compacted:
-                return reply  # pacing off → one build; the cap, tools, or a compaction → post as-is
+                return narration  # pacing off → one build; the cap, tools, or a compaction → stand
             # Absorb the fresh read regardless — this marks any self post and, crucially, keeps a
             # NOC probe's ack sub-second even when it lands mid-generation (it is acked here, not
             # deferred to the next wake). Only peer messages fold in and trigger a rebuild.
             new_peers, _ = self._absorb(session, self._fetch_fresh(), posted)
             if not new_peers:
-                return reply  # snapshot still current (any probe/self just handled) — post it
+                return narration  # snapshot still current (any probe/self just handled) — stand
             # Stale: a peer message landed during generation. Fold it in, roll the stale build out
-            # of the transcript, and regenerate against the current batch.
+            # of the transcript, and regenerate against the current batch. Safe precisely because
+            # this build ran no tools: it has said nothing, so there is nothing to unsay.
             batch.extend(new_peers)
             del session.history[base_len:]
 
     def _send_batch(self, session: Session, text: str, brief: str | None) -> str:
-        """Send the batch as one user turn, degrading the engine's step-cap to a graceful reply.
+        """Send the batch as one user turn, degrading the engine's step-cap to a graceful note.
 
         The batch counterpart of `_engage`'s model call; Loop 2 composes the brief once and passes
         it down, so a rebuild re-shows the same brief rather than re-composing (and re-fetching the
         live dashboard) per build. Messages carry no images, so this is text-only. `EngineError`
-        (the `max_steps` cap) degrades to a short, honest note the peer can read; other failures
+        (the `max_steps` cap) degrades to a short, honest note; other failures
         propagate to the entrypoint, which reports them cleanly.
         """
         self._sent = True  # the transcript is no longer pristine evidence (see `_readmit`)
+        self._degraded = False
         try:
             return session.send(text, brief=brief)
         except EngineError as error:
             return self._stuck_note(error)
 
     def _stuck_note(self, error: EngineError) -> str:
-        """The canned reply for a degraded turn — and the WARNING that says one happened.
+        """The canned narration for a degraded turn — and the WARNING that says one happened.
 
         `EngineError` reaches a wake only as the fallback-of-the-fallback: the step budget was
         spent *and* the engine's reserve summary (the self-authored progress report) failed or
-        came back empty. The peer sees a short honest note, which is right for the peer — and
-        for the operator it looked like a perfectly ordinary wake, because the note posts, the
-        item is marked seen, and the process exits ``0``. So the degradation is logged at
-        WARNING, carrying the engine's own reason, wherever a wake catches it.
+        came back empty. The note is now **unspoken** like every other turn ending (issue #293):
+        it goes to the journal and to the agent's own next turn, not to a peer — which is the
+        honest destination for "the harness gave up on this turn", a fact about the machinery
+        rather than an answer to anybody. To the operator this once looked like a perfectly
+        ordinary wake, so the degradation is logged at WARNING, carrying the engine's own reason,
+        wherever a wake catches it.
         """
+        self._degraded = True  # labels this turn's unspoken text `kind=stuck`
         _log.warning("degraded %s", kv(timeline=self.timeline_uuid, reason=str(error)))
         return "I got stuck working through that and stopped before reaching an answer."
 
@@ -2654,13 +2692,17 @@ def _turn_work(history: list[Message], turn: int) -> list[Message]:
     return work
 
 
-def _turn_reply(work: list[Message]) -> str | None:
-    """The final text reply a turn settled on, or ``None`` if it never got that far.
+def _turn_narration(work: list[Message]) -> str | None:
+    """The terminal narration a turn settled on, or ``None`` if it never got that far.
+
+    **This is the commit record** (issue #293): a turn that reached its final text *finished*, and
+    a finished turn is never re-driven — everything it meant to do, including everything it meant
+    to say, it did.
 
     "Got that far" is exact: an assistant turn with real content and **no** tool calls is the
-    engine's terminal reply (`Engine.run` returns on precisely that). An assistant turn that only
-    carries tool calls is mid-flight, and a `system` failure note (issue #244) is not a reply at
-    all — both correctly read as ``None``, i.e. *the model never finished*, i.e. safe to re-drive.
+    engine's terminal message (`Engine.run` returns on precisely that). An assistant turn that only
+    carries tool calls is mid-flight, and a `system` failure note (issue #244) is not a narration at
+    all — both correctly read as ``None``, i.e. *the model never finished*.
     """
     for message in reversed(work):
         if (
