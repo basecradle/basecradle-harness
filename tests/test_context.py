@@ -492,6 +492,42 @@ def test_an_over_length_400_compacts_and_retries_the_turn_once(tmp_path):
     assert not any("[turn failed" in (m.content or "") for m in session.history)
 
 
+def test_a_failing_save_never_masks_the_overflow_the_self_heal_is_keyed_on(tmp_path, monkeypatch):
+    """A save that fails in the `finally` must not eat the turn's own exception (issue #297).
+
+    `_exchange` persists in a `finally`, and an exception raised in a `finally` **replaces** the one
+    propagating through it. The one propagating through this one is load-bearing: `send` catches
+    `ProviderContextLengthError` to compact and retry — the self-heal that keeps an agent at its
+    context ceiling from failing identically on every wake, forever. Masked, it becomes an `OSError`
+    that no one catches, and the transcript stays over the wall.
+
+    The atomic write is what makes this reachable, which is why the guard ships with it: staging a
+    temp needs the old transcript and the new one on disk at once, and `fsync` is where a filesystem
+    reports the deferred write errors a buffered close used to swallow. **A near-full box is
+    precisely where an over-long transcript turns up.**
+
+    What the guard promises is exactly this and no more: the turn's own exception is what comes out.
+    (It does not promise the agent survives a full disk — nothing can persist on one.)
+    """
+    provider = ScriptedProvider(
+        ProviderContextLengthError("maximum context length exceeded", status_code=400),
+        usage=[None],
+    )
+    engine = Engine(provider, ToolRegistry(policy=Policy.locked()))
+    session = Session("timeline:t1", engine, path=tmp_path / "s.json")
+
+    def full_disk(*_args, **_kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr("basecradle_harness._session.open", full_disk, raising=False)
+
+    # No compactor on this session, so the overflow is re-raised rather than healed — which is what
+    # lets the test see *which* exception survived the `finally`. It must be the model's, not the
+    # disk's: an OSError here is the self-heal's trigger, eaten.
+    with pytest.raises(ProviderContextLengthError):
+        session.send("are you still there?")
+
+
 def test_the_retry_still_shows_the_model_the_image_the_peer_posted(tmp_path):
     from basecradle_harness import ImageContent
 

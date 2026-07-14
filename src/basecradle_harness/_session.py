@@ -62,6 +62,7 @@ import json
 import logging
 import os
 from pathlib import Path
+from uuid import uuid4
 
 from basecradle_harness._caching import anchor_cacheable_prefix, cache_mode
 from basecradle_harness._context import TOOL_RESULT_CAP, Compactor
@@ -117,6 +118,10 @@ class Session:
         self.engine = engine
         self.path = Path(path) if path is not None else None
         self.compactor = compactor
+        #: This session's private staging token for the atomic save (`_save`). Per *instance*, not
+        #: per process: two `Harness` instances over one home hold two `Session`s on the same path
+        #: in the same process, and they must not share a temp file.
+        self._token = uuid4().hex[:8]
         self.history: list[Message] = self._load()
         if not self.history and system_prompt:
             self.history.append(Message.system(system_prompt))
@@ -196,6 +201,7 @@ class Session:
         # anchor is stamped on a copy, so it never reaches `history` (see `_caching`).
         convo = anchor_cacheable_prefix(convo, stable=stable, mode=cache_mode(self.engine.provider))
         adopted = len(convo)
+        failing = False  # is an exception already on its way out through the `finally`?
         try:
             reply = self.engine.run(convo)
         except Exception as exc:
@@ -204,6 +210,7 @@ class Session:
             # every tool result). Mark the tail so a later reader knows the turn failed; the
             # `finally` then adopts and persists that partial transcript rather than discarding
             # the whole ledger the way a save-only-on-success path did (issue #244).
+            failing = True
             convo.append(Message.system(_failure_note(exc)))
             raise
         finally:
@@ -215,7 +222,7 @@ class Session:
             self.history.extend(convo[adopted:])
             turn.images = []
             _cap_tool_results(self.history)
-            self._save()
+            self._persist(masking=failing)
         return reply
 
     def _recover_from_overflow(self, mark: int, turn: Message, pixels: list[ImageContent]) -> bool:
@@ -304,6 +311,43 @@ class Session:
         _cap_tool_results(history)
         return history
 
+    def _persist(self, *, masking: bool) -> None:
+        """`_save`, from a `finally` that may already be carrying an exception out.
+
+        An exception raised inside a `finally` **replaces** the one propagating through it — and the
+        one propagating through *this* one is load-bearing. `send` catches
+        `ProviderContextLengthError` to compact the transcript and retry: the self-heal that keeps
+        an agent at its context ceiling from failing identically on every wake, forever (issue
+        #276). A save that failed while that exception was in flight would swallow it, the retry
+        would never run, and the agent would die of an unrelated `OSError` with its transcript still
+        over the wall.
+
+        The atomic write is what makes that reachable, which is why the guard arrives alongside it:
+        staging a temp needs the old transcript and the new one on disk at once (~2× the space,
+        where a truncating write needed 1×), and `fsync` is exactly where a filesystem reports the
+        deferred write errors a buffered `close()` used to swallow. **A near-full box is precisely
+        where an over-long transcript turns up.**
+
+        So when the turn is already failing, a failed save is logged and stood down: the transcript
+        is lost, which the high-water mark makes survivable (the item is re-driven — issue #285),
+        while the masked exception would not be. When nothing is in flight, a failed save *is* the
+        failure and it propagates untouched.
+
+        `masking` is passed in rather than sniffed from `sys.exc_info()`, and that is not a matter
+        of taste: `sys.exc_info()` reports the exception *currently being handled*, so inside an
+        `except OSError` it is the `OSError` itself — never `None`. The sniffed form therefore
+        swallows **every** save failure, including the ones that are the only failure. It did, and
+        the tests caught it.
+        """
+        try:
+            self._save()
+        except OSError as error:
+            if not masking:
+                raise  # nothing to mask — this failed save *is* the turn's failure
+            _log.error(
+                "Could not persist the transcript of a turn that was already failing: %s", error
+            )
+
     def _save(self) -> None:
         """Write the transcript **atomically** — a killed wake can never leave a torn one.
 
@@ -325,10 +369,19 @@ class Session:
         says so. The claim file is a few bytes of bookkeeping. The session is the agent's mind, and
         it was the one being written non-atomically. (Issue #297, finding 4.)
 
-        A `.tmp` suffixed with the pid, so two processes saving the same session cannot collide on
-        the temp path — the same guard `ClaimStore._write` uses. The name ends `.json.<pid>.tmp`,
-        which the cleanup sweep's `sessions/*.json` glob does not match, so a temp left behind by a
-        process killed inside this window is inert: never loaded, never mistaken for a transcript.
+        **The temp is per-`Session`, not per-process** (`_temp`), because a pid does not identify a
+        writer: two `Harness` instances over one home hold two `Session` objects on the *same* path
+        in the *same* process, and a shared temp name would let them tear each other's temp — which
+        `os.replace` would then publish, defeating the whole point. `ClaimStore` keys its temp on the
+        wake id for the same reason; a pid was the weaker guard.
+
+        **A leaked temp holds the whole transcript, so it is swept, not merely ignored.** On success
+        the temp *becomes* the transcript (that is what `os.replace` does) and on an exception the
+        `finally` removes it — but a process killed inside this window leaves it behind, containing
+        the entire conversation. `_cleanup.enumerate_artifacts` therefore purges `sessions/*.json.*
+        .tmp` alongside the transcript itself: a timeline deleted on the platform must not survive
+        on the box as a temp file the sweep never looked at. (Issue #297, and it is exactly the trap
+        `ClaimStore` avoids by keeping its temps inside a directory the sweep removes wholesale.)
 
         **The bound, stated rather than implied:** the *directory* entry is not fsynced, so a power
         loss immediately after `os.replace` may leave the previous transcript in place. That costs
@@ -340,12 +393,24 @@ class Session:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps([m.to_dict() for m in self.history], indent=2)
-        temp = self.path.with_suffix(self.path.suffix + f".{os.getpid()}.tmp")
-        with open(temp, "w") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())  # the bytes are on disk *before* the name points at them
-        os.replace(temp, self.path)
+        temp = self._temp(self.path)
+        try:
+            with open(temp, "w") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())  # the bytes are on disk *before* the name points at them
+            os.replace(temp, self.path)
+        finally:
+            # Success renamed it away; a failure must not leave a stray copy of the transcript.
+            temp.unlink(missing_ok=True)
+
+    def _temp(self, path: Path) -> Path:
+        """This session's private staging path — `<name>.json.<pid>-<token>.tmp`.
+
+        Dot-free between the `.json` and the `.tmp` so the cleanup sweep can recognize it by shape
+        (`_cleanup._SESSION_TEMP`). Unique per process *and* per `Session` instance; see `_save`.
+        """
+        return path.with_suffix(f"{path.suffix}.{os.getpid()}-{self._token}.tmp")
 
 
 def _cap_tool_results(history: list[Message]) -> None:

@@ -133,6 +133,38 @@ def test_enumerate_empty_home_is_empty(tmp_path):
     assert enumerate_artifacts(tmp_path) == {}
 
 
+def test_enumerate_finds_a_transcript_stranded_by_a_killed_save(tmp_path):
+    """A staged transcript left by a killed wake is swept — it holds the whole conversation.
+
+    `Session._save` writes to `<name>.json.<pid>-<token>.tmp` and renames it into place (issue
+    #297). On success the temp *becomes* the transcript; on an exception it is removed. But a
+    process **killed** inside that window leaves it behind, holding every message of the
+    conversation.
+
+    A sweep that purged `…json` and walked past `…json.4213-9f2c.tmp` would report a deleted
+    timeline as purged while leaving its transcript on the box forever — the exact outcome this
+    module exists to prevent. So the temp is attributed to its timeline like any other artifact.
+    """
+    sessions = tmp_path / "sessions"
+    sessions.mkdir(parents=True)
+    stem = quote(f"timeline:{DELETED}", safe="")
+    (sessions / f"{stem}.json").write_text("[]")
+    stranded = sessions / f"{stem}.json.4213-9f2c.tmp"
+    stranded.write_text('[{"role": "user", "content": "a secret the timeline no longer has"}]')
+
+    assert stranded in set(enumerate_artifacts(tmp_path)[DELETED])
+
+
+def test_enumerate_ignores_a_stranded_save_from_another_channel(tmp_path):
+    """…and the `github:` exclusion holds for the temp exactly as it does for the transcript."""
+    sessions = tmp_path / "sessions"
+    sessions.mkdir(parents=True)
+    stem = quote("github:pr-123", safe="")
+    (sessions / f"{stem}.json.4213-9f2c.tmp").write_text("[]")
+
+    assert enumerate_artifacts(tmp_path) == {}
+
+
 # --- the classify switch: only a clean 404 purges -----------------------------------------
 
 

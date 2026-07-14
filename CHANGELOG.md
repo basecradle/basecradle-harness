@@ -61,6 +61,26 @@ already wrote its records this way, for this reason, and said so in its docstrin
 a few bytes of bookkeeping; the session transcript is the agent's mind, and it was the one being
 written non-atomically.
 
+Three things ride with it, because an atomic write is not free and each of these is a way it could
+have made things worse:
+
+- **A staged transcript orphaned by a killed wake is swept.** The temp holds the *entire*
+  conversation. `_cleanup.enumerate_artifacts` globbed `sessions/*.json` and would have walked
+  right past `sessions/<source>.json.<pid>-<token>.tmp` — so a timeline deleted on the platform
+  would be reported as purged while its transcript sat on the box forever. The sweep now claims the
+  temp alongside the transcript. (`ClaimStore` never had this problem: its temps live inside a
+  directory the sweep removes wholesale.)
+- **The staging file is per-`Session`, not per-process.** Two `Harness` instances over one home hold
+  two `Session`s on the *same* path in the *same* process; keyed on the pid alone they would stage
+  into one file and could tear each other's temp — which `os.replace` would then publish, which is
+  the corruption the atomic write exists to prevent.
+- **A failed save no longer masks the exception the turn is dying of.** `_exchange` persists in a
+  `finally`, and an exception raised in a `finally` *replaces* the one propagating through it —
+  including the `ProviderContextLengthError` that `send` catches to compact and retry. Staging a
+  temp needs ~2× the disk a truncating write did, and `fsync` surfaces the deferred write errors a
+  buffered `close()` swallowed, so a near-full box — precisely where an over-long transcript turns
+  up — could newly eat the self-heal's trigger. It cannot now.
+
 Found while designing the keyed-resume follow-up (#297), which needs this as a prerequisite —
 incremental persistence multiplies the write windows per turn, so it must not be built over a
 non-atomic write.

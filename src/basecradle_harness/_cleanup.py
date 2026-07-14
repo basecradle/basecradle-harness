@@ -54,6 +54,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import shutil
 import sys
 from dataclasses import dataclass
@@ -73,6 +74,16 @@ _log = logging.getLogger("basecradle_harness")
 #: decoded source carries this prefix are timeline artifacts — a ``github:`` session is a
 #: different channel and is never swept.
 _TIMELINE_SOURCE_PREFIX = "timeline:"
+
+#: A transcript staged by `Session._save`'s atomic write and left behind by a process killed
+#: mid-save: ``sessions/<quoted-source>.json.<pid>-<token>.tmp`` (issue #297).
+#:
+#: It is swept because of what it *contains*. On success the temp is renamed into place and on an
+#: exception it is removed, so one only exists when a wake was killed inside the write window — and
+#: it then holds **the entire conversation**. A sweep that purged `…json` and walked past
+#: `…json.4213-9f2c.tmp` would report a deleted timeline as purged while leaving its transcript on
+#: the box forever, which is precisely the outcome this module exists to prevent.
+_SESSION_TEMP = re.compile(r"^(?P<source>.+)\.json\.[^.]+\.tmp$")
 
 
 @dataclass
@@ -117,10 +128,20 @@ def enumerate_artifacts(home: Path) -> dict[str, list[Path]]:
     # Session transcripts — `sessions/{quote(source)}.json`. Only timeline-sourced
     # sessions are ours; a `github:`/other channel session decodes without the prefix
     # and is left strictly alone (it has nothing to do with a deleted timeline).
+    #
+    # …and any transcript *staged* by the atomic save and orphaned by a killed wake
+    # (`<name>.json.<pid>-<token>.tmp`, see `_SESSION_TEMP`). It holds the whole
+    # conversation, so purging the transcript while leaving the temp would purge nothing.
     sessions = home / "sessions"
     if sessions.is_dir():
-        for path in sessions.glob("*.json"):
-            source = unquote(path.stem)
+        for path in sessions.iterdir():
+            if path.name.endswith(".json"):
+                encoded = path.name[: -len(".json")]
+            elif staged := _SESSION_TEMP.match(path.name):
+                encoded = staged.group("source")
+            else:
+                continue
+            source = unquote(encoded)
             if source.startswith(_TIMELINE_SOURCE_PREFIX):
                 add(source[len(_TIMELINE_SOURCE_PREFIX) :], path)
 
