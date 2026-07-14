@@ -167,6 +167,63 @@ def test_transcripts_persist_and_reload_across_instances(tmp_path):
     ]
 
 
+def test_a_crash_mid_save_leaves_the_previous_transcript_intact(tmp_path, monkeypatch):
+    """The transcript is published atomically, so a killed wake cannot tear it (issue #297).
+
+    A bare `write_text` truncates and *then* writes. A signal in between — `SIGKILL`, the default
+    disposition of `SIGTERM`, the OOM killer, a box reset — leaves half a file, and half a
+    transcript is not a degraded transcript: it is invalid JSON. `_load` raises on it, so the wake
+    dies on load — and so does every wake after it. The agent is bricked on that timeline, and its
+    memory of the conversation is gone, until a human deletes the file.
+
+    Here the crash is simulated where the real one is fatal: after the new bytes are written, before
+    they are published. What must survive is the *old* transcript, complete and loadable — never a
+    splice of the two.
+    """
+    agent = Harness(ScriptedProvider(text("The first answer.")), home=tmp_path)
+    agent.send("first", source="timeline:t1")
+    path = next((tmp_path / "sessions").iterdir())
+    before = path.read_text()
+
+    def die(_src, _dst):  # the kill lands between the write and the rename
+        raise OSError("killed")
+
+    monkeypatch.setattr("basecradle_harness._session.os.replace", die)
+
+    second = Harness(ScriptedProvider(text("The second answer.")), home=tmp_path)
+    with pytest.raises(OSError):
+        second.send("second", source="timeline:t1")
+
+    # Not truncated, not spliced, not empty: byte-for-byte the transcript we had before the crash.
+    assert path.read_text() == before
+    assert [
+        m.content
+        for m in convo(Harness(ScriptedProvider(), home=tmp_path).transcript("timeline:t1"))
+    ] == [
+        "first",
+        "The first answer.",
+    ]
+    # …and the staged copy is gone. It held the whole conversation; an exception must not leave it
+    # lying in the sessions dir (a *killed* process still can — which is why the sweep knows it).
+    assert [p.name for p in (tmp_path / "sessions").iterdir()] == [path.name]
+
+
+def test_two_sessions_on_one_path_never_share_a_staging_file(tmp_path):
+    """The temp is per-`Session`, not per-process — a pid does not identify a writer (issue #297).
+
+    Two `Harness` instances over one home hold two `Session` objects on the *same* transcript path
+    in the *same* process. Keyed on the pid alone they would stage into one file and could tear each
+    other's temp — which `os.replace` would then publish, which is the exact corruption the atomic
+    write exists to prevent.
+    """
+    home = tmp_path
+    one = Harness(ScriptedProvider(text("a")), home=home).session("timeline:t1")
+    two = Harness(ScriptedProvider(text("b")), home=home).session("timeline:t1")
+
+    assert one.path == two.path  # same transcript…
+    assert one._temp(one.path) != two._temp(two.path)  # …never the same staging file
+
+
 def test_no_home_means_no_transcript_files_are_written(tmp_path):
     agent = Harness(ScriptedProvider(text("ok")), home=None)
     agent.send("hi", source="github:pr-1")

@@ -42,6 +42,49 @@ passes over all of them.
 
 **No config change, no migration, no fleet campaign** — it rides the next roll.
 
+### Fixed: a killed wake could tear its own transcript in half (issue #297)
+
+`Session._save` wrote the transcript with a bare `write_text` — truncate, then write. A signal
+landing between those two (`SIGKILL`, the default disposition of `SIGTERM`, the OOM killer, a box
+reset) left **half a file**, and half a transcript is not a degraded transcript: it is invalid JSON.
+`_load` raises on it, so the wake dies on load — and so does the next one, and every one after that.
+The agent is **bricked on that timeline** and its memory of the conversation is gone, until a human
+deletes the file. The window was open on every turn of every agent.
+
+The transcript is now published atomically: write to a temp file, `fsync`, `os.replace`. A crash can
+leave the *previous* transcript intact or the *new* one complete — never a splice of the two, and
+never an empty file with a valid name. (The `fsync` is what makes that hold against a power loss and
+not only against a signal.)
+
+This is not a new idea in this codebase; it is an old one that skipped a file. `ClaimStore._write`
+already wrote its records this way, for this reason, and said so in its docstring. The claim file is
+a few bytes of bookkeeping; the session transcript is the agent's mind, and it was the one being
+written non-atomically.
+
+Three things ride with it, because an atomic write is not free and each of these is a way it could
+have made things worse:
+
+- **A staged transcript orphaned by a killed wake is swept.** The temp holds the *entire*
+  conversation. `_cleanup.enumerate_artifacts` globbed `sessions/*.json` and would have walked
+  right past `sessions/<source>.json.<pid>-<token>.tmp` — so a timeline deleted on the platform
+  would be reported as purged while its transcript sat on the box forever. The sweep now claims the
+  temp alongside the transcript. (`ClaimStore` never had this problem: its temps live inside a
+  directory the sweep removes wholesale.)
+- **The staging file is per-`Session`, not per-process.** Two `Harness` instances over one home hold
+  two `Session`s on the *same* path in the *same* process; keyed on the pid alone they would stage
+  into one file and could tear each other's temp — which `os.replace` would then publish, which is
+  the corruption the atomic write exists to prevent.
+- **A failed save no longer masks the exception the turn is dying of.** `_exchange` persists in a
+  `finally`, and an exception raised in a `finally` *replaces* the one propagating through it —
+  including the `ProviderContextLengthError` that `send` catches to compact and retry. Staging a
+  temp needs ~2× the disk a truncating write did, and `fsync` surfaces the deferred write errors a
+  buffered `close()` swallowed, so a near-full box — precisely where an over-long transcript turns
+  up — could newly eat the self-heal's trigger. It cannot now.
+
+Found while designing the keyed-resume follow-up (#297), which needs this as a prerequisite —
+incremental persistence multiplies the write windows per turn, so it must not be built over a
+non-atomic write.
+
 ## [0.67.0] - 2026-07-14
 
 **The Unspoken Channel: an agent now speaks only when it decides to.** By default, nothing an agent
