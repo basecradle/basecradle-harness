@@ -454,6 +454,24 @@ def test_vision_image_is_sent_as_an_input_image_part(router, responses_provider)
     assert {"type": "input_image", "image_url": "data:image/png;base64,AAAA"} in content
 
 
+def test_vision_image_is_sent_as_a_chat_image_url_part(router, provider):
+    """The **Chat Completions** surface serializes an image into the nested ``image_url`` content
+    part, so a vision-capable model reached over this surface actually sees the picture (issue
+    #313). Before, this surface silently dropped ``message.images`` on the wire while the Responses
+    surface (above) and the native xai-sdk adapter serialized them — the one surface that didn't."""
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="I see a cat."))
+    )
+
+    turn = Message.user("what's this?")
+    turn.images = [ImageContent(url="data:image/png;base64,AAAA", alt="cat.png")]
+    provider.chat([turn])
+
+    content = json.loads(route.calls.last.request.content)["messages"][0]["content"]
+    assert {"type": "text", "text": "what's this?"} in content
+    assert {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}} in content
+
+
 # === Errors (SDK exceptions → the harness provider hierarchy) ================
 
 

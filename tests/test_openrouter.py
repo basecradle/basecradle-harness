@@ -22,6 +22,7 @@ import pytest
 from openrouter import OpenRouter
 
 from basecradle_harness import (
+    ImageContent,
     Message,
     OpenRouterProvider,
     Provider,
@@ -195,6 +196,26 @@ def test_assistant_tool_calls_and_tool_results_serialize_back(router):
     # The assistant turn carried its tool call; the tool turn answered by id.
     assert body["messages"][1]["tool_calls"][0]["id"] == "call_1"
     assert body["messages"][2]["tool_call_id"] == "call_1"
+    provider.close()
+
+
+def test_vision_image_is_sent_as_a_chat_image_url_part(router):
+    """A turn carrying an image serializes into the Chat Completions ``image_url`` content part over
+    the native OpenRouter SDK, so a vision-capable OpenRouter model actually sees it (issue #313).
+    Before, the shared `chat_message_to_wire` dropped ``message.images`` — the OpenRouter path (the
+    fleet's only Chat-Completions surface) was exactly where a provisioned vision model would lose
+    it. The SDK marshals the parts list, proving the wire dicts are SDK-valid, not just well-shaped.
+    """
+    route = router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="I see a cat."))
+    )
+    provider = _provider()
+    turn = Message.user("what's this?")
+    turn.images = [ImageContent(url="data:image/png;base64,AAAA", alt="cat.png")]
+    provider.chat([turn])
+    content = json.loads(route.calls.last.request.content)["messages"][0]["content"]
+    assert {"type": "text", "text": "what's this?"} in content
+    assert {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}} in content
     provider.close()
 
 
