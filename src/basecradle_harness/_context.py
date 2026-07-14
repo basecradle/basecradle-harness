@@ -51,14 +51,29 @@ means "compaction off"), so `_warn_if_unguaranteed` **warns and never refuses** 
 silence, not the setting. It is derived from the constants above, never hardcoded, so it cannot rot
 when one of them is tuned.
 
-**One assumption in that arithmetic is stated rather than proved: one tool call per step.** A model
-may emit *several* tool calls in a single assistant turn (parallel calls — every model the fleet runs
-does), and each of them leaves its own result and its own arguments, so a step's real growth is the
-fan-out times what is counted here. `max_steps` bounds the model *calls*, not the tools dispatched,
-and nothing in the harness bounds the fan-out. This understates the worst case by that factor; it is
-**pre-existing** (it was always true of `TOOL_RESULT_CAP`) and it is **not** what issue #301 closed —
-bounding it means bounding a step's dispatch, which is a decision about the engine, not about what
-persists. Tracked in issue #304, and named here so the next reader of this proof is not misled by it.
+**The unit of the cap is the *step*, never the call — and that is what makes the arithmetic above
+true (issue #304).** A model may emit *several* tool calls in one assistant turn (parallel calls —
+every model the fleet runs does), and `max_steps` bounds the model's *calls*, not the tools it
+dispatched. So a per-*call* cap let a step's persisted growth scale with its fan-out, and the
+right-hand side above — counting one call per step — understated the worst case by that factor,
+silently and without bound. It is closed at the source rather than estimated with a fan-out constant
+(a guess inside a proof is how the proof rots): a step's tool results share one `TOOL_RESULT_CAP` and
+its calls' arguments share one `TOOL_ARGS_CAP`, water-filled (`_session._fill`), so **a step persists
+at most `persisted_step_cap()` characters of tool payload, however wide it fans out.** It costs the
+ordinary agent nothing: a lone call — the overwhelmingly common shape — gets the whole budget and is
+byte-for-byte what it always was, and a wide fan-out of *small* results keeps every one of them whole,
+because water-filling only takes room from the items that are over their share.
+
+**What that bounds, and what it does not — stated, because the difference is the whole reason the
+fix lives here and not in the engine.** These caps govern the payloads the harness persists *on the
+model's behalf*, which is the one class of content that can be arbitrarily large **independently of
+what the model wrote**: a three-token call can return a 200 KB mailbox. What is left in a step is the
+model's *own* output — its assistant text, and one `id`+`name` envelope per call it emitted — and that
+term the harness cannot bound and does not need to. It cannot, because the turn record must keep
+**every** call the model made: drop one and `_idempotency.creates` counts a different number, and a
+drifted ordinal is a message posted twice. It does not need to, because the provider already bounds it,
+at every response's max-output-tokens. (This is also why capping the *dispatch* was the wrong lever for
+#304, tempting as it looks: refusing to *run* a call does not un-write the call.)
 
 **A cut may land only immediately before a `user` turn.** This is the correctness constraint the
 whole rewrite turns on. Tool results follow the assistant turn that called them, so cutting
@@ -91,12 +106,18 @@ from basecradle_harness._provider import Provider
 
 _log = logging.getLogger("basecradle_harness")
 
-#: The most characters of one tool result that persist into the transcript. Above it, the result is
-#: elided to head + tail around a marker naming the original size (`_session._elide`). The model
-#: still saw the *whole* result on the turn the tool ran — this bounds only what every *future* turn
-#: re-reads and re-pays for. 4 KB is what the live containment prune used on @glm-5.2's transcripts
-#: (issue #275): comfortably more than a normal tool answer, far below the 142 KB mailbox dumps that
-#: drove one agent's context to 754 K input tokens per call.
+#: The most characters of tool results **one step** persists into the transcript — shared across
+#: every call that step made, not granted to each of them (issue #304). Over it, a result is elided
+#: to head + tail around a marker naming the original size (`_session._elide`). The model still saw
+#: the *whole* result on the turn the tool ran — this bounds only what every *future* turn re-reads
+#: and re-pays for. 4 KB is what the live containment prune used on @glm-5.2's transcripts (issue
+#: #275): comfortably more than a normal tool answer, far below the 142 KB mailbox dumps that drove
+#: one agent's context to 754 K input tokens per call.
+#:
+#: **Per step, because a step's fan-out is unbounded and `max_steps` is not a bound on it.** A lone
+#: call — the ordinary shape — gets the whole budget and is elided exactly as it always was; a step
+#: that fans out shares it, water-filled, so its *small* results survive whole and only the fat ones
+#: pay (`_session._fill`).
 #:
 #: **It lives here, not in `_session` where it is enforced**, because the compaction threshold's
 #: safety proof is computed from it (see the module docstring): it is an *input to the arithmetic*,
@@ -104,12 +125,13 @@ _log = logging.getLogger("basecradle_harness")
 #: proof noticing.
 TOOL_RESULT_CAP = 4096
 
-#: The most characters of one tool call's **arguments** that persist into the transcript. Over it,
-#: every argument gets a fair share of the budget and the ones that overflow theirs are cut to a head
-#: and a tail around a marker (`_session._cap_arguments`) — so the short arguments survive whole and
-#: the blob pays for itself. The model sent the *whole* arguments when the call ran; this bounds only
-#: what every *future* turn re-reads. **Characters as the model reads them, never as the disk escapes
-#: them** (`_session._json_size`) — a Japanese character costs one, not six.
+#: The most characters of tool-call **arguments** that **one step** persists into the transcript —
+#: shared across every call that step made, for the same reason `TOOL_RESULT_CAP` is (issue #304).
+#: Over it, every argument gets a fair share of the budget and the ones that overflow theirs are cut
+#: to a head and a tail around a marker (`_session._cap_arguments`) — so the short arguments survive
+#: whole and the blob pays for itself. The model sent the *whole* arguments when the call ran; this
+#: bounds only what every *future* turn re-reads. **Characters as the model reads them, never as the
+#: disk escapes them** (`_session._json_size`) — a Japanese character costs one, not six.
 #:
 #: **This was the one class of persisted content with no bound at all** (issue #301): the brief is
 #: never persisted, tool results are capped, images are evicted, the conversation is compacted — and
@@ -229,13 +251,21 @@ excerpt is gone. Do not speculate, do not pad, and do not address anyone: these 
 not a message. Everything you leave out is forgotten."""
 
 
-def persisted_call_cap() -> int:
-    """What one tool call may leave behind in the transcript, in characters.
+def persisted_step_cap() -> int:
+    """What one **step** may leave behind in the transcript, in characters — however wide it fans out.
 
-    Both halves, because both persist and both are replayed on every future wake: the **result** the
-    tool returned (`TOOL_RESULT_CAP`) and the **arguments** the model called it with (`TOOL_ARGS_CAP`).
-    Counting only the result — as this arithmetic did until issue #301 — was not a tight estimate but
-    a wrong one, because the arguments were not capped *at all*: the term it omitted was unbounded.
+    Both halves of a step's tool payload, because both persist and both are replayed on every future
+    wake: the **results** its calls returned (`TOOL_RESULT_CAP`) and the **arguments** it called them
+    with (`TOOL_ARGS_CAP`).
+
+    **The step is the unit, not the call** (issue #304). A model may emit several calls in one
+    assistant turn, and `max_steps` bounds the model's calls, not the tools dispatched — so a per-call
+    cap scaled a step's growth by a fan-out nothing bounds, and left the arithmetic below understating
+    the worst case without limit. `_session` shares each budget across the step's calls instead.
+
+    Counting only the result — as this arithmetic did until issue #301 — was likewise not a tight
+    estimate but a wrong one, because the arguments were not capped *at all*: the term it omitted was
+    unbounded. Both mistakes have the same shape, and this function is where they stay fixed.
     """
     return TOOL_RESULT_CAP + TOOL_ARGS_CAP
 
@@ -243,24 +273,26 @@ def persisted_call_cap() -> int:
 def worst_case_turn_tokens(max_steps: int) -> int:
     """The most one turn can add to the persisted transcript, in tokens — the proof's right-hand side.
 
-    Every step of the think→act loop may run a tool, and each call persists at most
-    `persisted_call_cap()` characters of result-plus-arguments. So one turn's worst-case persisted
-    growth is that cap times the step budget, converted at `WORST_CASE_CHARS_PER_TOKEN`. **Derived,
-    never hardcoded** — the whole point is that tuning either cap or the step budget moves this number
-    automatically, so the compaction threshold's safety argument can never quietly go stale behind a
-    literal.
+    Every step of the think→act loop may run tools, and a step persists at most `persisted_step_cap()`
+    characters of results-plus-arguments **whatever its fan-out** (issue #304). So one turn's worst-case
+    persisted growth is that cap times the step budget, converted at `WORST_CASE_CHARS_PER_TOKEN`.
+    **Derived, never hardcoded** — the whole point is that tuning either cap or the step budget moves
+    this number automatically, so the compaction threshold's safety argument can never quietly go stale
+    behind a literal.
 
-    It assumes **one call per step**, which is the fan-out gap named in the module docstring (issue
-    #304): a step that emits parallel calls multiplies this. Pre-existing, stated, not silent.
+    What it counts is the *tool payload* a step persists — the class the harness bounds. The model's own
+    output in that step (its text, and one id+name envelope per call it emitted) is bounded by the
+    provider's max-output-tokens, not by anything here; see the module docstring for why that term is
+    the provider's to bound and not ours.
     """
-    return math.ceil(persisted_call_cap() * max_steps / WORST_CASE_CHARS_PER_TOKEN)
+    return math.ceil(persisted_step_cap() * max_steps / WORST_CASE_CHARS_PER_TOKEN)
 
 
 def min_safe_limit(max_steps: int) -> int:
     """The smallest context budget that still guarantees no single turn can leap the threshold.
 
     Solve `limit × (1 - COMPACT_AT) >= worst_case_turn_tokens(max_steps)` for `limit`. At the shipped
-    constants (4 KB result + 2 KB arguments per call, 24 steps, half-ceiling trigger) this is ~98 K —
+    constants (4 KB result + 2 KB arguments per step, 24 steps, half-ceiling trigger) this is ~98 K —
     under the 128 K floor, which is why an agent that never touches the knobs is safe by construction
     and never hears a word about any of this. **That margin is what sizes `TOOL_ARGS_CAP`**: at a 4 KB
     argument cap this lands at 131,072, *above* the floor, and every stock agent would start warning.
@@ -282,7 +314,7 @@ def max_safe_steps(limit: int) -> int:
     the threshold past the wall and compaction would never fire in time — strictly worse. There the
     honest fix is to spend fewer steps per turn, so the warning quotes this number instead.
     """
-    return int(limit * (1.0 - COMPACT_AT) * WORST_CASE_CHARS_PER_TOKEN / persisted_call_cap())
+    return int(limit * (1.0 - COMPACT_AT) * WORST_CASE_CHARS_PER_TOKEN / persisted_step_cap())
 
 
 def is_context_overflow(text: str) -> bool:
@@ -457,14 +489,14 @@ class ContextBudget:
         _log.warning(
             "context budget %d (source=%s) leaves %d tokens of headroom above the compaction "
             "threshold, below the %d a single tool-heavy turn can add (%d chars of result + "
-            "arguments x %d steps at %.1f chars/token): a turn may overshoot the ceiling before "
-            "compaction, which runs only *between* turns, can fire. The over-length rescue "
+            "arguments per step x %d steps at %.1f chars/token): a turn may overshoot the ceiling "
+            "before compaction, which runs only *between* turns, can fire. The over-length rescue "
             "(emergency compaction + retry) still applies. %s",
             limit.tokens,
             limit.source,
             headroom,
             worst_case,
-            persisted_call_cap(),
+            persisted_step_cap(),
             self._max_steps,
             WORST_CASE_CHARS_PER_TOKEN,
             remedy,

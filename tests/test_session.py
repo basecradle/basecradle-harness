@@ -24,7 +24,10 @@ from basecradle_harness import (
     ToolCall,
     ToolRegistry,
 )
+from basecradle_harness._context import persisted_step_cap
+from basecradle_harness._idempotency import creates, interrupted
 from basecradle_harness._session import (
+    INTERRUPTED,
     TOOL_ARGS_CAP,
     TOOL_RESULT_CAP,
     _cap_arguments,
@@ -683,7 +686,9 @@ def test_a_call_is_capped_by_the_language_it_is_written_in_never_by_the_script()
     body = "こんにちは、今日の状況を共有します。" * 28  # ~500 characters: an ordinary post
     japanese = {"action": "create", "timeline": TIMELINE, "body": body}
 
-    assert _cap_arguments(japanese) == japanese, "an ordinary Japanese post did not survive the cap"
+    assert _cap_arguments(japanese, TOOL_ARGS_CAP) == japanese, (
+        "an ordinary Japanese post did not survive the cap"
+    )
 
     # The same post in English is likewise untouched — which is the entire point: same size, same fate.
     english = {
@@ -691,12 +696,12 @@ def test_a_call_is_capped_by_the_language_it_is_written_in_never_by_the_script()
         "timeline": TIMELINE,
         "body": "Hello, here is today's status. " * 17,
     }
-    assert _cap_arguments(english) == english
+    assert _cap_arguments(english, TOOL_ARGS_CAP) == english
 
     # And a Japanese body that *is* genuinely over the cap is excerpted like any other — in Japanese,
     # with its siblings intact — never stubbed away.
     long_form = {"action": "create", "timeline": TIMELINE, "body": "日本語の長い本文です。" * 800}
-    capped = _cap_arguments(long_form)
+    capped = _cap_arguments(long_form, TOOL_ARGS_CAP)
     assert _json_size(capped) <= TOOL_ARGS_CAP
     assert capped["action"] == "create" and capped["timeline"] == TIMELINE
     assert capped["body"].startswith("日本語の長い本文です。")
@@ -720,7 +725,7 @@ def test_a_call_of_several_medium_arguments_keeps_all_of_them(tmp_path):
         "notes": "N" * 700,
     }
 
-    capped = _cap_arguments(arguments)
+    capped = _cap_arguments(arguments, TOOL_ARGS_CAP)
 
     assert _json_size(capped) <= TOOL_ARGS_CAP
     assert list(capped) == list(arguments), (
@@ -762,6 +767,331 @@ def test_re_saving_a_capped_transcript_is_a_fixed_point(tmp_path):
     reloaded.note("a later turn re-saves the whole transcript")
 
     assert _stored_calls(path) == once
+
+
+# --- A step, not a call, is the unit of the cap (issue #304) ------------------
+#
+# `max_steps` bounds the model's *calls*, never the tools it dispatched: a model may emit several
+# tool calls in one assistant turn, and every model the fleet runs does. A per-*call* cap therefore
+# let one step's persisted growth scale with a fan-out nothing bounds — and the compaction
+# threshold's safety proof (`worst_case_turn_tokens`, which counts one call per step) understated
+# the worst case by exactly that factor, silently and without limit. These pin the fix: the step
+# shares one budget, whatever it fans out into.
+
+
+def call(call_id: str, name: str, **arguments) -> ToolCall:
+    return ToolCall(id=call_id, name=name, arguments=arguments)
+
+
+def fans_out(*calls: ToolCall) -> Message:
+    """One assistant turn carrying several tool calls — the parallel-call shape a real model emits."""
+    return Message.assistant(tool_calls=list(calls))
+
+
+def _stored_steps(path) -> list[int]:
+    """What each step's **tool payload** actually cost the transcript, in characters.
+
+    The proof's own quantity, read off the disk: per assistant turn, the arguments of every call it
+    made plus the content of every result answering them. This is the term
+    `_context.worst_case_turn_tokens` multiplies by the step budget — so what it counts here is what
+    that arithmetic must not understate.
+    """
+    stored = json.loads(path.read_text())
+    steps = []
+    for index, message in enumerate(stored):
+        if not message.get("tool_calls"):
+            continue
+        ids = {c["id"] for c in message["tool_calls"]}
+        payload = sum(_json_size(c["arguments"]) for c in message["tool_calls"])
+        for later in stored[index + 1 :]:
+            if later.get("role") == "assistant":
+                break
+            if later.get("role") == "tool" and later.get("tool_call_id") in ids:
+                payload += len(later.get("content") or "")
+        steps.append(payload)
+    return steps
+
+
+def test_a_step_that_fans_out_shares_one_result_budget(tmp_path):
+    """Three parallel calls, three mailbox dumps — and **one** `TOOL_RESULT_CAP` between them.
+
+    The defect this closes: each call used to get its own 4 KB, so a step's persisted growth was
+    `fan-out x cap` and the compaction proof — which counts one call per step — was quietly untrue.
+    The model still reads all three dumps in full on the turn they ran; what every *future* wake
+    re-reads is bounded by the step, not by how wide the model chose to fan out.
+    """
+    dumps = {box: f"BOX-{box}\n" + ("x" * 60_000) + f"\nEND-{box}" for box in ("a", "b", "c")}
+
+    class Mailboxes(Tool):
+        name = "mailbox"
+        description = "list a mailbox"
+
+        def run(self, **kwargs):
+            return dumps[kwargs["box"]]
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(
+        fans_out(
+            call("c1", "mailbox", box="a"),
+            call("c2", "mailbox", box="b"),
+            call("c3", "mailbox", box="c"),
+        ),
+        text("You have mail in all three."),
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Mailboxes()]).engine, path=path)
+
+    session.send("check all my mail")
+
+    # Sent whole: the model read every one of the three dumps in full on the turn they ran.
+    for dump in dumps.values():
+        assert ("tool", dump) in provider.snapshots[1]
+
+    # Kept capped — and capped **together**. Per-call, this step would have persisted three times
+    # the budget; the whole point is that it persists one.
+    results = [m for m in session.history if m.role == "tool"]
+    assert len(results) == 3
+    assert sum(len(m.content or "") for m in results) <= TOOL_RESULT_CAP
+
+    # Each one is still worth reading: its own head, its own tail, its own honest marker. A cap that
+    # degrades to a shrug would be cheaper and useless.
+    for (box, dump), stored in zip(dumps.items(), results):
+        assert stored.content.startswith(f"BOX-{box}")
+        assert stored.content.endswith(f"END-{box}")
+        assert f"of {len(dump)}" in stored.content
+    assert [m.tool_call_id for m in results] == ["c1", "c2", "c3"]  # pairing intact
+
+
+def test_a_wide_fan_out_of_small_results_keeps_every_one_of_them_whole(tmp_path):
+    """Fan-out alone costs nothing — **only fan-out that is also fat pays.**
+
+    This is why the shared budget is water-filled rather than sliced evenly. Ten parallel lookups
+    returning a line each fit the budget between them, and the smallest of any remaining set is never
+    larger than their mean — which *is* its share — so every one of them is kept byte for byte. An
+    even 1/10th slice would have taken a haircut off ten results that were never the problem.
+    """
+    answer = "Dallas, Texas."
+
+    class Lookup(Tool):
+        name = "lookup"
+        description = "look something up"
+
+        def run(self, **kwargs):
+            return answer
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(
+        fans_out(*(call(f"c{n}", "lookup", of=str(n)) for n in range(10))),
+        text("Ten answers."),
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Lookup()]).engine, path=path)
+
+    session.send("look up ten things")
+
+    results = [m for m in session.history if m.role == "tool"]
+    assert len(results) == 10
+    assert all(m.content == answer for m in results), "a small result paid for a wide fan-out"
+
+
+def test_a_step_that_fans_out_shares_one_argument_budget_and_still_reads_as_creates(tmp_path):
+    """The other half of the step's payload — and the trap that makes it dangerous to cap.
+
+    Three parallel `assets create` calls, each carrying a document. They share one `TOOL_ARGS_CAP`,
+    so the step is bounded. But **capping may never change what `create_kind` reads off a call**: the
+    idempotency ordinal is "the nth create of this kind in this turn", counted once by the live mint
+    and again by the recovery over the *reloaded* transcript. Cap an `action` away and a create
+    vanishes from the recovery's count, the ordinal drifts, and a key the platform has never seen is
+    a message posted twice. Water-filling keeps the short arguments whole, which is what makes the
+    two counts agree — so this asserts the bound *and* the thing the bound must not break.
+    """
+    document = "REPORT\n" + ("x" * 200_000) + "\nEND-OF-REPORT"
+
+    class Assets(Tool):
+        name = "assets"
+        description = "store an asset"
+
+        def run(self, **kwargs):
+            return "stored"
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(
+        fans_out(
+            *(
+                call(f"c{n}", "assets", action="create", title=f"Part {n}", content=document)
+                for n in range(3)
+            )
+        ),
+        text("Stored all three."),
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Assets()]).engine, path=path)
+
+    session.send("store these")
+
+    stored = _stored_calls(path)
+    assert len(stored) == 3
+    assert sum(_json_size(c["arguments"]) for c in stored) <= TOOL_ARGS_CAP
+
+    # …and every one of them is still, unmistakably, a create — which is what the recovery counts.
+    reloaded = Session("timeline:x", Harness(ScriptedProvider()).engine, path=path)
+    work = turn_work(reloaded.history, reloaded.history[0])
+    assert [(c.kind, c.ordinal) for c in creates(work)] == [
+        ("asset", 1),
+        ("asset", 2),
+        ("asset", 3),
+    ]
+
+
+class Wide(Tool):
+    """Takes a lot and gives a lot back — one call of it would swamp a transcript on its own."""
+
+    name = "wide"
+    description = "take a lot and give a lot back"
+
+    def __init__(self, chars: int = 100_000) -> None:
+        self.chars = chars
+
+    def run(self, **kwargs):
+        return "RESULT\n" + ("z" * self.chars)
+
+
+def _fan_out_step(path, fan_out: int, *, chars: int = 100_000) -> int:
+    """Run one step of `fan_out` fat calls and report what its tool payload cost the transcript."""
+    provider = ScriptedProvider(
+        fans_out(*(call(f"c{n}", "wide", body="y" * chars) for n in range(fan_out))),
+        text("Done."),
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Wide(chars)]).engine, path=path)
+    session.send("do a lot at once")
+    (step,) = _stored_steps(path)
+    return step
+
+
+def test_no_fan_out_can_make_a_step_persist_more_than_the_proof_allows(tmp_path):
+    """**The invariant, stated as the compaction proof needs it** (issue #304).
+
+    `worst_case_turn_tokens` = `persisted_step_cap() x max_steps`, and that is a real upper bound only
+    if a *step* — not a call — is what the cap governs. So: whatever the model fans out into, one
+    step's persisted tool payload stays inside `persisted_step_cap()`. Widen the fan-out and the
+    excerpts get thinner; the total does not move. Per-call, a 30-way step would have persisted thirty
+    times the budget, and the proof would have understated it by thirty.
+    """
+    for fan_out in (1, 2, 5, 10, 20, 30):
+        step = _fan_out_step(tmp_path / f"t{fan_out}.json", fan_out)
+        assert step <= persisted_step_cap(), (
+            f"a step that fanned out {fan_out} ways persisted {step} chars, over the "
+            f"{persisted_step_cap()} the compaction proof is built on"
+        )
+
+
+def test_a_steps_growth_is_bounded_by_what_the_model_wrote_never_by_what_its_tools_returned(
+    tmp_path,
+):
+    """The bound underneath the bound — and the one that holds at **every** fan-out, without exception.
+
+    Above ~50 parallel calls the total creeps past `persisted_step_cap()`, and that is not a leak: it
+    is the floor (`_gone`). A result cannot be dropped (its call would dangle, permanently) and neither
+    can a call's arguments (`create_kind` reads them), so each call keeps one short record saying how
+    much is gone — of the same order as the `id`+`name` envelope the transcript must keep for that call
+    anyway. **That residue scales with what the model emitted, never with what its tools returned**,
+    which is the thing "nothing replayed per wake may be unbounded" actually asks for: the harness
+    bounds the class of content that can be arbitrarily large *independently of what the model wrote* —
+    a three-token call can return a 200 KB mailbox — and the model's own emission is the provider's to
+    bound, at every response's max-output-tokens.
+
+    So: multiply the tools' output fiftyfold and the transcript does not move.
+    """
+    modest = _fan_out_step(tmp_path / "modest.json", 20, chars=100_000)
+    enormous = _fan_out_step(tmp_path / "enormous.json", 20, chars=5_000_000)
+
+    assert modest <= persisted_step_cap()
+    assert abs(enormous - modest) < 100, (
+        f"50x the tool output moved the transcript by {enormous - modest} chars: a step's persisted "
+        f"size is scaling with what its tools returned"
+    )
+
+
+def test_a_killed_wide_step_keeps_the_evidence_the_recovery_reads(tmp_path):
+    """**The shared budget must never cut the `INTERRUPTED` marker** — found reviewing this diff.
+
+    It is a *sentinel*, matched exactly: `_replayable` keeps an interrupted create's arguments whole
+    because of it, and `_idempotency.interrupted` finds the calls to re-issue by it. Per call it was
+    never at risk (~300 characters against a 4 KB cap). Share that cap across a step and a fan-out of
+    ~14 drives every share below it — at which point the marker is elided, and the damage is silent
+    and severe: the create's arguments are capped and the recovery re-posts the peer's message with
+    its body cut out, and the call is no longer even recognizable as one to re-issue.
+
+    So an interrupted result is outside the pool — never charged, never elided. The mirror of the
+    exception `_replayable` already makes on the arguments side, for the same reason: **the recovery's
+    evidence is never bounded away.**
+    """
+    body = "The full text of the message the peer is owed. " * 30
+    path = tmp_path / "t.json"
+    # A wake killed mid-chain: 20 creates issued, none recorded — exactly what `_load` heals.
+    path.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "post these"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": f"c{n}",
+                            "name": "messages",
+                            "arguments": {"action": "create", "timeline": TIMELINE, "body": body},
+                        }
+                        for n in range(20)
+                    ],
+                },
+            ]
+        )
+    )
+
+    session = Session("timeline:x", Harness(ScriptedProvider()).engine, path=path)
+    session.note("a later turn re-saves the whole transcript")
+
+    healed = [m for m in session.history if m.role == "tool"]
+    assert len(healed) == 20
+    assert all(m.content == INTERRUPTED for m in healed), "the cap ate the recovery's own sentinel"
+
+    # …and on disk, where the recovering wake will actually read it.
+    reloaded = Session("timeline:x", Harness(ScriptedProvider()).engine, path=path)
+    work = turn_work(reloaded.history, reloaded.history[0])
+    pending = interrupted(work, INTERRUPTED)
+    assert [(c.kind, c.ordinal) for c in pending] == [("message", n + 1) for n in range(20)]
+    # The whole point of finding them: each is re-issued from arguments that still carry the body.
+    assert all(c.call.arguments["body"] == body for c in pending), (
+        "an interrupted create's body was elided — the recovery would re-post it truncated"
+    )
+
+
+def test_re_saving_a_fanned_out_step_is_a_fixed_point(tmp_path):
+    """The transcript is re-saved on every turn for the life of the timeline, so the cap must settle.
+
+    A shared budget is where a ratchet would hide: cap a step's results *together*, and the capped
+    set is what the next save measures. Water-filling is what forecloses it — a set that already fits
+    its budget is kept whole, every item of it — so the second save writes the same bytes as the
+    first, and there is never a marker of a marker naming a size that is no longer true.
+    """
+
+    class Mailboxes(Tool):
+        name = "mailbox"
+        description = "list a mailbox"
+
+        def run(self, **kwargs):
+            return "BOX\n" + ("x" * 60_000)
+
+    path = tmp_path / "t.json"
+    provider = ScriptedProvider(
+        fans_out(*(call(f"c{n}", "mailbox", box=str(n)) for n in range(4))), text("Mail.")
+    )
+    session = Session("timeline:x", Harness(provider, tools=[Mailboxes()]).engine, path=path)
+    session.send("check my mail")
+    once = path.read_text()
+
+    reloaded = Session("timeline:x", Harness(ScriptedProvider()).engine, path=path)
+    reloaded.note("a later turn re-saves the whole transcript")
+
+    twice = json.loads(path.read_text())
+    assert twice[:-1] == json.loads(once), "the cap ground the step down a second time"
 
 
 def test_note_records_a_system_turn_without_calling_the_model(tmp_path):

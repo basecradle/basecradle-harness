@@ -5,6 +5,67 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+**The compaction proof counted one tool call per step. Models emit several.**
+
+### Fixed: a step, not a call, is the unit of the persistence caps (issue #304)
+
+`worst_case_turn_tokens` — the right-hand side of the inequality the 50% compaction threshold is
+proved against — sized a turn's persisted growth as `persisted_call_cap() × max_steps`. But
+`max_steps` bounds the model's **calls**, not the tools it dispatched: a model may emit several tool
+calls in one assistant turn (parallel calls; every model the fleet runs does), and the engine
+dispatched all of them, each leaving its own capped result *and* its own capped arguments. So a
+step's real growth was `fan-out × persisted_call_cap()`, **nothing in the harness bounded the
+fan-out**, and the proof understated the worst case by that factor — silently, and without limit.
+Pre-existing (it was always true of `TOOL_RESULT_CAP` alone) and named in `_context.py` rather than
+left unsaid; this is where it is closed.
+
+- **Both caps are now per *step*, shared across its calls** (`_session._capped_results`,
+  `_calls_payload`). A step's tool results share one `TOOL_RESULT_CAP`; its calls' arguments share
+  one `TOOL_ARGS_CAP`. `persisted_call_cap()` → **`persisted_step_cap()`**, and the arithmetic it
+  feeds is now a real upper bound instead of nearly one.
+- **Water-filled, which is what makes it free** (`_session._fill`, one allocator now behind all three
+  caps — a step's results, a step's calls, and one call's arguments). Every item gets an equal share
+  of the budget, smallest first; one that fits its share is kept byte for byte and rolls its surplus
+  over. So **a lone call gets the whole budget and is byte-for-byte unchanged** (the ordinary shape —
+  the fleet's transcripts are untouched by this), and **a wide fan-out of small results keeps every
+  one of them whole** (ten parallel lookups returning a line each cost nothing at all). Only a
+  fan-out that is *also fat* pays — precisely the shape that had to be bounded. It is also what makes
+  the cap a **fixed point**: an already-capped set fits, so re-saving it every turn never grinds an
+  excerpt into an excerpt of an excerpt.
+- **Capping the dispatch was the wrong lever, and it is the one that looks right.** Refusing to *run*
+  a call does not un-write the call: the assistant turn records every call the model **emitted**, and
+  it must — dropping one changes what `_idempotency.creates` counts, and a drifted ordinal is a
+  message posted twice. A dispatch cap would have left the persisted growth exactly as unbounded as
+  it found it, while refusing legitimate model behavior.
+- **The bound underneath the bound: a step's growth is bounded by what the *model* wrote, never by
+  what its *tools* returned.** Multiply the tools' output fiftyfold and the transcript does not move.
+  Past ~50 parallel calls the total does creep over the cap — that is the **floor**, not a leak: a
+  result cannot be dropped (its call would dangle, permanently) and neither can a call's arguments
+  (`create_kind` reads them), so each keeps one short `[... 60000 chars elided ...]` (`_gone`) saying
+  how much is gone. That residue is one small record per call *the model chose to make*, of the same
+  order as the `id`+`name` envelope the transcript must keep for that call anyway — and the provider
+  bounds it, at every response's max-output-tokens.
+- **The elision floor got terse.** The no-room-for-an-excerpt marker was ~149 characters of prose that
+  only makes sense *next to an excerpt* ("re-run it if you need it in full"); it now states the one
+  fact left to be honest about — how much was cut. Five times cheaper, per call, on the one shape
+  where every call is already down to its last few dozen characters.
+- **Capping still never hides a create.** A fanned-out step of three `assets create` calls keeps every
+  `action` (water-filling keeps the short arguments whole), so `_idempotency.creates` counts the same
+  ordinals off the reloaded transcript as the live mint did — pinned by a test, because the failure
+  mode is a duplicate post.
+- **The recovery's evidence is never bounded away** — caught reviewing this diff, and it is the reason
+  a shared budget needs more care than a per-call one: it can reach content a per-call budget never
+  could. `INTERRUPTED` is a *sentinel matched exactly* (`_replayable` keeps an interrupted create's
+  arguments whole because of it; `_idempotency.interrupted` finds the calls to re-issue by it), and at
+  ~342 characters it was never at risk against a 4 KB per-call cap. Shared across a step, a fan-out of
+  ~14 drives every share below it — and eliding it would have flipped `_replayable` to `False`, capped
+  the create's arguments, and **re-posted the peer's message with its body cut out**, with the call no
+  longer recognizable as one to re-issue at all. An interrupted result is now outside the pool: never
+  charged, never elided (`_is_interrupted`) — the mirror of the exception the arguments side already
+  makes.
+
 ## [0.71.0] - 2026-07-14
 
 **The one dependency the harness cannot run without was the one nothing reported.** An agent whose
