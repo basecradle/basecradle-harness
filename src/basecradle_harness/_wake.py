@@ -117,8 +117,14 @@ from basecradle_harness._brief import (
 )
 from basecradle_harness._code import CodeExecutionBridge
 from basecradle_harness._engine import compose_hooks
-from basecradle_harness._exceptions import EngineError, HarnessError, ProviderError
+from basecradle_harness._exceptions import (
+    EngineError,
+    HarnessError,
+    ProviderContextLengthError,
+    ProviderError,
+)
 from basecradle_harness._harness import Harness
+from basecradle_harness._idempotency import IdempotencyKeys, interrupted
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
 from basecradle_harness._mcp import load_mcp_configs
 from basecradle_harness._memory_provider import (
@@ -131,7 +137,7 @@ from basecradle_harness._messages import ImageContent, Message
 from basecradle_harness._observability import delivery_id, describe_provider, kv, log_unspoken
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
-from basecradle_harness._session import Session
+from basecradle_harness._session import INTERRUPTED, Session, turn_work
 from basecradle_harness._unspoken import MentionInformer, SpeechLedger
 from basecradle_harness._version import __version__
 
@@ -324,6 +330,44 @@ def _orphaned(claim: Claim, *, pid: int, wake: str, now: float | None = None) ->
     return age > _CLAIM_STALE_AFTER
 
 
+#: How far `ClaimStore.effective_owner` will follow a chain of take-overs before giving up. A
+#: recovery that dies can itself be recovered, so the chain is real — but it is one hop per crashed
+#: wake, so any depth beyond a handful means the records are corrupt, and spinning on them is worse
+#: than the stalled item they describe.
+_TAKEOVER_HOPS = 16
+
+
+def _read_claim(path: Path) -> Claim | None:
+    """Read a claim record from `path` — the one parser, shared by the claim and its take-over token.
+
+    Two shapes are tolerated rather than trusted, and **both degrade to `done`** — the conservative
+    reading, because `done` only ever costs a *skip*, while a wrong `in-flight` could re-drive an
+    item that was already answered.
+    """
+    try:
+        raw = path.read_text().strip()
+    except FileNotFoundError:
+        return None
+    if not raw:
+        return Claim(phase=_DONE)  # legacy: the pre-#285 code wrote an empty claim
+    try:
+        data = json.loads(raw)
+        return Claim(
+            phase=str(data["phase"]),
+            pid=data.get("pid"),
+            wake=data.get("wake"),
+            at=data.get("at"),
+            reason=data.get("reason"),
+        )
+    except (ValueError, KeyError, TypeError):
+        _log.warning(
+            "Unreadable claim record at %s; treating it as done rather than re-driving an item "
+            "we cannot reason about.",
+            path,
+        )
+        return Claim(phase=_DONE)
+
+
 def _payload(claim: Claim) -> dict[str, object]:
     """A claim as the JSON it persists as. One shape, so a `claim()` and a `commit()` cannot drift."""
     payload: dict[str, object] = {
@@ -422,8 +466,7 @@ class ClaimStore:
         A take-over is a **compare-and-swap**, not an overwrite: it must succeed only if the claim
         is still the very one the caller judged orphaned. The swap is decided by an exclusive
         create on a token path that names the dead owner — `.<uuid>.takeover.<owner>` — so exactly
-        one wake can ever take this message *from this owner*, and the winner then overwrites the
-        claim with its own record.
+        one wake can ever take this message *from this owner*, and the winner then writes the claim.
 
         Two simpler forms are **both broken**, and it is worth naming them, because each looks
         obviously fine:
@@ -438,21 +481,63 @@ class ClaimStore:
           it cannot tell the stale orphan from the live claim that replaced it. That distinction is
           the entire job, which is why the token names the owner it is taking over *from*.
 
-        Keying the token to the owner also keeps recovery **repeatable**: if the wake that takes the
-        message over then dies too, *its* wake id becomes the new owner, and the next recovery
-        competes on a different token path. A single non-generational token would let a message be
-        recovered exactly once, ever, and strand it in-flight forever afterwards.
+        **The token carries its record, exactly as `claim()`'s does, and for a sharper reason**
+        (issue #297). Winning the token and *then* writing the claim is two steps, and a wake that
+        dies between them — or simply hits `ENOSPC`, which needs no race at all — leaves the token
+        **taken** and the claim still naming the **dead** owner. Every future wake then judges that
+        stale owner, tries to reclaim from it, loses the token it can never win, and returns
+        `_PENDING`; `_settle` stops at the first `_PENDING`, so **the high-water mark is pinned
+        forever and the peer's message is never answered by anyone**. A stall is not better than a
+        drop — it *is* a drop, with the mark stuck behind it.
+
+        So the token is published already populated (link-from-temp, never observable empty), and it
+        *is* the record of who took over. `effective_owner` reads it, so a take-over that died
+        before it could write the claim is itself recoverable: the next wake sees that the real
+        owner is the wake named in the token, judges *that* wake, and competes on a fresh token path
+        keyed to it. That is what makes recovery **repeatable** — a single non-generational token
+        would let a message be recovered exactly once, ever, and strand it afterwards.
         """
         path = self._path(timeline, kind, uuid)
         path.parent.mkdir(parents=True, exist_ok=True)
-        token = path.parent / f".{quote(uuid, safe='')}.takeover.{quote(str(owner), safe='')}"
+        record = Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time())
+        token = self._token(path, uuid, owner)
+        temp = path.parent / f".{quote(uuid, safe='')}.{self.wake}.takeover.new"
+        temp.write_text(json.dumps(_payload(record)))
         try:
-            handle = os.open(token, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.link(temp, token)  # atomic create-if-absent, published already carrying the record
         except FileExistsError:
             return False  # another wake already took this orphan over — it owns it now
-        os.close(handle)
-        self._write(path, Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time()))
+        finally:
+            temp.unlink(missing_ok=True)
+        self._write(path, record)
         return True
+
+    def effective_owner(self, timeline: str, uuid: str, *, kind: str, claim: Claim) -> Claim:
+        """`claim`, unless a take-over won it and died before it could say so (issue #297).
+
+        `reclaim` wins a token and then writes the claim. Between those two the claim file still
+        names the *previous* owner — so a wake reading it would judge a wake that no longer holds
+        the item, and would then lose a token that is already spoken for, forever. Following the
+        token chain resolves the owner the claim file has not caught up with yet.
+
+        The chain is a chain because a recovery can itself be recovered: A takes over from D, dies;
+        B takes over from A, dies; C takes over from B. Each hop is a distinct wake id, so it
+        terminates — but it is bounded anyway, because the one thing worse than a stalled item is a
+        wake spinning on a corrupt one.
+        """
+        seen: set[str] = set()
+        while claim.wake is not None and claim.wake not in seen and len(seen) < _TAKEOVER_HOPS:
+            seen.add(claim.wake)
+            token = self._token(self._path(timeline, kind, uuid), uuid, claim.wake)
+            successor = _read_claim(token)
+            if successor is None or successor.wake is None:
+                break  # nobody took this owner over — the claim file is the truth
+            claim = successor
+        return claim
+
+    def _token(self, path: Path, uuid: str, owner: str | None) -> Path:
+        """The take-over token for `owner`'s claim: exclusive-create decides who takes it over."""
+        return path.parent / f".{quote(uuid, safe='')}.takeover.{quote(str(owner), safe='')}"
 
     def read(self, timeline: str, uuid: str, *, kind: str) -> Claim | None:
         """The claim on `(kind, timeline, uuid)`, or ``None`` if the item was never claimed.
@@ -466,30 +551,7 @@ class ClaimStore:
           means something we do not understand touched the file. Never re-drive on a record we
           cannot read.
         """
-        path = self._path(timeline, kind, uuid)
-        try:
-            raw = path.read_text().strip()
-        except FileNotFoundError:
-            return None
-        if not raw:
-            return Claim(phase=_DONE)  # legacy: the pre-#285 code wrote an empty claim
-        try:
-            data = json.loads(raw)
-            return Claim(
-                phase=str(data["phase"]),
-                pid=data.get("pid"),
-                wake=data.get("wake"),
-                at=data.get("at"),
-                reason=data.get("reason"),
-            )
-        except (ValueError, KeyError, TypeError):
-            _log.warning(
-                "Unreadable claim record for %s (%s); treating it as done rather than "
-                "re-driving an item we cannot reason about.",
-                uuid,
-                path,
-            )
-            return Claim(phase=_DONE)
+        return _read_claim(self._path(timeline, kind, uuid))
 
     def commit(self, timeline: str, uuid: str, *, kind: str) -> None:
         """Mark the item **done** — acted on, disposition final. The mark may now pass it."""
@@ -1040,6 +1102,12 @@ class WakeAgent:
         # One object, bound into the tools once; its contents cycle per wake (`reset`).
         self.speech = SpeechLedger()
 
+        # Deterministic `Idempotency-Key`s for the four platform creates (issue #297). Bound into
+        # the tools once, like the ledger above, and armed per *turn* with the item that turn is
+        # answering. It is what makes a killed wake's create safe to re-issue: the recovering wake
+        # mints the same key, so the platform returns the original record instead of a second one.
+        self.keys = IdempotencyKeys()
+
         # Bind the live platform handle into every platform-aware tool — the same
         # seam the poll loop uses, so a router-woken peer can act on the timeline
         # exactly as a polling one. One wake serves one timeline; bind once. The
@@ -1052,6 +1120,7 @@ class WakeAgent:
             home=self.harness.home,
             code_bridge=code_bridge,
             speech=self.speech,
+            keys=self.keys,
         )
         bind_platform_tools(self.harness.tools, context)
         if code_bridge is not None:
@@ -1277,9 +1346,20 @@ class WakeAgent:
             # claim time).
             self._ledger: list[tuple[str, str]] = []
             self._cursor: str | None = None
-            # Has this wake called the model yet? Recovery is only sound before it has — see
-            # `_readmit`. Set by `_send_batch`, the message path's only model call.
-            self._sent = False
+            # What `_recover` decided about each orphaned message, before this wake called the
+            # model at all (issue #297). `_readmit` reads it rather than recomputing: recovery
+            # reasons from the transcript, and the transcript stops being pristine evidence the
+            # moment this wake writes to it — which it does from inside `_absorb`'s own re-read
+            # loops. An orphan with no entry here is one recovery declined; it stays `_PENDING`.
+            self._recovered: dict[str, str] = {}
+            # Turns this wake has already resumed, and how that went. A dead wake's turn carried a
+            # *batch*, so several of its messages arrive here as orphans of the same turn — and a
+            # turn is finished **once**. On the happy path the transcript says so by itself (the
+            # resumed turn now has a narration, so the rest commit), but a resume that failed leaves
+            # the turn looking exactly as unfinished as it did before, and without this the next
+            # message of the same batch would resume it *again* — a second full step budget, and a
+            # second post under the next ordinal, which no key dedupes.
+            self._resumed: list[tuple[Message, str]] = []
             # A fresh identity per *wake*, not per process: an agent that wakes twice in one
             # process must see its own earlier wake's abandoned claims as orphaned, not as "mine".
             self.claims.wake = uuid4().hex
@@ -1737,7 +1817,7 @@ class WakeAgent:
             # ride into the model's input on this turn and are evicted after (see `Session`).
             rendered = render(item)
             text, images = rendered if isinstance(rendered, tuple) else (rendered, [])
-            narration = self._engage(session, text, images)
+            narration = self._engage(session, text, images, item)
             self._unspoken(narration)
             # **Memory observes every engaged turn — posted or silent** (issue #293). It used to
             # fire only when a reply posted, which under silence-default would quietly drop facts
@@ -1747,7 +1827,13 @@ class WakeAgent:
             self._observe(text, narration)
         return posted
 
-    def _engage(self, session: Session, text: str, images: list[ImageContent]) -> str:
+    def _engage(
+        self,
+        session: Session,
+        text: str,
+        images: list[ImageContent],
+        item: object | None = None,
+    ) -> str:
         """Run the model on one item, degrading the engine's step-cap to a graceful note.
 
         Returns the turn's **unspoken narration** — the model's final text, which the caller
@@ -1769,11 +1855,32 @@ class WakeAgent:
         so it is present and recent for the item it governs, and never persisted (see
         `_wake_brief`). The item's text is the retrieval query the memory provider's `context`
         hook ranks against, so recalled memory is relevant to this turn.
+
+        `item` is the platform item this turn is answering — an asset, a webhook delivery, an
+        activated task. It anchors the turn's idempotency keys and is recorded on the turn, exactly
+        as a message batch's uuids are (issue #297). These kinds do not yet *recover* (issue #289
+        owns that), but a create they make is keyed all the same: it costs nothing, and the day the
+        recovery reaches them the keys will already be right.
         """
         self.informer.arm(text)
         self._degraded = False
+        uuid = _uuid_of(item) if item is not None else None
+        if uuid is not None:
+            self.keys.begin(session, timeline=self.timeline_uuid, anchor=uuid)
+        else:
+            # No item to anchor on → **disarm**. Leaving the minter armed would key this turn's
+            # creates to the *previous* turn's anchor while counting their ordinals off this turn's
+            # work — reproducing a key the previous turn already used, so the platform hands back
+            # the old record and the new message is never posted, silently, with the tool reporting
+            # success. Unkeyed is the honest fallback: the create behaves as it always did.
+            self.keys.clear()
         try:
-            return session.send(text, images=images, brief=self._wake_brief(query=text))
+            return session.send(
+                text,
+                images=images,
+                brief=self._wake_brief(query=text),
+                items=[uuid] if uuid is not None else None,
+            )
         except EngineError as error:
             return self._stuck_note(error)
 
@@ -2175,9 +2282,19 @@ class WakeAgent:
         them and recovers them. `_settle` runs on *every* return path, including the early one:
         it is what turns "this wake handled it" into a durable fact, and skipping it on any path
         would leave a healthy wake's own messages looking orphaned to the next one.
+
+        **Recovery runs first, once, and finishes before the model is called at all** (issue #297).
+        It reads the transcript as evidence, and the transcript is only trustworthy evidence while
+        this wake has not yet written to it — so it cannot be something `_absorb` does *in passing*,
+        because `_absorb` is re-entered from the read-pacer and from the mid-generation staleness
+        loop, both of which run after a build. There it would be reasoning about a transcript its
+        own wake had compacted, rolled back, or extended, and the answer it got would be about some
+        other turn. One pass, up front, against a pristine transcript; `_absorb` then merely *reads*
+        the verdicts it reached.
         """
         posted: list[object] = []
         self._cursor = self.marks.get(self.timeline_uuid)
+        self._recover(session, messages)
         batch, probe_seen = self._absorb(session, messages, posted)
         if not batch:
             # Self-only / probe-only / empty: any probe acked, nothing to engage on. The model is
@@ -2289,7 +2406,7 @@ class WakeAgent:
         )
 
     def _readmit(self, session: Session, item: object) -> str:
-        """An already-claimed message: is it owned, settled, or **orphaned by a dead wake**?
+        """An already-claimed message: is it owned, settled, or held by a wake that **died**?
 
         The claim's *phase* answers the first two, and it is why the record exists at all:
 
@@ -2298,15 +2415,30 @@ class WakeAgent:
         - **in-flight, owner alive** → a genuinely concurrent wake owns it. Skip — exactly the
           pre-#285 behavior — but **`_PENDING`, not final**: the mark must not pass a message
           another wake could still die holding.
-        - **in-flight, owner gone** → the wake that took this message *died mid-turn*. Before
-          #285 that was the end of the story: the message was already marked seen, so no later
-          wake would ever see it again. Now it is recovered (`_recover_orphan`).
+        - **in-flight, owner gone** → the wake that took this message died mid-turn. It was
+          recovered before this wake called the model (`_recover`), and this simply reports the
+          verdict that pass reached. An orphan with **no** verdict was one recovery deliberately
+          declined — it stays `_PENDING`, so the mark holds and the next wake tries again.
+
+        This method used to do the recovering itself, and that was the bug (issue #297): `_absorb`
+        calls it from the read-pacer and from the mid-generation staleness loop, both of which run
+        *after* a build — so recovery could find itself reasoning about a transcript its own wake
+        had just compacted or rolled back. It now looks up an answer instead of computing one, and
+        the "is the evidence still pristine?" guard the old code needed is gone with the hazard.
         """
         uuid = item.content.uuid
+        recovered = self._recovered.get(uuid)
+        if recovered is not None:
+            # **This wake's own verdict, and it is read before anything else.** `_recover` may have
+            # *taken the claim over* — after which the claim file says `in-flight` owned by a wake
+            # that is very much alive (us), and the orphan test below would correctly answer "not
+            # orphaned" and hand back `_PENDING`, quietly dropping a message we had already decided
+            # to answer. The claim is evidence about *other* wakes; it has nothing to tell us about
+            # our own.
+            return recovered
         claim = self.claims.read(self.timeline_uuid, uuid, kind=_MESSAGES)
         if claim is None:
-            # The record vanished between our failed create and this read — a concurrent wake is
-            # recovering the same orphan and has just unlinked it. Race for it; the loser skips.
+            # The record vanished between our failed create and this read. Race for it; loser skips.
             return (
                 _OURS if self.claims.claim(self.timeline_uuid, uuid, kind=_MESSAGES) else _PENDING
             )
@@ -2314,62 +2446,64 @@ class WakeAgent:
             return _FINAL
         if not self.claims.orphaned(claim):
             return _PENDING
-        if self._sent:
-            # **Recovery reads the transcript as evidence, so it only runs while that evidence is
-            # pristine — i.e. before this wake has called the model itself.** After a build, two
-            # things stop being true: a compaction may have summarized the dead wake's turn away
-            # (so `_turn_of` would report "never sent" for a turn that ran tools, and re-drive it),
-            # and a stale-build rollback can delete a note we just appended. Deferring costs the
-            # peer one wake — the claim stays in-flight, the mark stays behind it, and the *next*
-            # wake recovers it against a freshly-loaded transcript. Losing the message costs
-            # everything, so the trade is not close.
-            return _PENDING
-        return self._recover_orphan(session, item, claim)
+        # An orphan with no verdict: recovery declined it (a live wake is recovering it, or we lost
+        # the take-over race). Undecided, so the mark may not pass it; the next wake tries again.
+        return _PENDING
+
+    # --- recovery: one pass, before the model, against a pristine transcript ---
+
+    def _recover(self, session: Session, items: list[object]) -> None:
+        """Decide the fate of every orphaned message in this scan, **before the model runs.**
+
+        The guarantee (issues #285, #293, #297): *at-least-once for the read, at-most-once for
+        every side effect. The turn is the unit of commit.* A dead wake's message is re-driven only
+        when the transcript **proves** nothing ran, and that proof is durable because the turn is
+        persisted incrementally — most of all, the assistant turn naming a tool call reaches disk
+        *before* that tool is dispatched (`_engine.run`). So:
+
+        > a tool call absent from the transcript is a tool call that never ran.
+
+        Four outcomes, tested in this order:
+
+        1. **No turn carries this message** → the wake was killed after claiming it but before the
+           model ever saw it. Nothing ran. **Re-drive.**
+        2. **The turn reached its terminal narration** → the model *finished*. Everything it decided
+           to say, it said itself, with its tools; everything it decided not to say was a decision.
+           **Commit.** Tested before the tool check on purpose: a turn that ran tools *and* settled
+           is a completed turn, not an interrupted one.
+        3. **The turn issued tool calls** → the wake died mid-chain. Its calls may have fired, so a
+           re-drive would fire them again — and it does not need one, because their results are on
+           disk. **Resume** it: let the model finish the turn it started (`_resume_orphan`). The
+           evidence is the *call*, not the result: a wake killed between the write and the POST is
+           resumed, not re-driven, because the alternative is a message posted twice.
+        4. **A turn, no calls, no narration** → it died inside the model call (the provider was
+           down, the box was killed). Nothing ran. **Re-drive**, after excising the dead turn's
+           inert residue, so the transcript does not accumulate a duplicate user turn per crash.
+
+        Walking oldest-first is what makes a *batch* recover coherently: the dead wake's turn
+        carried several messages, so the first of them resumes the turn, and the rest then find its
+        narration and commit. The `_resumed` set is belt-and-braces on that — a turn is finished
+        once.
+        """
+        for item in items:
+            uuid = _uuid_of(item)
+            if uuid is None:
+                continue
+            claim = self.claims.read(self.timeline_uuid, uuid, kind=_MESSAGES)
+            if claim is None or claim.settled or not self.claims.orphaned(claim):
+                continue  # never claimed (a peer's own post, a probe), already decided, or alive
+            # A take-over that won its token and died before it could rewrite the claim leaves the
+            # claim naming a wake that no longer holds the item. Judge the wake that really does.
+            claim = self.claims.effective_owner(
+                self.timeline_uuid, uuid, kind=_MESSAGES, claim=claim
+            )
+            if not self.claims.orphaned(claim):
+                continue  # a live wake is already recovering this one; leave it to them
+            self._recovered[uuid] = self._recover_orphan(session, item, claim)
 
     def _recover_orphan(self, session: Session, item: object, claim: Claim) -> str:
-        """A message a dead wake was holding. Decide from **evidence** what may safely happen to it.
-
-        The guarantee (issues #285, #293): *at-least-once for the read, at-most-once for every side
-        effect.* A message is re-driven only when the dead wake is **provably side-effect-free**,
-        and the proof is durable rather than inferred: `Session._exchange` persists the transcript
-        in a `finally` — *on the failure path too* (issue #244) — so a killed wake's partial turn,
-        tool results and all, is on disk. `_turn_of` finds the user turn that carried this message
-        (matched on its exact rendered line, so it is located even when a *later* dead wake has
-        since written its own turn), and `_turn_work` is what that turn produced.
-
-        **The commit record is the turn's own narration** (issue #293), and that is what the
-        Unspoken Channel changed here. It used to be the *reply on the timeline*: the harness held
-        the generated reply text, so recovery had to ask "did my reply land?" and answer it by
-        scanning the agent's own recent posts for a byte-identical body. That question no longer
-        exists. Speech is a tool call now, so anything the dead wake said, it said *itself*, and the
-        platform already has it. What is left to ask is only: **did the turn finish?** — and the
-        transcript answers that directly, with no timeline read, no body comparison, and no residual
-        false-match between two coincidentally identical bodies.
-
-        Three outcomes, in the order they are tested — and the order still matters:
-
-        1. **Never sent** (no user turn carries it) → the wake was killed after claiming but
-           *before* the model saw it. Nothing ran, nothing posted. **Re-drive.** (Testing the
-           transcript's *tail* instead would misread this case: the tail would be some earlier
-           wake's completed turn, and its narration mistaken for this message's.)
-        2. **The turn produced its terminal narration** → the model *finished*. Whatever it decided
-           to do on the timeline, it did — and whatever it decided not to do, it decided. There is
-           nothing to re-post (the harness holds no reply) and nothing to re-run. **Commit.** This
-           is deliberately tested before the tool check, because a turn that ran tools *and* settled
-           is a **completed** turn, not an interrupted one.
-        3. **Tools ran, no narration** → the wake died mid-tool-chain. Its side effects are real —
-           possibly including a message already posted — and a re-drive would fire them again (two
-           images for one request; the same answer sent twice). **Abandon, loudly.** This is the
-           residual at-most-once case: rare, and *named* rather than silent. (Closing it means
-           re-issuing the dead turn's platform calls under deterministic idempotency keys so the
-           platform dedupes them — the contract is live; the Python SDK's half is not yet. See
-           basecradle/basecradle-python#107.)
-        4. **Neither** → it died inside the model call (the provider was down, the retries ran out,
-           the box was killed). Nothing ran. **Re-drive** — this is the dominant case, and exactly
-           the one #284's retry could not save.
-        """
-        uuid = item.content.uuid
-        turn = _turn_of(session.history, _incoming_text(item))
+        """One orphan, classified from the transcript. See `_recover` for the four outcomes."""
+        turn = _turn_of(session.history, item)
         if turn is None:
             return self._redrive(item, claim, "the wake died before the model ever saw it")
 
@@ -2377,12 +2511,88 @@ class WakeAgent:
         if _turn_narration(work) is not None:
             return self._committed(item)
 
-        if any(turn_.role == "tool" for turn_ in work):
-            reason = "a tool had already run when the wake died — a re-drive would re-fire it"
+        if any(message.tool_calls for message in work):
+            already = self._resumed_outcome(turn)
+            if already is not None:
+                # This wake already finished (or failed to finish) this very turn for an older
+                # message of the same batch. Never run it twice.
+                return self._committed(item) if already == _FINAL else _PENDING
+            return self._resume_orphan(session, item, turn, claim)
+
+        # A turn with nothing in it: the model was called and never answered. Excise the residue
+        # before re-driving — the user turn is on disk now (it was not, before incremental
+        # persistence), so leaving it would stack a duplicate copy of the peer's message into the
+        # transcript on every failed wake, forever. Safe precisely because we just proved the turn
+        # issued no tool calls: there is nothing in it but a step note and a failure marker.
+        disposition = self._redrive(item, claim, "the wake died inside the model call")
+        if disposition == _OURS:
+            session.excise(turn)
+        return disposition
+
+    def _resume_orphan(self, session: Session, item: object, turn: Message, claim: Claim) -> str:
+        """The wake died mid-tool-chain. **Finish its turn** rather than re-running or dropping it.
+
+        This is what replaced "abandon, loudly" (issue #297). The old code was right that a
+        re-drive would re-fire the dead turn's tools, and right that dropping the peer was the
+        least-bad remaining option — but only because it had no third one. It has one now: the
+        turn's tool results are **on disk**, so the turn does not need re-running or abandoning. It
+        needs *continuing*. Zero tools re-fire, because their results are already there.
+
+        Two things happen before the model is handed the transcript:
+
+        - **The dangling calls are settled.** `Session._load` has already given each one a result
+          saying its outcome is unknown. For a **platform create** — and only for those four — that
+          is replaced by *actually re-issuing the call*, under the deterministic idempotency key the
+          dead wake minted for it (`_idempotency`): if it landed, the platform returns the original
+          record and nothing duplicates; if it did not, it lands now. Either way the model gets a
+          real answer instead of a shrug.
+        - **Everything else keeps the shrug**, and that is not laziness — it is the only correct
+          answer. No idempotency key can un-spend money at fal.ai, so a `generate_image` whose
+          outcome is unknown is **not re-run**. The model is told plainly and left to decide, which
+          is the Unspoken Channel's own stance applied to recovery: full visibility, never forcing.
+          It can read the timeline and see for itself.
+
+        **Only one wake may finish a turn.** The take-over CAS on this message is what says which —
+        and because the dead wake's turn may have carried a *batch*, the rest of that batch is
+        recognized here (`_resumed`) and committed when `_recover` reaches it, rather than resumed
+        a second time.
+        """
+        uuid = item.content.uuid
+        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=_MESSAGES, owner=claim.wake):
+            return _PENDING  # another recovering wake won the take-over; let it finish the turn
+        _log.warning(
+            "resuming %s",
+            kv(
+                message=uuid,
+                timeline=self.timeline_uuid,
+                handle=_handle_of(item),
+                reason="the wake died mid-tool-chain; finishing the turn it started",
+            ),
+        )
+        rendered = turn.content or _incoming_text(item)
+        disposition = _FINAL
+        try:
+            self.keys.begin(session, timeline=self.timeline_uuid, anchor=_anchor_of(turn, item))
+            self._reissue_interrupted_creates(session, turn)
+            self.informer.arm(rendered)
+            self._degraded = False
+            try:
+                narration = session.resume(turn, brief=self._wake_brief(query=rendered))
+            except EngineError as error:
+                narration = self._stuck_note(error)
+            self._unspoken(narration)
+            self._observe(rendered, narration)
+            self.claims.commit(self.timeline_uuid, uuid, kind=_MESSAGES)
+        except ProviderContextLengthError as error:
+            # The transcript has outgrown the model's window and **cannot be compacted** — the
+            # session already tried, and declined. Retrying next wake would fail identically, and
+            # forever: a resume adds no new user turn, so it never gives the compactor the cut point
+            # it lacked. That is not a delay, it is a permanent stall, with the mark pinned behind
+            # this message and the peer never answered. So this is the one place the residual
+            # at-most-once drop survives — rare, bounded, and **loud**, which is categorically
+            # better than an invisible one.
+            reason = f"the interrupted turn is over the model's context ceiling and cannot be compacted: {error}"
             self.claims.abandon(self.timeline_uuid, uuid, kind=_MESSAGES, reason=reason)
-            # The loudest thing a wake can say: a peer spoke and will never be engaged with again.
-            # Silence here is the original defect (issue #285, option 4) — a known drop is
-            # categorically better than an invisible one.
             _log.error(
                 "dropped %s",
                 kv(
@@ -2392,16 +2602,58 @@ class WakeAgent:
                     reason=reason,
                 ),
             )
-            session.note(
-                f"(A previous wake died partway through working on {_handle_of(item)}'s message, "
-                f"after it had already run tools, so that message was never finished and cannot be "
-                f"safely retried — a re-run would repeat whatever those tools did. It is not in the "
-                f"conversation above. Some of its work may have landed; if that matters here, read "
-                f"the timeline and see.)"
-            )
-            return _FINAL
+            disposition = _FINAL  # abandoned is *settled*: the mark may pass, so nothing stalls
+        except Exception:
+            # Anything else — the provider is down, the box is unhappy. Not a message lost: this
+            # wake's claim on it is in-flight, so the next wake finds it orphaned again and resumes
+            # against a transcript carrying whatever this attempt managed. Do not take the whole
+            # wake down over it; the other messages on this timeline still deserve an answer.
+            _log.exception("Resuming the interrupted turn failed; the next wake will try again.")
+            disposition = _PENDING
+        self._resumed.append((turn, disposition))
+        return disposition
 
-        return self._redrive(item, claim, "the wake died inside the model call")
+    def _resumed_outcome(self, turn: Message) -> str | None:
+        """How this wake's resume of `turn` went, or ``None`` if it has not resumed it.
+
+        Keyed by **identity**, not equality: two turns carrying the same text are `==`, and
+        resuming the wrong one twice is a second post the keys do not dedupe.
+        """
+        for resumed, outcome in self._resumed:
+            if resumed is turn:
+                return outcome
+        return None
+
+    def _reissue_interrupted_creates(self, session: Session, turn: Message) -> None:
+        """Re-run each interrupted **platform create** under the key its dead wake minted for it.
+
+        The one class of interrupted call that can be safely re-executed, because the platform
+        recognizes the key and returns the original record rather than making a second one. The
+        ordinal comes from `_idempotency.creates` — the *same* walk the live mint counts off, so the
+        two cannot disagree, and disagreeing would mean minting a key the platform has never seen
+        and posting the message twice.
+
+        Everything else keeps its "outcome unknown" result. A failure here is fed back to the model
+        as the tool's result, exactly as a live tool failure is: the turn continues either way.
+        """
+        # Name the turn *before* anything mints: the minter counts its ordinal off this turn's work,
+        # and an unnamed turn reads as no work at all — every create in it minting ordinal 1.
+        session.working_on(turn)
+        for create in interrupted(_turn_work(session.history, turn), INTERRUPTED):
+            with self.keys.reissue(create.kind, create.ordinal):
+                text = self.harness.engine.run_tool(create.call.name, create.call.arguments)
+            assert create.result is not None  # `interrupted` only yields calls that have one
+            create.result.content = text
+            _log.warning(
+                "re-issued %s",
+                kv(
+                    tool=create.call.name,
+                    kind=create.kind,
+                    ordinal=create.ordinal,
+                    timeline=self.timeline_uuid,
+                ),
+            )
+        session.persist()
 
     def _redrive(self, item: object, claim: Claim, why: str) -> str:
         """Take over an orphaned claim so this wake answers the message. `_PENDING` if we lose it.
@@ -2436,8 +2688,13 @@ class WakeAgent:
         it decided *not* to send is a decision, not a dropped write. So "did the reply land?" is not
         a question with an answer to hunt for; it is not a question at all.
 
-        The one durable fact worth recording is that this happened, so an operator reading the
-        journal after a crash can see a claim settled by a *later* wake rather than by its owner.
+        **A turn that settled on text having called no tools is a turn that chose silence**, and
+        that is a decision too — including the rare one a mid-generation rebuild was about to
+        replace (`_generate_settled` rolls a stale, speechless build back; a wake killed in the
+        window between writing it and unmaking it leaves it standing). Committing it is right: the
+        agent read the message and answered it with silence, and the newer message that triggered
+        the rebuild drives its own turn, with this whole exchange in front of the model. What must
+        never happen is the *reverse* — treating it as unfinished and running it again.
         """
         uuid = item.content.uuid
         _log.info(
@@ -2568,6 +2825,11 @@ class WakeAgent:
         """
         brief = self._wake_brief(query=_incoming_text(batch[-1]))
         base_len = len(session.history)  # rollback point: before any build
+        # The anchor every key this turn mints is derived from: the batch's **oldest** message, and
+        # oldest because it is the one thing a rebuild cannot change (a rebuild only ever appends
+        # newer messages). Fixed here, before the first build, so every build of this turn — and
+        # any later wake that has to finish it — mints the same keys.
+        anchor = _uuid_of(batch[0])
         builds = 0
         while True:
             rendered = _render_batch(batch)
@@ -2576,7 +2838,7 @@ class WakeAgent:
             # text the model is actually about to read. Arming also resets the one-shot nudge, so a
             # rolled-back build's nudge does not silence the informer on the build that replaces it.
             self.informer.arm(rendered)
-            narration = self._send_batch(session, rendered, brief)
+            narration = self._send_batch(session, rendered, brief, batch, anchor)
             builds += 1
             # **A compaction during the build invalidates `base_len`, so the build is committed.**
             # `Session.send` may compact (`_compact_if_needed`, and the over-length rescue), and a
@@ -2607,10 +2869,21 @@ class WakeAgent:
             # Stale: a peer message landed during generation. Fold it in, roll the stale build out
             # of the transcript, and regenerate against the current batch. Safe precisely because
             # this build ran no tools: it has said nothing, so there is nothing to unsay.
+            #
+            # The rollback **rewrites the file**, and since #297 it has to: the build being
+            # discarded is already on disk, so an in-memory-only `del` would leave it there for a
+            # wake killed before the replacement build persisted.
             batch.extend(new_peers)
-            del session.history[base_len:]
+            session.rollback(base_len)
 
-    def _send_batch(self, session: Session, text: str, brief: str | None) -> str:
+    def _send_batch(
+        self,
+        session: Session,
+        text: str,
+        brief: str | None,
+        batch: list[object],
+        anchor: str | None,
+    ) -> str:
         """Send the batch as one user turn, degrading the engine's step-cap to a graceful note.
 
         The batch counterpart of `_engage`'s model call; Loop 2 composes the brief once and passes
@@ -2618,11 +2891,20 @@ class WakeAgent:
         live dashboard) per build. Messages carry no images, so this is text-only. `EngineError`
         (the `max_steps` cap) degrades to a short, honest note; other failures
         propagate to the entrypoint, which reports them cleanly.
+
+        The turn is stamped with the **uuids it carries** and the minter is armed on the batch's
+        anchor (issue #297): together they are how a wake that is killed here is recoverable — the
+        uuids say which messages the model was shown, and the anchor is what any create in the turn
+        keys against, identically on the wake that dies and the wake that finishes it.
         """
-        self._sent = True  # the transcript is no longer pristine evidence (see `_readmit`)
         self._degraded = False
+        items = [uuid for uuid in (_uuid_of(message) for message in batch) if uuid is not None]
+        if anchor is not None:
+            self.keys.begin(session, timeline=self.timeline_uuid, anchor=anchor)
+        else:
+            self.keys.clear()  # nothing to anchor on — see `_engage`; never key to a stale anchor
         try:
-            return session.send(text, brief=brief)
+            return session.send(text, brief=brief, items=items)
         except EngineError as error:
             return self._stuck_note(error)
 
@@ -2648,69 +2930,114 @@ def _handle_of(item: object) -> str | None:
     return getattr(getattr(item, "user", None), "handle", None)
 
 
-def _turn_of(history: list[Message], rendered: str) -> int | None:
-    """The index of the user turn that carried `rendered` to the model, or ``None`` if none did.
+def _turn_of(history: list[Message], item: object) -> Message | None:
+    """The user turn that carried `item` to the model, or ``None`` if none did.
 
     The recovery classifier's first question (issue #285): *did the dead wake ever actually put
-    this message in front of the model?* `_render_batch` joins each message's `_incoming_text`
-    line with newlines, so a message's exact rendered line is a durable signature of the turn that
-    carried it — and a message is only ever batched once, so at most one turn genuinely holds it.
+    this message in front of the model?* The turn **carries the uuids it rendered** (`Message.items`,
+    issue #297), so the answer is an exact lookup, and a message is only ever batched once, so at
+    most one turn genuinely holds it.
+
+    **It used to be a text match, and that was broken in two ways** — badly enough that the double
+    post this whole issue is about was reachable in the field without any crash exotica. It compared
+    the message's rendered line against the turn's content *split on newlines*, so a body containing
+    a newline — a second paragraph, a list, a code block, the ordinary shape of a real message —
+    produced a multi-line needle that can never be an element of a list of single lines. It matched
+    nothing, the classifier concluded "the model never saw this", and it re-drove a turn that had
+    already posted. And the needle was **peer-controlled**: a peer could paste another message's
+    rendered line into their own body and steer the classifier at will. Neither is a thing you fix
+    by escaping harder; the turn simply has to record what it carried.
 
     **The whole history is searched, not just the tail.** Two dead wakes in a row would leave the
     *older* one's message behind an intervening user turn, and a tail-only test would report "never
-    sent" for a message that was in fact sent, generated for, and possibly answered — re-driving it
-    into a double reply.
+    sent" for a message that was in fact sent, generated for, and possibly answered.
 
-    Two details keep the match honest, and both guard the same failure — matching a turn that
-    merely *mentions* the message rather than the turn that *carried* it, which would hand the
-    orphan some other turn's reply:
-
-    - **A whole line, never a substring.** A peer can quote an earlier message inside their own
-      body; a substring test would match the quoting turn.
-    - **Oldest-first.** A quote is necessarily *newer* than the message it quotes, so scanning
-      forward reaches the turn that really carried the message before it reaches any turn that
-      merely repeats its text.
+    A transcript written before this version carries no uuids, so the old text match remains as the
+    **legacy fallback** — repaired to compare whole blocks rather than lines, so it is at least
+    right about multi-line bodies too. It heals itself: the next turn this session writes carries
+    uuids.
     """
-    for index, message in enumerate(history):
-        if message.role == "user" and rendered in (message.content or "").split("\n"):
-            return index
+    uuid = _uuid_of(item)
+    for message in history:
+        if message.role == "user" and uuid is not None and uuid in message.items:
+            return message
+    rendered = _incoming_text(item)
+    for message in history:
+        if message.role == "user" and not message.items and _carries(message.content, rendered):
+            return message
     return None
 
 
-def _turn_work(history: list[Message], turn: int) -> list[Message]:
-    """What one turn produced: everything the engine appended after `turn`, up to the next turn.
+def _carries(content: str | None, rendered: str) -> bool:
+    """Does this pre-#297 turn's rendered content contain `rendered` as a whole block?
 
-    The boundary is the next **user** turn, because that is what `Session.send` appends per turn.
-    (An image a tool returned also enters as a synthetic user turn — but a tool result always
-    precedes it, so the tool evidence is already inside the boundary when it matters.)
+    The legacy path only. "Whole block, never a substring" is the property the line-split was
+    reaching for — a peer can quote an earlier message inside their own body, and a substring test
+    would match the quoting turn — but a block may itself span lines, which is what the split got
+    wrong. Anchoring on the newline boundaries keeps the guard and drops the bug.
     """
-    work: list[Message] = []
-    for message in history[turn + 1 :]:
-        if message.role == "user":
-            break
-        work.append(message)
-    return work
+    if not content:
+        return False
+    if content == rendered:
+        return True
+    return (
+        content.startswith(f"{rendered}\n")
+        or content.endswith(f"\n{rendered}")
+        or f"\n{rendered}\n" in content
+    )
+
+
+def _anchor_of(turn: Message, item: object) -> str:
+    """The item a turn's idempotency keys are minted against — the **oldest** message it carried.
+
+    The oldest, because it is the one thing about a batch that recovery cannot change: a rebuild or
+    a re-drive only ever *appends* newer messages to it. Key the batch on its newest and the dead
+    wake and the wake that recovers it would compute different keys for the same post, and the
+    platform would dedupe nothing.
+
+    Falls back to the item itself for a legacy turn that carries no uuids — which is exactly right,
+    because such a turn is a single-message turn or nothing we can reason about anyway.
+    """
+    return turn.items[0] if turn.items else str(_uuid_of(item))
+
+
+def _turn_work(history: list[Message], turn: Message) -> list[Message]:
+    """What one turn produced — `_session.turn_work`, which is the *only* definition of it.
+
+    Aliased rather than re-implemented, and that is load-bearing: the idempotency ordinal is counted
+    once here, after a crash, and once in the live session while the turn runs, and the two numbers
+    must be equal. Two functions that obviously mean the same thing is how they stop being equal.
+    """
+    return turn_work(history, turn)
 
 
 def _turn_narration(work: list[Message]) -> str | None:
     """The terminal narration a turn settled on, or ``None`` if it never got that far.
 
-    **This is the commit record** (issue #293): a turn that reached its final text *finished*, and
-    a finished turn is never re-driven — everything it meant to do, including everything it meant
-    to say, it did.
+    **This is the commit record** (issue #293): a turn that reached its final text *finished*, and a
+    finished turn is never re-run — everything it meant to do, including everything it meant to say,
+    it did.
 
-    "Got that far" is exact: an assistant turn with real content and **no** tool calls is the
-    engine's terminal message (`Engine.run` returns on precisely that). An assistant turn that only
-    carries tool calls is mid-flight, and a `system` failure note (issue #244) is not a narration at
-    all — both correctly read as ``None``, i.e. *the model never finished*.
+    "Got that far" is **the last thing in the turn's work, and nothing weaker** (issue #297). The
+    obvious form — scan backwards for any assistant turn with text and no tool calls — is wrong,
+    because that shape is not the same as "the loop returned". `Engine.run` returns on
+    ``not reply.tool_calls and not extend``, and **both** shipped turn hooks extend on exactly that
+    shape: the mention informer nudges an agent that was addressed and did nothing, and the
+    code-execution bridge harvests a run's output files and feeds their uuids back. A turn that was
+    still being extended has an assistant text sitting *mid-work* — and reading it as the commit
+    record would settle the claim, advance the mark, and never look at the message again. The
+    `system` failure marker a raised run leaves behind (issue #244) is the same trap from the other
+    side: it sits *after* the last assistant turn, and a turn that failed is one to finish, not one
+    to file as done.
+
+    So: the work must **end** on an assistant turn with real content and no tool calls. That is what
+    the engine leaves behind when — and only when — it actually returned.
     """
-    for message in reversed(work):
-        if (
-            message.role == "assistant"
-            and not message.tool_calls
-            and (message.content or "").strip()
-        ):
-            return message.content
+    if not work:
+        return None
+    last = work[-1]
+    if last.role == "assistant" and not last.tool_calls and (last.content or "").strip():
+        return last.content
     return None
 
 

@@ -247,12 +247,20 @@ class _NoopTool(Tool):
 
     A provider that keys its reserve behavior on ``tools is None`` needs the budgeted loop to
     pass a real tool set, which only happens when the registry is non-empty (issue #243 tests).
+
+    It **counts its runs**, because the recovery's central promise is negative — a resumed turn must
+    not fire the dead turn's tools a second time — and a promise about something *not* happening can
+    only be tested by something that would have noticed (issue #297).
     """
 
     name = "noop"
     description = "Does nothing."
 
+    def __init__(self) -> None:
+        self.runs = 0
+
     def run(self, **kwargs) -> str:
+        self.runs += 1
         return "ok"
 
 
@@ -3905,15 +3913,21 @@ def crashed_wake_owning(home, *uuids, phase="in-flight"):
     return store
 
 
-def test_a_wake_that_died_after_a_tool_ran_abandons_the_message_loudly(platform, tmp_path, caplog):
-    """Outcome 3: tools fired, no reply. Re-driving would re-fire them — so it does NOT.
+def test_a_wake_that_died_after_a_tool_ran_is_resumed_never_abandoned(platform, tmp_path, caplog):
+    """Outcome 3: tools fired, no narration. The turn is **finished**, not dropped (issue #297).
 
-    This is the residual at-most-once case, and the *only* one. It is what the pre-#285 ordering
-    bought at the price of dropping every message; now it is the rare, named exception rather than
-    the routine, invisible rule. The drop must be **loud** (issue #285, option 4): an ERROR naming
-    the message uuid, and a note in the agent's own transcript so it knows it left a peer hanging.
+    This test used to pin the opposite, and its old name said so — *"abandons the message loudly"*.
+    That was right on the reasoning and wrong on the options: re-driving would re-fire the dead
+    turn's tools, so dropping the peer was the least-bad *remaining* choice. There is a third one
+    now. The turn's tool results are **on disk** (the transcript persists as the turn runs), so it
+    needs neither re-running nor abandoning — it needs **continuing**. The model is handed the
+    partial transcript and finishes the turn it started.
+
+    The two things that must both be true, and they are the whole guarantee: the model **is**
+    engaged (the peer is answered), and the tool is **not** run again (nothing double-fires).
     """
     serve_messages(platform, page(message(uuid=M0, body="generate me an image")))
+    tool = _NoopTool()
 
     class RunsAToolThenDies:
         provider, model = "openai", "gpt-4o"
@@ -3930,24 +3944,59 @@ def test_a_wake_that_died_after_a_tool_ran_abandons_the_message_loudly(platform,
             raise RuntimeError("killed after the tool had already run")
 
     client = BaseCradle(token=FAKE_TOKEN)
-    harness = Harness(RunsAToolThenDies(), tools=[_NoopTool()], home=tmp_path)
+    harness = Harness(RunsAToolThenDies(), tools=[tool], home=tmp_path)
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
     with pytest.raises(RuntimeError):
         agent.wake()
+    assert tool.runs == 1  # the dead wake really did run it
 
-    # The next wake finds an orphaned claim whose transcript shows a tool ran and no reply landed.
+    # The next wake finds an orphaned claim whose transcript shows a tool call was issued.
     serve_messages(platform, page(message(uuid=M0, body="generate me an image")))
-    second, second_provider = build_wake(tmp_path)
-    with caplog.at_level(logging.ERROR):
+    resumed = _NoopTool()
+
+    class FinishesTheTurn:
+        """Picks the turn up where it was cut off: speaks, then settles."""
+
+        provider, model = "openai", "gpt-4o"
+
+        def __init__(self):
+            self.calls = 0
+            self.seen: list[list[Message]] = []
+
+        def chat(self, messages, tools=None):
+            self.calls += 1
+            self.seen.append(list(messages))
+            if self.calls == 1:
+                return Message.assistant(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_2",
+                            name="messages",
+                            arguments={"action": "create", "body": "Here it is."},
+                        )
+                    ]
+                )
+            return Message.assistant(content="Finished the turn the last wake started.")
+
+    second, brain = build_wake(tmp_path, FinishesTheTurn(), tools=[MessagesTool(), resumed])
+    with caplog.at_level(logging.WARNING):
         posted = second.wake()
 
-    assert second_provider.prompts == []  # NOT re-run: the tool's side effects are real
-    assert posted == []
-    dropped = next(r.message for r in caplog.records if r.message.startswith("dropped"))
-    assert M0 in dropped  # loud, and it names the message
+    # It is finished, not written off: the model is engaged and the peer gets their answer.
+    assert len(posted) == 1
+    assert _posts(platform) == ["Here it is."]
+    # And the dead turn's tool is **not** run a second time — its result was already on disk, and
+    # was replayed to the model rather than re-executed. This is the whole promise.
+    assert resumed.runs == 0
+    # The model was handed the interrupted turn itself: the peer's message and the dead wake's own
+    # tool call and result are all in front of it, with no *new* user turn appended.
+    replayed = brain.seen[0]
+    assert any(m.role == "user" and "generate me an image" in (m.content or "") for m in replayed)
+    assert any(m.tool_calls and m.tool_calls[0].name == "noop" for m in replayed)
+    assert any(r.message.startswith("resuming") for r in caplog.records)
     claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
-    assert claim.phase == "abandoned" and "tool" in claim.reason
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # abandoned is final: the mark may pass
+    assert claim.phase == "done"  # the turn finished, so the claim is settled — not abandoned
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
 
 
 def test_a_completed_turn_is_committed_never_re_driven(platform, tmp_path, caplog):

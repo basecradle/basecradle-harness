@@ -178,7 +178,11 @@ class CodeExecutionBridge:
             stored = self._store_source(trace) + self._store_output_files(trace)
             if not stored:
                 return False
-            messages.append(Message.user(_artifact_note(stored)))
+            # `injected`: it wears the `user` role so the model reads it as input, but nobody said
+            # it — it is this turn's own harvest, part of its work. The recovery classifier walks a
+            # turn up to the next *real* user turn, so an unmarked one here would hide the
+            # narration behind it and read a finished turn as an interrupted one (issue #297).
+            messages.append(Message(role="user", content=_artifact_note(stored), injected=True))
             return True
         except Exception:  # noqa: BLE001 - the bridge must never break the wake; swallow + log
             _log.warning("Code-execution harvest failed; continuing.", exc_info=True)

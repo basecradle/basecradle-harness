@@ -40,6 +40,7 @@ from typing import Any
 
 import httpx
 
+from basecradle_harness._idempotency import ASSET
 from basecradle_harness._messages import ImageContent, ToolResult
 from basecradle_harness._platform import PlatformTool
 
@@ -180,9 +181,12 @@ class AssetsTool(PlatformTool):
                 return "No files on this timeline yet — nothing to view."
             return self._view(resolved)
         if action == "create":
+            # Minted before the validation, never after: the ordinal is counted off the
+            # transcript, which records this call either way (issue #297 — see `PlatformTool.key`).
+            key = self.key(ASSET)
             if content is None or not filename:
                 return "Error: 'create' needs both 'content' and a 'filename'."
-            return self._create(target, content, filename, description)
+            return self._create(target, content, filename, description, key)
         return f"Error: unknown action {action!r}. Use 'list', 'read', 'view', or 'create'."
 
     # --- uuid resolution -----------------------------------------------------
@@ -271,10 +275,28 @@ class AssetsTool(PlatformTool):
 
     # --- create --------------------------------------------------------------
 
-    def _create(self, timeline: str, content: str, filename: str, description: str | None) -> str:
+    def _create(
+        self,
+        timeline: str,
+        content: str,
+        filename: str,
+        description: str | None,
+        key: str | None = None,
+    ) -> str:
+        """Upload the model's text as an Asset. `key` is the deterministic Idempotency-Key (#297).
+
+        The content is inline in the tool call, so the re-issue a resume makes after a killed wake
+        replays byte-identical bytes — and the key means that even if the dead wake's upload landed,
+        the platform hands back the original Asset rather than storing the file twice.
+        """
         # The produced text goes straight to the upload as bytes — no temp file.
         asset = _upload(
-            self.context.client, timeline, content.encode("utf-8"), filename, description
+            self.context.client,
+            timeline,
+            content.encode("utf-8"),
+            filename,
+            description,
+            idempotency_key=key,
         )
         self.acted("asset", asset.content.uuid)  # a file on a timeline is a visible act (#293)
         return f"Uploaded {filename!r} ({asset.content.file.byte_size} bytes). {_describe(asset)}"
@@ -296,17 +318,34 @@ def _download(url: str) -> bytes:
     return response.content
 
 
-def _upload(client: Any, timeline: str, data: bytes, filename: str, description: str | None) -> Any:
+def _upload(
+    client: Any,
+    timeline: str,
+    data: bytes,
+    filename: str,
+    description: str | None,
+    *,
+    idempotency_key: str | None = None,
+) -> Any:
     """Upload raw bytes as a named asset on a timeline; return the created asset.
 
     The one place the SDK upload contract lives, shared by the assets tool's
     ``create`` and the image generator: an in-memory buffer named so the SDK (and
     the server) see the filename, streamed straight to the multipart create. No
     temp file — the strongest version of "keep scratch bounded" is no scratch.
+
+    `idempotency_key` is passed only by the **assets tool** (issue #297), and its absence
+    everywhere else is deliberate rather than an oversight. A generated image's upload is not
+    re-issued by a recovery — the *generation* that produced those bytes is the non-idempotent act,
+    and no key can un-spend it, so a killed wake's `generate_image` is surfaced to the model rather
+    than re-run. Keying the upload would buy nothing and cost the one thing that matters here:
+    the ordinal count, which must see exactly the creates the transcript's tool calls describe.
     """
     buffer = io.BytesIO(data)
     buffer.name = filename
-    return client.timelines.get(timeline).assets.create(file=buffer, description=description)
+    return client.timelines.get(timeline).assets.create(
+        file=buffer, description=description, idempotency_key=idempotency_key
+    )
 
 
 def _describe(asset: Any) -> str:

@@ -5,6 +5,139 @@ All notable changes to BaseCradle Harness are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.69.0] - 2026-07-14
+
+**A wake killed by a signal now finishes the turn it started, instead of saying it all again.** The
+delivery guarantee — *at-least-once for the read, at-most-once for every side effect* — was true of
+an **exception** and false of a **signal**, and the recovery could not tell the difference.
+
+### Fixed: the evidence the recovery reads did not survive a `kill -9` (issue #297)
+
+`Session._exchange` persisted the transcript in a `finally`. A `finally` runs on an exception and
+**not** on `SIGKILL`, on `SIGTERM`'s default disposition, on the OOM killer, or on a box reset — and
+the harness installs no handler. So a wake killed *after* the `messages` tool posted left **nothing**
+on disk: no user turn, no tool call, no result. The recovery read that emptiness, concluded "the wake
+died before the model ever saw it", re-drove the message, and the peer was answered **twice** — with
+every non-idempotent tool in the turn (`generate_image`) firing and billing a second time. None of it
+was exotic: a fleet box runs several agents on 16 GB, systemd sends `SIGTERM`, a router-side wake
+timeout kills.
+
+Three pieces, and they are one design:
+
+- **The turn persists as it runs.** The engine calls back after each append, and the ordering is the
+  contract: the assistant turn naming a tool call reaches disk **before that tool is dispatched**.
+  That is what licenses the classifier's central inference — *a tool call absent from the transcript
+  is a tool call that never ran* — and it is the one persist that is allowed to **fail the turn**
+  (nothing has run, so stopping costs nobody anything; continuing would run tools with no record of
+  them).
+- **An interrupted call is healed on load.** A kill mid-tool-chain leaves a call with no result, and
+  a dangling `tool_call_id` is malformed *permanently* — the provider 400s on it, and so does every
+  wake after that, until a human deletes the file. Incremental persistence done naively is therefore
+  **strictly worse than the bug it fixes**; healing is what makes it a fix. Every unanswered call gets
+  a result saying what is true: the outcome is unknown, and nothing has been re-run.
+- **The dead turn is resumed, not re-driven.** Its results are on disk, so it needs neither re-running
+  (which re-fires tools) nor abandoning (which drops the peer). The model is handed the partial
+  transcript and finishes what it started. `abandon` — the residual at-most-once drop — is gone from
+  the message path.
+
+### Added: deterministic idempotency keys on the four platform creates (`basecradle>=0.6`)
+
+The one genuinely unknowable state is a call killed between the platform `POST` and the write that
+would have recorded it. A **platform create** is re-issued under a key derived from
+`(timeline, message, kind, ordinal)` — so the wake that *died* and the wake that *recovers it* mint
+the identical key, the platform returns the original record, and there is exactly one of it. A
+**non-idempotent effect** is never re-run: no key can un-spend money at fal.ai, so the model is told
+the outcome is unknown and left to decide.
+
+The ordinal is read **off the transcript**, never off a counter, and that is the whole trick: at the
+instant a call runs, the create-shaped calls with results are exactly the ones earlier in call order,
+so the live count and the post-crash count are the same function over the same evidence. A counter
+would be a second source of truth — and it would drift the first time a create-shaped call was
+recorded without reaching the tool's create branch (the model passes an unknown kwarg, the engine
+feeds the `TypeError` back as the result). Off by one is a key the platform has never seen, which is
+a message posted twice.
+
+### Fixed: the recovery was blind to any message with a newline in it — **live in the field**
+
+Found by adversarially reviewing the plan, not the code. `_turn_of` asked "did the dead wake put this
+message in front of the model?" by matching the message's rendered line against the turn's content
+*split on newlines* — so a body containing a newline (a second paragraph, a list, a code block: the
+ordinary shape of a real message) produced a multi-line needle that **can never** be an element of a
+list of single lines. It matched nothing, the classifier said "never seen", and it re-drove a turn
+that had already posted. Every recovery test in the suite used a single-line body, which is why it
+survived since #285.
+
+The body is also **peer-controlled** — a peer could paste another message's rendered line into their
+own and steer the classifier. Neither problem is fixed by escaping harder. The turn now **carries the
+uuids it rendered** (`Message.items`), so the match is exact and the safety decision no longer rests
+on text a stranger wrote. Transcripts written by older versions keep the text match as a legacy
+fallback, repaired to compare whole blocks rather than lines.
+
+### Fixed: a compaction could summarize the peer's message away and keep the image caption
+
+The engine injects a `user`-role turn to *show* the model an image, and the code-execution bridge
+injects one naming the Assets a run produced. Both wear the role because it is the only one that
+content may ride on — but they are a turn's own **work**, not a new turn of the conversation. The
+compactor treated them as cut boundaries, so an injected turn could become the "newest user turn
+always survives" **floor**: the caption was kept and the peer's real message was summarized away.
+Valid transcript, broken agent — the recovery could no longer find the turn that carried a message.
+`Message.injected` now marks them, and the compactor skips them.
+
+### Fixed: a take-over that died mid-way pinned the high-water mark **forever**
+
+`ClaimStore.reclaim()` won an exclusive token and *then* wrote the claim. A crash between them — or
+an `ENOSPC`, which needs no race at all — left the token taken and the claim still naming the dead
+wake. Every future wake then judged that stale owner, tried to reclaim from it, lost a token it could
+never win, and returned `_PENDING`; `_settle` stops at the first `_PENDING`, so **the mark was pinned
+behind that message permanently and nobody ever answered it**. A stall is not better than a drop; it
+*is* a drop, with the cursor stuck behind it. The token now carries its own record, so a recovery
+that died is itself recoverable.
+
+### Fixed: five more, found by adversarially reviewing the plan and then the diff
+
+None of these were in the issue. Two would have shipped as silent drops.
+
+- **A resumed turn's continuation was appended to the end of the transcript**, not spliced into the
+  turn it was finishing. A resume can fail, and the wake goes on to answer newer messages — leaving
+  an older turn unfinished *behind* a newer one. The eventual continuation then filed an old turn's
+  narration under the newer turn, where the classifier read it as that turn's own terminal text,
+  committed a message nobody had answered, and let the mark sail past it. **A silent drop, produced
+  by the machinery built to prevent silent drops.**
+- **A turn the engine was still *extending* read as finished.** `Engine.run` returns on
+  `not reply.tool_calls and not extend` — and *both* shipped turn hooks extend on exactly that shape
+  (the mention informer nudges an agent addressed by name that did nothing; the code bridge harvests
+  a run's output files). Scanning backwards for "an assistant turn with text and no tool calls" found
+  a turn mid-extension and settled its claim. The terminal narration is now the **last** thing in a
+  turn's work, and nothing weaker — which also stops a *failed* turn (whose `system` failure marker
+  trails its last assistant text) being filed as done.
+- **A reused `tool_call_id` defeated both halves of the safety net.** Ids come straight off the wire
+  and nothing normalizes them; a model that numbers its calls per response (`call_0`, `call_1` — what
+  an OpenRouter-fronted model emits) reuses them across turns. Matching them globally paired a call
+  with the *previous* turn's result: an interrupted call looked answered (never healed → the provider
+  400s on that transcript forever) and the live ordinal ran one ahead of the recovery's (→ a key the
+  platform has never seen → a duplicate post). Calls are now paired to results **within the assistant
+  turn that issued them**, by one walk (`_idempotency.creates`) that both halves read.
+- **An image turn was appended between two tool results.** A tool returning pictures called alongside
+  any other tool produced `assistant(tool_calls) → tool → user(image) → tool`, which providers reject.
+  All of a turn's tool results now land before the single injected image turn.
+- **A resume that could not proceed retried forever.** A transcript over the model's ceiling that the
+  compactor declines to cut gave a resume no way out — and unlike `send`, a resume adds no new user
+  turn, so it never grows the cut point it lacked. The claim stayed in-flight and the mark stayed
+  pinned behind it: a permanent stall, which is a drop with the cursor stuck behind it. That case now
+  **abandons, loudly** — the residual at-most-once drop, rare, bounded, and named.
+
+### Changed
+
+- **`basecradle>=0.6`** (was `>=0.5`) — for `idempotency_key` on the four content creates.
+- **`Message`** gained three persisted fields: `items` (the platform items a user turn carried),
+  `injected` (a turn the engine or the bridge added to a turn's work), and nothing else changes about
+  how a transcript reads.
+- **`Engine.run(messages, on_progress=...)`** — the per-append persist hook. `None` (the library and
+  poll paths) is byte-identical to the loop without it.
+- **`Session.resume()`**, **`Session.rollback()`**, **`Session.excise()`**, **`Session.turn_work`** —
+  the seams the recovery needs. `rollback` is what the staleness guard now calls: the build it
+  discards is already on disk, so an in-memory-only `del` would leave it there.
+
 ## [0.68.0] - 2026-07-14
 
 **Every line that asks an agent for speech now names the tool that delivers it.** A follow-up to

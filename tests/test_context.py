@@ -492,10 +492,29 @@ def test_an_over_length_400_compacts_and_retries_the_turn_once(tmp_path):
     assert not any("[turn failed" in (m.content or "") for m in session.history)
 
 
+def _fails_after(n: int, monkeypatch):
+    """Let the first `n` saves through, then make every later one hit a full disk.
+
+    The turn now persists in more than one place (issue #297), and *which* save fails decides which
+    guard is under test: the one before the model call (the turn must die), or one after it (the
+    turn's own exception must survive).
+    """
+    real = open
+    saves = {"count": 0}
+
+    def maybe_full_disk(*args, **kwargs):
+        saves["count"] += 1
+        if saves["count"] > n:
+            raise OSError(28, "No space left on device")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("basecradle_harness._session.open", maybe_full_disk, raising=False)
+
+
 def test_a_failing_save_never_masks_the_overflow_the_self_heal_is_keyed_on(tmp_path, monkeypatch):
     """A save that fails in the `finally` must not eat the turn's own exception (issue #297).
 
-    `_exchange` persists in a `finally`, and an exception raised in a `finally` **replaces** the one
+    `_drive` persists in a `finally`, and an exception raised in a `finally` **replaces** the one
     propagating through it. The one propagating through this one is load-bearing: `send` catches
     `ProviderContextLengthError` to compact and retry — the self-heal that keeps an agent at its
     context ceiling from failing identically on every wake, forever. Masked, it becomes an `OSError`
@@ -516,16 +535,42 @@ def test_a_failing_save_never_masks_the_overflow_the_self_heal_is_keyed_on(tmp_p
     engine = Engine(provider, ToolRegistry(policy=Policy.locked()))
     session = Session("timeline:t1", engine, path=tmp_path / "s.json")
 
-    def full_disk(*_args, **_kwargs):
-        raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr("basecradle_harness._session.open", full_disk, raising=False)
+    # The disk fills *after* the user turn is safely down — so the model runs, overflows, and the
+    # save that fails is the one in the `finally`. That is the window the guard is for.
+    _fails_after(1, monkeypatch)
 
     # No compactor on this session, so the overflow is re-raised rather than healed — which is what
     # lets the test see *which* exception survived the `finally`. It must be the model's, not the
     # disk's: an OSError here is the self-heal's trigger, eaten.
     with pytest.raises(ProviderContextLengthError):
         session.send("are you still there?")
+
+
+def test_a_turn_that_cannot_record_the_message_never_calls_the_model(tmp_path, monkeypatch):
+    """A save that fails *before* the model call takes the turn down with it (issue #297).
+
+    This is the other side of the guard above, and the asymmetry is deliberate. A save that fails
+    mid-turn is stood down, because the turn may already have posted and killing it would undo
+    nothing. A save that fails **before** the model has been called is the opposite case in every
+    respect: nothing has run, nothing has posted, and proceeding would mean engaging the model on a
+    peer's message with **no durable record that we ever read it** — the precise state the whole
+    recovery design exists to make impossible (a wake killed after posting would then look, to its
+    successor, exactly like a wake that never started, and the reply would be sent twice).
+
+    So it fails, loudly and early. The claim on the message stays in-flight and the high-water mark
+    stays behind it, so the next wake re-drives it cleanly. An agent that cannot write down what it
+    was asked is an agent that must not answer.
+    """
+    provider = ScriptedProvider(Message.assistant(content="Hello, John."), usage=[None])
+    engine = Engine(provider, ToolRegistry(policy=Policy.locked()))
+    session = Session("timeline:t1", engine, path=tmp_path / "s.json")
+
+    _fails_after(0, monkeypatch)  # the very first save — the user turn — hits the wall
+
+    with pytest.raises(OSError):
+        session.send("are you still there?")
+
+    assert provider.calls == [], "the model was engaged on a message we could not record"
 
 
 def test_the_retry_still_shows_the_model_the_image_the_peer_posted(tmp_path):
@@ -856,3 +901,39 @@ def test_the_remedy_the_warning_quotes_actually_clears_the_warning():
 
     for steps in range(1, 200):
         assert not warns(min_safe_limit(steps), steps)  # the quoted budget clears it
+
+
+def test_a_cut_never_lands_on_an_injected_turn(tmp_path):
+    """The compactor's "newest user turn always survives" floor must mean the **peer's** turn.
+
+    Issue #297. The engine injects a `user`-role turn to *show* the model an image, and the
+    code-execution bridge injects one naming the Assets a run produced. Both wear the role because
+    it is the only one that content may ride on — but they are a turn's own *work*, not a new turn
+    of the conversation.
+
+    Counting one as a boundary is not merely untidy. It can become the **floor** — the newest "user"
+    turn, the one compaction promises to keep — at which point the transcript keeps the image caption
+    and summarizes the peer's actual message away. The result is a perfectly valid transcript and a
+    broken agent: the recovery classifier can no longer find the turn that carried a message, so a
+    wake killed while holding it re-drives a turn that already posted, and the peer is answered twice.
+    """
+    history = [
+        Message.system("charter"),
+        *conversation(20),
+        Message(role="user", content=f"[t] {JOHN}: look at this", items=["m-1"]),
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="assets", arguments={})]),
+        Message.tool(tool_call_id="c1", content="here it is"),
+        # What the engine appends to put the picture in front of the model.
+        Message(role="user", content="(Showing image: owl.png)", injected=True),
+        Message.assistant(content="A barn owl."),
+    ]
+    provider = ScriptedProvider(Message.assistant(content="SUMMARY"), usage=[None])
+    compactor = Compactor(provider, ContextBudget(provider, override=1_000))
+
+    assert compactor.emergency_compact(history)
+
+    # The peer's real turn survived; the injected one did not become the floor.
+    survivors = [m for m in history if m.role == "user"]
+    assert any(m.items == ["m-1"] for m in survivors), (
+        "compaction summarized the peer's message away and kept the image caption"
+    )

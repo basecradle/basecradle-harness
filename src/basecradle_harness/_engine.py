@@ -236,12 +236,28 @@ class Engine:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep or time.sleep
 
-    def run(self, messages: list[Message]) -> Message:
+    def run(
+        self, messages: list[Message], *, on_progress: Callable[[], None] | None = None
+    ) -> Message:
         """Drive the conversation to a final text reply.
 
         Appends each assistant turn and every tool result onto `messages` (so the
         list is the full transcript afterward) and returns the final assistant
         message.
+
+        `on_progress` is called each time the loop appends something a crash must not lose —
+        and **the moment it is called is the contract**, not a detail (issue #297). It fires
+        immediately after the assistant turn is appended and therefore **before a single one of
+        that turn's tool calls is dispatched**, so a caller that persists here can rely on the
+        one property the whole delivery guarantee rests on:
+
+        > a tool call absent from the transcript is a tool call that never ran.
+
+        Reverse the two and the guarantee inverts — a wake killed between the dispatch and the
+        write leaves a message posted with no record that it was, and the recovery re-drives it
+        into a second post. It fires again after every tool result (so a killed turn keeps the
+        work it finished), after an injected image turn, and after the reserve summary. `None`
+        (the default — the library and poll paths) is byte-identical to the loop without it.
 
         Before each provider call a terse **step-counter note** is appended (a
         trailing system turn: `Current Time: … / Step N of M.`), so the model always
@@ -274,16 +290,42 @@ class Engine:
                 messages.append(Message.system(_step_note(step, self.max_steps, started)))
                 reply = self._chat(messages, specs)
                 messages.append(reply)
+                # **Before the first dispatch, never after — and this one is allowed to fail the
+                # turn.** It is the write that turns "the model asked for these tools" into a
+                # durable fact, and every conclusion the recovery draws from an *absent* tool call
+                # rests on it landing first (issue #297). So it is the one progress call that is
+                # not swallowed: if it cannot be written, no tool may run. Nothing has posted yet,
+                # so the turn dies owing nobody anything, and the next wake picks the message up
+                # with the evidence intact. Swallowing it here would dispatch the tools with no
+                # record that they exist, which is precisely the bug — reached silently, on the
+                # near-full box where it is most likely.
+                if on_progress is not None:
+                    on_progress()
+                pictures: list[ImageContent] = []
                 for call in reply.tool_calls:
                     result = self._run_tool(call.name, call.arguments)
                     text, images = _split_result(result)
                     messages.append(Message.tool(tool_call_id=call.id, content=text))
-                    if images:
-                        # A function-tool result is text-only on every provider, so an
-                        # image enters as model *input*: a synthetic user turn carrying it.
-                        shown_turn = Message(role="user", content=_caption(images), images=images)
-                        messages.append(shown_turn)
-                        shown.append(shown_turn)
+                    _progress(on_progress)
+                    pictures.extend(images)
+                if pictures:
+                    # A function-tool result is text-only on every provider, so an image enters as
+                    # model *input*: a synthetic user turn carrying it. It goes after **every** tool
+                    # result of this turn, never between two of them — a provider requires an
+                    # assistant turn's tool results to follow it uninterrupted, and a `user` turn
+                    # spliced into the middle of them is a 400. (It used to be appended per call, so
+                    # a picture-returning tool called alongside any other tool produced exactly that.)
+                    #
+                    # `injected` says what it is: it wears the `user` role because that is the only
+                    # role an image may ride, but it is part of *this* turn's work, not a new turn of
+                    # the conversation, and the recovery classifier must not read it as a boundary
+                    # (issue #297).
+                    shown_turn = Message(
+                        role="user", content=_caption(pictures), images=pictures, injected=True
+                    )
+                    messages.append(shown_turn)
+                    shown.append(shown_turn)
+                    _progress(on_progress)
                 # A post-turn hook may append follow-up turns (e.g. the code-exec bridge
                 # storing output files as Assets and feeding their uuids back) and ask the loop
                 # to continue so the model can use them. It runs *after* any tool results, so a
@@ -291,6 +333,12 @@ class Engine:
                 # `max_steps` still caps the whole loop, and the bridge dedups its harvest, so a
                 # settled run surfaces nothing new and the hook returns False on the next pass.
                 extend = bool(self.turn_hook(reply, messages)) if self.turn_hook else False
+                if extend:
+                    # The hook appended turns of its own — and the code-execution bridge does more
+                    # than append: it *creates Assets on the timeline* before it does. Persist, so
+                    # what it did is on the record before the next provider call can be killed
+                    # mid-flight (issue #297).
+                    _progress(on_progress)
                 self._log_step(step, reply, extend, started)
                 if not reply.tool_calls and not extend:
                     _log.info("wake used %d/%d steps", step, self.max_steps)
@@ -304,7 +352,7 @@ class Engine:
             # findable by a severity filter rather than buried in the INFO stream.
             _log.warning("wake used %d/%d steps + reserve summary", self.max_steps, self.max_steps)
             self.reserve_used = True
-            return self._reserve_summary(messages)
+            return self._reserve_summary(messages, on_progress)
         finally:
             _evict_images(shown)
 
@@ -388,7 +436,9 @@ class Engine:
             "step %d/%d: %s (%.2fs)", step, self.max_steps, _step_action(reply, extend), elapsed
         )
 
-    def _reserve_summary(self, messages: list[Message]) -> Message:
+    def _reserve_summary(
+        self, messages: list[Message], on_progress: Callable[[], None] | None = None
+    ) -> Message:
         """One out-of-budget provider call for a self-authored progress report.
 
         The invariant: the model owns all N steps it was promised; this reserve call is the
@@ -440,7 +490,25 @@ class Engine:
         # text (they were never run, and a dangling tool-call turn would break the next wake).
         summary = Message.assistant(content=reply.content)
         messages.append(summary)
+        _progress(on_progress)  # the reserve report IS this turn's terminal narration — persist it
         return summary
+
+    def run_tool(self, name: str, arguments: dict) -> str:
+        """Run one tool call outside the loop, and return its text result (issue #297).
+
+        The recovery's seam. A wake killed mid-tool-chain leaves calls whose results were never
+        recorded; for the four platform creates — the only calls a deterministic idempotency key can
+        make safe to re-execute — the recovering wake re-runs them *here*, under the key the dead
+        wake minted, before handing the transcript back to the model to finish. Any images the tool
+        returns are dropped: this is a repair of the transcript, not a turn, and there is no model
+        call in flight to show them to.
+
+        It shares `_run_tool`'s contract exactly — a failure comes back as text the model can read,
+        never as an exception — because the model reading it cannot tell, and must not need to tell,
+        a call that failed live from one that failed on re-issue.
+        """
+        text, _ = _split_result(self._run_tool(name, arguments))
+        return text
 
     def _run_tool(self, name: str, arguments: dict) -> str | ToolResult:
         """Run one tool call, turning any failure into a result the model can read.
@@ -488,6 +556,32 @@ class Engine:
         _log.info("tool %s", kv(name=name, duration=f"{elapsed:.2f}s", outcome=_outcome(error)))
         if error is not None:
             _log.warning("tool %s", kv(name=name, error=error))
+
+
+def _progress(on_progress: Callable[[], None] | None) -> None:
+    """Call the persist hook **after** work has already happened — and never break the turn.
+
+    The asymmetry with the pre-dispatch call in `run` is the whole design, so it is worth saying
+    plainly. *That* one must fail the turn: nothing had run, so stopping costs nothing and
+    continuing would run tools with no record of them. *These* fire after a tool has already
+    executed — the message is on the timeline, the image is generated and paid for — and killing
+    the turn there restores nothing and undoes nothing. So the failure is logged and the turn
+    carries on.
+
+    Losing one of these is genuinely survivable, which is why it is allowed to be: the assistant
+    turn naming the call is already on disk from the pre-dispatch write, so a wake killed after a
+    lost save is still *resumed* rather than re-driven — the recovery simply heals one more call as
+    "outcome unknown" instead of reading its result. A worse answer, never a wrong one.
+
+    The ERROR is the point. A save that quietly stopped working would leave every wake looking
+    healthy, right up until the one that gets killed, with nothing in the journal to say why.
+    """
+    if on_progress is None:
+        return
+    try:
+        on_progress()
+    except Exception as exc:  # noqa: BLE001 - a failed persist degrades the turn; it never ends it
+        _log.error("Could not persist a turn in progress; some of its work may be lost: %s", exc)
 
 
 def _step_note(step: int, max_steps: int, now: datetime) -> str:

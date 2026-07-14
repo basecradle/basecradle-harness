@@ -133,6 +133,27 @@ class Message:
     it is deliberately not serialized: it is stamped onto a copy of the turn at
     call time and the stored transcript never carries it. An adapter whose cache is
     automatic (every one that ships today) ignores it entirely.
+
+    `injected` marks the synthetic `user` turn the **engine** appends to *show* the
+    model an image (a function-tool result is text-only on every provider, so a
+    picture has to enter as model input). It wears the `user` role because that is
+    the only role a provider will accept an image on — but it is **not a new turn of
+    the conversation**: it is part of the work of the turn already in flight, and
+    nobody said it. Unlike the two fields above it **is serialized**, because the one
+    reader that most needs the distinction reads the transcript back from disk after
+    a crash: the recovery classifier walks a turn's work up to the next *real* user
+    turn, and mistaking an image turn for a boundary would hide the narration behind
+    it — reading a turn that finished as one that was interrupted (issue #297).
+
+    `items` are the uuids of the platform items a `user` turn carried to the model —
+    the messages a batched wake rendered into it. It is serialized, and it is the
+    **recovery classifier's evidence** (`_wake._turn_of`): after a crash, "did the
+    dead wake ever put this message in front of the model?" is a uuid lookup here.
+    It used to be a text match against the turn's rendered content, which was wrong
+    in two ways that only a persisted uuid fixes — a body containing a newline could
+    never match at all (so the message was re-driven and answered twice), and the
+    body is *peer-controlled*, so a peer could forge another message's rendered line
+    into their own and steer the classifier (issue #297).
     """
 
     role: Role
@@ -142,6 +163,8 @@ class Message:
     images: list[ImageContent] = field(default_factory=list)
     code_execution: CodeExecutionTrace | None = None
     cache_anchor: bool = False
+    injected: bool = False
+    items: list[str] = field(default_factory=list)
 
     @classmethod
     def system(cls, content: str) -> Message:
@@ -179,6 +202,10 @@ class Message:
             data["tool_call_id"] = self.tool_call_id
         if self.images:
             data["images"] = [{"url": i.url, "alt": i.alt} for i in self.images]
+        if self.injected:
+            data["injected"] = True
+        if self.items:
+            data["items"] = list(self.items)
         return data
 
     @classmethod
@@ -193,6 +220,8 @@ class Message:
             ],
             tool_call_id=data.get("tool_call_id"),
             images=[ImageContent(url=i["url"], alt=i.get("alt")) for i in data.get("images", [])],
+            injected=bool(data.get("injected", False)),
+            items=list(data.get("items", [])),
         )
 
 

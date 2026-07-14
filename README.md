@@ -429,18 +429,23 @@ Because every wake is a fresh process, two properties matter that the poll loop 
 
 #### If a wake dies mid-turn, the peer's message is not lost
 
-A wake can die *after* it has taken a message but *before* it has finished — the provider is down, the retries run out, the box is killed. The message must not simply vanish, and its side effects must not be repeated. So each message is **claimed in two phases**: a wake takes it `in-flight`, and only marks it `done` once the turn has actually completed. Nothing is marked seen until then, so a wake that dies leaves its messages exactly where the next wake will find them.
+A wake can die *after* it has taken a message but *before* it has finished — the provider is down, the retries run out, the box is killed, the OOM killer picks it. The message must not simply vanish, and its side effects must not be repeated. So each message is **claimed in two phases**: a wake takes it `in-flight`, and only marks it `done` once the turn has actually completed. Nothing is marked seen until then, so a wake that dies leaves its messages exactly where the next wake will find them.
 
-What the next wake does with them is decided from **evidence** — the transcript on disk, which says how far the dead wake got:
+What the next wake does with them is decided from **evidence** — the transcript on disk, which says how far the dead wake got. And the transcript is written **as the turn runs**, not once at the end: most of all, the assistant turn naming a tool call reaches disk *before that tool is dispatched*. That ordering is what makes the whole table below true, because it licenses one inference — **a tool call absent from the transcript is a tool call that never ran**:
 
 | The dead wake… | What happens | Why |
 |---|---|---|
 | died **before the model saw it** | **re-driven** — engaged normally | Nothing ran. |
 | died **inside the model call** | **re-driven** — engaged normally | Nothing ran, nothing posted. This is the common case. |
 | **completed its turn** (reached its final text) | **committed** — no model call, nothing re-posted | The turn *finished*: whatever it decided to say, it already said, itself, with its tools. Whatever it decided not to say was a decision. |
-| died **mid-tool-chain** (a tool had run, no final text) | **abandoned**, and logged as an `ERROR` naming the message | Re-running would fire those side effects again — two images for one request, the same answer sent twice. A known drop beats an invisible one. |
+| died **mid-tool-chain** (a call was issued, no final text) | **resumed** — the model is handed the partial turn and finishes it | Its tool results are already on disk, so the turn needs neither re-running nor dropping. **Zero tools re-fire.** |
 
-The line that is never crossed: **a tool's side effects are never repeated** — and since the Unspoken Channel, *speech is a side effect*, so this is what stops an agent ever saying the same thing twice. A turn that ran tools is never regenerated. A claim held by a *live* concurrent wake is never stolen, so two wakes firing at once still engage exactly once between them.
+The line that is never crossed: **a tool's side effects are never repeated** — and since the Unspoken Channel, *speech is a side effect*, so this is what stops an agent ever saying the same thing twice. A claim held by a *live* concurrent wake is never stolen, so two wakes firing at once still engage exactly once between them.
+
+**Resuming needs an answer to one genuinely unknowable question**: the wake was killed between the platform `POST` and the write that would have recorded it, so did the message land or not? Two kinds of interrupted call, and they are not the same:
+
+- A **platform create** (`messages`, `assets`, `tasks`, `webhook_endpoints`) is **re-issued** under a deterministic `Idempotency-Key` — derived from the timeline, the message being answered, the kind of create, and its ordinal in the turn, so the wake that *died* and the wake that *recovers it* mint the identical key. If the create landed, the platform returns the original record; if it didn't, it lands now. Either way there is exactly one of it. (This is what `basecradle>=0.6` is for.)
+- A **non-idempotent effect** (`generate_image` → fal.ai, code execution) is **never** re-run — no key can un-spend money. The model is told plainly that the outcome is unknown and left to decide; it can read the timeline and see for itself. Full visibility, never forcing.
 
 > This got **simpler** when the auto-post went away. The harness used to hold a generated reply it still had to deliver, so recovery had to ask the timeline *"did my reply land?"* and answer it by matching message bodies byte-for-byte — with a residual false-match between two coincidentally identical replies. It holds no reply now. The commit record is the turn's own final text, in the transcript, and the question is simply **"did the turn finish?"**
 
