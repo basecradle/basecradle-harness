@@ -126,7 +126,7 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._harness import Harness
 from basecradle_harness._idempotency import IdempotencyKeys, interrupted
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
-from basecradle_harness._mcp import McpImageStore, load_mcp_configs
+from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs
 from basecradle_harness._memory_provider import (
     MemoryExchange,
     MemoryProvider,
@@ -3770,6 +3770,16 @@ def resolved_config() -> dict[str, object]:
       self-excludes a server into ``skipped`` this run never reads as desired-state drift. Names
       only, never a server's ``env``/``headers`` (non-secret by contract, like the opt-in stems).
       ``[]`` for the default empty ``mcp/`` dir.
+    - ``mcp_request_timeout`` — the **resolved** per-request MCP timeout in seconds
+      (`_timeout_from_env`: ``HARNESS_MCP_TIMEOUT`` if set to a positive number, else the ``20.0``
+      default), the ceiling a wake gives any single MCP request — the handshake, ``tools/list``, or
+      a ``tools/call`` — before the server degrades to ``skipped`` / a tool error instead of
+      stalling the wake (issue #320). Reported by the same resolved-not-declared path as everything
+      else here (the exact value `load_mcp_tools` would use), so the NOC can add an audited
+      ``mcp_timeout`` ``agent.env`` axis and confirm off-box that a browser-using agent got the
+      longer navigation headroom it needs — an env axis is auditable only if this file emits it
+      (their #195 law). A non-MCP agent still reports the resolved default; it is a number, never
+      ``null``.
     - ``model_params`` — the operator's ``model_params.json`` object **verbatim** (``{}`` when the
       file is absent), the optional SDK call tuning (``reasoning``, ``temperature``, …) that
       `_provider_from_config` threads into every model call but nothing else introspects (issue
@@ -3814,6 +3824,7 @@ def resolved_config() -> dict[str, object]:
         "skipped": sorted(name for name, _reason in resolved.skipped),
         "opt_in_tools": list(resolved.opt_in_stems),
         "mcp_servers": sorted({config.name for config in load_mcp_configs()}),
+        "mcp_request_timeout": _timeout_from_env(),
         "model_params": model_params,
         "model_params_stripped": stripped,
     }

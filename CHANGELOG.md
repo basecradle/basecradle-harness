@@ -7,6 +7,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.78.0] - 2026-07-14
+
+### Added: `--resolved-config` exposes the resolved MCP request timeout (issue #320)
+
+`resolved_config()` now emits a **`mcp_request_timeout`** field — the resolved per-request MCP
+timeout in seconds (`HARNESS_MCP_TIMEOUT` if set to a positive number, else the `20.0` default),
+the ceiling a wake gives any single MCP request (the handshake, `tools/list`, or a `tools/call`)
+before the server degrades to `skipped`/a tool error instead of stalling the wake. It is reported
+by the same resolved-not-declared path as every other field — the exact value `load_mcp_tools`
+would use, not a re-read of the raw env — so a non-positive or malformed override reports the
+`20.0` fallback the wake would actually apply. A number, never `null`, even on a non-MCP agent.
+
+This is the field the NOC's off-box drift audit needs to add an **audited `mcp_timeout`
+`agent.env` axis** (their `#195` law: an env axis is auditable only if `--resolved-config` emits
+it), so a browser-using agent can be given — and verified as having — the longer navigation
+headroom (e.g. 60 s) an MCP browser server needs. The scope-addition landed mid-#318 (routed from
+basecradle-noc#271) and was missed by 0.77.0's PR; filed standalone so it was not lost.
+
 ## [0.77.0] - 2026-07-14
 
 ### Added: MCP image content — vision inlining + screenshot-to-asset (issue #318)

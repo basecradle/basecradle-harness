@@ -1743,6 +1743,9 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     assert report["opt_in_tools"] == []
     # The MCP manifest (issue #261) is empty too — the default `mcp/` dir ships empty.
     assert report["mcp_servers"] == []
+    # The resolved per-request MCP timeout (issue #320): unset env → the 20.0-second default, so
+    # the NOC can audit an `mcp_timeout` axis off-box. A number, never null.
+    assert report["mcp_request_timeout"] == 20.0
     # The memory axis (issue #269): the *bound* store, and the version of the package backing it
     # (none for the built-in sqlite store — it ships inside the harness).
     assert report["memory_provider"] == "sqlite"
@@ -1843,6 +1846,29 @@ def test_resolved_config_reports_configured_mcp_servers_regardless_of_load(
     # And the failed load is honestly recorded in `skipped` (the loaded set diverges from the
     # configured set) — proving `mcp_servers` reports configuration, not liveness.
     assert "workmail" in report["skipped"]
+
+
+def test_resolved_config_reports_the_resolved_mcp_request_timeout(wake_env, monkeypatch):
+    """The MCP-timeout axis (issue #320): `--resolved-config` emits the **resolved** per-request
+    MCP timeout — the exact value a wake would use, not a re-read of the raw env — so the NOC can
+    add an audited `mcp_timeout` `agent.env` axis and confirm off-box (their #195 law) that a
+    browser-using agent got the longer navigation headroom it needs."""
+    # Unset → the 20.0-second default. Assert the value, not merely presence: a present-but-wrong
+    # timeout would pass a presence check while an agent silently stalls or over-waits.
+    monkeypatch.delenv("HARNESS_MCP_TIMEOUT", raising=False)
+    assert resolved_config()["mcp_request_timeout"] == 20.0
+
+    # A positive override is resolved through the same `_timeout_from_env` path the wake uses — a
+    # browser agent's 60-second navigation headroom shows through, so the axis is verifiable.
+    monkeypatch.setenv("HARNESS_MCP_TIMEOUT", "60")
+    assert resolved_config()["mcp_request_timeout"] == 60.0
+
+    # A non-positive or malformed value is not ground truth for what the wake does — it falls back
+    # to the default, exactly as `load_mcp_tools` would, so the reported number never lies.
+    monkeypatch.setenv("HARNESS_MCP_TIMEOUT", "0")
+    assert resolved_config()["mcp_request_timeout"] == 20.0
+    monkeypatch.setenv("HARNESS_MCP_TIMEOUT", "not-a-number")
+    assert resolved_config()["mcp_request_timeout"] == 20.0
 
 
 def test_resolved_config_reports_the_default_memory_provider_so_a_silent_fallback_is_visible(
