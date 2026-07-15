@@ -281,6 +281,12 @@ def test_view_returns_the_image_as_a_data_url(tool):
 
     assert isinstance(result, ToolResult)
     assert "cat.png" in result.text
+    # The tool result is metadata only — it never narrates perception (issue #316). Whether the
+    # pixels are actually *seen* is the engine's call (it gates on the model's vision and captions
+    # the injected image turn), so the tool must not promise a view it cannot verify.
+    assert "Looking at" not in result.text
+    assert result.text.startswith("uuid=")  # the `_describe` metadata line, and nothing else
+    assert "image/png" in result.text
     assert len(result.images) == 1
     image = result.images[0]
     assert image.alt == "cat.png"

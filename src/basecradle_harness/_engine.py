@@ -40,13 +40,14 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 
+from basecradle_harness._assets import model_sees_images
 from basecradle_harness._exceptions import (
     EngineError,
     ProviderResponseError,
     ProviderServerError,
 )
 from basecradle_harness._messages import ImageContent, Message, ToolResult, ToolSpec
-from basecradle_harness._observability import kv
+from basecradle_harness._observability import describe_provider, kv
 from basecradle_harness._provider import Provider
 from basecradle_harness._tools import ToolRegistry
 
@@ -309,22 +310,7 @@ class Engine:
                     _progress(on_progress)
                     pictures.extend(images)
                 if pictures:
-                    # A function-tool result is text-only on every provider, so an image enters as
-                    # model *input*: a synthetic user turn carrying it. It goes after **every** tool
-                    # result of this turn, never between two of them — a provider requires an
-                    # assistant turn's tool results to follow it uninterrupted, and a `user` turn
-                    # spliced into the middle of them is a 400. (It used to be appended per call, so
-                    # a picture-returning tool called alongside any other tool produced exactly that.)
-                    #
-                    # `injected` says what it is: it wears the `user` role because that is the only
-                    # role an image may ride, but it is part of *this* turn's work, not a new turn of
-                    # the conversation, and the recovery classifier must not read it as a boundary
-                    # (issue #297).
-                    shown_turn = Message(
-                        role="user", content=_caption(pictures), images=pictures, injected=True
-                    )
-                    messages.append(shown_turn)
-                    shown.append(shown_turn)
+                    self._show_images(pictures, messages, shown)
                     _progress(on_progress)
                 # A post-turn hook may append follow-up turns (e.g. the code-exec bridge
                 # storing output files as Assets and feeding their uuids back) and ask the loop
@@ -355,6 +341,66 @@ class Engine:
             return self._reserve_summary(messages, on_progress)
         finally:
             _evict_images(shown)
+
+    def _show_images(
+        self, pictures: list[ImageContent], messages: list[Message], shown: list[Message]
+    ) -> None:
+        """Place a picture-returning tool's images as model input — or, for a model with no
+        vision, an honest note in their place (issue #316).
+
+        A function-tool result is text-only on every provider, so an image enters as model
+        *input*: a synthetic `user` turn carrying it. It goes after **every** tool result of
+        this turn, never between two of them — a provider requires an assistant turn's tool
+        results to follow it uninterrupted, and a `user` turn spliced into the middle is a 400.
+        (It used to be appended per call, so a picture-returning tool called alongside any other
+        tool produced exactly that.)
+
+        **The pixels are shown only to a model that can take one** — the `view` tool's half of
+        #228's vision gate. The asset-wake already gates a *peer's posted* image this way
+        (`model_sees_images`, #228); `view` is the other entry point for pixels and until now was
+        ungated. That was latent under 0.74.0 (the Chat serializer dropped `message.images`, so
+        the pixels never reached the wire) and became live under #313/0.75.0, which taught that
+        serializer to *send* them: a text-only model that calls `view` would then have the pixels
+        put on the wire — where the endpoint rejects them or silently drops them — and read a
+        caption for a picture it never received. The gate is here, not in the tool, because only
+        the engine sees both the provider and the tool's returned pixels; the tool (body) has no
+        view of the model (brain). It **fails open** (`model_sees_images`): a model that reports
+        vision, or one whose capability can't be read, is shown the image exactly as before, so
+        the only behavior change is a model that *definitely* cannot see.
+
+        `injected` says what the turn is on both branches: it wears the `user` role because that
+        is the only role an image (or the note standing in for it) may ride, but it is part of
+        *this* turn's work, not a new turn of the conversation, so the recovery classifier and the
+        compactor must not read it as a boundary (issue #297).
+        """
+        if model_sees_images(self.provider):
+            shown_turn = Message(
+                role="user", content=_caption(pictures), images=pictures, injected=True
+            )
+            messages.append(shown_turn)
+            shown.append(shown_turn)  # only a pixel-bearing turn needs eviction after the reply
+            return
+        # No vision: withhold the pixels, and say so plainly rather than leave the model a caption
+        # that promises sight. The description already rode the tool result (`_describe`), so the
+        # note only has to name what was not shown and why. It carries no pixels, so it is not added
+        # to `shown` (nothing to evict) and stays as a permanent, bounded breadcrumb like the caption.
+        self._log_images_withheld(pictures)
+        messages.append(Message(role="user", content=_withheld_caption(pictures), injected=True))
+
+    def _log_images_withheld(self, pictures: list[ImageContent]) -> None:
+        """The loud, greppable record that a viewed image was withheld from a no-vision model (#316).
+
+        The asset-wake's sibling of this line is `_wake._log_image_degrade` (#228); a silent degrade
+        is a defect (#293's visibility law), so this is a WARNING too. The engine sees the image's
+        filename (`alt`) and the model, not the asset uuid — coarser than the wake's line, but enough
+        to see the swap happened and to whom.
+        """
+        names = _image_names(pictures)
+        _, model = describe_provider(self.provider)
+        _log.warning(
+            "view image withheld from a model with no vision %s",
+            kv(images=names, model=model, reason="model has no image input"),
+        )
 
     def _chat(self, messages: list[Message], tools: Sequence[ToolSpec] | None) -> Message:
         """One provider call, retrying the **transient** provider faults (issues #259, #284).
@@ -645,6 +691,15 @@ def _split_result(result: str | ToolResult) -> tuple[str, list[ImageContent]]:
     return result, []
 
 
+def _image_names(images: list[ImageContent]) -> str:
+    """The comma-joined filenames of a turn's images, `image` where one has no `alt`.
+
+    The shared spelling behind every line that *names* a set of images — the shown caption,
+    the withheld-note stand-in, and the degrade log — so the three never drift apart.
+    """
+    return ", ".join(image.alt or "image" for image in images)
+
+
 def _caption(images: list[ImageContent]) -> str:
     """A one-line caption for an injected image turn, naming the images shown.
 
@@ -652,8 +707,20 @@ def _caption(images: list[ImageContent]) -> str:
     images still sees *what* was shared, and it stays as the breadcrumb after the
     pixels are evicted.
     """
-    names = ", ".join(image.alt or "image" for image in images)
-    return f"(Showing image: {names})"
+    return f"(Showing image: {_image_names(images)})"
+
+
+def _withheld_caption(images: list[ImageContent]) -> str:
+    """`_caption`'s stand-in when the model has no image input (issue #316).
+
+    Names the file(s) and says plainly they were described, not shown — so a text-only model
+    reads an honest line instead of a caption promising a picture it never received. The
+    description itself rode the tool result (`_describe`), so this only has to say the image is
+    withheld and why.
+    """
+    return (
+        f"(No image input on this model — {_image_names(images)} was described above, not shown.)"
+    )
 
 
 def _evict_images(shown: list[Message]) -> None:
