@@ -77,7 +77,7 @@ from basecradle_harness._engine import (
 )
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
-from basecradle_harness._mcp import McpResolution, load_mcp_tools
+from basecradle_harness._mcp import McpImageStore, McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
 from basecradle_harness._model_params import load_model_params
@@ -184,6 +184,7 @@ class TimelineAgent:
         context_messages: int | None = DEFAULT_CONTEXT_MESSAGES,
         onboard: bool = True,
         code_bridge: CodeExecutionBridge | None = None,
+        mcp_images: McpImageStore | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -210,6 +211,9 @@ class TimelineAgent:
             home=self.harness.home,
             code_bridge=code_bridge,
             speech=self.speech,
+            # The per-wake MCP image store (issue #318), so the assets ``post_image`` action can
+            # post a screenshot an MCP tool returned. ``None`` unless an MCP server's tools loaded.
+            mcp_images=mcp_images,
         )
         bind_platform_tools(self.harness.tools, context)
         if code_bridge is not None:
@@ -287,6 +291,8 @@ class TimelineAgent:
             context_messages=_context_messages_from_env(),
             onboard=_onboard_from_env(),
             code_bridge=bridge,
+            # The per-wake MCP image store (issue #318): ``None`` unless an MCP server loaded.
+            mcp_images=resolved.mcp_images,
         )
 
     def poll_once(self) -> list[object]:
@@ -1168,6 +1174,7 @@ def _surface_broken_defaults(
         notices=resolved.notices,
         broken=resolved.broken + broken_lines,
         opt_in_stems=resolved.opt_in_stems,
+        mcp_images=resolved.mcp_images,
     )
 
 
@@ -1193,6 +1200,7 @@ def _merge_memory_tools(resolved: ResolvedTools, memory: MemoryProvider) -> Reso
         notices=resolved.notices,
         broken=resolved.broken,
         opt_in_stems=resolved.opt_in_stems,
+        mcp_images=resolved.mcp_images,
     )
 
 
@@ -1219,6 +1227,9 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
         notices=resolved.notices + mcp.notices,
         broken=resolved.broken,
         opt_in_stems=resolved.opt_in_stems,
+        # The per-wake image store (issue #318): carried so the assets ``post_image`` action can
+        # reach it via the `PlatformContext`. ``None`` unless an MCP server's tools loaded.
+        mcp_images=mcp.images,
     )
 
 
@@ -1270,6 +1281,7 @@ def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) ->
         notices=notices,
         broken=resolved.broken,
         opt_in_stems=resolved.opt_in_stems,
+        mcp_images=resolved.mcp_images,
     )
 
 

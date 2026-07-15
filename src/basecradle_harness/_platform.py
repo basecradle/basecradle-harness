@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from basecradle import BaseCradle, BaseCradleError
 
     from basecradle_harness._code import CodeExecutionBridge
+    from basecradle_harness._mcp import McpImageStore
 
 
 @dataclass(frozen=True)
@@ -84,6 +85,13 @@ class PlatformContext:
             #297). `None` → no key → the SDK sends no `Idempotency-Key` header and the
             create behaves exactly as it did before any of this existed, which is what keeps
             the seam free for every caller that has no recovery to do.
+        mcp_images: The per-wake `McpImageStore` (`_mcp.py`), or `None` when no MCP image source
+            is active. **The assets tool's `post_image` action reaches it here** to post an image
+            an MCP tool returned (a browser screenshot) to the timeline — the "show me what you
+            see" path, which works regardless of whether the model can *see* the image (issue
+            #318). Its uploads carry no idempotency key and are never re-issued by a recovery,
+            because the bytes live only in this volatile store — the same non-replayable shape a
+            generated image's upload has.
     """
 
     client: BaseCradle
@@ -92,6 +100,7 @@ class PlatformContext:
     code_bridge: CodeExecutionBridge | None = None
     speech: SpeechLedger | None = None
     keys: IdempotencyKeys | None = None
+    mcp_images: McpImageStore | None = None
 
 
 class PlatformTool(Tool):

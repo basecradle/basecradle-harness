@@ -56,6 +56,7 @@ Group-2 activation robustness bar. One flaky server never takes the wake down.
 from __future__ import annotations
 
 import atexit
+import base64
 import itertools
 import json
 import logging
@@ -69,7 +70,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from basecradle_harness._assets import (
+    _VIEWABLE_IMAGE_TYPES,
+    MAX_IMAGE_BYTES,
+    _data_url,
+    _media_type,
+)
 from basecradle_harness._install import config_home
+from basecradle_harness._messages import ImageContent, ToolResult
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 from basecradle_harness._version import __version__
 
@@ -96,6 +104,16 @@ _SEP = "__"
 # Queued by the stdio reader thread when the server's stdout closes (it exited/crashed), so
 # a request blocked waiting for a response fails fast instead of waiting out the timeout.
 _CLOSED = object()
+
+# How many recent MCP-returned images the per-wake `McpImageStore` keeps for the
+# ``assets action='post_image'`` path (issue #318). Small on purpose: a wake is one short-lived
+# process and the store is in-memory only, but each image can be up to `MAX_IMAGE_BYTES`, so the
+# ring is bounded in *count* to keep the worst-case footprint bounded. The common case is one
+# capture posted immediately; the ring covers "took several, post one".
+_IMAGE_STORE_CAP = 8
+
+# The alias that resolves to the most recent capture, mirroring the assets tool's ``'latest'``.
+_LATEST = "latest"
 
 
 class McpError(Exception):
@@ -179,6 +197,72 @@ def _parse_config(path: Path) -> McpServerConfig:
     )
 
 
+# --- the per-wake image store (issue #318) ------------------------------------
+
+
+@dataclass(frozen=True)
+class StashedImage:
+    """One image an MCP tool returned, held for the ``assets action='post_image'`` path.
+
+    `mimetype` is the bare media type (``image/png``); `data` is the decoded bytes, ready to
+    upload to the timeline exactly as the assets tool uploads a generated image.
+    """
+
+    mimetype: str
+    data: bytes
+
+
+class McpImageStore:
+    """A per-wake, in-memory, bounded ring of images MCP tools returned (issue #318).
+
+    The "show me what you see" half of MCP image support, and it is **independent of the model's
+    vision** — the point being that a text-only agent (e.g. @glm-5.2) can still *post* a browser
+    screenshot to the timeline even though it cannot itself see it. When an MCP tool result carries
+    an image, `_render_tool_result` stashes the decoded bytes here under a short handle
+    (``mcp-image-N``) and names that handle in the model-readable placeholder; the assets tool's
+    ``post_image`` action then looks the bytes back up by handle and uploads them through the
+    existing asset-create path.
+
+    It is deliberately **ephemeral**: never persisted, never replayed, and gone when the wake
+    process exits — the same stance the engine takes toward a viewed image's pixels. That is also
+    why a ``post_image`` create carries **no** idempotency key and is never re-issued by a recovery
+    (`_idempotency`): the bytes live only here, so a killed-and-resumed wake cannot reconstruct
+    them — exactly the non-replayable shape a generated image's upload already has. The ring is
+    bounded in count (`_IMAGE_STORE_CAP`); the oldest capture is evicted first.
+    """
+
+    def __init__(self, cap: int = _IMAGE_STORE_CAP) -> None:
+        self._cap = max(1, cap)
+        self._by_handle: dict[str, StashedImage] = {}  # insertion-ordered (dict, 3.7+)
+        self._count = 0  # monotonic, so a handle is never reused within a wake
+
+    def stash(self, mimetype: str, data: bytes) -> str:
+        """Store one image and return its handle (``mcp-image-N``), evicting the oldest if full."""
+        self._count += 1
+        handle = f"mcp-image-{self._count}"
+        self._by_handle[handle] = StashedImage(mimetype=mimetype, data=data)
+        while len(self._by_handle) > self._cap:
+            del self._by_handle[next(iter(self._by_handle))]  # drop the oldest (FIFO)
+        return handle
+
+    def get(self, handle: str | None) -> StashedImage | None:
+        """The image for `handle`, the ``'latest'`` alias, or ``None`` if unknown/empty."""
+        if handle is None:
+            return self.latest()
+        if handle.strip().lower() == _LATEST:
+            return self.latest()
+        return self._by_handle.get(handle.strip())
+
+    def latest(self) -> StashedImage | None:
+        """The most recently stashed image, or ``None`` when the store is empty."""
+        if not self._by_handle:
+            return None
+        return self._by_handle[next(reversed(self._by_handle))]
+
+    def __len__(self) -> int:
+        return len(self._by_handle)
+
+
 # --- the JSON-RPC clients -----------------------------------------------------
 
 
@@ -230,10 +314,15 @@ class McpClient(ABC):
         tools = result.get("tools")
         return list(tools) if isinstance(tools, list) else []
 
-    def call_tool(self, name: str, arguments: dict) -> str:
-        """Invoke ``tools/call`` and render the result into model-readable text."""
-        result = self._request("tools/call", {"name": name, "arguments": arguments})
-        return _render_tool_result(result)
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        """Invoke ``tools/call`` and return the raw JSON-RPC ``result`` dict.
+
+        The client speaks the protocol; rendering the result into what the *model* reads —
+        joining text blocks, and (issue #318) turning an image block into a `ToolResult` plus a
+        stashed capture — is `McpTool.run`'s job, because only the tool holds the per-wake
+        `McpImageStore`. Raises `McpError` if the call returned a JSON-RPC error.
+        """
+        return self._request("tools/call", {"name": name, "arguments": arguments})
 
     @staticmethod
     def _result_of(message: dict) -> dict:
@@ -470,25 +559,101 @@ def _error_text(error: object) -> str:
     return str(error)
 
 
-def _render_tool_result(result: dict) -> str:
-    """An MCP ``tools/call`` result as model-readable text.
+def _render_tool_result(result: dict, store: McpImageStore | None = None) -> str | ToolResult:
+    """An MCP ``tools/call`` result as what the model reads — text, and any images (issue #318).
 
-    Joins the ``text`` content blocks; a non-text block (an image, embedded resource) is
-    noted by type rather than inlined — passing MCP media into the model's vision input is
-    out of scope here. An ``isError`` result is prefixed so the model sees it failed.
+    Joins the ``text`` content blocks. An **image** block is no longer collapsed to a bare
+    ``[image content]`` placeholder: its bytes are decoded, and
+
+    - handed to the model as **vision input** — the block becomes an `ImageContent` on a
+      `ToolResult`, which the engine routes into the model's input exactly as the assets tool's
+      ``view`` action does. A model with no vision never receives the pixels: the engine's own
+      gate (`_engine._show_images` + `model_sees_images`, issue #316) substitutes an honest
+      withheld note, so this always attaches the image and lets the engine decide — the tool has
+      no view of the model (the body/brain split); and
+    - **stashed** in the per-wake `store` (when one is bound) under a handle the placeholder
+      names, so the agent can post the image to the timeline via ``assets action='post_image'``
+      *regardless of whether it can see it* (the "show me what you see" path).
+
+    The placeholder text describes the image (type + size + handle) on **every** path, so a
+    text-only model still gets an honest, non-empty result rather than nothing or a crash. Any
+    other non-text block (an embedded resource, audio) keeps the by-type placeholder — inlining
+    those is out of scope. An ``isError`` result is prefixed so the model sees it failed.
+
+    Returns a plain ``str`` when there is nothing to show (the common case, unchanged), and a
+    `ToolResult` only when at least one image was inlined as vision input.
     """
     blocks = result.get("content")
     parts: list[str] = []
+    images: list[ImageContent] = []
     if isinstance(blocks, list):
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-            if block.get("type") == "text":
+            block_type = block.get("type")
+            if block_type == "text":
                 parts.append(str(block.get("text", "")))
+            elif block_type == "image":
+                text, image = _render_image_block(block, store)
+                parts.append(text)
+                if image is not None:
+                    images.append(image)
             else:
                 parts.append(f"[{block.get('type', 'non-text')} content]")
     text = "\n".join(p for p in parts if p) or "(the tool returned no content)"
-    return f"Error: {text}" if result.get("isError") else text
+    text = f"Error: {text}" if result.get("isError") else text
+    return ToolResult(text=text, images=images) if images else text
+
+
+def _render_image_block(
+    block: dict, store: McpImageStore | None
+) -> tuple[str, ImageContent | None]:
+    """Render one MCP ``image`` content block into (placeholder text, vision image-or-None).
+
+    Decodes the base64 ``data``, stashes the bytes in `store` for the ``post_image`` path (when a
+    store is bound), and — for a viewable type within the size ceiling — builds an `ImageContent`
+    for vision input. The placeholder always names the type and size (cheap), and, when stashed,
+    the handle plus how to post it. A missing/undecodable payload, or one over the ceiling, yields
+    a describing placeholder and no image rather than a crash.
+    """
+    raw_b64 = block.get("data")
+    mimetype = _media_type(str(block.get("mimeType") or "")) or "image/png"
+    if not isinstance(raw_b64, str) or not raw_b64:
+        return "[image content (no data returned)]", None
+    try:
+        data = base64.b64decode(raw_b64, validate=True)
+    except (ValueError, TypeError):
+        return f"[image content ({mimetype}, could not decode)]", None
+    size = len(data)
+    if size <= 0:
+        return f"[image content ({mimetype}, empty)]", None
+    if size > MAX_IMAGE_BYTES:
+        return (
+            f"[image: {mimetype}, {_human_bytes(size)} — too large to show or share "
+            f"(over the {MAX_IMAGE_BYTES}-byte limit)]",
+            None,
+        )
+    handle = store.stash(mimetype, data) if store is not None else None
+    viewable = mimetype in _VIEWABLE_IMAGE_TYPES
+    image = ImageContent(url=_data_url(mimetype, data), alt=handle or "image") if viewable else None
+    prefix = f"image {handle}" if handle else "image"
+    note = "" if viewable else " (type not viewable to a model; described only)"
+    share = (
+        f" — to share it on this timeline, use the assets tool with "
+        f"action='post_image', image='{handle}'"
+        if handle is not None
+        else ""
+    )
+    return f"[{prefix}: {mimetype}, {_human_bytes(size)}{note}{share}]", image
+
+
+def _human_bytes(n: int) -> str:
+    """A compact human-readable byte size (``45.2 KB``) for an image placeholder."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
 
 
 # --- the tool wrapper ---------------------------------------------------------
@@ -514,16 +679,28 @@ class McpTool(Tool):
         description: str,
         parameters: dict,
         client: McpClient,
+        images: McpImageStore | None = None,
     ) -> None:
         self.name = mcp_tool_name(server, remote_name)
         self.description = description or f"The {remote_name!r} tool from MCP server {server!r}."
         self.parameters = parameters or NO_PARAMETERS
         self._remote_name = remote_name
         self._client = client
+        #: The per-wake image store, shared across every MCP tool of one resolution, so an image
+        #: this tool returns can be posted to the timeline via ``assets action='post_image'``
+        #: (issue #318). ``None`` on the library/test path — vision inlining still works, but there
+        #: is nowhere to stash a capture for the post path.
+        self._images = images
 
-    def run(self, **kwargs: object) -> str:
-        """Proxy the call to the MCP server and return its rendered result."""
-        return self._client.call_tool(self._remote_name, dict(kwargs))
+    def run(self, **kwargs: object) -> str | ToolResult:
+        """Proxy the call to the MCP server and render its result for the model.
+
+        Returns a `ToolResult` (text + vision images) when the server returned an image; a plain
+        ``str`` otherwise. Any returned image is also stashed in the per-wake store for the
+        ``post_image`` path (issue #318).
+        """
+        result = self._client.call_tool(self._remote_name, dict(kwargs))
+        return _render_tool_result(result, self._images)
 
 
 def mcp_tool_name(server: str, tool: str) -> str:
@@ -552,6 +729,9 @@ class McpResolution:
             "why isn't this server here?" trail, mirroring Group-2 activation.
         notices: One safe-by-default opt-out line per active server, surfaced in the brief.
         clients: The live clients, closed at process exit (registered with ``atexit``).
+        images: The per-wake `McpImageStore` shared by every active server's tools (issue #318),
+            carried to the assets tool via the `PlatformContext` so a returned image can be posted
+            to the timeline. ``None`` when no server loaded (nothing to stash).
     """
 
     tools: list[Tool] = field(default_factory=list)
@@ -559,6 +739,7 @@ class McpResolution:
     skipped: list[tuple[str, str]] = field(default_factory=list)
     notices: list[str] = field(default_factory=list)
     clients: list[McpClient] = field(default_factory=list)
+    images: McpImageStore | None = None
 
 
 def _timeout_from_env() -> float:
@@ -611,6 +792,10 @@ def load_mcp_tools(
     """
     timeout = _timeout_from_env() if timeout is None else timeout
     resolution = McpResolution()
+    # One image store per resolution, shared by every server's tools, so a screenshot from any
+    # active MCP tool can be posted via ``assets action='post_image'`` (issue #318). Bound onto
+    # the resolution only if a tool actually loads (below) — no MCP tools, nothing to stash.
+    store = McpImageStore()
     seen: set[str] = set()  # final tool names already claimed, across all servers
     for config in load_mcp_configs(home):
         client: McpClient | None = None
@@ -631,6 +816,7 @@ def load_mcp_tools(
                 description=str(spec.get("description") or ""),
                 parameters=spec.get("inputSchema") or NO_PARAMETERS,
                 client=client,
+                images=store,
             )
             # Two tools can collide on the *final* name even when their remote names differ —
             # sanitization (``a.b`` and ``a b`` both → ``a_b``) or the 64-char truncation can
@@ -655,6 +841,9 @@ def load_mcp_tools(
             config.name,
             loaded,
         )
+    # Bind the store only if at least one MCP tool loaded — with no MCP tools there is nothing to
+    # stash, and the assets ``post_image`` path stays cleanly "no captures available".
+    resolution.images = store if resolution.tools else None
     return resolution
 
 

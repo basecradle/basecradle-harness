@@ -126,7 +126,7 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._harness import Harness
 from basecradle_harness._idempotency import IdempotencyKeys, interrupted
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
-from basecradle_harness._mcp import load_mcp_configs
+from basecradle_harness._mcp import McpImageStore, load_mcp_configs
 from basecradle_harness._memory_provider import (
     MemoryExchange,
     MemoryProvider,
@@ -1057,6 +1057,7 @@ class WakeAgent:
         pacer: ReadPacer | None = None,
         max_builds: int = _DEFAULT_PACE_MAX_BUILDS,
         code_bridge: CodeExecutionBridge | None = None,
+        mcp_images: McpImageStore | None = None,
     ) -> None:
         if context_messages is not None and context_messages < 0:
             raise ValueError("context_messages must be non-negative or None")
@@ -1145,6 +1146,10 @@ class WakeAgent:
         # code-execution bridge (when active) is bound the same way, and rides the
         # context so the `code_attach` tool can reach it.
         self.code_bridge = code_bridge
+        # The per-wake MCP image store (issue #318), carried into the context so the assets
+        # ``post_image`` action can post an image an MCP tool returned. ``None`` unless an MCP
+        # server's tools loaded — then the post path stays cleanly "no captures available".
+        self.mcp_images = mcp_images
         context = PlatformContext(
             client=self.client,
             timeline=self.timeline_uuid,
@@ -1152,6 +1157,7 @@ class WakeAgent:
             code_bridge=code_bridge,
             speech=self.speech,
             keys=self.keys,
+            mcp_images=mcp_images,
         )
         bind_platform_tools(self.harness.tools, context)
         if code_bridge is not None:
@@ -1288,6 +1294,9 @@ class WakeAgent:
             # The Loop-2 mid-generation staleness rebuild cap (issue #226). Env-tuned; the Nth
             # build posts unconditionally. Shares the pacer's `HARNESS_PACE_ENABLED` kill switch.
             max_builds=_pace_max_builds_from_env(),
+            # The per-wake MCP image store (issue #318), so the assets ``post_image`` action can
+            # post a screenshot an MCP tool returned. ``None`` unless an MCP server's tools loaded.
+            mcp_images=resolved.mcp_images,
         )
 
     def wake(
