@@ -7,6 +7,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.76.0] - 2026-07-14
+
+### Fixed: the `view` tool gates on vision too, so a text-only model is never blind-sent pixels (issue #316)
+
+The `view` tool was the ungated sibling of #228's vision gate. #228 stops a **peer's posted** image
+from reaching a text-only model on the asset-wake (`model_sees_images`): the image is swapped for its
+text description before pixels are attached. But `view` is the *other* way pixels enter the model's
+input — the model asks to look at an image — and that path never consulted the gate. The 0.75.0
+CHANGELOG called the gate "a single, loud chokepoint upstream at the asset-wake"; it was one of two
+chokepoints, and `view` bypassed it.
+
+It was latent under 0.74.0 (the Chat Completions serializer dropped `message.images`, so a
+`view`ed image never reached the wire) and became live under #313/0.75.0, which taught that serializer
+to **send** images: a text-only model (e.g. `z-ai/glm-5.2`) that called `view` would then put the
+pixels on the wire — where the endpoint rejects them or silently drops them — and read a *"Looking at
+this image now"* caption for a picture it never received (found in #228's live-verify).
+
+The gate now runs on the `view` path too, in the **engine** — the one layer that sees both the
+provider and a tool's returned pixels (a tool has no view of the model: `PlatformContext` is client +
+timeline only, the body/brain split). When the model can see, the image is shown exactly as before;
+when it definitely cannot, the pixels are withheld, a plain note stands in for the caption (`No image
+input on this model — <file> was described above, not shown.`), and the swap is logged loudly
+(`view image withheld from a model with no vision …`), mirroring #228's degrade line. The gate
+**fails open** — a model that reports vision, or one whose capability can't be read, is unaffected —
+so the only behavior change is a model that *definitely* has no image input. The `view` tool result
+no longer narrates perception (it carries only the asset's metadata + description); whether the pixels
+are seen is the engine's call, said in the injected turn.
+
 ## [0.75.0] - 2026-07-14
 
 ### Fixed: the Chat Completions surface sends image input too (issue #313)

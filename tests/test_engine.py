@@ -133,6 +133,130 @@ def test_the_tool_result_text_is_the_tool_message():
     assert tool_turn.content == "Looking at cat.png now."
 
 
+# --- the view-path vision gate (issue #316) ----------------------------------
+
+
+class NoVisionProvider(ScriptedProvider):
+    """A model that *definitely* has no image input — `supports_vision()` says so.
+
+    Extends the scripted provider only by answering the vision capability, so the
+    engine's gate has a definite `False` to act on (the `z-ai/glm-5.2` case).
+    """
+
+    provider = "openrouter"
+    model = "z-ai/glm-5.2"
+
+    def supports_vision(self):
+        return False
+
+
+class BlindVisionProbeProvider(ScriptedProvider):
+    """Vision capability can't be read — the read raises. The gate must fail open."""
+
+    def supports_vision(self):
+        raise RuntimeError("modality metadata unavailable")
+
+
+def test_a_no_vision_model_gets_a_note_not_the_pixels():
+    """A text-only model that calls `view` is never handed the pixels (issue #316).
+
+    The image would otherwise be serialized onto the wire (post-#313 the Chat surface sends it),
+    where a text-only endpoint rejects or drops it. So the engine withholds the pixels and stands
+    an honest note in their place — no image on the second call, and the caption never promises a
+    view the model can't have.
+    """
+    provider = NoVisionProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="view", arguments={})]),
+        Message.assistant(content="I can't see it, but the description says it's a cat."),
+    )
+    engine = _engine(provider, ViewTool())
+    history = [Message.user("look at cat.png")]
+
+    reply = engine.run(history)
+
+    assert reply.content == "I can't see it, but the description says it's a cat."
+    # No pixels anywhere — not on the second provider call, not in the persisted transcript.
+    assert not any(m.images for m in provider.seen[1])
+    assert not any(m.images for m in history)
+    # The stand-in note replaces the caption: it names the file and says it was described, not shown.
+    note = next(m for m in history if m.role == "user" and m.injected)
+    assert (
+        note.content == "(No image input on this model — cat.png was described above, not shown.)"
+    )
+    assert note.images == []
+
+
+def test_the_no_vision_note_is_injected_so_recovery_never_treats_it_as_a_boundary():
+    """The stand-in note rides `injected=True`, exactly as the image turn does (issue #297).
+
+    An injected `user` turn is a turn's own work, not a new turn of the conversation, so the
+    recovery classifier and the compactor must not read it as a boundary.
+    """
+    provider = NoVisionProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="view", arguments={})]),
+        Message.assistant(content="ok"),
+    )
+    engine = _engine(provider, ViewTool())
+    history = [Message.user("look")]
+
+    engine.run(history)
+
+    note = next(m for m in history if "was described above" in (m.content or ""))
+    assert note.injected is True
+
+
+def test_a_no_vision_model_logs_the_withheld_image_loudly(caplog):
+    """A silent degrade is a defect (#293) — the swap is a greppable WARNING naming file + model."""
+    provider = NoVisionProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="view", arguments={})]),
+        Message.assistant(content="ok"),
+    )
+    engine = _engine(provider, ViewTool())
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        engine.run([Message.user("look")])
+
+    line = next(r.getMessage() for r in caplog.records if "withheld" in r.getMessage())
+    assert "cat.png" in line
+    assert "z-ai/glm-5.2" in line
+
+
+def test_the_tool_result_still_carries_the_description_for_a_no_vision_model():
+    """Withholding the pixels never withholds the *text* — the tool result is untouched.
+
+    The description the model reads instead of the picture rides the tool result, so a text-only
+    model is not left blind: it still gets everything the tool said about the file.
+    """
+    provider = NoVisionProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="view", arguments={})]),
+        Message.assistant(content="ok"),
+    )
+    engine = _engine(provider, ViewTool())
+    history = [Message.user("look")]
+
+    engine.run(history)
+
+    tool_turn = next(m for m in history if m.role == "tool")
+    assert tool_turn.content == "Looking at cat.png now."  # the fake tool's text, unmodified
+
+
+def test_the_gate_fails_open_when_vision_capability_cannot_be_read():
+    """A raising `supports_vision()` shows the image exactly as before (issue #228's fail-open)."""
+    provider = BlindVisionProbeProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="view", arguments={})]),
+        Message.assistant(content="a cat"),
+    )
+    engine = _engine(provider, ViewTool())
+
+    engine.run([Message.user("look")])
+
+    # Assert on the second provider call's snapshot — the pixels are evicted from `history` after
+    # the reply, so the only place they are observable is what the model actually saw.
+    image_turn = next(m for m in provider.seen[1] if m.images)
+    assert image_turn.content == "(Showing image: cat.png)"
+    assert image_turn.images[0].url == "data:image/png;base64,AAAA"
+
+
 class AlwaysViewProvider:
     """Calls the view tool while tools are offered; answers in text once they're withheld.
 

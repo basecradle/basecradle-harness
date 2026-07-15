@@ -268,13 +268,22 @@ class AssetsTool(PlatformTool):
         input as a data URL — self-contained, so it does not depend on the model's
         servers reaching the blob URL. A non-image (or oversized) asset comes back
         as a plain string explaining why it can't be shown, never as raw bytes.
+
+        The tool result carries only the asset's metadata (`_describe` — filename,
+        type, size, and any description); it does **not** narrate perception. Whether
+        the pixels are actually *seen* is the engine's call, not the tool's: a tool has
+        no view of the provider (the body/brain split — `PlatformContext` is client +
+        timeline only), and only the engine knows whether the model can take an image.
+        So the engine gates the pixels on `model_sees_images` and captions them (or, for
+        a text-only model, says plainly they were described, not shown — issue #316).
+        Claiming "looking at it now" here would promise vision the tool cannot verify.
         """
         asset = self.context.client.assets.get(uuid)
         meta = _describe(asset)
         result = image_input(asset.content.file)
         if isinstance(result, str):
             return f"{meta}\n({result})"  # a reason it can't be shown — not raw bytes
-        return ToolResult(text=f"{meta}\nLooking at this image now.", images=[result])
+        return ToolResult(text=meta, images=[result])
 
     # --- create --------------------------------------------------------------
 
