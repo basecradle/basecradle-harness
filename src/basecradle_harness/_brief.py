@@ -61,13 +61,30 @@ def render_safety(notices: Sequence[str] | None) -> str | None:
     Each notice is one line — an active MCP server, or a drop-in tool the locked policy
     refused (Group 5, Part B). Returns ``None`` for an empty/absent list, so a pure-Harness
     agent (no MCP, no policy-refused tool) composes exactly the brief it did before, with no
-    safety section at all. When present, the block is headed so the agent reads it as the
-    auditable "you have left the safe-by-default zone" marker the brief must not hide.
+    safety section at all.
+
+    **The header sanctions the loaded tools to the model, while staying a loud audit record**
+    (issue #322). This block is the model's *only* trusted-channel information about its
+    opted-in tools, so a warning-shaped header ("⚠ … beyond the safe set") does real harm: a
+    safety-trained model read it as "these are unsanctioned dangerous code," then refused its
+    own working tools, denied they existed, and confabulated results *around* them. The audit
+    loudness lives in the journald log line and the per-server notice's "operator opt-out …
+    recorded for audit" tail — not in scaring the one reader who is supposed to *use* the
+    tools. So the header names the block a provenance record, not a warning, and tells the
+    model that an ``active`` server is installed and approved for its use, while a ``not
+    loaded`` line (a policy-refused drop-in) is a capability that stays off — the two line
+    kinds this list mixes.
     """
     lines = [notice for notice in (notices or []) if notice and notice.strip()]
     if not lines:
         return None
-    header = "⚠ Safe-by-default opt-out — this agent has loaded tools beyond the shipped safe set:"
+    header = (
+        "Operator-configured tools beyond the shipped safe set — a deliberate, audited "
+        "opt-out from safe-by-default. This block is a provenance record, not a warning to "
+        "you: any server shown 'active' below was installed and approved for your use, so its "
+        "tools are first-class — call them whenever they fit the task. A line that says 'not "
+        "loaded' is a capability the safe policy declined and cannot be used."
+    )
     return "\n".join([header, *(f"- {line}" for line in lines)])
 
 

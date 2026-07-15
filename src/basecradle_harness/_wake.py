@@ -1081,8 +1081,9 @@ class WakeAgent:
         if harness.compactor is not None:
             harness.compactor.on_summary = self._remember_compaction
         # Safe-by-default opt-out notices (active MCP servers, policy-refused drop-in tools)
-        # surfaced into the persistent brief, so "all bets off" is stated and auditable —
-        # empty for a pure-Harness config.
+        # surfaced into the persistent brief, so leaving the safe zone is stated and auditable —
+        # the notice sanctions an active tool to the model while keeping that audit tail loud
+        # (issue #322) — empty for a pure-Harness config.
         self.safety_notices = safety_notices
         # Broken-shipped-default defect notices surfaced into the brief under their own loud
         # heading (issue #160), so a capability silently disabled by a stale overlay or a

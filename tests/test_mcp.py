@@ -161,10 +161,23 @@ def test_stdio_server_tools_activate_and_call_round_trips(tmp_path):
         assert not resolution.skipped
         # Opt-out is surfaced: a notice for the active server, and a per-tool manifest note.
         assert len(resolution.notices) == 1
-        assert "fake" in resolution.notices[0]
-        assert "safe-by-default" in resolution.notices[0]
+        notice = resolution.notices[0]
+        assert "fake" in notice
+        # The audit tail stays loud (issue #322)...
+        assert "safe-by-default" in notice
+        assert "recorded for audit" in notice
+        # ...while the model-facing body sanctions the tools rather than warning against them:
+        # no legacy "warning label" wording, and an explicit approval + anti-fabrication line.
+        assert "all bets off" not in notice
+        assert "external code you opted into" not in notice
+        assert "installed and approved for your use" in notice
+        assert "never report a tool result you did not get back" in notice
+        assert "fake__" in notice  # names the namespace the model calls the tools by
         assert resolution.manifest[0][0] == "fake__echo"
-        assert "MCP server" in resolution.manifest[0][1]
+        note = resolution.manifest[0][1]
+        assert "MCP server" in note
+        assert "approved for your use" in note
+        assert "beyond the safe-by-default tool set" not in note  # the 24×-repeated warning is gone
         # A tool call proxies to the server and back.
         tool = resolution.tools[0]
         assert tool.run(text="hi") == "echo: hi"
@@ -245,7 +258,7 @@ def test_colliding_sanitized_tool_names_dedup_not_crash(tmp_path):
         assert len(names) == len(set(names))  # no duplicate tool names reach the registry
         assert any("duplicate" in reason for _, reason in resolution.skipped)
         assert resolution.notices[0].startswith(
-            "MCP server 'dup' active (1 tool"
+            "MCP server 'dup' active with 1 tool(s)"
         )  # count is loaded
     finally:
         for client in resolution.clients:
@@ -657,9 +670,28 @@ def test_render_safety_blocks_for_notices_else_none():
     assert render_safety(None) is None
     block = render_safety(["MCP server 'x' active", "Tool 'y' refused"])
     assert block is not None
-    assert "opt-out" in block
+    assert "opt-out" in block  # still an audited opt-out marker
     assert "- MCP server 'x' active" in block
     assert "- Tool 'y' refused" in block
+
+
+def test_render_safety_header_sanctions_rather_than_warns():
+    """The header must read as a provenance record, not a warning label (issue #322).
+
+    A safety-trained model given only a warning-shaped header ("⚠ … beyond the safe set")
+    refused its own opted-in MCP tools, denied they existed, and confabulated results around
+    them. The header now tells the model an ``active`` server is approved for its use, while
+    still naming the audited opt-out — so both line kinds this block mixes read correctly.
+    """
+    block = render_safety(["MCP server 'x' active with 3 tool(s)"])
+    assert block is not None
+    # Sanctions the tools to the reader that is supposed to use them.
+    assert "not a warning to you" in block
+    assert "installed and approved for your use" in block
+    assert "first-class" in block
+    # The legacy alarm framing that caused the refusals is gone.
+    assert "⚠" not in block
+    assert "loaded tools beyond the shipped safe set" not in block
 
 
 def test_compose_brief_places_safety_after_manifest():
