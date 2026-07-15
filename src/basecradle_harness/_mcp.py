@@ -724,7 +724,7 @@ class McpResolution:
     Args:
         tools: The instantiated `McpTool` proxies for every active server's tools.
         manifest: ``(name, note)`` for each, for the Turn-0 brief's tool block — the note
-            marks the tool as coming from an MCP server (beyond the safe-by-default set).
+            marks the tool's MCP provenance and sanctions its use (issue #322).
         skipped: ``(server, reason)`` for every server that failed to load — the visible
             "why isn't this server here?" trail, mirroring Group-2 activation.
         notices: One safe-by-default opt-out line per active server, surfaced in the brief.
@@ -858,13 +858,33 @@ def _safe_close(client: McpClient | None) -> None:
 
 
 def _tool_note(server: str) -> str:
-    """The per-tool manifest note marking an MCP-sourced tool in the Turn-0 brief."""
-    return f"via MCP server {server!r} — beyond the safe-by-default tool set"
+    """The per-tool manifest note marking an MCP-sourced tool in the Turn-0 brief.
+
+    Repeated on *every* tool line (a 24-tool server writes it 24 times), so it is a strong
+    signal channel — and until issue #322 it repeated a warning ("beyond the safe-by-default
+    tool set") 24 times, reinforcing the model's read that these tools were off-limits. It now
+    repeats a sanction instead: provenance plus "approved for your use." The audit marker rides
+    the per-server notice and the journald log, not this per-line note.
+    """
+    return f"from MCP server {server!r} — installed and approved for your use"
 
 
 def _opt_out_notice(server: str, count: int) -> str:
-    """The one-line safe-by-default opt-out notice for an active server, surfaced in the brief."""
+    """The per-server safe-by-default opt-out notice for an active server, surfaced in the brief.
+
+    Sanctions the tools to the model while keeping the audit tail loud (issue #322). The prior
+    wording — "external code you opted into; all bets off" — was written for the operator's
+    audit trail but *read by the model*, which then refused the very tools this notice announces.
+    So it now states plainly that the server was deliberately installed and approved for the
+    agent's use, names the ``<server>__…`` namespace the tools are called by (a model handed the
+    bare names still would not call them), and closes the observed fabrication hole ("never report
+    a tool result you did not get back from a real call"). The "operator opt-out … recorded for
+    audit" tail keeps the safe-by-default record loud without poisoning the tools.
+    """
+    prefix = _sanitize(server)
     return (
-        f"MCP server {server!r} active ({count} tool(s)) — extends beyond the "
-        f"safe-by-default tool set (external code you opted into; all bets off)."
+        f"MCP server {server!r} active with {count} tool(s), named {prefix}__… — deliberately "
+        f"installed and approved for your use. They are first-class, working tools: call them to "
+        f"actually perform the work, and never report a tool result you did not get back from a "
+        f"real call. (An operator opt-out beyond the safe-by-default tool set, recorded for audit.)"
     )

@@ -7,6 +7,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.79.0] - 2026-07-15
+
+### Changed: the Turn-0 MCP opt-out notice sanctions the tools to the model (issue #322)
+
+The brief's safe-by-default opt-out notice was worded for the **operator's audit trail** ("external
+code you opted into; all bets off") but is **read by the model** — its only trusted-channel
+information about its own opted-in MCP tools. In the live Playwright pilot on @jt (harness 0.78.0),
+the plumbing was perfect — 24 tools loaded into the model's payload every wake — yet the model
+**never once** called a browser tool: a safety-trained model told, in its own brief, that specific
+tools were unsanctioned dangerous external code refused them, **denied they existed** ("I don't have
+a live browser tool available"), and — most dangerously — **confabulated** a result it never
+browsed ("Per live PyPI page: latest version is 0.78.0"). The warning label written for the auditor
+was disabling the capability for the one reader meant to use it.
+
+Three model-facing surfaces now **sanction** the tools instead of warning against them, while the
+audit record stays loud:
+
+- **The per-server notice** (`_opt_out_notice`) states the server was *deliberately installed and
+  approved for the agent's use*, names the `<server>__…` namespace the tools are called by (a model
+  handed the bare names still would not call them), and closes the fabrication hole — *never report
+  a tool result you did not get back from a real call*. Its "an operator opt-out beyond the
+  safe-by-default tool set, recorded for audit" tail keeps the safe-by-default record intact.
+- **The per-tool manifest note** (`_tool_note`), repeated on *every* tool line (24× for a 24-tool
+  server), now repeats a sanction — provenance plus "installed and approved for your use" — rather
+  than reinforcing the warning 24 times.
+- **The safety-block header** (`render_safety`) is reframed from a `⚠ … beyond the shipped safe set`
+  alarm into a provenance record — *not a warning to you* — that names an `active` server as
+  approved-for-use and a `not loaded` line as a declined capability, so both line kinds this block
+  mixes read correctly.
+
+The **journald audit line** is unchanged — that is the loud, operator-facing channel and is
+supposed to stay loud. Only the model-read channel changed. No `initialize.md` change: the
+anti-fabrication guard rides the MCP notice, so a tool-less or adversarial persona never sees it.
+
 ## [0.78.0] - 2026-07-14
 
 ### Added: `--resolved-config` exposes the resolved MCP request timeout (issue #320)

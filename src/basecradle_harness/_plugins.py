@@ -313,7 +313,8 @@ class ResolvedTools:
         notices: Safe-by-default opt-out lines surfaced in the Turn-0 brief — one per active
             MCP server, plus any tool refused by the locked policy (Group 5, Part B). Empty
             for a pure-Harness config; populated only when the operator has knowingly left
-            the safe zone, so "all bets off" is stated and auditable, never silent.
+            the safe zone, so that departure is stated and auditable, never silent. The line
+            sanctions an active tool to the model while keeping its audit tail loud (issue #322).
         broken: Defect lines for **shipped-default** plugins that failed to load (issue #160)
             — distinct from `notices` (an intentional opt-out) and from `skipped` (a normal,
             expected activation miss). A broken default is a defect: the brief renders these
