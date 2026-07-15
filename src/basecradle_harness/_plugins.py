@@ -44,9 +44,13 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from basecradle_harness._install import _read_manifest, config_home, plugin_relevant_to
 from basecradle_harness._tools import Tool
+
+if TYPE_CHECKING:  # type-only: avoids importing the MCP subsystem at plugin-load time
+    from basecradle_harness._mcp import McpImageStore
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -331,6 +335,10 @@ class ResolvedTools:
             NOC's fleet-drift audit compares declared-vs-active stems like-for-like, holding no
             stem→name map of its own. Empty for a config with no opt-in tool active (the safe
             default).
+        mcp_images: The per-wake MCP image store (issue #318), set only when an MCP server's tools
+            loaded. It rides the resolved set from `_merge_mcp_tools` to the hosting agent, which
+            threads it into the `PlatformContext` so the assets ``post_image`` action can post an
+            image an MCP tool returned. ``None`` for any config with no active MCP image source.
     """
 
     tools: list[Tool] = field(default_factory=list)
@@ -340,6 +348,11 @@ class ResolvedTools:
     notices: list[str] = field(default_factory=list)
     broken: list[str] = field(default_factory=list)
     opt_in_stems: list[str] = field(default_factory=list)
+    #: The per-wake MCP image store (issue #318), set only when an MCP server's tools loaded. It
+    #: rides the resolved set from `_merge_mcp_tools` to the hosting agent, which threads it into
+    #: the `PlatformContext` so the assets ``post_image`` action can post a returned image. ``None``
+    #: for any config with no active MCP image source (the common case).
+    mcp_images: McpImageStore | None = None
 
 
 def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> ResolvedTools:

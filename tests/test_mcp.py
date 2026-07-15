@@ -16,11 +16,16 @@ import pytest
 import respx
 
 from basecradle_harness import (
+    Engine,
     McpServerConfig,
     McpTool,
+    Message,
     Policy,
     ResolvedTools,
     Tool,
+    ToolCall,
+    ToolRegistry,
+    ToolResult,
     compose_brief,
     install,
     load_mcp_configs,
@@ -31,11 +36,18 @@ from basecradle_harness._basecradle import _apply_safe_policy, _merge_mcp_tools
 from basecradle_harness._mcp import (
     HttpMcpClient,
     McpError,
+    McpImageStore,
     _render_tool_result,
     _sse_response,
     mcp_tool_name,
 )
 from basecradle_harness._policy import SHELL
+
+# A 1×1 PNG, base64 — a real, decodable image for the image-block tests.
+_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4"
+    "2mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 # A minimal MCP server over stdio: initialize → tools/list (one `echo` tool) → tools/call.
 # Written to a temp file and launched with the test interpreter, so the stdio transport is
@@ -158,6 +170,46 @@ def test_stdio_server_tools_activate_and_call_round_trips(tmp_path):
         assert tool.run(text="hi") == "echo: hi"
         # The tool carries the server's declared schema.
         assert tool.parameters["properties"]["text"]["type"] == "string"
+    finally:
+        for client in resolution.clients:
+            client.close()
+
+
+def test_stdio_image_result_becomes_a_toolresult_and_is_stashed_for_posting(tmp_path):
+    # A server whose one tool returns an image block: load_mcp_tools must wire a shared image
+    # store onto the resolution, and the tool's run() must return a ToolResult (vision) *and*
+    # stash the bytes there for the assets post_image path (issue #318).
+    script = tmp_path / "shot.py"
+    script.write_text(
+        "import json, sys\n"
+        "def send(m):\n"
+        '    sys.stdout.write(json.dumps(m) + "\\n"); sys.stdout.flush()\n'
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if not line: continue\n"
+        "    req = json.loads(line); rid = req.get('id')\n"
+        "    if rid is None: continue\n"
+        "    if req['method'] == 'initialize':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'protocolVersion':'2025-06-18'}})\n"
+        "    elif req['method'] == 'tools/list':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'tools':["
+        "{'name':'screenshot','description':'shot','inputSchema':{}}]}})\n"
+        "    elif req['method'] == 'tools/call':\n"
+        "        send({'jsonrpc':'2.0','id':rid,'result':{'content':["
+        f"{{'type':'image','data':'{_PNG_B64}','mimeType':'image/png'}}]}}}})\n",
+        encoding="utf-8",
+    )
+    _drop_config(tmp_path, "browser", {"command": sys.executable, "args": [str(script)]})
+    resolution = load_mcp_tools(tmp_path, timeout=10)
+    try:
+        assert resolution.images is not None  # the store was wired onto the resolution
+        (tool,) = resolution.tools
+        result = tool.run()
+        assert isinstance(result, ToolResult)
+        assert len(result.images) == 1
+        # The same store the tool stashed into is the one carried on the resolution.
+        assert len(resolution.images) == 1
+        assert resolution.images.get("latest").mimetype == "image/png"
     finally:
         for client in resolution.clients:
             client.close()
@@ -303,7 +355,8 @@ def test_http_transport_lists_and_calls(tmp_path):
     try:
         tools = client.list_tools()
         assert [t["name"] for t in tools] == ["ping"]
-        assert client.call_tool("ping", {}) == "pong"
+        # call_tool returns the raw JSON-RPC result dict now; rendering is McpTool.run's job.
+        assert _render_tool_result(client.call_tool("ping", {})) == "pong"
         # The session id from initialize is echoed on later requests.
         later = route.calls[-1].request
         assert later.headers.get("mcp-session-id") == "sess-1"
@@ -349,8 +402,152 @@ def test_render_tool_result_marks_errors_and_non_text():
     assert _render_tool_result(
         {"content": [{"type": "text", "text": "nope"}], "isError": True}
     ) == ("Error: nope")
-    assert "[image content]" in _render_tool_result({"content": [{"type": "image", "data": "x"}]})
+    # A non-image, non-text block (an embedded resource) keeps the by-type placeholder.
+    assert "[resource content]" in _render_tool_result(
+        {"content": [{"type": "resource", "resource": {}}]}
+    )
+    # An image block with undecodable data degrades to a describing placeholder, not a crash.
+    assert "could not decode" in _render_tool_result({"content": [{"type": "image", "data": "!!"}]})
     assert _render_tool_result({}) == "(the tool returned no content)"
+
+
+# --- image content: vision inlining (Req A) + stashing for post_image (Req B) --
+
+
+def test_render_image_block_inlines_as_vision_and_stashes_with_a_handle():
+    store = McpImageStore()
+    result = _render_tool_result(
+        {
+            "content": [
+                {"type": "text", "text": "shot"},
+                {"type": "image", "data": _PNG_B64, "mimeType": "image/png"},
+            ]
+        },
+        store,
+    )
+    # It becomes a ToolResult so the engine can route the pixels into vision input.
+    assert isinstance(result, ToolResult)
+    assert len(result.images) == 1
+    assert result.images[0].url.startswith("data:image/png;base64,")
+    assert result.images[0].alt == "mcp-image-1"
+    # The text carries both the tool's own text and an honest placeholder naming the handle
+    # and how to post it — what a *non-vision* model reads in place of the picture.
+    assert "shot" in result.text
+    assert "mcp-image-1" in result.text
+    assert "image/png" in result.text
+    assert "post_image" in result.text
+    # And the bytes are stashed for the post_image path, keyed by that handle.
+    assert len(store) == 1
+    assert store.get("mcp-image-1").mimetype == "image/png"
+
+
+def test_render_image_block_without_a_store_still_inlines_but_offers_no_post_handle():
+    # The library/test path (no per-wake store): vision still works; there is just nothing to
+    # stash, so the placeholder names no reference and does not advertise post_image.
+    result = _render_tool_result(
+        {"content": [{"type": "image", "data": _PNG_B64, "mimeType": "image/png"}]}
+    )
+    assert isinstance(result, ToolResult)
+    assert len(result.images) == 1
+    assert "post_image" not in result.text
+    assert "mcp-image" not in result.text
+
+
+def test_render_image_block_unsupported_type_is_stashed_but_not_inlined():
+    # A non-viewable image type (a model can't take it as input) is described and stashed for the
+    # post path, but never inlined as vision — so the result is a plain str with no images.
+    store = McpImageStore()
+    result = _render_tool_result(
+        {"content": [{"type": "image", "data": _PNG_B64, "mimeType": "image/bmp"}]}, store
+    )
+    assert isinstance(result, str)  # no vision image → no ToolResult
+    assert "not viewable" in result
+    assert "post_image" in result  # still postable
+    assert len(store) == 1
+
+
+def test_render_image_block_over_the_size_ceiling_is_described_not_stored(monkeypatch):
+    # An image over MAX_IMAGE_BYTES is neither inlined nor stashed — just described — so the store
+    # (and the transcript) stay bounded.
+    import basecradle_harness._mcp as mcp
+
+    monkeypatch.setattr(mcp, "MAX_IMAGE_BYTES", 4)
+    store = McpImageStore()
+    result = _render_tool_result(
+        {"content": [{"type": "image", "data": _PNG_B64, "mimeType": "image/png"}]}, store
+    )
+    assert isinstance(result, str)
+    assert "too large" in result
+    assert len(store) == 0
+
+
+def test_image_store_is_a_bounded_ring_with_latest_and_by_handle_lookup():
+    store = McpImageStore(cap=2)
+    h1 = store.stash("image/png", b"one")
+    h2 = store.stash("image/png", b"two")
+    assert (h1, h2) == ("mcp-image-1", "mcp-image-2")
+    assert store.get("latest").data == b"two"
+    assert store.get(None).data == b"two"  # omitted ref → latest
+    assert store.get("mcp-image-1").data == b"one"
+    # A third stash evicts the oldest; its handle is never reused.
+    h3 = store.stash("image/png", b"three")
+    assert h3 == "mcp-image-3"
+    assert len(store) == 2
+    assert store.get("mcp-image-1") is None  # evicted
+    assert store.get("latest").data == b"three"
+
+
+def test_render_image_result_feeds_the_engines_vision_fork_both_ways():
+    """The MCP-rendered `ToolResult` drives the same vision gate `view` does (issues #316/#318).
+
+    Proven end-to-end: a tool returning exactly what `_render_tool_result` produces is shown to a
+    vision model and withheld from a text-only one — the fork the harness relies on to keep a
+    non-vision agent from ever receiving an image part.
+    """
+    store = McpImageStore()
+    rendered = _render_tool_result(
+        {"content": [{"type": "image", "data": _PNG_B64, "mimeType": "image/png"}]}, store
+    )
+
+    class _Shot(Tool):
+        name = "shot"
+        description = "Return a screenshot."
+
+        def run(self, **kwargs):
+            return rendered
+
+    class _Scripted:
+        def __init__(self, *replies, vision):
+            self._replies = list(replies)
+            self._vision = vision
+            self.seen = []
+
+        def chat(self, messages, tools=None):
+            self.seen.append(
+                [Message(role=m.role, content=m.content, images=list(m.images)) for m in messages]
+            )
+            return self._replies.pop(0)
+
+        def supports_vision(self):
+            return self._vision
+
+    def _run(vision):
+        provider = _Scripted(
+            Message.assistant(tool_calls=[ToolCall(id="c1", name="shot", arguments={})]),
+            Message.assistant(content="done"),
+            vision=vision,
+        )
+        registry = ToolRegistry()
+        registry.register(_Shot())
+        Engine(provider, registry).run([Message.user("take a screenshot")])
+        return provider
+
+    # Vision model: the pixels reach the model on the second call.
+    seen_vision = _run(True).seen[1]
+    assert any(m.images for m in seen_vision)
+    # Text-only model: no pixels anywhere — an honest note stands in instead.
+    seen_blind = _run(False).seen[1]
+    assert not any(m.images for m in seen_blind)
 
 
 def test_sse_response_finds_matching_id_ignoring_notifications():
@@ -429,11 +626,15 @@ def test_merge_mcp_tools_extends_set_and_carries_notices():
         manifest = [("s__echo", "via MCP server 's'")]
         skipped = [("dead", "did not load")]
         notices = ["MCP server 's' active"]
+        images = McpImageStore()
 
-    out = _merge_mcp_tools(base, _FakeMcpResolution())
+    fake = _FakeMcpResolution()
+    out = _merge_mcp_tools(base, fake)
     assert [t.name for t in out.tools] == ["plain", "s__echo"]
     assert out.skipped == [("dead", "did not load")]
     assert out.notices == ["MCP server 's' active"]
+    # The per-wake image store is carried onto the resolved set, so the assets tool can reach it.
+    assert out.mcp_images is fake.images
 
 
 def test_merge_mcp_tools_empty_is_noop():

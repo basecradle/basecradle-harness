@@ -107,8 +107,11 @@ class AssetsTool(PlatformTool):
         "an image you just posted) so you can actually see it and describe or reason "
         "about it; action='create' "
         "uploads a new file from the text content you provide, with a filename and an "
-        "optional description. Operations use the current timeline unless you pass a "
-        "timeline uuid. "
+        "optional description; action='post_image' posts an image a tool just returned "
+        "(such as a browser screenshot from an MCP tool) to the timeline — pass its "
+        "reference in 'image' (e.g. 'mcp-image-1', shown in the tool result, or 'latest' "
+        "for the most recent), so you can share what you captured even if you cannot see it "
+        "yourself. Operations use the current timeline unless you pass a timeline uuid. "
         "Assets are shared with every viewer and can never be edited or deleted — prefer "
         "your own storage for private or working files; upload what is meant for the peers here."
     )
@@ -117,7 +120,7 @@ class AssetsTool(PlatformTool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "read", "view", "create"],
+                "enum": ["list", "read", "view", "create", "post_image"],
                 "description": "What to do.",
             },
             "uuid": {
@@ -127,6 +130,14 @@ class AssetsTool(PlatformTool):
                     "'latest' for the most recent file on the timeline — e.g. an image "
                     "you just generated and posted, so you can view it without being "
                     "handed its uuid."
+                ),
+            },
+            "image": {
+                "type": "string",
+                "description": (
+                    "The reference of a captured image to post (post_image only) — e.g. "
+                    "'mcp-image-1' as shown in a tool result, or 'latest' for the most "
+                    "recently captured image. Defaults to the latest capture if omitted."
                 ),
             },
             "content": {
@@ -160,6 +171,7 @@ class AssetsTool(PlatformTool):
         filename: str | None = None,
         description: str | None = None,
         timeline: str | None = None,
+        image: str | None = None,
     ) -> str | ToolResult:
         """Dispatch on `action`. Returns a message written for the model to read.
 
@@ -190,7 +202,12 @@ class AssetsTool(PlatformTool):
             if content is None or not filename:
                 return "Error: 'create' needs both 'content' and a 'filename'."
             return self._create(target, content, filename, description, key)
-        return f"Error: unknown action {action!r}. Use 'list', 'read', 'view', or 'create'."
+        if action == "post_image":
+            return self._post_image(target, image, filename, description)
+        return (
+            f"Error: unknown action {action!r}. Use 'list', 'read', 'view', "
+            "'create', or 'post_image'."
+        )
 
     # --- uuid resolution -----------------------------------------------------
 
@@ -313,6 +330,52 @@ class AssetsTool(PlatformTool):
         self.acted("asset", asset.content.uuid)  # a file on a timeline is a visible act (#293)
         return f"Uploaded {filename!r} ({asset.content.file.byte_size} bytes). {_describe(asset)}"
 
+    # --- post_image ----------------------------------------------------------
+
+    def _post_image(
+        self,
+        timeline: str,
+        image: str | None,
+        filename: str | None,
+        description: str | None,
+    ) -> str:
+        """Post an image an MCP tool returned (a browser screenshot) to the timeline (issue #318).
+
+        The "show me what you see" path, and it is **independent of the model's vision**: the bytes
+        were stashed in the per-wake `McpImageStore` when the tool returned them, so a text-only
+        agent can share a screenshot it cannot itself see. `image` is the reference the tool result
+        named (``mcp-image-1``), or ``'latest'`` / omitted for the most recent capture.
+
+        Uploads through the same asset-create path as everything else — but with **no idempotency
+        key**, exactly like a generated image's upload (`_upload`, `generate_image`). That is
+        deliberate and load-bearing: the bytes live only in the volatile store, so a killed-and-
+        resumed wake cannot reconstruct them, which means the create must never be re-issued by the
+        recovery. Routing it through the keyed ``create`` action would classify it as a replayable
+        create (`_idempotency.CREATE_CALLS`) and the resume would try — and fail — to replay bytes
+        that no longer exist; a distinct action keeps it out of that set entirely.
+        """
+        store = self.context.mcp_images
+        if store is None or len(store) == 0:
+            return (
+                "Error: no captured images to post. An image only becomes postable after a tool "
+                "(e.g. a browser screenshot) returns one this wake; captures do not survive a "
+                "restart."
+            )
+        ref = (image or "latest").strip()
+        stashed = store.get(ref)
+        if stashed is None:
+            return (
+                f"Error: no captured image {ref!r}. Use the reference shown in the tool result "
+                "(e.g. 'mcp-image-1'), or 'latest' for the most recent capture."
+            )
+        name = filename or _capture_filename(stashed.mimetype)
+        asset = _upload(self.context.client, timeline, stashed.data, name, description)
+        self.acted("asset", asset.content.uuid)  # a file on a timeline is a visible act (#293)
+        return (
+            f"Posted {name!r} ({asset.content.file.byte_size} bytes) from capture {ref!r}. "
+            f"{_describe(asset)}"
+        )
+
 
 # --- shared rendering / type helpers -----------------------------------------
 
@@ -386,6 +449,21 @@ def _media_type(content_type: str) -> str:
     data URL it builds can never disagree on the same input.
     """
     return content_type.split(";", 1)[0].strip().lower()
+
+
+# The extension a `post_image` capture is named with when the model gives no filename,
+# by media type. An unknown type falls back to ``.img`` — the bytes upload either way.
+_CAPTURE_EXTENSIONS = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+
+def _capture_filename(content_type: str) -> str:
+    """A default filename for a posted capture (``capture.png``) from its media type."""
+    return f"capture.{_CAPTURE_EXTENSIONS.get(_media_type(content_type), 'img')}"
 
 
 def _is_text(content_type: str) -> bool:

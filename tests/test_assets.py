@@ -18,8 +18,11 @@ import pytest
 import respx
 from basecradle import BaseCradle
 
-from basecradle_harness import AssetsTool, PlatformContext, PlatformError, ToolResult
+from basecradle_harness import AssetsTool, PlatformContext, PlatformError, ToolCall, ToolResult
 from basecradle_harness._assets import model_sees_images
+from basecradle_harness._idempotency import create_kind
+from basecradle_harness._mcp import McpImageStore
+from basecradle_harness._unspoken import SpeechLedger
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -471,6 +474,123 @@ def test_create_uploads_the_produced_text_as_a_named_file(tool):
 def test_create_requires_content_and_filename(tool):
     assert "needs both" in tool.run(action="create", content="x")
     assert "needs both" in tool.run(action="create", filename="x.txt")
+
+
+# --- post_image: "show me what you see" (issue #318) -------------------------
+
+
+def _img_tool(client, store, speech=None):
+    """An AssetsTool bound to John's timeline with a per-wake MCP image `store`."""
+    t = AssetsTool()
+    t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID, mcp_images=store, speech=speech))
+    return t
+
+
+def _capture_upload_mock(mock, *, filename, content_type="image/png"):
+    """Wire the timeline-resolve GET + the assets POST, capturing the multipart body."""
+    captured = {}
+
+    def capture(request):
+        captured["body"] = request.content
+        captured["headers"] = request.headers
+        return httpx.Response(
+            201,
+            json={
+                "asset": asset(
+                    uuid=A_IMG,
+                    filename=filename,
+                    content_type=content_type,
+                    byte_size=len(PNG_BYTES),
+                    url=IMG_URL,
+                )
+            },
+        )
+
+    mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
+        return_value=httpx.Response(200, json=_timeline_envelope())
+    )
+    mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/assets").mock(side_effect=capture)
+    return captured
+
+
+def test_post_image_uploads_a_stashed_capture_by_handle(client):
+    store = McpImageStore()
+    handle = store.stash("image/png", PNG_BYTES)
+    speech = SpeechLedger()
+    tool = _img_tool(client, store, speech=speech)
+
+    with respx.mock(assert_all_called=True) as mock:
+        captured = _capture_upload_mock(mock, filename="capture.png")
+        result = tool.run(action="post_image", image=handle)
+
+    assert "Posted 'capture.png'" in result
+    assert PNG_BYTES in captured["body"]  # the stashed bytes were uploaded
+    assert b"capture.png" in captured["body"]  # a default filename derived from the mime type
+    # It records a visible act on the timeline (issue #293), like create/generate_image.
+    assert speech.acts and speech.acts[-1][0] == "asset"
+
+
+def test_post_image_defaults_to_the_latest_capture(client):
+    store = McpImageStore()
+    store.stash("image/png", b"old")
+    store.stash("image/jpeg", PNG_BYTES)  # newest
+    tool = _img_tool(client, store)
+
+    with respx.mock(assert_all_called=True) as mock:
+        captured = _capture_upload_mock(mock, filename="capture.jpg", content_type="image/jpeg")
+        result = tool.run(action="post_image")  # no image ref → latest
+
+    assert "Posted 'capture.jpg'" in result
+    assert PNG_BYTES in captured["body"]  # the newest capture, not the older one
+    assert b"capture.jpg" in captured["body"]  # jpeg → .jpg default name
+
+
+def test_post_image_honors_an_explicit_filename_and_description(client):
+    store = McpImageStore()
+    store.stash("image/png", PNG_BYTES)
+    tool = _img_tool(client, store)
+
+    with respx.mock(assert_all_called=True) as mock:
+        captured = _capture_upload_mock(mock, filename="homepage.png")
+        tool.run(action="post_image", filename="homepage.png", description="the landing page")
+
+    assert b"homepage.png" in captured["body"]
+    assert b"the landing page" in captured["body"]
+
+
+def test_post_image_carries_no_idempotency_key(client):
+    # The bytes live only in the volatile store, so the create must never be re-issued by a
+    # recovery — it is keyless, exactly like a generated image's upload (issue #318). Two proofs:
+    # the header is absent on the upload, and the call is not a keyed create in the ordinal count.
+    store = McpImageStore()
+    store.stash("image/png", PNG_BYTES)
+    tool = _img_tool(client, store)
+
+    with respx.mock(assert_all_called=True) as mock:
+        captured = _capture_upload_mock(mock, filename="capture.png")
+        tool.run(action="post_image")
+
+    assert "Idempotency-Key" not in captured["headers"]
+    assert create_kind(ToolCall(id="c", name="assets", arguments={"action": "post_image"})) is None
+
+
+def test_post_image_with_no_captures_is_a_clean_error(client):
+    # An empty store, or no store bound at all (no MCP configured), both explain there is nothing
+    # to post rather than crashing.
+    empty = _img_tool(client, McpImageStore())
+    assert "no captured images" in empty.run(action="post_image")
+
+    unbound = AssetsTool()
+    unbound.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))  # mcp_images=None
+    assert "no captured images" in unbound.run(action="post_image")
+
+
+def test_post_image_unknown_reference_is_a_clean_error(client):
+    store = McpImageStore()
+    store.stash("image/png", PNG_BYTES)
+    tool = _img_tool(client, store)
+    result = tool.run(action="post_image", image="mcp-image-99")
+    assert "no captured image 'mcp-image-99'" in result
 
 
 # --- cross-timeline + validation + binding -----------------------------------

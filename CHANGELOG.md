@@ -7,6 +7,44 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.77.0] - 2026-07-14
+
+### Added: MCP image content — vision inlining + screenshot-to-asset (issue #318)
+
+An image an MCP tool returns is no longer collapsed to a bare `[image content]` placeholder. This is
+Phase 2 of browser use: Phase 1 puts a Playwright MCP server on the fleet, and its `take_screenshot`
+tool returns an image block the harness could not use. Two independent capabilities close that gap,
+and the second deliberately does **not** depend on the first.
+
+**Vision inlining (vision models).** `_render_tool_result` now decodes an image block and hands it to
+the model as **vision input** — the tool returns a `ToolResult` carrying an `ImageContent`, which the
+engine routes into the model's input exactly as the assets tool's `view` action does. The fleet
+deliberately mixes vision and text-only models, so this rides the engine's **existing** vision gate
+(`_show_images` + `model_sees_images`, issue #316): a model that *definitely* has no image input
+(`z-ai/glm-5.2`, `input_modalities:["text"]`) is never handed the pixels — the engine substitutes an
+honest withheld note, and the tool result's text placeholder names the image's type and size on every
+path. The tool always attaches the image and lets the engine decide (the body/brain split — the tool
+has no view of the model). No config knob was needed: the modality answer is the same
+`supports_vision` capability #316 already reads, so **the NOC has nothing new to set** for the vision
+path.
+
+**Screenshot-to-asset, "show me what you see" (all models).** An image an MCP tool returns is stashed
+in a per-wake, in-memory `McpImageStore` under a short handle (`mcp-image-1`) the placeholder names,
+and the assets tool gains a `post_image` action that posts it to the timeline by that handle (or
+`latest`). This works **regardless of the model's vision**, so a text-only agent can *share* a
+screenshot it cannot itself see — Requirement B does not depend on Requirement A. The upload carries
+**no idempotency key** and is never re-issued by a recovery, exactly like a generated image's upload
+(`_upload`, `generate_image`): the bytes live only in the volatile store, so a killed-and-resumed
+wake cannot reconstruct them, and a distinct action keeps the call out of `_idempotency.CREATE_CALLS`
+entirely (routing it through the keyed `create` action would classify it as a replayable create and
+the resume would try — and fail — to replay bytes that no longer exist). The store is bounded in
+count and dies with the wake, so it adds nothing to what a wake replays.
+
+The `McpImageStore` threads from `load_mcp_tools` → `McpResolution` → `ResolvedTools` → the hosting
+agent → the `PlatformContext`, the same path the code-execution bridge already uses. With `mcp/`
+empty (the default) nothing changes: no store is bound, and `post_image` reports cleanly that there
+are no captures to post.
+
 ## [0.76.0] - 2026-07-14
 
 ### Fixed: the `view` tool gates on vision too, so a text-only model is never blind-sent pixels (issue #316)

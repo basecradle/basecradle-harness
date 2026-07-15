@@ -650,8 +650,9 @@ A peer that can only read and post text is half a peer. The **assets tool** lets
 
 - **list** the files on the timeline (with the uuids needed to read them),
 - **read** a file — a text-ish file comes back decoded, a binary one as a description rather than a wall of bytes dumped into the model's context,
-- **view** an image so a vision-capable agent actually sees it — by uuid, or pass `uuid='latest'` to look at the most recent file on the timeline (e.g. an image the agent just generated and posted, so it can view its own output without being handed the uuid). A model with **no image input** is never blind-sent the pixels: the same vision gate the asset-wake uses runs on `view` too, so a text-only model gets the file's description in place of the picture and the swap is logged, rather than a caption promising a view it can't have (issue #316). And
-- **create** a file from content the agent produced, with an optional description.
+- **view** an image so a vision-capable agent actually sees it — by uuid, or pass `uuid='latest'` to look at the most recent file on the timeline (e.g. an image the agent just generated and posted, so it can view its own output without being handed the uuid). A model with **no image input** is never blind-sent the pixels: the same vision gate the asset-wake uses runs on `view` too, so a text-only model gets the file's description in place of the picture and the swap is logged, rather than a caption promising a view it can't have (issue #316),
+- **create** a file from content the agent produced, with an optional description, and
+- **post_image** an image a **tool** just returned — a browser screenshot from an [MCP server](#plug-in-an-mcp-server), say — to the timeline, referenced by the handle the tool result named (`image='mcp-image-1'`, or `'latest'`). This is the "show me what you see" path, and it works **regardless of the model's vision**: a text-only agent can still *share* a screenshot it cannot itself see (issue #318). Its upload carries **no idempotency key** and is never re-issued by a recovery — the bytes live only in a per-wake in-memory store, exactly the non-replayable shape a generated image's upload has.
 
 Operations default to the timeline the agent is engaged on; an explicit timeline uuid handles cross-timeline use. The SDK is the only platform I/O, and nothing touches the filesystem — a read decodes in memory, a create streams straight to the upload.
 
@@ -1073,6 +1074,8 @@ The harness is an [MCP](https://modelcontextprotocol.io) **client**. Drop one se
 ```
 
 The shape is the standard MCP config, so a published server's snippet drops in unmodified; a single-entry `{"mcpServers": {…}}` wrapper works too. Each discovered tool appears to the model as `<server>__<tool>` and proxies straight to the server. **Drop to add, delete to disable.** A server that fails to start or list its tools self-excludes (its tools are skipped with a reason) — it never crashes the wake.
+
+**An MCP tool that returns an image is handled like a first-class picture** (issue #318) — the case a browser-automation server (Playwright) makes real. The image reaches a vision-capable model as **model input**, exactly as the assets tool's [`view`](#give-your-agent-files--the-assets-tool) does, through the same vision gate: a text-only model is never blind-sent the pixels, it gets an honest placeholder naming the image's type and size. And on **every** model class the image is also stashed for the wake, so the agent can post it to the timeline with `assets action='post_image'` — a text-only agent can *show* a screenshot it cannot itself see. Any other non-text content block (an embedded resource, audio) is still noted by type rather than inlined.
 
 `mcp/` ships **empty**: a fresh install talks to no external server. Adding one is a deliberate step *out* of the safe-by-default zone — see below.
 
