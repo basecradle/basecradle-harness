@@ -349,6 +349,7 @@ _XAI_DEFAULTS = {
     "grok_generate_image",
     "grok_edit_image",
     "grok_generate_video",
+    "xai_account_balance",
 }
 
 
@@ -396,6 +397,19 @@ def test_opting_a_power_tool_into_the_overlay_activates_it_subject_to_availabili
     assert "grok_generate_image" in {t.name for t in under_xai.tools}
     under_openai = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))
     assert "grok_generate_image" not in {t.name for t in under_openai.tools}  # availability gate
+
+
+def test_opting_in_xai_account_balance_activates_under_xai_only(tmp_path):
+    # The billing tool (issue #179) is opt-in and xai-affine, exactly like the grok media tools:
+    # it scaffolds only on explicit opt-in, activates under the xai provider, and self-excludes
+    # under openai (which has no equivalent balance surface).
+    home = tmp_path / "cfg"
+    install(home, provider="xai", opt_in=["xai_account_balance"])
+    assert (home / "tools" / "xai_account_balance.py").exists()
+    under_xai = resolve_plugins(load_plugins(home), _ctx(provider="xai", AI_API_KEY="xai-key"))
+    assert "xai_account_balance" in {t.name for t in under_xai.tools}
+    under_openai = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))
+    assert "xai_account_balance" not in {t.name for t in under_openai.tools}
 
 
 # --- OpenRouter provider lock-in (issue #234) --------------------------------

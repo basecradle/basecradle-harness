@@ -411,6 +411,7 @@ def test_every_shipped_power_tool_default_is_classified_opt_in():
         "code_execution",  # OpenAI Code Interpreter + xAI code execution + code_attach (issue #172)
         "system_prompt",  # self-authorship: read + edit own system-prompt.md (issue #241)
         "shell",  # full command-line access, unlocked-profile-only (issue #252)
+        "xai_account_balance",  # xAI Management API billing read, xai-only (issue #179)
     }
 
 

@@ -7,6 +7,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.80.0] - 2026-07-15
+
+### Added: `xai_account_balance` — an xAI agent can read its own prepaid credit balance (issue #179)
+
+A new **opt-in, xAI-only** tool that lets a cost-aware xAI persona (first target: **@briggs**) check
+the real-time prepaid credit balance of its **own** xAI account, so it can reason about its runway —
+throttle, prioritize cheap work, or ask a human to top up *before* it runs dry as a hard API failure —
+instead of discovering exhaustion mid-task.
+
+- **A billing surface, its own credential.** Unlike Live Search and the grok media tools (which ride
+  the inference key), this calls xAI's **Management API** (`management-api.x.ai`) with a dedicated
+  read-only **Management Key** (`XAI_MANAGEMENT_KEY`, scope `BillingRead`), never the agent's
+  `AI_API_KEY`. It is a plain read-only function tool — no shell, no platform client — that loads
+  under the locked profile once opted in.
+- **Opt-in + vendor-gated, like every powerful tool** (issue #168): off by default on every provider,
+  `requires=(Vendor("xai"),)` so it self-excludes on OpenAI/OpenRouter (no equivalent surface there),
+  and scaffolded only via `basecradle-harness-install --opt-in xai_account_balance`.
+- **Config:** `XAI_MANAGEMENT_KEY` (required for the opted-in agent) and optional `XAI_TEAM_ID`. The
+  team id is a **UUID**, not the literal `"default"` (which the endpoint rejects), so when `XAI_TEAM_ID`
+  is unset the tool **discovers the team from the key itself** (the management-key validation endpoint)
+  — a correctly-scoped key needs only the one variable.
+- **Verified against the live API** (a real account): the balance sits at `total.val` as a **string of
+  USD cents whose sign is inverted** — credit added is stored negative — so the available balance in
+  dollars is the *negated* cents / 100 (the docs' own example: `val "-1000"` = `$10.00`). Getting this
+  wrong reports a healthy positive balance as a negative one; the tool (and its tests) pin the correct
+  math, and a live-marked smoke test (`tests/test_xai_account_live.py`) exercises it against the real
+  endpoint.
+- **Fails soft, never leaks.** A missing key, wrong scope, unreachable endpoint, or unexpected response
+  all return a clear `unavailable — <reason>` rather than derailing the wake, and neither the key nor
+  the raw billing payload (its purchase/invoice ledger) is ever logged or returned — only the one
+  balance figure.
+
 ## [0.79.0] - 2026-07-15
 
 ### Changed: the Turn-0 MCP opt-out notice sanctions the tools to the model (issue #322)
