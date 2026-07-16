@@ -1080,6 +1080,34 @@ The shape is the standard MCP config, so a published server's snippet drops in u
 
 **An MCP tool that returns an image is handled like a first-class picture** (issue #318) — the case a browser-automation server (Playwright) makes real. The image reaches a vision-capable model as **model input**, exactly as the assets tool's [`view`](#give-your-agent-files--the-assets-tool) does, through the same vision gate: a text-only model is never blind-sent the pixels, it gets an honest placeholder naming the image's type and size. And on **every** model class the image is also stashed for the wake, so the agent can post it to the timeline with `assets action='post_image'` — a text-only agent can *show* a screenshot it cannot itself see. Any other non-text content block (an embedded resource, audio) is still noted by type rather than inlined.
 
+### The X API through the `xurl` bridge — a worked example
+
+[X](https://x.com) publishes a hosted [MCP server](https://docs.x.com/tools/mcp) at `https://api.x.com/mcp` that lets an agent work X **as itself** — full-archive post search, user lookup, timelines and mentions, bookmarks, trends and news, and drafting Articles, all with its own account's scopes. It is a good end-to-end example of the drop-in above: a stdio server that owns an OAuth 2.0 login and injects a fresh Bearer token on every call, so the harness never sees a credential — only a `Popen`-spawned stdio process, exactly like any other local MCP server.
+
+You reach it through the open-source [`xurl`](https://github.com/xdevplatform/xurl) bridge, which handles the OAuth for you. Drop this into `mcp/x_mcp.json`:
+
+```jsonc
+// ~/.config/basecradle/mcp/x_mcp.json — the X API, user context (the agent acts as the account)
+{
+  "command": "xurl",
+  "args": ["mcp", "https://api.x.com/mcp"],
+  "env": { "CLIENT_ID": "your-x-app-client-id", "CLIENT_SECRET": "your-x-app-client-secret" }
+}
+```
+
+- **`CLIENT_ID` / `CLIENT_SECRET`** are your X app's OAuth 2.0 credentials (X Developer Portal → your app → *Keys and tokens*). The app must have OAuth 2.0 enabled and the redirect URI `http://localhost:8080/callback` registered (override it with a `REDIRECT_URI` env value). They live in the `env` block — passed to the bridge **literally** via `Popen(env=…)`, never shell-expanded — so keep the file `chmod 600`.
+- **Prefer the native `xurl` binary over `npx`.** X's own examples use `"command": "npx", "args": ["-y", "@xdevplatform/xurl", "mcp", …]`, which is zero-install and fine to try. But the harness spawns the stdio server **fresh on every wake**, and `npx -y` re-resolves (and can re-download) the package each time — which can outrun `HARNESS_MCP_TIMEOUT` (default 20 s) and make the server intermittently self-exclude. Install it once (`npm install -g @xdevplatform/xurl`) and spawn the binary directly, as above. If token refresh on a busy account still trips the timeout, raise `HARNESS_MCP_TIMEOUT`.
+- **Headless first-run login.** With no cached token the bridge opens a browser and blocks until you sign in — impossible on a headless box. Authenticate **once, out of band, as the same OS user the agent runs as**, then the bridge silently reuses and auto-refreshes the cached token (`~/.xurl`) forever after:
+
+  ```bash
+  export CLIENT_ID=…; export CLIENT_SECRET=…   # the env block applies to the bridge, not to a manual xurl run
+  xurl auth oauth2 --headless                   # prints an auth URL; sign in on any device and paste the code back
+  ```
+
+  The login authorizes **whichever X account is signed in** when you complete it — sign in as the account you want the agent to act as. Treat `~/.xurl` and the cached token as secrets.
+
+An **app-only Bearer** variant — `{ "url": "https://api.x.com/mcp", "headers": { "Authorization": "Bearer …" } }` — needs no bridge and no login, but is **read-only with no user context**: the agent can search and read, but cannot act as the account. Use the bridge for anything the agent does *as itself*.
+
 `mcp/` ships **empty**: a fresh install talks to no external server. Adding one is a deliberate step *out* of the safe-by-default zone — see below.
 
 ## Add your own provider
