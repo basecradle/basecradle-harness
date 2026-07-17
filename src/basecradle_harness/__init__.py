@@ -125,6 +125,7 @@ from basecradle_harness._wake import (
     MarkStore,
     ReadPacer,
     SeenStore,
+    StaleTimelineError,
     WakeAgent,
     WakeBreaker,
 )
@@ -160,6 +161,7 @@ __all__ = [
     "WakeBreaker",
     "BreakerDecision",
     "ReadPacer",
+    "StaleTimelineError",
     # The persistent Turn-0 operating brief
     "compose_brief",
     "render_manifest",

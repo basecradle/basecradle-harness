@@ -41,6 +41,7 @@ from basecradle_harness import (
     MessagesTool,
     ReadPacer,
     SeenStore,
+    StaleTimelineError,
     Tool,
     WakeAgent,
     WakeBreaker,
@@ -605,6 +606,33 @@ def _locked_problem():
     }
 
 
+def _not_found_problem():
+    """An RFC 9457 problem doc for a deleted (or never-existed) timeline — the platform's 404.
+
+    The exact body the wake bootstrap fetch sees when a delivery references a timeline the
+    agent has since deleted (issue #327): `code: not_found`, so the SDK raises `NotFoundError`.
+    """
+    return {
+        "status": 404,
+        "code": "not_found",
+        "title": "Not Found",
+        "detail": "No record exists for the given UUID.",
+    }
+
+
+def _not_a_viewer_problem():
+    """An RFC 9457 problem doc for a timeline the agent may not view — the platform's 403.
+
+    A `ForbiddenError`, **not** a `NotFoundError`: the sharpest neighbor of the deleted-timeline
+    skip, and the one the skip must *not* swallow (issue #327 — 403 keeps failing loudly)."""
+    return {
+        "status": 403,
+        "code": "not_a_viewer",
+        "title": "Forbidden",
+        "detail": "You are not a viewer of this timeline.",
+    }
+
+
 def test_a_locked_timeline_refusal_reaches_the_model_instead_of_crashing(platform, tmp_path):
     """B2: a post refused by a locked timeline degrades — and now the *model* is the one told.
 
@@ -641,6 +669,61 @@ def test_main_returns_zero_on_a_locked_timeline(platform, wake_env):
     )
 
     assert main(["--timeline", TIMELINE_UUID]) == 0
+
+
+def test_a_deleted_timeline_at_bootstrap_raises_the_stale_signal(platform, tmp_path):
+    """The narrow translation (issue #327): the bootstrap timeline fetch's not-found 404 becomes
+    the `StaleTimelineError` skip signal — and it carries the uuid so `main` can name it.
+
+    This pins the *scope*: the signal is minted at the one place the wake first reads its
+    timeline record, so a 404 anywhere else stays an ordinary `NotFoundError` that exits 1."""
+    platform.get(f"/timelines/{TIMELINE_UUID}").mock(
+        return_value=httpx.Response(404, json=_not_found_problem())
+    )
+
+    with pytest.raises(StaleTimelineError) as caught:
+        build_wake(tmp_path)  # construction does the bootstrap fetch
+
+    assert caught.value.timeline == TIMELINE_UUID
+
+
+def test_main_skips_cleanly_on_a_deleted_timeline(platform, wake_env, caplog):
+    """Issue #327 end to end: a delivery for a since-deleted timeline is *expected staleness*,
+    not a fault. The bootstrap fetch 404s, and the entrypoint skips — one non-ERROR line, exit 0 —
+    so the router records `outcome=ok` and does not retry a wake that can never succeed (turning
+    one stale delivery into three failed attempts and a Wake Failures alarm was the whole bug).
+    """
+    platform.get(f"/timelines/{TIMELINE_UUID}").mock(
+        return_value=httpx.Response(404, json=_not_found_problem())
+    )
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        assert main(["--timeline", TIMELINE_UUID]) == 0
+
+    # One clear skip line, at INFO — the record the operator's flight recorder keeps.
+    skip = _line(caplog, "wake skipped")
+    assert f"timeline={TIMELINE_UUID}" in skip
+    assert "reason=timeline_deleted" in skip
+    # And crucially it is *not* an error: nothing failed, so no ERROR line and no alarm-worthy noise.
+    assert _lines(caplog, "ERROR") == []
+    assert not any(m.startswith("wake failed") for m in _lines(caplog))
+
+
+def test_main_still_fails_loudly_on_a_forbidden_timeline(platform, wake_env, caplog):
+    """The scope of the skip, proven at its sharpest edge (issue #327): a **403** at bootstrap —
+    a timeline the agent may not view — is *not* a `NotFoundError`, so it is not swallowed. It
+    keeps failing loudly (ERROR + exit 1), exactly as every transient and auth failure must, so
+    the router's retries and alarms still fire on the faults they exist for."""
+    platform.get(f"/timelines/{TIMELINE_UUID}").mock(
+        return_value=httpx.Response(403, json=_not_a_viewer_problem())
+    )
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        assert main(["--timeline", TIMELINE_UUID]) == 1
+
+    errors = _lines(caplog, "ERROR")
+    assert any(m.startswith("wake failed") and TIMELINE_UUID in m for m in errors)
+    assert not any(m.startswith("wake skipped") for m in _lines(caplog))  # never a benign skip
 
 
 def test_the_reserve_summary_is_unspoken_not_posted(platform, tmp_path, caplog):
