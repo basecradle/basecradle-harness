@@ -7,6 +7,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.80.1] - 2026-07-16
+
+### Fixed: a wake for a deleted timeline is a clean skip, not a hard failure (issue #327)
+
+When an agent rotates its HQ timeline — creating a fresh one and **deleting the old** — any
+`message.created` deliveries that queued behind the long wake still reference the *old* timeline.
+The router frees the per-agent lock, replays them, and every wake died at bootstrap: the timeline
+fetch returned the platform's not-found `404` (`No record exists for the given UUID.`), which the
+wake handler logged as an **ERROR** and exited `1`. The router (correctly, from its side) retries a
+nonzero exit 3×, so **one** stale delivery became **three** failed wake attempts — a Wake Failures
+alarm spike and failed bars on the Agent Operations dashboard every time a timeline is deleted with
+deliveries in flight. Observed live: `glm-5.2` burned ~9 failed attempts in 16 seconds rotating its
+HQ, and the pattern recurs on every rotation.
+
+- **A deleted timeline is expected staleness, not a fault.** Under BaseCradle's at-least-once,
+  best-effort push model, a delivery for a since-deleted timeline can never be delivered: the record
+  is gone and every retry fails byte-identically. So the wake's **bootstrap timeline fetch** now
+  translates the not-found `404` into a `StaleTimelineError`, and the `basecradle-harness-wake`
+  entrypoint catches it, logs one `wake skipped timeline=… reason=timeline_deleted` line at **INFO**,
+  and **exits `0`** — the router records `outcome=ok` and does not retry. No router-side change: an
+  exit `0` on a permanently-undeliverable wake makes the existing retry policy correct as-is. (A
+  deleted timeline and a never-existed UUID are indistinguishable at the API, and both are equally
+  undeliverable, so the same skip is right for both.)
+- **Scoped narrowly to the bootstrap 404, deliberately.** The skip wraps **only** the one place a
+  wake first reads its timeline record. Every other failure mode is unchanged and still exits `1`
+  loudly: a transient network error, a `5xx`, a timeout, an auth failure (`401`/`403` — including a
+  timeline the agent may not view), or a `404` on any *other* resource mid-wake. Those are exactly
+  the cases retries and alarms exist for, and they keep firing.
+
 ## [0.80.0] - 2026-07-15
 
 ### Added: `xai_account_balance` — an xAI agent can read its own prepaid credit balance (issue #179)

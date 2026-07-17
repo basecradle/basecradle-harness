@@ -83,7 +83,7 @@ from urllib.parse import quote, unquote
 from uuid import uuid4
 
 import httpx
-from basecradle import BaseCradle, BaseCradleError
+from basecradle import BaseCradle, BaseCradleError, NotFoundError
 
 from basecradle_harness._assets import _describe, _is_image, image_input, model_sees_images
 from basecradle_harness._basecradle import (
@@ -991,6 +991,31 @@ def _pace_max_builds_from_env() -> int:
     return max(1, int(raw))
 
 
+class StaleTimelineError(HarnessError):
+    """The wake's timeline no longer exists — a stale delivery, not a fault (issue #327).
+
+    Raised at the one place the wake first fetches its timeline record
+    (`WakeAgent.__init__`) when the platform answers the not-found 404 (``code:
+    not_found``): the delivery names a timeline that was deleted — most often the agent
+    rotated or deleted its own HQ timeline while this wake sat queued behind the
+    per-agent wake lock, but a never-existed UUID is indistinguishable at the API and is
+    equally undeliverable. Under BaseCradle's at-least-once, best-effort push this is
+    *expected staleness*: the record is gone, a retry can never succeed, and every retry
+    fails byte-identically. So `main` catches this **specific** signal, logs one skip
+    line, and exits 0 — the router records ``outcome=ok`` and does not retry, instead of
+    turning one stale delivery into three failed wake attempts and a Wake Failures alarm.
+
+    Deliberately narrow: it wraps only the bootstrap timeline fetch, so a 404 on any
+    *other* resource mid-wake, and every transient/auth failure (network, 5xx, 401/403),
+    still raise their own error and exit 1 exactly as before — those are what retries and
+    alarms exist for.
+    """
+
+    def __init__(self, timeline: str) -> None:
+        super().__init__(f"timeline {timeline} no longer exists (stale delivery)")
+        self.timeline = timeline
+
+
 class WakeAgent:
     """Answers one timeline's unseen messages in a single process, then is done.
 
@@ -1126,7 +1151,16 @@ class WakeAgent:
         # Loop-1 read-time seams — but shares the `HARNESS_PACE_ENABLED` kill switch: with
         # pacing off, Loop 2 does a single build and posts (see `_generate_settled`).
         self.max_builds = max(1, max_builds)
-        self.timeline = self.client.timelines.get(timeline)
+        # The bootstrap timeline fetch — the wake's first timeline-scoped read. A not-found
+        # 404 here means the delivery references a since-deleted (or never-existed) timeline:
+        # expected staleness under at-least-once push, not a fault. Translate it to the
+        # `StaleTimelineError` skip signal so `main` exits 0 instead of failing loudly and
+        # letting the router retry a permanently-undeliverable wake (issue #327). Scoped to
+        # this one fetch: every other failure (transient, auth, a 404 elsewhere) still raises.
+        try:
+            self.timeline = self.client.timelines.get(timeline)
+        except NotFoundError as gone:
+            raise StaleTimelineError(timeline) from gone
 
         # What this wake actually put on a timeline (issue #293). Now that the final text is never
         # auto-posted, the *only* messages that exist are the ones the model chose to create through
@@ -3918,6 +3952,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         agent = WakeAgent.from_env(timeline=args.timeline)
         agent.wake(trigger=args.message, event_trigger=args.event, asset_trigger=args.asset)
+    except StaleTimelineError:
+        # The delivery names a timeline the not-found 404 at bootstrap says no longer exists
+        # (an HQ rotation the agent itself did, a burst that outran a deletion, a never-existed
+        # UUID — all indistinguishable and all permanently undeliverable). Not a fault: skip
+        # cleanly with one non-ERROR line and exit 0, so the router records `outcome=ok` and
+        # does not retry a wake that can never succeed (issue #327). Every transient/auth failure
+        # still falls through to the loud exit 1 below — this catches *only* the bootstrap 404.
+        _log.info(
+            "wake skipped %s",
+            kv(timeline=args.timeline, delivery=delivery_id(), reason="timeline_deleted"),
+        )
+        return 0
     except (HarnessError, ProviderError, BaseCradleError, ValueError, KeyError) as error:
         # `_act_on` degrades the per-item failures (a locked-timeline post, the engine's
         # step cap) in flight, so a wake reaching a locked timeline still exits 0. A
