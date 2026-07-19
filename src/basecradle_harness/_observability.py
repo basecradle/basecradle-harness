@@ -38,6 +38,7 @@ model still receives the full text as its tool result, and the transcript keeps 
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import time
@@ -254,30 +255,68 @@ def log_llm_call(
     )
 
 
-def log_media_call(*, provider: str, kind: str, model: str, seconds: float) -> None:
-    """One INFO line per media generation: provider, what was made, and how long it took.
+def log_media_call(
+    *, provider: str, kind: str, model: str, seconds: float, cost: float | None = None
+) -> None:
+    """One INFO line per media generation: provider, what was made, how long it took, its cost.
 
     ``kind`` is the shape of the work (``image.generate``, ``image.edit``, ``video.generate``,
     ``audio.transcribe``) — the media endpoints are slow and expensive, so their duration is the
     number an operator actually wants. A *failed* generation is not logged here: the engine's
     per-tool line already carries its duration and error text, and a second line would only say
     the same thing twice.
+
+    ``cost`` is the dollar charge **as the provider stated it**, when it stated one — the same
+    honest-absence contract `log_llm_call` keeps, rendered through the same `_money` formatter, so a
+    media line's ``cost=`` is byte-identical to an LLM line's (see `_money` for the one cost
+    convention that spans both). It is the field that makes media generation visible to the tool-cost
+    dashboard: xAI reports the exact charge for image and video generation on the wire
+    (``usage.cost_in_usd_ticks``) and the grok media cells pass it here; OpenAI reports no media cost
+    on any endpoint, so ``cost`` stays ``None`` there and the field is simply omitted. Never derived
+    from a price table of the harness's own — the rule the LLM line's cost obeys, extended to media.
     """
-    _log.info("media %s", kv(provider=provider, kind=kind, model=model, duration=_secs(seconds)))
+    _log.info(
+        "media %s",
+        kv(provider=provider, kind=kind, model=model, duration=_secs(seconds), cost=_money(cost)),
+    )
+
+
+class MediaCall:
+    """The mutable handle `media_timer` yields, so a caller can record the provider-stated cost.
+
+    A media call's charge is knowable only *after* the vendor responds and its body is read — which
+    happens inside the timed block. So the timer hands back this handle; the tool sets ``cost`` from
+    the response body (a plain USD float, or ``None`` when the provider states none) and the timer
+    logs it on a clean exit. A block that never sets it — every OpenAI media path, which has no cost
+    to report — leaves it ``None``, and the line omits ``cost=`` exactly as before.
+    """
+
+    __slots__ = ("cost",)
+
+    def __init__(self) -> None:
+        self.cost: float | None = None
 
 
 @contextmanager
-def media_timer(*, provider: str, kind: str, model: str) -> Iterator[None]:
+def media_timer(*, provider: str, kind: str, model: str) -> Iterator[MediaCall]:
     """Time a media generation and log it — the call-site form of `log_media_call`.
 
     Wraps just the vendor call, so the duration is the *generation*, not the Asset upload that
     follows it (an operator asking "why did that take two minutes?" means the model, not the
-    file transfer). A block that raises logs nothing and lets the error through untouched: the
-    tool relays the failure to the model and the engine's tool line records it.
+    file transfer). Yields a `MediaCall` whose ``cost`` the caller may set from the response body;
+    it is logged on a clean exit. A block that raises logs nothing and lets the error through
+    untouched: the tool relays the failure to the model and the engine's tool line records it.
     """
+    call = MediaCall()
     started = time.monotonic()
-    yield
-    log_media_call(provider=provider, kind=kind, model=model, seconds=time.monotonic() - started)
+    yield call
+    log_media_call(
+        provider=provider,
+        kind=kind,
+        model=model,
+        seconds=time.monotonic() - started,
+        cost=call.cost,
+    )
 
 
 def token_counts(usage: Any) -> dict[str, int]:
@@ -390,11 +429,30 @@ def _money(cost: Any) -> str | None:
     stays short; a genuine zero renders as ``0`` rather than vanishing, because "this call was
     free" is a fact worth logging.
 
+    **The one cost convention, across every line kind.** ``cost=`` is emitted by the LLM line, the
+    media line, and any future line for a provider-billed call, all through this one formatter — so
+    it is always plain decimal USD, ``cost=([0-9.]+)``-matchable, whatever the kind. That uniformity
+    is load-bearing: the dashboard splits **LLM cost** from **tool cost** on the line *head*
+    (`` llm provider=`` vs everything else), not on the cost field. So the invariant is exactly that
+    ``cost=`` keeps this shape on every kind, and the `` llm provider=`` head never appears on a
+    non-LLM line (a media line begins ``media ``). A call carries ``cost=`` **when, and only when,
+    the provider states the figure** — never derived from a price table of the harness's own, because
+    a stale table is worse than an honest gap (OpenRouter's ``usage.cost``, xAI's ticks; OpenAI
+    states none, and the field is absent).
+
     Typed loosely on purpose: the figure comes straight off a vendor object (`Response.cost_usd`),
     so anything that is not a real number — ``None``, a string, a bool — is dropped rather than
-    formatted, and observability never breaks a turn over a vendor's surprise.
+    formatted, and observability never breaks a turn over a vendor's surprise. That guard extends to
+    the two shapes that *are* numbers yet would render **un-``cost=([0-9.]+)``-matchable** and so
+    slip a call silently out of the dashboard's rollup: a **negative** figure (``cost=-0.02`` — the
+    ``-`` is outside the pattern) and a **non-finite** one (a body carrying ``NaN``/``Infinity``,
+    which stdlib ``json`` decodes without complaint → ``cost=nan``/``cost=inf``). A charge is never
+    either, so a vendor that reports one is a surprise the field is *omitted* for — honest absence,
+    the same as any other unreadable cost — rather than logged in a shape the extraction can't read.
     """
     if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None
+    if not math.isfinite(cost) or cost < 0:
         return None
     return f"{cost:.8f}".rstrip("0").rstrip(".")
 

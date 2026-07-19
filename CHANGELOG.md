@@ -7,6 +7,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.81.0] - 2026-07-19
+
+### Added: the media line logs the provider-reported `cost=` for xAI image/video generation (issue #329)
+
+The per-generation **media** journal line now carries a `cost=` — the exact dollars xAI charged —
+so a grok image or video generation is no longer invisible dollars on the fleet's *Tool Cost by
+Agent* dashboard. Before this, `log_media_call` logged provider/kind/model/duration only, and every
+@eddie-murphy / @briggs media call spent real money the dashboard could not see (one 15s 720p clip
+is ~$2.10).
+
+- **Only the provider's own figure, never a price table.** xAI reports the exact charge on the REST
+  wire for image *and* video generation, not just chat — `usage.cost_in_usd_ticks` (1 tick =
+  1e-10 USD; the pinned `xai_sdk`'s own `cost.py` names the constant). The grok media cells parse it
+  off the response body and convert; the standing rule holds — the harness derives no cost from a
+  table of its own, so a call logs `cost=` **when, and only when, the provider states it**.
+- **The async video charge rides the completed `done` poll body** — verified against the SDK and
+  docs.x.ai, not assumed. The submit returns only a `request_id` (no usage); `usage` appears on the
+  final poll response that carries the finished clip (the REST analog of the SDK's `VideoResponse`),
+  so `_await_video` returns `(url, cost)` and the cost is read there. Image generate/edit read it off
+  their sync response body.
+- **OpenAI states no media cost, so the field is simply absent there** — the same honest-absence
+  contract the LLM line's `cost` already keeps, rendered through the same `_money` formatter. A media
+  `cost=` is byte-identical to an LLM `cost=` (plain decimal USD, `cost=([0-9.]+)`-matchable). The
+  dashboard splits **LLM cost** from **tool cost** on the line *head* (`llm provider=` vs `media …`),
+  never on the cost field, so that shape is a load-bearing invariant across both line kinds. To keep
+  it airtight, the shared `_money` formatter now also omits a **negative** or **non-finite**
+  (`NaN`/`Infinity`) figure — a charge is never either, and logging one in a shape the extraction
+  can't read would slip a call silently out of the rollup — hardening both line kinds at once.
+- **`media_timer` yields a `MediaCall` handle** whose `.cost` a tool sets from the response body
+  (the charge is knowable only after the vendor responds, inside the timed block); the timer logs it
+  on a clean exit, and a block that raises still logs nothing. OpenAI media paths leave the handle
+  untouched, so they log no `cost=` — a pure, backward-compatible addition.
+
 ## [0.80.1] - 2026-07-16
 
 ### Fixed: a wake for a deleted timeline is a clean skip, not a hard failure (issue #327)

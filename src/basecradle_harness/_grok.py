@@ -89,6 +89,31 @@ DEFAULT_TIMEOUT = 300.0
 DEFAULT_POLL_INTERVAL = 5.0
 DEFAULT_POLL_MAX_WAIT = 600.0
 
+#: xAI states a media call's charged cost natively — an integer count of *ticks* in the response's
+#: ``usage`` object, where 1 tick = 1e-10 USD (docs.x.ai → Cost Tracking; the pinned ``xai_sdk``'s
+#: own ``cost.py`` names the constant). The chat path reads it through the SDK's ``cost_usd``
+#: accessor (`_xai_sdk.py`); these REST media tools parse the raw JSON body, so they apply the same
+#: tick→dollar conversion here — never harness price arithmetic, only xAI's own stated figure.
+_USD_PER_TICK = 1e-10
+
+
+def _media_cost_usd(body: Any) -> float | None:
+    """The dollar cost of an xAI media call from its REST response body, or ``None`` if absent.
+
+    xAI reports the exact charge on the wire for image and video generation, not just chat, under
+    ``usage.cost_in_usd_ticks`` (docs.x.ai → Cost Tracking). Read it where the provider states it
+    and convert by the tick constant. A body carrying no usage/cost — an older API, an unexpected
+    shape, a non-numeric field — yields ``None``, so the media line simply logs no ``cost=``: the
+    same honest absence an OpenAI media call has, never a fabricated figure. For the **async video
+    flow** the usage rides the completed (``done``) poll body (the REST analog of the SDK's final
+    ``VideoResponse``), not the submit response, which returns only a ``request_id``.
+    """
+    usage = body.get("usage") if isinstance(body, dict) else None
+    ticks = usage.get("cost_in_usd_ticks") if isinstance(usage, dict) else None
+    if isinstance(ticks, bool) or not isinstance(ticks, (int, float)):
+        return None
+    return float(ticks) * _USD_PER_TICK
+
 
 class _GrokMediaTool(PlatformTool):
     """Shared base for the grok media tools: the xAI key, the HTTP plumbing, the upload.
@@ -237,8 +262,9 @@ class GrokGenerateImageTool(_GrokMediaTool):
             payload["resolution"] = resolution
 
         try:
-            with media_timer(provider="xai", kind="image.generate", model=self._model):
+            with media_timer(provider="xai", kind="image.generate", model=self._model) as call:
                 body = self._request(key, "POST", "images/generations", json=payload)
+                call.cost = _media_cost_usd(body)  # xAI states the charge on the sync body
             image_bytes = decode_image_payload(
                 body, download=_download, subject="the xAI image API"
             )
@@ -350,8 +376,9 @@ class GrokEditImageTool(_GrokMediaTool):
                 payload["image"] = sources[0]
             else:
                 payload["images"] = sources
-            with media_timer(provider="xai", kind="image.edit", model=self._model):
+            with media_timer(provider="xai", kind="image.edit", model=self._model) as call:
                 body = self._request(key, "POST", "images/edits", json=payload)
+                call.cost = _media_cost_usd(body)  # xAI states the charge on the sync body
             image_bytes = decode_image_payload(
                 body, download=_download, subject="the xAI image API"
             )
@@ -498,10 +525,11 @@ class GrokGenerateVideoTool(_GrokMediaTool):
             if image:
                 payload["image_url"] = self._source_image_url(image)
             # The timed span is submit → done (the poll loop *is* the generation on this
-            # endpoint); the clip download that follows is transfer, not model time.
-            with media_timer(provider="xai", kind="video.generate", model=self._model):
+            # endpoint); the clip download that follows is transfer, not model time. The charge
+            # rides the completed `done` poll body, so cost comes back from `_await_video`.
+            with media_timer(provider="xai", kind="video.generate", model=self._model) as call:
                 request_id = self._submit(key, payload)
-                video_url = self._await_video(key, request_id)
+                video_url, call.cost = self._await_video(key, request_id)
             video_bytes = _download(video_url)
         except ProviderConnectionError as exc:
             return f"Error generating video: could not reach the xAI video API: {exc}"
@@ -538,8 +566,13 @@ class GrokGenerateVideoTool(_GrokMediaTool):
             raise ProviderError("the xAI video API did not return a request_id.")
         return str(request_id)
 
-    def _await_video(self, key: str, request_id: str) -> str:
-        """Poll the job until it is ``done`` and return the produced video URL.
+    def _await_video(self, key: str, request_id: str) -> tuple[str, float | None]:
+        """Poll the job until it is ``done`` and return ``(video url, cost in USD | None)``.
+
+        The cost rides the **completed (``done``) poll body**: xAI reports
+        ``usage.cost_in_usd_ticks`` on the response carrying the finished clip, not on the submit
+        (which returns only a ``request_id``). ``None`` when that body states no cost, so the media
+        line logs none — the same honest absence every other unreported call gets.
 
         Raises a legible `ProviderError` if the job ``failed``/``expired`` (relaying xAI's own
         message) or does not finish within ``poll_max_wait`` — never a silent hang or an opaque
@@ -554,7 +587,7 @@ class GrokGenerateVideoTool(_GrokMediaTool):
                 url = video.get("url") if isinstance(video, dict) else None
                 if not url:
                     raise ProviderError("the xAI video API finished but returned no video url.")
-                return str(url)
+                return str(url), _media_cost_usd(body)
             if status in ("failed", "expired"):
                 error = body.get("error")
                 detail = error.get("message") if isinstance(error, dict) else error
