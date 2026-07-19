@@ -7,6 +7,7 @@ emitters are asserted through `caplog`.
 """
 
 import logging
+import re
 
 from basecradle_harness._observability import (
     delivery_id,
@@ -269,6 +270,28 @@ def test_a_cost_that_is_not_a_number_is_dropped_rather_than_crashing_the_wake(ca
     assert "cost=" not in caplog.records[0].getMessage()
 
 
+def test_a_negative_or_non_finite_cost_is_omitted_so_the_line_stays_greppable(caplog):
+    """`cost=` must stay `cost=([0-9.]+)`-matchable, or the call slips silently out of the
+    dashboard's rollup. A negative (`cost=-0.02`) or non-finite (`cost=nan`/`cost=inf`, which
+    stdlib `json` decodes without complaint) figure would break that — a charge is never either,
+    so the field is omitted rather than logged un-matchable. Both line kinds share `_money`."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=-0.02)
+        log_media_call(
+            provider="xai", kind="video.generate", model="grok-imagine-video", seconds=1, cost=-1.0
+        )
+        log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=float("inf"))
+        log_media_call(
+            provider="xai",
+            kind="image.generate",
+            model="grok-imagine-image-quality",
+            seconds=1,
+            cost=float("nan"),
+        )
+
+    assert all("cost=" not in r.getMessage() for r in caplog.records)
+
+
 # --- the media line ----------------------------------------------------------
 
 
@@ -303,6 +326,97 @@ def test_a_failed_generation_logs_nothing_and_lets_the_error_through(caplog):
     # The tool relays the failure to the model and the engine's tool line records it; a media
     # line here would time a call that never produced anything.
     assert not caplog.records
+
+
+# --- the provider-reported cost on the media line (issue #329) ---------------
+#
+# xAI reports the exact charge for image and video generation on the wire, so a media generation
+# is real money the tool-cost dashboard must see. The cost rides the same `_money` formatter as the
+# LLM line, so a media `cost=` is byte-identical to an LLM `cost=` — the dashboard splits LLM cost
+# from tool cost on the line *head*, never on the cost field.
+
+_COST_RE = re.compile(r"(?:^| )cost=([0-9.]+)(?: |$)")
+
+
+def test_the_media_line_carries_the_cost_when_the_provider_states_it(caplog):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_media_call(
+            provider="xai",
+            kind="video.generate",
+            model="grok-imagine-video",
+            seconds=61,
+            cost=2.1,  # one 15s 720p clip ≈ $2.10 — real dollars, previously invisible
+        )
+
+    assert caplog.records[0].getMessage() == (
+        "media provider=xai kind=video.generate model=grok-imagine-video duration=61.00s cost=2.1"
+    )
+
+
+def test_the_media_line_omits_cost_when_the_provider_states_none(caplog):
+    """OpenAI reports no media cost on any endpoint — the field is absent, not a fabricated `cost=0`."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_media_call(provider="openai", kind="image.generate", model="gpt-image-2", seconds=3.4)
+
+    assert "cost=" not in caplog.records[0].getMessage()
+
+
+def test_a_non_numeric_media_cost_is_dropped_rather_than_crashing_the_wake(caplog):
+    """A media cost comes straight off a vendor body, so a surprise there costs the *field*, never
+    the turn — the same guard the LLM cost has, since both render through `_money`."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_media_call(
+            provider="xai",
+            kind="image.generate",
+            model="grok-imagine-image-quality",
+            seconds=2,
+            cost="free",  # type: ignore[arg-type]
+        )
+
+    assert "cost=" not in caplog.records[0].getMessage()
+
+
+def test_media_and_llm_cost_render_in_the_same_plain_decimal_shape(caplog):
+    """Item 4 of #329: `cost=` must stay `cost=([0-9.]+)`-matchable — the same shape — on every
+    line kind, and the ` llm provider=` head must never appear on a non-LLM line."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=0.0038)
+        log_media_call(
+            provider="xai",
+            kind="image.generate",
+            model="grok-imagine-image-quality",
+            seconds=2,
+            cost=0.0038,
+        )
+
+    llm, media = (r.getMessage() for r in caplog.records[:2])
+    assert _COST_RE.search(llm).group(1) == "0.0038"
+    assert _COST_RE.search(media).group(1) == "0.0038"  # identical, plain decimal, on both kinds
+    # The head split the dashboard keys on: a media line is never mistaken for an LLM line.
+    assert media.startswith("media ") and not media.startswith("llm ")
+
+
+def test_the_media_timer_logs_the_cost_recorded_on_its_handle(caplog):
+    """The charge is known only after the vendor responds, inside the timed block — so the timer
+    yields a handle the tool sets, and logs it on a clean exit."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        with media_timer(
+            provider="xai", kind="image.generate", model="grok-imagine-image-quality"
+        ) as call:
+            call.cost = 0.02
+
+    line = caplog.records[0].getMessage()
+    assert line.startswith("media provider=xai kind=image.generate")
+    assert "cost=0.02" in line
+
+
+def test_the_media_timer_omits_cost_when_its_handle_is_left_unset(caplog):
+    """Every OpenAI media path leaves the handle untouched — the line carries no `cost=`."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        with media_timer(provider="openai", kind="image.generate", model="gpt-image-2"):
+            pass
+
+    assert "cost=" not in caplog.records[0].getMessage()
 
 
 # --- the delivery id and the provider descriptor -----------------------------

@@ -77,8 +77,12 @@ def video_tool(client):
     return t
 
 
-def image_b64(data=JPEG_BYTES):
-    return {"data": [{"b64_json": base64.b64encode(data).decode("ascii")}]}
+def image_b64(data=JPEG_BYTES, cost_ticks=None):
+    body = {"data": [{"b64_json": base64.b64encode(data).decode("ascii")}]}
+    if cost_ticks is not None:
+        # xAI states the charge on the response body: usage.cost_in_usd_ticks (1 tick = 1e-10 USD).
+        body["usage"] = {"cost_in_usd_ticks": cost_ticks}
+    return body
 
 
 def image_url_body():
@@ -510,3 +514,140 @@ def test_a_video_generation_times_the_submit_and_poll_span(video_tool, caplog):
 
     line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
     assert "kind=video.generate" in line and "provider=xai" in line
+
+
+# --- the provider-reported cost on the media line (issue #329) ---------------
+
+
+def _media_line(caplog):
+    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+
+
+def test_media_cost_usd_converts_ticks_and_degrades_to_none():
+    """The tick→dollar conversion, and the honest-absence guard: a body with no numeric cost yields
+    None (never a fabricated figure), so the media line simply omits `cost=`."""
+    from basecradle_harness._grok import _media_cost_usd
+
+    # xAI's own documented example: 200000000 ticks = $0.02 (1 tick = 1e-10 USD).
+    assert _media_cost_usd({"usage": {"cost_in_usd_ticks": 200000000}}) == pytest.approx(0.02)
+    assert _media_cost_usd({"usage": {"cost_in_usd_ticks": 0}}) == 0.0
+    # No usage, empty usage, or a non-numeric field → None, never a guess.
+    assert _media_cost_usd({"data": []}) is None
+    assert _media_cost_usd({"usage": {}}) is None
+    assert _media_cost_usd({"usage": {"cost_in_usd_ticks": None}}) is None
+    assert _media_cost_usd({"usage": {"cost_in_usd_ticks": "lots"}}) is None
+    assert _media_cost_usd({"usage": {"cost_in_usd_ticks": True}}) is None  # a bool is not a cost
+    assert _media_cost_usd(None) is None
+
+
+def test_image_media_line_carries_the_xai_reported_cost(image_tool, caplog):
+    import logging
+
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        # 200000000 ticks = $0.02 — the figure straight off xAI's cost-tracking docs.
+        mock.post(IMAGES_URL).mock(
+            return_value=httpx.Response(200, json=image_b64(cost_ticks=200000000))
+        )
+        _mock_upload(mock, captured)
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            image_tool.run(prompt="a neon skyline")
+
+    line = _media_line(caplog)
+    assert "kind=image.generate" in line
+    assert "cost=0.02" in line
+
+
+def test_image_media_line_omits_cost_when_xai_states_none(image_tool, caplog):
+    """A body with no usage block must not invent a cost — the field is simply absent."""
+    import logging
+
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(IMAGES_URL).mock(return_value=httpx.Response(200, json=image_b64()))
+        _mock_upload(mock, captured)
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            image_tool.run(prompt="a neon skyline")
+
+    assert "cost=" not in _media_line(caplog)
+
+
+def test_edit_media_line_carries_the_xai_reported_cost(edit_tool, caplog):
+    import logging
+
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID)
+        # 300000000 ticks = $0.03.
+        mock.post(EDITS_URL).mock(
+            return_value=httpx.Response(200, json=image_b64(cost_ticks=300000000))
+        )
+        _mock_upload(mock, captured)
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            edit_tool.run(image=SOURCE_UUID, prompt="recolor the car red")
+
+    line = _media_line(caplog)
+    assert "kind=image.edit" in line
+    assert "cost=0.03" in line
+
+
+def test_video_media_line_carries_cost_from_the_done_poll_body_not_the_submit(video_tool, caplog):
+    """The determination this issue asked to verify, pinned: the async video charge rides the
+    completed `done` poll body (xAI's final response), not the submit — which returns only a
+    request_id. The pending poll carries no usage either, so a cost on the line can only have come
+    from `done`."""
+    import logging
+
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        # The submit returns only a request_id — deliberately no usage/cost here.
+        mock.post(VIDEOS_URL).mock(
+            return_value=httpx.Response(200, json={"request_id": REQUEST_ID})
+        )
+        # Pending (no usage), then done (usage present) — 21000000000 ticks = $2.10, a 15s 720p clip.
+        mock.get(f"{XAI_BASE}/videos/{REQUEST_ID}").mock(
+            side_effect=[
+                httpx.Response(200, json={"status": "pending"}),
+                httpx.Response(
+                    200,
+                    json={
+                        "status": "done",
+                        "video": {"url": f"{XAI_BASE}/clips/out.mp4", "duration": 15},
+                        "usage": {"cost_in_usd_ticks": 21000000000},
+                    },
+                ),
+            ]
+        )
+        mock.get(f"{XAI_BASE}/clips/out.mp4").mock(
+            return_value=httpx.Response(200, content=MP4_BYTES)
+        )
+        _mock_upload(mock, captured)
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            video_tool.run(prompt="a drone shot over the ocean", duration=15)
+
+    line = _media_line(caplog)
+    assert "kind=video.generate" in line
+    assert "cost=2.1" in line
+
+
+def test_video_media_line_omits_cost_when_the_done_body_states_none(video_tool, caplog):
+    import logging
+
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(VIDEOS_URL).mock(
+            return_value=httpx.Response(200, json={"request_id": REQUEST_ID})
+        )
+        mock.get(f"{XAI_BASE}/videos/{REQUEST_ID}").mock(
+            return_value=httpx.Response(
+                200, json={"status": "done", "video": {"url": f"{XAI_BASE}/clips/out.mp4"}}
+            )
+        )
+        mock.get(f"{XAI_BASE}/clips/out.mp4").mock(
+            return_value=httpx.Response(200, content=MP4_BYTES)
+        )
+        _mock_upload(mock, captured)
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            video_tool.run(prompt="a drone shot over the ocean")
+
+    assert "cost=" not in _media_line(caplog)
