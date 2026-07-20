@@ -782,8 +782,9 @@ def test_a_turn_the_hook_was_still_extending_is_not_read_as_finished(tmp_path):
     """A terminal narration is the **last** thing in a turn's work, not merely present in it.
 
     `Engine.run` returns on `not reply.tool_calls and not extend` — and *both* shipped turn hooks
-    extend on exactly that shape (the mention informer nudges an agent that was addressed and did
-    nothing; the code bridge harvests a run's files and feeds their uuids back). Scanning backwards
+    extend on exactly that shape (the no-reply informer nudges an agent whose turn ended with nothing
+    done when the message called for a reply; the code bridge harvests a run's files and feeds their
+    uuids back). Scanning backwards
     for "an assistant turn with text and no tool calls" therefore finds a turn that was still being
     extended and calls it finished: the claim settles, the mark advances, and no wake ever looks at
     that message again.

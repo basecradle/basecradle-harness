@@ -112,7 +112,10 @@ def full_dashboard():
 
 
 def timeline():
-    # The timeline-get envelope is two keys: the timeline subject and its items.
+    # The timeline-get envelope is two keys: the timeline subject and its items. A **three-viewer
+    # group** (john owner, nova the agent, briggs) — deliberately not a one-on-one, so the poll
+    # agent's no-reply informer keeps its *one-on-one* arm (issue #332) out of these poll-mechanics
+    # tests. The one-on-one path has its own coverage in `test_unspoken.py`.
     return {
         "timeline": {
             "uuid": TIMELINE_UUID,
@@ -122,7 +125,13 @@ def timeline():
             "updated_at": "2026-06-02T00:00:00.000Z",
             "owner": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
             "participants": [
-                {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}
+                {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+                {
+                    "uuid": "019e7756-9f60-7a80-93a4-6f7081920314",
+                    "handle": "briggs",
+                    "name": "Briggs",
+                    "kind": "ai",
+                },
             ],
         },
         "items": [],

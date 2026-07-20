@@ -256,7 +256,7 @@ class CodeExecutionBridge:
         The bridge is not a `PlatformTool` (it is the engine's turn hook), so it records by hand
         rather than through `PlatformTool.acted`. It records at all because these uploads are *not*
         bookkeeping-neutral: a harvested output file lands on the timeline where every viewer sees
-        it, so a turn that produced one is not a silent turn, and the mention informer (issue #293)
+        it, so a turn that produced one is not a silent turn, and the no-reply informer (issue #293)
         must not tell the model it did nothing.
         """
         speech = getattr(self._context, "speech", None)

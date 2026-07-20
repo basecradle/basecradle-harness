@@ -73,6 +73,9 @@ PNG_BYTES = b"\x89PNG\r\n\x1a\n fake pixels"
 
 NOVA_UUID = "019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"  # the agent (me)
 JOHN_UUID = "019e7750-66ee-7e50-9e54-3bf8c3d6a8f1"  # the human
+# A distinct peer AI (not the agent, not the human) — pacing's one target kind, and the third
+# viewer that makes the shared timeline a **group** rather than a one-on-one (see `timeline`).
+PEER_AI_UUID = "019e7756-9f60-7a80-93a4-6f7081920314"
 TIMELINE_UUID = "019e7750-66ee-7f53-829f-13a8a710b6da"
 
 # Well-formed UUIDv7 message ids, oldest → newest.
@@ -194,6 +197,15 @@ def dashboard():
 
 
 def timeline():
+    """A **three-viewer group** timeline: john (owner), nova (the agent), and briggs.
+
+    Deliberately a group, not a one-on-one. The reconcile and pacing suites here model rooms with a
+    third peer — the pacing tests post as `briggs`, a distinct peer AI — so a group is the honest,
+    consistent fixture for them, and it keeps the no-reply informer's *one-on-one* arm (issue #332)
+    out of these tests, which are about batching, pacing, recovery, and marks, not the backstop. The
+    one-on-one arming has its own dedicated coverage in `test_unspoken.py`, on a two-viewer fixture
+    built for it.
+    """
     return {
         "timeline": {
             "uuid": TIMELINE_UUID,
@@ -203,7 +215,8 @@ def timeline():
             "updated_at": "2026-06-02T00:00:00.000Z",
             "owner": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
             "participants": [
-                {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}
+                {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+                {"uuid": PEER_AI_UUID, "handle": "briggs", "name": "Briggs", "kind": "ai"},
             ],
         },
         "items": [],
@@ -3038,9 +3051,6 @@ def test_activated_task_is_timestamped():
 # already fetches (the newest message's author `kind`, `body` length, `created_at`).
 # Human messages are unaffected (instant). These tests inject a fake clock and a
 # recording no-op sleep, so they assert the COMPUTED delay and never actually wait.
-
-# A distinct peer AI (not the agent, not the human) — pacing's one target kind.
-PEER_AI_UUID = "019e7756-9f60-7a80-93a4-6f7081920314"
 
 # The fixtures' `created_at` is `2026-06-04T00:00:00.000Z`; a clock pinned to that same
 # instant makes a message's age exactly 0, so the paced delay is the full read-time.

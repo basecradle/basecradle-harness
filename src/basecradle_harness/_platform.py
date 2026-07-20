@@ -74,7 +74,7 @@ class PlatformContext:
             sake: since the final-text auto-post was removed (issue #293), a tool call
             is the *only* way an agent speaks, so this ledger is the only truthful
             answer to "did the agent say anything this wake?" (the bookend's `posted=`)
-            and "did it act at all this turn?" (what the mention informer turns on).
+            and "did it act at all this turn?" (what the no-reply informer turns on).
             Recording is a two-line courtesy in the tool that already knows; inferring
             it later would mean parsing tool arguments to tell a `create` from a `list`.
         keys: The wake's `IdempotencyKeys` minter (`_idempotency.py`), or `None` outside
