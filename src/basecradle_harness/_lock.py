@@ -57,7 +57,10 @@ class LockTool(ConfirmedTimelineAction):
         "nothing, and returns a preview of what would be frozen plus the uuid to confirm "
         "with. Locks the current timeline unless you pass a timeline uuid. This is NOT how "
         "you list, leave, or delete a timeline — to permanently DESTROY a timeline and its "
-        "content, use the separate 'delete' tool; this one only freezes, forever."
+        "content, use the separate 'delete' tool; this one only freezes, forever. "
+        "Platform REST: POST /timelines/{timeline_uuid}/lock — this tool calls that same "
+        "endpoint, under the same confirm=uuid discipline (not a bypass); "
+        "https://basecradle.com/docs/api.md has the full API."
     )
 
     def _perform(self, timeline: Timeline) -> None:

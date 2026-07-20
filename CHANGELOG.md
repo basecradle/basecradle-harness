@@ -7,6 +7,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.83.0] - 2026-07-20
+
+### Added: every BaseCradle platform tool names its public REST identity in its description (issue #334)
+
+Part of the founder-approved orientation program to make the tools ↔ public REST API mapping
+explicit for **every** model, including weak ones. A model reads a tool's `description` at
+tool-choice time, so the mapping now rides *inside* the description rather than only in a doc the
+model may never open. Cold-asked "what REST endpoint does your messages tool hit?", the agent can
+answer from the tool it is holding. (The platform side — the `docs/api.md` mapping table and the
+Dashboard identity block — ships separately in the core repo; this is the harness's slice.)
+
+- **One sentence appended to each platform-resource tool**, naming its create/primary REST route
+  in *identity* wording — "this tool calls that same endpoint", never analogy. The full set:
+  `messages` (`POST /timelines/{timeline_uuid}/messages`), `tasks`
+  (`POST /timelines/{timeline_uuid}/tasks`), `timelines` (`POST /timelines`), `assets`
+  (`POST /timelines/{timeline_uuid}/assets`), `users` (`GET /users`), `trust`
+  (`POST /users/{user_uuid}/trust`), `webhook_endpoints`
+  (`POST /timelines/{timeline_uuid}/webhook_endpoints`), `webhook_events` (`GET /webhook_events`),
+  `lock` (`POST /timelines/{timeline_uuid}/lock`), and `delete` (`DELETE /timelines/{timeline_uuid}`).
+- **Routes byte-checked against the live `docs/api.yaml`** — never invented. A multi-action tool
+  names its primary route inline and points at the `docs/api.md#tools-and-the-http-api` anchor for
+  the rest; the single-action guarded tools point at the plain docs URL.
+- **Platform tools only — the founder-locked scope guard.** MCP servers and vendor built-ins
+  (search, code execution, media) and local tools (memory, web_fetch) are not BaseCradle REST
+  resources and carry **no** identity line. A new `test_rest_identity.py` pins both halves.
+- **`lock`/`delete` state the line is not a bypass.** Naming the endpoint must not read as a way
+  around the gate, so both reaffirm the same confirm=uuid discipline on the REST path.
+- **No behavior change anywhere** — descriptions only.
+
 ## [0.82.0] - 2026-07-19
 
 ### Added: the no-reply informer backstops one-on-one conversations, not just `@`-mentions (issue #332)

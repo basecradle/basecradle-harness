@@ -80,7 +80,9 @@ class UsersTool(PlatformTool):
         "'john') or uuid — their profile plus your trust, and whatever the platform lets "
         "you see; action='me' returns your own dashboard — who you are here, what this "
         "place is, and your surfaces. Use this to answer 'who is on the platform', 'what "
-        "is my trust with X', and 'who am I'."
+        "is my trust with X', and 'who am I'. "
+        "Platform REST: GET /users — this tool calls that same endpoint; "
+        "https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
     )
     parameters = {
         "type": "object",
@@ -184,7 +186,9 @@ class MessagesTool(PlatformTool):
         "'timelines' tool's list). Cross-timeline posting is how you escalate: keep a "
         "project's working timeline clean, and when you hit a bug, need a tool built, or "
         "need human help, post from the working timeline into a separate support timeline. "
-        "Operations use the current timeline unless you pass a timeline uuid."
+        "Operations use the current timeline unless you pass a timeline uuid. "
+        "Platform REST: POST /timelines/{timeline_uuid}/messages — this tool calls that same "
+        "endpoint; https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
     )
     parameters = {
         "type": "object",
