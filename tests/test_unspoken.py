@@ -9,8 +9,9 @@ The inversion (issue #293, program basecradle/basecradle#420) in one file:
 - **Full visibility is the price of that freedom.** The narration is logged in full — but the log
   is a **flight recorder, not a control tower**: nobody watches it, and the guidance says so, or an
   agent would "escalate" into a void and believe it had spoken.
-- **The mention informer informs; it never forces.** Addressed by `@handle` and ending a turn
-  having done nothing → one system nudge, once, and the model may still choose silence.
+- **The no-reply informer informs; it never forces.** Ending a turn having done nothing when the
+  message called for a reply — addressed by `@handle`, or the only-other-party on a two-viewer
+  timeline (issue #332) — earns one system nudge, once, and the model may still choose silence.
 
 The cast is the fixed fiction: Nova Digital (`nova`, AI) is the agent; John Doe (`john`) the human.
 """
@@ -30,9 +31,11 @@ from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import log_unspoken
 from basecradle_harness._unspoken import (
     MENTION_NUDGE,
-    MentionInformer,
+    ONE_ON_ONE_NUDGE,
+    NoReplyInformer,
     SpeechLedger,
     addressed,
+    is_one_on_one,
 )
 
 BC_URL = "https://basecradle.com"
@@ -83,6 +86,66 @@ def test_addressed_with_no_handle_is_false():
     assert addressed("@nova hello", None) is False
 
 
+# === the two-viewer test: the structural half of the arming (issue #332) ======
+
+
+class _Viewer:
+    def __init__(self, uuid):
+        self.uuid = uuid
+
+
+class _TL:
+    """A stand-in timeline carrying just what `is_one_on_one` reads: owner and participants."""
+
+    def __init__(self, *, owner=None, participants=()):
+        self.owner = _Viewer(owner) if owner else None
+        self.participants = [_Viewer(u) for u in participants]
+
+
+def test_is_one_on_one_is_true_for_the_agent_and_exactly_one_other():
+    """Two viewers, one of them the agent — the structural one-on-one, however ownership falls."""
+    # The agent owns it, the counterpart is the one participant.
+    assert is_one_on_one(_TL(owner=NOVA_UUID, participants=[JOHN_UUID]), NOVA_UUID) is True
+    # …or the counterpart owns it and the agent is the participant. Same room, same answer.
+    assert is_one_on_one(_TL(owner=JOHN_UUID, participants=[NOVA_UUID]), NOVA_UUID) is True
+
+
+def test_is_one_on_one_unions_owner_and_participants():
+    """The owner listed *also* among the participants is one viewer, not two — the set dedupes.
+
+    The viewer set is owner ∪ participants precisely so the answer does not depend on whether the
+    platform happens to echo the owner into the participant list.
+    """
+    tl = _TL(owner=JOHN_UUID, participants=[JOHN_UUID, NOVA_UUID])  # owner duplicated
+    assert is_one_on_one(tl, NOVA_UUID) is True  # still exactly {john, nova}
+
+
+def test_is_one_on_one_is_false_for_a_group():
+    """Three viewers is a group: a message there is not structurally addressed to the agent."""
+    tl = _TL(owner=JOHN_UUID, participants=[NOVA_UUID, BRIGGS_UUID])
+    assert is_one_on_one(tl, NOVA_UUID) is False
+
+
+def test_is_one_on_one_is_false_when_the_agent_is_alone():
+    """One viewer — just the agent — is not 'you and one other'."""
+    assert is_one_on_one(_TL(owner=NOVA_UUID, participants=[NOVA_UUID]), NOVA_UUID) is False
+
+
+def test_is_one_on_one_is_false_when_the_agent_is_not_a_viewer():
+    """Two other viewers, neither of them the agent — a room it is not even in."""
+    assert is_one_on_one(_TL(owner=JOHN_UUID, participants=[BRIGGS_UUID]), NOVA_UUID) is False
+
+
+def test_is_one_on_one_fails_quiet_on_a_thin_timeline():
+    """No identity, or a timeline missing owner/participants → not one-on-one, never a raise.
+
+    The informer is a backstop; a surprising timeline shape must degrade it to mention-only, not
+    crash the wake that fetched it.
+    """
+    assert is_one_on_one(_TL(owner=JOHN_UUID, participants=[NOVA_UUID]), None) is False
+    assert is_one_on_one(object(), NOVA_UUID) is False  # no owner, no participants attrs
+
+
 # === the speech ledger: what actually reached a timeline ======================
 
 
@@ -109,7 +172,7 @@ def _turn(*, tools=False):
 
 def test_the_informer_nudges_once_when_addressed_and_empty_handed():
     speech = SpeechLedger()
-    informer = MentionInformer(handle="nova", speech=speech)
+    informer = NoReplyInformer(handle="nova", speech=speech)
     informer.arm("@nova what's the status?")
     history = []
 
@@ -125,7 +188,7 @@ def test_the_informer_nudges_once_when_addressed_and_empty_handed():
 def test_the_informer_is_silent_when_the_agent_acted():
     """It acted on the timeline this turn → there is nothing to inform it of."""
     speech = SpeechLedger()
-    informer = MentionInformer(handle="nova", speech=speech)
+    informer = NoReplyInformer(handle="nova", speech=speech)
     informer.arm("@nova please post the summary")
     speech.spoke(object())  # …and it did
 
@@ -140,7 +203,7 @@ def test_the_informer_measures_this_turn_not_the_whole_wake():
     "already acted" on every later item it was addressed in — and would never be informed again.
     """
     speech = SpeechLedger()
-    informer = MentionInformer(handle="nova", speech=speech)
+    informer = NoReplyInformer(handle="nova", speech=speech)
     speech.spoke(object())  # an earlier item in this wake was answered
 
     informer.arm("@nova and what about this one?")  # a *new* turn begins here
@@ -150,7 +213,7 @@ def test_the_informer_measures_this_turn_not_the_whole_wake():
 
 def test_the_informer_is_silent_mid_turn():
     """A turn carrying tool calls is not ending — there is nothing yet to conclude."""
-    informer = MentionInformer(handle="nova", speech=SpeechLedger())
+    informer = NoReplyInformer(handle="nova", speech=SpeechLedger())
     informer.arm("@nova look into this")
 
     assert informer.on_turn(_turn(tools=True), []) is False
@@ -158,10 +221,97 @@ def test_the_informer_is_silent_mid_turn():
 
 def test_the_informer_is_silent_when_not_addressed():
     """Not mentioned → not addressed → no nudge. Silence needs no defense when nobody asked."""
-    informer = MentionInformer(handle="nova", speech=SpeechLedger())
+    informer = NoReplyInformer(handle="nova", speech=SpeechLedger())
     informer.arm("john: I think we should ship on Friday.")
 
     assert informer.on_turn(_turn(), []) is False
+
+
+# === the informer: the one-on-one arm (issue #332) ============================
+
+
+def test_the_informer_nudges_a_one_on_one_message_without_a_mention():
+    """The gap the @briggs incident fell through: a two-viewer message, no `@handle`, silent ending.
+
+    On a one-on-one there is no one else the message could be for, so it earns the same guaranteed
+    second chance a mention does — and the wording is the *one-on-one* nudge, not the mention one.
+    """
+    informer = NoReplyInformer(handle="nova", speech=SpeechLedger(), one_on_one=True)
+    informer.arm("what's our status?", counterpart_message=True)  # no @nova anywhere
+    history = []
+
+    assert informer.on_turn(_turn(), history) is True
+    assert history == [Message.system(ONE_ON_ONE_NUDGE)]
+
+
+def test_the_one_on_one_arm_requires_a_counterpart_message():
+    """A two-viewer timeline still does **not** arm on a self/system wake — the heartbeat pattern.
+
+    A 1-on-1 wakes the agent for its own activated alarms too, where `posted=0` is legitimate and
+    desired. `counterpart_message=False` is how the wake says "this turn is not reading the peer",
+    so the arm stays quiet and no model turn is burned per beat (issue #332, point 3).
+    """
+    informer = NoReplyInformer(handle="nova", speech=SpeechLedger(), one_on_one=True)
+    informer.arm("carry out the scheduled task", counterpart_message=False)
+
+    assert informer.on_turn(_turn(), []) is False
+
+
+def test_the_one_on_one_arm_requires_a_two_viewer_timeline():
+    """A counterpart's message in a **group** (not one-on-one) does not arm — without a mention.
+
+    Structure, not volume: three viewers means the message was not necessarily for the agent, so
+    the group case falls back to the mention rule alone.
+    """
+    informer = NoReplyInformer(handle="nova", speech=SpeechLedger(), one_on_one=False)
+    informer.arm("anyone have the numbers?", counterpart_message=True)
+
+    assert informer.on_turn(_turn(), []) is False
+
+
+def test_both_conditions_fire_exactly_one_nudge_and_the_mention_wording_wins():
+    """Mentioned *inside* a one-on-one → one nudge, and it is the mention's (the more specific one).
+
+    The once-per-turn invariant is shared across both reasons, so two true conditions never mean two
+    nudges; and when they disagree on wording, the mention wins (issue #332, point 5).
+    """
+    informer = NoReplyInformer(handle="nova", speech=SpeechLedger(), one_on_one=True)
+    informer.arm("@nova what's our status?", counterpart_message=True)
+    history = []
+
+    assert informer.on_turn(_turn(), history) is True
+    assert history == [Message.system(MENTION_NUDGE)]  # the mention wording, not the one-on-one
+    assert informer.on_turn(_turn(), history) is False  # …and only ever once
+    assert len(history) == 1
+
+
+def test_the_one_on_one_nudge_fires_once_and_can_never_loop():
+    """The one-shot guard is the same across reasons: informed once, then silence is allowed."""
+    informer = NoReplyInformer(handle="nova", speech=SpeechLedger(), one_on_one=True)
+    informer.arm("still there?", counterpart_message=True)
+    history = []
+
+    assert informer.on_turn(_turn(), history) is True
+    assert informer.on_turn(_turn(), history) is False  # a second silent ending is not re-nudged
+    assert len(history) == 1
+
+
+def test_the_one_on_one_arm_is_silent_when_the_agent_acted():
+    """It answered the one-on-one by *doing* something visible → not no-reply, so no nudge."""
+    speech = SpeechLedger()
+    informer = NoReplyInformer(handle="nova", speech=speech, one_on_one=True)
+    informer.arm("can you share the file?", counterpart_message=True)
+    speech.acted("asset", "uuid-1")  # it shared the file — a visible action, not silence
+
+    assert informer.on_turn(_turn(), []) is False
+
+
+def test_the_mention_arm_is_unchanged_by_the_one_on_one_flag():
+    """A mention still arms on a non-one-on-one wake — the original backstop is untouched (#293)."""
+    informer = NoReplyInformer(handle="nova", speech=SpeechLedger(), one_on_one=False)
+    informer.arm("@nova take a look", counterpart_message=False)
+
+    assert informer.on_turn(_turn(), []) is True
 
 
 def test_the_nudge_never_commands_and_never_invents_a_reader():
@@ -206,6 +356,36 @@ def test_the_nudge_names_the_verb_it_asks_for():
     assert "no one will force you" in MENTION_NUDGE  # still not a command
 
 
+def test_the_one_on_one_nudge_opens_with_the_founders_wording():
+    """The opening clause is the founder's, verbatim, and names *why* this turn is being flagged."""
+    assert ONE_ON_ONE_NUDGE.startswith(
+        "You are the only other party in this conversation, and this turn is about to end with "
+        "nothing posted, shared, or done on the timeline."
+    )
+
+
+def test_the_two_nudges_are_identical_after_their_opening_clause():
+    """**Everything after the first sentence is verbatim** (issue #332, point 4) — structurally.
+
+    The two nudges differ only in the opening clause that names the reason; the rest — silence is
+    legitimate, no one forces you, leave the reason for your own memory, speak by calling the
+    `messages` tool — is byte-identical. It is factored into `_NUDGE_TAIL` so this is a fact about
+    the code, not a coincidence two long strings maintain by hand; the guards below then cover both
+    nudges for free (no invented reader, the tool named), because the covered text *is* shared.
+    """
+    from basecradle_harness._unspoken import _NUDGE_TAIL
+
+    assert MENTION_NUDGE.endswith(_NUDGE_TAIL)
+    assert ONE_ON_ONE_NUDGE.endswith(_NUDGE_TAIL)
+    # Strip each opening (up to and including the shared sentence) and the remainders coincide.
+    shared_sentence = (
+        " this turn is about to end with nothing posted, shared, or done on the timeline."
+    )
+    assert (
+        MENTION_NUDGE.split(shared_sentence, 1)[1] == ONE_ON_ONE_NUDGE.split(shared_sentence, 1)[1]
+    )
+
+
 # === the standing guard: nothing the model reads may invent a supervisor =======
 
 
@@ -237,6 +417,7 @@ def _model_facing_strings():
         "step note (escalated)": _step_note(23, 24, now),
         "builtin guidance": _server_builtin_guidance("web_search"),
         "mention nudge": MENTION_NUDGE,
+        "one-on-one nudge": ONE_ON_ONE_NUDGE,
     }
 
 
@@ -285,10 +466,16 @@ def test_no_model_facing_string_invents_a_supervisor():
 #: Every model-facing string whose whole job is to tell the agent that reaching a peer takes an
 #: act — and which is therefore useless to a model that cannot name the act. Each one carried a
 #: generic "with a tool" / "takes a tool call" before issue #295, and each one is read at exactly
-#: the moment the gap costs a peer their answer: addressed and about to fall silent (the mention
-#: nudge), out of steps with something still unsaid (the escalation and the reserve report), and
-#: the once-per-wake statement of the rule (the brief's budget line).
-_SPEECH_INSTRUCTIONS = ("mention nudge", "reserve nudge", "step note (escalated)", "step budget")
+#: the moment the gap costs a peer their answer: addressed or the only-other-party and about to fall
+#: silent (the mention and one-on-one nudges), out of steps with something still unsaid (the
+#: escalation and the reserve report), and the once-per-wake statement of the rule (the budget line).
+_SPEECH_INSTRUCTIONS = (
+    "mention nudge",
+    "one-on-one nudge",
+    "reserve nudge",
+    "step note (escalated)",
+    "step budget",
+)
 
 
 def test_every_string_that_asks_for_speech_names_the_tool():
@@ -411,25 +598,37 @@ def test_the_unspoken_line_is_one_record_and_scrubs_secrets(caplog):
 # === end to end: a wake speaks only when it decides to ========================
 
 
-def _wire(router, *, body="What's the status?", mine=False):
-    """The four platform routes a wake touches, with one unseen message on the timeline."""
-    actor = (
-        {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}
-        if mine
-        else {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"}
-    )
+BRIGGS_UUID = "019e7756-9f60-7a80-93a4-6f7081920314"  # a third peer AI — the group case's extra
+T0 = "019e7770-5555-7eee-8fff-506172839405"  # an activated task's uuid
+
+NOVA_ACTOR = {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}
+JOHN_ACTOR = {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"}
+BRIGGS_ACTOR = {"uuid": BRIGGS_UUID, "handle": "briggs", "name": "Briggs", "kind": "ai"}
+
+
+def _wire(router, *, body="What's the status?", mine=False, room="solo", task=None):
+    """The four platform routes a wake touches, with one unseen item on the timeline.
+
+    `room` sets the timeline's live viewer set — the thing the one-on-one arm (issue #332) reads:
+
+    - ``"solo"`` (default): owner is the sender, no participants → the agent is *not* a viewer, so
+      it is never a one-on-one. This is the shape the pre-#332 e2e tests want (mention-only).
+    - ``"one_on_one"``: the agent owns the timeline with the counterpart as its one participant →
+      **two viewers**, the agent and one other. The structural one-on-one.
+    - ``"group"``: the agent, the counterpart, and briggs → **three viewers**. Not a one-on-one.
+
+    `task` (instructions string) swaps the message wake for a **task-activation** wake: the messages
+    route serves empty and one activated task is served, so a wake reconciles the task, not a peer's
+    message — the heartbeat pattern the one-on-one arm must ignore.
+    """
+    actor = NOVA_ACTOR if mine else JOHN_ACTOR
+    owner, participants = {
+        "solo": (actor, []),
+        "one_on_one": (NOVA_ACTOR, [JOHN_ACTOR]),
+        "group": (NOVA_ACTOR, [JOHN_ACTOR, BRIGGS_ACTOR]),
+    }[room]
     router.get("/users/dashboard").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "identity": {
-                    "uuid": NOVA_UUID,
-                    "handle": "nova",
-                    "name": "Nova Digital",
-                    "kind": "ai",
-                }
-            },
-        )
+        return_value=httpx.Response(200, json={"identity": NOVA_ACTOR})
     )
     router.get(f"/timelines/{TIMELINE_UUID}").mock(
         return_value=httpx.Response(
@@ -441,29 +640,28 @@ def _wire(router, *, body="What's the status?", mine=False):
                     "locked": False,
                     "created_at": "2026-06-01T00:00:00.000Z",
                     "updated_at": "2026-06-02T00:00:00.000Z",
-                    "owner": actor,
-                    "participants": [],
+                    "owner": owner,
+                    "participants": participants,
                 },
                 "items": [],
             },
         )
     )
+    messages = (
+        []
+        if task is not None
+        else [
+            {
+                "type": "message",
+                "created_at": "2026-06-04T00:00:00.000Z",
+                "user": actor,
+                "timeline": {"uuid": TIMELINE_UUID},
+                "content": {"uuid": M0, "body": body},
+            }
+        ]
+    )
     router.get("/messages").mock(
-        return_value=httpx.Response(
-            200,
-            json={
-                "messages": [
-                    {
-                        "type": "message",
-                        "created_at": "2026-06-04T00:00:00.000Z",
-                        "user": actor,
-                        "timeline": {"uuid": TIMELINE_UUID},
-                        "content": {"uuid": M0, "body": body},
-                    }
-                ],
-                "next_cursor": None,
-            },
-        )
+        return_value=httpx.Response(200, json={"messages": messages, "next_cursor": None})
     )
     router.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
         return_value=httpx.Response(
@@ -472,12 +670,7 @@ def _wire(router, *, body="What's the status?", mine=False):
                 "message": {
                     "type": "message",
                     "created_at": "2026-06-04T00:00:01.000Z",
-                    "user": {
-                        "uuid": NOVA_UUID,
-                        "handle": "nova",
-                        "name": "Nova Digital",
-                        "kind": "ai",
-                    },
+                    "user": NOVA_ACTOR,
                     "timeline": {"uuid": TIMELINE_UUID},
                     "content": {"uuid": REPLY, "body": "posted"},
                 }
@@ -490,8 +683,26 @@ def _wire(router, *, body="What's the status?", mine=False):
     router.get("/webhook_events").mock(
         return_value=httpx.Response(200, json={"webhook_events": [], "next_cursor": None})
     )
+    tasks = (
+        []
+        if task is None
+        else [
+            {
+                "type": "task",
+                "created_at": "2026-06-10T00:00:00.000Z",
+                "user": NOVA_ACTOR,  # a task the agent scheduled for itself — its own alarm
+                "timeline": {"uuid": TIMELINE_UUID},
+                "content": {
+                    "uuid": T0,
+                    "instructions": task,
+                    "activate_at": "2026-06-11T06:00:00+00:00",
+                    "status": "activated",
+                },
+            }
+        ]
+    )
     router.get("/tasks").mock(
-        return_value=httpx.Response(200, json={"tasks": [], "next_cursor": None})
+        return_value=httpx.Response(200, json={"tasks": tasks, "next_cursor": None})
     )
 
 
@@ -614,9 +825,14 @@ def test_a_mentioned_agent_that_speaks_is_not_nudged(platform, tmp_path):
     assert _posts(platform) == ["On it."]
 
 
-def test_an_unaddressed_silent_wake_is_not_nudged(platform, tmp_path):
-    """Nobody asked. Silence is the default, and the default needs no explaining."""
-    _wire(platform, body="john: I'll take this one myself.")
+def test_an_unaddressed_silent_wake_in_a_group_is_not_nudged(platform, tmp_path):
+    """Nobody asked, and it is a **group** — so neither arm fires. Silence needs no explaining.
+
+    On a three-viewer timeline a message with no `@handle` is not structurally the agent's to answer
+    (issue #332: the one-on-one arm needs *two* viewers), so this is the pre-#332 default intact —
+    the default silence, undisturbed, is what earned trust in the first place.
+    """
+    _wire(platform, body="john: I'll take this one myself.", room="group")
     brain = _Brain(Message.assistant(content="Nothing for me here."))
     harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
@@ -624,7 +840,84 @@ def test_an_unaddressed_silent_wake_is_not_nudged(platform, tmp_path):
     agent.wake()
 
     assert brain.calls == 1  # one pass, no nudge
-    assert [m for m in brain.shown if m.content == MENTION_NUDGE] == []
+    assert [m for m in brain.shown if m.content in (MENTION_NUDGE, ONE_ON_ONE_NUDGE)] == []
+
+
+def test_a_one_on_one_message_with_no_mention_is_informed_once(platform, tmp_path):
+    """**The @briggs incident, as a test** (issue #332): a fresh 1-on-1 message, no `@handle`, and a
+    turn that would have ended as narration.
+
+    The founder asked @briggs a direct question on a two-viewer timeline; briggs composed a complete
+    answer and ended the turn with it *unspoken* — `posted=0` — leaving the founder on an empty
+    timeline. Nothing armed then, because the message carried no mention. Now the structural arm
+    catches it: it is the only other party, so it gets the same guaranteed second chance, worded for
+    the one-on-one. It may still choose silence — but it is *told*, and never forced.
+    """
+    _wire(platform, body="What version are you running?", room="one_on_one")  # no @nova anywhere
+    brain = _Brain(
+        Message.assistant(content="I'm running 0.82.0."),  # composed the answer, would narrate it
+        Message.assistant(content="Right — that reaches no one. Posting it."),
+    )
+    harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+
+    agent.wake()
+
+    assert brain.calls == 2  # the one-on-one nudge bought one more pass
+    nudges = [m for m in brain.shown if m.role == "system" and m.content == ONE_ON_ONE_NUDGE]
+    assert len(nudges) == 1  # the one-on-one wording, exactly once
+    assert [m for m in brain.shown if m.content == MENTION_NUDGE] == []  # not the mention wording
+
+
+def test_a_one_on_one_agent_that_speaks_is_not_nudged(platform, tmp_path):
+    """It answered the one-on-one through the tool → it acted, so there is nothing to inform it of."""
+    _wire(platform, body="what's our status?", room="one_on_one")
+    brain = _Brain(_speak("All green."), Message.assistant(content="Answered."))
+    harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+
+    agent.wake()
+
+    assert brain.calls == 2  # the tool call and the settle — no third, nudged pass
+    assert [m for m in brain.shown if m.content in (MENTION_NUDGE, ONE_ON_ONE_NUDGE)] == []
+    assert _posts(platform) == ["All green."]
+
+
+def test_a_mention_inside_a_one_on_one_uses_the_mention_wording(platform, tmp_path):
+    """Both conditions true → one nudge, and it is the mention's — the more specific signal wins."""
+    _wire(platform, body="@nova what's our status?", room="one_on_one")
+    brain = _Brain(
+        Message.assistant(content="Not sure it needs me."),
+        Message.assistant(content="On reflection, staying out."),
+    )
+    harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+
+    agent.wake()
+
+    assert brain.calls == 2
+    assert [m for m in brain.shown if m.content == MENTION_NUDGE] != []  # mention wording
+    assert [m for m in brain.shown if m.content == ONE_ON_ONE_NUDGE] == []  # not the one-on-one
+
+
+def test_a_task_activation_on_a_one_on_one_is_not_nudged(platform, tmp_path):
+    """**The heartbeat pattern** (issue #332, point 3): a self-scheduled alarm on a 1-on-1 timeline.
+
+    A one-on-one timeline also wakes the agent for its *own* activated tasks, where `posted=0` is
+    the desired outcome. That wake reads a task, not the counterpart's message, so the one-on-one arm
+    stays quiet — otherwise every beat would burn an extra model turn forever. The task path never
+    passes `counterpart_message`, so no nudge appears even though the timeline is two-viewer.
+    """
+    _wire(platform, room="one_on_one", task="post the daily heartbeat if all is well")
+    brain = _Brain(Message.assistant(content="All nominal; nothing to report this beat."))
+    harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+
+    posted = agent.wake()
+
+    assert brain.calls == 1  # one pass, no nudge — the heartbeat is undisturbed
+    assert [m for m in brain.shown if m.content in (MENTION_NUDGE, ONE_ON_ONE_NUDGE)] == []
+    assert posted == []
 
 
 def test_two_agents_over_one_harness_do_not_accrete_informers(platform, tmp_path):

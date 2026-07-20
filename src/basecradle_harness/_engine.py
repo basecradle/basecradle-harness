@@ -132,8 +132,8 @@ _RESERVE_NUDGE = (
 #: when the turn carried no tool calls. The engine stays ignorant of *why* — the collaborators
 #: that know are injected, like the provider and tools. Two ship: the code-execution Asset bridge
 #: (harvest the run's output files into Assets, then feed their uuids back so the model can cite
-#: them) and the mention informer (`_unspoken.MentionInformer`: the agent was addressed and is
-#: ending its turn having done nothing — say why, or act). Compose several with `compose_hooks`.
+#: them) and the no-reply informer (`_unspoken.NoReplyInformer`: the agent's turn is ending with
+#: nothing done when the message called for a reply — say why, or act). Compose with `compose_hooks`.
 TurnHook = Callable[[Message, "list[Message]"], bool]
 
 

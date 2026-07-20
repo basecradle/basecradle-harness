@@ -138,7 +138,7 @@ from basecradle_harness._observability import delivery_id, describe_provider, kv
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
-from basecradle_harness._unspoken import MentionInformer, SpeechLedger
+from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -1165,7 +1165,7 @@ class WakeAgent:
         # What this wake actually put on a timeline (issue #293). Now that the final text is never
         # auto-posted, the *only* messages that exist are the ones the model chose to create through
         # a tool — so the tools record here as they act, and this ledger is what the bookend line
-        # counts (`posted=`) and what the mention informer reads to know whether a turn was silent.
+        # counts (`posted=`) and what the no-reply informer reads to know whether a turn was silent.
         # One object, bound into the tools once; its contents cycle per wake (`reset`).
         self.speech = SpeechLedger()
 
@@ -1199,7 +1199,7 @@ class WakeAgent:
             code_bridge.bind(context)
 
         # One Dashboard read answers "who am I?" — the identity uuid the actor self-filter
-        # tests every item against, and the **handle** the mention informer looks for. (The
+        # tests every item against, and the **handle** the no-reply informer looks for. (The
         # brief's orientation is the *live* `dashboard.md` primer, fetched per wake in
         # `_wake_brief`, not this structured read.) Read once: `me` is uncached, so touching
         # `self.client.me` twice would be a second HTTP round-trip on every wake.
@@ -1207,19 +1207,26 @@ class WakeAgent:
         self.me_uuid = identity.uuid
         self.me_handle = getattr(identity, "handle", None)
 
-        # The deterministic mention informer (issue #293): when the agent is addressed by its own
-        # @handle and its turn is about to end having done nothing on the timeline, it is *told* —
-        # once, and never forced. It rides the engine's `TurnHook`, the seam that already exists for
-        # exactly this ("the turn is about to end; does anything want to extend it?"), so it is
-        # **composed** onto whatever hook is already wired (the code-execution Asset bridge) rather
-        # than replacing it — the bridge runs first, and while it is still extending the turn the
-        # informer stays quiet, because a turn being extended is not a turn that is ending.
+        # The deterministic no-reply informer (issues #293, #332): when the agent's turn is about to
+        # end having done nothing on the timeline *and the message called for a reply* — it was
+        # addressed by its own @handle, or it is the only other party on a two-viewer timeline — it
+        # is *told*, once, and never forced. The two-viewer-ness is a per-wake fact, read here off
+        # the timeline this wake already fetched (the live viewer set at wake time, no extra read).
+        # It rides the engine's `TurnHook`, the seam that already exists for exactly this ("the turn
+        # is about to end; does anything want to extend it?"), so it is **composed** onto whatever
+        # hook is already wired (the code-execution Asset bridge) rather than replacing it — the
+        # bridge runs first, and while it is still extending the turn the informer stays quiet,
+        # because a turn being extended is not a turn that is ending.
         #
         # Composed onto the engine's **base** hook, never onto its live one: chaining would
         # *accrete*. Two agents built over one `Harness` would stack two informers, each holding the
         # other's dead `SpeechLedger` — and a stale-armed one would then nudge on a turn it knows
         # nothing about, reading "did it act?" off a ledger nobody writes to any more.
-        self.informer = MentionInformer(handle=self.me_handle, speech=self.speech)
+        self.informer = NoReplyInformer(
+            handle=self.me_handle,
+            speech=self.speech,
+            one_on_one=is_one_on_one(self.timeline, self.me_uuid),
+        )
         engine = self.harness.engine
         engine.turn_hook = compose_hooks(engine.base_turn_hook, self.informer.on_turn)
         # Whether *this* turn degraded to the canned note (the step budget spent **and** the reserve
@@ -2082,9 +2089,13 @@ class WakeAgent:
         Other failures still propagate (the entrypoint reports them cleanly); this catches only
         the step-cap, the one the issue names.
 
-        The mention informer is armed here, on the text the model is about to read: this is the
+        The no-reply informer is armed here, on the text the model is about to read: this is the
         one place that knows *what* the agent is being shown, and it is re-armed per model call
-        because "was I addressed, and did I act?" is a question about a turn, not about a wake.
+        because "was this addressed to me, and did I act?" is a question about a turn, not a wake.
+        This path serves the non-message kinds (an asset, a webhook delivery, an activated task),
+        so it never passes `counterpart_message`: a task activation or an asset on a 1-on-1 must
+        **not** arm the one-on-one nudge (the heartbeat pattern — issue #332). The mention arm still
+        fires if the item's text happens to address the agent.
 
         The persistent brief rides *with* this call — spliced in just ahead of the user turn,
         so it is present and recent for the item it governs, and never persisted (see
@@ -2886,7 +2897,14 @@ class WakeAgent:
         try:
             self.keys.begin(session, timeline=self.timeline_uuid, anchor=_anchor_of(turn, item))
             self._reissue_interrupted_creates(session, turn)
-            self.informer.arm(rendered)
+            # A resumed *message* turn from the counterpart earns the one-on-one arm exactly as a
+            # fresh one would; a resumed asset/task/webhook turn does not (issue #332). The kind is
+            # known here, so the gate is exact — and `not self._is_own(item)` keeps it to a peer's
+            # message, though the message reconcile only ever batches peer messages to begin with.
+            self.informer.arm(
+                rendered,
+                counterpart_message=kind == _MESSAGES and not self._is_own(item),
+            )
             self._degraded = False
             try:
                 narration = session.resume(turn, brief=self._wake_brief(query=rendered))
@@ -3275,10 +3293,19 @@ class WakeAgent:
         while True:
             rendered = _render_batch(batch)
             # Re-arm per build, not per wake: a rebuild reads a *different* batch (a message landed
-            # mid-generation), so "was I addressed, and have I acted?" has to be re-asked of the
-            # text the model is actually about to read. Arming also resets the one-shot nudge, so a
-            # rolled-back build's nudge does not silence the informer on the build that replaces it.
-            self.informer.arm(rendered)
+            # mid-generation), so "was this addressed to me, and have I acted?" has to be re-asked of
+            # the text the model is actually about to read. Arming also resets the one-shot nudge, so
+            # a rolled-back build's nudge does not silence the informer on the build that replaces it.
+            #
+            # This is the message path, so it passes `counterpart_message` — the one-on-one arm's
+            # gate (issue #332). `_absorb` self-filters the agent's own posts, so the batch is peer
+            # messages by construction; the check is written honestly anyway rather than resting on
+            # that distant invariant, and on a two-viewer timeline it is what turns a plain 1-on-1
+            # message with no @handle into a guaranteed second chance (the @briggs incident).
+            self.informer.arm(
+                rendered,
+                counterpart_message=any(not self._is_own(m) for m in batch),
+            )
             narration = self._send_batch(session, rendered, brief, batch, anchor)
             builds += 1
             # **A compaction during the build invalidates `base_len`, so the build is committed.**
@@ -3490,8 +3517,9 @@ def _turn_narration(work: list[Message]) -> str | None:
     obvious form — scan backwards for any assistant turn with text and no tool calls — is wrong,
     because that shape is not the same as "the loop returned". `Engine.run` returns on
     ``not reply.tool_calls and not extend``, and **both** shipped turn hooks extend on exactly that
-    shape: the mention informer nudges an agent that was addressed and did nothing, and the
-    code-execution bridge harvests a run's output files and feeds their uuids back. A turn that was
+    shape: the no-reply informer nudges an agent whose turn ended with nothing done when the message
+    called for a reply, and the code-execution bridge harvests a run's output files and feeds their
+    uuids back. A turn that was
     still being extended has an assistant text sitting *mid-work* — and reading it as the commit
     record would settle the claim, advance the mark, and never look at the message again. The
     `system` failure marker a raised run leaves behind (issue #244) is the same trap from the other

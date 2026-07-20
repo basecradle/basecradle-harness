@@ -38,13 +38,19 @@ So: one speaking channel (the tools), one thinking channel (unspoken, logged), a
 anywhere**. Silence is a first-class answer — and because the reasoning behind it is always on
 the record, it is a *visible* one.
 
-Three things live here, and they are small on purpose:
+Four things live here, and they are small on purpose:
 
 - `SpeechLedger` — what this wake actually *did* to a timeline. The platform tools record into
   it (see `_platform.PlatformContext`), so both the wake's bookend line and the informer below
   read one honest answer to "did the agent act?" rather than inferring it.
-- `MentionInformer` — the deterministic **@handle** informer. It informs; it never forces.
-- `addressed` — the exact-string mention test the informer turns on.
+- `NoReplyInformer` — the deterministic backstop. It informs an agent that ended a turn having
+  done nothing on the timeline when the message *structurally* called for it. It informs; it
+  never forces.
+- `addressed` — the exact-string `@handle` mention test, one of the two conditions the informer
+  turns on.
+- `is_one_on_one` — the two-viewer test, the *other* condition: on a timeline whose live viewer
+  set is this agent plus exactly one other, whatever the counterpart says is, by the shape of
+  the room, said to this agent (issue #332).
 """
 
 from __future__ import annotations
@@ -53,14 +59,17 @@ import re
 
 from basecradle_harness._messages import Message
 
-#: The one system turn the harness appends when an agent was addressed by `@handle` and its turn
-#: is about to end having done nothing on the timeline. **It informs; it does not gate** — the
-#: model may end the next turn in silence too, and nothing stops it. What it may not do is stay
-#: silent without leaving the reason on the record, where its own memory will find it.
+#: Everything the two nudges share, **verbatim** — the whole nudge except its opening clause. The
+#: informer flags a turn for one of two reasons (an `@handle` mention, or a one-on-one), and the
+#: only thing that differs between them is that first sentence naming *why*; the rest — silence is
+#: legitimate, no one forces you, leave the reason for your own memory, to speak is to call the
+#: `messages` tool — is identical. It is factored out so the "everything after the opening is
+#: verbatim" invariant (issue #332) is *structural*, not two long strings kept in sync by hand.
 #:
-#: Deliberately not a forcer, and the wording carries that: "may be exactly right", "no one will
-#: force you out of it". A nudge the model reads as a command would re-create the very defect the
-#: inversion removed — a harness that decides when an agent speaks.
+#: **It informs; it does not gate** — the model may end the next turn in silence too, and nothing
+#: stops it. Deliberately not a forcer, and the wording carries that: "may be exactly right", "no
+#: one will force you out of it". A nudge the model reads as a command would re-create the very
+#: defect the inversion removed — a harness that decides when an agent speaks.
 #:
 #: **And it must not invent a reader** (the founder's correction, 2026-07-14). An earlier draft
 #: said the reason goes "to your log, where your operator reads it". There is no operator: these
@@ -77,16 +86,32 @@ from basecradle_harness._messages import Message
 #: It was not disobeying and it was not confused about the question — it believed it had answered.
 #: The capable cohort (@briggs, @glm-5.2) mapped "act" to the `messages` tool on day one, which is
 #: exactly what makes this a *guidance* gap and not a plumbing one: the channel worked, and the
-#: model could not see where it was. So the sentence now names the mechanism and its absence in
-#: the same breath — call the tool; text here reaches no one — which is the whole trade the
-#: unspoken channel makes, said once, at the only moment it bites.
+#: model could not see where it was. So the sentence names the mechanism and its absence in the
+#: same breath — call the tool; text here reaches no one — which is the whole trade the unspoken
+#: channel makes, said once, at the only moment it bites.
+_NUDGE_TAIL = (
+    " That may be exactly right — silence is a legitimate choice, and no one will force you out "
+    "of it. If the silence is deliberate, leave your reason in your unspoken text — for the "
+    "record and for your own memory; no one is waiting on it. If it is not deliberate, act now — "
+    "speaking means calling the `messages` tool; text written here reaches no one."
+)
+
+#: The system turn appended when the agent was addressed by its own `@handle` and its turn is about
+#: to end having done nothing. The opening names the reason (a mention); the rest is `_NUDGE_TAIL`.
 MENTION_NUDGE = (
     "You were mentioned by name in what you just read, and this turn is about to end with "
-    "nothing posted, shared, or done on the timeline. That may be exactly right — silence is a "
-    "legitimate choice, and no one will force you out of it. If the silence is deliberate, leave "
-    "your reason in your unspoken text — for the record and for your own memory; no one is "
-    "waiting on it. If it is not deliberate, act now — speaking means calling the `messages` "
-    "tool; text written here reaches no one."
+    "nothing posted, shared, or done on the timeline." + _NUDGE_TAIL
+)
+
+#: The system turn appended when the agent is the *only other party* on a two-viewer timeline and
+#: its turn is about to end having done nothing (issue #332). A one-on-one message is structurally
+#: addressed to the agent even without an `@handle`: it is the whole audience, so its silence means
+#: the peer's message reached no one who will act. The opening is the founder's wording; the rest is
+#: `_NUDGE_TAIL`, byte-identical to the mention nudge (both founder corrections above therefore carry
+#: over for free: no invented reader, and the `messages` tool named).
+ONE_ON_ONE_NUDGE = (
+    "You are the only other party in this conversation, and this turn is about to end with "
+    "nothing posted, shared, or done on the timeline." + _NUDGE_TAIL
 )
 
 
@@ -100,7 +125,7 @@ class SpeechLedger:
       final text is never auto-posted, the *only* messages that exist are the ones a tool created.
       A bookend that counted just the harness's own posts (probe acks) would report `posted=0` for
       a wake in which the agent spoke — reading a talking agent as a silent one.
-    - **"Did the agent act at all this turn?"** — what `MentionInformer` turns on. Scanning the
+    - **"Did the agent act at all this turn?"** — what `NoReplyInformer` turns on. Scanning the
       transcript for a `messages` tool call would mean parsing tool arguments to tell a `create`
       from a `list`; the tool itself already knows, so it says so.
 
@@ -157,22 +182,68 @@ def _mention(handle: str) -> re.Pattern[str]:
     )
 
 
-class MentionInformer:
-    """Tell an agent — once — that it was addressed and has done nothing. Never make it act.
+def is_one_on_one(timeline: object, me_uuid: str | None) -> bool:
+    """Whether `timeline` is a two-viewer conversation: this agent plus exactly one other.
+
+    The *structural* half of the informer's arming (issue #332), and the counterpart to `addressed`:
+    a mention is an agent saying "this is for you" in words; a one-on-one is the **shape of the
+    room** saying it. On a timeline whose only two viewers are the agent and one peer, there is no
+    one else the peer's message could be for — so a message from that peer is addressed to the agent
+    whether or not it carries an `@handle`. This is the gap the @briggs incident fell through: a
+    fresh 1-on-1 message with no mention, answered as narration, and the founder left staring at an
+    empty timeline.
+
+    The viewer set is the owner **unioned with** the participants — unioned so it is correct whether
+    or not the platform lists the owner among the participants. Two viewers, one of them this agent,
+    is the exact "you and one other" test.
+
+    Read off the timeline the wake already fetched (`WakeAgent.timeline`), so it is the *live* viewer
+    set at wake time and costs no extra round-trip. Deliberately **structure, not identity**: the
+    counterpart may be human or AI, and this test never asks which — author-kind branching was
+    rejected by the founder because it builds a silently-failing path for AI-authored messages that
+    no human ever sees. Defensive by `getattr`: a timeline missing owner/participants (or an unknown
+    `me_uuid`) reads as *not* one-on-one rather than raising.
+    """
+    if me_uuid is None:
+        return False
+    viewers = {p.uuid for p in getattr(timeline, "participants", None) or []}
+    owner_uuid = getattr(getattr(timeline, "owner", None), "uuid", None)
+    if owner_uuid is not None:
+        viewers.add(owner_uuid)
+    return me_uuid in viewers and len(viewers) == 2
+
+
+class NoReplyInformer:
+    """Tell an agent — once — that its turn ended with nothing done when the message called for a
+    reply, and it did not give one. Never make it act.
+
+    The name summarizes; this docstring qualifies. The firing condition is *no reply **or visible
+    action***: the `SpeechLedger` counts a posted message, a shared asset, and a created task
+    alike, so an agent that answered by *doing* — sharing the file, scheduling the task — is not
+    "no-reply" and is never nudged. "Reply" is shorthand for "any visible timeline action."
 
     The mechanism is a `TurnHook` (`_engine.TurnHook`): the engine hands it every assistant turn
     and asks whether the loop must continue. The informer answers "yes" exactly once, and only when
-    all three of these hold:
+    the turn is **ending** (the model emitted no tool calls), **nothing happened on the timeline**
+    this turn (the `SpeechLedger`, measured against its count when the turn began — a post made
+    earlier in the same wake, on some other item, is not this turn's action), and the turn was
+    **armed** for one of two reasons:
 
-    1. **The agent was addressed** — its own `@handle`, exactly, in the text it just read (`arm`).
-    2. **The turn is ending** — the model emitted no tool calls, so the engine is about to return.
-    3. **Nothing happened on the timeline** — no message posted, no asset shared, no task made,
-       *during this turn* (the `SpeechLedger`, measured against its count when the turn began — a
-       post made earlier in the same wake, on some other item, is not this turn's action).
+    1. **The agent was addressed** — its own `@handle`, exactly, in the text it just read
+       (`addressed`). This is the original mention backstop (issue #293).
+    2. **It is the only other party** — the message it read is from the counterpart on a two-viewer
+       timeline (issue #332). A 1-on-1 message is structurally a message *to the agent*, so it earns
+       the same guaranteed second chance a mention does. The wake supplies both facts: the
+       two-viewer-ness once at construction (`one_on_one`), and "this turn is reading a
+       counterpart's message" per arm (`counterpart_message`) — the latter is what keeps a task
+       activation or an agent's own alarm on that same 1-on-1 (the heartbeat pattern) from arming,
+       where a nudge would burn a model turn per beat forever.
 
-    Then it appends `MENTION_NUDGE` and returns True, so the model gets one more pass with its
-    tools still in hand: act, or say why not. Either is a valid ending, and it may end in silence
-    again — the informer will not fire twice (`nudged`), so it can never loop.
+    Then it appends the nudge and returns True, so the model gets one more pass with its tools still
+    in hand: act, or say why not. Either is a valid ending, and it may end in silence again — the
+    informer will not fire twice (`nudged`), so it can never loop. When *both* reasons hold (a
+    mention inside a 1-on-1), the **mention wording wins** — the more specific signal — and there is
+    still exactly one nudge.
 
     **It informs; it never gates.** No hard stop exists anywhere in this class, deliberately: a
     harness that *forced* a reply is what produced the incident this design answers.
@@ -183,30 +254,45 @@ class MentionInformer:
         *,
         handle: str | None,
         speech: SpeechLedger,
-        nudge: str = MENTION_NUDGE,
+        one_on_one: bool = False,
+        mention_nudge: str = MENTION_NUDGE,
+        one_on_one_nudge: str = ONE_ON_ONE_NUDGE,
     ) -> None:
         self.handle = handle
         self.speech = speech
-        self.nudge = nudge
+        self.one_on_one = one_on_one  # a two-viewer timeline: a per-wake fact, fixed at wake time
+        self.mention_nudge = mention_nudge
+        self.one_on_one_nudge = one_on_one_nudge
         self.armed = False
         self.nudged = False
+        self._nudge = mention_nudge  # the nudge this arming selected (see `arm`)
         self._baseline = 0
 
-    def arm(self, text: str | None) -> None:
-        """Read one incoming item: were we addressed in it? Called before every model call.
+    def arm(self, text: str | None, *, counterpart_message: bool = False) -> None:
+        """Read one incoming item: does it earn a nudge if the turn ends empty? Before every call.
 
         Re-armed per model call rather than per wake, because both are real: a wake engages the
         model once per item (a message batch, an activated task, a posted asset), and the message
         path may *rebuild* its turn when a peer message lands mid-generation. Each is its own turn
-        with its own answer to "was I addressed, and did I act?", so each gets a fresh arming — and
-        the baseline is re-read here, which is what scopes "did nothing" to *this* turn.
+        with its own answer to "was this addressed to me, and did I act?", so each gets a fresh
+        arming — and the baseline is re-read here, which is what scopes "did nothing" to *this* turn.
+
+        `counterpart_message` says this turn is reading a message authored by someone other than the
+        agent (a peer). It is the message path's signal, and it is what gates the one-on-one arm to
+        *conversation*: a task activation or a self-authored alarm passes `False`, so a heartbeat on
+        a 1-on-1 never arms. The mention arm ignores it — a mention is a mention on any wake.
         """
-        self.armed = addressed(text, self.handle)
+        mentioned = addressed(text, self.handle)
+        solo = self.one_on_one and counterpart_message
+        self.armed = mentioned or solo
+        # Both true → the mention wording wins (the more specific reason). `_nudge` is read only
+        # when `armed`, so its value on an unarmed turn does not matter.
+        self._nudge = self.mention_nudge if mentioned else self.one_on_one_nudge
         self.nudged = False
         self._baseline = self.speech.actions
 
     def on_turn(self, reply: Message, messages: list[Message]) -> bool:
-        """The `TurnHook`: append the nudge iff addressed, ending, and empty-handed. Once."""
+        """The `TurnHook`: append the nudge iff armed, ending, and empty-handed. Once."""
         if not self.armed or self.nudged:
             return False
         if reply.tool_calls:
@@ -214,5 +300,5 @@ class MentionInformer:
         if self.speech.actions > self._baseline:
             return False  # it acted on the timeline this turn; it was not silent
         self.nudged = True
-        messages.append(Message.system(self.nudge))
+        messages.append(Message.system(self._nudge))
         return True  # one more pass, tools in hand: act, or say why not

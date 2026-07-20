@@ -116,7 +116,7 @@ from basecradle_harness._provider import Provider
 from basecradle_harness._search_params import load_search_params
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._tools import Tool
-from basecradle_harness._unspoken import MentionInformer, SpeechLedger
+from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._xai_sdk import (
     DEFAULT_SURFACE as XAI_SDK_DEFAULT_SURFACE,
 )
@@ -225,11 +225,23 @@ class TimelineAgent:
         dashboard = self.client.me
         self.me_uuid = dashboard.identity.uuid
 
-        # The mention informer (issue #293), composed onto whatever turn hook is already wired —
-        # the poll loop gets the identical behavior the wake path does, because there is one
+        # The no-reply informer (issues #293, #332), composed onto whatever turn hook is already
+        # wired — the poll loop gets the identical behavior the wake path does, because there is one
         # framework here, not two. See `WakeAgent.__init__` for why it composes rather than replaces.
-        self.informer = MentionInformer(
-            handle=getattr(dashboard.identity, "handle", None), speech=self.speech
+        #
+        # The one-on-one arm needs the timeline's live viewer set, and the poll agent deliberately
+        # keeps no `self.timeline` (nothing posts on its behalf any more — issue #293). So it is
+        # fetched once here, at startup: a real reader now exists for it, which is exactly the
+        # condition under which that `GET /timelines/{uuid}` is worth paying (once per process, never
+        # per poll). A fetch failure must not sink the agent — degrade to mention-only (`False`).
+        try:
+            one_on_one = is_one_on_one(self.client.timelines.get(self.timeline_uuid), self.me_uuid)
+        except Exception:  # noqa: BLE001 - the informer is a backstop; never let it break startup
+            one_on_one = False
+        self.informer = NoReplyInformer(
+            handle=getattr(dashboard.identity, "handle", None),
+            speech=self.speech,
+            one_on_one=one_on_one,
         )
         # Composed onto the engine's **base** hook, never its live one — chaining accretes, and a
         # second agent over the same `Harness` would stack a second informer holding a dead ledger.
@@ -319,10 +331,13 @@ class TimelineAgent:
             if message.user.uuid == self.me_uuid:
                 continue  # never engage with ourselves
             text = _incoming_text(message)
-            # Per *message*, not per poll: each is its own turn, with its own answer to "was I
-            # addressed, and did I act?" The ledger is what the informer reads, so it cycles with it.
+            # Per *message*, not per poll: each is its own turn, with its own answer to "was this
+            # addressed to me, and did I act?" The ledger is what the informer reads, so it cycles
+            # with it. Every message reaching here is a peer's (own posts are skipped just above),
+            # so `counterpart_message=True` — which arms the one-on-one nudge on a two-viewer
+            # timeline (issue #332), the poll-path twin of the wake path's message batch.
             self.speech.reset()
-            self.informer.arm(text)
+            self.informer.arm(text, counterpart_message=True)
             narration = self.harness.send(text)
             kind = "reserve" if self.harness.engine.reserve_used else "narration"
             log_unspoken(narration, timeline=self.timeline_uuid, kind=kind)

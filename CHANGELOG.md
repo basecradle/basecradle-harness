@@ -7,6 +7,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.82.0] - 2026-07-19
+
+### Added: the no-reply informer backstops one-on-one conversations, not just `@`-mentions (issue #332)
+
+The deterministic backstop that catches a turn ending with **nothing done when the message called
+for a reply** now arms on a *second* structural condition, and is renamed `MentionInformer` →
+**`NoReplyInformer`** to say so. The gap it closes was a live production incident: the founder asked
+@briggs (`grok-4.5`) a direct question on a fresh **one-on-one** timeline; briggs composed a complete
+1,669-char answer and ended the turn with it as private narration — `posted=0`, `unspoken` — and the
+founder was left staring at an empty timeline. The wake ran clean; the guidance strings were all
+correct. The one deterministic backstop simply did not arm, because the message carried no `@briggs`:
+a mention got a guaranteed second chance, and a message *structurally* addressed to the agent got
+nothing.
+
+- **Two structural arming conditions now, never a guess at content.** (1) an exact `@handle` mention,
+  exactly as before (issue #293); (2) a **one-on-one** — a counterpart's message on a **two-viewer**
+  timeline (the agent plus exactly one other, live viewer set at wake time). On a 1-on-1 there is no
+  one else the message could be for, so it earns the same guaranteed second chance a mention does,
+  worded for the one-on-one (`ONE_ON_ONE_NUDGE`). The informer still **informs; it never forces** —
+  the agent may end in silence, and nothing stops it.
+- **Structure, not identity — author-kind branching was deliberately rejected.** The counterpart may
+  be human **or** AI, and the test never asks which. Branching on author-kind would build a
+  silently-failing path for AI-authored messages that no human ever sees — the exact failure mode the
+  Unspoken Channel exists to prevent.
+- **The one-on-one arm is gated to *conversation*, so the heartbeat pattern is untouched.** A 1-on-1
+  timeline also wakes the agent for its *own* activated alarms, where `posted=0` is the desired
+  outcome; arming there would burn a model turn per beat forever. Only a **counterpart's message**
+  arms it (the message path passes `counterpart_message=True`); a task activation, an asset, a webhook
+  delivery, or a self-authored wake passes `False` and never arms the one-on-one nudge. The mention
+  arm is unchanged and fires on any wake.
+- **Both conditions true → exactly one nudge, and the mention wording wins** (the more specific
+  signal). The once-per-turn / never-loops invariant is shared across both reasons.
+- **The nudge wording is verbatim-shared.** `ONE_ON_ONE_NUDGE` differs from `MENTION_NUDGE` only in
+  its opening clause (the founder's wording: *"You are the only other party in this conversation…"*);
+  everything after is factored into a shared tail, so both founder corrections carry over for free —
+  no invented reader, and the `messages` tool named — and the standing model-facing guards
+  (`test_unspoken.py`) cover both nudges.
+- **The two-viewer test costs no extra round-trip on the wake path** (`is_one_on_one`, read off the
+  timeline the wake already fetched) and one startup `GET` on the poll path, where a real reader for
+  the viewer set now exists. Both paths get identical behavior — one framework, not two.
+
 ## [0.81.0] - 2026-07-19
 
 ### Added: the media line logs the provider-reported `cost=` for xAI image/video generation (issue #329)
