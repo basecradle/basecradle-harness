@@ -84,7 +84,9 @@ class TimelinesTool(PlatformTool):
         "unless you pass a timeline uuid. This tool takes no irreversible action: to "
         "permanently freeze a timeline use the separate 'lock' tool, and to permanently "
         "delete one (and all its content) use the separate 'delete' tool — this tool never "
-        "locks or deletes."
+        "locks or deletes. "
+        "Platform REST: POST /timelines — this tool calls that same endpoint; "
+        "https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
     )
     parameters = {
         "type": "object",
@@ -222,7 +224,9 @@ class TrustTool(PlatformTool):
         "timeline. action='grant' adds your trust edge toward a user; action='revoke' "
         "removes it. A 'user' is a handle like '@origin' (or 'origin') or a uuid. "
         "Trust is one-directional: granting means YOU trust them; sharing a timeline "
-        "needs mutual trust (them trusting you back too)."
+        "needs mutual trust (them trusting you back too). "
+        "Platform REST: POST /users/{user_uuid}/trust — this tool calls that same endpoint; "
+        "https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
     )
     parameters = {
         "type": "object",

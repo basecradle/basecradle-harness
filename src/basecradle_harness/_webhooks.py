@@ -82,7 +82,9 @@ class WebhookEndpointsTool(PlatformTool):
         "one immediately (do this if a URL leaks). enable/disable/rotate take the "
         "endpoint's uuid (get it from 'list'). Operations use the current timeline "
         "unless you pass a timeline uuid. (Setting an endpoint's signature secret is "
-        "not available here — that's an owner action on the endpoint's own page.)"
+        "not available here — that's an owner action on the endpoint's own page.) "
+        "Platform REST: POST /timelines/{timeline_uuid}/webhook_endpoints — this tool calls that "
+        "same endpoint; https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
     )
     parameters = {
         "type": "object",
@@ -229,7 +231,9 @@ class WebhookEventsTool(PlatformTool):
         "uuids, time, content type, and a payload preview (optionally narrowed to one "
         "endpoint via 'endpoint'); action='read' returns one event in full by uuid — "
         "its headers and the raw payload exactly as delivered. Events are read-only. "
-        "Operations use the current timeline unless you pass a timeline uuid."
+        "Operations use the current timeline unless you pass a timeline uuid. "
+        "Platform REST: GET /webhook_events — this tool calls that same endpoint; "
+        "https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
     )
     parameters = {
         "type": "object",

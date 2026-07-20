@@ -59,7 +59,10 @@ class DeleteTool(ConfirmedTimelineAction):
         "without the matching uuid is refused, deletes nothing, and returns a preview of what "
         "would be destroyed plus the uuid to confirm with. Deletes the current timeline unless "
         "you pass a timeline uuid. This is NOT how you leave a timeline or freeze one — to "
-        "freeze a timeline's content without destroying it, use the separate 'lock' tool."
+        "freeze a timeline's content without destroying it, use the separate 'lock' tool. "
+        "Platform REST: DELETE /timelines/{timeline_uuid} — this tool calls that same "
+        "endpoint, under the same confirm=uuid discipline (not a bypass); "
+        "https://basecradle.com/docs/api.md has the full API."
     )
 
     def _perform(self, timeline: Timeline) -> None:

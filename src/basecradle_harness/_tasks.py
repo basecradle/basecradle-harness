@@ -77,7 +77,9 @@ class TasksTool(PlatformTool):
         "activate_at takes a relative offset like '+90m', '+2h', or '+1d' (seconds, "
         "minutes, hours, days, weeks — resolved from now), or an absolute ISO-8601 "
         "timestamp like '2026-06-10T15:00:00Z'. "
-        "Operations use the current timeline unless you pass a timeline uuid."
+        "Operations use the current timeline unless you pass a timeline uuid. "
+        "Platform REST: POST /timelines/{timeline_uuid}/tasks — this tool calls that same "
+        "endpoint; https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
     )
     parameters = {
         "type": "object",

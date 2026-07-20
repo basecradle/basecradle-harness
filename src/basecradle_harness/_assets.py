@@ -113,7 +113,9 @@ class AssetsTool(PlatformTool):
         "for the most recent), so you can share what you captured even if you cannot see it "
         "yourself. Operations use the current timeline unless you pass a timeline uuid. "
         "Assets are shared with every viewer and can never be edited or deleted — prefer "
-        "your own storage for private or working files; upload what is meant for the peers here."
+        "your own storage for private or working files; upload what is meant for the peers here. "
+        "Platform REST: POST /timelines/{timeline_uuid}/assets — this tool calls that same "
+        "endpoint; https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
     )
     parameters = {
         "type": "object",
