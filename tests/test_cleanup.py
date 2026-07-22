@@ -33,6 +33,7 @@ from basecradle_harness._cleanup import (
     purge_one,
     sweep,
 )
+from basecradle_harness._report import BillingState
 
 # Real, well-formed UUIDv7 values (never `1111…` junk), per the test-data rule.
 DELETED = "0190a8c1-7f3e-7c2a-9b1d-3e4f5a6b7c8d"
@@ -50,9 +51,9 @@ def _session_path(home: Path, uuid: str) -> Path:
 
 
 def lay_down_all_kinds(home: Path, uuid: str) -> dict[str, Path]:
-    """Write all five artifact kinds for one timeline, using the real stores. Returns the paths.
+    """Write all six artifact kinds for one timeline, using the real stores. Returns the paths.
 
-    Marks/seen/claims/breaker go through the actual store classes so the on-disk encoding is
+    Marks/seen/claims/breaker/billing go through the actual store classes so the on-disk encoding is
     whatever the agent really writes; the session transcript is written at the same
     `quote`-derived path `Harness._transcript_path` produces.
     """
@@ -74,6 +75,9 @@ def lay_down_all_kinds(home: Path, uuid: str) -> dict[str, Path]:
     breaker = WakeBreaker(home)
     breaker.record_and_check(uuid)  # writes breaker/<uuid>.wakes
 
+    billing = BillingState(home)
+    billing.note_and_check(uuid)  # writes billing/<uuid>.blocked (issue #336)
+
     return {
         "session": session,
         "mark_messages": home / "marks" / f"{quote(uuid, safe='')}.txt",
@@ -82,6 +86,7 @@ def lay_down_all_kinds(home: Path, uuid: str) -> dict[str, Path]:
         "seen_tasks": home / "seen" / "tasks" / f"{quote(uuid, safe='')}.txt",
         "claims_dir": home / "claims" / "messages" / quote(uuid, safe=""),
         "breaker_wakes": home / "breaker" / f"{quote(uuid, safe='')}.wakes",
+        "billing_blocked": home / "billing" / f"{quote(uuid, safe='')}.blocked",
     }
 
 
@@ -116,7 +121,7 @@ def test_enumerate_round_trips_the_store_encoding(tmp_path):
 
     assert set(artifacts) == {DELETED}
     found = set(artifacts[DELETED])
-    # Every one of the five kinds (seven files/dirs) is attributed to the timeline.
+    # Every one of the six kinds (eight files/dirs) is attributed to the timeline.
     assert found == set(paths.values())
 
 
@@ -168,7 +173,7 @@ def test_enumerate_ignores_a_stranded_save_from_another_channel(tmp_path):
 # --- the classify switch: only a clean 404 purges -----------------------------------------
 
 
-def test_not_found_purges_all_five_kinds(tmp_path):
+def test_not_found_purges_all_kinds(tmp_path):
     paths = lay_down_all_kinds(tmp_path, DELETED)
     client = _FakeClient({DELETED: NotFoundError("gone")})
 

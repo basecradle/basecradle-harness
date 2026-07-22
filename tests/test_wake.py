@@ -39,6 +39,9 @@ from basecradle_harness import (
     MarkStore,
     Message,
     MessagesTool,
+    ProviderBillingError,
+    ProviderContextLengthError,
+    ProviderPayloadTooLargeError,
     ReadPacer,
     SeenStore,
     StaleTimelineError,
@@ -4576,3 +4579,181 @@ def test_a_compaction_during_a_build_never_lets_its_tools_re_fire(platform, tmp_
     agent.wake()
 
     assert tool_runs == [1], "the tool must run exactly once — a rebuild would re-fire it"
+
+
+# --- provider-failure taxonomy: report to the timeline, never a silent retry loop (issue #336) ---
+
+
+class RaisingProvider:
+    """A provider whose `chat` raises a fixed provider error — the failure-taxonomy path (issue #336).
+
+    It counts its calls, so a test can prove the wake **fails fast** (one call, not a per-item
+    hammering) and that the report is **model-free**: the notice reaches the timeline through the SDK
+    while the model has done nothing but raise.
+    """
+
+    provider = "openai"
+    model = "gpt-4o"
+
+    def __init__(self, error):
+        self.error = error
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        raise self.error
+
+
+def _too_large():
+    return ProviderPayloadTooLargeError(
+        "xAI gRPC error (RESOURCE_EXHAUSTED): CLIENT: Sent message larger than max "
+        "(25470493 vs. 20971520)",
+        status_code=413,
+    )
+
+
+def _out_of_funds():
+    return ProviderBillingError(
+        "billing",
+        status_code=402,
+        body='{"error": {"message": "Insufficient credits. Add more at openrouter.ai/credits"}}',
+    )
+
+
+def test_a_permanent_failure_is_reported_verbatim_and_the_item_is_marked_handled(
+    platform, tmp_path
+):
+    """The @briggs incident's fix: a payload-too-large is reported to the timeline (verbatim vendor
+    error), the driving message is marked handled, and the wake exits clean — no re-drive loop."""
+    serve_messages(platform, page(message(uuid=M0, body="see the attached photo")))
+    agent, provider = build_wake(tmp_path, provider=RaisingProvider(_too_large()))
+
+    posted = agent.wake()  # must not raise — the wake succeeded at its job (reporting)
+
+    # The verbatim vendor error is on the timeline, model-free (the model only raised, once).
+    assert provider.calls == 1
+    bodies = _posts(platform)
+    assert len(bodies) == 1
+    assert "Sent message larger than max (25470493 vs. 20971520)" in bodies[0]
+    assert "untouched" in bodies[0]  # decision 1: the original is not modified
+    assert len(posted) == 1  # the report counts as the wake's one visible act
+    # Marked handled: the mark advanced past M0, so a healthy second wake re-drives nothing.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
+    serve_messages(platform, page(message(uuid=M0, body="see the attached photo")))
+    healthy, healthy_provider = build_wake(tmp_path)
+    assert healthy.wake() == []
+    assert healthy_provider.prompts == []  # never re-driven — the report was the handling
+
+
+def test_an_oversized_asset_is_reported_and_never_re_driven(platform, tmp_path):
+    """The literal @briggs shape: a peer's image passes the local view gate, is sent to the vendor,
+    and the vendor rejects it. The verdict is relayed to the timeline and the asset is marked seen."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")  # baseline: only A1 is new
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="huge-photo.png")))
+    agent, provider = build_wake(tmp_path, provider=RaisingProvider(_too_large()))
+
+    posted = agent.wake()
+
+    assert provider.calls == 1
+    bodies = _posts(platform)
+    assert len(bodies) == 1
+    assert "huge-photo.png" in bodies[0]  # the report names the file the human recognizes
+    assert "Sent message larger than max" in bodies[0]
+    assert len(posted) == 1
+    # The asset mark advanced past A1 — the loud re-drive loop of 2026-07-21 is impossible now.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
+
+
+def test_a_billing_failure_reports_once_leaves_work_pending_and_self_heals(platform, tmp_path):
+    """Out-of-funds: one plain-language notice, pending work untouched, debounced quiet, and self-heal
+    on the first successful call after funding — the whole billing contract (issue #336)."""
+    # Wake 1 — out of funds. One notice; the message is left pending (mark does not advance).
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    first, _ = build_wake(tmp_path, provider=RaisingProvider(_out_of_funds()))
+    posted = first.wake()
+    assert len(posted) == 1
+    notice = _posts(platform)[0]
+    assert "out of credit" in notice and "Add funds" in notice
+    assert "Insufficient credits. Add more at openrouter.ai/credits" in notice  # verbatim
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) is None  # pending — the mark never moved
+
+    # Wake 2 — still out of funds. Debounced: it re-attempts but posts no second notice.
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    second, second_provider = build_wake(tmp_path, provider=RaisingProvider(_out_of_funds()))
+    assert second.wake() == []  # quiet
+    assert len(_posts(platform)) == 1  # still exactly one notice across the outage
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) is None  # still pending
+
+    # Wake 3 — funded again. The pending message is finally answered and the block clears.
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    third, third_provider = build_wake(tmp_path)  # a healthy provider
+    third.wake()
+    assert third_provider.prompts != []  # the pending work resumed — the model WAS consulted
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # now handled, the mark advanced
+    assert not _wake.BillingState(tmp_path).blocked(TIMELINE_UUID)  # self-healed
+
+
+def test_a_billing_wall_fails_the_rest_of_the_wake_fast(platform, tmp_path):
+    """Once out of funds, the wake stops calling the model — a later kind's item is left pending, not
+    hammered against an unfunded account (issue #336). One model call, not one per item."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, provider = build_wake(tmp_path, provider=RaisingProvider(_out_of_funds()))
+
+    agent.wake()
+
+    # The message hit the wall (1 call); the asset reconcile short-circuited without a second call.
+    assert provider.calls == 1
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) is None  # message pending
+    # The asset mark never advanced past its A0 baseline to the new A1 — the asset was left pending.
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A0
+
+
+def test_an_uncompactable_context_overflow_is_reported_not_looped(platform, tmp_path):
+    """Decision 4: a blown context that cannot self-heal (no compactor here) tells the human on the
+    timeline and is marked handled, instead of exiting 1 into a silent router-retry loop."""
+    serve_messages(platform, page(message(uuid=M0, body="a very long history")))
+    overflow = ProviderContextLengthError(
+        "This model's maximum context length is 128000 tokens", status_code=400
+    )
+    agent, provider = build_wake(tmp_path, provider=RaisingProvider(overflow))
+
+    posted = agent.wake()  # must not raise
+
+    assert provider.calls == 1
+    bodies = _posts(platform)
+    assert len(bodies) == 1
+    assert "too long for my context window" in bodies[0]
+    assert len(posted) == 1
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # handled
+
+
+def test_the_reported_failure_log_line_grammar_is_stable(platform, tmp_path, caplog):
+    """The NOC alarms on the exact `wake reported_failure kind=…` line (basecradle-noc#317), so pin
+    its grammar here — a silent field rename would break the alarm without failing any behavior test."""
+    import logging
+
+    serve_messages(platform, page(message(uuid=M0, body="see the attached photo")))
+    agent, _ = build_wake(tmp_path / "perm", provider=RaisingProvider(_too_large()))
+    with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+        agent.wake()
+    permanent = [r.getMessage() for r in caplog.records if "reported_failure" in r.getMessage()]
+    assert len(permanent) == 1
+    assert "wake reported_failure" in permanent[0]
+    assert "kind=permanent" in permanent[0]
+    assert "reason=payload_too_large" in permanent[0]
+    assert "provider=openai" in permanent[0]
+
+    # And the billing line carries `kind=billing` — the field the NOC's billing alert keys on.
+    caplog.clear()
+    serve_messages(platform, page(message(uuid=M0, body="hello")))
+    billing_agent, _ = build_wake(tmp_path / "bill", provider=RaisingProvider(_out_of_funds()))
+    with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+        billing_agent.wake()
+    billing = [r.getMessage() for r in caplog.records if "reported_failure" in r.getMessage()]
+    assert len(billing) == 1
+    assert "kind=billing" in billing[0]
+    assert "reason=out_of_funds" in billing[0]

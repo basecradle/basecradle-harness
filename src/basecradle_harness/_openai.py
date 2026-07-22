@@ -42,13 +42,16 @@ from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
+    ProviderBillingError,
     ProviderConnectionError,
     ProviderContextLengthError,
     ProviderError,
+    ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
 )
+from basecradle_harness._faults import is_out_of_funds
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
     log_llm_call,
@@ -386,7 +389,30 @@ class _ErrorMapper:
 
 
 def _from_status_error(exc) -> ProviderError:
-    """An ``openai.APIStatusError`` mapped to the right typed `ProviderAPIError` subclass."""
+    """An ``openai.APIStatusError`` mapped to the right typed `ProviderAPIError` subclass.
+
+    The failure taxonomy (issue #336) is mapped here by the *nature* of the fault, never by the
+    vendor — this one adapter serves OpenAI, xAI, and OpenRouter, so what it reads is the wire signal,
+    not who sent it. Beyond the pre-existing classes (context-overflow, auth, rate-limit, 5xx), two
+    **reported** classes are distinguished:
+
+    - **Out of funds** — OpenAI signals it as a **429 whose ``error.type``/``code`` is
+      ``insufficient_quota``**, the one 429 that is *not* a rate limit. It heals only when a human
+      funds the account, so it is `ProviderBillingError`, not a rate limit; the wake reports it and
+      debounces rather than retrying. The **structured code is checked first and status-independently**
+      (so an endpoint that signals out-of-funds as a 401/403 — e.g. xAI-via-``openai``, whose shape is
+      unconfirmed — is not swallowed as an auth error), with a text fallback scoped to the 429 body.
+    - **Payload too large** — a **413** that is not a context overflow: the request body exceeded the
+      endpoint's accept limit. Deterministic and content-shaped, so `ProviderPayloadTooLargeError`
+      (reported, the original never modified — issue #336, decision 1), not a retry.
+
+    A *generic* malformed-request 400/422 is deliberately **not** in the taxonomy: it is almost always
+    a fixable harness/config defect (a bad ``model_params.json`` key, a serialization bug), not a
+    permanent property of the peer's content — so it stays a plain `ProviderAPIError` and **propagates**
+    (CLAUDE.md → Provider Capabilities: "a bad model_params.json key propagates on the first raise").
+    Reporting it and marking the item handled would lose the peer's message the moment the config is
+    fixed; propagating leaves the message re-drivable. See issue #336's completion notes.
+    """
     status = exc.status_code
     body = _body_text(exc)
     message = getattr(exc, "message", None) or str(exc)
@@ -395,17 +421,33 @@ def _from_status_error(exc) -> ProviderError:
         # every later wake would rebuild the same over-long request and fail identically — so it is
         # classed apart from every other 400 and the session compacts and retries the turn once.
         return ProviderContextLengthError(message, status_code=status, body=body)
+    if _error_code(body) == "insufficient_quota":
+        # Out of funds — the account-blocked class. The **structured** code is authoritative and
+        # status-independent, so a 401/403/429 all resolve to billing here rather than being
+        # swallowed as auth/rate-limit below (issue #336). No false-positive risk: this is the
+        # vendor's own machine-readable code, not a message-text guess.
+        return ProviderBillingError(message, status_code=status, body=body)
     if status in (401, 403):
         return ProviderAuthError(
             f"Provider rejected the API key (HTTP {status}).", status_code=status, body=body
         )
     if status == 429:
+        # A 429 without the structured quota code: a genuine rate limit (transient), unless the body
+        # text names an out-of-funds cause — the defensive fallback for an endpoint whose body shape
+        # is not confirmed (xAI-via-``openai``). The text match is scoped to the 429 body so it can
+        # never re-read a 4xx that isn't rate-limit-shaped as an outage.
+        if is_out_of_funds(f"{message} {body}"):
+            return ProviderBillingError(message, status_code=status, body=body)
         return ProviderRateLimitError(
             "Provider rate-limited the request (HTTP 429).",
             status_code=status,
             body=body,
             retry_after=_retry_after(exc),
         )
+    if status == 413:
+        # A 413 that is not a context overflow (checked above): the request body was simply too
+        # large. Deterministic and file-shaped — reported, never retried, never modified (issue #336).
+        return ProviderPayloadTooLargeError(message, status_code=status, body=body)
     if status >= 500:
         # The provider fell over on its own side — transient, so the engine re-requests it
         # (issue #284). The SDK also retries 5xx internally; this class is what makes the policy
@@ -413,8 +455,29 @@ def _from_status_error(exc) -> ProviderError:
         return ProviderServerError(
             f"Provider failed on its own side (HTTP {status}).", status_code=status, body=body
         )
-    # Carry the provider's own message so the image/audio tools can relay the true cause.
+    # Carry the provider's own message so the image/audio tools can relay the true cause — and so a
+    # generic malformed-request 400/422 propagates (see the docstring) rather than being reported.
     return ProviderAPIError(message, status_code=status, body=body)
+
+
+def _error_code(body: str) -> str | None:
+    """The ``error.type`` (or ``error.code``) from an OpenAI-shaped error body, if present.
+
+    OpenAI's out-of-funds 429 carries ``{"error": {"type": "insufficient_quota", ...}}`` — a
+    structured signal, read here so the billing class does not rest on a message-text match. Any
+    non-JSON or unshaped body yields ``None`` and the caller falls back to the text heuristic.
+    """
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    error = data.get("error") if isinstance(data, dict) else None
+    if not isinstance(error, dict):
+        return None
+    code = error.get("type") or error.get("code")
+    return code if isinstance(code, str) else None
 
 
 def _body_text(exc) -> str:

@@ -46,12 +46,15 @@ from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAuthError,
+    ProviderBillingError,
     ProviderConnectionError,
     ProviderContextLengthError,
     ProviderError,
+    ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
 )
+from basecradle_harness._faults import is_out_of_funds, is_too_large
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
 from basecradle_harness._observability import log_llm_call, serving_endpoint, token_counts
 from basecradle_harness._openai_wire import format_citations
@@ -364,14 +367,35 @@ class _grpc_error_context:
         code = exc.code() if callable(getattr(exc, "code", None)) else None
         detail = exc.details() if callable(getattr(exc, "details", None)) else str(exc)
         message = f"xAI gRPC error ({getattr(code, 'name', code)}): {detail}"
-        if is_context_overflow(detail or ""):
+        detail = detail or ""
+        if is_context_overflow(detail):
             # The wall (issue #276): the prompt was over grok's context window — gRPC's
             # INVALID_ARGUMENT, the HTTP 400's analogue. Deterministic, so the session compacts and
             # retries the turn once rather than re-sending a request that fails identically forever.
-            raise ProviderContextLengthError(message, status_code=400, body=detail or "") from exc
+            raise ProviderContextLengthError(message, status_code=400, body=detail) from exc
         if code == grpc.StatusCode.UNAUTHENTICATED:
             raise ProviderAuthError(message, status_code=401) from exc
         if code == grpc.StatusCode.RESOURCE_EXHAUSTED:
+            # gRPC overloads RESOURCE_EXHAUSTED across three faults with three different remedies, so
+            # the *detail string* decides — never the bare code (issue #336). This is the exact
+            # misclassification the 2026-07-21 @briggs incident exposed: a client-side "message
+            # larger than max" was read as a rate limit and re-driven 51 times.
+            if is_too_large(detail):
+                # The ``xai-sdk``'s own 20 MiB channel cap, computed *client-side* before the wire:
+                # the request body is too large. Deterministic — the identical bytes are rejected
+                # identically — so it is reported once, never retried, and the file is never modified
+                # (decision 1). `status_code=413`: the HTTP analogue, so a caller reading the status
+                # sees "payload too large" regardless of the transport.
+                raise ProviderPayloadTooLargeError(message, status_code=413, body=detail) from exc
+            if is_out_of_funds(detail):
+                # Out of xAI credit — the account-blocked class. **Defensive**: xAI's exact
+                # out-of-credit gRPC shape could not be confirmed from its published docs (issue
+                # #336 says to match defensively and say so), so this rests on the detail phrasing;
+                # an unrecognized out-of-credit wording falls through to the rate-limit default
+                # below, which is the safe direction (a retry, not a false outage report).
+                # `status_code=402`: the HTTP Payment-Required analogue.
+                raise ProviderBillingError(message, status_code=402, body=detail) from exc
+            # A genuine rate limit — heals with time, so transient, exactly as before.
             raise ProviderRateLimitError(message, status_code=429) from exc
         if code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
             raise ProviderConnectionError(message) from exc
@@ -381,4 +405,10 @@ class _grpc_error_context:
             # retryable `ProviderResponseError` so the engine re-requests it, the same capability
             # class as the OpenAI/OpenRouter parse failures — a dropped wake, not a config bug.
             raise ProviderResponseError(message) from exc
+        # Anything else — an INVALID_ARGUMENT that is not a context overflow (gRPC's deterministic-400
+        # analogue), a PERMISSION_DENIED, etc. — stays a plain `ProviderError` and **propagates**. A
+        # generic malformed request is almost always a fixable harness/config defect, not a permanent
+        # property of the peer's content, so reporting-and-marking-handled would lose the peer's
+        # message once the config is fixed; propagating leaves it re-drivable (issue #336; CLAUDE.md →
+        # Provider Capabilities, "a bad model_params.json key propagates on the first raise").
         raise ProviderError(message) from exc

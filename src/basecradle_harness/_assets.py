@@ -52,10 +52,19 @@ _log = logging.getLogger("basecradle_harness")
 # log never blows up the model's context. 256 KiB is generous for prose/code.
 MAX_INLINE_BYTES = 256 * 1024
 
-# The largest image `view` will inline as model input. Vision images are heavier
-# than text but the model can handle a real photo; 20 MiB matches OpenAI's
-# per-image input ceiling. Larger than this is described, not shown.
-MAX_IMAGE_BYTES = 20 * 1024 * 1024
+# The largest image `view`/perception will load and base64-inline as model input. This is a
+# **machine sanity bound — what this box will hold in memory — not a prediction of any vendor's
+# input ceiling** (issue #336, decision 2). The old rationale ("matches OpenAI's per-image input
+# ceiling") was the same disease as a vendor cap table: a local guess at a remote limit that rots the
+# day a vendor changes it, and — worse — *pre-empts the vendor's own verdict*. So the number now
+# bounds only the one genuinely-local fact, the RAM cost of loading the blob and its base64/data-URL
+# expansion (roughly 2–3× the raw size, transiently). Everything under it is sent to the vendor for a
+# verdict; the vendor's own rejection of an over-large payload is now reported to the timeline
+# verbatim (the failure taxonomy — `ProviderPayloadTooLargeError`), so the harness no longer needs to
+# second-guess it here. A file over *this* bound is still described, not shown, and that refusal stays
+# a visible tool-result / perception string on every path (`image_input`, `_wake._perceive_asset`).
+# The original bytes are never modified anywhere — no downscaling, no recompression (decision 1).
+MAX_IMAGE_BYTES = 64 * 1024 * 1024
 
 # Image content types a vision model can take as input. Kept to the formats the
 # model providers document so `view` gives a clean "can't show that" rather than

@@ -29,10 +29,13 @@ from basecradle_harness._exceptions import (
     PolicyError,
     ProviderAPIError,
     ProviderAuthError,
+    ProviderBillingError,
     ProviderConnectionError,
     ProviderContextLengthError,
     ProviderError,
+    ProviderPayloadTooLargeError,
     ProviderRateLimitError,
+    ProviderRequestError,
     ProviderResponseError,
     ProviderServerError,
 )
@@ -260,6 +263,9 @@ __all__ = [
     "ProviderConnectionError",
     "ProviderAPIError",
     "ProviderAuthError",
+    "ProviderBillingError",
+    "ProviderPayloadTooLargeError",
+    "ProviderRequestError",
     "ProviderRateLimitError",
     "ProviderServerError",
 ]

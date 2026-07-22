@@ -19,7 +19,7 @@ import respx
 from basecradle import BaseCradle
 
 from basecradle_harness import AssetsTool, PlatformContext, PlatformError, ToolCall, ToolResult
-from basecradle_harness._assets import model_sees_images
+from basecradle_harness._assets import MAX_IMAGE_BYTES, model_sees_images
 from basecradle_harness._idempotency import create_kind
 from basecradle_harness._mcp import McpImageStore
 from basecradle_harness._unspoken import SpeechLedger
@@ -324,9 +324,12 @@ def test_view_rejects_an_unviewable_image_type(tool):
 
 def test_view_rejects_an_oversized_image(tool):
     with respx.mock(assert_all_called=True) as mock:
+        # Over the machine memory bound (`MAX_IMAGE_BYTES`, issue #336): the harness will not load a
+        # blob this large into RAM. It is *not* a vendor prediction — anything under it goes to the
+        # vendor for a verdict; only this local capability bound refuses without downloading.
         mock.get(f"{BC_URL}/assets/{A_IMG}").mock(
             return_value=httpx.Response(
-                200, json={"asset": image_asset(byte_size=30 * 1024 * 1024)}
+                200, json={"asset": image_asset(byte_size=MAX_IMAGE_BYTES + 1)}
             )
         )
         # No blob route: an oversized image is refused without downloading.
