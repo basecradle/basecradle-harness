@@ -63,9 +63,11 @@ from basecradle_harness._context import is_context_overflow
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
+    ProviderBillingError,
     ProviderConnectionError,
     ProviderContextLengthError,
     ProviderError,
+    ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
@@ -604,6 +606,12 @@ def _from_status_error(exc) -> ProviderError:
         return ProviderAuthError(
             f"OpenRouter rejected the API key (HTTP {status}).", status_code=status, body=body
         )
+    if status == 402:
+        # OpenRouter signals **insufficient credits** with a distinct HTTP 402 Payment Required —
+        # unlike OpenAI, it does not overload 429 for it. This is the account-blocked class: it heals
+        # only when a human funds the account, so the wake reports it and debounces rather than
+        # retrying a request that will fail identically until then (issue #336).
+        return ProviderBillingError(message, status_code=status, body=body)
     if status == 429:
         return ProviderRateLimitError(
             "OpenRouter rate-limited the request (HTTP 429).",
@@ -611,6 +619,10 @@ def _from_status_error(exc) -> ProviderError:
             body=body,
             retry_after=_retry_after(exc),
         )
+    if status == 413:
+        # A 413 that is not a context overflow (checked above): the request body was too large.
+        # Deterministic and file-shaped — reported once, never retried, never modified (issue #336).
+        return ProviderPayloadTooLargeError(message, status_code=status, body=body)
     if status >= 500:
         # OpenRouter (or the upstream it routed to) fell over on its own side — transient, so the
         # engine re-requests it (issue #284). It matters *most* here: this adapter disables the SDK's
@@ -620,7 +632,11 @@ def _from_status_error(exc) -> ProviderError:
         return ProviderServerError(
             f"OpenRouter failed on its own side (HTTP {status}).", status_code=status, body=body
         )
-    # Carry OpenRouter's own message + body so a caller can relay the true cause.
+    # Carry OpenRouter's own message + body so a caller can relay the true cause — and so a generic
+    # malformed-request 400/422 **propagates** rather than being reported: it is almost always a
+    # fixable harness/config defect, not a permanent property of the peer's content, and marking the
+    # peer's message handled would lose it the moment the config is fixed (issue #336; CLAUDE.md →
+    # Provider Capabilities, "a bad model_params.json key propagates on the first raise").
     return ProviderAPIError(message, status_code=status, body=body)
 
 

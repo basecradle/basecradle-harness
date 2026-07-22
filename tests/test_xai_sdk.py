@@ -22,9 +22,11 @@ from basecradle_harness import (
     Message,
     Provider,
     ProviderAuthError,
+    ProviderBillingError,
     ProviderConnectionError,
     ProviderContextLengthError,
     ProviderError,
+    ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
     ToolCall,
@@ -408,11 +410,44 @@ def test_grpc_internal_maps_to_the_retryable_response_error():
 
 
 def test_an_unclassified_grpc_error_stays_a_plain_provider_error():
-    # A code that is neither transient-response nor connection/auth/rate-limit stays a plain
-    # ProviderError (not retried) — so the response-retry never fires on an unrelated fault.
+    # A code that is neither transient-response nor connection/auth/rate-limit/too-large/out-of-funds
+    # stays a plain ProviderError (not retried, not reported) — so the response-retry never fires on
+    # an unrelated fault. A non-context INVALID_ARGUMENT (a fixable malformed request) is exactly this
+    # case: it propagates rather than being reported, so the peer's message stays re-drivable (#336).
     with pytest.raises(ProviderError) as exc:
         _provider_raising(grpc.StatusCode.INVALID_ARGUMENT).chat([Message.user("hi")])
     assert not isinstance(exc.value, ProviderResponseError)
+    assert type(exc.value) is ProviderError  # a plain provider error, not a reported subclass
+
+
+def test_grpc_resource_exhausted_reads_the_detail_not_just_the_code():
+    """The @briggs incident's root fix (issue #336): RESOURCE_EXHAUSTED is overloaded across three
+    faults with three remedies, so the *detail* decides — a bare one stays a rate limit, a
+    message-too-large is a permanent payload error, a credit-exhaustion is the billing class."""
+    too_large = _FakeRpcError(
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+        details="CLIENT: Sent message larger than max (25470493 vs. 20971520)",
+    )
+    with pytest.raises(ProviderPayloadTooLargeError) as exc:
+        XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=_RaisingClient(too_large)).chat(
+            [Message.user("hi")]
+        )
+    assert exc.value.status_code == 413
+    assert "Sent message larger than max" in str(exc.value)
+
+    out_of_funds = _FakeRpcError(
+        grpc.StatusCode.RESOURCE_EXHAUSTED, details="insufficient credit on this account"
+    )
+    with pytest.raises(ProviderBillingError) as exc:
+        XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=_RaisingClient(out_of_funds)).chat(
+            [Message.user("hi")]
+        )
+    assert exc.value.status_code == 402
+
+    # A bare RESOURCE_EXHAUSTED (no billing/too-large wording) is still a transient rate limit — the
+    # safe fall-through, so a genuine rate limit is never mis-reported as a permanent outage.
+    with pytest.raises(ProviderRateLimitError):
+        _provider_raising(grpc.StatusCode.RESOURCE_EXHAUSTED).chat([Message.user("hi")])
 
 
 # --- the per-call log line (issue #272) --------------------------------------
@@ -578,4 +613,6 @@ def test_an_ordinary_invalid_argument_is_not_mistaken_for_the_wall():
     with pytest.raises(ProviderError) as exc:
         provider.chat([Message.user("hi")])
 
+    # A non-context INVALID_ARGUMENT stays a plain provider error and propagates — never the context
+    # wall, and never a reported class (a fixable malformed request, not permanent-for-content, #336).
     assert not isinstance(exc.value, ProviderContextLengthError)

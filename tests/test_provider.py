@@ -22,10 +22,13 @@ from basecradle_harness import (
     Provider,
     ProviderAPIError,
     ProviderAuthError,
+    ProviderBillingError,
     ProviderConnectionError,
     ProviderContextLengthError,
     ProviderError,
+    ProviderPayloadTooLargeError,
     ProviderRateLimitError,
+    ProviderRequestError,
     ProviderResponseError,
     ProviderServerError,
     ToolCall,
@@ -511,6 +514,84 @@ def test_500_raises_the_retryable_server_error_keeping_the_body(router, provider
     assert exc.value.body == "boom"
     assert isinstance(exc.value, ProviderAPIError)  # the error relay gates on this
     assert not isinstance(exc.value, (ProviderAuthError, ProviderRateLimitError))
+
+
+def test_429_with_insufficient_quota_maps_to_the_billing_class(router, provider):
+    """OpenAI overloads 429: out-of-funds carries ``error.type == "insufficient_quota"`` and heals
+    only when a human pays, so it is the account-blocked class — never a rate limit (issue #336)."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            429,
+            json={
+                "error": {
+                    "message": "You exceeded your current quota, please check your plan and "
+                    "billing details.",
+                    "type": "insufficient_quota",
+                    "code": "insufficient_quota",
+                }
+            },
+        )
+    )
+
+    with pytest.raises(ProviderBillingError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert exc.value.status_code == 429
+    assert not isinstance(
+        exc.value, ProviderRateLimitError
+    )  # the whole point — it is not a rate limit
+    assert "billing details" in exc.value.body
+
+
+def test_413_maps_to_payload_too_large(router, provider):
+    """A 413 that is not a context overflow: the request body was too large. Deterministic and
+    file-shaped — reported once, never retried, the original never modified (issue #336)."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            413, json={"error": {"message": "Request payload size exceeds the limit"}}
+        )
+    )
+
+    with pytest.raises(ProviderPayloadTooLargeError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert exc.value.status_code == 413
+    assert isinstance(exc.value, ProviderRequestError)  # a permanent-for-the-request member
+    assert not isinstance(exc.value, ProviderContextLengthError)
+
+
+def test_a_generic_400_stays_a_plain_api_error_and_propagates(router, provider):
+    """A generic malformed-request 400 (not a context overflow, not out-of-funds) is a **fixable**
+    config/harness defect, not a permanent property of the peer's content — so it stays a plain
+    `ProviderAPIError` and propagates (marking the message handled would lose it on a config fix;
+    issue #336). It is deliberately **not** any reported taxonomy class."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            400, json={"error": {"message": "Invalid value for 'tools': expected an array"}}
+        )
+    )
+
+    with pytest.raises(ProviderAPIError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert exc.value.status_code == 400
+    assert type(exc.value) is ProviderAPIError  # not a request/billing/context/rate-limit subclass
+
+
+def test_insufficient_quota_is_billing_even_under_a_non_429_status(router, provider):
+    """The structured ``insufficient_quota`` code is authoritative and status-independent, so an
+    endpoint that signals out-of-funds as a 403 (rather than OpenAI's documented 429) is still the
+    billing class, not swallowed as an auth error (issue #336)."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            403, json={"error": {"message": "You are out of credits", "type": "insufficient_quota"}}
+        )
+    )
+
+    with pytest.raises(ProviderBillingError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert not isinstance(exc.value, ProviderAuthError)  # the 403 did not win — the quota code did
 
 
 def test_400_relays_the_providers_real_message(router, provider):

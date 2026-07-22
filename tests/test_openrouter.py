@@ -28,10 +28,13 @@ from basecradle_harness import (
     Provider,
     ProviderAPIError,
     ProviderAuthError,
+    ProviderBillingError,
     ProviderConnectionError,
     ProviderContextLengthError,
     ProviderError,
+    ProviderPayloadTooLargeError,
     ProviderRateLimitError,
+    ProviderRequestError,
     ProviderResponseError,
     ProviderServerError,
     ToolCall,
@@ -466,6 +469,60 @@ def test_500_maps_to_the_retryable_server_error_keeping_the_body(router):
         provider.chat([Message.user("Hi")])
     assert exc.value.status_code == 500
     assert "boom" in exc.value.body  # the body survives, so a tool can still relay the true cause
+    provider.close()
+
+
+def test_402_maps_to_the_billing_class(router):
+    """OpenRouter signals **insufficient credits** with a distinct HTTP 402 Payment Required — unlike
+    OpenAI it does not overload 429 — so 402 is the account-blocked class, reported and debounced,
+    never retried (issue #336)."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            402,
+            json={
+                "error": {"message": "Insufficient credits. Add more at openrouter.ai", "code": 402}
+            },
+        )
+    )
+    provider = _provider(retries_disabled=True)
+    with pytest.raises(ProviderBillingError) as exc:
+        provider.chat([Message.user("Hi")])
+    assert exc.value.status_code == 402
+    assert not isinstance(exc.value, ProviderRateLimitError)
+    assert "Insufficient credits" in exc.value.body
+    provider.close()
+
+
+def test_413_maps_to_payload_too_large(router):
+    """A 413 that is not a context overflow: the request body was too large — reported once, never
+    retried, the original never modified (issue #336)."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            413, json={"error": {"message": "Request too large", "code": 413}}
+        )
+    )
+    provider = _provider(retries_disabled=True)
+    with pytest.raises(ProviderPayloadTooLargeError) as exc:
+        provider.chat([Message.user("Hi")])
+    assert exc.value.status_code == 413
+    assert isinstance(exc.value, ProviderRequestError)
+    provider.close()
+
+
+def test_a_generic_400_stays_a_plain_api_error_and_propagates(router):
+    """A generic malformed-request 400 (not context, not out-of-funds) is a fixable config/harness
+    defect, not permanent-for-the-content — so it stays a plain `ProviderAPIError` and propagates,
+    rather than being reported and the peer's message marked handled (issue #336)."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            400, json={"error": {"message": "Invalid request body", "code": 400}}
+        )
+    )
+    provider = _provider(retries_disabled=True)
+    with pytest.raises(ProviderAPIError) as exc:
+        provider.chat([Message.user("Hi")])
+    assert exc.value.status_code == 400
+    assert type(exc.value) is ProviderAPIError  # not a reported subclass
     provider.close()
 
 

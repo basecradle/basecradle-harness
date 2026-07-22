@@ -7,6 +7,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.84.0] - 2026-07-21
+
+### Added: provider-failure taxonomy — fail once, report to the timeline (issue #336)
+
+A deterministic model-call failure — a payload the model won't accept, or an account out of funds —
+is no longer aborted-and-silently-retried into a router loop. It is **reported to the timeline once,
+verbatim, in the agent's own account**, and the driving item is handled or left pending as its
+nature demands. This closes the 2026-07-21 @briggs incident, where a ~19 MB photo base64-inflated
+past the `xai-sdk`'s 20 MiB gRPC send cap was misclassified as a rate limit and re-driven 51 times
+while the timeline stayed silent — the error lived only in journald and the Alarm Bell.
+
+- **Fault taxonomy, classified by nature, never by vendor.** Beyond the transient class (retried,
+  unchanged), two non-transient classes now report instead of propagating: `ProviderPayloadTooLargeError`
+  (permanent for the *content* — the incident's shape; the human sends a smaller file) and
+  `ProviderBillingError` (account-blocked / out of funds — a **sibling of the rate-limit class, not a
+  variant**). `ProviderContextLengthError` keeps its own compact-and-retry self-heal and reaches the
+  reporter only when that can't run. A **generic** malformed-request 400/422/`INVALID_ARGUMENT` is
+  deliberately *not* reported: it is almost always a fixable config/harness defect, so it stays a plain
+  `ProviderAPIError` and **propagates** (marking the peer's message handled would lose it on a config
+  fix — a delivery-guarantee violation). `ProviderRequestError` is the category base; its only shipped
+  member is `ProviderPayloadTooLargeError`.
+- **Every adapter maps its own SDK's signals** onto the shared classes: OpenAI — 413 → too-large,
+  `insufficient_quota` (structured, any status) → billing, a 429 whose body names out-of-funds →
+  billing else rate-limit; OpenRouter — 402 → billing, 413 → too-large; native xAI gRPC —
+  `RESOURCE_EXHAUSTED` disambiguated on the detail (client-side "message larger than max" → too-large,
+  credit/quota → billing, else → rate-limit). A generic 400/422/`INVALID_ARGUMENT` propagates as
+  before.
+- **Mechanical timeline reporter** (`_report.py`, `_wake._report_provider_failure`): posts the
+  **verbatim vendor error** through the BaseCradle SDK under the agent's identity — no LLM anywhere in
+  the failure path (the model is the thing that failed). This is the Unspoken Channel's second
+  sanctioned harness-authored post, admissible precisely because the model is unreachable.
+- **Billing debounce + self-heal** (`_report.BillingState`): one out-of-funds notice per outage per
+  timeline, pending work left pending, the rest of the wake failed fast, and the block cleared the
+  moment a call succeeds again — so a funded account resumes untouched.
+- **Founder-decided invariants (2026-07-21):** no file bytes are ever modified on any path (no
+  downscaling / recompression — the Active Storage precedent); no built-in vendor cap table (the
+  vendor's live rejection is the single source of truth). `MAX_IMAGE_BYTES` re-rationalized as a
+  **machine memory bound** (20 MiB → 64 MiB), no longer a prediction of a vendor's input ceiling.
+- **Observability:** a distinct, greppable `wake reported_failure kind=permanent|billing …` ERROR
+  line per reported failure (and a `wake billing_blocked …` WARNING for a debounced repeat), which
+  the NOC consumes for its Alarm Bell chart + billing alert (basecradle-noc#317).
+- **Cleanup parity:** the orphan-artifact sweep (`basecradle-harness-cleanup`) now purges a deleted
+  timeline's `billing/<uuid>.blocked` marker alongside its `marks/`/`seen/`/`claims/`/`breaker/`
+  artifacts (memory is still never touched).
+
 ## [0.83.0] - 2026-07-20
 
 ### Added: every BaseCradle platform tool names its public REST identity in its description (issue #334)

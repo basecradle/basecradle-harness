@@ -120,8 +120,10 @@ from basecradle_harness._engine import compose_hooks
 from basecradle_harness._exceptions import (
     EngineError,
     HarnessError,
+    ProviderBillingError,
     ProviderContextLengthError,
     ProviderError,
+    ProviderPayloadTooLargeError,
 )
 from basecradle_harness._harness import Harness
 from basecradle_harness._idempotency import IdempotencyKeys, interrupted
@@ -137,6 +139,14 @@ from basecradle_harness._messages import ImageContent, Message
 from basecradle_harness._observability import delivery_id, describe_provider, kv, log_unspoken
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
+from basecradle_harness._report import (
+    BILLING,
+    PERMANENT,
+    BillingState,
+    classify,
+    report_body,
+    verbatim,
+)
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
@@ -237,6 +247,21 @@ class SeenStore:
 _FINAL = "final"
 _OURS = "ours"
 _PENDING = "pending"
+
+#: The provider failures a wake **reports to the timeline** rather than letting propagate to a
+#: router-retry loop (issue #336). The adapters classify a fault into these typed classes; the wake
+#: catches this tuple around every model call and hands it to `_report_provider_failure`, which posts
+#: the verbatim vendor error mechanically. Exactly the three the adapters actually *produce* as
+#: reportable — a payload too large (the @briggs case), an out-of-funds account, and a context
+#: overflow that could not self-heal. A **generic** malformed-request 4xx is deliberately absent: it
+#: stays a plain `ProviderAPIError` and propagates (a fixable config defect, not a permanent property
+#: of the peer's content — see `_exceptions.ProviderRequestError`). `ProviderContextLengthError` is
+#: here only for the residual uncompactable case; the common case self-heals before this catch.
+_REPORTED_FAILURES = (
+    ProviderPayloadTooLargeError,
+    ProviderContextLengthError,
+    ProviderBillingError,
+)
 
 #: The three phases of a claim. `in-flight` is the *only* one that is not a final disposition:
 #: it says a wake took the item and has not yet finished with it. The other two are terminal —
@@ -1139,6 +1164,10 @@ class WakeAgent:
         # cap. Lives beside the other stores, under the same home root. A directly-constructed
         # wake gets the generous defaults; `from_env` threads the env-tuned breaker.
         self.breaker = breaker or WakeBreaker(self.marks.root)
+        # Out-of-funds debounce + self-heal state (issue #336): one billing notice per outage per
+        # timeline, cleared on the first successful model call. Lives beside the other stores, under
+        # the same home root.
+        self.billing = BillingState(self.marks.root)
         # Read-speed pacing (see `ReadPacer`): before answering a peer AI's message, sleep to
         # simulate a human reading it, so an AI↔AI exchange is watchable and stays under the
         # breaker's trip line. A directly-constructed wake gets the real defaults; `from_env`
@@ -1233,6 +1262,12 @@ class WakeAgent:
         # call failed). It labels the turn's unspoken text `kind=stuck`, so the journal tells the
         # three endings apart: an ordinary one, a step-capped self-authored report, and a give-up.
         self._degraded = False
+        # Whether an out-of-funds wall was hit *this wake* (issue #336). Once set, the rest of the
+        # wake fails fast — no further model calls — rather than hammering an unfunded account; the
+        # pending items are left for the next wake, which resumes them the moment a call succeeds.
+        # Reset at the start of every wake (`wake`), so the first model call always attempts (the
+        # self-heal probe).
+        self._billing_blocked = False
         if onboard:
             # The persistent brief rides every model call (see `_wake_brief`) and carries the
             # personality charter (`system-prompt.md`) itself, so a static turn-0 seed would
@@ -1413,6 +1448,10 @@ class WakeAgent:
         # process can never report the first one's posts.
         posted: list[object] = []
         self.speech.reset()
+        # Reset the in-memory out-of-funds latch (issue #336): the first model call of *this* wake
+        # always attempts, so a wake after a human tops up the account self-heals. Only a billing
+        # failure *this* wake re-arms it, short-circuiting the remaining calls.
+        self._billing_blocked = False
         outcome = "error"  # only a clean return past the reconciles earns another verdict
         try:
             if self._breaker_short_circuits():
@@ -2031,6 +2070,12 @@ class WakeAgent:
                     posted.append(ack)
                 ledger.append((uuid, _FINAL if ack is not None else _PENDING))
                 continue
+            if self._billing_blocked:
+                # An out-of-funds wall was hit earlier this wake; every model call now fails the same
+                # way (issue #336). Fail fast — do not claim or engage — and leave the item pending so
+                # it resumes on the next wake after funding.
+                ledger.append((uuid, _PENDING))
+                continue
             if self.claims.claim(self.timeline_uuid, uuid, kind=kind):
                 disposition = _OURS
             else:
@@ -2046,7 +2091,25 @@ class WakeAgent:
             # ride into the model's input on this turn and are evicted after (see `Session`).
             rendered = render(item)
             shown, images = rendered if isinstance(rendered, tuple) else (rendered, [])
-            narration = self._engage(session, shown, images, item)
+            try:
+                narration = self._engage(session, shown, images, item)
+            except _REPORTED_FAILURES as exc:
+                # A permanent or out-of-funds provider failure: report it to the timeline once, model-
+                # free, rather than propagating to a router-retry loop (issue #336). Permanent →
+                # commit the item (the report handled it, never re-drive). Billing → leave the claim
+                # in-flight (`_PENDING`) so it resumes after funding, and `self._billing_blocked` is now
+                # set, so the gate above short-circuits the rest of this wake's items.
+                disposition = self._report_provider_failure(
+                    exc,
+                    kind=kind,
+                    item_desc=self._report_item_desc(item, kind),
+                    log_item=uuid,
+                    posted=posted,
+                )
+                if disposition == _FINAL:
+                    self.claims.commit(self.timeline_uuid, uuid, kind=kind)
+                ledger.append((uuid, disposition))
+                continue
             self._unspoken(narration)
             # **Memory observes every engaged turn — posted or silent** (issue #293). It used to
             # fire only when a reply posted, which under silence-default would quietly drop facts
@@ -2123,14 +2186,19 @@ class WakeAgent:
             # success. Unkeyed is the honest fallback: the create behaves as it always did.
             self.keys.clear()
         try:
-            return session.send(
+            narration = session.send(
                 text,
                 images=images,
                 brief=self._wake_brief(query=text),
                 items=[uuid] if uuid is not None else None,
             )
         except EngineError as error:
-            return self._stuck_note(error)
+            narration = self._stuck_note(error)
+        # A call got through (a step-cap degrade still proves the provider answered) — clear any
+        # billing-blocked marker (issue #336). A provider *failure* propagates instead and never
+        # reaches this line, so the marker survives an outage.
+        self._model_ok()
+        return narration
 
     def _unspoken(self, text: str) -> None:
         """Journal a turn's final text — the Unspoken Channel's one delivery point (issue #293).
@@ -2564,8 +2632,40 @@ class WakeAgent:
             # are not re-read forever.
             self._settle(_MESSAGES)
             return posted
+        if self._billing_blocked:
+            # A recovery resume above hit an out-of-funds wall (messages is the first reconcile, so
+            # this is the only way the latch is set here). Leave the claimed batch pending — mark it
+            # `_PENDING` and settle, so the claims stay in-flight, the mark is held behind them, and
+            # the bootstrap declines to baseline over them (issue #336). It re-drives after funding.
+            self._ledger[_MESSAGES] = [
+                (uuid, _PENDING if d == _OURS else d) for uuid, d in self._ledger[_MESSAGES]
+            ]
+            self._settle(_MESSAGES)
+            return posted
         self._pace_and_settle(session, batch, posted, probe_seen)
-        narration = self._generate_settled(session, batch, posted)
+        try:
+            narration = self._generate_settled(session, batch, posted)
+        except _REPORTED_FAILURES as exc:
+            # A permanent or out-of-funds provider failure on the batch: report it once, model-free
+            # (issue #336). Permanent → `_settle` commits the batch and advances the mark (the report
+            # was the handling). Billing → the batch must stay **pending**, so its `_OURS` ledger
+            # entries are flipped to `_PENDING` first: that leaves the claims in-flight (`_settle`
+            # commits only `_OURS`), holds the mark behind them, **and** makes the bootstrap decline
+            # to baseline over them (it reads the ledger, not the claims). Skipping `_settle` here
+            # would not do the last of those — the bootstrap would baseline the still-`_OURS` batch.
+            disposition = self._report_provider_failure(
+                exc,
+                kind=_MESSAGES,
+                item_desc="your messages" if len(batch) > 1 else "your message",
+                log_item=_uuid_of(batch[0]),
+                posted=posted,
+            )
+            if disposition == _PENDING:
+                self._ledger[_MESSAGES] = [
+                    (uuid, _PENDING if d == _OURS else d) for uuid, d in self._ledger[_MESSAGES]
+                ]
+            self._settle(_MESSAGES)
+            return posted
         # The turn is over. Whatever the agent wanted to say, it has already said — through the
         # `messages` tool, mid-turn, because it chose to (issue #293). What is left is its final
         # text, and that is **unspoken**: written to its log and its memory, never posted.
@@ -2876,6 +2976,11 @@ class WakeAgent:
         a second time.
         """
         uuid = item.content.uuid
+        if self._billing_blocked:
+            # An out-of-funds wall was hit earlier this wake; a resume is a model call and would fail
+            # the same way (issue #336). Leave the orphan for the next wake, which retries after
+            # funding — do not even take the claim over.
+            return _PENDING
         if not self.claims.reclaim(self.timeline_uuid, uuid, kind=kind, owner=claim.wake):
             return _PENDING  # another recovering wake won the take-over; let it finish the turn
         _log.warning(
@@ -2910,6 +3015,7 @@ class WakeAgent:
                 narration = session.resume(turn, brief=self._wake_brief(query=rendered))
             except EngineError as error:
                 narration = self._stuck_note(error)
+            self._model_ok()  # a call got through → clear any billing-blocked marker (issue #336)
             self._unspoken(narration)
             self._observe(rendered, narration)
             self.claims.commit(self.timeline_uuid, uuid, kind=kind)
@@ -2921,12 +3027,46 @@ class WakeAgent:
             # this item and the peer never answered. So this is one of the two places the residual
             # at-most-once drop survives — rare, bounded, and **loud**, which is categorically
             # better than an invisible one. (The other is a turn a compaction destroyed; both go
-            # through `_drop`, so a lost item always reads the same way in the journal.)
+            # through `_drop`, so a lost item always reads the same way in the journal.) The human is
+            # also told on the timeline now (issue #336, decision 4: a blown context tells the human).
+            self._report_provider_failure(
+                error,
+                kind=kind,
+                item_desc=self._report_item_desc(item, kind),
+                log_item=uuid,
+                posted=None,
+            )
             disposition = self._drop(
                 item,
                 kind,
                 "the interrupted turn is over the model's context ceiling and cannot be "
                 f"compacted: {error}",
+            )
+        except ProviderBillingError as exc:
+            # Out of funds during recovery: report once (debounced) and set the fail-fast latch, then
+            # leave the reclaimed claim in-flight so the next wake retries after funding (issue #336).
+            disposition = self._report_provider_failure(
+                exc,
+                kind=kind,
+                item_desc=self._report_item_desc(item, kind),
+                log_item=uuid,
+                posted=None,
+            )
+        except ProviderPayloadTooLargeError as exc:
+            # A permanent, content-shaped provider failure (payload too large) on the resumed turn. A
+            # resume cannot be safely re-driven — its tools may have fired — so the report *is* the
+            # handling and the item is dropped (loud), the same residual at-most-once trade the
+            # context-overflow branch makes (issue #336). (A *generic* malformed-request 4xx is not a
+            # reported class — it propagates through the `except Exception` below and re-drives.)
+            self._report_provider_failure(
+                exc,
+                kind=kind,
+                item_desc=self._report_item_desc(item, kind),
+                log_item=uuid,
+                posted=None,
+            )
+            disposition = self._drop(
+                item, kind, f"the resumed turn hit a permanent provider failure: {verbatim(exc)}"
             )
         except Exception:
             # Anything else — the provider is down, the box is unhappy. Nothing lost: this wake's
@@ -3372,9 +3512,11 @@ class WakeAgent:
         else:
             self.keys.clear()  # nothing to anchor on — see `_engage`; never key to a stale anchor
         try:
-            return session.send(text, brief=brief, items=items)
+            narration = session.send(text, brief=brief, items=items)
         except EngineError as error:
-            return self._stuck_note(error)
+            narration = self._stuck_note(error)
+        self._model_ok()  # a call got through → clear any billing-blocked marker (issue #336)
+        return narration
 
     def _stuck_note(self, error: EngineError) -> str:
         """The canned narration for a degraded turn — and the WARNING that says one happened.
@@ -3391,6 +3533,115 @@ class WakeAgent:
         self._degraded = True  # labels this turn's unspoken text `kind=stuck`
         _log.warning("degraded %s", kv(timeline=self.timeline_uuid, reason=str(error)))
         return "I got stuck working through that and stopped before reaching an answer."
+
+    def _report_provider_failure(
+        self,
+        exc: ProviderError,
+        *,
+        kind: str,
+        item_desc: str,
+        log_item: str | None,
+        posted: list[object] | None,
+    ) -> str:
+        """Report a permanent / billing provider failure to the timeline — **model-free** (issue #336).
+
+        The model is the thing that just failed, so the harness posts the notice itself, mechanically,
+        through the SDK under the agent's identity (`_post` — the probe-ack path, which costs no vendor
+        credit). The vendor error rides inside **verbatim** (decision 3). This is the sanctioned
+        Unspoken-Channel exception: the model cannot be reached to speak, which is the one case that
+        invariant could not cover (see `_report`).
+
+        Returns the item's disposition, and the two classes diverge exactly here:
+
+        - **Permanent** → `_FINAL`. The report *is* the item's handling; the caller settles the item so
+          the mark passes it and it is never re-driven. One notice, always posted.
+        - **Billing** → `_PENDING`. The account is out of credit and heals only when a human funds it,
+          so the item is left pending and resumes on the first successful call after funding. The
+          notice is **debounced** per timeline (one per outage — `BillingState`) and `self._billing_blocked`
+          is set so the rest of this wake fails fast instead of hammering an unfunded account.
+
+        `posted` collects the posted notice for the wake's bookend count; ``None`` (the recovery path)
+        skips that accounting — the post is still made and still logged by `_post`.
+        """
+        rc = classify(exc)
+        if rc is None:  # pragma: no cover - the catch only ever hands us a reported class
+            raise exc
+        provider, _ = describe_provider(self.harness.provider)
+        body = report_body(rc, item=item_desc, provider=provider, exc=exc)
+        if rc.kind == BILLING:
+            self._billing_blocked = True
+            if self.billing.note_and_check(self.timeline_uuid):
+                sent = self._post(body, kind="failure-report")
+                if sent is not None and posted is not None:
+                    posted.append(sent)
+                _log.error(
+                    "wake reported_failure %s",
+                    kv(
+                        kind=BILLING,
+                        reason=rc.reason,
+                        provider=provider,
+                        timeline=self.timeline_uuid,
+                        delivery=delivery_id(),
+                    ),
+                )
+            else:
+                # Already announced this outage on this timeline — stay quiet ("fail fast and quiet"),
+                # but leave a greppable breadcrumb so the outage's *duration* is visible in the logs.
+                _log.warning(
+                    "wake billing_blocked %s",
+                    kv(
+                        reason=rc.reason,
+                        provider=provider,
+                        timeline=self.timeline_uuid,
+                        delivery=delivery_id(),
+                    ),
+                )
+            return _PENDING
+        sent = self._post(body, kind="failure-report")
+        if sent is not None and posted is not None:
+            posted.append(sent)
+        _log.error(
+            "wake reported_failure %s",
+            kv(
+                kind=PERMANENT,
+                reason=rc.reason,
+                provider=provider,
+                item=log_item,
+                timeline=self.timeline_uuid,
+                delivery=delivery_id(),
+            ),
+        )
+        return _FINAL
+
+    def _report_item_desc(self, item: object, kind: str) -> str:
+        """A peer-facing name for the item a failure report is about (a filename, or the kind).
+
+        For an asset the filename is what a human recognizes ("the file you shared (photo.jpg)"); the
+        other kinds have no natural name, so they read by what they are. Degrades to a bare noun if the
+        SDK object is shaped unexpectedly — a report must never crash on the item it is describing.
+        """
+        if kind == _ASSETS:
+            file = getattr(getattr(item, "content", None), "file", None)
+            filename = getattr(file, "filename", None)
+            return f"the file you shared ({filename})" if filename else "the file you shared"
+        if kind == _EVENTS:
+            return "the webhook delivery"
+        if kind == _TASKS:
+            return "the scheduled task"
+        return "your message"
+
+    def _model_ok(self) -> None:
+        """Self-heal after a successful model call: clear a billing-blocked marker if set (issue #336).
+
+        A call got through, so the account is funded again — the next outage should re-notify from a
+        clean slate. Costs a healthy wake nothing but one `exists()` check; only a genuine recovery
+        clears a marker and logs the recovery line.
+        """
+        if self.billing.recovered(self.timeline_uuid):
+            _log.info(
+                "wake billing_recovered %s",
+                kv(timeline=self.timeline_uuid, delivery=delivery_id()),
+            )
 
 
 def _handle_of(item: object) -> str | None:

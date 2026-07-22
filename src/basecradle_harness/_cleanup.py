@@ -39,6 +39,7 @@ High-water marks  ``marks/<uuid>.txt``, ``marks/<kind>/<uuid>.txt``
 Seen-set (tasks)  ``seen/<kind>/<uuid>.txt``
 Claims            ``claims/<kind>/<uuid>/*.claim``  (per-uuid directory)
 Wake-breaker      ``breaker/<uuid>.wakes``, ``breaker/<uuid>.tripped``
+Billing-blocked   ``billing/<uuid>.blocked``  (out-of-funds debounce, issue #336)
 ================  ==========================================================
 
 The sweep is idempotent and crash-safe: a re-run re-derives the artifact set from
@@ -175,6 +176,14 @@ def enumerate_artifacts(home: Path) -> dict[str, list[Path]]:
         for path in breaker.glob("*"):
             if path.suffix in (".wakes", ".tripped"):
                 add(unquote(path.stem), path)
+
+    # Billing-blocked markers — `billing/<uuid>.blocked` (issue #336). A stale marker for a deleted
+    # timeline is inert (that timeline never re-wakes), but it lives beside the other per-timeline
+    # stores and is purged with them so a deleted timeline leaves nothing behind on the box.
+    billing = home / "billing"
+    if billing.is_dir():
+        for path in billing.glob("*.blocked"):
+            add(unquote(path.stem), path)
 
     return artifacts
 
