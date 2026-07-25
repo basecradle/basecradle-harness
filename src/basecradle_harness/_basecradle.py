@@ -201,6 +201,15 @@ class TimelineAgent:
         # truthful answer to "did it speak?" now that nothing posts on its behalf (issue #293).
         self.speech = SpeechLedger()
 
+        # One Dashboard read answers "who am I?" and, when onboarding, "what is this
+        # place?" The Dashboard is the literal page a fresh peer wakes on; reading
+        # `bc.me` once serves both — `me` is uncached, so we never fetch it twice.
+        # It runs before the bind below so this agent's own handle can ride the
+        # context (issue #341); it depends on nothing the bind sets up.
+        dashboard = self.client.me
+        self.me_uuid = dashboard.identity.uuid
+        self.me_handle = getattr(dashboard.identity, "handle", None)
+
         # Wire the live platform handle into every platform-aware tool now that the
         # client and current timeline are resolved. This is the seam every Phase-2
         # tool reuses; a plain tool (memory) is skipped. One timeline per agent, so
@@ -209,6 +218,9 @@ class TimelineAgent:
             client=self.client,
             timeline=self.timeline_uuid,
             home=self.harness.home,
+            # This agent's own handle, so a tool that must name its sender (the direct-message
+            # tool's notification title, issue #341) reads it instead of hardcoding a name.
+            handle=self.me_handle,
             code_bridge=code_bridge,
             speech=self.speech,
             # The per-wake MCP image store (issue #318), so the assets ``post_image`` action can
@@ -218,12 +230,6 @@ class TimelineAgent:
         bind_platform_tools(self.harness.tools, context)
         if code_bridge is not None:
             code_bridge.bind(context)
-
-        # One Dashboard read answers "who am I?" and, when onboarding, "what is this
-        # place?" The Dashboard is the literal page a fresh peer wakes on; reading
-        # `bc.me` once serves both — `me` is uncached, so we never fetch it twice.
-        dashboard = self.client.me
-        self.me_uuid = dashboard.identity.uuid
 
         # The no-reply informer (issues #293, #332), composed onto whatever turn hook is already
         # wired — the poll loop gets the identical behavior the wake path does, because there is one
@@ -239,7 +245,7 @@ class TimelineAgent:
         except Exception:  # noqa: BLE001 - the informer is a backstop; never let it break startup
             one_on_one = False
         self.informer = NoReplyInformer(
-            handle=getattr(dashboard.identity, "handle", None),
+            handle=self.me_handle,
             speech=self.speech,
             one_on_one=one_on_one,
         )

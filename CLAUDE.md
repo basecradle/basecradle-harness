@@ -409,15 +409,20 @@ sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not 
 
 - **Powerful tools fail closed — opt-in on every provider (issue #168).** A powerful/dangerous
   tool — media generation (image, **video**, audio), web/X search, code execution,
-  **self-authorship** (an agent editing its own `system-prompt.md`, issue #241), and a **full
-  shell** (arbitrary on-box command execution as the agent's OS user, issue #252) — is **off by
+  **self-authorship** (an agent editing its own `system-prompt.md`, issue #241), a **full
+  shell** (arbitrary on-box command execution as the agent's OS user, issue #252), and an
+  **off-platform push to a human's phone** (issue #341) — is **off by
   default on every provider** and activates **only** when explicitly dropped into a persona's
   `tools/` overlay (the same "ships empty" stance as `mcp/`). The powerful defaults (by plugin
   stem): `generate_image`, `edit_image`, `hear_audio`, `web_search` (OpenAI), `xai_search`
   (xAI `web_search`/`x_search`), `openrouter_search`, `code_execution`, `grok_generate_image`,
   `grok_edit_image`, `grok_generate_video`, `system_prompt` (the read+edit self-authorship
   pair — the most powerful, and as of #241 enabled on **no** agent; enablement is a per-agent
-  founder decision), and `shell` (issue #252 — full command-line access; **doubly gated**, the
+  founder decision), `send_direct_message_to_origin` (issue #341 — an ntfy.sh push notification
+  to @origin's iPhone, leaving the platform entirely; powerful because it *interrupts a human*
+  rather than because it touches the box, and gated on its own `NTFY_DM_TOKEN` so an agent
+  provisioned without the credential never sees it), and `shell` (issue #252 — full command-line
+  access; **doubly gated**, the
   only opt-in default that *also* declares the `SHELL` policy capability, so it loads only for an
   agent that opts it in **and** runs `Policy.unlocked()`; every other powerful tool loads under
   the locked profile once opted in). **The `unlocked()` profile is selected at deploy time by

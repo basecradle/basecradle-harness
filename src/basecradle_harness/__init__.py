@@ -21,6 +21,7 @@ from basecradle_harness._code import CodeAttachTool, CodeExecutionBridge
 from basecradle_harness._confirmed import ConfirmedTimelineAction
 from basecradle_harness._context import Compactor, ContextBudget
 from basecradle_harness._delete import DeleteTool
+from basecradle_harness._direct_message import DirectMessageTool
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import (
     EngineError,
@@ -238,6 +239,7 @@ __all__ = [
     "GrokGenerateImageTool",
     "GrokGenerateVideoTool",
     "XaiAccountBalanceTool",
+    "DirectMessageTool",
     "WebhookEndpointsTool",
     "WebhookEventsTool",
     "SystemPromptReadTool",
