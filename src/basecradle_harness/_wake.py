@@ -1214,10 +1214,23 @@ class WakeAgent:
         # ``post_image`` action can post an image an MCP tool returned. ``None`` unless an MCP
         # server's tools loaded — then the post path stays cleanly "no captures available".
         self.mcp_images = mcp_images
+
+        # One Dashboard read answers "who am I?" — the identity uuid the actor self-filter
+        # tests every item against, and the **handle** the no-reply informer looks for (and
+        # that a tool naming its own sender reads off the context below — issue #341). (The
+        # brief's orientation is the *live* `dashboard.md` primer, fetched per wake in
+        # `_wake_brief`, not this structured read.) Read once: `me` is uncached, so touching
+        # `self.client.me` twice would be a second HTTP round-trip on every wake. It runs
+        # *before* the bind so the handle can ride the context; it depends on nothing below.
+        identity = self.client.me.identity
+        self.me_uuid = identity.uuid
+        self.me_handle = getattr(identity, "handle", None)
+
         context = PlatformContext(
             client=self.client,
             timeline=self.timeline_uuid,
             home=self.harness.home,
+            handle=self.me_handle,
             code_bridge=code_bridge,
             speech=self.speech,
             keys=self.keys,
@@ -1226,15 +1239,6 @@ class WakeAgent:
         bind_platform_tools(self.harness.tools, context)
         if code_bridge is not None:
             code_bridge.bind(context)
-
-        # One Dashboard read answers "who am I?" — the identity uuid the actor self-filter
-        # tests every item against, and the **handle** the no-reply informer looks for. (The
-        # brief's orientation is the *live* `dashboard.md` primer, fetched per wake in
-        # `_wake_brief`, not this structured read.) Read once: `me` is uncached, so touching
-        # `self.client.me` twice would be a second HTTP round-trip on every wake.
-        identity = self.client.me.identity
-        self.me_uuid = identity.uuid
-        self.me_handle = getattr(identity, "handle", None)
 
         # The deterministic no-reply informer (issues #293, #332): when the agent's turn is about to
         # end having done nothing on the timeline *and the message called for a reply* — it was

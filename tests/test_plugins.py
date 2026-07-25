@@ -412,6 +412,32 @@ def test_opting_in_xai_account_balance_activates_under_xai_only(tmp_path):
     assert "xai_account_balance" not in {t.name for t in under_openai.tools}
 
 
+def test_the_direct_message_tool_is_opt_in_and_provider_agnostic(tmp_path):
+    # It rings @origin's phone (issue #341), so it is powerful: absent from a default-riding
+    # install on every provider, and never auto-scaffolded. Its gate is the *credential*, not a
+    # vendor — the safety default is the capability, exactly as issue #168 settled.
+    home = tmp_path / "cfg"
+    install(home)  # no opt_in
+    assert not (home / "tools" / "send_direct_message_to_origin.py").exists()
+
+    install(home, opt_in=["send_direct_message_to_origin"])
+    assert (home / "tools" / "send_direct_message_to_origin.py").exists()
+    plugins = load_plugins(home)
+    for provider in ("openai", "xai", "openrouter"):
+        resolved = resolve_plugins(plugins, _ctx(provider=provider, NTFY_DM_TOKEN="tk_fake"))
+        assert "send_direct_message_to_origin" in {t.name for t in resolved.tools}
+
+
+def test_the_direct_message_tool_self_excludes_without_its_publish_credential(tmp_path):
+    # An agent provisioned without NTFY_DM_TOKEN never sees a tool that could only fail. The
+    # skip is logged with its reason, so a dropped credential is visible rather than silent.
+    home = tmp_path / "cfg"
+    install(home, opt_in=["send_direct_message_to_origin"])
+    resolved = resolve_plugins(load_plugins(home), _ctx())  # no NTFY_DM_TOKEN
+    assert "send_direct_message_to_origin" not in {t.name for t in resolved.tools}
+    assert any("NTFY_DM_TOKEN" in reason for _, reason in resolved.skipped)
+
+
 # --- OpenRouter provider lock-in (issue #234) --------------------------------
 
 

@@ -92,11 +92,20 @@ class PlatformContext:
             #318). Its uploads carry no idempotency key and are never re-issued by a recovery,
             because the bytes live only in this volatile store — the same non-replayable shape a
             generated image's upload has.
+        handle: This agent's **own** platform handle (no leading ``@``), or `None` when the
+            hosting agent could not resolve one. Both hosts read `bc.me` at startup already —
+            for the identity uuid and the no-reply informer — so carrying the handle here costs
+            nothing and spares a tool its own round-trip. **A tool that needs to say who it is
+            reads it here rather than hardcoding a name**: the direct-message tool titles
+            @origin's push notification with it (issue #341), and any later off-platform channel
+            faces the same question. `None` is a degrade, never a hard stop — a tool that cannot
+            name itself should still do its job and say that it could not.
     """
 
     client: BaseCradle
     timeline: str
     home: Path | None = None
+    handle: str | None = None
     code_bridge: CodeExecutionBridge | None = None
     speech: SpeechLedger | None = None
     keys: IdempotencyKeys | None = None
