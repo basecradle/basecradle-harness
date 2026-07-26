@@ -411,7 +411,8 @@ sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not 
   tool — media generation (image, **video**, audio), web/X search, code execution,
   **self-authorship** (an agent editing its own `system-prompt.md`, issue #241), a **full
   shell** (arbitrary on-box command execution as the agent's OS user, issue #252), and an
-  **off-platform push to a human's phone** (issue #341) — is **off by
+  **off-platform push to a human's phone** (issue #341), and a **standing research record a
+  human reads as evidence of skill** (issue #347) — is **off by
   default on every provider** and activates **only** when explicitly dropped into a persona's
   `tools/` overlay (the same "ships empty" stance as `mcp/`). The powerful defaults (by plugin
   stem): `generate_image`, `edit_image`, `hear_audio`, `web_search` (OpenAI), `xai_search`
@@ -421,7 +422,15 @@ sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not 
   founder decision), `send_direct_message_to_origin` (issue #341 — an ntfy.sh push notification
   to @origin's iPhone, leaving the platform entirely; powerful because it *interrupts a human*
   rather than because it touches the box, and gated on its own `NTFY_DM_TOKEN` so an agent
-  provisioned without the credential never sees it), and `shell` (issue #252 — full command-line
+  provisioned without the credential never sees it), `polymarket_paper` (issue #347 — a fenced
+  **paper** prediction-market instrument for forecast calibration: live *public* Gamma/CLOB reads,
+  a simulated $10,000 bankroll, no venue account and no money-movement path anywhere in the
+  design. It is powerful for a reason none of the others are — it spends nothing and touches no
+  box, but it keeps a standing calibration record a human will read as evidence of skill, and a
+  scoreboard nobody agreed to keep must not arrive switched on. Its ledger is **operator-owned**
+  (append-only, under `HARNESS_HOME`, state a fold over the rows) and its hourly sweep is a
+  deterministic job that imports no provider and no platform client, so it *cannot* call a model
+  or wake the agent), and `shell` (issue #252 — full command-line
   access; **doubly gated**, the
   only opt-in default that *also* declares the `SHELL` policy capability, so it loads only for an
   agent that opts it in **and** runs `Policy.unlocked()`; every other powerful tool loads under

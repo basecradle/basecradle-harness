@@ -287,8 +287,9 @@ never imported.
 **Powerful tools fail closed.** Media generation (image, **video**, audio), web/X search,
 code execution, **self-authorship** (an agent editing its own system prompt — see
 [Self-authorship](#self-authorship--an-agent-edits-its-own-system-prompt)), a **full
-[shell](#run-any-command--the-shell-tool)**, and the
-[**direct message** to a human's phone](#ring-the-humans-phone--the-direct-message-tool) are
+[shell](#run-any-command--the-shell-tool)**, the
+[**direct message** to a human's phone](#ring-the-humans-phone--the-direct-message-tool), and the
+[**paper-trading instrument**](#measure-your-forecasts--the-paper-trading-instrument) are
 **opt-in on every provider** — they ship in the package but are **off by default**, the same "ships empty" stance
 as `mcp/`. A persona gets one only when you drop its
 plugin into the persona's `tools/` overlay; a default-riding agent comes up with the **benign /
@@ -1161,6 +1162,40 @@ agent = Harness(
 )
 print("send_direct_message_to_origin" in agent.tools)  # -> True
 ```
+
+## Measure your forecasts — the paper-trading instrument
+
+**`polymarket_paper`** answers one question about an agent: *are its probability estimates any good?* It gives the agent real, live public prediction-market prices and an entirely **simulated** $10,000 bankroll, makes it write down a probability **before** it can take a position, and scores those probabilities against what actually happened. Out comes a Brier score, a calibration error, a hit rate, and a simulated P&L.
+
+**No real money exists anywhere in the design.** No venue account, no wallet, no key material, no transfer path — not disabled, *absent*. The instrument reaches exactly two public, read-only endpoints (Polymarket's Gamma API and its public CLOB) over plain HTTPS `GET`s, and that is the whole of its network access. It is a **powerful, [opt-in](#powerful-tools-are-opt-in--the-capability-rule)** tool for an unusual reason: it spends nothing and touches no box, but it keeps a standing record a human will read as evidence of skill, and a scoreboard nobody agreed to keep should not arrive switched on.
+
+```bash
+basecradle-harness-install --opt-in polymarket_paper
+```
+
+Ten operations, and no others: `list_markets`, `get_market`, `log_forecast`, `place_order`, `cancel_order`, `get_orders`, `get_fills`, `get_positions`, `get_pnl`, `get_scorecard`.
+
+- **A position requires a forecast.** `place_order` refuses a buy with `forecast_required` until the agent has logged a probability for that exact `(market_id, outcome)`. One forecast covers as many sized adds as it likes until it logs a new one; selling and cancelling need none. Optional forecast logging would produce a calibration record with holes in exactly the places an agent found inconvenient — this makes it complete by construction.
+- **The agent cannot write its own scoreboard.** Cash, fees, fills, marks, P&L and resolution are all *derived* — from an append-only ledger the harness owns (under `$HARNESS_HOME/polymarket`) and from public market state. No operation accepts a price, a fee, a P&L figure or an outcome; `get_pnl` and `get_scorecard` are reads. Every row carries `epoch_id, ts, type, payload, schema_version`, nothing is ever updated or deleted, and all state is a fold over the log — so there is no counter that can drift away from the record.
+- **The fill model is deterministic.** A market order walks the book FIFO by price and **cancels** any unfilled remainder (never a phantom resting order); a limit order takes its marketable part as taker and rests the remainder. A resting order that the book later crosses fills as **maker, at its own price**. Fees are recorded on the fill row with their source. A market that publishes **no fee** (`0`) is recorded as a zero, tagged `market` — the venue's own fact. A fee-charging market publishes a flag rather than a notional rate (live, every such market reads `1000` whatever its real category rate), so those fills take the contract's 100 bps taker / 0 maker default, tagged `fee_source=default` — the number is the harness's and the row says so. No synthetic slippage: reproducibility over theater.
+- **Caps and a burn ceiling, enforced rather than requested.** $500 per order, $2,000 net notional per market, 20 open positions, a $10,000 bankroll the agent has no way to top up. 200 tool calls and 40 orders per UTC day, after which it returns a structured `rate_limited` — never a hang, and never a hidden loop. Every reply carries `budgets` saying what is left.
+- **The sweep never wakes the agent.** Settlement, resting-order fills and marks happen in a separate hourly job — `basecradle-harness-polymarket-sweep`, wired as a systemd timer in [`deploy/`](deploy/). It writes to the ledger and nothing else; it imports no provider and no platform client, so it *cannot* call a model or post a message. The agent discovers what happened on its next pull.
+
+Everything left to the implementer is frozen into the epoch's first ledger row, so a scorecard can never be read against terms other than the ones it ran under: the Brier observation is locked at **position open** (`brier_attribution: "position_open"` — one conviction, one scored observation, so slicing an order into fifty fills cannot dilute a bad call), the re-check policy is `hourly_sweep_plus_on_touch`, and the promotion thresholds sit beside the caps.
+
+```python
+from basecradle_harness import Harness, MemoryTool, OpenAIProvider, PolymarketPaperTool
+
+# A PlatformTool — it calls no BaseCradle endpoint, but takes the agent's home off the bound
+# context, because that is where the operator-owned ledger lives.
+agent = Harness(
+    OpenAIProvider(model="gpt-5.4-mini"),
+    tools=[MemoryTool(), PolymarketPaperTool()],
+)
+print("polymarket_paper" in agent.tools)  # -> True
+```
+
+Errors come back in one shape — `{"ok": false, "error": "<code>", "message": "...", "budgets": {...}}` — with codes `not_found`, `invalid_params`, `insufficient_cash`, `insufficient_shares`, `market_closed`, `size_too_small`, `cap_exceeded`, `rate_limited`, `frozen`, `forecast_required`, `not_implemented`, and `upstream_unavailable` for the case where Polymarket itself did not answer (reporting an outage as "no such market" would have the agent reason from something false).
 
 ## Add your own tool
 

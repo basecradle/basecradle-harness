@@ -52,3 +52,46 @@ cleanup:
 ```bash
 HARNESS_HOME=/path/to/home basecradle-harness-cleanup --timeline <uuid>
 ```
+
+## Paper-Trading Sweep (`basecradle-harness-polymarket-sweep`)
+
+Only for an agent with the **`polymarket_paper`** stem opted in. It settles markets that public
+state now reports resolved, fills resting limit orders the book has crossed, and refreshes
+mark-to-market prices — appending to that agent's paper ledger under `$HARNESS_HOME/polymarket`
+and touching nothing else.
+
+**It makes no model call and sends no wake.** The module it runs imports no provider and no
+BaseCradle client, so there is nothing in it that could; the agent finds out what happened on
+its next `get_fills` / `get_positions` / `get_orders` (issue #347, NORMATIVE §A3). It therefore
+needs **no `BASECRADLE_TOKEN` and no `AI_API_KEY`** — two public, read-only endpoints over
+HTTPS GETs is the whole of its network access.
+
+| File | Role |
+|---|---|
+| `basecradle-harness-polymarket-sweep@.service` | oneshot, runs the sweep as agent `%i` |
+| `basecradle-harness-polymarket-sweep@.timer` | schedule — **hourly, and contractually so** |
+
+The hourly cadence is not a suggestion: "hourly sweep plus on any agent tool call touching that
+market" is the resting-limit re-check policy, frozen into each epoch's `epoch_open` ledger row.
+Changing it changes the simulation's semantics, so move it at an epoch boundary.
+
+```bash
+cp basecradle-harness-polymarket-sweep@.{service,timer} /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now basecradle-harness-polymarket-sweep@jt.timer
+
+# One-off run / manual verify:
+systemctl start basecradle-harness-polymarket-sweep@jt.service
+journalctl -u basecradle-harness-polymarket-sweep@jt.service --no-pager | tail
+```
+
+Operator controls (all ledger-only, all append-only):
+
+```bash
+# Halt new orders on the current epoch — reads/cancels keep working, place_order returns `frozen`.
+basecradle-harness-polymarket-sweep --home /home/jt --freeze "under review"
+basecradle-harness-polymarket-sweep --home /home/jt --unfreeze
+
+# Start a fresh epoch (a new bankroll and a new scorecard; the old ledger is never touched).
+basecradle-harness-polymarket-sweep --home /home/jt --new-epoch
+```
