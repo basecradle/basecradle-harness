@@ -307,6 +307,80 @@ provider requirement (`Vendor("xai")` / `OpenAIKey()`) decides whether a powerfu
   tools by construction, never "on unless someone remembered to prune." Capability is the
   invariant; the provider is incidental.
 
+### A stem is not a tool name — `basecradle-harness-resolve`
+
+`--opt-in` takes a plugin **file stem**. That stem is **not** the tool name the model sees, and the
+gap is not cosmetic:
+
+| Stem | Resolves to |
+|---|---|
+| `xai_search` | the `web_search` **and** `x_search` built-ins — one stem, **two** names |
+| `code_execution` | the `code_interpreter` built-in **+** the `code_attach` tool (on OpenAI); the `code_execution` built-in alone (on xAI) |
+| `hear_audio` | the `listen` tool — a different name entirely |
+| `generate_image` | the `generate_image` tool — but only where `AI_API_KEY` is set |
+
+So the mapping is **many-to-many, provider-dependent, surface-dependent, profile-dependent, and
+credential-dependent**. Written down by hand it goes stale or is simply wrong the first time — and
+a wrong name in an automated tool-set assertion is a check that can never go green. Don't write it
+down; compute it:
+
+```bash
+# What does granting `xai_search` to an xAI agent actually arm?
+basecradle-harness-resolve --provider xai --sdk xai-sdk --opt-in xai_search
+#   "builtins": ["web_search", "x_search"]
+
+# The full active set for a persona whose overlay is pruned to two plugins:
+basecradle-harness-resolve --provider xai --sdk xai-sdk --only messages,xai_search
+#   "tools":    ["memory", "messages"]        <- `memory` rides the memory provider, not a stem
+#   "builtins": ["web_search", "x_search"]
+```
+
+It is **pure**: no config home is read or written, no model client is built, no network is touched,
+and **no environment variable is consulted** — every axis is an argument (`--provider`, `--sdk`,
+`--surface`, `--model`, `--profile`, `--opt-in`, `--only`, `--memory-provider`), so the same
+arguments always give the same answer on any machine. That is what makes it usable from CI or a
+GitHub Action against a pinned harness version, with no agent anywhere in sight.
+
+The JSON is an **additive contract**: `harness_version`, the echoed/validated inputs
+(`ai_provider`, `ai_sdk`, `ai_sdk_surface`, `ai_model`, `active_profile`), `credentials`,
+`memory`, `requested_stems`, `tools` and `builtins` (the active names — same meaning as
+[`--resolved-config`](#run-under-a-router-wake-mode)'s fields of those names), `opt_in_tools` (the
+active opt-in **stems**, the inventory axis — deliberately *not* narrowed by the policy gate, same
+as `--resolved-config`), `stems`, `skipped`, `excluded_stems`, `broken`, and `omitted`.
+
+- **`stems`** is the complete map — *every* shipped stem, so one call answers any delta without a
+  second invocation. Each entry: `opt_in`, `granted`, `status` (`active` | `inactive` |
+  `excluded`), `reason`, the `tools` and `builtins` it contributed, `assumes_credential`, and its
+  own `skipped` list.
+- **`skipped`** is the flat name-level "why isn't this tool here?" trail, each entry attributed to
+  its stem. **`excluded_stems`** is the stem-level counterpart — a *name* is skipped, a *stem* is
+  excluded, and they are different questions.
+- **Credentials are assumed, and it says so.** Some plugins gate on a credential
+  (`generate_image` on `AI_API_KEY`, `send_direct_message_to_origin` on `NTFY_DM_TOKEN`). By
+  default they are assumed **present** — the caller is normally asking about a *provisioned* agent
+  — `credentials.assumed` names every var assumed, and each conditional resolved name carries
+  `assumes_credential`. Pass `--no-assume-credentials` to assume them absent instead, in which
+  case those tools report `inactive` with the unmet requirement as their reason. What it never
+  does is silently include or silently omit one.
+- **`omitted` states what it cannot answer**, in-band rather than in prose: MCP proxy tools (they
+  come from an agent's own `mcp/*.json` drop-ins, which no stem set predicts) and a tool's
+  **runtime** self-veto (`shell` refusing to load as root) — the latter is a property of the box,
+  not the configuration, so applying it would make the answer depend on who ran the command.
+- **`broken` names any shipped default that would not import.** Such a stem reports
+  `status: "broken"` with the load error rather than an ordinary `inactive` — a package defect must
+  not be misread as the configuration excluding a tool, because that is a silently short answer.
+- **A typo is fatal.** An unrecognized stem — or an unknown `--provider`, `--sdk`, `--profile`, or
+  an SDK-mismatched `--surface` — exits non-zero with **nothing on stdout**, listing the valid
+  values. (`--sdk` is validated here even though a wake defers it to the provider build: this path
+  builds no provider, so a typo would not error, it would quietly answer a *different* question.) A
+  stem that is real but merely unavailable here (`xai_search` under `--provider openai`) is a normal
+  answer: `status: "excluded"`, with the reason.
+
+This is the **off-box sibling** of `basecradle-harness-wake --resolved-config`: that one reports
+what a *live box* is doing (its installed overlay, its `agent.env`, its MCP drop-ins); this one
+answers what a configuration *would* resolve to, from the installed package alone. The two are
+pinned against each other in the test suite, so they cannot drift apart.
+
 ### Self-authorship — an agent edits its own system prompt
 
 The most powerful tool in the kit: **`system_prompt_read`** and **`system_prompt_edit`** let an
@@ -400,6 +474,10 @@ basecradle-harness-wake --version   # -> basecradle-harness-wake 0.19.0
 # so it is safe to run repeatedly over SSH; the fleet deployer (the NOC) reads it to
 # verify a deploy by GROUND TRUTH, never self-report:
 basecradle-harness-wake --resolved-config
+
+# The off-box counterpart: what *would* a given configuration resolve to? Pure — no
+# config home, no credentials, no network, no env read. See "A stem is not a tool name":
+basecradle-harness-resolve --provider xai --sdk xai-sdk --opt-in xai_search
 ```
 
 `--resolved-config` resolves through the same code paths a wake uses — the validated `(provider, sdk, surface)` triple and the active tool set after the full plugin/memory/MCP/locked-policy resolution — so the JSON is what the agent *would actually do*, not a declared list. It builds **no** model provider (no `AI_API_KEY` needed; `ai_model` is the raw env value, `null` if unset) and runs **no** config-home reconcile (no writes), so it reports the overlay as it is on disk. The field set is an additive contract: `harness_version`, `ai_provider`, `ai_sdk`, `ai_sdk_surface`, `ai_sdk_version`, `platform_sdk_version` (the installed version of the `basecradle` **platform SDK** — the harness's one hard dependency, read from installed metadata like the two version fields above, *never* from the `basecradle>=0.6` pin the harness declares about itself. Every timeline read and every idempotent create the [delivery guarantee](#if-a-wake-dies-mid-turn-the-peers-message-is-not-lost) rests on needs that floor, and this path builds no platform client — so before this field an agent whose venv sat on an old SDK read *green on every drift axis* and failed the first time it spoke. `null`, never `""`, if the SDK is not installed at all: a defect, not a shrug — an agent with no platform SDK has no body), `ai_model`, `active_profile` (the deploy-selected [policy profile](#safe-by-default) — `locked` or `unlocked`, from [`HARNESS_PROFILE`](#run-your-first-agent-on-a-timeline), fail-closed to `locked`; it governs the tool set, so a [shell-class](#run-any-command--the-shell-tool) opted-in tool shows under `tools` when `unlocked` and under `skipped` when `locked` — the ground truth that confirms a shell-class enablement's profile actually landed), `tools` (active function tools), `builtins` (active server-side built-ins), `skipped` (plugins that did not activate — the "why isn't this tool here?" trail), `opt_in_tools` (the active [powerful, opt-in](#powerful-tools-are-opt-in--the-capability-rule) tools' source-file **stems** — the unit the fleet inventory keys on, reported because it is **not** 1:1 with the resolved names: `code_execution` → the `code_interpreter` built-in **+** the `code_attach` tool, `hear_audio` → `listen`; `[]` for a safe default config), `mcp_servers` (the sorted **names** of the configured [`mcp/*.json`](#plug-in-an-mcp-server) drop-ins — reported from the on-disk config independent of whether each one loaded this run, so a transient upstream blip never reads as drift; names only, never a server's `env`/`headers`; `[]` for the default empty `mcp/` dir), `mcp_request_timeout` (the **resolved** per-request MCP timeout in seconds — `HARNESS_MCP_TIMEOUT` if set to a positive number, else the `20.0` default — the ceiling a wake gives any single MCP request before the server degrades to `skipped`/a tool error instead of stalling the wake. Reported by the same resolved-not-declared path as everything else, so the NOC can add an audited `mcp_timeout` axis and confirm off-box that a browser-using agent got the longer navigation headroom it needs; a number, never `null`, even on a non-MCP agent), `memory_provider` (the **bound** [memory backend](#swap-the-memory-backend--the-memory-provider) — `sqlite`, `mempalace`, or a custom `module:Class` — read off the provider the agent actually built, *not* a re-read of `HARNESS_MEMORY_PROVIDER`; only the harness knows which store it binds, and without this an agent that lost the var would fall back to SQLite, quietly abandon its palace, and still read green everywhere else — and reading the memory backend *off* the `tools` list is exactly the parallel model this field retires, since a provider is free to contribute no tool at all), `memory_provider_version` (the installed version of the package backing it — the `mempalace` extra today; `null` for the built-in `sqlite` store, which ships *inside* the harness and so has no separate pin, and `null` for a custom provider, whose package the harness cannot honestly name. `mempalace` with `null` is a **defect**, not a shrug: the provider bound but its extra is missing, so that agent loses its memory on its next wake), `max_context_tokens` (the operator's [context-budget](#the-context-budget--the-transcript-compacts-itself) override from `HARNESS_MAX_CONTEXT_TOKENS`, or `null` when unset — and `0` means compaction is **disabled** on this agent, the state most worth being able to see from outside. The *resolved* ceiling is deliberately absent: below the override it comes from the adapter's live capability — an API call this read-only path never makes and holds no key for — so a number here would be a guess, and a guessed field in the file a drift audit trusts is worse than an honest gap. The wake logs the limit it resolved and its source), `model_params` (the operator's [`model_params.json`](#model-parameters--model_paramsjson) object **verbatim**, `{}` when absent — non-secret call tuning like `reasoning`/`temperature`, the wire-level proof a setting is actually loaded that no other field showed), and `model_params_stripped` (the keys in `model_params` the active SDK's build **drops** as harness-owned collisions — plus `extra_body` on the SDKs that do not support it; `[]` when nothing collides, so the effective tuning is `model_params` minus these). A malformed `model_params.json` makes `--resolved-config` exit non-zero with the reason — the same failure a wake would hit, caught at verify time.

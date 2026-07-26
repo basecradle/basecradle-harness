@@ -583,7 +583,12 @@ _SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
 
 
 def _resolve_surface(sdk: str) -> str:
-    """Resolve ``AI_SDK_SURFACE`` against the active SDK adapter's declared surfaces.
+    """`_surface_for` against the process environment's ``AI_SDK_SURFACE`` — the wake's reader."""
+    return _surface_for(sdk, os.environ.get("AI_SDK_SURFACE"))
+
+
+def _surface_for(sdk: str, raw: str | None) -> str:
+    """Resolve a raw ``AI_SDK_SURFACE`` value against the active SDK adapter's declared surfaces.
 
     The uniform, SDK-scoped contract (issue #163): the active adapter owns its surface set, so
     the openai-shaped default no longer lives in this generic reader. The single rule —
@@ -596,8 +601,12 @@ def _resolve_surface(sdk: str) -> str:
     adapter declares no surface set here — e.g. a future native ``xai-sdk`` or ``anthropic``).
     For an SDK with no surface declaration, an *unset* var resolves to ``""`` and the precise
     "no adapter yet" error is left to the provider build; a *set* var is the clear error above.
+
+    `raw` is passed in rather than read here so the one rule serves both the wake (which reads the
+    env) and the deterministic off-box resolver (`_resolve.resolve_stems`, which takes a
+    ``--surface`` argument and must never depend on the environment it happens to run in).
     """
-    raw = (os.environ.get("AI_SDK_SURFACE") or "").strip().lower()
+    raw = (raw or "").strip().lower()
     spec = _SDK_SURFACES.get(sdk)
     if spec is None:
         if raw:

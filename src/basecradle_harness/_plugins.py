@@ -356,18 +356,24 @@ class ResolvedTools:
     mcp_images: McpImageStore | None = None
 
 
-def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> ResolvedTools:
-    """Settle a list of plugins into the active tool set under `ctx`.
+def claim_plugins(
+    plugins: Iterable[ToolPlugin], ctx: ActivationContext
+) -> tuple[dict[str, ToolPlugin], list[tuple[str, str]]]:
+    """The one ordered pass behind `resolve_plugins`: ``name → winning plugin``, plus the skips.
 
-    One ordered pass builds a ``name → winning plugin`` map: each *active* plugin claims its
-    name, and a later active plugin overrides an earlier one (overlay precedence). An
-    *inactive* plugin never claims a name — so when two plugins share a name but only one's
-    `requires` are met, that one wins ("exactly one activates per config"); a name claimed by
-    no active plugin simply yields no tool. Claimed plugins are then split into instantiated
-    function tools and built-in names.
+    Each *active* plugin claims its `resolved_name`, and a later active plugin overrides an
+    earlier one (overlay precedence). An *inactive* plugin never claims a name — so when two
+    plugins share a name but only one's `requires` are met, that one wins ("exactly one activates
+    per config"); a name claimed by no active plugin simply yields no tool.
 
-    Inactive plugins are recorded in `skipped` with their unmet reason and logged once, so an
-    OpenAI-coupled tool dropping under the wrong provider is *visible*, not silent.
+    Factored out of `resolve_plugins` so a caller that needs the **attribution** — which plugin
+    (and so which source-file stem, and which credential requirement) produced each resolved name
+    — reads it off the same single pass rather than re-deriving it. `_resolve.resolve_stems` is
+    that caller: a second, parallel implementation of "who won this name" is exactly the kind of
+    transcribed map issue #345 exists to delete.
+
+    Returns ``(claimed, skipped)`` — the winning plugin per name, and ``(name, reason)`` for every
+    plugin that did not activate (including one whose name another plugin went on to claim).
     """
     claimed: dict[str, ToolPlugin] = {}
     skipped: list[tuple[str, str]] = []
@@ -377,6 +383,19 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
             claimed[name] = plugin  # later active plugin wins the name (overlay precedence)
         else:
             skipped.append((name, plugin.unmet(ctx)))
+    return claimed, skipped
+
+
+def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> ResolvedTools:
+    """Settle a list of plugins into the active tool set under `ctx`.
+
+    One ordered pass (`claim_plugins`) builds a ``name → winning plugin`` map; the claimed
+    plugins are then split into instantiated function tools and built-in names.
+
+    Inactive plugins are recorded in `skipped` with their unmet reason and logged once, so an
+    OpenAI-coupled tool dropping under the wrong provider is *visible*, not silent.
+    """
+    claimed, skipped = claim_plugins(plugins, ctx)
 
     for name, reason in skipped:
         if name not in claimed:  # only note a name that ends up with no active provider
@@ -489,6 +508,32 @@ def load_plugins_report(
         ) as p:
             plugins, broken = _load_dir(Path(p), provider)
         plugins = [plugin for plugin in plugins if not plugin.opt_in]
+    return _classify_broken(plugins, broken)
+
+
+def load_default_plugins(provider: str | None = None) -> LoadedPlugins:
+    """Load the **packaged** tool-plugin defaults, ignoring any config home entirely.
+
+    `load_plugins_report`'s sibling for the off-box question: *what does the installed package
+    ship?* — rather than *what is this agent's overlay?*. It reads only ``_defaults/tools/``, so
+    it is the same file set `install` copies out and the same one the not-yet-installed fallback
+    loads, and it needs no ``$HOME``, no ``agent.env``, and no installed config home.
+
+    Two deliberate differences from `load_plugins_report`'s fallback path:
+
+    - the **opt-in (powerful) defaults are kept**, because the caller's whole question is which
+      stems they *could* grant — `_resolve.resolve_stems` applies the grant filter itself, by
+      stem, exactly as `_install._opt_in_scaffold_set` does at scaffold time;
+    - the config home is never consulted, so an installed overlay on the box running this cannot
+      change the answer. Determinism is the point (issue #345): the same package version and the
+      same arguments must produce the same map on a laptop, in CI, and on a fleet box.
+
+    ``provider`` filters by source affinity before import, exactly as the loader does — a
+    provider-mismatched plugin is not imported (and so cannot trigger a vendor-SDK import the
+    caller's venv does not have). ``None`` loads every file.
+    """
+    with resources.as_file(resources.files("basecradle_harness").joinpath(*_DEFAULTS_TOOLS)) as p:
+        plugins, broken = _load_dir(Path(p), provider)
     return _classify_broken(plugins, broken)
 
 
