@@ -180,11 +180,33 @@ def memory_provider_from_env(home: str | os.PathLike[str] | None = None) -> Memo
     location); it is passed to the built-in providers and ignored by a custom class
     that takes no args.
     """
-    raw = (os.environ.get(_PROVIDER_VAR) or _SQLITE).strip()
-    selector = raw.lower()
-    if selector == _SQLITE:
+    return memory_provider_named(os.environ.get(_PROVIDER_VAR), home)
+
+
+def memory_provider_named(
+    selector: str | None, home: str | os.PathLike[str] | None = None
+) -> MemoryProvider:
+    """Build a memory provider from an explicit selector — `memory_provider_from_env` minus the env.
+
+    The same three-way rule (``sqlite`` / ``mempalace`` / a dotted ``module:Class`` path), with the
+    selector supplied by the caller instead of read from ``HARNESS_MEMORY_PROVIDER``. ``None`` or
+    empty means the default, exactly as an unset var does.
+
+    It exists so the deterministic off-box resolver (`_resolve.resolve_stems`) can answer *which
+    tools a given memory backend contributes* by asking the provider itself — the memory tool is
+    part of the resolved tool set (`_basecradle._merge_memory_tools`) but comes from no plugin
+    stem, so without this the caller would have to hold a private ``sqlite → memory`` /
+    ``mempalace → memory_search`` table. That is the parallel model basecradle-noc#62 forbade.
+
+    Constructing a built-in provider is **side-effect-free**: `SqliteMemoryStore` opens its
+    connection lazily on first use, and the MemPalace adapter only records its paths — so this is
+    safe on the pure-resolution path, which never calls a store op.
+    """
+    raw = (selector or _SQLITE).strip()
+    lowered = raw.lower()
+    if lowered == _SQLITE:
         return SqliteMemoryProvider(_store_path(home))
-    if selector == _MEMPALACE:
+    if lowered == _MEMPALACE:
         from basecradle_harness._mempalace import MemPalaceMemoryProvider
 
         return MemPalaceMemoryProvider(palace_path=_palace_path(home))

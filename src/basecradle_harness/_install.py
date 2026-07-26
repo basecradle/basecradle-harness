@@ -409,6 +409,24 @@ def _is_tool_plugin(rel: str) -> bool:
     return rel.startswith("tools/") and rel.endswith(".py")
 
 
+def packaged_tool_sources() -> dict[str, str]:
+    """Every shipped tool-plugin default as ``{file stem: source text}``.
+
+    The stem vocabulary a caller may name — the same unit ``--opt-in`` takes and the fleet
+    inventory keys on — paired with the source the AST classifiers (`plugin_opts_in`,
+    `plugin_relevant_to`) read. Source, never import: a stem is therefore known even when its
+    plugin is provider-mismatched and so never loaded, which is exactly what lets a **typo** be
+    distinguished from a **real-but-unavailable** tool (the distinction `_warn_unmatched_opt_in`
+    draws at install time). `_resolve.resolve_stems` reads it so the resolver and the installer
+    can never disagree about which stems exist or which of them are powerful.
+    """
+    return {
+        rel[len("tools/") : -len(".py")]: text
+        for rel, text in _packaged_defaults().items()
+        if _is_tool_plugin(rel)
+    }
+
+
 def _power_tool_stems(shipped: dict[str, str]) -> set[str]:
     """The file stems of every powerful (`opt_in`) tool-plugin default in `shipped`."""
     return {

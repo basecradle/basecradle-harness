@@ -7,6 +7,73 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.86.0] - 2026-07-26
+
+### Added: `basecradle-harness-resolve` — the stem→resolved-names map, computed (issue #345)
+
+A tool's **stem** (its plugin file's name, what `--opt-in` takes and what the fleet inventory
+declares) is not its **resolved name** (what the model sees, and what a tool-set assertion pins).
+The mapping between them is many-to-many, and every axis of the config moves it:
+
+| Stem | Resolves to |
+|---|---|
+| `xai_search` | the `web_search` **and** `x_search` built-ins — one stem, **two** names |
+| `code_execution` | `code_interpreter` **+** `code_attach` (OpenAI); `code_execution` alone (xAI) |
+| `hear_audio` | the `listen` tool — a different name entirely |
+
+Until now the only way to answer "what does granting this stem actually arm?" was to read the
+plugin file or trust prose about it — and prose has been wrong about it in more than one repo.
+basecradle-noc#344 documented `xai_search` as resolving to `x_search` alone; as a both-directions
+tool-set pin that is a check which can never go green. **The mapping must be computed, never
+transcribed.** This command computes it.
+
+- **Pure, and that is the feature.** No config home is read or written, no model client is built,
+  no network is touched, and **no environment variable is consulted for a resolution input** —
+  every axis is an argument (`--provider`, `--sdk`, `--surface`, `--model`, `--profile`,
+  `--opt-in`, `--only`, `--memory-provider`). The same arguments give the same answer on a laptop,
+  in CI, and on a fleet box, which is what lets a GitHub Action compute a pin against a pinned
+  harness version with no agent in sight.
+- **The off-box sibling of `--resolved-config`, not a replacement.** That one answers *what is this
+  box doing right now* (its installed overlay, its `agent.env`, its MCP drop-ins); this one answers
+  *what would this configuration resolve to*, from the installed package's shipped defaults alone.
+  The two are pinned against each other in the test suite across four provider/SDK cells and a
+  pruned overlay, so they cannot drift apart the day a plugin file changes.
+- **It reuses the resolver rather than modelling it.** `claim_plugins` (factored out of
+  `resolve_plugins`, one ordered pass, now shared) settles which plugin wins each name;
+  `_install`'s AST classifiers decide powerful-vs-benign and provider affinity; `_merge_memory_tools`
+  folds in the memory provider's tools. There is no second model of "what wins" here to go stale.
+- **`--only` models a pruned persona.** A deliberately tool-restricted agent whose operator deleted
+  defaults from its overlay is the case a whole-default-set answer gets wrong, so it is a first-class
+  input: `--only messages,xai_search` on xAI computes `["memory", "messages", "web_search",
+  "x_search"]` — including `memory`, which comes from the memory *provider* and no stem at all
+  (`--memory-provider` is therefore an input too, so nobody has to keep a private `sqlite → memory`
+  table; the parallel model basecradle-noc#62 refused to accept).
+- **Credentials are assumed, and it says which.** Some plugins gate on a credential at resolve time
+  (`generate_image` on `AI_API_KEY`, `send_direct_message_to_origin` on `NTFY_DM_TOKEN`). They are
+  assumed **present** by default — the caller is normally asking about a *provisioned* agent —
+  `credentials.assumed` names every var assumed, and each conditional resolved name carries
+  `assumes_credential`. `--no-assume-credentials` flips it, reporting those tools `inactive` with
+  the unmet requirement as the reason. What it never does is silently include or silently omit one.
+- **A defect is never an absence.** A shipped default that will not import reports
+  `status: "broken"` with its load error and rides a top-level `broken` list — an ordinary
+  `inactive` would blame the configuration for a package defect, and quietly shorten the answer.
+- **It states what it cannot answer, in-band.** The `omitted` list names the two: MCP proxy tools
+  (an agent's own `mcp/*.json` drop-ins, which no stem set predicts) and a tool's **runtime**
+  self-veto (`shell` refusing to load as root) — a property of the *box*, not the configuration, so
+  applying it would make the answer depend on the euid of whoever ran the command.
+- **A typo is fatal; unavailability is an answer.** An unrecognized stem — or an unknown
+  `--provider`/`--sdk`/`--profile`, or an SDK-mismatched `--surface` — exits non-zero with
+  **nothing on stdout** (a half-answer an automation might parse is worse than none) and lists the
+  valid values. `--sdk` is validated *here* although a wake defers it to the provider build: this
+  path builds no provider, so `--sdk openroute` would not error — it would silently drop
+  `openrouter_search` and answer a different question. A real-but-unavailable stem — `xai_search`
+  under `--provider openai` — is a normal `status: "excluded"` with its reason. That is the same
+  distinction the installer's `--opt-in` warning draws, drawn once so the two can never disagree.
+
+Output is pretty-printed JSON with a stable key order, an additive field contract, and full
+per-stem attribution (`stems`, `skipped`, `excluded_stems`). Documented in the README under
+"A stem is not a tool name".
+
 ## [0.85.0] - 2026-07-25
 
 ### Added: `send_direct_message_to_origin` — an opt-in push notification to the founder's phone (issue #341)
