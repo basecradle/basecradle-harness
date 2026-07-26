@@ -7,6 +7,44 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.89.0] - 2026-07-26
+
+### Changed: `polymarket_paper` measures and no longer grades (issue #350)
+
+0.87.0 shipped four promotion thresholds, frozen into every epoch's `epoch_open` row and used to
+compute `kill_flags` and `promotion_eligible`. §2.3 named those fields without defining their
+thresholds, so the numbers were invented here. Three of the four disagree with the governing
+contract, in **both** directions: the sample floors were four and six times too loose, the Brier
+bar too strict. Well inside that gap the instrument would have reported
+`promotion_eligible: true` while the real bar sat four times away — handing a true-looking
+artifact to the very agent under measurement. (The contract's actual bars are deliberately not
+reproduced here; that is the point of the change. They are on issue #350.)
+
+Correcting the four numbers would have fixed today and left the mechanism: this package cannot
+read the governing contract, cannot test against it, and will not be told when it moves, so any
+bar held here is an assertion nobody can check — and it was hash-chained into row 1, where
+tamper-evidence lent the copy an authority it did not have. So the bar left instead:
+
+- **No promotion thresholds anywhere in the package.** The four constants are gone, and
+  `epoch_open` no longer records a `promotion` block. That row still freezes every rule this stem
+  *enforces* — bankroll, caps, day ceilings, fee defaults, fill model, resting re-check policy,
+  Brier attribution — which is the distinction that decides what belongs there: a rule the machine
+  obeys, never a rule it merely quotes. Each layer pre-commits the rules it owns; this one owns
+  measurement.
+- **`get_scorecard` renders no verdict.** `kill_flags`, `promotion_eligible` and
+  `promotion_thresholds` are removed. Every input those bars take is still reported —
+  `resolved_n`, `brier`, `calibration_error`, `hit_rate`, `paper_pnl`, `max_drawdown_pct`,
+  `distinct_event_clusters` — and the governance layer, which holds the only copy that binds
+  anything, does the comparing. A tool that reports facts and refuses a verdict beats one that
+  renders a verdict against thresholds nobody here can verify.
+- **`frozen` survives as a field of its own.** It was the one `kill_flags` entry this stem
+  actually owned — not a verdict but its own state, and the one fact that says the numbers beside
+  it are not a live result.
+- **A removal, not a migration.** No schema bump: an epoch already on a box whose row 1 carries
+  the old block still verifies (the chain hashes what is on disk) and still folds (the fold reads
+  named keys, so the stale block is inert). Pinned by test, because a stricter payload reader
+  added later would silently take it away.
+
 ## [0.88.0] - 2026-07-26
 
 ### Added: the `polymarket_paper` ledger is tamper-evident, and refuses to report off a broken chain (issue #347)

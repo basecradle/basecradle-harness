@@ -12,13 +12,20 @@ import json
 from decimal import Decimal
 
 from basecradle_harness._polymarket_engine import (
-    PROMOTION_MIN_CLUSTERS,
-    PROMOTION_MIN_RESOLVED,
     calibration_error,
-    kill_flags,
     scorecard,
 )
-from basecradle_harness._polymarket_ledger import Observation, PaperState, current_epoch
+from basecradle_harness._polymarket_ledger import (
+    GENESIS_PREV,
+    SCHEMA_VERSION,
+    Epoch,
+    Observation,
+    PaperState,
+    current_epoch,
+    open_epoch,
+    row_hash,
+    store_root,
+)
 from tests.test_polymarket import (
     CONDITION_ID,
     MARKET_ID,
@@ -576,41 +583,103 @@ def test_a_systematically_overconfident_sample_shows_calibration_error():
     assert calibration_error(sample) == Decimal("0.9")
 
 
-def test_promotion_needs_a_sample_diversity_and_calibration():
-    thin = state_with([observed("0.9", 1)])
-    assert "thin_sample" in scorecard(thin)["kill_flags"]
-    assert scorecard(thin)["promotion_eligible"] is False
-
-    broad = state_with([observed("0.9", 1, f"e{i}") for i in range(PROMOTION_MIN_RESOLVED)])
-    card = scorecard(broad)
-    assert card["resolved_n"] == PROMOTION_MIN_RESOLVED
-    assert card["distinct_event_clusters"] >= PROMOTION_MIN_CLUSTERS
-    assert card["kill_flags"] == []
-    assert card["promotion_eligible"] is True
+#: Every key this stem is forbidden to emit (issue #350): a promotion threshold it cannot
+#: verify, or a verdict rendered against one.
+_VERDICT_KEYS = frozenset({"promotion", "promotion_eligible", "promotion_thresholds", "kill_flags"})
 
 
-def test_one_lucky_theme_is_not_promotable():
-    single_event = state_with([observed("0.9", 1, "e1") for _ in range(PROMOTION_MIN_RESOLVED)])
-    # All twenty share an obs_id, so build them distinctly but on one event.
-    single_event.observations = {
-        f"obs-{i}": observed("0.9", 1, "e1") for i in range(PROMOTION_MIN_RESOLVED)
-    }
+def test_the_scorecard_measures_and_renders_no_verdict():
+    """The whole of issue #350: this instrument reports facts, and grades nothing.
+
+    0.87.0 invented four promotion thresholds because §2.3 named the fields without defining
+    them, and they disagreed with the governing contract in *both* directions. Better numbers
+    would have been the same defect with a longer fuse — a package that cannot read the
+    contract, cannot test against it and will not be told when it moves has no business
+    holding the bar. So the bar left, and every input it takes stayed.
+    """
+    state = state_with([observed("0.9", 1, f"e{i}") for i in range(20)])
+    state.max_drawdown_pct = Decimal("40")  # a breach under any plausible bar
+    card = scorecard(state)
+
+    assert not _VERDICT_KEYS & card.keys()
+    # ...and the governance layer's four comparisons all have their inputs here.
+    assert card["resolved_n"] == 20
+    assert card["distinct_event_clusters"] == 20
+    assert card["brier"] == float(Decimal("0.01"))
+    assert card["max_drawdown_pct"] == float(Decimal("40"))
+
+
+def test_one_lucky_theme_still_shows_as_one_cluster():
+    """Diversity stays *measured* — it is the input the removed `low_diversity` flag read."""
+    single_event = state_with([])
+    # Twenty observations that all ride one event — distinct ids, one cluster.
+    single_event.observations = {f"obs-{i}": observed("0.9", 1, "e1") for i in range(20)}
     single_event.event_clusters = {"e1"}
-    assert "low_diversity" in scorecard(single_event)["kill_flags"]
+    card = scorecard(single_event)
+    assert card["resolved_n"] == 20
+    assert card["distinct_event_clusters"] == 1
 
 
-def test_a_frozen_account_is_never_promotable():
-    state = state_with([observed("0.9", 1, f"e{i}") for i in range(PROMOTION_MIN_RESOLVED)])
+def test_a_frozen_account_says_so_on_the_scorecard():
+    """`frozen` is not a verdict — it is the fact that these numbers are not a live result.
+
+    It was the one `kill_flags` entry this stem actually owned, so it survives the removal as
+    a field of its own rather than vanishing with the flags it sat among.
+    """
+    state = state_with([observed("0.9", 1, f"e{i}") for i in range(20)])
+    assert scorecard(state)["frozen"] is False
     state.frozen = True
-    assert "frozen" in scorecard(state)["kill_flags"]
+    assert scorecard(state)["frozen"] is True
 
 
-def test_a_drawdown_breach_is_a_kill_flag():
-    state = state_with([observed("0.9", 1, f"e{i}") for i in range(PROMOTION_MIN_RESOLVED)])
-    state.max_drawdown_pct = Decimal("40")
-    assert "drawdown_breach" in kill_flags(
-        state, resolved_n=PROMOTION_MIN_RESOLVED, brier=Decimal("0.01"), clusters=20
-    )
+def test_the_epoch_open_row_records_no_promotion_threshold(tmp_path):
+    """The rulebook row states the rules this stem *enforces* — and a promotion bar is not one.
+
+    The recurrence guard for #350's actual harm: the wrong bars were hash-chained into row 1,
+    where tamper-evidence lent an unverifiable copy the look of authority. Re-adding any of
+    them fails here.
+    """
+    payload = open_epoch(tmp_path).rows()[0]["payload"]
+
+    assert not _VERDICT_KEYS & payload.keys()
+    # The rules it does enforce are all still frozen there.
+    assert payload["caps"]["max_order_notional_usd"] == "500"
+    assert payload["brier_attribution"] == "position_open"
+    assert payload["fee_defaults_bps"]["taker"] == "100"
+
+
+def test_an_epoch_opened_under_the_old_block_still_verifies_and_folds(tmp_path):
+    """Dropping a payload key must not break an epoch already on a box.
+
+    The fix ships onto boxes holding a live epoch whose row 1 *does* carry the 0.87.0
+    `promotion` block, hash-chained. Nothing rewrites that row — the fold reads named keys, so
+    the stale block is simply inert — and the chain still verifies because it hashes what is on
+    disk. That is what makes this a removal rather than a migration, and a stricter payload
+    reader added later would silently take it away.
+    """
+    directory = store_root(tmp_path) / "epoch-20260726T000000Z"
+    directory.mkdir(parents=True)
+    row = {
+        "epoch_id": "epoch-20260726T000000Z",
+        "ts": "2026-07-26T00:00:00.000000Z",
+        "type": "epoch_open",
+        "payload": {
+            "bankroll_usd": "10000",
+            "brier_attribution": "position_open",
+            "promotion": {"min_resolved": 20, "min_event_clusters": 5, "max_brier": "0.20"},
+        },
+        "schema_version": SCHEMA_VERSION,
+        "prev": GENESIS_PREV,
+    }
+    row["hash"] = row_hash(row)
+    (directory / "ledger.jsonl").write_text(json.dumps(row, separators=(",", ":")) + "\n")
+
+    epoch = Epoch(directory)
+    assert epoch.verify().ok is True
+    state = epoch.state()
+    assert state.cash == Decimal("10000")  # it still folds
+    assert scorecard(state)["brier_attribution"] == "position_open"
+    assert not _VERDICT_KEYS & scorecard(state).keys()  # and the stale block stays unread
 
 
 def test_a_position_opened_by_market_id_still_counts_its_event_cluster(tmp_path):
@@ -634,10 +703,9 @@ def test_a_position_opened_by_market_id_still_counts_its_event_cluster(tmp_path)
     assert card["distinct_event_clusters"] == 2
 
 
-def test_the_scorecard_carries_the_frozen_attribution_and_thresholds():
+def test_the_scorecard_carries_the_frozen_attribution():
     card = scorecard(state_with([observed("0.9", 1)]))
     assert card["brier_attribution"] == "position_open"
-    assert card["promotion_thresholds"]["min_resolved"] == PROMOTION_MIN_RESOLVED
 
 
 # --- the equity curve ----------------------------------------------------------------------
