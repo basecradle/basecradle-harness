@@ -42,10 +42,19 @@ so a value round-trips exactly.
 
 **The frozen-for-the-epoch choices live in the first row.** `epoch_open` records the
 bankroll, the caps, the budget ceilings, the fill-model version, the resting-limit
-re-check policy, the fee defaults, the promotion thresholds and — §A2's explicit
-implementer choice — ``brier_attribution: "position_open"``. Freezing them *in the log*
-rather than in code is what makes a later change safe: constants may move, and an epoch
-that was scored under the old ones still says so.
+re-check policy, the fee defaults and — §A2's explicit implementer choice —
+``brier_attribution: "position_open"``. Freezing them *in the log* rather than in code is
+what makes a later change safe: constants may move, and an epoch that was scored under the
+old ones still says so.
+
+**It records the rules this instrument *enforces*, and nothing else** (issue #350). Every
+entry in that row is a rule the machine obeys — a cap that refuses an order, a fee that
+changes a fill, an attribution that decides what gets scored. Promotion thresholds are not
+such a rule: they gate nothing here, they change no number below, and they belong to a
+governance contract this package cannot read. Recording a copy of them made the row assert
+something it had no way to keep true, inside a tamper-evident record that lent the copy an
+authority it did not have. Each layer pre-commits the rules it owns; this one owns
+measurement.
 """
 
 from __future__ import annotations
@@ -130,12 +139,17 @@ MAX_LIST_LIMIT = 50
 DEFAULT_TAKER_FEE_BPS = Decimal("100")
 DEFAULT_MAKER_FEE_BPS = Decimal("0")
 
-#: Promotion gates (§2.3 names the fields but not the thresholds — an implementer choice,
-#: frozen per epoch in `epoch_open` so moving them later cannot rewrite a finished epoch).
-PROMOTION_MIN_RESOLVED = 20
-PROMOTION_MIN_CLUSTERS = 5
-PROMOTION_MAX_BRIER = Decimal("0.20")
-PROMOTION_MAX_DRAWDOWN_PCT = Decimal("25")
+#: There are deliberately **no promotion thresholds here** (issue #350). §2.3 names
+#: `kill_flags` and `promotion_eligible` without defining them, and 0.87.0 filled that gap by
+#: inventing four numbers — which turned out to disagree with the governing contract in both
+#: directions (4x and 6x looser on the sample floors, stricter on Brier). The numbers were the
+#: symptom; the disease is that a package which cannot read the contract, cannot test against
+#: it, and will not be told when it moves is not a place a governing threshold can live. So
+#: this stem measures and does not grade: it reports `resolved_n`, `brier`,
+#: `calibration_error`, `hit_rate`, `paper_pnl`, `max_drawdown_pct` and
+#: `distinct_event_clusters`, and the governance layer — the authority, holding the only copy
+#: that binds anything — does the comparison. A tool that reports facts and refuses to render
+#: a verdict beats one that renders a verdict against thresholds nobody here can verify.
 
 #: Calibration bins: ten equal-width buckets over (0,1), the standard ECE decomposition.
 CALIBRATION_BINS = 10
@@ -898,10 +912,14 @@ def current_epoch(home: str | Path, *, create: bool = True, now=None) -> Epoch |
 def open_epoch(home: str | Path, *, now=None) -> Epoch:
     """Start a new epoch: a fresh directory and the `epoch_open` row that freezes its terms.
 
-    Everything §2.3, §2.4 and §A2 leave to the implementer is written down here — the
-    bankroll, the caps, the day ceilings, the fee defaults, the fill model, the resting
-    re-check policy, the Brier attribution and the promotion thresholds — so a scorecard can
-    never be read against terms other than the ones its epoch actually ran under.
+    Everything §2.3, §2.4 and §A2 leave to the implementer *and this stem then enforces* is
+    written down here — the bankroll, the caps, the day ceilings, the fee defaults, the fill
+    model, the resting re-check policy and the Brier attribution — so a scorecard can never be
+    read against terms other than the ones its epoch actually ran under.
+
+    Promotion thresholds are **not** among them (issue #350): they gate nothing this row
+    governs, and they are owned by a contract this package cannot read. See the constants
+    block above for why a copy here was worse than no copy at all.
     """
     clock = now or utc_now
     started = clock()
@@ -934,12 +952,6 @@ def open_epoch(home: str | Path, *, now=None) -> Epoch:
             "fee_defaults_bps": {
                 "taker": DEFAULT_TAKER_FEE_BPS,
                 "maker": DEFAULT_MAKER_FEE_BPS,
-            },
-            "promotion": {
-                "min_resolved": PROMOTION_MIN_RESOLVED,
-                "min_event_clusters": PROMOTION_MIN_CLUSTERS,
-                "max_brier": PROMOTION_MAX_BRIER,
-                "max_drawdown_pct": PROMOTION_MAX_DRAWDOWN_PCT,
             },
             "funding": "fixed at epoch open; no operation in this stem credits cash",
         },

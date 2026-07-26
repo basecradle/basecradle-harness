@@ -67,10 +67,6 @@ from basecradle_harness._polymarket_ledger import (
     MAX_ORDER_NOTIONAL,
     ORDER,
     ORDER_CLOSE,
-    PROMOTION_MAX_BRIER,
-    PROMOTION_MAX_DRAWDOWN_PCT,
-    PROMOTION_MIN_CLUSTERS,
-    PROMOTION_MIN_RESOLVED,
     SETTLEMENT,
     UNFREEZE,
     Epoch,
@@ -816,11 +812,25 @@ def sweep(epoch: Epoch, data: PolymarketData, *, state: PaperState | None = None
 
 
 def scorecard(state: PaperState) -> dict[str, Any]:
-    """§2.3's `get_scorecard` body: calibration, hit rate, paper P&L, and the promotion gates.
+    """§2.3's `get_scorecard` body: calibration, hit rate, paper P&L — measurements, no verdict.
 
     Brier and calibration error are computed over **scored** observations only; an epoch
     with none reports them as `null` rather than as zero, because a perfect-looking 0.0 from
     an empty sample is the single most misleading number this instrument could emit.
+
+    **It renders no verdict** (issue #350). §2.3 names `promotion_eligible` and `kill_flags`
+    without defining their thresholds, and 0.87.0 answered by inventing four — which disagreed
+    with the governing contract in both directions. The lasting fix is not better numbers but
+    no numbers: a promotion bar belongs to a contract this package cannot read, cannot test
+    against, and will not be told about when it moves, so an eligibility claim computed here
+    is an assertion nobody can check. It is also read by the very agent under measurement,
+    which is the last party who should be handed a verdict field to optimize toward. Every
+    input those bars take is right here — `resolved_n`, `brier`, `calibration_error`,
+    `paper_pnl`, `max_drawdown_pct`, `distinct_event_clusters` — and the governance layer,
+    which holds the only copy that binds anything, does the comparing.
+
+    `frozen` stays, because it is not a verdict: it is this stem's own state, and it is the
+    one fact that says the numbers beside it are not a live result.
     """
     scored = [
         o for o in state.observations.values() if o.result is not None and o.brier is not None
@@ -842,7 +852,6 @@ def scorecard(state: PaperState) -> dict[str, Any]:
     )
     clusters = len(state.event_clusters)
     paper_pnl = money(state.realized_pnl + state.unrealized_pnl)
-    flags = kill_flags(state, resolved_n=resolved_n, brier=brier, clusters=clusters)
     return {
         "epoch_id": state.epoch_id,
         "started_at": state.started_at,
@@ -853,15 +862,8 @@ def scorecard(state: PaperState) -> dict[str, Any]:
         "paper_pnl": _num(paper_pnl),
         "max_drawdown_pct": _num(money(state.max_drawdown_pct)),
         "distinct_event_clusters": clusters,
-        "kill_flags": flags,
-        "promotion_eligible": not flags,
+        "frozen": state.frozen,
         "brier_attribution": state.brier_attribution,
-        "promotion_thresholds": {
-            "min_resolved": PROMOTION_MIN_RESOLVED,
-            "min_event_clusters": PROMOTION_MIN_CLUSTERS,
-            "max_brier": _num(PROMOTION_MAX_BRIER),
-            "max_drawdown_pct": _num(PROMOTION_MAX_DRAWDOWN_PCT),
-        },
     }
 
 
@@ -885,35 +887,6 @@ def calibration_error(scored) -> Decimal | None:
         frequency = Decimal(sum(1 for o in group if o.result == 1)) / n
         error += (n / total) * abs(mean_p - frequency)
     return money(error)
-
-
-def kill_flags(
-    state: PaperState, *, resolved_n: int, brier: Decimal | None, clusters: int
-) -> list[str]:
-    """What disqualifies this epoch from promotion right now.
-
-    §2.3 names `kill_flags` and `promotion_eligible` without defining them, so these are an
-    implementer choice — recorded in the epoch's `epoch_open` row and frozen there, so
-    moving a threshold later cannot silently re-grade a finished epoch. The four:
-
-    - ``frozen`` — the account is halted, so nothing it shows is a live result;
-    - ``thin_sample`` — too few resolved observations to say anything about calibration;
-    - ``low_diversity`` — the record rides too few distinct events to be skill rather than
-      one lucky theme;
-    - ``drawdown_breach`` / ``poor_calibration`` — it traded, and it traded badly.
-    """
-    flags: list[str] = []
-    if state.frozen:
-        flags.append("frozen")
-    if resolved_n < PROMOTION_MIN_RESOLVED:
-        flags.append("thin_sample")
-    if clusters < PROMOTION_MIN_CLUSTERS:
-        flags.append("low_diversity")
-    if state.max_drawdown_pct > PROMOTION_MAX_DRAWDOWN_PCT:
-        flags.append("drawdown_breach")
-    if brier is not None and brier > PROMOTION_MAX_BRIER:
-        flags.append("poor_calibration")
-    return flags
 
 
 # --- small helpers ----------------------------------------------------------------------
