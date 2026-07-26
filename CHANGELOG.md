@@ -7,6 +7,59 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.90.0] - 2026-07-26
+
+### Added: `--resolved-config` reports the overlay's present tool stems (issue #352)
+
+`basecradle-harness-wake --resolved-config` reported which tools *resolved*. It did not report
+**which plugin files the overlay contains** — and on some agents that set is deliberately smaller
+than the shipped defaults, because an operator deleted files from `~/.config/basecradle/tools/`
+at provisioning time. Two fleet agents run such a hand-pruned overlay as a *containment boundary*
+on an adversarial red-team persona: one resolves 2 tools where its shipped defaults would resolve
+12, the other 4 against 14. That pruning existed only as **absent files in a directory**, recorded
+in no git-tracked state and readable by nothing off-box.
+
+Everything downstream inherited that blindness: an agent's tool pin could not be **computed**, only
+carried forward as an opaque baseline, and a re-provision from desired state would produce a
+full-tool agent whose git-tracked config said nothing was wrong.
+
+- **New field `overlay_tool_stems`** — the sorted stems of every `*.py` plugin file the loader
+  walked in the config home's `tools/` overlay. Read off **the loader's own walk**
+  (`LoadedPlugins.overlay_stems`), never a second `tools/*.py` listing: a directory glob anywhere
+  else is a parallel model of what the harness loads, and it drifts — the same reason
+  `mcp_servers` became a harness-reported manifest rather than a name derived from tool prefixes.
+- **Presence, never a verdict.** It includes a provider-mismatched file (present on disk, never
+  imported), a broken one, and an operator's own additions, because whether a given set is
+  *correct* is a governance question this package cannot answer and must not appear to.
+- **Three-valued, and the distinction is load-bearing.** `null` = the overlay is not the source at
+  all (the packaged-defaults fallback); `[]` = installed and holding nothing — a deleted `tools/`
+  dir, **zero tools**, a real and meaningful state; a list = exactly what is there. On an older
+  harness the key is *absent*, which is a fourth thing again: unknown, not empty. Collapsing any
+  pair of those would make the audit lie about precisely the agent it exists to watch.
+
+It composes with `basecradle-harness-resolve --only` (0.86.0), whose `--only` takes exactly this
+vocabulary — so a pruned agent's `exact_tools` pin is now *derived from the box* rather than
+remembered about it.
+
+### Changed: a pruned overlay surviving an upgrade is now a pinned contract (issue #352)
+
+The pruning above held only because `_install._reconcile` treats a deleted shipped default as a
+deleted conffile and does not resurrect it. That behavior was documented and generically tested,
+but never pinned for the case that carries a **security** property — so it was an accident rather
+than a contract. A future installer that helpfully re-laid benign defaults on upgrade would
+silently re-arm ~10 tools on both red-team agents, and the only witness would be a drift pin
+reddening *after* the box had already changed. It is now pinned three ways: over the real packaged
+defaults, across a *source-changed* release (the `KEPT_DELETED` branch a genuine upgrade takes),
+and end-to-end — that after the upgrade the loader still sees the pruned set.
+
+### Internal
+
+`ResolvedTools` reconstructions (`_merge_memory_tools`, `_merge_mcp_tools`, `_apply_safe_policy`,
+`_surface_broken_defaults`, `_resolve._apply_policy`) now use `dataclasses.replace` instead of
+enumerating every field by hand. Each of those five sites had to carry every field forward
+explicitly, so adding one meant five chances to drop it silently — a resolved set that quietly
+loses a field fails no test and logs nothing.
+
 ## [0.89.0] - 2026-07-26
 
 ### Changed: `polymarket_paper` measures and no longer grades (issue #350)

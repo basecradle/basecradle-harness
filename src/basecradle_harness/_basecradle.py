@@ -63,6 +63,7 @@ import logging
 import os
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1145,6 +1146,11 @@ def _resolve_tools(
     # grok/xAI plugins. The resolver still applies the full activation gate on what remains.
     loaded = load_plugins_report(provider=provider_name)
     resolved = resolve_plugins(loaded.plugins, ctx)
+    # What the overlay *contains*, stamped from the load that just happened (issue #352).
+    # `resolve_plugins` settles what activated; only the loader knows which files were there —
+    # including the ones no gate let through. Everything below reconstructs with `replace`, so
+    # this rides through the merges and the policy filter without each one having to carry it.
+    resolved = replace(resolved, overlay_stems=loaded.overlay_stems)
     memory = memory_provider_from_env()
     resolved = _merge_memory_tools(resolved, memory)
     resolved = _merge_mcp_tools(resolved, load_mcp_tools())
@@ -1196,16 +1202,7 @@ def _surface_broken_defaults(
     skipped = resolved.skipped + [
         (name, f"shipped default failed to load: {exc}") for name, exc in broken_defaults
     ]
-    return ResolvedTools(
-        tools=resolved.tools,
-        builtins=resolved.builtins,
-        skipped=skipped,
-        manifest=resolved.manifest,
-        notices=resolved.notices,
-        broken=resolved.broken + broken_lines,
-        opt_in_stems=resolved.opt_in_stems,
-        mcp_images=resolved.mcp_images,
-    )
+    return replace(resolved, skipped=skipped, broken=resolved.broken + broken_lines)
 
 
 def _merge_memory_tools(resolved: ResolvedTools, memory: MemoryProvider) -> ResolvedTools:
@@ -1222,15 +1219,10 @@ def _merge_memory_tools(resolved: ResolvedTools, memory: MemoryProvider) -> Reso
     added = [tool for tool in memory.tools() if tool.name not in existing]
     if not added:
         return resolved
-    return ResolvedTools(
+    return replace(
+        resolved,
         tools=resolved.tools + added,
-        builtins=resolved.builtins,
-        skipped=resolved.skipped,
         manifest=resolved.manifest + [(tool.name, None) for tool in added],
-        notices=resolved.notices,
-        broken=resolved.broken,
-        opt_in_stems=resolved.opt_in_stems,
-        mcp_images=resolved.mcp_images,
     )
 
 
@@ -1249,14 +1241,12 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
     existing = {tool.name for tool in resolved.tools}
     added = [tool for tool in mcp.tools if tool.name not in existing]
     added_manifest = [entry for entry in mcp.manifest if entry[0] not in existing]
-    return ResolvedTools(
+    return replace(
+        resolved,
         tools=resolved.tools + added,
-        builtins=resolved.builtins,
         skipped=resolved.skipped + mcp.skipped,
         manifest=resolved.manifest + added_manifest,
         notices=resolved.notices + mcp.notices,
-        broken=resolved.broken,
-        opt_in_stems=resolved.opt_in_stems,
         # The per-wake image store (issue #318): carried so the assets ``post_image`` action can
         # reach it via the `PlatformContext`. ``None`` unless an MCP server's tools loaded.
         mcp_images=mcp.images,
@@ -1303,16 +1293,7 @@ def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) ->
     if not refused:
         return resolved
     manifest = [entry for entry in resolved.manifest if entry[0] not in refused]
-    return ResolvedTools(
-        tools=permitted,
-        builtins=resolved.builtins,
-        skipped=skipped,
-        manifest=manifest,
-        notices=notices,
-        broken=resolved.broken,
-        opt_in_stems=resolved.opt_in_stems,
-        mcp_images=resolved.mcp_images,
-    )
+    return replace(resolved, tools=permitted, skipped=skipped, manifest=manifest, notices=notices)
 
 
 # The env var that selects the deploy profile (issue #256). Delivered per-agent through

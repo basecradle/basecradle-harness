@@ -4078,6 +4078,29 @@ def resolved_config() -> dict[str, object]:
       and a name can differ from its stem — ``hear_audio`` → ``listen``). Reporting the stems
       lets the NOC's fleet-drift audit compare declared-vs-active inventory like-for-like,
       holding no stem→name map of its own. ``[]`` for a safe default config (no opt-in tool).
+    - ``overlay_tool_stems`` — what this box's ``tools/`` overlay **contains**: the sorted stems
+      of every plugin file the loader walked there (issue #352). Everything else in this report
+      says what *activated*; this says what was *there to activate*, which is the one input to
+      that resolution nothing could read off-box. It matters because a **hand-pruned** overlay is
+      a real fleet configuration — two agents run one deliberately, as a containment boundary —
+      and it exists only as *absent files in a directory*, recorded in no git-tracked state. Its
+      consequence was that the NOC could not **compute** such an agent's tool pin, only carry an
+      opaque baseline forward; with this field plus `basecradle-harness-resolve --only <stems>`
+      (issue #345) the pin is derived from the box rather than remembered about it.
+
+      Read off the loader's own walk (`LoadedPlugins.overlay_stems`), never a second
+      ``tools/*.py`` listing — a directory glob anywhere else is a parallel model of what the
+      harness loads, and it drifts. **Presence, never a verdict**: it includes a
+      provider-mismatched file (present, never imported), a broken one, and an operator's own
+      additions, because whether a given set is *correct* is a governance question this package
+      cannot answer. Three-valued, and the distinction is load-bearing: ``null`` means the
+      overlay is not the source at all (a config home that predates tool defaults, or none —
+      the packaged-defaults fallback), ``[]`` means the overlay is installed and holds nothing
+      (a deleted ``tools/`` dir — **zero tools**, a real and meaningful state), and a list names
+      exactly what is there. On a harness older than 0.90.0 the key is **absent**, which is a
+      fourth thing again — unknown, not empty. It is *stems*, like ``opt_in_tools`` and unlike
+      ``tools``/``builtins``: one stem can fan out to several resolved names and a name can
+      differ from its stem.
     - ``mcp_servers`` — the sorted **names** of the **configured** MCP servers, one per
       ``mcp/<name>.json`` drop-in (`load_mcp_configs`), independent of whether each one loaded
       this run (issue #261). The MCP-overlay analogue of ``opt_in_tools`` / ``active_profile``:
@@ -4141,6 +4164,9 @@ def resolved_config() -> dict[str, object]:
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),
         "opt_in_tools": list(resolved.opt_in_stems),
+        "overlay_tool_stems": (
+            None if resolved.overlay_stems is None else list(resolved.overlay_stems)
+        ),
         "mcp_servers": sorted({config.name for config in load_mcp_configs()}),
         "mcp_request_timeout": _timeout_from_env(),
         "model_params": model_params,
