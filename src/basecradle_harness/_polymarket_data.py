@@ -9,12 +9,16 @@ arguments. There is no code path from a model-supplied string to a URL — not a
 not a path, not a host override — so "the agent cannot fetch an arbitrary page" is a
 property of the call graph, not a filter somebody has to keep correct.
 
-**Only GET, ever.** The client has no `post`, no `put`, no session, no cookie jar and
-sends no `Authorization` header. That is what makes the §2.5 non-goal "authenticated
-Polymarket/CLOB trading APIs" mechanically true rather than a promise: an authenticated
-trade is a signed POST, and this file cannot make one. `test_polymarket.py` asserts both
-halves against a mocked transport — every request is a GET, and every host is one of the
-two constants.
+**Only GET, ever — and that is load-bearing, so do not add a write verb here.** The client
+has no `post`, no `put`, no session, no cookie jar and sends no `Authorization` header. That
+is what makes the §2.5 non-goal "authenticated Polymarket/CLOB trading APIs" mechanically
+true rather than a promise: an authenticated trade is a **signed POST**, so the forbidden
+thing is not merely refused, it is *unbuildable from this file*. Adding a `_post` — even for
+an innocent-looking public batch endpoint like the CLOB's `/midpoints` — quietly demotes that
+property from "cannot" to "does not", and the next person to need a signature finds the
+plumbing already there. If a batch read is ever worth it, add it as another GET or not at
+all. `test_polymarket.py` asserts both halves against a mocked transport: every request a
+GET, every host one of the two constants.
 
 **What comes back is structured fields, never a document.** Each endpoint is parsed into
 a frozen dataclass here; no raw HTML, no screenshots, no response body reaches the model.

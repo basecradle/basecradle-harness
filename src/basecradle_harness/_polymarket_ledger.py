@@ -23,6 +23,18 @@ on every call. A whole epoch is at most a few tens of thousands of small rows (t
 ceiling is 200 calls a day), so the fold costs milliseconds and buys an audit trail that
 cannot disagree with itself.
 
+**The rows are hash-chained, and that is tamper-*evidence*, not tamper-proofing.** Each row
+carries `prev` (the hash of the row before it) and its own `hash`, so an edit, a deletion or a
+reordering breaks the linkage and is caught by replay — cheap, because a fold-based design is
+already re-reading every row. The distinction matters and should not be overstated: the harness
+runs as the **agent's own UID**, so a same-UID write path is unavoidable and "the agent cannot
+write this file" was never true at the filesystem layer — it was true only because this agent
+has no shell. Integrity therefore rests on detection, not prevention: `verify_chain` refuses to
+report numbers off a broken chain, and the **on-box JSONL is a spool** whose authoritative copy
+is the per-row log line the NOC ships off-box, under a UID the agent does not have. The chain
+head and row count surface in `get_scorecard` so an external verifier can pin both — which is
+what catches a tamperer who re-hashes the file forward or truncates its tail.
+
 **Money is `Decimal` end to end.** Prices arrive from Polymarket as strings, sizes are
 fractional, and a tick is 0.001; floats would put `0.30000000000000004` into a row that is
 never allowed to be corrected in place. Serialization to the ledger is via `str(Decimal)`,
@@ -38,9 +50,11 @@ that was scored under the old ones still says so.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -56,8 +70,14 @@ except ImportError:  # pragma: no cover - not the fleet's platform
 _log = logging.getLogger("basecradle_harness")
 
 #: The ledger row schema. Bumped when a row's payload shape changes incompatibly; every
-#: row carries it, so a reader can always tell which vintage it is looking at.
-SCHEMA_VERSION = 1
+#: row carries it, so a reader can always tell which vintage it is looking at. **2** added the
+#: hash chain (`prev` + `hash`); version-1 rows are unchained and are *refused* rather than
+#: accepted, because a chain cannot vouch for rows written before it existed.
+SCHEMA_VERSION = 2
+
+#: What the first row of an epoch chains from. A fixed, domain-separated constant rather than
+#: zeros, so a row lifted out of another log cannot pass as somebody's genesis.
+GENESIS_PREV = "genesis:basecradle-harness:polymarket_paper:v1"
 
 #: §A2's implementer choice, made once and frozen per epoch: a Brier observation is locked
 #: from the forecast current at **position open** — the instant a ``(market_id, outcome)``
@@ -582,6 +602,113 @@ def track_equity(state: PaperState) -> None:
             state.max_drawdown_pct = drawdown
 
 
+# --- the hash chain ----------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ChainStatus:
+    """The verdict on an epoch's hash chain: does the record vouch for itself?
+
+    `ok` is the only thing a caller should branch on, and the branch is **refuse**, never
+    "report with a warning". `head` and `rows` are what an external verifier pins against the
+    off-box copy — together they catch the attack the chain alone cannot, a tamperer who
+    rewrites the file forward or truncates its tail into a shorter but internally consistent
+    chain.
+    """
+
+    ok: bool
+    head: str
+    rows: int
+    broken_at: int | None = None
+    reason: str = ""
+
+
+def canonical(row: Mapping[str, Any]) -> bytes:
+    """A row's bytes for hashing: sorted keys, compact, its own `hash` excluded.
+
+    Computed from the **parsed** row rather than the line on disk, so re-serializing with
+    different whitespace, key order or escaping cannot change a hash. That matters because the
+    verifier and the writer are different code paths at different times.
+    """
+    body = {key: value for key, value in row.items() if key != "hash"}
+    return json.dumps(body, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def row_hash(row: Mapping[str, Any]) -> str:
+    """The row's own hash — sha256 over `canonical`, hex."""
+    return hashlib.sha256(canonical(row)).hexdigest()
+
+
+def verify_chain(epoch_id: str, rows: list[dict[str, Any]]) -> ChainStatus:
+    """Recompute every row's hash and check its linkage to the row before it.
+
+    Three ways a chain fails, and each names the row it failed at so a human has somewhere to
+    look: a row whose recomputed hash does not match the one it carries (its content changed),
+    a row whose `prev` does not match the previous row's hash (a row was removed or reordered),
+    and a first row that does not chain from genesis (the head of the log was cut off).
+
+    An **unchained** row — one written before the chain existed, `schema_version` 1 — fails
+    too, deliberately. A chain cannot vouch for rows it never saw, so accepting them would make
+    the whole verdict a lie about exactly the period an attacker would target.
+    """
+    if not rows:
+        return ChainStatus(ok=True, head=GENESIS_PREV, rows=0)
+    previous = GENESIS_PREV
+    for index, row in enumerate(rows):
+        carried = row.get("hash")
+        if not carried or "prev" not in row:
+            return ChainStatus(
+                ok=False,
+                head=previous,
+                rows=index,
+                broken_at=index,
+                reason=(
+                    f"row {index} ({row.get('type')!r}) carries no hash — it predates the "
+                    "chained ledger (schema_version 1). A chain cannot vouch for rows written "
+                    "before it existed; start a new epoch."
+                ),
+            )
+        if row.get("prev") != previous:
+            return ChainStatus(
+                ok=False,
+                head=previous,
+                rows=index,
+                broken_at=index,
+                reason=(
+                    f"row {index} ({row.get('type')!r}) chains to {row.get('prev')!r} but the "
+                    f"row before it hashes to {previous!r} — a row was altered, removed or "
+                    "reordered here."
+                ),
+            )
+        recomputed = row_hash(row)
+        if recomputed != carried:
+            return ChainStatus(
+                ok=False,
+                head=previous,
+                rows=index,
+                broken_at=index,
+                reason=(
+                    f"row {index} ({row.get('type')!r}) does not match its own hash — its "
+                    "content was changed after it was written."
+                ),
+            )
+        if row.get("epoch_id") != epoch_id:
+            return ChainStatus(
+                ok=False,
+                head=previous,
+                rows=index,
+                broken_at=index,
+                reason=(
+                    f"row {index} claims epoch {row.get('epoch_id')!r} but sits in "
+                    f"{epoch_id!r} — a row was moved between epochs."
+                ),
+            )
+        previous = str(carried)
+    return ChainStatus(ok=True, head=previous, rows=len(rows))
+
+
 # --- the epoch -------------------------------------------------------------------
 
 
@@ -627,19 +754,53 @@ class Epoch:
         return rows
 
     def state(self, *, today: str | None = None) -> PaperState:
-        """The folded state of this epoch right now."""
+        """The folded state of this epoch right now.
+
+        Callers that will *report numbers* must check `verify` first — see `ChainStatus`. This
+        does not verify on its own, because the sweep and the tool both want the fold and the
+        verdict from **one** read of the file rather than two.
+        """
         state = replay(self.rows(), today=today)
         state.epoch_id = state.epoch_id or self.epoch_id
         return state
 
+    def verify(self, rows: list[dict[str, Any]] | None = None) -> ChainStatus:
+        """Whether this epoch's hash chain holds, and its head. See `verify_chain`."""
+        return verify_chain(self.epoch_id, self.rows() if rows is None else rows)
+
+    @property
+    def head(self) -> str:
+        """The hash of the last row — the value an external verifier pins.
+
+        Read off the last *parseable* line rather than kept in memory, because the other
+        writer (the sweep, or the wake) may have appended since this object was built.
+        """
+        for row in reversed(self.rows()):
+            digest = row.get("hash")
+            if digest:
+                return str(digest)
+        return GENESIS_PREV
+
     # --- writing ----------------------------------------------------------------
 
     def append(self, kind: str, payload: dict[str, Any], *, at: datetime | None = None) -> dict:
-        """Append one row and return it. The only mutation this module offers.
+        """Append one **chained** row and return it. The only mutation this module offers.
 
-        The write is `O_APPEND` + `fsync`: a row that a later fold depends on must be on
-        disk before the operation that wrote it reports success, for the same reason the
-        engine persists an assistant turn before dispatching its tools.
+        Each row carries `prev` (the previous row's hash, genesis for the first) and its own
+        `hash`, so a retroactive edit or a removed row breaks the linkage at the next row and
+        is caught by replay (`verify_chain`). This is **tamper-evidence, not tamper-proofing**:
+        the harness runs as the agent's own UID, so a same-UID write path is unavoidable and
+        the honest goal is that an edit cannot go unnoticed rather than that it cannot happen.
+
+        The write is `O_APPEND` + `fsync`: a row a later fold depends on must be on disk before
+        the operation that wrote it reports success, for the same reason the engine persists an
+        assistant turn before dispatching its tools.
+
+        **The row is also emitted to the log, in full.** The on-box JSONL is a *spool*; the
+        record is the off-box copy the NOC already ships out of journald. That is what closes
+        the one attack a chain alone cannot see — a tamperer who edits a row and re-hashes the
+        whole file forward, or who truncates its tail — because the off-box copy carries the
+        rows and the heads as they were written, under a UID the agent does not have.
         """
         moment = at or self._now()
         row = {
@@ -648,13 +809,19 @@ class Epoch:
             "type": kind,
             "payload": _jsonable(payload),
             "schema_version": SCHEMA_VERSION,
+            "prev": self.head,
         }
+        row["hash"] = row_hash(row)
         self.directory.mkdir(parents=True, exist_ok=True)
         line = json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
         with open(self.path, "a", encoding="utf-8") as handle:
             handle.write(line)
             handle.flush()
             os.fsync(handle.fileno())
+        # The off-box path. One line per row, greppable, machine-parseable; at the §2.2 ceiling
+        # of 200 calls a day this is a few hundred KB per agent per day, which buys a copy of
+        # the record that the agent's UID cannot reach or rewrite.
+        _log.info("polymarket_ledger_row %s", line.rstrip("\n"))
         return row
 
 
