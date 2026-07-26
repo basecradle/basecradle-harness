@@ -61,6 +61,10 @@ basecradle-harness-install = "basecradle_harness._install:main"
 # GC the on-box artifacts of deleted timelines: the NOC schedules `--sweep` per agent on a
 # cadence (deploy/). Sweep-only; memory (memory.db + the MemPalace palace) is never touched.
 basecradle-harness-cleanup = "basecradle_harness._cleanup:main"
+# The polymarket_paper instrument's deterministic sweep (issue #347): settle resolved markets,
+# fill crossed resting limit orders, refresh marks. Ledger-only — it never calls a model and
+# never wakes the agent (NORMATIVE §A3). Scheduled hourly per agent that has the stem.
+basecradle-harness-polymarket-sweep = "basecradle_harness._polymarket_engine:main"
 # Resolve a *hypothetical* config (provider + opt-in stems) to the tool names and built-ins it
 # activates, as JSON — the deterministic stem→resolved-names map fleet automation computes pins
 # from (issue #345). Pure: no config home, no credentials, no network, no writes. The off-box

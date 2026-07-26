@@ -7,6 +7,75 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.87.0] - 2026-07-26
+
+### Added: `polymarket_paper` — a fenced paper-trading instrument for forecast calibration (issue #347)
+
+A **simulated** prediction-market instrument for measuring one thing: whether a research
+persona's probability estimates are any good. Live *public* Polymarket prices, an entirely
+fictional $10,000 bankroll, and **no real funds and no venue account anywhere in the design** —
+not disabled, absent. The agent must write down a probability *before* it can take a position,
+and those probabilities are what the scorecard grades. Opt-in and off by default, like every
+powerful tool (`basecradle-harness-install --opt-in polymarket_paper`).
+
+Ten operations and no others: `list_markets`, `get_market`, `log_forecast`, `place_order`,
+`cancel_order`, `get_orders`, `get_fills`, `get_positions`, `get_pnl`, `get_scorecard`.
+
+- **The fences are structural, not advisory.** There is no parameter through which a string
+  becomes a request destination — no url, host, path, or endpoint — because the data client owns
+  two host constants and builds every path itself. It issues **GET requests only**, to
+  `gamma-api.polymarket.com` and `clob.polymarket.com`, with no auth header and no cookie jar:
+  an authenticated trade is a signed POST, and the module cannot make one. What comes back is
+  parsed fields; no HTML, no screenshot, no document reaches the model. Tests assert both halves
+  against the traffic the real client generated, not against the docstring.
+- **A position requires a forecast.** `place_order` refuses a buy with `forecast_required` until
+  a probability is logged for that exact `(market_id, outcome)`; one forecast covers any number
+  of sized adds until superseded, and selling and cancelling need none. Optional forecast logging
+  would leave the calibration record with holes in exactly the places an agent found
+  inconvenient.
+- **Brier attribution is `position_open`, chosen and frozen.** The observation is locked from the
+  forecast current when a position goes flat → non-flat. Per-fill attribution was the alternative
+  and was rejected: it lets an agent slice one conviction into fifty fills and dilute a bad call
+  fifty-to-one against a good one, which is an attack on the metric rather than a measurement.
+  An observation is scored even if the position was closed before resolution — otherwise the
+  record only grades the trades that happened to be held to the end.
+- **The ledger is operator-owned and append-only.** One directory per epoch under
+  `$HARNESS_HOME/polymarket`, every row carrying `epoch_id, ts, type, payload, schema_version`,
+  no UPDATE and no DELETE, corrections as compensating entries. **All state is a fold over the
+  rows** — cash, positions, orders, fills, the equity curve *and* the day's burn counters — so
+  there is no counter that can drift away from the record (the same reasoning the delivery
+  guarantee's create ordinal is built on). The agent reads through the `get_*` projections and
+  can supply no price, fee, P&L figure or resolution; none of those exist in the surface.
+- **The fill model is deterministic.** A market order walks the book FIFO by price and
+  **cancels** its unfilled remainder rather than leaving a phantom rest; a limit order takes its
+  marketable part as taker and rests the remainder, which later fills as **maker at its own
+  price**. Settlement pays $1.00/$0.00 on public market state (the CLOB's `winner` flags) and
+  never on an agent's claim. No synthetic slippage.
+- **Fees are recorded with their source, after checking what the venue actually publishes.**
+  A market with fees switched off publishes `0`, and that zero is recorded as read, tagged
+  `market` — the opposite of the silent zeroing §2.4 forbids. A fee-*charging* market turns out
+  to publish a **flag, not a notional rate**: `taker_base_fee`/`maker_base_fee` read `1000` on
+  every such market — crypto, sports and economics alike, whose published category rates differ
+  — with the real charge following the venue's own price curve, taker-only. Read naively as
+  basis points of notional that is a **10% fee on a trade the venue charges about 1% on**, and
+  it bills a maker on a venue that documents that makers are never billed. So those fills take
+  the contract's 100 bps taker / 0 maker default, tagged `fee_source=default`, and the
+  divergence is reported on the issue rather than papered over.
+- **Caps and burn ceiling are enforced, not requested.** $500/order, $2,000 net notional/market,
+  20 open positions (resting buys counted — twenty queued bids are twenty positions), a bankroll
+  with no top-up path. 200 calls and 40 orders per UTC day, then a structured `rate_limited`
+  until 00:00 UTC — never a hang, never a hidden loop. Every response carries `budgets`.
+- **The sweep never wakes the agent** (`basecradle-harness-polymarket-sweep`, hourly systemd
+  units in `deploy/`). It settles, fills crossed resting orders, and re-marks — ledger only. Its
+  module imports no provider, no engine and no BaseCradle client, and a test pins that import set
+  exactly, so "makes no model call and sends no wake" is a property of the call graph rather than
+  a promise. The agent discovers everything on its next pull.
+- **One error code beyond the contract's list: `upstream_unavailable`.** Every listed code
+  describes a verdict on the agent's *request*; none describes "Polymarket did not answer."
+  Reporting an outage as `not_found` would have the agent reason from "this market does not
+  exist," which is false and consequential. Declared on the issue before the build rather than
+  smuggled in.
+
 ## [0.86.0] - 2026-07-26
 
 ### Added: `basecradle-harness-resolve` — the stem→resolved-names map, computed (issue #345)
