@@ -23,9 +23,16 @@ runs it does not import this one.
   document reaches the model.
 - **No money and no venue (§2.5).** No operation transfers, withdraws, deposits, bridges,
   or touches key material, because none exists in the enum and nothing here can sign.
-- **The agent cannot write its own scoreboard.** Cash, P&L, fees, fills and resolutions are
-  all *derived* — from the ledger and from public market state. No operation accepts a
-  price, a fee, a P&L figure, or a resolution. `get_pnl` and `get_scorecard` are reads.
+- **The agent cannot write its own scoreboard — and if the record is edited anyway, every
+  operation stops.** Cash, P&L, fees, fills and resolutions are all *derived* from the ledger
+  and from public market state; no operation accepts a price, a fee, a P&L figure, or a
+  resolution. But the harness runs as the agent's **own UID**, so "cannot write the file" was
+  never a filesystem fact — it held only because this agent has no shell. Integrity therefore
+  rests on **detection**: the ledger's rows are hash-chained, every call verifies the chain
+  before it computes anything, and a break returns `ledger_tampered` with **no numbers at
+  all** rather than numbers with a warning. A scoreboard that degrades quietly is the one
+  failure this instrument cannot survive, because the governance layer's tampering trigger
+  has no other detector.
 - **A position requires a forecast (§A2).** `place_order` refuses with `forecast_required`
   unless the agent has already logged a probability for that exact ``(market, outcome)``.
   Optional forecast logging would produce a promotion folder with two undefined headline
@@ -157,7 +164,10 @@ class PolymarketPaperTool(PlatformTool):
         "share, 0 to 1, and a winning share settles at $1.00 and a loser at $0.00. Caps: $500 "
         "per order, $2,000 net per market, 20 open positions. Budget: 200 calls and 40 orders "
         "per UTC day, and every reply tells you what is left. Resting limit orders fill on a "
-        "sweep, so check get_orders and get_fills to find out what happened while you were away."
+        "sweep, so check get_orders and get_fills to find out what happened while you were away. "
+        "The ledger behind all of this is hash-chained and verified on every call: if it ever "
+        "fails to verify, every action here returns 'ledger_tampered' and no numbers, and that "
+        "is not something you can fix — report it and stop."
     )
     parameters = {
         "type": "object",
@@ -309,6 +319,10 @@ class PolymarketPaperTool(PlatformTool):
         """`run`'s body, with the store lock held. See `run` for why that boundary matters."""
         epoch = current_epoch(self._home(), now=self._now)
         assert epoch is not None  # current_epoch(create=True) always returns one
+        rows = epoch.rows()
+        chain = epoch.verify(rows)
+        if not chain.ok:
+            return self._refuse_broken_chain(epoch, chain)
         state = epoch.state(today=today)
 
         if action not in ACTIONS:
@@ -356,6 +370,42 @@ class PolymarketPaperTool(PlatformTool):
         body["as_of"] = stamp(moment)
         body["budgets"] = _budgets(state)
         return json.dumps(body, ensure_ascii=False)
+
+    def _refuse_broken_chain(self, epoch: Epoch, chain) -> str:
+        """A broken ledger chain refuses **everything** — and returns no numbers at all.
+
+        The requirement is `get_pnl` / `get_scorecard`, and this goes past it deliberately: a
+        record that cannot vouch for itself cannot be trusted to say what an agent holds, what
+        it forecast, or what its budget is either — and a *write* onto an unverifiable chain
+        buries the break under new rows. So every operation stops, reads and writes alike, and
+        the sweep refuses to append (`_polymarket_engine.sweep`).
+
+        The alternative — numbers plus a warning — is the one failure this instrument cannot
+        survive, because the governance layer's scoreboard-tampering trigger has no other
+        detector. A degraded scoreboard reads as a working one.
+
+        Nothing here is repairable by the agent, and the message says so, so the model does not
+        spend a turn trying. `budgets` is `{}` rather than a count, because the count would
+        itself be derived from the rows under suspicion.
+        """
+        _log.error(
+            "polymarket_paper: LEDGER CHAIN BROKEN epoch=%s rows_verified=%d head=%s reason=%s",
+            epoch.epoch_id,
+            chain.rows,
+            chain.head,
+            chain.reason,
+        )
+        return _error(
+            "ledger_tampered",
+            (
+                f"this paper account's ledger does not verify, so no number it holds can be "
+                f"reported: {chain.reason} Every operation is refused until an operator "
+                f"investigates (epoch {epoch.epoch_id}, {chain.rows} row(s) verified, last "
+                f"good chain head {chain.head}). You cannot fix this from here, and nothing "
+                "you do will change it — say so if someone asks you why you have stopped."
+            ),
+            {},
+        )
 
     # --- wiring -----------------------------------------------------------------
 
@@ -559,10 +609,23 @@ class PolymarketPaperTool(PlatformTool):
             # `get_pnl` and `get_scorecard` can never report the same drawdown differently.
             "max_drawdown_pct": _num(money(state.max_drawdown_pct)),
             "epoch_id": state.epoch_id,
+            "chain_head": epoch.head,
+            "chain_verified": True,  # `_run_locked` refuses before any number is computed
         }
 
     def _op_get_scorecard(self, epoch, data, state, kwargs) -> dict[str, Any]:
-        return scorecard(state)
+        """The scorecard, plus the chain head an external verifier pins it against.
+
+        Reaching here at all means the chain verified — `_run_locked` refuses first — so the
+        numbers below are known to derive from an intact record, and `chain_head` +
+        `chain_rows` let an off-box verifier confirm it is the *same* record it was shipped.
+        """
+        card = scorecard(state)
+        chain = epoch.verify()
+        card["chain_head"] = chain.head
+        card["chain_rows"] = chain.rows
+        card["chain_verified"] = chain.ok
+        return card
 
     def _op_log_forecast(self, epoch, data, state, kwargs) -> dict[str, Any]:
         """Lock a probability for one outcome — §A2's precondition for taking a position.

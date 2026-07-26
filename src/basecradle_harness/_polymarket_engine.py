@@ -98,6 +98,15 @@ def money(value: Decimal) -> Decimal:
     return value.quantize(CENTS, rounding=ROUND_HALF_UP)
 
 
+class BrokenChain(Exception):
+    """The ledger's hash chain does not verify, so nothing may be written or reported.
+
+    Separate from `PaperReject` on purpose: a `PaperReject` is a verdict on the agent's
+    *request* and the agent can act on it, while this is a verdict on the *record itself* and
+    nobody on the agent's side can do anything about it.
+    """
+
+
 class PaperReject(Exception):
     """A structured refusal, carrying one of §2.6's codes.
 
@@ -778,7 +787,24 @@ def sweep(epoch: Epoch, data: PolymarketData, *, state: PaperState | None = None
     holding it, and a second exclusive `flock` from the same process on a second descriptor
     deadlocks rather than no-ops. The two entry points (the tool's `run`, this module's
     `main`) each take it once, around fold and mutation together.
+
+    **Refuses to append to a chain that does not verify.** A sweep is the one writer that runs
+    with nobody watching, so it is the worst place to extend a broken ledger: new rows would
+    chain cleanly onto the tampered ones and bury the break under legitimate history. It stops
+    and says so instead, loudly, and leaves the evidence exactly as it found it. (The tool
+    refuses first when it calls this, so the check costs a pass only on the cron path.)
     """
+    chain = epoch.verify()
+    if not chain.ok:
+        _log.error(
+            "polymarket sweep: LEDGER CHAIN BROKEN epoch=%s rows_verified=%d head=%s reason=%s "
+            "- refusing to append",
+            epoch.epoch_id,
+            chain.rows,
+            chain.head,
+            chain.reason,
+        )
+        raise BrokenChain(chain.reason)
     live = state or epoch.state()
     written = 0
     for market_id in markets_to_sweep(live):
@@ -961,6 +987,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--all-epochs", action="store_true", help="sweep every epoch, not the newest"
     )
+    parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="check the ledger hash chain and print its head; write nothing (exit 1 if broken)",
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -987,6 +1018,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"no polymarket_paper epoch under {home} — nothing to sweep")
             return 0
 
+        if args.verify:
+            # The operator's / NOC's integrity probe: report each epoch's verdict, head and row
+            # count — the two values an off-box verifier pins — and write nothing at all.
+            broken = False
+            for epoch in targets:
+                chain = epoch.verify()
+                verdict = "OK" if chain.ok else "BROKEN"
+                print(f"{epoch.epoch_id}: {verdict} rows={chain.rows} head={chain.head}")
+                if not chain.ok:
+                    print(f"  {chain.reason}")
+                    broken = True
+            return 1 if broken else 0
+
         data = PolymarketData()
         for epoch in targets:
             if args.freeze:
@@ -997,7 +1041,13 @@ def main(argv: list[str] | None = None) -> int:
                 epoch.append(UNFREEZE, {"by": "operator"})
                 print(f"{epoch.epoch_id}: unfrozen")
                 continue
-            written = sweep(epoch, data)
+            try:
+                written = sweep(epoch, data)
+            except BrokenChain as broken:
+                # Loud and non-zero: this is the governance layer's tampering detector, and a
+                # cron job that exits 0 on it has told nobody anything.
+                print(f"{epoch.epoch_id}: LEDGER CHAIN BROKEN — {broken}")
+                return 1
             print(f"{epoch.epoch_id}: {written} row(s) written")
     return 0
 

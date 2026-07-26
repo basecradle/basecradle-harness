@@ -7,6 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.88.0] - 2026-07-26
+
+### Added: the `polymarket_paper` ledger is tamper-evident, and refuses to report off a broken chain (issue #347)
+
+0.87.0 shipped the instrument with an append-only ledger whose integrity rested on a *capability*
+fact rather than a structural one, and said so in words that were too strong. The harness runs as
+the **agent's own UID**, so "the agent cannot write the ledger" was never true at the filesystem
+layer — it held only because this agent has no shell stem. The day anyone grants one, the whole
+performance history becomes retroactively editable and nothing in the stem would notice. This
+closes that, with tamper-*evidence* rather than tamper-proofing (a same-UID write path is
+unavoidable, so the honest goal is that an edit cannot go unnoticed):
+
+- **The rows are hash-chained.** `SCHEMA_VERSION` → 2: every row carries `prev` (the previous
+  row's hash) and its own `hash` — sha256 over the row's canonical form (sorted keys, compact
+  separators, computed from *parsed* values so re-serialization cannot shift it), chaining from a
+  domain-separated genesis constant. An edit, a deletion or a reordering breaks the linkage at the
+  next row and is caught by replay, which a fold-based design was already paying for.
+- **A broken chain returns no numbers, from any operation.** Verification runs on the same pass as
+  the fold, inside the store lock, before anything is computed. A break returns `ledger_tampered`
+  with an empty `budgets` — *not* numbers with a warning attached, because a scoreboard that
+  degrades quietly reads as a working one and the governance layer's tampering trigger has no
+  other detector. Reads and writes alike refuse, and the sweep will not extend a chain it cannot
+  verify (a write onto a broken chain buries the break under legitimate-looking history).
+- **The on-box JSONL is a spool, not the record.** Every append also emits the whole row as a
+  `polymarket_ledger_row {...}` log line, so the authoritative copy lives off-box in journald,
+  under a user the agent is not. `get_scorecard` publishes `chain_head` + `chain_rows` for an
+  external verifier to pin — which is what catches the one attack the chain alone cannot see, a
+  tamperer who re-hashes the file forward or truncates its tail into a shorter but internally
+  consistent chain.
+- **`basecradle-harness-polymarket-sweep --verify`** reports each epoch's verdict, head and row
+  count and writes nothing; the sweep exits non-zero on a break, so a cron job cannot swallow it.
+- **Version-1 (unchained) rows are refused, not accepted.** A chain cannot vouch for rows written
+  before it existed, so accepting them would make the verdict a lie about exactly the period an
+  attacker would target. No epoch existed on any box, so this costs nothing and avoids a chain
+  that vouches for history it never saw.
+
+New error code: **`ledger_tampered`** — the second beyond the contract's list (after
+`upstream_unavailable`). `frozen` would have been a lie: a freeze is an operator's decision about
+a working instrument, not a verdict on the record.
+
 ## [0.87.0] - 2026-07-26
 
 ### Added: `polymarket_paper` — a fenced paper-trading instrument for forecast calibration (issue #347)

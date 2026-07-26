@@ -650,7 +650,7 @@ def test_a_duplicate_client_order_id_returns_the_original_result(tmp_path):
 # --- the ledger boundary ----------------------------------------------------------------
 
 
-def test_every_row_carries_the_normative_envelope(tmp_path):
+def test_every_row_carries_the_normative_envelope_and_its_chain_links(tmp_path):
     with upstream():
         tool = make_tool(tmp_path)
         forecast(tool)
@@ -658,8 +658,16 @@ def test_every_row_carries_the_normative_envelope(tmp_path):
     rows = current_epoch(tmp_path).rows()
     assert rows
     for row in rows:
-        assert set(row) == {"epoch_id", "ts", "type", "payload", "schema_version"}
-        assert row["schema_version"] == 1
+        assert set(row) == {
+            "epoch_id",
+            "ts",
+            "type",
+            "payload",
+            "schema_version",
+            "prev",
+            "hash",
+        }
+        assert row["schema_version"] == 2
         assert row["ts"].endswith("Z")
 
 
@@ -1054,3 +1062,247 @@ def test_decimal_prices_survive_the_round_trip(tmp_path):
     fill = next(r for r in current_epoch(tmp_path).rows() if r["type"] == "fill")
     assert fill["payload"]["price"] == "0.333"
     assert Decimal(fill["payload"]["notional"]) == Decimal("3.33")
+
+
+# --- the hash chain: tamper-evidence, and refusal on a break -----------------------------
+
+
+def test_the_rows_form_a_chain_from_genesis(tmp_path):
+    from basecradle_harness._polymarket_ledger import GENESIS_PREV, row_hash
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    rows = current_epoch(tmp_path).rows()
+    assert rows[0]["prev"] == GENESIS_PREV
+    previous = GENESIS_PREV
+    for row in rows:
+        assert row["prev"] == previous
+        assert row["hash"] == row_hash(row)
+        previous = row["hash"]
+    assert current_epoch(tmp_path).head == rows[-1]["hash"]
+
+
+def test_an_intact_chain_verifies(tmp_path):
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    chain = current_epoch(tmp_path).verify()
+    assert chain.ok is True
+    assert chain.rows == len(current_epoch(tmp_path).rows())
+    assert chain.broken_at is None
+
+
+def tamper(tmp_path, index, mutate):
+    """Rewrite one row in place — what an agent with a shell would do."""
+    ledger = current_epoch(tmp_path).path
+    rows = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+    mutate(rows[index])
+    ledger.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+
+
+def test_editing_a_row_breaks_the_chain(tmp_path):
+    """The whole point: a retroactive edit is detectable by replay."""
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+
+    def inflate(row):
+        row["payload"]["p"] = "0.99"
+
+    forecast_index = next(
+        i for i, r in enumerate(current_epoch(tmp_path).rows()) if r["type"] == "forecast"
+    )
+    tamper(tmp_path, forecast_index, inflate)
+    chain = current_epoch(tmp_path).verify()
+    assert chain.ok is False
+    assert chain.broken_at == forecast_index
+    assert "does not match its own hash" in chain.reason
+
+
+def test_deleting_a_row_breaks_the_chain(tmp_path):
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    ledger = current_epoch(tmp_path).path
+    lines = [line for line in ledger.read_text().splitlines() if line.strip()]
+    del lines[2]  # a row an agent would rather nobody replayed
+    ledger.write_text("\n".join(lines) + "\n")
+    chain = current_epoch(tmp_path).verify()
+    assert chain.ok is False
+    assert "altered, removed or reordered" in chain.reason
+
+
+def test_a_row_lifted_from_another_epoch_breaks_the_chain(tmp_path):
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    tamper(tmp_path, 1, lambda row: row.__setitem__("epoch_id", "epoch-somewhere-else"))
+    chain = current_epoch(tmp_path).verify()
+    assert chain.ok is False
+
+
+def test_unchained_rows_from_before_the_chain_are_refused(tmp_path):
+    """A chain cannot vouch for rows written before it existed, so it must not pretend to."""
+    with upstream():
+        make_tool(tmp_path).run(action="get_pnl")
+    tamper(tmp_path, 0, lambda row: (row.pop("hash"), row.pop("prev")))
+    chain = current_epoch(tmp_path).verify()
+    assert chain.ok is False
+    assert "predates the chained ledger" in chain.reason
+
+
+@pytest.mark.parametrize(
+    "action,kwargs",
+    [
+        ("get_pnl", {}),
+        ("get_scorecard", {}),
+        ("get_positions", {}),
+        ("get_orders", {}),
+        ("get_fills", {}),
+        ("list_markets", {}),
+        ("get_market", {"market_id": MARKET_ID}),
+        ("log_forecast", {"market_id": MARKET_ID, "outcome": "Yes", "p": "0.5"}),
+    ],
+)
+def test_a_broken_chain_returns_no_numbers_from_any_operation(tmp_path, action, kwargs):
+    """The requirement, and the one failure this instrument cannot survive if softened.
+
+    A scoreboard that reports numbers off a record it cannot vouch for — even with a warning
+    attached — reads as a working scoreboard, and the governance layer's tampering trigger has
+    no other detector. So the answer is an error and *no numbers at all*.
+    """
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+        tamper(tmp_path, 1, lambda row: row["payload"].__setitem__("p", "0.99"))
+        body = call(tool, action, **kwargs)
+
+    assert body["ok"] is False
+    assert body["error"] == "ledger_tampered"
+    assert set(body) == {"ok", "error", "message", "budgets"}
+    # Not one number from the record leaks out — not a price, not a count, not a budget.
+    for leaked in ("cash_usd", "equity_usd", "realized_pnl", "brier", "positions", "markets"):
+        assert leaked not in body
+    assert body["budgets"] == {}
+
+
+def test_a_broken_chain_refuses_writes_too(tmp_path):
+    """A write onto an unverifiable chain buries the break under legitimate-looking rows."""
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+        before = len(current_epoch(tmp_path).rows())
+        tamper(tmp_path, 1, lambda row: row["payload"].__setitem__("p", "0.99"))
+        assert buy(tool)["error"] == "ledger_tampered"
+
+    assert len(current_epoch(tmp_path).rows()) == before  # not even a `call` row was added
+
+
+def test_the_sweep_refuses_to_extend_a_broken_chain(tmp_path, capsys):
+    """The sweep runs with nobody watching, so it is the worst place to bury a break."""
+    from basecradle_harness._polymarket_engine import main
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+        tamper(tmp_path, 1, lambda row: row["payload"].__setitem__("p", "0.99"))
+        before = len(current_epoch(tmp_path).rows())
+        assert main(["--home", str(tmp_path)]) == 1  # non-zero: a cron job must say so
+
+    assert "LEDGER CHAIN BROKEN" in capsys.readouterr().out
+    assert len(current_epoch(tmp_path).rows()) == before
+
+
+def test_the_verify_flag_reports_the_head_and_writes_nothing(tmp_path, capsys):
+    from basecradle_harness._polymarket_engine import main
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    epoch = current_epoch(tmp_path)
+    before = epoch.path.read_bytes()
+
+    assert main(["--home", str(tmp_path), "--verify"]) == 0
+    out = capsys.readouterr().out
+    assert "OK" in out and epoch.head in out
+    assert epoch.path.read_bytes() == before
+
+    tamper(tmp_path, 1, lambda row: row["payload"].__setitem__("p", "0.99"))
+    assert main(["--home", str(tmp_path), "--verify"]) == 1
+    assert "BROKEN" in capsys.readouterr().out
+
+
+def test_the_scorecard_publishes_the_chain_head_for_an_external_verifier(tmp_path):
+    """The head plus the row count is what catches a tamperer who re-hashes the file forward."""
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+        pnl = call(tool, "get_pnl")
+        # get_scorecard last: every call appends its own `call` row, so the head advances
+        # with each one and only the final operation's head matches the file's.
+        card = call(tool, "get_scorecard")
+
+    epoch = current_epoch(tmp_path)
+    assert card["chain_verified"] is True
+    assert card["chain_head"] == epoch.head
+    assert card["chain_rows"] == len(epoch.rows())
+    assert len(pnl["chain_head"]) == 64 and pnl["chain_head"] != card["chain_head"]
+
+
+def test_every_row_is_emitted_off_box_in_full(tmp_path, caplog):
+    """The on-box file is a spool; the record is the copy journald ships out from under the UID.
+
+    Full rows, not just heads: at the §2.2 ceiling that is a few hundred KB a day, and it buys
+    a copy complete enough to *reconstruct* the ledger rather than only to notice it moved.
+    """
+    with upstream(), caplog.at_level("INFO", logger="basecradle_harness"):
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+
+    emitted = [
+        json.loads(rec.message.split(" ", 1)[1])
+        for rec in caplog.records
+        if rec.message.startswith("polymarket_ledger_row ")
+    ]
+    on_disk = current_epoch(tmp_path).rows()
+    assert emitted == on_disk  # every row, in order, byte-for-byte equivalent
+
+
+def test_a_rewritten_chain_still_fails_against_the_pinned_head(tmp_path):
+    """A tamperer who re-hashes the whole file forward produces a *valid* chain, so the
+    on-box verdict alone cannot catch them — the off-box head is what does."""
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    pinned_head = current_epoch(tmp_path).head
+    pinned_rows = len(current_epoch(tmp_path).rows())
+
+    # Rewrite the forecast and re-chain every row after it, exactly as an attacker would.
+    from basecradle_harness._polymarket_ledger import GENESIS_PREV, row_hash
+
+    ledger = current_epoch(tmp_path).path
+    rows = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+    rows[1]["payload"]["p"] = "0.99"
+    previous = GENESIS_PREV
+    for row in rows:
+        row["prev"] = previous
+        row["hash"] = row_hash(row)
+        previous = row["hash"]
+    ledger.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+
+    assert current_epoch(tmp_path).verify().ok is True  # internally consistent...
+    assert current_epoch(tmp_path).head != pinned_head  # ...but not the record that was shipped
+    assert len(current_epoch(tmp_path).rows()) == pinned_rows

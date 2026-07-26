@@ -85,6 +85,24 @@ systemctl start basecradle-harness-polymarket-sweep@jt.service
 journalctl -u basecradle-harness-polymarket-sweep@jt.service --no-pager | tail
 ```
 
+**Integrity — the part that matters most.** The ledger's rows are hash-chained and the on-box
+JSONL is only a *spool*: every row is emitted in full as a `polymarket_ledger_row {...}` line
+through the harness logger, so journald (which the NOC already ships) holds the authoritative
+copy under a user the agent is not. Two things follow for operations:
+
+- The sweep **exits non-zero and writes nothing** if the chain does not verify. Alarm on that
+  exit code — it is the governance layer's scoreboard-tampering detector, and the agent-side
+  symptom is only that every `polymarket_paper` call returns `ledger_tampered`.
+- Verify a box on demand without writing anything:
+
+```bash
+basecradle-harness-polymarket-sweep --home /home/jt --verify
+# epoch-20260726T183744Z: OK rows=14 head=1abaee5a…
+```
+
+Pin `head` + `rows` against the off-box copy: a chain that verifies on-box can still have been
+rewritten forward wholesale, and only the shipped copy catches that.
+
 Operator controls (all ledger-only, all append-only):
 
 ```bash
