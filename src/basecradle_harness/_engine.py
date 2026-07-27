@@ -106,6 +106,13 @@ def _fault(exc: object) -> str:
 #: Per-persona override rides `HARNESS_MAX_STEPS` (see `_max_steps_from_env`).
 DEFAULT_MAX_STEPS = 24
 
+#: How every step-counter note opens, and the fixed part of its counter line (`_step_note`) —
+#: together, how one is recognized in a transcript (`is_step_note`). Constants rather than literals
+#: in two places for the reason `_context._SUMMARY_MARKER` is: a marker whose writer and reader
+#: spell it separately drifts the first time the wording is edited, silently, with nothing failing.
+_STEP_NOTE_HEADER = "Current Time: "
+_STEP_NOTE_MARKER = "\n\nStep "
+
 #: Below this many steps *remaining* (counting the current one), the live counter switches from
 #: the terse "Step N of M." to strategic guidance — prioritize, summarize, self-schedule a
 #: continuation, and end with a text reply. Small so the escalation is only the final stretch.
@@ -630,6 +637,32 @@ def _progress(on_progress: Callable[[], None] | None) -> None:
         _log.error("Could not persist a turn in progress; some of its work may be lost: %s", exc)
 
 
+def is_step_note(message: Message) -> bool:
+    """Is this system turn one of `_step_note`'s live step-counter notes?
+
+    The step ledger is a *permanent* resident of the transcript — the notes are tiny and never
+    evicted, but a step budget of 24 lays one down per model call, forever — so the
+    context-attribution line reports them as their own section rather than folding them in with
+    the charter (`_attribution`). Answering that needs a way to recognize one, and this is it.
+
+    Keyed on the two constants the note is *written* from, and living beside them for the same
+    reason `_context._SUMMARY_MARKER` and `_context.is_summary` live together: a reader that
+    spells a marker for itself drifts from the writer the first time the note's wording is
+    touched, and nothing fails when it does — the section simply, silently, starts reporting zero.
+
+    **Both** constants, because the header alone is not unique. The brief's own time anchor
+    (`_wake._now_line`) opens identically, and while it is never persisted today, a recognizer
+    that would misread it is one restored legacy transcript away from attributing the whole brief
+    to the step ledger. `_STEP_NOTE_MARKER` is what only a step note carries.
+    """
+    content = message.content or ""
+    return (
+        message.role == "system"
+        and content.startswith(_STEP_NOTE_HEADER)
+        and _STEP_NOTE_MARKER in content
+    )
+
+
 def _step_note(step: int, max_steps: int, now: datetime) -> str:
     """The live step-counter note appended before one provider call.
 
@@ -642,21 +675,23 @@ def _step_note(step: int, max_steps: int, now: datetime) -> str:
     The escalation names the `messages` tool (issue #295). "Which takes a tool call" is a reminder
     only to a model that already knows *which* tool; to the one that does not, it is a riddle posed
     at the exact moment its steps are running out.
+
+    Both fixed parts are composed from the constants `is_step_note` reads, so the note the model
+    sees and the note the attribution line recognizes can never be two different notes.
     """
-    header = f"Current Time: {now:%Y-%m-%d %H:%M:%S} UTC"
+    header = f"{_STEP_NOTE_HEADER}{now:%Y-%m-%d %H:%M:%S} UTC"
+    counter = f"{_STEP_NOTE_MARKER}{step} of {max_steps}."
     remaining = max_steps - step + 1  # steps left, counting this one
-    if remaining <= _ESCALATION_THRESHOLD:
-        body = (
-            f"Step {step} of {max_steps}. Steps are running low. Prioritize the most important "
-            "remaining actions — including anything you still mean to say on a timeline, which "
-            "means calling the `messages` tool — summarize progress cleanly, and if work remains, "
-            f"schedule a follow-up task before you run out. Step {max_steps} is your final action "
-            "step — end it with plain text to finish cleanly. Never ignore the step counter; "
-            "treat it as a hard constraint."
-        )
-    else:
-        body = f"Step {step} of {max_steps}."
-    return f"{header}\n\n{body}"
+    if remaining > _ESCALATION_THRESHOLD:
+        return header + counter
+    escalation = (
+        " Steps are running low. Prioritize the most important remaining actions — including "
+        "anything you still mean to say on a timeline, which means calling the `messages` tool — "
+        "summarize progress cleanly, and if work remains, schedule a follow-up task before you "
+        f"run out. Step {max_steps} is your final action step — end it with plain text to finish "
+        "cleanly. Never ignore the step counter; treat it as a hard constraint."
+    )
+    return header + counter + escalation
 
 
 def _step_action(reply: Message, extend: bool) -> str:

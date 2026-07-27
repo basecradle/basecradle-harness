@@ -832,9 +832,9 @@ def test_a_batch_mate_of_a_turn_this_wake_resumed_is_committed_not_abandoned(pla
     session = agent.harness.session(agent.source)
     real_resume = Session.resume
 
-    def resume_then_compact(self, turn, *, brief=None):
+    def resume_then_compact(self, turn, *, brief=None, brief_sections=None):
         """Stand in for the compaction `Session.resume` really does at the end of a turn."""
-        reply = real_resume(self, turn, brief=brief)
+        reply = real_resume(self, turn, brief=brief, brief_sections=brief_sections)
         erased = Message.system("[Earlier conversation summarized] ...")
         erased.items = list(turn.items)
         self.history[:] = [erased]  # exactly what a cut past the resumed turn leaves behind

@@ -684,8 +684,8 @@ class Compactor:
         Tools are withheld (`tools=None`): summarizing is reading, not acting.
         """
         # The previous compaction's summary rides first and whole; the fresh region fills what's left.
-        carried = _render([m for m in dropped if _is_summary(m)])
-        excerpt = _render([m for m in dropped if not _is_summary(m)])
+        carried = _render([m for m in dropped if is_summary(m)])
+        excerpt = _render([m for m in dropped if not is_summary(m)])
         allowance = int(limit.tokens * SUMMARY_INPUT_FRACTION * chars_per_token)
         room = max(0, allowance - len(carried))
         if len(excerpt) > room:
@@ -746,14 +746,21 @@ def _prelude_end(history: list[Message]) -> int:
     """
     index = 0
     while (
-        index < len(history) and history[index].role == "system" and not _is_summary(history[index])
+        index < len(history) and history[index].role == "system" and not is_summary(history[index])
     ):
         index += 1
     return index
 
 
-def _is_summary(message: Message) -> bool:
-    """Is this the system turn a previous compaction left behind? (See `_prelude_end`.)"""
+def is_summary(message: Message) -> bool:
+    """Is this the system turn a previous compaction left behind? (See `_prelude_end`.)
+
+    Public because the context-attribution line reports summarized conversation as its own
+    section (`_attribution`), and it must answer the question **the same way this file does** —
+    off `_SUMMARY_MARKER`, the marker the compactor itself writes. A second spelling of "is this
+    a summary?" living in the reporting module would drift from the one that governs behavior,
+    and the log would then attribute a section that compaction does not recognize.
+    """
     return message.role == "system" and (message.content or "").startswith(_SUMMARY_MARKER)
 
 
@@ -786,7 +793,7 @@ def _cut_index(history: list[Message], head: int, keep_chars: int) -> int | None
     chosen = boundaries[-1]  # the floor: the newest real user turn always survives
     tail = 0
     for index in reversed(range(head, len(history))):
-        tail += _size(history[index])
+        tail += message_chars(history[index])
         if _is_boundary(history[index]) and tail <= keep_chars:
             chosen = index
     return chosen if chosen > head else None
@@ -852,7 +859,7 @@ def _summary_note(dropped: int, summary: str) -> str:
     )
 
 
-def _size(message: Message) -> int:
+def message_chars(message: Message) -> int:
     """One message's cost in characters — its text, plus the tool calls it carried.
 
     Images are not counted: they are evicted after the turn that showed them (`Engine`), so they are
@@ -862,6 +869,11 @@ def _size(message: Message) -> int:
     the same unit: what a character costs the model does not depend on the script it is written in. With
     the default, this counted a message's *text* raw and its tool call's *arguments* escaped — one
     function, two units, and a sixfold overcount of any non-Latin argument.
+
+    Public because the context-attribution line (`_attribution`) measures the assembled payload
+    section by section and must do it in **this** unit. Two functions answering "how big is this
+    message?" would be two units again — the exact defect the paragraph above records — and here
+    the attribution would silently disagree with the compaction arithmetic it exists to explain.
     """
     total = len(message.content or "")
     for call in message.tool_calls:
@@ -871,4 +883,4 @@ def _size(message: Message) -> int:
 
 def _chars(messages: Sequence[Message]) -> int:
     """The whole transcript's cost in characters — the quantity the token estimate scales."""
-    return sum(_size(message) for message in messages)
+    return sum(message_chars(message) for message in messages)

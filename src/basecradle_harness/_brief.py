@@ -32,11 +32,23 @@ The brief is composed, in order, of a current-time anchor followed by four parts
 
 Composition is pure (`compose_brief` / `render_manifest`); the one impure piece, the
 live dashboard fetch (`fetch_dashboard_md`), is isolated and tolerant by construction.
+
+**The parts are named, and the names are reported** (issue #369). The brief is the one
+section of a wake's assembled context whose composition is invisible from the outside — it
+reaches the model as a single system turn, so a transcript-shaped measurement can only say
+"the brief was 52 K characters", never *which* of the eight parts above that was. So
+composition is expressed as `brief_parts` — an ordered list of ``(name, text)`` — and
+`compose_brief` is the join over it, which is what lets the context-attribution line break the
+brief down by part without a second, drifting copy of the composition order (`_attribution`).
 """
 
 from __future__ import annotations
 
 from collections.abc import Sequence
+
+#: What separates two parts of the composed brief. Named because `brief_section_sizes` has to
+#: charge it to somebody for the sizes to be a true partition of the joined text.
+_JOIN = "\n\n"
 
 
 def render_manifest(entries: Sequence[tuple[str, str | None]]) -> str | None:
@@ -136,6 +148,61 @@ def render_budget(max_steps: int | None) -> str | None:
     )
 
 
+def brief_parts(
+    *,
+    now: str | None = None,
+    budget: str | None = None,
+    initialize: str | None,
+    manifest: str | None,
+    defects: str | None = None,
+    safety: str | None = None,
+    dashboard: str | None,
+    memory: str | None = None,
+    system_prompt: str | None,
+) -> list[tuple[str, str]]:
+    """The brief's non-empty parts, **named**, in composition order — what `compose_brief` joins.
+
+    The composition order lives here and nowhere else; `compose_brief` is `join_brief` over this
+    list, and the context-attribution line's per-part sizes are `brief_section_sizes` over the
+    same list (issue #369). One list, so the text the model reads and the sizes the log reports
+    can never describe different briefs.
+
+    A part that is absent or blank is simply not in the list — which is why a section it would
+    have named never appears on the attribution line either, rather than appearing as a zero.
+    """
+    named = (
+        ("now", now),
+        ("budget", budget),
+        ("initialize", initialize),
+        ("manifest", manifest),
+        ("defects", defects),
+        ("safety", safety),
+        ("dashboard", dashboard),
+        ("memory", memory),
+        ("system_prompt", system_prompt),
+    )
+    return [(name, part) for name, part in named if part and part.strip()]
+
+
+def join_brief(parts: Sequence[tuple[str, str]]) -> str | None:
+    """The composed brief text from `brief_parts` output — ``None`` when there are no parts."""
+    return _JOIN.join(part for _, part in parts) if parts else None
+
+
+def brief_section_sizes(parts: Sequence[tuple[str, str]]) -> dict[str, int]:
+    """Each part's share of the joined brief, in characters, summing to exactly its length.
+
+    The separator between two parts is charged to the part that *follows* it, so the sizes are a
+    true partition of `join_brief(parts)` rather than an approximation that leaves a few
+    unattributed characters per section. That matters more than the two characters do: the
+    attribution line's whole claim is that its sections *add up*, and a reader who checks and
+    finds they do not has no way to tell a rounding convention from a missing section.
+    """
+    return {
+        name: len(part) + (len(_JOIN) if index else 0) for index, (name, part) in enumerate(parts)
+    }
+
+
 def compose_brief(
     *,
     now: str | None = None,
@@ -168,23 +235,25 @@ def compose_brief(
     provider case) composes exactly the brief it did before these seams existed. The **step
     budget** rides right after the time anchor and before the operating guidance — it is a
     standing fact about how the turn is bounded, so the model reads it up front (issue #243).
+
+    The order itself lives in `brief_parts`; this is the join over it. A caller that also needs
+    the per-part sizes (the wake, for the context-attribution line) calls `brief_parts` once and
+    then `join_brief` + `brief_section_sizes` on the result, so a single composition produces both
+    — and, more to the point, so the live dashboard is fetched once rather than twice.
     """
-    parts = [
-        part
-        for part in (
-            now,
-            budget,
-            initialize,
-            manifest,
-            defects,
-            safety,
-            dashboard,
-            memory,
-            system_prompt,
+    return join_brief(
+        brief_parts(
+            now=now,
+            budget=budget,
+            initialize=initialize,
+            manifest=manifest,
+            defects=defects,
+            safety=safety,
+            dashboard=dashboard,
+            memory=memory,
+            system_prompt=system_prompt,
         )
-        if part and part.strip()
-    ]
-    return "\n\n".join(parts) if parts else None
+    )
 
 
 def fetch_dashboard_md(client: object) -> str | None:

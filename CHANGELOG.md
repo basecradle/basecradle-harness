@@ -7,6 +7,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.93.0] - 2026-07-26
+
+### Added: one line per assembled turn saying what the context is made of (issue #369)
+
+An agent's input-token count is its single largest recurring cost, and nothing in the fleet could
+say **what composes it**. The per-call line reports the total the provider charged for
+(`llm … tokens_in=`) and the compaction line reports when the total crossed a threshold — but a
+standing agent sitting at ~494 K input tokens per call left the obvious question unanswerable:
+how much of that is the charter, the tool schemas, the timeline history, recalled memory, or the
+per-wake brief? (basecradle-noc#388, where an intended-vs-defect ruling was blocked on exactly
+that attribution.)
+
+`Session._drive` now emits one `context attribution` line per assembled turn, immediately before
+the turn's first model call:
+
+```text
+INFO context attribution unit=chars source=timeline:019e77…6da total=12794 messages=13 tools=1474
+tools_count=1 brief=10546 brief_now=268 brief_budget=573 brief_initialize=9582 brief_manifest=41
+brief_dashboard=43 brief_system_prompt=39 history=774 history_charter=0 history_summary=0
+history_steps=208 history_user=196 history_assistant=130 history_tool=240 history_other=0 images=0
+```
+
+- **Measured off the assembled payload, never re-derived.** The list measured is the list about to
+  be handed to `Engine.run`, and the schemas are the registry's own — the `overlay_tool_stems`
+  principle applied to context: report what loaded. Nothing reads a config or a prompt file to
+  reconstruct a number it could have counted.
+- **The sections add up.** `tools + brief + history + images == total`, exactly, which is what makes
+  a share computed off it a real share. The brief's parts are charged their joining separators so
+  they partition the brief; image payload is its own section rather than folded into the turn that
+  carries it, because base64 is enormous in characters and is not billed in text tokens.
+- **The unit is characters, and the line names it.** Tokens would need a tokenizer per model and GLM
+  publishes none, so the harness will not fabricate them — it counts in the same unit the compaction
+  arithmetic already uses (`_context.message_chars`, `ensure_ascii=False`). The `llm` line that
+  follows carries the provider's own `tokens_in` for very nearly this payload, so the two together
+  give a *measured* chars→tokens ratio per agent and per model rather than an assumed one — the
+  engine's step-counter note and the adapter's wire envelope ride inside `tokens_in` and not
+  inside these characters, so the ratio errs slightly high, which is the safe direction.
+- **Measurements, no verdict.** No section is labelled bloat and no threshold lives here.
+- Composition seams gained names rather than a second, drifting copy: `_brief.brief_parts` /
+  `join_brief` / `brief_section_sizes` (the brief's text and its per-part sizes now come from one
+  composition, so the live dashboard is still fetched once), and `_engine.is_step_note` beside the
+  note it reads — so the step ledger is its own section and the brief's look-alike time anchor can
+  never be mistaken for one. `_context._is_summary` / `_size` are now public as `is_summary` /
+  `message_chars` for the same reason: one question, one answer, one unit.
+- `Session.send` / `Session.resume` take an optional `brief_sections`; omitting it costs only the
+  brief's per-part breakdown. A failure anywhere in the measurement is a `WARNING` and nothing more.
+
 ## [0.92.0] - 2026-07-26
 
 ### Changed: the epoch probe states the limit of its own tamper check (issue #353)
