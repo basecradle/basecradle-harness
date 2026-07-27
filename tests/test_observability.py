@@ -307,9 +307,11 @@ def test_the_media_line_names_the_provider_kind_model_and_duration(caplog):
 
 
 def test_the_media_timer_logs_a_completed_generation(caplog):
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        with media_timer(provider="openai", kind="image.generate", model="gpt-image-2"):
-            pass
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        media_timer(provider="openai", kind="image.generate", model="gpt-image-2"),
+    ):
+        pass
 
     line = caplog.records[0].getMessage()
     assert line.startswith("media provider=openai kind=image.generate model=gpt-image-2 duration=")
@@ -399,11 +401,13 @@ def test_media_and_llm_cost_render_in_the_same_plain_decimal_shape(caplog):
 def test_the_media_timer_logs_the_cost_recorded_on_its_handle(caplog):
     """The charge is known only after the vendor responds, inside the timed block — so the timer
     yields a handle the tool sets, and logs it on a clean exit."""
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        with media_timer(
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        media_timer(
             provider="xai", kind="image.generate", model="grok-imagine-image-quality"
-        ) as call:
-            call.cost = 0.02
+        ) as call,
+    ):
+        call.cost = 0.02
 
     line = caplog.records[0].getMessage()
     assert line.startswith("media provider=xai kind=image.generate")
@@ -412,9 +416,11 @@ def test_the_media_timer_logs_the_cost_recorded_on_its_handle(caplog):
 
 def test_the_media_timer_omits_cost_when_its_handle_is_left_unset(caplog):
     """Every OpenAI media path leaves the handle untouched — the line carries no `cost=`."""
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        with media_timer(provider="openai", kind="image.generate", model="gpt-image-2"):
-            pass
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        media_timer(provider="openai", kind="image.generate", model="gpt-image-2"),
+    ):
+        pass
 
     assert "cost=" not in caplog.records[0].getMessage()
 

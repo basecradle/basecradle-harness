@@ -28,8 +28,8 @@ What genuinely differs is the **queue** an unsettled item comes back on, and the
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import httpx
 import pytest
@@ -828,7 +828,7 @@ def test_a_batch_mate_of_a_turn_this_wake_resumed_is_committed_not_abandoned(pla
     )
     dead._save()
 
-    agent, brain = build_wake(tmp_path, Finishes(), tools=[MessagesTool()])
+    agent, _brain = build_wake(tmp_path, Finishes(), tools=[MessagesTool()])
     session = agent.harness.session(agent.source)
     real_resume = Session.resume
 

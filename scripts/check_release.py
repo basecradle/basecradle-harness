@@ -39,7 +39,7 @@ CHANGELOG = ROOT / "CHANGELOG.md"
 VERSION_FILE = ROOT / "src" / "basecradle_harness" / "_version.py"
 
 UNRELEASED = "Unreleased"
-_HEADER = re.compile(r"^## \[([^\]]+)\]", re.M)
+_HEADER = re.compile(r"^## \[([^\]]+)\]", re.MULTILINE)
 _VERSION = re.compile(r'__version__\s*=\s*"([^"]+)"')
 _NUMERIC = re.compile(r"^(\d+(?:\.\d+)*)(.*)$")
 
@@ -64,10 +64,10 @@ def released(changelog: str) -> list[str]:
 
 def unreleased_body(changelog: str) -> str:
     """Whatever sits under `## [Unreleased]`, up to the next section."""
-    parts = re.split(r"^## \[Unreleased\][^\n]*\n", changelog, maxsplit=1, flags=re.M)
+    parts = re.split(r"^## \[Unreleased\][^\n]*\n", changelog, maxsplit=1, flags=re.MULTILINE)
     if len(parts) < 2:
         return ""
-    return re.split(r"^## \[", parts[1], maxsplit=1, flags=re.M)[0].strip()
+    return re.split(r"^## \[", parts[1], maxsplit=1, flags=re.MULTILINE)[0].strip()
 
 
 def sort_key(v: str) -> tuple[tuple[int, ...], int, str]:

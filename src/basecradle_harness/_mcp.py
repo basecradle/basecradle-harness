@@ -352,7 +352,7 @@ class StdioMcpClient(McpClient):
     def start(self) -> None:
         assert self.config.command is not None
         try:
-            self._proc = subprocess.Popen(  # noqa: S603 - args are an explicit list, shell=False
+            self._proc = subprocess.Popen(  # args are an explicit list, shell=False
                 [self.config.command, *self.config.args],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -438,7 +438,7 @@ class StdioMcpClient(McpClient):
         try:
             if proc.stdin is not None:
                 proc.stdin.close()
-        except Exception:  # noqa: BLE001 - best-effort teardown
+        except Exception:  # noqa: BLE001, S110 - best-effort teardown
             pass
 
 
@@ -628,11 +628,11 @@ def _render_image_block(
     if size <= 0:
         return f"[image content ({mimetype}, empty)]", None
     if size > MAX_IMAGE_BYTES:
-        return (
+        too_large = (
             f"[image: {mimetype}, {_human_bytes(size)} — too large to show or share "
-            f"(over the {MAX_IMAGE_BYTES}-byte limit)]",
-            None,
+            f"(over the {MAX_IMAGE_BYTES}-byte limit)]"
         )
+        return too_large, None
     handle = store.stash(mimetype, data) if store is not None else None
     viewable = mimetype in _VIEWABLE_IMAGE_TYPES
     image = ImageContent(url=_data_url(mimetype, data), alt=handle or "image") if viewable else None
@@ -853,7 +853,7 @@ def _safe_close(client: McpClient | None) -> None:
         return
     try:
         client.close()
-    except Exception:  # noqa: BLE001 - teardown of a failed server must not raise
+    except Exception:  # noqa: BLE001, S110 - teardown of a failed server must not raise
         pass
 
 

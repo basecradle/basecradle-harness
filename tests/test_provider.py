@@ -886,9 +886,11 @@ def test_a_call_that_never_returned_logs_no_llm_line(router, provider, caplog):
     retry/give-up story to tell."""
     router.post(CHAT_URL).mock(return_value=httpx.Response(500, json={"error": {"message": "no"}}))
 
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        with pytest.raises(ProviderAPIError):
-            provider.chat([Message.user("hello")])
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        pytest.raises(ProviderAPIError),
+    ):
+        provider.chat([Message.user("hello")])
 
     assert not any(m.startswith("llm ") for m in (r.getMessage() for r in caplog.records))
 

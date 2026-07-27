@@ -86,10 +86,16 @@ Issues = "https://github.com/basecradle/basecradle-harness/issues"
 # ships only via its optional extra.
 # `openrouter` is likewise a dev dep so the suite exercises the real OpenRouter SDK adapter
 # offline — the SDK's httpx transport is respx-mocked, so it never touches the network.
+# `ruff`'s floor is a correctness constraint, not a preference: the *default rule set is
+# version-dependent* (0.16 took it from 59 rules to 413, and it now formats Python blocks inside
+# Markdown too — issue #367). `[tool.ruff.lint].ignore` and this repo's per-site `noqa`s are
+# written against 0.16's defaults, so a resolve that picked an older ruff would lint a different
+# repo than CI does and pass on findings CI rejects. Floored, deliberately uncapped: a future
+# expansion should arrive as a red Dependabot PR to be worked, not be suppressed by a ceiling.
 dev = [
     "pytest>=8",
     "respx>=0.22",
-    "ruff>=0.9",
+    "ruff>=0.16",
     "openai>=2.43,<3",
     "xai-sdk>=1.17,<2",
     "openrouter>=1.1.2,<2",
@@ -109,7 +115,54 @@ packages = ["src/basecradle_harness"]
 line-length = 100
 
 [tool.ruff.lint]
-extend-select = ["I"]
+# Import hygiene, held independently of the default set. `I` is also in ruff 0.16's defaults;
+# `E402` was in the *pre*-0.16 default (`E4`) and ruff's 0.16 curation dropped it. Both are stated
+# explicitly so sorted, top-of-file imports stay *this repo's* requirement rather than something
+# inherited — adopting 0.16's defaults should not quietly cost coverage the repo already had.
+extend-select = ["I", "E402"]
+
+# Ruff 0.16 took the default rule set from 59 rules to 413 (issue #367). This repo **tracks** that
+# default set rather than freezing an explicit `select`: a later expansion then surfaces as a red
+# Dependabot PR — the gate working — instead of as rules quietly never adopted. `ignore` is the
+# deliberate other half: the rules this repo does *not* adopt, each with its reason. Nothing is
+# suppressed silently, here or at a call site; the handful of one-off exceptions to rules that
+# *are* adopted carry a per-site `noqa` with a reason, so a future accident still trips the rule.
+ignore = [
+    # RUF012 mutable-class-default — `parameters = {...}` *is* the `Tool` contract, and the
+    # framework's most public teaching surface: `_tools.py`'s own docstring and the README's
+    # add-a-tool example both show it. Writing `parameters: ClassVar[dict[str, Any]] = {...}` in
+    # every tool and every test double taxes exactly the "read it and extend it in an afternoon"
+    # readability the kit exists for — and it buys nothing here, because a tool's JSON Schema is
+    # read-only by construction: nothing in this package, and nothing a plugin author writes,
+    # mutates it. The shared-mutation hazard the rule guards has no site to occur at.
+    "RUF012",
+    # FURB157 verbose-decimal-constructor — the paper-trading ledger quotes *every* `Decimal`
+    # literal, uniformly. The rule would rewrite only the integral ones (`Decimal("10000")` →
+    # `Decimal(10000)`, value- and exponent-identical), leaving `Decimal("0.001")` quoted beside
+    # `Decimal(1)` unquoted in the same argument list. That mixture teaches the next reader that
+    # an unquoted literal is fine — and an unquoted *fractional* one (`Decimal(0.001)`) is a real
+    # binary-float bug in a module whose whole point is exact money. Always-quote makes every
+    # unquoted `Decimal(` a visible flag in review; cosmetic consistency is not worth losing it.
+    "FURB157",
+    # PYI034 non-self-return-type — flake8-pyi is written for stub files. These are runtime
+    # classes (the provider adapters and their `_ErrorMapper`s), none of them subclassed anywhere
+    # in the package or its tests, so the concrete return type on `__enter__` is both accurate and
+    # what a reader wants. `Self` needs `typing_extensions` on Python 3.10, which the core refuses
+    # to take on ("every dependency is debt") for a type-checker this repo's CI does not run.
+    "PYI034",
+    # RUF022 unsorted-dunder-all — `__all__` is ordered by concept and carries section comments
+    # ("# The agent", "# The context budget", …) that document what each group *is*. Alphabetizing
+    # it destroys that documentation and would strand the comments beside unrelated names.
+    "RUF022",
+    # TRY004 type-check-without-type-error — the flagged `isinstance` checks are all parse/validation
+    # boundaries (`model_params.json`, `search_params.json`, an `mcp/*.json` drop-in, a vendor
+    # endpoint's body) whose documented contract is a *single* `ValueError` carrying a
+    # human-readable, path-naming message, uniform across every way the input can be malformed.
+    # Callers catch exactly that (`_mcp.py`'s per-server skip; the contract `_basecradle.py`
+    # documents for `load_model_params`), so splitting one branch out as `TypeError` converts a
+    # reported bad-config into an uncaught crash — a behavioural change, not a lint fix.
+    "TRY004",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

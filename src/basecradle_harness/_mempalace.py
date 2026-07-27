@@ -311,7 +311,8 @@ def _import(submodule: str):
     """
     try:
         return __import__(f"mempalace.{submodule}", fromlist=[submodule])
-    except ImportError as error:  # noqa: TRY003 - the message is the actionable bit
+    except ImportError as error:
+        # A long message on the raise, deliberately: the message is the actionable bit.
         raise ImportError(_MISSING) from error
 
 

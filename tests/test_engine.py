@@ -715,9 +715,11 @@ def test_the_give_up_leaves_a_diagnosable_log_trail(caplog):
     _delays, spy = _no_sleep()
     engine = Engine(provider, ToolRegistry(), response_retries=2, sleep=spy)
 
-    with caplog.at_level("WARNING", logger="basecradle_harness"):
-        with pytest.raises(ProviderResponseError):
-            engine.run([Message.user("hi")])
+    with (
+        caplog.at_level("WARNING", logger="basecradle_harness"),
+        pytest.raises(ProviderResponseError),
+    ):
+        engine.run([Message.user("hi")])
 
     warnings = [
         r for r in caplog.records if r.levelname == "WARNING" and "unparseable" in r.message

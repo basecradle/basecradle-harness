@@ -8,7 +8,7 @@ second is what makes those shares true; the third is what makes them useful.
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -28,7 +28,9 @@ from basecradle_harness._context import TOOL_RESULT_CAP
 from basecradle_harness._engine import _step_note, is_step_note
 from tests.test_session import ScriptedProvider, calls_tool, text
 
-NOW = datetime(2026, 7, 26, 12, 0, 0)
+# Aware UTC, matching what `Engine` actually feeds `_step_note` (`datetime.now(timezone.utc)`) —
+# the note labels itself UTC, so the fixture should be the same kind of value the note renders.
+NOW = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
 
 
 class Weather(Tool):
@@ -252,9 +254,10 @@ def test_a_measurement_failure_warns_and_returns_rather_than_raising(caplog):
 # --- measured off the assembled payload, end to end ---------------------------
 
 
-def build(tmp_path, *replies, tools=(Weather(),)):
+def build(tmp_path, *replies, tools=None):
     registry = ToolRegistry()
-    for tool in tools:
+    # `None` (not `()`) is the "use the default" sentinel, so `tools=()` still means "no tools".
+    for tool in (Weather(),) if tools is None else tools:
         registry.register(tool)
     return Session(
         "timeline:0198e3f1-0000-7000-8000-000000000001",

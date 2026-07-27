@@ -143,15 +143,17 @@ class TestReadmeExamples:
     @pytest.mark.parametrize("block_number", range(len(python_blocks())))
     def test_block_runs_verbatim(self, block_number):
         code = python_blocks()[block_number]
-        exec(compile(code, f"{README}#block{block_number}", "exec"), {})
+        # Running the README's own blocks verbatim is precisely what this asserts, so the
+        # `exec` is the test, not a finding.
+        exec(compile(code, f"{README}#block{block_number}", "exec"), {})  # noqa: S102
 
     def test_custom_provider_block_is_offline_and_echoes(self, capsys):
         """The add-a-provider example must work with no model at all."""
         block = next(b for b in python_blocks() if "class EchoProvider" in b)
-        exec(compile(block, str(README), "exec"), {})
+        exec(compile(block, str(README), "exec"), {})  # noqa: S102 - the README is the fixture
         assert "You said: Hello!" in capsys.readouterr().out
 
     def test_safety_block_prints_the_policy_error(self, capsys):
         block = next(b for b in python_blocks() if "DangerousTool" in b)
-        exec(compile(block, str(README), "exec"), {})
+        exec(compile(block, str(README), "exec"), {})  # noqa: S102 - the README is the fixture
         assert "PolicyError" in capsys.readouterr().out

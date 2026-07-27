@@ -117,6 +117,7 @@ Writing your own is one small class — implement only the surfaces you want:
 ```python
 from basecradle_harness import MemoryProvider
 
+
 class MyMemory(MemoryProvider):
     """Automatic memory: capture every exchange, inject what's relevant at Turn 0."""
 
@@ -816,6 +817,7 @@ Writing your **own** platform tool is the same one-class contract, with one extr
 ```python
 from basecradle_harness import PlatformTool
 
+
 class WhoAmI(PlatformTool):
     name = "whoami"
     description = "Report the agent's own handle on BaseCradle."
@@ -1277,6 +1279,7 @@ A tool is one small class: a `name`, a `description`, a JSON-Schema for its `par
 ```python
 from basecradle_harness import Harness, OpenAIProvider, Tool
 
+
 class Uppercase(Tool):
     name = "uppercase"
     description = "Return the given text in uppercase."
@@ -1288,6 +1291,7 @@ class Uppercase(Tool):
 
     def run(self, text: str) -> str:
         return text.upper()
+
 
 agent = Harness(OpenAIProvider(model="gpt-5.4-mini"), tools=[Uppercase()])
 
@@ -1352,6 +1356,7 @@ A provider is **any object with a `chat(messages, tools=None) -> Message` method
 ```python
 from basecradle_harness import Harness, Message
 
+
 class EchoProvider:
     """A provider in a few lines — the hackability promise, kept honest."""
 
@@ -1361,6 +1366,7 @@ class EchoProvider:
         # *user* message rather than assuming it is last.
         last = next(m.content for m in reversed(messages) if m.role == "user")
         return Message.assistant(content=f"You said: {last}")
+
 
 agent = Harness(EchoProvider())
 print(agent.send("Hello!"))  # -> You said: Hello!
@@ -1383,6 +1389,7 @@ The shipped Harness loads tools through a **locked policy** that forbids the she
 ```python
 from basecradle_harness import PolicyError, SHELL, Tool, ToolRegistry
 
+
 class DangerousTool(Tool):
     name = "shell"
     description = "Run a command."
@@ -1390,6 +1397,7 @@ class DangerousTool(Tool):
 
     def run(self, command: str) -> str:
         return "not reachable under the safe profile"
+
 
 registry = ToolRegistry()  # defaults to the locked, safe profile
 try:

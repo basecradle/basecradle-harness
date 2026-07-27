@@ -525,7 +525,7 @@ class Engine:
         messages.append(Message.system(_RESERVE_NUDGE))
         try:
             reply = self._chat(messages, None)
-        except Exception as exc:  # noqa: BLE001 - surface as EngineError; the wake posts the canned note
+        except Exception as exc:  # surface as EngineError; the wake posts the canned note
             _log.warning("Reserve summary call failed after the step budget was spent: %s", exc)
             raise EngineError(
                 f"Step budget of {self.max_steps} spent and the reserve summary call failed: {exc}"

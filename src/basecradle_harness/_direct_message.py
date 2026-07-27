@@ -233,7 +233,7 @@ class DirectMessageTool(PlatformTool):
                 self._discovered_handle = (
                     getattr(self.context.client.me.identity, "handle", "") or ""
                 )
-            except Exception:  # noqa: BLE001 - identity is a nicety here; the message is the point
+            except Exception:  # identity is a nicety here; the message is the point
                 logger.debug("direct_message could not resolve its own handle", exc_info=True)
                 self._discovered_handle = ""
         return self._discovered_handle or None
