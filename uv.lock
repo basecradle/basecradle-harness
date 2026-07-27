@@ -265,7 +265,7 @@ requires-dist = [
     { name = "basecradle", specifier = ">=0.6" },
     { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.4" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=2.43,<3" },
-    { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=0.11.3,<1.2" },
+    { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=1.1.2,<2" },
     { name = "xai-sdk", marker = "extra == 'xai-sdk'", specifier = ">=1.17,<2" },
 ]
 provides-extras = ["mempalace", "openai", "openrouter", "xai-sdk"]
@@ -273,7 +273,7 @@ provides-extras = ["mempalace", "openai", "openrouter", "xai-sdk"]
 [package.metadata.requires-dev]
 dev = [
     { name = "openai", specifier = ">=2.43,<3" },
-    { name = "openrouter", specifier = ">=0.11.3,<1.2" },
+    { name = "openrouter", specifier = ">=1.1.2,<2" },
     { name = "pytest", specifier = ">=8" },
     { name = "respx", specifier = ">=0.22" },
     { name = "ruff", specifier = ">=0.9" },
