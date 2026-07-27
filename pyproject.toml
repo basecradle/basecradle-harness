@@ -70,6 +70,11 @@ basecradle-harness-polymarket-sweep = "basecradle_harness._polymarket_engine:mai
 # from (issue #345). Pure: no config home, no credentials, no network, no writes. The off-box
 # sibling of `basecradle-harness-wake --resolved-config`, which reports a live box instead.
 basecradle-harness-resolve = "basecradle_harness._resolve:main"
+# Prove this agent's *declared* capability set is actually present and current — the fail-closed
+# converge probe (issue #374). Exits nonzero, with a specific diagnosis, when a shipped default or
+# a granted opt-in tool is missing, the overlay predates the running package, or the state cannot
+# be proven at all. `--emit-claims` prints its rows for the fleet claims-vs-evidence ledger.
+basecradle-harness-verify = "basecradle_harness._verify:main"
 
 [project.urls]
 Homepage = "https://basecradle.com"

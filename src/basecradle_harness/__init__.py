@@ -55,6 +55,7 @@ from basecradle_harness._install import (
     install,
     installed_version,
     prompt_text,
+    read_declaration,
     reconcile_on_upgrade,
     system_prompt_text,
 )
@@ -126,6 +127,7 @@ from basecradle_harness._system_prompt import (
 )
 from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
+from basecradle_harness._verify import Finding, VerifyReport, claims, verify
 from basecradle_harness._version import __version__
 from basecradle_harness._wake import (
     BreakerDecision,
@@ -163,6 +165,12 @@ __all__ = [
     "prompt_text",
     "system_prompt_text",
     "InstallReport",
+    # The declaration + its fail-closed prover (issue #374)
+    "read_declaration",
+    "verify",
+    "claims",
+    "VerifyReport",
+    "Finding",
     "MarkStore",
     "SeenStore",
     "Claim",

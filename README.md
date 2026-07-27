@@ -203,6 +203,7 @@ wake end timeline=019e77… outcome=ok turns=1 steps=2/24 posted=0 duration=3.31
 | `model_params.json` | *(optional, config-home file — not an env var)* operator-owned model-call parameters (`temperature`, `max_tokens`, `reasoning`, …). See [Model parameters](#model-parameters--model_paramsjson) |
 | `HARNESS_SYSTEM_PROMPT` | *(legacy fallback)* standing instructions. The charter is now sourced from real files under the config home — see [The config home](#the-config-home-installer--upgrader) — and this is consulted only when the config home was never installed |
 | `BASECRADLE_CONFIG_HOME` | *(optional)* where the config home lives. Defaults to `$HOME/.config/basecradle` |
+| `BASECRADLE_AGENT_SLUG` | *(optional)* this agent's slug, used as the `agent:<slug>` subject of `basecradle-harness-verify --emit-claims`. Defaults to the OS user, which on a fleet box *is* the slug — set it only where that does not hold |
 | `HARNESS_MEMORY_PROVIDER` | *(optional)* the [memory backend](#swap-the-memory-backend--the-memory-provider) the agent binds: `sqlite` (default), `mempalace`, or a `module:Class` path to your own. `basecradle-harness-wake --resolved-config` reports the **bound** one, so a dropped var never silently downgrades an agent's memory unseen |
 | `HARNESS_CONTEXT_MESSAGES` | *(optional)* how many backlog messages to seed as context — an integer, or `all` for the whole timeline. Defaults to `50` |
 | `HARNESS_ONBOARD` | *(optional)* orient the agent on startup — a bounded Dashboard summary prepended to the poll loop's charter, and (under a router) the [persistent operating brief](#run-under-a-router-wake-mode) re-asserted each wake. **On by default**; set to a falsy value (`0`/`false`/`no`/`off`) to come up with only your own charter |
@@ -250,6 +251,7 @@ basecradle-harness-install --config-home <dir>   # or an explicit location
   tools/               # tool-plugin overlay — drop in a *.py to add/override/disable a tool
   mcp/                 # MCP server configs — drop in a *.json to add a server; empty = safe
   .manifest.json       # the installer's bookkeeping — leave it be
+  .declared.json       # what this agent *claims* to have — proved by basecradle-harness-verify
 ```
 
 The location resolves from `--config-home`, then `$BASECRADLE_CONFIG_HOME`, then
@@ -304,10 +306,72 @@ provider requirement (`Vendor("xai")` / `OpenAIKey()`) decides whether a powerfu
 - **Grandfathered, never stripped:** upgrading an existing config home that a *prior* version
   had already scaffolded a powerful tool into **keeps** it — and the installer says so **loudly**
   (the summary names each grandfathered tool), so the policy change is never silent. New agents
-  get the opt-in (off) default; delete a file to drop one.
+  get the opt-in (off) default.
+- **Retire one** with `basecradle-harness-install --revoke-opt-in generate_image`. Deleting the
+  file is *not* how you retire a granted tool: the grant is durable (see
+  [Prove it](#prove-it--basecradle-harness-verify)), so a plain reconcile restores a granted tool
+  that has gone missing and says so loudly. That asymmetry is the point — an absence nobody
+  declared is a *strip*, and it has to be distinguishable from a decision.
 - **Why:** a persona that's dangerous *by design* (a red-team agent) must get **zero** powerful
   tools by construction, never "on unless someone remembered to prune." Capability is the
   invariant; the provider is incidental.
+
+### Prove it — `basecradle-harness-verify`
+
+Everything above is *reconciliation*, and reconciliation is expressed in observations — a file is
+present, a hash matches. An observation cannot tell your deliberate deletion from a capability
+something **took away**, and that gap has a cost: an overlay tool stripped by a plain
+`pip install -U`, a config home never reconciled after the package moved under it, an opt-in a
+mis-provided converge pruned — none of these raise, none log, and none stop the agent. It simply
+cannot do a thing it believes it can. **Absence emits no signal**, so the fix is a command that
+turns red when a claimed capability is not there:
+
+```bash
+basecradle-harness-verify                          # exit 0 = proven; exit 1 = a specific gap
+basecradle-harness-verify --json                   # the same verdict, machine-readable
+basecradle-harness-verify --expect-version 0.95.0  # …and the pin you deployed
+```
+
+Every reconcile writes `.declared.json` — this agent's **declaration**: the powerful stems it was
+granted, the provider the install filtered for, and which managed files were present when the
+reconcile finished. `basecradle-harness-verify` proves that declaration, and exits nonzero naming
+what is missing:
+
+| It reports | When |
+|---|---|
+| `overlay-file-missing` | a file that was there at the last reconcile is gone now |
+| `opt-in-missing` | a **granted** powerful tool is not in the overlay — it was stripped |
+| `config-home-stale` | the overlay was reconciled by a different harness version than the one running |
+| `overlay-stale` / `default-not-installed` | the manifest records an older default text, or a default this package ships was never laid down |
+| `provider-mismatch` | the overlay was reconciled for a different `AI_PROVIDER` than this agent runs |
+| `package-version-mismatch` / `package-pin-mismatch` | installed metadata disagrees with the imported package, or with `--expect-version` |
+| `config-home-not-installed`, `declaration-missing`, `declaration-contract-unknown` | nothing can be proven here at all |
+
+Two things it deliberately does **not** do. It never reports an **operator edit** or a deletion a
+reconcile has already seen — it proves the *declared set*, not pristine-ness, and a checker that
+reddens on your own legitimate work is one you switch off. And it never reports **activation**: a
+tool file can be present and still not activate (its provider, its key, the locked policy), which
+is what `basecradle-harness-wake --resolved-config` answers. Both gaps ride in the JSON under
+`notes` rather than living in prose here.
+
+The one thing it *does* insist on is that **unproven is red**: a config home that was never
+installed, a declaration that will not parse, a declaration from a `contract` this version does not
+know — each exits nonzero, because "nothing to check, looks fine" is the original defect wearing a
+checker's clothes.
+
+**For a fleet deployer.** `--emit-claims` prints this agent's rows for a claims-vs-evidence ledger
+(Claims Manifest Contract v1) — one `dependency`-class row per declared capability, each naming
+this same command as its probe and `<config-home>/.verified.json` (written on a *successful*
+verify, so its timestamp is the age of a real proof) as its evidence:
+
+```bash
+basecradle-harness-verify --emit-claims            # subject: agent:<slug>, from $BASECRADLE_AGENT_SLUG or the OS user
+```
+
+It emits the claims **whatever the verdict** — a claim that disappears when it stops being true
+would make the ledger agree with the box precisely when the box is wrong. Run the probe **as the
+agent, with its environment**; without one it falls back to the config home's own `agent.env` for
+`AI_PROVIDER` and, failing that, says in the finding that it had to assume.
 
 ### A stem is not a tool name — `basecradle-harness-resolve`
 
