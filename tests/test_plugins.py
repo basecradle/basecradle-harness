@@ -24,6 +24,7 @@ from basecradle_harness import (
     load_plugins_report,
     resolve_plugins,
 )
+from basecradle_harness._plugins import load_default_plugins
 
 
 # A trivial tool to stand in for a real impl — no platform, no provider, nothing to bind.
@@ -592,3 +593,86 @@ def test_a_provider_mismatched_broken_file_is_not_imported_so_never_a_defect(tmp
     # Skipped before import → not imported, so not a defect and not a crash.
     assert report.broken_defaults == []
     assert all("rogue_xai" not in p.resolved_name for p in report.plugins)
+
+
+# --- the overlay's present stems (issue #352) --------------------------------
+#
+# What the box's `tools/` overlay *contains*, as distinct from what activated. It is the one
+# input to resolution that was unreadable off-box, and a hand-pruned overlay — a real fleet
+# containment boundary — exists only as absent files in a directory.
+
+
+def test_overlay_stems_report_what_the_overlay_contains(tmp_path):
+    home = tmp_path / "cfg"
+    install(home, provider="openai")
+    (home / "tools" / "assets.py").unlink()  # pruned
+    (home / "tools" / "greet.py").write_text(_ADDED_TOOL)  # operator's own
+
+    report = load_plugins_report(home, provider="openai")
+
+    assert report.overlay_stems is not None
+    assert "assets" not in report.overlay_stems  # deleted → not present
+    assert "greet" in report.overlay_stems  # an operator addition is presence too
+    assert "web_fetch" in report.overlay_stems
+    assert report.overlay_stems == sorted(report.overlay_stems)  # stable ordering
+
+
+def test_overlay_stems_are_presence_not_a_verdict(tmp_path):
+    """A file that is *there* is reported even when no gate lets it through — a broken one, and
+    a provider-mismatched one that is never even imported. Presence is upstream of activation;
+    collapsing them would make the read-back answer a different question than it was asked."""
+    home = tmp_path / "cfg"
+    install(home, provider="xai", opt_in=["grok_generate_image"])
+    (home / "tools" / "broken.py").write_text("this is not valid python :(\n")
+
+    # Loaded as an *openai* agent: grok_generate_image is provider-mismatched, so it is skipped
+    # before import — and still present on disk, which is what this field reports.
+    report = load_plugins_report(home, provider="openai")
+
+    assert report.overlay_stems is not None
+    assert "grok_generate_image" in report.overlay_stems  # present, never imported
+    assert "broken" in report.overlay_stems  # present, failed to load
+    assert not any(p.stem == "grok_generate_image" for p in report.plugins)  # not active
+
+
+def test_an_installed_but_emptied_overlay_reports_zero_stems_not_none(tmp_path):
+    """`[]` (installed, holds nothing → **zero tools**) and `None` (no overlay at all) are
+    different facts, and collapsing them would make the audit lie on exactly the agent whose
+    operator removed every tool on purpose."""
+    home = tmp_path / "cfg"
+    install(home, provider="openai")
+    for path in (home / "tools").glob("*.py"):
+        path.unlink()
+
+    report = load_plugins_report(home, provider="openai")
+
+    assert report.overlay_stems == []
+    assert report.plugins == []  # and it really does mean zero tools
+
+
+def test_a_deleted_tools_dir_reports_zero_stems_not_none(tmp_path):
+    import shutil
+
+    home = tmp_path / "cfg"
+    install(home, provider="openai")
+    shutil.rmtree(home / "tools")  # the whole dir, not just its files
+
+    report = load_plugins_report(home, provider="openai")
+
+    assert report.overlay_stems == []  # installed → an absent dir is a deletion, not "no overlay"
+    assert report.plugins == []
+
+
+def test_an_uninstalled_config_home_reports_no_overlay_at_all(tmp_path):
+    """The packaged-defaults fallback consulted no overlay, so there is nothing to report the
+    contents of — `None`, never the packaged set, which would be the one lie this field exists
+    to prevent (the box would read as carrying files it does not have)."""
+    report = load_plugins_report(tmp_path / "never-installed", provider="openai")
+
+    assert report.overlay_stems is None
+    assert report.plugins  # yet the defaults still loaded, exactly as before
+
+
+def test_load_default_plugins_reports_no_overlay(tmp_path):
+    # The off-box question ("what does the package ship?") reads no config home by construction.
+    assert load_default_plugins(provider="openai").overlay_stems is None

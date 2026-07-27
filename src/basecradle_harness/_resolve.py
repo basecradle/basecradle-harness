@@ -49,7 +49,7 @@ import argparse
 import json
 import sys
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from basecradle_harness._basecradle import (
     _PROVIDERS,
@@ -176,15 +176,11 @@ def _apply_policy(resolved: ResolvedTools, policy: Policy) -> tuple[ResolvedTool
         refused[tool.name] = f"refused by the safe-by-default policy: needs {blocked}"
     if not refused:
         return resolved, {}
-    filtered = ResolvedTools(
+    filtered = replace(
+        resolved,
         tools=permitted,
-        builtins=resolved.builtins,
         skipped=resolved.skipped + sorted(refused.items()),
         manifest=[entry for entry in resolved.manifest if entry[0] not in refused],
-        notices=resolved.notices,
-        broken=resolved.broken,
-        opt_in_stems=resolved.opt_in_stems,
-        mcp_images=resolved.mcp_images,
     )
     return filtered, refused
 

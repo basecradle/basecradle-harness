@@ -4757,3 +4757,50 @@ def test_the_reported_failure_log_line_grammar_is_stable(platform, tmp_path, cap
     assert len(billing) == 1
     assert "kind=billing" in billing[0]
     assert "reason=out_of_funds" in billing[0]
+
+
+def test_resolved_config_reports_the_overlays_present_tool_stems(wake_env, monkeypatch, tmp_path):
+    """The overlay read-back (issue #352): what this box's `tools/` overlay *contains*, as
+    distinct from what activated. It is the input a pin is computed from, and on a hand-pruned
+    agent — a real fleet containment boundary — it exists nowhere but as absent files on disk."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    install(cfg, provider="openai", opt_in=["generate_image"])
+    (cfg / "tools" / "assets.py").unlink()  # the operator prunes a benign default
+
+    report = resolved_config()
+
+    stems = report["overlay_tool_stems"]
+    assert "assets" not in stems  # pruned → absent, and now *readable* as absent
+    assert "web_fetch" in stems and "generate_image" in stems
+    assert stems == sorted(stems)
+    # Presence, never a verdict, and never a re-derivation of the resolved names: `opt_in_tools`
+    # is the powerful subset of this, and `tools` is a different vocabulary entirely.
+    assert set(report["opt_in_tools"]) <= set(stems)
+    assert "assets" not in report["tools"]
+
+
+def test_resolved_config_distinguishes_an_empty_overlay_from_no_overlay(
+    wake_env, monkeypatch, tmp_path
+):
+    """`[]` (installed, holds nothing → zero tools) and `null` (the packaged-defaults fallback,
+    no overlay consulted) are different facts about a box; a reader that cannot tell them apart
+    would call a deliberately tool-less agent 'unconfigured' — or the reverse."""
+    never = tmp_path / "never-installed"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(never))
+    report = resolved_config()
+    assert report["overlay_tool_stems"] is None  # no overlay at all
+    assert report["tools"]  # yet the packaged defaults resolved, exactly as before
+
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    install(cfg, provider="openai")
+    for path in (cfg / "tools").glob("*.py"):
+        path.unlink()
+
+    report = resolved_config()
+
+    assert report["overlay_tool_stems"] == []  # installed and emptied — a real, stated state
+    assert report["opt_in_tools"] == []
+    # `[]` here really does mean zero *plugin* tools; the memory provider's tool is not one.
+    assert [name for name in report["tools"] if name != "memory"] == []

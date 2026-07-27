@@ -783,3 +783,70 @@ def test_cli_provider_flag_overrides_the_env(tmp_path, monkeypatch, capsys):
     capsys.readouterr()
     assert _XAI_DEFAULTS <= _tool_files(home)
     assert _OPENAI_DEFAULTS.isdisjoint(_tool_files(home))
+
+
+# --- a pruned overlay survives an upgrade (issue #352) -----------------------
+#
+# Two fleet agents run **hand-pruned** overlays: an operator deleted benign default plugins at
+# provisioning time, as a deliberate containment boundary on an adversarial red-team persona.
+# That pruning survives every upgrade today only because `_reconcile` treats a deleted default
+# as a deleted conffile — behavior that was *documented* and *generic*, but never pinned for the
+# case that actually carries a security property. A future installer that helpfully re-laid
+# benign defaults would silently re-arm ~10 tools on both agents, and nothing would notice until
+# a drift pin reddened *after* the box had changed. So: pinned, on the real packaged defaults,
+# in both reconcile branches (source-unchanged and source-changed).
+
+
+def test_upgrade_over_a_pruned_overlay_does_not_resurrect_deleted_tool_plugins(tmp_path):
+    home = tmp_path / "cfg"
+    install(home, provider="openai")
+    pruned = {"assets.py", "tasks.py", "timelines.py", "users.py"}
+    kept = _tool_files(home) - pruned
+    assert pruned <= _tool_files(home)  # the fixture is real: these shipped, then were removed
+    for name in pruned:
+        (home / "tools" / name).unlink()  # the operator's containment decision
+
+    report = install(home, provider="openai")  # re-run the installer, as a fleet rollout does
+
+    assert _tool_files(home) == kept  # every pruned plugin stays gone
+    for name in pruned:
+        assert report.actions[f"tools/{name}"] in (UNCHANGED, KEPT_DELETED)
+        assert not (home / "tools" / f"{name}.new").exists()  # nor laid down beside it
+
+
+def test_a_pruned_tool_plugin_stays_deleted_when_the_shipped_source_changes(tmp_path):
+    # The other reconcile branch, and the one a real release exercises: the shipped default's
+    # *source* changed since the last install, so the upgrader has a genuinely new file to offer.
+    # It must still respect the deletion (KEPT_DELETED), not treat "we have something new" as
+    # licence to resurrect a capability the operator removed.
+    home = tmp_path / "cfg"
+    install(home, defaults={"tools/assets.py": "# v1\n", "tools/notes.md": "v1\n"})
+    (home / "tools" / "assets.py").unlink()
+
+    report = install(home, defaults={"tools/assets.py": "# v2 CHANGED\n", "tools/notes.md": "v1\n"})
+
+    assert report.actions["tools/assets.py"] == KEPT_DELETED
+    assert not (home / "tools" / "assets.py").exists()
+    assert not (home / "tools" / "assets.py.new").exists()
+
+
+def test_a_pruned_overlay_still_reads_as_pruned_after_an_upgrade(tmp_path):
+    # End to end, which is the property that actually matters: after the upgrade the *loader*
+    # sees the pruned set — so the resolved tool set (and the `overlay_tool_stems` read-back the
+    # NOC computes a pin from) reflects the containment boundary, not the shipped defaults.
+    from basecradle_harness._plugins import load_plugins_report
+
+    home = tmp_path / "cfg"
+    install(home, provider="openai")
+    for name in ("assets.py", "tasks.py", "timelines.py", "users.py"):
+        (home / "tools" / name).unlink()
+
+    install(home, provider="openai")
+    loaded = load_plugins_report(home, provider="openai")
+
+    assert loaded.overlay_stems is not None
+    assert {"assets", "tasks", "timelines", "users"}.isdisjoint(loaded.overlay_stems)
+    assert "web_fetch" in loaded.overlay_stems  # the survivors are untouched
+    names = {p.resolved_name for p in loaded.plugins}
+    assert "web_fetch" in names  # the control: this resolution is real, not an empty set
+    assert names.isdisjoint({"assets", "tasks", "timelines", "users"})

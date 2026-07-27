@@ -336,6 +336,16 @@ class ResolvedTools:
             NOC's fleet-drift audit compares declared-vs-active stems like-for-like, holding no
             stem→name map of its own. Empty for a config with no opt-in tool active (the safe
             default).
+        overlay_stems: What the config home's ``tools/`` overlay **contains** — every ``*.py``
+            plugin file the loader enumerated there, by stem, sorted (issue #352). Presence, never
+            a verdict: it includes a provider-mismatched file (present, not imported), a broken
+            one, and an operator's own additions, because the question it answers is *which plugin
+            files does this box's overlay carry?* — which is upstream of every activation gate.
+            ``None`` when the overlay is **not the source** (the not-yet-installed fallback, where
+            the packaged defaults load directly, and `load_default_plugins`), so "no overlay" and
+            "an overlay holding nothing" — a deleted ``tools/`` dir, i.e. zero tools — never
+            collapse onto each other. Stamped by the caller that did the load
+            (`_basecradle._resolve_tools`), since `resolve_plugins` sees plugins, not files.
         mcp_images: The per-wake MCP image store (issue #318), set only when an MCP server's tools
             loaded. It rides the resolved set from `_merge_mcp_tools` to the hosting agent, which
             threads it into the `PlatformContext` so the assets ``post_image`` action can post an
@@ -349,6 +359,9 @@ class ResolvedTools:
     notices: list[str] = field(default_factory=list)
     broken: list[str] = field(default_factory=list)
     opt_in_stems: list[str] = field(default_factory=list)
+    #: The overlay's present plugin-file stems, or ``None`` when the overlay is not the source
+    #: (issue #352). See the class docstring — the three-valued distinction is the contract.
+    overlay_stems: list[str] | None = None
     #: The per-wake MCP image store (issue #318), set only when an MCP server's tools loaded. It
     #: rides the resolved set from `_merge_mcp_tools` to the hosting agent, which threads it into
     #: the `PlatformContext` so the assets ``post_image`` action can post a returned image. ``None``
@@ -443,10 +456,19 @@ class LoadedPlugins:
     (`_basecradle._surface_broken_defaults`), never vanished. A broken *operator-added* file
     stays a soft skip — one bad drop-in must not take the agent down — so it is logged at
     ``WARNING`` and left out of `broken_defaults`.
+
+    `overlay_stems` answers a different question from either of those: not *what activated* and
+    not *what is broken*, but **what the config home's ``tools/`` overlay contains** — every
+    ``*.py`` file the loader walked there, by stem (issue #352). It is read off that same walk
+    rather than by a second directory listing, so no parallel model of "what is installed" can
+    exist here to drift from the one the agent actually loads. ``None`` when the overlay was not
+    the source — the not-yet-installed fallback path, and `load_default_plugins` — which is what
+    keeps "this box has no overlay" distinguishable from "this box's overlay is empty".
     """
 
     plugins: list[ToolPlugin] = field(default_factory=list)
     broken_defaults: list[tuple[str, str]] = field(default_factory=list)
+    overlay_stems: list[str] | None = None
 
 
 def load_plugins(
@@ -484,7 +506,8 @@ def load_plugins_report(
     *broken* file is never hidden by it: it still attempts to import and surfaces as a defect.
     ``None`` (the direct API / test default) imports every file, unfiltered.
 
-    Returns a `LoadedPlugins`: the loadable plugins, plus any **shipped-default** file that
+    Returns a `LoadedPlugins`: the loadable plugins, the overlay's present stems (`None` on the
+    fallback path — see `LoadedPlugins.overlay_stems`), plus any **shipped-default** file that
     failed to load (a defect to surface loudly — see `LoadedPlugins`). A broken file is a
     broken *default* when its filename is one of the packaged ``_defaults/tools/`` names
     (always true on the fallback path, where every file *is* a packaged default; true on the
@@ -493,11 +516,17 @@ def load_plugins_report(
     root = config_home(home)
     tools_dir = root / "tools"
     tools_installed = any(key.startswith("tools/") for key in _read_manifest(root))
+    stems: list[str] | None
     if tools_installed:
         # Installed → the overlay is authoritative; a removed dir/files is the operator's
         # deletion, honored (zero tools), never resurrected from the packaged defaults. A
         # powerful (`opt_in`) plugin *present here* is an explicit per-persona opt-in — kept.
-        plugins, broken = _load_dir(tools_dir, provider) if tools_dir.is_dir() else ([], [])
+        # The stems come back from that same walk, so what the box reports it carries and what
+        # the box actually loads can never be two different answers (issue #352). A deleted
+        # `tools/` dir is an overlay holding nothing — `[]`, never `None`.
+        plugins, broken, stems = (
+            _load_dir(tools_dir, provider) if tools_dir.is_dir() else ([], [], [])
+        )
     else:
         # Not yet installed for tools → load the packaged defaults straight from the package,
         # but **drop the opt-in (powerful) defaults**: they fail closed and activate only when
@@ -506,9 +535,12 @@ def load_plugins_report(
         with resources.as_file(
             resources.files("basecradle_harness").joinpath(*_DEFAULTS_TOOLS)
         ) as p:
-            plugins, broken = _load_dir(Path(p), provider)
+            plugins, broken, _packaged_stems = _load_dir(Path(p), provider)
         plugins = [plugin for plugin in plugins if not plugin.opt_in]
-    return _classify_broken(plugins, broken)
+        # No overlay was consulted, so there are no overlay stems to report — and reporting the
+        # packaged set here would be the one lie this field exists to prevent.
+        stems = None
+    return _classify_broken(plugins, broken, stems)
 
 
 def load_default_plugins(provider: str | None = None) -> LoadedPlugins:
@@ -531,13 +563,18 @@ def load_default_plugins(provider: str | None = None) -> LoadedPlugins:
     ``provider`` filters by source affinity before import, exactly as the loader does — a
     provider-mismatched plugin is not imported (and so cannot trigger a vendor-SDK import the
     caller's venv does not have). ``None`` loads every file.
+
+    `LoadedPlugins.overlay_stems` is ``None`` here by construction: no config home was read, so
+    there is no overlay to report the contents of.
     """
     with resources.as_file(resources.files("basecradle_harness").joinpath(*_DEFAULTS_TOOLS)) as p:
-        plugins, broken = _load_dir(Path(p), provider)
-    return _classify_broken(plugins, broken)
+        plugins, broken, _packaged_stems = _load_dir(Path(p), provider)
+    return _classify_broken(plugins, broken, None)
 
 
-def _classify_broken(plugins: list[ToolPlugin], broken: list[tuple[str, str]]) -> LoadedPlugins:
+def _classify_broken(
+    plugins: list[ToolPlugin], broken: list[tuple[str, str]], overlay_stems: list[str] | None
+) -> LoadedPlugins:
     """Split broken files into loud shipped-default defects (ERROR) and soft operator skips.
 
     The single classification point so the log level and the brief surfacing agree on what
@@ -559,7 +596,9 @@ def _classify_broken(plugins: list[ToolPlugin], broken: list[tuple[str, str]]) -
             broken_defaults.append((name, exc))
         else:
             _log.warning("Skipping tool plugin file %s: %s", name, exc)
-    return LoadedPlugins(plugins=plugins, broken_defaults=broken_defaults)
+    return LoadedPlugins(
+        plugins=plugins, broken_defaults=broken_defaults, overlay_stems=overlay_stems
+    )
 
 
 def _default_tool_filenames() -> frozenset[str]:
@@ -572,8 +611,8 @@ def _default_tool_filenames() -> frozenset[str]:
 
 def _load_dir(
     directory: Path, provider: str | None = None
-) -> tuple[list[ToolPlugin], list[tuple[str, str]]]:
-    """Load the ``*.py`` plugin files in `directory`: the declared plugins, and the broken ones.
+) -> tuple[list[ToolPlugin], list[tuple[str, str]], list[str]]:
+    """Load the ``*.py`` plugin files in `directory`: the plugins, the broken ones, the stems.
 
     Only ``*.py`` is loaded (so the upgrader's ``*.py.new`` shadow files are ignored). When
     `provider` is named, a file whose source declares affinity for a *different* provider is
@@ -583,17 +622,26 @@ def _load_dir(
     log — `_classify_broken` decides whether it is a loud shipped-default defect or a soft
     operator skip. Either way one broken file never takes the agent down: the loadable plugins are
     still returned.
+
+    The third return is every walked file's **stem**, sorted — *presence*, decided before any of
+    the gates above and therefore including the provider-mismatched file that was never imported,
+    the broken one, and an operator's own additions (issue #352). It comes off this walk rather
+    than a second ``glob`` at the caller precisely so it cannot disagree with what was loaded;
+    that a directory listing and the loader's own knowledge would drift is not hypothetical —
+    it is the parallel-model failure the ``mcp_servers`` manifest already retired once.
     """
     plugins: list[ToolPlugin] = []
     broken: list[tuple[str, str]] = []
+    stems: list[str] = []
     for path in sorted(directory.glob("*.py")):
+        stems.append(path.stem)
         if provider is not None and not _relevant(path, provider):
             continue  # provider-mismatched → don't even import it
         try:
             plugins.extend(_plugins_in_file(path))
         except Exception as exc:  # noqa: BLE001 - a bad file is collected, never fatal
             broken.append((path.name, str(exc)))
-    return plugins, broken
+    return plugins, broken, sorted(set(stems))
 
 
 def _relevant(path: Path, provider: str) -> bool:
