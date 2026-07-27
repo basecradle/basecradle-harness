@@ -1158,7 +1158,7 @@ wheels = [
 
 [[package]]
 name = "mempalace"
-version = "3.4.1"
+version = "3.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "chromadb" },
@@ -1170,9 +1170,9 @@ dependencies = [
     { name = "tokenizers" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dc/38/b5bd19281a337b2e48434dcd617b6c452f45702faff7a2e96fa463702326/mempalace-3.4.1.tar.gz", hash = "sha256:7f7982f3a37d96560274aca385fb60199e32a1159939e7b50e581230cc9265a8", size = 25109136, upload-time = "2026-06-15T09:39:06.678Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/3e/27936499c22259acda3cf793b9c6d0d0038a83fce50cfcddf2703b034c12/mempalace-3.6.0.tar.gz", hash = "sha256:6e80dd335a071d93452d6f52c457be74211cbdc8f67acda19665899d11a8ffd7", size = 25312229, upload-time = "2026-07-17T10:52:58.126Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/41/6a29ac07c72528b2b4c8e7be1f3754ca0b001f70bcaaed32085b4cf8118a/mempalace-3.4.1-py3-none-any.whl", hash = "sha256:d926e79d29f2d9d85780adb6f248ccf57775b33c56f53347d54d2e5d688f34dd", size = 491175, upload-time = "2026-06-15T09:39:03.978Z" },
+    { url = "https://files.pythonhosted.org/packages/98/db/c6369c7d300ea161dc1115f2bca23485122483e13db6e8ee05686982d1d8/mempalace-3.6.0-py3-none-any.whl", hash = "sha256:924341896d88e6d586734211fc431ed65baf7fbc26bce499337f8eaf108d91aa", size = 580713, upload-time = "2026-07-17T10:52:56.496Z" },
 ]
 
 [[package]]
