@@ -752,6 +752,7 @@ def test_the_sweep_module_cannot_reach_a_model_or_the_platform():
     allowed = {
         "__future__",
         "argparse",
+        "json",  # the read-only probe's output format (issue #353) — stdlib, no I/O of its own
         "logging",
         "os",
         "sys",
@@ -761,8 +762,14 @@ def test_the_sweep_module_cannot_reach_a_model_or_the_platform():
         "typing",
         "basecradle_harness._polymarket_data",
         "basecradle_harness._polymarket_ledger",
+        # A single module-level string constant, so the probe can stamp the contract version it
+        # is answering under. It imports nothing itself — the allow-list stays a real guard.
+        "basecradle_harness._version",
     }
     assert _imported_modules(SOURCE / "_polymarket_engine.py") <= allowed
+    # And the version module really is inert: a leaf that pulls in a provider would smuggle the
+    # whole model path in behind a name that reads as harmless.
+    assert _imported_modules(SOURCE / "_version.py") == set()
 
 
 def test_neither_the_ledger_nor_the_data_client_reaches_the_platform():
@@ -1306,3 +1313,152 @@ def test_a_rewritten_chain_still_fails_against_the_pinned_head(tmp_path):
     assert current_epoch(tmp_path).verify().ok is True  # internally consistent...
     assert current_epoch(tmp_path).head != pinned_head  # ...but not the record that was shipped
     assert len(current_epoch(tmp_path).rows()) == pinned_rows
+
+
+# --- the read-only epoch probe (issue #353) ----------------------------------
+#
+# The freeze is a live operational lever used as a safety control on an armed adversarial
+# persona — and until this it was reachable only through a tool call inside a wake (which no
+# monitor can make) or by reading the ledger on the box (which needs a shell nobody has). So
+# `polymarket_paper` being *armed* was git-tracked and drift-audited, while being *frozen* was
+# neither declared nor readable: a write-only control on a security boundary.
+
+
+def _probe(home, *extra):
+    """Run `--verify --json` and return the parsed report plus the exit code."""
+    import io
+
+    from basecradle_harness._polymarket_engine import main
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        code = main(["--home", str(home), "--verify", "--json", *extra])
+    return json.loads(buffer.getvalue()), code
+
+
+def test_the_probe_reports_the_epochs_freeze_state(tmp_path):
+    from basecradle_harness._polymarket_engine import main
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    epoch = current_epoch(tmp_path)
+
+    report, code = _probe(tmp_path)
+
+    assert code == 0
+    assert report["chain_ok"] is True
+    assert report["epoch"]["epoch_id"] == epoch.epoch_id
+    assert report["epoch"]["frozen"] is False and report["epoch"]["frozen_reason"] == ""
+    assert report["epoch"]["head"] == epoch.head
+    assert report["epoch"]["rows"] == len(epoch.rows())
+    assert report["epoch"]["chain_ok"] is True
+
+    assert main(["--home", str(tmp_path), "--freeze", "verifying off-box log shipping"]) == 0
+    report, code = _probe(tmp_path)
+
+    assert code == 0  # a freeze is a state, never an error
+    assert report["epoch"]["frozen"] is True
+    assert report["epoch"]["frozen_reason"] == "verifying off-box log shipping"
+
+    assert main(["--home", str(tmp_path), "--unfreeze"]) == 0
+    report, _ = _probe(tmp_path)
+    assert report["epoch"]["frozen"] is False  # the lift is visible too, which is the point
+
+
+def test_the_probe_distinguishes_no_epoch_from_an_unfrozen_one(tmp_path):
+    """A freshly provisioned agent has no epoch at all. Reporting that as `frozen: false` would
+    make the audit say a *nonexistent* instrument is running unfrozen — the two are different
+    facts about a box and an axis built on them must be able to tell them apart."""
+    report, code = _probe(tmp_path)
+
+    assert code == 0
+    assert report["epoch"] is None and report["epochs"] == []
+    assert report["chain_ok"] is True  # nothing is broken; there is simply nothing
+
+
+def test_the_probe_refuses_to_answer_frozen_off_a_broken_chain(tmp_path):
+    """The freeze is folded out of exactly the rows whose integrity just failed. A tamperer who
+    removed the `freeze` row would otherwise be reported as `frozen: false` — the one wrong
+    answer that matters, on a control whose whole purpose is to stop trading. `null` is the only
+    honest state, and `chain_ok` sits beside it saying why."""
+    from basecradle_harness._polymarket_engine import main
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    assert main(["--home", str(tmp_path), "--freeze", "emergency halt"]) == 0
+    assert _probe(tmp_path)[0]["epoch"]["frozen"] is True  # control: it really was frozen
+
+    tamper(tmp_path, 1, lambda row: row["payload"].__setitem__("p", "0.99"))
+    report, code = _probe(tmp_path)
+
+    assert code == 1  # a monitor's cheapest signal
+    assert report["chain_ok"] is False and report["epoch"]["chain_ok"] is False
+    assert report["epoch"]["frozen"] is None  # never `false`
+    assert report["epoch"]["frozen_reason"] is None
+    assert report["epoch"]["broken_at"] == 1 and report["epoch"]["reason"]
+    # rows/head are the *verified prefix* — how far the record vouches for itself.
+    assert report["epoch"]["rows"] == 1
+
+
+def test_the_probe_writes_nothing_at_all(tmp_path):
+    """Including on an agent that has never traded: taking the store lock would create
+    `<home>/polymarket/` and a `.lock`, so an hourly fleet monitor would litter a paper-trading
+    store onto every box it audited — the audit changing the thing it audits."""
+
+    from basecradle_harness._polymarket_engine import main
+
+    def tree(root):
+        return {path: path.read_bytes() for path in sorted(root.rglob("*")) if path.is_file()}
+
+    assert _probe(tmp_path)[1] == 0
+    assert list(tmp_path.iterdir()) == []  # not even the store dir, nor its .lock
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    before = tree(tmp_path)
+    assert before  # the control: there is now something that *could* have been written to
+
+    for _ in range(3):  # safe to run repeatedly, which is what a monitor does
+        assert _probe(tmp_path)[1] == 0
+        assert main(["--home", str(tmp_path), "--verify"]) == 0  # the text mode too
+
+    assert tree(tmp_path) == before  # every byte under the home, ledger and lock alike
+
+
+def test_the_probe_reports_every_epoch_and_keeps_the_current_one_named(tmp_path):
+    from basecradle_harness._polymarket_engine import main
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    first = current_epoch(tmp_path).epoch_id
+    assert main(["--home", str(tmp_path), "--new-epoch"]) == 0
+    second = current_epoch(tmp_path).epoch_id
+    assert second != first
+
+    report, code = _probe(tmp_path, "--all-epochs")
+
+    assert code == 0
+    assert [entry["epoch_id"] for entry in report["epochs"]] == [first, second]
+    # `epoch` stays the *current* one either way, so a monitor's axis reads the same field
+    # whether or not history was asked for.
+    assert report["epoch"]["epoch_id"] == second
+    assert _probe(tmp_path)[0]["epoch"]["epoch_id"] == second
+
+
+def test_json_is_refused_without_verify_because_every_other_mode_writes(tmp_path):
+    """`--json` is the monitor's spelling of `--verify`; binding them is what keeps "safe to run
+    repeatedly" a property of the flag rather than of the caller's care."""
+    from basecradle_harness._polymarket_engine import main
+
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--home", str(tmp_path), "--json"])
+    assert exit_info.value.code == 2  # argparse's usage error
+    assert list(tmp_path.iterdir()) == []  # and it wrote nothing on the way out

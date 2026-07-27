@@ -7,6 +7,67 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.91.0] - 2026-07-26
+
+### Added: a read-only surface for the `polymarket_paper` epoch state (issue #353)
+
+`basecradle-harness-polymarket-sweep --verify --json` prints the instrument's epoch state as
+machine-readable JSON: `epoch_id`, `frozen`, `frozen_reason`, `rows`, `chain_ok`, `head`,
+`broken_at` and `reason`, per epoch, plus a `chain_ok` roll-up. Exit `1` if any verified chain is
+broken, `0` otherwise.
+
+**The freeze was a write-only control on a security boundary.** It is a live operational lever —
+an armed adversarial persona's epoch frozen *at the engine*, so writes are refused by machinery
+rather than by anyone's discipline, then lifted deliberately once off-box log shipping was
+witnessed. But the state was reachable only two ways, and neither works for an off-box auditor:
+`get_scorecard`'s `frozen` field, which needs a **tool call inside a wake** that no monitor can
+make, and reading the ledger on the box, which needs a **shell nobody has by design**. So
+`polymarket_paper` being *armed* was git-tracked and drift-audited hourly in both directions,
+while being *frozen* was neither declared nor readable — it could be lifted by a regression, an
+operator mistake, or a re-provision that lost the state, and every fleet signal would stay green,
+including the heartbeat built to catch that class.
+
+The sweep carries it rather than `--resolved-config`, because that command answers *what would
+this configuration resolve to* and a freeze is **runtime state**, not resolution.
+
+Three properties of the shape, each load-bearing:
+
+- **`epoch` is `null` when no epoch exists**, an object when one does. "No epoch" and "an epoch
+  that is not frozen" are different facts, and collapsing them would make the audit read a
+  freshly-provisioned agent as an un-frozen one.
+- **`frozen` is `null` on a broken chain, never `false`.** The freeze is folded out of exactly the
+  rows whose integrity just failed, so a tamperer who removed the `freeze` row would be reported
+  as un-frozen — the one wrong answer that matters on a control whose purpose is to stop trading.
+  This is the same refusal `get_scorecard` makes with its numbers, applied to the one field that
+  is not a number. `chain_ok` sits beside it saying why.
+- **`rows` and `head` are the verified prefix** — on an intact chain the whole log and its real
+  head; on a broken one, how far the record vouches for itself and the last hash that did.
+
+`epoch` stays the *current* epoch whether or not `--all-epochs` was passed, so a monitor reads one
+field either way. `--json` is refused without `--verify`, because every other mode of this command
+writes — binding them is what keeps "safe to run repeatedly" a property of the flag rather than of
+the caller's care.
+
+**A freeze stays immediately actuatable by hand.** Nothing here makes the safety action depend on
+a declaration having landed first; `--freeze` is unchanged and still takes effect the moment it
+runs.
+
+### Fixed: `--verify` no longer creates a paper-trading store on a box that has none
+
+Taking the store lock does `mkdir` + open a `.lock`, so `--verify` created `<home>/polymarket/`
+on an agent that had never traded — the audit changing the box it audits, and an hourly fleet
+monitor would have littered a paper-trading store onto every agent it probed, including the ones
+without the instrument. `store_lock(create=False)` keys on the **lock file's own existence**:
+present means a live store, and taking it there writes nothing; absent means nothing has ever
+written here, so it yields unlocked and the caller reports "no epoch". The race that opens is
+benign by construction — the only concurrent possibility is the store's *first* write, and either
+answer is true a moment either side of it. `--verify` is now byte-for-byte inert under the agent's
+whole home, in both output modes, which is what the test pins.
+
+Its text line gains a `frozen=true|false|unknown` field, **appended** rather than spliced in: the
+existing prefix and `rows=`/`head=` pairs are what an off-box reader may already parse, and adding
+a field to the end of a key=value line cannot break a reader that inserting a word mid-line would.
+
 ## [0.90.0] - 2026-07-26
 
 ### Added: `--resolved-config` reports the overlay's present tool stems (issue #352)
