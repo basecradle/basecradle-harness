@@ -7,6 +7,87 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.95.0] - 2026-07-27
+
+### Added: the declared capability set, and a fail-closed prover for it (issue #374)
+
+The night of 2026-07-26→27 produced five independent instances of one failure shape — *a system
+that reads green while a capability is silently absent* (basecradle#460). This repo owns the
+first: fleet boxes read as converged while a plain `pip install -U` had left config-home overlays
+stale and opt-in tools gone. Nothing broke, only by luck.
+
+The reason it was invisible is structural, not an oversight. The whole install/upgrade layer is
+expressed in **observations** — a file is present, a hash matches — and an observation cannot tell
+an operator's deliberate deletion from a capability something *stripped*. The conffile discipline
+reads absence as intent, correctly and by design, so a prune **ratified itself** at the next
+reconcile and erased its own evidence. Fleet observability catches failures that *happen*; none of
+these happened.
+
+So every reconcile now writes **`.declared.json`** — what the agent *claims*, as distinct from what
+the manifest records us having laid down: the powerful stems **granted** (cumulative and durable,
+surviving both a prune and the file itself going missing), the **provider** the install filtered
+for, and which managed files were **present** when the reconcile finished. And a new command
+proves it:
+
+```bash
+basecradle-harness-verify                          # exit 0 = proven; exit 1 = a specific gap
+basecradle-harness-verify --json                   # the same verdict, machine-readable
+basecradle-harness-verify --expect-version 0.95.0  # …and the pin you deployed
+basecradle-harness-verify --emit-claims            # ledger rows (Claims Manifest Contract v1)
+```
+
+It reports `overlay-file-missing`, `opt-in-missing`, `config-home-stale`, `overlay-stale`,
+`default-not-installed`, `provider-mismatch`, `package-version-mismatch`, `package-pin-mismatch`,
+and the three unprovable states (`config-home-not-installed`, `declaration-missing`,
+`declaration-contract-unknown`) — each with the observed values and the command that closes it.
+
+Four properties are the design:
+
+- **It proves the declared set, never pristine-ness.** An operator edit and a reconcile-ratified
+  deletion are both legitimate and neither is a finding. A prover that reddens on legitimate work
+  is switched off inside a week, and a switched-off prover proves nothing.
+- **Unproven is red.** No config home, an unparseable declaration, a declaration from a future
+  `contract` — all exit nonzero. "Nothing to check, looks fine" is the original defect wearing a
+  prover's clothes.
+- **The claims are emitted whatever the verdict**, because a claim that disappears when it stops
+  being true makes the ledger agree with the box precisely when the box is wrong.
+- **Activation is deliberately out of scope** — a present tool can still be inactive for want of a
+  key, and folding that in would make a missing `AI_API_KEY` read as a stripped overlay.
+  `basecradle-harness-wake --resolved-config` is the authority there; the split rides in the
+  report's `notes`, not in prose.
+
+### Changed: a granted power tool's absence is a strip, not a decision (issue #374)
+
+The one deliberate inversion of an older rule, and the load-bearing half of the fix. For a benign
+default an absence is still honored as the operator's deletion, exactly as before. For a
+**granted** powerful tool it is not: the grant is an explicit declaration of presence, so a
+reconcile **restores** a missing one (`RESTORED`, reported loudly in the summary) instead of
+ratifying its removal — and `--revoke-opt-in <stems>` is the new, symmetric way to withdraw a
+grant (it drops the record and removes the pristine file; an edited copy is kept, with a warning
+that the tool stays loadable until you delete it yourself).
+
+The migration is safe in the direction that matters: the initial grant set is bootstrapped from
+what is **present** in the overlay, never from what the manifest remembers laying down — so a
+power tool retired the old way, by deleting the file when deletion *was* the retirement, reads as
+the retirement it was and is not resurrected.
+
+### Fixed: a provider check that cannot itself be mis-provided (issue #374)
+
+`.declared.json` records the provider the reconcile filtered for, which makes the self-ratifying
+prune visible: an installer run without the agent's `AI_PROVIDER` filters for the `openai` default
+and deletes a vendor agent's whole pristine tranche, updating the manifest as it goes, so every
+later reconcile agrees and nothing is left to notice. Verify now catches that as
+`provider-mismatch` — and to keep the check from having the same disease, it falls back to the
+config home's own `agent.env` when the probe is launched without the agent's environment, reports
+**where** it learned the provider (`active_provider_source`), and says so in the finding when it
+had to assume.
+
+### Added: `BASECRADLE_AGENT_SLUG`
+
+The `agent:<slug>` subject of the emitted claims. Defaults to the OS user, which on a fleet box
+*is* the slug (one slug across the GitHub App bot, the OS user, and the platform handle); set it
+only where that does not hold.
+
 ## [0.94.0] - 2026-07-27
 
 ### Changed: the OpenRouter context ceiling honors the operator's routing pin (issue #372)

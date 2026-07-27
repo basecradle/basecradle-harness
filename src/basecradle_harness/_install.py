@@ -18,6 +18,7 @@ The layout the installer scaffolds::
       tools/               # tool-plugin overlay (drop-in *.py) — loaded by `_plugins` (Group 2)
       mcp/                 # MCP server configs (drop-in *.json) — loaded by `_mcp` (Group 5)
       .manifest.json       # bookkeeping: the hash of every shipped default as installed
+      .declared.json       # bookkeeping: the agent's *declared* capability set (issue #374)
 
 **The conffile upgrader.** Re-running the installer against a newer package is an
 *upgrade*, and the same per-file reconcile (`_reconcile`) drives both: on a first run
@@ -36,6 +37,29 @@ and against the on-disk file:
 The operator's config dir is never clobbered; only pristine defaults refresh. This
 per-agent reconcile is exactly what a fleet rollout loops over a pinned version.
 
+**The declaration (issue #374).** The reconcile above is expressed entirely in *observations* —
+a file is present, a hash matches — and an observation cannot tell an operator's deliberate
+deletion from a capability something **stripped**. That ambiguity is what let the 2026-07-26→27
+incident read green while opt-in tools were gone: absence emits no signal. So every reconcile
+also writes ``.declared.json``, the agent's **declared** capability set — what it *claims* to
+have, as distinct from what the manifest records us having *laid down*:
+
+- ``opt_in`` — the powerful stems **granted** on this config home, cumulative and durable. It
+  outlives a prune (which pops a manifest entry, erasing the strip's own evidence) and it is
+  what makes a stripped power tool **restorable** by a plain reconcile rather than silently
+  gone. Deleting the file is therefore *not* a revocation here; ``--revoke-opt-in`` is.
+- ``provider`` — the provider the reconcile filtered for, so a converge that ran the installer
+  without the agent's ``AI_PROVIDER`` (and so pruned its whole vendor tranche) is *detectable*
+  rather than self-ratifying.
+- ``files`` — the manifest-tracked paths present on disk when the reconcile finished. This is
+  the line between a deletion the operator *declared* (ratified by a reconcile that saw it
+  absent) and one that happened *since*, which is a strip.
+
+Nothing here decides anything at install time except the opt-in grant; the declaration exists to
+be **proven** — `_verify` is the fail-closed prover, and `basecradle-harness-verify` the command
+a converge runs. A capability may not be claimed without something that turns red when it is
+absent.
+
 **Boundary.** This module owns *where things live and how install/upgrade works* — it
 scaffolds the ``tools/`` and ``mcp/`` overlay dirs and reconciles the shipped defaults,
 but the loading of those overlays lives elsewhere (`_plugins` for ``tools/``, `_mcp` for
@@ -53,7 +77,7 @@ import json
 import logging
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
@@ -79,6 +103,17 @@ _MANIFEST_NAME = ".manifest.json"
 # config home, so without this stamp a stale `tools/` overlay (a default plugin from the
 # previous version) silently outlives the upgrade — exactly the issue #160 failure.
 _VERSION_NAME = ".version"
+
+# Bookkeeping, not an operator file: the agent's **declared** capability set (issue #374) — the
+# opt-in grants, the provider the reconcile filtered for, and which managed files were present
+# when it finished. The manifest says what we *laid down*; this says what the agent *claims*, and
+# only the second one can be falsified by a strip. Leading dot signals "tooling — do not edit"; it
+# is never composed into anything the model reads.
+_DECLARATION_NAME = ".declared.json"
+
+#: The declaration's schema version. Bumped only on a breaking shape change; a reader that does
+#: not recognize the value **fails closed** (`_verify`) rather than guessing at a newer shape.
+DECLARATION_CONTRACT = 1
 
 # The package subtree the shipped defaults live in. The installer copies these out to the
 # config home; it is the *only* place defaults exist — there is no magic in-package
@@ -254,6 +289,13 @@ UNCHANGED = "unchanged"  # shipped default unchanged since last install → left
 PRUNED = (
     "pruned"  # a previously-installed default is now provider-mismatched → removed (issue #160)
 )
+# A **granted** opt-in tool that had gone missing → laid back down (issue #374). The one case where
+# a reconcile writes a file the operator does not currently have: its presence is *declared*, so an
+# undeclared absence is a strip to heal, not a deletion to respect. `--revoke-opt-in` is how the
+# grant goes away.
+RESTORED = "restored"
+# A grant withdrawn by `--revoke-opt-in`: the pristine file removed and the declaration updated.
+REVOKED = "revoked"
 
 
 @dataclass
@@ -267,6 +309,10 @@ class InstallReport:
     # Power tools (now opt-in, issue #168) a *prior* version had scaffolded into this config home
     # and that the upgrade KEPT rather than silently strip — the grandfather list, surfaced loudly.
     grandfathered: list[str] = field(default_factory=list)
+    # The powerful stems **granted** on this config home after this run (issue #374) — the durable
+    # declaration written to `.declared.json`, cumulative across runs and unaffected by a file
+    # going missing. `_verify` proves each one is actually on disk.
+    granted: list[str] = field(default_factory=list)
 
     def of(self, action: str) -> list[str]:
         """The relative paths whose outcome was ``action`` (for tests and the summary)."""
@@ -282,14 +328,24 @@ class InstallReport:
         lines = [head, tally]
         for rel in self.new_files:
             lines.append(f"  kept your edited {rel} — new default written to {rel}.new")
+        if restored := self.of(RESTORED):
+            # Loud, never a silent heal: a *granted* opt-in tool was missing and has been laid
+            # back down. Something removed it between reconciles (issue #374's whole subject), and
+            # a converge that quietly repaired it would leave nobody any the wiser.
+            lines.append(
+                f"  RESTORED granted opt-in tool(s) that had gone missing: {', '.join(restored)}. "
+                "Something removed them since the last reconcile — use --revoke-opt-in if the "
+                "removal was intended."
+            )
         if self.grandfathered:
             # Loud, never silent: an existing config keeps power tools that are now opt-in by
             # default (issue #168). Name each so the operator sees the policy change and can
             # delete any it no longer wants. New installs get the opt-in (off) default.
             kept = ", ".join(self.grandfathered)
             lines.append(
-                f"  kept (now opt-in, grandfathered from a prior install): {kept}. "
-                "These powerful tools are off by default for new agents; delete a file to drop it."
+                f"  kept (granted on this config home, carried forward): {kept}. "
+                "These powerful tools are off by default for new agents; retire one with "
+                "--revoke-opt-in <stem> (deleting the file no longer drops it — issue #374)."
             )
         return "\n".join(lines)
 
@@ -303,6 +359,7 @@ def install(
     defaults: dict[str, str] | None = None,
     provider: str | None = None,
     opt_in: Sequence[str] = (),
+    revoke_opt_in: Sequence[str] = (),
 ) -> InstallReport:
     """Scaffold the config home and reconcile the shipped defaults — idempotent, re-runnable.
 
@@ -324,14 +381,24 @@ def install(
     hazard), and one a prior install already laid down is **pruned** if still pristine. ``None``
     (the default the direct API and tests use) lays down every default unfiltered, as before.
 
-    **Powerful tools are opt-in (issue #168).** A tool-plugin default marked ``opt_in`` (media
-    generation, web/X search, code execution) is **not** scaffolded for a fresh agent — it ships
-    in the package but stays off until explicitly chosen, the same "ships empty" stance as
-    ``mcp/``. Two ways it still lands: it is named in ``opt_in`` (a list of plugin file stems,
-    e.g. ``["grok_generate_image"]`` — the ``--opt-in`` CLI flag), **or** a *prior* version had
-    already scaffolded it into this config home, in which case it is **grandfathered** — kept,
-    never silently stripped (the founder's "tools stay the same" migration rule) and reported
-    **loudly** in ``InstallReport.grandfathered``. Deletions stay respected either way.
+    **Powerful tools are opt-in (issue #168), and the grant is durable (issue #374).** A
+    tool-plugin default marked ``opt_in`` (media generation, web/X search, code execution) is
+    **not** scaffolded for a fresh agent — it ships in the package but stays off until explicitly
+    chosen, the same "ships empty" stance as ``mcp/``. Three ways it still lands: it is named in
+    ``opt_in`` (a list of plugin file stems, e.g. ``["grok_generate_image"]`` — the ``--opt-in``
+    CLI flag); it is **already granted** on this config home (recorded in ``.declared.json``, or —
+    bootstrapping an install that predates the declaration — already sitting in the overlay), in
+    which case it is **grandfathered**: kept, never silently stripped (the founder's "tools stay
+    the same" migration rule) and reported **loudly** in ``InstallReport.grandfathered``; or it is
+    granted and *missing*, in which case it is **restored** (`RESTORED`) and that is reported
+    louder still, because something took it.
+
+    That last case is the one that changes an older rule, deliberately. For a benign default an
+    absence is honored as the operator's deletion, exactly as before. For a **granted** power tool
+    it is not: the grant is an explicit declaration of presence, so an absence nobody declared is a
+    strip, and the symmetric way to withdraw the grant is ``revoke_opt_in`` (the
+    ``--revoke-opt-in`` flag) — which drops it from the declaration and removes the pristine file.
+    Without that asymmetry a prune erases its own evidence and every later reconcile ratifies it.
     """
     root = config_home(home)
     report = InstallReport(config_home=root)
@@ -348,18 +415,28 @@ def install(
     recorded = _read_manifest(root)
     updated: dict[str, str] = dict(recorded)
 
-    # Power tools (issue #168) are excluded from the scaffold set unless explicitly opted in or
-    # grandfathered (already recorded from a prior install). Kept separate from the provider
-    # filter so the provider-prune below still keys on `shipped_provider`, unchanged.
-    shipped, grandfathered_rels = _opt_in_scaffold_set(shipped_provider, recorded, opt_in)
+    # The durable grant set (issue #374), settled *before* anything is written so it reads the
+    # overlay as the operator left it. Revocations are applied here and their files removed below.
+    explicit = _stems(opt_in)
+    revoked = _stems(revoke_opt_in)
+    granted = _granted_stems(root, shipped_all, explicit, revoked)
+
+    # Power tools (issue #168) are excluded from the scaffold set unless granted. Kept separate
+    # from the provider filter so the provider-prune below still keys on `shipped_provider`.
+    shipped, grandfathered_rels = _opt_in_scaffold_set(shipped_provider, granted, explicit)
 
     # A typo in --opt-in (the stem-vs-name trap, e.g. "listen" for the file "hear_audio") would
     # otherwise scaffold nothing, silently — so name any opt-in that matched no powerful default.
-    _warn_unmatched_opt_in(opt_in, shipped_all)
+    _warn_unmatched_opt_in([*opt_in, *revoke_opt_in], shipped_all)
 
     for rel in sorted(shipped):
-        action = _reconcile(root, rel, shipped[rel], recorded, updated, report)
+        # A granted power tool's *presence* is declared, so a missing one is restored rather than
+        # respected as a deletion. Everything else keeps the plain conffile semantics.
+        declared = _is_tool_plugin(rel) and rel[len("tools/") : -len(".py")] in granted
+        action = _reconcile(root, rel, shipped[rel], recorded, updated, report, declared=declared)
         report.actions[rel] = action
+
+    _revoke_grants(root, shipped_all, revoked, recorded, updated, report)
 
     # A grandfathered power tool is one we kept because it was already on disk — so report only
     # those that are *actually present* after the reconcile. This catches every "not kept" case,
@@ -370,8 +447,10 @@ def install(
     ]
     if report.grandfathered:
         _log.warning(
-            "Grandfathered %d power tool(s) now opt-in by default (issue #168), kept on this "
-            "existing config home rather than stripped: %s. New agents get them off by default.",
+            "Carried forward %d granted power tool(s), opt-in by default (issue #168), kept on "
+            "this existing config home rather than stripped: %s. New agents get them off by "
+            "default; retire one with --revoke-opt-in <stem> (issue #374 — deleting the file is "
+            "read as a strip and restored, not as a retirement).",
             len(report.grandfathered),
             ", ".join(report.grandfathered),
         )
@@ -380,6 +459,12 @@ def install(
         _prune_mismatched_defaults(root, shipped_all, shipped_provider, recorded, updated, report)
 
     _write_manifest(root, updated)
+    # The declaration (issue #374): what this agent *claims* — the grants, the provider filtered
+    # for, and which managed files ended the run on disk. Written from the post-reconcile
+    # filesystem, so the "present" set is an observation of what really landed and not a
+    # restatement of what we meant to do. `basecradle-harness-verify` proves it.
+    report.granted = sorted(granted)
+    _write_declaration(root, provider=provider, granted=granted, tracked=updated)
     # Stamp the harness version that produced this config home, so a later wake can detect a
     # `pip install -U` (running version ≠ stamped version) and reconcile the overlay before
     # loading it. Written last, after the defaults are reconciled, so a crash mid-reconcile
@@ -436,45 +521,77 @@ def _power_tool_stems(shipped: dict[str, str]) -> set[str]:
     }
 
 
-def _warn_unmatched_opt_in(opt_in: Sequence[str], shipped_all: dict[str, str]) -> None:
-    """Warn (loudly, never silently) for any ``--opt-in`` name that matches no powerful default.
+def _warn_unmatched_opt_in(named: Sequence[str], shipped_all: dict[str, str]) -> None:
+    """Warn (loudly, never silently) for any grant/revoke name that matches no powerful default.
 
     Catches the stem-vs-name trap (issue #168): ``--opt-in listen`` names the *tool* but the file
     stem is ``hear_audio``, so it would otherwise scaffold nothing with no diagnostic — the
     operator thinks they granted a tool that is silently absent. A name that matches a power tool
     which is merely provider-mismatched is *not* flagged here (it is a real tool, just unavailable
-    for this provider); only a name matching no power tool at all is a likely typo.
+    for this provider); only a name matching no power tool at all is a likely typo. The same trap
+    bites a ``--revoke-opt-in`` typo, where the cost is worse — the operator believes a capability
+    is retired and it is still there — so both flags' names come through here.
     """
     known = _power_tool_stems(shipped_all)
-    unknown = sorted({name.removesuffix(".py") for name in opt_in} - known)
+    unknown = sorted(_stems(named) - known)
     if unknown:
         _log.warning(
-            "--opt-in named no powerful tool default and scaffolded nothing for: %s. The known "
-            "opt-in tools are: %s. (Pass the plugin *file stem*, e.g. 'hear_audio', not 'listen'.)",
+            "--opt-in/--revoke-opt-in named no powerful tool default and did nothing for: %s. The "
+            "known opt-in tools are: %s. (Pass the plugin *file stem*, e.g. 'hear_audio', not "
+            "'listen'.)",
             ", ".join(unknown),
             ", ".join(sorted(known)),
         )
 
 
+def _stems(names: Sequence[str]) -> set[str]:
+    """Normalize plugin-file names to stems — the ``--opt-in`` / ``--revoke-opt-in`` vocabulary."""
+    return {name.removesuffix(".py") for name in names if name}
+
+
+def _granted_stems(
+    root: Path, shipped_all: dict[str, str], explicit: set[str], revoked: set[str]
+) -> set[str]:
+    """The powerful stems **granted** on this config home after this run (issue #374).
+
+    Three sources union, then the revocations come off:
+
+    - **the recorded grants** (``.declared.json``), which is what makes a grant durable: it
+      survives a prune that pops the manifest entry, and it survives the file itself going
+      missing — the two ways a strip used to erase its own evidence;
+    - **presence in the overlay**, because dropping a powerful plugin file into ``tools/`` *is*
+      the documented way to grant one, and a grant made that way deserves the same durable record
+      (and the same ledger row) as one made with the flag. Read before anything is written, so it
+      is the operator's overlay and not this run's own handiwork;
+    - **``explicit``** — this run's ``--opt-in``.
+
+    A grant for a stem this package does not ship, or does not ship for the active provider, is
+    **kept**: a provider switch or a package that re-adds the tool should find the grant intact,
+    and `_verify` is where an unshippable grant is reported rather than quietly dropped here.
+    """
+    recorded = declared_opt_in(read_declaration(root))
+    present = {
+        rel[len("tools/") : -len(".py")]
+        for rel, text in shipped_all.items()
+        if _is_tool_plugin(rel) and plugin_opts_in(text) and root.joinpath(*rel.split("/")).exists()
+    }
+    return (recorded | present | explicit) - revoked
+
+
 def _opt_in_scaffold_set(
-    shipped: dict[str, str], recorded: dict[str, str], opt_in: Sequence[str]
+    shipped: dict[str, str], granted: set[str], explicit: set[str]
 ) -> tuple[dict[str, str], list[str]]:
     """Filter the scaffold set for the opt-in policy (issue #168); return it + the grandfathered.
 
     A powerful tool-plugin default (``opt_in=True`` in its source) is **excluded** from the
-    scaffold set — it ships in the package but stays off for a fresh agent — **unless**:
-
-    - it is named in ``opt_in`` (by its file stem, e.g. ``"grok_generate_image"``), an explicit
-      operator choice (the ``--opt-in`` flag), **or**
-    - it is already **recorded** (a prior install scaffolded it) — *grandfathered*, kept rather
-      than silently stripped (the founder's "tools stay the same" rule). Its ``rel`` is returned
-      in the second element so the caller can report it loudly.
+    scaffold set — it ships in the package but stays off for a fresh agent — unless its stem is
+    in `granted` (see `_granted_stems`). A granted stem that this run did not name explicitly is
+    *grandfathered*: kept rather than silently stripped (the founder's "tools stay the same"
+    rule), and its ``rel`` is returned in the second element so the caller can report it loudly.
 
     Benign defaults (and all non-tool defaults) pass through untouched, keeping the normal
-    install-then-prune behavior. A grandfathered/opted-in default re-enters the reconcile, so a
-    respected deletion still wins (the caller drops a `KEPT_DELETED` one from the loud report).
+    install-then-prune behavior.
     """
-    opt_in_stems = {name.removesuffix(".py") for name in opt_in}
     result: dict[str, str] = {}
     grandfathered: list[str] = []
     for rel, text in shipped.items():
@@ -482,13 +599,55 @@ def _opt_in_scaffold_set(
             result[rel] = text  # benign default / non-tool file → unchanged
             continue
         stem = rel[len("tools/") : -len(".py")]
-        if stem in opt_in_stems:
-            result[rel] = text  # explicit operator opt-in
-        elif rel in recorded:
-            result[rel] = text  # grandfathered: a prior install already laid it down
-            grandfathered.append(rel)
-        # else: powerful + neither opted-in nor previously installed → not scaffolded
+        if stem in granted:
+            result[rel] = text
+            if stem not in explicit:
+                grandfathered.append(rel)  # granted by an earlier run, carried forward
+        # else: powerful and not granted → not scaffolded
     return result, grandfathered
+
+
+def _revoke_grants(
+    root: Path,
+    shipped_all: dict[str, str],
+    revoked: set[str],
+    recorded: dict[str, str],
+    updated: dict[str, str],
+    report: InstallReport,
+) -> None:
+    """Withdraw a grant: stop tracking the path, and remove the file if it is still ours.
+
+    The symmetric counterpart of ``--opt-in``, and the *only* way to make a granted power tool's
+    absence legitimate — deleting the file alone is what a strip looks like, so it cannot also be
+    the revocation. (The grant itself already left the declaration upstream, in `_granted_stems`;
+    this is the on-disk half.) A **pristine** copy is removed, because it is ours and unmodified;
+    an operator-**edited** one is kept, exactly as every other conffile rule keeps an edit, and
+    said out loud, because the tool stays loadable from the overlay until they delete it
+    themselves. Either way the manifest entry goes: a revoked path is no longer a default this
+    installer manages, so an edited leftover becomes the operator's file outright.
+    """
+    for stem in sorted(revoked):
+        rel = f"tools/{stem}.py"
+        if rel not in shipped_all:
+            continue  # not a shipped default; the grant is dropped either way
+        target = root.joinpath(*rel.split("/"))
+        updated.pop(rel, None)
+        if not target.exists():
+            continue  # already gone — the grant record is what was left to clear
+        try:
+            pristine = _hash(target.read_text(encoding="utf-8")) == recorded.get(rel)
+        except OSError:
+            pristine = False
+        if pristine:
+            target.unlink()
+            report.actions[rel] = REVOKED
+        else:
+            _log.warning(
+                "Revoked the grant for %r, but %s differs from the shipped default so it was "
+                "kept — the tool stays active until you delete that file yourself.",
+                stem,
+                target,
+            )
 
 
 def _prune_mismatched_defaults(
@@ -590,6 +749,8 @@ def _reconcile(
     recorded: dict[str, str],
     updated: dict[str, str],
     report: InstallReport,
+    *,
+    declared: bool = False,
 ) -> str:
     """Reconcile one shipped default against the manifest and the on-disk file (dpkg conffile).
 
@@ -606,6 +767,11 @@ def _reconcile(
     - otherwise → the operator edited it: keep theirs, write the new default beside it as
       ``<name>.new``, and note it.
 
+    ``declared`` (issue #374) inverts exactly one of those: a granted opt-in tool's *presence* is
+    declared, so an absent one is **restored** rather than respected as a deletion. It is checked
+    before the "default unchanged" short-circuit, because a strip does not need the shipped
+    default to have changed in order to have happened.
+
     ``updated`` is advanced to the new default's hash in every branch (the manifest always
     records the *current* shipped default for a path), so a subsequent same-version run is a
     clean no-op and a later genuine change re-evaluates from an accurate baseline.
@@ -614,6 +780,12 @@ def _reconcile(
     new = _hash(default_text)
     was = recorded.get(rel)
     updated[rel] = new  # the manifest tracks the current shipped default for this path
+
+    if declared and not target.exists():
+        _write(target, default_text)
+        # A first grant is an ordinary install; a granted file that *was* here and is not any more
+        # is a strip, and the two must not read alike in the report.
+        return INSTALLED if was is None else RESTORED
 
     if was == new:
         return UNCHANGED  # default unchanged since last install → operator's copy is theirs
@@ -675,6 +847,72 @@ def _write_manifest(root: Path, manifest: dict[str, str]) -> None:
     """Persist the per-file default hashes, sorted for a stable, diff-friendly file."""
     body = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     _write(_manifest_path(root), body)
+
+
+# --- the declaration (issue #374) ---------------------------------------------
+
+
+def declaration_path(root: str | os.PathLike[str] | None = None) -> Path:
+    """The declaration file's path — what `_verify` proves and the claims emitter enumerates."""
+    return config_home(root) / _DECLARATION_NAME
+
+
+def read_declaration(root: str | os.PathLike[str] | None = None) -> dict[str, object]:
+    """The agent's declared capability set, or ``{}`` when there is none to read.
+
+    ``{}`` for a config home that was never installed, one installed by a harness predating the
+    declaration, and one whose file is unreadable or malformed. All three mean the same thing to
+    every caller: **nothing is declared here**, which for the installer is a set to bootstrap and
+    for `_verify` is a claim that cannot be proven — red, never assumed green. A newer
+    ``contract`` is deliberately *not* filtered out here: the reader that cares
+    (`_verify._check_declaration`) must be able to tell "absent" from "present but from a future
+    shape", because those have different remedies.
+    """
+    path = declaration_path(root)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def declared_opt_in(declaration: Mapping[str, object]) -> set[str]:
+    """The granted opt-in stems in a declaration, tolerant of a damaged or foreign shape.
+
+    A hand-edited or truncated file must not crash a reconcile; a non-list (or a list holding
+    non-strings) degrades to "nothing recorded", which the installer then re-bootstraps from the
+    overlay and `_verify` reports as an unprovable declaration. Silent *widening* would be the
+    dangerous direction — never inferring a grant that is not written down.
+    """
+    value = declaration.get("opt_in")
+    return {item for item in value if isinstance(item, str)} if isinstance(value, list) else set()
+
+
+def declared_files(declaration: Mapping[str, object]) -> set[str]:
+    """The managed paths a declaration records as present, tolerant of a damaged shape."""
+    value = declaration.get("files")
+    return {item for item in value if isinstance(item, str)} if isinstance(value, list) else set()
+
+
+def _write_declaration(
+    root: Path, *, provider: str | None, granted: set[str], tracked: dict[str, str]
+) -> None:
+    """Persist the declaration: the grants, the provider filtered for, the managed files present.
+
+    ``files`` is stat'd off the *post-reconcile* filesystem rather than derived from what the
+    reconcile decided to do, so it records what actually landed. That is the whole point of the
+    field: it is the line between an absence the operator declared — ratified here, by a reconcile
+    that saw it gone — and one that happened afterwards, which is a strip and turns verify red.
+    """
+    body = {
+        "contract": DECLARATION_CONTRACT,
+        "provider": provider,
+        "opt_in": sorted(granted),
+        "files": sorted(rel for rel in tracked if root.joinpath(*rel.split("/")).exists()),
+    }
+    _write(declaration_path(root), json.dumps(body, indent=2, sort_keys=True) + "\n")
 
 
 # --- the version stamp --------------------------------------------------------
@@ -898,13 +1136,26 @@ def main(argv: list[str] | None = None) -> int:
             "comma-separated plugin file stems to scaffold despite being powerful/opt-in tools "
             "(issue #168) — e.g. --opt-in generate_image,web_search. Powerful tools (media "
             "generation, web/X search, code execution) are off by default for a new agent; this "
-            "is how you grant one. Already-installed ones are kept (grandfathered) regardless."
+            "is how you grant one. Already-granted ones are kept (grandfathered) regardless."
+        ),
+    )
+    parser.add_argument(
+        "--revoke-opt-in",
+        default="",
+        metavar="NAMES",
+        help=(
+            "comma-separated plugin file stems whose opt-in grant to withdraw (issue #374): the "
+            "grant is dropped from .declared.json and the pristine file removed. This is the "
+            "*only* way to retire a granted powerful tool — deleting the file alone is what a "
+            "strip looks like, so a reconcile restores it and `basecradle-harness-verify` "
+            "reports it missing until the grant is withdrawn here."
         ),
     )
     args = parser.parse_args(argv)
 
     provider = None if args.all_providers else (args.provider or active_provider_from_env())
     opt_in = [name.strip() for name in args.opt_in.split(",") if name.strip()]
-    report = install(args.config_home, provider=provider, opt_in=opt_in)
+    revoke = [name.strip() for name in args.revoke_opt_in.split(",") if name.strip()]
+    report = install(args.config_home, provider=provider, opt_in=opt_in, revoke_opt_in=revoke)
     print(report.summary())
     return 0

@@ -389,6 +389,7 @@ for the location: `--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.conf
   tools/               # tool-plugin overlay (drop-in *.py); add/override/disable
   mcp/                 # MCP server configs (drop-in *.json); empty by default = safe
   .manifest.json       # bookkeeping: the hash of every shipped default as installed
+  .declared.json       # bookkeeping: the agent's *declared* capability set (issue #374)
 ```
 
 - **Installer — `basecradle-harness-install`** (`basecradle_harness._install`). Idempotent
@@ -413,6 +414,50 @@ lives in the **`config-home-install` skill**. The Phase-2 build history (the too
 mechanism, read tools, persistent Turn 0, pluggable memory, the MCP client, the cross-wake
 circuit-breaker, image tools, the native xAI adapter, the Eddie profile, and the orphan-artifact
 sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not the charter.
+
+### Green-While-Absent: the declared set is proven, never assumed (Recurrence Guard)
+
+The whole install/upgrade layer above is written in **observations** — a file is present, a hash
+matches — and an observation cannot tell an operator's deliberate deletion from a capability
+something **stripped**. That is not a gap in a check; it is the absence of one, and it is the
+harness's instance of a fleet-wide failure shape (basecradle#460, five independent instances the
+night of 2026-07-26→27): *fleet observability catches failures that happen; none of these
+happened.* An overlay tool gone, a config home never reconciled after `pip install -U`, a vendor
+tranche pruned by a converge that ran the installer without the agent's `AI_PROVIDER` — none
+raise, none log, none stop the agent. It simply cannot do a thing it believes it can. **Absence
+emits no signal**, so nothing but a prover will ever produce one.
+
+The floor, and it is not negotiable: **no capability may be claimed without something that turns
+red when it is absent.** `install` writes the claim (`.declared.json`: the grants, the provider
+filtered for, the managed files present when the reconcile finished);
+**`basecradle-harness-verify`** (`_verify.py`) proves it and exits nonzero with a specific
+diagnosis; `--emit-claims` prints the rows for the fleet's claims-vs-evidence ledger (Claims
+Manifest Contract v1 — the **NOC owns that contract**; amendments go up through the capital, never
+peer-to-peer). Four things about it are load-bearing, and each has an "obviously fine" broken form:
+
+- **It proves the *declared* set, never pristine-ness.** An operator edit and a reconcile-ratified
+  deletion are both legitimate and neither is a finding. A prover that reddens on legitimate work
+  is switched off inside a week, and a switched-off prover proves nothing.
+- **Unproven is red.** No config home, an unparseable declaration, a declaration from a `contract`
+  this version does not know — every one exits nonzero. "Nothing to check, looks fine" is the
+  original defect wearing a prover's clothes.
+- **A granted power tool's absence is a strip, not a decision — and that inverts an older rule on
+  purpose.** For a benign default an absence is still honored as the operator's deletion; for a
+  *granted* one it is healed (`RESTORED`, reported loudly) and `--revoke-opt-in` is the symmetric
+  way to withdraw. Without that asymmetry a prune erases its own evidence and every later
+  reconcile ratifies it — which is exactly what happened. (The migration is safe in the one
+  direction that matters: the initial grant set is bootstrapped from what is *present* in the
+  overlay, never from what the manifest remembers laying down, so a pre-#374 deletion reads as the
+  retirement it was and is not resurrected.)
+- **The claims are emitted whatever the verdict.** A claim that disappears when it stops being
+  true makes the ledger agree with the box precisely when the box is wrong.
+
+What it deliberately does **not** prove is *activation* — a present tool can still be inactive for
+want of a key — because folding that in would make a missing `AI_API_KEY` read as a stripped
+overlay. `--resolved-config` is the authority there, and the split is stated in the report's
+`notes` rather than left in prose. The corollary for anything added to the config home later: **a
+new kind of managed state needs a declaration entry and a check, or it is a capability nobody can
+see the absence of.**
 
 ### Security invariants (never relaxed, never moved to a skill)
 

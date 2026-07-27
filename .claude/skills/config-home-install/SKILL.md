@@ -1,6 +1,6 @@
 ---
 name: config-home-install
-description: Step-by-step procedure for scaffolding and upgrading a Harness config home with basecradle-harness-install — the installer's per-file conffile-upgrade logic, granting powerful tools with --opt-in, the loud grandfather report, and the per-agent fleet rollout. Use when installing or upgrading a config home, running or debugging basecradle-harness-install, deciding how a shipped default reconciles against an operator's edits, or granting/pruning a persona's powerful tools. The config-home layout, resolution order, and the two security invariants (capability opt-in fails-closed, MCP safe-by-default) live in CLAUDE.md → Config Home; this skill carries the procedure.
+description: Step-by-step procedure for scaffolding and upgrading a Harness config home with basecradle-harness-install — the installer's per-file conffile-upgrade logic, granting powerful tools with --opt-in, retiring one with --revoke-opt-in, proving the result with basecradle-harness-verify, the loud grandfather report, and the per-agent fleet rollout. Use when installing or upgrading a config home, running or debugging basecradle-harness-install or basecradle-harness-verify, deciding how a shipped default reconciles against an operator's edits, or granting/retiring a persona's powerful tools. The config-home layout, resolution order, and the two security invariants (capability opt-in fails-closed, MCP safe-by-default) live in CLAUDE.md → Config Home; this skill carries the procedure.
 ---
 
 # Config Home — Install / Upgrade Procedure
@@ -54,6 +54,39 @@ This scaffolds the named powerful defaults into the persona's `tools/` overlay (
 drop the file in by hand). An opt-in plugin *present* in the overlay activates, gated only by
 its `requires` (an OpenAI key, the xAI vendor, etc.). Deciding a persona's target tool-set is
 the **capital's** governance call; applying it on a box is the **NOC's** deploy.
+
+The grant is **durable** (issue #374): it is recorded in `.declared.json` and carried across
+every later reconcile, so a granted tool that goes missing is *restored* (loudly) rather than
+ratified as a deletion.
+
+## Retiring a powerful tool (`--revoke-opt-in`)
+
+```bash
+basecradle-harness-install --config-home <dir> --revoke-opt-in <stems>
+```
+
+**Deleting the file is not a retirement** — under #374 a plain reconcile puts a granted tool
+back, because an undeclared absence is what a strip looks like. `--revoke-opt-in` is the
+symmetric withdrawal: it drops the grant from `.declared.json` and removes the pristine file. An
+operator-*edited* copy is kept (the conffile rule still wins) and a `WARNING` says so, because
+the tool stays loadable from the overlay until they delete it themselves.
+
+## Proving it (`basecradle-harness-verify`)
+
+An install that half-applied looks identical to one that worked, so the deploy step is not done
+until it is proven:
+
+```bash
+basecradle-harness-verify --config-home <dir>                     # exit 0 = proven
+basecradle-harness-verify --config-home <dir> --expect-version X  # …and the pin you deployed
+basecradle-harness-verify --config-home <dir> --emit-claims       # ledger rows for the NOC
+```
+
+Run it **as the agent, with its environment** (it needs `AI_PROVIDER`; failing that it reads the
+config home's own `agent.env`, and failing *that* it says in the finding that it had to assume).
+Exit nonzero is the product: it is what turns a stripped overlay into a red converge. The
+invariants — proves the declared set not pristine-ness, unproven is red, claims emitted whatever
+the verdict — live in CLAUDE.md → Green-While-Absent.
 
 ## Grandfather, loudly (on upgrade)
 

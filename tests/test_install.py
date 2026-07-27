@@ -23,6 +23,8 @@ from basecradle_harness._install import (
     KEPT_EDITED,
     PRUNED,
     REFRESHED,
+    RESTORED,
+    REVOKED,
     UNCHANGED,
     charter_from_config,
     charter_from_env,
@@ -31,6 +33,7 @@ from basecradle_harness._install import (
     plugin_relevant_to,
     plugin_source_providers,
     prompt_text,
+    read_declaration,
     system_prompt_text,
 )
 from basecradle_harness._version import __version__
@@ -109,7 +112,10 @@ def test_upgrade_grandfathers_a_previously_scaffolded_power_tool_loudly(tmp_path
 
     assert (home / "tools" / "generate_image.py").exists()  # kept
     assert "tools/generate_image.py" in report.grandfathered
-    assert "grandfathered" in report.summary() and "generate_image" in report.summary()
+    assert "granted" in report.summary() and "generate_image" in report.summary()
+    # And the advice it gives is the one that still works: since #374 a deletion is read as a
+    # strip and restored, so `--revoke-opt-in` is the only thing that retires a granted tool.
+    assert "--revoke-opt-in" in report.summary()
 
 
 def test_a_fresh_install_does_not_grandfather_anything(tmp_path):
@@ -117,18 +123,72 @@ def test_a_fresh_install_does_not_grandfather_anything(tmp_path):
     assert report.grandfathered == []
 
 
-def test_a_deleted_grandfathered_power_tool_is_not_reported_as_kept(tmp_path):
-    # An operator who DELETES a grandfathered power tool must not be told it was "kept" — the
-    # report is gated on the file actually existing on disk, not on the reconcile action (a
-    # deleted-but-source-unchanged file reconciles as UNCHANGED, not KEPT_DELETED).
+def test_a_deleted_granted_power_tool_is_restored_loudly_not_ratified(tmp_path):
+    # Issue #374 inverts the old rule here, deliberately: a *granted* power tool's presence is
+    # declared, so an absence nobody declared is a strip — restored, and said out loud. Ratifying
+    # it (the pre-#374 behavior) is what let a prune erase its own evidence.
     home = tmp_path / "cfg"
-    install(home, opt_in=["generate_image"])  # a prior install scaffolded it
-    (home / "tools" / "generate_image.py").unlink()  # operator drops the capability
+    install(home, opt_in=["generate_image"])  # the grant is now durable
+    (home / "tools" / "generate_image.py").unlink()  # something takes it away
 
-    report = install(home)  # same-source upgrade
+    report = install(home)  # a plain reconcile, no --opt-in
 
-    assert not (home / "tools" / "generate_image.py").exists()  # stays deleted, never resurrected
-    assert "tools/generate_image.py" not in report.grandfathered  # and NOT reported as kept
+    assert (home / "tools" / "generate_image.py").exists()  # healed, not respected
+    assert report.actions["tools/generate_image.py"] == RESTORED
+    assert "RESTORED" in report.summary() and "generate_image" in report.summary()
+
+
+def test_a_power_tool_dropped_before_the_declaration_existed_is_not_resurrected(tmp_path):
+    # Migration safety for the #374 inversion. An operator who retired a power tool the old way —
+    # by deleting the file, when deletion *was* the retirement — must not have it handed back on
+    # the first reconcile that writes a declaration. The bootstrap therefore derives the initial
+    # grants from what is *present* in the overlay, never from what the manifest remembers laying
+    # down, so a pre-#374 deletion reads as the retirement it was.
+    home = tmp_path / "cfg"
+    install(home, opt_in=["generate_image"])
+    (home / ".declared.json").unlink()  # a config home from before the declaration existed
+    (home / "tools" / "generate_image.py").unlink()  # retired the only way there was
+
+    report = install(home)
+
+    assert not (home / "tools" / "generate_image.py").exists()
+    assert report.granted == []
+
+
+def test_revoke_opt_in_is_how_a_granted_power_tool_actually_retires(tmp_path):
+    # The symmetric withdrawal: the grant leaves the declaration and the pristine file goes with
+    # it — and a later plain reconcile does NOT bring it back, which is what makes the revocation
+    # a real retirement rather than a race against the next converge.
+    home = tmp_path / "cfg"
+    install(home, opt_in=["generate_image"])
+
+    report = install(home, revoke_opt_in=["generate_image"])
+
+    assert not (home / "tools" / "generate_image.py").exists()
+    assert report.actions["tools/generate_image.py"] == REVOKED
+    assert report.granted == []
+    assert read_declaration(home)["opt_in"] == []
+
+    again = install(home)  # the next converge leaves it retired
+    assert not (home / "tools" / "generate_image.py").exists()
+    assert again.granted == []
+
+
+def test_revoking_an_edited_power_tool_keeps_the_operators_file_and_warns(tmp_path, caplog):
+    # The conffile rule still wins over a revocation: an edited file is the operator's, so it is
+    # kept — and the fact that the *tool therefore stays loadable* is stated, never left implied.
+    import logging
+
+    home = tmp_path / "cfg"
+    install(home, opt_in=["generate_image"])
+    (home / "tools" / "generate_image.py").write_text("# mine now\n")
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        report = install(home, revoke_opt_in=["generate_image"])
+
+    assert (home / "tools" / "generate_image.py").read_text() == "# mine now\n"
+    assert report.granted == []  # the grant is gone even though the file is not
+    assert "generate_image" in caplog.text and "kept" in caplog.text
 
 
 def test_opt_in_with_an_unknown_stem_warns_loudly(tmp_path, caplog):
