@@ -608,12 +608,10 @@ def apply_settlement(state: PaperState, payload: dict[str, Any]) -> None:
 def track_equity(state: PaperState) -> None:
     """Update the peak and the worst drawdown after a row that moved the curve."""
     equity = state.equity
-    if equity > state.peak_equity:
-        state.peak_equity = equity
+    state.peak_equity = max(state.peak_equity, equity)
     if state.peak_equity > 0:
         drawdown = (state.peak_equity - equity) / state.peak_equity * Decimal(100)
-        if drawdown > state.max_drawdown_pct:
-            state.max_drawdown_pct = drawdown
+        state.max_drawdown_pct = max(state.max_drawdown_pct, drawdown)
 
 
 # --- the hash chain ----------------------------------------------------------------

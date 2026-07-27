@@ -148,7 +148,7 @@ def test_the_anchor_lands_on_the_last_frozen_turn_ahead_of_the_brief():
     # Exactly one breakpoint, and it is the previous wake's assistant reply — the last frozen turn.
     assert anchored(wake) == [("assistant", "one")]
     # Everything the brief and the newest turn contributed stays volatile, behind the anchor.
-    at = [i for i, (_, _, anchor) in enumerate(wake) if anchor][0]
+    at = next(i for i, (_, _, anchor) in enumerate(wake) if anchor)
     assert ("system", "BRIEF-B", False) in wake[at + 1 :]
     assert ("user", "second", False) in wake[at + 1 :]
 

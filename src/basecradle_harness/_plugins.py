@@ -36,13 +36,13 @@ xAI one), exactly one activates per config — the one whose requirements the co
 from __future__ import annotations
 
 import hashlib
-import importlib.resources as resources
 import importlib.util
 import logging
 import sys
 from abc import ABC, abstractmethod
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
+from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING
 

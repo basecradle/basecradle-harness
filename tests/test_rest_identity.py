@@ -54,11 +54,15 @@ def _exported_tool_classes():
     classes = []
     for name in dir(h):
         obj = getattr(h, name)
-        if isinstance(obj, type) and issubclass(obj, h.Tool) and obj is not h.Tool:
+        if (
+            isinstance(obj, type)
+            and issubclass(obj, h.Tool)
+            and obj is not h.Tool
             # Abstract bases (PlatformTool, ConfirmedTimelineAction) never assign a
             # description, so this keeps only the concrete, model-facing tools.
-            if isinstance(getattr(obj, "description", None), str):
-                classes.append(obj)
+            and isinstance(getattr(obj, "description", None), str)
+        ):
+            classes.append(obj)
     return classes
 
 

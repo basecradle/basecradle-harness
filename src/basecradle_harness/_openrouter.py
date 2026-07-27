@@ -211,7 +211,7 @@ def require_openrouter_sdk():
     letting a bare ``ModuleNotFoundError`` surface from inside a wake.
     """
     try:
-        import openrouter  # noqa: PLC0415 - lazy: the core must import without the vendor SDK
+        import openrouter  # lazy: the core must import without the vendor SDK
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised via monkeypatched import
         raise ProviderError(
             "The 'openrouter' SDK is not installed, so the harness has no way to reach a model "

@@ -48,9 +48,10 @@ can un-spend money at fal.ai), and they consume no ordinal, so runtime and repla
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING
 
 from basecradle_harness._messages import Message, ToolCall
 

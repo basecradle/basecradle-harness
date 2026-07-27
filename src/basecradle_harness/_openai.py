@@ -91,7 +91,7 @@ def require_openai_sdk():
     rather than letting a bare ``ModuleNotFoundError`` surface from inside a wake.
     """
     try:
-        import openai  # noqa: PLC0415 - lazy: the core must import without the vendor SDK
+        import openai  # lazy: the core must import without the vendor SDK
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised via monkeypatched import
         raise ProviderError(
             "The 'openai' SDK is not installed, so the harness has no way to reach a model "
@@ -491,7 +491,7 @@ def _body_text(exc) -> str:
     if response is not None:
         try:
             return response.text
-        except Exception:  # noqa: BLE001 - a body we can't read degrades to empty, never crashes
+        except Exception:  # noqa: BLE001, S110 - unreadable body degrades to empty, never crashes
             pass
     body = getattr(exc, "body", None)
     return str(body) if body is not None else ""

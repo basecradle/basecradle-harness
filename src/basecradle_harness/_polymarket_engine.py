@@ -335,7 +335,7 @@ def place_order(
         )
 
     book = data.book(refs.token_id, refs.outcome)
-    taker, maker = fee_rates(clob)
+    taker, _ = fee_rates(clob)
     levels = book.asks if side == "buy" else book.bids
     if order_type == "limit":
         assert limit_price is not None  # validated above

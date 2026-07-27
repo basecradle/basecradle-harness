@@ -484,7 +484,7 @@ def _is_text(content_type: str) -> bool:
     base = _media_type(content_type)
     if base.startswith("text/"):
         return True
-    if base.endswith("+json") or base.endswith("+xml"):
+    if base.endswith(("+json", "+xml")):
         return True
     return base in _TEXTUAL_APPLICATION_TYPES
 

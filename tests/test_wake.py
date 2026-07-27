@@ -488,7 +488,7 @@ def test_reinvocation_replies_to_nothing(platform, tmp_path):
     """A second process (same home) sees the persisted mark and answers nothing."""
     # First wake: one message, one reply. Mark is persisted under `home`.
     serve_messages(platform, page(message(uuid=M0, body="hi")))
-    first, first_provider = build_wake(tmp_path)
+    first, _first_provider = build_wake(tmp_path)
     assert len(first.wake()) == 1
 
     # Second wake: a brand-new process, same timeline state — nothing newer than M0.
@@ -1258,7 +1258,7 @@ def test_a_large_activation_burst_is_fully_drained(platform, tmp_path):
     tasks = [task(uuid=u, instructions=f"task {i}") for i, u in reversed(list(enumerate(uuids)))]
     serve_messages(platform, page())
     serve_tasks(platform, task_page(*tasks))
-    agent, provider = build_wake(tmp_path)
+    agent, _provider = build_wake(tmp_path)
 
     posted = agent.wake()
 
@@ -3210,7 +3210,7 @@ def test_a_wake_answering_a_human_does_not_pace(platform, tmp_path):
     """The existing human path is byte-for-byte unchanged — no sleep, instant reply."""
     serve_messages(platform, page(message(uuid=M0, body="What's the status?")))  # john, human
     pacer, sleep = _pacer()
-    agent, provider = build_wake(tmp_path, pacer=pacer)
+    agent, _provider = build_wake(tmp_path, pacer=pacer)
 
     agent.wake()
 
@@ -3239,7 +3239,7 @@ def test_a_task_only_wake_does_not_pace(platform, tmp_path):
     serve_messages(platform, page(message(uuid=M0, body="old")))
     serve_tasks(platform, task_page(task(uuid=T0, instructions="post the daily summary")))
     pacer, sleep = _pacer()
-    agent, provider = build_wake(tmp_path, pacer=pacer)
+    agent, _provider = build_wake(tmp_path, pacer=pacer)
 
     agent.wake()
 
@@ -3280,7 +3280,7 @@ def test_a_probe_earlier_in_the_batch_still_skips_pacing(platform, tmp_path):
         ),
     )
     pacer, sleep = _pacer()
-    agent, provider = build_wake(tmp_path, pacer=pacer, probe_secret=PROBE_SECRET)
+    agent, _provider = build_wake(tmp_path, pacer=pacer, probe_secret=PROBE_SECRET)
 
     agent.wake()
 
@@ -3293,7 +3293,7 @@ def test_pacing_never_crashes_the_wake_on_a_bad_timestamp(platform, tmp_path):
         platform, page(peer_ai_message(uuid=M0, body="x" * 400, created_at="not-a-timestamp"))
     )
     pacer, sleep = _pacer()
-    agent, provider = build_wake(tmp_path, pacer=pacer)
+    agent, _provider = build_wake(tmp_path, pacer=pacer)
 
     posted = agent.wake()  # must not raise despite the unparseable stamp
 
@@ -3427,8 +3427,10 @@ def test_a_newer_ai_message_during_the_read_restarts_the_settle(platform, tmp_pa
     assert len(provider.prompts) == 1
     assert posted == []
     assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] briggs: first from Brain\n"
-        "[2026-06-04T00:00:00.000Z] briggs: and a follow-up from Brain"
+        (
+            "[2026-06-04T00:00:00.000Z] briggs: first from Brain\n"
+            "[2026-06-04T00:00:00.000Z] briggs: and a follow-up from Brain"
+        )
     ]
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # mark past the newest arrival
 
@@ -3456,8 +3458,10 @@ def test_a_human_arriving_during_the_read_settles_immediately(platform, tmp_path
     assert len(provider.prompts) == 1  # one batched turn over both messages
     assert posted == []  # a silent brain: it thought, and said nothing
     assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] briggs: a long AI message\n"
-        "[2026-06-04T00:00:00.000Z] john: STOP!"
+        (
+            "[2026-06-04T00:00:00.000Z] briggs: a long AI message\n"
+            "[2026-06-04T00:00:00.000Z] john: STOP!"
+        )
     ]
 
 
@@ -4072,9 +4076,12 @@ def test_a_crashing_wake_still_reports_what_it_had_done(platform, tmp_path, capl
     harness = Harness(Exploding(), home=tmp_path)
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=False)
 
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        with pytest.raises(RuntimeError):  # the failure still propagates — nothing is swallowed
-            agent.wake()
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        # the failure still propagates — nothing is swallowed
+        pytest.raises(RuntimeError),
+    ):
+        agent.wake()
 
     end = _line(caplog, "wake end")
     assert "outcome=error" in end
@@ -4681,7 +4688,7 @@ def test_a_billing_failure_reports_once_leaves_work_pending_and_self_heals(platf
 
     # Wake 2 — still out of funds. Debounced: it re-attempts but posts no second notice.
     serve_messages(platform, page(message(uuid=M0, body="are you there?")))
-    second, second_provider = build_wake(tmp_path, provider=RaisingProvider(_out_of_funds()))
+    second, _second_provider = build_wake(tmp_path, provider=RaisingProvider(_out_of_funds()))
     assert second.wake() == []  # quiet
     assert len(_posts(platform)) == 1  # still exactly one notice across the outage
     assert MarkStore(tmp_path).get(TIMELINE_UUID) is None  # still pending

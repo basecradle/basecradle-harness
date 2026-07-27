@@ -3096,7 +3096,7 @@ class WakeAgent:
             disposition = self._drop(
                 item, kind, f"the resumed turn hit a permanent provider failure: {verbatim(exc)}"
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - one item's failure must not take the wake down
             # Anything else — the provider is down, the box is unhappy. Nothing lost: this wake's
             # claim on the item is in-flight, so the next wake finds it orphaned again and resumes
             # against a transcript carrying whatever this attempt managed. Do not take the whole

@@ -80,8 +80,8 @@ def require_xai_sdk():
     bare ``ModuleNotFoundError`` surface from inside a wake.
     """
     try:
-        import xai_sdk  # noqa: PLC0415 - lazy: the core must import without the vendor SDK
-        import xai_sdk.tools  # noqa: PLC0415 - submodule (Agent Tools) is not auto-imported by __init__
+        import xai_sdk  # lazy: the core must import without the vendor SDK
+        import xai_sdk.tools  # submodule (Agent Tools) is not auto-imported by __init__
     except ModuleNotFoundError as exc:  # pragma: no cover - exercised via monkeypatched import
         raise ProviderError(
             "The 'xai-sdk' SDK is not installed, so the harness has no way to reach a model "
@@ -359,7 +359,7 @@ class _grpc_error_context:
         if exc is None:
             return False
         try:
-            import grpc  # noqa: PLC0415 - lazy: only needed to classify, only on the error path
+            import grpc  # lazy: only needed to classify, only on the error path
         except ModuleNotFoundError:  # pragma: no cover - grpc ships with xai-sdk
             return False
         if not isinstance(exc, grpc.RpcError):

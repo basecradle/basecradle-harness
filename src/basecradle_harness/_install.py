@@ -49,13 +49,13 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
-import importlib.resources as resources
 import json
 import logging
 import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from importlib import resources
 from pathlib import Path
 
 from basecradle_harness._version import __version__
