@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.92.0] - 2026-07-26
+
+### Changed: the epoch probe states the limit of its own tamper check (issue #353)
+
+0.91.0 documented `frozen: null` on a broken chain as covering "a tamperer who removed the
+`freeze` row". Live verification against a built wheel found that claim true only for a removal
+*inside* the log. A hash chain detects an edit or a removal mid-log — the next row's `prev` stops
+matching — and **cannot** detect a **truncated tail**: lopping the final rows off leaves a shorter
+chain that verifies perfectly. So a trailing `freeze` deleted from the end reports
+`chain_ok: true` with `frozen: false`, honestly describing a log that is itself a lie.
+
+That is not a defect in the probe and there is no on-box fix — the harness runs as the agent's own
+UID, so any expected-length marker is equally writable. It is the property `ChainStatus` already
+names as the reason the ledger is a **spool** whose authoritative copy ships off-box, and it is why
+every epoch reports `rows` and `head`: they are the pin an external verifier compares against that
+copy. The defect was the *documentation*, which implied a coverage the mechanism does not have —
+and a monitor built on `chain_ok` alone would have had a blind spot exactly where a tamperer would
+aim.
+
+- `_epoch_report` / `_verify` docstrings and the README now state both cases precisely, and say
+  plainly that an audit alarming only on `chain_ok` is incomplete by construction: it must also
+  pin `(rows, head)`.
+- A test pins **both** behaviors — mid-log removal caught (`chain_ok: false`, `frozen: null`),
+  tail truncation not caught but visible in the pin — so the limit is asserted rather than
+  assumed, and a later change that makes the tail case merely *look* handled fails.
+
 ## [0.91.0] - 2026-07-26
 
 ### Added: a read-only surface for the `polymarket_paper` epoch state (issue #353)

@@ -1404,6 +1404,46 @@ def test_the_probe_refuses_to_answer_frozen_off_a_broken_chain(tmp_path):
     assert report["epoch"]["rows"] == 1
 
 
+def test_a_truncated_tail_is_not_detectable_on_box_and_the_pin_is_what_catches_it(tmp_path):
+    """The limit of the refusal above, pinned rather than assumed — because an axis built on
+    `chain_ok` alone has a blind spot exactly where a tamperer would aim.
+
+    A chain catches an edit or a removal *inside* the log: the next row's `prev` stops matching.
+    It cannot catch a **truncated tail** — lopping the final rows off leaves a shorter chain
+    that verifies perfectly, so a trailing `freeze` deleted from the end reads `chain_ok: true`
+    with `frozen: false`, honestly describing a log that is itself a lie. That is not a defect
+    here (no on-box check can help: the harness runs as the agent's own UID, so any expected-
+    length marker is equally writable) — it is why `rows` and `head` are published, as the pin
+    against the off-box row copy. This test exists so nobody reads the `frozen: null` refusal as
+    covering more than it does, and so a later "fix" that makes the tail case merely *look*
+    handled fails here.
+    """
+    from basecradle_harness._polymarket_engine import main
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    assert main(["--home", str(tmp_path), "--freeze", "emergency halt"]) == 0
+    epoch = current_epoch(tmp_path)
+    intact = _probe(tmp_path)[0]["epoch"]
+    assert intact["frozen"] is True and intact["chain_ok"] is True
+
+    # Truncate the tail: drop the trailing `freeze` row, and nothing else.
+    rows = epoch.path.read_text(encoding="utf-8").splitlines()
+    assert json.loads(rows[-1])["type"] == "freeze"
+    epoch.path.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
+
+    report, code = _probe(tmp_path)
+
+    # The chain still verifies — this is the honest, documented limit.
+    assert code == 0 and report["chain_ok"] is True
+    assert report["epoch"]["frozen"] is False  # the log now says un-frozen, and it verifies
+    # ...and the pin is what gives it away: both moved, against the off-box copy of the row.
+    assert report["epoch"]["rows"] == intact["rows"] - 1
+    assert report["epoch"]["head"] != intact["head"]
+
+
 def test_the_probe_writes_nothing_at_all(tmp_path):
     """Including on an agent that has never traded: taking the store lock would create
     `<home>/polymarket/` and a `.lock`, so an hourly fleet monitor would litter a paper-trading
