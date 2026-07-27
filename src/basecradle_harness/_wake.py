@@ -108,8 +108,10 @@ from basecradle_harness._basecradle import (
     resolved_model_params,
 )
 from basecradle_harness._brief import (
-    compose_brief,
+    brief_parts,
+    brief_section_sizes,
     fetch_dashboard_md,
+    join_brief,
     render_budget,
     render_defects,
     render_manifest,
@@ -1146,6 +1148,11 @@ class WakeAgent:
         # written to the transcript (issue #275). Reset each wake.
         self._brief: str | None = None
         self._brief_composed = False
+        # What each named part of that brief contributed, in characters — reporting only, read by
+        # the context-attribution line so the brief is broken down by part rather than logged as
+        # one opaque block (issue #369). Composed from the same `brief_parts` list the text is
+        # joined from, so the two can never describe different briefs.
+        self._brief_sections: dict[str, int] = {}
         # The shared HMAC key for the NOC synthetic-probe marker (see `_probe`). Set → the
         # message, webhook, and task reconciles each recognize a signed probe in their own
         # carrier field and ack it token-free, before the model. Unset → the short-circuit
@@ -1464,6 +1471,7 @@ class WakeAgent:
             session = self.harness.session(self.source)
             self._brief = None  # compose the brief once this wake, lazily, before the model
             self._brief_composed = False
+            self._brief_sections = {}
             # The per-wake bookkeeping, **per kind** (issues #285, #289). `_ledger[kind]` is every
             # item of that kind this wake looked at, in timeline order, with what it decided —
             # `_settle` reads it to move that kind's record, and may never move it past an item that
@@ -2190,10 +2198,16 @@ class WakeAgent:
             # success. Unkeyed is the honest fallback: the create behaves as it always did.
             self.keys.clear()
         try:
+            # Two steps, not one expression: `_brief_sections` is filled *by* composing the brief,
+            # so reading it as a sibling keyword argument would make this correct only because
+            # Python evaluates them left to right. Named first, it is correct for a reason a
+            # reader can see.
+            brief = self._wake_brief(query=text)
             narration = session.send(
                 text,
                 images=images,
-                brief=self._wake_brief(query=text),
+                brief=brief,
+                brief_sections=self._brief_sections,
                 items=[uuid] if uuid is not None else None,
             )
         except EngineError as error:
@@ -2276,9 +2290,14 @@ class WakeAgent:
         (a permission/IO error on `prompts/*.md` mid-wake) — so the whole composition is
         guarded too: any failure degrades to *no brief* and the wake carries on, the same
         invariant the dashboard fetch is held to.
+
+        Composed as a list of **named** parts (`brief_parts`) rather than straight to text, so the
+        same single composition yields both the string the model reads and the per-part sizes the
+        context-attribution line reports (issue #369). Calling a second composition for the sizes
+        would fetch the live dashboard twice and could report parts the model was never shown.
         """
         try:
-            return compose_brief(
+            parts = brief_parts(
                 now=_now_line(),
                 budget=render_budget(self.harness.engine.max_steps),
                 initialize=prompt_text("initialize.md"),
@@ -2294,6 +2313,10 @@ class WakeAgent:
                 "Failed to compose the persistent brief; proceeding without it.", exc_info=True
             )
             return None
+        # Sizes and text off the *same* composition, so the attribution line can never report the
+        # parts of a brief the model was not shown — and so the live dashboard is fetched once.
+        self._brief_sections = brief_section_sizes(parts)
+        return join_brief(parts)
 
     def _memory_context(self, query: str | None) -> str | None:
         """The memory provider's recalled context for this turn, guarded — never breaks the wake.
@@ -3016,7 +3039,8 @@ class WakeAgent:
             )
             self._degraded = False
             try:
-                narration = session.resume(turn, brief=self._wake_brief(query=rendered))
+                brief = self._wake_brief(query=rendered)  # named first — see `_engage`
+                narration = session.resume(turn, brief=brief, brief_sections=self._brief_sections)
             except EngineError as error:
                 narration = self._stuck_note(error)
             self._model_ok()  # a call got through → clear any billing-blocked marker (issue #336)
@@ -3516,7 +3540,9 @@ class WakeAgent:
         else:
             self.keys.clear()  # nothing to anchor on — see `_engage`; never key to a stale anchor
         try:
-            narration = session.send(text, brief=brief, items=items)
+            narration = session.send(
+                text, brief=brief, brief_sections=self._brief_sections, items=items
+            )
         except EngineError as error:
             narration = self._stuck_note(error)
         self._model_ok()  # a call got through → clear any billing-blocked marker (issue #336)

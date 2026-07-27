@@ -70,6 +70,13 @@ byte-stable prefix, so volatile content goes at the *tail*: the frozen history f
 then the brief, then the newest user turn. Moving the brief to the head of the list
 ("system prompts go first") would change the prefix on every request and silently
 destroy caching — an invariant stated in this repo's CLAUDE.md → Context Discipline.
+
+**And because this is where the payload is assembled, this is where it is accounted for**
+(issue #369). `_drive` emits one `context attribution` line naming what each section of the
+assembled turn contributes — tool schemas, the brief and each of its parts, the transcript by
+role, image payload — measured off the list it is about to hand the engine. Every discipline
+above bounds *something*; the line is what makes it possible to see which of them is doing the
+work, and which of them is not. See `_attribution`.
 """
 
 from __future__ import annotations
@@ -82,6 +89,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 from uuid import uuid4
 
+from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._caching import anchor_cacheable_prefix, cache_mode
 from basecradle_harness._context import TOOL_ARGS_CAP, TOOL_RESULT_CAP, Compactor
 from basecradle_harness._engine import Engine
@@ -202,6 +210,10 @@ class Session:
         #: `_span`, never by `history[-n:]` — on a resume the work is not at the tail.
         self._at = 0
         self._span: tuple[int, int] = (0, 0)
+        #: What each named part of the current call's brief contributed, for the
+        #: context-attribution line only (issue #369). Set by `send`/`resume` from their own
+        #: argument, so it can never describe a brief other than the one this call was handed.
+        self._brief_sections: dict[str, int] | None = None
         self.history: list[Message] = self._load()
         if not self.history and system_prompt:
             self.history.append(Message.system(system_prompt))
@@ -212,6 +224,7 @@ class Session:
         *,
         images: list[ImageContent] | None = None,
         brief: str | None = None,
+        brief_sections: dict[str, int] | None = None,
         items: list[str] | None = None,
     ) -> str:
         """Send one user message, run the loop to a text reply, persist the turn.
@@ -245,11 +258,17 @@ class Session:
         provider's own reported usage for this turn crossed the compaction threshold, the
         transcript is compacted for the *next* one.
 
+        `brief_sections` is what each named part of the brief contributed
+        (`_brief.brief_section_sizes`) — reporting only, read by the context-attribution line so
+        the brief is broken down by part rather than reported as one opaque block (issue #369).
+        ``None`` is the ordinary library case and costs only that breakdown.
+
         `items` are the uuids of the platform items this turn is carrying (the messages a wake
         batched into it). They persist *on* the turn, and they are how a later wake knows — after
         a crash, from the transcript alone — that this message was put in front of the model
         (issue #297). Nothing in the send path reads them; the recovery does.
         """
+        self._brief_sections = brief_sections
         pixels = list(images) if images else []
         turn = Message(
             role="user", content=text, images=list(pixels), items=list(items) if items else []
@@ -273,7 +292,13 @@ class Session:
         self._compact_if_needed()
         return reply.content or ""
 
-    def resume(self, turn: Message, *, brief: str | None = None) -> str:
+    def resume(
+        self,
+        turn: Message,
+        *,
+        brief: str | None = None,
+        brief_sections: dict[str, int] | None = None,
+    ) -> str:
         """Finish the interrupted turn `turn` — **no new user turn** (issue #297).
 
         A wake killed mid-tool-chain leaves a real turn on disk: the peer's message, the calls the
@@ -292,7 +317,10 @@ class Session:
         found it. Locating it twice would be two chances to disagree, and an *index* would be worse
         than either: the compaction this resume may itself trigger rewrites `history` shorter, and
         every index into it then names some other turn.
+
+        `brief_sections` is reporting only, exactly as in `send`.
         """
+        self._brief_sections = brief_sections
         if _index_of(self.history, turn) is None:
             raise ValueError("the turn to resume is not in this transcript")
         self._turn = turn
@@ -330,9 +358,10 @@ class Session:
         # splice point for the brief, which is not a coincidence: they are the same
         # stable/volatile boundary, named once here.
         stable = len(self.history) - 1
-        if brief:
-            convo.insert(len(convo) - 1, Message.system(brief))
-        return self._drive(convo, stable=stable, turn=turn, at=len(self.history))
+        brief_turn = Message.system(brief) if brief else None
+        if brief_turn is not None:
+            convo.insert(len(convo) - 1, brief_turn)
+        return self._drive(convo, stable=stable, turn=turn, at=len(self.history), brief=brief_turn)
 
     def _continue(self, turn: Message, brief: str | None) -> Message:
         """`_exchange` for a resume: replay the transcript **as it stood when the turn was cut off**.
@@ -357,12 +386,19 @@ class Session:
         """
         at = _turn_end(self.history, turn)
         convo = list(self.history[:at])
-        if brief:
-            convo.append(Message.system(brief))
-        return self._drive(convo, stable=at, turn=None, at=at)
+        brief_turn = Message.system(brief) if brief else None
+        if brief_turn is not None:
+            convo.append(brief_turn)
+        return self._drive(convo, stable=at, turn=None, at=at, brief=brief_turn)
 
     def _drive(
-        self, convo: list[Message], *, stable: int, turn: Message | None, at: int
+        self,
+        convo: list[Message],
+        *,
+        stable: int,
+        turn: Message | None,
+        at: int,
+        brief: Message | None = None,
     ) -> Message:
         """Run the engine over `convo`, adopting and persisting whatever it produced.
 
@@ -374,7 +410,22 @@ class Session:
         end of that turn's existing work, which may be nowhere near the tail: appending there would
         file an old turn's narration under a newer turn, and the recovery would read it as the newer
         turn's own (see `_continue`).
+
+        `brief` is the ephemeral brief's own turn (or ``None``), passed down rather than located,
+        so the attribution line can tell it from the transcript by **identity** — the splice point
+        is stated once, where the splice happens, and never restated as an index somewhere else.
         """
+        # The one line that says what this turn is about to cost, section by section (issue #369).
+        # It runs *before* the anchor because the anchor is a transient flag carrying no content —
+        # the payload it measures is the same either way — and because a copy-on-write anchor would
+        # be free to replace the very `Message` the brief is identified by.
+        log_context_attribution(
+            convo,
+            tools=self.engine.tools.specs(),
+            brief=brief,
+            brief_sections=self._brief_sections,
+            source=self.source,
+        )
         # Tell an explicit-cache provider (Anthropic) where the stable prefix ends; a provider that
         # caches automatically — every one that ships — is unaffected and this is a no-op. The
         # anchor is stamped on a copy, so it never reaches `history` (see `_caching`).
