@@ -1192,12 +1192,41 @@ Ten operations, and no others: `list_markets`, `get_market`, `log_forecast`, `pl
 
 - **A position requires a forecast.** `place_order` refuses a buy with `forecast_required` until the agent has logged a probability for that exact `(market_id, outcome)`. One forecast covers as many sized adds as it likes until it logs a new one; selling and cancelling need none. Optional forecast logging would produce a calibration record with holes in exactly the places an agent found inconvenient — this makes it complete by construction.
 - **The agent cannot write its own scoreboard.** Cash, fees, fills, marks, P&L and resolution are all *derived* — from an append-only ledger the harness owns (under `$HARNESS_HOME/polymarket`) and from public market state. No operation accepts a price, a fee, a P&L figure or an outcome; `get_pnl` and `get_scorecard` are reads. Every row carries `epoch_id, ts, type, payload, schema_version, prev, hash`, nothing is ever updated or deleted, and all state is a fold over the log — so there is no counter that can drift away from the record.
-- **The ledger is tamper-evident, and a broken chain returns no numbers.** The harness runs as the agent's own OS user, so "the agent cannot write that file" is not a filesystem fact — it holds only while the agent has no shell. Integrity therefore rests on **detection, not prevention**: the rows are hash-chained (each carries the previous row's hash), every call verifies the chain before computing anything, and a break returns `ledger_tampered` with **no numbers at all** — not numbers with a warning, because a scoreboard that degrades quietly reads as a working one. Every operation refuses, reads and writes alike, and the sweep will not extend a chain it cannot verify. The on-box file is a **spool**: each row is also emitted in full as a `polymarket_ledger_row {...}` log line, so the authoritative copy lives off-box under a user the agent is not, and `get_scorecard` publishes `chain_head` + `chain_rows` for an external verifier to pin against it. Check a box by hand with `basecradle-harness-polymarket-sweep --verify` (exit 1 if broken).
+- **The ledger is tamper-evident, and a broken chain returns no numbers.** The harness runs as the agent's own OS user, so "the agent cannot write that file" is not a filesystem fact — it holds only while the agent has no shell. Integrity therefore rests on **detection, not prevention**: the rows are hash-chained (each carries the previous row's hash), every call verifies the chain before computing anything, and a break returns `ledger_tampered` with **no numbers at all** — not numbers with a warning, because a scoreboard that degrades quietly reads as a working one. Every operation refuses, reads and writes alike, and the sweep will not extend a chain it cannot verify. The on-box file is a **spool**: each row is also emitted in full as a `polymarket_ledger_row {...}` log line, so the authoritative copy lives off-box under a user the agent is not, and `get_scorecard` publishes `chain_head` + `chain_rows` for an external verifier to pin against it. Check a box by hand with `basecradle-harness-polymarket-sweep --verify` (exit 1 if broken), or by machine with `--verify --json` (see below).
 - **The fill model is deterministic.** A market order walks the book FIFO by price and **cancels** any unfilled remainder (never a phantom resting order); a limit order takes its marketable part as taker and rests the remainder. A resting order that the book later crosses fills as **maker, at its own price**. Fees are recorded on the fill row with their source. A market that publishes **no fee** (`0`) is recorded as a zero, tagged `market` — the venue's own fact. A fee-charging market publishes a flag rather than a notional rate (live, every such market reads `1000` whatever its real category rate), so those fills take the contract's 100 bps taker / 0 maker default, tagged `fee_source=default` — the number is the harness's and the row says so. No synthetic slippage: reproducibility over theater.
 - **Caps and a burn ceiling, enforced rather than requested.** $500 per order, $2,000 net notional per market, 20 open positions, a $10,000 bankroll the agent has no way to top up. 200 tool calls and 40 orders per UTC day, after which it returns a structured `rate_limited` — never a hang, and never a hidden loop. Every reply carries `budgets` saying what is left.
 - **The sweep never wakes the agent.** Settlement, resting-order fills and marks happen in a separate hourly job — `basecradle-harness-polymarket-sweep`, wired as a systemd timer in [`deploy/`](deploy/). It writes to the ledger and nothing else; it imports no provider and no platform client, so it *cannot* call a model or post a message. The agent discovers what happened on its next pull.
 
 - **It measures; it does not grade.** `get_scorecard` reports `resolved_n`, `brier`, `calibration_error`, `hit_rate`, `paper_pnl`, `max_drawdown_pct`, `distinct_event_clusters` and `frozen` — and renders **no** promotion verdict, because a promotion bar belongs to a governing contract this package cannot read, cannot test against, and will not be told about when it moves. An eligibility claim computed here would be an assertion nobody can check, read by the very agent under measurement. Whoever owns the bar does the comparing, from these numbers.
+- **The epoch state is auditable from outside the box.** `--verify --json` prints the state of the instrument as JSON and writes **nothing** — not a row, not the store dir (see below) — makes no model call, and is safe to run on a schedule. Without it a freeze is a *write-only control*: `get_scorecard`'s `frozen` is reachable only through a tool call inside a wake, which no monitor can make, and reading the ledger needs a shell nobody has by design — so an undeclared unfreeze could happen and every fleet signal would stay green.
+
+  ```bash
+  basecradle-harness-polymarket-sweep --home ~ --verify --json
+  ```
+
+  ```json
+  {
+    "harness_version": "0.91.0",
+    "home": "/home/example",
+    "epoch": {
+      "epoch_id": "epoch-20260726T203000Z",
+      "path": "/home/example/polymarket/epoch-20260726T203000Z/ledger.jsonl",
+      "frozen": false,
+      "frozen_reason": "",
+      "rows": 17,
+      "chain_ok": true,
+      "head": "3f0c…",
+      "broken_at": null,
+      "reason": ""
+    },
+    "epochs": [ "…the epochs this run verified, oldest first…" ],
+    "chain_ok": true
+  }
+  ```
+
+  Without `--json` the same probe stays human-legible, one line per epoch — `epoch-…: OK rows=17 head=3f0c… frozen=false`.
+
+  Three things about the JSON shape are deliberate. **`epoch` is `null` when the agent has no epoch at all** — a fact different from "an epoch that is not frozen", and collapsing them would make the audit read a freshly-provisioned agent as an un-frozen one. **`frozen` is `null` on a broken chain, never `false`** — the freeze is folded out of exactly the rows whose integrity just failed, so a tamperer who removed the `freeze` row would otherwise be reported as un-frozen, which is the one wrong answer that matters on a control whose purpose is to stop trading; `chain_ok` sits beside it saying why. And **`rows`/`head` are the verified prefix**: on an intact chain the whole log and its real head, on a broken one how far the record vouches for itself and the last hash that did. `epoch` stays the *current* epoch whether or not `--all-epochs` was passed, so a monitor reads one field either way. Exit is `1` if any verified chain is broken, `0` otherwise. `--json` is refused without `--verify`, because every other mode of this command writes.
 
 Everything left to the implementer **and enforced here** is frozen into the epoch's first ledger row, so a scorecard can never be read against terms other than the ones it ran under: the Brier observation is locked at **position open** (`brier_attribution: "position_open"` — one conviction, one scored observation, so slicing an order into fifty fills cannot dilute a bad call), the re-check policy is `hourly_sweep_plus_on_touch`, and the caps and fee defaults sit beside them. Each layer pre-commits the rules it owns; this one owns measurement.
 

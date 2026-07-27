@@ -37,6 +37,7 @@ agent learns what happened on its next `get_fills` / `get_positions` / `get_orde
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import sys
@@ -78,9 +79,12 @@ from basecradle_harness._polymarket_ledger import (
     current_epoch,
     epochs,
     open_epoch,
+    replay,
     store_lock,
     track_equity,
+    verify_chain,
 )
+from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -928,6 +932,108 @@ def _num(value: Decimal | None) -> float | None:
     return None if value is None else float(value)
 
 
+# --- the read-only probe ---------------------------------------------------------------
+
+
+def _epoch_report(epoch: Epoch) -> dict[str, Any]:
+    """One epoch's state for the read-only probe: the chain verdict, and the freeze.
+
+    Both come off **one** read of the ledger file — `verify` and `state` each re-read it
+    otherwise, and a probe that reads twice can straddle a concurrent append and describe two
+    different files as though they were one.
+
+    **`frozen` is `None` on a broken chain, and that is the whole care of this function.** The
+    freeze is a *safety control*, and the answer is folded out of exactly the rows whose
+    integrity just failed — so a tamperer who removed the `freeze` row would be reported as
+    ``frozen: false``, which is the one wrong answer that matters here. There is no honest
+    third state but "unknown", and `chain_ok` sits beside it saying why. This is the same
+    refusal `get_scorecard` makes with its numbers, applied to the one field that is not a
+    number: a control that degrades quietly reads as a working one.
+
+    `rows` and `head` are the **verified prefix** — on an intact chain the whole log and its
+    real head; on a broken one, how far the record vouches for itself and the last hash that
+    did. `broken_at` and `reason` name where it stopped, so a human has somewhere to look.
+    """
+    rows = epoch.rows()
+    chain = verify_chain(epoch.epoch_id, rows)
+    state = replay(rows) if chain.ok else None
+    return {
+        "epoch_id": epoch.epoch_id,
+        "path": str(epoch.path),
+        "frozen": None if state is None else state.frozen,
+        "frozen_reason": None if state is None else state.frozen_reason,
+        "rows": chain.rows,
+        "chain_ok": chain.ok,
+        "head": chain.head,
+        "broken_at": chain.broken_at,
+        "reason": chain.reason,
+    }
+
+
+def _verify(home: Path, *, all_epochs: bool, as_json: bool) -> int:
+    """`--verify`: report the epoch state and write **nothing**. Exit 1 if a chain is broken.
+
+    The off-box audit surface for a control that was previously write-only (issue #353). A
+    freeze is a live operational lever — the capital froze an armed red-team persona's epoch at
+    the engine while it verified that rows were reaching the off-box log store, then lifted it —
+    and until now the state was reachable only through `get_scorecard` (a tool call inside a
+    wake, which no monitor can make) or by reading the ledger on the box (which needs a shell
+    nobody has by design). So an undeclared unfreeze could happen and every fleet signal would
+    stay green, including the drift heartbeat built to catch exactly that class.
+
+    It writes nothing at all — not even the store dir, which taking the lock would otherwise
+    create on an agent that has never traded (`store_lock(create=False)`) — makes no model call
+    (this module imports no provider and no platform client), and is safe to run on a schedule.
+
+    **"No epoch" and "an epoch that is not frozen" are different facts**, so they are reported
+    differently: `epoch` is ``null`` for the first and an object for the second. Collapsing them
+    would make the audit read a freshly-provisioned agent as an un-frozen one, which is the
+    reading the whole probe exists to prevent.
+    """
+    with store_lock(home, create=False):
+        targets = (
+            epochs(home) if all_epochs else [e for e in [current_epoch(home, create=False)] if e]
+        )
+        reports = [_epoch_report(epoch) for epoch in targets]
+
+    broken = [report for report in reports if not report["chain_ok"]]
+    if as_json:
+        print(
+            json.dumps(
+                {
+                    "harness_version": __version__,
+                    "home": str(home),
+                    # The **current** (newest) epoch — the one a monitor's axis is about — or
+                    # `null` when this agent has none. With `--all-epochs` it is `epochs[-1]`.
+                    "epoch": reports[-1] if reports else None,
+                    "epochs": reports,
+                    "chain_ok": not broken,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 1 if broken else 0
+
+    if not targets:
+        print(f"no polymarket_paper epoch under {home} — nothing to sweep")
+        return 0
+    for report in reports:
+        verdict = "OK" if report["chain_ok"] else "BROKEN"
+        # `frozen=` is **appended**, never spliced in: the line's existing prefix and its
+        # `rows=`/`head=` pairs are what an off-box reader may already be parsing, and adding a
+        # field to the end of a key=value line cannot break one that adding a word in the middle
+        # would. (The JSON is the contract to build against; this stays legible for a human.)
+        frozen = "unknown" if report["frozen"] is None else str(report["frozen"]).lower()
+        print(
+            f"{report['epoch_id']}: {verdict} rows={report['rows']} "
+            f"head={report['head']} frozen={frozen}"
+        )
+        if not report["chain_ok"]:
+            print(f"  {report['reason']}")
+    return 1 if broken else 0
+
+
 # --- the operator's job ---------------------------------------------------------------
 
 
@@ -965,13 +1071,30 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="check the ledger hash chain and print its head; write nothing (exit 1 if broken)",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="with --verify: emit the epoch state as JSON (epoch_id, frozen, rows, chain_ok, head)",
+    )
     args = parser.parse_args(argv)
+    if args.as_json and not args.verify:
+        # `--json` is the *monitor's* spelling of `--verify`, and it is bound to it deliberately:
+        # every other mode of this command writes to the ledger, and a caller reaching for a
+        # machine-readable answer is asking a read-only question. Refusing here is what keeps
+        # "safe to run repeatedly" a property of the flag rather than of the caller's care.
+        parser.error("--json is only available with --verify (every other mode writes).")
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     # httpx logs every request at INFO; this runs hourly per agent, and a cron job that writes
     # three lines of URL noise per market per hour into journald is a job nobody reads.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     home = Path(args.home or os.environ.get("HARNESS_HOME") or ".").expanduser()
+
+    # The read-only probe runs *outside* the mutating lock, and takes its own non-creating one:
+    # every path below this writes, and the audit must not be the thing that changes the box.
+    if args.verify:
+        return _verify(home, all_epochs=args.all_epochs, as_json=args.as_json)
 
     # The whole run is under the store lock: the agent's wake is the other writer against this
     # same ledger, and both of them fill resting orders. Taking it here (and in the tool's
@@ -990,19 +1113,6 @@ def main(argv: list[str] | None = None) -> int:
         if not targets:
             print(f"no polymarket_paper epoch under {home} — nothing to sweep")
             return 0
-
-        if args.verify:
-            # The operator's / NOC's integrity probe: report each epoch's verdict, head and row
-            # count — the two values an off-box verifier pins — and write nothing at all.
-            broken = False
-            for epoch in targets:
-                chain = epoch.verify()
-                verdict = "OK" if chain.ok else "BROKEN"
-                print(f"{epoch.epoch_id}: {verdict} rows={chain.rows} head={chain.head}")
-                if not chain.ok:
-                    print(f"  {chain.reason}")
-                    broken = True
-            return 1 if broken else 0
 
         data = PolymarketData()
         for epoch in targets:

@@ -845,7 +845,7 @@ def store_root(home: str | Path) -> Path:
 
 
 @contextmanager
-def store_lock(home: str | Path):
+def store_lock(home: str | Path, *, create: bool = True):
     """Hold an exclusive lock on one agent's paper store, across processes.
 
     **There is more than one writer, and that is by design.** The tool writes from a wake; the
@@ -870,9 +870,25 @@ def store_lock(home: str | Path):
     On a platform without `fcntl` (not the fleet's, but the kit is public) it degrades to no
     locking rather than refusing to run — a single-writer install is the common case, and
     failing there would be worse than the race it prevents.
+
+    ``create=False`` is the **read-only probe's** mode (issue #353): taking this lock creates
+    ``<home>/polymarket/`` and a ``.lock`` file, which on an agent that has never traded is the
+    audit *changing the box it is auditing* — and a monitor that runs hourly on every agent in
+    the fleet would litter a paper-trading store onto every one of them, including the agents
+    that do not have the instrument. So the probe keys on the **lock file's own existence**
+    rather than the store dir's: present means a live store, and taking it there writes nothing
+    (an ``a+`` open of an existing file appends no bytes and moves no mtime); absent means
+    nothing has ever written here, so there is nothing to lock, nothing to read, and it yields
+    unlocked for the caller to report "no epoch". The race that opens is benign by construction
+    — the only thing that could be happening concurrently is the store's *first* write, which
+    the reader would then report as freshly-opened or absent, and either answer is true a
+    moment either side of it.
     """
     root = store_root(home)
     handle = None
+    if not create and not (root / ".lock").exists():
+        yield  # nothing has ever written here, and a probe must not bring the store into being
+        return
     try:
         root.mkdir(parents=True, exist_ok=True)
         handle = open(root / ".lock", "a+")  # noqa: SIM115 - released in the finally below
