@@ -1,0 +1,16 @@
+version: 2
+updates:
+# `uv`, not `pip`, and the reason is `uv.lock`. This repo resolves through uv end to end
+# (`uv sync`, a committed lockfile, `astral-sh/setup-uv` in CI), so a `pip`-ecosystem bump
+# would edit `pyproject.toml` and leave the lock stale — a PR whose own CI, which installs
+# from the lock, never tests the bump it claims to make.
+- package-ecosystem: uv
+  directory: "/"
+  schedule:
+    interval: weekly
+  open-pull-requests-limit: 10
+- package-ecosystem: github-actions
+  directory: "/"
+  schedule:
+    interval: weekly
+  open-pull-requests-limit: 10
