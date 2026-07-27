@@ -7,11 +7,39 @@ is not the same as **reaching** it, and how a cache is reached differs by vendor
 not cosmetic:
 
 - **automatic** — the endpoint caches a repeated prefix by itself, with nothing on the wire. OpenAI,
-  xAI, and (verified live) OpenRouter's GLM endpoints. The engine does nothing.
+  xAI, and (verified live) most of OpenRouter's GLM endpoints. The engine does nothing.
 - **explicit** — the client must *mark* the cacheable prefix, or it gets **nothing at all**.
   Anthropic is the one that matters: a Claude agent shipped without breakpoints pays full freight on
   every token of every wake, silently, forever. Nothing errors; the bill just arrives.
 - **none** — the endpoint has no prompt cache. The engine does nothing.
+
+``automatic`` behind a router is a weaker promise than it looks (issue #372)
+---------------------------------------------------------------------------
+The mode answers *"what must the client put on the wire?"* — and for a router the honest answer is
+still **nothing**. It does not answer *"will there be a hit?"*, and behind a router those two come
+apart in a way worth stating once: caching is a property of **the upstream that serves the call**,
+so a hit needs consecutive calls to reach *the same* upstream, and which upstream that is belongs to
+the router, not the client. Measured on ``z-ai/glm-5.2`` across 33 endpoints: most cache a repeated
+prefix in full (StreamLake, Z.AI, SiliconFlow, AtlasCloud, Alibaba, BaseTen, Chutes — ~99.9% of a
+287 K-token prefix, at ~5.4× cheaper), some cache **nothing at all** (Novita, DeepInfra), and one
+caches about half (Fireworks). Whether a given wake pays full freight is therefore decided by where
+it lands, and the engine has no honest lever on that:
+
+- OpenRouter's **sticky routing** pins a conversation to one upstream, but its *implicit* form
+  "only activates after a cache hit is detected" — which a cold first call on a fresh endpoint can
+  never produce. Nothing in the message list breaks that circle.
+- Passing an explicit ``session_id`` was **measured and rejected** as a fix: it pins eagerly, which
+  makes a landing on a *non-caching* endpoint durable instead of transient, and it drifted anyway.
+  Across four A/B trials it never beat sending nothing, and at production scale it cost 2.75× more.
+- The only lever that worked is the operator's own ``provider`` routing preference in
+  ``model_params.json``, which the SDK already carries to the wire. That is a **routing policy**
+  choice — cost, latency, and quantization all ride on it — and deliberately not the framework's to
+  make. What the harness owes it is honesty about the consequences, which is why `context_limit`
+  reads the same pin when it computes the ceiling (`_openrouter._pinned_slugs`).
+
+So the rule for a router adapter: declare the mode by what the wire needs, and **never read a hit
+rate as a capability**. `AUTOMATIC` here means *nothing to send*, not *caching achieved* — the
+per-call ``cached_tokens=`` on the log line is the only thing that says what actually happened.
 
 The asymmetry is the whole point: *automatic* and *none* fail safe (do nothing, lose nothing), and
 *explicit* fails **expensive and invisible**. So the mode is a thing an adapter **declares**, not a

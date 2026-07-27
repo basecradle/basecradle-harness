@@ -252,11 +252,19 @@ class OpenRouterProvider:
     """
 
     #: How this adapter's endpoints reach their prompt cache (issue #277). OpenRouter passes caching
-    #: through to whichever upstream serves the call, and every endpoint the fleet routes to caches
+    #: through to whichever upstream serves the call, and the endpoints the fleet routes to cache
     #: **automatically** — verified live rather than trusted: a `z-ai/glm-5.2` probe returned
     #: ``cached_tokens: 238277`` billed at the cache-read rate while OpenRouter's own
     #: ``supports_implicit_caching`` metadata read ``false`` on every one of that model's endpoints.
     #: That is exactly why the mode is *declared* here and never inferred from provider metadata.
+    #:
+    #: What it does **not** claim is a hit (issue #372): the mode says what the *wire* needs, and
+    #: behind a router the cache lives at whichever upstream served the call — so a hit also needs
+    #: the next call to land there, which is the router's decision and not the engine's. Measured on
+    #: ``z-ai/glm-5.2``: most endpoints cache a repeated prefix in full, two (Novita, DeepInfra)
+    #: cache none of it, and one (Fireworks) caches about half. `basecradle_harness._caching` carries
+    #: the reasoning and the fixes that were measured and rejected; the operator's ``provider``
+    #: routing pin is the only lever, and `context_limit` reads it so using it stays honest.
     #:
     #: Same stated exception as the `openai` adapter: routed at an explicit-cache model
     #: (``anthropic/claude-*``), a pass-through router needs breakpoints and this declaration would
@@ -379,15 +387,23 @@ class OpenRouterProvider:
           will actually route to are counted.
         - **``max_prompt_tokens`` beats ``context_length`` where an endpoint sets it** — it is the
           tighter promise about the *prompt* specifically, which is the half we are budgeting.
+        - **An endpoint the operator's routing pin excludes is not in the pool** (issue #372). A
+          `provider` preference in ``model_params.json`` is the operator *narrowing* who may serve
+          the call, so the wall the request meets is the largest endpoint **still allowed** — read
+          from their own declaration (`_pinned_slugs`), never from a table of this repo's own.
 
-        **The bound worth knowing:** if an operator pins routing to one provider (via
-        ``model_params.json``), the effective ceiling is *that* endpoint's, not the pool's best. The
-        harness does not parse routing preferences, so `HARNESS_MAX_CONTEXT_TOKENS` is the answer
-        there — as it is for an operator who wants a *tighter* budget than the ceiling for cost
-        reasons, which is a policy choice and deliberately not the framework's to make.
+        Reading the pin is what lets the context budget see an operator's routing choice at all.
+        Without it the pool's best case is reported no matter how narrowly routing is pinned, and an
+        agent pinned to a small endpoint sits *above* its real ceiling while believing it has
+        headroom — the silent walk out of the compaction guarantee that `CLAUDE.md` → Context
+        Discipline spells out as an inequality. `HARNESS_MAX_CONTEXT_TOKENS` remains the answer for
+        an operator who wants a *tighter* budget than the ceiling for cost reasons, which is a
+        policy choice and deliberately not the framework's to make.
 
         ``None`` on any failure (or a model id without the ``author/slug`` shape the endpoints API
-        needs) — the budget then falls to its conservative floor.
+        needs) — the budget then falls to its conservative floor. Also ``None`` when a pin allows
+        nothing the live pool offers: OpenRouter would fail that request itself, and the budget is
+        not the right place to discover it.
         """
         author, _, slug = self.model.partition("/")
         # An OpenRouter model id may carry a routing **variant** — ``z-ai/glm-5.2:free``,
@@ -402,8 +418,11 @@ class OpenRouterProvider:
         except Exception as exc:  # noqa: BLE001 - degrade to the floor; never break a wake
             _log.warning("Could not read %s's context limit from OpenRouter: %s", self.model, exc)
             return None
+        allow, deny = _pinned_slugs(self._default_params.get("provider"))
         best = 0
         for endpoint in getattr(getattr(response, "data", None), "endpoints", None) or ():
+            if not _routable(endpoint, allow, deny):
+                continue
             ceiling = _endpoint_ceiling(endpoint)
             if ceiling is not None:
                 best = max(best, ceiling)
@@ -560,6 +579,94 @@ class _ErrorMapper:
                 "reasoning, reasoning_effort, top_p, …); remove the offending key."
             ) from exc
         return False  # not an SDK/transport error — let it propagate unchanged
+
+
+def _slug_set(value: Any) -> frozenset[str]:
+    """A routing-preference list read as a set of comparable slugs — empty for anything else.
+
+    A bare ``str`` is rejected rather than iterated: ``only: "streamlake"`` is a plausible operator
+    typo, and treating it as a sequence would turn it into a set of single characters that matches
+    no endpoint — narrowing the pool to nothing on a typo. Slugs are compared casefolded so an
+    operator who writes ``"StreamLake"`` is read the same way OpenRouter reads it.
+    """
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        return frozenset()
+    return frozenset(
+        item.strip().casefold() for item in value if isinstance(item, str) and item.strip()
+    )
+
+
+def _pinned_slugs(routing: Any) -> tuple[frozenset[str] | None, frozenset[str]]:
+    """An operator's ``provider`` preferences as (slugs allowed — or ``None`` for *any* — , denied).
+
+    Only the keys that genuinely **narrow** who may serve the call are read, and each is read for
+    what OpenRouter does with it:
+
+    - ``only`` restricts the pool outright, whatever ``allow_fallbacks`` says.
+    - ``order`` restricts it **only** alongside ``allow_fallbacks: false``. On its own it is a
+      *preference*: OpenRouter tries the listed endpoints first and then falls through to the rest,
+      so the pool — and the ceiling a request can meet — is still the whole pool. Reading ``order``
+      as a restriction would under-report the ceiling for the common case and compact early.
+    - **Both together intersect**, since each is a restriction in its own right: ``only`` bounds the
+      candidates and a no-fallback ``order`` bounds them again. Taking ``only`` alone there would
+      report a ceiling from an endpoint the request can never actually reach.
+    - ``ignore`` removes endpoints, and it narrows whether or not anything else is set.
+
+    ``sort``, ``quantizations``, ``max_price``, ``data_collection``, ``require_parameters`` and the
+    rest also shape routing, and are deliberately **not** read: this endpoint list cannot be
+    filtered on them honestly, and a guess would be a table of assumptions about a vendor's routing
+    — the thing this adapter refuses to keep (see `cache_mode` on why declarations are verified, not
+    inferred). Unread preferences leave the pool wide, which is the safe direction (`_routable`).
+    """
+    if not isinstance(routing, Mapping):
+        return None, frozenset()
+    allow: frozenset[str] | None = None
+    if only := _slug_set(routing.get("only")):
+        allow = only
+    if routing.get("allow_fallbacks") is False and (order := _slug_set(routing.get("order"))):
+        allow = order if allow is None else allow & order
+    return allow, _slug_set(routing.get("ignore"))
+
+
+def _endpoint_slug(endpoint: Any) -> str | None:
+    """The **routing slug** an operator names in ``only``/``order``/``ignore``, or ``None``.
+
+    It is the ``tag``'s leading segment — ``"streamlake/fp8"`` → ``streamlake``,
+    ``"atlas-cloud/fp8"`` → ``atlas-cloud``, ``"alibaba"`` → ``alibaba`` — verified live against
+    every slug this repo has pinned. ``provider_name`` is **not** usable for it: the transform is
+    not mechanical (``"Sail Research"`` → ``sail-research``, but ``"AtlasCloud"`` → ``atlas-cloud``
+    and ``"Io Net"`` → ``io-net``), so deriving a slug from it would silently drop the wrong
+    endpoints — and silently dropping the *largest* one is a ceiling too low, compacting a healthy
+    transcript away.
+
+    ``tag`` is a **required** field of the SDK's typed endpoint model, so it cannot go quietly
+    missing: a payload without it fails response validation and `context_limit` already degrades to
+    the conservative floor with a warning. The ``None`` here is for a duck-typed endpoint object
+    (a test double), read by ``getattr`` exactly as defensively as every other field in this module.
+    """
+    tag = getattr(endpoint, "tag", None)
+    if not isinstance(tag, str):
+        return None
+    return tag.partition("/")[0].strip().casefold() or None
+
+
+def _routable(endpoint: Any, allow: frozenset[str] | None, deny: frozenset[str]) -> bool:
+    """Whether the operator's routing preferences still let this endpoint serve a request.
+
+    An endpoint whose slug cannot be read stays **in** the pool, and the asymmetry is the reason:
+    a ceiling reported too *high* degrades into the over-length rescue — the request 400s, the
+    session compacts and retries, and the failure is visible and self-healing; a ceiling too *low*
+    compacts a healthy transcript away early, permanently, and says nothing. Between an honest
+    degradation and a silent loss of the conversation, this errs toward keeping the conversation.
+    """
+    if allow is None and not deny:
+        return True
+    slug = _endpoint_slug(endpoint)
+    if slug is None:
+        return True
+    if allow is not None and slug not in allow:
+        return False
+    return slug not in deny
 
 
 def _endpoint_ceiling(endpoint: Any) -> int | None:

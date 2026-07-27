@@ -40,6 +40,7 @@ from basecradle_harness import (
     ToolCall,
     ToolSpec,
 )
+from basecradle_harness._openrouter import _routable
 
 # A fabricated OpenRouter endpoint + a correctly-shaped fake key. The SDK posts to
 # ``<server_url>/chat/completions`` — verified against the real 0.11.3 SDK.
@@ -790,6 +791,161 @@ def test_max_prompt_tokens_beats_context_length_where_an_endpoint_sets_it(router
 
     # The tighter promise about the *prompt* is the half we are budgeting.
     assert _provider().context_limit() == 200_000
+
+
+#
+# An operator's routing pin narrows the pool, so it narrows the ceiling (issue #372). Pinning
+# routing is the only measured lever on prompt caching behind a router, and before this the harness
+# reported the whole pool's best case no matter how narrowly routing was pinned — an agent pinned to
+# a small endpoint sat above its real ceiling believing it had headroom.
+
+
+def _pooled_body():
+    """The three-endpoint pool the pin tests narrow, spanning 10× in ceiling as the live one does."""
+    return _endpoints_body(
+        _endpoint(name="Ambient", context_length=101_376),
+        _endpoint(name="StreamLake", context_length=1_024_000),
+        _endpoint(name="Novita", context_length=1_048_576),
+    )
+
+
+def test_only_narrows_the_ceiling_to_the_endpoints_it_allows(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    provider = _provider(provider={"only": ["ambient"], "allow_fallbacks": False})
+
+    # The pool's best case is 1,048,576, but nothing may serve this agent except Ambient — so the
+    # wall it actually meets is Ambient's, and budgeting against the pool would compact far too late.
+    assert provider.context_limit() == 101_376
+
+
+def test_only_narrows_even_when_fallbacks_are_allowed(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    # `only` is a hard restriction in OpenRouter's own semantics: `allow_fallbacks` governs whether
+    # it may fall *outside the listed set*, and with `only` there is no outside.
+    assert _provider(provider={"only": ["streamlake"]}).context_limit() == 1_024_000
+
+
+def test_ignore_removes_an_endpoint_from_the_pool(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    # Dropping the largest endpoint really does lower the wall, so the ceiling has to follow it down.
+    assert _provider(provider={"ignore": ["novita"]}).context_limit() == 1_024_000
+
+
+def test_order_alone_is_a_preference_and_does_not_narrow_the_ceiling(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    # `order` without `allow_fallbacks: false` only says *try these first*; OpenRouter still falls
+    # through to the rest of the pool, so the largest endpoint is still reachable. Reading it as a
+    # restriction would under-report the ceiling for the common case and compact a healthy
+    # transcript away early.
+    assert _provider(provider={"order": ["ambient"]}).context_limit() == 1_048_576
+
+
+def test_order_narrows_when_fallbacks_are_refused(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    provider = _provider(provider={"order": ["ambient"], "allow_fallbacks": False})
+
+    # With fallbacks refused the ordered list *is* the pool.
+    assert provider.context_limit() == 101_376
+
+
+def test_only_and_a_no_fallback_order_intersect(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    provider = _provider(
+        provider={
+            "only": ["ambient", "streamlake"],
+            "order": ["ambient"],
+            "allow_fallbacks": False,
+        }
+    )
+
+    # Each key is a restriction in its own right, so the reachable pool is their intersection —
+    # Ambient alone. Reading `only` alone would report StreamLake's 1,024,000, a ceiling from an
+    # endpoint this request can never reach.
+    assert provider.context_limit() == 101_376
+
+
+def test_a_pin_is_matched_casefolded_and_across_quantization_tags(router):
+    """The slug is the `tag`'s leading segment, so one pin covers a provider's every variant."""
+    router.get(ENDPOINTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=_endpoints_body(
+                # The live pool really does list one provider several times, one row per
+                # quantization — `streamlake/fp8` and `streamlake/fast` are both StreamLake.
+                _endpoint(name="StreamLake", context_length=1_024_000),
+                {**_endpoint(name="StreamLake", context_length=524_288), "tag": "streamlake/fast"},
+                _endpoint(name="Novita", context_length=1_048_576),
+            ),
+        )
+    )
+
+    # An operator who writes the display-cased name is read the way OpenRouter reads it, and both
+    # StreamLake rows are allowed — so the ceiling is the larger of the two, not Novita's.
+    assert _provider(provider={"only": ["StreamLake"]}).context_limit() == 1_024_000
+
+
+def test_a_tagless_endpoints_payload_degrades_to_no_ceiling(router):
+    """`tag` is a *required* field of the SDK's endpoint model, so it cannot go quietly missing.
+
+    A payload without it fails response validation outright, which the existing read already handles
+    the safe way: warn, and let the budget fall to its conservative floor. Worth pinning, because the
+    slug-matching above is the first thing to depend on that field.
+    """
+    body = _endpoints_body(
+        {k: v for k, v in _endpoint(name="Novita", context_length=1_048_576).items() if k != "tag"},
+    )
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=body))
+
+    assert _provider(provider={"only": ["novita"]}).context_limit() is None
+
+
+def test_an_endpoint_with_no_readable_slug_stays_in_the_pool():
+    """The unreadable case errs toward a ceiling too high, and the reason is the asymmetry.
+
+    Too high degrades into the over-length rescue — the request 400s, the session compacts and
+    retries, visibly. Too low compacts a healthy transcript away early and silently. Reached here
+    through a duck-typed endpoint (every field in this module is read by `getattr`), since the typed
+    SDK model cannot produce it.
+    """
+
+    class _Tagless:
+        status = 0
+        context_length = 1_048_576
+        max_prompt_tokens = None
+
+    assert _routable(_Tagless(), frozenset({"ambient"}), frozenset()) is True
+
+
+def test_a_pin_that_allows_nothing_in_the_pool_reports_no_ceiling(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    # OpenRouter would fail that request itself; the budget is not the place to discover a typo, so
+    # it falls to its conservative floor rather than inventing a number.
+    assert _provider(provider={"only": ["nobody-serves-this"]}).context_limit() is None
+
+
+def test_a_bare_string_pin_is_not_read_as_a_list_of_characters(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    # `only: "streamlake"` is a plausible operator typo. Iterating the string would produce a set of
+    # single characters matching no endpoint, narrowing the pool to nothing — so a malformed
+    # preference is ignored and the pool stays whole.
+    assert _provider(provider={"only": "streamlake"}).context_limit() == 1_048_576
+
+
+def test_routing_preferences_the_ceiling_cannot_read_leave_the_pool_whole(router):
+    router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
+
+    # `sort`, `max_price`, `quantizations`, … also shape routing, and this endpoint list cannot be
+    # filtered on them honestly. Guessing would be a local table of assumptions about a vendor's
+    # routing — the thing this adapter refuses to keep.
+    assert _provider(provider={"sort": "price"}).context_limit() == 1_048_576
 
 
 def test_an_unreachable_endpoints_api_degrades_to_no_answer(router):
