@@ -602,11 +602,11 @@ So a wake-mode agent bounds its own conversation. After a turn settles, it asks 
 - **A cut lands only immediately before a `user` turn** — never mid-tool-chain, which would strand a tool result from the call it answers and leave a *permanently* malformed transcript. If no safe cut exists, the compactor declines and logs it rather than producing one it cannot prove is well-formed.
 - **An agent already past the wall self-heals.** An over-length `400` is recognized (on every provider) as its own error class: the transcript is compacted hard and the turn re-run **once**. No session-file surgery. The one case it does *not* re-run is an overflow that struck **after a tool had already executed** — re-running there could post the same message or create the same task twice, so the work stays in the transcript, the wake degrades as it always did, and the compaction still lands so the *next* wake comes in under the ceiling.
 
-The ceiling itself resolves in one order — **`HARNESS_MAX_CONTEXT_TOKENS` → the adapter → a conservative floor** — and never from a hardcoded model→limit table, which cannot express a router's reality (one OpenRouter model id is served by endpoints spanning **10×** in context ceiling) and rots silently the day a vendor ships a new model. Each adapter answers however it honestly can: `xai-sdk` reads its SDK's `max_prompt_length`; `openrouter` computes the real ceiling of the endpoints it would actually route to (skipping the ones OpenRouter has taken out of rotation); the `openai` SDK reads a `context_length` if the endpoint it is pointed at states one — **and OpenAI itself does not**, so an OpenAI-direct agent falls to the floor of **128,000**.
+The ceiling itself resolves in one order — **`HARNESS_MAX_CONTEXT_TOKENS` → the adapter → a conservative floor** — and never from a hardcoded model→limit table, which cannot express a router's reality (one OpenRouter model id is served by endpoints spanning **10×** in context ceiling) and rots silently the day a vendor ships a new model. Each adapter answers however it honestly can: `xai-sdk` reads its SDK's `max_prompt_length`; `openrouter` computes the real ceiling of the endpoints it would actually route to (skipping the ones OpenRouter has taken out of rotation, **and the ones your own [`provider` routing pin](#behind-a-router-automatic-means-nothing-to-send--not-a-hit) excludes**); the `openai` SDK reads a `context_length` if the endpoint it is pointed at states one — **and OpenAI itself does not**, so an OpenAI-direct agent falls to the floor of **128,000**.
 
 > **If your model's context window is below 128 K, `HARNESS_MAX_CONTEXT_TOKENS` is not optional.** The floor is *conservative* only for models at or above it (true of everything the majors currently ship). Below it, the assumed ceiling sits *above* the real one and compaction would never fire in time.
 
-Set `HARNESS_MAX_CONTEXT_TOKENS` to override the ceiling for any reason — a model the adapter can't read, routing you have pinned, or simply a **tighter budget than the ceiling** because you would rather compact early than replay half a million tokens per wake. It always wins; `0` disables compaction entirely — including the self-heal above, because "off" means off, and an agent whose context you manage yourself is one whose transcript the harness will not rewrite behind your back. `basecradle-harness-wake --resolved-config` reports it, and the wake logs the limit it actually resolved (`context limit limit=1048576 source=adapter`) and every compaction it performs.
+Set `HARNESS_MAX_CONTEXT_TOKENS` to override the ceiling for any reason — a model the adapter can't read, a routing preference the adapter cannot read a ceiling from, or simply a **tighter budget than the ceiling** because you would rather compact early than replay half a million tokens per wake. It always wins; `0` disables compaction entirely — including the self-heal above, because "off" means off, and an agent whose context you manage yourself is one whose transcript the harness will not rewrite behind your back. `basecradle-harness-wake --resolved-config` reports it, and the wake logs the limit it actually resolved (`context limit limit=1048576 source=adapter`) and every compaction it performs.
 
 #### Set the budget too low and you lose a guarantee — the harness will tell you
 
@@ -644,6 +644,38 @@ The asymmetry is the whole reason this is *declared* rather than guessed: `autom
 Two things follow, and both are deliberate. The breakpoint lands on the **frozen transcript only** — never through the brief, which is a snapshot of a moment and would buy a cache write that can never be read. And on an agent's very first wake it lands on the **charter**, the largest byte-stable block an agent has: caching it on wake one is what makes wake two a cache *read*.
 
 Whether it is working is never inferred — it is **read off the response**: `cached_tokens=` rides [the per-call log line](#what-a-wake-logs) on every provider that reports it. That matters, because a provider's own metadata can lie: OpenRouter advertises `supports_implicit_caching: false` on every `z-ai/glm-5.2` endpoint while caching demonstrably works (a live probe returned `cached_tokens: 238277`, billed at the cache-read rate). **Trust the count, never the claim.**
+
+#### Behind a router, `automatic` means *nothing to send* — not *a hit*
+
+`cache_mode` answers **"what must the client put on the wire?"**, and for a router the honest answer is still *nothing*. It does not promise a hit, and behind a router those two come apart: the cache lives at **whichever upstream served the call**, so a hit also needs the *next* call to land there — and that is the router's decision, not the harness's. One OpenRouter model id fans out to dozens of endpoints that do not behave alike. Measured across the 33 live `z-ai/glm-5.2` endpoints:
+
+| What the endpoint does with a repeated prefix | Endpoints |
+|---|---|
+| Caches it in full (~99.9% of a 287 K-token prefix, ~5.4× cheaper) | StreamLake, Z.AI, SiliconFlow, AtlasCloud, Alibaba, BaseTen, Chutes |
+| Caches about **half** of it | Fireworks |
+| Caches **none** of it | Novita, DeepInfra |
+
+So an agent can sit at `cached_tokens=0` on every call while nothing is wrong with its request. OpenRouter's **sticky routing** is what normally rescues this — it pins a conversation to one upstream — but its implicit form only activates *after a cache hit is detected*, which a cold first call on a fresh endpoint can never produce, and the pin expires after **5 minutes** of inactivity. An event-driven agent whose wakes are minutes apart re-enters that lottery every wake, and loses it whenever the first landing is a non-caching endpoint.
+
+Passing an explicit `session_id` looks like the fix and **was measured and rejected**: it pins eagerly, which makes a landing on a *non-caching* endpoint durable instead of transient. Across four A/B trials it never beat sending nothing (5/13 cached calls either way), and at production scale it pinned a non-caching endpoint and cost **2.75× more**. The harness therefore sends nothing extra.
+
+The one lever that works is **your own routing preference**, which the native `openrouter` SDK already carries to the wire — put a `provider` object in [`model_params.json`](#model-parameters--model_paramsjson) restricting routing to endpoints you have measured:
+
+```jsonc
+// <agent-home>/.config/basecradle/model_params.json
+{
+  "provider": {
+    "only": ["streamlake", "z-ai", "siliconflow", "atlas-cloud", "alibaba", "baseten"],
+    "allow_fallbacks": true
+  }
+}
+```
+
+> **Which cell you are on decides where that object goes.** `provider` is a real constructor argument of the `openai` adapter (the endpoint-vendor label it logs), so on **`AI_SDK=openai`** — including pointed at `openrouter.ai` — a top-level `provider` key is a harness-owned collision, stripped with a WARNING; reach OpenRouter's routing there through `extra_body: {"provider": {…}}`, which that SDK passes through. On the native **`AI_SDK=openrouter`** it is an ordinary parameter and rides as written, and only that adapter's ceiling reads it.
+
+Live, at production scale: call 1 cold at `$0.2426`, then `cached_tokens=296384` of `296447` — `$0.0451` a call, a **5.4×** cut held for every later call. This is a **routing policy** decision — cost, latency, and quantization all ride on it — so the harness will not make it for you, and it keeps no table of which endpoints cache: that list above is a measurement with a date on it, not a contract, and only the `cached_tokens=` on your own log line says what is happening now.
+
+What the harness *does* owe you is honesty about the consequence: **`context_limit` reads the same pin.** Narrowing routing narrows the real ceiling, so a pin to one endpoint now reports *that* endpoint's window (a StreamLake-only pin: `1024000`, not the pool's `1048576`) — without which a pinned agent would sit above its real ceiling believing it had headroom, [forfeiting the compaction guarantee](#set-the-budget-too-low-and-you-lose-a-guarantee--the-harness-will-tell-you) silently. `only` and `ignore` narrow it; `order` narrows it only with `allow_fallbacks: false` (alone it is a *preference* — OpenRouter still falls through to the rest of the pool). Preferences that this endpoint list cannot be filtered on honestly (`sort`, `max_price`, `quantizations`, …) leave the ceiling at the pool's, where `HARNESS_MAX_CONTEXT_TOKENS` remains the answer.
 
 ### The step budget, live counter, and reserve summary
 

@@ -7,6 +7,54 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.94.0] - 2026-07-27
+
+### Changed: the OpenRouter context ceiling honors the operator's routing pin (issue #372)
+
+Filed to find out why @glm-5.2 sat at `cached_tokens=0` on every call while re-billing ~290 K input
+tokens per step. Measured across the 33 live `z-ai/glm-5.2` endpoints, and the answer is not the
+request shape: **the harness's message layout already earns the hit** — 296,384 of 296,447 tokens
+cached at production scale, `$0.2426` → `$0.0451` a call — and whether a given wake gets it is
+decided by *which upstream it lands on*. Most endpoints cache a repeated prefix in full (StreamLake,
+Z.AI, SiliconFlow, AtlasCloud, Alibaba, BaseTen, Chutes); Fireworks caches about half; **Novita and
+DeepInfra cache none of it**. OpenRouter's implicit sticky routing normally rescues this, but it
+activates only *after* a cache hit is observed — which a cold first call on a fresh endpoint can
+never produce — and the pin expires after 5 minutes of inactivity.
+
+An explicit `session_id` was the obvious fix and is **measured and rejected**, recorded here so it
+is not re-proposed: it pins eagerly, which makes a landing on a non-caching endpoint durable rather
+than transient. Over four fair A/B trials it never beat sending nothing (5/13 cached calls either
+way), and at production scale it pinned a non-caching endpoint, drifted anyway, and cost **2.75×
+more**. Nothing was added to the wire.
+
+The lever that works is the operator's own `provider` routing preference, which the `openrouter`
+SDK already carries — so the shipped change is the thing that makes *using* it safe:
+`OpenRouterProvider.context_limit` now reads that same pin when it computes the ceiling.
+
+- **Narrowing routing narrows the ceiling.** A pin to one endpoint reports that endpoint's window
+  (a StreamLake-only pin: `1024000`, not the pool's `1048576`). Without this, pinning routing left
+  an agent sitting above its real ceiling believing it had headroom — a silent walk out of the
+  single-turn compaction guarantee, which is exactly the failure class that guarantee's warning
+  exists to make loud.
+- **Read for what OpenRouter does with each key.** `only` restricts outright; `ignore` removes;
+  `order` restricts **only** alongside `allow_fallbacks: false` (alone it is a preference — routing
+  still falls through to the rest of the pool, so reading it as a restriction would under-report the
+  ceiling in the common case and compact a healthy transcript away early).
+- **Unreadable preferences leave the pool whole.** `sort`, `max_price`, `quantizations`, … cannot be
+  filtered on honestly from the endpoint list, and a guess would be a local table of assumptions
+  about a vendor's routing — the thing this adapter refuses to keep. A malformed preference
+  (`only: "streamlake"`, a bare string) is ignored rather than iterated into a set of characters
+  that matches nothing. The slug is matched casefolded off each endpoint's `tag`, so one pin covers
+  a provider's every quantization row.
+
+The direction of every fallback is deliberate: a ceiling too **high** degrades into the over-length
+rescue — the request 400s, the session compacts and retries, visibly — while one too **low** compacts
+a healthy transcript away early and silently. Between an honest degradation and a quiet loss of the
+conversation, this errs toward keeping the conversation.
+
+Also corrected in the docs: `cache_mode = automatic` behind a router says *nothing goes on the wire*,
+never *a hit was achieved*. Only the `cached_tokens=` on the per-call line says what happened.
+
 ## [0.93.0] - 2026-07-26
 
 ### Added: one line per assembled turn saying what the context is made of (issue #369)
