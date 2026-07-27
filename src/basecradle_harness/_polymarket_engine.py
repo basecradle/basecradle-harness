@@ -944,11 +944,21 @@ def _epoch_report(epoch: Epoch) -> dict[str, Any]:
 
     **`frozen` is `None` on a broken chain, and that is the whole care of this function.** The
     freeze is a *safety control*, and the answer is folded out of exactly the rows whose
-    integrity just failed — so a tamperer who removed the `freeze` row would be reported as
-    ``frozen: false``, which is the one wrong answer that matters here. There is no honest
-    third state but "unknown", and `chain_ok` sits beside it saying why. This is the same
-    refusal `get_scorecard` makes with its numbers, applied to the one field that is not a
-    number: a control that degrades quietly reads as a working one.
+    integrity just failed — so an edit that removed the `freeze` row from the middle of the log
+    would be reported as ``frozen: false``, which is the one wrong answer that matters here.
+    There is no honest third state but "unknown", and `chain_ok` sits beside it saying why.
+    This is the same refusal `get_scorecard` makes with its numbers, applied to the one field
+    that is not a number: a control that degrades quietly reads as a working one.
+
+    **What that refusal does *not* cover, stated here rather than assumed:** a chain detects an
+    edit or a removal *in the middle* (the next row's ``prev`` stops matching), and **cannot**
+    detect a **truncated tail** — lopping the final rows off leaves a shorter chain that
+    verifies perfectly. So a trailing `freeze` deleted from the end reads ``chain_ok: true``
+    with ``frozen: false``, honestly reporting a log that is itself a lie. That is not a gap in
+    this function; it is the property `ChainStatus` already names, and it is precisely why
+    `rows` and `head` are published: they are the pin an external verifier compares against the
+    off-box row copy, under a UID the agent does not have. **An audit that alarms only on
+    `chain_ok` is incomplete by construction** — it must also pin ``(rows, head)``.
 
     `rows` and `head` are the **verified prefix** — on an intact chain the whole log and its
     real head; on a broken one, how far the record vouches for itself and the last hash that
@@ -989,6 +999,10 @@ def _verify(home: Path, *, all_epochs: bool, as_json: bool) -> int:
     differently: `epoch` is ``null`` for the first and an object for the second. Collapsing them
     would make the audit read a freshly-provisioned agent as an un-frozen one, which is the
     reading the whole probe exists to prevent.
+
+    **The probe is one half of the audit, and says so.** ``chain_ok`` catches an edit within the
+    log; it cannot catch a **truncated tail**, which is why every epoch also reports ``rows`` and
+    ``head`` — the pin against the off-box row copy. See `_epoch_report`.
     """
     with store_lock(home, create=False):
         targets = (
