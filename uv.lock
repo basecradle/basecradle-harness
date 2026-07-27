@@ -219,14 +219,14 @@ wheels = [
 
 [[package]]
 name = "basecradle"
-version = "0.6.0"
+version = "0.8.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/86/de/8fd519b48d67f4b2fe24138c875042cd675faf37b983c45e19416e4624ba/basecradle-0.6.0.tar.gz", hash = "sha256:e34e5bb5122b28773acdcf0be23d5597077b5eaf7607fd887524edbafb46a377", size = 91028, upload-time = "2026-07-14T05:32:53.921Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/19/e7/efd53b85f75a173e5dc28ae0770628f912f123858752dbbde8cab4db2225/basecradle-0.8.0.tar.gz", hash = "sha256:9518f47bd6fcca7338f6db32ae282cdb6180466da6b146b2dc93df196ddf6ae6", size = 94959, upload-time = "2026-07-17T23:59:35.008Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/24/9b/f0ff270b50c09a71175605f5914b75a53964b975ef74999dbbb3ef09952b/basecradle-0.6.0-py3-none-any.whl", hash = "sha256:f7e097bfc2c69b378ff2b34d61ad1c0aed189569531a271556a4c78e584e56f0", size = 32502, upload-time = "2026-07-14T05:32:52.78Z" },
+    { url = "https://files.pythonhosted.org/packages/a0/02/c574f39cbcfd5ae8e8e48144beb5934f151a4a3a18c55918977cdc71c5c1/basecradle-0.8.0-py3-none-any.whl", hash = "sha256:5fa0134879e4f9b2d9d9fc1866ef8be186d2e8564c0d8d30961d45cad98bdc97", size = 34010, upload-time = "2026-07-17T23:59:33.842Z" },
 ]
 
 [[package]]
@@ -265,7 +265,7 @@ requires-dist = [
     { name = "basecradle", specifier = ">=0.6" },
     { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.4" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=2.43,<3" },
-    { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=0.11.3,<0.12" },
+    { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=1.1.2,<2" },
     { name = "xai-sdk", marker = "extra == 'xai-sdk'", specifier = ">=1.17,<2" },
 ]
 provides-extras = ["mempalace", "openai", "openrouter", "xai-sdk"]
@@ -273,7 +273,7 @@ provides-extras = ["mempalace", "openai", "openrouter", "xai-sdk"]
 [package.metadata.requires-dev]
 dev = [
     { name = "openai", specifier = ">=2.43,<3" },
-    { name = "openrouter", specifier = ">=0.11.3,<0.12" },
+    { name = "openrouter", specifier = ">=1.1.2,<2" },
     { name = "pytest", specifier = ">=8" },
     { name = "respx", specifier = ">=0.22" },
     { name = "ruff", specifier = ">=0.9" },
@@ -1158,7 +1158,7 @@ wheels = [
 
 [[package]]
 name = "mempalace"
-version = "3.4.1"
+version = "3.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "chromadb" },
@@ -1170,9 +1170,9 @@ dependencies = [
     { name = "tokenizers" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dc/38/b5bd19281a337b2e48434dcd617b6c452f45702faff7a2e96fa463702326/mempalace-3.4.1.tar.gz", hash = "sha256:7f7982f3a37d96560274aca385fb60199e32a1159939e7b50e581230cc9265a8", size = 25109136, upload-time = "2026-06-15T09:39:06.678Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ac/3e/27936499c22259acda3cf793b9c6d0d0038a83fce50cfcddf2703b034c12/mempalace-3.6.0.tar.gz", hash = "sha256:6e80dd335a071d93452d6f52c457be74211cbdc8f67acda19665899d11a8ffd7", size = 25312229, upload-time = "2026-07-17T10:52:58.126Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7f/41/6a29ac07c72528b2b4c8e7be1f3754ca0b001f70bcaaed32085b4cf8118a/mempalace-3.4.1-py3-none-any.whl", hash = "sha256:d926e79d29f2d9d85780adb6f248ccf57775b33c56f53347d54d2e5d688f34dd", size = 491175, upload-time = "2026-06-15T09:39:03.978Z" },
+    { url = "https://files.pythonhosted.org/packages/98/db/c6369c7d300ea161dc1115f2bca23485122483e13db6e8ee05686982d1d8/mempalace-3.6.0-py3-none-any.whl", hash = "sha256:924341896d88e6d586734211fc431ed65baf7fbc26bce499337f8eaf108d91aa", size = 580713, upload-time = "2026-07-17T10:52:56.496Z" },
 ]
 
 [[package]]
@@ -1679,7 +1679,7 @@ wheels = [
 
 [[package]]
 name = "openai"
-version = "2.43.0"
+version = "2.48.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -1691,14 +1691,14 @@ dependencies = [
     { name = "tqdm" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f3/fa/88d0c58a0c58df7e6758e66b99c5d028d5e0bb49f8812d7203940cd9dbf1/openai-2.43.0.tar.gz", hash = "sha256:e74d238200a26868977002190fb6631613480a93dfe0c9c982e77021ed60a017", size = 785369, upload-time = "2026-06-17T17:06:56.06Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2a/ae/d4d1835488c0350424009dac5095b9a3e173bee12fd2e421ee27e2142c42/openai-2.48.0.tar.gz", hash = "sha256:231b1e7661dda14574986c2f71451e9d584b7fe69e0ee6480e12ed090b48fc16", size = 1093427, upload-time = "2026-07-23T20:15:50.402Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a3/d2/ba767f4bbb30776c03d40906a2d3afad716a165ffa1771fc23b8992f7920/openai-2.43.0-py3-none-any.whl", hash = "sha256:65a670b54fadf2268c9e1330133373c963eb779ee969e5cbad419ec2c21dce97", size = 1355077, upload-time = "2026-06-17T17:06:53.614Z" },
+    { url = "https://files.pythonhosted.org/packages/b5/2a/dcb891114e303c4379d4a498f10222e33eee540bcef4e1e493bd0af2b242/openai-2.48.0-py3-none-any.whl", hash = "sha256:c98df30aaaf93c51979f64d3e7c5b76464f8be0173368266229eb8fe6bd30f2c", size = 1648520, upload-time = "2026-07-23T20:15:48.052Z" },
 ]
 
 [[package]]
 name = "openrouter"
-version = "0.11.3"
+version = "1.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpcore" },
@@ -1706,9 +1706,9 @@ dependencies = [
     { name = "jsonpath-python" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f8/e4/6408a4d0e9e18d6e65178297a20c62175567bceec613e6b8a9405651de67/openrouter-0.11.3.tar.gz", hash = "sha256:349ec72ccb1c879205eafc201baca0569f3031d87b4700d1820d539f65ecdf75", size = 354772, upload-time = "2026-07-03T20:00:33.924Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8f/3e/813fba70f40f1acdccb3cbe98498adfcb21898de55fddbbea995675afbce/openrouter-1.1.2.tar.gz", hash = "sha256:4ac659dcf66a767a7ccddc0a0432ff5e567461471ccb379d1378b514044775e2", size = 395437, upload-time = "2026-07-25T23:41:31.027Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1f/1e/95ac462ce2484e1bda01ca302631f7ac11fac227228c170b592f0c9593c2/openrouter-0.11.3-py3-none-any.whl", hash = "sha256:3d9c7483fb94f2d4f5f1256d619daac0698cb08b537997fbbc6240c5a8e5890f", size = 792565, upload-time = "2026-07-03T20:00:32.638Z" },
+    { url = "https://files.pythonhosted.org/packages/d0/30/0bedd326392c7762688d5a5634703218a033f03e39e568747cd6cd37b1e1/openrouter-1.1.2-py3-none-any.whl", hash = "sha256:e62f406e7f5e7c645c7f2368e086bafbac8e97019ad5fa4f714b8daedfbcdc4a", size = 856791, upload-time = "2026-07-25T23:41:29.381Z" },
 ]
 
 [[package]]
@@ -2395,7 +2395,7 @@ wheels = [
 
 [[package]]
 name = "pytest"
-version = "9.0.3"
+version = "9.1.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "colorama", marker = "sys_platform == 'win32'" },
@@ -2406,9 +2406,9 @@ dependencies = [
     { name = "pygments" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7d/0d/549bd94f1a0a402dc8cf64563a117c0f3765662e2e668477624baeec44d5/pytest-9.0.3.tar.gz", hash = "sha256:b86ada508af81d19edeb213c681b1d48246c1a91d304c6c81a427674c17eb91c", size = 1572165, upload-time = "2026-04-07T17:16:18.027Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/e4/47/b9efed96c114afcfa3c9d3fe98a76a1d14c74a9e266d397cf6eb64be5e01/pytest-9.1.1.tar.gz", hash = "sha256:1088fbde8f2b49d95a549a195707afa7a76a3ce9bcadc26b6d71f0ffda5fe313", size = 1636369, upload-time = "2026-06-19T10:58:32.857Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/24/a372aaf5c9b7208e7112038812994107bc65a84cd00e0354a88c2c77a617/pytest-9.0.3-py3-none-any.whl", hash = "sha256:2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9", size = 375249, upload-time = "2026-04-07T17:16:16.13Z" },
+    { url = "https://files.pythonhosted.org/packages/24/25/1de2678b631f5a49215c6c96fff41ba892b0a34df68d6d80292b1b48aa7f/pytest-9.1.1-py3-none-any.whl", hash = "sha256:37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c", size = 386536, upload-time = "2026-06-19T10:58:31.347Z" },
 ]
 
 [[package]]
