@@ -431,9 +431,10 @@ The floor, and it is not negotiable: **no capability may be claimed without some
 red when it is absent.** `install` writes the claim (`.declared.json`: the grants, the provider
 filtered for, the managed files present when the reconcile finished);
 **`basecradle-harness-verify`** (`_verify.py`) proves it and exits nonzero with a specific
-diagnosis; `--emit-claims` prints the rows for the fleet's claims-vs-evidence ledger (Claims
-Manifest Contract v1 — the **NOC owns that contract**; amendments go up through the capital, never
-peer-to-peer). Four things about it are load-bearing, and each has an "obviously fine" broken form:
+diagnosis; **`basecradle-harness-claims`** prints the rows for the fleet's claims-vs-evidence
+ledger (Claims Manifest Contract v1 — the **NOC owns that contract**; amendments go up through the
+capital, never peer-to-peer). Four things about it are load-bearing, and each has an "obviously
+fine" broken form:
 
 - **It proves the *declared* set, never pristine-ness.** An operator edit and a reconcile-ratified
   deletion are both legitimate and neither is a finding. A prover that reddens on legitimate work
@@ -450,7 +451,21 @@ peer-to-peer). Four things about it are load-bearing, and each has an "obviously
   overlay, never from what the manifest remembers laying down, so a pre-#374 deletion reads as the
   retirement it was and is not resurrected.)
 - **The claims are emitted whatever the verdict.** A claim that disappears when it stops being
-  true makes the ledger agree with the box precisely when the box is wrong.
+  true makes the ledger agree with the box precisely when the box is wrong. **That is why the
+  emitter is its own console script and not a verify flag** (issue #376): the NOC's enumerated-op
+  wrapper runs a component's emitter from its own baked map, as a **bare bin with no arguments**,
+  as the agent's own user under `env -i`, and a bare `basecradle-harness-verify` prints a human
+  report and exits 1 on a finding — right logic, wrong shape for that seam. So
+  `basecradle-harness-claims` (`emit_main`) is a command whose *whole* behavior is "state the
+  claims": no arguments, because the config home comes from `$HOME` and the subject from the OS
+  user, which is what makes the manifest describe the agent it runs as (the wrapper refuses any
+  other subject, so an emitter offering `--subject` would be offering to speak for someone else);
+  and **exit 0 whatever the verdict**, including on a box with no config home at all — refusing
+  there is the tempting inversion and installs *no manifest*, which deletes every row for that
+  agent and turns a specific, probeable `harness-config-home` red into a generic "the emitter
+  failed": green-while-absent reappearing one level up, inside the instrument built to catch it.
+  Nonzero means only *the claims cannot be stated*. Both emitters serialize through one
+  `claims_document`, so "they agree" is construction, not discipline.
 
 What it deliberately does **not** prove is *activation* — a present tool can still be inactive for
 want of a key — because folding that in would make a missing `AI_API_KEY` read as a stripped

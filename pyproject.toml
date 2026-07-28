@@ -75,6 +75,11 @@ basecradle-harness-resolve = "basecradle_harness._resolve:main"
 # a granted opt-in tool is missing, the overlay predates the running package, or the state cannot
 # be proven at all. `--emit-claims` prints its rows for the fleet claims-vs-evidence ledger.
 basecradle-harness-verify = "basecradle_harness._verify:main"
+# Print this agent's claims manifest and exit 0 — the emitter the NOC's enumerated-op wrapper runs
+# from its baked KNOWN_CLAIM_EMITTERS map (issue #376): a bare bin, no arguments, as the agent's own
+# user under `env -i`. Separate from verify because that seam needs a command whose *whole* behavior
+# is "state the claims": bare verify prints a human report and exits 1 on a finding.
+basecradle-harness-claims = "basecradle_harness._verify:emit_main"
 
 [project.urls]
 Homepage = "https://basecradle.com"

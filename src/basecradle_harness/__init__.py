@@ -127,7 +127,7 @@ from basecradle_harness._system_prompt import (
 )
 from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
-from basecradle_harness._verify import Finding, VerifyReport, claims, verify
+from basecradle_harness._verify import Finding, VerifyReport, claims, claims_document, verify
 from basecradle_harness._version import __version__
 from basecradle_harness._wake import (
     BreakerDecision,
@@ -169,6 +169,7 @@ __all__ = [
     "read_declaration",
     "verify",
     "claims",
+    "claims_document",
     "VerifyReport",
     "Finding",
     "MarkStore",

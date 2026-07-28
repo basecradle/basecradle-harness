@@ -32,11 +32,21 @@ authority — ``basecradle-harness-wake --resolved-config`` reads the live resol
 and folding it in here would make a missing ``AI_API_KEY`` read as a stripped overlay. The report
 says so in-band (``notes``) rather than leaving it for a reader to remember.
 
-The claims emitter (``--emit-claims``) is the other half: it prints this agent's rows for the
-fleet's claims-vs-evidence ledger (Claims Manifest Contract v1, owned by the NOC), each pointing
-at this same command as its probe. It is deliberately **independent of the verdict** — a box whose
-verify is red must still emit its claims, or the ledger loses the row and the absence goes back to
-being invisible, which is where this started.
+The claims emitter is the other half: it prints this agent's rows for the fleet's
+claims-vs-evidence ledger (Claims Manifest Contract v1, owned by the NOC), each pointing at this
+same command as its probe. It is deliberately **independent of the verdict** — a box whose verify
+is red must still emit its claims, or the ledger loses the row and the absence goes back to being
+invisible, which is where this started.
+
+It has **two** entrypoints, and the second one is the seam the NOC's collector actually uses
+(issue #376). ``basecradle-harness-verify --emit-claims`` is the human/ad-hoc form; the NOC's
+enumerated-op wrapper instead runs a component's emitter from a **baked** map
+(``KNOWN_CLAIM_EMITTERS[basecradle-harness]=basecradle-harness-claims``) as a bare bin with **no
+arguments**, as the agent's own OS user under ``env -i`` — so the emitter must be a command whose
+*whole* behavior is "print this agent's manifest and exit 0". The bare ``basecradle-harness-verify``
+cannot be that command: it prints a human report and exits 1 on a finding. Hence
+``basecradle-harness-claims`` (`emit_main`), a thin alias that serializes through the same
+`claims_document` so the two can never drift.
 """
 
 from __future__ import annotations
@@ -48,6 +58,7 @@ import logging
 import os
 import shlex
 import sys
+import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -744,6 +755,28 @@ def _is_prompt(rel: str) -> bool:
     return rel.startswith("prompts/")
 
 
+def claims_document(
+    home: str | os.PathLike[str] | None = None,
+    *,
+    subject: str | None = None,
+) -> str:
+    """The claims manifest as the exact bytes an emitter prints — serialized in **one** place.
+
+    Two commands emit this manifest — ``basecradle-harness-claims`` and
+    ``basecradle-harness-verify --emit-claims`` — and for the same box they must produce the same
+    bytes, because the NOC installs one of them root-owned as the file the ledger and every later
+    probe read. "They both call ``json.dumps``" is not that guarantee; it is two call sites that
+    agree until one of them gains a keyword. So there is one call site, and both entrypoints write
+    what it returns.
+
+    ``ensure_ascii`` is left at its default *deliberately* here, which is the opposite of the rule
+    `_session` follows: these bytes are not context to be measured, they are a file written under
+    ``env -i LC_ALL=C``, where ``sys.stdout`` encodes as ASCII. An escaped manifest always survives
+    that pipe; a raw one would fail on the first non-Latin character in a path.
+    """
+    return json.dumps(claims(home, subject=subject), indent=2, sort_keys=True)
+
+
 # --- the CLI ------------------------------------------------------------------
 
 
@@ -824,7 +857,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.emit_claims:
-        print(json.dumps(claims(args.config_home, subject=args.subject), indent=2, sort_keys=True))
+        print(claims_document(args.config_home, subject=args.subject))
         return 0
 
     report = verify(
@@ -842,3 +875,70 @@ def main(argv: list[str] | None = None) -> int:
         # and so a failure is never mistaken for output.
         print(report.summary(), file=sys.stderr)
     return 0 if report.ok else 1
+
+
+def emit_main(argv: list[str] | None = None) -> int:
+    """The ``basecradle-harness-claims`` entrypoint: print this agent's manifest, and nothing else.
+
+    This is the shape the NOC's enumerated-op wrapper requires of a claims emitter (issue #376,
+    consumer spec basecradle-noc#406). ``provision-claims`` looks the command up in its own **baked**
+    ``KNOWN_CLAIM_EMITTERS`` map — the authorization boundary, ratified by installing the wrapper —
+    and runs it as the agent's own OS user under ``env -i`` with nothing but ``HOME``, a venv-first
+    ``PATH`` and ``LC_ALL=C``. Three properties follow, and none of them is decoration:
+
+    **It takes no arguments, by design, not by omission.** It answers both questions through the
+    ordinary resolvers — `config_home` and `agent_slug`, the same two a wake and an installer use,
+    overrides and all — which under the wrapper's stripped environment reduce to exactly ``HOME``
+    and the OS user, because the fleet sets neither ``BASECRADLE_CONFIG_HOME`` nor
+    ``BASECRADLE_AGENT_SLUG``. So the manifest describes *the agent this process is*, which is what
+    makes it trustworthy: the wrapper refuses any manifest whose ``subject`` is not
+    ``agent:<the slug it launched>``, so an emitter offering a ``--subject`` override would be
+    offering to state claims about an agent it is not. `main`'s ``--emit-claims`` keeps those
+    switches because it is the ad-hoc form, run by a human who already knows which box they mean.
+
+    **It exits 0 whatever the verify verdict**, for the reason `claims` exists at all: the rows are
+    a *declaration*, not a verdict. A red box that emitted nothing would take its own claims out of
+    the ledger at the exact moment the ledger is the thing that would have caught it. The verdict
+    arrives separately, and later, when the NOC runs each row's probe.
+
+    **A box with no config home therefore still emits** — the two unconditional rows (see `claims`)
+    — rather than failing. This is the one place the issue's phrasing and its byte-for-byte
+    requirement pull apart, and the resolution is not a preference: exiting nonzero here would make
+    ``provision-claims`` install *no manifest at all*, which deletes every row for that agent from
+    the ledger and turns a specific, probeable ``harness-config-home`` red into a generic "the
+    emitter failed" — the green-while-absent shape reappearing one level up, inside the instrument
+    built to catch it. Nonzero is reserved for genuinely *not being able to state the claims*: no
+    resolvable ``HOME``, an unwritable stdout, anything unforeseen. For those the wrapper's "the
+    component cannot state its claims" is exactly the right failure, and the reason is on stderr,
+    which the wrapper keeps (bounded) and shows.
+    """
+    parser = argparse.ArgumentParser(
+        prog="basecradle-harness-claims",
+        description=(
+            "Print this agent's claims manifest (Claims Manifest Contract v1) as JSON and exit 0. "
+            "Takes no arguments: the config home comes from $HOME and the subject slug from the "
+            "OS user, so the manifest always describes the agent this command runs as. Exits "
+            "nonzero only when the claims cannot be stated at all."
+        ),
+    )
+    parser.parse_args(argv)
+    try:
+        document = claims_document()
+        # Built first, then written and flushed inside the guard: a serialization failure must not
+        # leave half a manifest on stdout, and a flush that fails at interpreter shutdown instead
+        # would exit nonzero with an "Exception ignored" traceback rather than a stated reason.
+        sys.stdout.write(document + "\n")
+        sys.stdout.flush()
+    except Exception as error:  # noqa: BLE001 - any failure here is "cannot emit", which is the verdict
+        # The one-line reason goes **first** and the stack after it, deliberately: the wrapper shows
+        # a bounded *head* of stderr, and the head of a traceback is the top of the stack — three
+        # venv paths, and never the exception that a reader needs. This way the truncated view is
+        # the diagnosis and the full view (journald, or a human running it directly) is the stack.
+        print(
+            f"basecradle-harness-claims: cannot state this agent's claims: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
+        traceback.print_exc()
+        return 1
+    return 0
