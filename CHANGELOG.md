@@ -7,6 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.95.1] - 2026-07-28
+
+### Added: `basecradle-harness-claims`, the no-arg claims emitter (issue #376)
+
+0.95.0 shipped the emission path as `basecradle-harness-verify --emit-claims`. Right logic, wrong
+*shape* for the seam that consumes it. The NOC's enumerated-op wrapper does not accept a command
+from anyone — that would make its deploy key an arbitrary-code-execution channel into every agent
+box. It resolves a component's emitter from its **own baked map**
+(`KNOWN_CLAIM_EMITTERS[basecradle-harness]`) and runs it as a **bare bin with no arguments**, as the
+agent's own OS user under `env -i`, requiring three things of it: a Contract v1 JSON object on
+stdout, the invoking agent as the subject, and **exit 0 whatever the verify verdict**. The bare
+`basecradle-harness-verify` cannot be that command — it prints a human report and exits 1 on a
+finding.
+
+So the emission path is now its own console script, a thin alias over the same code:
+
+```bash
+basecradle-harness-claims                          # this agent's manifest on stdout; always exit 0
+basecradle-harness-verify --emit-claims            # the same bytes, with --config-home/--subject
+```
+
+**It takes no arguments by design, not by omission.** The config home comes from `$HOME` and the
+subject slug from the OS user it runs as, so the manifest always describes *the agent this command
+runs as* — which is exactly the property the wrapper relies on when it validates that a manifest's
+`subject` is the agent it launched. An emitter that accepted a `--subject` would be offering to
+state claims about an agent it is not. `--emit-claims` keeps the switches because it is the ad-hoc
+form, run by a human who already knows which box they mean.
+
+**A box with no config home still emits**, rather than failing — the one place the shape's obvious
+reading and its byte-for-byte requirement pull apart, and not a preference. Exiting nonzero there
+reads as the careful answer and is the worse one: `provision-claims` would install *no manifest*,
+which deletes every row for that agent from the ledger and turns a specific, probeable
+`harness-config-home` red into a generic "the emitter failed" — green-while-absent reappearing one
+level up, inside the instrument built to catch it. Nonzero is reserved for genuinely *not being
+able to state the claims* (no resolvable `$HOME`, an unwritable stdout), with the reason on stderr
+in one line, which is what the wrapper keeps and shows.
+
+Both entrypoints serialize through one `claims_document`, so identical output is construction
+rather than discipline — two `json.dumps` call sites agree until one of them gains a keyword.
+
 ## [0.95.0] - 2026-07-27
 
 ### Added: the declared capability set, and a fail-closed prover for it (issue #374)

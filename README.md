@@ -203,7 +203,7 @@ wake end timeline=019e77… outcome=ok turns=1 steps=2/24 posted=0 duration=3.31
 | `model_params.json` | *(optional, config-home file — not an env var)* operator-owned model-call parameters (`temperature`, `max_tokens`, `reasoning`, …). See [Model parameters](#model-parameters--model_paramsjson) |
 | `HARNESS_SYSTEM_PROMPT` | *(legacy fallback)* standing instructions. The charter is now sourced from real files under the config home — see [The config home](#the-config-home-installer--upgrader) — and this is consulted only when the config home was never installed |
 | `BASECRADLE_CONFIG_HOME` | *(optional)* where the config home lives. Defaults to `$HOME/.config/basecradle` |
-| `BASECRADLE_AGENT_SLUG` | *(optional)* this agent's slug, used as the `agent:<slug>` subject of `basecradle-harness-verify --emit-claims`. Defaults to the OS user, which on a fleet box *is* the slug — set it only where that does not hold |
+| `BASECRADLE_AGENT_SLUG` | *(optional)* this agent's slug, used as the `agent:<slug>` subject of the [claims manifest](#state-the-claims--basecradle-harness-claims). Defaults to the OS user, which on a fleet box *is* the slug — set it only where that does not hold |
 | `HARNESS_MEMORY_PROVIDER` | *(optional)* the [memory backend](#swap-the-memory-backend--the-memory-provider) the agent binds: `sqlite` (default), `mempalace`, or a `module:Class` path to your own. `basecradle-harness-wake --resolved-config` reports the **bound** one, so a dropped var never silently downgrades an agent's memory unseen |
 | `HARNESS_CONTEXT_MESSAGES` | *(optional)* how many backlog messages to seed as context — an integer, or `all` for the whole timeline. Defaults to `50` |
 | `HARNESS_ONBOARD` | *(optional)* orient the agent on startup — a bounded Dashboard summary prepended to the poll loop's charter, and (under a router) the [persistent operating brief](#run-under-a-router-wake-mode) re-asserted each wake. **On by default**; set to a falsy value (`0`/`false`/`no`/`off`) to come up with only your own charter |
@@ -329,7 +329,7 @@ turns red when a claimed capability is not there:
 ```bash
 basecradle-harness-verify                          # exit 0 = proven; exit 1 = a specific gap
 basecradle-harness-verify --json                   # the same verdict, machine-readable
-basecradle-harness-verify --expect-version 0.95.0  # …and the pin you deployed
+basecradle-harness-verify --expect-version 0.95.1  # …and the pin you deployed
 ```
 
 Every reconcile writes `.declared.json` — this agent's **declaration**: the powerful stems it was
@@ -359,19 +359,45 @@ installed, a declaration that will not parse, a declaration from a `contract` th
 know — each exits nonzero, because "nothing to check, looks fine" is the original defect wearing a
 checker's clothes.
 
-**For a fleet deployer.** `--emit-claims` prints this agent's rows for a claims-vs-evidence ledger
-(Claims Manifest Contract v1) — one `dependency`-class row per declared capability, each naming
-this same command as its probe and `<config-home>/.verified.json` (written on a *successful*
-verify, so its timestamp is the age of a real proof) as its evidence:
+Run the probe **as the agent, with its environment**; without one it falls back to the config
+home's own `agent.env` for `AI_PROVIDER` and, failing that, says in the finding that it had to
+assume.
+
+### State the claims — `basecradle-harness-claims`
+
+A verdict answers *is this agent's declared set here?* A **claim** is the other half: the row that
+says this agent asserts the capability at all, so a ledger somewhere else can ask, on a schedule,
+*when was that last demonstrably true?* This command prints those rows — one `dependency`-class row
+per declared capability (Claims Manifest Contract v1), each naming `basecradle-harness-verify` as
+its probe and `<config-home>/.verified.json` (written on a *successful* verify, so its timestamp is
+the age of a real proof) as its evidence:
 
 ```bash
-basecradle-harness-verify --emit-claims            # subject: agent:<slug>, from $BASECRADLE_AGENT_SLUG or the OS user
+basecradle-harness-claims                          # this agent's manifest on stdout; always exit 0
+basecradle-harness-verify --emit-claims            # the same manifest, with --config-home/--subject
 ```
 
-It emits the claims **whatever the verdict** — a claim that disappears when it stops being true
-would make the ledger agree with the box precisely when the box is wrong. Run the probe **as the
-agent, with its environment**; without one it falls back to the config home's own `agent.env` for
-`AI_PROVIDER` and, failing that, says in the finding that it had to assume.
+The two print **identical bytes** for the same box. They differ only in who is asking:
+
+- **`basecradle-harness-claims` takes no arguments, on purpose.** It answers both questions through
+  the ordinary resolvers — which, in the stripped environment a collector runs it under, means the
+  config home from `$HOME` and the subject slug from the OS user. So the manifest always describes
+  *the agent this command runs as*, which is the property a collector relies on when it runs the
+  bin bare, as that agent. An emitter that accepted a `--subject` would be offering to state claims
+  about an agent it is not.
+- **`--emit-claims` keeps the switches** because it is the ad-hoc form, run by a human who already
+  knows which box and which agent they mean.
+
+Two things it does **whatever the state of the box**, and both are the point:
+
+- **It exits 0 even when `basecradle-harness-verify` exits 1.** The rows are a *declaration*, not a
+  verdict — a red box that emitted nothing would take its own claims out of the ledger at the exact
+  moment the ledger is what would have caught it. The verdict arrives separately, when each row's
+  probe runs.
+- **A box with no config home still emits** the two unconditional rows (`harness-config-home`,
+  `harness-package-pin`), so even a never-installed agent has something in the ledger to be red
+  about. Nonzero is reserved for genuinely *not being able to state the claims* — no resolvable
+  `$HOME`, an unwritable stdout — and the reason goes to stderr, in one line.
 
 ### A stem is not a tool name — `basecradle-harness-resolve`
 

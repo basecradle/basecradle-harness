@@ -23,6 +23,8 @@ from basecradle_harness._verify import (
     DECLARATION_CONTRACT,
     VerifyReport,
     claims,
+    claims_document,
+    emit_main,
     main,
     verify,
 )
@@ -448,6 +450,152 @@ def test_emit_claims_exits_zero_on_a_failing_box(converged, monkeypatch, capsys)
 
     assert code == 0  # a declaration, not a verdict
     assert json.loads(capsys.readouterr().out)["subject"] == "agent:jt"
+
+
+# --- the no-arg emitter (issue #376) ------------------------------------------
+#
+# The seam: the NOC's enumerated-op wrapper runs a component's emitter from its own baked map, as a
+# bare bin with NO arguments, as the agent's OS user under `env -i` (HOME + a venv-first PATH). What
+# it requires is exactly three things — a Contract v1 object on stdout, the invoking agent as the
+# subject, and exit 0 whatever the verify verdict — so those are what these pin. The environment is
+# reproduced rather than described: every test here clears the two overrides the wrapper does not
+# pass, and points HOME at the box under test.
+
+
+@pytest.fixture
+def as_the_agent(tmp_path, monkeypatch):
+    """A converged box reached the way the wrapper reaches it: ``HOME`` alone, no overrides.
+
+    Deliberately *not* the `converged` fixture with an override bolted on. The whole no-arg
+    contract is that ``$HOME/.config/basecradle`` is the answer, so a test that pointed
+    ``BASECRADLE_CONFIG_HOME`` at the box would prove the emitter works in an environment the
+    wrapper never gives it.
+    """
+    monkeypatch.setattr(_install, "_packaged_defaults", lambda: dict(V1))
+    monkeypatch.delenv("BASECRADLE_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("BASECRADLE_AGENT_SLUG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    root = tmp_path / "home" / ".config" / "basecradle"
+    install(root, provider="openai", opt_in=["power"])
+    assert _install.config_home() == root  # the resolution under test, not an assumption
+    return root
+
+
+def test_the_emitter_prints_a_contract_v1_manifest_for_the_invoking_agent(
+    as_the_agent, monkeypatch, capsys
+):
+    _verifying(monkeypatch)
+    monkeypatch.setattr(_verify.getpass, "getuser", lambda: "jt")
+
+    code = emit_main([])
+
+    assert code == 0
+    manifest = json.loads(capsys.readouterr().out)
+    assert manifest["contract"] == 1
+    assert manifest["component"] == "basecradle-harness"
+    # The wrapper refuses any manifest whose subject is not the agent it launched, and it passes no
+    # --subject: the OS user *is* the answer, per the fleet's one-slug-everywhere rule.
+    assert manifest["subject"] == "agent:jt"
+    assert "overlay-tool:power" in [row["claim"] for row in manifest["claims"]]
+
+
+def test_the_emitter_exits_zero_on_a_red_box(as_the_agent, monkeypatch, capsys):
+    """The whole reason bare verify cannot serve this seam: a finding must not suppress the rows."""
+    _verifying(monkeypatch)
+    (as_the_agent / "tools" / "power.py").unlink()  # the strip verify reddens on
+    assert not verify(as_the_agent, provider="openai", record=False).ok
+
+    code = emit_main([])
+
+    assert code == 0
+    ids = [row["claim"] for row in json.loads(capsys.readouterr().out)["claims"]]
+    assert "overlay-tool:power" in ids  # the row that must be there *to be* red
+
+
+def test_the_emitter_matches_emit_claims_byte_for_byte(as_the_agent, monkeypatch, capsys):
+    """One red box, two entrypoints, identical bytes — one serializer guarantees it, not discipline.
+
+    The NOC installs whichever one it ran as the root-owned file every later probe resolves its
+    `cmd` out of, so a drift between them would be a manifest that describes a box nobody emitted.
+    Neither call names a subject: the *default* resolution has to agree too, or the wrapper's
+    subject check would pass for one form and fail for the other on the same box.
+    """
+    _verifying(monkeypatch)
+    (as_the_agent / "tools" / "power.py").unlink()  # the DoD's state: a red verdict
+
+    assert emit_main([]) == 0
+    from_emitter = capsys.readouterr().out
+    assert main(["--config-home", str(as_the_agent), "--emit-claims"]) == 0
+    from_verify = capsys.readouterr().out
+
+    assert from_emitter == from_verify
+    assert json.loads(from_emitter)["claims"]  # not two empty strings agreeing
+
+
+def test_the_emitter_still_states_the_unconditional_rows_with_no_config_home(
+    tmp_path, monkeypatch, capsys
+):
+    """A box with nothing installed emits and exits 0 — refusing would delete its own red row.
+
+    Exiting nonzero here reads as the safer answer and is the worse one: `provision-claims` would
+    install no manifest, so the ledger would hold *zero* rows for this agent and the specific,
+    probeable `harness-config-home` red becomes a generic "the emitter failed" — green-while-absent
+    reappearing one level up, inside the instrument built to catch it.
+    """
+    monkeypatch.delenv("BASECRADLE_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("BASECRADLE_AGENT_SLUG", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "never-installed"))
+
+    code = emit_main([])
+
+    assert code == 0
+    manifest = json.loads(capsys.readouterr().out)
+    assert [row["claim"] for row in manifest["claims"]] == [
+        "harness-config-home",
+        "harness-package-pin",
+    ]
+
+
+def test_the_emitter_exits_nonzero_and_says_why_when_it_cannot_emit(monkeypatch, capsys):
+    """The one nonzero case: the claims genuinely cannot be stated. The reason goes to stderr.
+
+    The wrapper keeps a bounded head of stderr and shows it on failure, so a one-line reason is
+    what turns "the component cannot state its claims" into something actionable — where an
+    uncaught traceback would spend that budget on the *top* of a stack it truncates.
+    """
+
+    def unresolvable(_home=None):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(_verify, "config_home", unresolvable)
+
+    code = emit_main([])
+
+    captured = capsys.readouterr()
+    assert code == 1
+    assert captured.out == ""  # never half a manifest
+    assert "cannot state this agent's claims" in captured.err
+    assert "Could not determine home directory." in captured.err
+
+
+def test_the_emitter_takes_no_arguments(as_the_agent, monkeypatch):
+    """Not an omission: the wrapper validates the subject against the agent it launched, so an
+    emitter that accepted a --subject would be offering to state claims about an agent it is not."""
+    _verifying(monkeypatch)
+
+    for rejected in (["--subject", "someone-else"], ["--config-home", str(as_the_agent)]):
+        with pytest.raises(SystemExit) as exit_:
+            emit_main(rejected)
+        assert exit_.value.code == 2  # argparse refused the question, not the emitter the claims
+
+
+def test_the_claims_document_is_the_bytes_that_get_written(converged, monkeypatch):
+    _verifying(monkeypatch)
+
+    document = claims_document(converged, subject="jt")
+
+    assert json.loads(document) == claims(converged, subject="jt")
+    assert document == json.dumps(claims(converged, subject="jt"), indent=2, sort_keys=True)
 
 
 # --- the incident-1 regression ------------------------------------------------
