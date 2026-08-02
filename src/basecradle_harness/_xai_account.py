@@ -1,4 +1,4 @@
-"""Read the agent's own xAI prepaid credit balance — cost self-awareness (issue #179).
+"""Read the agent's own xAI credit runway — cost self-awareness (issues #179, #384).
 
 An xAI persona whose charter treats capital as a first-class concern can see its remaining
 runway and reason about it — throttle, prioritize cheap experiments, or ask a human to top up
@@ -8,26 +8,40 @@ It talks to the xAI **Management API** (`management-api.x.ai`), a billing/accoun
 distinct from the inference endpoint (`api.x.ai`), with its own dedicated credential — a
 read-only **Management Key** (`XAI_MANAGEMENT_KEY`), never the agent's inference `AI_API_KEY`.
 So it is a plain, read-only function `Tool` (no platform client, no policy capability, no shell)
-that makes one authenticated HTTPS GET and returns a figure — the same locked-profile-safe shape
+that makes authenticated HTTPS GETs and returns a figure — the same locked-profile-safe shape
 as `web_fetch`.
+
+**The posted ledger is not the runway, and that is the whole point of this tool (issue #384).**
+`…/prepaid/balance` returns a *settled* ledger: its SPEND rows are keyed by billing period and
+land at **cycle close**, not continuously. So mid-cycle it reports credit that has in fact
+already been consumed, and the gap grows as the cycle progresses — measured live on 2026-08-02,
+the ledger said **$517.49** while the Console showed **$47.42** remaining against **$469.51** of
+usage. That is not a parse or a sign bug; it is the wrong *question*. A runway instrument that
+silently answers it is worse than no instrument, because an agent reads the number as spendable
+and keeps spending. The live figure lives on the **postpaid invoice preview**
+(`…/postpaid/invoice/preview` → `coreInvoice.prepaidCredits`), which nets the cycle's unposted
+usage. **Do not "simplify" this back to the ledger alone.** The ledger is still read, but only
+as *context*, and it is never presented as remaining credit — when the preview is unavailable
+the tool says so in the same breath as the ledger total and calls it an upper bound.
 
 Two things the live API taught us that the naive sketch got wrong (both verified against a real
 account, issue #179):
 
-- **The balance lives at `total.val` as a string of USD *cents*** — not `total.amount`/
-  `total.value`. And the **sign is inverted**: credit *added* (a PURCHASE) is stored negative,
-  credit *spent* positive, so the available balance in dollars is the *negated* cents / 100 (the
-  docs' own example: `val "-1000"` = `$10.00`). Getting this wrong reports a healthy positive
-  balance as a negative one.
+- **A figure lives at `<field>.val` as a string of USD *cents*** — not `.amount`/`.value`. And
+  the **sign convention is inverted**: *credit* is stored negative and *spend* positive, so a
+  credit figure in dollars is the *negated* cents / 100 (the docs' own example: `val "-1000"` =
+  `$10.00`). Getting this wrong reports a healthy positive balance as a negative one. The same
+  convention governs the preview: `prepaidCredits` and `prepaidCreditsUsed` are credit-signed
+  (negative), while `totalWithCorr` is a spend figure and is already positive.
 - **The team path segment is a UUID, not the literal `"default"`** — that 400s (`Invalid uuid`).
   The key knows its own team, so the tool *discovers* it from the management-key validation
   endpoint; `XAI_TEAM_ID` is an optional override, not a required (and misleading) default.
 
 Everything fails **soft**: a missing key, the wrong scope, an unreachable endpoint, or an
-unexpected response all return a clear "balance unavailable — <reason>" string rather than
-raising, so a billing check never derails a wake. And it is careful with what it exposes: it
-never logs or returns the key, and it never returns the raw billing payload (whose `changes`
-ledger carries purchase/invoice history) — only the one computed balance figure the agent needs.
+unexpected response all return a clear "unavailable — <reason>" string rather than raising, so a
+billing check never derails a wake. And it is careful with what it exposes: it never logs or
+returns the key, and it never returns a raw billing payload (whose `changes` ledger carries
+purchase/invoice history) — only the computed figures the agent needs.
 """
 
 from __future__ import annotations
@@ -35,6 +49,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -50,14 +65,14 @@ DEFAULT_BASE_URL = "https://management-api.x.ai"
 #: never block a wake for long, so this is short — a timeout is a ceiling, not a fixed wait.
 DEFAULT_TIMEOUT = 15.0
 
-#: How long a fetched balance is reused before re-reading (seconds). A prepaid balance moves
-#: slowly, and a model reasoning about its runway may check it more than once in a turn; a short
-#: cache keeps those from each hitting the billing endpoint. ``0`` disables caching entirely.
+#: How long a fetched figure is reused before re-reading (seconds). Credit moves slowly, and a
+#: model reasoning about its runway may check it more than once in a turn; a short cache keeps
+#: those from each hitting the billing endpoint. ``0`` disables caching entirely.
 DEFAULT_CACHE_TTL = 30.0
 
 
 class _BalanceUnavailable(Exception):
-    """An internal signal carrying a model-readable reason the balance couldn't be read.
+    """An internal signal carrying a model-readable reason a figure couldn't be read.
 
     Raised by the request/parse helpers and turned into the tool's ``"unavailable — <reason>"``
     return string by `run`. Its message is always safe to show the model — it names *what* went
@@ -65,18 +80,38 @@ class _BalanceUnavailable(Exception):
     """
 
 
+@dataclass(frozen=True)
+class _Cycle:
+    """The live mid-cycle picture, read off the postpaid invoice preview.
+
+    `remaining_usd` is the answer the tool exists to give — prepaid credit net of this cycle's
+    usage so far. The other two are context (and optional: a preview that carries the remaining
+    figure but not the breakdown still answers the question), rendered so the model can see the
+    burn behind the number rather than just its level.
+    """
+
+    remaining_usd: float
+    usage_usd: float | None
+    prepaid_used_usd: float | None
+
+
 class XaiAccountBalanceTool(Tool):
-    """`xai_account_balance` — report this agent's own xAI prepaid credit balance.
+    """`xai_account_balance` — report the credit remaining on this agent's own xAI account.
 
     A plain read-only `Tool` (no platform client, no policy capability) that calls the xAI
     Management API with a dedicated `XAI_MANAGEMENT_KEY` (read-only billing scope), so an xAI
     agent can see its remaining credit and reason about its runway. Its plugin gates it to the
     xAI provider (`Vendor("xai")`) and marks it opt-in like every powerful tool.
 
+    The figure it leads with is the **live** one — prepaid credit net of the current billing
+    cycle's usage, from the postpaid invoice preview — never the posted prepaid ledger, which
+    settles at cycle close and overstates runway mid-cycle (issue #384). The ledger is read as
+    context and, if the preview is unavailable, reported *as a labelled upper bound* rather than
+    as remaining credit.
+
     It degrades to a clear ``"xAI account balance unavailable — <reason>"`` string in every
     failure mode (no key, wrong scope, endpoint unreachable, unexpected response) rather than
-    raising. It never logs or returns the key or the raw billing payload — only the computed
-    balance figure.
+    raising. It never logs or returns the key or a raw billing payload — only computed figures.
 
     Args:
         management_key: The Management Key. ``None`` (the default) reads `XAI_MANAGEMENT_KEY`
@@ -85,18 +120,19 @@ class XaiAccountBalanceTool(Tool):
             is discovered from the key itself (and cached on the instance).
         base_url: The Management API root (for a proxy or a test double).
         timeout: Per-request timeout in seconds.
-        cache_ttl: Seconds to reuse a fetched balance before re-reading; ``0`` disables it.
+        cache_ttl: Seconds to reuse a fetched figure before re-reading; ``0`` disables it.
         clock: The monotonic clock the cache measures against (injectable for tests).
     """
 
     name = "xai_account_balance"
     description = (
-        "Check the real-time prepaid credit balance of your own xAI account, in US dollars. Use "
-        "it to reason about your runway — throttle or prioritize cheap work when credit is low, "
-        "or ask a human to top up before you run dry mid-task. Takes no arguments and can see "
-        "only your own account's balance, nothing else. (When an X Developer account is linked, "
-        "X API credit purchases grant free xAI credits, so this figure can reflect X-side spend "
-        "rewards too.)"
+        "Check the credit remaining on your own xAI account right now, in US dollars — the live "
+        "figure, net of the current billing cycle's usage so far (which the posted prepaid "
+        "ledger does not yet reflect, and so overstates). Use it to reason about your runway: "
+        "throttle or prioritize cheap work when credit is low, or ask a human to top up before "
+        "you run dry mid-task. Takes no arguments and can see only your own account, nothing "
+        "else. (When an X Developer account is linked, X API credit purchases grant free xAI "
+        "credits, so this figure can reflect X-side spend rewards too.)"
     )
     parameters = NO_PARAMETERS
 
@@ -117,10 +153,10 @@ class XaiAccountBalanceTool(Tool):
         self._cache_ttl = cache_ttl
         self._clock = clock
         self._resolved_team: str | None = None
-        self._cached: tuple[float, str] | None = None  # (monotonic expiry, balance text)
+        self._cached: tuple[float, str] | None = None  # (monotonic expiry, rendered text)
 
     def run(self) -> str:
-        """Fetch and format the prepaid balance, or a clear reason it is unavailable."""
+        """Report the live credit remaining, or a clear reason it is unavailable."""
         key = self._management_key or os.environ.get("XAI_MANAGEMENT_KEY")
         if not key:
             return (
@@ -132,30 +168,44 @@ class XaiAccountBalanceTool(Tool):
         if cached is not None:
             return cached
 
-        try:
-            with httpx.Client(
-                headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
-            ) as client:
+        headers = {"Authorization": f"Bearer {key}"}
+        with httpx.Client(headers=headers, timeout=self._timeout) as client:
+            # The team is a hard precondition — neither figure is reachable without it.
+            try:
                 team = self._team(client)
-                balance_usd = self._balance(client, team)
-        except _BalanceUnavailable as exc:
-            return f"xAI account balance unavailable — {exc}"
-        except httpx.RequestError as exc:
-            return (
-                f"xAI account balance unavailable — couldn't reach the xAI Management API ({exc})."
-            )
+            except _BalanceUnavailable as exc:
+                return f"xAI account balance unavailable — {exc}"
 
-        text = _render(balance_usd, self._now_utc())
+            # The two figures are *alternatives*, not a chain: the preview is the answer, the
+            # ledger is context, and either can fail without taking the other down with it.
+            try:
+                cycle: _Cycle | None = self._cycle(client, team)
+                no_cycle = ""
+            except _BalanceUnavailable as exc:
+                cycle, no_cycle = None, str(exc)
+            try:
+                posted: float | None = self._posted(client, team)
+            except _BalanceUnavailable:
+                posted = None
+
+        as_of = self._now_utc()
+        if cycle is not None:
+            text = _render_live(cycle, posted, as_of)
+        elif posted is not None:
+            text = _render_posted_only(posted, no_cycle, as_of)
+        else:
+            return f"xAI account balance unavailable — {no_cycle}"
+
         if self._cache_ttl > 0:
             self._cached = (self._clock() + self._cache_ttl, text)
         return text
 
-    # --- the two HTTP calls ---------------------------------------------------
+    # --- the three HTTP calls -------------------------------------------------
 
     def _team(self, client: httpx.Client) -> str:
         """The team UUID: an explicit override, else discovered from the key (then cached).
 
-        The balance endpoint's path segment is a team *UUID* — the literal ``"default"`` 400s
+        The billing endpoints' path segment is a team *UUID* — the literal ``"default"`` 400s
         (``Invalid uuid``). The management-key validation endpoint reports the team the key acts
         for, so a correctly-scoped key needs no `XAI_TEAM_ID` at all; the override just skips the
         discovery call.
@@ -166,8 +216,7 @@ class XaiAccountBalanceTool(Tool):
         if self._resolved_team is not None:
             return self._resolved_team
 
-        response = client.get(f"{self._base_url}/auth/management-keys/validation")
-        data = self._json(response, "validate the management key")
+        data = self._get(client, "/auth/management-keys/validation", "validate the management key")
         team = data.get("teamId")
         if not isinstance(team, str) or not team:
             raise _BalanceUnavailable(
@@ -177,18 +226,35 @@ class XaiAccountBalanceTool(Tool):
         self._resolved_team = team
         return team
 
-    def _balance(self, client: httpx.Client, team: str) -> float:
-        """Read the prepaid balance for `team` and return it in USD dollars."""
-        response = client.get(f"{self._base_url}/v1/billing/teams/{team}/prepaid/balance")
-        data = self._json(response, "read the prepaid balance")
-        return _parse_balance_usd(data)
+    def _cycle(self, client: httpx.Client, team: str) -> _Cycle:
+        """The live mid-cycle figures — the answer, read off the postpaid invoice preview."""
+        data = self._get(
+            client,
+            f"/v1/billing/teams/{team}/postpaid/invoice/preview",
+            "read the live credits remaining",
+        )
+        return _parse_cycle(data)
 
-    def _json(self, response: httpx.Response, action: str) -> dict[str, Any]:
-        """Decode a Management API response to JSON, mapping failures to soft reasons.
+    def _posted(self, client: httpx.Client, team: str) -> float:
+        """The *posted* prepaid ledger total in USD — context only, never the runway figure."""
+        data = self._get(
+            client,
+            f"/v1/billing/teams/{team}/prepaid/balance",
+            "read the posted prepaid ledger",
+        )
+        return _parse_posted_usd(data)
+
+    def _get(self, client: httpx.Client, path: str, action: str) -> dict[str, Any]:
+        """GET a Management API path and decode it, mapping every failure to a soft reason.
 
         Never surfaces the response *body*: a 4xx billing body can echo account detail, and the
-        contract is that only the computed balance figure ever leaves this tool.
+        contract is that only computed figures ever leave this tool.
         """
+        try:
+            response = client.get(f"{self._base_url}{path}")
+        except httpx.RequestError as exc:
+            raise _BalanceUnavailable(f"couldn't reach the xAI Management API ({exc}).") from None
+
         status = response.status_code
         if status in (401, 403):
             raise _BalanceUnavailable(
@@ -214,7 +280,7 @@ class XaiAccountBalanceTool(Tool):
     # --- caching --------------------------------------------------------------
 
     def _cached_balance(self) -> str | None:
-        """The cached balance text if still fresh, else ``None``."""
+        """The cached text if still fresh, else ``None``."""
         if self._cached is None:
             return None
         expiry, text = self._cached
@@ -223,37 +289,136 @@ class XaiAccountBalanceTool(Tool):
         return None
 
     def _now_utc(self) -> datetime:
-        """Wall-clock now, in UTC — the ``as of`` stamp on a freshly-read balance."""
+        """Wall-clock now, in UTC — the ``as of`` stamp on a freshly-read figure."""
         return datetime.now(timezone.utc)
 
 
-def _parse_balance_usd(data: dict[str, Any]) -> float:
-    """The available prepaid balance in USD dollars, from the Management API's cents ledger.
+def _parse_cycle(data: dict[str, Any]) -> _Cycle:
+    """The live mid-cycle figures from the postpaid invoice preview.
+
+    Shape: ``{"coreInvoice": {"prepaidCredits": {"val": "-11847"}, "totalWithCorr": {"val":
+    "7138"}, "prepaidCreditsUsed": {"val": "-7138"}}}``. Credit figures are stored **negative**
+    (the module-wide convention) and are negated back to dollars; ``totalWithCorr`` is a *spend*
+    figure and is already positive.
+
+    Only ``prepaidCredits`` is required — it is the answer. **It is negated, never ``abs()``d:**
+    an absolute value would render a positive (overdrawn) reading as healthy available credit,
+    silently inverting the one condition this tool exists to warn about.
+    """
+    core = data.get("coreInvoice")
+    if not isinstance(core, dict):
+        raise _BalanceUnavailable(
+            "the xAI Management API's invoice preview carried no coreInvoice."
+        )
+    remaining_cents = _cents(core, "prepaidCredits")
+    if remaining_cents is None:
+        raise _BalanceUnavailable(
+            "the xAI Management API's invoice preview carried no usable prepaidCredits figure."
+        )
+    usage_cents = _cents(core, "totalWithCorr")
+    used_cents = _cents(core, "prepaidCreditsUsed")
+    return _Cycle(
+        remaining_usd=-remaining_cents / 100.0,
+        usage_usd=None if usage_cents is None else usage_cents / 100.0,
+        prepaid_used_usd=None if used_cents is None else -used_cents / 100.0,
+    )
+
+
+def _cents(holder: dict[str, Any], field: str) -> int | None:
+    """The integer cents at ``holder[field]["val"]``, or ``None`` if absent or unparseable."""
+    figure = holder.get(field)
+    if not isinstance(figure, dict) or "val" not in figure:
+        return None
+    try:
+        return int(str(figure["val"]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_posted_usd(data: dict[str, Any]) -> float:
+    """The **posted** prepaid ledger total in USD — a settled figure, not the runway.
 
     The endpoint returns ``{"total": {"val": "<cents>"}, "changes": [...]}`` where ``val`` is a
-    **string** of USD cents whose **sign is inverted**: credit added (a PURCHASE) is stored
-    negative and credit spent positive, so the current *available* balance in dollars is the
-    negated cents / 100 (the docs' own example: ``val "-1000"`` = ``$10.00``). This — the field
-    name, the string type, and the inverted sign — was verified live against a real account
-    (issue #179), where the ``changes`` ledger summed exactly to ``total``.
+    string of USD cents in the inverted (credit-negative) convention, so the total in dollars is
+    the negated cents / 100. Its SPEND rows settle at **cycle close**, which is exactly why this
+    figure is context and never the answer — see the module docstring and issue #384.
     """
     total = data.get("total")
     if not isinstance(total, dict) or "val" not in total:
-        raise _BalanceUnavailable("the xAI Management API response carried no balance total.")
+        raise _BalanceUnavailable("the xAI Management API response carried no ledger total.")
     try:
         cents = int(str(total["val"]))
     except (TypeError, ValueError):
         raise _BalanceUnavailable(
-            "the xAI Management API returned a non-numeric balance."
+            "the xAI Management API returned a non-numeric ledger total."
         ) from None
     return -cents / 100.0
 
 
-def _render(balance_usd: float, as_of: datetime) -> str:
-    """Format the balance as one model-readable line carrying the figure and an ``as of`` stamp."""
-    stamp = as_of.isoformat(timespec="seconds").replace("+00:00", "Z")
-    if balance_usd < 0:
-        figure = f"-${abs(balance_usd):,.2f} (the account is overdrawn)"
-    else:
-        figure = f"${balance_usd:,.2f}"
-    return f"xAI prepaid credit balance: {figure} USD (as of {stamp})."
+def _dollars(usd: float) -> str:
+    """A signed USD figure — ``$42.50`` / ``-$5.00``."""
+    return f"-${abs(usd):,.2f}" if usd < 0 else f"${usd:,.2f}"
+
+
+def _stamp(as_of: datetime) -> str:
+    """The ``as of`` timestamp, ISO-8601 to the second with a ``Z`` suffix."""
+    return as_of.isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _headline(label: str, usd: float, as_of: datetime) -> str:
+    """One uniform headline shape: label, signed figure, ``USD``, stamp.
+
+    Deliberately *uniform* — an overdraft is called out in the body rather than spliced into the
+    headline, so the figure is always in the same place and a reader (or a regex, or the model)
+    never has to parse around a parenthetical that appears only sometimes.
+    """
+    return f"{label}: {_dollars(usd)} USD (as of {_stamp(as_of)})."
+
+
+def _overdraft(usd: float) -> list[str]:
+    """The overdraft sentence, when there is one — leading the context so it is not buried."""
+    return ["The account is overdrawn."] if usd < 0 else []
+
+
+def _render_live(cycle: _Cycle, posted_usd: float | None, as_of: datetime) -> str:
+    """The good case: the live remaining figure, with the burn and the ledger behind it.
+
+    The posted ledger is included *labelled*, which is the point — an agent that meets that
+    larger number elsewhere (the Console, another client reading `…/prepaid/balance`) can now
+    tell what it is instead of treating it as spendable.
+    """
+    context = _overdraft(cycle.remaining_usd)
+    context.append("Live figure — prepaid credit net of this billing cycle's usage so far.")
+    if cycle.usage_usd is not None:
+        drawn = (
+            f", {_dollars(cycle.prepaid_used_usd)} of it drawn from prepaid credit"
+            if cycle.prepaid_used_usd is not None
+            else ""
+        )
+        context.append(f"This cycle: {_dollars(cycle.usage_usd)} used{drawn}.")
+    if posted_usd is not None:
+        context.append(
+            f"Posted prepaid ledger: {_dollars(posted_usd)} — that total settles only at cycle "
+            "close, so mid-cycle it overstates runway; it is not what you have left to spend."
+        )
+    headline = _headline("xAI credits remaining", cycle.remaining_usd, as_of)
+    return f"{headline}\n" + " ".join(context)
+
+
+def _render_posted_only(posted_usd: float, reason: str, as_of: datetime) -> str:
+    """The degraded case: the ledger total, explicitly *not* offered as remaining credit.
+
+    The one thing this must never do is let a posted total pass as a live one (issue #384), so
+    the disclaimer leads the second line rather than trailing it, and the label on the figure
+    itself says "posted prepaid ledger", never "remaining" or "available".
+    """
+    context = [
+        (
+            f"This is NOT your remaining credit — the live figure was unavailable: {reason} The "
+            "posted ledger settles only at cycle close, so mid-cycle it overstates runway by "
+            "roughly this cycle's unbilled usage. Treat it as an upper bound, not a budget."
+        ),
+        *_overdraft(posted_usd),
+    ]
+    headline = _headline("xAI posted prepaid ledger total", posted_usd, as_of)
+    return f"{headline}\n" + " ".join(context)

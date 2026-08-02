@@ -1,9 +1,13 @@
-# Default tool plugin: xai_account_balance — read the agent's own xAI prepaid credit balance.
+# Default tool plugin: xai_account_balance — read the credit remaining on the agent's own xAI
+# account.
 #
 # A plain read-only function Tool (not a server-side built-in): it calls the xAI *Management API*
 # (management-api.x.ai) with a dedicated read-only Management Key (XAI_MANAGEMENT_KEY), a
 # billing/account surface distinct from the inference endpoint and its AI_API_KEY. So an xAI
 # persona whose charter treats capital as first-class can see its own remaining runway.
+#
+# The figure is the *live* one — prepaid credit net of the current billing cycle's usage — not the
+# posted prepaid ledger, which settles at cycle close and overstates runway mid-cycle (issue #384).
 #
 # Powerful (it reaches an account/billing surface with a dedicated credential) → opt_in
 # everywhere (issue #168): off by default on every provider, activates only when this file is
@@ -17,6 +21,6 @@ from basecradle_harness import ToolPlugin, Vendor, XaiAccountBalanceTool
 PLUGIN = ToolPlugin(
     impl=XaiAccountBalanceTool,
     requires=(Vendor("xai"),),
-    note="Reads your own xAI prepaid credit balance (read-only billing; xAI provider only).",
+    note="Reads the live credit remaining on your own xAI account (read-only billing; xAI only).",
     opt_in=True,
 )

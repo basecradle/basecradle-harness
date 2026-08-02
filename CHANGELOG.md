@@ -7,6 +7,62 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.96.0] - 2026-08-02
+
+### Fixed: `xai_account_balance` reports the *live* credits remaining, not the posted ledger (issue #384)
+
+The tool read `…/prepaid/balance` and rendered its `total` as the agent's runway. That endpoint is
+a **settled** ledger: its SPEND rows are keyed by billing period and land at **cycle close**, not
+continuously. So mid-cycle it reports credit the account has in fact already consumed, and the gap
+widens as the cycle runs. Measured live on 2026-08-02 (reported by @origin, diagnosed by @briggs):
+the tool said **$517.49** while the Console showed **$47.42** remaining against **$469.51** of
+30-day usage — an overstatement of roughly the entire unposted cycle.
+
+The arithmetic and the auth path were fine; the *question* was wrong, and that is the worse kind of
+defect for this tool. `xai_account_balance` is chartered as a runway instrument — its whole purpose
+is that an agent throttles or asks for a top-up before it runs dry — so a number that reads as
+spendable and is not is worse than no number at all.
+
+The live figure comes from the **postpaid invoice preview**, which nets the cycle's unposted usage:
+
+```text
+GET /v1/billing/teams/{teamId}/postpaid/invoice/preview
+  coreInvoice.prepaidCredits      → prepaid still available right now   (the answer)
+  coreInvoice.totalWithCorr       → this cycle's usage so far           (context)
+  coreInvoice.prepaidCreditsUsed  → prepaid applied against this cycle  (context)
+```
+
+The output leads with that figure and is labelled so the semantics cannot regress quietly:
+
+```text
+xAI credits remaining: $118.47 USD (as of 2026-08-02T07:05:11Z).
+Live figure — prepaid credit net of this billing cycle's usage so far. This cycle: $71.38 used,
+$71.38 of it drawn from prepaid credit. Posted prepaid ledger: $517.49 — that total settles only
+at cycle close, so mid-cycle it overstates runway; it is not what you have left to spend.
+```
+
+Four things about the shape, each deliberate:
+
+- **The posted ledger is still read, but only as *labelled context*.** It is not dead weight: the
+  Console and any other client reading `…/prepaid/balance` (CodexBar among them) show that larger
+  number, so an agent that meets it elsewhere can now tell what it is instead of treating it as
+  spendable. It is never called "remaining" or "available".
+- **When the preview is unavailable the tool falls back to the ledger *as an explicit upper
+  bound***, never as live remaining — the fallback headline reads `xAI posted prepaid ledger
+  total:` and the line under it says, in the model's face, that this is **not** remaining credit
+  and why. Losing the ledger, conversely, does not lose the answer: it is context, not a
+  dependency.
+- **The credit figure is negated, never `abs()`d.** An absolute value would render a positive
+  (overdrawn) reading as healthy available credit — silently inverting the one condition the tool
+  exists to warn about. This keeps the module-wide inverted-sign convention: credit is stored
+  negative, spend positive.
+- **The `unavailable` path is not cached**, so a transient billing outage cannot pin the tool at
+  "unavailable" for the whole TTL.
+
+The mid-cycle divergence now has a regression test (the ledger's `$517.49` against the preview's
+`$118.47`, in the live proportions), and the live smoke test carries the invariant a fixture
+cannot: **the live figure never exceeds the posted ledger**, which is the direction of the bug.
+
 ## [0.95.1] - 2026-07-28
 
 ### Added: `basecradle-harness-claims`, the no-arg claims emitter (issue #376)
