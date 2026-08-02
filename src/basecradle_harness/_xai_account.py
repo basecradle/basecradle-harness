@@ -1,4 +1,4 @@
-"""Read the agent's own xAI credit runway — cost self-awareness (issues #179, #384).
+"""Read the agent's own xAI credit runway — cost self-awareness (issues #179, #384, #388).
 
 An xAI persona whose charter treats capital as a first-class concern can see its remaining
 runway and reason about it — throttle, prioritize cheap experiments, or ask a human to top up
@@ -19,10 +19,23 @@ the ledger said **$517.49** while the Console showed **$47.42** remaining agains
 usage. That is not a parse or a sign bug; it is the wrong *question*. A runway instrument that
 silently answers it is worse than no instrument, because an agent reads the number as spendable
 and keeps spending. The live figure lives on the **postpaid invoice preview**
-(`…/postpaid/invoice/preview` → `coreInvoice.prepaidCredits`), which nets the cycle's unposted
-usage. **Do not "simplify" this back to the ledger alone.** The ledger is still read, but only
-as *context*, and it is never presented as remaining credit — when the preview is unavailable
-the tool says so in the same breath as the ledger total and calls it an upper bound.
+(`…/postpaid/invoice/preview`). **Do not "simplify" this back to the ledger alone.** The ledger
+is still read, but only as *context*, and it is never presented as remaining credit — when the
+preview is unavailable the tool says so in the same breath as the ledger total and calls it an
+upper bound.
+
+**The live figure is a *subtraction*, and reading one field of the preview was the same defect
+one surface in (issue #388).** `coreInvoice.prepaidCredits` is not "credit left to spend": it is
+the prepaid credit this cycle is drawing *against*, before netting what it has already drawn, and
+`coreInvoice.prepaidCreditsUsed` is that draw. The Console's **Credits remaining** is the
+difference. Reporting the first field alone overstated runway roughly threefold on a live account
+— 2026-08-02 21:14 UTC, `prepaidCredits` **$168.47** against a Console showing **$52.14**, where
+$168.47 − $116.66 drawn = **$51.81** — so getting the surface right in #384 fixed the *question*
+and left the *arithmetic* wrong. Both fields are therefore required: a preview carrying only
+`prepaidCredits` is not a live reading at all and is treated as an unavailable one, never as
+remaining credit. And `totalWithCorr` is **not** a stand-in for the draw — it is the cycle's
+*total* spend, including whatever ran past prepaid onto the postpaid invoice, so subtracting it
+renders a merely-exhausted account as a phantom overdraft.
 
 Two things the live API taught us that the naive sketch got wrong (both verified against a real
 account, issue #179):
@@ -84,15 +97,21 @@ class _BalanceUnavailable(Exception):
 class _Cycle:
     """The live mid-cycle picture, read off the postpaid invoice preview.
 
-    `remaining_usd` is the answer the tool exists to give — prepaid credit net of this cycle's
-    usage so far. The other two are context (and optional: a preview that carries the remaining
-    figure but not the breakdown still answers the question), rendered so the model can see the
-    burn behind the number rather than just its level.
+    `remaining_usd` is the answer the tool exists to give, and it is a **subtraction** (issue
+    #388): the prepaid credit this cycle draws against, less what it has drawn so far. It is
+    *derived* rather than stored, so the headline figure and the two terms behind it can never
+    disagree. `usage_usd` is context and optional — the cycle's *total* spend, which runs past
+    the prepaid draw once prepaid is exhausted and is therefore never a stand-in for it.
     """
 
-    remaining_usd: float
+    prepaid_usd: float
+    prepaid_used_usd: float
     usage_usd: float | None
-    prepaid_used_usd: float | None
+
+    @property
+    def remaining_usd(self) -> float:
+        """Prepaid credit net of this cycle's draw — the Console's *Credits remaining*."""
+        return self.prepaid_usd - self.prepaid_used_usd
 
 
 class XaiAccountBalanceTool(Tool):
@@ -103,11 +122,12 @@ class XaiAccountBalanceTool(Tool):
     agent can see its remaining credit and reason about its runway. Its plugin gates it to the
     xAI provider (`Vendor("xai")`) and marks it opt-in like every powerful tool.
 
-    The figure it leads with is the **live** one — prepaid credit net of the current billing
-    cycle's usage, from the postpaid invoice preview — never the posted prepaid ledger, which
-    settles at cycle close and overstates runway mid-cycle (issue #384). The ledger is read as
-    context and, if the preview is unavailable, reported *as a labelled upper bound* rather than
-    as remaining credit.
+    The figure it leads with is the **live** one — the postpaid invoice preview's prepaid credit
+    *less this cycle's draw against it* (issue #388), which is what the Console calls **Credits
+    remaining**. It is never the posted prepaid ledger, which settles at cycle close and overstates
+    runway mid-cycle (issue #384), and never the preview's undrawn `prepaidCredits` alone. The
+    ledger is read as context and, if the preview is unavailable, reported *as a labelled upper
+    bound* rather than as remaining credit.
 
     It degrades to a clear ``"xAI account balance unavailable — <reason>"`` string in every
     failure mode (no key, wrong scope, endpoint unreachable, unexpected response) rather than
@@ -127,8 +147,9 @@ class XaiAccountBalanceTool(Tool):
     name = "xai_account_balance"
     description = (
         "Check the credit remaining on your own xAI account right now, in US dollars — the live "
-        "figure, net of the current billing cycle's usage so far (which the posted prepaid "
-        "ledger does not yet reflect, and so overstates). Use it to reason about your runway: "
+        "figure, net of what this billing cycle has already drawn from your prepaid credit (which "
+        "the posted prepaid ledger does not yet reflect, and so overstates). Use it to reason "
+        "about your runway: "
         "throttle or prioritize cheap work when credit is low, or ask a human to top up before "
         "you run dry mid-task. Takes no arguments and can see only your own account, nothing "
         "else. (When an X Developer account is linked, X API credit purchases grant free xAI "
@@ -296,31 +317,41 @@ class XaiAccountBalanceTool(Tool):
 def _parse_cycle(data: dict[str, Any]) -> _Cycle:
     """The live mid-cycle figures from the postpaid invoice preview.
 
-    Shape: ``{"coreInvoice": {"prepaidCredits": {"val": "-11847"}, "totalWithCorr": {"val":
-    "7138"}, "prepaidCreditsUsed": {"val": "-7138"}}}``. Credit figures are stored **negative**
-    (the module-wide convention) and are negated back to dollars; ``totalWithCorr`` is a *spend*
-    figure and is already positive.
+    Shape: ``{"coreInvoice": {"prepaidCredits": {"val": "-16847"}, "prepaidCreditsUsed": {"val":
+    "-11666"}, "totalWithCorr": {"val": "11666"}}}``. Credit figures are stored **negative** (the
+    module-wide convention) and are negated back to dollars; ``totalWithCorr`` is a *spend* figure
+    and is already positive.
 
-    Only ``prepaidCredits`` is required — it is the answer. **It is negated, never ``abs()``d:**
-    an absolute value would render a positive (overdrawn) reading as healthy available credit,
-    silently inverting the one condition this tool exists to warn about.
+    ``prepaidCredits`` **and** ``prepaidCreditsUsed`` are both required, because the answer is
+    their difference (issue #388) — the first alone is the credit the cycle draws *against*, not
+    what is left of it. So a preview carrying only the first is not a live reading at all: it
+    raises, and the caller falls back to the posted ledger *labelled an upper bound*, which is the
+    single place this tool is permitted to show a figure that is not the runway. Returning
+    ``prepaidCredits`` as remaining is the defect itself, and it is the shape a "tolerant" parse
+    reintroduces.
+
+    Both are **negated, never ``abs()``d:** an absolute value would render a positive (overdrawn)
+    reading as healthy available credit, silently inverting the one condition this tool exists to
+    warn about.
     """
     core = data.get("coreInvoice")
     if not isinstance(core, dict):
         raise _BalanceUnavailable(
             "the xAI Management API's invoice preview carried no coreInvoice."
         )
-    remaining_cents = _cents(core, "prepaidCredits")
-    if remaining_cents is None:
+    prepaid_cents = _cents(core, "prepaidCredits")
+    used_cents = _cents(core, "prepaidCreditsUsed")
+    if prepaid_cents is None or used_cents is None:
+        missing = "prepaidCredits" if prepaid_cents is None else "prepaidCreditsUsed"
         raise _BalanceUnavailable(
-            "the xAI Management API's invoice preview carried no usable prepaidCredits figure."
+            f"the xAI Management API's invoice preview carried no usable {missing} figure; the "
+            "live remaining credit is prepaidCredits minus prepaidCreditsUsed, so both are needed."
         )
     usage_cents = _cents(core, "totalWithCorr")
-    used_cents = _cents(core, "prepaidCreditsUsed")
     return _Cycle(
-        remaining_usd=-remaining_cents / 100.0,
+        prepaid_usd=-prepaid_cents / 100.0,
+        prepaid_used_usd=-used_cents / 100.0,
         usage_usd=None if usage_cents is None else usage_cents / 100.0,
-        prepaid_used_usd=None if used_cents is None else -used_cents / 100.0,
     )
 
 
@@ -383,19 +414,19 @@ def _overdraft(usd: float) -> list[str]:
 def _render_live(cycle: _Cycle, posted_usd: float | None, as_of: datetime) -> str:
     """The good case: the live remaining figure, with the burn and the ledger behind it.
 
-    The posted ledger is included *labelled*, which is the point — an agent that meets that
-    larger number elsewhere (the Console, another client reading `…/prepaid/balance`) can now
-    tell what it is instead of treating it as spendable.
+    The subtraction is **shown**, not merely performed (issue #388): an agent that meets
+    `prepaidCredits` elsewhere — the Console's own invoice preview, another client — can see which
+    number that is and why it is the larger one. The posted ledger is included *labelled* for the
+    same reason: every bigger figure this account can show is named here, so none of them can pass
+    itself off as spendable.
     """
     context = _overdraft(cycle.remaining_usd)
-    context.append("Live figure — prepaid credit net of this billing cycle's usage so far.")
+    context.append(
+        f"Live figure — {_dollars(cycle.prepaid_usd)} of prepaid credit less the "
+        f"{_dollars(cycle.prepaid_used_usd)} this billing cycle's usage has drawn from it."
+    )
     if cycle.usage_usd is not None:
-        drawn = (
-            f", {_dollars(cycle.prepaid_used_usd)} of it drawn from prepaid credit"
-            if cycle.prepaid_used_usd is not None
-            else ""
-        )
-        context.append(f"This cycle: {_dollars(cycle.usage_usd)} used{drawn}.")
+        context.append(f"This cycle: {_dollars(cycle.usage_usd)} used in total.")
     if posted_usd is not None:
         context.append(
             f"Posted prepaid ledger: {_dollars(posted_usd)} — that total settles only at cycle "

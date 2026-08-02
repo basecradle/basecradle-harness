@@ -6,8 +6,9 @@
 # billing/account surface distinct from the inference endpoint and its AI_API_KEY. So an xAI
 # persona whose charter treats capital as first-class can see its own remaining runway.
 #
-# The figure is the *live* one — prepaid credit net of the current billing cycle's usage — not the
-# posted prepaid ledger, which settles at cycle close and overstates runway mid-cycle (issue #384).
+# The figure is the *live* one — the invoice preview's prepaid credit less what this billing cycle
+# has already drawn from it (issue #388). It is neither the posted prepaid ledger, which settles at
+# cycle close and overstates runway mid-cycle (issue #384), nor that undrawn prepaid figure alone.
 #
 # Powerful (it reaches an account/billing surface with a dedicated credential) → opt_in
 # everywhere (issue #168): off by default on every provider, activates only when this file is

@@ -7,6 +7,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.96.1] - 2026-08-02
+
+### Fixed: the live credits-remaining figure nets the cycle's prepaid draw (issue #388)
+
+0.96.0 moved `xai_account_balance` off the posted ledger and onto the postpaid invoice preview —
+the right *surface* — and then read one field of it. `coreInvoice.prepaidCredits` is not "credit
+left to spend": it is the prepaid credit the cycle is drawing **against**, before netting what it
+has already drawn, and `coreInvoice.prepaidCreditsUsed` is that draw. The Console's **Credits
+remaining** is the difference. So the tool was still ~3× high, measured live on 2026-08-02
+(reported by @origin, diagnosed by @briggs):
+
+```text
+GET /v1/billing/teams/{teamId}/postpaid/invoice/preview     (2026-08-02 ~21:14 UTC)
+  coreInvoice.prepaidCredits.val      = "-16847"   →  $168.47   ← what 0.96.0 reported
+  coreInvoice.prepaidCreditsUsed.val  = "-11666"   →  $116.66
+  Console "Credits remaining"                      →   $52.14
+  $168.47 − $116.66                                →   $51.81   ← the answer
+```
+
+The same shape held that morning against a Console showing `$47.42`: `$118.47 − $71.38 = $47.09`.
+
+Both terms are now **required**. A preview carrying only `prepaidCredits` is not a live reading at
+all — it degrades to the posted ledger *labelled an upper bound*, which is the one place this tool
+is permitted to show a figure that is not the runway. The tolerant parse (fall back to
+`prepaidCredits` when the draw is missing) *is* the defect, so it is refused rather than guessed.
+
+The subtraction is now **shown**, not merely performed, so every larger figure this account can
+display is named where an agent meets it:
+
+```text
+xAI credits remaining: $51.81 USD (as of 2026-08-02T21:14:03Z).
+Live figure — $168.47 of prepaid credit less the $116.66 this billing cycle's usage has drawn
+from it. This cycle: $116.66 used in total. Posted prepaid ledger: $567.49 — that total settles
+only at cycle close, so mid-cycle it overstates runway; it is not what you have left to spend.
+```
+
+Three things carried over deliberately:
+
+- **`totalWithCorr` is never substituted for the draw.** It is the cycle's *total* spend, which
+  runs past prepaid onto the postpaid invoice, so subtracting it would render a merely-exhausted
+  account as a phantom overdraft. It stays context.
+- **Nothing is `abs()`d.** An overdraft is now *born* in the subtraction as well as read off a
+  stored sign — $1.00 of prepaid credit against $6.00 drawn is `-$5.00`, and it renders as an
+  overdraft, never as healthy credit.
+- **The posted-ledger context and its upper-bound fallback are unchanged** — #384's half stands.
+
+The live smoke test gains the guard that was missing: it now checks the headline against an
+**independent oracle** — the raw preview, fetched without the tool — asserting the figure equals
+`prepaidCredits − prepaidCreditsUsed` and sits strictly below `prepaidCredits` whenever the cycle
+has drawn anything. Without it that file passed on this bug, because the ledger was larger still.
+
 ## [0.96.0] - 2026-08-02
 
 ### Fixed: `xai_account_balance` reports the *live* credits remaining, not the posted ledger (issue #384)
