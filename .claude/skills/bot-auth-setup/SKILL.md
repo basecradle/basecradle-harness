@@ -1,12 +1,12 @@
 ---
 name: bot-auth-setup
-description: Operational setup so this session's git commits, pushes, and GitHub API writes act as the basecradle-harness-ai[bot] identity rather than falling through to the ambient gh login (the founder's). Covers the local git author config, minting a short-lived installation token with the fleet gh-app-token helper, and routing both gh and git push through it. Use at the start of any session that will push a branch, open/merge a PR, or comment on an issue as the bot, or when a write unexpectedly lands as drawkkwast. The identity table + post-as-your-own-bot invariant live in CLAUDE.md → Fleet Bot Identity.
+description: Operational setup so this session's git commits, pushes, and GitHub API writes act as the basecradle-harness-ai[bot] identity rather than falling through to the ambient gh login (@origin's). Covers the local git author config, minting a short-lived installation token with the fleet gh-app-token helper, and routing both gh and git push through it. Use at the start of any session that will push a branch, open/merge a PR, or comment on an issue as the bot, or when a write unexpectedly lands as drawkkwast. The identity table + post-as-your-own-bot invariant live in CLAUDE.md → Fleet Bot Identity.
 ---
 
 # Bot Auth Setup — basecradle-harness-ai[bot]
 
 The invariant lives in `CLAUDE.md` → "Fleet Bot Identity / Auth Routing": every issue, comment,
-PR, and commit is attributable to the bot, never anonymously behind the founder's account. This
+PR, and commit is attributable to the bot, never anonymously behind @origin's account. This
 skill is the concrete setup so the write actually lands as the bot.
 
 ## 1. Git author (local, never committed)
@@ -23,7 +23,7 @@ No `Co-Authored-By` trailer on bot commits — the commit author already *is* th
 ## 2. Mint a token and route gh + git through it
 
 Mint a short-lived (~1h) installation token with the shared fleet helper and route **both** `gh`
-and `git push` through it — otherwise `gh` falls through to the ambient login (the founder's) and
+and `git push` through it — otherwise `gh` falls through to the ambient login (@origin's) and
 the write lands as `drawkkwast`:
 
 ```bash
@@ -40,7 +40,7 @@ git push "https://x-access-token:${GH_TOKEN}@github.com/basecradle/basecradle-ha
 
 ## Helper details and gotchas
 
-- The helper (`gh-app-token`) and registry (`fleet-apps.json`) live in the founder's Claude
+- The helper (`gh-app-token`) and registry (`fleet-apps.json`) live in @origin's Claude
   workspace on the laptop; on the fleet server each agent's own provisioned credentials serve this
   role (basecradle#277, the router, has shipped).
 - `gh-app-token --author` prints the commit-author string; `--remote` prints the authenticated
