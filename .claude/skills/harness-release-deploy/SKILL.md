@@ -1,6 +1,6 @@
 ---
 name: harness-release-deploy
-description: Step-by-step procedure for releasing and deploying basecradle-harness — the OIDC Trusted-Publishing pipeline (v* tag → TestPyPI rehearsal → capital-approved pypi env-gate → PyPI), the contractual workflow/environment names, the four-owner build→publish→deploy→verify flow, and the on-box @jt verify commands. Use when cutting a release, bumping the version for a release, waiting on or reasoning about the pypi env-gate, or confirming a release reached and converged the fleet. The standing invariants (released ≠ deployed; no closing keyword on release PRs; the capital not the founder actuates publish) live in CLAUDE.md → Releasing.
+description: Step-by-step procedure for releasing and deploying basecradle-harness — the OIDC Trusted-Publishing pipeline (v* tag → TestPyPI rehearsal → capital-approved pypi env-gate → PyPI), the contractual workflow/environment names, the four-owner build→publish→deploy→verify flow, and the on-box @jt verify commands. Use when cutting a release, bumping the version for a release, waiting on or reasoning about the pypi env-gate, or confirming a release reached and converged the fleet. The standing invariants (released ≠ deployed; no closing keyword on release PRs; the capital not @origin actuates publish) live in CLAUDE.md → Releasing.
 ---
 
 # Harness Release + Deploy Procedure
@@ -10,7 +10,7 @@ The invariants live in `CLAUDE.md` → "Releasing" and govern at all times:
   recurring *released ≠ deployed* failure class).
 - **No closing keyword on a release PR** — close the release issue by hand, only after the package
   is verified live on PyPI, recording version + URL in the closing comment.
-- **The capital, not the founder, actuates publish** (`constitution.md` → Earned Autonomy).
+- **The capital, not @origin, actuates publish** (`constitution.md` → Earned Autonomy).
 
 This skill is the step-by-step pipeline behind them.
 
@@ -46,7 +46,7 @@ section, bump `_version.py`), delete and re-push the tag. The same script runs o
 **Contractual names — never rename:** the workflow filename and the environment names
 `testpypi` / `pypi` match the Trusted Publisher registrations on PyPI/TestPyPI. Renaming any of
 them breaks the trust relationship. The `pypi` environment's required reviewer is `drawkkwast` as
-a *config* fact, but that credential is operated by the **capital** via local `gh` — the founder
+a *config* fact, but that credential is operated by the **capital** via local `gh` — @origin
 is out of the publish loop.
 
 ## The four-owner flow (keep the owners separate)
