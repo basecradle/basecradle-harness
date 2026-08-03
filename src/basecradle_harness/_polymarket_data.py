@@ -31,8 +31,9 @@ The three sources, and why each is used:
   that matters most — each token's `winner` flag, which is how a resolved market is
   recognized. §2.4 requires resolution to come from public market state and never from an
   agent claim; this field is that state.
-- **CLOB `/book`** — the order book the deterministic fill model walks, plus the last trade
-  price the MTM mark falls back to.
+- **CLOB `/book`** — the order book the deterministic fill model walks and the MTM mark is
+  computed from. Its `last_trade_price` is **market**-scoped and is deliberately not used for
+  a token's mark; see `Book.mid`.
 
 **Money is `Decimal`, from the string the API sent.** Polymarket returns prices and sizes
 as strings; parsing them straight into `Decimal` keeps a 0.001 tick exact through a book
@@ -135,7 +136,13 @@ class Book:
     token_id: str
     bids: tuple[Level, ...]  # best (highest price) first
     asks: tuple[Level, ...]  # best (lowest price) first
-    last_trade_price: Decimal | None = None
+
+    #: The CLOB's `last_trade_price` off this token's `/book`, kept **only** because it is on
+    #: the wire — it is deliberately unused. It is named for what it actually is: the field is
+    #: **market**-scoped, not token-scoped, and both tokens of a binary market return the
+    #: identical value (verified live, 2026-08-03). Using it as *this token's* price is issue
+    #: #390's D2 and it is a silent, sign-flipping lie; see `mid`.
+    market_last_trade_price: Decimal | None = None
 
     @property
     def best_bid(self) -> Decimal | None:
@@ -147,11 +154,37 @@ class Book:
 
     @property
     def mid(self) -> Decimal | None:
-        """The MTM mark per §2.4: mid of the two sides, else last trade, else nothing."""
+        """The MTM mark: the midpoint, with an empty side held at the contract's own bound.
+
+        **A missing side is information, not an absence** — and getting that wrong inverted a
+        live position's mark by ~$1,000 (issue #390, D2). An outcome share pays $1.00 or $0.00,
+        so its price is bounded by ``[0, 1]`` *by the instrument's definition*: nobody bidding
+        means the bid side is worth $0.00, and nobody offering means the ask side is capped at
+        $1.00. Substituting those bounds is not an approximation — it is the venue's own
+        convention, and it makes this property agree with the CLOB's published `/midpoint` and
+        with Gamma's `outcomePrices` by construction rather than by luck (checked against live
+        public data, 2026-08-03: a leg with no bids and a $0.001 best ask midpoints at $0.0005
+        upstream, and now here).
+
+        **What it replaced, so nobody helpfully puts it back.** The fallback used to be the
+        `/book` payload's `last_trade_price`, which reads like a per-token field and is not:
+        both tokens of a binary market return the *same* number, because it is the market's
+        last trade — quoted in whichever leg happened to trade. That side is almost always the
+        liquid one, so a deep-out-of-the-money token, which is exactly the token whose bid side
+        is empty, took the **complement's** price. A leg worth $0.0005 marked at $0.999. Nothing
+        errored, no test failed, and the ledger simply recorded a $772.95 unrealized *gain* on a
+        position that had lost everything. A token-scoped last trade does exist upstream
+        (`/last-trade-price?token_id=`), and it is deliberately not used either: with both bounds
+        in place the only book left unpriced is one that is empty on *both* sides, which is a
+        market nobody is trading — and a stale print from a dead book is exactly the confident
+        number D3 exists to stop reporting. ``None`` is the honest answer there.
+        """
         bid, ask = self.best_bid, self.best_ask
-        if bid is not None and ask is not None:
-            return (bid + ask) / Decimal(2)
-        return self.last_trade_price
+        if bid is None and ask is None:
+            return None
+        floor = bid if bid is not None else Decimal(0)
+        ceiling = ask if ask is not None else Decimal(1)
+        return (floor + ceiling) / Decimal(2)
 
 
 @dataclass(frozen=True)
@@ -474,7 +507,7 @@ class PolymarketData:
                 token_id=str(token_id),
                 bids=_levels(body.get("bids"), reverse=True),
                 asks=_levels(body.get("asks"), reverse=False),
-                last_trade_price=_dec_or_none(body.get("last_trade_price")),
+                market_last_trade_price=_dec_or_none(body.get("last_trade_price")),
             )
 
         cached: Book = self._cached("book", str(token_id), fetch)
@@ -488,7 +521,7 @@ class PolymarketData:
                 token_id=cached.token_id,
                 bids=cached.bids,
                 asks=cached.asks,
-                last_trade_price=cached.last_trade_price,
+                market_last_trade_price=cached.market_last_trade_price,
             )
         )
 

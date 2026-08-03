@@ -129,6 +129,19 @@ class Upstream:
         self.search_has_more = False
         self.status = {}  # path -> status code, to force an outage
         self.fail_ids: set[str] = set()  # market ids whose lookup should 503
+        # Tokens whose `/book` 404s. The live CLOB does this the moment it switches a
+        # market's order book off, which is every resolved market (checked 2026-08-03).
+        self.no_book: set[str] = set()
+
+    def delist(self, market_id=MARKET_ID):
+        """Gamma forgets a market entirely — its ordinary lifecycle once one resolves.
+
+        Of 400 resolved markets the CLOB still served with winner flags, 400 were gone from
+        Gamma (measured against live public data, 2026-08-03). This is the normal case, not
+        an edge case, and issue #390 is what it cost.
+        """
+        self.gamma.pop(market_id, None)
+        self.listing = [row for row in self.listing if str(row.get("id")) != market_id]
 
     # -- more markets, for the multi-market and cap cases -----------------------
     def add_market(self, index: int, *, asks=(("0.31", "500"),)) -> str:
@@ -161,14 +174,24 @@ class Upstream:
         return market_id
 
     def resolve(self, winner="Yes", condition_id=CONDITION_ID):
-        """Mark a market resolved in public state — the only way settlement can be triggered."""
+        """Mark a market resolved in public state — the only way settlement can be triggered.
+
+        Shaped exactly as the live CLOB shapes a resolved market, which is more than the
+        winner flags: it also **switches the order book off** and starts 404ing `/book` for
+        both tokens (checked against live public data, 2026-08-03). Fabricating a resolved
+        market that still had a book is what let issue #390's D1 hide — the gate that refused
+        every book-less market sat on the shared resolution path, so nothing in the suite ever
+        settled a market shaped like a real one.
+        """
         market = dict(self.clob[condition_id])
         market["closed"] = True
         market["accepting_orders"] = False
+        market["enable_order_book"] = False
         market["tokens"] = [
             dict(token, winner=(token["outcome"] == winner)) for token in market["tokens"]
         ]
         self.clob[condition_id] = market
+        self.no_book |= {str(token["token_id"]) for token in market["tokens"]}
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
@@ -208,6 +231,8 @@ class Upstream:
                 return httpx.Response(200, json=self.clob[key])
             if path == "/book":
                 token = request.url.params.get("token_id", "")
+                if token in self.no_book:
+                    return httpx.Response(404, json={"error": "no orderbook exists"})
                 return httpx.Response(200, json=self.books.get(token, book(token=token)))
         return httpx.Response(404, json={"error": f"unrouted {host}{path}"})
 

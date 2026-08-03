@@ -170,6 +170,12 @@ FREEZE = "freeze"
 UNFREEZE = "unfreeze"
 NOTE = "note"
 
+#: A tracked market that public data no longer publishes at all, and its counterpart when it
+#: comes back (issue #390). Two row types rather than one flag with a boolean, mirroring
+#: `freeze`/`unfreeze`: each row *is* the transition, so the log reads as the history it is.
+MARKET_GONE = "market_gone"
+MARKET_BACK = "market_back"
+
 #: The store's directory under the agent's home. One level, then one dir per epoch.
 STORE_DIRNAME = "polymarket"
 
@@ -261,7 +267,15 @@ class Forecast:
 
 @dataclass
 class Observation:
-    """One Brier observation: a forecast locked at position-open, scored at settlement."""
+    """One Brier observation: a forecast locked at position-open, scored at settlement.
+
+    `condition_id` is folded from the row (which has always carried it) because it is the
+    **only** handle that survives Gamma dropping a market: an observation whose position was
+    closed before resolution still has to be graded, and by then there may be no position and
+    no order left to read a condition id off (issue #390). Dropping it on the floor is how a
+    market with nothing but an unscored forecast becomes unsettleable — precisely the
+    survivorship hole `markets_to_sweep` exists to close.
+    """
 
     obs_id: str
     market_id: str
@@ -270,6 +284,7 @@ class Observation:
     forecast_id: str
     opened_at: str
     event_id: str = ""
+    condition_id: str = ""
     result: int | None = None  # 1 won, 0 lost, None unresolved
     brier: Decimal | None = None
     scored_at: str = ""
@@ -302,6 +317,8 @@ class PaperState:
     fills: list[dict[str, Any]] = field(default_factory=list)
     observations: dict[str, Observation] = field(default_factory=dict)
     event_clusters: set[str] = field(default_factory=set)
+    #: Market ids public data no longer publishes, so nothing here can be priced (issue #390).
+    unpriceable: dict[str, str] = field(default_factory=dict)  # market_id -> reason
     frozen: bool = False
     frozen_reason: str = ""
     peak_equity: Decimal = Decimal(0)
@@ -322,6 +339,33 @@ class PaperState:
             (o for o in self.orders.values() if o.is_open), key=lambda o: (o.created_at, o.order_id)
         )
 
+    def active_market_ids(self) -> set[str]:
+        """Every market this epoch still has business with.
+
+        Open positions and resting orders are obvious. **Unscored observations are the one that
+        is easy to miss**: an agent that opened a position, closed it at a profit and never
+        touched the market again still has a forecast waiting to be graded, and dropping it
+        would quietly bias the scorecard toward the trades that were held to resolution.
+
+        One definition, two readers — the sweep's work list and the "what cannot be priced"
+        projection. Two copies of this set would drift, and the drift would be invisible: a
+        market the sweep still chases but the projection stops mentioning.
+        """
+        wanted = {p.market_id for p in self.open_positions()}
+        wanted |= {o.market_id for o in self.open_orders()}
+        wanted |= {obs.market_id for obs in self.observations.values() if obs.result is None}
+        return wanted
+
+    def stranded_markets(self) -> list[str]:
+        """Unpriceable markets that still have open work — what an operator must force-resolve.
+
+        Filtered by `active_market_ids` deliberately: once a market's positions are settled and
+        its observations scored, the `market_gone` row stays in the log (it is history, and the
+        log is append-only) but there is nothing left to strand. Reporting it forever would
+        turn a resolved incident into a permanent alarm.
+        """
+        return sorted(self.unpriceable.keys() & self.active_market_ids())
+
     def mark_for(self, position: Position) -> Decimal:
         """The MTM price for a position: the last recorded mark, else its own average cost.
 
@@ -329,8 +373,47 @@ class PaperState:
         defined for a position whose market has not been marked yet — a position opened
         seconds ago, before any sweep. It reads as "no gain, no loss yet", which is the
         honest statement of what is known.
+
+        **A mark on an unpriceable market is discarded, not carried** (issue #390). When public
+        data stops publishing a market, the last mark it left behind does not become the price
+        — it becomes a number with a date on it, and every hour that passes makes it a worse
+        one while it goes on reading as live. Falling back to cost says exactly what is known
+        ("no gain, no loss that anyone here can evidence") and keeps `equity` continuous and
+        defined; the *fact* that it is unpriceable rides beside it in `unpriceable`, so a
+        projection can say so rather than quietly presenting a stale number as a live one.
         """
+        if position.market_id in self.unpriceable:
+            return position.avg_price
         return self.marks.get((position.market_id, position.outcome), position.avg_price)
+
+    def last_known_mark(self, position: Position) -> Decimal | None:
+        """The most recent mark recorded for a position, priceable or not — for display only.
+
+        Deliberately separate from `mark_for`: a projection may *show* an operator the last
+        number the sweep saw, but nothing may compute equity or P&L from it once the market
+        has gone unpriceable. Keeping the two apart is what stops the stale mark from leaking
+        back into the arithmetic through a well-meaning "we already have it here" edit.
+        """
+        return self.marks.get((position.market_id, position.outcome))
+
+    def condition_for(self, market_id: str) -> str:
+        """The CLOB condition id this epoch recorded for a market, or ``""``.
+
+        The ledger is the *only* place this survives once Gamma drops a market, and every row
+        that can create work for the sweep carries it — a position, a resting order, an
+        unscored observation. Read in that order and the sweep can still reach the authoritative
+        resolution source for a market that public discovery has forgotten (issue #390).
+        """
+        for position in self.positions.values():
+            if position.market_id == market_id and position.condition_id:
+                return position.condition_id
+        for order in self.orders.values():
+            if order.market_id == market_id and order.condition_id:
+                return order.condition_id
+        for obs in self.observations.values():
+            if obs.market_id == market_id and obs.condition_id:
+                return obs.condition_id
+        return ""
 
     @property
     def equity(self) -> Decimal:
@@ -420,7 +503,9 @@ def replay(rows: list[dict[str, Any]], *, today: str | None = None) -> PaperStat
 
 #: The row kinds that can move the equity curve. Everything else (a `call`, a `forecast`)
 #: leaves the curve alone, so a busy read-only day does not manufacture drawdown samples.
-_EQUITY_MOVING = frozenset({EPOCH_OPEN, FILL, SETTLEMENT, MARK})
+#: `market_gone` / `market_back` are here because they change what `mark_for` answers — a
+#: market going unpriceable discards its stale mark, which moves equity as surely as a new one.
+_EQUITY_MOVING = frozenset({EPOCH_OPEN, FILL, SETTLEMENT, MARK, MARKET_GONE, MARKET_BACK})
 
 
 def _apply(
@@ -511,6 +596,7 @@ def _apply(
             forecast_id=str(payload.get("forecast_id") or ""),
             opened_at=ts,
             event_id=str(payload.get("event_id") or ""),
+            condition_id=str(payload.get("condition_id") or ""),
         )
         state.observations[obs.obs_id] = obs
         if obs.event_id:
@@ -523,6 +609,16 @@ def _apply(
             obs.result = int(payload.get("result") or 0)
             obs.brier = _dec_or_none(payload.get("brier"))
             obs.scored_at = ts
+        return
+
+    if kind == MARKET_GONE:
+        market_id = str(payload.get("market_id") or "")
+        if market_id:
+            state.unpriceable[market_id] = str(payload.get("reason") or "")
+        return
+
+    if kind == MARKET_BACK:
+        state.unpriceable.pop(str(payload.get("market_id") or ""), None)
         return
 
     if kind == FREEZE:

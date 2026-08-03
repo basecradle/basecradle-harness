@@ -7,6 +7,83 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.97.0] - 2026-08-03
+
+### Fixed: a resolved market could never settle, and a dead leg marked at par (issue #390)
+
+A live `polymarket_paper` position — 1,000 Yes on a Fed-hike market — sat open for four days
+after the Fed had *held*, showing a confident **+$772.95 unrealized gain** on a leg the market
+priced at $0.0005, while the scorecard's `resolved_n` stayed pinned at zero. Nothing errored and
+nothing logged. Three independent defects, each fixed here.
+
+**The mark was inverted.** `Book.mid` fell back to the `/book` payload's `last_trade_price` when
+one side of a token's book was empty. That field reads like the token's and is the **market's**:
+both legs of a binary market return the identical value, quoted in whichever leg last traded —
+almost always the liquid one. A deep-out-of-the-money token is precisely the token nobody bids
+on, so it was precisely the token that fell through to that fallback and took the *complement's*
+price. Measured against live public data on 2026-08-03, this mispriced **every one of 18
+one-sided books** in a 100-book sample, by **$0.9985 a share** — essentially full contract value,
+sign-flipped:
+
+```text
+market 3128024  "Gen.G"      Gamma outcomePrice 0.0005   old mark 0.999   new mark 0.0005
+                bids: (none)   asks: 0.001 x 537,959      /book last_trade_price 0.999
+```
+
+An empty side is now held at the contract's own bound — a share pays $1.00 or $0.00, so no bid
+*is* a floor of $0.00 and no offer *is* a ceiling of $1.00 — which makes the mark agree with the
+CLOB's published `/midpoint` and Gamma's `outcomePrices` by construction. Verified live: 100
+books, 18 of them one-sided, **zero** disagreements with the venue's own midpoint. A book empty
+on both sides now has no mark at all rather than a stale print from a dead market, and the field
+is renamed `market_last_trade_price` so it cannot be mistaken for the token's again.
+
+**Settlement could not run, for two separate reasons.** `sweep_market` resolved through Gamma
+first — and Gamma *deletes* a market when it resolves. Not rarely: of 400 resolved markets the
+CLOB still served with winner flags, **400 were gone from Gamma**. So the sweep lost the market
+at the exact moment it finally had something to settle. It now falls back to the CLOB by the
+`condition_id` the ledger has recorded on every position, order and observation since v1, and
+settles normally. (`Observation` now folds that id too, so a market whose position was closed
+before resolution can still have its forecast graded.) Independently, `resolve_market` refused
+any market with `enable_order_book: false` — which is what the CLOB reports for *every* resolved
+market — so a tradability gate sat across the settlement path and skipped it. That gate moved to
+`place_order`, the one operation for which it is true. The test suite's resolved-market fixture
+now matches the live shape (book off, `/book` 404ing), which is what makes both fixes hold.
+
+**Nothing said the position was unpriceable.** When public data stops publishing a market
+entirely, the sweep now records a `market_gone` row and `get_positions` reports `priceable:
+false` with `mtm_price`, `mtm_value` and `unrealized_pnl` all `null` — the last mark rides along
+as `last_known_mark`, shown but never computed from. The position is carried at **cost basis** in
+`equity_usd`, claiming neither a gain nor a loss nobody can evidence, and `get_positions` /
+`get_pnl` carry an `unpriceable_markets` list. A *transient* outage never triggers this; only a
+clean "no such market" from both sources does, and the flag lifts itself (`market_back`) if the
+data returns.
+
+### Added: `--force-resolve`, an operator-side settlement of last resort (issue #390)
+
+For the residual case the automatic path cannot reach — the CLOB has forgotten the market too, or
+never flagged a winner. It settles at $1.00/$0.00, realizes the P&L, scores the Brier against the
+forecasts locked at position-open and moves `resolved_n`, all as **ordinary append-only rows**
+carrying `resolution_source: "operator_force_resolve"` plus who decided it and on what evidence.
+The chain is never rewritten, and it refuses to append to one that does not verify.
+
+```bash
+# previews and writes nothing...
+basecradle-harness-polymarket-sweep --home ~ \
+    --force-resolve 1654959 --winner No --evidence "FOMC statement 2026-07-29"
+# ...until a second, deliberate act
+basecradle-harness-polymarket-sweep --home ~ \
+    --force-resolve 1654959 --winner No --evidence "FOMC statement 2026-07-29" --by capital --yes
+```
+
+It is **operator-side and nothing else**: no action, no parameter, and no import reaches it from
+the model-facing module, and a test pins that the agent's ten-operation surface did not grow. A
+resolution is the single most valuable thing an agent could write into its own scoreboard.
+`--evidence` is required. The winning outcome is matched case-insensitively against what the
+ledger spells, and a name the epoch never traded is **flagged, not refused** — that is the normal
+shape of a losing position (the live case held `Yes` on a market that resolved `No`), and it is
+also what a misspelling looks like, so it is called out beside the per-position `WON`/`LOST`
+lines rather than acted on silently.
+
 ## [0.96.1] - 2026-08-02
 
 ### Fixed: the live credits-remaining figure nets the cycle's prepaid draw (issue #388)

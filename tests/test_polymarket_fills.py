@@ -394,12 +394,30 @@ def test_a_market_not_accepting_orders_is_refused(tmp_path):
     assert body["error"] == "market_closed"
 
 
-def test_a_market_without_an_order_book_is_not_implemented(tmp_path):
+def test_a_market_without_an_order_book_cannot_be_ordered_on(tmp_path):
+    """The tradability gate lives on `place_order` — the one op for which it is true."""
     with upstream() as fake:
         fake.clob[CONDITION_ID] = clob_market(enable_order_book=False)
         tool = make_tool(tmp_path)
-        body = forecast(tool)
+        forecast(tool)
+        body = buy(tool, shares="10")
     assert body["error"] == "not_implemented"
+
+
+def test_a_market_without_an_order_book_is_still_readable(tmp_path):
+    """Resolution turns the book off, so a tradability gate on the shared path hid it.
+
+    Issue #390: `resolve_market` refused every book-less market with `not_implemented`, which
+    put a *trading* precondition across `get_market`, `log_forecast` **and the sweep** — so a
+    market became unreadable and unsettleable at the exact moment it resolved.
+    """
+    with upstream() as fake:
+        fake.clob[CONDITION_ID] = clob_market(enable_order_book=False)
+        tool = make_tool(tmp_path)
+        assert forecast(tool)["ok"] is True
+        body = call(tool, "get_market", market_id=MARKET_ID)
+    assert body["ok"] is True
+    assert body["market"]["question"]
 
 
 def test_an_unknown_outcome_is_not_found(tmp_path):
@@ -756,12 +774,17 @@ def test_positions_carry_the_normative_fields(tmp_path):
         "outcome",
         "shares",
         "avg_price",
+        "priceable",
         "mtm_price",
         "mtm_value",
         "unrealized_pnl",
     }
+    assert position["priceable"] is True
     assert position["avg_price"] == 0.43
     assert body["equity_usd"] > 0
+    # The stranded block is absent on a healthy call, not present-and-empty: it costs no
+    # context on the case that is almost always the case (issue #390).
+    assert "unpriceable_markets" not in body
 
 
 def test_the_no_side_is_a_separate_position(tmp_path):

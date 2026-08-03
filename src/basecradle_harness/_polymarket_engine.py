@@ -63,6 +63,8 @@ from basecradle_harness._polymarket_ledger import (
     FILL,
     FREEZE,
     MARK,
+    MARKET_BACK,
+    MARKET_GONE,
     MAX_MARKET_EXPOSURE,
     MAX_OPEN_POSITIONS,
     MAX_ORDER_NOTIONAL,
@@ -229,9 +231,14 @@ class MarketRefs:
 def resolve_market(data: PolymarketData, market_id: str, outcome: str | None = None) -> MarketRefs:
     """Gamma + CLOB for one market (and optionally one outcome), or a `PaperReject`.
 
-    A market with its order book disabled is `not_implemented` rather than `market_closed`:
-    it is not shut, it is a structure this instrument does not simulate, and saying so
-    plainly is more useful to the agent than a wrong-but-familiar code.
+    **This resolves; it does not judge tradability.** The `enable_order_book` gate used to
+    live here, and that put a *trading* precondition across the **settlement** path: the CLOB
+    turns the book off when a market resolves, so every market this instrument most needed to
+    settle answered `not_implemented`, `sweep_market` logged "skipping", and the position was
+    stranded with its forecast unscored (issue #390). The gate now sits in `place_order`,
+    which is the one operation for which "this instrument cannot simulate it" is true — and a
+    resolved market stays readable through `get_market`, which is the honest answer to an
+    agent asking what became of a market it holds.
     """
     try:
         summary = data.market_summary(str(market_id))
@@ -240,11 +247,6 @@ def resolve_market(data: PolymarketData, market_id: str, outcome: str | None = N
         raise PaperReject("not_found", str(exc)) from exc
     except PolymarketUnavailable as exc:
         raise PaperReject("upstream_unavailable", str(exc)) from exc
-    if not state.enable_order_book:
-        raise PaperReject(
-            "not_implemented",
-            f"market {market_id} has no CLOB order book, so this instrument cannot simulate it",
-        )
     token = ""
     name = ""
     if outcome is not None:
@@ -291,6 +293,17 @@ def place_order(
 
     refs = resolve_market(data, market_id, outcome)
     market, clob = refs.summary, refs.state
+
+    # A market with no CLOB order book is `not_implemented` rather than `market_closed`: it is
+    # not shut, it is a structure this instrument does not simulate, and saying so plainly is
+    # more useful to the agent than a wrong-but-familiar code. The check belongs *here* and
+    # nowhere upstream — see `resolve_market`, where sitting on the shared path silently
+    # disabled settlement for every resolved market.
+    if not clob.enable_order_book:
+        raise PaperReject(
+            "not_implemented",
+            f"market {market_id} has no CLOB order book, so this instrument cannot simulate it",
+        )
 
     if clob.closed or not clob.accepting_orders or not market.accepting_orders:
         raise PaperReject("market_closed", f"market {market_id} is not accepting orders")
@@ -609,6 +622,15 @@ def sweep_market(epoch: Epoch, data: PolymarketData, state: PaperState, market_i
     never fill and its marks are meaningless. Otherwise re-check the resting orders against
     a fresh book and then refresh the marks, so a fill and the mark that follows it are
     consistent with the same snapshot.
+
+    **Discovery failing is not resolution failing** (issue #390). Gamma *deletes* a market
+    once it resolves — not rarely, but as the ordinary lifecycle: of 400 resolved markets the
+    CLOB still served with winner flags, **400 were gone from Gamma** (measured 2026-08-03).
+    Going Gamma-first therefore meant the sweep lost the market at the exact moment it finally
+    had something to settle, and the position sat open forever with its forecast ungraded. The
+    authoritative resolution source is the CLOB, it is keyed by `condition_id`, and the ledger
+    has recorded that id on every position, order and observation since v1 — so a market
+    public discovery has forgotten is still reachable, and `_settle_delisted` reaches it.
     """
     try:
         refs = resolve_market(data, market_id)
@@ -616,12 +638,120 @@ def sweep_market(epoch: Epoch, data: PolymarketData, state: PaperState, market_i
         if reject.code == "upstream_unavailable":
             _log.info("polymarket sweep: %s unreachable (%s); leaving it alone", market_id, reject)
             return 0
+        if reject.code == "not_found":
+            return _settle_delisted(epoch, data, state, market_id)
         _log.info("polymarket sweep: skipping %s (%s)", market_id, reject.code)
         return 0
     if refs.state.resolved:
-        return settle_market(epoch, data, state, refs)
-    written = recheck_resting(epoch, data, state, refs)
-    return written + refresh_marks(epoch, data, state, refs)
+        # Settle *first* and clear the flag after — see `_mark_listed` on why that order is
+        # not arbitrary.
+        written = settle_market(epoch, state, market_id, refs.state)
+        return written + _mark_listed(epoch, state, market_id)
+    written = _mark_listed(epoch, state, market_id)
+    return (
+        written
+        + recheck_resting(epoch, data, state, refs)
+        + refresh_marks(epoch, data, state, refs)
+    )
+
+
+def _settle_delisted(epoch: Epoch, data: PolymarketData, state: PaperState, market_id: str) -> int:
+    """Gamma has dropped this market. Try the CLOB by condition id; else flag it unpriceable.
+
+    Every branch here is a *fact about what is knowable*, and the three are kept apart on
+    purpose:
+
+    - **The CLOB says resolved** → settle, exactly as a listed market would. This is the
+      common case, and it needs no operator at all.
+    - **Upstream is unreachable** → change nothing. A Polymarket outage must never read as
+      "this market ceased to exist"; the same discipline the orphan-artifact sweep applies to
+      a 404-versus-anything-else (CLAUDE.md → Config Home), for the same reason.
+    - **The CLOB has nothing either, or has it and has not called it** → the position is real
+      and nothing on earth can price it. Flag it, stop marking it, and say so, so an operator
+      knows to reach for `--force-resolve`.
+    """
+    condition_id = state.condition_for(market_id)
+    if not condition_id:
+        return _mark_gone(epoch, state, market_id, "public data no longer publishes this market")
+    try:
+        clob = data.market_state(condition_id)
+    except MarketNotFound:
+        return _mark_gone(
+            epoch, state, market_id, "neither Gamma nor the CLOB publishes this market any more"
+        )
+    except PolymarketUnavailable as exc:
+        _log.info("polymarket sweep: %s unreachable (%s); leaving it alone", market_id, exc)
+        return 0
+    if clob.resolved:
+        _log.info(
+            "polymarket sweep: %s is gone from Gamma but resolved on the CLOB (%s); settling",
+            market_id,
+            ", ".join(clob.winning_outcomes()),
+        )
+        written = settle_market(epoch, state, market_id, clob)
+        return written + _mark_listed(epoch, state, market_id)
+    return _mark_gone(
+        epoch,
+        state,
+        market_id,
+        "Gamma no longer publishes this market and the CLOB has not reported a resolution for it",
+    )
+
+
+def _mark_gone(epoch: Epoch, state: PaperState, market_id: str, reason: str) -> int:
+    """Record that a market can no longer be priced. Idempotent — one row per transition."""
+    if market_id in state.unpriceable:
+        return 0
+    epoch.append(MARKET_GONE, {"market_id": market_id, "reason": reason})
+    state.seq += 1
+    state.unpriceable[market_id] = reason
+    track_equity(state)  # discarding a stale mark moves the curve; the fold does this too
+    _log.warning(
+        "polymarket sweep: market %s is UNPRICEABLE (%s) - its positions are carried at cost "
+        "and need an operator --force-resolve",
+        market_id,
+        reason,
+    )
+    return 1
+
+
+def _mark_listed(epoch: Epoch, state: PaperState, market_id: str) -> int:
+    """Record that a market public data had dropped is being published again. Idempotent.
+
+    **Clearing the flag un-hides every stale mark in that market at once, so where it runs in
+    a sweep is deliberate.** The invariant being kept is simply that *while a market is
+    flagged, no mark of its ever reaches a computation* — so the clear goes **after** a
+    settlement (which walks a market's positions one at a time, sampling the equity curve
+    between them, and would otherwise value the not-yet-settled ones off marks the flag says
+    are meaningless) and **before** a mark refresh (whose freshly-written mark would otherwise
+    be ignored by the very equity sample that follows it).
+    """
+    if market_id not in state.unpriceable:
+        return 0
+    epoch.append(MARKET_BACK, {"market_id": market_id})
+    state.seq += 1
+    state.unpriceable.pop(market_id, None)
+    track_equity(state)
+    _log.info("polymarket sweep: market %s is priceable again", market_id)
+    return 1
+
+
+def _book_or_none(data: PolymarketData, token_id: str, outcome: str) -> Book | None:
+    """This token's book, or ``None`` when there is no book to be had.
+
+    The CLOB **404s `/book` for a market whose order book it has switched off** — which is
+    every resolved market, and which the sweep now walks past on its way to settling one
+    (issue #390 moved the `enable_order_book` gate off the shared path, so this call is
+    reachable where it never used to be). An unfetchable book is not an error to abort a sweep
+    over: it is simply nothing to fill against and nothing to mark from, and the caller says so
+    by doing neither. Letting it raise would take down the sweep of *every other* market behind
+    it in the loop.
+    """
+    try:
+        return data.book(token_id, outcome)
+    except (MarketNotFound, PolymarketUnavailable) as exc:
+        _log.info("polymarket sweep: no book for %s (%s)", outcome or token_id, exc)
+        return None
 
 
 def recheck_resting(epoch: Epoch, data: PolymarketData, state: PaperState, refs: MarketRefs) -> int:
@@ -635,7 +765,9 @@ def recheck_resting(epoch: Epoch, data: PolymarketData, state: PaperState, refs:
     for order in state.open_orders():
         if order.market_id != refs.summary.market_id or order.limit_price is None:
             continue
-        book = data.book(order.token_id, order.outcome)
+        book = _book_or_none(data, order.token_id, order.outcome)
+        if book is None:
+            continue
         levels = marketable(
             book.asks if order.side == "buy" else book.bids, order.side, order.limit_price
         )
@@ -676,7 +808,9 @@ def refresh_marks(epoch: Epoch, data: PolymarketData, state: PaperState, refs: M
     for position in state.open_positions():
         if position.market_id != refs.summary.market_id:
             continue
-        book = data.book(position.token_id, position.outcome)
+        book = _book_or_none(data, position.token_id, position.outcome)
+        if book is None:
+            continue
         mark = book.mid
         if mark is None:
             continue
@@ -703,21 +837,52 @@ def refresh_marks(epoch: Epoch, data: PolymarketData, state: PaperState, refs: M
     return written
 
 
-def settle_market(epoch: Epoch, data: PolymarketData, state: PaperState, refs: MarketRefs) -> int:
+def settle_market(epoch: Epoch, state: PaperState, market_id: str, clob: MarketState) -> int:
     """Settle a resolved market: cancel what rests, pay out at $1.00/$0.00, score the Briers.
 
     The resolution comes from public market state (`MarketState.winners`) and from nowhere
-    else. Observations are scored even when the position was closed before resolution: the
-    forecast was made and acted on, and a calibration record that only scores the trades an
-    agent happened to hold to the end is a calibration record with a survivorship hole in it.
+    else. It takes the `MarketState` rather than a `MarketRefs` because the CLOB is the whole
+    authority here and Gamma's half is not needed — which is what lets the delisted path
+    (issue #390) settle a market Gamma has deleted, off the condition id in the ledger.
+    """
+    return _settle(
+        epoch,
+        state,
+        market_id,
+        winners={name.casefold() for name in clob.winning_outcomes()},
+        source="clob_public_market_state",
+        extra={},
+        cancel_reason="market resolved",
+    )
+
+
+def _settle(
+    epoch: Epoch,
+    state: PaperState,
+    market_id: str,
+    *,
+    winners: set[str],
+    source: str,
+    extra: dict[str, Any],
+    cancel_reason: str,
+) -> int:
+    """Write one market's settlement: cancels, payouts, Brier scores. Returns rows written.
+
+    The one body behind both the automatic path and the operator's `--force-resolve`, so the
+    two can never settle *differently* — same $1.00/$0.00 payout, same realized P&L, same Brier
+    against the same locked forecasts, same append-only rows. Only the `resolution_source` on
+    the row and the operator attribution beside it differ, which is exactly the thing that
+    should differ: where the verdict came from.
+
+    Observations are scored even when the position was closed before resolution: the forecast
+    was made and acted on, and a calibration record that only scores the trades an agent
+    happened to hold to the end is a calibration record with a survivorship hole in it.
     """
     written = 0
-    market_id = refs.summary.market_id
-    winners = {name.casefold() for name in refs.state.winning_outcomes()}
 
     for order in state.open_orders():
         if order.market_id == market_id:
-            _close_order(epoch, state, order, status="cancelled", reason="market resolved")
+            _close_order(epoch, state, order, status="cancelled", reason=cancel_reason)
             written += 1
 
     for position in list(state.open_positions()):
@@ -734,7 +899,8 @@ def settle_market(epoch: Epoch, data: PolymarketData, state: PaperState, refs: M
             "payout": payout,
             "cost_basis": position.cost,
             "realized_pnl": money(payout - position.cost),
-            "resolution_source": "clob_public_market_state",
+            "resolution_source": source,
+            **extra,
         }
         epoch.append(SETTLEMENT, payload)
         state.seq += 1
@@ -757,6 +923,8 @@ def settle_market(epoch: Epoch, data: PolymarketData, state: PaperState, refs: M
                 "result": result,
                 "brier": brier,
                 "attribution": state.brier_attribution,
+                "resolution_source": source,
+                **extra,
             },
         )
         state.seq += 1
@@ -766,18 +934,193 @@ def settle_market(epoch: Epoch, data: PolymarketData, state: PaperState, refs: M
     return written
 
 
+# --- the operator's force-resolve (issue #390) -----------------------------------------
+
+
+def market_outcomes(state: PaperState, market_id: str) -> list[str]:
+    """Every outcome name this epoch has ever recorded for a market, in a stable order.
+
+    What the operator's `--winner` is *checked against* — but deliberately not restricted to,
+    and the difference is the whole usability of this lever. A settlement pays $1.00 to the
+    outcome it recognizes and **$0.00 to every other position in the market**, so a typo would
+    silently realize a total loss on a winning position and score its Brier against the wrong
+    result, permanently, with no row to take back. That argues for a strict allow-list — and a
+    strict allow-list is wrong, because **the winning outcome is very often one the agent never
+    traded**: the live case that opened issue #390 held *Yes* on a market that resolved *No*,
+    so the ledger had never heard the only correct answer. Refusing there would refuse exactly
+    the invocation the lever exists for.
+
+    So this list drives a **warning and a preview, not a veto** (see `preview_force_resolve`):
+    an unrecognized name is called out in the preview beside the per-position `WON`/`LOST`
+    lines, and `--yes` is the operator's acknowledgement of what they just read. That covers
+    the one genuinely dangerous typo — the one that turns a `WON` into a `LOST` — while leaving
+    the ordinary case workable.
+    """
+    names: list[str] = []
+    for source in (
+        (p.outcome for p in state.positions.values() if p.market_id == market_id),
+        (o.outcome for o in state.orders.values() if o.market_id == market_id),
+        (b.outcome for b in state.observations.values() if b.market_id == market_id),
+        (o for (m, o) in state.forecasts if m == market_id),
+    ):
+        for name in source:
+            if name and name not in names:
+                names.append(name)
+    return sorted(names)
+
+
+@dataclass(frozen=True)
+class ForcedResolution:
+    """What a force-resolve would do (a preview) or did (after it was written)."""
+
+    market_id: str
+    winner: str
+    evidence: str
+    settles: tuple[tuple[str, Decimal, Decimal, bool], ...]  # outcome, shares, cost, won
+    cancels: tuple[str, ...]
+    scores: tuple[tuple[str, str, Decimal, int], ...]  # obs_id, outcome, p, result
+    known_outcomes: tuple[str, ...] = ()
+    #: Whether `winner` is an outcome this epoch has traded. ``False`` is *ordinary* — a losing
+    #: position never touched the winning side — and is also what a typo looks like, so it is
+    #: surfaced rather than acted on silently. See `market_outcomes`.
+    winner_known: bool = True
+    rows_written: int = 0
+
+    @property
+    def realized_pnl(self) -> Decimal:
+        return money(
+            sum(
+                ((shares if won else Decimal(0)) - cost for _, shares, cost, won in self.settles),
+                Decimal(0),
+            )
+        )
+
+
+def preview_force_resolve(
+    state: PaperState, market_id: str, winner: str, evidence: str
+) -> ForcedResolution:
+    """Validate an operator's force-resolve and describe exactly what it would write.
+
+    Writes nothing. Every refusal is a `PaperReject` so the CLI prints one sentence rather than
+    a traceback, and so the *same* validation guards the preview and the commit — a preview an
+    operator reads followed by a commit that checks something else is a preview that lied.
+    """
+    if not evidence.strip():
+        raise PaperReject(
+            "invalid_params",
+            "--evidence is required: a force-resolve overrides public market state, so the "
+            "record has to say what it was resolved from",
+        )
+    if not winner.strip():
+        raise PaperReject("invalid_params", "--winner is required: name the outcome that won")
+    known = market_outcomes(state, market_id)
+    if not known:
+        raise PaperReject(
+            "not_found",
+            f"this epoch has no positions, orders or observations on market {market_id}; "
+            "there is nothing here to resolve",
+        )
+    # Matched case-insensitively against what the ledger spells, so `no` settles `No`; a name
+    # that matches nothing is kept verbatim and flagged, never refused (see `market_outcomes`).
+    matched = [name for name in known if name.casefold() == winner.strip().casefold()]
+    won = matched[0] if matched else winner.strip()
+
+    settles = tuple(
+        (p.outcome, p.shares, p.cost, p.outcome.casefold() == won.casefold())
+        for p in state.open_positions()
+        if p.market_id == market_id
+    )
+    cancels = tuple(o.order_id for o in state.open_orders() if o.market_id == market_id)
+    scores = tuple(
+        (obs.obs_id, obs.outcome, obs.p, 1 if obs.outcome.casefold() == won.casefold() else 0)
+        for obs in state.observations.values()
+        if obs.market_id == market_id and obs.result is None
+    )
+    if not settles and not cancels and not scores:
+        raise PaperReject(
+            "invalid_params",
+            f"market {market_id} has nothing left to settle in this epoch — no open position, "
+            "no resting order and no unscored forecast. It has already been resolved.",
+        )
+    return ForcedResolution(
+        market_id=market_id,
+        winner=won,
+        evidence=evidence,
+        settles=settles,
+        cancels=cancels,
+        scores=scores,
+        known_outcomes=tuple(known),
+        winner_known=bool(matched),
+    )
+
+
+def force_resolve(
+    epoch: Epoch, state: PaperState, market_id: str, winner: str, evidence: str, *, by: str
+) -> ForcedResolution:
+    """Settle a market by operator decision, as ordinary append-only rows (issue #390).
+
+    **The escape hatch for a resolution nothing public will ever report.** Gamma deleting a
+    resolved market is now handled automatically off the CLOB (`_settle_delisted`), so this is
+    the residual case: the CLOB has forgotten it too, or never flagged a winner, and an open
+    position would otherwise sit forever with its forecast ungraded and the scorecard's
+    `resolved_n` pinned where it was.
+
+    **It is operator-side and nothing else.** There is no action in `ACTIONS` that reaches it,
+    no parameter that names it, and the module that exposes the agent's surface does not import
+    it — the agent cannot resolve its own market any more than it could before, which is the
+    §2.5 line this instrument's whole integrity rests on. It is reached from
+    `basecradle-harness-polymarket-sweep --force-resolve`, on the box, by whoever runs the box.
+
+    **It corrects by appending, never by rewriting.** The chain is untouched, and the rows are
+    the same `order_close` / `settlement` / `brier_score` rows the automatic path writes,
+    carrying `resolution_source="operator_force_resolve"` plus the operator and the evidence —
+    so the log says on its face which settlements a human decided and on what basis. That is
+    the pattern the `freeze`/`unfreeze` levers already use, and it is what keeps an override
+    auditable rather than indistinguishable from the machine's own work.
+    """
+    plan = preview_force_resolve(state, market_id, winner, evidence)
+    written = _settle(
+        epoch,
+        state,
+        market_id,
+        winners={plan.winner.casefold()},
+        source="operator_force_resolve",
+        extra={"resolved_by": by, "resolution_evidence": evidence, "forced": True},
+        cancel_reason=f"market force-resolved by {by}",
+    )
+    # The market is settled, so it is no longer *stranded*. Any `market_gone` row stays in the
+    # log — it is history — and `stranded_markets` filters on open work, so nothing left here
+    # needs pricing and nothing goes on reporting that it does.
+    _log.warning(
+        "polymarket force-resolve: market=%s winner=%s by=%s evidence=%s rows=%d realized=%s",
+        market_id,
+        plan.winner,
+        by,
+        evidence,
+        written,
+        plan.realized_pnl,
+    )
+    return ForcedResolution(
+        market_id=plan.market_id,
+        winner=plan.winner,
+        evidence=plan.evidence,
+        settles=plan.settles,
+        cancels=plan.cancels,
+        scores=plan.scores,
+        known_outcomes=plan.known_outcomes,
+        winner_known=plan.winner_known,
+        rows_written=written,
+    )
+
+
 def markets_to_sweep(state: PaperState) -> list[str]:
     """Every market the sweep still has business with, in a stable order.
 
-    Open positions and resting orders are obvious. **Unscored observations are the one that
-    is easy to miss**: an agent that opened a position, closed it at a profit and never
-    touched the market again still has a forecast waiting to be graded, and dropping it
-    would quietly bias the scorecard toward the trades that were held to resolution.
+    The set itself is `PaperState.active_market_ids` — one definition, shared with the "what
+    cannot be priced" projection, so the sweep's work list and the operator's stranded list can
+    never disagree about what is still outstanding.
     """
-    wanted = {p.market_id for p in state.open_positions()}
-    wanted |= {o.market_id for o in state.open_orders()}
-    wanted |= {obs.market_id for obs in state.observations.values() if obs.result is None}
-    return sorted(wanted)
+    return sorted(state.active_market_ids())
 
 
 def sweep(epoch: Epoch, data: PolymarketData, *, state: PaperState | None = None) -> int:
@@ -1051,6 +1394,70 @@ def _verify(home: Path, *, all_epochs: bool, as_json: bool) -> int:
 # --- the operator's job ---------------------------------------------------------------
 
 
+def _force_resolve_cli(epoch: Epoch, args) -> int:
+    """`--force-resolve` against one epoch: verify, preview, and write only under `--yes`.
+
+    **It previews by default, and that is the safety rather than a courtesy.** A settlement is
+    irreversible in an append-only log — there is no row to take back, only a compensating one
+    somebody has to notice is needed — and it pays $0.00 to every outcome that is not the one
+    named. So the operator sees the exact positions, cancels and Brier scores first, and the
+    write is a second, deliberate act.
+
+    **The chain is verified before anything is written**, for the reason `sweep` does it:
+    appending onto a broken ledger chains new rows cleanly onto tampered ones and buries the
+    break under legitimate history. A market a human has to settle by hand is *exactly* the
+    situation where somebody might have reached for the file directly first.
+    """
+    chain = epoch.verify()
+    if not chain.ok:
+        print(f"{epoch.epoch_id}: LEDGER CHAIN BROKEN — {chain.reason}")
+        return 1
+    state = epoch.state()
+    try:
+        plan = preview_force_resolve(state, args.force_resolve, args.winner, args.evidence)
+    except PaperReject as reject:
+        # A market this epoch knows nothing about is not an error when sweeping *every* epoch:
+        # only one of them holds the position, and the rest are correctly silent.
+        if args.all_epochs and reject.code == "not_found":
+            print(f"{epoch.epoch_id}: nothing on market {args.force_resolve}; skipped")
+            return 0
+        print(f"{epoch.epoch_id}: refusing to force-resolve — {reject.message}")
+        return 2
+
+    print(f"{epoch.epoch_id}: force-resolve market {plan.market_id} -> winner {plan.winner!r}")
+    print(f"  evidence: {plan.evidence}   by: {args.by}")
+    if not plan.winner_known:
+        # Ordinary for a losing position, and identical in shape to a typo — so it is said out
+        # loud, next to the WON/LOST lines that show what it costs. See `market_outcomes`.
+        print(
+            f"  NOTE: {plan.winner!r} is not an outcome this epoch has traded (it has "
+            f"{list(plan.known_outcomes)}). That is normal when the position lost — but if it "
+            "is a misspelling, every position below settles at $0.00. Check the lines."
+        )
+    for outcome, shares, cost, won in plan.settles:
+        payout = money(shares if won else Decimal(0))
+        print(
+            f"  settle   {outcome!r}: {shares} shares, basis ${money(cost)} -> payout "
+            f"${payout} ({'WON' if won else 'LOST'}), realized ${money(payout - cost)}"
+        )
+    for order_id in plan.cancels:
+        print(f"  cancel   resting order {order_id}")
+    for obs_id, outcome, p, result in plan.scores:
+        print(
+            f"  score    {obs_id} {outcome!r}: p={p} result={result} "
+            f"brier={money((p - Decimal(result)) ** 2)}"
+        )
+    print(f"  net realized P&L: ${plan.realized_pnl}")
+
+    if not args.yes:
+        print("  (preview only — nothing written; re-run with --yes to commit)")
+        return 0
+
+    done = force_resolve(epoch, state, plan.market_id, plan.winner, plan.evidence, by=args.by)
+    print(f"{epoch.epoch_id}: {done.rows_written} row(s) written; chain head {epoch.head}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """`basecradle-harness-polymarket-sweep` — the §A3 job. Mutates the ledger, wakes no one.
 
@@ -1075,6 +1482,37 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--freeze", metavar="REASON", help="halt new orders on this epoch")
     parser.add_argument("--unfreeze", action="store_true", help="lift a freeze on this epoch")
     parser.add_argument(
+        "--force-resolve",
+        metavar="MARKET_ID",
+        help=(
+            "settle a market by operator decision when public data never will (needs --winner "
+            "and --evidence; previews unless --yes is given)"
+        ),
+    )
+    parser.add_argument(
+        "--winner",
+        metavar="OUTCOME",
+        default="",
+        help="with --force-resolve: the winning outcome, spelled as this ledger spells it",
+    )
+    parser.add_argument(
+        "--evidence",
+        metavar="REF",
+        default="",
+        help="with --force-resolve: what the resolution is evidenced by (required, recorded)",
+    )
+    parser.add_argument(
+        "--by",
+        metavar="WHO",
+        default="operator",
+        help="with --force-resolve: who decided it, recorded on every row (default: operator)",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="with --force-resolve: actually write it (without this, only the preview prints)",
+    )
+    parser.add_argument(
         "--new-epoch", action="store_true", help="open a fresh epoch and sweep nothing"
     )
     parser.add_argument(
@@ -1092,6 +1530,8 @@ def main(argv: list[str] | None = None) -> int:
         help="with --verify: emit the epoch state as JSON (epoch_id, frozen, rows, chain_ok, head)",
     )
     args = parser.parse_args(argv)
+    if (args.winner or args.evidence or args.yes) and not args.force_resolve:
+        parser.error("--winner, --evidence and --yes are only available with --force-resolve.")
     if args.as_json and not args.verify:
         # `--json` is the *monitor's* spelling of `--verify`, and it is bound to it deliberately:
         # every other mode of this command writes to the ledger, and a caller reaching for a
@@ -1137,6 +1577,11 @@ def main(argv: list[str] | None = None) -> int:
             if args.unfreeze:
                 epoch.append(UNFREEZE, {"by": "operator"})
                 print(f"{epoch.epoch_id}: unfrozen")
+                continue
+            if args.force_resolve:
+                code = _force_resolve_cli(epoch, args)
+                if code:
+                    return code
                 continue
             try:
                 written = sweep(epoch, data)
