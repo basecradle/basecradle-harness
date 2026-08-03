@@ -520,25 +520,49 @@ class PolymarketPaperTool(PlatformTool):
         }
 
     def _op_get_positions(self, epoch, data, state, kwargs) -> dict[str, Any]:
+        """Open positions, with an unpriceable one saying so instead of quoting a stale number.
+
+        A position whose market public data has stopped publishing has **no** `mtm_price`,
+        no `mtm_value` and no `unrealized_pnl` — they are `null`, and `priceable` is `false`
+        (issue #390). Reporting the last mark the sweep happened to catch would be presenting a
+        number with a date on it as a live one; the live case that forced this had a leg worth
+        $0.0005 showing a confident `+772.95` unrealized gain for four days. The position is
+        carried at cost in `equity_usd`, which claims no gain and no loss, and
+        `last_known_mark` is kept beside the `null` so an operator can still see what the
+        sweep last saw without any projection computing from it.
+        """
         positions = []
         for position in state.open_positions():
+            priceable = position.market_id not in state.unpriceable
             mark = state.mark_for(position)
-            positions.append(
-                {
-                    "market_id": position.market_id,
-                    "outcome": position.outcome,
-                    "shares": _num(position.shares),
-                    "avg_price": _num(position.avg_price),
-                    "mtm_price": _num(mark),
-                    "mtm_value": _num(_round(position.shares * mark)),
-                    "unrealized_pnl": _num(_round(position.shares * mark - position.cost)),
-                }
-            )
-        return {
+            row = {
+                "market_id": position.market_id,
+                "outcome": position.outcome,
+                "shares": _num(position.shares),
+                "avg_price": _num(position.avg_price),
+                "priceable": priceable,
+                "mtm_price": _num(mark) if priceable else None,
+                "mtm_value": _num(_round(position.shares * mark)) if priceable else None,
+                "unrealized_pnl": (
+                    _num(_round(position.shares * mark - position.cost)) if priceable else None
+                ),
+            }
+            if not priceable:
+                row["last_known_mark"] = _num(state.last_known_mark(position))
+                row["unpriceable_reason"] = state.unpriceable.get(position.market_id, "")
+                row["note"] = (
+                    "Polymarket no longer publishes this market, so nothing can price it and "
+                    "no mark here would be honest. It is carried at cost until an operator "
+                    "settles it; you cannot fix this and nothing you do will change it."
+                )
+            positions.append(row)
+        body: dict[str, Any] = {
             "cash_usd": _num(_round(state.cash)),
             "equity_usd": _num(_round(state.equity)),
             "positions": positions,
         }
+        body.update(_stranded(state))
+        return body
 
     def _op_place_order(self, epoch, data, state, kwargs) -> dict[str, Any]:
         """Place one order against the `as_of` book. Every refusal is a §2.6 code."""
@@ -599,6 +623,7 @@ class PolymarketPaperTool(PlatformTool):
 
     def _op_get_pnl(self, epoch, data, state, kwargs) -> dict[str, Any]:
         return {
+            **_stranded(state),
             "cash_usd": _num(_round(state.cash)),
             "equity_usd": _num(_round(state.equity)),
             "realized_pnl": _num(_round(state.realized_pnl)),
@@ -681,6 +706,33 @@ def _error(code: str, message: str, budgets: dict[str, Any]) -> str:
         {"ok": False, "error": code, "message": message, "budgets": budgets},
         ensure_ascii=False,
     )
+
+
+def _stranded(state: PaperState) -> dict[str, Any]:
+    """The `unpriceable_markets` block, present **only** when something is actually stranded.
+
+    Absent on the overwhelmingly common healthy call, so it costs no context and reads as the
+    exception it is; present the moment a market with open work goes unpriceable, because the
+    alternative is the agent silently reasoning from a total that quietly excludes a position
+    it still holds (issue #390). It tells the model plainly that this is not its to fix — the
+    same stance `ledger_tampered` takes — so it does not spend turns trading around a number
+    nobody can produce.
+    """
+    stranded = state.stranded_markets()
+    if not stranded:
+        return {}
+    return {
+        "unpriceable_markets": stranded,
+        "unpriceable_note": (
+            "Polymarket has stopped publishing "
+            f"{'these markets' if len(stranded) > 1 else 'this market'}, so no live price "
+            "exists for anything held in "
+            f"{'them' if len(stranded) > 1 else 'it'}. Those positions are carried at cost "
+            "basis in equity_usd and are excluded from unrealized P&L, and their forecasts "
+            "stay unscored until an operator settles them off the record. You cannot resolve "
+            "this from here — say so if someone asks."
+        ),
+    }
 
 
 def _budgets(state: PaperState) -> dict[str, Any]:
