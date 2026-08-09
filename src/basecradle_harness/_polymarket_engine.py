@@ -72,6 +72,7 @@ from basecradle_harness._polymarket_ledger import (
     ORDER_CLOSE,
     SETTLEMENT,
     UNFREEZE,
+    ChainStatus,
     Epoch,
     Observation,
     Order,
@@ -81,6 +82,7 @@ from basecradle_harness._polymarket_ledger import (
     current_epoch,
     epochs,
     open_epoch,
+    prefix_head,
     replay,
     store_lock,
     track_equity,
@@ -1278,7 +1280,7 @@ def _num(value: Decimal | None) -> float | None:
 # --- the read-only probe ---------------------------------------------------------------
 
 
-def _epoch_report(epoch: Epoch) -> dict[str, Any]:
+def _epoch_report(epoch: Epoch, *, head_at: int | None = None) -> dict[str, Any]:
     """One epoch's state for the read-only probe: the chain verdict, and the freeze.
 
     Both come off **one** read of the ledger file — `verify` and `state` each re-read it
@@ -1306,11 +1308,20 @@ def _epoch_report(epoch: Epoch) -> dict[str, Any]:
     `rows` and `head` are the **verified prefix** — on an intact chain the whole log and its
     real head; on a broken one, how far the record vouches for itself and the last hash that
     did. `broken_at` and `reason` name where it stopped, so a human has somewhere to look.
+
+    **`head_at` is the other half of that pin, and it exists because `head` goes stale** (issue
+    #395). A witness that recorded ``(rows, head)`` an hour ago cannot compare it to anything once
+    the log has legitimately grown: rows-above-the-witness reads as honest growth, and a tamperer
+    who truncates *below* the witnessed count and refills *past* it presents identically. Asking
+    for the head **at the witnessed count** closes that arm — see `prefix_head` — so it is
+    reported off the same single read as everything else here, and only when a caller asked. The
+    keys are absent otherwise, never `null`: a runner that forgot the flag must not read as a
+    ledger that had no answer.
     """
     rows = epoch.rows()
     chain = verify_chain(epoch.epoch_id, rows)
     state = replay(rows) if chain.ok else None
-    return {
+    report = {
         "epoch_id": epoch.epoch_id,
         "path": str(epoch.path),
         "frozen": None if state is None else state.frozen,
@@ -1321,9 +1332,41 @@ def _epoch_report(epoch: Epoch) -> dict[str, Any]:
         "broken_at": chain.broken_at,
         "reason": chain.reason,
     }
+    if head_at is not None:
+        report.update(_head_at_report(rows, chain, head_at))
+    return report
 
 
-def _verify(home: Path, *, all_epochs: bool, as_json: bool) -> int:
+def _head_at_report(rows: list[dict[str, Any]], chain: ChainStatus, count: int) -> dict[str, Any]:
+    """The `--head-at` answer for one epoch: the hash, and — when there is none — why.
+
+    Emission discipline is the probe's, unchanged: an id, a count, a hash, nothing else. A row's
+    payload never crosses this seam, and the reason is a sentence about the *chain*, never about
+    what a row contained.
+
+    The two ways an answer is `null` are told apart on purpose, because they mean opposite things
+    to the caller. **Chain broken at or before there** is a fact the probe already reported and
+    the monitor already alarms on. **A log shorter than the witness** is not a fact the box can
+    judge at all — from here it is simply a smaller number — and it is precisely the caller's
+    truncation signal, so it is said plainly rather than folded into the broken-chain case.
+    """
+    head = prefix_head(rows, chain, count)
+    if head is not None:
+        reason = ""
+    elif not chain.ok:
+        reason = (
+            f"the chain does not verify past row {chain.rows}, so the first {count} rows are not "
+            "a prefix this ledger vouches for; there is no head to assert at that count"
+        )
+    else:
+        reason = (
+            f"this epoch holds {chain.rows} verified row(s), fewer than the {count} asked for — "
+            "nothing here happened at that count"
+        )
+    return {"head_at_rows": count, "head_at": head, "head_at_reason": reason}
+
+
+def _verify(home: Path, *, all_epochs: bool, as_json: bool, head_at: int | None = None) -> int:
     """`--verify`: report the epoch state and write **nothing**. Exit 1 if a chain is broken.
 
     The off-box audit surface for a control that was previously write-only (issue #353). A
@@ -1346,12 +1389,20 @@ def _verify(home: Path, *, all_epochs: bool, as_json: bool) -> int:
     **The probe is one half of the audit, and says so.** ``chain_ok`` catches an edit within the
     log; it cannot catch a **truncated tail**, which is why every epoch also reports ``rows`` and
     ``head`` — the pin against the off-box row copy. See `_epoch_report`.
+
+    **`head_at` never moves the exit code, and that is the contract.** The exit stays what it has
+    always been — ``1`` iff a verified chain is broken, ``0`` otherwise — because a hash at a
+    count is an *answer*, and the caller is the only one who knows what to compare it against:
+    the box has no witness and therefore no opinion about whether the answer is the expected one.
+    A truncation the witness will catch reads as a plain ``0`` here (`head_at: null`, with the
+    reason saying the log is shorter than the count asked for), exactly as a tail truncated below
+    an off-box row copy reads as ``chain_ok: true`` today.
     """
     with store_lock(home, create=False):
         targets = (
             epochs(home) if all_epochs else [e for e in [current_epoch(home, create=False)] if e]
         )
-        reports = [_epoch_report(epoch) for epoch in targets]
+        reports = [_epoch_report(epoch, head_at=head_at) for epoch in targets]
 
     broken = [report for report in reports if not report["chain_ok"]]
     if as_json:
@@ -1382,12 +1433,20 @@ def _verify(home: Path, *, all_epochs: bool, as_json: bool) -> int:
         # field to the end of a key=value line cannot break one that adding a word in the middle
         # would. (The JSON is the contract to build against; this stays legible for a human.)
         frozen = "unknown" if report["frozen"] is None else str(report["frozen"]).lower()
-        print(
+        line = (
             f"{report['epoch_id']}: {verdict} rows={report['rows']} "
             f"head={report['head']} frozen={frozen}"
         )
+        if head_at is not None:
+            # `is None`, never a falsy test: a hash is the one thing here that must not be
+            # confused with the absence of one, whatever a future genesis constant looks like.
+            answer = "none" if report["head_at"] is None else report["head_at"]
+            line += f" head_at[{head_at}]={answer}"
+        print(line)
         if not report["chain_ok"]:
             print(f"  {report['reason']}")
+        if head_at is not None and report["head_at_reason"]:
+            print(f"  {report['head_at_reason']}")
     return 1 if broken else 0
 
 
@@ -1529,9 +1588,28 @@ def main(argv: list[str] | None = None) -> int:
         dest="as_json",
         help="with --verify: emit the epoch state as JSON (epoch_id, frozen, rows, chain_ok, head)",
     )
+    parser.add_argument(
+        "--head-at",
+        metavar="N",
+        type=int,
+        default=None,
+        help=(
+            "with --verify: also report the chain head after the first N rows — N is a row "
+            "*count*, so passing a witness's recorded `rows` yields that witness's `head`. "
+            "Null (never an error) when the first N rows are not a verified prefix"
+        ),
+    )
     args = parser.parse_args(argv)
     if (args.winner or args.evidence or args.yes) and not args.force_resolve:
         parser.error("--winner, --evidence and --yes are only available with --force-resolve.")
+    if args.head_at is not None and not args.verify:
+        # Bound to `--verify` for the reason `--json` is, below: it is a read-only question, and
+        # every other mode of this command writes.
+        parser.error("--head-at is only available with --verify (every other mode writes).")
+    if args.head_at is not None and args.head_at < 0:
+        # A count, so a negative one is the *caller's* mistake, not a fact about the ledger — and
+        # a probe that answered `null` here would launder a runner bug into a ledger finding.
+        parser.error("--head-at takes a row count (0 or more).")
     if args.as_json and not args.verify:
         # `--json` is the *monitor's* spelling of `--verify`, and it is bound to it deliberately:
         # every other mode of this command writes to the ledger, and a caller reaching for a
@@ -1548,7 +1626,7 @@ def main(argv: list[str] | None = None) -> int:
     # The read-only probe runs *outside* the mutating lock, and takes its own non-creating one:
     # every path below this writes, and the audit must not be the thing that changes the box.
     if args.verify:
-        return _verify(home, all_epochs=args.all_epochs, as_json=args.as_json)
+        return _verify(home, all_epochs=args.all_epochs, as_json=args.as_json, head_at=args.head_at)
 
     # The whole run is under the store lock: the agent's wake is the other writer against this
     # same ledger, and both of them fill resting orders. Taking it here (and in the tool's

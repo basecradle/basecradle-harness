@@ -7,6 +7,53 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.98.0] - 2026-08-09
+
+### Added: the epoch probe can answer "what was the head at row K" (issue #395)
+
+The off-box ledger audit (`basecradle-noc#377`) pins `(rows, head)` once an hour and compares
+three ways: rows below the witness is a truncation, rows equal with a different head is a
+re-chaining, and rows **above** the witness was treated as honest growth with nothing checked.
+That third arm was soft because `head` answers "what is the head *now*" — the instant the log
+grows past what a witness recorded, the witness has nothing left to compare against, and a
+tamperer who truncates *below* the witnessed count and refills *past* it presents identically
+to ordinary growth.
+
+Every row's hash commits to the entire prefix before it, so the head **at** a count is still a
+fact the box can state, and a refill cannot reproduce it. `--verify` gains `--head-at N`:
+
+```bash
+basecradle-harness-polymarket-sweep --home ~ --verify --json --head-at 17
+```
+
+```json
+"head_at_rows": 17,
+"head_at": "3f0c…",
+"head_at_reason": ""
+```
+
+`N` is a **row count, not a zero-based index**, so a witness passes its recorded `rows` and gets
+its recorded `head` back — no conversion for a caller to get wrong. Five properties are the
+design:
+
+- **A hash is asserted only for a verified prefix.** If the chain does not verify that far, the
+  break is reported exactly as today and `head_at` is `null` — inventing a head for rows the
+  chain just refused to vouch for would be the probe asserting the one thing it cannot.
+- **A count beyond the log is an answer, not an error.** It is the *caller's* truncation signal,
+  and the box has no witness and therefore no opinion about it. `head_at_reason` says which of
+  the two nulls it is, because they mean opposite things to the caller.
+- **The exit code is unchanged** — `1` iff a verified chain is broken, `0` otherwise. An answer
+  crosses as `0`; the compare belongs to whoever holds the witness.
+- **The keys are absent unless asked for**, never `null`. Output with no `--head-at` is
+  byte-for-byte what it was, and a runner that forgot the flag cannot read as a ledger that had
+  no answer.
+- **Read-only, same emission discipline, same single read of the file**: a non-creating lock,
+  ids and counts and hashes and booleans only, never a row payload.
+
+`--head-at` is refused without `--verify` (every other mode of this command writes), and a
+negative count is a usage error rather than a `null` that would launder a runner bug into a
+ledger finding. The human-legible line gains ` head_at[17]=3f0c…` (or `=none`), appended.
+
 ## [0.97.0] - 2026-08-03
 
 ### Fixed: a resolved market could never settle, and a dead leg marked at par (issue #390)
