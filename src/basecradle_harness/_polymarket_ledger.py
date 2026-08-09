@@ -817,6 +817,39 @@ def verify_chain(epoch_id: str, rows: list[dict[str, Any]]) -> ChainStatus:
     return ChainStatus(ok=True, head=previous, rows=len(rows))
 
 
+def prefix_head(rows: list[dict[str, Any]], chain: ChainStatus, count: int) -> str | None:
+    """The chain head after the first `count` rows, or ``None`` when that prefix is unverified.
+
+    This is the read an **off-box witness** needs once the ledger has grown past what it pinned
+    (issue #395). `ChainStatus.head` answers "what is the head *now*", which a witness holding
+    ``(K, H_K)`` from an hour ago can no longer compare against anything: a log that has
+    legitimately grown to N > K rows presents identically to one truncated below K and refilled
+    past it. But every row's hash commits to the entire prefix before it, so the head *at* K is
+    still a fact the box can state — and a refill cannot reproduce it.
+
+    **`None` is an answer, never an error**, and it means exactly one thing: the first `count` rows
+    are not a prefix this chain vouches for. Two ways that happens and both matter to the caller —
+    the chain broke at or before there (`chain.rows` stopped short of `count`), or the log simply
+    holds fewer rows than were asked for, which is the *caller's* truncation signal. Asserting a
+    hash either way would be the probe inventing a fact about rows it never verified.
+
+    `count == 0` is genesis: the empty prefix verifies trivially and its head is what the first
+    row chains from — the honest answer to a witness that pinned an epoch before its first row.
+
+    `len(rows)` is checked as well as `chain.rows`, which is redundant while both come off one
+    read (they do here) and is not an assumption worth resting an `IndexError` on: this runs
+    inside a probe whose whole job is to *answer*, and a crash there is read off-box as a box
+    that could not be audited.
+    """
+    if count < 0 or count > chain.rows or count > len(rows):
+        return None
+    if count == 0:
+        return GENESIS_PREV
+    # Within the verified prefix by the check above, and `verify_chain` refuses any row that
+    # carries no hash — so this is the hash it recomputed and matched, not a value taken on trust.
+    return str(rows[count - 1]["hash"])
+
+
 # --- the epoch -------------------------------------------------------------------
 
 

@@ -1491,6 +1491,7 @@ def test_the_probe_writes_nothing_at_all(tmp_path):
 
     for _ in range(3):  # safe to run repeatedly, which is what a monitor does
         assert _probe(tmp_path)[1] == 0
+        assert _probe(tmp_path, "--head-at", "3")[1] == 0  # the prefix read is read-only too
         assert main(["--home", str(tmp_path), "--verify"]) == 0  # the text mode too
 
     assert tree(tmp_path) == before  # every byte under the home, ledger and lock alike
@@ -1526,4 +1527,223 @@ def test_json_is_refused_without_verify_because_every_other_mode_writes(tmp_path
     with pytest.raises(SystemExit) as exit_info:
         main(["--home", str(tmp_path), "--json"])
     assert exit_info.value.code == 2  # argparse's usage error
+    assert list(tmp_path.iterdir()) == []  # and it wrote nothing on the way out
+
+
+# --- the prefix read an off-box witness needs (issue #395) -------------------
+#
+# `head` answers "what is the head *now*", which goes stale the moment the ledger grows: a
+# witness holding `(K, H_K)` from an hour ago has nothing left to compare it against, so
+# rows-above-the-witness was audited as honest growth with nothing checked. Every row's hash
+# commits to the whole prefix before it, so the head *at* K is still a fact the box can state —
+# and a truncate-and-refill cannot reproduce it.
+
+
+def rechain(home):
+    """Re-`prev` and re-`hash` every row on disk — what a tamperer does to make a file verify."""
+    from basecradle_harness._polymarket_ledger import GENESIS_PREV, row_hash
+
+    ledger = current_epoch(home).path
+    rows = [json.loads(line) for line in ledger.read_text().splitlines() if line.strip()]
+    previous = GENESIS_PREV
+    for row in rows:
+        row["prev"] = previous
+        row["hash"] = row_hash(row)
+        previous = row["hash"]
+    ledger.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    return rows
+
+
+def test_head_at_the_witnessed_count_is_that_witnesss_head(tmp_path):
+    """The contract the NOC runner binds to: `--head-at <witness.rows>` yields `witness.head`.
+
+    A row count, never a zero-based index — the witness records `rows` and `head` together, and
+    a surface that made the caller convert between the two would be a subtraction somebody
+    eventually gets wrong in the one place nobody re-derives it.
+    """
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    epoch = current_epoch(tmp_path)
+    witnessed_rows, witnessed_head = len(epoch.rows()), epoch.head
+
+    report, code = _probe(tmp_path, "--head-at", str(witnessed_rows))
+
+    assert code == 0
+    assert report["epoch"]["head_at_rows"] == witnessed_rows  # echoed: the answer self-describes
+    assert report["epoch"]["head_at"] == witnessed_head == report["epoch"]["head"]
+    assert report["epoch"]["head_at_reason"] == ""
+
+
+def test_head_at_answers_the_witnesss_question_after_the_ledger_has_grown(tmp_path):
+    """The whole point. Once the log has grown past K, `head` no longer answers anything the
+    witness asked — but the head *at* K still does, over a prefix that is now interior."""
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+        witnessed_rows = len(current_epoch(tmp_path).rows())
+        witnessed_head = current_epoch(tmp_path).head
+        call(tool, "get_pnl")  # every call appends its own row: the ledger grows honestly
+        call(tool, "get_orders")
+
+    report, code = _probe(tmp_path, "--head-at", str(witnessed_rows))
+
+    assert code == 0
+    assert report["epoch"]["rows"] > witnessed_rows  # grown...
+    assert report["epoch"]["head"] != witnessed_head  # ...so the live head has moved on
+    assert report["epoch"]["head_at"] == witnessed_head  # ...and the prefix is still intact
+
+
+def test_head_at_catches_a_truncate_and_refill_that_reads_as_pure_growth(tmp_path):
+    """The attack the third arm of the off-box compare could not see (basecradle-noc#458).
+
+    Truncate *below* the witnessed count, refill *past* it, re-chain the file: the result
+    verifies perfectly, holds more rows than the witness recorded, and so presents to an audit
+    that only pins `(rows, head)` as ordinary growth. The prefix hash is what gives it away —
+    the refilled rows cannot reproduce `H_K`, because `H_K` commits to every row before it.
+    """
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    epoch = current_epoch(tmp_path)
+    witnessed_rows, witnessed_head = len(epoch.rows()), epoch.head
+    assert witnessed_rows > 3  # the control: there is a prefix here worth truncating into
+
+    rows = epoch.rows()
+    kept = rows[: witnessed_rows - 2]  # truncate below the witness...
+    for number in range(4):  # ...and refill past it with rows nobody witnessed
+        forged = json.loads(json.dumps(rows[-1]))
+        forged["ts"] = f"2026-08-09T0{number}:00:00Z"
+        kept.append(forged)
+    epoch.path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in kept))
+    rechain(tmp_path)
+
+    report, code = _probe(tmp_path, "--head-at", str(witnessed_rows))
+
+    assert code == 0 and report["chain_ok"] is True  # internally consistent: the blind spot
+    assert report["epoch"]["rows"] > witnessed_rows  # and it presents as growth
+    assert report["epoch"]["head_at"] != witnessed_head  # ...but the prefix is not the one pinned
+    assert report["epoch"]["head_at"]  # a hash *was* asserted — the caller does the comparing
+    assert report["epoch"]["head_at_reason"] == ""
+
+
+def test_head_at_asserts_no_hash_past_a_break(tmp_path):
+    """A prefix that does not verify has no head, so the probe states the break and no hash.
+
+    Asserting one would be the probe vouching for rows the chain just refused to vouch for —
+    the same refusal `frozen: null` makes, applied to the one field a witness compares.
+    """
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    total = len(current_epoch(tmp_path).rows())
+    tamper(tmp_path, 1, lambda row: row["payload"].__setitem__("p", "0.99"))
+
+    report, code = _probe(tmp_path, "--head-at", str(total))
+
+    assert code == 1  # the broken chain, exactly as today
+    assert report["epoch"]["chain_ok"] is False and report["epoch"]["broken_at"] == 1
+    assert report["epoch"]["head_at"] is None
+    assert "does not verify" in report["epoch"]["head_at_reason"]
+
+    # ...but the part that *did* verify still answers: row 1 is the break, so a prefix of 1 holds.
+    verified, _ = _probe(tmp_path, "--head-at", "1")
+    assert verified["epoch"]["head_at"] == verified["epoch"]["head"]  # the verified prefix's head
+    assert verified["epoch"]["head_at_reason"] == ""
+
+
+def test_head_at_beyond_the_log_is_an_answer_not_an_error(tmp_path):
+    """A ledger shorter than the witness is the caller's truncation signal, and the box has no
+    opinion about it — from here it is simply a smaller number. So it exits 0 and says so
+    plainly, rather than being laundered into the broken-chain verdict it is not."""
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    total = len(current_epoch(tmp_path).rows())
+
+    report, code = _probe(tmp_path, "--head-at", str(total + 5))
+
+    assert code == 0 and report["chain_ok"] is True  # an answer crosses as 0
+    assert report["epoch"]["head_at"] is None
+    assert report["epoch"]["head_at_rows"] == total + 5
+    assert f"holds {total} verified row(s)" in report["epoch"]["head_at_reason"]
+
+
+def test_head_at_zero_is_genesis_and_no_epoch_is_still_no_epoch(tmp_path):
+    """The empty prefix verifies trivially and its head is what the first row chains from — the
+    honest answer to a witness that pinned an epoch before it had written anything."""
+    from basecradle_harness._polymarket_ledger import GENESIS_PREV
+
+    empty, code = _probe(tmp_path, "--head-at", "0")
+    assert code == 0 and empty["epoch"] is None  # no epoch stays a different fact from no rows
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+
+    report, code = _probe(tmp_path, "--head-at", "0")
+    assert code == 0 and report["epoch"]["head_at"] == GENESIS_PREV
+
+
+def test_head_at_is_absent_unless_it_was_asked_for(tmp_path):
+    """Backward compatible, and *absent* rather than `null`: a runner that forgot the flag must
+    not read as a ledger that had no answer. The keys appear only when a caller asked."""
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+
+    report, code = _probe(tmp_path)
+
+    assert code == 0
+    assert "head_at" not in report["epoch"] and "head_at_rows" not in report["epoch"]
+    assert "head_at_reason" not in report["epoch"]
+    assert report["epoch"]["head"]  # everything it always reported is untouched
+
+
+def test_head_at_reports_per_epoch_and_stays_legible_without_json(tmp_path, capsys):
+    from basecradle_harness._polymarket_engine import main
+
+    with upstream():
+        tool = make_tool(tmp_path)
+        forecast(tool)
+        buy(tool)
+    first = current_epoch(tmp_path).epoch_id
+    assert main(["--home", str(tmp_path), "--new-epoch"]) == 0
+    second = current_epoch(tmp_path).epoch_id
+    capsys.readouterr()
+
+    report, code = _probe(tmp_path, "--all-epochs", "--head-at", "2")
+
+    # Each epoch answers for itself: the same count, against its own chain.
+    assert code == 0
+    assert [entry["epoch_id"] for entry in report["epochs"]] == [first, second]
+    assert report["epochs"][0]["head_at"] and report["epochs"][0]["head_at_reason"] == ""
+    assert report["epochs"][1]["head_at"] is None  # a fresh one-row epoch has no prefix of 2
+
+    # The human line appends, never splices: an off-box reader parsing the existing pairs keeps
+    # working, and a fresh one gets the answer at the end.
+    assert main(["--home", str(tmp_path), "--verify", "--all-epochs", "--head-at", "2"]) == 0
+    out = capsys.readouterr().out
+    assert f"{first}: OK rows={report['epochs'][0]['rows']} " in out
+    assert f"head_at[2]={report['epochs'][0]['head_at']}" in out
+    assert "head_at[2]=none" in out  # the second epoch, said plainly rather than omitted
+    assert report["epochs"][1]["head_at_reason"] in out  # ...with the why on the line below
+
+
+def test_head_at_is_refused_without_verify_and_refuses_a_negative_count(tmp_path):
+    """Bound to `--verify` for the reason `--json` is — every other mode of this command writes.
+    A negative count is the *caller's* mistake, and answering `null` would launder a runner bug
+    into a ledger finding."""
+    from basecradle_harness._polymarket_engine import main
+
+    for argv in (["--head-at", "3"], ["--verify", "--head-at", "-1"]):
+        with pytest.raises(SystemExit) as exit_info:
+            main(["--home", str(tmp_path), *argv])
+        assert exit_info.value.code == 2  # argparse's usage error
     assert list(tmp_path.iterdir()) == []  # and it wrote nothing on the way out
