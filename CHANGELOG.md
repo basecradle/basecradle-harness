@@ -7,6 +7,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.99.0] - 2026-08-11
+
+### Removed (breaking): the `polymarket_paper` experiment, in full (issue #397)
+
+The paper-trading instrument is **permanently decommissioned** (founder decision, @origin,
+2026-08-10). It never should have been baked into the shipped harness: an experiment is a
+standalone MCP server an operator drops in, not a core tool the framework carries and versions
+for everyone. The removal is a deletion, not a disable — there is no flag that brings it back.
+
+Gone from the package: `_polymarket.py`, `_polymarket_data.py`, `_polymarket_engine.py`,
+`_polymarket_ledger.py`, the `polymarket_paper` plugin default, and the two systemd sweep units.
+
+**Breaking, in three places a downstream install can feel:**
+
+- **Public exports removed** — `PolymarketPaperTool`, `PolymarketData`, `PaperEpoch`,
+  `PaperState`, `PaperReject`, `BrokenChain`, `ChainStatus`, `verify_chain`, `row_hash`. An
+  `from basecradle_harness import PolymarketPaperTool` now raises `ImportError`.
+- **Console script removed** — `basecradle-harness-polymarket-sweep` no longer exists. Any
+  systemd timer still pointing at it must be disabled; `basecradle-harness-polymarket-sweep@.service`
+  and `@.timer` are deleted from `deploy/`.
+- **The `polymarket_paper` plugin stem is gone**, so it is no longer a grantable opt-in.
+
+**What an agent that had the grant sees on upgrade** (measured against a real 0.98.0-era config
+home, not reasoned about). The green-while-absent floor (issue #374) does exactly its job and
+nothing is silently stripped:
+
+- The agent **keeps working**. The leftover `tools/polymarket_paper.py` in the overlay is no
+  longer a shipped default, so the loader treats it as an operator drop-in: it fails to import,
+  is skipped at `WARNING`, and stays out of `broken_defaults`. One bad file does not take a
+  wake down.
+- **`basecradle-harness-verify` goes red**, as it should — the grant is a claimed capability
+  that cannot exist: `grant-not-shipped: granted, but basecradle-harness 0.99.0 ships no
+  tools/polymarket_paper.py`. Its printed remedy is the fix, and it works:
+
+  ```bash
+  basecradle-harness-install --revoke-opt-in polymarket_paper
+  ```
+
+  Two notes for whoever runs it: the revoke also prints `--opt-in/--revoke-opt-in named no
+  powerful tool default and did nothing for: polymarket_paper` — that warning is about the
+  *shipped default* (correctly, there is none), and the grant **is** withdrawn from
+  `.declared.json` regardless; and the dead overlay file itself is left on disk, because
+  `--revoke-opt-in` only removes a file the installer still owns. Delete it by hand to
+  de-clutter, or let a restore-to-default converge take it.
+
+An agent's existing `$HARNESS_HOME/polymarket` ledger is **not** touched by this change —
+nothing in the package reads or writes it any more, and removing an agent's own on-box data is
+an operator act, not a `pip install -U` side effect.
+
+The historical entries below are left exactly as written: the past is logged, not rewritten.
+
 ## [0.98.0] - 2026-08-09
 
 ### Added: the epoch probe can answer "what was the head at row K" (issue #395)

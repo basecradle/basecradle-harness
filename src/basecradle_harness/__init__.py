@@ -112,11 +112,6 @@ from basecradle_harness._plugins import (
     resolve_plugins,
 )
 from basecradle_harness._policy import BASECRADLE, SHELL, Policy
-from basecradle_harness._polymarket import PolymarketPaperTool
-from basecradle_harness._polymarket_data import PolymarketData
-from basecradle_harness._polymarket_engine import BrokenChain, PaperReject
-from basecradle_harness._polymarket_ledger import ChainStatus, PaperState, row_hash, verify_chain
-from basecradle_harness._polymarket_ledger import Epoch as PaperEpoch
 from basecradle_harness._provider import Provider
 from basecradle_harness._reads import MessagesTool, UsersTool
 from basecradle_harness._session import Session
@@ -258,16 +253,6 @@ __all__ = [
     "WebhookEventsTool",
     "SystemPromptReadTool",
     "SystemPromptEditTool",
-    # The fenced paper-trading instrument (issue #347): public data, simulated money
-    "PolymarketPaperTool",
-    "PolymarketData",
-    "PaperEpoch",
-    "PaperState",
-    "PaperReject",
-    "BrokenChain",
-    "ChainStatus",
-    "verify_chain",
-    "row_hash",
     "bind_platform_tools",
     # Message vocabulary
     "Message",

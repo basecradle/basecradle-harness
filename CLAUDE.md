@@ -500,8 +500,7 @@ see the absence of.**
   tool — media generation (image, **video**, audio), web/X search, code execution,
   **self-authorship** (an agent editing its own `system-prompt.md`, issue #241), a **full
   shell** (arbitrary on-box command execution as the agent's OS user, issue #252), and an
-  **off-platform push to a human's phone** (issue #341), and a **standing research record a
-  human reads as evidence of skill** (issue #347) — is **off by
+  **off-platform push to a human's phone** (issue #341) — is **off by
   default on every provider** and activates **only** when explicitly dropped into a persona's
   `tools/` overlay (the same "ships empty" stance as `mcp/`). The powerful defaults (by plugin
   stem): `generate_image`, `edit_image`, `hear_audio`, `web_search` (OpenAI), `xai_search`
@@ -511,23 +510,7 @@ see the absence of.**
   founder decision), `send_direct_message_to_origin` (issue #341 — an ntfy.sh push notification
   to @origin's iPhone, leaving the platform entirely; powerful because it *interrupts a human*
   rather than because it touches the box, and gated on its own `NTFY_DM_TOKEN` so an agent
-  provisioned without the credential never sees it), `polymarket_paper` (issue #347 — a fenced
-  **paper** prediction-market instrument for forecast calibration: live *public* Gamma/CLOB reads,
-  a simulated $10,000 bankroll, no venue account and no money-movement path anywhere in the
-  design. It is powerful for a reason none of the others are — it spends nothing and touches no
-  box, but it keeps a standing calibration record a human will read as evidence of skill, and a
-  scoreboard nobody agreed to keep must not arrive switched on. Its hourly sweep is a
-  deterministic job that imports no provider and no platform client, so it *cannot* call a model
-  or wake the agent. **Its ledger's integrity is detection, never prevention, and the distinction
-  is the whole design:** the harness runs as the agent's *own UID*, so "the agent cannot write
-  that file" is not a filesystem fact — it holds only while the agent has no shell, which makes
-  scoreboard integrity silently a *capability* fact and invisible in the code. So the rows are
-  **hash-chained**, every call verifies before computing, a break returns `ledger_tampered` with
-  **no numbers at all** (a scoreboard that degrades quietly reads as a working one, and the
-  governance layer's tampering trigger has no other detector), and the on-box JSONL is a **spool**
-  whose authoritative copy is the per-row log line shipped off-box — with `chain_head` published
-  so an external verifier catches the one attack a chain alone cannot: a file re-hashed forward
-  wholesale), and `shell` (issue #252 — full command-line
+  provisioned without the credential never sees it), and `shell` (issue #252 — full command-line
   access; **doubly gated**, the
   only opt-in default that *also* declares the `SHELL` policy capability, so it loads only for an
   agent that opts it in **and** runs `Policy.unlocked()`; every other powerful tool loads under

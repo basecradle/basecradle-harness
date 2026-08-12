@@ -290,9 +290,8 @@ never imported.
 **Powerful tools fail closed.** Media generation (image, **video**, audio), web/X search,
 code execution, **self-authorship** (an agent editing its own system prompt — see
 [Self-authorship](#self-authorship--an-agent-edits-its-own-system-prompt)), a **full
-[shell](#run-any-command--the-shell-tool)**, the
-[**direct message** to a human's phone](#ring-the-humans-phone--the-direct-message-tool), and the
-[**paper-trading instrument**](#measure-your-forecasts--the-paper-trading-instrument) are
+[shell](#run-any-command--the-shell-tool)**, and the
+[**direct message** to a human's phone](#ring-the-humans-phone--the-direct-message-tool) are
 **opt-in on every provider** — they ship in the package but are **off by default**, the same "ships empty" stance
 as `mcp/`. A persona gets one only when you drop its
 plugin into the persona's `tools/` overlay; a default-riding agent comes up with the **benign /
@@ -1325,105 +1324,6 @@ agent = Harness(
 )
 print("send_direct_message_to_origin" in agent.tools)  # -> True
 ```
-
-## Measure your forecasts — the paper-trading instrument
-
-**`polymarket_paper`** answers one question about an agent: *are its probability estimates any good?* It gives the agent real, live public prediction-market prices and an entirely **simulated** $10,000 bankroll, makes it write down a probability **before** it can take a position, and scores those probabilities against what actually happened. Out comes a Brier score, a calibration error, a hit rate, and a simulated P&L.
-
-**No real money exists anywhere in the design.** No venue account, no wallet, no key material, no transfer path — not disabled, *absent*. The instrument reaches exactly two public, read-only endpoints (Polymarket's Gamma API and its public CLOB) over plain HTTPS `GET`s, and that is the whole of its network access. It is a **powerful, [opt-in](#powerful-tools-are-opt-in--the-capability-rule)** tool for an unusual reason: it spends nothing and touches no box, but it keeps a standing record a human will read as evidence of skill, and a scoreboard nobody agreed to keep should not arrive switched on.
-
-```bash
-basecradle-harness-install --opt-in polymarket_paper
-```
-
-Ten operations, and no others: `list_markets`, `get_market`, `log_forecast`, `place_order`, `cancel_order`, `get_orders`, `get_fills`, `get_positions`, `get_pnl`, `get_scorecard`.
-
-- **A position requires a forecast.** `place_order` refuses a buy with `forecast_required` until the agent has logged a probability for that exact `(market_id, outcome)`. One forecast covers as many sized adds as it likes until it logs a new one; selling and cancelling need none. Optional forecast logging would produce a calibration record with holes in exactly the places an agent found inconvenient — this makes it complete by construction.
-- **The agent cannot write its own scoreboard.** Cash, fees, fills, marks, P&L and resolution are all *derived* — from an append-only ledger the harness owns (under `$HARNESS_HOME/polymarket`) and from public market state. No operation accepts a price, a fee, a P&L figure or an outcome; `get_pnl` and `get_scorecard` are reads. Every row carries `epoch_id, ts, type, payload, schema_version, prev, hash`, nothing is ever updated or deleted, and all state is a fold over the log — so there is no counter that can drift away from the record.
-- **The ledger is tamper-evident, and a broken chain returns no numbers.** The harness runs as the agent's own OS user, so "the agent cannot write that file" is not a filesystem fact — it holds only while the agent has no shell. Integrity therefore rests on **detection, not prevention**: the rows are hash-chained (each carries the previous row's hash), every call verifies the chain before computing anything, and a break returns `ledger_tampered` with **no numbers at all** — not numbers with a warning, because a scoreboard that degrades quietly reads as a working one. Every operation refuses, reads and writes alike, and the sweep will not extend a chain it cannot verify. The on-box file is a **spool**: each row is also emitted in full as a `polymarket_ledger_row {...}` log line, so the authoritative copy lives off-box under a user the agent is not, and `get_scorecard` publishes `chain_head` + `chain_rows` for an external verifier to pin against it. Check a box by hand with `basecradle-harness-polymarket-sweep --verify` (exit 1 if broken), or by machine with `--verify --json` (see below).
-- **The fill model is deterministic.** A market order walks the book FIFO by price and **cancels** any unfilled remainder (never a phantom resting order); a limit order takes its marketable part as taker and rests the remainder. A resting order that the book later crosses fills as **maker, at its own price**. Fees are recorded on the fill row with their source. A market that publishes **no fee** (`0`) is recorded as a zero, tagged `market` — the venue's own fact. A fee-charging market publishes a flag rather than a notional rate (live, every such market reads `1000` whatever its real category rate), so those fills take the contract's 100 bps taker / 0 maker default, tagged `fee_source=default` — the number is the harness's and the row says so. No synthetic slippage: reproducibility over theater.
-- **Caps and a burn ceiling, enforced rather than requested.** $500 per order, $2,000 net notional per market, 20 open positions, a $10,000 bankroll the agent has no way to top up. 200 tool calls and 40 orders per UTC day, after which it returns a structured `rate_limited` — never a hang, and never a hidden loop. Every reply carries `budgets` saying what is left.
-- **The sweep never wakes the agent.** Settlement, resting-order fills and marks happen in a separate hourly job — `basecradle-harness-polymarket-sweep`, wired as a systemd timer in [`deploy/`](deploy/). It writes to the ledger and nothing else; it imports no provider and no platform client, so it *cannot* call a model or post a message. The agent discovers what happened on its next pull.
-- **Resolution comes from the CLOB, because Gamma deletes a market when it resolves.** That is the ordinary lifecycle, not an edge case: of 400 resolved markets the public CLOB still served with winner flags, **400 were gone from Gamma** (measured 2026-08-03). So a market that vanishes from discovery is still settled — off the `condition_id` the ledger has recorded on every position, order and observation since v1 — and a resolved market's switched-off order book no longer blocks it either. A market nothing public will resolve is a different thing, and it says so rather than guessing (below).
-- **A mark is the midpoint, with an empty side held at the contract's own bound.** An outcome share pays $1.00 or $0.00, so nobody bidding *is* a floor of $0.00 and nobody offering *is* a ceiling of $1.00 — which makes the mark agree with the CLOB's published `/midpoint` and Gamma's `outcomePrices` by construction. It deliberately does **not** fall back to `/book`'s `last_trade_price`: that field reads like the token's and is the *market's* — both legs of a binary market return the identical value — so a deep-out-of-the-money token, which is precisely the token nobody bids on, took the **complement's** price. Live, that mispriced every one of 18 one-sided books by $0.9985 a share, marking worthless legs at par. A book empty on *both* sides has no mark at all rather than a stale print from a dead market.
-- **A position nothing can price says so, instead of quoting a stale number.** When public data stops publishing a market entirely, `get_positions` reports `priceable: false` with `mtm_price`, `mtm_value` and `unrealized_pnl` all `null` (the last mark the sweep saw rides alongside as `last_known_mark`, shown but never computed from), the position is carried at **cost basis** in `equity_usd` so equity claims neither a gain nor a loss nobody can evidence, and `get_positions`/`get_pnl` carry an `unpriceable_markets` list. A *transient* outage never triggers this — only a clean "no such market" from both sources does, because a Polymarket outage must never read as "this market ceased to exist" — and the flag lifts by itself if the data comes back.
-- **An operator can settle by hand what nothing public will ever resolve.** `--force-resolve` is an **operator-side** lever on the sweep binary: there is no action, no parameter and no code path that reaches it from the agent, because a resolution is the single most valuable thing an agent could write into its own scoreboard. It settles at $1.00/$0.00, realizes the P&L, scores the Brier against the forecasts locked at position-open and moves `resolved_n` — all as **ordinary append-only rows** carrying `resolution_source: "operator_force_resolve"` plus who decided it and on what evidence, so an override stays distinguishable from the machine's own work forever. It **previews and writes nothing** unless `--yes` is given, because a settlement is irreversible in an append-only log:
-
-  ```bash
-  # 1. read what it would do — positions settled, orders cancelled, Briers scored
-  basecradle-harness-polymarket-sweep --home ~ \
-      --force-resolve 1654959 --winner No --evidence "FOMC statement 2026-07-29"
-  # 2. commit it
-  basecradle-harness-polymarket-sweep --home ~ \
-      --force-resolve 1654959 --winner No --evidence "FOMC statement 2026-07-29" \
-      --by capital --yes
-  ```
-
-  `--evidence` is required — an override that does not say what it was resolved from is not auditable. The winning outcome is matched case-insensitively against what the ledger spells, and a name the epoch has never traded is **flagged, not refused**: that is the normal shape of a *losing* position (the live case held `Yes` on a market that resolved `No`), and it is also what a misspelling looks like, so it is called out in the preview beside the per-position `WON`/`LOST` lines rather than acted on silently.
-
-- **It measures; it does not grade.** `get_scorecard` reports `resolved_n`, `brier`, `calibration_error`, `hit_rate`, `paper_pnl`, `max_drawdown_pct`, `distinct_event_clusters` and `frozen` — and renders **no** promotion verdict, because a promotion bar belongs to a governing contract this package cannot read, cannot test against, and will not be told about when it moves. An eligibility claim computed here would be an assertion nobody can check, read by the very agent under measurement. Whoever owns the bar does the comparing, from these numbers.
-- **The epoch state is auditable from outside the box.** `--verify --json` prints the state of the instrument as JSON and writes **nothing** — not a row, not the store dir (see below) — makes no model call, and is safe to run on a schedule. Without it a freeze is a *write-only control*: `get_scorecard`'s `frozen` is reachable only through a tool call inside a wake, which no monitor can make, and reading the ledger needs a shell nobody has by design — so an undeclared unfreeze could happen and every fleet signal would stay green.
-
-  ```bash
-  basecradle-harness-polymarket-sweep --home ~ --verify --json
-  ```
-
-  ```json
-  {
-    "harness_version": "0.91.0",
-    "home": "/home/example",
-    "epoch": {
-      "epoch_id": "epoch-20260726T203000Z",
-      "path": "/home/example/polymarket/epoch-20260726T203000Z/ledger.jsonl",
-      "frozen": false,
-      "frozen_reason": "",
-      "rows": 17,
-      "chain_ok": true,
-      "head": "3f0c…",
-      "broken_at": null,
-      "reason": ""
-    },
-    "epochs": [ "…the epochs this run verified, oldest first…" ],
-    "chain_ok": true
-  }
-  ```
-
-  Without `--json` the same probe stays human-legible, one line per epoch — `epoch-…: OK rows=17 head=3f0c… frozen=false`.
-
-  **`--head-at N` answers the question a stale witness can no longer ask.** `head` is the head *now*, so an off-box witness holding `(rows, head)` from an hour ago has nothing left to compare once the ledger has grown: rows-above-the-witness reads as honest growth, and a tamperer who truncates *below* the witnessed count and refills *past* it presents identically. Every row's hash commits to the entire prefix before it, so the head **at** a given count is still a fact the box can state — and a refill cannot reproduce it.
-
-  ```bash
-  # ask at the count you witnessed; compare the answer to the head you witnessed with it
-  basecradle-harness-polymarket-sweep --home ~ --verify --json --head-at 17
-  ```
-
-  ```json
-  "head_at_rows": 17,
-  "head_at": "3f0c…",
-  "head_at_reason": ""
-  ```
-
-  `N` is a **row count, not a zero-based index**, so passing a witness's recorded `rows` yields that witness's `head` — no conversion for a caller to get wrong. The three keys are added to every epoch object, and **only when asked for**: with no `--head-at` the output is byte-for-byte what it was, and their *absence* (never a `null`) is what keeps a runner that forgot the flag from reading as a ledger that had no answer. **A hash is asserted only for a verified prefix.** `head_at` is `null` — with `head_at_reason` saying which — when the chain does not verify that far (the break is reported exactly as today, and no head is invented for rows the chain just refused to vouch for), or when the epoch simply holds fewer rows than were asked for. That second case is **an answer, not an error**: it is the caller's truncation signal, and the box has no witness and so no opinion about it, so `--head-at` never moves the exit code — it stays `1` iff a verified chain is broken, `0` otherwise, and a plain answer crosses as `0`. `--head-at` is refused without `--verify` (every other mode writes), and a negative count is an argparse usage error rather than a `null` that would launder a runner bug into a ledger finding. The human-legible line gains ` head_at[17]=3f0c…` (or `=none`) **appended**, never spliced.
-
-  Three things about the JSON shape are deliberate. **`epoch` is `null` when the agent has no epoch at all** — a fact different from "an epoch that is not frozen", and collapsing them would make the audit read a freshly-provisioned agent as an un-frozen one. **`frozen` is `null` on a broken chain, never `false`** — the freeze is folded out of exactly the rows whose integrity just failed, so an edit that removed the `freeze` row from the middle of the log would otherwise be reported as un-frozen, which is the one wrong answer that matters on a control whose purpose is to stop trading; `chain_ok` sits beside it saying why. And **`rows`/`head` are the verified prefix**: on an intact chain the whole log and its real head, on a broken one how far the record vouches for itself and the last hash that did. `epoch` stays the *current* epoch whether or not `--all-epochs` was passed, so a monitor reads one field either way. Exit is `1` if any verified chain is broken, `0` otherwise. `--json` is refused without `--verify`, because every other mode of this command writes.
-
-  **An audit built on `chain_ok` alone is incomplete, by construction.** A hash chain detects an edit or a removal *inside* the log — the next row's `prev` stops matching — and **cannot** detect a **truncated tail**: lopping the final rows off leaves a shorter chain that verifies perfectly. So a trailing `freeze` deleted from the end reports `chain_ok: true` with `frozen: false`, honestly describing a log that is itself a lie. That is the gap [the off-box spool exists to close](#measure-your-forecasts--the-paper-trading-instrument), and it is why every epoch publishes `rows` and `head`: **pin them against the off-box row copy**, which lives under a UID the agent is not. Both halves, or the audit has a blind spot exactly where a tamperer would aim. And a pin **goes stale the moment the ledger grows** — `head` then answers a question the witness never asked — which is what `--head-at` above is for: it re-asks the witness's own question against the prefix that is now interior, so growth is *verified* rather than assumed honest.
-
-Everything left to the implementer **and enforced here** is frozen into the epoch's first ledger row, so a scorecard can never be read against terms other than the ones it ran under: the Brier observation is locked at **position open** (`brier_attribution: "position_open"` — one conviction, one scored observation, so slicing an order into fifty fills cannot dilute a bad call), the re-check policy is `hourly_sweep_plus_on_touch`, and the caps and fee defaults sit beside them. Each layer pre-commits the rules it owns; this one owns measurement.
-
-```python
-from basecradle_harness import Harness, MemoryTool, OpenAIProvider, PolymarketPaperTool
-
-# A PlatformTool — it calls no BaseCradle endpoint, but takes the agent's home off the bound
-# context, because that is where the operator-owned ledger lives.
-agent = Harness(
-    OpenAIProvider(model="gpt-5.4-mini"),
-    tools=[MemoryTool(), PolymarketPaperTool()],
-)
-print("polymarket_paper" in agent.tools)  # -> True
-```
-
-Errors come back in one shape — `{"ok": false, "error": "<code>", "message": "...", "budgets": {...}}` — with codes `not_found`, `invalid_params`, `insufficient_cash`, `insufficient_shares`, `market_closed`, `size_too_small`, `cap_exceeded`, `rate_limited`, `frozen`, `forecast_required`, `not_implemented`, plus two more: `upstream_unavailable` for when Polymarket itself did not answer (reporting an outage as "no such market" would have the agent reason from something false), and `ledger_tampered` when the hash chain does not verify — the only error that refuses *every* operation and returns an empty `budgets`, because the count would itself come from the rows under suspicion.
 
 ## Add your own tool
 
