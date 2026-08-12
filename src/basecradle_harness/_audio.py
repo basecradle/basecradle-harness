@@ -21,7 +21,7 @@ It mirrors `view`'s on-demand, ephemeral shape: the agent listens only when it
 chooses (never eagerly inlined), a non-audio asset comes back as a clean note rather
 than a failure, and an oversized one is described, not force-fed. The transcription
 model is OpenAI's Audio API, sharing the agent's one key (``gpt-5.4-mini`` reasons,
-``gpt-image-2`` paints, ``gpt-4o-transcribe`` listens).
+``gpt-image-2`` paints, ``gpt-transcribe`` listens).
 
 Video is deliberately out of scope (heavier, and frame extraction would collide with
 the no-subprocess safety boundary) — when it comes, it gets its own pure-Python path.
@@ -40,9 +40,11 @@ from basecradle_harness._platform import PlatformTool
 #: OpenAI's Audio API root. Transcription is an OpenAI service; this changes only for
 #: a proxy, not to reach another vendor (the key is the OpenAI key).
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-#: The transcription model. ``gpt-4o-transcribe`` is the current speech-to-text model;
-#: ``whisper-1`` is the older alternative the same endpoint accepts.
-DEFAULT_MODEL = "gpt-4o-transcribe"
+#: The transcription model. ``gpt-transcribe`` is OpenAI's current speech-to-text model;
+#: ``gpt-4o-transcribe`` and ``whisper-1`` are the older alternatives the same endpoint
+#: accepts. Not ``gpt-live-transcribe`` — that is the *streaming* variant, and this tool
+#: transcribes a whole file in one call.
+DEFAULT_MODEL = "gpt-transcribe"
 #: Transcription is slow next to a chat call — give it room before giving up.
 DEFAULT_TIMEOUT = 120.0
 #: The largest audio file to transcribe. 25 MiB is OpenAI's per-file upload ceiling;
@@ -63,7 +65,7 @@ class HearAudioTool(PlatformTool):
             ``AI_API_KEY`` at call time, so constructing the tool needs no
             secret (a keyless construction just errors, readably, if used).
         base_url: The Audio API root. Defaults to OpenAI.
-        model: The transcription model. Defaults to ``gpt-4o-transcribe``.
+        model: The transcription model. Defaults to ``gpt-transcribe``.
         timeout: Per-request timeout in seconds (transcription is slow).
     """
 

@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.100.0] - 2026-08-12
+
+### Changed: two media-tool default models move to the vendors' current stable (issue #399)
+
+A fleet media-tool version audit (capital, 2026-08-12) found every deployed agent running
+pristine tool overlays with no model pins — so the *packaged* default is what actually loads
+fleet-wide, and two of them had fallen behind their vendor's current model. Both replacement
+IDs were verified live against the vendors' own model-listing APIs before this bump.
+
+- **`listen` (`_audio.py`)** — `DEFAULT_MODEL` `gpt-4o-transcribe` → **`gpt-transcribe`**.
+  OpenAI released it 2026-07-28 as the recommended transcription model: roughly half the word
+  error rate of the `4o` line, at a lower price. `gpt-4o-transcribe` and `whisper-1` remain
+  accepted by the same endpoint for an operator who pins one. Deliberately *not*
+  `gpt-live-transcribe`, which is the **streaming** variant — this tool transcribes a whole
+  file in one call.
+- **`grok_generate_video` (`_grok.py`)** — `DEFAULT_VIDEO_MODEL` `grok-imagine-video` →
+  **`grok-imagine-video-1.5`**. xAI's `GET /v1/video-generation-models` shows the old ID with
+  `aliases: []` — it is the *frozen original*, never a rolling pointer at the current model —
+  while `-1.5` carries the current-stable aliases (`-preview`, `-2026-05-30`). **Cost change:**
+  1.5 bills $0.080/sec against the old model's $0.050/sec; @origin approved the increase
+  2026-08-12. An operator who wants the cheaper clip can still pass `grok-imagine-video`
+  explicitly.
+
+`DEFAULT_IMAGE_MODEL` (`grok-imagine-image-quality`) and the OpenAI image default
+(`gpt-image-2`) were audited in the same pass and are current — both unchanged.
+
 ## [0.99.0] - 2026-08-11
 
 ### Removed (breaking): the `polymarket_paper` experiment, in full (issue #397)
