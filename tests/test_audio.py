@@ -87,7 +87,7 @@ def test_listen_transcribes_the_audio(tool):
     # The audio rode as a multipart upload carrying the blob bytes and the model name.
     assert "multipart/form-data" in captured["content_type"]
     assert MP3_BYTES in captured["body"]
-    assert b"gpt-4o-transcribe" in captured["body"]
+    assert b"gpt-transcribe" in captured["body"]
     # ...and the transcript comes back for the model to read.
     assert TRANSCRIPT in result
     assert "Transcript:" in result

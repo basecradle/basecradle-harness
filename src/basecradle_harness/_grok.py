@@ -21,7 +21,8 @@ split by operation → every option tested):
   one source, or ``images`` (an array of them) for a composite (docs.x.ai images/editing +
   multi-image-editing).
 - `GrokGenerateVideoTool` (``grok_generate_video``) — text → video **or** image → video, via
-  xAI's **asynchronous** video endpoint (``POST /v1/videos/generations``, ``grok-imagine-video``).
+  xAI's **asynchronous** video endpoint (``POST /v1/videos/generations``,
+  ``grok-imagine-video-1.5``).
   This is the harness's first video capability. Generation takes minutes: the call returns a
   ``request_id`` and the tool polls ``GET /v1/videos/{request_id}`` until the clip is ``done``,
   then downloads the produced ``.mp4`` and uploads it as an Asset that renders inline in the UI.
@@ -75,8 +76,12 @@ from basecradle_harness._platform import PlatformTool, explain
 DEFAULT_BASE_URL = "https://api.x.ai/v1"
 #: The grok image model — xAI's quality image tier.
 DEFAULT_IMAGE_MODEL = "grok-imagine-image-quality"
-#: The grok video model. ``grok-imagine-video-1.5`` is the newer alternative an operator can pass.
-DEFAULT_VIDEO_MODEL = "grok-imagine-video"
+#: The grok video model. ``grok-imagine-video-1.5`` is xAI's current stable video model — the
+#: one carrying the rolling aliases (``-preview``, a dated alias). ``grok-imagine-video`` is the
+#: frozen original an operator can still pass: it has *no* aliases, so it is a pinned model and
+#: never a pointer at the current one. 1.5 bills more per second (@origin approved the change,
+#: 2026-08-12); xAI's own listing is the authority on both the lineup and the price.
+DEFAULT_VIDEO_MODEL = "grok-imagine-video-1.5"
 #: Per-request HTTP timeout. Generous — a generation submit/poll call is slower than a chat
 #: call, and ``grok_edit_image`` runs the same class of slow, high-fidelity image-edit work
 #: (``grok-imagine-image-quality``) that a measured ~133s ``gpt-image-2`` ``quality: high``

@@ -361,7 +361,7 @@ def test_video_submits_polls_to_done_and_posts_the_clip(video_tool):
         result = video_tool.run(prompt="a drone shot over the ocean", duration=6)
 
     sent = json.loads(submit.calls.last.request.content)
-    assert sent["model"] == "grok-imagine-video"
+    assert sent["model"] == "grok-imagine-video-1.5"
     assert sent["prompt"] == "a drone shot over the ocean"
     assert sent["duration"] == 6
     assert MP4_BYTES in captured["upload"]

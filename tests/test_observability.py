@@ -278,7 +278,11 @@ def test_a_negative_or_non_finite_cost_is_omitted_so_the_line_stays_greppable(ca
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=-0.02)
         log_media_call(
-            provider="xai", kind="video.generate", model="grok-imagine-video", seconds=1, cost=-1.0
+            provider="xai",
+            kind="video.generate",
+            model="grok-imagine-video-1.5",
+            seconds=1,
+            cost=-1.0,
         )
         log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=float("inf"))
         log_media_call(
@@ -298,11 +302,11 @@ def test_a_negative_or_non_finite_cost_is_omitted_so_the_line_stays_greppable(ca
 def test_the_media_line_names_the_provider_kind_model_and_duration(caplog):
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_media_call(
-            provider="xai", kind="video.generate", model="grok-imagine-video", seconds=61
+            provider="xai", kind="video.generate", model="grok-imagine-video-1.5", seconds=61
         )
 
     assert caplog.records[0].getMessage() == (
-        "media provider=xai kind=video.generate model=grok-imagine-video duration=61.00s"
+        "media provider=xai kind=video.generate model=grok-imagine-video-1.5 duration=61.00s"
     )
 
 
@@ -345,13 +349,13 @@ def test_the_media_line_carries_the_cost_when_the_provider_states_it(caplog):
         log_media_call(
             provider="xai",
             kind="video.generate",
-            model="grok-imagine-video",
+            model="grok-imagine-video-1.5",
             seconds=61,
             cost=2.1,  # one 15s 720p clip ≈ $2.10 — real dollars, previously invisible
         )
 
     assert caplog.records[0].getMessage() == (
-        "media provider=xai kind=video.generate model=grok-imagine-video duration=61.00s cost=2.1"
+        "media provider=xai kind=video.generate model=grok-imagine-video-1.5 duration=61.00s cost=2.1"
     )
 
 
