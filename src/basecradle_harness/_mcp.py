@@ -79,6 +79,7 @@ from basecradle_harness._assets import (
 from basecradle_harness._install import config_home
 from basecradle_harness._messages import ImageContent, ToolResult
 from basecradle_harness._tools import NO_PARAMETERS, Tool
+from basecradle_harness._venv import with_interpreter_bin
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -341,6 +342,12 @@ class StdioMcpClient(McpClient):
     so a secret in the config is passed straight to the child and never interpolated. A
     daemon reader thread drains stdout into a queue, so a blocking ``readline`` can never
     wedge the wake; ``stderr`` is discarded (server logging is not our transport).
+
+    That environment carries the harness's own venv ``bin`` on ``PATH`` (`_venv`), because a
+    bare ``command`` is resolved against exactly the ``PATH`` it is handed — so a server
+    installed *into the agent's venv* is launchable by name rather than only by absolute path.
+    It is applied under the config's ``env``, so an operator who sets ``PATH`` explicitly still
+    wins outright.
     """
 
     def __init__(self, config: McpServerConfig, timeout: float) -> None:
@@ -357,7 +364,7 @@ class StdioMcpClient(McpClient):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env={**os.environ, **self.config.env},
+                env={**with_interpreter_bin(os.environ), **self.config.env},
                 text=True,
                 bufsize=1,
             )

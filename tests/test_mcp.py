@@ -9,6 +9,7 @@ policy filter, and the brief's safety section.
 """
 
 import json
+import shlex
 import sys
 
 import httpx
@@ -263,6 +264,44 @@ def test_colliding_sanitized_tool_names_dedup_not_crash(tmp_path):
     finally:
         for client in resolution.clients:
             client.close()
+
+
+def _bare_name_launcher(tmp_path, monkeypatch, name="nova-mcp"):
+    """A fake MCP server reachable only as `name`, from a bin dir `sys.executable` now sits in.
+
+    The shape of a server installed *into the agent's venv*: its console script lands beside
+    the harness's own entry points, in a directory nothing puts on ``PATH`` (issue #409).
+    """
+    script = _write_server_script(tmp_path)
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    launcher = bin_dir / name
+    command = f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))}"
+    launcher.write_text(f"#!/bin/sh\n{command}\n", encoding="utf-8")
+    launcher.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python3"))
+    return name
+
+
+def test_a_stdio_server_beside_the_interpreter_launches_by_bare_name(tmp_path, monkeypatch):
+    """A bare `command` resolves against exactly the PATH it is handed — so it carries the venv."""
+    _drop_config(tmp_path, "fake", {"command": _bare_name_launcher(tmp_path, monkeypatch)})
+    resolution = load_mcp_tools(tmp_path, timeout=10)
+    try:
+        assert [t.name for t in resolution.tools] == ["fake__echo"]
+        assert resolution.skipped == []
+    finally:
+        for client in resolution.clients:
+            client.close()
+
+
+def test_an_explicit_path_in_the_servers_env_still_wins(tmp_path, monkeypatch):
+    """The harness's addition sits *under* the config's env, so an operator's PATH is absolute."""
+    name = _bare_name_launcher(tmp_path, monkeypatch)
+    _drop_config(tmp_path, "fake", {"command": name, "env": {"PATH": "/usr/bin:/bin"}})
+    resolution = load_mcp_tools(tmp_path, timeout=5)
+    assert resolution.tools == []
+    assert resolution.skipped[0][0] == "fake"
 
 
 def test_failed_server_self_excludes_with_reason(tmp_path):

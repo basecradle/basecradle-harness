@@ -7,6 +7,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.103.0] - 2026-08-17
+
+### Fixed: the agent's own console scripts are reachable by name (issue #409)
+
+0.102.0 pointed the `mempalace` CLI at the palace the harness binds, and the live acceptance run
+on @briggs then found the other half of the same defect one layer up: the CLI worked, but typing
+its name did not.
+
+```console
+$ mempalace status
+/bin/bash: line 1: mempalace: command not found
+```
+
+A wake is launched by absolute path — the router runs `/home/<agent>/venv/bin/basecradle-harness-wake`
+— so nothing ever *activates* the venv the agent is installed into, and the subprocesses the agent
+spawns inherit that un-activated environment. `mempalace`, `basecradle-harness-verify`, and every
+entry point an extra brings sat one directory away, reachable only by someone who already knew the
+private venv path and typed it every time: the same defect #409 exists to remove.
+
+- **The directory holding those scripts is now on the `PATH` of every command the agent runs** —
+  its `shell` tool, and any stdio MCP server it spawns.
+- **Derived, never configured.** It is read off `sys.executable` at spawn time, so it is whatever
+  venv the process is actually running from: move or rebuild the venv and the next wake finds the
+  new location, because it *is* the running interpreter's location. Nothing for provisioning to
+  mirror and nothing that can go stale — the same property that makes the palace publication safe.
+  A shared symlink into `/usr/local/bin` was rejected for collapsing per-agent isolation the moment
+  a second agent lands on a box, and a configured `PATH` for being a second source of truth.
+- **It only ever adds.** The box's own tools stay exactly as reachable as they were, an entry
+  already on `PATH` is left where it is, and an interpreter outside a venv contributes a directory
+  every sane `PATH` already has — a no-op rather than a reordering.
+- **It goes on twice, and the second time is not redundancy.** The `shell` tool runs `/bin/bash -lc`,
+  a login shell, so the profile is sourced *before* the command — and some distributions'
+  `/etc/profile` **assigns** `PATH` outright rather than appending to it, silently discarding an
+  inherited prepend. So the directory is put in the child's environment *and* re-added by a one-line
+  prelude ahead of the command, which runs after the profile has had its say. Both match an exact
+  `PATH` entry, so a profile that keeps the inherited one costs no duplicate.
+- **An MCP server's own `env` still wins.** The addition is applied *under* the config's `env`, so
+  an operator who sets `PATH` there is absolute — and a server installed into the agent's venv
+  becomes launchable by bare name.
+- **The agent is told.** The `shell` plugin's note now says its own command-line tools are on its
+  `PATH` and can be run by name. Putting them there is worth nothing if the agent never learns
+  they exist.
+
 ## [0.102.0] - 2026-08-16
 
 ### Fixed: the `mempalace` CLI now defaults to the palace the harness actually bound (issue #409)

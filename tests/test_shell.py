@@ -15,7 +15,9 @@ tests pin ``workdir`` to a temp dir so they never depend on a valid ``$HOME``.
 """
 
 import os
+import sys
 from importlib.resources import files
+from pathlib import Path
 
 import pytest
 
@@ -33,7 +35,8 @@ from basecradle_harness import (
 )
 from basecradle_harness._basecradle import _apply_safe_policy, _profile_from_env
 from basecradle_harness._install import plugin_opts_in, plugin_source_providers
-from basecradle_harness._shell import _ROOT_REFUSAL, _running_as_root
+from basecradle_harness._shell import _ROOT_REFUSAL, _running_as_root, _with_path
+from basecradle_harness._venv import path_preamble
 
 
 @pytest.fixture
@@ -82,6 +85,14 @@ def test_the_note_steers_to_scratch_and_workspace_over_assets():
     assert "~/scratch" in note
     assert "~/workspace" in note
     assert "Prefer them over timeline assets for anything not meant to be shared." in note
+
+
+def test_the_note_says_the_agents_own_command_line_tools_are_on_its_path():
+    # Issue #409: putting them on PATH is worth nothing if the agent never learns they are
+    # there. A channel the model cannot see is a channel the model cannot use.
+    note = _shipped_shell_plugin().note
+    assert "on your PATH" in note
+    assert "mempalace" in note
 
 
 # --- The policy boundary (the real, shipped tool) ----------------------------
@@ -335,6 +346,74 @@ def test_binary_output_does_not_crash_the_tool(shell):
     """Undecodable bytes are replaced, not fatal — a command that emits binary still returns."""
     result = shell.run(command="head -c 16 /dev/urandom")
     assert "[exit code: 0]" in result
+
+
+# --- The harness's own console scripts are on PATH (issue #409) ---------------
+
+
+def test_a_script_beside_the_interpreter_resolves_by_bare_name(tmp_path, monkeypatch):
+    """The defect, in one test: a CLI in the agent's venv answered `command not found`.
+
+    Nothing activates the venv — the router launches a wake by absolute path — so before this
+    the agent could reach `mempalace` only by typing the private venv path it was not told.
+    """
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    script = bin_dir / "nova-cli"
+    script.write_text("#!/bin/sh\necho reached\n")
+    script.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python3"))
+
+    result = ShellTool(workdir=str(tmp_path)).run(command="nova-cli")
+    assert "reached" in result
+    assert "[exit code: 0]" in result
+
+
+def test_the_harnesss_own_entry_point_resolves_by_bare_name(tmp_path, monkeypatch):
+    """The acceptance shape itself: the real entry point, from the real venv this suite runs in.
+
+    ``PATH`` is stripped to the system directories first — the shape of the wake the router
+    actually launches, which activates nothing. Without that the test would pass on the
+    developer's activated shell and prove nothing.
+    """
+    monkeypatch.setenv("PATH", f"/usr/bin{os.pathsep}/bin")
+    wake = Path(sys.executable).with_name("basecradle-harness-wake")
+    assert wake.exists(), "run the suite from the venv the package is installed into"
+
+    result = ShellTool(workdir=str(tmp_path)).run(command="command -v basecradle-harness-wake")
+    assert str(wake) in result
+
+
+def test_the_directory_is_on_the_path_the_command_sees_exactly_once(tmp_path, monkeypatch):
+    """Reachable is the contract; *where* it lands is the box's call once its profile has run.
+
+    Both halves of the fix put it there, and they agree on the match, so a profile that keeps
+    the inherited entry (macOS's `path_helper` keeps it and reorders it) costs no duplicate.
+    """
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python3"))
+
+    result = ShellTool(workdir=str(tmp_path)).run(command='echo "$PATH"')
+    assert result.split("\n")[0].split(os.pathsep).count(str(bin_dir)) == 1
+
+
+def test_the_inherited_path_is_added_to_never_replaced(shell):
+    """It only ever adds: the box's own tools stay exactly as reachable as they were."""
+    result = shell.run(command='echo "$PATH"')
+    assert "/usr/bin" in result.split("\n")[0].split(os.pathsep)
+
+
+def test_the_prelude_precedes_the_model_command():
+    """One line, spliced ahead — it must run *after* the login shell has sourced the profile."""
+    assembled = _with_path("echo hello")
+    assert assembled == f"{path_preamble()}\necho hello"
+    assert assembled.count("\n") == 1
+
+
+def test_the_command_is_untouched_when_there_is_no_directory_to_add(monkeypatch):
+    monkeypatch.setattr(sys, "executable", "")
+    assert _with_path("echo hello") == "echo hello"
 
 
 # --- The plugin: opt-in, provider-agnostic, double-gated ---------------------
