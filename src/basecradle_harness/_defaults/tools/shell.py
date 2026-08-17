@@ -23,6 +23,8 @@ PLUGIN = ToolPlugin(
         "and network calls with no sandbox beyond your Unix permissions. "
         "Your home directory has `~/scratch` (temporary — files untouched for 3 days are "
         "deleted automatically) and `~/workspace` (durable, private — see its README). Prefer "
-        "them over timeline assets for anything not meant to be shared."
+        "them over timeline assets for anything not meant to be shared. "
+        "The command-line tools installed alongside your harness are on your PATH — run them "
+        "by name (`mempalace status` reads your own memory palace, if that is your backend)."
     ),
 )
