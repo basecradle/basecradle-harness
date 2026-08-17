@@ -1114,6 +1114,12 @@ def _resolve_tools_and_provider() -> tuple[
     # already-current one; guarded so a reconcile hiccup never blocks startup.
     _reconcile_config_on_upgrade(provider_name)
     resolved, memory = _resolve_tools(provider_name, sdk, surface)
+    # Publish the palace this agent just bound to MemPalace's own CLI config, so the documented
+    # `mempalace` commands operate on the live palace rather than an empty default (issue #409).
+    # Here rather than inside `_resolve_tools`, deliberately: this function is the "an agent is
+    # being built to act" seam, while `_resolve_tools` is shared with the read-only
+    # `resolved_config` introspection, which must not write.
+    _publish_palace_binding(memory)
     bridge = _maybe_code_bridge(provider_name, surface, resolved.builtins)
     provider = _provider_from_config(
         provider_name, sdk, surface, builtins=resolved.builtins, code_bridge=bridge
@@ -1181,6 +1187,40 @@ def _reconcile_config_on_upgrade(provider: str) -> None:
     except Exception:  # noqa: BLE001 - a reconcile hiccup must never block the agent's startup
         _log.warning(
             "Config-home upgrade reconcile failed; continuing with the existing overlay.",
+            exc_info=True,
+        )
+
+
+def _publish_palace_binding(memory: MemoryProvider) -> None:
+    """Point the `mempalace` CLI at the palace a MemPalace-provider agent just bound (issue #409).
+
+    A no-op for every other provider — the import is lazy and the `isinstance` gate is what keeps a
+    SQLite agent (and a non-harness MemPalace user) on upstream's untouched defaults. `isinstance`
+    rather than an exact-class check on purpose: a *subclass* of the adapter is still an agent with
+    a palace under its home, and its CLI has the same gap.
+
+    Guarded exactly as the upgrade reconcile above is, and for the same reason: this is an operator
+    convenience, so a read-only home, a full disk, or a permission error must cost the convenience
+    and never the wake. Its absence is not silent — the CLI *names the path it looked at*
+    ("No palace found at ~/.mempalace/palace"), which says on its face that the publication did not
+    land, and the failure is logged here besides.
+
+    Deliberately **not** a `basecradle-harness-verify` claim: verify runs as the agent's own user
+    under `env -i` (issue #376) with neither `HARNESS_HOME` nor `HARNESS_MEMORY_PROVIDER` in its
+    environment, so it could not tell a genuinely missing publication from an agent that simply is
+    not on this provider — a check that reds on a healthy box gets switched off, and a switched-off
+    prover proves nothing.
+    """
+    from basecradle_harness._mempalace import MemPalaceMemoryProvider, publish_palace_binding
+
+    if not isinstance(memory, MemPalaceMemoryProvider):
+        return
+    try:
+        publish_palace_binding(memory.palace_path)
+    except Exception:  # noqa: BLE001 - a CLI convenience must never block the agent's startup
+        _log.warning(
+            "Could not publish the MemPalace palace path to the mempalace CLI config; "
+            "`mempalace` commands may need an explicit --palace.",
             exc_info=True,
         )
 

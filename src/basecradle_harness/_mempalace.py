@@ -44,15 +44,29 @@ quote-formatted markdown file under ``<palace>/conversations/`` and mines that d
 (MemPalace skips already-mined files, so re-mining the dir only processes the new one).
 Known bound: one small file accrues per exchange — acceptable for a reference adapter; a
 production deployment would compact or rotate them.
+
+**One palace, one mind — including from the CLI** (issue #409). The adapter's palace lives under
+the *agent's* home (``$HARNESS_HOME/mempalace``), which is what keeps two agents on one box from
+sharing a mind; MemPalace's own `mempalace` CLI defaults to ``~/.mempalace/palace``, which is right
+for the 1-AI-1-human install upstream ships for. Nothing joined the two, so a bare ``mempalace
+status`` on a provisioned agent reported an empty palace it had never used while the live one sat
+a directory away with thousands of drawers. `publish_palace_binding` closes that: the harness
+*publishes* the path it just bound into ``~/.mempalace/config.json``, so every CLI command that
+defaults its palace lands on the agent's live one. It is a **projection of the binding, never an
+input to it** — the adapter reads that file back at no point, so the file can never redirect the
+agent's mind, and it is rewritten from the live value on every bind so it cannot go stale.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import uuid
 from pathlib import Path
 
 from basecradle_harness._memory_provider import MemoryExchange, MemoryProvider, MemoryScope
+from basecradle_harness._observability import kv
 from basecradle_harness._tools import Tool
 
 _log = logging.getLogger("basecradle_harness")
@@ -93,6 +107,13 @@ _MISSING = (
     "MemPalace is not installed. Install the optional extra to use the MemPalace memory "
     "provider:  pip install basecradle-harness[mempalace]"
 )
+
+# Where the `mempalace` CLI keeps its config, and the key it reads the default palace from
+# (`mempalace.config.MempalaceConfig`). Upstream's own names — the harness publishes into the
+# operator's existing file rather than inventing a parallel one. See `publish_palace_binding`.
+_CLI_CONFIG_DIR = ".mempalace"
+_CLI_CONFIG_FILE = "config.json"
+_CLI_PALACE_KEY = "palace_path"
 
 
 class MemPalaceMemoryProvider(MemoryProvider):
@@ -286,6 +307,125 @@ class MemPalaceSearchTool(Tool):
         if not hits:
             return f"No memories match {query!r}."
         return f"Memories matching {query!r}:\n" + _render_hits(hits)
+
+
+# --- the CLI binding: one palace, reachable by both halves (issue #409) -------
+
+
+def publish_palace_binding(palace_path: str | Path) -> Path | None:
+    """Point the `mempalace` CLI's *default* palace at the one the harness just bound.
+
+    Writes ``palace_path`` into ``~/.mempalace/config.json`` — the file every ``mempalace``
+    command reads when it is given no ``--palace`` — so a bare ``mempalace status`` / ``search`` /
+    ``sync`` / ``repair-status`` operates on the agent's live palace instead of the empty
+    ``~/.mempalace/palace`` default it has never used. Returns the file it wrote, or ``None`` when
+    there was nothing to do (already correct) or nothing it *may* do (an unreadable file — see
+    below). The caller guards it: publishing is a convenience, and a failure here must never take a
+    wake down.
+
+    **It publishes; it never reads.** The adapter resolves its palace from ``$HARNESS_HOME`` (and
+    `MEMPALACE_PALACE_PATH`) alone — `_memory_provider._palace_path` — and this file is a
+    *projection* of that answer, refreshed from the live value every time the agent binds. That is
+    the whole reason it is not the "second source of truth" a hand-written config would be: it
+    cannot go stale against a moved ``HARNESS_HOME`` (the next bind rewrites it), and it cannot
+    redirect the agent's mind (nothing reads it back). Precedence is untouched in both directions —
+    ``--palace`` still wins over everything, and `MEMPALACE_PALACE_PATH` still wins over this file,
+    for the CLI *and* for the adapter.
+
+    **The operator's file is merged, never replaced.** ``config.json`` is upstream's, and it carries
+    settings that a palace's data depends on — ``backend``, ``collection_name``, and especially
+    ``embedding_model``, which ChromaDB rejects reads against if it stops matching what the palace
+    was embedded with. So every other key is read and written back untouched, and a file that
+    cannot be parsed (or is not an object) is **left completely alone** and reported: upstream
+    ignores such a file too, so the CLI is already pointing at its default and the operator has a
+    hand-edit to fix — quietly overwriting it would destroy their work to fix a symptom. (The merge
+    is read-modify-write, as upstream's own ``set_embedding_model`` / ``set_backend`` are, so a
+    write racing one of *those* can lose it. The window is one bind wide and closes for good: once
+    the published path is right this returns without writing at all, on this bind and every one
+    after.)
+
+    **Nothing here creates a palace.** It writes one small JSON file; it never runs ``init`` or
+    ``mine``, and it never materializes ``~/.mempalace/palace``. It is reached only when an agent
+    binds the MemPalace provider (``HARNESS_MEMORY_PROVIDER=mempalace``), so a SQLite-provider
+    agent and a non-harness MemPalace user keep upstream's defaults exactly.
+
+    **Bounded to this OS user, which is the isolation boundary.** ``~`` is the agent's own home, so
+    per-agent palaces stay per-agent (one OS user per agent — the fleet's universal-identity rule).
+    Two agents deliberately sharing one OS user with different ``HARNESS_HOME``s would have this
+    file name whichever bound last; their *palaces* stay separate regardless, because the adapter
+    never reads it, and ``--palace`` names either one.
+    """
+    wanted = os.path.abspath(os.path.expanduser(str(palace_path)))
+    config_dir = Path.home() / _CLI_CONFIG_DIR
+    config_file = config_dir / _CLI_CONFIG_FILE
+
+    existing = _read_cli_config(config_file)
+    if existing is None:  # present but unparseable — the operator's to fix, not ours to clobber
+        _log.warning(
+            "memory %s",
+            kv(op="palace-binding", result="skipped", reason="unreadable", config=str(config_file)),
+        )
+        return None
+    # Upstream expanduser()s the stored value, so compare the way it will be read — a `~`-relative
+    # path an operator wrote by hand is already correct and must not be rewritten every wake.
+    if os.path.expanduser(str(existing.get(_CLI_PALACE_KEY, ""))) == wanted:
+        return None
+
+    _write_cli_config(config_dir, config_file, {**existing, _CLI_PALACE_KEY: wanted})
+    _log.info(
+        "memory %s",
+        kv(op="palace-binding", palace=wanted, config=str(config_file)),
+    )
+    return config_file
+
+
+def _read_cli_config(config_file: Path) -> dict | None:
+    """The CLI's existing config as a dict — ``{}`` when absent, ``None`` when unusable.
+
+    The two "nothing there" cases are deliberately *not* the same. An absent file is the ordinary
+    first-run state and is created. A file that exists but does not parse as a JSON **object** is a
+    hand-edit only its author can fix, and is the one case this refuses to touch (see
+    `publish_palace_binding`).
+    """
+    try:
+        raw = config_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _write_cli_config(config_dir: Path, config_file: Path, data: dict) -> None:
+    """Publish the merged config atomically, at owner-only permissions.
+
+    Atomic (temp → ``fsync`` → `os.replace`) for the same reason the session transcript is: a
+    signal landing mid-write would otherwise leave invalid JSON, and upstream reads an unparseable
+    ``config.json`` as *empty* — silently reverting the CLI to a default palace this exists to
+    correct. The mode matches upstream's own (``0700`` dir, ``0600`` file): a config file can carry
+    an embeddings API key, so the published copy is never briefly world-readable, and an existing
+    directory's permissions are left as the operator set them.
+    """
+    if not config_dir.exists():
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = config_dir / f".{_CLI_CONFIG_FILE}.{uuid.uuid4().hex}.tmp"
+    # `os.open` with the mode, not a chmod after the fact: an `open(..., "w")` would create the
+    # file at the umask's permissions and only then tighten it, which is a window. Outside the
+    # `try` on purpose — a failure to *create* leaves nothing to clean up, and unlinking a path
+    # that could not be made would replace the real error with a misleading one.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, config_file)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # --- helpers -----------------------------------------------------------------

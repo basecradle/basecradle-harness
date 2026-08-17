@@ -7,6 +7,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.102.0] - 2026-08-16
+
+### Fixed: the `mempalace` CLI now defaults to the palace the harness actually bound (issue #409)
+
+On a `HARNESS_MEMORY_PROVIDER=mempalace` agent the harness and MemPalace's own CLI did not agree
+on where the palace lives. The adapter binds `$HARNESS_HOME/mempalace` — per-agent, beside
+`memory.db`, which is what keeps two agents on one box from sharing a mind. The `mempalace` CLI
+defaults to `~/.mempalace/palace`, which is right for the one-human-one-AI install upstream ships
+for. Nothing joined the two, so on @briggs a bare `mempalace status` reported *"No palace found"*
+while the live palace — 13 MB, 2,488 drawers — sat one directory away, reachable only by someone
+who already knew the harness-private path and typed `--palace` every time.
+
+- **The harness publishes its binding.** When a MemPalace-provider agent binds, the path it just
+  bound is written to `~/.mempalace/config.json` — the file every `mempalace` command reads when
+  given no `--palace`. One property upstream (`MempalaceConfig.palace_path`) serves `status`,
+  `search`, `sync`, `mine`, `repair-status`, `migrate` and `wake-up` alike, so pointing it points
+  all of them.
+- **A projection of the binding, never an input to it.** The adapter still resolves its palace
+  from the environment alone and reads that file at no point, so it cannot redirect the agent's
+  mind — and it is rewritten from the live value on *every* bind, so it cannot go stale after
+  `HARNESS_HOME` moves. That is what separates it from the hand-written config the issue warned
+  about: a second source of truth is correct only until the two drift, and this one cannot.
+- **`MEMPALACE_PALACE_PATH` (and the legacy `MEMPAL_PALACE_PATH`) is now honored by the adapter**,
+  in upstream's own order. It sits *above* the published file in the CLI's precedence, so an
+  adapter that ignored it would let anyone exporting that var re-open the split in the other
+  direction — silently, with the publication no longer able to say so.
+- **The operator's file is merged, never replaced,** and one that does not parse is left alone and
+  reported rather than clobbered. `config.json` carries settings a palace's *data* depends on —
+  `embedding_model` above all, which ChromaDB refuses reads against once it stops matching.
+- **Nothing creates a palace.** No `init`, no `mine`, no `~/.mempalace/palace`. A `sqlite`-provider
+  agent and any non-harness MemPalace user keep upstream's defaults exactly, and `--palace` still
+  outranks everything. Publishing is guarded: a read-only home costs the convenience, never the
+  wake — and its absence is not silent, because the CLI names the path it looked at.
+
 ## [0.101.0] - 2026-08-16
 
 ### Changed: the `openai` extra adopts the 3.x major, which moved the SDK to HTTPX2 (issue #410)
