@@ -7,6 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.101.0] - 2026-08-16
+
+### Changed: the `openai` extra adopts the 3.x major, which moved the SDK to HTTPX2 (issue #410)
+
+`openai` 3.0 has exactly one breaking change, and it is underneath the API rather than in it:
+the SDK's HTTP client is now [HTTPX2](https://httpx2.pydantic.dev/) — a **separate
+distribution** on `httpcore2`, not a new major of `httpx` — and installing `openai` no longer
+installs `httpx`. The pin moves `>=2.43,<3` → **`>=3,<4`** on both the `[openai]` extra and the
+dev group. The fleet default is to adopt the major rather than pin back.
+
+- **Nothing in the adapter changed.** `OpenAIProvider` builds numeric timeouts and never injects
+  an HTTP client, so both surfaces, the built-ins, vision, and the error taxonomy carried over
+  untouched — the `_ErrorMapper` reads a status error's `response.text` / `headers` structurally,
+  and HTTPX2 answers the same. Verified live against `api.openai.com`, not only in the mocks.
+- **Operational note — TLS.** HTTPX2 verifies certificates against the **operating system's**
+  trust store; HTTPX used `certifi`'s, which `openai` no longer installs either. An ordinary
+  machine or distro base image is unaffected. A minimal container without system CA
+  certificates — or a TLS-inspecting proxy — needs the CA bundle installed, or `SSL_CERT_FILE` /
+  `SSL_CERT_DIR` set. This is the one thing about the bump that can bite a deployment, so it is
+  in `README.md` beside the install line as well as here.
+- **`httpx` is now a declared dependency of the core.** It always was one *in fact* — the package
+  imports it directly in nine modules (`_webfetch`, `_grok`, `_images`, `_assets`,
+  `_direct_message`, `_xai_account`, `_mcp`, `_http`, `_wake`) — but it arrived through
+  `basecradle` and, until now, `openai` as well. Losing the second supplier is a good moment to
+  stop relying on somebody else's dependency graph for something we import ourselves. No new
+  package is installed by this; the floor (`>=0.28`) matches the SDK's.
+- **The suite now intercepts both HTTPX families.** respx patches one transport family per
+  router, and the harness legitimately drives two at once — HTTPX2 for the model call, `httpx`
+  for the platform SDK, the OpenRouter SDK, and the harness's own HTTP — with the *same test*
+  routinely mocking both (every wake test mocks the platform and the model). One mocker covering
+  `httpcore` and `httpcore2` (`tests/conftest._HTTPCoreBothMocker`) restores that, with no
+  per-test change: respx hands each family the same structurally-read request and response
+  objects, so all ~220 existing mock sites work unmodified.
+- **Two tests pin what the mocks cannot.** A mocked transport is blind to a transport change by
+  construction — that blindness is *why* this landed as a red Dependabot PR instead of a caught
+  regression — so `test_the_sdk_client_rides_httpx2` asserts the family the SDK actually drives
+  (and that it is not the migration guide's legacy escape hatch), and the new marked-live
+  `tests/test_openai_live.py` makes one real call to `api.openai.com`, TLS included. The OpenAI
+  adapter is @jt's brain and was the last shipped SDK path with no live probe.
+
 ## [0.100.0] - 2026-08-12
 
 ### Changed: two media-tool default models move to the vendors' current stable (issue #399)
