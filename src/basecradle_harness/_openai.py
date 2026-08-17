@@ -379,7 +379,8 @@ class _ErrorMapper:
             # `ProviderResponseError`; the engine re-requests it before giving up.
             raise ProviderResponseError(str(exc)) from exc
         if isinstance(exc, json.JSONDecodeError):
-            # httpx's ``response.json()`` raises this on a truncated / non-JSON 200 body, and the
+            # The HTTP client's ``response.json()`` raises this on a truncated / non-JSON 200 body
+            # (HTTPX2 since ``openai`` 3.0, HTTPX before it — the fault is the same), and the
             # SDK lets it propagate raw — it is exactly the "EOF while parsing a value" fault this
             # issue names, so it too maps to the retryable `ProviderResponseError` (issue #259).
             raise ProviderResponseError(

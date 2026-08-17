@@ -1,8 +1,8 @@
 """Shared fixtures. All HTTP is mocked with respx — no test ever touches a model.
 
 The endpoint is a fabricated OpenAI-compatible host; the key is a correctly-shaped fake. respx
-mocks httpx at the transport level, so it intercepts the ``openai`` SDK's own httpx client
-without any network — the SDK adapter is tested against real, SDK-valid response bodies. Model
+mocks the HTTP client at the transport level, so it intercepts each SDK's own client without
+any network — the SDK adapter is tested against real, SDK-valid response bodies. Model
 responses follow the OpenAI chat-completions / Responses schemas.
 """
 
@@ -10,6 +10,8 @@ import json
 
 import pytest
 import respx
+import respx.mocks
+from respx.mocks import HTTPCoreMocker
 
 from basecradle_harness import OpenAIProvider
 
@@ -18,6 +20,45 @@ BASE_URL = "https://api.openai.test/v1"
 CHAT_URL = f"{BASE_URL}/chat/completions"
 RESPONSES_URL = f"{BASE_URL}/responses"
 FAKE_KEY = "sk-test-0123456789abcdefghijklmnop"
+
+
+class _HTTPCoreBothMocker(HTTPCoreMocker):
+    """respx's transport mocker, patching **both** HTTPX families this suite drives.
+
+    ``openai>=3`` moved its client to HTTPX2 — a separate distribution on ``httpcore2``, not a
+    new major of ``httpx`` — while everything else the harness speaks HTTP with is still legacy
+    ``httpx``: the BaseCradle SDK, the OpenRouter SDK, and the harness's own calls (web_fetch,
+    the Grok tools, the ntfy push, asset downloads). A respx router patches **one** family, so a
+    default router would silently stop intercepting the model endpoint the moment the SDK moved
+    — which is exactly how this arrived: every route still registered, none of them called.
+
+    Both families are patched by one mocker rather than by two routers because the *same* test
+    routinely mocks both at once (every wake test mocks the platform **and** the model), and a
+    split would make ``assert_all_called`` answer for only half the routes. respx converts each
+    intercepted request to an ``httpx.Request`` and hands back an ``httpcore.Response``; HTTPX2
+    reads both structurally, so the legacy objects the routes are written against keep working
+    on either transport — which is why the suite needed no per-test change.
+
+    Installed as respx's default mocker below, so the ~220 bare ``respx.mock(...)`` call sites
+    (and the `router` fixture) get it without naming it — subclass-plus-``DEFAULT_MOCKER`` is the
+    extension respx's own maintainer points forked-transport users at (respx#316), and the same
+    shape his ``pytest-httpx2`` plugin ships; this one covers both families in a single mocker
+    rather than the plugin's httpcore2-only one, which is the part the mixed suite needs.
+    """
+
+    name = "httpcore+httpcore2"
+    targets = [
+        *HTTPCoreMocker.targets,
+        "httpcore2._sync.connection.HTTPConnection",
+        "httpcore2._sync.connection_pool.ConnectionPool",
+        "httpcore2._sync.http_proxy.HTTPProxy",
+        "httpcore2._async.connection.AsyncHTTPConnection",
+        "httpcore2._async.connection_pool.AsyncConnectionPool",
+        "httpcore2._async.http_proxy.AsyncHTTPProxy",
+    ]
+
+
+respx.mocks.DEFAULT_MOCKER = _HTTPCoreBothMocker.name
 
 
 @pytest.fixture(autouse=True)

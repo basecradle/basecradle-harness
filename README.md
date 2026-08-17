@@ -14,7 +14,9 @@ The shipped Harness is **safe by default**: the install has no code path to a sh
 pip install 'basecradle-harness[openai]'
 ```
 
-Python 3.10+. The harness core depends only on the `basecradle` SDK (which brings `httpx`) — and on **no model-vendor SDK**. That is deliberate: the harness reaches an LLM **only through a vendor's official SDK**, and each agent installs only the one its config names, as an *extra*. `[openai]` is the one v0 ships (it pins the `openai` package); install it for the OpenAI stack. With no vendor-SDK extra installed, the harness comes up with no way to reach a model and says so plainly — "no LLM, by design."
+Python 3.10+. The harness core depends only on the `basecradle` SDK and `httpx` — and on **no model-vendor SDK**. That is deliberate: the harness reaches an LLM **only through a vendor's official SDK**, and each agent installs only the one its config names, as an *extra*. `[openai]` is the one v0 ships (it pins `openai>=3,<4`); install it for the OpenAI stack. With no vendor-SDK extra installed, the harness comes up with no way to reach a model and says so plainly — "no LLM, by design."
+
+> **`[openai]` and TLS.** `openai` 3.0 moved the SDK's HTTP client to [HTTPX2](https://httpx2.pydantic.dev/), which verifies certificates against the **operating system's** trust store rather than `certifi`'s. An ordinary machine or distro base image is unaffected. A minimal container without system CA certificates — or a TLS-inspecting corporate proxy — needs the CA bundle installed, or `SSL_CERT_FILE=/path/to/ca-bundle.pem` (or `SSL_CERT_DIR`) set. Nothing else in the harness changed: the model path is the same `AI_SDK=openai` adapter, and the harness's own HTTP (web_fetch, the Grok media tools, asset downloads) still runs on `httpx`.
 
 ## Quickstart — talk to an agent
 

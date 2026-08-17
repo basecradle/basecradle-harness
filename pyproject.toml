@@ -20,7 +20,15 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
-dependencies = ["basecradle>=0.6"]
+dependencies = [
+    "basecradle>=0.6",
+    # Declared because the package **imports it directly** — `_webfetch`, `_grok`, `_images`,
+    # `_assets`, `_direct_message`, `_xai_account`, `_mcp`, `_http`, `_wake`. It was never a new
+    # install: `basecradle` requires `httpx>=0.28` and, until `openai` 3.0, the vendor SDK did too.
+    # That second supplier is gone (3.0 moved to HTTPX2 and stopped installing `httpx`), so what
+    # was an accident of somebody else's dependency graph is now stated. Floor matches `basecradle`'s.
+    "httpx>=0.28",
+]
 
 # The harness reaches an LLM only through a vendor's official SDK — never hand-rolled HTTP.
 # The core depends on NO vendor SDK; each agent installs only the extra its AI_SDK names, so
@@ -31,10 +39,16 @@ dependencies = ["basecradle>=0.6"]
 # The `openai` vendor SDK (AI_SDK=openai): the one adapter v0 ships. Drives the model loop
 # (Responses + Chat Completions), the server-side web_search built-in, vision, and the
 # gpt-image-2 / audio endpoints — all through this package, no harness-owned HTTP.
-# Pin: floor is the version Milestone 1 was built and tested against (2.43); major-capped so a
-# breaking 3.0 never auto-upgrades — the pin is bumped deliberately, in lockstep with the
+# Pin: floor is the major this adapter is built and tested against (3.x); major-capped so a
+# breaking 4.0 never auto-upgrades — the pin is bumped deliberately, in lockstep with the
 # harness version (issue #158), and `basecradle-harness-wake --version` reports both.
-openai = ["openai>=2.43,<3"]
+# The 3.0 floor is a hard requirement, not a preference (issue #410): 3.0 moved the SDK's client
+# to **HTTPX2** — a separate distribution on `httpcore2`, not a new major of `httpx` — and the
+# suite intercepts that transport family. It also changed the **TLS trust store**: HTTPX2 reads
+# the operating system's, where HTTPX read `certifi`'s. A box with system CA certificates is
+# unaffected (verified live against api.openai.com); a minimal image without them needs them
+# installed, or `SSL_CERT_FILE` / `SSL_CERT_DIR` set.
+openai = ["openai>=3,<4"]
 # The native xAI SDK (AI_SDK=xai-sdk): the Grok personas' end-state brain (issue #165). A
 # gRPC client — grok chat + tool calling + Live Search, natively, no OpenAI-wire shim. Floor is
 # the version this adapter was built against (1.17); major-capped so a breaking 2.0 never
@@ -84,12 +98,11 @@ Source = "https://github.com/basecradle/basecradle-harness"
 Issues = "https://github.com/basecradle/basecradle-harness/issues"
 
 [dependency-groups]
-# `openai` is a dev dep so the test suite exercises the real SDK adapter offline (respx
-# mocks its httpx transport); in production it ships only via the `openai` optional extra.
 # `openai` and `xai-sdk` are dev deps so the suite exercises both real SDK adapters offline —
-# openai's httpx transport is respx-mocked; the xai-sdk (gRPC) adapter builds real protos and
-# runs against an injected fake client, so neither ever touches the network. In production each
-# ships only via its optional extra.
+# openai's transport is respx-mocked (HTTPX2 since openai 3.0, which is why `tests/conftest.py`
+# installs a mocker covering **both** HTTPX families); the xai-sdk (gRPC) adapter builds real
+# protos and runs against an injected fake client, so neither ever touches the network. In
+# production each ships only via its optional extra.
 # `openrouter` is likewise a dev dep so the suite exercises the real OpenRouter SDK adapter
 # offline — the SDK's httpx transport is respx-mocked, so it never touches the network.
 # `ruff`'s floor is a correctness constraint, not a preference: the *default rule set is
@@ -102,7 +115,7 @@ dev = [
     "pytest>=8",
     "respx>=0.22",
     "ruff>=0.16",
-    "openai>=2.43,<3",
+    "openai>=3,<4",
     "xai-sdk>=1.17,<2",
     "openrouter>=1.1.2,<2",
 ]

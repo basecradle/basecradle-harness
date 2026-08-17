@@ -240,11 +240,11 @@ Mirrors the Python SDK for ecosystem consistency.
 | Python | **3.10+** | Modern typing, no legacy baggage |
 | Toolchain | **uv** | venvs, deps, build, publish — one tool |
 | Lint + format | **ruff** | CI enforces; no style debates |
-| Tests | **pytest** + **respx** | respx mocks httpx at the transport level; model-provider calls mocked the same way — tests never hit the network |
+| Tests | **pytest** + **respx** | respx mocks at the transport level; model-provider calls mocked the same way — tests never hit the network. The suite drives **two** HTTPX families (HTTPX2 for the `openai` SDK since its 3.0, `httpx` for everything else), so one mocker covers `httpcore` **and** `httpcore2` — `tests/conftest._HTTPCoreBothMocker`, issue #410 |
 | Packaging | **pyproject.toml** only | hatchling backend. No setup.py |
 | Types | Hints everywhere + **py.typed** | Types are documentation |
 
-Runtime dependencies start at `basecradle` (the SDK; brings httpx) and **no model-vendor SDK** — the vendor SDK ships only as an *optional extra* per `AI_SDK` (`[openai]` is the one v0 ships, pinning `openai`), so the core stays light and an agent installs only the brain it uses. Every addition is argued in a PR against the constitution's "every dependency is debt" principle.
+Runtime dependencies start at `basecradle` (the SDK) plus `httpx` — declared because the package imports it directly in nine modules, not because it adds an install: `basecradle` already requires it, and `openai` did too until its 3.0 moved to HTTPX2 and stopped shipping it (issue #410) — and **no model-vendor SDK**: the vendor SDK ships only as an *optional extra* per `AI_SDK` (`[openai]` is the one v0 ships, pinning `openai`), so the core stays light and an agent installs only the brain it uses. Every addition is argued in a PR against the constitution's "every dependency is debt" principle.
 
 ## Conventions
 

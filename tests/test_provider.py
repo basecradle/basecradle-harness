@@ -1,17 +1,19 @@
 """The ``openai`` SDK adapter (`OpenAIProvider`), behind the provider-agnostic `Provider` seam.
 
 The harness reaches a model **only through a vendor SDK** (issue #158); this is that adapter
-for ``AI_SDK=openai``. Every test mocks the HTTP transport with respx — and because respx
-patches httpx at the transport level, it intercepts the ``openai`` SDK's *own* httpx client, so
-these tests drive the **real SDK** against SDK-valid response bodies without ever touching the
-network. Both surfaces are covered: ``chat`` (Chat Completions) and ``responses`` (the Responses
-API, with the server-side ``web_search`` built-in and vision).
+for ``AI_SDK=openai``. Every test mocks the HTTP transport with respx — patched at the transport
+level, so it intercepts the ``openai`` SDK's *own* client (HTTPX2 since openai 3.0; see
+`tests/conftest._HTTPCoreBothMocker`) and these tests drive the **real SDK** against SDK-valid
+response bodies without ever touching the network. Both surfaces are covered: ``chat`` (Chat
+Completions) and ``responses`` (the Responses API, with the server-side ``web_search`` built-in
+and vision).
 """
 
 import json
 import logging
 
 import httpx
+import httpx2
 import pytest
 
 from basecradle_harness import (
@@ -708,6 +710,26 @@ def test_default_surface_is_responses():
     provider = OpenAIProvider(model="gpt-4o", api_key=FAKE_KEY)
     assert provider.surface == "responses"
     provider.close()
+
+
+def test_the_sdk_client_rides_httpx2():
+    """The adapter drives the SDK's **HTTPX2** client — pinned, because nothing else says so.
+
+    ``openai`` 3.0 moved off ``httpx``, and the suite's mocker (`tests/conftest`) patches *both*
+    families — so the day the SDK goes back to legacy ``httpx``, or the day someone injects a
+    legacy client through the migration guide's escape hatch, every other test here keeps passing
+    and nobody learns that production changed transports, and with it its TLS trust store. This
+    is that fact asserted rather than inferred (issue #410). Read off the SDK's private client
+    attribute deliberately: the transport is not part of the SDK's public surface, and the
+    alternative is not checking at all.
+    """
+    provider = _chat()
+    try:
+        client = provider._client._client
+        assert isinstance(client, httpx2.Client)
+        assert not isinstance(client, httpx.Client)  # not the legacy escape hatch
+    finally:
+        provider.close()
 
 
 def test_default_params_pass_through(router):
