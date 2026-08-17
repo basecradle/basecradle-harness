@@ -100,6 +100,49 @@ def test_from_env_home_points_the_store_at_the_agent_home(monkeypatch, tmp_path)
     assert provider.store.path == tmp_path / "memory.db"
 
 
+def test_from_env_home_points_the_palace_at_the_agent_home(monkeypatch, tmp_path):
+    """The MemPalace palace is per-agent, beside the SQLite default — the isolation that keeps two
+    agents on one box from sharing a mind."""
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.delenv("MEMPALACE_PALACE_PATH", raising=False)
+
+    assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "mempalace"
+
+
+# MemPalace's own palace-path vars, read in upstream's order (issue #409). The adapter honors them
+# because the `mempalace` CLI does: the harness publishes its binding into `~/.mempalace/config.json`,
+# which sits *below* these vars in upstream's precedence — so an adapter that ignored them would let
+# any exported var split the two halves again, silently, with the publication unable to say so.
+
+
+def test_palace_path_prefers_mempalaces_own_env_var(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "elsewhere"))
+
+    assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "elsewhere"
+
+
+def test_palace_path_honors_the_legacy_spelling_and_the_order_between_them(monkeypatch, tmp_path):
+    """Upstream reads ``MEMPALACE_PALACE_PATH`` *or* ``MEMPAL_PALACE_PATH``, in that order — and a
+    set-but-**empty** first var falls through to the second rather than winning as "set"."""
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
+    monkeypatch.setenv("MEMPAL_PALACE_PATH", str(tmp_path / "legacy"))
+
+    assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "legacy"
+
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", str(tmp_path / "current"))
+    assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "current"
+
+
+def test_both_palace_path_vars_empty_falls_back_to_the_agent_home(monkeypatch, tmp_path):
+    monkeypatch.setenv("HARNESS_MEMORY_PROVIDER", "mempalace")
+    monkeypatch.setenv("MEMPALACE_PALACE_PATH", "")
+    monkeypatch.setenv("MEMPAL_PALACE_PATH", "")
+
+    assert memory_provider_from_env(home=tmp_path).palace_path == tmp_path / "mempalace"
+
+
 def test_from_env_loads_a_custom_provider_by_dotted_path(monkeypatch):
     """A 'module:Class' value imports any MemoryProvider subclass — the custom-provider seam."""
     monkeypatch.setenv(

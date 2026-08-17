@@ -114,6 +114,17 @@ The MemPalace adapter is the reference implementation of the *middleware* style:
 
 It also gives the model **one read-only tool, `memory_search`** — deliberate recall beside the automatic kind. Turn-0 injection happens *once* per wake, against the incoming message's text; a memory the agent turns out to need mid-task, and that the top-K didn't surface, would otherwise be unreachable for the rest of that wake ("what was that endpoint we discussed in March?"). The tool is the way back to the palace with a query the model writes itself — the same in-process search `context` runs, and **no write surface**: `observe` stays the palace's only writer, so there is no concurrent-writer problem to solve.
 
+**The `mempalace` CLI reaches the same palace, with no flags.** MemPalace ships its own command line, and it defaults to `~/.mempalace/palace` — right for the one-human-one-AI install it was written for, wrong for a harness agent whose palace lives under *its* home. So when a MemPalace-provider agent binds, the harness writes the path it just bound into `~/.mempalace/config.json`, the file every `mempalace` command reads when you give it no `--palace`. A bare `mempalace status` or `mempalace search "…"` then operates on the agent's live palace instead of an empty directory it has never used:
+
+```console
+$ mempalace status
+  MemPalace Status — 2488 drawers
+  WING: conversations
+    ROOM: technical             1711 drawers
+```
+
+That file is a **projection of the binding, never an input to it** — the adapter resolves its own palace from `$HARNESS_HOME` and never reads the file back, so it cannot redirect the agent's mind, and it is rewritten from the live value on every bind, so it cannot go stale after a move. Your settings in it (`embedding_model`, `backend`, …) are merged, never replaced; a `config.json` that doesn't parse is left alone and reported rather than clobbered; and nothing here ever creates a palace — an agent on the default `sqlite` provider, and anyone using MemPalace outside the harness, keeps upstream's behavior untouched. Precedence is upstream's in both directions: `--palace` beats everything, and **`MEMPALACE_PALACE_PATH`** (or the legacy `MEMPAL_PALACE_PATH`) beats the file — which is exactly why the adapter honors those vars too. If it didn't, exporting one would point the CLI somewhere the agent isn't, silently.
+
 Writing your own is one small class — implement only the surfaces you want:
 
 ```python
@@ -207,6 +218,7 @@ wake end timeline=019e77… outcome=ok turns=1 steps=2/24 posted=0 duration=3.31
 | `BASECRADLE_CONFIG_HOME` | *(optional)* where the config home lives. Defaults to `$HOME/.config/basecradle` |
 | `BASECRADLE_AGENT_SLUG` | *(optional)* this agent's slug, used as the `agent:<slug>` subject of the [claims manifest](#state-the-claims--basecradle-harness-claims). Defaults to the OS user, which on a fleet box *is* the slug — set it only where that does not hold |
 | `HARNESS_MEMORY_PROVIDER` | *(optional)* the [memory backend](#swap-the-memory-backend--the-memory-provider) the agent binds: `sqlite` (default), `mempalace`, or a `module:Class` path to your own. `basecradle-harness-wake --resolved-config` reports the **bound** one, so a dropped var never silently downgrades an agent's memory unseen |
+| `MEMPALACE_PALACE_PATH` | *(optional, provider-scoped)* MemPalace's **own** palace-path variable (legacy spelling `MEMPAL_PALACE_PATH`), honored by the adapter for the reason [above](#swap-the-memory-backend--the-memory-provider): the `mempalace` CLI reads it ahead of the config file the harness publishes, so if the adapter ignored it, exporting it would silently point the two halves at different palaces. Unset (the normal case) → the palace is `$HARNESS_HOME/mempalace`. Set it to an **absolute** path — upstream resolves a relative one against the process's cwd, and a wake's is not your shell's |
 | `HARNESS_CONTEXT_MESSAGES` | *(optional)* how many backlog messages to seed as context — an integer, or `all` for the whole timeline. Defaults to `50` |
 | `HARNESS_ONBOARD` | *(optional)* orient the agent on startup — a bounded Dashboard summary prepended to the poll loop's charter, and (under a router) the [persistent operating brief](#run-under-a-router-wake-mode) re-asserted each wake. **On by default**; set to a falsy value (`0`/`false`/`no`/`off`) to come up with only your own charter |
 | `HARNESS_PROFILE` | *(optional)* the [policy profile](#safe-by-default) the agent runs under: `locked` (default) or `unlocked`. **Fail-closed** — unset, empty, or any unrecognized value is `locked`, the safe shipped default. `unlocked` selects `Policy.unlocked()` — the deploy lever that admits a [shell-class](#run-any-command--the-shell-tool) opted-in tool, the env-driven counterpart to passing `Policy.unlocked()` in the library API (it is how the unlocked profile's second gate is delivered in a deployment). Safety is enforced *around* it: the NOC sets it per-agent (via `agent.env`) only after verifying the account is unprivileged, and the shell tool's own root-refusal backstop still fires regardless |
