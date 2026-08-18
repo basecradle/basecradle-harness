@@ -7,6 +7,7 @@ responses follow the OpenAI chat-completions / Responses schemas.
 """
 
 import json
+import re
 
 import pytest
 import respx
@@ -14,6 +15,21 @@ import respx.mocks
 from respx.mocks import HTTPCoreMocker
 
 from basecradle_harness import OpenAIProvider
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """A log line as a human reads it — the ANSI verdict colors stripped back off (issue #414).
+
+    The colors are wrapped around **whole tokens**, so almost every existing assertion (a substring
+    search for ``outcome=ok``, for ``wake failed``) matches the colored bytes untouched. The ones
+    that need this are the *anchored* ones — ``startswith("wake end")`` — which is exactly the class
+    of consumer the token-integrity rule cannot protect. Tests that assert on the color itself read
+    the raw record instead; this is for the ones that only ever cared what the line *said*.
+    """
+    return _ANSI.sub("", text)
+
 
 # A fabricated OpenAI-compatible endpoint and a correctly-shaped fake key.
 BASE_URL = "https://api.openai.test/v1"

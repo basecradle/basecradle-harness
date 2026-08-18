@@ -12,6 +12,7 @@ The load-bearing case is **transient-error-keeps**: a platform outage must never
 never enumerated, so a purge can never reach them.
 """
 
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
@@ -33,6 +34,7 @@ from basecradle_harness._cleanup import (
     purge_one,
     sweep,
 )
+from basecradle_harness._observability import RED, RESET
 from basecradle_harness._report import BillingState
 
 # Real, well-formed UUIDv7 values (never `1111…` junk), per the test-data rule.
@@ -326,9 +328,15 @@ def test_main_requires_a_mode(tmp_path, monkeypatch):
         main([])
 
 
-def test_main_errors_without_harness_home(monkeypatch):
+def test_main_errors_without_harness_home(monkeypatch, caplog):
     monkeypatch.delenv("HARNESS_HOME", raising=False)
-    assert main(["--timeline", DELETED]) == 1
+    with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+        assert main(["--timeline", DELETED]) == 1
+
+    # The sweep that never ran is a verdict, so its head is RED (issue #414) — and `cleanup failed`
+    # is still a contiguous, greppable token inside it.
+    line = next(m for m in (r.getMessage() for r in caplog.records) if "cleanup failed" in m)
+    assert line.startswith(f"{RED}cleanup failed{RESET} ")
 
 
 def test_main_timeline_purges_via_cli(tmp_path, monkeypatch):

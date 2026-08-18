@@ -53,6 +53,7 @@ from basecradle_harness import (
 )
 from basecradle_harness._basecradle import _incoming_text, _parse_created_at
 from basecradle_harness._messages import ToolCall
+from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
 from basecradle_harness._wake import (
     _activated_task_text,
     _incoming_asset_text,
@@ -65,6 +66,7 @@ from basecradle_harness._wake import (
     main,
     resolved_config,
 )
+from tests.conftest import plain
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -720,6 +722,8 @@ def test_main_skips_cleanly_on_a_deleted_timeline(platform, wake_env, caplog):
     skip = _line(caplog, "wake skipped")
     assert f"timeline={TIMELINE_UUID}" in skip
     assert "reason=timeline_deleted" in skip
+    # A skip is the in-between verdict, so it reads YELLOW rather than green or red (issue #414).
+    assert any(m.startswith(f"{YELLOW}wake skipped{RESET} ") for m in _raw(caplog))
     # And crucially it is *not* an error: nothing failed, so no ERROR line and no alarm-worthy noise.
     assert _lines(caplog, "ERROR") == []
     assert not any(m.startswith("wake failed") for m in _lines(caplog))
@@ -740,6 +744,7 @@ def test_main_still_fails_loudly_on_a_forbidden_timeline(platform, wake_env, cap
     errors = _lines(caplog, "ERROR")
     assert any(m.startswith("wake failed") and TIMELINE_UUID in m for m in errors)
     assert not any(m.startswith("wake skipped") for m in _lines(caplog))  # never a benign skip
+    assert any(m.startswith(f"{RED}wake failed{RESET} ") for m in _raw(caplog))  # issue #414
 
 
 def test_the_reserve_summary_is_unspoken_not_posted(platform, tmp_path, caplog):
@@ -3831,11 +3836,18 @@ def test_parse_created_at_handles_z_suffix_and_naive_stamps():
 
 
 def _lines(caplog, level=None) -> list[str]:
-    return [r.getMessage() for r in caplog.records if level is None or r.levelname == level]
+    # Stripped of the ANSI verdict colors (issue #414), so these read what the line *says*. The
+    # colors themselves are asserted on the raw records, in `test_observability.py`.
+    return [plain(r.getMessage()) for r in caplog.records if level is None or r.levelname == level]
 
 
 def _line(caplog, prefix: str) -> str:
     return next(m for m in _lines(caplog) if m.startswith(prefix))
+
+
+def _raw(caplog) -> list[str]:
+    """The records with their ANSI verdict colors intact — for the tests that assert on the bytes."""
+    return [r.getMessage() for r in caplog.records]
 
 
 def test_a_wake_is_bookended_by_a_start_and_an_end_line(platform, tmp_path, caplog):
@@ -3860,6 +3872,45 @@ def test_a_wake_is_bookended_by_a_start_and_an_end_line(platform, tmp_path, capl
     # into. A silent wake reports `posted=0` — visibly, deliberately silent.
     assert "posted=1" in end
     assert re.search(r"duration=\d+\.\d\ds", end)
+
+
+def test_the_bookends_are_colored_and_stay_greppable(platform, tmp_path, caplog):
+    """The wake's lifecycle in color (issue #414) — GREEN opens, BLUE closes, the verdict its own.
+
+    Asserted on the **raw** records, unlike every other test in this file, because the bytes are
+    the contract: a journald reader, a Live Tail filter, and a ClickHouse `match()` all read these
+    exact spans. The plain tokens must survive the color, which is the whole point of wrapping a
+    *whole* token rather than part of one.
+    """
+    serve_messages(platform, page(message(uuid=M0, body="What's the status?")))
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    raw = [r.getMessage() for r in caplog.records]
+    start = next(m for m in raw if "wake start" in m)
+    end = next(m for m in raw if "wake end" in m)
+
+    assert start.startswith(f"{GREEN}wake start{RESET} ")
+    assert end.startswith(f"{BLUE}wake end{RESET} ")
+    assert f"{GREEN}outcome=ok{RESET}" in end
+    # The correlation values a human copies out are untouched by any of it.
+    assert f"timeline={TIMELINE_UUID}" in start and f"timeline={TIMELINE_UUID}" in end
+    # And a plain substring search — the thing the token rule exists to protect — still finds both.
+    assert "wake start" in start and "wake end" in end and "outcome=ok" in end
+
+
+def test_no_color_takes_the_wake_lines_back_to_plain_bytes(platform, tmp_path, caplog, monkeypatch):
+    """The operator's escape hatch, honored end-to-end rather than only in the formatter."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert "\x1b" not in "".join(r.getMessage() for r in caplog.records)
 
 
 def test_a_named_trigger_rides_the_start_line(platform, tmp_path, caplog):
@@ -3931,6 +3982,8 @@ def test_a_breaker_declined_wake_says_so_in_its_end_line(platform, tmp_path, cap
     end = _line(caplog, "wake end")
     assert "outcome=declined" in end
     assert "steps=0/24" in end  # no provider call was made
+    # A decline is the third verdict word, and it reads YELLOW — neither a success nor a fault.
+    assert any(f"{YELLOW}outcome=declined{RESET}" in m for m in _raw(caplog))
 
 
 def test_a_successful_post_logs_the_message_it_created(platform, tmp_path, caplog):
@@ -3961,6 +4014,7 @@ def test_a_refused_post_is_logged_at_error(platform, tmp_path, caplog):
 
     errors = _lines(caplog, "ERROR")
     assert any(m.startswith("post failed") and TIMELINE_UUID in m for m in errors)
+    assert any(m.startswith(f"{RED}post failed{RESET} ") for m in _raw(caplog))  # issue #414
     assert "outcome=ok" in _line(caplog, "wake end")  # the wake itself still completed
     assert "posted=0" in _line(caplog, "wake end")  # …having delivered nothing
 
@@ -3987,6 +4041,7 @@ def test_the_step_cap_degradation_is_logged_at_warning(platform, tmp_path, caplo
 
     warnings = _lines(caplog, "WARNING")
     assert any(m.startswith("degraded") and "reserve summary" in m for m in warnings)
+    assert any(m.startswith(f"{YELLOW}degraded{RESET} ") for m in _raw(caplog))  # issue #414
     assert "steps=2/2" in _line(caplog, "wake end")  # the budget was genuinely spent
 
 
@@ -4673,9 +4728,17 @@ def test_an_oversized_asset_is_reported_and_never_re_driven(platform, tmp_path):
     assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="assets") == A1
 
 
-def test_a_billing_failure_reports_once_leaves_work_pending_and_self_heals(platform, tmp_path):
+def test_a_billing_failure_reports_once_leaves_work_pending_and_self_heals(
+    platform, tmp_path, caplog
+):
     """Out-of-funds: one plain-language notice, pending work untouched, debounced quiet, and self-heal
-    on the first successful call after funding — the whole billing contract (issue #336)."""
+    on the first successful call after funding — the whole billing contract (issue #336).
+
+    The three lines it walks through carry the three verdict colors (issue #414): the onset is a
+    reported failure (RED), each debounced repeat is a block (YELLOW), and the self-heal is a
+    recovery (GREEN).
+    """
+    caplog.set_level(logging.INFO, logger="basecradle_harness")
     # Wake 1 — out of funds. One notice; the message is left pending (mark does not advance).
     serve_messages(platform, page(message(uuid=M0, body="are you there?")))
     first, _ = build_wake(tmp_path, provider=RaisingProvider(_out_of_funds()))
@@ -4700,6 +4763,11 @@ def test_a_billing_failure_reports_once_leaves_work_pending_and_self_heals(platf
     assert third_provider.prompts != []  # the pending work resumed — the model WAS consulted
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # now handled, the mark advanced
     assert not _wake.BillingState(tmp_path).blocked(TIMELINE_UUID)  # self-healed
+
+    lines = _raw(caplog)
+    assert any(m.startswith(f"{RED}wake reported_failure{RESET} ") for m in lines)
+    assert any(m.startswith(f"{YELLOW}wake billing_blocked{RESET} ") for m in lines)
+    assert any(m.startswith(f"{GREEN}wake billing_recovered{RESET} ") for m in lines)
 
 
 def test_a_billing_wall_fails_the_rest_of_the_wake_fast(platform, tmp_path):
@@ -4740,7 +4808,14 @@ def test_an_uncompactable_context_overflow_is_reported_not_looped(platform, tmp_
 
 def test_the_reported_failure_log_line_grammar_is_stable(platform, tmp_path, caplog):
     """The NOC alarms on the exact `wake reported_failure kind=…` line (basecradle-noc#317), so pin
-    its grammar here — a silent field rename would break the alarm without failing any behavior test."""
+    its grammar here — a silent field rename would break the alarm without failing any behavior test.
+
+    **The ANSI head (issue #414) changes what "exact" buys, and that is pinned below too.** The
+    color wraps the whole `wake reported_failure` token, so a search for that token still finds the
+    line; it does *not* keep the token adjacent to the `kind=` that follows, because the head's
+    `RESET` now sits in the gap. A consumer spanning the two must wildcard across it
+    (`wake reported_failure.*kind=billing`) — the literal-space form no longer matches.
+    """
     import logging
 
     serve_messages(platform, page(message(uuid=M0, body="see the attached photo")))
@@ -4764,6 +4839,15 @@ def test_the_reported_failure_log_line_grammar_is_stable(platform, tmp_path, cap
     assert len(billing) == 1
     assert "kind=billing" in billing[0]
     assert "reason=out_of_funds" in billing[0]
+
+    # The head is RED on both classes — a reported failure is the loudest verdict a wake states.
+    assert permanent[0].startswith(f"{RED}wake reported_failure{RESET} ")
+    assert billing[0].startswith(f"{RED}wake reported_failure{RESET} ")
+    # What the token rule preserves, and what it does not — the exact distinction any out-of-repo
+    # consumer of this line is coupled to.
+    assert "wake reported_failure" in billing[0] and "kind=billing" in billing[0]
+    assert re.search(r"wake reported_failure.*kind=billing", billing[0])
+    assert not re.search(r"wake reported_failure kind=billing", billing[0])
 
 
 def test_resolved_config_reports_the_overlays_present_tool_stems(wake_env, monkeypatch, tmp_path):

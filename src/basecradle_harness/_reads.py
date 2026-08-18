@@ -48,7 +48,7 @@ from basecradle import BaseCradleError
 
 from basecradle_harness._governance import _resolve_user, _UserNotFound
 from basecradle_harness._idempotency import MESSAGE
-from basecradle_harness._observability import kv
+from basecradle_harness._observability import RED, head, kv
 from basecradle_harness._platform import PlatformTool, explain
 
 _log = logging.getLogger("basecradle_harness")
@@ -251,7 +251,8 @@ class MessagesTool(PlatformTool):
                 # invariant when it owned the reply; the tool inherits it along with the channel.
                 # The model still gets the refusal back as its tool result (below), so it can react.
                 _log.error(
-                    "post failed %s",
+                    "%s %s",
+                    head("post failed", RED),
                     kv(
                         timeline=timeline or self.context.timeline,
                         kind="tool",
