@@ -52,7 +52,6 @@ cannot be that command: it prints a human report and exits 1 on a finding. Hence
 from __future__ import annotations
 
 import argparse
-import getpass
 import json
 import logging
 import os
@@ -80,6 +79,11 @@ from basecradle_harness._install import (
     plugin_opts_in,
     read_declaration,
 )
+from basecradle_harness._log_grammar import COLUMNS as LOG_GRAMMAR_COLUMNS
+from basecradle_harness._log_grammar import IDENTIFIER as LOG_GRAMMAR_IDENTIFIER
+from basecradle_harness._log_grammar import SCRIPT as LOG_GRAMMAR_SCRIPT
+from basecradle_harness._log_grammar import TTL_HOURS as LOG_GRAMMAR_TTL_HOURS
+from basecradle_harness._observability import agent_slug
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -108,11 +112,6 @@ COMPONENT = "basecradle-harness"
 #: agent's declaration against a default nobody chose. So it is read, as a fallback only, for the
 #: one variable that decides which defaults an install lays down.
 _AGENT_ENV_NAME = "agent.env"
-
-#: The env var naming this agent's slug when the OS user is not it. The fleet's universal-identity
-#: rule makes the OS user, the GitHub App bot, and the platform handle **one** slug, so the login
-#: name is the right default and this is the escape hatch for a box that departs from it.
-SLUG_ENV = "BASECRADLE_AGENT_SLUG"
 
 #: The honest gaps, stated in-band rather than left in prose for a caller to remember — the same
 #: never-silently-omit discipline `_resolve` applies to its own answer.
@@ -666,37 +665,25 @@ def _record_success(root: Path, report: VerifyReport) -> str | None:
 # --- the claims emitter -------------------------------------------------------
 
 
-def agent_slug(explicit: str | None = None) -> str:
-    """This agent's slug: an explicit argument, else ``BASECRADLE_AGENT_SLUG``, else the OS user.
+def _script(name: str) -> str:
+    """A console script's absolute path, resolved beside the running interpreter.
 
-    The fleet's universal-identity rule makes an agent's slug **one** string across every system it
-    touches — its GitHub App bot, its OS user and home, its platform handle — so the login name is
-    the correct default here rather than a guess. The env var is the escape hatch for a box that
-    departs from it (a laptop, a shared account), and the argument is for a caller that already
-    knows.
+    That is where a venv puts its scripts, so the resulting ``cmd`` works from a converge that has
+    neither the agent's ``PATH`` nor its shell. Falls back to the bare name when the script is not
+    beside this interpreter (an editable checkout, a test), which keeps the manifest readable
+    rather than pointing at a path that does not exist.
     """
-    if explicit:
-        return explicit
-    from_env = os.environ.get(SLUG_ENV, "").strip()
-    if from_env:
-        return from_env
-    try:
-        return getpass.getuser()
-    except Exception:  # noqa: BLE001 - no passwd entry / no LOGNAME: name it rather than crash
-        return "unknown"
+    script = Path(sys.executable).with_name(name)
+    return str(script) if script.exists() else name
 
 
 def _probe_command(root: Path) -> str:
     """The command a converge runs to prove these claims — absolute, and explicit about the home.
 
-    Resolved beside the running interpreter (where a venv puts its console scripts) so the string
-    works from a converge that has neither the agent's ``PATH`` nor its shell, and pinned to the
-    config home *this* emitter read, so the probe can never end up proving a different agent's
-    overlay than the one the claims describe.
+    Pinned to the config home *this* emitter read, so the probe can never end up proving a
+    different agent's overlay than the one the claims describe.
     """
-    script = Path(sys.executable).with_name("basecradle-harness-verify")
-    exe = str(script) if script.exists() else "basecradle-harness-verify"
-    return f"{shlex.quote(exe)} --config-home {shlex.quote(str(root))}"
+    return f"{shlex.quote(_script('basecradle-harness-verify'))} --config-home {shlex.quote(str(root))}"
 
 
 def claims(
@@ -746,8 +733,37 @@ def claims(
         "contract": CLAIMS_CONTRACT,
         "subject": f"agent:{agent_slug(subject)}",
         "component": COMPONENT,
-        "claims": [row(claim) for claim in ids],
+        "claims": [row(claim) for claim in ids] + _log_grammar_rows(),
     }
+
+
+def _log_grammar_rows() -> list[dict[str, object]]:
+    """The log-grammar claims — one per NOC derived column this package's grammar feeds.
+
+    Different in class from every other row here, and deliberately so. The rest of this manifest is
+    ``dependency``: *is the capability present after a converge?*, re-proven by the converge floor.
+    A log-grammar claim asks something the floor structurally cannot — *do the bytes a founder-named
+    alarm matches still exist?* — about a line that appears **only when a vendor account runs out of
+    money**. Silence is its normal state, so its proof is a forced exercise on a TTL: `class: rare`
+    (basecradle-noc#509, ratified 2026-08-18).
+
+    Unconditional, like the two config-home rows above: an agent that cannot emit its billing
+    grammar must have a row in the ledger to be red about, and deriving the set from anything
+    observable here would drop exactly the claim that matters.
+    """
+    return [
+        {
+            "claim": f"log-grammar:{column}",
+            "class": "rare",
+            "prove": {
+                "kind": "probe",
+                "cmd": f"{shlex.quote(_script(LOG_GRAMMAR_SCRIPT))} {column}",
+            },
+            "evidence": f"journal:{LOG_GRAMMAR_IDENTIFIER}",
+            "ttl_hours": LOG_GRAMMAR_TTL_HOURS,
+        }
+        for column in LOG_GRAMMAR_COLUMNS
+    ]
 
 
 def _is_prompt(rel: str) -> bool:

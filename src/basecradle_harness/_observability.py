@@ -46,6 +46,7 @@ model still receives the full text as its tool result, and the transcript keeps 
 
 from __future__ import annotations
 
+import getpass
 import logging
 import math
 import os
@@ -113,6 +114,21 @@ _SECRETS = re.compile(
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)[^&\s]+"
 )
+
+#: The record format every harness line is rendered with — the severity token, a space, the
+#: message. It is a *contract*, not a preference: neither emitter on an agent box sets a syslog
+#: priority (the wake-runner wraps the harness in ``systemd-cat`` with no ``--priority``), so
+#: every line reaches journald at the same priority and **severity survives only as this text
+#: token inside the message**. The fleet's ``level`` column extracts it (basecradle-noc#207), so a
+#: line rendered any other way has no severity anywhere. Named here rather than inlined at the one
+#: `logging.basicConfig` call so a synthetic line (`_log_grammar`) can wear the same envelope the
+#: real one does instead of hand-spelling it.
+LOG_FORMAT = "%(levelname)s %(message)s"
+
+#: The env var naming this agent's slug when the OS user is not it. The fleet's universal-identity
+#: rule makes the OS user, the GitHub App bot, and the platform handle **one** slug, so the login
+#: name is the right default and this is the escape hatch for a box that departs from it.
+SLUG_ENV = "BASECRADLE_AGENT_SLUG"
 
 #: The env var the router's wake-runner exports so a wake can echo the delivery that spawned it
 #: (basecradle-router#170). Optional by contract: absent → the correlation field is simply
@@ -184,6 +200,31 @@ def color_enabled() -> bool:
     reloading the module.
     """
     return not os.environ.get(NO_COLOR_ENV, "")
+
+
+def agent_slug(explicit: str | None = None) -> str:
+    """This agent's slug: an explicit argument, else ``BASECRADLE_AGENT_SLUG``, else the OS user.
+
+    The fleet's universal-identity rule makes an agent's slug **one** string across every system it
+    touches — its GitHub App bot, its OS user and home, its platform handle — so the login name is
+    the correct default here rather than a guess. The env var is the escape hatch for a box that
+    departs from it (a laptop, a shared account), and the argument is for a caller that already
+    knows.
+
+    It lives beside `delivery_id` because it is the same kind of value: a correlation identity
+    resolved from the environment the process was started in, read by the claims emitter (as a
+    manifest ``subject``) and by `_log_grammar` (as the ``agent=`` field the fleet's ``agent``
+    label falls back to when the journald identifier is not a wake's).
+    """
+    if explicit:
+        return explicit
+    from_env = os.environ.get(SLUG_ENV, "").strip()
+    if from_env:
+        return from_env
+    try:
+        return getpass.getuser()
+    except Exception:  # noqa: BLE001 - no passwd entry / no LOGNAME: name it rather than crash
+        return "unknown"
 
 
 def head(text: str, color: str) -> str:

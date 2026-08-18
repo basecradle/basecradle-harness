@@ -50,6 +50,7 @@ from basecradle_harness._exceptions import (
     ProviderPayloadTooLargeError,
 )
 from basecradle_harness._media import _detail_from_body
+from basecradle_harness._observability import RED, YELLOW, head, kv
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -144,6 +145,90 @@ def report_body(rc: ReportClass, *, item: str, provider: str | None, exc: Provid
     if rc.reason == _CONTEXT_LENGTH:
         return base + " This conversation has grown too long for my context window here."
     return base
+
+
+# --- the two billing log lines: one author, two callers (basecradle-noc#509) ------------------
+
+
+#: The stamp that marks a line as manufactured by the fleet's own instrumentation rather than real
+#: traffic — the wake-origin contract's vocabulary (basecradle-noc#473, @origin 2026-08-11),
+#: generalized to this line class by the capital on 2026-08-18: ``source=probe`` means *synthetic*,
+#: on a wake line and on a log-grammar line alike. It is the one token that keeps a probe-emitted
+#: billing line out of the founder-named *LLM Vendor Payment Failed* page, via the block-list
+#: predicate the NOC's four wake charts already carry.
+PROBE_SOURCE = "probe"
+
+
+def billing_onset_line(
+    *,
+    reason: str,
+    provider: str | None = None,
+    timeline: str | None = None,
+    delivery: str | None = None,
+    source: str | None = None,
+    agent: str | None = None,
+) -> str:
+    """The **onset** line — the one notice per out-of-funds outage, per timeline.
+
+    ``ERROR wake reported_failure kind=billing reason=… provider=… timeline=… delivery=…``
+
+    This function is the *only* author of these bytes, and that is the whole reason it exists
+    (basecradle-noc#509). The NOC's ``billing_blocked`` column matches
+    ``wake reported_failure.*kind=billing`` on it, and that column powers **LLM Vendor Payment
+    Failed** — a founder-named page-the-human alert (basecradle-noc#317). A needle line like this
+    one exists *only on the failure path*, so nothing arrives on a healthy fleet for the NOC's
+    extraction guard to watch, and a rename would take the alarm silently dark. `_log_grammar`
+    therefore emits the same line synthetically on a cadence — through **this** function, so a
+    refactor that changes the real line changes the probe's line in the same edit. Two spellings
+    would let the probe keep proving a grammar production no longer writes.
+
+    ``source`` and ``agent`` are the **probe-only** trailing fields (the capital's ruling 3,
+    2026-08-18: the grammar-under-proof bytes are never altered or interleaved; probe-only fields
+    trail them). Production passes neither, and `kv` drops them — so the real line is byte-for-byte
+    what it was before this function existed, and *carrying no* ``source=`` is what keeps it inside
+    the alarm's block-list predicate. See `_log_grammar` for why the probe passes no ``provider``.
+    """
+    return f"{head('wake reported_failure', RED)} " + kv(
+        kind=BILLING,
+        reason=reason,
+        provider=provider,
+        timeline=timeline,
+        delivery=delivery,
+        source=source,
+        agent=agent,
+    )
+
+
+def billing_repeat_line(
+    *,
+    reason: str,
+    provider: str | None = None,
+    timeline: str | None = None,
+    delivery: str | None = None,
+    source: str | None = None,
+    agent: str | None = None,
+) -> str:
+    """The **debounced repeat** — the breadcrumb every subsequent blocked wake leaves in the journal.
+
+    ``WARNING wake billing_blocked reason=… provider=… timeline=… delivery=…``
+
+    The onset is posted once per outage, so without this line an outage would look like a single
+    instant rather than a duration, and the NOC's alert would auto-resolve after the first line
+    while the agent is *still* unfunded and still being woken. That is why ``billing_blocked``
+    matches **two** clauses, and why the probe emits both: the extraction guard asks only whether
+    the column extracted *anything*, so one working clause would green a column whose other clause
+    has gone deaf (the two-clause finding on basecradle-noc#509, adopted by the capital).
+
+    Same single-author contract as `billing_onset_line`; same probe-only trailing fields.
+    """
+    return f"{head('wake billing_blocked', YELLOW)} " + kv(
+        reason=reason,
+        provider=provider,
+        timeline=timeline,
+        delivery=delivery,
+        source=source,
+        agent=agent,
+    )
 
 
 class BillingState:
