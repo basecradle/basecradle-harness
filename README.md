@@ -382,10 +382,11 @@ assume.
 
 A verdict answers *is this agent's declared set here?* A **claim** is the other half: the row that
 says this agent asserts the capability at all, so a ledger somewhere else can ask, on a schedule,
-*when was that last demonstrably true?* This command prints those rows — one `dependency`-class row
-per declared capability (Claims Manifest Contract v1), each naming `basecradle-harness-verify` as
-its probe and `<config-home>/.verified.json` (written on a *successful* verify, so its timestamp is
-the age of a real proof) as its evidence:
+*when was that last demonstrably true?* This command prints those rows (Claims Manifest Contract
+v1) — one `dependency`-class row per declared capability, each naming `basecradle-harness-verify`
+as its probe and `<config-home>/.verified.json` (written on a *successful* verify, so its timestamp
+is the age of a real proof) as its evidence, plus one `rare`-class
+[log-grammar row](#prove-the-alarm-still-hears--basecradle-harness-log-grammar):
 
 ```bash
 basecradle-harness-claims                          # this agent's manifest on stdout; always exit 0
@@ -409,10 +410,50 @@ Two things it does **whatever the state of the box**, and both are the point:
   verdict — a red box that emitted nothing would take its own claims out of the ledger at the exact
   moment the ledger is what would have caught it. The verdict arrives separately, when each row's
   probe runs.
-- **A box with no config home still emits** the two unconditional rows (`harness-config-home`,
-  `harness-package-pin`), so even a never-installed agent has something in the ledger to be red
-  about. Nonzero is reserved for genuinely *not being able to state the claims* — no resolvable
+- **A box with no config home still emits** the three unconditional rows (`harness-config-home`,
+  `harness-package-pin`, `log-grammar:billing_blocked`), so even a never-installed agent has
+  something in the ledger to be red about. Nonzero is reserved for genuinely *not being able to state the claims* — no resolvable
   `$HOME`, an unwritable stdout — and the reason goes to stderr, in one line.
+
+### Prove the alarm still hears — `basecradle-harness-log-grammar`
+
+Some of this package's log lines are read by an alarm somewhere else. The out-of-funds pair is the
+sharp case: `wake reported_failure … kind=billing` and its debounced repeat `wake billing_blocked`
+are what a fleet monitor matches to page a human when an agent's model account runs dry
+([issue #336](https://github.com/basecradle/basecradle-harness/issues/336)). Both lines exist
+**only on the failure path**, so on a healthy install nothing in the pattern is ever written — and
+a monitor that watches its columns by asking *"is this still extracting anything?"* has nothing to
+watch. Rename a field and the page goes silently dark; that has already happened once, when the
+[colour roll](#what-a-wake-logs) repainted both heads at once.
+
+So the harness exercises its own needle grammar on demand:
+
+```bash
+basecradle-harness-log-grammar billing_blocked     # 0 = emitted and readable back; 75 = could not ask
+```
+
+It renders both lines **through the very functions the real failure path renders them with**,
+writes them to journald under its own `basecradle-log-grammar` identifier at INFO, and reads them
+back to prove they landed. Nothing else changes: no model call, no vendor credit, no message, no
+platform I/O. It is wired as a `rare`-class claim so a ledger can fire it on a cadence and notice
+when it stops being provable.
+
+Three properties make it safe to point at a page-the-human alert:
+
+- **Every synthetic line is stamped `source=probe`**, unconditionally — there is no quiet mode to
+  get wrong. Monitors exclude that stamp with a block-list, so a synthetic never reaches the alert
+  while a **real** failure (which carries no stamp) always does. The direction matters: if the
+  stamp ever stopped being read, the probes would *flood* the alert rather than a genuine outage
+  being silently dropped.
+- **One author for the bytes.** Production and probe call the same two renderers, so a refactor
+  that changes the real line changes the synthetic in the same edit. Two spellings would let the
+  probe keep proving a grammar production no longer writes.
+- **Both clauses are emitted separately**, because a monitor asking only *"did anything extract?"*
+  would stay green on one working clause while the other rotted.
+
+It carries no `provider=`, `stage=`, `outcome=` or other field a neighbouring metric keys on, and
+every value is a bare token — a monitor that manufactures false readings in the instrument beside
+it is worse than the gap it closes.
 
 ### A stem is not a tool name — `basecradle-harness-resolve`
 

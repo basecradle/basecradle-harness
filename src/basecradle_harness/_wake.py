@@ -155,6 +155,8 @@ from basecradle_harness._report import (
     BILLING,
     PERMANENT,
     BillingState,
+    billing_onset_line,
+    billing_repeat_line,
     classify,
     report_body,
     verbatim,
@@ -3621,10 +3623,8 @@ class WakeAgent:
                 if sent is not None and posted is not None:
                     posted.append(sent)
                 _log.error(
-                    "%s %s",
-                    head("wake reported_failure", RED),
-                    kv(
-                        kind=BILLING,
+                    "%s",
+                    billing_onset_line(
                         reason=rc.reason,
                         provider=provider,
                         timeline=self.timeline_uuid,
@@ -3635,9 +3635,8 @@ class WakeAgent:
                 # Already announced this outage on this timeline — stay quiet ("fail fast and quiet"),
                 # but leave a greppable breadcrumb so the outage's *duration* is visible in the logs.
                 _log.warning(
-                    "%s %s",
-                    head("wake billing_blocked", YELLOW),
-                    kv(
+                    "%s",
+                    billing_repeat_line(
                         reason=rc.reason,
                         provider=provider,
                         timeline=self.timeline_uuid,

@@ -54,6 +54,7 @@ from basecradle_harness import (
 from basecradle_harness._basecradle import _incoming_text, _parse_created_at
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
+from basecradle_harness._report import billing_onset_line
 from basecradle_harness._wake import (
     _activated_task_text,
     _incoming_asset_text,
@@ -4848,6 +4849,18 @@ def test_the_reported_failure_log_line_grammar_is_stable(platform, tmp_path, cap
     assert "wake reported_failure" in billing[0] and "kind=billing" in billing[0]
     assert re.search(r"wake reported_failure.*kind=billing", billing[0])
     assert not re.search(r"wake reported_failure kind=billing", billing[0])
+
+    # And the line the wake actually logged IS the shared renderer's output, byte for byte
+    # (basecradle-noc#509). The log-grammar probe emits its synthetic through the same two
+    # functions, so this equality is what stops the probe proving a grammar production has drifted
+    # away from — the alarm dark and the claims ledger green at the same time.
+    assert billing[0] == billing_onset_line(
+        reason="out_of_funds", provider="openai", timeline=TIMELINE_UUID
+    )
+    # A real failure carries **no** `source=`: the alarm excludes `source=probe` with a block-list,
+    # so a stamp leaking onto this path would filter a genuine out-of-funds event out of the
+    # founder-named page, silently.
+    assert "source=" not in billing[0]
 
 
 def test_resolved_config_reports_the_overlays_present_tool_stems(wake_env, monkeypatch, tmp_path):

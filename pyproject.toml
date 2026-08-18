@@ -90,6 +90,12 @@ basecradle-harness-verify = "basecradle_harness._verify:main"
 # user under `env -i`. Separate from verify because that seam needs a command whose *whole* behavior
 # is "state the claims": bare verify prints a human report and exits 1 on a finding.
 basecradle-harness-claims = "basecradle_harness._verify:emit_main"
+# Emit this package's *needle* log grammar into the journal and prove it landed — the log-grammar
+# claim probe (basecradle-noc#509). The lines an out-of-funds vendor account produces exist only on
+# the failure path, so nothing on a healthy fleet arrives for the NOC's extraction guard to watch
+# and a rename would take the founder-named LLM Vendor Payment Failed alert silently dark. Renders
+# through the production renderers, stamped `source=probe` so it can never page a human.
+basecradle-harness-log-grammar = "basecradle_harness._log_grammar:main"
 
 [project.urls]
 Homepage = "https://basecradle.com"

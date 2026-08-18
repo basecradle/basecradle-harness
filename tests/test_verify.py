@@ -17,7 +17,7 @@ import logging
 
 import pytest
 
-from basecradle_harness import _install, _verify
+from basecradle_harness import _install, _observability, _verify
 from basecradle_harness._install import install, read_declaration
 from basecradle_harness._verify import (
     DECLARATION_CONTRACT,
@@ -373,7 +373,12 @@ def test_claims_carry_one_dependency_row_per_declared_capability(converged, monk
     assert "harness-config-home" in ids and "harness-package-pin" in ids
     assert "overlay-tool:power" in ids and "overlay-tool:notes" in ids
     assert "overlay-prompt:system-prompt.md" in ids
+    # Every *capability* row is `dependency` — present after a converge, re-proven by the converge
+    # floor. The log-grammar rows are deliberately not (a `rare` forced exercise on a TTL, which is
+    # the one thing the floor structurally cannot do); they are pinned in `test_log_grammar.py`.
     for row in manifest["claims"]:
+        if row["claim"].startswith("log-grammar:"):
+            continue
         assert row["class"] == "dependency"
         assert row["ttl_hours"] is None
         assert row["prove"]["kind"] == "probe"
@@ -397,7 +402,9 @@ def test_claims_are_emitted_even_when_the_box_is_failing(converged, monkeypatch)
 def test_a_box_with_no_config_home_still_has_rows_to_be_red_about(tmp_path):
     ids = [row["claim"] for row in claims(tmp_path / "nothing-here")["claims"]]
 
-    assert ids == ["harness-config-home", "harness-package-pin"]
+    # The log-grammar row is unconditional for the same reason the other two are: an agent that
+    # cannot emit the grammar a founder-named alarm matches must have a row to be red about.
+    assert ids == ["harness-config-home", "harness-package-pin", "log-grammar:billing_blocked"]
 
 
 def test_the_subject_slug_falls_back_to_the_env_then_the_os_user(converged, monkeypatch):
@@ -485,7 +492,7 @@ def test_the_emitter_prints_a_contract_v1_manifest_for_the_invoking_agent(
     as_the_agent, monkeypatch, capsys
 ):
     _verifying(monkeypatch)
-    monkeypatch.setattr(_verify.getpass, "getuser", lambda: "jt")
+    monkeypatch.setattr(_observability.getpass, "getuser", lambda: "jt")
 
     code = emit_main([])
 
@@ -553,6 +560,7 @@ def test_the_emitter_still_states_the_unconditional_rows_with_no_config_home(
     assert [row["claim"] for row in manifest["claims"]] == [
         "harness-config-home",
         "harness-package-pin",
+        "log-grammar:billing_blocked",
     ]
 
 

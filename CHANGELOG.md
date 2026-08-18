@@ -7,6 +7,52 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.105.0] - 2026-08-18
+
+### Added: `basecradle-harness-log-grammar` — proving a needle log line still exists (issue #416)
+
+The fleet's **LLM Vendor Payment Failed** alert is founder-named and pages a human when an agent's
+model account runs out of prepaid credit. It fires off one derived column whose whole definition is
+a regex over two lines this package writes — `wake reported_failure … kind=billing` and its
+debounced repeat `wake billing_blocked`. **Both exist only on the failure path**, so nothing on a
+healthy fleet arrives for the monitor's extraction guard to watch, and a field rename would take
+the page silently dark. That is not hypothetical: the 0.104.0 colour roll repainted both heads and
+broke both clauses at once, caught only because two sibling builders read their emitting side
+before shipping.
+
+The monitor cannot close that from its side — it cannot make a vendor account run out of money, and
+would not want an instrument that could. The property belongs to the emitter, so the check does
+too (basecradle-noc#509, joint shape ratified by the capital 2026-08-18).
+
+```bash
+basecradle-harness-log-grammar billing_blocked   # 0 = emitted and readable back; 75 = could not ask
+```
+
+- **One author for the bytes.** The two billing lines are now rendered by
+  `_report.billing_onset_line` / `billing_repeat_line`, called by *both* the real failure path and
+  the probe. A refactor that changes the real line changes the synthetic in the same edit — two
+  spellings would let the probe keep proving a grammar production no longer writes.
+- **It cannot page a human.** Every synthetic carries `source=probe` unconditionally (no quiet mode
+  to get wrong), which monitors exclude with a **block-list** — so a real failure, which carries no
+  stamp, always reaches the alert, and a stamp that stopped being read would make the probes flood
+  it rather than let a genuine outage be dropped.
+- **Both clauses are emitted separately**, because a guard asking only *"did the column extract
+  anything?"* stays green on one working clause while the other rots.
+- **Its own journald identifier** (`basecradle-log-grammar`, INFO): not the wake identifier, which
+  is the router's contract to spell, whose journal is a flight recorder that must not be salted
+  with synthetic failures, and which scopes the fleet's `error_lines` column.
+- **It carries no field a neighbouring metric keys on** — no `provider=`, `stage=`, `outcome=` — and
+  every value is a bare token. A monitor that manufactures false readings in the instrument beside
+  it is worse than the gap it closes.
+- Emitted as a `rare`-class claim (`log-grammar:billing_blocked`, `ttl_hours: 1`) beside the
+  existing `dependency` rows, and **unconditional**: an agent that cannot emit the grammar must
+  still have a row in the ledger to be red about.
+
+`agent_slug` / `BASECRADLE_AGENT_SLUG` moved from `_verify` to `_observability`, beside
+`delivery_id` — the same kind of environment-resolved correlation identity, now read by both the
+claims emitter and the probe. `LOG_FORMAT` is likewise named there rather than inlined, so a
+synthetic line wears the same envelope a real one does instead of hand-spelling it.
+
 ## [0.104.0] - 2026-08-18
 
 ### Added: the wake journal's verdict lines are colored (issue #414)
