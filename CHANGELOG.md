@@ -7,6 +7,50 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.104.0] - 2026-08-18
+
+### Added: the wake journal's verdict lines are colored (issue #414)
+
+A fleet-wide convention, decided by @origin on 2026-08-17 and landing in the router's and the
+NOC's journals as siblings: a wake's **lifecycle and its verdict** are what a human scanning
+Better Stack Live Tail is actually looking for, and in a stream of uniform grey they are found by
+reading rather than by seeing.
+
+```
+INFO \x1b[32mwake start\x1b[0m timeline=019e77…6da provider=openai model=gpt-5.4-mini
+INFO \x1b[34mwake end\x1b[0m timeline=019e77…6da \x1b[32moutcome=ok\x1b[0m turns=1 steps=2/24 posted=1 duration=6.12s
+```
+
+- **GREEN** opens a wake and reports a recovery (`wake start`, `wake billing_recovered`); **BLUE**
+  closes one (`wake end`); **RED** is a failure (`wake failed`, `wake reported_failure`,
+  `post failed`, `cleanup failed`); **YELLOW** is the in-between (`wake skipped`,
+  `wake billing_blocked`, `degraded`). The `outcome=` pair carries its own color wherever it
+  appears — including the per-tool line — GREEN `ok`, RED `error`, YELLOW `declined`.
+- **A color wraps a whole token, never part of one.** That is the property everything rests on:
+  `\x1b[32mwake start\x1b[0m timeline=…`, so `grep 'wake start'` and a Live Tail filter for
+  `outcome=error` keep matching bytes that are still contiguous. Splitting a token
+  (`outcome=\x1b[32mok\x1b[0m`) would break every search for it *silently* — nothing errors, the line
+  still looks right, and the query that used to find it simply returns nothing forever.
+- **Only verdicts are colored.** A head that names a *fact* stays plain — `llm`, `tool`, `media`,
+  `unspoken`, `posted`, `step`, `context …` — because coloring everything flattens the signal back
+  into noise, and because those heads are the anchors the fleet dashboard extracts on
+  (` llm provider=`, ` tool name=`, ` unspoken timeline=`), which a color span would sit inside.
+  **Correlation values are never colored** either: `timeline=`, `delivery=`, `provider=` are data a
+  human copies out of the line.
+- **`NO_COLOR`** (the [cross-ecosystem opt-out](https://no-color.org), set to anything non-empty)
+  drops the color and every line goes out in plain bytes. Deliberately **not** gated on
+  `isatty()` — the whole point is a surface that is never a terminal: a deployed wake writes to
+  stderr, systemd captures it, Vector ships it, and a human reads it in Live Tail; not one of those
+  hops is a tty, so a tty gate would turn the feature off in exactly the place it was built for.
+
+**What the token rule does *not* buy, stated because a consumer outside this repo depends on it.**
+It preserves a search for one **whole** token. It does not preserve a pattern that reaches *past* a
+token into the next one, because the head's reset now sits in that gap: an adjacent-pair literal
+(`wake reported_failure kind=billing`) and a trailing-space anchor (`wake failed `) stop matching,
+while the same pattern written with a wildcard across the gap (`wake reported_failure.*kind=billing`)
+keeps working. Both shapes are pinned in `test_observability.py` and `test_wake.py` so the
+distinction is read off a test rather than rediscovered.
+
 ## [0.103.0] - 2026-08-17
 
 ### Fixed: the agent's own console scripts are reachable by name (issue #409)

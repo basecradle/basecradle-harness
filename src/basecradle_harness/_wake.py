@@ -138,7 +138,17 @@ from basecradle_harness._memory_provider import (
     describe_memory_provider,
 )
 from basecradle_harness._messages import ImageContent, Message
-from basecradle_harness._observability import delivery_id, describe_provider, kv, log_unspoken
+from basecradle_harness._observability import (
+    BLUE,
+    GREEN,
+    RED,
+    YELLOW,
+    delivery_id,
+    describe_provider,
+    head,
+    kv,
+    log_unspoken,
+)
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._report import (
@@ -1443,7 +1453,8 @@ class WakeAgent:
         delivery = delivery_id()
         provider, model = describe_provider(self.harness.provider)
         _log.info(
-            "wake start %s",
+            "%s %s",
+            head("wake start", GREEN),
             kv(
                 timeline=self.timeline_uuid,
                 trigger=_trigger_label(trigger, event_trigger, asset_trigger),
@@ -1519,7 +1530,8 @@ class WakeAgent:
             # than three turns of ten.
             engine = self.harness.engine
             _log.info(
-                "wake end %s",
+                "%s %s",
+                head("wake end", BLUE),
                 kv(
                     timeline=self.timeline_uuid,
                     outcome=outcome,
@@ -3561,7 +3573,11 @@ class WakeAgent:
         wherever a wake catches it.
         """
         self._degraded = True  # labels this turn's unspoken text `kind=stuck`
-        _log.warning("degraded %s", kv(timeline=self.timeline_uuid, reason=str(error)))
+        _log.warning(
+            "%s %s",
+            head("degraded", YELLOW),
+            kv(timeline=self.timeline_uuid, reason=str(error)),
+        )
         return "I got stuck working through that and stopped before reaching an answer."
 
     def _report_provider_failure(
@@ -3605,7 +3621,8 @@ class WakeAgent:
                 if sent is not None and posted is not None:
                     posted.append(sent)
                 _log.error(
-                    "wake reported_failure %s",
+                    "%s %s",
+                    head("wake reported_failure", RED),
                     kv(
                         kind=BILLING,
                         reason=rc.reason,
@@ -3618,7 +3635,8 @@ class WakeAgent:
                 # Already announced this outage on this timeline — stay quiet ("fail fast and quiet"),
                 # but leave a greppable breadcrumb so the outage's *duration* is visible in the logs.
                 _log.warning(
-                    "wake billing_blocked %s",
+                    "%s %s",
+                    head("wake billing_blocked", YELLOW),
                     kv(
                         reason=rc.reason,
                         provider=provider,
@@ -3631,7 +3649,8 @@ class WakeAgent:
         if sent is not None and posted is not None:
             posted.append(sent)
         _log.error(
-            "wake reported_failure %s",
+            "%s %s",
+            head("wake reported_failure", RED),
             kv(
                 kind=PERMANENT,
                 reason=rc.reason,
@@ -3669,7 +3688,8 @@ class WakeAgent:
         """
         if self.billing.recovered(self.timeline_uuid):
             _log.info(
-                "wake billing_recovered %s",
+                "%s %s",
+                head("wake billing_recovered", GREEN),
                 kv(timeline=self.timeline_uuid, delivery=delivery_id()),
             )
 
@@ -4295,7 +4315,8 @@ def main(argv: list[str] | None = None) -> int:
         # does not retry a wake that can never succeed (issue #327). Every transient/auth failure
         # still falls through to the loud exit 1 below — this catches *only* the bootstrap 404.
         _log.info(
-            "wake skipped %s",
+            "%s %s",
+            head("wake skipped", YELLOW),
             kv(timeline=args.timeline, delivery=delivery_id(), reason="timeline_deleted"),
         )
         return 0
@@ -4310,7 +4331,8 @@ def main(argv: list[str] | None = None) -> int:
         # at all — was the one line a journald/Live-Tail severity filter could not find. The
         # print stays for a terminal run (where logging may be quieter than the operator's eyes).
         _log.error(
-            "wake failed %s",
+            "%s %s",
+            head("wake failed", RED),
             kv(timeline=args.timeline, error=str(error), delivery=delivery_id()),
         )
         print(f"basecradle-harness-wake: {error}", file=sys.stderr)

@@ -37,6 +37,7 @@ from basecradle_harness._unspoken import (
     addressed,
     is_one_on_one,
 )
+from tests.conftest import plain
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -763,7 +764,9 @@ def test_a_silent_wake_posts_nothing_and_says_why(platform, tmp_path, caplog):
 
     assert posted == []
     assert _posts(platform) == []  # not one word — the peer's timeline is untouched
-    end = next(m.getMessage() for m in caplog.records if m.getMessage().startswith("wake end"))
+    end = next(
+        m for m in (plain(r.getMessage()) for r in caplog.records) if m.startswith("wake end")
+    )
     assert "posted=0" in end  # visibly silent
     unspoken = next(m.getMessage() for m in caplog.records if m.getMessage().startswith("unspoken"))
     assert "It needs no reply" in unspoken  # …and the reason is on the record

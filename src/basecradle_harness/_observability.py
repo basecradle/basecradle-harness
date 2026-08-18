@@ -15,6 +15,15 @@ through `kv` all the same, so one grep syntax reads the whole stream.
 What is deliberately *not* logged: prompts, request bodies, response bodies, and API keys. A log
 line names the shape of a call — provider, model, duration, token counts — never its content.
 
+**Color is the one presentation choice made here** (issue #414, founder decision 2026-08-17), and
+only because it is not really presentation: a wake's lifecycle and its verdict are what a human
+scanning a fleet-wide Live Tail is looking for, and in a stream of uniform grey they are found by
+reading rather than by seeing. So a *verdict* — a head like ``wake start`` or ``wake failed``, and
+the ``outcome=`` pair — is wrapped in an ANSI color, and everything else stays exactly the bytes it
+was. The whole convention rests on one rule (`head`): the escape wraps a **whole token**, never
+part of one, so nothing that could grep the plain line stops matching the colored one. Set
+`NO_COLOR_ENV` and every line goes out plain.
+
 **The one deliberate exception is the agent's own voice** (`log_unspoken`, issue #293). Since the
 final-text auto-post was removed, a turn's narration is *unspoken*: it reaches no timeline and no
 peer, so this stream is the only place it exists. That is the trade the Unspoken Channel is built
@@ -53,6 +62,44 @@ _log = logging.getLogger("basecradle_harness")
 #: to the failure, not a copy of it: the model already received the full error as its tool result,
 #: and the transcript keeps it.
 MAX_VALUE = 240
+
+#: The ANSI SGR codes the fleet's journal is colored with (founder decision, 2026-08-17). Four
+#: colors and a reset, shared with the router's and the NOC's own lines so one palette reads
+#: across the whole Live Tail: GREEN for a good outcome, RED for a bad one, YELLOW for the
+#: in-between (a skip, a decline, a block), BLUE for the neutral bookend that closes a wake.
+GREEN = "\x1b[32m"
+BLUE = "\x1b[34m"
+YELLOW = "\x1b[33m"
+RED = "\x1b[31m"
+RESET = "\x1b[0m"
+
+#: The cross-ecosystem opt-out (https://no-color.org): set to *anything* non-empty and every line
+#: goes out in plain bytes. Honored rather than invented — an operator whose downstream cannot
+#: render SGR should not have to learn a harness-specific knob for it.
+#:
+#: **Deliberately not gated on `isatty()`**, which is the "fix" this will attract: the whole point
+#: of the color is a surface that is *never* a terminal. A deployed wake writes to stderr, systemd
+#: captures it into journald, Vector ships it to Better Stack, and a human reads it there — not one
+#: of those hops is a tty, so a tty gate would turn the feature off in exactly the place it was
+#: built for and leave it on only where nobody was looking.
+NO_COLOR_ENV = "NO_COLOR"
+
+#: The keys whose **value** is a verdict rather than data, and the vocabulary each one colors by.
+#:
+#: This is the second half of the color contract and the reason it lives in `kv` rather than at a
+#: call site: `outcome` is a *closed* vocabulary written by two emitters (`_wake`'s bookend,
+#: `_engine`'s per-tool line), so coloring it by value in one place means every `outcome=` token in
+#: the stream reads the same, and a third emitter gets it right by construction. A value outside the
+#: vocabulary is left **plain** — the same honest-absence rule `cost` and `endpoint` keep: an
+#: unrecognized verdict is not guessed at a color.
+#:
+#: Everything else stays plain, and the exclusion is load-bearing rather than incidental:
+#: `timeline=`, `delivery=`, `provider=`, `model=` are **correlation values** — data a human copies
+#: out and pastes into a query — and coloring them would put escape bytes inside the very tokens the
+#: line exists to hand over.
+_VERDICT_VALUES: dict[str, dict[str, str]] = {
+    "outcome": {"ok": GREEN, "error": RED, "declined": YELLOW},
+}
 
 #: Credential shapes scrubbed out of any logged value — defense in depth at the *source*, so a
 #: secret never enters the journal in the first place rather than relying on the shipping layer to
@@ -128,6 +175,47 @@ _COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost",),)
 _ROUTING_METADATA: tuple[str, ...] = ("openrouter_metadata", "endpoints", "available")
 
 
+def color_enabled() -> bool:
+    """Is the journal colored on this run? Read per line, never cached at import.
+
+    Per-call on purpose: the config home's ``agent.env`` is loaded *after* this module imports, so
+    a value frozen at import would answer for the environment the interpreter started in rather
+    than the one the agent actually runs under — and it would make the setting untestable without
+    reloading the module.
+    """
+    return not os.environ.get(NO_COLOR_ENV, "")
+
+
+def head(text: str, color: str) -> str:
+    r"""A line's leading **verdict** token, colored as one contiguous span.
+
+    The token-integrity rule, and it is the whole of the convention: the escape goes *outside* the
+    token, never inside it — ``\x1b[32mwake start\x1b[0m timeline=…``, never
+    ``wake \x1b[32mstart\x1b[0m``. The searchable bytes stay adjacent, so every substring search
+    that worked on the plain line still matches the colored one: ``journalctl | grep 'wake start'``,
+    a Better Stack Live Tail filter, a ClickHouse ``match()``. Splitting a token would break every
+    one of them silently — nothing errors, the line still *looks* right, and the query that used to
+    find it simply returns nothing forever.
+
+    **What this buys, stated precisely, because the gap is where a consumer breaks.** It preserves a
+    search for **one whole token**. It does *not* preserve a pattern spanning the gap *between* two
+    tokens — a colored head is followed by ``RESET`` and then the separator, so an adjacent-pair
+    literal (``wake reported_failure kind=billing``) or a trailing-space anchor (``wake failed ``)
+    no longer matches, while the same pattern written with a wildcard across the gap
+    (``wake end .*outcome=error``) still does. Anything outside this repo that greps these lines is
+    coupled to that distinction; see the color inventory in `README.md` for the lines this applies
+    to.
+
+    Which lines get a head, and it is a rule rather than a list: **a head is colored when it states
+    a verdict about a unit of work** — did it start, end, fail, get skipped, get blocked, recover —
+    and left plain when it names a *fact*: ``llm``, ``tool``, ``media``, ``unspoken``, ``posted``,
+    ``step``, ``memory``, ``context …``. Color everything and the signal is gone; and those
+    fact-heads are also the anchors the fleet dashboard extracts on (`` llm provider=``,
+    `` tool name=``, `` unspoken timeline=``), which a head span would sit inside.
+    """
+    return f"{color}{text}{RESET}" if color_enabled() else text
+
+
 def kv(**fields: Any) -> str:
     """``key=value`` pairs in the order given, dropping the ones with nothing to say.
 
@@ -141,9 +229,37 @@ def kv(**fields: Any) -> str:
     ``outcome=ok``, run to the length of a whole response body, or carry a credential. A parser
     reading this stream must be able to trust that the fields it sees are the fields the harness
     wrote.
+
+    A **verdict** field (`_VERDICT_VALUES`) is colored — the whole ``key=value`` pair, by the same
+    token-integrity rule `head` keeps, so ``outcome=ok`` stays greppable as ``outcome=ok`` and never
+    becomes ``outcome=`` plus a colored ``ok``. The color is applied to the *rendered* pair, after
+    `_value` has flattened, scrubbed, bounded, and quoted it — so the escape can never end up inside
+    a value, and a hostile error text still cannot forge one: a tool that returns the literal
+    ``outcome=ok`` gets it rendered as a quoted `error` value, which is not a verdict field and is
+    not colored.
     """
-    rendered = ((key, _value(value)) for key, value in fields.items() if value is not None)
-    return " ".join(f"{key}={value}" for key, value in rendered if value != "")
+    colored = color_enabled()
+    parts: list[str] = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        rendered = _value(value)
+        if rendered == "":
+            continue
+        parts.append(_field(key, rendered, colored=colored))
+    return " ".join(parts)
+
+
+def _field(key: str, rendered: str, *, colored: bool) -> str:
+    """One rendered ``key=value`` pair, colored whole when it is a verdict and plain otherwise.
+
+    ``colored`` is resolved once per line by `kv` rather than re-read here, so a line is never half
+    colored — and so a wake's hottest formatting path does not read the environment once per field.
+    """
+    pair = f"{key}={rendered}"
+    vocabulary = _VERDICT_VALUES.get(key) if colored else None
+    color = vocabulary.get(rendered) if vocabulary else None
+    return f"{color}{pair}{RESET}" if color else pair
 
 
 def _value(value: Any) -> str:

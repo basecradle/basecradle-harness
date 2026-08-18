@@ -65,7 +65,7 @@ from urllib.parse import unquote
 from basecradle._exceptions import BaseCradleError, ForbiddenError, NotFoundError
 
 from basecradle_harness._basecradle import _client_from_env, _configure_logging
-from basecradle_harness._observability import kv
+from basecradle_harness._observability import RED, head, kv
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -358,7 +358,7 @@ def main(argv: list[str] | None = None) -> int:
         # wake CLI's does (issue #272): a bare print is unleveled, so the sweep that never ran is
         # invisible to a severity filter — and a silently-failing sweep looks exactly like a
         # sweep with nothing to do.
-        _log.error("cleanup failed %s", kv(error=str(error)))
+        _log.error("%s %s", head("cleanup failed", RED), kv(error=str(error)))
         print(f"basecradle-harness-cleanup: {error}", file=sys.stderr)
         return 1
     return 0

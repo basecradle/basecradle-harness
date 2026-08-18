@@ -8,13 +8,25 @@ emitters are asserted through `caplog`.
 
 import logging
 import re
+from datetime import datetime, timezone
 
+from basecradle_harness import ToolRegistry
+from basecradle_harness._engine import Engine
 from basecradle_harness._observability import (
+    BLUE,
+    GREEN,
+    NO_COLOR_ENV,
+    RED,
+    RESET,
+    YELLOW,
+    color_enabled,
     delivery_id,
     describe_provider,
+    head,
     kv,
     log_llm_call,
     log_media_call,
+    log_unspoken,
     media_timer,
     reported_cost,
     serving_endpoint,
@@ -521,3 +533,154 @@ def test_a_bare_token_value_stays_unquoted_so_the_common_line_greps_cleanly():
     assert kv(timeline="019e7750-66ee-7f53-829f-13a8a710b6da", posted=3, duration="1.20s") == (
         "timeline=019e7750-66ee-7f53-829f-13a8a710b6da posted=3 duration=1.20s"
     )
+
+
+# --- the ANSI verdict colors (issue #414) ------------------------------------
+#
+# The whole convention rests on one property: a color wraps a **whole token**, so nothing that
+# could grep the plain line stops matching the colored one. These pin that property from both
+# sides — the bytes that must be there, and the bytes that must *not* be inside a token.
+
+
+def test_a_colored_head_keeps_its_token_contiguous():
+    line = head("wake start", GREEN)
+
+    assert line == f"{GREEN}wake start{RESET}"
+    assert "wake start" in line  # the searchable bytes are still adjacent
+    assert "\x1b" not in line[line.index("wake start") : line.index("wake start") + 10]
+
+
+def test_every_fleet_color_is_the_sgr_code_the_convention_names():
+    # Founder-decided 2026-08-17 and shared with the router and the NOC — a palette that differs
+    # per repo is not a palette. Pinned as literals so a "tidy-up" cannot renumber them.
+    assert (GREEN, BLUE, YELLOW, RED, RESET) == (
+        "\x1b[32m",
+        "\x1b[34m",
+        "\x1b[33m",
+        "\x1b[31m",
+        "\x1b[0m",
+    )
+
+
+def test_a_verdict_pair_is_colored_whole_so_outcome_ok_still_greps():
+    line = kv(timeline="abc", outcome="ok", posted=1)
+
+    assert f"{GREEN}outcome=ok{RESET}" in line
+    assert "outcome=ok" in line  # …and the pair itself is one contiguous run
+    assert "timeline=abc" in line and "posted=1" in line
+
+
+def test_each_outcome_word_gets_its_own_color():
+    assert f"{GREEN}outcome=ok{RESET}" in kv(outcome="ok")
+    assert f"{RED}outcome=error{RESET}" in kv(outcome="error")
+    assert f"{YELLOW}outcome=declined{RESET}" in kv(outcome="declined")
+
+
+def test_an_unrecognized_outcome_is_left_plain_rather_than_guessed():
+    # The honest-absence rule `cost` and `endpoint` keep: a word outside the vocabulary is not
+    # assigned a color on a hunch.
+    assert kv(outcome="weird") == "outcome=weird"
+
+
+def test_correlation_values_are_never_colored():
+    # They are data a human copies out of the line and pastes into a query. An escape byte inside
+    # one is a uuid that no longer round-trips.
+    line = kv(timeline="019e7750-66ee-7f53-829f-13a8a710b6da", delivery="0199abc", outcome="ok")
+
+    assert "timeline=019e7750-66ee-7f53-829f-13a8a710b6da" in line
+    assert "delivery=0199abc" in line
+    # Everything ahead of the first escape byte — i.e. everything but the verdict — is plain.
+    assert (
+        line.split("\x1b")[0] == "timeline=019e7750-66ee-7f53-829f-13a8a710b6da delivery=0199abc "
+    )
+
+
+def test_an_error_text_that_says_outcome_ok_is_not_colored_into_a_verdict():
+    # `_value` already quotes it into a single `error=` value; the color layer keys on the *field*,
+    # never on the text, so a hostile tool cannot paint itself green.
+    line = kv(error="outcome=ok everything is fine")
+
+    assert GREEN not in line
+    assert line.startswith("error=")
+
+
+def test_no_color_turns_the_whole_stream_plain(monkeypatch):
+    monkeypatch.setenv(NO_COLOR_ENV, "1")
+
+    assert color_enabled() is False
+    assert head("wake failed", RED) == "wake failed"
+    assert kv(timeline="abc", outcome="error") == "timeline=abc outcome=error"
+
+
+def test_an_empty_no_color_is_not_an_opt_out(monkeypatch):
+    # https://no-color.org: *present and non-empty*. An exported-but-blank var is how a shell
+    # leaves a variable it never set, and it must not silently disable the feature.
+    monkeypatch.setenv(NO_COLOR_ENV, "")
+
+    assert color_enabled() is True
+    assert head("wake start", GREEN) == f"{GREEN}wake start{RESET}"
+
+
+def test_the_color_setting_is_read_per_line_not_frozen_at_import(monkeypatch):
+    # `agent.env` is loaded after this module imports, so a value cached at import would answer for
+    # the wrong environment.
+    assert head("wake start", GREEN).startswith(GREEN)
+    monkeypatch.setenv(NO_COLOR_ENV, "1")
+    assert head("wake start", GREEN) == "wake start"
+    monkeypatch.delenv(NO_COLOR_ENV)
+    assert head("wake start", GREEN).startswith(GREEN)
+
+
+def test_the_fact_heads_stay_plain_so_the_dashboards_extraction_anchors_survive(caplog):
+    # `llm`, `media` and `unspoken` name a *fact*, not a verdict — and the fleet dashboard extracts
+    # on their heads with the following field attached (` llm provider=`, ` unspoken timeline=`).
+    # A head span would sit exactly in that gap.
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(provider="openai", model="gpt-5.4-mini", seconds=1.0)
+        log_media_call(provider="xai", kind="image.generate", model="grok-2-image", seconds=2.0)
+        log_unspoken("thinking out loud", timeline="019e77")
+
+    lines = [r.getMessage() for r in caplog.records]
+    assert "\x1b" not in "".join(lines)
+    assert any(m.startswith("llm provider=") for m in lines)
+    assert any(m.startswith("media provider=") for m in lines)
+    assert any(m.startswith("unspoken timeline=") for m in lines)
+
+
+def test_the_tool_lines_outcome_is_colored_but_its_head_is_not(caplog):
+    # The one line carrying both halves of the split: ` tool name=` is a dashboard anchor and stays
+    # plain, while its `outcome=` is a verdict and does not.
+    started = datetime(2026, 8, 17, tzinfo=timezone.utc)
+    engine = Engine(provider=None, tools=ToolRegistry(), clock=lambda: started)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        engine._log_tool("memory", started)
+        engine._log_tool("memory", started, error="boom")
+
+    lines = [r.getMessage() for r in caplog.records]
+    assert all(m.startswith("tool name=memory") for m in lines)
+    assert any(f"{GREEN}outcome=ok{RESET}" in m for m in lines)
+    assert any(f"{RED}outcome=error{RESET}" in m for m in lines)
+    # …and the dashboard's own two-token pattern still spans the line.
+    assert any(re.search(r"tool name=.*outcome=error", m) for m in lines)
+
+
+def test_a_colored_head_is_followed_by_the_reset_and_not_by_its_separator():
+    """The precise byte shape of a colored line — and the one thing the token rule does NOT buy.
+
+    A whole-token search keeps working (`wake end`, `outcome=error`). A pattern that reaches *past*
+    the token — a trailing-space anchor (``wake failed ``) or an adjacent-pair literal
+    (``wake reported_failure kind=billing``) — does not, because the head's ``RESET`` now sits in
+    that gap. This is the shape every out-of-repo consumer of these lines is coupled to, so it is
+    pinned here rather than left to be rediscovered: a pattern spanning the gap must wildcard it
+    (``wake end.*outcome=error``), never spell it as a literal space.
+    """
+    line = f"{head('wake end', BLUE)} {kv(timeline='abc', outcome='error')}"
+
+    assert line == f"{BLUE}wake end{RESET} timeline=abc {RED}outcome=error{RESET}"
+    # Whole tokens: still searchable, exactly as the convention promises.
+    assert "wake end" in line and "outcome=error" in line
+    assert re.search(r"wake end.*outcome=error", line)
+    # Across the gap: no longer. Both shapes below are live NOC patterns as of this change.
+    assert not re.search(r"wake end .*outcome=error", line)
+    assert not re.search(r"wake end timeline=", line)
