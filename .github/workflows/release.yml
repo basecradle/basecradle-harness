@@ -40,7 +40,7 @@ jobs:
     needs: preflight
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.0.0
+      - uses: astral-sh/setup-uv@v10.0.1
       - name: Build the wheel and sdist
         run: uv build
       - uses: actions/upload-artifact@v7
