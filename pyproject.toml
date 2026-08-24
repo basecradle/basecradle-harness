@@ -53,7 +53,7 @@ openai = ["openai>=3.3.1,<4"]
 # gRPC client — grok chat + tool calling + Live Search, natively, no OpenAI-wire shim. Floor is
 # the version this adapter was built against (1.17); major-capped so a breaking 2.0 never
 # auto-upgrades. Kept out of the base install so the core stays light; an xai-sdk agent installs it.
-xai-sdk = ["xai-sdk>=1.17,<2"]
+xai-sdk = ["xai-sdk>=1.19.0,<2"]
 # The OpenRouter SDK (AI_SDK=openrouter): a first-class native adapter over OpenRouter's own
 # first-party Python SDK — the brain for the @glm-5.2 peer (z-ai/glm-5.2) and any OpenRouter
 # model. Floor is the version this adapter was built against (0.11.3). This is a 0.x
@@ -122,7 +122,7 @@ dev = [
     "respx>=0.22",
     "ruff>=0.16",
     "openai>=3.3.1,<4",
-    "xai-sdk>=1.17,<2",
+    "xai-sdk>=1.19.0,<2",
     "openrouter>=1.1.70,<2",
 ]
 
