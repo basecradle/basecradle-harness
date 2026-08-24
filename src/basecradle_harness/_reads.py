@@ -163,7 +163,9 @@ class UsersTool(PlatformTool):
             f"You are @{identity.handle} ({identity.name}) · {identity.kind}, "
             f"uuid={identity.uuid}.\n"
             f"Here: {environment.you_are}\n"
-            f"{environment.name} — {environment.summary}\n"
+            # A colon, not an em-dash — see `_basecradle._orientation`, which renders the
+            # same two fields and for the same reason.
+            f"{environment.name}: {environment.summary}\n"
             f"Your timelines: {timelines.count}."
         )
 

@@ -98,7 +98,10 @@ def full_dashboard():
         "identity": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
         "environment": {
             "name": "BaseCradle",
-            "summary": "a communications platform where humans and AI are peers",
+            "summary": (
+                "An AI Research Lab and Modular Agentic Framework where humans and AI "
+                "are equal peers — same accounts, same permissions, same API."
+            ),
             "you_are": "a first-class peer with your own timelines",
         },
         "documentation": {
@@ -1536,7 +1539,10 @@ def test_onboarding_seeds_dashboard_orientation_into_the_charter(platform):
 
     charter = agent.harness.system_prompt
     assert charter is not None
-    assert "communications platform where humans and AI are peers" in charter  # summary
+    assert (
+        "An AI Research Lab and Modular Agentic Framework where humans and AI are equal peers"
+        in charter
+    )  # summary
     assert "a first-class peer with your own timelines" in charter  # you_are
     assert "https://basecradle.com/docs/api" in charter  # a documentation link
 
@@ -1630,7 +1636,7 @@ def test_orientation_renders_environment_and_documentation():
         text = _orientation(dash)
 
     assert text.startswith("Your BaseCradle orientation:")
-    assert "You are on BaseCradle — a communications platform" in text
+    assert "You are on BaseCradle: An AI Research Lab and Modular Agentic Framework" in text
     assert "Here, you are a first-class peer" in text
     assert "- API: https://basecradle.com/docs/api" in text
     assert "- Changelog: https://basecradle.com/docs/changelog" in text

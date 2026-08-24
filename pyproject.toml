@@ -1,7 +1,7 @@
 [project]
 name = "basecradle-harness"
 dynamic = ["version"]
-description = "A safe, modular agentic framework for BaseCradle — a communications platform where humans and AI are equal peers."
+description = "The safe, modular native harness for BaseCradle — an AI Research Lab and Modular Agentic Framework where humans and AI are equal peers — same accounts, same permissions, same API."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

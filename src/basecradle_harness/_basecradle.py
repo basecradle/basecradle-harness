@@ -530,7 +530,10 @@ def _orientation(dashboard: object) -> str | None:
         summary = getattr(env, "summary", None)
         you_are = getattr(env, "you_are", None)
         if name and summary:
-            lines.append(f"You are on {name} — {summary}")
+            # A colon, not an em-dash: the platform's own summary carries an em-dash
+            # ("… equal peers — same accounts, same permissions, same API"), and a second
+            # one here reads as the matched pair around a parenthetical it is not.
+            lines.append(f"You are on {name}: {summary}")
         elif summary:
             lines.append(summary)
         if you_are:

@@ -398,7 +398,7 @@ class OpenRouterProvider:
         headroom — the silent walk out of the compaction guarantee that `CLAUDE.md` → Context
         Discipline spells out as an inequality. `HARNESS_MAX_CONTEXT_TOKENS` remains the answer for
         an operator who wants a *tighter* budget than the ceiling for cost reasons, which is a
-        policy choice and deliberately not the framework's to make.
+        policy choice and deliberately not the harness's to make.
 
         ``None`` on any failure (or a model id without the ``author/slug`` shape the endpoints API
         needs) — the budget then falls to its conservative floor. Also ``None`` when a pin allows
