@@ -269,7 +269,7 @@ requires-dist = [
     { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.7.1" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=3.3.1,<4" },
     { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=1.1.70,<2" },
-    { name = "xai-sdk", marker = "extra == 'xai-sdk'", specifier = ">=1.17,<2" },
+    { name = "xai-sdk", marker = "extra == 'xai-sdk'", specifier = ">=1.19.0,<2" },
 ]
 provides-extras = ["mempalace", "openai", "openrouter", "xai-sdk"]
 
@@ -280,7 +280,7 @@ dev = [
     { name = "pytest", specifier = ">=8" },
     { name = "respx", specifier = ">=0.22" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "xai-sdk", specifier = ">=1.17,<2" },
+    { name = "xai-sdk", specifier = ">=1.19.0,<2" },
 ]
 
 [[package]]
@@ -3346,7 +3346,7 @@ wheels = [
 
 [[package]]
 name = "xai-sdk"
-version = "1.18.0"
+version = "1.19.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -3357,10 +3357,11 @@ dependencies = [
     { name = "protobuf" },
     { name = "pydantic" },
     { name = "requests" },
+    { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3f/33/e09aacf91323617a7e9717a3ae9893b15dd73c469a8d57eb083794555d61/xai_sdk-1.18.0.tar.gz", hash = "sha256:e3a8f58f37675cc154906fd78be7d26dd9215e5602ee3c40c1d2a03fb589bbaf", size = 453105, upload-time = "2026-08-13T01:26:39.86Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/db/85/85ae73cbc9de7e1529e87a5eb807fa11727dd59eac887957c87c0e721893/xai_sdk-1.19.0.tar.gz", hash = "sha256:65733bfb83826b10872b8c8af58003104cbd33ce69f0fdfc0d52bb670de7b0e7", size = 466299, upload-time = "2026-08-18T18:02:06.402Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/5e/4bd6ed8d44783d9938e6db2b890dc58b26da75f15962e35e8d676365e406/xai_sdk-1.18.0-py3-none-any.whl", hash = "sha256:9e8bcc9e7ec9c92209801056e6ba9740ebde4f7e6a0b2ec111e9d78233f85ef9", size = 274111, upload-time = "2026-08-13T01:26:38.255Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/b5/6f6783b97fb3a5498eb852ccaa706e1a2c0de2409480e3c99428e85234fe/xai_sdk-1.19.0-py3-none-any.whl", hash = "sha256:4af1a629ad9304d0b05fa052d84ce77b7b61242a6d59d5936b692fec95fb52c1", size = 278826, upload-time = "2026-08-18T18:02:04.892Z" },
 ]
 
 [[package]]
