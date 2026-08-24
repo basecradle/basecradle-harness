@@ -266,7 +266,7 @@ dev = [
 requires-dist = [
     { name = "basecradle", specifier = ">=0.6" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.4" },
+    { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.7.1" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=3.3.1,<4" },
     { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=1.1.70,<2" },
     { name = "xai-sdk", marker = "extra == 'xai-sdk'", specifier = ">=1.17,<2" },
@@ -1187,7 +1187,7 @@ wheels = [
 
 [[package]]
 name = "mempalace"
-version = "3.7.0"
+version = "3.7.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "chromadb" },
@@ -1199,9 +1199,9 @@ dependencies = [
     { name = "tokenizers" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/9e/88/a7ded317b52c4accb21f5ea86ff7a1db6567c694fcabb5a697d06683a106/mempalace-3.7.0.tar.gz", hash = "sha256:9485f6fa5b43c5614c2b60c8f20d9f0afd0112f3b7ba32a994673128f8558461", size = 25655659, upload-time = "2026-08-11T14:07:12.808Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/72/90/1b0e4f891ce35ef64d74bd075b8bfde567b200d4710314a77d1052630597/mempalace-3.7.1.tar.gz", hash = "sha256:4e7602fc89b763ad525c7bc71a65a07017f39f5912cfa6496be5109ce992d331", size = 25674896, upload-time = "2026-08-14T17:52:04.669Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/60/fa/a6ad2f6166eb438430cc17f88ac2813b6895a0086f18b8c214c78b42248b/mempalace-3.7.0-py3-none-any.whl", hash = "sha256:6ef6f1ae916de7bba1295b4c42e89ec9ae8a4aabb1e1309ff8488cca583bf673", size = 713898, upload-time = "2026-08-11T14:07:10.083Z" },
+    { url = "https://files.pythonhosted.org/packages/83/4c/3db8cf56ba7ddfb1d3ce1274cf2c98a0b7bcab173d1192a46d3848d4224d/mempalace-3.7.1-py3-none-any.whl", hash = "sha256:4d0627a5f07a597d18747f553af0341fe75646b9c61818c9d5998b6b50fff597", size = 721208, upload-time = "2026-08-14T17:52:02.744Z" },
 ]
 
 [[package]]
