@@ -1,4 +1,4 @@
-"""Harness — a safe, modular agentic framework for BaseCradle.
+"""Harness — the safe, modular native harness for BaseCradle.
 
 A hackable reference you build *on*, not a black box: a small, readable agent
 core with clean extension points for human AI developers to fork and extend.

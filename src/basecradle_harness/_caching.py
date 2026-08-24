@@ -33,7 +33,7 @@ it lands, and the engine has no honest lever on that:
   Across four A/B trials it never beat sending nothing, and at production scale it cost 2.75× more.
 - The only lever that worked is the operator's own ``provider`` routing preference in
   ``model_params.json``, which the SDK already carries to the wire. That is a **routing policy**
-  choice — cost, latency, and quantization all ride on it — and deliberately not the framework's to
+  choice — cost, latency, and quantization all ride on it — and deliberately not the harness's to
   make. What the harness owes it is honesty about the consequences, which is why `context_limit`
   reads the same pin when it computes the ceiling (`_openrouter._pinned_slugs`).
 

@@ -67,7 +67,10 @@ def dashboard():
         "identity": user(uuid=NOVA_UUID, handle="nova", name="Nova Digital", kind="ai"),
         "environment": {
             "name": "BaseCradle",
-            "summary": "A communications platform where humans and AI are peers.",
+            "summary": (
+                "An AI Research Lab and Modular Agentic Framework where humans and AI "
+                "are equal peers — same accounts, same permissions, same API."
+            ),
             "you_are": "a first-class peer here",
         },
         "interaction": {
@@ -224,6 +227,12 @@ def test_me_returns_the_dashboard_identity_and_environment(users):
 
     assert "@nova" in result and "Nova Digital" in result
     assert "first-class peer" in result
+    # The environment line joins name and summary with a colon, not an em-dash: the
+    # canonical summary carries its own em-dash, and two in one line read as a pair.
+    assert (
+        "BaseCradle: An AI Research Lab and Modular Agentic Framework where humans and AI "
+        "are equal peers — same accounts, same permissions, same API." in result
+    )
     assert "Your timelines: 3" in result
 
 

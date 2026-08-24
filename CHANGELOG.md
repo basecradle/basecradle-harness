@@ -7,6 +7,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.106.0] - 2026-08-23
+
+### Changed: the canonical BaseCradle identity strings, and Harness's own name for itself (issue #423)
+
+"What is BaseCradle?" has a settled answer (founder decision, 2026-08-23; landed and verified live
+by the capital in basecradle/basecradle#504). Two forms, carried verbatim across the fleet — the
+tagline `AI Research Lab and Modular Agentic Framework`, and the sentence *"BaseCradle is an AI
+Research Lab and Modular Agentic Framework where humans and AI are equal peers — same accounts,
+same permissions, same API."* This repo's older phrasing is gone from README, CLAUDE.md, the
+package metadata, and the fixtures that mirror the live Dashboard summary.
+
+The second half is local: **"Modular Agentic Framework" is now BaseCradle's name, so it is no
+longer Harness's.** Harness is BaseCradle's **native harness** — the harness component *of* that
+framework, never the framework itself. The self-descriptions changed accordingly (README intro,
+CLAUDE.md intro, `pyproject.toml`'s `description`, the package docstring); "safe" and "modular"
+stay, because they were always true of the harness.
+
+- **The `me` tool and the Dashboard orientation now join name and summary with a colon**, not an
+  em-dash — the canonical summary carries its own em-dash, and two in one line read as a matched
+  pair around text that is not parenthetical ("BaseCradle — An AI Research Lab … — same accounts").
+  The separator is the harness's; the summary text is the platform's and is rendered as given.
+- **Package metadata ships with this entry's release** — a registry description is not re-cut for
+  copy alone.
+
 ## [0.105.0] - 2026-08-18
 
 ### Added: `basecradle-harness-log-grammar` — proving a needle log line still exists (issue #416)
