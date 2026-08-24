@@ -48,7 +48,7 @@ dependencies = [
 # the operating system's, where HTTPX read `certifi`'s. A box with system CA certificates is
 # unaffected (verified live against api.openai.com); a minimal image without them needs them
 # installed, or `SSL_CERT_FILE` / `SSL_CERT_DIR` set.
-openai = ["openai>=3,<4"]
+openai = ["openai>=3.3.1,<4"]
 # The native xAI SDK (AI_SDK=xai-sdk): the Grok personas' end-state brain (issue #165). A
 # gRPC client — grok chat + tool calling + Live Search, natively, no OpenAI-wire shim. Floor is
 # the version this adapter was built against (1.17); major-capped so a breaking 2.0 never
@@ -121,7 +121,7 @@ dev = [
     "pytest>=8",
     "respx>=0.22",
     "ruff>=0.16",
-    "openai>=3,<4",
+    "openai>=3.3.1,<4",
     "xai-sdk>=1.17,<2",
     "openrouter>=1.1.2,<2",
 ]
