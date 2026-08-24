@@ -268,7 +268,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.4" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=3.3.1,<4" },
-    { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=1.1.2,<2" },
+    { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=1.1.70,<2" },
     { name = "xai-sdk", marker = "extra == 'xai-sdk'", specifier = ">=1.17,<2" },
 ]
 provides-extras = ["mempalace", "openai", "openrouter", "xai-sdk"]
@@ -276,7 +276,7 @@ provides-extras = ["mempalace", "openai", "openrouter", "xai-sdk"]
 [package.metadata.requires-dev]
 dev = [
     { name = "openai", specifier = ">=3.3.1,<4" },
-    { name = "openrouter", specifier = ">=1.1.2,<2" },
+    { name = "openrouter", specifier = ">=1.1.70,<2" },
     { name = "pytest", specifier = ">=8" },
     { name = "respx", specifier = ">=0.22" },
     { name = "ruff", specifier = ">=0.16" },
@@ -1727,7 +1727,7 @@ wheels = [
 
 [[package]]
 name = "openrouter"
-version = "1.1.54"
+version = "1.1.70"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpcore" },
@@ -1735,9 +1735,9 @@ dependencies = [
     { name = "jsonpath-python" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e0/46/07fddb3090e8263dae09e91704eac6c9469cf56fabaf5124c528bc07b474/openrouter-1.1.54.tar.gz", hash = "sha256:03ac2e53284dea2546decf78cd30473176315af5134127b44fd9ea79e5bc37c1", size = 424177, upload-time = "2026-08-13T23:08:34.401Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/11/778c3bc751af0d31a8ea00f62ddcc2fd1ea7cb9def7ddeac37746e85d733/openrouter-1.1.70.tar.gz", hash = "sha256:c2f577484745bf4583412b61bb7d01764edda1c7c2feae3886632bbcae4bb42f", size = 427794, upload-time = "2026-08-21T00:21:55.409Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b5/d2/4c5732405bf8b22b6eb0fd1ade0d56df26d6f11eff0f6a25b905d2c0b40a/openrouter-1.1.54-py3-none-any.whl", hash = "sha256:25081ffd381bc0f63728da5c465ef8b6eb28c11161d8cd338ccefede037d325c", size = 919900, upload-time = "2026-08-13T23:08:32.221Z" },
+    { url = "https://files.pythonhosted.org/packages/14/41/fe9c945821cf54244735cf0470d75ddfac7ed5112019469774d5305330d1/openrouter-1.1.70-py3-none-any.whl", hash = "sha256:638a821c439a8c7d09d6edd47cb5b6b42f94245c67503a3960ad9cd747fd9959", size = 923199, upload-time = "2026-08-21T00:21:53.758Z" },
 ]
 
 [[package]]

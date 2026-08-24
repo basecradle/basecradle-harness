@@ -60,7 +60,7 @@ xai-sdk = ["xai-sdk>=1.17,<2"]
 # Speakeasy-generated SDK: its *minor* is the breaking axis (typed signatures and `components`
 # names can drift on a minor bump), so it is minor-capped (`<0.12`) — bump the cap deliberately,
 # never blindly. Kept out of the base install so the core stays light; an openrouter agent installs it.
-openrouter = ["openrouter>=1.1.2,<2"]
+openrouter = ["openrouter>=1.1.70,<2"]
 # The MemPalace memory provider (a reference `MemoryProvider`): a local-first OSS memory
 # system (ChromaDB + SQLite). Kept out of the base install so the core stays light — the
 # adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace.
@@ -123,7 +123,7 @@ dev = [
     "ruff>=0.16",
     "openai>=3.3.1,<4",
     "xai-sdk>=1.17,<2",
-    "openrouter>=1.1.2,<2",
+    "openrouter>=1.1.70,<2",
 ]
 
 [build-system]
