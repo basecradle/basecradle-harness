@@ -52,7 +52,13 @@ account, issue #179):
 
 Everything fails **soft**: a missing key, the wrong scope, an unreachable endpoint, or an
 unexpected response all return a clear "unavailable — <reason>" string rather than raising, so a
-billing check never derails a wake. And it is careful with what it exposes: it never logs or
+billing check never derails a wake. That is a *contract*, and three of the ways to break it are
+not `httpx` errors at all, so each is guarded where it actually happens rather than at the call
+(issue #428): an **oversized integer** parses cleanly from a `val` string and then overflows the
+`/ 100.0` (`_cents`); `json` raises **`RecursionError`**, not a `ValueError`, on a deeply nested
+body (`_get`); and `httpx` ASCII-encodes a header value at **client construction**, so a key
+carrying a pasted smart quote raises `UnicodeEncodeError` before any request exists for
+`except httpx.RequestError` to see (`run`). And it is careful with what it exposes: it never logs or
 returns the key, and it never returns a raw billing payload (whose `changes` ledger carries
 purchase/invoice history) — only the computed figures the agent needs.
 """
@@ -189,8 +195,23 @@ class XaiAccountBalanceTool(Tool):
         if cached is not None:
             return cached
 
-        headers = {"Authorization": f"Bearer {key}"}
-        with httpx.Client(headers=headers, timeout=self._timeout) as client:
+        # The client is built *inside* a guard, not outside one: httpx encodes a header value as
+        # ASCII at construction time, so a key carrying a smart quote, a non-breaking space or an
+        # accented character — the ordinary consequence of pasting a credential — raises
+        # `UnicodeEncodeError` before any request exists for `except httpx.RequestError` to see.
+        # A misconfigured credential is the case this tool most owes a soft answer to.
+        try:
+            client_cm = httpx.Client(
+                headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
+            )
+        except UnicodeEncodeError:
+            return (
+                "xAI account balance unavailable — XAI_MANAGEMENT_KEY contains a non-ASCII "
+                "character, so it cannot be sent as a header; check for a smart quote or a "
+                "non-breaking space picked up when it was pasted."
+            )
+
+        with client_cm as client:
             # The team is a hard precondition — neither figure is reachable without it.
             try:
                 team = self._team(client)
@@ -288,7 +309,9 @@ class XaiAccountBalanceTool(Tool):
             )
         try:
             data = response.json()
-        except ValueError:
+        except (ValueError, RecursionError):
+            # `json` raises `RecursionError` — not a `ValueError` — on a deeply nested body, so
+            # a hostile or broken intermediary could otherwise raise straight out of `run`.
             raise _BalanceUnavailable(
                 f"the xAI Management API returned an unreadable response trying to {action}."
             ) from None
@@ -356,14 +379,23 @@ def _parse_cycle(data: dict[str, Any]) -> _Cycle:
 
 
 def _cents(holder: dict[str, Any], field: str) -> int | None:
-    """The integer cents at ``holder[field]["val"]``, or ``None`` if absent or unparseable."""
+    """The integer cents at ``holder[field]["val"]``, or ``None`` if absent or unparseable.
+
+    "Unparseable" includes **too large to be a dollar figure**, and that check is not padding:
+    a numeric string has no width limit, so a 400-digit one parses to a perfectly good Python
+    `int` here and then raises `OverflowError` at the ``cents / 100.0`` every caller does —
+    *out of* `run`, which this tool's whole contract says can never happen. Rejecting it at the
+    one place that reads a figure keeps that guarantee where the callers can't forget it.
+    """
     figure = holder.get(field)
     if not isinstance(figure, dict) or "val" not in figure:
         return None
     try:
-        return int(str(figure["val"]))
-    except (TypeError, ValueError):
+        cents = int(str(figure["val"]))
+        float(cents)  # the conversion every caller's division performs — raise it here, not there
+    except (TypeError, ValueError, OverflowError):
         return None
+    return cents
 
 
 def _parse_posted_usd(data: dict[str, Any]) -> float:
@@ -379,16 +411,26 @@ def _parse_posted_usd(data: dict[str, Any]) -> float:
         raise _BalanceUnavailable("the xAI Management API response carried no ledger total.")
     try:
         cents = int(str(total["val"]))
-    except (TypeError, ValueError):
+        float(cents)  # see `_cents`: an oversized integer parses fine and then overflows the / 100
+    except (TypeError, ValueError, OverflowError):
         raise _BalanceUnavailable(
-            "the xAI Management API returned a non-numeric ledger total."
+            "the xAI Management API returned an unusable ledger total."
         ) from None
     return -cents / 100.0
 
 
 def _dollars(usd: float) -> str:
-    """A signed USD figure — ``$42.50`` / ``-$5.00``."""
-    return f"-${abs(usd):,.2f}" if usd < 0 else f"${usd:,.2f}"
+    """A signed USD figure — ``$42.50`` / ``-$5.00``.
+
+    **Both arms format the magnitude.** The positive arm formatting ``usd`` directly is the
+    obvious shape and it is wrong for ``-0.0``: ``-0.0 < 0`` is `False`, so a negative zero falls
+    through to it and renders ``$-0.00`` — the sign on the wrong side of the dollar, outside the
+    uniform headline shape `_headline` promises and the live probe's regex depends on. Every
+    figure here is currently ``-int / 100.0`` and ``-0 / 100.0`` is ``+0.0``, so this is not
+    reachable today; it is written this way so a future change to how a figure is derived cannot
+    silently arm it (it *was* reachable in the OpenRouter sibling, which quantizes a float).
+    """
+    return f"-${abs(usd):,.2f}" if usd < 0 else f"${abs(usd):,.2f}"
 
 
 def _stamp(as_of: datetime) -> str:

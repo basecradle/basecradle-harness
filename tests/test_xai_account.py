@@ -30,7 +30,7 @@ import pytest
 import respx
 
 from basecradle_harness import Policy, ToolRegistry, XaiAccountBalanceTool
-from basecradle_harness._xai_account import DEFAULT_BASE_URL
+from basecradle_harness._xai_account import DEFAULT_BASE_URL, _dollars
 
 # A fabricated, well-formed UUIDv7 standing in for the agent's team — never a real team id.
 TEAM = "019510a0-2b3c-7d4e-8f01-23456789abcd"
@@ -488,6 +488,75 @@ def test_the_raw_ledger_history_never_reaches_the_model(tool):
     assert "xAI credits remaining: $51.81 USD" in result
     assert "INV-SECRET-42" not in result
     assert "PURCHASE" not in result
+
+
+# --- run() never raises: the malformed-response cases -------------------------
+
+
+def test_an_oversized_figure_degrades_instead_of_raising(tool):
+    """A numeric string has no width limit; `cents / 100.0` does.
+
+    A 400-digit `val` parses to a perfectly good Python `int` and then raises `OverflowError`
+    at the division every caller performs — straight out of `run()`, which the module's whole
+    contract says can never happen.
+    """
+    huge = "-" + "1" * 400
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(
+            mock,
+            preview=httpx.Response(200, json=_preview_body(prepaid_cents=huge)),
+            ledger=httpx.Response(200, json=_ledger_body(total_cents=huge)),
+        )
+        result = tool.run()  # must not raise
+
+    assert result.startswith("xAI account balance unavailable — ")
+    assert "111" not in result  # nothing of the figure is surfaced
+
+
+def test_a_deeply_nested_body_degrades_instead_of_raising(tool):
+    # `json` raises `RecursionError`, not a `ValueError`, past a certain nesting depth.
+    raw = "[" * 2000 + "]" * 2000
+    nested = httpx.Response(200, content=raw, headers={"content-type": "application/json"})
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock, preview=nested, ledger=nested)
+        result = tool.run()  # must not raise
+
+    assert result.startswith("xAI account balance unavailable — ")
+
+
+def test_a_non_ascii_key_degrades_instead_of_raising():
+    """httpx ASCII-encodes a header value at *client construction*, before any request exists.
+
+    So a key carrying a smart quote or a non-breaking space — what pasting a credential actually
+    produces — raised `UnicodeEncodeError` straight out of `run()`, past the `httpx.RequestError`
+    guard, which never sees it. A misconfigured credential is the case this tool most owes a soft
+    answer to.
+    """
+    tool = XaiAccountBalanceTool(
+        management_key="xai-\u201cnot-ascii\u201d", team_id=TEAM, cache_ttl=0
+    )
+    with respx.mock(assert_all_called=False) as mock:
+        preview, _ = _mock_both(mock)
+        result = tool.run()  # must not raise
+
+    assert not preview.called  # it never got as far as a request
+    assert result.startswith("xAI account balance unavailable — ")
+    assert "non-ASCII" in result
+    assert "XAI_MANAGEMENT_KEY" in result
+    assert "not-ascii" not in result  # the key is never echoed back
+
+
+def test_the_renderer_never_prints_a_sign_on_the_wrong_side_of_the_dollar():
+    """`-0.0 < 0` is `False`, so a negative zero would fall through `_dollars`' positive arm.
+
+    Not reachable through the parse today — every figure is `-int / 100.0` and `-0 / 100.0` is
+    `+0.0` — so this pins the renderer directly, which is the point: a future change to how a
+    figure is derived must not silently arm `$-0.00`.
+    """
+    assert _dollars(-0.0) == "$0.00"
+    assert _dollars(0.0) == "$0.00"
+    assert _dollars(-5.25) == "-$5.25"
+    assert _dollars(1234.5) == "$1,234.50"
 
 
 # --- caching -----------------------------------------------------------------

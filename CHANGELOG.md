@@ -7,6 +7,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.108.0] - 2026-08-28
+
+### Fixed: `xai_account_balance` is held to its own never-raise contract (issue #428)
+
+The module promises that every failure "returns a clear `unavailable — <reason>` string rather
+than raising, so a billing check never derails a wake." Three ways to break that are not `httpx`
+errors at all, so none was caught. All three were found by running the OpenRouter mirror's
+adversarial cases (issue #425) against this sibling, and each is guarded where it actually
+happens rather than at the call site:
+
+- **An oversized integer overflows the division.** `_cents` parses `val` with `int(str(...))`
+  under `except (TypeError, ValueError)`, and a numeric string has no width limit — so a
+  400-digit one parses to a perfectly good Python `int` and then raises `OverflowError` at the
+  `cents / 100.0` every caller performs.
+- **`json` raises `RecursionError`, not `ValueError`,** on a deeply nested body.
+- **httpx ASCII-encodes a header value at *client construction*,** before any request object
+  exists — so `except httpx.RequestError` around `client.get` could never see it, and any
+  non-ASCII character in `XAI_MANAGEMENT_KEY` raised `UnicodeEncodeError` out of `run()`. The
+  trigger is a key that picked up a smart quote or a non-breaking space when it was pasted, which
+  is exactly the misconfigured-credential case this tool most owes a soft answer to.
+
+Also hardens `_dollars`, which formatted the raw value on its positive arm: `-0.0 < 0` is `False`,
+so a negative zero renders `$-0.00` — the sign on the wrong side of the dollar, outside the
+uniform headline shape `_headline` promises and the live probe's regex depends on. Not reachable
+through this tool's parse today (every figure is `-int / 100.0`, and `-0 / 100.0` is `+0.0`), so
+this is hardening rather than a live fix; it *was* reachable in the OpenRouter sibling, which
+quantizes a float.
+
 ## [0.107.0] - 2026-08-28
 
 ### Added: `openrouter_account_balance` — the OpenRouter mirror of `xai_account_balance` (issue #425)
