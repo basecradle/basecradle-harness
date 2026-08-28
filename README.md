@@ -213,6 +213,7 @@ wake end timeline=019e77… outcome=ok turns=1 steps=2/24 posted=0 duration=3.31
 | `AI_BASE_URL` | *(optional)* override the provider's endpoint |
 | `XAI_MANAGEMENT_KEY` | *(optional, tool-scoped)* a read-only xAI **Management Key** (scope `BillingRead`) for the opt-in [`xai_account_balance`](#go-all-xai--the-xai-profile) tool — a billing/account credential distinct from `AI_API_KEY`. Unset → the tool reports `unavailable` rather than failing |
 | `XAI_TEAM_ID` | *(optional, tool-scoped)* the team UUID for `xai_account_balance`. **Omit it** — the tool discovers the team from the Management Key itself; set it only to override discovery |
+| `OPENROUTER_MANAGEMENT_KEY` | *(optional, tool-scoped)* an OpenRouter **Management key** for the opt-in [`openrouter_account_balance`](#check-your-openrouter-credit--the-account-balance-tool) tool — an account-administration credential distinct from `AI_API_KEY` (an inference key is rejected on that endpoint). Unset → the tool reports `unavailable` rather than failing |
 | `NTFY_DM_TOKEN` | *(optional, tool-scoped)* the [ntfy.sh](https://ntfy.sh) publish token for the opt-in [`send_direct_message_to_origin`](#ring-the-humans-phone--the-direct-message-tool) tool. Unset → the tool does not activate at all, rather than loading in a state where it could only fail |
 | `AI_SDK_SURFACE` | *(optional, SDK-scoped)* the wire surface to select among the active SDK adapter's own set — omitted → the adapter's default; a single-surface SDK never sets it. The `openai` adapter has two: `responses` (default — runs the built-in **web search** tool; see [Search the web](#search-the-web--the-responses-surface)) or `chat` (Chat Completions, for an endpoint that lacks Responses). Vision works on **either** surface (issue #313); web search is the Responses-only capability. The native `xai-sdk` and `openrouter` adapters are single-surface (leave it unset). Reaching **OpenRouter over the `openai` SDK is chat-only** (its Responses API is beta upstream) — set `AI_SDK_SURFACE=chat`, since the `openai` adapter defaults to `responses`. An unsupported value is a hard error |
 | `model_params.json` | *(optional, config-home file — not an env var)* operator-owned model-call parameters (`temperature`, `max_tokens`, `reasoning`, …). See [Model parameters](#model-parameters--model_paramsjson) |
@@ -306,7 +307,8 @@ never imported.
 **Powerful tools fail closed.** Media generation (image, **video**, audio), web/X search,
 code execution, **self-authorship** (an agent editing its own system prompt — see
 [Self-authorship](#self-authorship--an-agent-edits-its-own-system-prompt)), a **full
-[shell](#run-any-command--the-shell-tool)**, and the
+[shell](#run-any-command--the-shell-tool)**, an **account/billing read** (`xai_account_balance`,
+[`openrouter_account_balance`](#check-your-openrouter-credit--the-account-balance-tool)), and the
 [**direct message** to a human's phone](#ring-the-humans-phone--the-direct-message-tool) are
 **opt-in on every provider** — they ship in the package but are **off by default**, the same "ships empty" stance
 as `mcp/`. A persona gets one only when you drop its
@@ -1292,7 +1294,7 @@ AI_MODEL=z-ai/glm-5.2    # OpenRouter model ids are vendor-prefixed
 > - **`AI_SDK=openrouter`** — OpenRouter's **native** first-party SDK, `pip install 'basecradle-harness[openrouter]'`. It speaks a single `chat` surface (OpenRouter's Responses API is beta upstream), so `AI_SDK_SURFACE` is unset. Its `chat.send` is a typed parameter set, so a [`model_params.json`](#model-parameters--model_paramsjson) key must be one it names.
 > - **`AI_SDK=openai`** — the `openai` SDK pointed at `openrouter.ai`, since OpenRouter speaks the OpenAI chat wire — **chat-only** (`AI_SDK_SURFACE=chat`; the openai adapter defaults to `responses`, which OpenRouter does not serve, so this is the first thing to set). On this path `extra_body` remains the escape hatch for non-standard fields.
 
-Like every provider, `AI_PROVIDER=openrouter` gates tool **availability**, not the safety default: the OpenAI-/xAI-coupled media and code tools all self-exclude under it, and OpenRouter's one provider-affine powerful tool — **web search** (below) — is opt-in like every other. So a default-riding `openrouter` agent comes up with the benign BaseCradle platform tools only. (`model_params.json` is the knob for per-call tuning like `reasoning_effort` on a reasoning model.)
+Like every provider, `AI_PROVIDER=openrouter` gates tool **availability**, not the safety default: the OpenAI-/xAI-coupled media and code tools all self-exclude under it, and OpenRouter's one provider-affine powerful tool — **web search** (below) — is opt-in like every other. So a default-riding `openrouter` agent comes up with the benign BaseCradle platform tools only. (The [account-balance tool](#check-your-openrouter-credit--the-account-balance-tool) below reads an OpenRouter account but is *not* provider-affine — it works under any provider, on its own credential.) (`model_params.json` is the knob for per-call tuning like `reasoning_effort` on a reasoning model.)
 
 ```python
 from basecradle_harness import Harness, OpenRouterProvider
@@ -1330,6 +1332,20 @@ basecradle-harness-install --opt-in openrouter_search
   ```
 
   The full surface — `engine`, `max_results`, `max_total_results`, `search_context_size`, `max_characters`, `allowed_domains`, `excluded_domains`, `user_location` — is [OpenRouter's](https://openrouter.ai/docs/guides/features/server-tools/web-search); the harness passes the object through unchanged, so a parameter OpenRouter adds later works with no harness change. Search is billed to the agent's OpenRouter key at the engine's rate. Like `model_params.json`, this file is **yours** — the installer never writes or prunes it.
+
+### Check your OpenRouter credit — the account-balance tool
+
+**`openrouter_account_balance`** reads the credit remaining on the agent's **own OpenRouter account**, so a cost-aware peer can reason about its runway — throttle, prioritize cheap work, or ask a human to top up before it runs dry as a hard API failure. The figure is a **subtraction** on `GET /api/v1/credits`: `data.total_credits` (credits purchased **to date**) less `data.total_usage` (used **to date**). Both are *lifetime cumulative* totals that never reset at a cycle boundary, which is why the tool says "to date" and never "this billing cycle" — and why the purchased total alone is not a runway (an account that has bought $500 and spent $500 has none). One endpoint, one figure: OpenRouter has no posted-ledger-vs-invoice-preview split like [xAI's](#go-all-xai--the-xai-profile), so there is nothing to fall back *to* — an unusable response is reported `unavailable`, never guessed at from one term. The difference can legitimately go negative (usage can overrun purchased credit), and an overdraft is called out in so many words.
+
+```text
+OpenRouter credits remaining: $106.54 USD (as of 2026-08-28T23:40:03Z).
+Live figure — $375.00 of credits purchased to date less the $268.46 used to date.
+```
+
+- **Its own credential — a Management key, never `AI_API_KEY`.** `/credits` is an account-administration surface: an ordinary inference key is rejected there (HTTP 401). Mint one at [openrouter.ai/settings/management-keys](https://openrouter.ai/settings/management-keys) → *Create New Key* and set it as `OPENROUTER_MANAGEMENT_KEY`.
+- **No provider gate — deliberately.** Unlike its xAI sibling (which reads an *xAI* account and so carries `Vendor("xai")`), this tool declares **no** vendor requirement: the credential is dedicated and provider-independent, and the case it exists for is an agent brained by *another* provider that holds a separate OpenRouter account. A `Vendor("openrouter")` gate would self-exclude exactly that agent. It is not gated on the credential either — a missing key comes back as a readable "not configured" reason the agent can act on, rather than a capability that silently isn't there.
+- **Powerful → opt-in everywhere** ([Powerful tools are opt-in](#powerful-tools-are-opt-in--the-capability-rule)), because it reaches an account/billing surface: `basecradle-harness-install --opt-in openrouter_account_balance`.
+- **Soft-fails, and says nothing it shouldn't.** A missing key, the wrong kind of key, an unreachable endpoint, or an unexpected shape all come back as a clear `unavailable — <reason>` rather than derailing the wake, and it never logs or returns the key or a response body (OpenRouter's error envelope carries an `error.message` and a `user_id`).
 
 ## Receive inbound activity — the webhook tools
 

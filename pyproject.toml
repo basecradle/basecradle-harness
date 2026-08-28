@@ -23,10 +23,11 @@ classifiers = [
 dependencies = [
     "basecradle>=0.6",
     # Declared because the package **imports it directly** — `_webfetch`, `_grok`, `_images`,
-    # `_assets`, `_direct_message`, `_xai_account`, `_mcp`, `_http`, `_wake`. It was never a new
-    # install: `basecradle` requires `httpx>=0.28` and, until `openai` 3.0, the vendor SDK did too.
-    # That second supplier is gone (3.0 moved to HTTPX2 and stopped installing `httpx`), so what
-    # was an accident of somebody else's dependency graph is now stated. Floor matches `basecradle`'s.
+    # `_assets`, `_direct_message`, `_xai_account`, `_openrouter_account`, `_mcp`, `_http`,
+    # `_wake`. It was never a new install: `basecradle` requires `httpx>=0.28` and, until
+    # `openai` 3.0, the vendor SDK did too. That second supplier is gone (3.0 moved to HTTPX2
+    # and stopped installing `httpx`), so what was an accident of somebody else's dependency
+    # graph is now stated. Floor matches `basecradle`'s.
     "httpx>=0.28",
 ]
 

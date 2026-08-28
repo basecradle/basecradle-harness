@@ -7,6 +7,96 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.107.0] - 2026-08-28
+
+### Added: `openrouter_account_balance` — the OpenRouter mirror of `xai_account_balance` (issue #425)
+
+An agent holding an OpenRouter account can now read its own credit runway the way an xAI agent
+already could — same shape, same soft-failure contract, same locked-profile-safe plumbing. It is a
+plain read-only function tool (no platform client, no policy capability, no shell) that makes one
+authenticated GET and returns a figure, so a cost-aware peer can throttle, prioritize cheap work,
+or ask a human to top up *before* it runs dry as a hard API failure.
+
+```
+OpenRouter credits remaining: $106.54 USD (as of 2026-08-28T23:40:03Z).
+Live figure — $375.00 of credits purchased to date less the $268.46 used to date.
+```
+
+- **The figure is a subtraction on one endpoint.** `GET /api/v1/credits` returns two *lifetime
+  cumulative* USD totals — `data.total_credits` (purchased to date) and `data.total_usage` (used to
+  date) — and the runway is their difference. None of the xAI Management API's traps exist here: no
+  cents strings, no inverted sign convention, no team-UUID discovery, and **no posted-ledger vs.
+  invoice-preview dichotomy**. There is nothing to fall back *to*, so an unusable response is
+  reported `unavailable` — never guessed at from one term. Reporting `total_credits` alone would be
+  xAI's issue #388 defect one vendor over: that is credit ever *bought*, not what is left of it.
+- **"To date", never "this billing cycle".** These totals do not reset at cycle close, so cycle
+  wording would be false — and a runway figure the model misreads as a cycle budget is the same
+  class of defect as xAI's stale posted ledger (issue #384). The difference can legitimately go
+  negative (usage can overrun purchased credit), so the overdraft callout is kept.
+- **The arithmetic shown is the arithmetic done.** Both terms are quantized to cents at the parse
+  boundary, so the context line's subtraction lands exactly on the headline. `total_usage` carries
+  sub-cent precision (`268.464928179` in a live reading), which would otherwise let a rounded
+  display contradict an unrounded headline — or render a four-tenths-of-a-cent overrun as an
+  alarming `-$0.00`.
+- **Its own credential — `OPENROUTER_MANAGEMENT_KEY`, never `AI_API_KEY`.** `/credits` is an
+  account-administration surface: an ordinary inference key is rejected there (verified live,
+  HTTP 401). Mint one at `openrouter.ai/settings/management-keys`.
+- **No vendor gate — the one deliberate divergence from its xAI sibling.** `xai_account_balance`
+  carries `Vendor("xai")` because it reads an *xAI* account; this tool declares **no** vendor
+  requirement, because its credential is dedicated and provider-independent and the ordering case
+  is an agent brained by *another* provider that holds a separate OpenRouter account. A
+  `Vendor("openrouter")` gate would self-exclude exactly the agent it was built for. It is not
+  gated on the credential either (the way the DM tool gates on `NTFY_DM_TOKEN`): a missing key
+  reaches the model as a soft, readable "not configured" reason it can act on, rather than as a
+  capability that silently is not there (issue #374).
+- **Powerful → opt-in everywhere** (issue #168), because it reaches an account/billing surface:
+  `basecradle-harness-install --opt-in openrouter_account_balance`. Soft-fails every way it can
+  (no key, the wrong kind of key, an unreachable endpoint, an unexpected shape) rather than
+  derailing a wake, and never logs or returns the key or a response body — OpenRouter's error
+  envelope carries an `error.message` and a `user_id`.
+
+**`run()` never raises, and the renderer never prints a malformed figure.** Both are contract, so
+both are pinned rather than assumed. Self-review found four ways the first could break and one way
+the second could, all reachable from a drifted, broken, or hostile response:
+
+- Python's `json` accepts the non-standard `NaN` / `Infinity` literals. Neither survives the
+  renderer — `nan < 0` is `False`, so the overdraft check silently reports healthy, and both
+  format as a *figure* (`$nan USD`). They are not figures; the response is unreadable.
+- A JSON integer literal has no width limit, so a 400-digit one parses fine and then `float()`
+  raises `OverflowError` — straight out of `run()`.
+- `json` raises `RecursionError`, not a `ValueError`, past a nesting depth.
+- httpx ASCII-encodes a header value at **client construction**, before any request exists, so a
+  key carrying a smart quote or a non-breaking space — what pasting a credential actually produces
+  — raised `UnicodeEncodeError` past the `httpx.RequestError` guard, which never sees it. A
+  misconfigured credential is the case this tool most owes a soft answer to, and it now names the
+  problem without echoing the key.
+- `round()` manufactures `-0.0` from anything in `[-0.005, 0)`, and `-0.0 < 0` is `False`, so a
+  value that *is* zero to the cent fell through the renderer's positive arm as `$-0.00` — the sign
+  on the wrong side of the dollar, outside the uniform headline shape every reader, regex and the
+  live probe depend on, and precisely the alarming near-zero "overdraft" the cent quantization
+  exists to remove. Both arms now format the magnitude.
+
+**The cache carries the credential it was read with.** The key is resolved from the environment at
+*call* time, so a bare `(expiry, text)` entry would serve one account's figure — with that
+account's `as of` stamp — as another's for the rest of the TTL after the credential is repointed.
+
+Also corrected, all of them lists that this tool made staler rather than newly wrong:
+
+- `_defaults/tools/xai_account_balance.py` claimed OpenAI and OpenRouter "expose no equivalent
+  balance surface", which is no longer true of OpenRouter. Its `Vendor("xai")` gate is right for
+  the reason it always was — it reads an *xAI* account — not for that one.
+- The capability categories behind `opt_in` had drifted in four places, one of them the
+  `--opt-in` **`--help` text an operator reads** to find out what the flag grants: all still said
+  "media generation, web/X search, code execution" and had never picked up the shell,
+  self-authorship, the phone push, or an account/billing read. `ToolPlugin.opt_in`'s own docstring
+  now also states that a powerful plugin may legitimately declare **no** `requires` gate, leaving
+  `opt_in` as the only thing keeping it off a default-riding agent — the design, not a gap.
+- `pyproject.toml`'s httpx-importer list — the sole justification for the core `httpx` dependency,
+  and so the one place a reader checks who actually needs it — did not name the new module.
+- `docs/harness-internals.md` called `opt_in` "the seven powerful defaults" in the present tense
+  against fifteen shipped; it is now stamped as the set *as of #168* and points at what pins the
+  current one.
+
 ## [0.106.0] - 2026-08-23
 
 ### Changed: the canonical BaseCradle identity strings, and Harness's own name for itself (issue #423)
