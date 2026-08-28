@@ -234,14 +234,17 @@ class ToolPlugin:
     existing plugin that sets no `note` is unaffected.
 
     `opt_in` marks a **powerful/dangerous** tool — media generation (image, video, audio),
-    web/X search, code execution — that must **fail closed**: it is **off by default on every
+    web/X search, code execution, self-authorship, a full shell, an account/billing read, an
+    off-platform push to a human's phone — that must **fail closed**: it is **off by default on every
     provider** (issue #168) and activates **only** when the operator explicitly drops it into a
     persona's ``tools/`` overlay (the same "ships empty" pattern as ``mcp/``). An opt-in plugin
     is **not** auto-loaded from the packaged defaults and **not** auto-scaffolded by the
     installer; a benign/platform plugin (the default, ``opt_in=False``) keeps the normal
     shipped-default → install-then-prune behavior. This is a **capability** classification,
-    **provider-agnostic** — the `requires` gate (`Vendor`/`OpenAIKey`) decides *availability*,
-    never the safety default. Detected from source (AST) by `_install.plugin_opts_in` so the
+    **provider-agnostic** — the `requires` gate (`Vendor`/`OpenAIKey`/`EnvSet`) decides
+    *availability*, never the safety default, and a powerful plugin may legitimately declare
+    **no** gate at all (`openrouter_account_balance`, issue #425), leaving `opt_in` as the only
+    thing keeping it off a default-riding agent. That is the design, not a gap. Detected from source (AST) by `_install.plugin_opts_in` so the
     installer and loader agree without importing the plugin.
     """
 

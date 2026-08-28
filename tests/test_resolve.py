@@ -65,6 +65,11 @@ def test_only_computes_a_pruned_personas_exact_tools_pin():
         ("openai", "openai", []),
         ("xai", "xai-sdk", ["xai_search", "grok_generate_image", "xai_account_balance"]),
         ("openrouter", "openrouter", ["openrouter_search"]),
+        # The cross-provider row (issue #425): a powerful stem with NO `requires` at all, granted
+        # on an agent brained by a *different* vendor — @briggs's shape. Every other row's opt-ins
+        # are provider-affine and matched to their own row, so none of them would notice a
+        # regression that made a no-requires plugin resolve by provider.
+        ("xai", "xai-sdk", ["openrouter_account_balance"]),
     ],
 )
 def test_matches_resolved_config_on_the_box(monkeypatch, tmp_path, provider, sdk, opt_in):

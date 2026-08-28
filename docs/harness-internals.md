@@ -59,9 +59,11 @@ powerful tool's *availability/wiring*, **never** the safety default — there is
 OpenAI, opt-in on xAI" split. *(Decided by the capital + founder, applying Option 1 uniformly;
 see [[classify-safety-by-capability-not-provider]].)*
 
-- **The flag.** A `ToolPlugin` marks itself `opt_in=True` (the seven powerful defaults:
+- **The flag.** A `ToolPlugin` marks itself `opt_in=True` (the powerful defaults *as of #168*:
   `generate_image`, `edit_image`, `hear_audio`, OpenAI `web_search`, xAI `web_search`/`x_search`,
-  `grok_generate_image`, `grok_generate_video`). The packaged-default fallback **drops** opt-in
+  `grok_generate_image`, `grok_generate_video` — the set has grown since; CLAUDE.md's Security
+  invariants carries the current roster, and `tests/test_install.py` is what actually pins it
+  against the shipped files). The packaged-default fallback **drops** opt-in
   plugins; the installer **does not scaffold** them; both detect the flag from source via AST
   (`_install.plugin_opts_in`, the no-import discipline shared with provider affinity).
 - **Granting one.** `basecradle-harness-install --opt-in <stems>` scaffolds the named powerful

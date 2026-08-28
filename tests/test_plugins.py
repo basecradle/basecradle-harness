@@ -342,6 +342,12 @@ def test_removing_the_whole_tools_dir_once_installed_yields_no_tools(tmp_path):
     assert load_plugins(home) == []
 
 
+# The powerful tools with no provider affinity at all — opt-in everywhere (issue #168) and
+# available everywhere, so `opt_in` is the *only* thing keeping them off a default-riding agent.
+# They are what makes the disjointness guards below real rather than incidental: a `requires`
+# gate cannot exclude a plugin that declares none.
+_UNIVERSAL_POWER_TOOLS = {"openrouter_account_balance"}
+
 # The powerful xAI-affine defaults — opt-in everywhere (issue #168), so absent from a default
 # load; available only under provider="xai" (their `requires`) once opted into an overlay.
 _XAI_DEFAULTS = {
@@ -361,7 +367,7 @@ def test_a_never_installed_config_home_falls_back_to_benign_defaults_only(tmp_pa
     plugins = load_plugins(tmp_path / "never-installed")
     names = {p.resolved_name for p in plugins}
     assert names == _DEFAULT_TOOLS
-    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS) & names)
+    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS | _UNIVERSAL_POWER_TOOLS) & names)
 
 
 def test_default_riding_xai_agent_is_benign_only_no_grok_tools_auto_armed():
@@ -371,7 +377,7 @@ def test_default_riding_xai_agent_is_benign_only_no_grok_tools_auto_armed():
     resolved = resolve_plugins(load_plugins(), _ctx(provider="xai", AI_API_KEY="xai-key"))
     names = {t.name for t in resolved.tools}
     assert names == _DEFAULT_TOOLS
-    assert not (_XAI_DEFAULTS & names)
+    assert not ((_XAI_DEFAULTS | _UNIVERSAL_POWER_TOOLS) & names)
     assert resolved.builtins == []  # no web_search / x_search auto-armed
 
 
@@ -385,7 +391,7 @@ def test_a_freshly_installed_home_loads_benign_tools_only_end_to_end(tmp_path):
     plugins = load_plugins(home)
     names = {p.resolved_name for p in plugins}
     assert names == _DEFAULT_TOOLS
-    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS) & names)
+    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS | _UNIVERSAL_POWER_TOOLS) & names)
 
 
 def test_opting_a_power_tool_into_the_overlay_activates_it_subject_to_availability(tmp_path):
@@ -403,7 +409,8 @@ def test_opting_a_power_tool_into_the_overlay_activates_it_subject_to_availabili
 def test_opting_in_xai_account_balance_activates_under_xai_only(tmp_path):
     # The billing tool (issue #179) is opt-in and xai-affine, exactly like the grok media tools:
     # it scaffolds only on explicit opt-in, activates under the xai provider, and self-excludes
-    # under openai (which has no equivalent balance surface).
+    # under openai (it reads an *xAI* account, so the provider gate is the right one here —
+    # unlike openrouter_account_balance, whose account is reachable from any provider, below).
     home = tmp_path / "cfg"
     install(home, provider="xai", opt_in=["xai_account_balance"])
     assert (home / "tools" / "xai_account_balance.py").exists()
@@ -411,6 +418,42 @@ def test_opting_in_xai_account_balance_activates_under_xai_only(tmp_path):
     assert "xai_account_balance" in {t.name for t in under_xai.tools}
     under_openai = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))
     assert "xai_account_balance" not in {t.name for t in under_openai.tools}
+
+
+def test_the_openrouter_balance_tool_is_opt_in_and_activates_on_every_provider(tmp_path):
+    # The deliberate divergence from its xAI sibling (issue #425): NO Vendor gate. The ordering
+    # case is an agent brained by another provider that holds a *separate* OpenRouter account, so
+    # a Vendor("openrouter") gate would self-exclude exactly the agent this exists for. It is
+    # still powerful → opt-in everywhere, and never auto-scaffolded.
+    home = tmp_path / "cfg"
+    install(home, provider="xai")  # no opt_in
+    assert not (home / "tools" / "openrouter_account_balance.py").exists()
+
+    for provider in ("openai", "xai", "openrouter"):
+        install(home, provider=provider, opt_in=["openrouter_account_balance"])
+        assert (home / "tools" / "openrouter_account_balance.py").exists()  # never pruned
+        resolved = resolve_plugins(load_plugins(home), _ctx(provider=provider, AI_API_KEY="sk"))
+        assert "openrouter_account_balance" in {t.name for t in resolved.tools}
+
+
+def test_the_openrouter_balance_tool_activates_without_its_credential(tmp_path, monkeypatch):
+    # Deliberately NOT gated on OPENROUTER_MANAGEMENT_KEY the way the DM tool gates on
+    # NTFY_DM_TOKEN: a missing key must reach the model as a soft, readable "not configured"
+    # reason it can act on, never as a capability that silently is not there (issue #374).
+    #
+    # The delenv is load-bearing, not hygiene: `run()` reads the environment at call time, so on
+    # a box that actually exports the key — the box an operator debugging this tool is sitting at
+    # — this test would make a real HTTPS request, in a file whose contract is that everything
+    # here is offline.
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+    home = tmp_path / "cfg"
+    install(home, opt_in=["openrouter_account_balance"])
+    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))  # no management key
+    tools = {t.name: t for t in resolved.tools}
+    assert "openrouter_account_balance" in tools
+    assert (
+        "OPENROUTER_MANAGEMENT_KEY is not configured" in tools["openrouter_account_balance"].run()
+    )
 
 
 def test_the_direct_message_tool_is_opt_in_and_provider_agnostic(tmp_path):
@@ -450,11 +493,13 @@ def test_default_riding_openrouter_agent_is_benign_only(monkeypatch):
     # A default-riding @glm-5.2-style agent (provider=openrouter, no overlay) gets the benign/
     # platform set only — no media gen, no Live Search, no code execution auto-armed. Every
     # provider-coupled power tool self-excludes because its `requires` names openai/xai, not
-    # openrouter, so the whole media/search/code surface is off by construction.
+    # openrouter. `openrouter_account_balance` is the case that proves the safety default is the
+    # *capability*, never the vendor (issue #168): its `requires` names nothing at all, so no gate
+    # excludes it here and `opt_in` alone is what keeps it off — which is the whole design.
     resolved = resolve_plugins(load_plugins(), _openrouter_ctx(AI_API_KEY="sk-or-key"))
     names = {t.name for t in resolved.tools}
     assert names == _DEFAULT_TOOLS
-    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS) & names)
+    assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS | _UNIVERSAL_POWER_TOOLS) & names)
     assert resolved.builtins == []  # no web_search / x_search / code_execution armed
 
 
@@ -570,7 +615,7 @@ def test_load_for_xai_skips_the_openai_coupled_plugins(tmp_path):
     names = {p.resolved_name for p in plugins}
     # Both the grok power tools (opt-in) and the openai-coupled ones (provider-mismatched) are
     # absent from a default xai load; the benign defaults remain.
-    assert not (_XAI_DEFAULTS & names)
+    assert not ((_XAI_DEFAULTS | _UNIVERSAL_POWER_TOOLS) & names)
     assert "generate_image" not in names and "listen" not in names
     assert "assets" in names
 

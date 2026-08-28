@@ -13,8 +13,10 @@
 # Powerful (it reaches an account/billing surface with a dedicated credential) → opt_in
 # everywhere (issue #168): off by default on every provider, activates only when this file is
 # dropped into a persona's tools/ overlay (basecradle-harness-install --opt-in xai_account_balance).
-# `requires=(Vendor("xai"),)` gates *availability* to the xAI provider — it self-excludes on
-# OpenAI/OpenRouter, which expose no equivalent balance surface — never the safety default.
+# `requires=(Vendor("xai"),)` gates *availability* to the xAI provider — it self-excludes
+# elsewhere, because this endpoint reads an *xAI* account and nothing else — never the safety
+# default. An agent that also holds an OpenRouter account reads that one with the separate,
+# provider-agnostic openrouter_account_balance tool (issue #425).
 #
 # Delete this file to disable the tool.
 from basecradle_harness import ToolPlugin, Vendor, XaiAccountBalanceTool

@@ -382,7 +382,8 @@ def install(
     (the default the direct API and tests use) lays down every default unfiltered, as before.
 
     **Powerful tools are opt-in (issue #168), and the grant is durable (issue #374).** A
-    tool-plugin default marked ``opt_in`` (media generation, web/X search, code execution) is
+    tool-plugin default marked ``opt_in`` (media generation, web/X search, code execution,
+    self-authorship, a shell, an account/billing read, a push to a human's phone) is
     **not** scaffolded for a fresh agent — it ships in the package but stays off until explicitly
     chosen, the same "ships empty" stance as ``mcp/``. Three ways it still lands: it is named in
     ``opt_in`` (a list of plugin file stems, e.g. ``["grok_generate_image"]`` — the ``--opt-in``
@@ -1135,8 +1136,10 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "comma-separated plugin file stems to scaffold despite being powerful/opt-in tools "
             "(issue #168) — e.g. --opt-in generate_image,web_search. Powerful tools (media "
-            "generation, web/X search, code execution) are off by default for a new agent; this "
-            "is how you grant one. Already-granted ones are kept (grandfathered) regardless."
+            "generation, web/X search, code execution, self-authorship, a shell, an "
+            "account/billing read, a push to a human's phone) are off by default for a new "
+            "agent; this is how you grant one. Already-granted ones are kept (grandfathered) "
+            "regardless."
         ),
     )
     parser.add_argument(
