@@ -728,9 +728,16 @@ _OWNED_XAI_SDK = frozenset(
         "stream",
         # The per-session cache-affinity routing key the harness binds itself (issue #431). Owned
         # for a sharper reason than most of this set: a *static* value here is not merely overridden
-        # wiring, it is actively harmful — one id for every session pins the whole box to one xAI
-        # server, defeating the affinity it looks like it is asking for. The warning is the point.
+        # wiring, it is actively harmful — one id for every session names every session on the box
+        # the same thing. The warning is the point.
         "conversation_id",
+        # The client's gRPC metadata, which is where the affinity key *actually* rides on this SDK
+        # (issue #433) — and therefore the obvious word an operator reaches for here. The harness
+        # owns it outright: it is a `Client` constructor concern, not call tuning, so a key of this
+        # name would instead be splatted into `chat.create`, whose signature is **closed** — a hard
+        # `TypeError: unexpected keyword argument`, not the warned-and-dropped collision this file
+        # promises. Same reason `http_headers` is owned on the OpenRouter side.
+        "metadata",
     }
 )
 _OWNED_OPENROUTER = frozenset(

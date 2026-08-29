@@ -96,11 +96,13 @@ def test_live_search_works_alongside_function_tools_without_bouncing():
 
 @pytest.mark.skipif(not KEY, reason="set XAI_API_KEY to run the live xAI cache-affinity probe")
 def test_a_bound_conversation_earns_the_per_server_cache_hit():
-    """The #431 fix against the real fleet: does ``conversation_id`` actually buy the discount?
+    """The #431/#433 fix against the real fleet: does ``x-grok-conv-id`` actually buy the discount?
 
-    This is the other check the mocked-client suite structurally cannot make. The offline tests
-    prove the field goes on the create; only the live endpoint can say whether xAI *routes* on it —
-    the same gap the deprecated ``SearchParameters`` path fell through.
+    The last of three checks, each answering what the one below it cannot. The mocked-client tests
+    prove the adapter *decided* on a key; `test_xai_sdk_wire.py` proves the key **left the process**
+    (a real gRPC server reads it back off the connection) — the step whose absence let 0.110.0 ship
+    a key the SDK swallowed into a telemetry attribute; and only the live endpoint can say whether
+    xAI **routes** on it, the same gap the deprecated ``SearchParameters`` path fell through.
 
     The shape is deliberate. **One arm, not an A/B**: the unbound control is inherently lucky —
     a scattered call can land on a warm server anyway (that is exactly what @briggs's 0.2–18% was),

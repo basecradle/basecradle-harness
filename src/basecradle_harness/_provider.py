@@ -45,10 +45,16 @@ Two more belong to prompt caching (issues #277, #431):
   repeated prefix only pays out when the next call lands there; the fix is to send a stable
   conversation id, and the harness binds the **session id** — the string a transcript is keyed by,
   and therefore exactly the unit whose bytes repeat — before every turn. An adapter that needs no
-  such key simply does not define the method, and nothing happens. ``None`` means *omit the field*:
-  an adapter must never fabricate an id, which would read as a fresh conversation on every call.
+  such key simply does not define the method, and nothing happens. ``None`` means *send no key*: an
+  adapter must never fabricate an id, which would read as a fresh conversation on every call.
   This capability fails safe in the cost direction only — unbound, an agent keeps working and
   quietly re-pays for its prefix, which is why `_caching` records what it cost before it was found.
+  Deliberately, it says only *which* conversation and never *where the key goes*: that is the
+  adapter's, and it is not always a request field — on the ``xai-sdk`` it is gRPC call metadata, and
+  binding it to the SDK's same-named ``conversation_id`` keyword instead reached no server at all
+  (issue #433). **An adapter has not implemented this until something proves the key left the
+  process**; a fake client cannot, so the native adapter's proof is a real gRPC server
+  (`tests/test_xai_sdk_wire.py`).
 
 A fifth belongs to perception (issue #228):
 

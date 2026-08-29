@@ -1109,6 +1109,23 @@ def test_model_params_conversation_id_is_stripped_on_the_xai_sdk_build(monkeypat
     provider.close()
 
 
+def test_model_params_metadata_is_stripped_on_the_xai_sdk_build(monkeypatch, caplog):
+    # The affinity key rides as the client's gRPC `metadata` (issue #433), so `metadata` is now the
+    # obvious word an operator reaches for on this adapter — and `chat.create`'s signature is closed,
+    # so an unowned key of that name would be a hard `TypeError` rather than the warned-and-dropped
+    # collision this file promises. Owned for the same reason `http_headers` is on the OpenRouter side.
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    _write_model_params(
+        {"metadata": {"x-grok-conv-id": "one-id-for-everything"}, "temperature": 0.3}
+    )
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("xai", "xai-sdk", "native")
+    assert provider._default_params == {"temperature": 0.3}
+    assert "'metadata'" in caplog.text
+    provider.close()
+
+
 def test_model_params_timeout_is_stripped_on_the_openrouter_build(monkeypatch, caplog):
     # `timeout` is a harness-owned constructor arg — stripped like on the xai-sdk branch, so a
     # non-numeric value can never reach `int(timeout * 1000)`. Regression guard for the owned-set.
