@@ -7,6 +7,65 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.109.0] - 2026-08-28
+
+### Added: a plugin declares the environment it depends on but does not gate on (issue #427)
+
+`OPENROUTER_MANAGEMENT_KEY` and `XAI_MANAGEMENT_KEY` are read by their tools at call time and
+were named in **exactly one place in the repo: a table in `README.md`.** Nothing machine-readable
+knew they existed — `_resolve._plugin_credentials` builds `credentials` only from `EnvSet`
+requirements, so a tool that reads an env var *without gating on it* contributed nothing, and
+`basecradle-harness-resolve` and `--resolved-config` both answered "what is this agent configured
+to do?" with a tool set including `openrouter_account_balance` and no indication that it needs a
+credential nobody has provisioned. The tool then soft-failed on every call, forever, into a log
+nobody reads.
+
+It is issue #374's green-while-absent shape one level out. The declared-set machinery proves a
+tool *file* is present; nothing enumerated the *environment* a granted tool depends on, so an
+operator provisioning an agent could not ask the box which keys the configuration wanted. It was
+pre-existing (`xai_account_balance` gates on `Vendor("xai")`, not `EnvSet`) and could never have
+closed by accident, because `openrouter_account_balance` declares **no** `requires` at all —
+which is the whole point of #425: a `Vendor` gate would self-exclude the very agent it was built
+for.
+
+- **`ToolPlugin.needs_env`** — env vars a plugin's tool reads at call time and cannot work
+  without, declared for **reporting only**. It never gates, never filters, never refuses. That
+  distinction is the design: declaring it as an `EnvSet` is exactly what must *not* happen, since
+  a missing key has to reach the model as a soft, readable "not configured" reason it can act on,
+  never as a capability that silently is not there. Declared iff the tool cannot work without it
+  — `XAI_TEAM_ID` (discovered from the key when unset) is deliberately excluded, because a var
+  reported as wanted on every healthy box is noise, and a report that reddens on a correct
+  configuration is one nobody reads twice.
+- **`basecradle-harness-resolve`** gains `credentials.needs_env` (the ungated reads) and
+  `credentials.wanted` (the union — the one field answering *which keys does this configuration
+  want provisioned?*), plus a per-stem `needs_env`. `wanted` is **mode-independent**: what a
+  configuration wants is not a function of what `--no-assume-credentials` pretends is present,
+  and naming a key matters most exactly where its absence is why a tool is inactive.
+- **`basecradle-harness-wake --resolved-config`** gains **`tool_env`** — `env var → is it set?`
+  over every variable the *active* tool set depends on, **presence only, never a value**. It
+  covers both classes a tool can depend on, so a gated var is `true` by construction and the
+  contract is one sentence: **every `false` is an active tool that cannot do its job.**
+- **Backfilled** on both account tools and on the three grok media tools, which read `AI_API_KEY`
+  ungated while their OpenAI counterparts gate on `OpenAIKey` — the same dependency with opposite
+  visibility, decided by nothing.
+- **Reported, never proven.** Nothing here reddens `basecradle-harness-verify`: an operator's
+  decision not to provision an optional tool's key is legitimate, and folding activation into the
+  declared-set prover is the split `--resolved-config` already states in its `notes`. A refused
+  tool takes its dependency with it (pruned by name in both policy filters), so neither surface
+  ever names a credential read by a tool the box does not have.
+
+### Fixed: `_ALL_POWER_STEMS` is now all power stems (issue #427)
+
+`tests/test_install.py` derived it from the two provider-affine file sets — **eight** stems
+against **fifteen** shipped `opt_in` ones — so its nine call sites drove the install / prune /
+revoke paths with no **provider-agnostic** powerful stem at all, which is precisely the shape
+`openrouter_account_balance` introduced. It is now derived from the shipped files, and a new
+exact-set test asserts what each provider's scaffold **is** rather than only what it includes and
+excludes — the both-directions check the containment assertions never made. That also retired a
+stale claim the omission was hiding: "OpenRouter has no provider-affine power tools of its own"
+stopped being true when `openrouter_search` landed in #237.
+
+
 ## [0.108.0] - 2026-08-28
 
 ### Fixed: `xai_account_balance` is held to its own never-raise contract (issue #428)

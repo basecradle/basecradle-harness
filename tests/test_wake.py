@@ -1921,6 +1921,62 @@ def test_resolved_config_reports_active_opt_in_stems(wake_env, monkeypatch, tmp_
     assert "code_attach" in report["tools"]
 
 
+def test_resolved_config_reports_the_env_its_active_tools_read(wake_env, monkeypatch, tmp_path):
+    """The operator-facing hole issue #427 closed, in the exact shape that opened it.
+
+    An agent with both account tools opted in reports a tool set that *looks* armed while neither
+    Management Key is provisioned; before this field, the only place either key was named in the
+    whole repo was a table in README.md, so an operator could not ask the box which keys the
+    configuration wanted. Presence only, never a value — this file is pasted into issues.
+    """
+    monkeypatch.delenv("XAI_MANAGEMENT_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("AI_SDK", "xai-sdk")
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    install(cfg, provider="xai", opt_in=["xai_account_balance", "openrouter_account_balance"])
+
+    report = resolved_config()
+
+    assert {"xai_account_balance", "openrouter_account_balance"} <= set(report["tools"])
+    assert report["tool_env"] == {
+        "OPENROUTER_MANAGEMENT_KEY": False,
+        "XAI_MANAGEMENT_KEY": False,
+    }
+    # The contract in one sentence: every `false` is an active tool that cannot do its job. Set
+    # one, and it flips — the field is read at report time, not frozen at install.
+    monkeypatch.setenv("XAI_MANAGEMENT_KEY", "mk-fake")
+    assert resolved_config()["tool_env"]["XAI_MANAGEMENT_KEY"] is True
+
+
+def test_resolved_config_tool_env_covers_gated_credentials_too(wake_env, monkeypatch, tmp_path):
+    """It is the environment the active set reads — both classes — not just the ungated half.
+
+    A gated var is ``true`` by construction (its absence is why the tool would not be in the set at
+    all), which is what makes the "every false is a finding" reading safe. Reporting only the
+    ungated half would make the field's definition conditional, and a conditional definition is
+    the kind that drifts.
+    """
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    install(cfg, provider="openai", opt_in=["generate_image"])  # gates on OpenAIKey → AI_API_KEY
+
+    report = resolved_config()
+
+    assert "generate_image" in report["tools"]
+    assert report["tool_env"] == {"AI_API_KEY": True}
+
+
+def test_resolved_config_reports_no_tool_env_for_an_ordinary_agent(wake_env, monkeypatch, tmp_path):
+    """The default install's benign tools read no environment, so the map is empty — pure signal."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    install(cfg, provider="openai")
+
+    assert resolved_config()["tool_env"] == {}
+
+
 def test_resolved_config_reports_configured_mcp_servers_regardless_of_load(
     wake_env, monkeypatch, tmp_path
 ):

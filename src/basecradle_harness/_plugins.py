@@ -251,6 +251,37 @@ class ToolPlugin:
     impl: type[Tool] | None = None
     builtin: str | None = None
     requires: tuple[Requirement, ...] = ()
+    needs_env: tuple[str, ...] = ()
+    """Environment variables this plugin's tool reads **at call time** and cannot do its job
+    without — declared for **reporting only**, never a gate (issue #427).
+
+    It is the deliberate counterpart of an `EnvSet` requirement, and the difference is the whole
+    point: both declare the same *dependency*, and they differ in what happens when it is absent.
+    An `EnvSet` in `requires` **gates** — the plugin does not activate, the model never sees the
+    tool, and `--resolved-config` reports it under ``skipped`` with the reason. A `needs_env` var
+    does **none** of that: the tool activates, the model sees it, and a call returns a soft,
+    readable "not configured" reason it can act on. That is the right shape for a tool whose
+    credential is *dedicated* rather than provider-wide (``openrouter_account_balance``, issue
+    #425 — gating it on its key would make the capability silently not-there rather than
+    reportably unconfigured), and it is exactly why nothing machine-readable knew such a key
+    existed: `_resolve._plugin_credentials` walks `requires`, and an ungated read contributes
+    nothing to walk. This field is what it walks instead.
+
+    Declare a var here iff the tool **cannot work** without it. A var the tool merely *prefers*
+    — ``XAI_TEAM_ID``, whose absence costs one discovery call and nothing else — is deliberately
+    **not** declared: it would read as a provisioning gap on every healthy box, and a report that
+    reddens on a correct configuration is one nobody reads twice.
+
+    The declaration is about the **plugin** path (the loader instantiates a tool with no
+    arguments), so it is accurate there; a library caller wiring the same tool by hand with an
+    explicit ``management_key=`` needs no env var and is outside its scope.
+
+    Reported by `basecradle-harness-resolve` (``credentials.needs_env`` / ``credentials.wanted``,
+    and per-stem) and by ``basecradle-harness-wake --resolved-config`` (``tool_env``, mapped to
+    whether each is actually set on the box). It never filters, never refuses, and never turns a
+    verify red — an operator's decision not to provision an optional tool's key is legitimate,
+    and the split between *present* and *activated* that `_verify` states in its ``notes`` stands
+    unchanged."""
     name: str | None = None
     note: str | None = None
     opt_in: bool = False
@@ -349,6 +380,17 @@ class ResolvedTools:
             "an overlay holding nothing" — a deleted ``tools/`` dir, i.e. zero tools — never
             collapse onto each other. Stamped by the caller that did the load
             (`_basecradle._resolve_tools`), since `resolve_plugins` sees plugins, not files.
+        env_dependencies: ``resolved name → the env vars that name's plugin depends on``, sorted,
+            for every **active** name that depends on any (issue #427) — a plugin's `needs_env`
+            (read at call time, never gated) **union** the vars its `EnvSet` requirements gate on.
+            Names with no dependency are absent, so an ordinary config's map is empty. Keyed by
+            `ToolPlugin.resolved_name` rather than by stem or wire name, because that is the unit
+            the two post-resolution filters (`_basecradle._apply_safe_policy`,
+            `_resolve._apply_policy`) drop by — they prune this map alongside `manifest`, so a
+            policy-refused tool never leaves its credential behind claiming to be read. It is what
+            lets ``--resolved-config`` answer *which environment does this box's live tool set
+            actually read?* — the question nothing could answer while an ungated read was declared
+            in no machine-readable place.
         mcp_images: The per-wake MCP image store (issue #318), set only when an MCP server's tools
             loaded. It rides the resolved set from `_merge_mcp_tools` to the hosting agent, which
             threads it into the `PlatformContext` so the assets ``post_image`` action can post an
@@ -362,6 +404,10 @@ class ResolvedTools:
     notices: list[str] = field(default_factory=list)
     broken: list[str] = field(default_factory=list)
     opt_in_stems: list[str] = field(default_factory=list)
+    #: ``resolved name -> the env vars that name depends on`` for every active name that depends
+    #: on one (issue #427): its plugin's ungated `ToolPlugin.needs_env` plus the vars its `EnvSet`
+    #: requirements gate on. Empty for a config whose tools read no environment.
+    env_dependencies: dict[str, list[str]] = field(default_factory=dict)
     #: The overlay's present plugin-file stems, or ``None`` when the overlay is not the source
     #: (issue #352). See the class docstring — the three-valued distinction is the contract.
     overlay_stems: list[str] | None = None
@@ -370,6 +416,26 @@ class ResolvedTools:
     #: the `PlatformContext` so the assets ``post_image`` action can post a returned image. ``None``
     #: for any config with no active MCP image source (the common case).
     mcp_images: McpImageStore | None = None
+
+
+def plugin_env_dependencies(plugin: ToolPlugin) -> list[str]:
+    """Every environment variable `plugin` depends on, sorted — gated and ungated alike.
+
+    The union of the two ways a plugin can name an env var, which exist because they differ in
+    what absence *does*, not in what they declare (issue #427):
+
+    - its `EnvSet` requirements (``OpenAIKey`` is one), which **gate** — absent, the plugin never
+      activates and the model never sees the tool;
+    - its `needs_env`, which does **not** gate — absent, the tool activates and a call returns a
+      readable "not configured" reason.
+
+    Both are still *this configuration wants this variable set*, which is the only question an
+    operator provisioning a box is asking, so both surfaces answer it from this one function
+    rather than from two walks that could drift.
+    """
+    return sorted(
+        {req.var for req in plugin.requires if isinstance(req, EnvSet)} | set(plugin.needs_env)
+    )
 
 
 def claim_plugins(
@@ -435,12 +501,19 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
     opt_in_stems = sorted(
         {plugin.stem for plugin in claimed.values() if plugin.opt_in and plugin.stem}
     )
+    # The active names' environment dependencies (issue #427) — read off the same `claimed` map
+    # everything else here is, so it can only ever describe the set that actually resolved. Only
+    # names that depend on something appear; an ordinary config contributes nothing.
+    env_dependencies = {
+        name: deps for name, plugin in claimed.items() if (deps := plugin_env_dependencies(plugin))
+    }
     return ResolvedTools(
         tools=tools,
         builtins=builtins,
         skipped=skipped,
         manifest=manifest,
         opt_in_stems=opt_in_stems,
+        env_dependencies=env_dependencies,
     )
 
 

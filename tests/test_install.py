@@ -13,6 +13,8 @@ no second build, no package surgery.
 
 import json
 
+import pytest
+
 from basecradle_harness import config_home, install, installed_version, reconcile_on_upgrade
 from basecradle_harness._install import (
     _MANIFEST_NAME,
@@ -449,16 +451,33 @@ def test_plugin_opts_in_detects_the_flag_without_importing():
     assert plugin_opts_in("this is not valid python :(") is False
 
 
-def test_every_shipped_power_tool_default_is_classified_opt_in():
-    # The whole safety guarantee rests on these being flagged — pin it against the package.
+def _shipped_power_stems() -> set[str]:
+    """Every powerful (``opt_in``) stem the package actually ships, read off the files.
+
+    The one derivation of "which stems are powerful", so nothing here can transcribe a subset and
+    then test against its own mistake (issue #427). It classifies with `plugin_opts_in` — the same
+    AST reader the installer and the loader use — rather than by importing the plugins.
+    """
     from importlib.resources import files
 
-    power_stems = set()
     root = files("basecradle_harness").joinpath("_defaults", "tools")
-    for child in root.iterdir():
-        if child.name.endswith(".py") and plugin_opts_in(child.read_text()):
-            power_stems.add(child.name[: -len(".py")])
-    assert power_stems == {
+    return {
+        child.name.removesuffix(".py")
+        for child in root.iterdir()
+        if child.name.endswith(".py") and plugin_opts_in(child.read_text())
+    }
+
+
+def _shipped_tool_source(stem: str) -> str:
+    """The packaged source of one shipped tool-plugin default, for the AST classifiers."""
+    from importlib.resources import files
+
+    return files("basecradle_harness").joinpath("_defaults", "tools", f"{stem}.py").read_text()
+
+
+def test_every_shipped_power_tool_default_is_classified_opt_in():
+    # The whole safety guarantee rests on these being flagged — pin it against the package.
+    assert _shipped_power_stems() == {
         "generate_image",
         "edit_image",
         "hear_audio",
@@ -498,7 +517,24 @@ _XAI_DEFAULTS = {
 _OPENAI_DEFAULTS = {"generate_image.py", "edit_image.py", "hear_audio.py", "web_search.py"}
 # Every provider-affine default is now a powerful, opt-in tool (issue #168), so provider
 # affinity is observable at scaffold time only when the tool is explicitly opted in.
-_ALL_POWER_STEMS = [name[: -len(".py")] for name in _XAI_DEFAULTS | _OPENAI_DEFAULTS]
+#
+# Derived from the shipped files, never transcribed (issue #427). It used to be built from the two
+# provider-affine sets above — eight stems against fifteen shipped ones — so its nine call sites
+# drove the install / prune / revoke paths with **no provider-agnostic** powerful stem at all,
+# which is precisely the shape `openrouter_account_balance` introduced (a powerful default with no
+# `requires` whatever, issue #425). A hand-written list of "every X" tests its author's memory;
+# this one goes red the day a stem is added rather than quietly not covering it.
+_ALL_POWER_STEMS = sorted(_shipped_power_stems())
+# The provider-agnostic half — powerful, but declaring no vendor affinity at all, so it is laid
+# down for **every** provider once opted in and pruned by none of them. Read off each file's own
+# declared affinity (`plugin_source_providers`), not by subtracting the two media/search sets
+# above: `code_execution` (openai+xai), `openrouter_search` (openrouter) and `xai_account_balance`
+# (xai) are all provider-affine while belonging to neither of those sets.
+_UNIVERSAL_POWER = {
+    f"{stem}.py"
+    for stem in _ALL_POWER_STEMS
+    if plugin_source_providers(_shipped_tool_source(stem)) is None
+}
 
 
 def _tool_files(home):
@@ -534,15 +570,91 @@ def test_install_without_opt_in_lays_down_no_power_tools_on_any_provider(tmp_pat
     assert "assets.py" in files  # benign defaults still present
 
 
-def test_install_for_openrouter_lays_down_only_universal_defaults(tmp_path):
-    # OpenRouter has no provider-affine power tools of its own (issue #234): even opting in every
-    # power stem lays down NONE of them (all are openai/xai-coupled → mismatched), just the benign
-    # universal defaults. @glm-5.2 comes up tool-lean by construction.
+def test_install_for_openrouter_lays_down_no_vendor_media_stack(tmp_path):
+    # OpenRouter reaches neither vendor's media/search stack, so opting in every power stem lays
+    # down none of those — but it is NOT true that OpenRouter has no powerful tools of its own:
+    # `openrouter_search` is openrouter-affine (issue #237) and the provider-agnostic ones land
+    # everywhere. That claim (this test's former name) survived only because `_ALL_POWER_STEMS`
+    # omitted both classes; it is asserted properly in the exact-set test below (issue #427).
     home = tmp_path / "cfg"
     install(home, provider="openrouter", opt_in=_ALL_POWER_STEMS)
     files = _tool_files(home)
     assert (_XAI_DEFAULTS | _OPENAI_DEFAULTS).isdisjoint(files)
+    assert _UNIVERSAL_POWER <= files  # a provider-agnostic power tool is laid down for everyone
+    assert "openrouter_search.py" in files  # OpenRouter's own affine power tool
     assert "assets.py" in files  # benign universal defaults are always present
+
+
+# The exact power-tool scaffold per provider, hand-written (issue #427). Every other assertion in
+# this file is a containment check — `<=` or `isdisjoint` over one media set — which is why a
+# provider-agnostic powerful stem could be added and covered by nothing: no test asserted what the
+# scaffold *is*, only what it includes and excludes. These are written out rather than recomputed
+# with `plugin_relevant_to`, deliberately: recomputing them with the installer's own predicate
+# would assert that the code agrees with itself. A new shipped power tool turns this red, and the
+# fix is to decide which providers it belongs to and say so here.
+_POWER_SCAFFOLD = {
+    "openai": {
+        "code_execution.py",
+        "edit_image.py",
+        "generate_image.py",
+        "hear_audio.py",
+        "openrouter_account_balance.py",
+        "send_direct_message_to_origin.py",
+        "shell.py",
+        "system_prompt.py",
+        "web_search.py",
+    },
+    "xai": {
+        "code_execution.py",
+        "grok_edit_image.py",
+        "grok_generate_image.py",
+        "grok_generate_video.py",
+        "openrouter_account_balance.py",
+        "send_direct_message_to_origin.py",
+        "shell.py",
+        "system_prompt.py",
+        "xai_account_balance.py",
+        "xai_search.py",
+    },
+    "openrouter": {
+        "openrouter_account_balance.py",
+        "openrouter_search.py",
+        "send_direct_message_to_origin.py",
+        "shell.py",
+        "system_prompt.py",
+    },
+}
+
+
+@pytest.mark.parametrize("provider", sorted(_POWER_SCAFFOLD))
+def test_opting_in_every_power_stem_lays_down_exactly_its_providers_set(tmp_path, provider):
+    """Opting in everything lays down *exactly* this provider's power tools — no more, no fewer.
+
+    The both-directions check the containment assertions never made. "No more" is the safety half
+    (issue #168): a stem that is not this provider's must never appear. "No fewer" is the one that
+    was missing, and it is the half `openrouter_account_balance` needs — a powerful default with
+    **no** ``requires`` at all (issue #425), which belongs to every provider and so is invisible to
+    any assertion phrased as "the xAI set is absent".
+    """
+    home = tmp_path / "cfg"
+    install(home, provider=provider, opt_in=_ALL_POWER_STEMS)
+    power_files = {f"{stem}.py" for stem in _ALL_POWER_STEMS}
+    assert _tool_files(home) & power_files == _POWER_SCAFFOLD[provider]
+
+
+def test_the_provider_agnostic_power_tools_are_scaffolded_for_every_provider(tmp_path):
+    """A powerful stem with no vendor affinity lands on *every* provider — stated once, plainly.
+
+    The property `_ALL_POWER_STEMS` could not exercise while it was built from the two
+    provider-affine media sets (issue #427). It is the whole point of a provider-agnostic power
+    tool: `openrouter_account_balance` exists precisely for an agent brained by another vendor
+    (issue #425), so a scaffold that filtered it by provider would defeat it.
+    """
+    for provider, expected in _POWER_SCAFFOLD.items():
+        home = tmp_path / provider
+        install(home, provider=provider, opt_in=_ALL_POWER_STEMS)
+        assert _UNIVERSAL_POWER <= expected  # the hand-written sets agree with the affinity read
+        assert _UNIVERSAL_POWER <= _tool_files(home)
 
 
 def test_a_switch_to_openrouter_prunes_a_mismatched_opted_in_default(tmp_path):

@@ -4146,6 +4146,45 @@ def resolved_config() -> dict[str, object]:
       fourth thing again — unknown, not empty. It is *stems*, like ``opt_in_tools`` and unlike
       ``tools``/``builtins``: one stem can fan out to several resolved names and a name can
       differ from its stem.
+    - ``tool_env`` — ``env var → is it set (non-empty) in this process's environment?``, over
+      every variable the **active tool plugins declare** a dependency on (issue #427). Presence
+      only, **never a value**: this file is read by the drift audit and pasted into issues, and a
+      boolean answers the operator's question without carrying a secret anywhere. Read from the
+      process environment at report time, like every env-sourced field here — so a probe invoked
+      with a stripped environment reports the same falses this one would, for the same reason
+      ``active_profile`` would read ``locked``.
+
+      It exists because an env var a tool reads *without gating on it* was, until #427, named in
+      exactly one machine-readable place: nowhere. ``xai_account_balance`` and
+      ``openrouter_account_balance`` read a dedicated Management Key at call time and soft-fail
+      with "not configured" when it is missing — deliberately, so the model gets a readable reason
+      rather than a capability that silently is not there (issue #425) — but that made the key
+      invisible to every surface that answers *what is this agent configured to do?*. An operator
+      provisioning the agent could not ask the box which keys the configuration wanted; they had
+      to read the README and know to. The declaration is `ToolPlugin.needs_env`; this field is
+      where it surfaces.
+
+      The map covers **both** classes a tool can depend on — a plugin's ungated ``needs_env`` and
+      the vars its `EnvSet` requirements gate on — so it is a complete statement of the
+      environment the live tool set reads. A gated var is ``true`` by construction (its absence is
+      why the tool would not be here), which makes the contract one sentence: **every ``false`` is
+      an active tool that cannot do its job.** A var a tool merely prefers is deliberately absent
+      (``XAI_TEAM_ID``, discovered from the key when unset) — see `ToolPlugin.needs_env`.
+
+      **What it does not cover, stated rather than left to be discovered:** it reads *plugin*
+      declarations, so two other env-reading subsystems are deliberately out of scope, each
+      because a different field already answers for it. The **memory provider**'s own
+      configuration (a palace path) is reported by ``memory_provider`` /
+      ``memory_provider_version``, which say which store actually bound — the question that
+      matters there. An **MCP server**'s ``env`` block is written by the operator in the
+      ``mcp/<name>.json`` drop-in itself, so it is not a dependency they could fail to know
+      about; ``mcp_servers`` names the configured servers, and the block's values stay unreported
+      because they can be secrets.
+
+      It reports; it never judges. An operator's decision not to provision an optional tool's key
+      is legitimate, so nothing here reddens `basecradle-harness-verify`, and the
+      present-vs-activated split that verify states in its ``notes`` is unchanged. ``{}`` for a
+      config whose active tool plugins read no environment, which is the ordinary case.
     - ``mcp_servers`` — the sorted **names** of the **configured** MCP servers, one per
       ``mcp/<name>.json`` drop-in (`load_mcp_configs`), independent of whether each one loaded
       this run (issue #261). The MCP-overlay analogue of ``opt_in_tools`` / ``active_profile``:
@@ -4212,6 +4251,10 @@ def resolved_config() -> dict[str, object]:
         "overlay_tool_stems": (
             None if resolved.overlay_stems is None else list(resolved.overlay_stems)
         ),
+        "tool_env": {
+            var: bool(os.environ.get(var))
+            for var in sorted({v for deps in resolved.env_dependencies.values() for v in deps})
+        },
         "mcp_servers": sorted({config.name for config in load_mcp_configs()}),
         "mcp_request_timeout": _timeout_from_env(),
         "model_params": model_params,

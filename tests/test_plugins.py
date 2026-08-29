@@ -24,7 +24,7 @@ from basecradle_harness import (
     load_plugins_report,
     resolve_plugins,
 )
-from basecradle_harness._plugins import load_default_plugins
+from basecradle_harness._plugins import load_default_plugins, plugin_env_dependencies
 
 
 # A trivial tool to stand in for a real impl — no platform, no provider, nothing to bind.
@@ -480,6 +480,103 @@ def test_the_direct_message_tool_self_excludes_without_its_publish_credential(tm
     resolved = resolve_plugins(load_plugins(home), _ctx())  # no NTFY_DM_TOKEN
     assert "send_direct_message_to_origin" not in {t.name for t in resolved.tools}
     assert any("NTFY_DM_TOKEN" in reason for _, reason in resolved.skipped)
+
+
+# --- ungated env dependencies (issue #427) -----------------------------------
+#
+# The gap: an env var a tool reads at call time *without gating on it* was declared in no
+# machine-readable place, so `--resolved-config` and `basecradle-harness-resolve` both answered
+# "what is this agent configured to do?" with a tool set including `openrouter_account_balance`
+# and no indication it needs a credential nobody has provisioned. `needs_env` is the declaration;
+# these pin that it reports and — the load-bearing half — that it never *gates*.
+
+
+def test_needs_env_reports_the_dependency_without_gating_on_it(tmp_path, monkeypatch):
+    """The whole contract in one test: declared, reported, and still active with the var unset.
+
+    If this ever starts gating, the tool stops reaching the model at all and the "not configured"
+    reason the model can act on becomes a capability that silently is not there — the exact
+    inversion issue #425 rejected on purpose.
+    """
+    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+    home = tmp_path / "cfg"
+    install(home, opt_in=["openrouter_account_balance"])
+
+    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))  # no management key
+
+    assert "openrouter_account_balance" in {t.name for t in resolved.tools}  # NOT gated
+    assert resolved.env_dependencies["openrouter_account_balance"] == ["OPENROUTER_MANAGEMENT_KEY"]
+
+
+def test_env_dependencies_unions_the_gated_and_ungated_declarations():
+    """One name can depend both ways, and the map is the union — the operator's whole question.
+
+    An `EnvSet` and a `needs_env` differ in what *absence* does, not in what they declare, so a
+    surface answering "which keys does this want set?" must read both or it answers half.
+    """
+    plugin = ToolPlugin(
+        impl=_Echo, requires=(EnvSet("GATED_KEY"),), needs_env=("UNGATED_KEY", "GATED_KEY")
+    )
+
+    assert plugin_env_dependencies(plugin) == ["GATED_KEY", "UNGATED_KEY"]  # deduped, sorted
+
+    resolved = resolve_plugins([plugin], _ctx(GATED_KEY="x"))
+    assert resolved.env_dependencies == {"echo": ["GATED_KEY", "UNGATED_KEY"]}
+
+
+def test_a_plugin_that_reads_no_environment_contributes_nothing():
+    """The ordinary case is an empty map — the field is signal, not a per-tool row of nulls."""
+    assert resolve_plugins([ToolPlugin(impl=_Echo)], _ctx()).env_dependencies == {}
+
+
+def test_an_inactive_plugins_env_dependency_is_not_reported_as_read(tmp_path):
+    """`env_dependencies` describes the **active** set: a tool that is not here reads nothing.
+
+    Reported off the same `claimed` map as the tools themselves, so it cannot name a credential
+    read by a tool the box does not have — which would be an operator chasing a key for nothing.
+    """
+    home = tmp_path / "cfg"
+    install(home, provider="xai", opt_in=["xai_account_balance"])
+
+    # Under xAI it activates and names its Management Key...
+    active = resolve_plugins(load_plugins(home), _ctx(provider="xai", sdk="xai-sdk"))
+    assert active.env_dependencies == {"xai_account_balance": ["XAI_MANAGEMENT_KEY"]}
+    # ...and under any other provider it self-excludes, taking its dependency with it.
+    inactive = resolve_plugins(load_plugins(home), _ctx(provider="openai"))
+    assert "xai_account_balance" not in {t.name for t in inactive.tools}
+    assert inactive.env_dependencies == {}
+
+
+def test_the_xai_media_stack_declares_the_provider_key_its_openai_twin_gates_on(tmp_path):
+    """The asymmetry #427 names: same dependency, opposite visibility, decided by nothing.
+
+    `generate_image` gates on `OpenAIKey` (an `EnvSet` on AI_API_KEY) so the key was reported;
+    `grok_generate_image` gates on the *provider* and read the same key ungated, so an xAI
+    agent's media stack named no credential at all. Both now report it.
+    """
+    home = tmp_path / "cfg"
+    install(home, provider="xai", opt_in=["grok_generate_image"])
+    xai = resolve_plugins(load_plugins(home), _ctx(provider="xai", sdk="xai-sdk", AI_API_KEY="sk"))
+    assert xai.env_dependencies == {"grok_generate_image": ["AI_API_KEY"]}
+
+    openai_home = tmp_path / "openai-cfg"
+    install(openai_home, provider="openai", opt_in=["generate_image"])
+    openai = resolve_plugins(load_plugins(openai_home), _ctx(AI_API_KEY="sk"))
+    assert openai.env_dependencies == {"generate_image": ["AI_API_KEY"]}
+
+
+def test_xai_team_id_is_deliberately_not_declared(tmp_path):
+    """`needs_env` means *cannot work without*, never merely *reads* — and the distinction bites.
+
+    `xai_account_balance` reads XAI_TEAM_ID too, but discovers the team from the key when it is
+    unset, so its absence costs one HTTP call and nothing else. Declared, it would read as a
+    provisioning gap on every correctly-configured box; a report that reddens on a healthy agent
+    is one nobody reads twice.
+    """
+    home = tmp_path / "cfg"
+    install(home, provider="xai", opt_in=["xai_account_balance"])
+    resolved = resolve_plugins(load_plugins(home), _ctx(provider="xai", sdk="xai-sdk"))
+    assert "XAI_TEAM_ID" not in resolved.env_dependencies["xai_account_balance"]
 
 
 # --- OpenRouter provider lock-in (issue #234) --------------------------------

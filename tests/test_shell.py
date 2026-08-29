@@ -135,6 +135,25 @@ def test_env_path_filters_shell_under_locked_and_surfaces_the_refusal():
     assert any("shell" in notice for notice in filtered.notices)
 
 
+def test_a_policy_refused_tool_takes_its_env_dependency_with_it():
+    """A refused tool is not read at run time, so its credential leaves the report too (#427).
+
+    Without the prune, ``--resolved-config`` would name an environment variable as read by a tool
+    set that does not contain the tool that reads it — sending an operator to provision a key for
+    a capability the profile has refused. Pruned by name alongside the manifest, in both the wake's
+    filter and `basecradle-harness-resolve`'s.
+    """
+    resolved = ResolvedTools(
+        tools=[ShellTool()],
+        manifest=[("shell", "note")],
+        env_dependencies={"shell": ["SOME_KEY"], "memory": ["KEPT_KEY"]},
+    )
+
+    filtered = _apply_safe_policy(resolved)  # locked: shell is refused
+
+    assert filtered.env_dependencies == {"memory": ["KEPT_KEY"]}
+
+
 def test_env_path_keeps_shell_under_unlocked():
     resolved = ResolvedTools(tools=[ShellTool()], manifest=[("shell", "note")])
 

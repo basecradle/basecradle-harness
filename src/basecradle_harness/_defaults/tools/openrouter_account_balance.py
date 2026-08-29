@@ -19,11 +19,18 @@
 # on NTFY_DM_TOKEN): a missing key must reach the model as a soft, readable "not configured"
 # reason it can act on, not as a capability that silently is not there (issue #374).
 #
+# `needs_env` is how that ungated dependency stays *visible* anyway (issue #427): it reports —
+# through `basecradle-harness-resolve`'s `credentials.wanted` and `--resolved-config`'s `tool_env`
+# — without gating, so an operator provisioning this agent can ask the box which keys its
+# configuration wants instead of reading the README and knowing to. Before it existed this key was
+# named in exactly one place in the repo: a table in README.md.
+#
 # Delete this file to disable the tool.
 from basecradle_harness import OpenRouterAccountBalanceTool, ToolPlugin
 
 PLUGIN = ToolPlugin(
     impl=OpenRouterAccountBalanceTool,
+    needs_env=("OPENROUTER_MANAGEMENT_KEY",),
     note=(
         "Reads the credit remaining on your own OpenRouter account (read-only; needs a "
         "Management key, not the inference key)."
