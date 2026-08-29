@@ -1094,6 +1094,21 @@ def test_model_params_stream_is_stripped_on_the_xai_sdk_build(monkeypatch, caplo
     provider.close()
 
 
+def test_model_params_conversation_id_is_stripped_on_the_xai_sdk_build(monkeypatch, caplog):
+    # The cache-affinity routing key is harness-owned (issue #431), and this collision matters more
+    # than most: one static id for every session pins the whole box to a single xAI server, which is
+    # the anti-pattern the fix removes. So it is warned-and-dropped, and the session's own binding
+    # is what rides.
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+    _write_model_params({"conversation_id": "one-id-for-everything", "temperature": 0.3})
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("xai", "xai-sdk", "native")
+    assert provider._default_params == {"temperature": 0.3}
+    assert "'conversation_id'" in caplog.text
+    provider.close()
+
+
 def test_model_params_timeout_is_stripped_on_the_openrouter_build(monkeypatch, caplog):
     # `timeout` is a harness-owned constructor arg — stripped like on the xai-sdk branch, so a
     # non-numeric value can never reach `int(timeout * 1000)`. Regression guard for the owned-set.

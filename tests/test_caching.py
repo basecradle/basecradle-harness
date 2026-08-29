@@ -13,13 +13,24 @@ and no network.
 
 import pytest
 
-from basecradle_harness import Harness, Message, ToolCall
+from basecradle_harness import (
+    Compactor,
+    ContextBudget,
+    Engine,
+    Harness,
+    Message,
+    Policy,
+    Session,
+    ToolCall,
+    ToolRegistry,
+)
 from basecradle_harness._caching import (
     AUTOMATIC,
     CACHE_MODES,
     EXPLICIT,
     NONE,
     anchor_cacheable_prefix,
+    bind_conversation,
     cache_mode,
 )
 from basecradle_harness._openai import OpenAIProvider
@@ -308,3 +319,133 @@ def test_a_contentless_anchor_never_reaches_the_wire_as_an_empty_block():
     wire = chat_message_to_wire(Message(role="assistant", tool_calls=tool_calls, cache_anchor=True))
 
     assert wire["content"] is None
+
+
+# --- Cache affinity: which server holds the prefix (issue #431) ---------------
+
+
+class BindingProvider(ScriptedProvider):
+    """An adapter that declares the affinity capability — a stand-in for the xAI one.
+
+    Records every bind *and* what was in force at each `chat`, because those are two different
+    questions: the first says the session told the adapter who it was, the second says the value
+    was still there when the call actually went out.
+    """
+
+    def __init__(self, *replies: Message) -> None:
+        super().__init__(*replies)
+        self.conversation: str | None = None
+        self.bound: list[str | None] = []
+        self.in_force: list[str | None] = []
+
+    def bind_conversation(self, conversation: str | None) -> None:
+        self.conversation = conversation
+        self.bound.append(conversation)
+
+    def chat(self, messages, tools=None):
+        self.in_force.append(self.conversation)
+        return super().chat(messages, tools)
+
+
+def test_the_session_binds_its_own_source_before_it_drives():
+    """The key is the session id — the string the transcript is already keyed by.
+
+    That is the whole reason it is the right key: the affinity unit and the cacheable unit are the
+    same unit, so a hit is possible exactly when the bytes repeat.
+    """
+    provider = BindingProvider(text("one"))
+    Harness(provider, system_prompt="be terse").session("timeline:019f6e71-2a12-7b69").send("hi")
+
+    assert provider.bound == ["timeline:019f6e71-2a12-7b69"]
+    assert provider.in_force == ["timeline:019f6e71-2a12-7b69"]
+
+
+def test_each_session_rebinds_so_two_timelines_never_share_a_server():
+    """One engine, many sessions (the unified-identity design) — and one provider object between
+    them. Every turn rebinds, or the second timeline would ride the first one's routing key and
+    both would herd onto one server holding one of their prefixes."""
+    provider = BindingProvider(text("one"), text("two"), text("three"))
+    harness = Harness(provider, system_prompt="be terse")
+
+    harness.session("timeline:a").send("first")
+    harness.session("timeline:b").send("second")
+    harness.session("timeline:a").send("third")
+
+    assert provider.in_force == ["timeline:a", "timeline:b", "timeline:a"]
+
+
+def test_the_binding_holds_for_every_call_of_a_multi_step_turn():
+    """A turn is several provider calls (tool → result → model again), and they share one prefix.
+    The bind is sticky across them; re-scattering mid-turn would miss on the longest prefix of all."""
+    provider = BindingProvider(
+        Message.assistant(tool_calls=[ToolCall(id="call-1", name="memory", arguments={})]),
+        text("done"),
+    )
+    Harness(provider, system_prompt="be terse").session("timeline:x").send("remember this")
+
+    assert provider.in_force == ["timeline:x", "timeline:x"]
+
+
+def test_the_compaction_summarize_call_inherits_the_session_binding():
+    """The compactor is a model call too, made while working the session, so it belongs to it.
+
+    Nothing rebinds between the turn and the compaction that follows it — stickiness is what makes
+    that correct rather than accidental, and this is the call that proves the difference.
+    """
+    provider = BindingProvider(text("my reply"), text("SUMMARY"))
+    session = Session(
+        "timeline:c",
+        Engine(provider, ToolRegistry(policy=Policy.locked())),
+        compactor=Compactor(provider, ContextBudget(provider, override=1_000)),
+    )
+    session.history.extend([Message.user(f"turn {i}") for i in range(40)])
+    provider.last_tokens_in = 100_000  # the reply call reported a size past the threshold
+
+    session.send("go")
+
+    # Two calls: the turn, then the summarization the threshold triggered — both on this session.
+    assert provider.in_force == ["timeline:c", "timeline:c"]
+
+
+def test_an_adapter_that_declares_nothing_is_simply_left_alone():
+    """The capability discipline: an adapter written before this existed keeps working untouched,
+    and no vendor branch anywhere decides which is which."""
+    provider = ScriptedProvider(text("one"))  # no `bind_conversation`
+    Harness(provider, system_prompt="be terse").session("timeline:x").send("hi")
+
+    assert not hasattr(provider, "conversation")
+
+
+@pytest.mark.parametrize("conversation", [None, ""])
+def test_an_empty_conversation_binds_none_so_the_adapter_omits_the_field(conversation):
+    """`None` means *omit*, never fabricate: a made-up id is a fresh conversation to the vendor on
+    every call — a guaranteed miss where the status quo was at least a lucky one."""
+    provider = BindingProvider()
+
+    bind_conversation(provider, conversation)
+
+    assert provider.conversation is None
+
+
+def test_a_raising_bind_costs_a_warning_and_never_the_wake(caplog):
+    """Affinity is an optimization. A dropped peer message is not a price worth paying for one."""
+
+    class Hostile(ScriptedProvider):
+        def bind_conversation(self, conversation):
+            raise RuntimeError("no routing for you")
+
+    provider = Hostile(text("one"))
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        reply = Harness(provider, system_prompt="be terse").session("timeline:x").send("hi")
+
+    assert reply == "one"
+    assert any("bind the conversation id" in r.message for r in caplog.records)
+
+
+def test_bind_conversation_is_a_no_op_for_an_adapter_without_the_method():
+    """Called directly, on the plain `Provider` contract — no attribute, no call, no error."""
+
+    class Adapter:
+        def chat(self, messages, tools=None): ...  # pragma: no cover - never called
+
+    bind_conversation(Adapter(), "timeline:x")  # must not raise

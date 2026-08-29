@@ -30,6 +30,18 @@ harness function registry as bogus ``no tool named`` bounces (issue #183). The g
 `PlatformTool`s over httpx (`basecradle_harness._grok`) — independent of the chat SDK, and granted
 only by opt-in. Exposing a capability is never granting it to a persona.
 
+Cache affinity — the ``conversation_id`` (issue #431)
+-----------------------------------------------------
+xAI's prompt cache is **per-server**, so a repeated prefix only pays out when the next call lands on
+the server that holds it. xAI's remedy is a stable conversation id (``conversation_id`` on
+``chat.create``, the SDK's form of the ``x-grok-conv-id`` header), which routes consecutive calls
+back to the same server. This adapter never sent one and the cost was measured, not theorized:
+@briggs hit 0.2–18% on a byte-stable ~210 K-token prefix where every other adapter was earning
+92–99%. `bind_conversation` takes the harness **session id** and `chat` puts it on the create;
+unbound, the field is simply **omitted** — never a fabricated value, which would be a fresh
+conversation to xAI on every call. The reasoning, and why OpenRouter's rejected session pin
+(issue #372) is the opposite situation rather than a precedent against this, lives in `_caching`.
+
 Stateless per turn: the full conversation is sent every call and the harness owns history.
 """
 
@@ -109,14 +121,21 @@ class XaiSdkProvider:
         client: An already-built ``xai_sdk.Client`` (or compatible). The seam tests inject a fake
             through, so the gRPC client is never constructed — and built when omitted.
         default_params: Extra keyword parameters passed to ``chat.create`` on every call (e.g.
-            ``temperature=0.2``). ``model``, ``messages``, ``tools`` always take precedence.
+            ``temperature=0.2``). ``model``, ``messages``, ``tools`` always take precedence — and so
+            does ``conversation_id`` once something has bound one (`bind_conversation`). In a
+            deployment an operator never reaches this: ``conversation_id`` is harness-owned, so
+            `_basecradle._split_model_params` strips it out of ``model_params.json`` with a WARNING
+            first — a single static value would pin every session on the box to one xAI server,
+            defeating the affinity it looks like it is asking for. The precedence here is what keeps
+            a library caller who passes one directly from silently overriding a bound session.
     """
 
     #: How xAI reaches its prompt cache (issue #277): **automatically**, with nothing on the wire —
     #: the proto reports the hit back as ``cached_prompt_text_tokens``, which is already on the
     #: per-call log line. The engine places no breakpoint. This adapter is direct-to-vendor, so
-    #: unlike the router-fronting adapters it carries no routed-model caveat: xAI is the only
-    #: endpoint it can reach, and grok's cache is automatic.
+    #: unlike the router-fronting adapters it carries no routed-*model* caveat: xAI is the only
+    #: endpoint it can reach, and grok's cache is automatic. It does carry a routed-*server* one —
+    #: the cache is per-server, which `bind_conversation` addresses (issue #431).
     cache_mode = AUTOMATIC
 
     def __init__(
@@ -137,6 +156,11 @@ class XaiSdkProvider:
         #: until the first call answers.
         self.last_tokens_in: int | None = None
         self._builtin_tools = list(builtin_tools)
+        #: The conversation this adapter's next calls belong to — xAI's per-server cache-affinity
+        #: routing key (issue #431), set by `bind_conversation` and ``None`` until something binds
+        #: one. A library caller driving the engine with no `Session` never binds, and then an
+        #: operator's own ``conversation_id`` in ``model_params.json`` (if any) is what rides.
+        self._conversation: str | None = None
         self._default_params = default_params
         self._xai = require_xai_sdk()
         if client is not None:
@@ -160,6 +184,13 @@ class XaiSdkProvider:
         payload: dict[str, Any] = dict(self._default_params)
         payload["model"] = self.model
         payload["messages"] = [self._to_wire(m, chat_mod) for m in messages]
+        if self._conversation:
+            # Cache affinity: route this call back to the server holding this session's prefix
+            # (issue #431). Harness-owned like `model`/`messages`/`tools`, and for the same reason —
+            # a *static* `conversation_id` in `model_params.json` would pin every session on the box
+            # to one server, which is the anti-pattern this exists to prevent. Unbound, whatever the
+            # operator set (usually nothing) is left exactly as it is.
+            payload["conversation_id"] = self._conversation
         # Function tools and the opted-in server-side built-ins (search, code execution) share
         # one ``tools`` list: all are native ``chat_pb2.Tool`` protos (issue #171 — Agent Tools).
         wire_tools = [chat_mod.tool(t.name, t.description, t.parameters) for t in tools or ()]
@@ -195,6 +226,16 @@ class XaiSdkProvider:
             cost=getattr(response, "cost_usd", None),
         )
         return self._from_wire(response)
+
+    def bind_conversation(self, conversation: str | None) -> None:
+        """Route this adapter's next calls to the server holding `conversation`'s prefix (#431).
+
+        The cache-affinity capability (`_caching.bind_conversation`). The harness binds the session
+        id before each turn; ``None`` (or an empty string) clears it, and `chat` then **omits**
+        ``conversation_id`` rather than inventing one — a fabricated id is a new conversation to xAI
+        on every call, which buys a guaranteed miss instead of a lucky one.
+        """
+        self._conversation = conversation or None
 
     def context_limit(self) -> int | None:
         """This model's context ceiling, straight from xAI — the `ContextBudget` capability (#276).

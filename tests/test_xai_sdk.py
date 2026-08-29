@@ -616,3 +616,74 @@ def test_an_ordinary_invalid_argument_is_not_mistaken_for_the_wall():
     # A non-context INVALID_ARGUMENT stays a plain provider error and propagates — never the context
     # wall, and never a reported class (a fixable malformed request, not permanent-for-content, #336).
     assert not isinstance(exc.value, ProviderContextLengthError)
+
+
+# --- cache affinity: the conversation_id (issue #431) ------------------------
+
+
+def test_no_conversation_id_until_one_is_bound():
+    """Unbound, the field is **omitted** — never a fabricated id, which would read as a brand-new
+    conversation to xAI on every call and turn a lucky hit into a guaranteed miss."""
+    provider = _provider(_response(content="ok"))
+    provider.chat([Message.user("Hi")])
+
+    assert "conversation_id" not in provider._client.chat.captured
+
+
+def test_a_bound_conversation_rides_every_create():
+    """The whole fix: consecutive calls carry the same key, so xAI routes them back to the server
+    holding this session's prefix instead of scattering them across its fleet."""
+    provider = _provider(_response(content="ok"))
+    provider.bind_conversation("timeline:019f6e71-2a12-7b69-a204-0fec1497b9c2")
+
+    provider.chat([Message.user("Hi")])
+    first = provider._client.chat.captured["conversation_id"]
+    provider.chat([Message.user("Again")])
+
+    assert first == "timeline:019f6e71-2a12-7b69-a204-0fec1497b9c2"
+    assert provider._client.chat.captured["conversation_id"] == first
+
+
+@pytest.mark.parametrize("conversation", [None, ""])
+def test_clearing_the_binding_omits_the_field_again(conversation):
+    """`None` (and an empty string, which is not an id either) means omit — the contract the
+    `Provider` capability states, so a caller with no session never invents one."""
+    provider = _provider(_response(content="ok"))
+    provider.bind_conversation("timeline:x")
+    provider.bind_conversation(conversation)
+
+    provider.chat([Message.user("Hi")])
+
+    assert "conversation_id" not in provider._client.chat.captured
+
+
+def test_the_bound_conversation_wins_over_a_static_model_params_value():
+    """Harness-owned, like `model`/`messages`/`tools`. A single `conversation_id` left in
+    `model_params.json` would pin *every* session on the box to one server — the anti-pattern this
+    exists to prevent — so the session's own key overrides it."""
+    provider = XaiSdkProvider(
+        "grok-4.3",
+        api_key=FAKE_KEY,
+        client=_FakeClient(_response(content="ok")),
+        conversation_id="one-id-for-everything",
+    )
+    provider.bind_conversation("timeline:x")
+
+    provider.chat([Message.user("Hi")])
+
+    assert provider._client.chat.captured["conversation_id"] == "timeline:x"
+
+
+def test_a_constructor_value_still_rides_when_nothing_is_bound():
+    """The mirror: a library caller driving an `Engine` with no `Session` binds nothing, and the
+    value they passed is left exactly as they wrote it — the adapter fabricates nothing either way."""
+    provider = XaiSdkProvider(
+        "grok-4.3",
+        api_key=FAKE_KEY,
+        client=_FakeClient(_response(content="ok")),
+        conversation_id="chosen-by-hand",
+    )
+
+    provider.chat([Message.user("Hi")])
+
+    assert provider._client.chat.captured["conversation_id"] == "chosen-by-hand"
