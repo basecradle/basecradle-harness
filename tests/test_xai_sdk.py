@@ -805,3 +805,82 @@ def test_a_conversation_grpc_could_not_carry_is_refused_at_bind_time(caplog, reb
 
     assert clients.keys == [None]  # no rebuild, and nothing grpc would have thrown on
     assert "cache affinity" in caplog.text
+
+
+def test_a_failed_rebuild_costs_the_hit_and_not_the_wake(caplog, rebuilding):
+    """The rebuild is the one piece of the affinity path that runs *inside* `chat`, so it sits
+    outside both guards that cover the rest of it: `_caching.bind_conversation`'s blanket
+    try/except wraps only the bind, and `_mapped_errors` classifies only gRPC faults. Unguarded, a
+    construction failure would kill the wake for an optimization."""
+    provider, _clients = rebuilding
+    original = provider._client
+
+    def refuse(**kwargs):
+        raise OSError("too many open files")
+
+    provider._xai.Client = refuse
+    provider.bind_conversation("timeline:one")
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        reply = provider.chat([Message.user("Hi")])
+
+    assert reply.content == "ok"  # answered, on the client it already had
+    assert provider._client is original
+    assert "continuing unbound" in caplog.text
+
+
+def test_a_failed_rebuild_is_not_reattempted_every_turn(caplog, rebuilding):
+    """And it gives up on *that conversation*, once. A session rebinds the same id before every
+    turn, so retrying would repeat the identical failure — and the identical warning — for the life
+    of the process. A different conversation still gets its own fresh attempt."""
+    provider, _ = rebuilding
+    attempts: list[dict] = []
+
+    def refuse(**kwargs):
+        attempts.append(kwargs)
+        raise OSError("too many open files")
+
+    provider._xai.Client = refuse
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        for _ in range(3):
+            provider.bind_conversation("timeline:one")  # what `Session._drive` does every turn
+            provider.chat([Message.user("Hi")])
+        provider.bind_conversation("timeline:two")
+        provider.chat([Message.user("Hi")])
+
+    assert len(attempts) == 2  # one per conversation, not one per turn
+    assert caplog.text.count("continuing unbound") == 2
+
+
+def test_a_client_that_refuses_to_close_does_not_strand_its_replacement(rebuilding):
+    """Releasing the old channel is *cleanup*, and cleanup must not cost the wake or the switch: a
+    channel that refuses to close is a leaked socket, and letting that escape would make it a dead
+    wake instead. (The publish-then-close order in `_bound_client` is the belt to this suspenders —
+    it keeps even a non-`Exception` failure from stranding the replacement unreferenced with its
+    own channel open, which would be the same leak reached through the other door.)"""
+    provider, clients = rebuilding
+    provider.bind_conversation("timeline:one")
+    provider.chat([Message.user("Hi")])
+    live = provider._client
+
+    def refuse():
+        raise RuntimeError("channel has a call in flight")
+
+    live.close = refuse
+    provider.bind_conversation("timeline:two")
+    provider.chat([Message.user("Hi")])
+
+    assert provider._client is clients.clients[-1]  # the replacement is in place, not stranded
+    assert clients.keys == [None, "timeline:one", "timeline:two"]
+
+
+def test_an_unusable_key_warns_once_per_key_not_once_per_turn(caplog, rebuilding):
+    """Same reasoning as the failed rebuild: the de-duplication lives with the *value*, because the
+    caller rebinds unconditionally. A per-turn warning is a log nobody can read."""
+    provider, _ = rebuilding
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        for _ in range(3):
+            provider.bind_conversation("timeline:ｕｎｉｃｏｄｅ")
+        provider.bind_conversation("timeline:ｏｔｈｅｒ")
+
+    assert caplog.text.count("cache affinity") == 2

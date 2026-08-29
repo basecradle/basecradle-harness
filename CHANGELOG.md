@@ -36,9 +36,19 @@ HTTP/2 headers by another name, so this is the same header the REST surfaces tak
   it, and reads the metadata back off the connection. Run against 0.110.0's adapter those tests
   report `x-grok-conv-id` absent on every call; against this one they report the session id. No
   network leaves the box, so they run in the default offline suite.
-- **An unusable key is refused, not raised.** grpc rejects a non-printable-ASCII metadata value at
-  *call* time, inside the model call, where it would cost the whole wake. Affinity is an
-  optimization, so `bind_conversation` drops such a key with a warning and runs unbound instead.
+- **Affinity never costs a wake, on any of its three failure paths.** grpc rejects a
+  non-printable-ASCII metadata value at *call* time, inside the model call — so `bind_conversation`
+  refuses such a key on the way in and runs unbound (warning once per key, not once per turn: a
+  session rebinds before every turn). A rebuild that *fails* — the one part of this path that runs
+  inside `chat`, outside both `_caching.bind_conversation`'s blanket guard and `_mapped_errors` —
+  logs, gives up on that conversation, and keeps answering on the client it already has; giving up
+  is what stops it re-attempting the identical failure on every future turn forever. And releasing
+  the replaced channel is best-effort, so a channel that refuses to close is a leaked socket rather
+  than a dead wake.
+- **`metadata` is now harness-owned in `model_params.json`.** It is where the key actually rides, so
+  it is the obvious word to reach for — and `chat.create`'s signature is closed, so an unowned key
+  of that name would be a hard `TypeError` rather than the warned-and-dropped collision that file
+  promises. Same reason `http_headers` is owned on the OpenRouter side.
 - **`conversation_id` stays on the create**, correctly labelled: it is the right value for the SDK's
   telemetry attribute, and it remains harness-owned in `model_params.json` for the same reason as
   before.

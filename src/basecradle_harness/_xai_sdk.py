@@ -42,9 +42,10 @@ every other adapter was earning 92–99%.
 
 **The near miss is worth writing down** (issue #433, found by the NOC as basecradle#512). Version
 0.110.0 bound the key to ``chat.create(conversation_id=...)`` — which the SDK *accepts* and then
-**never puts on the wire**: in ``xai-sdk`` 1.19.0 ``BaseClient.create`` peels ``conversation_id``
-off ``**settings``, hands it to the `Chat`, and its sole consumer is the OpenTelemetry span
-attribute ``gen_ai.conversation.id``; no request proto in the wheel carries such a field at all.
+**never puts on the wire**: in ``xai-sdk`` 1.19.0 ``chat.create`` declares ``conversation_id`` as
+its own keyword and hands it to the `Chat` **beside** the request settings rather than into them,
+and its sole consumer there is the OpenTelemetry span attribute ``gen_ai.conversation.id``; no
+request proto in the wheel carries such a field at all.
 Every test passed, no log line changed, and the discount stayed unearned. **A key a Python
 signature accepts is not a key on the wire** — which is why the tests for this stand up a real gRPC
 server and read back the metadata the SDK actually sent (`tests/test_xai_sdk_wire.py`).
@@ -112,11 +113,17 @@ def _close_client(client: Any) -> None:
     """Release a client's gRPC channel, if it is the kind of client that has one to release.
 
     Duck-typed because an injected client (the test seam, a library caller's own) need not offer
-    ``close`` at all.
+    ``close`` at all — and **best-effort**, because closing is cleanup: a channel that refuses to
+    close (a pending call, a library caller's own throwing ``close``) is a leaked socket, and
+    letting that escape would turn a leaked socket into a dead wake.
     """
     close = getattr(client, "close", None)
-    if callable(close):
+    if not callable(close):
+        return
+    try:
         close()
+    except Exception as exc:  # noqa: BLE001 - cleanup; a failure to release must not fail the caller
+        _log.warning("Could not close an xAI client's gRPC channel: %s", exc)
 
 
 def _fits_grpc_metadata(value: str) -> bool:
@@ -212,9 +219,13 @@ class XaiSdkProvider:
         #: is the only seam the key can reach (issue #433). ``None`` for an injected client: there
         #: is nothing to rebuild it from, and rebuilding someone else's client is not ours to do.
         self._client_kwargs: dict[str, Any] | None = None
-        #: The conversation `self._client`'s metadata currently carries, so a rebuild happens on a
-        #: genuine change and not once per turn.
+        #: The bound conversation `self._client` has already been **reconciled against** — normally
+        #: the key its metadata carries, and on a rebuild that failed, the key it gave up on. Either
+        #: way it is what makes the work happen on a genuine change and not once per turn.
         self._client_conversation: str | None = None
+        #: The last conversation refused as unable to ride the wire, so the warning is emitted once
+        #: per bad key rather than once per turn (a session rebinds before every turn).
+        self._refused_conversation: str | None = None
         self._default_params = default_params
         self._xai = require_xai_sdk()
         if client is not None:
@@ -241,8 +252,9 @@ class XaiSdkProvider:
         payload["messages"] = [self._to_wire(m, chat_mod) for m in messages]
         if self._conversation:
             # Telemetry only, and named here so nobody re-derives 0.110.0's mistake from the code:
-            # `xai-sdk` 1.19.0 peels `conversation_id` off `**settings` and spends it on one
-            # OpenTelemetry span attribute (`gen_ai.conversation.id`) — it reaches no request proto
+            # `xai-sdk` 1.19.0 takes `conversation_id` as its own keyword, keeps it beside the
+            # request settings, and spends it on one OpenTelemetry span attribute
+            # (`gen_ai.conversation.id`) — it reaches no request proto
             # and therefore no server (issue #433 / basecradle#512). It is still the *right* value
             # for that attribute, so it stays; what actually earns the cache is the
             # `x-grok-conv-id` metadata on `_bound_client`'s channel. Harness-owned like
@@ -305,13 +317,19 @@ class XaiSdkProvider:
         """
         key = conversation or None
         if key is not None and not _fits_grpc_metadata(key):
-            _log.warning(
-                "Not binding %r for xAI cache affinity: a gRPC metadata value must be printable "
-                "ASCII. Calls will run unbound (no x-grok-conv-id), which costs the per-server "
-                "cache hit but never a wake.",
-                conversation,
-            )
+            if key != self._refused_conversation:
+                # Once per bad key, not once per turn: a session rebinds the same id before every
+                # turn, so an unconditional warning here would repeat for the life of the process.
+                _log.warning(
+                    "Not binding %r for xAI cache affinity: a gRPC metadata value must be "
+                    "printable ASCII. Calls will run unbound (no x-grok-conv-id), which costs the "
+                    "per-server cache hit but never a wake.",
+                    conversation,
+                )
+                self._refused_conversation = key
             key = None
+        else:
+            self._refused_conversation = None
         self._conversation = key
 
     def _bound_client(self) -> Any:
@@ -335,15 +353,33 @@ class XaiSdkProvider:
         kwargs = dict(self._client_kwargs)
         if self._conversation:
             kwargs["metadata"] = ((CONVERSATION_METADATA_KEY, self._conversation),)
-        # Built before the old one is closed: a construction failure then leaves this adapter with
-        # the working client it already had, rather than with none.
-        fresh = self._xai.Client(**kwargs)
-        # Release the channel this one replaces; never leak a socket per session switch. Closing the
-        # *client* rather than calling `close()` keeps the two meanings apart: this provider is not
-        # being closed, only the client it is done with.
-        _close_client(self._client)
+        stale = self._client
+        try:
+            fresh = self._xai.Client(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - affinity is an optimization; never break a wake
+            # This is the one part of the affinity path that runs inside `chat`, so it sits outside
+            # both guards that used to cover it: `_caching.bind_conversation`'s blanket try/except
+            # (which only wraps the bind) and `_mapped_errors` (which only classifies gRPC faults).
+            # A raw failure here would kill the wake for an optimization. Worse, it would kill
+            # *every* wake: the session rebinds the same id before every turn, so an unguarded
+            # rebuild would re-attempt the identical failure forever. So the adapter **gives up on
+            # this conversation** — marking it reconciled below is what makes that once, not
+            # per-turn — and keeps running on the client it already has, unbound and lucky, exactly
+            # where #431 found it. A *different* conversation gets its own fresh attempt.
+            _log.warning(
+                "Could not rebuild the xAI client for cache affinity (%s); continuing unbound on "
+                "the existing client. Calls will run without x-grok-conv-id, which costs the "
+                "per-server cache hit but never a wake.",
+                exc,
+            )
+            self._client_conversation = self._conversation
+            return stale
+        # Publish the new client *before* releasing the old one. The other order leaves a window
+        # where a throwing `close` strands `fresh` unreferenced with its channel still open — the
+        # very per-switch socket leak this close exists to prevent, reached through the other door.
         self._client = fresh
         self._client_conversation = self._conversation
+        _close_client(stale)
         return fresh
 
     def context_limit(self) -> int | None:
