@@ -97,6 +97,12 @@ def test_matches_resolved_config_on_the_box(monkeypatch, tmp_path, provider, sdk
     assert computed["tools"] == live["tools"]
     assert computed["builtins"] == live["builtins"]
     assert computed["opt_in_tools"] == live["opt_in_tools"]
+    # The env axis (issue #427). A subset, not equality, and deliberately: `wanted` is taken over
+    # the **candidate** plugins (so a tool inactive *because* its key is unset still names the
+    # key) while the box reports only what its **active** set reads. Every var the box reads must
+    # still be one the off-box answer knew about — a name the two surfaces disagree on is exactly
+    # the drift this file exists to catch.
+    assert set(live["tool_env"]) <= set(computed["credentials"]["wanted"])
 
 
 def test_matches_resolved_config_for_a_pruned_overlay(monkeypatch, tmp_path):
@@ -188,7 +194,12 @@ def test_credential_gated_tools_are_assumed_present_and_say_so():
     """
     report = resolve_stems(provider="openai", opt_in="generate_image,hear_audio,web_search")
 
-    assert report["credentials"] == {"mode": "assumed", "assumed": ["AI_API_KEY"]}
+    assert report["credentials"] == {
+        "mode": "assumed",
+        "assumed": ["AI_API_KEY"],
+        "needs_env": [],  # none of these three reads an *ungated* var
+        "wanted": ["AI_API_KEY"],
+    }
     assert report["stems"]["generate_image"]["assumes_credential"] == ["AI_API_KEY"]
     # `hear_audio` is the stem-vs-name trap in the same breath: its tool is called `listen`.
     assert report["stems"]["hear_audio"]["tools"] == ["listen"]
@@ -207,7 +218,15 @@ def test_no_assume_credentials_reports_them_inactive_with_the_reason():
     """
     report = resolve_stems(provider="openai", opt_in="generate_image", assume_credentials=False)
 
-    assert report["credentials"] == {"mode": "absent", "assumed": []}
+    assert report["credentials"] == {
+        "mode": "absent",
+        "assumed": [],
+        "needs_env": [],
+        # Mode-independent, and that is the point (issue #427): what a configuration *wants*
+        # provisioned does not change with what the simulation pretends is present. Naming the
+        # key is most useful exactly here, where its absence is why the tool is inactive.
+        "wanted": ["AI_API_KEY"],
+    }
     entry = report["stems"]["generate_image"]
     assert entry["status"] == "inactive"
     assert "AI_API_KEY" in entry["reason"]
@@ -215,6 +234,84 @@ def test_no_assume_credentials_reports_them_inactive_with_the_reason():
     assert {"name": "generate_image", "stem": "generate_image", "reason": entry["reason"]} in (
         report["skipped"]
     )
+
+
+# --- ungated credentials (issue #427) ----------------------------------------
+
+
+def test_an_ungated_call_time_credential_is_named_though_it_gates_nothing():
+    """The gap #427 closed: a key read at call time, gating nothing, named nowhere machine-readable.
+
+    `credentials.assumed` is built from the `EnvSet` requirements, so a tool that reads a key
+    *without* gating on it contributed nothing to it — and `openrouter_account_balance`
+    deliberately declares no `requires` at all (issue #425), so the omission could never close by
+    accident. The tool is active, and the report now says what it needs anyway.
+    """
+    report = resolve_stems(provider="xai", sdk="xai-sdk", opt_in="openrouter_account_balance")
+
+    assert report["credentials"]["assumed"] == []  # nothing gates — the old answer, still true
+    assert report["credentials"]["needs_env"] == ["OPENROUTER_MANAGEMENT_KEY"]
+    assert report["credentials"]["wanted"] == ["OPENROUTER_MANAGEMENT_KEY"]
+    entry = report["stems"]["openrouter_account_balance"]
+    assert entry["status"] == "active"  # reported, never gated
+    assert entry["needs_env"] == ["OPENROUTER_MANAGEMENT_KEY"]
+    assert entry["assumes_credential"] == []  # it is not conditional on the key — that is the point
+
+
+def test_wanted_is_the_union_of_both_ways_a_plugin_can_name_a_variable():
+    """One field answers "which keys does this configuration want set?" — gated and ungated alike.
+
+    Splitting it across two lists a caller must union is the same "read the docs and know to"
+    failure the ungated read had in the first place.
+    """
+    report = resolve_stems(
+        provider="xai",
+        sdk="xai-sdk",
+        opt_in="xai_account_balance,openrouter_account_balance,send_direct_message_to_origin",
+    )
+
+    assert report["credentials"]["assumed"] == ["NTFY_DM_TOKEN"]  # the gated half
+    assert report["credentials"]["needs_env"] == [
+        "OPENROUTER_MANAGEMENT_KEY",
+        "XAI_MANAGEMENT_KEY",
+    ]
+    assert report["credentials"]["wanted"] == [
+        "NTFY_DM_TOKEN",
+        "OPENROUTER_MANAGEMENT_KEY",
+        "XAI_MANAGEMENT_KEY",
+    ]
+
+
+def test_wanted_does_not_move_with_the_credential_mode():
+    """What a configuration *wants* provisioned is not a function of what we pretend is present.
+
+    Under ``--no-assume-credentials`` the DM tool is inactive — and naming NTFY_DM_TOKEN matters
+    most exactly there, because its absence is *why*. Only `assumed` (which drives the simulation)
+    empties.
+    """
+    kwargs = {
+        "provider": "xai",
+        "sdk": "xai-sdk",
+        "opt_in": "xai_account_balance,send_direct_message_to_origin",
+    }
+    assumed = resolve_stems(**kwargs)
+    absent = resolve_stems(**kwargs, assume_credentials=False)
+
+    assert absent["credentials"]["assumed"] == []
+    assert absent["stems"]["send_direct_message_to_origin"]["status"] == "inactive"
+    assert absent["credentials"]["wanted"] == assumed["credentials"]["wanted"]
+    assert absent["credentials"]["needs_env"] == assumed["credentials"]["needs_env"]
+    # And an inactive stem still names the ungated key it would need — a property of the plugin
+    # file, not of whether it won a name this time.
+    assert absent["stems"]["xai_account_balance"]["needs_env"] == ["XAI_MANAGEMENT_KEY"]
+
+
+def test_a_stem_reading_no_environment_reports_an_empty_list_never_a_missing_key():
+    """The field is present on every stem entry — an additive contract, not a conditional one."""
+    report = resolve_stems(provider="openai", opt_in="web_search")
+
+    assert report["stems"]["web_search"]["needs_env"] == []
+    assert report["stems"]["messages"]["needs_env"] == []
 
 
 # --- fan-out, naming, and the gates -------------------------------------------

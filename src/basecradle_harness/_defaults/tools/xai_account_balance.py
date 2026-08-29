@@ -18,12 +18,20 @@
 # default. An agent that also holds an OpenRouter account reads that one with the separate,
 # provider-agnostic openrouter_account_balance tool (issue #425).
 #
+# `needs_env` reports the Management Key without gating on it (issue #427), so the key is visible
+# to `basecradle-harness-resolve` and `--resolved-config` rather than named only in the README.
+# XAI_TEAM_ID is deliberately NOT declared: the team is discovered from the key when it is unset,
+# so its absence costs one HTTP call and nothing else — declaring it would read as a provisioning
+# gap on every correctly-configured box, and a report that reddens on a healthy agent is one
+# nobody reads twice. `needs_env` means *cannot work without*, never *reads*.
+#
 # Delete this file to disable the tool.
 from basecradle_harness import ToolPlugin, Vendor, XaiAccountBalanceTool
 
 PLUGIN = ToolPlugin(
     impl=XaiAccountBalanceTool,
     requires=(Vendor("xai"),),
+    needs_env=("XAI_MANAGEMENT_KEY",),
     note="Reads the live credit remaining on your own xAI account (read-only billing; xAI only).",
     opt_in=True,
 )

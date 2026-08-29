@@ -75,6 +75,7 @@ from basecradle_harness._plugins import (
     ToolPlugin,
     claim_plugins,
     load_default_plugins,
+    plugin_env_dependencies,
     resolve_plugins,
 )
 from basecradle_harness._policy import Policy
@@ -157,6 +158,30 @@ def _credential_vars(plugins: Sequence[ToolPlugin]) -> list[str]:
     return sorted(set().union(*(_plugin_credentials(p) for p in plugins)) if plugins else set())
 
 
+def _ungated_vars(plugins: Sequence[ToolPlugin]) -> list[str]:
+    """Every env var the given plugins read at call time but never gate on (issue #427).
+
+    The class `_credential_vars` structurally cannot see: a `needs_env` var appears in no
+    `requires`, so the activation walk contributes nothing for it and ``credentials.assumed``
+    named neither Management Key. Reported beside the gated set rather than folded into it,
+    because the two differ in what absence *does* — a gated var absent means the tool is not
+    there; an ungated one absent means the tool is there and cannot work.
+    """
+    return sorted(set().union(*(set(p.needs_env) for p in plugins)) if plugins else set())
+
+
+def _wanted_vars(plugins: Sequence[ToolPlugin]) -> list[str]:
+    """Every env var the given plugins depend on at all — the provisioning answer (issue #427).
+
+    Computed through the shared `plugin_env_dependencies` rather than as the union of the two
+    reported splits above, so a *third* way to declare an env dependency added later is picked up
+    here by construction instead of quietly falling out of the one field an operator reads.
+    """
+    return sorted(
+        set().union(*(set(plugin_env_dependencies(p)) for p in plugins)) if plugins else set()
+    )
+
+
 def _apply_policy(resolved: ResolvedTools, policy: Policy) -> tuple[ResolvedTools, dict[str, str]]:
     """Drop the tools `policy` forbids, returning the filtered set and ``{name: reason}``.
 
@@ -181,6 +206,11 @@ def _apply_policy(resolved: ResolvedTools, policy: Policy) -> tuple[ResolvedTool
         tools=permitted,
         skipped=resolved.skipped + sorted(refused.items()),
         manifest=[entry for entry in resolved.manifest if entry[0] not in refused],
+        # Same prune as the wake's, for the same reason (issue #427): a refused tool takes its
+        # env dependency with it, so neither surface reports a credential read by nothing.
+        env_dependencies={
+            name: deps for name, deps in resolved.env_dependencies.items() if name not in refused
+        },
     )
     return filtered, refused
 
@@ -227,6 +257,12 @@ def resolve_stems(
             it is always stated: the one thing this must never do is silently include or silently
             omit a credential-gated tool. Assumed is the default because the caller is almost
             always computing a pin for a *provisioned* agent, which by definition holds its key.
+
+            It governs the **gated** credentials only. An **ungated** call-time read
+            (`ToolPlugin.needs_env` — issue #427) is not simulated at all, because it decides
+            nothing: it is reported under ``credentials.needs_env`` (and per stem) whatever the
+            mode, and it is why ``credentials.wanted`` — the union, the answer to *which keys does
+            this configuration want provisioned?* — is mode-independent.
 
     Returns:
         A JSON-serializable report — the field contract documented in the README under
@@ -283,7 +319,13 @@ def resolve_stems(
     loaded = load_default_plugins(provider=provider)
     candidates = [p for p in loaded.plugins if p.stem in candidate_stems]
 
-    credentials = _credential_vars(candidates) if assume_credentials else []
+    # The gated set drives the simulation; the ungated one is reported and gates nothing, so it
+    # deliberately never reaches the `ActivationContext` (issue #427). Both are computed
+    # mode-independently — what a configuration *wants* does not change with what we pretend is
+    # present — and only `assumed` is emptied under `--no-assume-credentials`.
+    gated = _credential_vars(candidates)
+    ungated = _ungated_vars(candidates)
+    credentials = gated if assume_credentials else []
     env: Mapping[str, str] = {var: _ASSUMED for var in credentials}
     ctx = ActivationContext(
         provider=provider, sdk=sdk, surface=resolved_surface, model=model, env=env
@@ -329,6 +371,8 @@ def resolve_stems(
         "credentials": {
             "mode": "assumed" if assume_credentials else "absent",
             "assumed": credentials,
+            "needs_env": ungated,
+            "wanted": _wanted_vars(candidates),
         },
         "memory": {
             "provider": memory_name,
@@ -358,6 +402,11 @@ class _StemReport:
     tools: list[str] = field(default_factory=list)
     builtins: list[str] = field(default_factory=list)
     credentials: set[str] = field(default_factory=set)
+    #: The stem's ungated call-time env reads (`ToolPlugin.needs_env`, issue #427). Unlike
+    #: `credentials` it is **not** conditional on the plugin having claimed a name: an
+    #: `assumes_credential` describes a name that activated *because* we assumed a var present,
+    #: while this is a property of the plugin file itself and true whatever the plugin resolved to.
+    needs_env: set[str] = field(default_factory=set)
     skipped: list[dict[str, str]] = field(default_factory=list)
 
     def as_json(self) -> dict[str, object]:
@@ -388,6 +437,7 @@ class _StemReport:
             "tools": sorted(self.tools),
             "builtins": sorted(self.builtins),
             "assumes_credential": sorted(self.credentials),
+            "needs_env": sorted(self.needs_env),
             "skipped": self.skipped,
         }
 
@@ -456,6 +506,10 @@ def _attribute(
         stem = str(plugin.stem)
         report = reports[stem]
         name = plugin.resolved_name
+        # Recorded here rather than on the contributing branch below, deliberately: an ungated
+        # read is a fact about the plugin, not about whether it won a name, so an *inactive*
+        # stem still names the key it would need (issue #427).
+        report.needs_env |= set(plugin.needs_env)
         if not plugin.active(ctx):
             reason = plugin.unmet(ctx)
         elif claimed.get(name) is not plugin:

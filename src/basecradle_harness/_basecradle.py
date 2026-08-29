@@ -1336,7 +1336,20 @@ def _apply_safe_policy(resolved: ResolvedTools, policy: Policy | None = None) ->
     if not refused:
         return resolved
     manifest = [entry for entry in resolved.manifest if entry[0] not in refused]
-    return replace(resolved, tools=permitted, skipped=skipped, manifest=manifest, notices=notices)
+    # A refused tool is not read at run time, so its env dependency leaves with it (issue #427) —
+    # pruned by name alongside the manifest, or `--resolved-config` would report an environment
+    # variable as read by a tool set that does not contain the tool that reads it.
+    env_deps = {
+        name: deps for name, deps in resolved.env_dependencies.items() if name not in refused
+    }
+    return replace(
+        resolved,
+        tools=permitted,
+        skipped=skipped,
+        manifest=manifest,
+        notices=notices,
+        env_dependencies=env_deps,
+    )
 
 
 # The env var that selects the deploy profile (issue #256). Delivered per-agent through
