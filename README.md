@@ -626,7 +626,7 @@ The rules, so you can rely on it:
 - **Harness-owned keys always win.** A key the harness sets for correctness (`model`, the
   messages, `tools`, each build's wiring args) is stripped with a WARNING — this file is call
   *tuning*, not a way to override wiring. The model id is `AI_MODEL`, never a `model_params.json`
-  key. So is `conversation_id` on the `xai-sdk` build: the harness binds it [per session](#direct-to-xai-automatic-doesnt-promise-a-hit-either--the-cache-is-per-server), and one static value here would pin every session on the box to a single xAI server.
+  key. So is `conversation_id` on the `xai-sdk` build: the harness binds it [per session](#direct-to-xai-automatic-doesnt-promise-a-hit-either--the-cache-is-per-server) (it names the session in the SDK's telemetry; the *routing* key is gRPC metadata the harness owns outright), and one static value here would name every session on the box the same thing.
 - **Loud on malformed.** A present-but-invalid file (bad JSON, or a top level that isn't an
   object) fails the wake at startup rather than running silently untuned. A missing file is simply
   off.
@@ -841,9 +841,11 @@ What the harness *does* owe you is honesty about the consequence: **`context_lim
 
 #### Direct to xAI, `automatic` doesn't promise a hit either — the cache is **per-server**
 
-The same gap opens with no router in sight. xAI runs a fleet, and a cache entry lives on **the one server that served your call** — so a repeated prefix only pays out if the next call lands back there. xAI's own remedy is a stable conversation id (`x-grok-conv-id` on the HTTP surfaces, `conversation_id` on `chat.create` in the `xai-sdk`), which routes consecutive calls to the same server.
+The same gap opens with no router in sight. xAI runs a fleet, and a cache entry lives on **the one server that served your call** — so a repeated prefix only pays out if the next call lands back there. xAI's own remedy is a stable conversation id, which they spell per surface: the `x-grok-conv-id` HTTP header on Chat Completions, `prompt_cache_key` in the Responses body, and — for the gRPC API the `xai-sdk` speaks — `x-grok-conv-id` as **gRPC call metadata**.
 
-The harness sends one, keyed to the **session id** — the string a transcript is already keyed by (`timeline:019f6e71-…`). That is the right key because the affinity unit and the cacheable unit are the *same* unit: one transcript per session is exactly the block of bytes that repeats. Nothing configures it, and no session ever borrows another's key. Bound to nothing — a library caller driving an `Engine` with no `Session` — the field is simply **omitted**, never faked: a made-up id reads as a brand-new conversation on every call, which is a guaranteed miss where the status quo was at least a lucky one.
+The harness sends one, keyed to the **session id** — the string a transcript is already keyed by (`timeline:019f6e71-…`). That is the right key because the affinity unit and the cacheable unit are the *same* unit: one transcript per session is exactly the block of bytes that repeats. Nothing configures it, and no session ever borrows another's key. Bound to nothing — a library caller driving an `Engine` with no `Session` — **no key is sent at all**, never a faked one: a made-up id reads as a brand-new conversation on every call, which is a guaranteed miss where the status quo was at least a lucky one.
+
+> **A key the SDK accepts is not a key on the wire.** The first cut of this bound the id to `xai_sdk`'s same-named `chat.create(conversation_id=...)` — which the SDK takes, and then spends on an OpenTelemetry span attribute. It reaches no request proto and therefore no xAI server; every test passed, no log line changed, and the discount stayed unearned. The key rides gRPC metadata now, and because `xai_sdk` fixes a client's metadata at construction, the adapter rebuilds its client when the bound session changes (cheap — a gRPC channel connects lazily, and every turn of a session binds the same key). The tests for it stand up a **real gRPC server** on loopback and read back what the SDK actually sent, because a fake client cannot tell you that.
 
 It was not free before that. Measured live on 2026-08-29, a Grok agent re-sending a byte-stable ~210 K-token prefix ~45 s apart hit **0.2%–18%** — several calls at `cached_tokens=512`, one at **0** — while every other adapter on the identical engine and message layout earned 92–99%. The sporadic partial hits were luck: a call landing on a server that happened to still be warm.
 

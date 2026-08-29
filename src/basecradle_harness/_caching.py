@@ -54,9 +54,10 @@ Direct-to-vendor, `automatic` does not promise a hit either — xAI's cache is *
 The same gap opens without a router in sight, for a different reason, and it cost real money before
 anyone saw it (issue #431). xAI runs a fleet, and a cache entry lives on **the one server that
 served the call** — so a request that lands anywhere else re-pays for a prefix xAI already has.
-Their own guidance is to send a stable conversation id (``x-grok-conv-id`` on the HTTP surfaces,
-``conversation_id`` on ``chat.create`` in the ``xai-sdk``) precisely so consecutive calls route back
-to the same server. The harness never sent one, and the bill said so: measured live 2026-08-29,
+Their own guidance is to send a stable conversation id — ``x-grok-conv-id`` as an HTTP header on the
+Chat Completions surface, ``prompt_cache_key`` in the Responses body, and ``x-grok-conv-id`` as
+**gRPC metadata** on the native surface — precisely so consecutive calls route back to the same
+server. The harness never sent one, and the bill said so: measured live 2026-08-29,
 @briggs re-sent a byte-stable ~210 K-token prefix roughly 45 seconds apart and hit
 **0.2%–18%** — several calls at ``cached_tokens=512``, one at **0**, against the 92–99% every other
 adapter was earning on the identical engine and the identical message layout. Roughly half of a
@@ -71,6 +72,14 @@ only the charter, so a coarser key would herd unrelated prefixes onto one server
 would not exist. Keying on the session id rather than on any timeline-specific notion covers every
 session kind, present and future (``default``, a hypothetical ``github:pr-123``), with no
 special-casing anywhere. The id is opaque plumbing to xAI — a routing key, never content.
+
+**Where the adapter puts that key is the adapter's problem, and it is not always a request field**
+(issue #433). This capability hands over a string; it does not say what goes on the wire, because
+only the adapter knows. On the ``xai-sdk`` the answer turned out to be gRPC call metadata rather
+than a ``chat.create`` field — the SDK accepts a ``conversation_id`` keyword and spends it on an
+OpenTelemetry span attribute, so 0.110.0 bound the key, passed every test, and reached no server
+with it. The lesson generalizes past xAI and is why this capability is deliberately thin: **an
+adapter has not implemented `bind_conversation` until something proves the key left the process.**
 
 **This is not the OpenRouter session pin, and it must not be "consistency"-ed away.** Issue #372
 measured an eager `session_id` pin *for OpenRouter* and **rejected** it — and the reasoning does not

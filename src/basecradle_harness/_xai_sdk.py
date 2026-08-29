@@ -30,17 +30,35 @@ harness function registry as bogus ``no tool named`` bounces (issue #183). The g
 `PlatformTool`s over httpx (`basecradle_harness._grok`) — independent of the chat SDK, and granted
 only by opt-in. Exposing a capability is never granting it to a persona.
 
-Cache affinity — the ``conversation_id`` (issue #431)
------------------------------------------------------
+Cache affinity — ``x-grok-conv-id`` as gRPC metadata (issues #431, #433)
+------------------------------------------------------------------------
 xAI's prompt cache is **per-server**, so a repeated prefix only pays out when the next call lands on
-the server that holds it. xAI's remedy is a stable conversation id (``conversation_id`` on
-``chat.create``, the SDK's form of the ``x-grok-conv-id`` header), which routes consecutive calls
-back to the same server. This adapter never sent one and the cost was measured, not theorized:
-@briggs hit 0.2–18% on a byte-stable ~210 K-token prefix where every other adapter was earning
-92–99%. `bind_conversation` takes the harness **session id** and `chat` puts it on the create;
-unbound, the field is simply **omitted** — never a fabricated value, which would be a fresh
-conversation to xAI on every call. The reasoning, and why OpenRouter's rejected session pin
-(issue #372) is the opposite situation rather than a precedent against this, lives in `_caching`.
+the server that holds it. xAI's remedy is a stable conversation id, and their prompt-caching guide
+spells it out per surface: the ``x-grok-conv-id`` HTTP header on Chat Completions,
+``prompt_cache_key`` in the Responses body, and — for the gRPC API this adapter speaks — *"pass
+``x-grok-conv-id`` as gRPC metadata to enable sticky routing for cache reuse."* The cost of sending
+nothing was measured, not theorized: @briggs hit 0.2–18% on a byte-stable ~210 K-token prefix where
+every other adapter was earning 92–99%.
+
+**The near miss is worth writing down** (issue #433, found by the NOC as basecradle#512). Version
+0.110.0 bound the key to ``chat.create(conversation_id=...)`` — which the SDK *accepts* and then
+**never puts on the wire**: in ``xai-sdk`` 1.19.0 ``BaseClient.create`` peels ``conversation_id``
+off ``**settings``, hands it to the `Chat`, and its sole consumer is the OpenTelemetry span
+attribute ``gen_ai.conversation.id``; no request proto in the wheel carries such a field at all.
+Every test passed, no log line changed, and the discount stayed unearned. **A key a Python
+signature accepts is not a key on the wire** — which is why the tests for this stand up a real gRPC
+server and read back the metadata the SDK actually sent (`tests/test_xai_sdk_wire.py`).
+
+So the key now rides where xAI says to put it: gRPC **call metadata**, which is HTTP/2 headers by
+another name. The one constraint the design has to absorb is that ``xai_sdk`` fixes that metadata
+**per Client** — it is baked into the channel's ``_APIAuthPlugin`` (TLS) or ``AuthInterceptor``
+(insecure) at construction, and the SDK's stub calls pass no per-call ``metadata=``. There is
+therefore no per-call seam to reach, so the adapter **rebuilds its client when the bound
+conversation changes** (`_bound_client`): cheap, because a gRPC channel connects lazily, and rare,
+because every turn of a session binds the same key. `bind_conversation` takes the harness **session
+id**; unbound, nothing is sent — never a fabricated value, which would read as a fresh conversation
+to xAI on every call. The reasoning, and why OpenRouter's rejected session pin (issue #372) is the
+opposite situation rather than a precedent against this, lives in `_caching`.
 
 Stateless per turn: the full conversation is sent every call and the harness owns history.
 """
@@ -81,6 +99,34 @@ DEFAULT_SURFACE = "native"
 #: `openai` adapter (which serves three) it is a class constant, not a constructor arg. It rides
 #: the per-call log line as ``provider=xai``.
 PROVIDER = "xai"
+
+#: xAI's cache-affinity routing key, spelled the way their docs spell it for **this** surface
+#: (issue #433): *"pass ``x-grok-conv-id`` as gRPC metadata to enable sticky routing for cache
+#: reuse."* gRPC metadata *is* HTTP/2 headers, so this is the same header the REST surfaces take —
+#: which is exactly why it belongs in the call's metadata and not in the request body, where the
+#: 1.19.0 wheel has no field to put it in (see the module docstring).
+CONVERSATION_METADATA_KEY = "x-grok-conv-id"
+
+
+def _close_client(client: Any) -> None:
+    """Release a client's gRPC channel, if it is the kind of client that has one to release.
+
+    Duck-typed because an injected client (the test seam, a library caller's own) need not offer
+    ``close`` at all.
+    """
+    close = getattr(client, "close", None)
+    if callable(close):
+        close()
+
+
+def _fits_grpc_metadata(value: str) -> bool:
+    """Can `value` ride as an ASCII gRPC metadata value (issue #433)?
+
+    grpc encodes a non-``-bin`` metadata value as an HTTP/2 header value and rejects anything
+    outside printable ASCII. The check lives here, on the way *in*, so a session id that could
+    never reach the wire is dropped at bind time instead of raising inside the model call.
+    """
+    return all(" " <= ch <= "~" for ch in value)
 
 
 def require_xai_sdk():
@@ -157,10 +203,18 @@ class XaiSdkProvider:
         self.last_tokens_in: int | None = None
         self._builtin_tools = list(builtin_tools)
         #: The conversation this adapter's next calls belong to — xAI's per-server cache-affinity
-        #: routing key (issue #431), set by `bind_conversation` and ``None`` until something binds
-        #: one. A library caller driving the engine with no `Session` never binds, and then an
+        #: routing key (issues #431, #433), set by `bind_conversation` and ``None`` until something
+        #: binds one. A library caller driving the engine with no `Session` never binds, and then an
         #: operator's own ``conversation_id`` in ``model_params.json`` (if any) is what rides.
         self._conversation: str | None = None
+        #: What `self._client` was built with, kept so it can be **rebuilt** when the bound
+        #: conversation changes — the SDK fixes a channel's gRPC metadata at construction, so that
+        #: is the only seam the key can reach (issue #433). ``None`` for an injected client: there
+        #: is nothing to rebuild it from, and rebuilding someone else's client is not ours to do.
+        self._client_kwargs: dict[str, Any] | None = None
+        #: The conversation `self._client`'s metadata currently carries, so a rebuild happens on a
+        #: genuine change and not once per turn.
+        self._client_conversation: str | None = None
         self._default_params = default_params
         self._xai = require_xai_sdk()
         if client is not None:
@@ -176,6 +230,7 @@ class XaiSdkProvider:
                 kwargs["api_host"] = api_host
             if timeout is not None:
                 kwargs["timeout"] = timeout
+            self._client_kwargs = kwargs
             self._client = self._xai.Client(**kwargs)
 
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:
@@ -185,11 +240,15 @@ class XaiSdkProvider:
         payload["model"] = self.model
         payload["messages"] = [self._to_wire(m, chat_mod) for m in messages]
         if self._conversation:
-            # Cache affinity: route this call back to the server holding this session's prefix
-            # (issue #431). Harness-owned like `model`/`messages`/`tools`, and for the same reason —
-            # a *static* `conversation_id` in `model_params.json` would pin every session on the box
-            # to one server, which is the anti-pattern this exists to prevent. Unbound, whatever the
-            # operator set (usually nothing) is left exactly as it is.
+            # Telemetry only, and named here so nobody re-derives 0.110.0's mistake from the code:
+            # `xai-sdk` 1.19.0 peels `conversation_id` off `**settings` and spends it on one
+            # OpenTelemetry span attribute (`gen_ai.conversation.id`) — it reaches no request proto
+            # and therefore no server (issue #433 / basecradle#512). It is still the *right* value
+            # for that attribute, so it stays; what actually earns the cache is the
+            # `x-grok-conv-id` metadata on `_bound_client`'s channel. Harness-owned like
+            # `model`/`messages`/`tools`, and for a sharper reason — a *static* `conversation_id` in
+            # `model_params.json` would pin every session on the box to one server, the anti-pattern
+            # this exists to prevent. Unbound, whatever the operator set is left exactly as it is.
             payload["conversation_id"] = self._conversation
         # Function tools and the opted-in server-side built-ins (search, code execution) share
         # one ``tools`` list: all are native ``chat_pb2.Tool`` protos (issue #171 — Agent Tools).
@@ -198,8 +257,11 @@ class XaiSdkProvider:
         if wire_tools:
             payload["tools"] = wire_tools
         started = time.monotonic()
+        # The client whose channel carries this session's `x-grok-conv-id` — the affinity key's
+        # only route to the wire on this SDK (issue #433).
+        client = self._bound_client()
         with self._mapped_errors():
-            conversation = self._client.chat.create(**payload)
+            conversation = client.chat.create(**payload)
             response = conversation.sample()
         # The native response carries usage as a proto (attributes, not keys); `log_llm_call`
         # reads either shape, so the gRPC path logs the same line as the HTTP ones — token counts
@@ -231,11 +293,58 @@ class XaiSdkProvider:
         """Route this adapter's next calls to the server holding `conversation`'s prefix (#431).
 
         The cache-affinity capability (`_caching.bind_conversation`). The harness binds the session
-        id before each turn; ``None`` (or an empty string) clears it, and `chat` then **omits**
-        ``conversation_id`` rather than inventing one — a fabricated id is a new conversation to xAI
-        on every call, which buys a guaranteed miss instead of a lucky one.
+        id before each turn; ``None`` (or an empty string) clears it, and the next call then sends
+        **no** ``x-grok-conv-id`` at all rather than inventing one — a fabricated id is a new
+        conversation to xAI on every call, which buys a guaranteed miss instead of a lucky one.
+
+        A key gRPC could not carry is **refused here rather than raised there** (issue #433). ASCII
+        metadata values are printable ASCII on the wire, and grpc rejects anything else — at *call*
+        time, inside `chat`, where it would fail the model call and the whole wake. Affinity is an
+        optimization and must never cost a wake, so an unusable key is logged and dropped, leaving
+        this adapter exactly as well off as it was before #431: unbound, and lucky.
         """
-        self._conversation = conversation or None
+        key = conversation or None
+        if key is not None and not _fits_grpc_metadata(key):
+            _log.warning(
+                "Not binding %r for xAI cache affinity: a gRPC metadata value must be printable "
+                "ASCII. Calls will run unbound (no x-grok-conv-id), which costs the per-server "
+                "cache hit but never a wake.",
+                conversation,
+            )
+            key = None
+        self._conversation = key
+
+    def _bound_client(self) -> Any:
+        """The client whose gRPC metadata carries the currently-bound conversation (issue #433).
+
+        ``xai_sdk`` fixes a client's metadata **at construction** — it is closed over by the
+        channel's ``_APIAuthPlugin`` (TLS) or ``AuthInterceptor`` (insecure), and the SDK's stub
+        calls pass no per-call ``metadata=`` — so there is no per-call seam, and switching the key
+        means switching the client. That is cheaper than it reads: a gRPC channel connects **lazily**,
+        so building one costs an object, not a handshake, and the handshake it does eventually cost
+        is amortized over every turn of the session that asked for it.
+
+        Rebuilt only on a genuine **change**, which is what keeps that true: every turn of a session
+        binds the same id, so the steady state is one client per session and nothing per turn. An
+        **injected** client (the test seam, a library caller supplying their own) is returned
+        untouched — there are no kwargs to rebuild it from, and silently replacing a client someone
+        handed us would discard whatever they configured it with.
+        """
+        if self._client_kwargs is None or self._client_conversation == self._conversation:
+            return self._client
+        kwargs = dict(self._client_kwargs)
+        if self._conversation:
+            kwargs["metadata"] = ((CONVERSATION_METADATA_KEY, self._conversation),)
+        # Built before the old one is closed: a construction failure then leaves this adapter with
+        # the working client it already had, rather than with none.
+        fresh = self._xai.Client(**kwargs)
+        # Release the channel this one replaces; never leak a socket per session switch. Closing the
+        # *client* rather than calling `close()` keeps the two meanings apart: this provider is not
+        # being closed, only the client it is done with.
+        _close_client(self._client)
+        self._client = fresh
+        self._client_conversation = self._conversation
+        return fresh
 
     def context_limit(self) -> int | None:
         """This model's context ceiling, straight from xAI — the `ContextBudget` capability (#276).
@@ -373,9 +482,7 @@ class XaiSdkProvider:
         return _grpc_error_context()
 
     def close(self) -> None:
-        close = getattr(self._client, "close", None)
-        if callable(close):
-            close()
+        _close_client(self._client)
 
     def __enter__(self) -> XaiSdkProvider:
         return self

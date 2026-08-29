@@ -7,6 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.111.0] - 2026-08-29
+
+### Fixed: the xAI cache-affinity key now reaches the wire — `conversation_id` never did (issue #433)
+
+0.110.0 bound xAI's per-server cache-affinity key to `chat.create(conversation_id=...)`, and
+`xai-sdk` 1.19.0 **accepts that keyword and then throws it away**: `BaseClient.create` peels it off
+`**settings` and its sole consumer is the OpenTelemetry span attribute `gen_ai.conversation.id`. No
+request proto in the wheel carries such a field, so the key reached no xAI server. Every test
+passed, no log line changed, and the ~75% cached-prefix discount on the four `xai-sdk` agents stayed
+unearned. (Found by the NOC with serialized-request-bytes proof: basecradle#512.)
+
+**A key a Python signature accepts is not a key on the wire.**
+
+The key now rides where xAI's own prompt-caching guide says to put it on this surface: *"pass
+`x-grok-conv-id` as gRPC metadata to enable sticky routing for cache reuse."* gRPC metadata is
+HTTP/2 headers by another name, so this is the same header the REST surfaces take.
+
+- **The mechanism.** `xai_sdk` fixes a client's metadata **at construction** — it is closed over by
+  the channel's `_APIAuthPlugin` (TLS) or `AuthInterceptor` (insecure) — and its stub calls pass no
+  per-call `metadata=`, so there is no per-call seam. The adapter therefore rebuilds its client when
+  the bound conversation **changes** (`_bound_client`). That is cheap: a gRPC channel connects
+  lazily, and every turn of a session binds the same key, so the steady state is one client per
+  session and nothing per turn. The replaced client is closed, so cycling timelines leaks no channel.
+- **The verification bar, raised.** A fake client structurally cannot answer "did it leave the
+  process?" — which is exactly how the defect shipped green. `tests/test_xai_sdk_wire.py` stands up
+  a **real gRPC server** on loopback, drives a **real** `xai_sdk.Client` built by the real adapter at
+  it, and reads the metadata back off the connection. Run against 0.110.0's adapter those tests
+  report `x-grok-conv-id` absent on every call; against this one they report the session id. No
+  network leaves the box, so they run in the default offline suite.
+- **An unusable key is refused, not raised.** grpc rejects a non-printable-ASCII metadata value at
+  *call* time, inside the model call, where it would cost the whole wake. Affinity is an
+  optimization, so `bind_conversation` drops such a key with a warning and runs unbound instead.
+- **`conversation_id` stays on the create**, correctly labelled: it is the right value for the SDK's
+  telemetry attribute, and it remains harness-owned in `model_params.json` for the same reason as
+  before.
+
+Unchanged: the `bind_conversation` engine seam (issue #431), the session id as the key, and the
+omit-rather-than-fabricate contract when nothing is bound.
+
+
 ## [0.110.0] - 2026-08-29
 
 ### Fixed: the xai-sdk adapter binds a `conversation_id`, so xAI's per-server cache can be reached (issue #431)

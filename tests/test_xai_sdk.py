@@ -33,6 +33,7 @@ from basecradle_harness import (
     ToolSpec,
     XaiSdkProvider,
 )
+from basecradle_harness._xai_sdk import CONVERSATION_METADATA_KEY
 
 _TYPE = chat_pb2.ToolCallType
 
@@ -618,7 +619,15 @@ def test_an_ordinary_invalid_argument_is_not_mistaken_for_the_wall():
     assert not isinstance(exc.value, ProviderContextLengthError)
 
 
-# --- cache affinity: the conversation_id (issue #431) ------------------------
+# --- cache affinity: the conversation_id (issues #431, #433) -----------------
+#
+# These pin the ``conversation_id`` the adapter puts on ``chat.create``, which — as issue #433
+# established — is **telemetry**: `xai-sdk` 1.19.0 spends it on the OpenTelemetry span attribute
+# ``gen_ai.conversation.id`` and puts it on no request proto. It is still the right value for that
+# attribute, and it is still harness-owned (a static one in ``model_params.json`` would name every
+# session on the box the same thing), so the behavior is pinned here. What actually earns the
+# per-server cache is the ``x-grok-conv-id`` gRPC metadata, and that is proven where a fake client
+# structurally cannot prove it: against a real gRPC server, in `test_xai_sdk_wire.py`.
 
 
 def test_no_conversation_id_until_one_is_bound():
@@ -631,8 +640,8 @@ def test_no_conversation_id_until_one_is_bound():
 
 
 def test_a_bound_conversation_rides_every_create():
-    """The whole fix: consecutive calls carry the same key, so xAI routes them back to the server
-    holding this session's prefix instead of scattering them across its fleet."""
+    """Consecutive calls carry the same id, so a session's spans group under one conversation
+    instead of scattering. (The *routing* half of that is the metadata — `test_xai_sdk_wire.py`.)"""
     provider = _provider(_response(content="ok"))
     provider.bind_conversation("timeline:019f6e71-2a12-7b69-a204-0fec1497b9c2")
 
@@ -687,3 +696,112 @@ def test_a_constructor_value_still_rides_when_nothing_is_bound():
     provider.chat([Message.user("Hi")])
 
     assert provider._client.chat.captured["conversation_id"] == "chosen-by-hand"
+
+
+# --- the client rebuild that puts the key on the wire (issue #433) -----------
+#
+# `xai_sdk` fixes a client's gRPC metadata at construction and its stub calls take no per-call
+# ``metadata=``, so switching the affinity key means switching the client. These pin the *cost* of
+# that mechanism (it must not rebuild per turn, and it must not leak the channel it replaces) and
+# its *seam* (an injected client is never replaced). That the rebuilt client's metadata actually
+# reaches a server is `test_xai_sdk_wire.py`'s job — a fake cannot answer it.
+
+
+class _RecordingClients:
+    """Stands in for ``xai_sdk.Client``: records every construction, hands back a fake client."""
+
+    def __init__(self, response):
+        self._response = response
+        self.built: list[dict] = []
+        self.clients: list[_FakeClient] = []
+
+    def __call__(self, **kwargs):
+        self.built.append(kwargs)
+        client = _FakeClient(self._response)
+        self.clients.append(client)
+        return client
+
+    @property
+    def keys(self) -> list[str | None]:
+        """The ``x-grok-conv-id`` each construction asked for, ``None`` where none was set."""
+        return [dict(kw.get("metadata") or ()).get(CONVERSATION_METADATA_KEY) for kw in self.built]
+
+
+@pytest.fixture
+def rebuilding(monkeypatch):
+    """A real `XaiSdkProvider` that builds its own (fake) clients, so rebuilds are countable."""
+    import xai_sdk
+
+    from basecradle_harness import _xai_sdk
+
+    clients = _RecordingClients(_response(content="ok"))
+    monkeypatch.setattr(
+        _xai_sdk,
+        "require_xai_sdk",
+        lambda: SimpleNamespace(Client=clients, chat=xai_sdk.chat, tools=xai_sdk.tools),
+    )
+    return XaiSdkProvider("grok-4.3", api_key=FAKE_KEY), clients
+
+
+def test_the_client_is_rebuilt_only_when_the_conversation_changes(rebuilding):
+    """Every turn of a session rebinds the same id (`Session._drive` does it unconditionally), so
+    keying the rebuild on the *value* is what keeps a per-session cost from becoming a per-turn one."""
+    provider, clients = rebuilding
+    provider.bind_conversation("timeline:one")
+    provider.chat([Message.user("Hi")])
+    provider.bind_conversation("timeline:one")
+    provider.chat([Message.user("Again")])
+    provider.bind_conversation("timeline:one")
+    provider.chat([Message.user("And again")])
+
+    assert clients.keys == [None, "timeline:one"]  # the constructor's, then one rebuild
+
+
+def test_each_session_gets_a_client_carrying_its_own_key(rebuilding):
+    """One adapter serves every session. A stale key would herd a second timeline's prefix onto the
+    first one's server — the anti-pattern, not the fix — so a switch has to take."""
+    provider, clients = rebuilding
+    provider.bind_conversation("timeline:one")
+    provider.chat([Message.user("Hi")])
+    provider.bind_conversation("timeline:two")
+    provider.chat([Message.user("Hi")])
+
+    assert clients.keys == [None, "timeline:one", "timeline:two"]
+
+
+def test_the_replaced_client_is_closed_so_a_session_switch_leaks_no_channel(rebuilding):
+    """A gRPC channel holds sockets. An agent cycling timelines would accumulate one per switch for
+    the life of the process, which is a slow leak nothing would ever raise on."""
+    provider, clients = rebuilding
+    provider.bind_conversation("timeline:one")
+    provider.chat([Message.user("Hi")])
+    provider.bind_conversation("timeline:two")
+    provider.chat([Message.user("Hi")])
+
+    assert [c.closed for c in clients.clients] == [True, True, False]  # only the live one is open
+
+
+def test_an_injected_client_is_never_replaced():
+    """The seam the whole offline suite rests on, and the contract for a library caller who supplies
+    their own client: there is nothing to rebuild it from, and replacing it would throw away
+    whatever they configured it with. Such a caller runs unbound — no affinity, and no surprise."""
+    client = _FakeClient(_response(content="ok"))
+    provider = XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=client)
+    provider.bind_conversation("timeline:one")
+
+    provider.chat([Message.user("Hi")])
+
+    assert provider._client is client
+
+
+def test_a_conversation_grpc_could_not_carry_is_refused_at_bind_time(caplog, rebuilding):
+    """Affinity is an optimization and must never cost a wake. grpc rejects a non-ASCII metadata
+    value at **call** time, inside the model call, so an unusable key is dropped on the way in —
+    leaving the adapter exactly as well off as it was before any of this: unbound, and lucky."""
+    provider, clients = rebuilding
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        provider.bind_conversation("timeline:ｕｎｉｃｏｄｅ")
+    provider.chat([Message.user("Hi")])
+
+    assert clients.keys == [None]  # no rebuild, and nothing grpc would have thrown on
+    assert "cache affinity" in caplog.text
