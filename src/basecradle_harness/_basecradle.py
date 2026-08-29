@@ -726,6 +726,11 @@ _OWNED_XAI_SDK = frozenset(
         "messages",
         "tools",
         "stream",
+        # The per-session cache-affinity routing key the harness binds itself (issue #431). Owned
+        # for a sharper reason than most of this set: a *static* value here is not merely overridden
+        # wiring, it is actively harmful — one id for every session pins the whole box to one xAI
+        # server, defeating the affinity it looks like it is asking for. The warning is the point.
+        "conversation_id",
     }
 )
 _OWNED_OPENROUTER = frozenset(

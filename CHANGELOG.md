@@ -7,6 +7,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.110.0] - 2026-08-29
+
+### Fixed: the xai-sdk adapter binds a `conversation_id`, so xAI's per-server cache can be reached (issue #431)
+
+xAI's prompt cache is **per-server** — an entry lives on the one server that served the call — so a
+byte-stable prefix pays out only if the next request lands back there. xAI's remedy is a stable
+conversation id (`x-grok-conv-id` on the HTTP surfaces, `conversation_id` on `chat.create` in the
+`xai-sdk`); this adapter never sent one, and every call took its chances across the fleet.
+
+The cost was measured, not theorized. Live on 2026-08-29, @briggs re-sent a byte-stable ~210 K-token
+prefix roughly 45 seconds apart and earned **0.2%–18%** — several calls at `cached_tokens=512`, one
+at **0** — while @glm-5.2 (92%), @jt (99%), and @memory-prince (93%) were earning near-full hits on
+the identical engine and the identical stable-prefix-first message layout. Roughly half of a ~$50 xAI
+burn should have been cache-discounted and was not. The sporadic partial hits were luck: a call
+landing on a server that happened to still be warm.
+
+- **`bind_conversation(conversation)`** — a new adapter capability (`_caching`), read exactly like
+  `cache_mode`: an adapter that wants a routing key declares the method, one that does not is left
+  alone, and no vendor branch exists above the adapter layer. `Session._drive` binds before every
+  turn, alongside the explicit-cache anchor — the two halves of one question, *where* the stable
+  prefix ends and *whose* it is.
+- **The key is the session id** (`timeline:019f6e71-…`) — the string the transcript is already keyed
+  by, which is exactly the unit whose bytes repeat, so affinity aligns 1:1 with the cacheable
+  content. It covers every session kind present and future (`default`, a hypothetical
+  `github:pr-123`) with no special-casing, and it is opaque plumbing to xAI: a routing key, never
+  content.
+- **Unbound means omit, never fabricate.** A library caller driving an `Engine` with no `Session`
+  binds nothing and the field is left off the create — an invented id would read as a brand-new
+  conversation on every call, a guaranteed miss where the status quo was at least a lucky one. The
+  binding is sticky across a turn's several calls and across the compaction summarize that follows
+  it (all of them are work on that session), and a raising adapter costs a WARNING, never a wake.
+- **This is not the rejected OpenRouter session pin (#372), and the module docs now say so** — the
+  distinction is that a router fans one model id across dozens of third-party upstreams that do not
+  behave alike, so pinning makes a bad landing durable; xAI is one vendor's homogeneous fleet
+  reached directly, where the only question is finding the server holding your prefix. Read #372 as
+  *never read a hit rate as a capability*, not as *never send a routing key*.
+- **`conversation_id` is harness-owned**, so an operator's `model_params.json` value is stripped
+  with a WARNING at provider build (`_OWNED_XAI_SDK`), like `model`/`messages`/`tools`. The reason
+  is sharper here than for most of that set: a single static id is not merely overridden wiring, it
+  pins *every* session on the box to one xAI server — the exact anti-pattern this fix removes.
+- A `live`-marked probe (`tests/test_xai_sdk_live.py`) asserts the **value** — most of the prompt
+  came back cached on call 2 — off the `cached_tokens=` the endpoint itself reported. It is
+  deliberately one-armed: an unbound control can land warm by luck, so asserting a control *miss*
+  would be asserting the absence of luck.
+
 ## [0.109.0] - 2026-08-28
 
 ### Added: a plugin declares the environment it depends on but does not gate on (issue #427)

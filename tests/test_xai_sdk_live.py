@@ -17,7 +17,10 @@ repeatable command rather than a one-off manual probe.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+import uuid
 
 import pytest
 
@@ -89,3 +92,56 @@ def test_live_search_works_alongside_function_tools_without_bouncing():
     bounced = {"web_search", "x_search", "x_semantic_search", "x_keyword_search"}
     assert not any(call.name in bounced for call in reply.tool_calls)
     assert reply.content  # a real grounded answer, not a confabulated empty turn
+
+
+@pytest.mark.skipif(not KEY, reason="set XAI_API_KEY to run the live xAI cache-affinity probe")
+def test_a_bound_conversation_earns_the_per_server_cache_hit():
+    """The #431 fix against the real fleet: does ``conversation_id`` actually buy the discount?
+
+    This is the other check the mocked-client suite structurally cannot make. The offline tests
+    prove the field goes on the create; only the live endpoint can say whether xAI *routes* on it —
+    the same gap the deprecated ``SearchParameters`` path fell through.
+
+    The shape is deliberate. **One arm, not an A/B**: the unbound control is inherently lucky —
+    a scattered call can land on a warm server anyway (that is exactly what @briggs's 0.2–18% was),
+    so asserting a control *miss* would be a flaky test asserting the absence of luck. What is not
+    luck is the bound arm: with the routing key held constant, call 2 must find the prefix call 1
+    left. So this asserts a **value** — most of the prompt came back cached — rather than the mere
+    presence of a counter, and it uses the one authority the design recognizes for the question
+    (`_caching`): the ``cached_tokens=`` the endpoint itself reported, off the per-call log line.
+
+    The prefix is arm-private (a fresh uuid in the body) so no earlier run of this test can warm it,
+    and it is well past the ~512-token granularity xAI appears to cache at.
+    """
+    tag = uuid.uuid4().hex
+    body = "\n".join(
+        f"{tag} note {i}: the quick brown fox jumps over the lazy dog." for i in range(1200)
+    )
+    messages = [
+        Message.system("You are a terse assistant."),
+        Message.user(f"{body}\n\nReply with the single word: ok"),
+    ]
+    provider = XaiSdkProvider(model="grok-4.3", api_key=KEY)
+    provider.bind_conversation(f"timeline:{uuid.uuid4()}")
+
+    logger = logging.getLogger("basecradle_harness")
+    records: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: records.append(record.getMessage())  # type: ignore[method-assign]
+    logger.addHandler(handler)
+    previous = logger.level
+    logger.setLevel(logging.INFO)
+    try:
+        provider.chat(messages)  # cold: writes the prefix onto whichever server serves it
+        provider.chat(messages)  # warm: the same key must route back to that server
+    finally:
+        logger.setLevel(previous)
+        logger.removeHandler(handler)
+        provider.close()
+
+    llm = [line for line in records if line.startswith("llm ")]
+    assert len(llm) == 2, llm
+    cached = int(re.search(r"cached_tokens=(\d+)", llm[1]).group(1))
+    tokens_in = int(re.search(r"tokens_in=(\d+)", llm[1]).group(1))
+    # Not "> 0" — a scattered call gets that by luck. Affinity means most of the prefix comes back.
+    assert cached > tokens_in * 0.5, f"cached={cached} of tokens_in={tokens_in}: {llm[1]}"

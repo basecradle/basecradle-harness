@@ -6,8 +6,10 @@ already *observes* it — ``cached_tokens=`` rides the per-call log line (issue 
 is not the same as **reaching** it, and how a cache is reached differs by vendor in a way that is
 not cosmetic:
 
-- **automatic** — the endpoint caches a repeated prefix by itself, with nothing on the wire. OpenAI,
-  xAI, and (verified live) most of OpenRouter's GLM endpoints. The engine does nothing.
+- **automatic** — the endpoint caches a repeated prefix by itself, so nothing has to *mark* it.
+  OpenAI, xAI, and (verified live) most of OpenRouter's GLM endpoints. The engine places no
+  breakpoint. (*Reaching* that cache can still take a routing key — see `bind_conversation` below;
+  the mode answers what must be **marked**, never what must be **sent**.)
 - **explicit** — the client must *mark* the cacheable prefix, or it gets **nothing at all**.
   Anthropic is the one that matters: a Claude agent shipped without breakpoints pays full freight on
   every token of every wake, silently, forever. Nothing errors; the bill just arrives.
@@ -47,6 +49,40 @@ thing the engine guesses, and the standing rule (`CLAUDE.md` → Provider Capabi
 adapter ships without declaring one. Read as a capability, never a vendor branch: the engine asks
 every adapter the same question and does exactly one thing with the answer.
 
+Direct-to-vendor, `automatic` does not promise a hit either — xAI's cache is **per-server**
+-------------------------------------------------------------------------------------------
+The same gap opens without a router in sight, for a different reason, and it cost real money before
+anyone saw it (issue #431). xAI runs a fleet, and a cache entry lives on **the one server that
+served the call** — so a request that lands anywhere else re-pays for a prefix xAI already has.
+Their own guidance is to send a stable conversation id (``x-grok-conv-id`` on the HTTP surfaces,
+``conversation_id`` on ``chat.create`` in the ``xai-sdk``) precisely so consecutive calls route back
+to the same server. The harness never sent one, and the bill said so: measured live 2026-08-29,
+@briggs re-sent a byte-stable ~210 K-token prefix roughly 45 seconds apart and hit
+**0.2%–18%** — several calls at ``cached_tokens=512``, one at **0**, against the 92–99% every other
+adapter was earning on the identical engine and the identical message layout. Roughly half of a
+~$50 xAI burn should have been discounted and was not. The sporadic partial hits were luck: a call
+landing on a server that happened to still be warm.
+
+So the harness **binds a conversation** to the adapter before every turn (`bind_conversation`), and
+the key is **the session id** — the string the `Session` is already keyed by, e.g.
+``timeline:019f6e71-…``. That is exactly the unit whose transcript *is* the repeated prefix (one
+transcript per session), so affinity aligns 1:1 with the cacheable bytes; cross-session calls share
+only the charter, so a coarser key would herd unrelated prefixes onto one server and a finer one
+would not exist. Keying on the session id rather than on any timeline-specific notion covers every
+session kind, present and future (``default``, a hypothetical ``github:pr-123``), with no
+special-casing anywhere. The id is opaque plumbing to xAI — a routing key, never content.
+
+**This is not the OpenRouter session pin, and it must not be "consistency"-ed away.** Issue #372
+measured an eager `session_id` pin *for OpenRouter* and **rejected** it — and the reasoning does not
+transfer, because it turned on the one property xAI does not have: OpenRouter fans one model id out
+across **dozens of third-party upstreams that do not behave alike**, some of which cache nothing at
+all, so pinning made a landing on a non-caching endpoint *durable* instead of transient (at
+production scale, 2.75× more expensive). xAI is a single vendor's **homogeneous** fleet reached
+directly, where every server caches the same way and the only question is whether the next call
+finds the one holding your prefix. Same-looking knob, opposite situation: there, a pin risks
+sticking to a bad endpoint; here, there is no bad endpoint to stick to. Read #372 as *never read a
+hit rate as a capability* — never as *never send a routing key*.
+
 Where the breakpoint goes, and why it is the same boundary the cache already turns on
 -------------------------------------------------------------------------------------
 The message list is already built stable-prefix-first, volatile-tail-last, precisely so a provider's
@@ -80,9 +116,12 @@ clear it.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 
 from basecradle_harness._messages import Message
+
+_log = logging.getLogger("basecradle_harness")
 
 #: The endpoint caches a repeated prefix on its own; nothing goes on the wire.
 AUTOMATIC = "automatic"
@@ -109,6 +148,38 @@ def cache_mode(provider: object) -> str:
     """
     declared = getattr(provider, "cache_mode", None)
     return declared if declared in CACHE_MODES else AUTOMATIC
+
+
+def bind_conversation(provider: object, conversation: str | None) -> None:
+    """Tell an adapter which conversation its next calls belong to — for cache **affinity** (#431).
+
+    A capability, read the same way as `cache_mode`: an adapter that wants a routing key declares
+    ``bind_conversation``; one that does not is left alone, and this is a no-op. There is no
+    ``if provider == xai`` above the adapter layer, and a third-party adapter written before this
+    existed keeps working untouched.
+
+    `conversation` is the `Session`'s ``source`` — the string a transcript is keyed by, which is
+    exactly the unit whose bytes repeat. An empty or absent one binds ``None``, and an adapter's
+    contract on ``None`` is **omit the field**, never invent a value: a made-up id is a *new*
+    conversation to the vendor on every call, which is a cache miss dressed up as a fix.
+
+    The binding is **sticky** until the next one, and that is deliberate rather than incidental:
+    every model call the harness makes while working a session belongs to that session — the turn
+    itself, the engine's retries and its reserve summary, and the compaction summarize call that
+    runs after it (`_context.Compactor._summarize`). `Session._drive` rebinds before each turn, so
+    the value in force is always the session about to be driven. A caller that drives an `Engine`
+    directly, with no `Session`, never binds and is unchanged.
+
+    Best-effort by construction: a raising adapter costs a log line and a worse hit rate, never a
+    wake. A routing hint is not worth a dropped peer message.
+    """
+    bind = getattr(provider, "bind_conversation", None)
+    if not callable(bind):
+        return
+    try:
+        bind(conversation or None)
+    except Exception as exc:  # noqa: BLE001 - affinity is an optimization; never break a wake
+        _log.warning("Could not bind the conversation id for cache affinity: %s", exc)
 
 
 def anchor_cacheable_prefix(messages: list[Message], *, stable: int, mode: str) -> list[Message]:

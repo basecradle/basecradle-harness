@@ -90,7 +90,7 @@ from typing import Any, TypeVar
 from uuid import uuid4
 
 from basecradle_harness._attribution import log_context_attribution
-from basecradle_harness._caching import anchor_cacheable_prefix, cache_mode
+from basecradle_harness._caching import anchor_cacheable_prefix, bind_conversation, cache_mode
 from basecradle_harness._context import TOOL_ARGS_CAP, TOOL_RESULT_CAP, Compactor
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
@@ -426,9 +426,15 @@ class Session:
             brief_sections=self._brief_sections,
             source=self.source,
         )
-        # Tell an explicit-cache provider (Anthropic) where the stable prefix ends; a provider that
-        # caches automatically — every one that ships — is unaffected and this is a no-op. The
-        # anchor is stamped on a copy, so it never reaches `history` (see `_caching`).
+        # Two halves of the same question, asked of every adapter and answered by the ones that can
+        # (`_caching`). *Where* the stable prefix ends: an explicit-cache provider (Anthropic) gets a
+        # breakpoint there, stamped on a copy so it never reaches `history`; every adapter that ships
+        # caches automatically and this is a no-op. And *whose* prefix it is: an adapter with a
+        # per-server cache (xAI) is bound to this session, so the call routes back to the server
+        # already holding these bytes (issue #431). The source is the key precisely because it is
+        # what the transcript is keyed by — the affinity unit and the cacheable unit are the same
+        # unit. Both are read by capability; there is no vendor branch here.
+        bind_conversation(self.engine.provider, self.source)
         convo = anchor_cacheable_prefix(convo, stable=stable, mode=cache_mode(self.engine.provider))
         adopted = len(convo)
         # Publish the in-flight work, so the progress hook can persist it *in the right place* and

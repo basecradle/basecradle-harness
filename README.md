@@ -626,7 +626,7 @@ The rules, so you can rely on it:
 - **Harness-owned keys always win.** A key the harness sets for correctness (`model`, the
   messages, `tools`, each build's wiring args) is stripped with a WARNING — this file is call
   *tuning*, not a way to override wiring. The model id is `AI_MODEL`, never a `model_params.json`
-  key.
+  key. So is `conversation_id` on the `xai-sdk` build: the harness binds it [per session](#direct-to-xai-automatic-doesnt-promise-a-hit-either--the-cache-is-per-server), and one static value here would pin every session on the box to a single xAI server.
 - **Loud on malformed.** A present-but-invalid file (bad JSON, or a top level that isn't an
   object) fails the wake at startup rather than running silently untuned. A missing file is simply
   off.
@@ -797,7 +797,7 @@ Caching a standing agent's transcript is the difference between paying full pric
 
 | `cache_mode` | Who | What the engine does |
 |---|---|---|
-| `automatic` | OpenAI, xAI, OpenRouter *(every adapter that ships today)* | **Nothing.** The endpoint caches a repeated prefix by itself, with nothing on the wire. |
+| `automatic` | OpenAI, xAI, OpenRouter *(every adapter that ships today)* | **Nothing to the message list.** The endpoint caches a repeated prefix by itself, so no breakpoint is placed. (*Reaching* that cache can still need a routing key — see [per-server](#direct-to-xai-automatic-doesnt-promise-a-hit-either--the-cache-is-per-server).) |
 | `explicit` | Anthropic | Places **one breakpoint** at the [stable/volatile boundary](#what-the-transcript-keeps) — the last frozen turn, just ahead of the per-wake brief. |
 | `none` | — | Nothing. The endpoint has no prompt cache. |
 
@@ -838,6 +838,17 @@ The one lever that works is **your own routing preference**, which the native `o
 Live, at production scale: call 1 cold at `$0.2426`, then `cached_tokens=296384` of `296447` — `$0.0451` a call, a **5.4×** cut held for every later call. This is a **routing policy** decision — cost, latency, and quantization all ride on it — so the harness will not make it for you, and it keeps no table of which endpoints cache: that list above is a measurement with a date on it, not a contract, and only the `cached_tokens=` on your own log line says what is happening now.
 
 What the harness *does* owe you is honesty about the consequence: **`context_limit` reads the same pin.** Narrowing routing narrows the real ceiling, so a pin to one endpoint now reports *that* endpoint's window (a StreamLake-only pin: `1024000`, not the pool's `1048576`) — without which a pinned agent would sit above its real ceiling believing it had headroom, [forfeiting the compaction guarantee](#set-the-budget-too-low-and-you-lose-a-guarantee--the-harness-will-tell-you) silently. `only` and `ignore` narrow it; `order` narrows it only with `allow_fallbacks: false` (alone it is a *preference* — OpenRouter still falls through to the rest of the pool). Preferences that this endpoint list cannot be filtered on honestly (`sort`, `max_price`, `quantizations`, …) leave the ceiling at the pool's, where `HARNESS_MAX_CONTEXT_TOKENS` remains the answer.
+
+#### Direct to xAI, `automatic` doesn't promise a hit either — the cache is **per-server**
+
+The same gap opens with no router in sight. xAI runs a fleet, and a cache entry lives on **the one server that served your call** — so a repeated prefix only pays out if the next call lands back there. xAI's own remedy is a stable conversation id (`x-grok-conv-id` on the HTTP surfaces, `conversation_id` on `chat.create` in the `xai-sdk`), which routes consecutive calls to the same server.
+
+The harness sends one, keyed to the **session id** — the string a transcript is already keyed by (`timeline:019f6e71-…`). That is the right key because the affinity unit and the cacheable unit are the *same* unit: one transcript per session is exactly the block of bytes that repeats. Nothing configures it, and no session ever borrows another's key. Bound to nothing — a library caller driving an `Engine` with no `Session` — the field is simply **omitted**, never faked: a made-up id reads as a brand-new conversation on every call, which is a guaranteed miss where the status quo was at least a lucky one.
+
+It was not free before that. Measured live on 2026-08-29, a Grok agent re-sending a byte-stable ~210 K-token prefix ~45 s apart hit **0.2%–18%** — several calls at `cached_tokens=512`, one at **0** — while every other adapter on the identical engine and message layout earned 92–99%. The sporadic partial hits were luck: a call landing on a server that happened to still be warm.
+
+> **This is not the OpenRouter session pin, and the distinction is the whole point.** That one was measured and *rejected* (above) because OpenRouter fans one model id across **dozens of third-party upstreams that don't behave alike** — some cache nothing — so pinning makes a bad landing *durable*. xAI is one vendor's **homogeneous** fleet reached directly: every server caches the same way, and the only question is whether you find the one holding your prefix. Same-looking knob, opposite situation.
+
 
 ### The step budget, live counter, and reserve summary
 
