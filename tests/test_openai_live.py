@@ -49,3 +49,29 @@ def test_a_real_turn_reaches_openai_over_the_sdks_own_transport():
     assert reply.role == "assistant"
     assert "pong" in (reply.content or "").lower()
     assert provider.last_tokens_in and provider.last_tokens_in > 0
+
+
+@pytest.mark.parametrize("surface", ["responses", "chat"])
+@pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
+def test_openai_accepts_the_cache_affinity_key_on_both_surfaces(surface):
+    """The live half of issue #435: OpenAI really takes ``prompt_cache_key``, on both surfaces.
+
+    The offline tests prove the field leaves the process on the real request body — respx reads
+    the actual bytes — but only the endpoint can say whether it is *accepted*. That distinction is
+    the whole cost of getting this wrong: an unknown top-level field is a 400 on every wake, which
+    is a silent agent rather than a missed discount.
+
+    Deliberately an **acceptance** probe, not a hit-rate one. A cache read needs a prefix over a
+    thousand tokens and two calls close together, and the answer would be a measurement with a date
+    on it — the standing rule is that ``cached_tokens=`` on a real agent's log line is the authority
+    for that, never a test (`_caching`).
+    """
+    provider = OpenAIProvider(model=MODEL, api_key=KEY, surface=surface, max_retries=0)
+    provider.bind_conversation("timeline:019f6e71-2a12-7b69-a204-0fec1497b9c2")
+    try:
+        reply = provider.chat([Message.user("Reply with exactly: pong")])
+    finally:
+        provider.close()
+
+    assert "pong" in (reply.content or "").lower()
+    assert provider.last_tokens_in and provider.last_tokens_in > 0

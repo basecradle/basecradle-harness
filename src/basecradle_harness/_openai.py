@@ -35,6 +35,7 @@ import logging
 import os
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 from basecradle_harness._caching import AUTOMATIC
@@ -81,6 +82,75 @@ SURFACES = ("responses", "chat")
 #: The surface used when ``AI_SDK_SURFACE`` is unset — this adapter's default wire surface.
 DEFAULT_SURFACE = "responses"
 
+#: The cache-affinity routing key as a **body field**, spelled the way both vendors that take it
+#: spell it. OpenAI: *"Set `prompt_cache_key` to help requests with the same prefix reach the same
+#: cache."* xAI, for its Responses surface: *"routes requests to the same server, maximizing cache
+#: hits."* Same word, two vendors, and that is their doing rather than an assumption of ours.
+CACHE_KEY_FIELD = "prompt_cache_key"
+
+#: The same key as an HTTP **header**, which is how xAI's Chat Completions surface takes it:
+#: *"the x-grok-conv-id HTTP header routes requests with the same conversation ID to the same
+#: server."* Byte-identical to the gRPC metadata key the native adapter sends
+#: (`_xai_sdk.CONVERSATION_METADATA_KEY`) — gRPC metadata *is* HTTP/2 headers.
+CONVERSATION_HEADER = "x-grok-conv-id"
+
+
+@dataclass(frozen=True)
+class _Affinity:
+    """Where one endpoint wants the cache-affinity routing key: a body field, or a header.
+
+    Exactly one is set, and that is **enforced at import** rather than trusted: `_AFFINITY` is a
+    module-level literal, so a malformed entry fails the package's import with a readable message
+    instead of reaching a call site as ``create(**{None: ...})`` on somebody's first wake. A carrier
+    is a *vendor* fact — the endpoint decides what it will read a routing key out of — so it is
+    resolved once at construction and never re-derived at call time.
+    """
+
+    field: str | None = None
+    header: str | None = None
+
+    def __post_init__(self) -> None:
+        if bool(self.field) == bool(self.header):
+            raise ValueError(
+                "An affinity carrier names either a body field or a header, never both and never "
+                f"neither (got field={self.field!r}, header={self.header!r})."
+            )
+
+
+#: What each ``(AI_PROVIDER, surface)`` cell this one adapter can be aimed at wants, read off each
+#: vendor's own guidance rather than by symmetry with its neighbours (issue #435).
+#:
+#: **A decided "send nothing" is written as an explicit ``None``, not as an absent key**, and the
+#: distinction is the whole discipline: in a plain dict a deliberate no and a cell nobody thought
+#: about are the same silence, which is precisely the green-while-absent shape this repo keeps
+#: getting bitten by. Every buildable cell is a key here, and `test_openai_affinity` fails the build
+#: when one is not — so wiring a fourth vendor forces the question rather than inheriting an answer.
+#: A `provider` label that is not a key at all (an operator's own) also sends nothing: the only
+#: thing this feature can do is put a vendor field on a wire, and doing that at an endpoint that
+#: never asked for it is a 400 on every wake.
+_AFFINITY: dict[tuple[str, str], _Affinity | None] = {
+    # OpenAI documents the field for exactly this purpose, and recommends exactly this value:
+    # *"Group a prompt version with a stable user, workspace, session, or thread ID that matches
+    # how your application reuses context"*, with the one caution being **cardinality** — *"do not
+    # generate a new key for every request."* The harness's key is one per session, stable for the
+    # life of that session, which is the recommended shape rather than an approximation of it.
+    ("openai", "responses"): _Affinity(field=CACHE_KEY_FIELD),
+    ("openai", "chat"): _Affinity(field=CACHE_KEY_FIELD),
+    # xAI's per-server cache, reached over HTTP instead of gRPC — the same defect issue #431
+    # measured (0.2–18% where every other adapter earned 92–99%) and issue #433 fixed for the
+    # native SDK. Their guidance spells it differently per surface, so this table does too.
+    ("xai", "responses"): _Affinity(field=CACHE_KEY_FIELD),
+    ("xai", "chat"): _Affinity(header=CONVERSATION_HEADER),
+    # A decided **no**. A routing pin was measured for OpenRouter in issue #372 and **rejected**: it
+    # fans one model id across dozens of third-party upstreams that do not behave alike, so pinning
+    # makes a landing on a non-caching one *durable* instead of transient — across four A/B trials
+    # it never beat sending nothing, and at production scale it cost 2.75× more. Nothing goes on
+    # that wire until a measurement overturns that one. (``("openrouter", "responses")`` is not a
+    # cell at all: that combination is chat-only and `_basecradle._provider_from_config` refuses it.)
+    # See `_caching` for why xAI is the opposite situation rather than a precedent against this.
+    ("openrouter", "chat"): None,
+}
+
 
 def require_openai_sdk():
     """Import and return the ``openai`` package, or raise a clear "no LLM, by design" error.
@@ -115,6 +185,11 @@ class OpenAIProvider:
             adapter serves OpenAI, xAI, and OpenRouter alike, and only `_provider_from_config`
             knows which endpoint it aimed the client at. It rides the per-call log line so a
             grok-through-the-openai-SDK wake reads ``provider=xai``, not ``provider=openai``.
+            It is also the one thing that decides which **cache-affinity** carrier this client
+            uses (`_AFFINITY`, issue #435), so aim it honestly: a label the table does not know
+            sends no routing key at all, which is the right answer for a third-party
+            OpenAI-compatible endpoint and the reason the fallback is silence rather than
+            OpenAI's spelling.
         surface: ``"responses"`` (default) or ``"chat"`` — this adapter's internal wire
             surface (see the module docstring). Server-side built-ins and vision require
             ``"responses"``.
@@ -192,6 +267,14 @@ class OpenAIProvider:
         self._code_container = code_container
         self._extra_body = dict(extra_body) if extra_body else None
         self._default_params = default_params
+        #: How *this* endpoint takes a cache-affinity routing key — a body field, a header, or
+        #: (for a cell absent from `_AFFINITY`, and for any `provider` label the operator invented)
+        #: nothing at all. Resolved once: the carrier is a fixed property of the endpoint this
+        #: client is aimed at, and a call-time lookup would be a vendor branch on every turn.
+        self._affinity = _AFFINITY.get((provider, surface))
+        #: The conversation this adapter's next calls belong to, or ``None`` (issue #435). Bound by
+        #: `bind_conversation`; sticky until the next bind, exactly as on the native xAI adapter.
+        self._conversation: str | None = None
         self._openai = openai
         self._client = openai.OpenAI(
             api_key=key,
@@ -203,6 +286,41 @@ class OpenAIProvider:
             # adapter stays vendor-neutral (the header seam, exactly as `extra_body` is the body one).
             default_headers=dict(extra_headers) if extra_headers else None,
         )
+
+    def bind_conversation(self, conversation: str | None) -> None:
+        """Route this adapter's next calls to the cache holding `conversation`'s prefix (issue #435).
+
+        The cache-affinity capability (`_caching.bind_conversation`), and the counterpart of the
+        native xAI adapter's — with one difference that made it a much smaller change: the ``openai``
+        SDK takes both carriers **per call** (a body field, or ``extra_headers=``), so there is no
+        client to rebuild and binding is a plain assignment.
+
+        The harness binds the session id before each turn; ``None`` (or an empty string) clears it,
+        and the next call then sends **no** key rather than inventing one — a fabricated id reads as
+        a fresh conversation to the vendor on every call, which is a guaranteed miss where the
+        status quo was at least a lucky one.
+
+        Binding is unconditional and cheap; whether anything reaches the wire is decided by
+        `_affinity_args`, which is where the endpoint's own answer lives. So an OpenRouter-aimed
+        client can be bound all day and still put nothing on its wire (issue #372).
+        """
+        self._conversation = conversation or None
+
+    def _affinity_args(self) -> dict[str, Any]:
+        """This call's routing-key contribution: a body field, an ``extra_headers`` entry, or ``{}``.
+
+        Returned as kwargs to splat rather than mutated into the payload in place, so the two
+        surfaces share one answer and neither has to know which carrier it got.
+
+        The header form is a **per-call** ``extra_headers``, which the SDK merges *over* the
+        client's ``default_headers`` — so it composes with the headers the config layer already
+        sets (OpenRouter's routing metadata, an operator's own) instead of replacing them.
+        """
+        if self._affinity is None or not self._conversation:
+            return {}
+        if self._affinity.header:
+            return {"extra_headers": {self._affinity.header: self._conversation}}
+        return {self._affinity.field: self._conversation}
 
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:
         """Run one model turn through the SDK and return the assistant's reply."""
@@ -225,6 +343,10 @@ class OpenAIProvider:
             payload["tools"] = wire_tools
         if self._extra_body:
             payload["extra_body"] = dict(self._extra_body)
+        # After `_default_params`, deliberately: the bound session's key is harness wiring and wins
+        # over anything a library caller passed at construction (the operator's `model_params.json`
+        # never gets this far — `_basecradle._OWNED_OPENAI` strips it with a warning first).
+        payload.update(self._affinity_args())
         started = time.monotonic()
         with self._mapped_errors():
             response = self._client.responses.create(**payload)
@@ -254,6 +376,7 @@ class OpenAIProvider:
             payload["tools"] = [chat_tool_to_wire(t) for t in tools]
         if self._extra_body:
             payload["extra_body"] = dict(self._extra_body)
+        payload.update(self._affinity_args())  # see `_responses_turn` on why it lands last
         started = time.monotonic()
         with self._mapped_errors():
             response = self._client.chat.completions.create(**payload)

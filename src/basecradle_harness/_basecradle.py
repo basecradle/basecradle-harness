@@ -695,6 +695,12 @@ def _xai_search_parameters(builtins: Sequence[str]) -> dict[str, Any] | None:
 # ``stream: true`` would not just override wiring but crash the turn — strip it everywhere.
 # ``extra_body`` is *not* listed here: it is lifted out separately (D4) — merged on the openai
 # SDK, warned-and-dropped on the SDKs where it is not a legal concept.
+#: The endpoint vendors the one ``openai``-SDK adapter is wired to reach. Named rather than inlined
+#: in the guard below because it is the *matrix* — every cell of ``provider × surface`` needs a
+#: decided cache-affinity answer (`_openai._AFFINITY`), and a test enumerates the cells from here.
+#: A second, drifting copy of this list would let a newly-wired vendor read as already-decided.
+OPENAI_SDK_PROVIDERS = ("openai", "xai", "openrouter")
+
 _OWNED_OPENAI = frozenset(
     {
         "model",
@@ -713,6 +719,13 @@ _OWNED_OPENAI = frozenset(
         "input",
         "tools",
         "stream",
+        # The per-session cache-affinity routing key the harness binds itself (issue #435), on the
+        # cells whose vendor takes it as a body field. Owned for the same sharper reason as the
+        # native SDK's `conversation_id` below: a *static* value here is not merely overridden
+        # wiring, it is actively harmful — one id for every session names every session on the box
+        # the same thing, herding unrelated prefixes onto one server and defeating the affinity it
+        # looks like it is asking for. The warning is the point.
+        "prompt_cache_key",
     }
 )
 _OWNED_XAI_SDK = frozenset(
@@ -987,7 +1000,7 @@ def _provider_from_config(
             "also xAI over api.x.ai and OpenRouter over openrouter.ai), 'xai-sdk' (native xAI), "
             "and 'openrouter' (native OpenRouter). Set one of those."
         )
-    if provider not in ("openai", "xai", "openrouter"):
+    if provider not in OPENAI_SDK_PROVIDERS:
         raise ValueError(
             f"AI_PROVIDER={provider!r} has no adapter via the openai SDK — 'openai', 'xai', and "
             "'openrouter' are wired (xAI over api.x.ai, OpenRouter over openrouter.ai)."

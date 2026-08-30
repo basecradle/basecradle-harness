@@ -1109,6 +1109,21 @@ def test_model_params_conversation_id_is_stripped_on_the_xai_sdk_build(monkeypat
     provider.close()
 
 
+def test_model_params_prompt_cache_key_is_stripped_on_the_openai_build(monkeypatch, caplog):
+    # The openai-SDK adapter's half of the same collision (issue #435). One static value here names
+    # every session on the box the same thing, herding unrelated prefixes onto one server — the
+    # exact anti-pattern the per-session binding exists to remove. Warned and dropped; the session's
+    # own key rides.
+    monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    _write_model_params({"prompt_cache_key": "one-id-for-everything", "temperature": 0.3})
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("openai", "openai", "responses")
+    assert provider._default_params == {"temperature": 0.3}
+    assert "'prompt_cache_key'" in caplog.text
+    provider.close()
+
+
 def test_model_params_metadata_is_stripped_on_the_xai_sdk_build(monkeypatch, caplog):
     # The affinity key rides as the client's gRPC `metadata` (issue #433), so `metadata` is now the
     # obvious word an operator reaches for on this adapter — and `chat.create`'s signature is closed,

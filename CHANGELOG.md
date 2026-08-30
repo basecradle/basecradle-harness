@@ -7,6 +7,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.114.0] - 2026-08-30
+
+### Fixed: the rest of the cache-affinity matrix — `OpenAIProvider` sent no routing key on any of its three vendors (issue #435)
+
+[Issue #433](https://github.com/basecradle/basecradle-harness/issues/433) put the affinity key on
+the gRPC wire for `AI_SDK=xai-sdk`. `bind_conversation` was implemented on that **one** adapter, so
+`OpenAIProvider` — the one aimed at OpenAI, xAI *and* OpenRouter, across two surfaces — sent nothing
+anywhere, and the question had simply never been asked of it. `_caching.bind_conversation` is a
+no-op for an adapter that does not define the method, by design, so nothing said so.
+
+**The cells do not have the same answer**, so each was read off its own vendor's guidance
+(`_openai._AFFINITY`, reasoned in `_caching`):
+
+| `AI_PROVIDER` | Surface | On the wire |
+|---|---|---|
+| `openai` | `responses`, `chat` | `prompt_cache_key` (body) |
+| `xai` | `responses` | `prompt_cache_key` (body) |
+| `xai` | `chat` | `x-grok-conv-id` (header) |
+| `openrouter` | `chat` | **nothing** — a decided *no* |
+
+- **xAI over the `openai` SDK** is the same per-server cache #431 measured (0.2–18% where every
+  other adapter earned 92–99%), reached over HTTP instead of gRPC. The SDK takes both carriers
+  **per call**, so unlike the native adapter there is no client to rebuild — binding is a plain
+  assignment.
+- **OpenAI gets a key on its own documented advice, not by symmetry.** OpenAI describes
+  `prompt_cache_key` as helping "requests with the same prefix reach the same cache" and recommends
+  exactly the value the harness has — "a stable user, workspace, session, or thread ID" — its one
+  caution being cardinality, which one stable key per session satisfies by construction. What makes
+  it safe where #372's OpenRouter pin was not is a property rather than a brand: the key "[does] not
+  pin requests to a machine", and the machines are OpenAI's own, so there is no non-caching endpoint
+  to stick to. **No live measurement was made** (the fleet runs no OpenAI-brained agent); that is
+  stated rather than papered over, and `cached_tokens=` stays the authority.
+- **OpenRouter sends nothing**, and #372's measurement stands until something overturns it.
+
+**A decided "no" is a present key, never an absent row.** In a plain table a deliberate no and a
+cell nobody considered are the same silence — the green-while-absent shape again — so OpenRouter's
+cell holds an explicit null, and a test enumerates the buildable cells from the config layer's own
+wired-provider list (now `_basecradle.OPENAI_SDK_PROVIDERS`, hoisted so there is one source of
+truth) and fails the build when one has no answer.
+
+**Verified off the actual request.** Per the standing rule #433 produced — *an adapter has not
+implemented `bind_conversation` until something outside the adapter proves the bytes left* — every
+assertion reads the recorded HTTP request's real body and real headers through respx, never a mock's
+arguments. The header form is a per-call `extra_headers`, which the SDK merges *over* the client's
+defaults, so it composes with OpenRouter's routing-metadata header and an operator's own.
+
+`prompt_cache_key` joins the harness-owned keys stripped from `model_params.json` with a warning: a
+single static value there would name every session on the box the same thing, herding unrelated
+prefixes onto one server and defeating the affinity it looks like it is asking for.
+
 ## [0.113.0] - 2026-08-29
 
 ### Fixed: only dialogue is mined — the memory boundary is enforced, and a scrub removes what got in (issue #438)
