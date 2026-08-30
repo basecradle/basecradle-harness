@@ -138,6 +138,7 @@ from basecradle_harness._memory_provider import (
     describe_memory_provider,
 )
 from basecradle_harness._messages import ImageContent, Message
+from basecradle_harness._mining import strip_injected
 from basecradle_harness._observability import (
     BLUE,
     GREEN,
@@ -671,10 +672,27 @@ class ClaimStore:
 _DEFAULT_BREAKER_MAX = 10
 _DEFAULT_BREAKER_WINDOW = 60.0
 
-#: The "user" side of the exchange a compaction summary is `observe`d as, on a memory provider with
-#: no store of its own (MemPalace). Its miner reads dialogue, so the summary needs a prompt to be the
-#: answer *to* — and this states plainly what it is, so a later search hit reads as the agent's own
-#: notes-to-self rather than as something a peer said (issue #276).
+#: The canned narration a turn falls back on when the engine's own reserve summary failed too
+#: (`WakeAgent._stuck_note`). Named because two readers need it by value: the note itself, and the
+#: mining boundary — the harness wrote this sentence, so it is never handed to a mining memory
+#: provider as though the model had said it (issue #438, `_mining`).
+_STUCK_NOTE = "I got stuck working through that and stopped before reaching an answer."
+
+#: The UTC-conversion instruction that rides the brief's current-time anchor (`_now_line`, issue
+#: #180). Hoisted out of the f-string so the scrub catalog can name the *same* sentence the brief
+#: composes from rather than a second copy of it (issue #438).
+_NOW_LINE_INSTRUCTION = (
+    "This clock is UTC. For a question about a specific locale's date or time, convert "
+    "from UTC to that timezone first — the local day can differ from the UTC day (e.g. "
+    "US Central is UTC-5 in summer / UTC-6 in winter)."
+)
+
+#: The "user" side of the exchange a compaction summary *used to* be observed as, on a memory
+#: provider with no store of its own (issue #276). **Historical**: the mining boundary retired that
+#: path (`_remember_compaction`, issue #438) — the harness wrote this sentence, so mining it was
+#: itself a boundary violation. It survives as a constant because every palace mined before the fix
+#: is full of copies of it, and the scrub catalog (`_mining`) must name the exact string the harness
+#: wrote rather than a second copy of it.
 _COMPACTION_OBSERVE_NOTE = (
     "[Context compaction] Summarize the work and conversation about to be dropped from my "
     "transcript, so it survives in memory."
@@ -2142,7 +2160,7 @@ class WakeAgent:
             # arriving in items the agent chose not to answer: a peer's birthday mentioned in a
             # message the agent had no reason to reply to must still be recallable, from any
             # timeline, later. The exchange is real whether or not anyone else heard it.
-            self._observe(shown, narration)
+            self._observe(_dialogue_of(item, kind), narration)
             # **The claim settles the instant its turn ends — not at `_settle`, and this is not
             # tidiness.** `_act_on` runs one turn *per item*, and a later item's turn can compact the
             # transcript (`Session.send` ends in `_compact_if_needed`, and an over-length rescue
@@ -2362,6 +2380,27 @@ class WakeAgent:
     def _observe(self, user: str, assistant: str) -> None:
         """Hand a completed exchange to the memory provider's `observe` hook, guarded.
 
+        **The one place the harness mines, and therefore the one place the boundary is kept**
+        (issue #438). A mining provider stores exactly two things — the text that came *into*
+        the harness and the text the *model* produced — and nothing the harness composed. This
+        docstring has claimed that since the seam shipped; it was false on four paths, and
+        @briggs found the proof in his own Turn-0 recall (two of five hits were copies of the
+        pre-0.112.0 recall heading, mined out of a brief and served back to him as memory).
+
+        The paths are closed at their sources, not here — `user` now arrives from an item's
+        **dialogue** rendering rather than the model-facing one (`_dialogue_of`), the compaction
+        summary is no longer mined at all (`_remember_compaction`), and the two things this
+        method does itself are:
+
+        - **A canned narration is not the model's output.** When the turn degraded, `assistant`
+          is `_STUCK_NOTE` — a sentence the *harness* wrote. It is dropped, and the peer's
+          message is still mined, because their half of the exchange is real whatever happened
+          to ours.
+        - **The recall block's own framing is stripped** (`strip_injected`). Defense in depth,
+          and deliberately narrow: it catches the one residue closure cannot reach — a model
+          quoting its own injected recall back in a reply, which is genuine LLM output on a path
+          that is genuinely mined.
+
         Fires after each real exchange (never on a probe ack or a self-skip — those never
         reach here). A no provider, or one whose hook is a no-op (the default SQLite
         provider), does nothing. A hook that *raises* is swallowed: auto-capture is a
@@ -2369,6 +2408,12 @@ class WakeAgent:
         posted.
         """
         if self.memory_provider is None:
+            return
+        user = strip_injected(user)
+        assistant = "" if self._degraded else strip_injected(assistant)
+        if not (user.strip() or assistant.strip()):
+            # Nothing but scaffolding, or a degraded turn on an item with no text of its own.
+            # Mining an empty exchange writes a drawer that can only ever dilute retrieval.
             return
         try:
             self.memory_provider.observe(
@@ -2384,44 +2429,61 @@ class WakeAgent:
         _log.debug("memory %s", kv(op="observe", chars=len(user) + len(assistant)))
 
     def _remember_compaction(self, summary: str) -> None:
-        """Write a compaction summary to durable memory — the answer to issue #276's requirement 7.
+        """Write a compaction summary to durable memory — issue #276's requirement 7, **bounded
+        by the mining boundary** (issue #438).
 
-        **The gap this closes.** The memory seam's `observe` hook is handed the *dialogue* only
-        (user text + the agent's reply — no briefs, no tool dumps), which is right: it is what keeps
-        MemPalace's palace worth searching. But it means tool-driven work leaves no durable trace
-        unless the agent happened to narrate it. Before compaction that is harmless — the tool
-        results are still in the live transcript. At compaction it stops being harmless: the turns
-        go, and with them any record that the work ever happened.
+        **The gap this closes.** `_observe` captures the *dialogue* only, which is right: it is
+        what keeps a mined palace worth searching. But it means tool-driven work leaves no
+        durable trace unless the agent happened to narrate it. Before compaction that is
+        harmless — the tool results are still in the live transcript. At compaction it stops
+        being harmless: the turns go, and with them any record that the work ever happened. So
+        the boundary is where it is captured, because the boundary is where it would be lost.
+        The summarizer is instructed to record the work first
+        (`_context._SUMMARIZE_INSTRUCTION`), and that summary is written here — to a provider
+        that has a durable **store** of its own:
 
-        So the boundary is where it is captured, because the boundary is where it would be lost. The
-        summarizer is instructed to record the work first (`_context._SUMMARIZE_INSTRUCTION`), and
-        that summary is written **here**, to whichever durable surface the bound provider has:
-
-        - a provider with a `store` (the default SQLite one, whose `observe` is a no-op) → a write
-          under an append-only, timestamped key, readable by the agent's own memory tool;
-        - a provider without one (MemPalace, a pure middleware whose `store` is `None` by design) →
-          its `observe` hook, which is what it durably keeps.
+        - a provider with a `store` (the default SQLite one, whose `observe` is a no-op) → a
+          write under an append-only, timestamped key, readable by the agent's own memory tool.
 
         What is *not* written is raw tool output: the point is a record of what was done, not a
-        second copy of the bytes being dropped — that would re-create this very bloat inside memory.
+        second copy of the bytes being dropped — that would re-create this very bloat inside
+        memory.
 
-        Its caller (`Compactor._remember`) guards it, like every memory hook: a failure here logs
-        and the compaction still stands. Memory is best-effort; the transcript bound is not.
+        **A provider with no store is no longer written to at all, and that is the fix, not a
+        regression** (issue #438). A store-less provider (MemPalace) is a *miner*: the only way
+        to hand it anything is `observe`, which files what it is given as a remembered exchange.
+        And this summary is the one thing in the harness that is guaranteed **not** to be one.
+        It is model text, but not the agent's reply: it is composed by a summarization call the
+        harness prompts, over a harness-composed rendering of a transcript region that carries
+        step notes, nudges, failure markers, injected captions, raw tool results — and, on any
+        agent whose transcript predates issue #275, whole persisted copies of the Turn-0 brief.
+        That is the route by which the pre-0.112.0 recall heading reached @briggs's palace, and
+        no filter over the *output* can close it, because the leak is in the input.
+
+        Nothing is mined in its place, deliberately: every user and assistant turn in the
+        dropped region **was already mined when it happened**, turn by turn, by `_observe`. A
+        dialogue-only re-mine at compaction would write a second copy of memories the palace
+        already holds — paid for in retrieval quality, which is the thing memory exists for.
+        What is genuinely not carried over for a mining provider is the *tool-work* half of the
+        summary, and that is the trade the boundary asks for: the transcript still gets the
+        summary in full (`Compactor`), so nothing is lost to the agent's own next turn.
+
+        Its caller (`Compactor._remember`) guards it, like every memory hook: a failure here
+        logs and the compaction still stands. Memory is best-effort; the transcript bound is not.
         """
         if self.memory_provider is None:
             return
-        scope = MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid)
         store = getattr(self.memory_provider, "store", None)
         write = getattr(store, "write", None)
-        if callable(write):
-            key = f"compaction/{self.source}/{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}"
-            write(key, summary)
-            _log.info("memory %s", kv(op="write", key=key, chars=len(summary)))
+        if not callable(write):
+            _log.debug(
+                "memory %s",
+                kv(op="skip", source="compaction", reason="mining provider; boundary #438"),
+            )
             return
-        self.memory_provider.observe(
-            MemoryExchange(user=_COMPACTION_OBSERVE_NOTE, assistant=summary, scope=scope)
-        )
-        _log.info("memory %s", kv(op="observe", source="compaction", chars=len(summary)))
+        key = f"compaction/{self.source}/{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}"
+        write(key, summary)
+        _log.info("memory %s", kv(op="write", key=key, chars=len(summary)))
 
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
         """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.
@@ -3059,7 +3121,11 @@ class WakeAgent:
                 narration = self._stuck_note(error)
             self._model_ok()  # a call got through → clear any billing-blocked marker (issue #336)
             self._unspoken(narration)
-            self._observe(rendered, narration)
+            # A resumed **message** turn is mined from `rendered`, not from the item: the dead
+            # wake's turn may have carried a *batch* (`_render_batch`), and mining the one item
+            # that owned the claim would forget the peers it was answered alongside. That
+            # rendering is already dialogue — every other kind's is not (`_dialogue_of`).
+            self._observe(rendered if kind == _MESSAGES else _dialogue_of(item, kind), narration)
             self.claims.commit(self.timeline_uuid, uuid, kind=kind)
         except ProviderContextLengthError as error:
             # The transcript has outgrown the model's window and **cannot be compacted** — the
@@ -3580,7 +3646,7 @@ class WakeAgent:
             head("degraded", YELLOW),
             kv(timeline=self.timeline_uuid, reason=str(error)),
         )
-        return "I got stuck working through that and stopped before reaching an answer."
+        return _STUCK_NOTE
 
     def _report_provider_failure(
         self,
@@ -3861,6 +3927,33 @@ def _trigger_label(trigger: str | None, event: str | None, asset: str | None) ->
     return None
 
 
+def _dialogue_of(item: object, kind: str) -> str:
+    """One inbound item as **dialogue** — the only rendering the harness may mine (issue #438).
+
+    The sibling of the `render`/`text` callables `_act_on` hands the model, and deliberately not
+    the same function. Those exist to tell the model *what to do* with an item, so they carry
+    harness-composed framing — "Use the assets tool to 'read' it…", "Decide whether and how to
+    act on it. Its payload:", "Carry out its instructions:". That framing is instruction, not
+    conversation, and mining it files the harness's own words as something the agent remembers
+    being told.
+
+    What each kind keeps is the item's own content plus its provenance — the ``[created_at]``
+    stamp and the handle. Provenance is deliberately *in*: a mined chunk is only findable by what
+    it says, and a handle and a date are exactly the exact tokens the palace searches on.
+
+    Composed from the same halves the model-facing renderers are built from (`_asset_dialogue`,
+    `_event_dialogue`, `_task_dialogue`), never a second spelling of them — a mined rendering
+    that drifted from the shown one would be a memory of a conversation that did not happen.
+    """
+    if kind == _ASSETS:
+        return _asset_dialogue(item)
+    if kind == _EVENTS:
+        return f"{_event_dialogue(item)}\n{_event_payload(item.content)}"
+    if kind == _TASKS:
+        return f"{_task_dialogue(item)}\n{item.content.instructions}"
+    return _incoming_text(item)
+
+
 def _render_batch(messages: list[object]) -> str:
     """Render a batch of unseen messages as one turn's text — the many-to-one reply input.
 
@@ -3916,12 +4009,7 @@ def _now_line() -> str:
     """
     n = datetime.now(timezone.utc)
     anchor = f"Current Time: {n:%Y-%m-%d %H:%M:%S} UTC (+00:00, {n:%A})"
-    instruction = (
-        "This clock is UTC. For a question about a specific locale's date or time, convert "
-        "from UTC to that timezone first — the local day can differ from the UTC day (e.g. "
-        "US Central is UTC-5 in summer / UTC-6 in winter)."
-    )
-    return f"{anchor}\n{instruction}"
+    return f"{anchor}\n{_NOW_LINE_INSTRUCTION}"
 
 
 def _incoming_asset_text(asset: object) -> str:
@@ -3936,10 +4024,22 @@ def _incoming_asset_text(asset: object) -> str:
     The leading ``[created_at]`` stamp is the asset item's own timeline timestamp, read
     against the brief's `Current Time:` anchor so the model can reason about its age.
     """
+    return _asset_dialogue(asset) + _ASSET_TOOL_HINT
+
+
+#: What the harness appends to an asset line so the model knows how to open the file. Framing,
+#: not dialogue: `_asset_dialogue` is the half that gets mined (issue #438).
+_ASSET_TOOL_HINT = (
+    " Use the assets tool to 'read' it (or 'view' an image / 'listen' to audio) if you want to "
+    "engage with it."
+)
+
+
+def _asset_dialogue(asset: object) -> str:
+    """The peer-authored half of a posted asset: who shared what, when. Never the tool hint."""
     return (
         f"[{asset.created_at}] {asset.user.handle} posted a file to this timeline: "
-        f"{_describe(asset)}. Use the assets tool to 'read' it (or 'view' an image / "
-        "'listen' to audio) if you want to engage with it."
+        f"{_describe(asset)}."
     )
 
 
@@ -3960,18 +4060,32 @@ def _incoming_event_text(event: object) -> str:
     against the brief's `Current Time:` anchor so the model can reason about its age.
     """
     content = event.content
-    payload = content.payload
-    if len(payload) > _MAX_EVENT_PAYLOAD:
-        payload = (
-            payload[:_MAX_EVENT_PAYLOAD].rstrip()
-            + f"\n… (payload truncated — use the webhook_events tool to read {content.uuid} in full)"
+    payload = _event_payload(content)
+    if len(content.payload) > _MAX_EVENT_PAYLOAD:
+        payload += (
+            f"\n… (payload truncated — use the webhook_events tool to read {content.uuid} in full)"
         )
+    return _event_dialogue(event) + _EVENT_ACT_HINT + f"\n{payload}"
+
+
+#: The instruction the harness wraps around a delivery. Framing, not dialogue (issue #438).
+_EVENT_ACT_HINT = " Decide whether and how to act on it. Its payload:"
+
+
+def _event_dialogue(event: object) -> str:
+    """The delivery's own header — what arrived, from which endpoint, when."""
+    content = event.content
     return (
         f"[{event.created_at}] An inbound webhook was delivered to this timeline "
         f"(event {content.uuid}, endpoint {event.webhook_endpoint.uuid}, "
-        f"content_type {content.content_type}). Decide whether and how to act on it. "
-        f"Its payload:\n{payload}"
+        f"content_type {content.content_type})."
     )
+
+
+def _event_payload(content: object) -> str:
+    """The delivery body, bounded — the externally-authored text, with no harness pointer on it."""
+    payload = content.payload
+    return payload if len(payload) <= _MAX_EVENT_PAYLOAD else payload[:_MAX_EVENT_PAYLOAD].rstrip()
 
 
 def _activated_task_text(task: object) -> str:
@@ -3987,10 +4101,20 @@ def _activated_task_text(task: object) -> str:
     complementary ``scheduled for {activate_at}`` text stays.
     """
     content = task.content
+    return _task_dialogue(task) + _TASK_CARRY_OUT_HINT + f"\n{content.instructions}"
+
+
+#: The directive the harness wraps around an activation. Framing, not dialogue (issue #438) —
+#: the task's own `instructions` are authored by the agent or a peer and are mined; this is not.
+_TASK_CARRY_OUT_HINT = " Carry out its instructions:"
+
+
+def _task_dialogue(task: object) -> str:
+    """The activation's own header — which task, when it was scheduled for, when it fired."""
+    content = task.content
     return (
         f"[{task.created_at}] A task you scheduled has activated and is due now "
-        f"(task {content.uuid}, scheduled for {content.activate_at}). "
-        f"Carry out its instructions:\n{content.instructions}"
+        f"(task {content.uuid}, scheduled for {content.activate_at})."
     )
 
 

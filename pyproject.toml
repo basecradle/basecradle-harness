@@ -97,6 +97,10 @@ basecradle-harness-claims = "basecradle_harness._verify:emit_main"
 # and a rename would take the founder-named LLM Vendor Payment Failed alert silently dark. Renders
 # through the production renderers, stamped `source=probe` so it can never page a human.
 basecradle-harness-log-grammar = "basecradle_harness._log_grammar:main"
+# Find (and with --apply, delete) harness-composed scaffolding mined into a MemPalace palace before
+# the mining boundary was enforced (issue #438). Dry run by default; the dry run is also the
+# discovery pass for scaffolding classes the catalog does not yet name.
+basecradle-harness-scrub-palace = "basecradle_harness._scrub:main"
 
 [project.urls]
 Homepage = "https://basecradle.com"

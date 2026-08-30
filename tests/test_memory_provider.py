@@ -511,6 +511,12 @@ def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):
 # searching. But it means tool-driven work leaves no durable trace unless the agent narrated it.
 # That is harmless while the turns are still in the transcript, and stops being harmless the moment
 # compaction drops them. So the boundary is where the work is captured.
+#
+# ...for a provider with a **store**. Issue #438 took the other half away on purpose: a store-less
+# provider is a *miner*, `observe` is the only way to hand it anything, and this summary is the one
+# piece of model text in the harness that is not the agent's reply — it is distilled from a region
+# carrying step notes, nudges, tool results, and (before issue #275) whole persisted briefs. That is
+# how the pre-0.112.0 recall heading reached @briggs's palace.
 
 
 def test_a_compaction_summary_is_written_to_a_providers_store(platform, tmp_path):
@@ -528,20 +534,20 @@ def test_a_compaction_summary_is_written_to_a_providers_store(platform, tmp_path
     memory.close()
 
 
-def test_a_storeless_provider_gets_the_summary_through_observe(platform, tmp_path):
-    """MemPalace is a pure middleware: its `store` is None by design, so `observe` is the surface."""
+def test_a_storeless_provider_is_never_mined_a_compaction_summary(platform, tmp_path):
+    """A miner gets nothing: the summary is harness-composed, and `observe` is mining (issue #438).
+
+    The inverse of the test above, and the one that pins the boundary. A store-less provider
+    (MemPalace) has no surface but `observe`, so "write the summary somewhere durable" and "file
+    the summary as a remembered exchange" are the same act — and the second one is the leak.
+    """
     memory = RecordingProvider()
     memory.store = None
     agent = _wake(tmp_path, memory)
 
     agent._remember_compaction("WORK DONE: I filed the issue.")
 
-    assert len(memory.observed) == 1
-    exchange = memory.observed[0]
-    assert exchange.assistant == "WORK DONE: I filed the issue."
-    assert "compaction" in exchange.user.lower()  # framed as the agent's own notes, not a peer's
-    # Scoped to the *agent*, never partitioned by timeline — memory is one mind across every channel.
-    assert exchange.scope.agent == agent.me_uuid
+    assert memory.observed == []
 
 
 def test_a_memory_failure_never_undoes_a_compaction(platform, tmp_path):

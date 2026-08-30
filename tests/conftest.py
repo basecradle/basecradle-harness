@@ -14,7 +14,7 @@ import respx
 import respx.mocks
 from respx.mocks import HTTPCoreMocker
 
-from basecradle_harness import OpenAIProvider
+from basecradle_harness import OpenAIProvider, _mining
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -88,6 +88,9 @@ def _isolated_config_home(tmp_path_factory, monkeypatch):
     that exercises the config home overrides it (or passes an explicit ``home=``).
     """
     monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(tmp_path_factory.mktemp("config-home")))
+    # The scaffolding catalog reads that home's charter and memoizes the result (`_mining.catalog`),
+    # so a catalog built under one test's config home would answer for the next one's.
+    _mining._reset()
 
 
 @pytest.fixture

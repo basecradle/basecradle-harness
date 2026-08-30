@@ -7,6 +7,88 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.113.0] - 2026-08-29
+
+### Fixed: only dialogue is mined — the memory boundary is enforced, and a scrub removes what got in (issue #438)
+
+`_wake._observe`'s docstring had promised since the memory seam shipped that the hook "is handed
+the *dialogue* only (user text + the agent's reply — no briefs, no tool dumps)." Nothing enforced
+it, and it was false. @briggs read the proof off his own Turn-0 recall on the first 0.112.0 wake:
+**two of five injected hits were copies of the pre-0.112.0 recall heading itself** — the brief,
+mined into the palace, and served back to him as memory, occupying top-K slots real memories
+should hold.
+
+The founder's invariant, stated 2026-08-29: a mining provider stores **the text sent into the
+harness** and **the LLM's output**, and *nothing the harness composes* — not the charter, not any
+part of the Turn-0 brief, not the tool manifest, not the recalled-memory section itself, not tool
+results.
+
+**The arrival route, positively identified.** Before [issue #275](https://github.com/basecradle/basecradle-harness/issues/275)
+the brief was **persisted** into the transcript on every wake (`session.note(brief)`) — recall
+block and all. #275 made it ephemeral but removed nothing already written, so those copies sat in
+live transcripts when compaction landed ([issue #276](https://github.com/basecradle/basecradle-harness/issues/276)).
+Compaction renders the region it drops **verbatim** for the summarizer, and its summary was handed
+to `observe` on a store-less provider. The heading rode the summary into the palace. The leak is
+in the *input*, so no filter over the output could ever have closed it.
+
+**Closed at the sources — a filter is not the fix.**
+
+- **An inbound item is mined from a new *dialogue* rendering, not the model-facing one**
+  (`_dialogue_of`). The model is told what to do with an item ("Use the assets tool to 'read'
+  it", "Decide whether and how to act on it. Its payload:", "Carry out its instructions:"); the
+  palace gets the item's own content plus its provenance — the timestamp and the handle. Both
+  halves are composed from the same constants, so a mined rendering can never drift from the
+  shown one. A resumed *message* turn is still mined from the turn's own rendering, because that
+  turn may have carried a batch.
+- **A compaction summary is no longer mined at all**, on a store-less (mining) provider. It is
+  model text but it is not the agent's reply, and every user and assistant turn in the region it
+  summarizes **was already mined when it happened**. A provider with a `store` (the default
+  SQLite one) still gets it written under a timestamped key, readable with the agent's own
+  `memory` tool — a write, not mining. What a mining provider loses is the tool-*work* half of
+  that summary; the transcript still receives the summary in full.
+- **The harness never files its own words as the agent's.** A turn that ended on the canned "I
+  got stuck…" note mines the peer's half and an empty reply.
+- **Defense in depth, deliberately narrow.** The recall block's own framing literals are stripped
+  from text entering `observe`, case-insensitively — catching the one residue closure cannot: the
+  model quoting its injected recall back in a reply, which is genuine model output on a path that
+  is genuinely mined. An exchange that empties out is not mined at all.
+
+The boundary is pinned by a synthetic wake carrying a distinct sentinel in the charter, the tool
+manifest, the dashboard and the recalled-memory block: the test asserts the model **saw** every
+one and the provider was handed **none**, so a future edit that re-opens a path fails the build
+without anyone having had to think of that path.
+
+### Added: `basecradle-harness-scrub-palace` — remove harness scaffolding from a mined palace
+
+Prevention does not clean a palace that is already polluted. The new console script does, and it
+is **dry run by default**:
+
+```bash
+basecradle-harness-scrub-palace            # report; delete nothing
+basecradle-harness-scrub-palace --apply    # delete exactly what the dry run reported
+```
+
+- The **catalog is versioned in code and assembled from the constants the harness composes from**
+  — never re-typed, so it moves when a wording does. It covers the recall heading (current *and*
+  the pre-0.112.0 one, which exists in no source file any more), the fence tags, the compaction
+  prompt and summarizer instruction, the canned stuck note, the brief's generated sections, the
+  engine's step and reserve notes, the turn hooks' nudges, the transcript's repair markers, and
+  **this box's own charter** as the config home holds it.
+- **Exact-literal matching, never fuzzy.** A chunk is deleted only when *every* content-bearing
+  line is a catalog literal, so a real memory that merely mentions memory, tools or the brief
+  cannot match. A chunk mixing scaffolding with real content is reported under `REVIEW` and
+  deleted by nothing.
+- **The dry run is the discovery pass**, printing every match in full, grouped by class and
+  reason — the artifact a review gates an apply on.
+- **`--apply` removes the conversation file with its drawers**, and that is load-bearing:
+  MemPalace re-mines any file whose drawers are gone or incomplete, so a scrub that left the file
+  behind would be undone by the very next wake. Only paths inside the palace's own
+  `conversations/` directory are ever unlinked.
+
+Smoke-tested against a real MemPalace 3.8.0 palace built through the adapter itself: the dry run's
+counts matched what apply did, the scaffolding was gone, the real memories searched back
+identically, and a subsequent `observe` did not re-mine what was removed.
+
 ## [0.112.0] - 2026-08-29
 
 ### Fixed: the MemPalace Turn-0 recall is fenced, and says who wrote it (issue #436)
