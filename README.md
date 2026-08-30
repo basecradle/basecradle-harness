@@ -140,6 +140,31 @@ The command itself is reachable by that bare name too — the venv the agent is 
 
 That file is a **projection of the binding, never an input to it** — the adapter resolves its own palace from `$HARNESS_HOME` and never reads the file back, so it cannot redirect the agent's mind, and it is rewritten from the live value on every bind, so it cannot go stale after a move. Your settings in it (`embedding_model`, `backend`, …) are merged, never replaced; a `config.json` that doesn't parse is left alone and reported rather than clobbered; and nothing here ever creates a palace — an agent on the default `sqlite` provider, and anyone using MemPalace outside the harness, keeps upstream's behavior untouched. Precedence is upstream's in both directions: `--palace` beats everything, and **`MEMPALACE_PALACE_PATH`** (or the legacy `MEMPAL_PALACE_PATH`) beats the file — which is exactly why the adapter honors those vars too. If it didn't, exporting one would point the CLI somewhere the agent isn't, silently.
 
+**Only dialogue is mined — nothing the harness composes ever reaches the palace.** A mining provider stores exactly two things: the text that came *into* the harness (a peer's message, an activated task's instructions, a delivered webhook's payload) and the **model's own output**. The charter, the tool manifest, the step budget, the current-time anchor, the dashboard, the recalled-memory block itself, the canned note a degraded turn ends on, tool results — none of it is dialogue, and none of it is handed to `observe` ([issue #438](https://github.com/basecradle/basecradle-harness/issues/438)). This was a claim in a docstring before it was a rule in the code, and the claim was false: @briggs found two of five Turn-0 recall hits were copies of the recall block's *own heading*, mined out of his brief and served back to him as memory.
+
+Three things enforce it, and the first two are the fix:
+
+- **An inbound item is mined from its dialogue rendering, not the one the model reads.** The model is told what to *do* with an item ("Use the assets tool to 'read' it", "Carry out its instructions:"); the palace gets the item's own content plus its provenance — the timestamp and the handle, which are exactly the exact tokens recall searches on.
+- **The harness never files its own words as the agent's.** A turn that ended on the canned "I got stuck…" note mines the peer's half and an empty reply; and a **compaction summary is no longer mined at all** on a store-less provider. That summary is model text but it is not the agent's reply — it is distilled from a transcript region carrying step notes, nudges, tool results and (before [issue #275](https://github.com/basecradle/basecradle-harness/issues/275)) whole persisted copies of the brief, which is precisely how the old heading got in. Nothing replaces it, because every user and assistant turn in that region **was already mined when it happened**. A provider with a `store` (the default SQLite one) still gets the summary written under a timestamped key, readable with the agent's own `memory` tool — that is a write, not mining.
+- **Defense in depth, deliberately narrow.** The recall block's framing literals are stripped from text on its way into `observe`, case-insensitively. This catches the one residue closure cannot: the model quoting its own injected recall back in a reply, which is genuine model output on a path that is genuinely mined.
+
+### Scrub a polluted palace — `basecradle-harness-scrub-palace`
+
+Enforcing the boundary stops new scaffolding; it does not remove what a palace mined before the fix. That is what this does — **dry run by default**:
+
+```bash
+basecradle-harness-scrub-palace                      # report; delete nothing
+basecradle-harness-scrub-palace --palace /path/to/palace
+basecradle-harness-scrub-palace --apply              # delete exactly what the dry run reported
+```
+
+The palace resolves the way a wake resolves it (`MEMPALACE_PALACE_PATH`, else `$HARNESS_HOME/mempalace`), so running it as the agent's own OS user needs no flags.
+
+- **The catalog is versioned in code and assembled from the constants the harness composes from** — the recall heading (current *and* the pre-0.112.0 one, which exists in no source file any more), the fence tags, the compaction prompt and summarizer instruction, the canned stuck note, the brief's generated sections, the engine's step and reserve notes, the turn hooks' nudges, the transcript's own repair markers, and **this box's charter** (`system-prompt.md` / `initialize.md` as the config home actually holds them, not just the shipped defaults).
+- **Matching is exact-literal, never fuzzy.** A chunk is deleted only when *every* content-bearing line in it is a catalog literal — so a real memory that merely *mentions* memory, tools or the brief cannot match. A chunk that quotes a scaffolding line **beside real content** is reported under `REVIEW` and deleted by nothing.
+- **The dry run is also the discovery pass.** It prints every match in full (never an excerpt — a review gates the apply on it), grouped by the catalog class and its reason. Anything scaffolding-shaped that shows up under `REVIEW` and is not yet in the catalog goes to review and, if confirmed, into the catalog; then the dry run is repeated. It never becomes an improvised delete.
+- **`--apply` removes the conversation file with the drawers, and that is load-bearing.** The adapter mines *files*, and MemPalace re-mines any file whose drawers are gone or incomplete — so a scrub that left the file behind would be undone by the very next wake. Only paths inside the palace's own `conversations/` directory are ever unlinked.
+
 Writing your own is one small class — implement only the surfaces you want:
 
 ```python
