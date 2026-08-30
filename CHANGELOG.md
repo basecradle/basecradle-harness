@@ -7,6 +7,62 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.115.0] - 2026-08-30
+
+### Fixed: the scrub deleted quotes out of real conversations, and unlinked the conversations with them (issue #444)
+
+The [#438](https://github.com/basecradle/basecradle-harness/issues/438) scrub's staging dry run
+classified five chunks `SCRUB` on @briggs's palace. **All five were quote-lines sliced out of real
+conversations** — three of them @origin's own 2026-08-16 Title Case charter-draft lines, sent *to*
+@briggs in a message; two were the recall heading quoted inside the #436 design threads. He read the
+source files from his own seat and called a hold.
+
+**The false-positive class: a real conversation that quotes scaffolding, chunked so the quote stands
+alone in its own drawer.** `classify`'s whole-chunk exact-literal rule is sound for what a chunk
+*is* — but chunking can make a quote-only line into a whole chunk, at which point "every
+content-bearing line is a catalog literal" is true of genuine dialogue. And nothing at the matcher
+level divides the two: `_LEAD` strips the leading `> ` before matching, and it has to, because
+MemPalace's exchange format quotes the **user half of every exchange** that way — so pre-0.114.0
+pollution riding the user slot arrived quote-prefixed too. The prefix cannot tell "the harness
+composed this" from "a person quoted it".
+
+**The compounding layer** was `--apply`'s file unlink — correct for the re-mine invariant, and
+therefore fatal here: one `SCRUB` chunk dragged the *entire real conversation file*, deleting a
+founder's actual conversation record while its sibling `KEEP` drawers survived orphaned of their
+provenance.
+
+**The fix stops trying to divine intent and reads a structural fact instead: a real conversation
+mines sibling drawers, and a pure scaffolding artifact does not.** The unit of a scrub is now the
+**source file, never the drawer**:
+
+- A file is scrubbable only when **every** drawer it mined classified `SCRUB` — unanimity. One
+  sibling that is a memory, is mixed, or cannot be classified at all holds the **whole** file:
+  every one of its matches moves to a new **`HELD`** list, deleted by nothing, drawer and file
+  alike. `HELD` is its own report section rather than a note inside `REVIEW`, because the two say
+  different things — a review finding mixes scaffolding with content *in one chunk*; a held finding
+  is pure catalog text whose *file* is a real conversation.
+- **A drawer with no recorded provenance is held too.** Unanimity is a statement about a file's
+  other drawers, and one that names no file has none that can be counted. Before this it was
+  deleted on its own text alone — exactly the evidence the hold ruled insufficient. Unproven is
+  held; the failure direction here is always "left alone".
+- **Both the unlink and the drawer delete re-check the condition at the point of action**
+  (`_blocked`), not only where `scan` sorted the findings. The founder's condition is about what
+  the tool *does*, and a rule enforced only in the classifier is a rule the delete site does not
+  have.
+
+This satisfies the founder's condition without touching the catalog — the capital's own reading, and
+the reason the file-unanimity direction cuts the knot: it needs no intent-divination. It also
+preserves the files-first re-mine invariant, because the two rules turn out to be one rule read from
+both ends: **a file is scrubbed whole or not at all**, so an unlink can never drag a conversation
+other drawers still remember, and a surviving drawer is never orphaned of the file it was mined
+from. A pure compaction-summary-of-a-brief file — the original #438 pollution vehicle — is exactly
+the unanimous case, so true pollution still dies whole.
+
+Tests pin the class end to end: a synthetic palace whose one real conversation quotes **every**
+catalog literal (the quote lines derived from `catalog()` itself, so a class added later is covered
+the day it lands) loses nothing on apply — not a drawer, not the file — while a unanimously
+scaffolding file beside it still dies whole.
+
 ## [0.114.0] - 2026-08-30
 
 ### Fixed: the rest of the cache-affinity matrix — `OpenAIProvider` sent no routing key on any of its three vendors (issue #435)
