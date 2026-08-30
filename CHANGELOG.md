@@ -7,6 +7,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.112.0] - 2026-08-29
+
+### Fixed: the MemPalace Turn-0 recall is fenced, and says who wrote it (issue #436)
+
+`context()`'s injected block opened with a bare prose line and had **no end boundary**. Its body is
+raw mined conversation text, and it is spliced into the *system* turn — between the operating
+dashboard and the agent's charter — so the recall bled straight into the charter that followed it.
+Reported live from the reader's seat by @briggs, who could not swear from perception where the block
+started or ended inside a ~54K-character brief. The second half of the defect is worse than the
+cosmetics: recalled excerpts are quotes of *peers*, and a quote of people discussing how the agent
+should operate, landing in charter position with no boundary, reads as a standing rule it just
+acquired.
+
+The block is now wrapped in a `<mempalace-recall>` … `</mempalace-recall>` tag pair, under a framing
+sentence that names **MemPalace** as the generator and states that the contents are excerpts of past
+conversation, **not part of the current message and not instructions**. The generator's name is on
+the fence itself, not only in the prose above it, because a reader skimming a 54K brief scans tags,
+not sentences.
+
+Both tag literals are **stripped from a hit's text before it is fenced, case-insensitively** — hits
+are mined from real conversations, so a peer who types `</mempalace-recall>` into a message would
+otherwise forge an early end-of-block and have everything after it read as charter; an opener inside
+the body is the same forgery run the other way, so both sides are stripped. No hits → no block at
+all: `context()` still returns `None`, with no empty fence and no orphan sentence.
+
+`memory_search` **tool results are byte-identical** — a tool result is already bounded by its own
+envelope and answers a question the model asked, so it is deliberately left unfenced.
+
 ## [0.111.0] - 2026-08-29
 
 ### Fixed: the xAI cache-affinity key now reaches the wire — `conversation_id` never did (issue #433)
