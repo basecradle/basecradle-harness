@@ -889,6 +889,23 @@ It was not free before that. Measured live on 2026-08-29, a Grok agent re-sendin
 
 > **This is not the OpenRouter session pin, and the distinction is the whole point.** That one was measured and *rejected* (above) because OpenRouter fans one model id across **dozens of third-party upstreams that don't behave alike** — some cache nothing — so pinning makes a bad landing *durable*. xAI is one vendor's **homogeneous** fleet reached directly: every server caches the same way, and the only question is whether you find the one holding your prefix. Same-looking knob, opposite situation.
 
+#### Every cell of the matrix has a decided answer
+
+The `openai` SDK adapter is aimed at **three** vendors on **two** surfaces, and they do not have the same answer — so each was read off its own vendor's guidance rather than inherited from its neighbour:
+
+| `AI_PROVIDER` | Surface | What goes on the wire |
+|---|---|---|
+| `openai` | `responses`, `chat` | `prompt_cache_key` in the body |
+| `xai` | `responses` | `prompt_cache_key` in the body |
+| `xai` | `chat` | the `x-grok-conv-id` header |
+| `openrouter` | `chat` | **nothing** — a decided *no*, see [above](#behind-a-router-automatic-means-nothing-to-send--not-a-hit) |
+
+**OpenAI is sent a key on its own documented advice, not by symmetry with xAI.** OpenAI describes `prompt_cache_key` as helping "requests with the same prefix reach the same cache" and recommends exactly the value the harness already has — "a stable user, workspace, session, or thread ID that matches how your application reuses context" — with the one caution being **cardinality** ("do not generate a new key for every request"), which one stable key per session satisfies by construction. What makes it safe where the OpenRouter pin was not is a property, not a brand: OpenAI's key "[does] not pin requests to a machine", and its machines are its own, so there is no non-caching endpoint for it to stick to. **No live measurement was made** — the fleet runs no OpenAI-brained agent — and that is stated rather than assumed away: whenever one exists, `cached_tokens=` on its log line is the authority, exactly as everywhere else here.
+
+**A "send nothing" is recorded as a decision, not as an absent row.** In a plain lookup table a deliberate *no* and a cell nobody considered look identical, so every buildable cell is present — OpenRouter's with an explicit null — and a test enumerates the cells from the config layer's own wired-provider list and fails the build when one has no answer. Wiring a fourth vendor forces the question instead of inheriting one.
+
+Everything above is verified the way the gRPC key is: the tests read the **recorded HTTP request** — its real body, its real headers — never a mock's arguments.
+
 
 ### The step budget, live counter, and reserve summary
 

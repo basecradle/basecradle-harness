@@ -81,6 +81,31 @@ OpenTelemetry span attribute, so 0.110.0 bound the key, passed every test, and r
 with it. The lesson generalizes past xAI and is why this capability is deliberately thin: **an
 adapter has not implemented `bind_conversation` until something proves the key left the process.**
 
+The rest of the matrix, decided per cell rather than by symmetry (issue #435)
+----------------------------------------------------------------------------
+`bind_conversation` shipped on exactly one adapter in #433, which left `OpenAIProvider` — the one
+adapter aimed at **three** vendors — sending no routing key anywhere. The cells do not have the
+same answer, so each was read off its own vendor's guidance and the answers live in
+`_openai._AFFINITY`, where a cell's **absence** is the decision:
+
+- **``AI_PROVIDER=xai`` over the ``openai`` SDK** — the same per-server cache #431 measured, reached
+  over HTTP instead of gRPC, and xAI spells the remedy per surface: ``prompt_cache_key`` in the
+  Responses body, ``x-grok-conv-id`` as a Chat Completions header. Both go on the wire. The SDK
+  takes each **per call**, so unlike the native adapter there is no client to rebuild.
+- **``AI_PROVIDER=openai``** — sent, and *not* by symmetry with xAI: OpenAI documents
+  ``prompt_cache_key`` for this exact purpose (*"help requests with the same prefix reach the same
+  cache"*) and recommends exactly the value the harness has (*"a stable user, workspace, session, or
+  thread ID that matches how your application reuses context"*). Their one stated caution is
+  **cardinality** — *"do not generate a new key for every request"* — and one stable key per session
+  is the recommended shape rather than an approximation of it. What makes this different from the
+  rejected OpenRouter pin is the property below, not the vendor's name: OpenAI's own machines are
+  homogeneous and the key *"[does] not pin requests to a machine"*, so there is no bad endpoint for
+  it to stick to. **No live measurement was made** — the fleet runs no OpenAI-brained agent to
+  measure on — and that is stated rather than papered over: whenever one appears, the
+  ``cached_tokens=`` on its log line is the authority, exactly as it is everywhere else.
+- **``AI_PROVIDER=openrouter``** (through either adapter) — **nothing**, and this is the one cell
+  where sending a key would be a regression, not an omission. See the paragraph below.
+
 **This is not the OpenRouter session pin, and it must not be "consistency"-ed away.** Issue #372
 measured an eager `session_id` pin *for OpenRouter* and **rejected** it — and the reasoning does not
 transfer, because it turned on the one property xAI does not have: OpenRouter fans one model id out
