@@ -15,6 +15,13 @@ this account can show being mistaken for the runway:
   the credit the cycle draws *against*, not what is left of it. The tool must lead with
   `prepaidCredits − prepaidCreditsUsed`, never the first field alone.
 
+A third thing pinned here belongs to the *live* suite rather than to the tool: that suite's #388
+assertion runs against an account which never stops spending, so the last two tests in this file
+drive the real live function against a preview whose draw advances between reads — once proving it
+survives the drift, once proving it still catches the #388 defect through it. A live-marked test
+cannot prove its own race-freedom (it needs a real key, and the race is a coincidence of timing), so
+the proof lives offline, beside the fixtures that can produce the condition on demand (issue #450).
+
 The fixture bodies are one coherent (fabricated) snapshot in the live proportions of 2026-08-02
 21:14 UTC, when the Console showed **$52.14** remaining: `$168.47` of prepaid credit, `$116.66`
 drawn this cycle → **$51.81** remaining, against a `$567.49` posted ledger. Those proportions are
@@ -31,6 +38,7 @@ import respx
 
 from basecradle_harness import Policy, ToolRegistry, XaiAccountBalanceTool
 from basecradle_harness._xai_account import DEFAULT_BASE_URL, _dollars
+from tests import test_xai_account_live as live
 
 # A fabricated, well-formed UUIDv7 standing in for the agent's team — never a real team id.
 TEAM = "019510a0-2b3c-7d4e-8f01-23456789abcd"
@@ -38,6 +46,10 @@ KEY = "xai-mgmt-fake-key-000"
 VALIDATE_URL = f"{DEFAULT_BASE_URL}/auth/management-keys/validation"
 PREVIEW_URL = f"{DEFAULT_BASE_URL}/v1/billing/teams/{TEAM}/postpaid/invoice/preview"
 LEDGER_URL = f"{DEFAULT_BASE_URL}/v1/billing/teams/{TEAM}/prepaid/balance"
+
+# `prepaidCreditsUsed` advancing $0.04 a read: half the fleet draw measured on the NOC prober box
+# (2026-08-31, $0.08 in 32 s) and four times the $0.01 the live suite used to compare against.
+DRIFT = ["-46430", "-46434", "-46438"]
 
 
 def _preview_body(
@@ -325,6 +337,7 @@ def test_an_explicit_team_id_skips_discovery(tool):
 def test_team_id_read_from_the_environment(monkeypatch):
     monkeypatch.setenv("XAI_MANAGEMENT_KEY", KEY)
     monkeypatch.setenv("XAI_TEAM_ID", TEAM)
+    monkeypatch.setattr(live, "KEY", KEY)  # never build the oracle's header from an ambient key
     tool = XaiAccountBalanceTool(cache_ttl=0)  # both from env
     with respx.mock(assert_all_called=True) as mock:
         _mock_both(mock)
@@ -628,3 +641,80 @@ def test_loads_under_the_locked_default_profile():
     registry.register(XaiAccountBalanceTool())
     assert "xai_account_balance" in registry
     assert XaiAccountBalanceTool().parameters == {"type": "object", "properties": {}}
+
+
+# --- the live suite's own race, pinned offline (issue #450) -------------------
+
+
+def _a_drifting_preview(prepaid_cents: str, drawn_cents: list[str]):
+    """A preview whose `prepaidCreditsUsed` advances on every read — a live account, spending.
+
+    The one condition the live suite runs under and no fixture used to reproduce: three xAI
+    personas draw on that account continuously, so two oracle reads seconds apart are two
+    different numbers.
+    """
+    reads = iter(drawn_cents)
+    last = drawn_cents[-1]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal last
+        last = next(reads, last)
+        return httpx.Response(200, json=_preview_body(prepaid_cents, last))
+
+    return respond
+
+
+def test_the_live_bracket_survives_an_account_that_moves_between_reads(monkeypatch):
+    """The live `test_the_live_figure_nets_the_cycles_prepaid_draw` passes while the account moves.
+
+    The live suite's #388 assertion used to be an **equality** against a single oracle read, which
+    compares two figures fetched at two different instants. Measured on the NOC prober box
+    2026-08-31, ordinary fleet traffic moved `prepaidCreditsUsed` by $0.08 in 32 seconds — eight
+    times the $0.01 tolerance — so the arm that would have run it daily was held disarmed rather
+    than install a known-intermittent false page whose red is indistinguishable from the real
+    Management-API drift it exists to catch (basecradle-noc#573).
+
+    A live-marked test cannot prove its own race-freedom (it needs a real key, and the race is a
+    coincidence of timing), so it is proven **here**, offline, by driving the real live function
+    against a preview that advances between every read. `$0.04` per read is half the measured
+    fleet rate and four times the old tolerance.
+    """
+    monkeypatch.setenv("XAI_MANAGEMENT_KEY", KEY)
+    monkeypatch.setenv("XAI_TEAM_ID", TEAM)
+    monkeypatch.setattr(live, "KEY", KEY)  # never build the oracle's header from an ambient key
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(PREVIEW_URL).mock(side_effect=_a_drifting_preview("-51847", DRIFT))
+        mock.get(LEDGER_URL).mock(return_value=httpx.Response(200, json=_ledger_body()))
+        live.test_the_live_figure_nets_the_cycles_prepaid_draw()
+
+
+def test_the_live_bracket_still_catches_the_388_defect_while_the_account_moves(monkeypatch):
+    """Widening to a bracket must not widen away the regression the assertion exists for.
+
+    The adversarial half of the test above, and the one that makes the fix a fix rather than a
+    loosened tolerance: under the *same* drifting account, a tool that reports `prepaidCredits`
+    itself as the runway — issue #388 exactly — still fails. A few seconds of draw spans cents;
+    the #388 defect overstates by the whole cycle's draw.
+    """
+    monkeypatch.setenv("XAI_MANAGEMENT_KEY", KEY)
+    monkeypatch.setenv("XAI_TEAM_ID", TEAM)
+    monkeypatch.setattr(live, "KEY", KEY)  # never build the oracle's header from an ambient key
+
+    class _Regressed:
+        """0.96.0's defect: the undrawn prepaid credit rendered as what is left to spend."""
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def run(self) -> str:
+            return (
+                "xAI credits remaining: $518.47 USD (as of 2026-08-31T05:10:59Z).\n"
+                "Posted prepaid ledger: $567.49 — not what you have left to spend."
+            )
+
+    monkeypatch.setattr(live, "XaiAccountBalanceTool", _Regressed)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(PREVIEW_URL).mock(side_effect=_a_drifting_preview("-51847", DRIFT))
+        with pytest.raises(AssertionError, match="outside the"):
+            live.test_the_live_figure_nets_the_cycles_prepaid_draw()

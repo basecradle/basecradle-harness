@@ -41,9 +41,10 @@ NOC rather than leaving it to fire. And **the assertions stay ours** — the NOC
 this suite instead of re-implementing it, so what this file proves is what gets proven on a cadence,
 and adding a case here needs no coordination at all.
 
-The other four live suites (``test_xai_sdk_live.py``, ``test_openrouter_live.py``, and the two
-account-balance ones) still have **no** trigger — issue #450 carries that, blocked on dedicated
-prober keys.
+The other four live suites have the same trigger now (issue #450): the prober grew from this one
+pinned path into a **registry** of five arms — ``openai`` (this file), ``xai``, ``openrouter``,
+``xai-account``, ``openrouter-account`` — each with its own dedicated key, its own freshness clock,
+and its own ``armed`` flag, since four keys do not arrive as one event.
 """
 
 from __future__ import annotations
