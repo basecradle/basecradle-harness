@@ -7,6 +7,44 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.115.1] - 2026-08-30
+
+### Documented: the live smoke suite has a run trigger, and its key is its own (issues #443, #441)
+
+`tests/test_openai_live.py` proves the two classes a mocked transport is structurally blind to —
+`openai` 3.0's HTTPX2 + OS-trust-store move ([#410](https://github.com/basecradle/basecradle-harness/issues/410)),
+and whether OpenAI still *accepts* the `prompt_cache_key` the adapter sends on every wake
+([#435](https://github.com/basecradle/basecradle-harness/issues/435); an unknown top-level field is
+a 400 on every wake, i.e. a silent agent, not a missed discount). **Nothing ran it.**
+`addopts = -m 'not live'` deselects it from every default run and from CI, and it skips itself green
+with no key — three states, *passed* / *skipped* / *never invoked*, and from outside the box the
+last two are indistinguishable from the first. That is this repo's own named failure shape,
+Green-While-Absent, pointed at its own test suite, and it is why the live-test key stayed dead for
+an unknown period ([#441](https://github.com/basecradle/basecradle-harness/issues/441)) until a
+human happened to live-smoke by hand.
+
+The trigger now exists, and lives in the NOC rather than here
+([basecradle-noc#563](https://github.com/basecradle/basecradle-noc/issues/563), per the capital's
+routing ruling): this repo keeps its **zero Actions secrets** posture, the key never touches GitHub,
+and a red pages through the fleet's standing alert path. It clones the tip of `main` and runs *this
+suite's own invocation* — never a re-implementation of its assertions, which would be a second
+spelling of this repo's contract living in another one. Weekly on green, daily on red. **A skip is
+red**, and that verdict cannot come from the exit code: pytest exits `0` when every collected test
+skips, so an absent key is byte-identical to a pass at the process boundary — it is read off a
+JUnit report instead, where `skipped > 0` and `tests == 0` are both failures. Proven red on a real
+invocation before it was trusted (key absent → `skip=3 rc=0` → FAIL; a bad key → three real HTTP
+401s).
+
+Two facts now recorded in the suite's own docstring, where the next reader of that file will be:
+the key is a **dedicated** `Harness Live Test` credential, never a copy of @jt's runtime key (that
+copy is exactly what made a rotation on his box kill this suite silently — @origin's ruling on #441
+is one key per consumer); and the file's path plus the `live` marker are a **cross-repo contract**,
+so renaming either makes the prober collect zero tests and go red as *never invoked*.
+
+Docs only — no behavior change. The other four live suites still have no trigger;
+[#450](https://github.com/basecradle/basecradle-harness/issues/450) carries that, blocked on
+dedicated prober keys.
+
 ## [0.115.0] - 2026-08-30
 
 ### Fixed: the scrub deleted quotes out of real conversations, and unlinked the conversations with them (issue #444)

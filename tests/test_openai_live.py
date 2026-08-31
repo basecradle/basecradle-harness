@@ -15,8 +15,35 @@ deliberately::
 
     AI_API_KEY=sk-... uv run pytest -m live tests/test_openai_live.py -v
 
-The @jt live-test key is `AI_PROVIDER_API_KEY` in the laptop's harness-test env (the older
-name for the same value); export it as ``AI_API_KEY`` to run this.
+**The key is this suite's own, and that is the point** (issue #441). It is a dedicated OpenAI key
+named *Harness Live Test*, on the laptop as ``AI_PROVIDER_API_KEY`` in
+``~/.config/basecradle/harness-test.env``; export it as ``AI_API_KEY`` to run this. It is **not**
+@jt's key, and must never be seeded from one again: this env file used to hold a *copy* of @jt's
+runtime key, so rotating his box's credential silently killed this suite. Two consumers sharing one
+credential is the defect — @origin's ruling on #441 is one key per consumer, the same per-consumer
+isolation the fleet's per-agent keys already follow.
+
+**Something runs this on a schedule now, and a SKIP is RED** (issue #443). Nothing did before:
+``-m 'not live'`` hides it from every default run and from CI, and it skips itself green with no
+key — so the suite had three states, *passed* / *skipped* / *never invoked*, and from outside the
+box the last two look exactly like the first. The dead key above went unnoticed for an unknown
+period for precisely that reason. The trigger is a NOC prober (``basecradle-noc#563``): weekly on
+green, daily on red, cloning the tip of ``main`` and running this file's own invocation with a
+**third** dedicated key that lives only on the NOC box. Its verdict is read off a JUnit report
+rather than ``returncode`` — pytest exits **0** when every collected test skips, so an absent key is
+byte-identical to a pass at the process boundary — and a run reporting ``skipped > 0`` is a failure
+there, per this suite's non-negotiable.
+
+Two consequences for anyone editing this file. **The path and the marker are a cross-repo
+contract**: the prober selects ``-m live tests/test_openai_live.py``, so renaming either makes it
+collect zero tests, which it reads as *never invoked* and calls red — correct and loud, but tell the
+NOC rather than leaving it to fire. And **the assertions stay ours** — the NOC deliberately runs
+this suite instead of re-implementing it, so what this file proves is what gets proven on a cadence,
+and adding a case here needs no coordination at all.
+
+The other four live suites (``test_xai_sdk_live.py``, ``test_openrouter_live.py``, and the two
+account-balance ones) still have **no** trigger — issue #450 carries that, blocked on dedicated
+prober keys.
 """
 
 from __future__ import annotations
