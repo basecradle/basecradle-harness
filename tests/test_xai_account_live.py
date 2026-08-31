@@ -28,6 +28,34 @@ deliberately::
 
 This is the repeatable form of the founder live-verify: the printed figure is what gets compared
 against the Console's **Credits remaining**.
+
+**Something runs this on a schedule now, and a SKIP is RED** (issue #450). Nothing did before: ``-m
+'not live'`` hides this file from every default run and from CI, and it skips itself green with no
+key — three states, *passed* / *skipped* / *never invoked*, and from outside the box the last two
+look exactly like the first. That is this repo's own named failure shape, Green-While-Absent,
+pointed at the one suite that can catch drift in the Management API an agent reads its own runway
+from — a stale figure is an agent reasoning about money it does not have. The trigger is the NOC
+prober (``basecradle-noc#563``, grown from one pinned path to a **registry** of five arms in
+``basecradle-noc#575``): this file is the **``xai-account``** arm, and the prober clones the tip of
+``main`` and runs this file's own invocation with a **dedicated** ``XAI_MANAGEMENT_KEY`` that lives
+only on the NOC box — never a copy of a running agent's runtime key, per @origin's per-consumer
+ruling on #441. Weekly on green, daily on red, per arm. The verdict is read off a JUnit report
+rather than ``returncode``, because pytest exits **0** when every collected test skips, so an
+absent key is byte-identical to a pass at the process boundary; a run reporting ``skipped > 0`` is
+a failure there.
+
+Two consequences for anyone editing this file. **The path and the marker are a cross-repo
+contract**: the arm selects ``-m live tests/test_xai_account_live.py``, so renaming either makes it
+collect zero tests, which the prober reads as *never invoked* and calls red — correct and loud, but
+tell the NOC rather than leaving it to fire. And **the assertions stay ours** — the prober runs
+this suite instead of re-implementing it, so what this file proves is what gets proven on a
+cadence, and adding a case here needs no coordination at all.
+
+This arm carries one extra constraint the others do not, and it is written up where it lives
+(`test_the_live_figure_nets_the_cycles_prepaid_draw`): the account it reads is **actively spending**
+while the test runs, so any assertion here has to be sound against a figure that moves between two
+HTTP requests. An equality against a single oracle read is not, and the arm was held disarmed until
+it became a bracket.
 """
 
 from __future__ import annotations
@@ -114,28 +142,63 @@ def test_reports_the_live_credits_remaining_not_the_posted_ledger():
     )
 
 
+def _remaining_usd(core: dict[str, Any]) -> float:
+    """What the preview says is left: the prepaid credit less the draw against it, in dollars."""
+    return _credit_usd(core, "prepaidCredits") - _credit_usd(core, "prepaidCreditsUsed")
+
+
 @pytest.mark.skipif(not KEY, reason="set XAI_MANAGEMENT_KEY to run the live xAI balance probe")
 def test_the_live_figure_nets_the_cycles_prepaid_draw():
     """The #388 regression, against the live payload: remaining is a subtraction, not a field.
 
     The oracle is the raw preview, read independently of the tool. Two things are asserted, and
-    the second is the one 0.96.0 would have failed: the headline equals `prepaidCredits` minus
+    the second is the one 0.96.0 would have failed: the headline is `prepaidCredits` minus
     `prepaidCreditsUsed`, and — once the cycle has drawn anything — it is strictly *below*
     `prepaidCredits`, which is the credit the cycle draws against rather than what is left of it.
-    """
-    core = _live_core_invoice()
-    prepaid = _credit_usd(core, "prepaidCredits")
-    drawn = _credit_usd(core, "prepaidCreditsUsed")
-    print(f"\nlive preview: prepaidCredits ${prepaid:,.2f}, drawn ${drawn:,.2f}\n")
 
+    **The oracle is read twice and the first assertion is a bracket, not an equality, because the
+    account never stops moving.** Three xAI personas (@briggs, @jt, @glm-5.2) draw on this account
+    continuously, so an equality against a single oracle read compares two figures fetched at two
+    different instants — a race with no defect behind it, and the tool's read is always the later
+    of the two, so it can only ever fail in the one direction. Measured on the NOC prober box
+    2026-08-31: ordinary fleet traffic moved `prepaidCreditsUsed` by **$0.08 in 32 seconds**,
+    eight times the $0.01 tolerance, one run failing and the next passing. That is a known
+    intermittent false page whose red would be indistinguishable from the real Management-API
+    drift this arm exists to catch, so it was held disarmed rather than shipped
+    ([basecradle-noc#573](https://github.com/basecradle/basecradle-noc/issues/573)).
+
+    **Widening the tolerance is the wrong fix**: it prices in today's burn rate and goes stale the
+    day a fourth persona lands. `prepaidCreditsUsed` is *monotonic*, so bracketing makes the
+    assertion **exact** instead of approximate — sandwich the tool's read between two oracle reads
+    and its figure must lie in the interval they span, whatever the account did meanwhile. The
+    #388 catch survives whole: a tool reporting `prepaidCredits` itself as the runway is outside
+    any bracket a few seconds of draw can span. The interval is written `min`/`max` rather than
+    `after <= x <= before` so the one event that moves the pair the *other* way — a top-up landing
+    mid-probe — widens it instead of false-failing it.
+    """
+    before = _live_core_invoice()
     result = XaiAccountBalanceTool(cache_ttl=0).run()
+    after = _live_core_invoice()
+
+    low, high = sorted((_remaining_usd(before), _remaining_usd(after)))
+    # The larger of the two, for the same reason the bracket takes min/max: a top-up mid-probe is
+    # the one event that raises it, and the #388 check must not fail on the read that missed it.
+    prepaid = max(_credit_usd(before, "prepaidCredits"), _credit_usd(after, "prepaidCredits"))
+    drawn = _credit_usd(before, "prepaidCreditsUsed")
+    print(
+        f"\nlive preview: prepaidCredits ${prepaid:,.2f}, drawn ${drawn:,.2f}, "
+        f"remaining bracketed by ${low:,.2f} … ${high:,.2f}\n"
+    )
+
     remaining = _REMAINING.search(result)
     assert remaining, f"no live credits-remaining headline in:\n{result}"
 
     live_usd = _usd(remaining)
-    assert live_usd == pytest.approx(prepaid - drawn, abs=0.01), (
-        f"live remaining ${live_usd:,.2f} is not prepaidCredits ${prepaid:,.2f} less the "
-        f"${drawn:,.2f} drawn this cycle (= ${prepaid - drawn:,.2f}):\n{result}"
+    # A cent of slack each side: the headline is rendered to two decimals, the oracle is exact.
+    assert low - 0.01 <= live_usd <= high + 0.01, (
+        f"live remaining ${live_usd:,.2f} is outside the ${low:,.2f} … ${high:,.2f} bracket the "
+        f"oracle spans around this read — prepaidCredits less prepaidCreditsUsed, taken either "
+        f"side of the tool's own call:\n{result}"
     )
     if drawn > 0:
         assert live_usd < prepaid, (

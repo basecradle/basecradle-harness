@@ -7,6 +7,60 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.115.2] - 2026-08-31
+
+### Documented: the other four live suites have a run trigger too — and the account arm's race is fixed (issue #450)
+
+[#443](https://github.com/basecradle/basecradle-harness/issues/443) closed Green-While-Absent for
+**one** of this repo's five live suites. The other four — `test_xai_sdk_live.py`,
+`test_openrouter_live.py`, `test_xai_account_live.py`, `test_openrouter_account_live.py` — were
+that same sentence unchanged, four more times: deselected by `addopts = -m 'not live'`, skipping
+themselves green with no key, and invoked by nobody. Not cosmetic classes, either: a server-rejected
+xAI wiring is a silent agent on the fleet's Grok personas, and a stale balance read is an agent
+reasoning about runway it does not have.
+
+The trigger lives in the NOC, as the capital's routing ruling on #443 already settled (this repo
+keeps its **zero Actions secrets** posture, and no key ever touches GitHub). The prober grew from
+one pinned path into a **registry** of five arms — `openai`, `xai`, `openrouter`, `xai-account`,
+`openrouter-account` ([basecradle-noc#575](https://github.com/basecradle/basecradle-noc/issues/575))
+— each with its **own** dedicated key per @origin's per-consumer ruling on
+[#441](https://github.com/basecradle/basecradle-harness/issues/441), its own freshness clock, and
+its own `armed` flag, since four keys do not arrive as one event. Weekly on green, daily on red, per
+arm. **A skip is red**, and that verdict is read off a JUnit report rather than the exit code —
+pytest exits `0` when every collected test skips, so an absent key is byte-identical to a pass at
+the process boundary. Each arm's path and `live` marker are a **cross-repo contract**, now recorded
+in each suite's own docstring where the next reader of that file will be.
+
+### Fixed: the live xAI balance test raced the account it was reading (issue #450)
+
+`test_the_live_figure_nets_the_cycles_prepaid_draw` compared the tool's figure to a single oracle
+read with `abs=0.01` — two HTTP requests, at two instants, against an account **three xAI personas
+are actively spending from**. Measured on the NOC prober box 2026-08-31, ordinary fleet traffic
+moved `prepaidCreditsUsed` by **$0.08 in 32 seconds**, eight times the tolerance: one run failed,
+the next passed. The `xai-account` arm was rightly held disarmed rather than install a
+known-intermittent false page whose red would be indistinguishable from the real Management-API
+drift the arm exists to catch
+([basecradle-noc#573](https://github.com/basecradle/basecradle-noc/issues/573)).
+
+Widening the tolerance would price in today's burn rate and go stale the day a fourth persona
+lands. `prepaidCreditsUsed` is **monotonic**, so the assertion is now a **bracket** — read the
+oracle, call the tool, read the oracle again, and the tool's figure must lie in the interval the two
+reads span — which makes it *exact* rather than approximate on an account that never stops moving.
+The interval is taken as `min`/`max` so the one event that moves the pair the other way, a top-up
+landing mid-probe, widens it instead of false-failing it. The
+[#388](https://github.com/basecradle/basecradle-harness/issues/388) catch survives whole: a few
+seconds of draw spans cents, while reporting `prepaidCredits` itself as the runway overstates by the
+whole cycle's draw.
+
+**A live-marked test cannot prove its own race-freedom** — it needs a real key, and the race is a
+coincidence of timing — so the proof lives offline in `test_xai_account.py`, driving the *real* live
+function against a mocked preview whose draw advances between every read: once proving it survives
+the drift, once (with a #388-regressed tool) proving the widened assertion still catches the defect
+through it. Verified against the pre-fix form under the same fixture: the old equality fails
+(`$54.13 != $54.17`), the bracket passes.
+
+Docs and tests only — no behavior change.
+
 ## [0.115.1] - 2026-08-30
 
 ### Documented: the live smoke suite has a run trigger, and its key is its own (issues #443, #441)

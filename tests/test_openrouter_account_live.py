@@ -22,6 +22,33 @@ deliberately::
 
 This is the repeatable form of the live verify: the printed figure is what gets compared against
 the account's Credits page.
+
+**Something runs this on a schedule now, and a SKIP is RED** (issue #450). Nothing did before: ``-m
+'not live'`` hides this file from every default run and from CI, and it skips itself green with no
+key — three states, *passed* / *skipped* / *never invoked*, and from outside the box the last two
+look exactly like the first. That is this repo's own named failure shape, Green-While-Absent,
+pointed at the one suite that can catch drift in ``/credits``' path, auth, or shape — the figure an
+agent reads its own OpenRouter runway from. The trigger is the NOC prober (``basecradle-noc#563``,
+grown from one pinned path to a **registry** of five arms in ``basecradle-noc#575``): this file is
+the **``openrouter-account``** arm, and the prober clones the tip of ``main`` and runs this file's
+own invocation with a **dedicated** ``OPENROUTER_MANAGEMENT_KEY`` that lives only on the NOC box —
+never a copy of a running agent's runtime key, per @origin's per-consumer ruling on #441. Weekly on
+green, daily on red, per arm. The verdict is read off a JUnit report rather than ``returncode``,
+because pytest exits **0** when every collected test skips, so an absent key is byte-identical to a
+pass at the process boundary; a run reporting ``skipped > 0`` is a failure there.
+
+Two consequences for anyone editing this file. **The path and the marker are a cross-repo
+contract**: the arm selects ``-m live tests/test_openrouter_account_live.py``, so renaming either
+makes it collect zero tests, which the prober reads as *never invoked* and calls red — correct and
+loud, but tell the NOC rather than leaving it to fire. And **the assertions stay ours** — the
+prober runs this suite instead of re-implementing it, so what this file proves is what gets proven
+on a cadence, and adding a case here needs no coordination at all.
+
+One asymmetry, checked rather than assumed, so it does not read as a finding later:
+`test_an_inference_key_is_rejected_softly_not_as_a_crash` hardcodes its own bad key to assert the
+soft-failure path, so under a deliberately-bogus ``OPENROUTER_MANAGEMENT_KEY`` it correctly still
+passes while the arm goes red on the other test. With **no** key both skip, which is red for the
+right reason.
 """
 
 from __future__ import annotations
