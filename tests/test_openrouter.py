@@ -714,6 +714,10 @@ def _endpoint(*, name, context_length, status=0, max_prompt_tokens=None):
         "max_prompt_tokens": max_prompt_tokens,
         "pricing": {"prompt": "0.00000042", "completion": "0.00000132", "discount": 0},
         "supported_parameters": ["tools", "tool_choice", "reasoning"],
+        # Required by the SDK's typed model since openrouter 1.1.117, and a four-key boolean map on
+        # every endpoint the live pool serves. Nothing here reads it — but a fixture the unmarshaller
+        # rejects makes `context_limit()` degrade to `None` for every test below.
+        "supports_tool_choice": {"none": True, "auto": True, "required": True, "function": True},
         "quantization": "fp8",
         "tag": f"{name.lower()}/fp8",
         "status": status,
