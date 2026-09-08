@@ -67,18 +67,32 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 
 from basecradle_harness._memory_provider import MemoryExchange, MemoryProvider, MemoryScope
-from basecradle_harness._observability import kv
+from basecradle_harness._observability import _secs, kv
+from basecradle_harness._rerank import (
+    SURFACE_TOOL,
+    SURFACE_TURN0,
+    MemPalaceReranker,
+    pool_size,
+    reranker_from_env,
+)
 from basecradle_harness._tools import Tool
 
 _log = logging.getLogger("basecradle_harness")
 
 # How many relevant chunks `context` retrieves to inject at Turn 0, and the tool returns when
 # the model names no count. Bounded so a large palace can't flood the model's context window.
-DEFAULT_N_RESULTS = 5
+#
+# Eight rather than the original five (issue #464, founder-decided): the LLM reranker reads a pool
+# of twenty and hands back the best of them, so the injected set is now *chosen* rather than
+# whatever the hybrid ranked first — which makes a wider set worth paying for. It widens on a
+# rerank-off agent too, deliberately: one constant, one behaviour, so a rerank outage never also
+# silently narrows what an agent remembers.
+DEFAULT_N_RESULTS = 8
 
 # The ceiling on a *model-chosen* count (`memory_search`'s `n_results`). The Turn-0 default is
 # small because it is paid on every wake; a deliberate search is paid only when the agent asks,
@@ -156,6 +170,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
             `DEFAULT_N_RESULTS`.
         agent: The agent label MemPalace files mined exchanges under (provenance only;
             scoping is by `palace_path`).
+        reranker: The LLM reranker `search` runs the candidate pool through (issue #464).
+            ``None`` — the default — resolves it from the environment
+            (`basecradle_harness._rerank.reranker_from_env`), which itself answers ``None``
+            unless ``HARNESS_MEMPALACE_RERANK_MODEL`` names a model. Pass one explicitly to
+            inject a double; there is no way to *disable* an env-configured reranker from here,
+            because the env var already is the switch and a second one would be a way to disagree
+            with it.
     """
 
     def __init__(
@@ -164,10 +185,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
         *,
         n_results: int = DEFAULT_N_RESULTS,
         agent: str = "harness",
+        reranker: MemPalaceReranker | None = None,
     ) -> None:
         self.palace_path = Path(palace_path)
         self.n_results = n_results
         self.agent = agent
+        self.reranker = reranker if reranker is not None else reranker_from_env()
         # No host-local SQLite store of our own — MemPalace is the engine. The base
         # `store` attribute stays None, which is correct for a middleware provider.
 
@@ -213,19 +236,36 @@ class MemPalaceMemoryProvider(MemoryProvider):
         query = (scope.query or "").strip()
         if not query:
             return None
-        hits = self.search(query)
+        hits = self.search(query, surface=SURFACE_TURN0)
         if not hits:
             return None
         return _fenced(_render_hits(hits))
 
-    def search(self, query: str, n_results: int | None = None) -> list[dict]:
+    def search(
+        self, query: str, n_results: int | None = None, *, surface: str = SURFACE_TOOL
+    ) -> list[dict]:
         """The one retrieval call both memory surfaces make: relevant chunks for `query`.
 
         Shared by the automatic `context` hook (Turn-0 injection) and the model-facing
         `MemPalaceSearchTool` (deliberate mid-task recall), so the two can never drift apart
-        on *how* the palace is searched — the union pool, the no-`max_distance` rule, and the
-        bound all live here once. Returns the raw hit dicts (possibly empty); rendering is the
-        caller's, because a Turn-0 block and a tool result read differently.
+        on *how* the palace is searched — the union pool, the no-`max_distance` rule, the
+        bound, and (since issue #464) **the LLM rerank** all live here once. Returns the raw hit
+        dicts (possibly empty); rendering is the caller's, because a Turn-0 block and a tool
+        result read differently.
+
+        **With a reranker bound** (`reranker`, i.e. ``HARNESS_MEMPALACE_RERANK_MODEL`` is set) the
+        hybrid search fetches a *pool* of `pool_size` candidates instead of the requested count, a
+        model picks the best ``n_results`` of them, and those come back in the model's order. The
+        hits are the searcher's own dicts, selected by index — no model-authored text enters them,
+        so nothing about the #438 mining boundary changes: rerank is read-side only.
+
+        **Without one** the call is byte-identical to what it was before rerank existed: the same
+        ``n_results``, the same union strategy, the same slice. Rerank is off by *absence*.
+
+        `surface` names which half asked (`SURFACE_TURN0` / `SURFACE_TOOL`) and rides the log lines
+        so a per-wake Turn-0 recall is separable from a deliberate mid-task search. It defaults to
+        the tool surface — the deliberate one — because that is what a third-party caller of this
+        method is doing.
 
         Empty before the palace exists (nothing observed yet) — short-circuited without
         touching MemPalace. A backend that cannot serve the union request answers with an error
@@ -234,6 +274,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
         """
         if not self.palace_path.exists():
             return []
+        wanted = self.n_results if n_results is None else n_results
+        pool = pool_size(wanted) if self.reranker is not None else wanted
+        started = time.monotonic()
         searcher = _import("searcher")
         # Never pass `max_distance`: upstream's union merge opens with
         # `if max_distance > 0.0: return`, so *any* distance threshold silently disables
@@ -243,11 +286,36 @@ class MemPalaceMemoryProvider(MemoryProvider):
         result = searcher.search_memories(
             query,
             str(self.palace_path),
-            n_results=self.n_results if n_results is None else n_results,
+            n_results=pool,
             candidate_strategy=_CANDIDATE_STRATEGY,
         )
-        hits = result.get("results") if isinstance(result, dict) else None
-        return [hit for hit in (hits or []) if isinstance(hit, dict) and hit.get("text")]
+        raw = result.get("results") if isinstance(result, dict) else None
+        hits = [hit for hit in (raw or []) if isinstance(hit, dict) and hit.get("text")]
+        if self.reranker is not None:
+            hits = self.reranker.rerank(query, hits, wanted, surface=surface)
+        else:
+            # A no-op when the searcher honored `n_results`, and the guard against a backend that
+            # did not — the requested bound is this method's promise, not upstream's.
+            hits = hits[:wanted]
+        _log_recall(
+            surface=surface,
+            reranked=self.reranker is not None,
+            pool=pool,
+            hits=hits,
+            seconds=time.monotonic() - started,
+        )
+        return hits
+
+    def close(self) -> None:
+        """Release the reranker's HTTP client, if one was ever built.
+
+        A wake is one process and would reclaim it on exit anyway; the caller that needs this is
+        the long-lived `basecradle_harness.TimelineAgent` poll loop, which holds one provider for
+        the life of the process. MemPalace itself owns nothing to close here — its library API is
+        called per operation — so this is the reranker's socket and nothing else.
+        """
+        if self.reranker is not None:
+            self.reranker.close()
 
     # --- tools: deliberate recall on top of the automatic hooks ---------------
 
@@ -333,7 +401,9 @@ class MemPalaceSearchTool(Tool):
         """
         if not query or not query.strip():
             return "Error: 'memory_search' needs a query."
-        hits = self.provider.search(query.strip(), _bounded(n_results, self.provider.n_results))
+        hits = self.provider.search(
+            query.strip(), _bounded(n_results, self.provider.n_results), surface=SURFACE_TOOL
+        )
         if not hits:
             return f"No memories match {query!r}."
         return f"Memories matching {query!r}:\n" + _render_hits(hits)
@@ -459,6 +529,35 @@ def _write_cli_config(config_dir: Path, config_file: Path, data: dict) -> None:
 
 
 # --- helpers -----------------------------------------------------------------
+
+
+def _log_recall(
+    *, surface: str, reranked: bool, pool: int, hits: list[dict], seconds: float
+) -> None:
+    """The ``mempalace recall`` line — one per retrieval, on either surface.
+
+    **INFO, where the old generic ``memory op=recall`` line was DEBUG** (issue #464, the founder's
+    explicit ask): one line per engaged wake is the whole A/B for the reranker, and a line nobody
+    ships is a measurement nobody can make. It is emitted here rather than in `_wake` because this
+    is the only place that knows the four facts that matter — which surface asked, whether rerank
+    ran, how deep the pool went, and how much came back. The generic seam line stays where it is,
+    at DEBUG, for a provider that is not this one.
+
+    ``chars`` counts the recalled **chunk text**, not the rendered block: it is the quantity that
+    is comparable between the two surfaces (Turn-0 fences and captions its hits; the tool does
+    not), and it is what an operator asking "how much memory is this wake paying for?" means.
+    """
+    _log.info(
+        "mempalace recall %s",
+        kv(
+            surface=surface,
+            rerank="on" if reranked else "off",
+            pool=pool,
+            injected=len(hits),
+            duration=_secs(seconds),
+            chars=sum(len(str(hit.get("text") or "")) for hit in hits),
+        ),
+    )
 
 
 def _bounded(n_results: int | None, default: int) -> int:

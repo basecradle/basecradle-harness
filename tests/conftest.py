@@ -8,6 +8,8 @@ responses follow the OpenAI chat-completions / Responses schemas.
 
 import json
 import re
+import sys
+import types
 
 import pytest
 import respx
@@ -75,6 +77,51 @@ class _HTTPCoreBothMocker(HTTPCoreMocker):
 
 
 respx.mocks.DEFAULT_MOCKER = _HTTPCoreBothMocker.name
+
+
+# The keyword arguments MemPalace's `search_memories` actually accepts. The fake rejects
+# anything outside this set, so a kwarg the adapter invents (or one upstream renames) fails
+# the suite here rather than raising a TypeError against the real library in production.
+_SEARCH_KWARGS = {"n_results", "candidate_strategy", "max_distance"}
+
+
+@pytest.fixture
+def fake_mempalace(monkeypatch):
+    """Install fake ``mempalace.convo_miner`` / ``mempalace.searcher`` modules.
+
+    Returns the two fakes so a test can assert how the adapter called them. ``mine_convos``
+    records its args; ``search_memories`` records the kwargs it was *passed* (not their
+    defaults — the `max_distance` guard below turns on that distinction) and returns
+    whatever the test stashes on it.
+    """
+    convo_miner = types.ModuleType("mempalace.convo_miner")
+    convo_miner.calls = []
+
+    def mine_convos(convo_dir, palace_path, **kwargs):
+        convo_miner.calls.append((convo_dir, palace_path, kwargs))
+
+    convo_miner.mine_convos = mine_convos
+
+    searcher = types.ModuleType("mempalace.searcher")
+    searcher.result = {"results": []}
+    searcher.queries = []
+
+    def search_memories(query, palace_path, **kwargs):
+        unknown = set(kwargs) - _SEARCH_KWARGS
+        assert not unknown, f"MemPalace's search_memories takes no {sorted(unknown)} kwarg"
+        searcher.queries.append((query, palace_path, kwargs))
+        return searcher.result
+
+    searcher.search_memories = search_memories
+
+    parent = types.ModuleType("mempalace")
+    parent.convo_miner = convo_miner
+    parent.searcher = searcher
+
+    monkeypatch.setitem(sys.modules, "mempalace", parent)
+    monkeypatch.setitem(sys.modules, "mempalace.convo_miner", convo_miner)
+    monkeypatch.setitem(sys.modules, "mempalace.searcher", searcher)
+    return convo_miner, searcher
 
 
 @pytest.fixture(autouse=True)

@@ -17,6 +17,7 @@ import httpx
 import pytest
 import respx
 from basecradle import BaseCradle
+from openrouter import OpenRouter
 
 from basecradle_harness import (
     Harness,
@@ -29,7 +30,12 @@ from basecradle_harness import (
 from basecradle_harness import _wake as wake_module
 from basecradle_harness._engine import EngineError
 from basecradle_harness._install import install
-from basecradle_harness._mempalace import _CLOSE_TAG, _INJECTED_HEADING, _OPEN_TAG
+from basecradle_harness._mempalace import (
+    _CLOSE_TAG,
+    _INJECTED_HEADING,
+    _OPEN_TAG,
+    MemPalaceMemoryProvider,
+)
 from basecradle_harness._messages import Message
 from basecradle_harness._mining import _LEGACY_RECALL_HEADING as LEGACY_HEADING
 from basecradle_harness._mining import (
@@ -39,6 +45,7 @@ from basecradle_harness._mining import (
     classify,
     strip_injected,
 )
+from basecradle_harness._rerank import MemPalaceReranker
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -61,6 +68,9 @@ CHARTER_SENTINEL = "SENTINEL-CHARTER-do-not-mine-this-personality-charter-line"
 MANIFEST_SENTINEL = "SENTINEL-MANIFEST-do-not-mine-this-tool-note"
 DASHBOARD_SENTINEL = "SENTINEL-DASHBOARD-do-not-mine-this-platform-primer"
 RECALL_SENTINEL = "SENTINEL-RECALL-do-not-mine-this-recalled-memory"
+# The reranker's *own* output. Not a brief surface — a whole extra model whose text the boundary
+# has never had to account for (issue #464). It must reach neither the agent's model nor the palace.
+RERANK_SENTINEL = "SENTINEL-RERANK-do-not-show-or-mine-this-reranker-narration"
 SENTINELS = (CHARTER_SENTINEL, MANIFEST_SENTINEL, DASHBOARD_SENTINEL, RECALL_SENTINEL)
 
 
@@ -453,3 +463,82 @@ def test_scope_is_the_agent_not_the_timeline(platform, tmp_path):
     agent.wake()
 
     assert provider.observed[-1].scope == MemoryScope(agent=agent.me_uuid, timeline=TIMELINE_UUID)
+
+
+# === the reranker is read-side only: its own words reach nobody (issue #464) ====================
+
+
+def test_the_rerankers_output_never_reaches_the_model_or_the_palace(
+    platform, tmp_path, monkeypatch, fake_mempalace
+):
+    """The rerank model is a second model in the loop, so it gets a sentinel of its own.
+
+    The #438 boundary is about what the harness *composes*; a reranker is a new class of text
+    entirely — a vendor's answer, mid-retrieval, with a peer's mined excerpts in its prompt. The
+    design's claim is that **only a validated list of integers** is consumed from it, so its prose
+    is structurally unable to reach the agent's context or its memory. This proves the claim end to
+    end, on a real wake, through the real SDK: the reranked memory *does* arrive (or the test would
+    pass for the wrong reason), and the reranker's narration arrives nowhere.
+    """
+    _, searcher = fake_mempalace
+    searcher.result = {
+        "results": [{"text": "filler memory"}, {"text": f"> john: {RECALL_SENTINEL}"}]
+    }
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    with respx.mock(assert_all_called=False) as rerank_router:
+        rerank_route = rerank_router.post("https://openrouter.test/api/v1/chat/completions").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "gen-1",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "z-ai/glm-5.3-flash",
+                    "system_fingerprint": "fp",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "finish_reason": "stop",
+                            "message": {
+                                "role": "assistant",
+                                # Valid picks *plus* prose the reranker has no licence to emit.
+                                "content": ('{"picks": [2, 1], "note": "' + RERANK_SENTINEL + '"}'),
+                            },
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+                },
+            )
+        )
+        provider = MemPalaceMemoryProvider(
+            palace_path=palace,
+            reranker=MemPalaceReranker(
+                model="z-ai/glm-5.3-flash",
+                client=OpenRouter(
+                    api_key="sk-or-v1-0123456789abcdef0123456789abcdef",
+                    server_url="https://openrouter.test/api/v1",
+                    retry_config=None,
+                ),
+                providers=("deepinfra",),
+            ),
+        )
+        model = _CannedModel(text="John lives in Dallas.")
+        _agent(tmp_path, provider, model, monkeypatch).wake()
+
+    # The rerank call really happened — without this the whole test passes on a path that never ran.
+    assert rerank_route.called
+    shown = "\n".join(m.content or "" for m in model.shown)
+    # And its ranking is what the model was shown: picks were [2, 1], so the sentinel hit leads.
+    recall = shown.partition(_OPEN_TAG)[2].partition(_CLOSE_TAG)[0]
+    assert recall.strip().splitlines() == [f"- > john: {RECALL_SENTINEL}", "- filler memory"]
+    # The reranker's prose reached neither the agent's context nor the palace.
+    assert RERANK_SENTINEL not in shown
+    mined = "\n".join(
+        path.read_text(encoding="utf-8") for path in (palace / "conversations").glob("*.md")
+    )
+    assert mined, "the turn was never mined at all"
+    assert RERANK_SENTINEL not in mined
+    for sentinel in SENTINELS:
+        assert sentinel not in mined

@@ -47,6 +47,8 @@ import pytest
 
 from basecradle_harness import Message, OpenRouterProvider
 
+from .conftest import plain
+
 pytestmark = pytest.mark.live
 
 KEY = os.environ.get("OPENROUTER_API_KEY")
@@ -170,3 +172,108 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
         f"endpoint={endpoint!r} with a server-side search active — issue #280 exactly: the search "
         f"tool's upstream logged as the model's. Real pool: {sorted(pool)}"
     )
+
+
+# === the MemPalace reranker (issue #464) ======================================
+
+#: The rerank model the fleet runs (a founder decision, not this file's choice).
+RERANK_MODEL = "z-ai/glm-5.3-flash"
+
+#: A US-only routing pin, the shape every production rerank call sends. Several slugs rather than
+#: one because ``allow_fallbacks: false`` means a single pinned endpoint having a bad minute is a
+#: red release gate for a reason that is not this code — and a rerank pin is a *list* in production
+#: too, so this stays the production shape rather than a test-only narrowing.
+RERANK_PROVIDERS = ("deepinfra", "baseten", "fireworks", "together")
+
+
+def _rerank_line(caplog) -> str:
+    """The rerank line with its ANSI verdict color stripped — ``outcome=`` is a colored field."""
+    return plain(
+        next(
+            m for m in (r.getMessage() for r in caplog.records) if m.startswith("mempalace rerank")
+        )
+    )
+
+
+@pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
+def test_the_live_reranker_picks_and_reports_what_it_cost(caplog):
+    """One real rerank call — the release gate for issue #464.
+
+    Everything the offline suite proves about the reranker is proved against a body **we** wrote.
+    Four things only a live call can settle, and each has already burned this repo once in another
+    form: that ``provider: {only, allow_fallbacks: false, data_collection: "deny"}`` is *accepted*
+    rather than 400'd; that ``reasoning: {effort: "low"}`` alongside ``response_format:
+    json_object`` is a combination the model actually honors; that the model returns the documented
+    ``{"picks": [...]}`` shape well enough to survive validation; and that ``usage.cost`` still
+    lands, since a cost field that quietly stopped arriving would take the rerank spend series dark
+    with nothing failing.
+
+    The pool is built so the **right answer is unambiguous** and sits *below* the hybrid cut — a
+    reranker that simply echoed ``1, 2, 3`` would fail here, which is what makes this a check on
+    the ranking rather than on the plumbing.
+    """
+    import logging
+
+    from basecradle_harness._rerank import SURFACE_TURN0, MemPalaceReranker
+
+    pool = [
+        {"text": "> john: the office coffee machine is broken again"},
+        {"text": "> john: my favourite colour is green"},
+        {"text": "> nova: the sprint demo moved to Thursday"},
+        {"text": "> john: remember the staging endpoint is api.staging.example.com"},
+        {"text": "> nova: lunch is at noon"},
+    ]
+    reranker = MemPalaceReranker(
+        model=RERANK_MODEL, api_key=KEY, providers=RERANK_PROVIDERS, timeout=120.0
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            chosen = reranker.rerank(
+                "what was that staging endpoint we discussed?", pool, 1, surface=SURFACE_TURN0
+            )
+    finally:
+        reranker.close()
+
+    line = _rerank_line(caplog)
+    assert _field(line, "outcome") == "ok", f"the live rerank fell back: {line}"
+    # The ranking, not the plumbing: the answer is the fourth candidate, below a top-3 cut.
+    assert chosen[0]["text"].endswith("api.staging.example.com"), line
+    assert _field(line, "picked") == "1"
+    assert _field(line, "pool") == "5"
+    # A *value*, not a presence: a cost field that renders `0` is a spend series that reads free.
+    cost = _field(line, "cost")
+    assert cost and float(cost) > 0, f"the live usage block reported no cost: {line}"
+    # The routing pin was honored — `allow_fallbacks: false` means this can only be one of ours.
+    assert _field(line, "endpoint"), f"the live response named no serving upstream: {line}"
+
+
+@pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
+def test_a_live_rerank_against_a_nonexistent_model_is_config_class(caplog):
+    """The loud half of the taxonomy, proved against the real endpoint's own 4xx.
+
+    A silently-dead reranker is the failure issue #464 exists to prevent, and ERROR is what makes
+    the fleet's "Error on AI Server" alert fire — so "a misconfigured model id pages" must not rest
+    on a status code this repo *assumed* OpenRouter returns for one. The offline suite can only
+    assert the mapping from a status we chose; this asserts the status.
+    """
+    import logging
+
+    from basecradle_harness._rerank import SURFACE_TOOL, MemPalaceReranker
+
+    reranker = MemPalaceReranker(
+        model="z-ai/glm-does-not-exist-5.3", api_key=KEY, providers=RERANK_PROVIDERS
+    )
+    try:
+        with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+            chosen = reranker.rerank("q", [{"text": "a"}, {"text": "b"}], 2, surface=SURFACE_TOOL)
+    finally:
+        reranker.close()
+
+    # It falls back rather than raising — a broken reranker never costs the agent its memories.
+    assert [hit["text"] for hit in chosen] == ["a", "b"]
+    record = next(r for r in caplog.records if r.getMessage().startswith("mempalace rerank"))
+    assert record.levelno == logging.ERROR, record.getMessage()
+    assert _field(
+        record.getMessage(),
+        "reason",
+    ).startswith("config:"), record.getMessage()

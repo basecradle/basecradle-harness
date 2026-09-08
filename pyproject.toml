@@ -65,6 +65,13 @@ openrouter = ["openrouter>=1.1.70,<2"]
 # The MemPalace memory provider (a reference `MemoryProvider`): a local-first OSS memory
 # system (ChromaDB + SQLite). Kept out of the base install so the core stays light — the
 # adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace.
+#
+# The optional **LLM reranker** (issue #464) needs the `openrouter` extra above *as well* —
+# `pip install 'basecradle-harness[openai,mempalace,openrouter]'`. Deliberately not folded in
+# here and deliberately not a `mempalace-rerank` extra of its own: reranking is opt-in by
+# absence (no `HARNESS_MEMPALACE_RERANK_MODEL`, no rerank), so every MemPalace agent would
+# otherwise install a vendor SDK it never imports — and a second extra name for one dependency
+# is a second pin the fleet has to keep in step with the first. One dependency, one extra.
 mempalace = ["mempalace>=3.7.1"]
 
 [project.scripts]

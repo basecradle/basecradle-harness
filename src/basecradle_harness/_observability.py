@@ -166,6 +166,18 @@ _TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
 #: the dashboard layer, where staleness is visible.
 _COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost",),)
 
+#: Where a provider states how many of the completion's tokens went to **reasoning**. Deliberately
+#: kept out of `_TOKEN_FIELDS` — that dict is the shared ``llm`` line's field set, and adding a
+#: field there would change the bytes of a line the fleet dashboard already extracts on. This is
+#: read by whichever caller wants it (`reasoning_tokens`), so a new line kind can carry the fact
+#: without renegotiating the old one.
+_REASONING_FIELDS: tuple[tuple[str, ...], ...] = (
+    ("completion_tokens_details", "reasoning_tokens"),  # the Chat wire: OpenAI, OpenRouter
+    ("output_tokens_details", "reasoning_tokens"),  # OpenAI Responses
+    ("reasoning_tokens",),  # flat, where a vendor reports it that way
+)
+
+
 #: Where a provider names the **upstream that actually served the call**. A router is not a server:
 #: OpenRouter fronts ~27 distinct endpoints for a single model id, and they differ by up to 10× in
 #: context ceiling and 5.4× in prompt price — so ``provider=openrouter`` alone cannot say what a
@@ -508,6 +520,20 @@ def reported_cost(usage: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def reasoning_tokens(usage: Any) -> int | None:
+    """How many completion tokens the provider says went to **reasoning**, or ``None``.
+
+    Read the same way every other usage fact is (`_first` over `_REASONING_FIELDS`), so one reader
+    serves a mapping, a typed model, and a proto. ``None`` — the field omitted — whenever the
+    provider reports nothing: a non-reasoning model has no number here, and an invented zero would
+    be indistinguishable from a reasoning model that happened to spend nothing.
+    """
+    value = _first(usage, _REASONING_FIELDS) if usage is not None else None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def serving_endpoint(response: Any) -> str | None:

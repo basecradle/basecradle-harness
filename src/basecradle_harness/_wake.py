@@ -162,6 +162,11 @@ from basecradle_harness._report import (
     report_body,
     verbatim,
 )
+from basecradle_harness._rerank import (
+    RERANK_MODEL_VAR,
+    RERANK_PROVIDERS_VAR,
+    providers_from_env,
+)
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
@@ -2371,9 +2376,15 @@ class WakeAgent:
                 "Memory provider context() failed; omitting recalled memory.", exc_info=True
             )
             return None
-        # DEBUG, never INFO: recall runs on every engaged wake, and a routine line per wake per
-        # memory op would drown the signal the rest of this stream exists to carry. It is here
-        # for the operator who turns HARNESS_LOG_LEVEL up to chase a memory question.
+        # DEBUG, never INFO: this is the *seam's* line — it fires for whatever provider is bound,
+        # and for the shipped SQLite one (whose `context` is a no-op) it would say `chars=0` on
+        # every wake of every agent forever. It is here for the operator who turns
+        # HARNESS_LOG_LEVEL up to chase a memory question.
+        #
+        # A provider that has something worth saying says it itself, at the level it deserves: the
+        # MemPalace adapter emits `mempalace recall …` at INFO with the four facts only it knows —
+        # which surface asked, whether the LLM rerank ran, how deep the pool went, how much came
+        # back (issue #464). That is the line the fleet reads; this one stays the seam's fallback.
         _log.debug("memory %s", kv(op="recall", chars=len(recalled or "")))
         return recalled
 
@@ -4129,6 +4140,12 @@ _SDK_DISTRIBUTIONS = {"openai": "openai", "xai-sdk": "xai-sdk", "anthropic": "an
 # var, so the name is a constant.
 _PLATFORM_DISTRIBUTION = "basecradle"
 
+# The PyPI distribution the MemPalace reranker needs (issue #464). A constant for the same reason
+# the platform SDK's is: the reranker reaches exactly one vendor, so there is no axis to select on
+# — and an agent may carry this extra while its *brain* runs on a different SDK entirely, which is
+# precisely why it needs a version field of its own rather than riding `ai_sdk_version`.
+_RERANK_SDK_DISTRIBUTION = "openrouter"
+
 
 def _dist_version(dist: str) -> str | None:
     """The **installed** version of a distribution, or ``None`` if it is not installed.
@@ -4339,6 +4356,22 @@ def resolved_config() -> dict[str, object]:
       **drops** as harness-owned collisions (plus ``extra_body`` on the SDKs that do not support
       it): the "warn and win" set (`resolved_model_params`). ``[]`` when nothing collides; the
       effective tuning the SDK receives is ``model_params`` minus these.
+    - ``mempalace_rerank_model`` / ``mempalace_rerank_providers`` /
+      ``mempalace_rerank_sdk_version`` — the MemPalace **LLM reranker**'s configuration (issue
+      #464): the OpenRouter model id that reranks (``null`` = rerank off, the shipped default), the
+      OpenRouter provider slugs it is pinned to as a list (``[]`` when unset), and the installed
+      version of the ``openrouter`` distribution the rerank call needs — reported with the same
+      *key-present / null-when-not-installed* semantics as ``ai_sdk_version``, and read from
+      installed metadata for the same reason. The **key is never reported**, here or anywhere:
+      this file is pasted into issues.
+
+      Two things need it, and both are the failure classes this report already exists for. A
+      *configured-but-dead* reranker — a model named with the SDK missing — is invisible from
+      outside the box otherwise (the configured-but-dead MCP overlay lesson), and it degrades
+      silently to plain hybrid, which is exactly a capability that is a corpse while every health
+      signal reads green. And the NOC may only pin an extra whose version the harness reports
+      (`fleet-ops.md` §4), so an agent brained by ``openai`` or ``xai-sdk`` that carries the
+      ``openrouter`` extra **solely** to rerank is unpinnable without this field.
     - ``max_context_tokens`` — the operator's context-budget override (`HARNESS_MAX_CONTEXT_TOKENS`;
       issue #276), or ``null`` when unset. ``0`` means compaction is **disabled** on this agent, and
       that is the state worth being able to see from outside. The *resolved* ceiling is deliberately
@@ -4368,6 +4401,11 @@ def resolved_config() -> dict[str, object]:
         "max_context_tokens": _max_context_tokens_from_env(),
         "memory_provider": memory_name,
         "memory_provider_version": memory_version,
+        "mempalace_rerank_model": (os.environ.get(RERANK_MODEL_VAR) or "").strip() or None,
+        "mempalace_rerank_providers": list(
+            providers_from_env(os.environ.get(RERANK_PROVIDERS_VAR))
+        ),
+        "mempalace_rerank_sdk_version": _dist_version(_RERANK_SDK_DISTRIBUTION),
         "tools": sorted(tool.name for tool in resolved.tools),
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),
