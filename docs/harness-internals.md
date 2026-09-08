@@ -481,10 +481,14 @@ library API. So it is built here (`_rerank.py`), with no MemPalace fork and no M
 - **Its own key, its own client, never the brain's.** `HARNESS_MEMPALACE_RERANK_API_KEY` is required
   when the model is set and **never** falls back to `AI_API_KEY` — an agent brained by `openai` or
   `xai-sdk` reranks on OpenRouter without either credential learning about the other. Routing is
-  pinned by `HARNESS_MEMPALACE_RERANK_PROVIDERS` → `provider: {only, allow_fallbacks: false,
+  pinned by `HARNESS_MEMPALACE_RERANK_PROVIDERS` → `provider: {only, allow_fallbacks: true,
   data_collection: "deny"}`, and the slug list lives in **config, never in code**: which endpoints
   are acceptable is a jurisdiction decision with a date on it, and a vendor list baked into a package
-  rots the way a vendor cap table does.
+  rots the way a vendor cap table does. The **list** is the jurisdiction guarantee and the fallback
+  flag is not (issue #468): `only` restricts the pool outright whatever `allow_fallbacks` says, so a
+  fallback is a second attempt *inside* the pin. It shipped `false` and cost the first real wake its
+  rerank — OpenRouter picked one pinned upstream, that upstream's shared pool answered 429, and the
+  call failed with three acceptable endpoints untried.
 - **Vendor SDK only, and the prompt differs from upstream's on purpose.** The call goes through the
   real `openrouter` SDK (fleet law: zero harness-owned HTTP to a model endpoint), reusing this repo's
   `_ErrorMapper` and `require_openrouter_sdk`. Upstream's benchmark asks the model to pick **one** hit

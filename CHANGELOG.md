@@ -7,6 +7,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.116.2] - 2026-09-08
+
+### Fixed: one upstream's 429 no longer defeats the MemPalace reranker (issue #468)
+
+The rerank call pinned routing with `allow_fallbacks: false`, and the first real wake after the
+0.116.1 rollout paid for it: OpenRouter picked Modal out of the pinned list, Modal's shared upstream
+pool answered `429` (`limit_source: upstream_provider_shared_pool`), and with fallbacks off
+OpenRouter did not try the other three pinned providers. One vendor's momentary limit, and the whole
+reranker fell back to plain hybrid — the fallback path working exactly as designed, for a cause that
+was ours rather than the vendor's.
+
+The call now sends `allow_fallbacks: true`, with `only` and `data_collection: "deny"` unchanged.
+**The list is the jurisdiction guarantee; the flag never was.** `only` restricts the pool outright
+whatever `allow_fallbacks` says, so a fallback is a second attempt *inside* the pin — reproduced
+against the live endpoint with the same request shape: fallbacks off, `429` from Modal 3/3;
+fallbacks on with the identical `only` list, `200` 3/3, served by CoreWeave and Parasail and never
+by a provider outside the list.
+
+No retry ships inside the harness: OpenRouter's in-list fallback *is* the retry, and it costs
+nothing. One line in the request builder; the request-bytes test that pins the provider object moves
+with it, and the live release gate exercises the new shape.
+
 ## [0.116.1] - 2026-09-08
 
 ### Changed: Turn-0 injects ten memories, not eight (issue #466)
