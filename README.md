@@ -180,8 +180,8 @@ The prefix is `HARNESS_MEMPALACE_*`, not `MEMPALACE_*`, because the latter is up
 Both halves are visible in the log, in their own series (never the `llm` one, so a rerank never lands in your model-spend rollup):
 
 ```text
-INFO  mempalace recall  surface=turn0 rerank=on pool=20 injected=8 duration=3.41s chars=2871
-INFO  mempalace rerank  surface=turn0 provider=openrouter endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 pool=20 picked=8 outcome=ok
+INFO  mempalace recall  surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
+INFO  mempalace rerank  surface=turn0 provider=openrouter endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 pool=20 picked=10 outcome=ok
 WARN  mempalace rerank  surface=tool  provider=openrouter model=z-ai/glm-5.3-flash duration=31.02s outcome=fallback reason=timeout
 ERROR mempalace rerank  surface=turn0 provider=openrouter model=z-ai/glm-5.3-flash outcome=fallback reason=config:missing_api_key
 ```
@@ -1054,8 +1054,8 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
 - **One line per memory recall, on a [MemPalace](#swap-the-memory-backend--the-memory-provider) agent**, plus one per [rerank](#let-a-model-pick-what-gets-recalled--the-llm-reranker) when a rerank model is configured. Recall runs on every engaged wake, so what it fetched, what it injected, and whether the reranker helped is exactly the question a standing agent's operator asks — and a line nobody ships is a measurement nobody can make:
 
   ```
-  INFO mempalace recall surface=turn0 rerank=on pool=20 injected=8 duration=3.41s chars=2871
-  INFO mempalace rerank surface=turn0 provider=openrouter endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 pool=20 picked=8 outcome=ok
+  INFO mempalace recall surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
+  INFO mempalace rerank surface=turn0 provider=openrouter endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 pool=20 picked=10 outcome=ok
   ```
 
   The fields are spelled exactly as the LLM line spells them, so one grep syntax reads both — but the **head is `mempalace`, never `llm`**, for the same reason the media line's is `media`: the dashboard splits LLM spend from everything else on the line head, and a reranker billed into that series would inflate every agent's model-cost rollup with a second, unrelated spend. A rerank that fell back says so (`outcome=fallback reason=…`) at `WARNING`, or at `ERROR` once per wake when the reranker is *configured and dead* rather than merely having a bad minute.

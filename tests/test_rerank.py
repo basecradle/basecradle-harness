@@ -136,7 +136,7 @@ def router():
 def test_pool_reaches_past_the_requested_count():
     """A pool the size of the request is a reorder, which the Turn-0 surface cannot even see."""
     assert pool_size(1) == POOL_FLOOR
-    assert pool_size(DEFAULT_N_RESULTS) == POOL_FLOOR  # 8 → the floor still wins
+    assert pool_size(DEFAULT_N_RESULTS) == POOL_FLOOR  # 10 → 2k lands exactly on the floor
     assert pool_size(20) == 40
     assert pool_size(0) == POOL_FLOOR  # a degenerate request still gets a sane pool
 

@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.116.1] - 2026-09-08
+
+### Changed: Turn-0 injects ten memories, not eight (issue #466)
+
+The founder ruling on the one judgement call [#464](https://github.com/basecradle/basecradle-harness/issues/464)
+left open: `DEFAULT_N_RESULTS` is **10**. One constant, one behaviour, for every MemPalace agent
+whatever its rerank state — the same reading [#464](https://github.com/basecradle/basecradle-harness/issues/464)
+took, with a different number.
+
+Nothing else moves. `MAX_N_RESULTS` stays 20 and the pool rule stays `max(20, 2 × requested)`, so a
+Turn-0 rerank still reads a pool of twenty and returns the best ten; the `memory_search` tool's
+default follows the constant, as it already did.
+
 ## [0.116.0] - 2026-09-08
 
 ### Added: an LLM picks the memories that get injected — the MemPalace reranker (issue #464)
