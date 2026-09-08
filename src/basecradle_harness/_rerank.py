@@ -106,11 +106,13 @@ RERANK_MODEL_VAR = "HARNESS_MEMPALACE_RERANK_MODEL"
 RERANK_API_KEY_VAR = "HARNESS_MEMPALACE_RERANK_API_KEY"
 
 #: A comma-separated list of OpenRouter provider slugs the rerank call may route to, sent as
-#: ``provider: {only: [...], allow_fallbacks: false, data_collection: "deny"}``. Required whenever
+#: ``provider: {only: [...], allow_fallbacks: true, data_collection: "deny"}``. Required whenever
 #: the model is set, and deliberately **not defaulted in code**: which endpoints are acceptable is
 #: a jurisdiction/data-policy decision with a date on it, and a vendor list baked into a package
 #: rots the way a vendor cap table does (`basecradle_harness._openrouter` carries that lesson).
-#: Configuration is where a list that changes belongs.
+#: Configuration is where a list that changes belongs. **The list is the guarantee; the fallback
+#: flag is not** (issue #468) — ``only`` restricts the pool outright whatever ``allow_fallbacks``
+#: says, so fallbacks route *within* the pinned list and never outside it.
 RERANK_PROVIDERS_VAR = "HARNESS_MEMPALACE_RERANK_PROVIDERS"
 
 #: The reasoning budget the rerank call asks for. Ranking twenty short excerpts against one query
@@ -226,9 +228,13 @@ class MemPalaceReranker:
         model: The OpenRouter model id to rank with (``z-ai/glm-5.3-flash`` on the fleet).
         api_key: The rerank-scoped OpenRouter key. Never the agent's brain key.
         providers: The OpenRouter provider slugs the call may route to, sent as an ``only`` list
-            with ``allow_fallbacks: false`` and ``data_collection: "deny"`` — so a routing decision
-            an operator made about jurisdiction and data policy is enforced by the vendor rather
-            than hoped for.
+            with ``data_collection: "deny"`` — so a routing decision an operator made about
+            jurisdiction and data policy is enforced by the vendor rather than hoped for. Sent
+            with ``allow_fallbacks: true``, and the two are not in tension: ``only`` is a hard
+            restriction whatever the flag says, so a fallback is a *second attempt inside the
+            pinned list*. Off, it was not (issue #468): OpenRouter picked one pinned upstream,
+            that upstream's shared pool answered 429, and the call failed with three acceptable
+            endpoints untried — a momentary limit at one vendor defeating the whole reranker.
         fault: A pre-known config fault (a missing key or provider list) this reranker was born
             with. It never reranks; every call falls back to hybrid and reports (see
             `reranker_from_env`).
@@ -339,7 +345,11 @@ class MemPalaceReranker:
                     response_format={"type": "json_object"},
                     provider={
                         "only": list(self.providers),
-                        "allow_fallbacks": False,
+                        # Fallbacks stay *inside* `only` — the jurisdiction guarantee is that list,
+                        # never this flag (issue #468). With them off, one pinned upstream's shared
+                        # pool returning a 429 defeated the whole reranker while three acceptable
+                        # endpoints sat idle.
+                        "allow_fallbacks": True,
                         "data_collection": "deny",
                     },
                 )

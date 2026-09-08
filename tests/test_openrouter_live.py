@@ -180,9 +180,11 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
 RERANK_MODEL = "z-ai/glm-5.3-flash"
 
 #: A US-only routing pin, the shape every production rerank call sends. Several slugs rather than
-#: one because ``allow_fallbacks: false`` means a single pinned endpoint having a bad minute is a
-#: red release gate for a reason that is not this code — and a rerank pin is a *list* in production
-#: too, so this stays the production shape rather than a test-only narrowing.
+#: one because a single pinned endpoint having a bad minute would be a red release gate for a
+#: reason that is not this code — and a rerank pin is a *list* in production too, so this stays the
+#: production shape rather than a test-only narrowing. Since issue #468 the call also sends
+#: ``allow_fallbacks: true``, so a limited upstream is retried *within* this list rather than
+#: failing the call; that is the behaviour this probe exercises.
 RERANK_PROVIDERS = ("deepinfra", "baseten", "fireworks", "together")
 
 
@@ -201,7 +203,7 @@ def test_the_live_reranker_picks_and_reports_what_it_cost(caplog):
 
     Everything the offline suite proves about the reranker is proved against a body **we** wrote.
     Four things only a live call can settle, and each has already burned this repo once in another
-    form: that ``provider: {only, allow_fallbacks: false, data_collection: "deny"}`` is *accepted*
+    form: that ``provider: {only, allow_fallbacks: true, data_collection: "deny"}`` is *accepted*
     rather than 400'd; that ``reasoning: {effort: "low"}`` alongside ``response_format:
     json_object`` is a combination the model actually honors; that the model returns the documented
     ``{"picks": [...]}`` shape well enough to survive validation; and that ``usage.cost`` still
@@ -243,7 +245,9 @@ def test_the_live_reranker_picks_and_reports_what_it_cost(caplog):
     # A *value*, not a presence: a cost field that renders `0` is a spend series that reads free.
     cost = _field(line, "cost")
     assert cost and float(cost) > 0, f"the live usage block reported no cost: {line}"
-    # The routing pin was honored — `allow_fallbacks: false` means this can only be one of ours.
+    # The routing pin was honored. `only` is the hard restriction — `allow_fallbacks: true` lets
+    # OpenRouter retry *inside* this list (issue #468), never outside it — so a served call is a
+    # call one of these endpoints served.
     assert _field(line, "endpoint"), f"the live response named no serving upstream: {line}"
 
 

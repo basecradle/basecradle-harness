@@ -174,8 +174,14 @@ def test_the_request_carries_the_pin_the_effort_and_the_candidates(router):
     """The **bytes on the wire**, not what the adapter decided (the issue #433 lesson).
 
     Four things the founder decided ride this body, and every one of them is invisible to a test
-    that stops at the SDK boundary: the US-only routing pin with fallbacks off and data collection
-    denied, `low` reasoning, JSON output, and the candidates **whole** — no truncation.
+    that stops at the SDK boundary: the US-only routing pin with data collection denied, `low`
+    reasoning, JSON output, and the candidates **whole** — no truncation.
+
+    ``allow_fallbacks`` is **true** and that is the pin working rather than a hole in it (issue
+    #468): ``only`` is a hard restriction whatever the flag says, so a fallback retries *inside*
+    the pinned list. With it off, OpenRouter picked one pinned upstream, that upstream's shared
+    pool answered 429, and the reranker fell back to hybrid with three acceptable endpoints
+    untried — one vendor's bad minute defeating the feature.
     """
     route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
     long_memory = "x" * 4000
@@ -187,7 +193,7 @@ def test_the_request_carries_the_pin_the_effort_and_the_candidates(router):
     assert body["model"] == MODEL
     assert body["provider"] == {
         "only": list(PROVIDERS),
-        "allow_fallbacks": False,
+        "allow_fallbacks": True,
         "data_collection": "deny",
     }
     assert body["reasoning"] == {"effort": "low"}
