@@ -12,7 +12,6 @@ import json
 import os
 import stat
 import sys
-import types
 from pathlib import Path
 
 import pytest
@@ -25,51 +24,12 @@ from basecradle_harness._memory_provider import (
     _palace_path,
     memory_provider_from_env,
 )
-from basecradle_harness._mempalace import MemPalaceMemoryProvider, MemPalaceSearchTool
-
-# The keyword arguments MemPalace's `search_memories` actually accepts. The fake rejects
-# anything outside this set, so a kwarg the adapter invents (or one upstream renames) fails
-# the suite here rather than raising a TypeError against the real library in production.
-_SEARCH_KWARGS = {"n_results", "candidate_strategy", "max_distance"}
-
-
-@pytest.fixture
-def fake_mempalace(monkeypatch):
-    """Install fake ``mempalace.convo_miner`` / ``mempalace.searcher`` modules.
-
-    Returns the two fakes so a test can assert how the adapter called them. ``mine_convos``
-    records its args; ``search_memories`` records the kwargs it was *passed* (not their
-    defaults — the `max_distance` guard below turns on that distinction) and returns
-    whatever the test stashes on it.
-    """
-    convo_miner = types.ModuleType("mempalace.convo_miner")
-    convo_miner.calls = []
-
-    def mine_convos(convo_dir, palace_path, **kwargs):
-        convo_miner.calls.append((convo_dir, palace_path, kwargs))
-
-    convo_miner.mine_convos = mine_convos
-
-    searcher = types.ModuleType("mempalace.searcher")
-    searcher.result = {"results": []}
-    searcher.queries = []
-
-    def search_memories(query, palace_path, **kwargs):
-        unknown = set(kwargs) - _SEARCH_KWARGS
-        assert not unknown, f"MemPalace's search_memories takes no {sorted(unknown)} kwarg"
-        searcher.queries.append((query, palace_path, kwargs))
-        return searcher.result
-
-    searcher.search_memories = search_memories
-
-    parent = types.ModuleType("mempalace")
-    parent.convo_miner = convo_miner
-    parent.searcher = searcher
-
-    monkeypatch.setitem(sys.modules, "mempalace", parent)
-    monkeypatch.setitem(sys.modules, "mempalace.convo_miner", convo_miner)
-    monkeypatch.setitem(sys.modules, "mempalace.searcher", searcher)
-    return convo_miner, searcher
+from basecradle_harness._mempalace import (
+    DEFAULT_N_RESULTS,
+    MAX_N_RESULTS,
+    MemPalaceMemoryProvider,
+    MemPalaceSearchTool,
+)
 
 
 def _scope(query=None):
@@ -357,7 +317,9 @@ def test_search_tool_recalls_through_the_same_union_search_as_context(fake_mempa
     assert (query, palace_path) == ("that endpoint we discussed in March", str(palace))
     assert kwargs["candidate_strategy"] == "union"  # inherited from #266 — never vector-only
     assert "max_distance" not in kwargs  # which would silently kill the union pool
-    assert kwargs["n_results"] == 5  # the provider's default when the model names no count
+    # The provider's default when the model names no count — read from the constant, so a
+    # deliberate change to it (5 → 8 in issue #464) stays one edit rather than a hunt for literals.
+    assert kwargs["n_results"] == DEFAULT_N_RESULTS
 
 
 def test_search_tool_clamps_a_model_chosen_bound(fake_mempalace, tmp_path):
@@ -377,7 +339,12 @@ def test_search_tool_clamps_a_model_chosen_bound(fake_mempalace, tmp_path):
     tool.run(query="anything", n_results="3")  # a model can send a string
     tool.run(query="anything", n_results=8)
 
-    assert [kwargs["n_results"] for _q, _p, kwargs in searcher.queries] == [20, 1, 5, 8]
+    assert [kwargs["n_results"] for _q, _p, kwargs in searcher.queries] == [
+        MAX_N_RESULTS,
+        1,
+        DEFAULT_N_RESULTS,  # a string is not an integer bound — fall back to the default
+        8,
+    ]
 
 
 def test_search_tool_reports_a_miss_so_the_model_can_refine(fake_mempalace, tmp_path):
