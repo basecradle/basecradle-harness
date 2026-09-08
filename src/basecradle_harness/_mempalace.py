@@ -87,12 +87,12 @@ _log = logging.getLogger("basecradle_harness")
 # How many relevant chunks `context` retrieves to inject at Turn 0, and the tool returns when
 # the model names no count. Bounded so a large palace can't flood the model's context window.
 #
-# Eight rather than the original five (issue #464, founder-decided): the LLM reranker reads a pool
-# of twenty and hands back the best of them, so the injected set is now *chosen* rather than
-# whatever the hybrid ranked first — which makes a wider set worth paying for. It widens on a
-# rerank-off agent too, deliberately: one constant, one behaviour, so a rerank outage never also
-# silently narrows what an agent remembers.
-DEFAULT_N_RESULTS = 8
+# Ten rather than the original five (issue #464, widened again by founder ruling in issue #466):
+# the LLM reranker reads a pool of twenty and hands back the best of them, so the injected set is
+# now *chosen* rather than whatever the hybrid ranked first — which makes a wider set worth paying
+# for. It widens on a rerank-off agent too, deliberately: one constant, one behaviour, so a rerank
+# outage never also silently narrows what an agent remembers.
+DEFAULT_N_RESULTS = 10
 
 # The ceiling on a *model-chosen* count (`memory_search`'s `n_results`). The Turn-0 default is
 # small because it is paid on every wake; a deliberate search is paid only when the agent asks,

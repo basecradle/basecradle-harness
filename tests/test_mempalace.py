@@ -318,7 +318,8 @@ def test_search_tool_recalls_through_the_same_union_search_as_context(fake_mempa
     assert kwargs["candidate_strategy"] == "union"  # inherited from #266 — never vector-only
     assert "max_distance" not in kwargs  # which would silently kill the union pool
     # The provider's default when the model names no count — read from the constant, so a
-    # deliberate change to it (5 → 8 in issue #464) stays one edit rather than a hunt for literals.
+    # deliberate change to it (5 → 8 in issue #464, → 10 in issue #466) stays one edit rather than
+    # a hunt for literals.
     assert kwargs["n_results"] == DEFAULT_N_RESULTS
 
 

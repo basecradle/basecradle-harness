@@ -471,7 +471,9 @@ library API. So it is built here (`_rerank.py`), with no MemPalace fork and no M
   the palace is reranked, for the same reason they cannot drift on how it is searched. The hybrid
   search fetches `pool_size(k) = max(20, 2k)` candidates, the model picks `k`, and those come back in
   its order. `DEFAULT_N_RESULTS` moved **5 → 8** in the same change: the injected set is now *chosen*
-  rather than "whatever the hybrid ranked first", which makes a wider set worth paying for.
+  rather than "whatever the hybrid ranked first", which makes a wider set worth paying for. A
+  founder ruling (issue #466) then set it to **10** — the one judgement call #464 left open; the
+  pool rule is unchanged, so a Turn-0 rerank still reads twenty and returns the best ten.
 - **Off by absence.** `HARNESS_MEMPALACE_RERANK_MODEL` unset → `reranker_from_env()` is `None`,
   `search` runs the identical query it ran before, and the `openrouter` SDK is never imported. There
   is no shadow mode and no `…_ENABLED` companion: the model id *is* the switch, so there is no second
