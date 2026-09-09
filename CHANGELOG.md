@@ -7,6 +7,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.116.3] - 2026-09-09
+
+### Fixed: image-to-video sent the wrong body key, so every image-to-video was text-to-video (issue #470)
+
+`grok_generate_video`'s image-to-video path never worked. It sent
+
+```json
+{"image_url": "https://…/blobs/<uuid>"}
+```
+
+— a **top-level `image_url`** carrying the platform's signed blob URL. `image_url` is the
+*`xai_sdk` keyword argument*, not the REST field: xAI's documented body is an `image` **object**
+(`{"url": …}`, a public URL or a base64 data URI). xAI ignores an unknown top-level key, so the
+call ran as plain text-to-video — no error, the same `cost=0.4` on the media line, the same
+latency, and a clip that matched the prompt and not the still. Production evidence
+(2026-08-13, an @origin ↔ @eddie-murphy timeline): four calls with an explicit "this exact image
+is frame 1" prompt, four clips with a different character each time. The test suite *pinned* the
+bug — it asserted `sent["image_url"]`.
+
+The source now rides `image`, built by `_GrokMediaTool._source_image` — **the same helper, and the
+same object, `grok_edit_image` already sent** (`{"type": "image_url", "url": "data:…;base64,…"}`):
+the bytes inlined rather than a URL, because the signed Asset URL is not assumed publicly fetchable
+by xAI's servers. Both endpoints document the same `image` object, so both get the same shape and
+that assumption is now held in exactly one place. The old `_source_image_url` (and its claim that xAI
+could fetch the blob) is deleted; the rewritten test asserts the object *and* the absence of
+`image_url`, since the absent half is the half that was failing.
+
+A generated clip's result now ends `Watch it with watch_video to check the result.` — the agent
+verifies its own work; the harness never tells a model to ask a human to look.
+
+Also corrected while in the file: the `resolution` parameter's description named only
+`480p`/`720p`, where `grok-imagine-video-1.5` (the default model) documents `1080p` as well and
+supports it natively for image-to-video. The historical 0.30.0 entry is left as written.
+
+
 ## [0.116.2] - 2026-09-08
 
 ### Fixed: one upstream's 429 no longer defeats the MemPalace reranker (issue #468)

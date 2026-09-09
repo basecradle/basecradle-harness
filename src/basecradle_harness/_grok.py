@@ -19,13 +19,26 @@ split by operation → every option tested):
   OpenAI `edit_image` — there is no ``mask`` parameter. xAI composites up to **3** source
   images. The request shape is ``image`` (a single ``{"type":"image_url","url":…}`` object) for
   one source, or ``images`` (an array of them) for a composite (docs.x.ai images/editing +
-  multi-image-editing).
+  multi-image-editing) — the shape image-to-video now shares (see below).
 - `GrokGenerateVideoTool` (``grok_generate_video``) — text → video **or** image → video, via
   xAI's **asynchronous** video endpoint (``POST /v1/videos/generations``,
   ``grok-imagine-video-1.5``).
   This is the harness's first video capability. Generation takes minutes: the call returns a
   ``request_id`` and the tool polls ``GET /v1/videos/{request_id}`` until the clip is ``done``,
   then downloads the produced ``.mp4`` and uploads it as an Asset that renders inline in the UI.
+
+One source-image shape, for every endpoint that takes one
+---------------------------------------------------------
+``POST /v1/images/edits`` and ``POST /v1/videos/generations`` document the **same** ``image``
+object — ``url`` (a public URL *or* a base64 data URI) or a Files-API ``file_id`` — so
+`_GrokMediaTool._source_image` builds it once and both tools send it.
+
+It was two shapes until issue #470, and the second one was wrong: image-to-video sent a
+**top-level** ``image_url`` (the *xai_sdk keyword argument*, not the REST field) pointing at the
+platform blob URL. xAI ignores an unknown body key, so **every** image-to-video call silently ran
+plain text-to-video — no error, the same cost and latency, a clip that matched the prompt and not
+the still. One assumption held in one place is the guard: a second copy is a second thing that can
+be wrong, and this one was wrong for a month with nothing to say so.
 
 Why function tools, not a provider built-in
 -------------------------------------------
@@ -93,6 +106,11 @@ DEFAULT_TIMEOUT = 300.0
 #: "typically takes up to several minutes" (xAI), so the default ceiling is roomy.
 DEFAULT_POLL_INTERVAL = 5.0
 DEFAULT_POLL_MAX_WAIT = 600.0
+
+#: Appended to a generated clip's result. The agent produced a video it cannot see; this names the
+#: tool that lets it look, so self-verification is a step it can take rather than a favour it has
+#: to ask a human for.
+_WATCH_HINT = "Watch it with watch_video to check the result."
 
 #: xAI states a media call's charged cost natively — an integer count of *ticks* in the response's
 #: ``usage`` object, where 1 tick = 1e-10 USD (docs.x.ai → Cost Tracking; the pinned ``xai_sdk``'s
@@ -190,6 +208,36 @@ class _GrokMediaTool(PlatformTool):
             raise ProviderError(
                 f"couldn't read source image asset {uuid!r}: {explain(error)}"
             ) from error
+
+    def _source_image(self, uuid: str) -> dict[str, str]:
+        """Resolve a source image Asset uuid to an xAI ``image`` object (a base64 data URI).
+
+        **One shape for every xAI endpoint that takes a source image.** ``images/edits`` and
+        ``videos/generations`` document the *same* ``image`` object (docs.x.ai → REST API
+        Reference → Images / Videos), so one helper builds it and both tools send it.
+
+        The bytes are **inlined** rather than pointed at — the signed Asset blob URL is not
+        assumed publicly fetchable by xAI's servers — and the object carries
+        ``type: "image_url"`` beside the url. That key is not in the REST reference's schema for
+        the object; it is in the **image-editing guide's own curl example** (docs.x.ai →
+        Model Capabilities → Image Editing), which is why it is sent, and because both endpoints
+        take the same object type it is sent to both. Should xAI ever reject it, the fix is one
+        line here and it is one line for both tools — which is the point of a single helper.
+
+        A bad uuid (or a download failure) raises a legible `ProviderError` the caller relays, so
+        the AI learns *why* the source couldn't be read.
+        """
+        file = self._source_file(uuid)
+        try:
+            data = _download(file.url)
+        except httpx.HTTPError as exc:
+            raise ProviderError(f"couldn't download source image asset {uuid!r}: {exc}") from exc
+        # A blob missing its content-type would crash `_data_url` (it splits the string) — fall
+        # back to a generic type so a malformed asset still relays legibly, never AttributeErrors.
+        return {
+            "type": "image_url",
+            "url": _data_url(file.content_type or "application/octet-stream", data),
+        }
 
 
 class GrokGenerateImageTool(_GrokMediaTool):
@@ -403,26 +451,6 @@ class GrokEditImageTool(_GrokMediaTool):
             "Edited and posted",
         )
 
-    def _source_image(self, uuid: str) -> dict[str, str]:
-        """Resolve a source image Asset uuid to an xAI ``image_url`` object (a base64 data URI).
-
-        xAI's edit endpoint takes the image inline as a data URI rather than a fetchable URL — the
-        signed Asset URL is not assumed publicly reachable by xAI's servers — so the bytes are
-        downloaded and base64-encoded. A bad uuid (or a download failure) raises a legible
-        `ProviderError` the caller relays, so the AI learns *why* the source couldn't be read.
-        """
-        file = self._source_file(uuid)
-        try:
-            data = _download(file.url)
-        except httpx.HTTPError as exc:
-            raise ProviderError(f"couldn't download source image asset {uuid!r}: {exc}") from exc
-        # A blob missing its content-type would crash `_data_url` (it splits the string) — fall
-        # back to a generic type so a malformed asset still relays legibly, never AttributeErrors.
-        return {
-            "type": "image_url",
-            "url": _data_url(file.content_type or "application/octet-stream", data),
-        }
-
 
 class GrokGenerateVideoTool(_GrokMediaTool):
     """``grok_generate_video`` — generate a video (text→video or image→video) and post it.
@@ -430,6 +458,10 @@ class GrokGenerateVideoTool(_GrokMediaTool):
     xAI's video endpoint is asynchronous: the submit returns a ``request_id`` and the tool
     polls until the clip is ``done``, then downloads and uploads it. ``poll_interval`` and
     ``poll_max_wait`` are constructor knobs so a test can drive the poll loop without sleeping.
+
+    Image-to-video sends the source as the documented ``image`` object built by the shared
+    `_GrokMediaTool._source_image` — the bytes inlined as a data URI, exactly as the edit tool
+    sends them, never a blob URL xAI is assumed able to fetch (issue #470).
     """
 
     name = "grok_generate_video"
@@ -466,7 +498,9 @@ class GrokGenerateVideoTool(_GrokMediaTool):
             },
             "resolution": {
                 "type": "string",
-                "description": "Optional resolution, e.g. '480p' or '720p'. Omit for the default.",
+                "description": (
+                    "Optional resolution: '480p', '720p', or '1080p'. Omit for the default."
+                ),
             },
             "filename": {
                 "type": "string",
@@ -528,7 +562,11 @@ class GrokGenerateVideoTool(_GrokMediaTool):
 
         try:
             if image:
-                payload["image_url"] = self._source_image_url(image)
+                # ``image`` — the documented request field (an object). NOT ``image_url``: that
+                # is the *xai_sdk* keyword argument, and sending it as a REST body key is the
+                # bug this replaced (issue #470) — xAI ignored the unknown key and silently ran
+                # plain text-to-video, at identical cost, for every image-to-video call.
+                payload["image"] = self._source_image(image)
             # The timed span is submit → done (the poll loop *is* the generation on this
             # endpoint); the clip download that follows is transfer, not model time. The charge
             # rides the completed `done` poll body, so cost comes back from `_await_video`.
@@ -546,22 +584,18 @@ class GrokGenerateVideoTool(_GrokMediaTool):
         target = timeline or self.context.timeline
         ext = sniff_media_ext(video_bytes, "mp4")
         name = media_filename(filename, prompt, ext)
-        return self._post_asset(
+        posted = self._post_asset(
             target,
             video_bytes,
             name,
             description or f"Generated video: {prompt}",
             "Generated and posted",
         )
-
-    def _source_image_url(self, uuid: str) -> str:
-        """Resolve a source image Asset uuid to its dereferenceable blob URL.
-
-        xAI's image-to-video takes an ``image_url`` (not bytes), and the platform blob URL is
-        already authorized, so xAI's servers can fetch it. A bad uuid raises a legible
-        `ProviderError` the caller relays — the AI learns *why* the source couldn't be read.
-        """
-        return self._source_file(uuid).url
+        # Point the model at its own eyes. A generated clip is the one asset whose *content* the
+        # agent has never seen — it asked for motion and got back a uuid — so the result names the
+        # tool that closes that loop. Never "ask the human to check": the agent verifies its own
+        # work (`watch_video`, issue #471).
+        return f"{posted} {_WATCH_HINT}"
 
     def _submit(self, key: str, payload: dict[str, Any]) -> str:
         """Submit the generation job and return its ``request_id``."""

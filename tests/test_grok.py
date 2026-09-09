@@ -369,13 +369,46 @@ def test_video_submits_polls_to_done_and_posts_the_clip(video_tool):
     assert "Generated and posted" in result and A_MEDIA in result
 
 
-def test_video_image_to_video_resolves_the_source_asset_to_a_url(video_tool):
+def test_video_image_to_video_sends_the_image_object_as_a_base64_data_uri(video_tool):
+    """The source rides ``image`` — the documented field — as inlined bytes, never ``image_url``.
+
+    The bug this pins (issue #470): the tool sent a top-level ``image_url`` (the *xai_sdk keyword
+    argument*, not the REST field) carrying the platform blob URL. xAI ignores an unknown body key,
+    so every image-to-video call silently ran plain text-to-video — no error, identical cost, a
+    clip that ignored the still. Assert the wrong key is **absent**, not only that the right one is
+    present: the absent half is the half that was failing.
+    """
     captured = {}
     with respx.mock(assert_all_called=True) as mock:
-        # The source Asset uuid is resolved to its blob URL and sent as image_url.
-        mock.get(f"{BC_URL}/assets/{SOURCE_UUID}").mock(
-            return_value=httpx.Response(200, json=source_asset_response(SOURCE_UUID))
+        _mock_source(mock, SOURCE_UUID)
+        submit = mock.post(VIDEOS_URL).mock(
+            return_value=httpx.Response(200, json={"request_id": REQUEST_ID})
         )
+        mock.get(f"{XAI_BASE}/videos/{REQUEST_ID}").mock(
+            return_value=httpx.Response(
+                200, json={"status": "done", "video": {"url": f"{XAI_BASE}/clips/out.mp4"}}
+            )
+        )
+        mock.get(f"{XAI_BASE}/clips/out.mp4").mock(
+            return_value=httpx.Response(200, content=MP4_BYTES)
+        )
+        _mock_upload(mock, captured)
+        result = video_tool.run(prompt="animate this", image=SOURCE_UUID)
+
+    sent = json.loads(submit.calls.last.request.content)
+    expected = "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+    # The same object the edit tool sends — one shape, one helper, one assumption.
+    assert sent["image"] == {"type": "image_url", "url": expected}
+    assert "image_url" not in sent  # the key that silently made this text-to-video
+    # The agent is pointed at its own eyes, never at a human's.
+    assert "Watch it with watch_video to check the result." in result
+
+
+def test_video_image_to_video_survives_a_source_asset_with_no_content_type(video_tool):
+    """A blob with no content-type falls back to a generic type, exactly as the edit path does."""
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID, content_type=None)
         submit = mock.post(VIDEOS_URL).mock(
             return_value=httpx.Response(200, json={"request_id": REQUEST_ID})
         )
@@ -391,7 +424,7 @@ def test_video_image_to_video_resolves_the_source_asset_to_a_url(video_tool):
         video_tool.run(prompt="animate this", image=SOURCE_UUID)
 
     sent = json.loads(submit.calls.last.request.content)
-    assert sent["image_url"] == f"{BC_URL}/blobs/{SOURCE_UUID}"
+    assert sent["image"]["url"].startswith("data:application/octet-stream;base64,")
 
 
 def test_video_relays_a_failed_job_status_legibly(video_tool):
