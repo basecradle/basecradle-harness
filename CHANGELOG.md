@@ -7,6 +7,67 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.118.1] - 2026-09-09
+
+### Changed: one `llm` line per model call, `purpose=` names the role (issue #485)
+
+The fleet dashboard had three model-spend families built three different ways: the brain on the
+` llm provider=` head, the MemPalace reranker on a private ` mempalace rerank ` head, and the
+blind-model describer on a plain `llm` line **indistinguishable from the brain's** — so a Gemini
+describer's spend read as @glm-5.2's, and the helper had no cost, outcome or duration series at all.
+@origin's ruling from his audit: **one grammar for every model call**, with a category that names
+the role.
+
+**Three names, three places, never mixed.** The **log** says the category (`purpose=memory`); the
+**UI** says the human name (Memory System — the NOC's business); the **software** appears only as a
+field value (`provider=mempalace`, `model=google/…`). The word "mempalace" never names a category or
+a line head again.
+
+One `llm` line per model-call **attempt**, whatever the outcome. Fields in order — and the order is
+the contract, because the NOC's column regexes are written against it: `provider` `purpose` `kind`
+`endpoint` `model` `duration` `tokens_*` `cached_tokens` `tokens_reasoning` `cost` `outcome`
+`reason` `detail`, then that purpose's extras.
+
+```
+INFO  llm provider=openai purpose=main model=gpt-5.4-mini duration=3.41s tokens_in=4210 tokens_out=96 tokens_total=4306
+INFO  llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
+INFO  llm provider=openrouter purpose=helper kind=image.describe endpoint=Novita model=google/gemini-3-flash duration=1.50s tokens_in=812 tokens_out=96 cost=0.0021 outcome=ok subject=cat.png
+ERROR llm provider=openrouter purpose=helper kind=video.describe model=google/gemini-3-flash outcome=fallback reason=config:missing_api_key subject=clip.mp4
+INFO  memory recall provider=mempalace surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
+```
+
+- `purpose=main` — the brain. Nothing about those calls changes but the new field, and no `kind`.
+- `purpose=memory kind=rerank` — the reranker. **Replaces** the ` mempalace rerank ` line entirely:
+  one event, one line, and a dollar never on two lines.
+- `purpose=helper kind=image.describe|video.describe` — the describer. **Replaces** the
+  ` media provider=describer ` line, which wore the dashboard's *tools* head; a model call is not a
+  tool. Its failures leave the private `describer failed` head for the same `llm` line at
+  `outcome=fallback`, so a describer that is *configured and dead* is finally countable.
+- `mempalace recall` → **`memory recall`**, with `provider=mempalace` added. A recall keeps its own
+  head because it is **not** a model call: it spends nothing and has no tokens to report.
+- Tool/media lines (` media provider=xai … cost=`) are unchanged and carry no `purpose`.
+
+**The capture seam is what makes "one line per attempt" true.** The line is emitted inside the
+provider adapter, and only the *caller* can tell a usable answer from an empty one — so inside
+`capture_llm_call` the adapter's `log_llm_call` records into an `LlmCall` rather than emitting, and
+the
+caller writes the one line once it knows the outcome. Letting the adapter emit and adding a second
+line for a bad answer would count the attempt twice, put its dollar in the category twice, and leave
+the *good* path with no `outcome=` at all.
+
+**Two axes, stated because conflating them is the mistake:** `purpose` is a field on model calls;
+*spend category* (main / memory / helper / tools) is the dashboard's construct, derived from the
+line class. The NOC pins that every `cost=` belongs to exactly one category; the harness pins its
+own half — a rerank or describe attempt logs exactly one `llm` line, and no other line carries its
+`cost=`.
+
+The ` llm provider=` head is **byte-frozen** — it is the dashboard's anchor for the whole family and
+the denominator of its extraction alarm — so the purpose rides *inside* the line, never as a new
+head.
+
+No public API change: `capture_llm_call`, `LlmCall` and `MAIN`/`MEMORY`/`HELPER` are internal
+seams in `_observability`, which the package does not export.
+
 ## [0.118.0] - 2026-09-09
 
 ### Changed: `assets` is the noun, the verb is the sense — `view` / `watch` / `listen` (issue #484)

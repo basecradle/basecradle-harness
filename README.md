@@ -177,16 +177,16 @@ The prefix is `HARNESS_MEMPALACE_*`, not `MEMPALACE_*`, because the latter is up
 | **Config** | A model set with no key or no providers · the `openrouter` extra not installed · a rejected key (401/403) · an unfunded account (402) · a model id that does not exist | **ERROR**, once per wake — it is dead until a human acts, and ERROR is what raises an alert |
 | **Runtime** | A timeout · a transport blip · 429 · 5xx · an unparseable or unusable answer | **WARNING** — transient, and the next wake may well be fine |
 
-Both halves are visible in the log, in their own series (never the `llm` one, so a rerank never lands in your model-spend rollup):
+Both halves are visible in the log. A **recall** is not a model call — it spends nothing — so it keeps its own head; a **rerank** is one, so it is an [`llm` line](#what-a-wake-logs) like any other, carrying `purpose=memory kind=rerank` so your model-spend rollup can tell it from the brain's:
 
 ```text
-INFO  mempalace recall  surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
-INFO  mempalace rerank  surface=turn0 provider=openrouter endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 pool=20 picked=10 outcome=ok
-WARN  mempalace rerank  surface=tool  provider=openrouter model=z-ai/glm-5.3-flash duration=31.02s outcome=fallback reason=timeout
-ERROR mempalace rerank  surface=turn0 provider=openrouter model=z-ai/glm-5.3-flash outcome=fallback reason=config:missing_api_key
+INFO  memory recall provider=mempalace surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
+INFO  llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
+WARN  llm provider=openrouter purpose=memory kind=rerank model=z-ai/glm-5.3-flash duration=31.02s outcome=fallback reason=timeout surface=tool
+ERROR llm provider=openrouter purpose=memory kind=rerank model=z-ai/glm-5.3-flash outcome=fallback reason=config:missing_api_key surface=turn0
 ```
 
-An agent with no rerank model logs `mempalace recall … rerank=off` and no rerank line at all. And `basecradle-harness-wake --resolved-config` [reports](#run-under-a-router-wake-mode) the model, the provider pin, and the installed SDK version (never the key), so a *configured-but-dead* reranker is visible from off the box rather than quietly degrading to hybrid.
+An agent with no rerank model logs `memory recall … rerank=off` and no rerank line at all. And `basecradle-harness-wake --resolved-config` [reports](#run-under-a-router-wake-mode) the model, the provider pin, and the installed SDK version (never the key), so a *configured-but-dead* reranker is visible from off the box rather than quietly degrading to hybrid.
 
 ### Scrub a polluted palace — `basecradle-harness-scrub-palace`
 
@@ -1007,11 +1007,11 @@ A deployed wake is a one-shot process nobody is watching, so its **journal is it
 
 ```
 INFO wake start timeline=019e77…6da provider=openai model=gpt-5.4-mini delivery=0199…c9d
-INFO llm provider=openai model=gpt-5.4-mini duration=3.41s tokens_in=4210 tokens_out=96 tokens_total=4306
+INFO llm provider=openai purpose=main model=gpt-5.4-mini duration=3.41s tokens_in=4210 tokens_out=96 tokens_total=4306
 INFO tool name=messages duration=0.09s outcome=ok
 INFO posted message=019e7755…203 timeline=019e77…6da kind=tool chars=184
 INFO step 1/24: tools=messages (3.50s)
-INFO llm provider=openai model=gpt-5.4-mini duration=2.02s tokens_in=4390 tokens_out=71 tokens_total=4461
+INFO llm provider=openai purpose=main model=gpt-5.4-mini duration=2.02s tokens_in=4390 tokens_out=71 tokens_total=4461
 INFO step 2/24: final reply (2.02s)
 INFO wake used 2/24 steps
 INFO unspoken timeline=019e77…6da kind=narration chars=64 text="Answered John's status question. Nothing else outstanding here."
@@ -1020,7 +1020,21 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
 
 - **Bookends.** Every wake opens with what it is about to run (timeline, the trigger when one was named, provider, model) and closes with what came of it (`outcome=ok|declined|error`, model turns, steps against the [budget](#the-step-budget-live-counter-and-reserve-summary), messages posted, wall-clock). **`posted=0` is a real outcome, not a failure** — the agent read, thought, and chose not to speak ([the Unspoken Channel](#how-an-agent-speaks--the-unspoken-channel)); the `unspoken` line on that wake carries its reasoning.
 - **One `unspoken` line per turn** — the model's final text, which reached no timeline and no peer. It is the **one** place this stream carries content rather than the shape of a call, and the one field that is **never truncated**: it exists nowhere else, so bounding it would turn "full visibility" into "the first 240 characters of visibility". Credential shapes are scrubbed and newlines flattened, so it stays one greppable record. The end line rides a `finally`, so a wake that *crashes* still reports what it had done. `max_steps` is a **per-turn** budget and a wake can take several turns — one per item (unseen messages batch into a single turn; an activated task, a posted asset, or a webhook delivery each get their own), plus one for every [mid-generation rebuild](#read-speed-pacing-aiai-conversations). So `steps` is a sum across `turns` and may exceed the cap on a multi-turn wake — which is what `turns` is there to say.
-- **One line per model call**, on every provider — the adapter that made it, the model, how long it took, and what it cost. `provider=` names the **endpoint vendor**, not the SDK, so grok-through-the-`openai`-SDK reads `provider=xai`. The cost fields are **capabilities, answered by whoever can**: each adapter reports what its provider actually says, and a field a provider has no answer for is simply absent — the harness ships **no price table**, because a stale table is worse than an honest gap.
+- **One `llm` line per model-call attempt, whatever the outcome** — on every provider and for every *purpose*. The adapter that made it, the model, how long it took, and what it cost. `provider=` names the **endpoint vendor**, not the SDK, so grok-through-the-`openai`-SDK reads `provider=xai`. The cost fields are **capabilities, answered by whoever can**: each adapter reports what its provider actually says, and a field a provider has no answer for is simply absent — the harness ships **no price table**, because a stale table is worse than an honest gap.
+
+  **`purpose=` names what the model was doing for the agent** — one grammar for every model call, whoever made it:
+
+  | `purpose=` | Whose call | Extra fields |
+  |---|---|---|
+  | `main` | the agent's **brain** | none — a main call carries no `kind` |
+  | `memory` | the [MemPalace reranker](#let-a-model-pick-what-gets-recalled--the-llm-reranker) (`kind=rerank`) | `surface=turn0\|tool`, `pool=`, `picked=` |
+  | `helper` | the [blind-model describer](#give-a-blind-model-eyes--the-describer) (`kind=image.describe\|video.describe`) | `subject=` (the file described) |
+
+  A non-`main` line also carries **`outcome=ok\|fallback`** and, on a fallback, **`reason=<class:detail>`** — so a helper or memory model that is *configured and dead* is visible as a rising `fallback` rather than as an agent that merely stopped doing something. Before this, the reranker wore a private `mempalace rerank` head and the describer's calls landed on a plain `llm` line **indistinguishable from the brain's**, so a second model's spend read as the first's.
+
+  **Three names in three places, never mixed.** The log says the **category** (`purpose=memory`); a dashboard says the human name (Memory System); and the *software* — MemPalace, Gemini — appears only as a **field value** (`provider=mempalace`, `model=google/…`). And `purpose` is a field on **model calls** only: media/tool lines are not model calls and carry none, which is how a dashboard tells model spend from tool spend.
+
+  **One attempt, one line, and a dollar on exactly one line.** A call that answered with something unusable rides the *same* line its success would have written, with `outcome=fallback` — never a second line, which would count the attempt twice and its cost twice over.
 
   | Field | What it says | Where it lands |
   |---|---|---|
@@ -1034,7 +1048,7 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   So a routed call earns the full line, and an operator can answer "what did that cost, who served it, and was the cache doing anything?" from the journal alone:
 
   ```
-  INFO llm provider=openrouter endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445
+  INFO llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445
   ```
 - **One line per tool run** (name, duration, `ok`/`error`) — because a failing tool's error is fed back *to the model* as its result, which made it invisible to the operator; a failure now also logs a `WARNING` carrying the error text.
 - **One line per [context compaction](#the-context-budget--the-transcript-compacts-itself)**, plus one naming the context limit the agent resolved and where it came from — so "which ceiling is this agent actually on, and is it compacting?" is answerable from the journal, never inferred:
@@ -1046,16 +1060,24 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
 
   A compaction that **declines** (no safe cut point) or **fails** (the summarization call errored) is a `WARNING`, because the agent keeps working and nothing else would look wrong; an over-length `400` — the wall — is a `WARNING` too, naming the compact-and-retry it triggered.
 - **One line per assembled turn saying what the context is *made of*** — see [below](#what-the-context-is-made-of).
-- **One line per media generation** (`kind=image.generate` / `image.edit` / `video.generate` / `audio.transcribe`), timing the vendor call, not the Asset upload after it. It carries the same **`cost=`** the LLM line does **when the provider states one** — xAI reports the exact charge for image and video generation natively (`usage.cost_in_usd_ticks`, 1 tick = 1e-10 USD; for the async video flow it rides the completed `done` poll body), so a grok image or video generation shows its dollars; OpenAI reports no media cost, so the field is absent there. The dashboard splits **LLM cost** from **tool cost** on the line *head* (`llm provider=` vs `media …`), never on the cost field, so `cost=` stays the same `cost=([0-9.]+)`-matchable shape on both:
+- **One line per media generation** (`kind=image.generate` / `image.edit` / `video.generate` / `audio.transcribe`), timing the vendor call, not the Asset upload after it. It carries the same **`cost=`** the LLM line does **when the provider states one** — xAI reports the exact charge for image and video generation natively (`usage.cost_in_usd_ticks`, 1 tick = 1e-10 USD; for the async video flow it rides the completed `done` poll body), so a grok image or video generation shows its dollars; OpenAI reports no media cost, so the field is absent there. A media line is **not a model call**: it keeps its own head, carries no `purpose=`, and its `cost=` is the dashboard's *tools* category. `cost=` stays the same `cost=([0-9.]+)`-matchable shape on every line that has one:
 
   ```
   INFO media provider=xai kind=video.generate model=grok-imagine-video-1.5 duration=61.00s cost=2.1
   ```
 - **One line per memory recall, on a [MemPalace](#swap-the-memory-backend--the-memory-provider) agent**, plus one per [rerank](#let-a-model-pick-what-gets-recalled--the-llm-reranker) when a rerank model is configured. Recall runs on every engaged wake, so what it fetched, what it injected, and whether the reranker helped is exactly the question a standing agent's operator asks — and a line nobody ships is a measurement nobody can make:
 
+  A **recall is not a model call** — it spends nothing and has no tokens — so it keeps its own head, `memory recall`, naming the *category* with the software as a field value. The rerank *is* a model call, so it is an `llm` line like any other:
+
   ```
-  INFO mempalace recall surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
-  INFO mempalace rerank surface=turn0 provider=openrouter endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 pool=20 picked=10 outcome=ok
+  INFO memory recall provider=mempalace surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
+  INFO llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
+  ```
+
+  And a describe, on an agent with a [describer](#give-a-blind-model-eyes--the-describer) configured:
+
+  ```
+  INFO llm provider=openrouter purpose=helper kind=image.describe endpoint=Novita model=google/gemini-3-flash duration=1.50s tokens_in=812 tokens_out=96 cost=0.0021 outcome=ok subject=cat.png
   ```
 
   The fields are spelled exactly as the LLM line spells them, so one grep syntax reads both — but the **head is `mempalace`, never `llm`**, for the same reason the media line's is `media`: the dashboard splits LLM spend from everything else on the line head, and a reranker billed into that series would inflate every agent's model-cost rollup with a second, unrelated spend. A rerank that fell back says so (`outcome=fallback reason=…`) at `WARNING`, or at `ERROR` once per wake when the reranker is *configured and dead* rather than merely having a bad minute.

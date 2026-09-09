@@ -73,6 +73,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import TYPE_CHECKING, Any
 
 from basecradle_harness._assets import model_sees_video
@@ -89,7 +90,14 @@ from basecradle_harness._exceptions import (
     ProviderServerError,
 )
 from basecradle_harness._messages import ImageContent, Message, VideoContent
-from basecradle_harness._observability import media_timer
+from basecradle_harness._observability import (
+    HELPER,
+    LlmCall,
+    capture_llm_call,
+    describe_provider,
+    log_llm_call,
+    reasoning_tokens,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from basecradle_harness._provider import Provider
@@ -119,6 +127,13 @@ DESCRIBER_API_KEY_VAR = "HARNESS_DESCRIBER_API_KEY"
 #: reason this var exists: @glm-5.2's brain pins ``provider.only`` to GLM hosts, none of which
 #: serve a Gemini-class describer — an inherited pin fails every call with no eligible provider.
 DESCRIBER_PROVIDERS_VAR = "HARNESS_DESCRIBER_PROVIDERS"
+
+#: The ``kind=`` a describe carries on its `llm` line — the *job* within the ``helper`` category
+#: (issue #485). **Thing then verb**, matching the media lines' own vocabulary (``video.generate``,
+#: ``audio.transcribe``) rather than inventing a second word order for the same idea. Constants
+#: rather than literals at four call sites, because a job name is a dashboard column's gate.
+IMAGE_KIND = "image.describe"
+VIDEO_KIND = "video.describe"
 
 #: The instruction the describer is given. **Fixed harness text, deliberately not configurable.**
 #: It is read by no human and tuned by no operator: its whole job is to turn pixels into the
@@ -224,7 +239,7 @@ class Describer:
         return self._ask(
             DESCRIBE_PROMPT,
             images=images,
-            kind="image.describe",
+            kind=IMAGE_KIND,
             subject=_names(images),
         )
 
@@ -255,7 +270,7 @@ class Describer:
             described = self._ask(
                 DESCRIBE_PROMPT + DESCRIBE_VIDEO_SUFFIX,
                 videos=[watched.clip],
-                kind="video.describe",
+                kind=VIDEO_KIND,
                 subject=name,
             )
             if described is None:
@@ -273,12 +288,15 @@ class Describer:
                 end=clip.sampling.end,
             )
         except ValueError as exc:
-            self._failed(name, "undecodable_video", detail=str(exc))
+            # No model call happened, but a *describe attempt* did and it produced nothing —
+            # which is what `outcome=fallback` on this purpose means. It carries no duration and
+            # no cost, exactly as a config-class fault does.
+            self._report(name, kind=VIDEO_KIND, reason="undecodable_video", detail=str(exc))
             return None
         described = self._ask(
             DESCRIBE_PROMPT + DESCRIBE_FRAMES_SUFFIX,
             images=frames,
-            kind="video.describe",
+            kind=VIDEO_KIND,
             subject=name,
         )
         return None if described is None else f"{summary}\n{described}"
@@ -306,55 +324,115 @@ class Describer:
         if self.fault is not None or self.provider is None:
             # Born broken — a missing key or provider list, or a provider that would not build. No
             # call is attempted; the report is the whole behaviour.
-            self._failed(subject, self.fault or "config:no_provider", detail=self.detail)
+            self._report(
+                subject, kind=kind, reason=self.fault or "config:no_provider", detail=self.detail
+            )
             return None
         turn = Message(
             role="user", content=prompt, images=list(images or []), videos=list(videos or [])
         )
-        try:
-            # The `llm provider=… model=…` line the adapter emits **is** this call's cost record —
-            # so `MediaCall.cost` is deliberately left unset rather than filled with a second copy
-            # of the same figure, which any dashboard summing media spend would double-count. This
-            # line exists to make the *perception* visible (which asset, how long), not the money.
-            with media_timer(provider="describer", kind=kind, model=self.model):
+        started = time.monotonic()
+        # `capture_llm_call` holds back the adapter's own line, so the one `llm` line this attempt
+        # writes is written below — where the outcome is known (issue #485). Before it, a describe
+        # emitted an untagged `llm` line the dashboard read as the *brain's*, plus a
+        # `media provider=describer` line, and that head is the dashboard's **tools** category,
+        # which a model call is not. One attempt, one line, one category.
+        with capture_llm_call() as call:
+            try:
                 reply = self.provider.chat([turn], None)
-        except ProviderError as exc:
-            self._failed(subject, _fault_of(exc), detail=str(exc))
-            return None
-        except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
-            # An adapter is allowed to raise something the taxonomy has never seen; that is a
-            # runtime-class unknown, not a reason to take the wake down over a picture.
-            self._failed(subject, "provider_error", detail=f"{type(exc).__name__}: {exc}")
-            return None
+            except ProviderError as exc:
+                self._report(
+                    subject,
+                    kind=kind,
+                    call=call,
+                    reason=_fault_of(exc),
+                    detail=str(exc),
+                    started=started,
+                )
+                return None
+            except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
+                # An adapter is allowed to raise something the taxonomy has never seen; that is a
+                # runtime-class unknown, not a reason to take the wake down over a picture.
+                self._report(
+                    subject,
+                    kind=kind,
+                    call=call,
+                    reason="provider_error",
+                    detail=f"{type(exc).__name__}: {exc}",
+                    started=started,
+                )
+                return None
         text = (getattr(reply, "content", None) or "").strip()
-        if not text:
-            self._failed(subject, "empty_response")
-            return None
-        return text
+        # A call that answered with nothing usable was still made and still billed, so its tokens
+        # and cost ride this line exactly as a success's do — the reranker's rule, in its words.
+        self._report(
+            subject,
+            kind=kind,
+            call=call,
+            reason=None if text else "empty_response",
+            started=started,
+        )
+        return text or None
 
-    def _failed(self, subject: str, reason: str, *, detail: str | None = None) -> None:
-        """The loud, greppable record that a description was not produced (#293's visibility law).
+    def _report(
+        self,
+        subject: str,
+        *,
+        kind: str,
+        reason: str | None,
+        call: LlmCall | None = None,
+        detail: str | None = None,
+        started: float | None = None,
+    ) -> None:
+        """The one `llm` line this describe attempt writes, whatever happened (issue #485).
+
+        It carries what only the adapter knew (`LlmCall` — the endpoint, the usage, the cost) plus
+        the one thing only this method knows: whether the answer was **usable**. That split is why
+        the line is written here and not in the adapter — see `capture_llm_call`.
 
         A silently-absent describer is the Green-While-Absent shape this repo names: the agent goes
-        on working, blind, and nothing says so.
+        on working, blind, and nothing says so. A failure that had its own private head
+        (``describer failed``) was invisible to every column that counts describes, which is
+        precisely how a *configured and dead* describer read identical to a deliberately blind one.
 
         **Severity is the taxonomy, not the volume** — the same split `_rerank.py` draws, in the
-        same words. A ``config:`` reason is *dead until a human acts*, so it is **ERROR**, which is
-        what pages; everything else can succeed unchanged next time, so it is **WARNING**. A
-        config-class report after the first drops to DEBUG: this object lives exactly one wake, so
-        "once per wake" needs no clock, and a chatty wake cannot turn one defect into a storm.
+        same words. A working describe is **INFO**: the WARNING belongs to the degrade it replaced,
+        and one on every success is how a real warning stops being read. A ``config:`` reason is
+        *dead until a human acts*, so it is **ERROR**, which is what pages; everything else can
+        succeed unchanged next time, so it is **WARNING**. A config-class report after the first
+        drops to DEBUG: this object lives exactly one wake, so "once per wake" needs no clock, and
+        a chatty wake cannot turn one defect into a storm.
         """
-        from basecradle_harness._observability import kv
-
-        is_config = reason.startswith("config:")
-        level = logging.ERROR if is_config else logging.WARNING
-        if is_config and self._reported_config:
-            level = logging.DEBUG
-        self._reported_config = self._reported_config or is_config
-        _log.log(
-            level,
-            "describer failed %s",
-            kv(subject=subject, model=self.model, reason=reason, detail=detail),
+        level = logging.INFO
+        if reason:
+            is_config = reason.startswith("config:")
+            level = logging.ERROR if is_config else logging.WARNING
+            if is_config and self._reported_config:
+                level = logging.DEBUG
+            self._reported_config = self._reported_config or is_config
+        call = call or LlmCall()
+        seconds = call.seconds
+        if seconds is None and started is not None:
+            seconds = time.monotonic() - started
+        log_llm_call(
+            # The adapter's own provider name where there was a call, this describer's configured
+            # one otherwise — never a guess: a born-broken describer has no adapter to ask.
+            provider=call.provider or describe_provider(self.provider)[0],
+            purpose=HELPER,
+            kind=kind,
+            endpoint=call.endpoint,
+            model=self.model,
+            seconds=seconds,
+            usage=call.usage,
+            # Read the same way the reranker reads it, so the two purposes' lines carry the same
+            # facts under the same names — one grep syntax across the whole grammar.
+            tokens_reasoning=reasoning_tokens(call.usage),
+            cost=call.cost,
+            outcome="ok" if reason is None else "fallback",
+            reason=reason,
+            detail=detail,
+            extra={"subject": subject},
+            level=level,
         )
 
 

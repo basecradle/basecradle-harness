@@ -75,13 +75,11 @@ from basecradle_harness._exceptions import (
     ProviderServerError,
 )
 from basecradle_harness._observability import (
-    _money,
-    _secs,
-    kv,
+    MEMORY,
+    log_llm_call,
     reasoning_tokens,
     reported_cost,
     serving_endpoint,
-    token_counts,
 )
 from basecradle_harness._openrouter import (
     DEFAULT_TIMEOUT,
@@ -92,6 +90,10 @@ from basecradle_harness._openrouter import (
 )
 
 _log = logging.getLogger("basecradle_harness")
+
+#: The ``kind=`` this purpose's calls carry — the *job* within the ``memory`` category (issue
+#: #485). Thing-then-verb where a job has both (``image.describe``); a rerank is one word.
+RERANK_KIND = "rerank"
 
 #: The OpenRouter model id that reranks — **and the feature's only switch**. Absent or empty means
 #: rerank is off: plain hybrid retrieval, byte-identical to the behaviour before this module, and
@@ -314,7 +316,7 @@ class MemPalaceReranker:
     def _pick(self, query: str, hits: Sequence[dict], k: int, *, surface: str) -> list[int]:
         """The model's validated 1-based picks, or ``[]`` meaning *fall back to hybrid*.
 
-        Every exit from this method is logged exactly once, on the one ``mempalace rerank`` line —
+        Every exit from this method is logged exactly once, on the one ``llm`` line —
         including the failures, and including a failure that still cost money (a call that answered
         with unusable JSON is billed, so its tokens and cost ride the line the same as a success).
         """
@@ -423,14 +425,21 @@ class MemPalaceReranker:
         endpoint: str | None = None,
         detail: str | None = None,
     ) -> None:
-        """The ``mempalace rerank`` line — one per rerank attempt, whatever the outcome.
+        """The reranker's ``llm`` line — one per rerank attempt, whatever the outcome.
 
-        The head is ``mempalace rerank`` and never ``llm``: the fleet dashboard splits **LLM spend**
-        from everything else on the literal `` llm provider=`` head (`_observability._money`), and a
-        reranker billed into that series would silently inflate every agent's model-cost rollup with
-        a second, unrelated spend. The ``provider=``/``cost=``/``tokens_*=`` fields are spelled the
-        same way the LLM line spells them, so one grep syntax still reads them — but they land in
-        their own series, which is what the NOC asked for.
+        **It is the shared `llm` line now, on the shared head** (issue #485). It used to wear a
+        private ``mempalace rerank`` head, because the fleet dashboard split LLM spend from
+        everything else on the literal `` llm provider=`` and a reranker billed into that series
+        would have inflated every agent's model-cost rollup with a second, unrelated spend. The
+        dashboard now splits on ``purpose=`` instead, which is the better cut of the same problem:
+        one grammar for every model call, and a category that names the *role* rather than a head
+        that names the software. So the money moves onto this head **and off the old one** — one
+        event, one line, and a dollar never on two lines.
+
+        The category is ``purpose=memory`` and the job is ``kind=rerank`` — never
+        ``purpose=mempalace``: the software is a *field value* (``model=``, and the recall line's
+        ``provider=mempalace``), never a category. ``surface``/``pool``/``picked`` ride last as this
+        purpose's own extras.
 
         Severity is the taxonomy, not the volume: config-class is **ERROR once per wake** (it is
         dead until a human acts, and ERROR is what pages), and everything after that first report is
@@ -442,24 +451,21 @@ class MemPalaceReranker:
             if is_config and self._reported_config:
                 level = logging.DEBUG
             self._reported_config = self._reported_config or is_config
-        _log.log(
-            level,
-            "mempalace rerank %s",
-            kv(
-                surface=surface,
-                provider=PROVIDER,
-                endpoint=endpoint,
-                model=self.model,
-                duration=None if seconds is None else _secs(seconds),
-                **token_counts(usage),
-                tokens_reasoning=reasoning_tokens(usage),
-                cost=_money(reported_cost(usage)),
-                pool=pool,
-                picked=picked,
-                outcome="ok" if reason is None else "fallback",
-                reason=reason,
-                detail=detail,
-            ),
+        log_llm_call(
+            provider=PROVIDER,
+            purpose=MEMORY,
+            kind=RERANK_KIND,
+            endpoint=endpoint,
+            model=self.model,
+            seconds=seconds,
+            usage=usage,
+            tokens_reasoning=reasoning_tokens(usage),
+            cost=reported_cost(usage),
+            outcome="ok" if reason is None else "fallback",
+            reason=reason,
+            detail=detail,
+            extra={"surface": surface, "pool": pool, "picked": picked},
+            level=level,
         )
 
 

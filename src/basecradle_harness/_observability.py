@@ -54,6 +54,8 @@ import re
 import time
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 _log = logging.getLogger("basecradle_harness")
@@ -388,19 +390,118 @@ def delivery_id() -> str | None:
     return (os.environ.get(DELIVERY_ID_ENV) or "").strip() or None
 
 
+#: The three things a model can be doing for an agent — the **log category**, a closed set
+#: (issue #485, @origin's audit of the fleet dashboard 2026-09-09). Three names in three places
+#: and never mixed: the **log** says the category (``memory``); the **UI** says the human name
+#: (Memory System — the NOC's business, not this package's); the **software** (MemPalace, Gemini)
+#: appears only as a *field value* (``provider=mempalace``, ``model=google/…``). The word
+#: "mempalace" therefore never names a category or a line head again.
+MAIN = "main"
+MEMORY = "memory"
+HELPER = "helper"
+
+
+@dataclass
+class LlmCall:
+    """What an adapter recorded about a call whose line its **caller** will write.
+
+    Everything an `llm` line needs that only the adapter knows — the endpoint a router picked, the
+    usage the vendor reported, the cost it stated, how long the call took. Every field stays
+    ``None`` when the call raised before the adapter got that far, so the caller's line simply
+    carries less rather than carrying a guess.
+    """
+
+    provider: str | None = None
+    model: str | None = None
+    seconds: float | None = None
+    usage: Any = None
+    endpoint: str | None = None
+    cost: float | None = None
+
+
+#: The capture handle for the model call currently in flight, or ``None`` — which is the ordinary
+#: case, the brain's own call, emitted by the adapter as it always was. It is ambient rather than
+#: an argument because `log_llm_call` is reached **inside the provider adapter**, layers below the
+#: caller: a non-brain caller reaches a model through the brain's own adapter family (which is what
+#: keeps them one error taxonomy), so threading a parameter would mean touching every adapter. Set
+#: only by `capture_llm_call`, always with try/finally, around exactly one call.
+_CAPTURE: ContextVar[LlmCall | None] = ContextVar("llm_capture", default=None)
+
+
+@contextmanager
+def capture_llm_call() -> Iterator[LlmCall]:
+    """Hold back the `llm` line an adapter would emit, so its caller writes the one line instead.
+
+    The seam a **non-brain** model call wraps its provider call in (issue #485). Inside this block
+    `log_llm_call` **records instead of emitting**, and the caller emits once — with a
+    ``purpose=``, and with the one field the adapter cannot supply: the **outcome**.
+
+    That split is the whole reason this exists. An adapter's line is written the instant the vendor
+    answers, and only the caller can tell an answer that is *usable* from one that is empty or
+    malformed. Letting the adapter emit and then adding a second line for the bad answer would put
+    **two** `llm` lines on one attempt — double-counting the call, double-counting its dollar, and
+    (worse) leaving the good path with no ``outcome=`` at all, since an adapter has no notion of
+    one. One attempt, one line, one outcome.
+
+    Yields the `LlmCall` the adapter fills; if the call raises, it comes back empty.
+
+    **Wrap exactly one model call, on this thread, and nothing else.** Three properties of an
+    ambient capture fail invisibly otherwise, and they are stated rather than left to be
+    rediscovered: a *second* call inside the block overwrites the first's record (a lost field); a
+    call made for some *other* purpose inside the block is captured and **never emitted at all** (a
+    lost line, which is worse); and a `ContextVar` does not cross a thread, so an adapter that
+    dispatched its request to a worker would emit its own untagged line while the caller emitted a
+    second. No shipped adapter does any of the three — that is the assumption to re-check before
+    adding one.
+    """
+    call = LlmCall()
+    token = _CAPTURE.set(call)
+    try:
+        yield call
+    finally:
+        _CAPTURE.reset(token)
+
+
 def log_llm_call(
     *,
     provider: str,
     model: str,
-    seconds: float,
+    seconds: float | None,
+    purpose: str | None = None,
+    kind: str | None = None,
     usage: Any = None,
     endpoint: str | None = None,
     cost: float | None = None,
+    tokens_reasoning: int | None = None,
+    outcome: str | None = None,
+    reason: str | None = None,
+    detail: str | None = None,
+    extra: Mapping[str, Any] | None = None,
+    level: int = logging.INFO,
 ) -> None:
-    """One INFO line per model call: who answered, how long it took, what it cost.
+    """**One `llm` line per model-call attempt, whatever the outcome** — the whole grammar.
 
     Every provider adapter calls this around its own SDK call, so the LLM leg of a wake is
-    visible on every provider rather than only where someone remembered to instrument it.
+    visible on every provider rather than only where someone remembered to instrument it. Since
+    issue #485 it is also the *only* emitter of a model call, for every purpose: the brain, the
+    MemPalace reranker, and the blind-model describer all land here, in one grammar, with
+    ``purpose=`` naming what the model was doing for the agent.
+
+    Before that they were three families built three ways — the brain on this head, the reranker on
+    a private ``mempalace rerank`` head, and the describer on a plain ``llm`` line **indistinguishable
+    from the brain's**, so a second model's spend read as the first's. One grammar is what lets a
+    dashboard split them; the fields are spelled identically across all three so one grep syntax
+    reads them all.
+
+    **The head is byte-frozen at** ``llm provider=``. It is the fleet dashboard's anchor for the
+    whole family (and the denominator of its extraction alarm), so a purpose is added *inside* the
+    line and never spelled as a new head.
+
+    **Field order is the contract** and matches what the NOC's column regexes were written against:
+    ``provider purpose kind endpoint model duration tokens_* cached_tokens tokens_reasoning cost
+    outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
+    ``picked``). `kv` drops whatever is ``None``, so a call with nothing to report is byte-identical
+    to what it always was apart from ``purpose=main``.
 
     Four of the fields are **capabilities, answered by whoever can**: token counts
     (`token_counts`), the cached-prompt count that says whether caching is doing anything, the
@@ -410,16 +511,40 @@ def log_llm_call(
     no serving endpoint distinct from itself, and most vendors report tokens but never dollars. A
     provider that reports none of them still gets its provider/model/duration line, which is the
     part that is always true.
+
+    A call with no explicit `purpose` is the brain's (``purpose=main``, no ``kind``) — unless a
+    `capture_llm_call` block is active, in which case this **records rather than emits** and its
+    caller writes the line. `level` is the caller's, because severity is the *taxonomy* — a
+    config-class reranker fault is ERROR and a runtime one WARNING, while a call that worked is
+    INFO.
     """
-    _log.info(
+    captured = _CAPTURE.get()
+    if captured is not None and purpose is None:
+        # Inside `capture_llm_call`: record what only this adapter knows and let the caller write
+        # the line, once, when it can also state the outcome. See `capture_llm_call` for why. An
+        # explicit `purpose` is a caller writing its own line and is never captured.
+        captured.provider, captured.model, captured.seconds = provider, model, seconds
+        captured.usage, captured.endpoint, captured.cost = usage, endpoint, cost
+        return
+    if purpose is None:
+        purpose = MAIN
+    _log.log(
+        level,
         "llm %s",
         kv(
             provider=provider,
+            purpose=purpose,
+            kind=kind,
             endpoint=endpoint,
             model=model,
-            duration=_secs(seconds),
+            duration=None if seconds is None else _secs(seconds),
             **token_counts(usage),
+            tokens_reasoning=tokens_reasoning,
             cost=_money(cost),
+            outcome=outcome,
+            reason=reason,
+            detail=detail,
+            **(extra or {}),
         ),
     )
 

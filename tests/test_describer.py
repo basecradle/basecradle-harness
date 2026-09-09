@@ -34,6 +34,8 @@ from basecradle_harness._describer import (
     DESCRIBER_API_KEY_VAR,
     DESCRIBER_MODEL_VAR,
     DESCRIBER_PROVIDERS_VAR,
+    IMAGE_KIND,
+    VIDEO_KIND,
     described_caption,
     describer_providers_from_env,
 )
@@ -211,7 +213,11 @@ def test_a_faulted_describer_reports_at_error_and_answers_nothing(caplog):
             is None
         )
 
-    records = [r for r in caplog.records if "describer failed" in r.getMessage()]
+    records = [
+        r
+        for r in caplog.records
+        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+    ]
     assert [r.levelno for r in records] == [logging.ERROR]  # config-class pages
     assert "reason=config:missing_api_key" in records[0].getMessage()
 
@@ -226,7 +232,11 @@ def test_a_config_fault_is_reported_once_per_wake_and_then_drops_to_debug(caplog
         for _ in range(3):
             describer.describe_images(image)
 
-    levels = [r.levelno for r in caplog.records if "describer failed" in r.getMessage()]
+    levels = [
+        r.levelno
+        for r in caplog.records
+        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+    ]
     assert levels == [logging.ERROR, logging.DEBUG, logging.DEBUG]
 
 
@@ -239,7 +249,11 @@ def test_a_provider_that_will_not_build_is_a_config_fault_carrying_the_reason(mo
     assert describer.fault == "config:no_provider"
     with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
         assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
-    line = next(r.getMessage() for r in caplog.records if "describer failed" in r.getMessage())
+    line = next(
+        r.getMessage()
+        for r in caplog.records
+        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+    )
     assert "reason=config:no_provider" in line
     assert "a-sdk-that-does-not-exist" in line  # the vendor's/adapter's own words, relayed
 
@@ -324,7 +338,11 @@ def test_a_describer_that_raises_falls_back_to_the_withheld_caption(caplog):
     assert note.content == (
         "(No image input on this model — cat.png was described above, not shown.)"
     )
-    line = next(r.getMessage() for r in caplog.records if "describer failed" in r.getMessage())
+    line = next(
+        r.getMessage()
+        for r in caplog.records
+        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+    )
     # Runtime-class: WARNING, not ERROR — this can succeed next time unchanged.
     assert "reason=provider_error" in line and "upstream 503" in line and "d/model" in line
 
@@ -568,6 +586,156 @@ def test_a_vendor_error_carrying_the_key_is_redacted_before_it_is_logged(caplog)
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
         assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
 
-    line = next(r.getMessage() for r in caplog.records if "describer failed" in r.getMessage())
+    line = next(
+        r.getMessage()
+        for r in caplog.records
+        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+    )
     assert secret not in line
     assert "[redacted]" in line
+
+
+# === One attempt, one line: the #485 grammar ==================================
+
+
+class LoggingDescriberProvider(FakeDescriberProvider):
+    """A describer adapter that logs its call the way every real one does.
+
+    The plain fake never calls `log_llm_call`, so it cannot show the thing that matters here: a
+    real adapter *does*, and the capture seam has to swallow that line so the caller can write the
+    one line carrying the outcome. Without this the tests would pass on a describer whose adapter
+    was silent — the one case where nothing needs suppressing.
+    """
+
+    def chat(self, messages, tools=None):
+        from basecradle_harness._observability import log_llm_call
+
+        log_llm_call(
+            provider=self.provider,
+            model=self.model,
+            seconds=1.5,
+            endpoint="Novita",
+            cost=0.0021,
+            usage={"prompt_tokens": 812, "completion_tokens": 96},
+        )
+        return super().chat(messages, tools)
+
+
+def _helper_lines(caplog):
+    return [r for r in caplog.records if r.getMessage().startswith("llm ")]
+
+
+def test_a_describe_logs_exactly_one_llm_line_carrying_purpose_helper(caplog):
+    """The grammar's own invariant: one `llm` line per attempt, and no other line carries its cost.
+
+    Three things were wrong before issue #485 and this pins all three. The describer's call landed
+    on a plain `llm` line **indistinguishable from the brain's**, so a second model's spend read as
+    the first's; it also wrote a ` media provider=describer ` line, and that head is the
+    dashboard's *tools* category, which a model call is not; and neither line carried an
+    ``outcome=``, so a describer that was configured and **dead** looked exactly like a
+    deliberately blind agent.
+    """
+    describer = Describer(LoggingDescriberProvider(), "d/model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="cat.png")]) == DESCRIPTION
+
+    lines = _helper_lines(caplog)
+    assert len(lines) == 1, [r.getMessage() for r in lines]
+    message = lines[0].getMessage()
+    assert lines[0].levelno == logging.INFO  # the feature working is not a warning
+    for field in (
+        "provider=openrouter",
+        "purpose=helper",
+        "kind=image.describe",
+        "endpoint=Novita",  # the adapter's knowledge, carried onto the caller's line
+        "model=d/model",
+        "duration=1.50s",
+        "tokens_in=812",
+        "cost=0.0021",
+        "outcome=ok",
+        "subject=cat.png",
+    ):
+        assert field in message, message
+    assert "reason=" not in message
+    # The money is on exactly one line, and never on the tools head.
+    assert not [r for r in caplog.records if "cost=" in r.getMessage() and r is not lines[0]]
+    assert not [r for r in caplog.records if " media provider=" in f" {r.getMessage()}"]
+
+
+def test_a_clip_is_described_under_the_video_kind():
+    assert VIDEO_KIND == "video.describe" and IMAGE_KIND == "image.describe"
+
+
+def test_an_answer_that_arrives_unusable_is_still_one_line_and_still_billed(caplog):
+    """A call that answered with nothing usable was made and charged for — the reranker's rule.
+
+    So its tokens and cost ride the same single line a success would write, with
+    ``outcome=fallback``. Emitting the adapter's line *and* a failure line would count the attempt
+    twice and put the dollar in the category twice over.
+    """
+    describer = Describer(LoggingDescriberProvider(answer="   "), "d/model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="cat.png")]) is None
+
+    lines = _helper_lines(caplog)
+    assert len(lines) == 1
+    message = lines[0].getMessage()
+    assert lines[0].levelno == logging.WARNING  # runtime-class: it can succeed next time
+    assert "outcome=fallback" in message and "reason=empty_response" in message
+    assert "cost=0.0021" in message  # billed, and counted exactly once
+
+
+def test_a_call_that_never_happened_carries_no_duration_and_no_cost(caplog):
+    """A config-class fault has no call behind it — so the line is honest about having none."""
+    describer = describer_from_env(_env(**{DESCRIBER_API_KEY_VAR: None}))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        describer.describe_images([ImageContent(url="x", alt="cat.png")])
+
+    message = _helper_lines(caplog)[0].getMessage()
+    assert "outcome=fallback" in message and "reason=config:missing_api_key" in message
+    assert "duration=" not in message and "cost=" not in message
+
+
+class LoggingBlindProvider(BlindProvider):
+    """The brain, logging its own calls the way every real adapter does."""
+
+    def chat(self, messages, tools=None):
+        from basecradle_harness._observability import log_llm_call
+
+        log_llm_call(
+            provider=self.provider,
+            model=self.model,
+            seconds=4.0,
+            cost=0.05,
+            usage={"prompt_tokens": 90210, "completion_tokens": 40},
+        )
+        return super().chat(messages, tools)
+
+
+def test_a_wake_that_describes_tells_the_two_models_spend_apart(caplog):
+    """The defect issue #485 closes, end to end: a second model's dollars read as the first's.
+
+    @glm-5.2 is the fleet's only text-only brain, so on every picture it hands the pixels to a
+    Gemini-class describer — a real OpenRouter call on the agent's own account. Both landed on a
+    plain `llm` line with nothing to tell them apart, so the describer's spend inflated the brain's
+    rollup and the helper had no cost series of its own to appear in.
+    """
+    brain = LoggingBlindProvider(*_turn("view"))
+    engine = _engine(brain, ViewTool(), Describer(LoggingDescriberProvider(), "d/model"))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        engine.run([Message.user("look")])
+
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
+    main = [m for m in lines if "purpose=main" in m]
+    helper = [m for m in lines if "purpose=helper" in m]
+    assert len(main) == 2  # the brain's two turns
+    assert len(helper) == 1  # one picture, one describe, one line
+    assert len(main) + len(helper) == len(lines)  # every model call names a purpose
+    # The dollars are separable, which is the whole point.
+    assert all("cost=0.05" in m for m in main)
+    assert "cost=0.0021" in helper[0] and "model=d/model" in helper[0]
+    assert "z-ai/glm-5.2" not in helper[0]
