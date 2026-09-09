@@ -287,13 +287,19 @@ def test_an_empty_pool_never_calls_the_model(router):
 # === The log lines ============================================================
 
 
-def test_the_rerank_line_carries_the_call_and_never_the_llm_head(router, caplog):
-    """The observability contract, field by field — and the one head it must never wear.
+def test_the_rerank_line_is_the_shared_llm_line_carrying_purpose_memory(router, caplog):
+    """The observability contract, field by field — and the head it now *must* wear (issue #485).
 
-    The fleet dashboard splits **LLM spend** from everything else on the literal `` llm provider=``
-    head. A reranker billed into that series would inflate every agent's model-cost rollup with a
-    second, unrelated spend, which is why the NOC asked for its own head — so this asserts the
-    absence as hard as it asserts the fields.
+    **This test is the inverse of the one it replaces**, and the flip is the deliverable. The
+    reranker used to wear a private ``mempalace rerank`` head because the fleet dashboard split
+    LLM spend from everything else on the literal `` llm provider=``, and a reranker billed into
+    that series would have inflated every agent's model-cost rollup with a second, unrelated
+    spend. @origin's audit cut the same problem better: one grammar for every model call, split by
+    a ``purpose=`` that names the **role**, never by a head that names the software. So the money
+    moves onto this head and off the old one — one event, one line, a dollar never on two lines.
+
+    ``purpose=memory``, never ``purpose=mempalace``: the log says the *category*, the UI says the
+    human name, and the software appears only as a field value.
     """
     body = completion(picks(*range(1, 9)))
     body["openrouter_metadata"] = _routing_metadata("DeepInfra", "Novita")
@@ -301,7 +307,11 @@ def test_the_rerank_line_carries_the_call_and_never_the_llm_head(router, caplog)
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         reranker().rerank("q", hits(20), 8, surface=SURFACE_TURN0)
 
-    line = next(r for r in caplog.records if r.getMessage().startswith("mempalace rerank"))
+    line = next(
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("llm ") and "purpose=memory" in r.getMessage()
+    )
     message = line.getMessage()
     assert line.levelno == logging.INFO
     for field in (
@@ -319,12 +329,19 @@ def test_the_rerank_line_carries_the_call_and_never_the_llm_head(router, caplog)
     ):
         assert field in message, message
     assert "duration=" in message
-    assert " llm provider=" not in message
+    assert "purpose=memory" in message and "kind=rerank" in message
+    assert "purpose=mempalace" not in message  # the software is never a category
     assert "reason=" not in message  # a clean call names no fault
+    # The head, byte-for-byte as the dashboard anchors on it. Asserted against the **rendered**
+    # record, because the NOC's gate carries a leading space that only the level prefix supplies —
+    # a test reading `record.getMessage()` would pass on a line the dashboard cannot see.
+    from basecradle_harness._observability import LOG_FORMAT
+
+    assert " llm provider=" in logging.Formatter(LOG_FORMAT).format(line)
 
 
 def test_the_recall_line_reports_the_pool_and_what_was_injected(fake_mempalace, tmp_path, caplog):
-    """``mempalace recall`` at INFO, on both surfaces — the founder's explicit one-line-per-wake ask.
+    """``memory recall`` at INFO, on both surfaces — the founder's explicit one-line-per-wake ask.
 
     It is the A/B: without ``rerank=`` and ``pool=`` on a shipped line, whether the reranker helped
     is a question nobody outside the box can answer.
@@ -338,7 +355,7 @@ def test_the_recall_line_reports_the_pool_and_what_was_injected(fake_mempalace, 
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         provider.search("q", 2, surface=SURFACE_TOOL)
 
-    line = next(r for r in caplog.records if r.getMessage().startswith("mempalace recall"))
+    line = next(r for r in caplog.records if r.getMessage().startswith("memory recall"))
     assert line.levelno == logging.INFO
     message = line.getMessage()
     assert "surface=tool" in message
@@ -359,8 +376,8 @@ def test_a_rerank_off_agent_says_so_and_emits_no_rerank_line(fake_mempalace, tmp
         MemPalaceMemoryProvider(palace_path=palace).search("q", 3, surface=SURFACE_TURN0)
 
     messages = [r.getMessage() for r in caplog.records]
-    assert any("mempalace recall" in m and "rerank=off" in m for m in messages)
-    assert not any(m.startswith("mempalace rerank") for m in messages)
+    assert any("memory recall" in m and "rerank=off" in m for m in messages)
+    assert not any(("purpose=memory" in m) for m in messages)
 
 
 # === Off by absence ===========================================================
@@ -407,7 +424,11 @@ def test_provider_slugs_keep_their_order_and_drop_the_blanks():
 
 
 def _reason_of(records):
-    line = next(r for r in records if r.getMessage().startswith("mempalace rerank"))
+    line = next(
+        r
+        for r in records
+        if r.getMessage().startswith("llm ") and "purpose=memory" in r.getMessage()
+    )
     reason = line.getMessage().partition("reason=")[2].split(" ")[0]
     return line.levelno, reason
 
@@ -457,7 +478,11 @@ def test_an_unparseable_answer_is_runtime_class(router, caplog):
     level, reason = _reason_of(caplog.records)
     assert (level, reason) == (logging.WARNING, "parse")
     # It still cost money, so the line still carries what it cost.
-    line = next(r for r in caplog.records if r.getMessage().startswith("mempalace rerank"))
+    line = next(
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("llm ") and "purpose=memory" in r.getMessage()
+    )
     assert "cost=0.000846" in line.getMessage()
 
 
@@ -526,7 +551,11 @@ def test_a_config_fault_is_reported_once_per_wake(router, caplog):
         for _ in range(3):
             subject.rerank("q", hits(20), 2, surface=SURFACE_TOOL)
 
-    levels = [r.levelno for r in caplog.records if r.getMessage().startswith("mempalace rerank")]
+    levels = [
+        r.levelno
+        for r in caplog.records
+        if r.getMessage().startswith("llm ") and "purpose=memory" in r.getMessage()
+    ]
     assert levels == [logging.ERROR, logging.DEBUG, logging.DEBUG]
 
 
@@ -557,3 +586,24 @@ def _always_picks(numbers):
             return list(numbers)
 
     return _Fixed(model=MODEL, api_key=FAKE_KEY, providers=PROVIDERS)
+
+
+def test_a_rerank_attempt_logs_exactly_one_llm_line_and_the_cost_only_once(router, caplog):
+    """The grammar's own invariant (issue #485): one line per attempt, one line per dollar.
+
+    The reranker's spend used to live on a head of its own, which kept it out of the main-model
+    rollup at the price of a second grammar. Moving it onto the `llm` line is only safe if the old
+    line is *gone* — two lines for one event would double-count the call and put its dollar in two
+    categories at once, which is exactly what the dashboard's four-way spend split cannot survive.
+    """
+    body = completion(picks(*range(1, 9)))
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        reranker().rerank("q", hits(20), 8, surface=SURFACE_TURN0)
+
+    llm = [r for r in caplog.records if r.getMessage().startswith("llm ")]
+    costed = [r for r in caplog.records if "cost=" in r.getMessage()]
+    assert len(llm) == 1
+    assert costed == llm  # the dollar is on that line and on no other
+    assert not [r for r in caplog.records if "mempalace rerank" in r.getMessage()]

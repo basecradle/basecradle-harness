@@ -71,7 +71,12 @@ import time
 import uuid
 from pathlib import Path
 
-from basecradle_harness._memory_provider import MemoryExchange, MemoryProvider, MemoryScope
+from basecradle_harness._memory_provider import (
+    _MEMPALACE,
+    MemoryExchange,
+    MemoryProvider,
+    MemoryScope,
+)
 from basecradle_harness._observability import _secs, kv
 from basecradle_harness._rerank import (
     SURFACE_TOOL,
@@ -534,7 +539,14 @@ def _write_cli_config(config_dir: Path, config_file: Path, data: dict) -> None:
 def _log_recall(
     *, surface: str, reranked: bool, pool: int, hits: list[dict], seconds: float
 ) -> None:
-    """The ``mempalace recall`` line — one per retrieval, on either surface.
+    """The ``memory recall`` line — one per retrieval, on either surface.
+
+    **The head names the category, never the software** (issue #485, @origin's audit): it was
+    ``mempalace recall``, and MemPalace is a *thing this agent runs*, not a category of work. So
+    the head is ``memory`` — the same word the model calls carry as ``purpose=memory`` — and the
+    software moves into a field, ``provider=mempalace``, exactly as ``model=`` names the software
+    on a model call. It keeps its **own head** rather than joining the ``llm`` line because a
+    recall is **not a model call**: it spends nothing on a provider and has no tokens to report.
 
     **INFO, where the old generic ``memory op=recall`` line was DEBUG** (issue #464, the founder's
     explicit ask): one line per engaged wake is the whole A/B for the reranker, and a line nobody
@@ -548,8 +560,9 @@ def _log_recall(
     not), and it is what an operator asking "how much memory is this wake paying for?" means.
     """
     _log.info(
-        "mempalace recall %s",
+        "memory recall %s",
         kv(
+            provider=_MEMPALACE,
             surface=surface,
             rerank="on" if reranked else "off",
             pool=pool,

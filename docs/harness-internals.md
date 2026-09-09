@@ -529,15 +529,17 @@ library API. So it is built here (`_rerank.py`), with no MemPalace fork and no M
   reranked nothing forever with nothing paged: the silently-dead reranker, hiding inside the mechanism
   built to catch it. The classifier now reads the vendor's message the way `is_context_overflow` reads
   the context wall.
-- **Its own log series, never `llm`.** `mempalace recall …` (INFO, one per retrieval: `surface`,
-  `rerank=on|off`, `pool`, `injected`, `duration`, `chars`) and `mempalace rerank …` (INFO on success,
-  WARNING/ERROR on a fault: `surface`, `provider`, `endpoint`, `model`, `duration`, token counts +
-  `tokens_reasoning`, `cost`, `pool`, `picked`, `outcome`, `reason`). The fields are spelled exactly as
-  the `llm` line spells them so one grep syntax reads both — but the head is deliberately different,
-  because the fleet dashboard splits LLM spend from everything else on the literal `` llm provider=``
-  head and a reranker billed into that series would inflate every agent's model-cost rollup with a
-  second, unrelated spend. The generic `memory op=recall` seam line stays at DEBUG: it fires for
-  whatever provider is bound, and on the shipped SQLite one it would say `chars=0` forever.
+- **Two lines, and only one of them is a model call** (as amended by issue #485 — it shipped with
+  both on their own heads). `memory recall …` (INFO, one per retrieval: `provider=mempalace`,
+  `surface`, `rerank=on|off`, `pool`, `injected`, `duration`, `chars`) keeps its own head because a
+  recall spends nothing and has no tokens to report. The **rerank** is a model call, so it is an
+  `llm` line like every other — `purpose=memory kind=rerank`, INFO on success and WARNING/ERROR on a
+  fault, with `surface`/`pool`/`picked` as its purpose's extras. It wore a private
+  `mempalace rerank` head until #485, because the dashboard split LLM spend from everything else on
+  the literal `` llm provider=`` and a reranker billed into that series would have inflated every
+  agent's model-cost rollup; the split now runs on `purpose=`, which is the better cut of the same
+  problem. The generic `memory op=recall` seam line stays at DEBUG: it fires for whatever provider is
+  bound, and on the shipped SQLite one it would say `chars=0` forever.
 
 **Boundary:** live verification is the capital's, via the live-gated `test_openrouter_live.py` (added
 to the **existing** `openrouter` prober arm rather than a new file, so it is probed on a cadence with
@@ -746,3 +748,89 @@ vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
 `ToolPlugin` to hang `needs_env` on (issue #427's shape without a plugin), and a `false` for a
 variable nobody wants is the `XAI_TEAM_ID` noise that map deliberately avoids. Live verification is
 the capital's, on @glm-5.2.
+
+---
+
+### The Log Grammar — one `llm` line per model call, `purpose=` names the role (issue #485)
+
+**Three model-spend families, built three different ways.** The brain logged on the ` llm provider=`
+head; the MemPalace reranker on a private ` mempalace rerank ` head; the blind-model describer on a
+plain `llm` line **indistinguishable from the brain's** — so a Gemini describer's spend read as
+@glm-5.2's, and the helper had no cost, outcome or duration series at all. @origin's audit of the
+fleet dashboard, 2026-09-09: **one grammar for every model call**, with a category that names the
+*role*.
+
+**Three names, three places, never mixed.** This is the rule the whole change turns on:
+
+| Where | What it says | Example |
+|---|---|---|
+| the **log** | the **category** — a closed set | `purpose=memory` |
+| the **UI** | the human name — the NOC's business, not this package's | Memory System |
+| the **software** | a **field value**, never a category or a head | `provider=mempalace`, `model=google/…` |
+
+So the word "mempalace" never names a category or a line head again. `purpose=mempalace` would be
+the defect, not a shorter spelling.
+
+- **The grammar.** One `llm` line per model-call **attempt**, whatever the outcome. Fields in `kv()`
+  order — and the order is the contract, because the NOC's column regexes were written against it:
+  `provider` `purpose` `kind` `endpoint` `model` `duration` `tokens_*` `cached_tokens`
+  `tokens_reasoning` `cost` `outcome` `reason` `detail`, then that purpose's own extras. `kv` drops
+  whatever is `None`, so a brain call is byte-identical to what it always was apart from
+  `purpose=main`.
+
+  ```
+  INFO  llm provider=openai purpose=main model=gpt-5.4-mini duration=3.41s tokens_in=4210 tokens_out=96 tokens_total=4306
+  INFO  llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
+  INFO  llm provider=openrouter purpose=helper kind=image.describe endpoint=Novita model=google/gemini-3-flash duration=1.50s tokens_in=812 tokens_out=96 cost=0.0021 outcome=ok subject=cat.png
+  ERROR llm provider=openrouter purpose=helper kind=video.describe model=google/gemini-3-flash outcome=fallback reason=config:missing_api_key subject=clip.mp4
+  ```
+
+  `kind` is **thing then verb** (`image.describe`, `video.describe`), matching the media lines'
+  existing vocabulary (`video.generate`, `audio.transcribe`) rather than inventing a second word
+  order for the same idea. A `purpose=main` line carries **no** `kind` — the brain has one job.
+
+- **Two axes, and conflating them is the mistake to avoid.** `purpose` is a **field on model
+  calls**. *Spend category* (main / memory / helper / tools) is the **dashboard's construct**,
+  derived from the line class: the first three are `purpose=` values on the `llm` head, and *tools*
+  is the ` media provider=` head, which carries no `purpose` because a media generation is not a
+  model call. The NOC pins that every `cost=` the harness writes belongs to exactly one of the four;
+  the harness pins its own half — **a rerank or describe attempt logs exactly one `llm` line, and no
+  other line carries its `cost=`**.
+
+- **The capture seam is what makes "one line per attempt" true** (`_observability.capture_llm_call`).
+  The line is emitted *inside the provider adapter*, and only the **caller** can tell an answer that
+  is usable from one that is empty or malformed — so inside `capture_llm_call` the adapter's
+  `log_llm_call` **records into an `LlmCall` instead of emitting**, and the caller writes the one
+  line once it knows the outcome. Letting the adapter emit and adding a second line for a bad answer
+  would count the attempt twice, put its dollar in the category twice, and — worse — leave the *good*
+  path with no `outcome=` at all, since an adapter has no notion of one.
+
+  It is ambient (a `ContextVar`) rather than a parameter for a reason worth stating: the describer
+  reaches a model through **the brain's own adapter family**, which is exactly what keeps them one
+  error taxonomy, so threading a parameter would mean touching every adapter for a seam one caller
+  uses. The price of ambience is three invisible failure modes, all named in the docstring — a
+  second call inside the block overwrites the record; a call for some *other* purpose inside it is
+  captured and never emitted; and a `ContextVar` does not cross a thread, so an adapter that
+  dispatched to a worker would emit its own line while the caller emitted a second. No shipped
+  adapter does any of the three, which is the assumption to re-check before adding one.
+
+- **The reranker keeps its severity taxonomy; the describer gains one.** Config-class is ERROR once
+  per wake then DEBUG (dead until a human acts, and ERROR is what pages); runtime-class is WARNING
+  (it can succeed unchanged next time); a call that worked is INFO. The describer's failures used to
+  wear a private `describer failed` head, which was invisible to every column that counts describes
+  — precisely how a *configured and dead* describer read identical to a deliberately blind agent.
+
+- **A recall is not a model call.** `mempalace recall` → **`memory recall`**, with
+  `provider=mempalace` added: the head names the category and the software becomes a field value,
+  exactly as `model=` does on a model call. It keeps its own head rather than joining the `llm` line
+  because it spends nothing on a provider and has no tokens to report.
+
+- **The `llm` head itself is byte-frozen.** It is the fleet dashboard's anchor for the whole family
+  *and* the denominator of its extraction alarm, so a purpose is added **inside** the line and never
+  spelled as a new head. The NOC's own gate carries a leading space (` llm provider=`) that only the
+  level prefix supplies, so `test_rerank.py` asserts it against the **rendered** record — a test
+  reading `record.getMessage()` would pass on a line the dashboard cannot see.
+
+**Boundary:** the harness never learns the NOC's regexes and the NOC never learns the emitter — the
+contract is the field shapes above, published in the completion comment. Live verification is the
+capital's, after the NOC re-points its columns.

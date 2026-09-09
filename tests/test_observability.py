@@ -220,7 +220,7 @@ def test_the_llm_line_names_the_provider_model_duration_and_tokens(caplog):
         )
 
     assert caplog.records[0].getMessage() == (
-        "llm provider=xai model=grok-4.3 duration=2.50s tokens_in=90 tokens_out=10 tokens_total=100"
+        "llm provider=xai purpose=main model=grok-4.3 duration=2.50s tokens_in=90 tokens_out=10 tokens_total=100"
     )
 
 
@@ -229,7 +229,7 @@ def test_the_llm_line_still_lands_when_the_sdk_reports_no_usage(caplog):
         log_llm_call(provider="openai", model="gpt-5.4-mini", seconds=0.4)
 
     assert caplog.records[0].getMessage() == (
-        "llm provider=openai model=gpt-5.4-mini duration=0.40s"
+        "llm provider=openai purpose=main model=gpt-5.4-mini duration=0.40s"
     )
 
 
@@ -253,7 +253,7 @@ def test_the_llm_line_names_the_serving_endpoint_the_cache_hit_and_the_cost(capl
         )
 
     assert caplog.records[0].getMessage() == (
-        "llm provider=openrouter endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s "
+        "llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s "
         "tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445"
     )
 

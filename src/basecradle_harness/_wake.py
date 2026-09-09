@@ -2465,7 +2465,7 @@ class WakeAgent:
         # HARNESS_LOG_LEVEL up to chase a memory question.
         #
         # A provider that has something worth saying says it itself, at the level it deserves: the
-        # MemPalace adapter emits `mempalace recall …` at INFO with the four facts only it knows —
+        # MemPalace adapter emits `memory recall …` at INFO with the four facts only it knows —
         # which surface asked, whether the LLM rerank ran, how deep the pool went, how much came
         # back (issue #464). That is the line the fleet reads; this one stays the seam's fallback.
         _log.debug("memory %s", kv(op="recall", chars=len(recalled or "")))
