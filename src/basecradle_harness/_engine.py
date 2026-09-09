@@ -930,8 +930,19 @@ def _media_name(clip: VideoContent) -> str:
 
 
 def _video_caption(clip: VideoContent) -> str:
-    """The caption on a natively-shown video turn — the breadcrumb left after eviction."""
-    return f"(Showing video: {_media_name(clip)})"
+    """The caption on a natively-shown video turn — the breadcrumb left after eviction.
+
+    A clip the agent asked to narrow is still sent whole here (the sampler never runs on this
+    tier), so the caption says which of those two things happened — issue #481. With no window
+    asked for it is byte-identical to what it always was, which is the regression bar.
+    """
+    from basecradle_harness._video import window_note
+
+    note = window_note(clip.sampling)
+    name = _media_name(clip)
+    if note is None:
+        return f"(Showing video: {name})"
+    return f"(Showing video: {name} — the whole clip: {note}.)"
 
 
 def _unsampled_caption(clip: VideoContent, error: Exception) -> str:

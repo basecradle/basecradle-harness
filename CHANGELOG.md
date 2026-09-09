@@ -7,6 +7,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.117.2] - 2026-09-09
+
+### Fixed: `watch_video`'s `start`/`end` were silently ignored on the video-native tier (issue #481)
+
+`WatchVideoTool` promised the window as a real knob — *"'start' and 'end' (seconds) narrow the
+window so you can look closely at one moment of a long clip"* — and `_engine._show_video` honored it
+on exactly one of its three tiers. A model that takes **video** is sent the clip **whole**: the
+sampler never runs there, `clip.sampling` was never read, and the caption said only
+`(Showing video: clip.mp4)`. An agent that narrowed to `start=10, end=12` on a 60 s clip got all
+sixty seconds and had no way to learn it. That is the issue #479 defect in a different place — the
+model reasoning about a perception it did not have — and the same remedy applies: **say what
+actually happened.**
+
+One shared clause (`_video.window_note`) now rides the native caption on both paths, the sighted one
+(`_engine._video_caption`) and the described one (`_describer._watched_facts`):
+
+```
+(Showing video: clip.mp4 — the whole clip: the start/end window you asked for (10s-12s) narrows
+sampled frames only.)
+```
+
+The tool's own description stops promising the window unconditionally. With **no** window asked for,
+every caption is byte-identical to what it was — a note about a window nobody named would be noise
+on every caption forever, and that is the regression bar a test pins.
+
+**This is deliberately a statement, not a trim.** Honoring the window on the native tier means
+re-encoding the clip, and the harness has a standing rule never to modify a file's bytes (issue
+#336, founder-decided). Whether to make an exception for a deliberate trim is a decision above this
+module and stays open on #481; whether the agent is *told* is not a decision at all.
+
+Offline only: no new dependency, no new env var, no wire change.
+
 ## [0.117.1] - 2026-09-09
 
 ### Changed: a described video is described temporally — first frame / over time / last frame (issue #479)

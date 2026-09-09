@@ -472,13 +472,15 @@ def _watched_facts(name: str, clip: VideoContent) -> str | None:
     clip a vision model has just watched successfully is a fact about this decoder, not about the
     clip the brain is being told about.
     """
-    from basecradle_harness._video import decode_data_url, probe, video_facts
+    from basecradle_harness._video import decode_data_url, probe, video_facts, window_note
 
     try:
         info = probe(decode_data_url(clip.url))
     except ValueError:
         return None
-    return f"(Watched the whole of {name} ({video_facts(info)}).)"
+    note = window_note(clip.sampling)
+    tail = "" if note is None else f" — {note}"
+    return f"(Watched the whole of {name} ({video_facts(info)}){tail}.)"
 
 
 def _fault_of(exc: ProviderError) -> str:

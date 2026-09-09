@@ -26,7 +26,7 @@ from basecradle_harness import (
 )
 from basecradle_harness._assets import MAX_VIDEO_BYTES, model_sees_video, video_input
 from basecradle_harness._platform import PlatformContext
-from basecradle_harness._video import decode_data_url
+from basecradle_harness._video import decode_data_url, window_note
 
 BC_URL = "https://api.basecradle.test/v1"
 TIMELINE = "019e7754-7d4e-7f50-8162-aaaabbbbcccc"
@@ -391,6 +391,42 @@ def test_watch_video_on_an_oversized_clip_says_so_without_fetching_it(tool):
 
 def test_watch_video_needs_a_uuid(tool):
     assert "needs the video asset's uuid" in tool.run()
+
+
+@pytest.mark.parametrize(
+    ("sampling", "span"),
+    [
+        (FrameSampling(start=10, end=12), "10s-12s"),
+        (FrameSampling(start=10), "from 10s"),
+        (FrameSampling(end=12), "up to 12s"),
+        (FrameSampling(start=1.5, end=2.25), "1.5s-2.25s"),
+    ],
+)
+def test_a_window_the_native_tier_cannot_apply_is_named_rather_than_dropped(sampling, span):
+    """Issue #481: the agent asked to look at one moment and was shown all of them.
+
+    `start`/`end` narrow the sampled-frames tier; a model that takes video is sent the clip whole
+    and the sampler never runs. Saying nothing leaves the agent reasoning about a perception it did
+    not have — the #479 shape in a different place.
+    """
+    note = window_note(sampling)
+
+    assert note == f"the start/end window you asked for ({span}) narrows sampled frames only"
+
+
+def test_no_window_asked_for_is_no_note_at_all():
+    """The ordinary case, and the regression bar: a note about a window nobody named is noise."""
+    assert window_note(FrameSampling()) is None
+    assert (
+        window_note(FrameSampling(every=0.5)) is None
+    )  # `every` is frames-scoped in its own words
+
+
+def test_watch_videos_description_no_longer_promises_the_window_on_every_tier():
+    """The overpromise that made the silence a lie: it read as an unconditional narrowing."""
+    assert "if your model takes video it is shown the whole clip instead" in (
+        WatchVideoTool.description
+    )
 
 
 def test_watch_videos_parameters_offer_the_window_but_never_a_frame_cap():

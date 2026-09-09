@@ -346,6 +346,20 @@ def test_a_video_model_is_handed_the_clip_itself():
     assert not turn.images  # a native-video turn carries no frames
 
 
+def test_a_native_video_caption_names_a_window_it_could_not_apply():
+    """Issue #481. The clip still goes whole — that is the tier — but the caption says so now."""
+    provider = VideoProvider(*_watch_reply())
+    engine = _engine(provider, WatchTool(FrameSampling(start=1, end=2)))
+
+    engine.run([Message.user("watch it")])
+
+    turn = next(m for m in provider.seen[1] if m.videos)
+    assert turn.content == (
+        "(Showing video: clip.mp4 — the whole clip: the start/end window you asked for (1s-2s) "
+        "narrows sampled frames only.)"
+    )
+
+
 def test_a_vision_only_model_is_handed_sampled_frames_instead():
     provider = VisionOnlyProvider(*_watch_reply())
     engine = _engine(provider, WatchTool())
