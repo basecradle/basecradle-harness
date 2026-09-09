@@ -18,15 +18,26 @@ call time. There is no shadow mode and no companion ``…_ENABLED`` flag — the
 switch, for the same reason it is in `_rerank.py`: two ways to say the same thing is one way to
 disagree with yourself.
 
-One provider, one key, one axis
--------------------------------
-The describer runs on the agent's **own** provider, SDK, surface, key and base URL — a second
-adapter instance built by the same factory with a different model. There is deliberately no
-``…_PROVIDER`` / ``…_SDK`` / ``…_API_KEY`` companion: with exactly one legal value, an axis is not a
-choice, it is a second place for the config to be wrong. (This is the opposite call from the
-MemPalace reranker, which *does* carry its own key — and the difference is the reason: that key
-reaches a **different vendor** from the brain, so keeping the two credentials apart is the point.
-Here it is the same vendor and the same account, so a second key would be the same secret twice.)
+Its own key, its own routing — the rerank trio, mirrored
+---------------------------------------------------------
+The describer shares the brain's **SDK, surface and endpoint** — that is what makes it one adapter
+family and one error taxonomy — and shares **nothing else**. Three vars configure it, spelled and
+required exactly as `_rerank.py`'s three are, and each of the two beyond the model is load-bearing:
+
+- **Its own key** (``HARNESS_DESCRIBER_API_KEY``), never a fallback to ``AI_API_KEY``. Fleet rule:
+  one key per agent per purpose, so a rotated or compromised describer key never touches the
+  brain's account.
+- **Its own OpenRouter provider pin** (``HARNESS_DESCRIBER_PROVIDERS``), and it must **not**
+  inherit the brain's. @glm-5.2's ``model_params.json`` pins ``provider.only`` to GLM hosts
+  (novita, baidu, streamlake, …) — none of which serve a Gemini-class describer, so an inherited
+  pin would fail *every* describer call with "no eligible provider". The describer therefore drops
+  ``model_params.json`` entirely (``inherit_params=False``): that file is tuning for **this
+  agent's brain**, at best irrelevant to a different model and at worst exactly that pin.
+
+Both are **required whenever the model is set**, and a model configured without them is not "off"
+— it is a describer carrying a *config fault*, which falls back to the withheld caption on every
+call and says so at ERROR. Nobody configures a describer by accident, so a configured-and-dead one
+is a defect to page on, while an unconfigured one is a choice.
 
 The describer gets the same three tiers as the brain
 -----------------------------------------------------
@@ -35,12 +46,21 @@ A describer is just a model, so it is asked the same capability questions: if it
 `watch_video` sampler, unchanged) and shows it those. So on OpenRouter a Gemini-class describer
 watches the real video for a GLM brain, while a vision-only describer reads its frames.
 
-Never a fabricated description
-------------------------------
-Any failure — no adapter, no key, a raise, a refusal, an empty answer — falls back to the withheld
-caption the agent had before this existed, with a WARNING naming the describer and the reason. A
-blind agent told *"I could not see it"* is in the state it was already in; a blind agent handed an
-invented description is worse than blind.
+Never a fabricated description, and the loudness is graded
+-----------------------------------------------------------
+Any failure falls back to the withheld caption the agent had before this existed. A blind agent
+told *"I could not see it"* is in the state it was already in; a blind agent handed an invented
+description is worse than blind. Nothing here raises into a wake.
+
+Which *level* it says so at is the taxonomy, not the volume — `_rerank.py`'s two classes, the same
+distinction and the same words:
+
+- **Config-class** — a model set with no key or no provider list, a rejected key (401/403), an
+  unfunded account (402), a model id that does not exist. *Dead until a human acts*, so **ERROR**,
+  and ERROR is what makes the fleet's "Error on AI Server" alert fire. **Once per wake**: the life
+  of this object is the wake, and repeats drop to DEBUG so one defect cannot become a storm.
+- **Runtime-class** — a timeout, a 429, a 5xx, a transport blip, an unparseable or empty answer.
+  Transient and self-healing, so **WARNING** for that call.
 
 The describer's output is **model-generated text about peer content**. It is injected as context
 and nothing more: never executed, never a tool call, and never mined as the agent's own words — it
@@ -56,6 +76,18 @@ import os
 from typing import TYPE_CHECKING, Any
 
 from basecradle_harness._assets import model_sees_video
+from basecradle_harness._exceptions import (
+    ProviderAPIError,
+    ProviderAuthError,
+    ProviderBillingError,
+    ProviderConnectionError,
+    ProviderContextLengthError,
+    ProviderError,
+    ProviderPayloadTooLargeError,
+    ProviderRateLimitError,
+    ProviderResponseError,
+    ProviderServerError,
+)
 from basecradle_harness._messages import ImageContent, Message, VideoContent
 from basecradle_harness._observability import media_timer
 
@@ -64,9 +96,29 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 _log = logging.getLogger("basecradle_harness")
 
-#: The model id that describes what a blind brain cannot see, on the agent's **own** provider.
-#: Absent or empty = describer off, and off is byte-identical to the pre-#472 behavior.
+#: The model id that describes what a blind brain cannot see — **and the feature's only switch**.
+#: Absent or empty = describer off, and off is byte-identical to the pre-#472 behavior. There is
+#: deliberately no ``…_ENABLED`` companion; two ways to say the same thing is one way to disagree
+#: with yourself.
 DESCRIBER_MODEL_VAR = "HARNESS_DESCRIBER_MODEL"
+
+#: The key the describer calls with — **dedicated to this purpose on this agent**, never the
+#: agent's brain key and never a fallback to ``AI_API_KEY`` (fleet rule: one key per agent per
+#: purpose). Required whenever the model is set: a model with no key is *config-class dead*, which
+#: is loud, not a quiet slide back to the withheld caption.
+DESCRIBER_API_KEY_VAR = "HARNESS_DESCRIBER_API_KEY"
+
+#: A comma-separated list of OpenRouter provider slugs the describer call may route to, sent as
+#: ``provider: {only: [...], allow_fallbacks: true, data_collection: "deny"}`` — the same object,
+#: built by the same helper, as the MemPalace reranker's. Required whenever the model is set, and
+#: deliberately **not defaulted in code**: which endpoints are acceptable is a jurisdiction and
+#: data-policy decision with a date on it, and a vendor list baked into a package rots the way a
+#: vendor cap table does.
+#:
+#: It is a *separate* list from the brain's rather than an inherited one, and that is the whole
+#: reason this var exists: @glm-5.2's brain pins ``provider.only`` to GLM hosts, none of which
+#: serve a Gemini-class describer — an inherited pin fails every call with no eligible provider.
+DESCRIBER_PROVIDERS_VAR = "HARNESS_DESCRIBER_PROVIDERS"
 
 #: The instruction the describer is given. **Fixed harness text, deliberately not configurable.**
 #: It is read by no human and tuned by no operator: its whole job is to turn pixels into the
@@ -100,12 +152,33 @@ class Describer:
     returns is parsed as structure, and the only thing consumed is its text.
     """
 
-    def __init__(self, provider: Provider, model: str) -> None:
+    def __init__(
+        self,
+        provider: Provider | None,
+        model: str,
+        *,
+        fault: str | None = None,
+        detail: str | None = None,
+    ) -> None:
         self.provider = provider
         #: The describer's model id, carried so every caption and every log line can **name** it.
         #: A description whose author is unnamed reads as the brain's own perception, which is the
         #: one thing this must never claim.
         self.model = model
+        #: A config fault this describer was **born with** — a missing key or provider list, or a
+        #: provider that would not build. It never describes; every call reports and answers
+        #: ``None``. Deliberately not the same thing as *no describer at all*: an unconfigured
+        #: agent is a choice, a configured-and-dead one is a defect (see `describer_from_env`).
+        self.fault = fault
+        #: What made that fault concrete (a vendor's own words, an adapter's error), carried so the
+        #: report can name it. `describer_from_env` stays side-effect-free — **every** fault,
+        #: born-with or per-call, is reported at the point of *use*, so one code path decides
+        #: loudness and a resolution-only read (`--resolved-config`) logs nothing at all.
+        self.detail = detail
+        #: Whether a config-class fault has already been reported this wake. The object's life
+        #: **is** the wake, so "once per wake" needs no clock: after the first report, repeats drop
+        #: to DEBUG and one defect cannot become a storm.
+        self._reported_config = False
 
     def describe_images(self, images: list[ImageContent]) -> str | None:
         """The pictures in words, or ``None`` if the describer could not answer.
@@ -148,7 +221,7 @@ class Describer:
                 end=clip.sampling.end,
             )
         except ValueError as exc:
-            self._failed(name, f"could not sample frames: {exc}")
+            self._failed(name, "undecodable_video", detail=str(exc))
             return None
         described = self._ask(
             DESCRIBE_PROMPT + DESCRIBE_FRAMES_SUFFIX,
@@ -178,6 +251,11 @@ class Describer:
         **Every failure is caught here**, because the alternative is a wake that dies over a
         picture. The result is ``None`` and the caller says so honestly.
         """
+        if self.fault is not None or self.provider is None:
+            # Born broken — a missing key or provider list, or a provider that would not build. No
+            # call is attempted; the report is the whole behaviour.
+            self._failed(subject, self.fault or "config:no_provider", detail=self.detail)
+            return None
         turn = Message(
             role="user", content=prompt, images=list(images or []), videos=list(videos or [])
         )
@@ -188,28 +266,43 @@ class Describer:
             # line exists to make the *perception* visible (which asset, how long), not the money.
             with media_timer(provider="describer", kind=kind, model=self.model):
                 reply = self.provider.chat([turn], None)
+        except ProviderError as exc:
+            self._failed(subject, _fault_of(exc), detail=str(exc))
+            return None
         except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
-            self._failed(subject, f"{type(exc).__name__}: {exc}")
+            # An adapter is allowed to raise something the taxonomy has never seen; that is a
+            # runtime-class unknown, not a reason to take the wake down over a picture.
+            self._failed(subject, "provider_error", detail=f"{type(exc).__name__}: {exc}")
             return None
         text = (getattr(reply, "content", None) or "").strip()
         if not text:
-            self._failed(subject, "the describer returned no text")
+            self._failed(subject, "empty_response")
             return None
         return text
 
-    def _failed(self, subject: str, reason: str) -> None:
+    def _failed(self, subject: str, reason: str, *, detail: str | None = None) -> None:
         """The loud, greppable record that a description was not produced (#293's visibility law).
 
         A silently-absent describer is the Green-While-Absent shape this repo names: the agent goes
-        on working, blind, and nothing says so. WARNING rather than ERROR because the fallback is a
-        real, honest outcome the agent had before this feature existed — not a dead capability
-        awaiting a human, which is the distinction `_rerank.py` draws in the same words.
+        on working, blind, and nothing says so.
+
+        **Severity is the taxonomy, not the volume** — the same split `_rerank.py` draws, in the
+        same words. A ``config:`` reason is *dead until a human acts*, so it is **ERROR**, which is
+        what pages; everything else can succeed unchanged next time, so it is **WARNING**. A
+        config-class report after the first drops to DEBUG: this object lives exactly one wake, so
+        "once per wake" needs no clock, and a chatty wake cannot turn one defect into a storm.
         """
         from basecradle_harness._observability import kv
 
-        _log.warning(
+        is_config = reason.startswith("config:")
+        level = logging.ERROR if is_config else logging.WARNING
+        if is_config and self._reported_config:
+            level = logging.DEBUG
+        self._reported_config = self._reported_config or is_config
+        _log.log(
+            level,
             "describer failed %s",
-            kv(subject=subject, model=self.model, reason=reason),
+            kv(subject=subject, model=self.model, reason=reason, detail=detail),
         )
 
 
@@ -219,38 +312,75 @@ def describer_model_from_env(env: Any = None) -> str | None:
     return (source.get(DESCRIBER_MODEL_VAR) or "").strip() or None
 
 
-def describer_from_env() -> Describer | None:
-    """Build the describer the environment configures, or ``None`` when none is configured.
+def describer_providers_from_env(env: Any = None) -> tuple[str, ...]:
+    """The configured OpenRouter provider slugs for the describer, in order.
 
-    The provider is built by the **same factory the brain was**, with only the model overridden —
-    so the describer inherits the agent's SDK, surface, key, base URL and routing pins by
-    construction, and cannot drift from them. Built with **no server built-ins and no code
-    bridge**: a describer that could search the web or run code is not a sense organ.
-
-    A build failure (no adapter for the SDK, no `AI_MODEL`, a malformed ``model_params.json``) is
-    caught and logged rather than raised: a misconfigured describer must cost the *description*,
-    never the wake. The import is local because the factory lives in `_basecradle`, which imports
-    the engine that calls this.
+    Order is preserved because OpenRouter reads ``only`` as a list; blanks are dropped so a
+    trailing comma is not a slug; case is left exactly as the operator wrote it — the value is sent
+    to OpenRouter, not compared locally, and normalising it here would be this package quietly
+    holding an opinion about a vendor's slug spelling. (`_rerank.providers_from_env`, in every
+    detail: two spellings of one parse is one that can drift.)
     """
-    model = describer_model_from_env()
+    source = env if env is not None else os.environ
+    return tuple(
+        slug.strip()
+        for slug in (source.get(DESCRIBER_PROVIDERS_VAR) or "").split(",")
+        if slug.strip()
+    )
+
+
+def describer_from_env(env: Any = None) -> Describer | None:
+    """The agent's describer, or ``None`` when no model is configured (describer off).
+
+    ``None`` is the ordinary state and the shipped default: every perception path then behaves
+    exactly as it did before this module existed. A model *with* a missing key or provider list is
+    **not** ``None`` — it is a describer carrying a config fault, which falls back to the withheld
+    caption on every call and says so at ERROR once per wake. The difference is the whole point:
+    nobody configures a describer by accident, so a configured-and-dead one is a defect to page on,
+    while an unconfigured one is a choice.
+
+    What it takes from the brain is the **SDK, surface and endpoint** — one adapter family, one
+    error taxonomy — via the brain's own factory, so those cannot drift. What it does **not** take
+    is the brain's key, its routing pin, or its ``model_params.json``: see `DESCRIBER_API_KEY_VAR`
+    and `DESCRIBER_PROVIDERS_VAR` for why each of those is a separate configuration and not an
+    oversight. It is built with **no server built-ins and no code bridge**: a describer that could
+    search the web or run code is not a sense organ.
+
+    A build failure (no adapter for the SDK, no ``AI_MODEL``) becomes a config fault rather than a
+    raise: a misconfigured describer must cost the *description*, never the wake. The import is
+    local because the factory lives in `_basecradle`, which imports the engine that calls this.
+
+    `env` overrides only the **describer's own three** variables. The brain's ``(provider, sdk,
+    surface)`` triple always comes from the process environment, and deliberately: the describer is
+    defined as *the brain's stack with a different model, key and pin*, so resolving that stack
+    from a caller-supplied mapping would let it be built against a stack the agent is not running.
+    """
+    source = env if env is not None else os.environ
+    model = describer_model_from_env(source)
     if not model:
         return None
+    # Read once, checked once, passed once — a second read here is a second thing to keep in step.
+    api_key = (source.get(DESCRIBER_API_KEY_VAR) or "").strip()
+    if not api_key:
+        return Describer(None, model, fault="config:missing_api_key")
+    providers = describer_providers_from_env(source)
+    if not providers:
+        return Describer(None, model, fault="config:missing_providers")
     try:
         from basecradle_harness._basecradle import _config_from_env, _provider_from_config
 
         provider_name, sdk, surface = _config_from_env()
-        provider = _provider_from_config(provider_name, sdk, surface, model=model)
-    except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
-        # ERROR, not WARNING: a describer named in config that cannot be built is dead until a
-        # human fixes the config — the class `_rerank.py` calls config-class, and the level the
-        # fleet's "Error on AI Server" alert fires on. A per-call failure below is WARNING.
-        _log.error(
-            "describer unavailable — %s is set to %r but no provider could be built: %s",
-            DESCRIBER_MODEL_VAR,
-            model,
-            exc,
+        provider = _provider_from_config(
+            provider_name,
+            sdk,
+            surface,
+            model=model,
+            api_key=api_key,
+            routing=providers,
+            inherit_params=False,
         )
-        return None
+    except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
+        return Describer(None, model, fault="config:no_provider", detail=str(exc))
     return Describer(provider, model)
 
 
@@ -263,6 +393,42 @@ def described_caption(subject: str, model: str, description: str) -> str:
     something it did not.
     """
     return f"(This model has no image input. {subject} was described by {model}:)\n{description}"
+
+
+def _fault_of(exc: ProviderError) -> str:
+    """A provider fault → the ``reason=`` this line carries, and its class by the ``config:`` prefix.
+
+    The same taxonomy `_rerank._fault_of` draws, and for the same reason: **config-class** is *dead
+    until a human acts* — a rejected key, an unfunded account, a model id that does not exist —
+    while **runtime-class** is everything that can succeed next time unchanged. A 402 sits with the
+    bad key rather than beside the 429 above it precisely because a rate limit heals with time and
+    an empty account heals only when somebody puts money in it.
+
+    A generic 4xx is runtime-class deliberately: it is far more likely a fixable harness/config
+    defect than a permanent property of the pool, and reporting it as config-class would page a
+    human for something the next release fixes.
+
+    Ordered most-specific first, because these classes subclass one another.
+    """
+    if isinstance(exc, ProviderAuthError):
+        return "config:auth"
+    if isinstance(exc, ProviderBillingError):
+        return "config:billing"
+    if isinstance(exc, ProviderRateLimitError):
+        return "rate_limited"
+    if isinstance(exc, ProviderServerError):
+        return "server_error"
+    if isinstance(exc, ProviderContextLengthError):
+        return "context_length"
+    if isinstance(exc, ProviderPayloadTooLargeError):
+        return "payload_too_large"
+    if isinstance(exc, ProviderResponseError):
+        return "invalid_response"
+    if isinstance(exc, ProviderConnectionError):
+        return "transport"
+    if isinstance(exc, ProviderAPIError):
+        return "config:model_not_found" if getattr(exc, "status_code", None) == 404 else "api_error"
+    return "provider_error"
 
 
 def _names(images: list[ImageContent]) -> str:

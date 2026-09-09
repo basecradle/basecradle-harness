@@ -118,7 +118,12 @@ from basecradle_harness._brief import (
     render_safety,
 )
 from basecradle_harness._code import CodeExecutionBridge
-from basecradle_harness._describer import described_caption, describer_model_from_env
+from basecradle_harness._describer import (
+    DESCRIBER_API_KEY_VAR,
+    described_caption,
+    describer_model_from_env,
+    describer_providers_from_env,
+)
 from basecradle_harness._engine import compose_hooks
 from basecradle_harness._exceptions import (
     EngineError,
@@ -4418,15 +4423,18 @@ def resolved_config() -> dict[str, object]:
       **drops** as harness-owned collisions (plus ``extra_body`` on the SDKs that do not support
       it): the "warn and win" set (`resolved_model_params`). ``[]`` when nothing collides; the
       effective tuning the SDK receives is ``model_params`` minus these.
-    - ``describer_model`` — the blind-model **describer** (issue #472): the model id on this
-      agent's *own* provider that describes images and video for a brain with no image input,
-      ``null`` when unset (the shipped default, and byte-identical to the pre-#472 behavior).
-      Reported for the same reason the rerank fields are: a describer is configured in one env var,
-      costs money on every withheld picture, and is otherwise invisible from off the box — so a
-      drift pass could not tell a deliberately-blind agent from one whose describer was dropped.
-      No key or endpoint axis appears beside it, and that is the design rather than an omission:
-      the describer runs on the agent's own SDK/surface/key/base URL (already reported above), so
-      a second set of fields would be the same configuration reported twice.
+    - ``describer_model`` / ``describer_providers`` / ``describer_api_key_set`` — the blind-model
+      **describer** (issue #472), reported as the rerank trio is and for the same reasons: the
+      model id that describes images and video for a brain with no image input (``null`` when
+      unset — the shipped default, byte-identical to the pre-#472 behavior), the OpenRouter
+      provider slugs it is pinned to (``[]`` when unset), and whether its **dedicated** key is
+      present. The **key is never reported**, here or anywhere — this file is pasted into issues.
+      All three matter from off the box: a describer costs money on every withheld picture and is
+      otherwise invisible, and a *configured-but-dead* one — a model named with no key or no
+      provider list — degrades silently to the honest caption, which is exactly the state a drift
+      pass must be able to tell apart from a deliberately blind agent. The key also rides
+      ``tool_env`` (below) when a model is configured, which is issue #427's ungated-call-time-read
+      surface; the two are different consumers of the same fact, not the fact twice.
     - ``mempalace_rerank_model`` / ``mempalace_rerank_providers`` /
       ``mempalace_rerank_sdk_version`` — the MemPalace **LLM reranker**'s configuration (issue
       #464): the OpenRouter model id that reranks (``null`` = rerank off, the shipped default), the
@@ -4478,6 +4486,8 @@ def resolved_config() -> dict[str, object]:
         ),
         "mempalace_rerank_sdk_version": _dist_version(_RERANK_SDK_DISTRIBUTION),
         "describer_model": describer_model_from_env(),
+        "describer_providers": list(describer_providers_from_env()),
+        "describer_api_key_set": bool((os.environ.get(DESCRIBER_API_KEY_VAR) or "").strip()),
         "tools": sorted(tool.name for tool in resolved.tools),
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),
@@ -4487,7 +4497,16 @@ def resolved_config() -> dict[str, object]:
         ),
         "tool_env": {
             var: bool(os.environ.get(var))
-            for var in sorted({v for deps in resolved.env_dependencies.values() for v in deps})
+            for var in sorted(
+                {v for deps in resolved.env_dependencies.values() for v in deps}
+                # The describer's key is an **ungated call-time read** with no plugin to declare it
+                # (issue #427's shape, without a `ToolPlugin` to hang `needs_env` on), so it is
+                # unioned in here — but *only when a describer is configured*, because a `false`
+                # for a variable nobody wants is the `XAI_TEAM_ID` noise this map deliberately
+                # avoids. With one configured the map's contract holds exactly: **every `false` is
+                # an active capability that cannot do its job.**
+                | ({DESCRIBER_API_KEY_VAR} if describer_model_from_env() else set())
+            )
         },
         "mcp_servers": sorted({config.name for config in load_mcp_configs()}),
         "mcp_request_timeout": _timeout_from_env(),

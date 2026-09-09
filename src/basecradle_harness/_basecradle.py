@@ -886,6 +886,24 @@ def resolved_model_params(sdk: str) -> tuple[dict[str, Any], list[str]]:
     return loaded, sorted(stripped)
 
 
+def _routing_pin(providers: Sequence[str]) -> dict[str, Any]:
+    """OpenRouter provider slugs → the ``provider`` body object, spelled once for the whole repo.
+
+    The same three keys `_rerank.py` sends, and the same reasoning behind each: ``only`` is the
+    jurisdiction guarantee (it restricts the pool outright), ``data_collection: "deny"`` makes an
+    operator's data-policy decision the *vendor's* to enforce rather than ours to hope for, and
+    ``allow_fallbacks: true`` is **not** in tension with ``only`` — a fallback is a second attempt
+    *inside* the pinned list. Off, it was not (issue #468): OpenRouter picked one pinned upstream,
+    that upstream's shared pool answered 429, and the call failed with three acceptable endpoints
+    untried. One vendor's bad minute must not defeat a feature.
+    """
+    return {
+        "only": list(providers),
+        "allow_fallbacks": True,
+        "data_collection": "deny",
+    }
+
+
 def _provider_from_config(
     provider: str,
     sdk: str,
@@ -894,6 +912,9 @@ def _provider_from_config(
     builtins: Sequence[str] = (),
     code_bridge: CodeExecutionBridge | None = None,
     model: str | None = None,
+    api_key: str | None = None,
+    routing: Sequence[str] | None = None,
+    inherit_params: bool = True,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -934,15 +955,30 @@ def _provider_from_config(
     overrides wiring; a malformed file raises here, failing the wake loudly at startup (the
     read-only introspection paths never build a provider, so they never touch it).
     """
-    # `model` overrides ``AI_MODEL`` for a **second** provider instance on the same stack — today
-    # the blind-model describer (issue #472), which is the agent's own SDK, surface, key, base URL
-    # and routing pins with a different model id. Overriding here rather than building a parallel
-    # factory is the whole point: a describer cannot drift from the brain's wiring, because there
-    # is only one place that wiring is spelled. ``AI_MODEL`` is still required either way, so a
-    # config missing it fails on the brain, where the error is actionable.
+    # The four overrides build a **second** provider instance on the same stack — today the
+    # blind-model describer (issue #472). Building it here rather than in a parallel factory is the
+    # point: the parts it *shares* with the brain (SDK, surface, endpoint, error mapping) cannot
+    # drift, because there is only one place they are spelled.
+    #
+    # What it deliberately does **not** share is the whole reason there are four and not one:
+    #
+    # - ``model`` — a different model id (that is the feature).
+    # - ``api_key`` — its **own** key, never the brain's. Fleet rule: one key per agent per
+    #   purpose, so a compromised or rotated describer key never touches the brain's account.
+    # - ``routing`` — its **own** OpenRouter provider pin. @glm-5.2's brain pins ``provider.only``
+    #   to GLM hosts; a Gemini-class describer routed there fails with *no eligible provider* on
+    #   every call. Spelled per SDK **here**, where every other vendor branch lives, so the caller
+    #   never has to know how a body field reaches a given wire.
+    # - ``inherit_params`` — ``False`` drops ``model_params.json`` entirely. That file is tuning
+    #   for *this agent's brain* (its reasoning effort, its routing pin); inherited it is at best
+    #   irrelevant to a different model and at worst exactly the pin above.
+    #
+    # ``AI_MODEL`` is still required either way, so a config missing it fails on the brain, where
+    # the error is actionable.
     model = model or os.environ.get("AI_MODEL")
     if not model:
         raise ValueError("AI_MODEL is required — the model id to run (e.g. gpt-5.4-mini).")
+    loaded_params = load_model_params if inherit_params else dict
 
     # ``model_params.json`` is read *after* each branch's config-shape guards (below), never here:
     # a config mismatch (e.g. AI_SDK=xai-sdk + AI_PROVIDER=openrouter) must surface its own
@@ -956,14 +992,16 @@ def _provider_from_config(
                 f"(got {provider!r}). Use AI_SDK=openai for a non-xAI provider."
             )
         params, extra_body = _split_model_params(
-            load_model_params(), owned=_OWNED_XAI_SDK, sdk_label="the native xai-sdk"
+            loaded_params(), owned=_OWNED_XAI_SDK, sdk_label="the native xai-sdk"
         )
         if extra_body is not None:
             _log.warning(
                 "model_params.json sets 'extra_body', which the native xai-sdk does not support "
                 "(it is an openai-SDK concept) — ignoring it."
             )
-        return XaiSdkProvider(model, builtin_tools=list(builtins), **params)
+        # `routing` is an OpenRouter concept; xAI is a single vendor reached directly, so a pin
+        # here would be a body field its endpoint has never heard of. Dropped, not sent.
+        return XaiSdkProvider(model, api_key=api_key, builtin_tools=list(builtins), **params)
 
     if sdk == "openrouter":
         if provider != "openrouter":
@@ -973,7 +1011,7 @@ def _provider_from_config(
                 "provider, or set AI_PROVIDER=openrouter."
             )
         params, extra_body = _split_model_params(
-            load_model_params(), owned=_OWNED_OPENROUTER, sdk_label="the openrouter SDK"
+            loaded_params(), owned=_OWNED_OPENROUTER, sdk_label="the openrouter SDK"
         )
         if extra_body is not None:
             _log.warning(
@@ -993,8 +1031,14 @@ def _provider_from_config(
         web_search_params = (
             load_search_params() or None if WEB_SEARCH_BUILTIN in builtin_list else None
         )
+        if routing:
+            # The native SDK carries the pin as a plain `chat.send(provider=…)` keyword, which is
+            # the same path `model_params.json` uses — so an explicit `routing` **replaces** any
+            # inherited pin rather than fighting it (and with `inherit_params=False` there is none).
+            params["provider"] = _routing_pin(routing)
         return OpenRouterProvider(
             model,
+            api_key=api_key,
             base_url=base_url,
             builtin_tools=builtin_list,
             web_search_params=web_search_params,
@@ -1023,7 +1067,7 @@ def _provider_from_config(
         )
     base_url = os.environ.get("AI_BASE_URL") or _PROVIDER_BASE_URLS.get(provider)
     params, params_extra_body = _split_model_params(
-        load_model_params(), owned=_OWNED_OPENAI, sdk_label="the openai SDK"
+        loaded_params(), owned=_OWNED_OPENAI, sdk_label="the openai SDK"
     )
     # `extra_headers` is now harness wiring on one of this adapter's three endpoints (the routing
     # header, below), so it is **lifted out** of the operator's tuning rather than splatted with it —
@@ -1040,6 +1084,7 @@ def _provider_from_config(
         extra_body = _merge_extra_body(params_extra_body, harness_extra_body)
         return OpenAIProvider(
             model,
+            api_key=api_key,
             base_url=base_url,
             provider=provider,
             surface=surface,
@@ -1058,12 +1103,19 @@ def _provider_from_config(
         # also serves OpenAI and xAI, where the header would be meaningless — which endpoint we are
         # aimed at is this layer's knowledge, and keeping it here is what keeps the adapter free of
         # a vendor branch.
+        # On this cell the pin is a **body** field, so it rides `extra_body` — the openai SDK's
+        # escape hatch — rather than a keyword. Same pin, different spelling: which one a wire
+        # takes is this layer's knowledge, which is why `routing` is a list of slugs at the seam.
+        routed = _merge_extra_body(
+            params_extra_body, {"provider": _routing_pin(routing)} if routing else None
+        )
         return OpenAIProvider(
             model,
+            api_key=api_key,
             base_url=base_url,
             provider=provider,
             surface=surface,
-            extra_body=params_extra_body,
+            extra_body=routed,
             extra_headers=_merge_extra_headers(
                 params_extra_headers, OPENROUTER_ROUTING_METADATA_HEADER
             ),
@@ -1074,6 +1126,7 @@ def _provider_from_config(
     code_container = code_bridge.container_spec if code_bridge is not None else None
     return OpenAIProvider(
         model,
+        api_key=api_key,
         base_url=base_url,
         provider=provider,
         surface=surface,
