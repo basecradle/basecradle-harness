@@ -163,6 +163,55 @@ Four invariants, each with an "obviously fine" broken form:
 
 One **stated gap**: the issue asks for `reasoning.exclude: true` (billed, not returned), and the pinned `openrouter` SDK models `reasoning` with only `effort`/`summary`, **silently dropping** an `exclude` key before serialization. Sending a key that never reaches the wire is the issue #433 anti-pattern exactly, and fleet law forbids hand-rolling the HTTP around it — so the harness sends what the SDK can express and `test_rerank.py` pins the absence, so the day the SDK gains the field the test fails and the key goes in. It costs response bytes and nothing else: reasoning tokens are billed either way and the reranker discards everything but the picks.
 
+## The Blind-Model Describer — a second model's eyes (issue #472)
+
+A text-only brain (@glm-5.2, `input_modalities: ["text"]`) reaches the honest "described above, not
+shown" tier on every picture and every clip. Honest is not working. **`HARNESS_DESCRIBER_MODEL`** —
+a model id on the agent's *own* provider — makes the harness send the pixels to that model and hand
+the brain its words, across all three perception paths (`view`, `watch_video`, and a peer's image on
+arrival at the asset wake) through **one** seam (`Engine.describer`, memoized per wake), so they can
+never diverge on which model describes or how.
+
+| Var | Meaning |
+|---|---|
+| `HARNESS_DESCRIBER_MODEL` | The describer's model id, on the agent's own provider/SDK/surface/key. **Absent or empty = describer off** — byte-identical to the pre-#472 behavior, down to the log lines, with nothing imported and no adapter built. |
+
+There is deliberately **no** `…_PROVIDER` / `…_SDK` / `…_API_KEY` companion, and that is the
+*opposite* call from the MemPalace reranker's dedicated key — the difference is the reason. The
+rerank key reaches a **different vendor** from the brain, so keeping the credentials apart is the
+point; the describer is the same vendor and the same account, so a second key is the same secret
+twice and an axis with one legal value is not a choice, it is a second place for the config to be
+wrong. `_provider_from_config(..., model=…)` builds it — the **brain's own factory with the model
+overridden** — so it inherits the SDK, surface, key, base URL and routing pins by construction. A
+parallel factory would be a second place that wiring is spelled, and a describer routed differently
+from its brain is a different bill and a different endpoint on the `llm` line.
+
+Four invariants, each with an "obviously fine" broken form:
+
+- **Off by absence, and the model id is the only switch** — no shadow mode, no `…_ENABLED`
+  companion, for the same reason `_rerank.py` has none. The regression bar is a test.
+- **Never a fabricated description, and the failure classes are graded.** A per-call failure (a
+  raise, an empty answer, a clip that will not decode) falls back to the withheld caption with a
+  **WARNING** naming the describer and the reason; a describer *named in config that cannot be
+  built* logs **ERROR** — config-class, dead until a human acts, the level the fleet's "Error on AI
+  Server" alert fires on — and the wake runs on. A working describer logs **INFO**: the WARNING
+  belongs to the degrade it replaced, and one on every successful description is how a real warning
+  stops being read. Nothing here ever raises into a wake.
+- **The caption always names the describer.** Without it the brain reads a paragraph about a picture
+  it never received as its own perception — and so does anyone reading its memory a month later. The
+  describer is also put through the **brain's own** fail-closed `model_sees_video` gate, so a
+  video-capable describer watches the clip and a vision-only one reads its frames: one rule applied
+  twice, never two that can drift. It is offered no tools — a describer with tools is an agent.
+- **A second model's prose gets a mining sentinel of its own.** The description is neither the
+  agent's words nor a peer's; it is a third party's account of a peer's content. It sits outside the
+  #438 boundary *by construction* — it rides an engine-injected turn, and `_dialogue_of` mines an
+  asset's own dialogue and nothing else — which is precisely the kind of claim #438 proved a
+  docstring cannot be trusted to keep, so `test_mining.py` proves it on a real wake.
+
+`--resolved-config` reports `describer_model` and **nothing beside it**: the describer's provider,
+SDK, surface and key are the agent's own and already reported, so a second set of fields would be
+the same configuration reported twice.
+
 ## The Unspoken Channel (Recurrence Guard)
 
 **By default, nothing an agent generates touches a timeline.** Every timeline interaction is an intentional tool call; all other model output is *unspoken* — logged, remembered, seen by no one (issues #293, basecradle#420; `_unspoken.py`). The founder's principle governs it: *"We do everything we can to be sure the AI understands in a clear and concise way, we never force its action or inaction, but we do require full visibility which is the price of that freedom."*

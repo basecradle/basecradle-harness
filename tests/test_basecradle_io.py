@@ -822,6 +822,59 @@ def test_provider_from_config_openai_builds_the_sdk_adapter(monkeypatch):
     provider.close()
 
 
+def test_the_model_override_builds_a_second_instance_on_the_brains_own_wiring(monkeypatch):
+    """The describer's adapter path (issue #472): same SDK, surface, key, base URL — new model.
+
+    Overriding the model on the *one* factory is what makes a describer unable to drift from the
+    brain's wiring; a parallel factory would be a second place for that wiring to be spelled.
+    """
+    _set_model_key(monkeypatch)
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("AI_BASE_URL", "https://gateway.example.com/v1")
+
+    brain = _provider_from_config("openai", "openai", "chat")
+    describer = _provider_from_config("openai", "openai", "chat", model="google/gemini-3-flash")
+
+    assert brain.model == "z-ai/glm-5.2"
+    assert describer.model == "google/gemini-3-flash"  # the *only* difference
+    assert describer.surface == brain.surface == "chat"
+    assert describer.base_url == brain.base_url == "https://gateway.example.com/v1"
+    assert describer.provider == brain.provider == "openai"
+    brain.close()
+    describer.close()
+
+
+def test_the_model_override_carries_the_openrouter_routing_pins(monkeypatch):
+    """A pinned agent's describer must route the same way its brain does, or it is a different bill."""
+    _set_model_key(monkeypatch)
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+    monkeypatch.delenv("AI_BASE_URL", raising=False)
+
+    brain = _provider_from_config("openrouter", "openai", "chat")
+    describer = _provider_from_config("openrouter", "openai", "chat", model="google/gemini-3-flash")
+
+    # The routing-metadata header is harness wiring set on this endpoint, not tuning — a describer
+    # built any other way would silently lose it and report no endpoint on its own `llm` line. It
+    # lands as the SDK client's `default_headers`, which is where the wire actually reads it from.
+    headers = dict(describer._client.default_headers)
+    assert (
+        headers["X-OpenRouter-Metadata"]
+        == dict(brain._client.default_headers)["X-OpenRouter-Metadata"]
+    )
+    assert describer.base_url == brain.base_url
+    brain.close()
+    describer.close()
+
+
+def test_ai_model_is_still_required_even_when_a_model_is_overridden(monkeypatch):
+    """The brain is where a missing AI_MODEL is actionable — the override must not paper over it."""
+    monkeypatch.delenv("AI_MODEL", raising=False)
+    monkeypatch.setenv("AI_API_KEY", "sk-test")
+
+    with pytest.raises(ValueError, match="AI_MODEL is required"):
+        _provider_from_config("openai", "openai", "chat")
+
+
 def test_provider_from_config_openai_honors_the_chat_surface(monkeypatch):
     _set_model_key(monkeypatch)
     provider = _provider_from_config("openai", "openai", "chat")

@@ -1415,6 +1415,83 @@ def test_the_image_degrade_is_logged_loudly(platform, tmp_path, caplog):
     assert TIMELINE_UUID in line
 
 
+class _DescribingProvider:
+    """A stand-in describer: answers vision=True and returns a fixed description."""
+
+    provider = "openrouter"
+    model = "google/gemini-3-flash"
+
+    def __init__(self):
+        self.seen = []
+
+    def supports_vision(self):
+        return True
+
+    def supports_video(self):
+        return False
+
+    def chat(self, messages, tools=None):
+        self.seen.append(messages)
+        from basecradle_harness import Message
+
+        return Message.assistant(content="A hand-drawn architecture diagram labelled 'wake path'.")
+
+
+def test_a_posted_image_is_described_on_arrival_when_a_describer_is_configured(platform, tmp_path):
+    """A blind agent is *shown* nothing, so it is *told* — the asset wake's half of issue #472.
+
+    Without a describer this same case is the #228 degrade (asserted above). With one, the picture
+    is described on arrival exactly the way a sighted model is shown it on arrival, so the two
+    perception paths — `view` and the asset wake — degrade identically rather than diverging.
+    """
+    from basecradle_harness import Describer
+
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, provider = build_wake(tmp_path, provider=_TextOnlyProvider())
+    vision = _DescribingProvider()
+    agent.harness.engine._describer = Describer(vision, "google/gemini-3-flash")
+
+    agent.wake()
+
+    assert provider.last_images == []  # the brain still never receives pixels it cannot take
+    prompt = provider.prompts[0]
+    assert "hand-drawn architecture diagram" in prompt  # it got the *content*, not just a filename
+    assert "diagram.png" in prompt  # and the peer's own line, which is what memory mines
+    assert len(vision.seen) == 1 and vision.seen[0][0].images  # the describer saw the pixels
+    # The description **names its author** on this path exactly as it does on `view` — otherwise a
+    # blind agent (and its memory, a month later) reads it as its own perception.
+    assert "described by google/gemini-3-flash" in prompt
+    # The tool hint is dropped here on purpose: its whole job is "here is how to open this file",
+    # and the file has just been opened. A blind agent could not `view` it anyway.
+    assert "Use the assets tool" not in prompt
+
+
+def test_a_describer_that_cannot_answer_leaves_the_plain_degrade_untouched(
+    platform, tmp_path, caplog
+):
+    """Never a fabricated description: a failing describer returns the agent to the #228 behavior."""
+    from basecradle_harness import Describer
+
+    class _Broken(_DescribingProvider):
+        def chat(self, messages, tools=None):
+            raise RuntimeError("describer upstream is down")
+
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A1, filename="diagram.png")))
+    agent, provider = build_wake(tmp_path, provider=_TextOnlyProvider())
+    agent.harness.engine._describer = Describer(_Broken(), "google/gemini-3-flash")
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        agent.wake()
+
+    assert provider.last_images == []
+    assert "diagram.png" in provider.prompts[0]
+    assert "model has no vision input" in _line(caplog, "image degraded to text")
+
+
 def test_a_vision_capable_model_is_still_shown_the_image(platform, tmp_path, caplog):
     """The gate fails toward perception: a model that answers vision=True keeps seeing the picture,
     and no degrade line is logged — the change is confined to the definite no-vision case."""
@@ -1859,6 +1936,24 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     # additive contract so a verifier can rely on the keys existing.
     assert report["model_params"] == {}
     assert report["model_params_stripped"] == []
+    # The blind-model describer (issue #472): null on the shipped default, which is the state a
+    # drift pass has to be able to tell apart from "the describer was dropped".
+    assert report["describer_model"] is None
+
+
+def test_resolved_config_reports_the_configured_describer(wake_env, monkeypatch, capsys):
+    """A describer is one env var, costs money on every withheld picture, and is otherwise
+    invisible from off the box — so it is reported, exactly as the rerank model is."""
+    monkeypatch.setenv("HARNESS_DESCRIBER_MODEL", "  google/gemini-3-flash  ")
+
+    assert main(["--resolved-config"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["describer_model"] == "google/gemini-3-flash"  # trimmed, never the raw value
+    # No key or endpoint axis rides beside it, and that is the design: the describer runs on the
+    # agent's own SDK/surface/key/base URL, already reported above, so a second set of fields
+    # would be the same configuration reported twice — and a second place for it to be wrong.
+    assert not [key for key in report if key.startswith("describer_") and key != "describer_model"]
 
 
 def test_resolved_config_reports_loaded_model_params_and_collisions(

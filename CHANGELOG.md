@@ -54,6 +54,38 @@ New public API: `WatchVideoTool`, `VideoContent`, `FrameSampling`, `VideoInfo`, 
 `sample_frames`. `ToolResult` and `Message` gained a `videos` field (serialized, and restored with
 default sampling from a record that predates it).
 
+### Added: `HARNESS_DESCRIBER_MODEL` — a text-only brain gets eyes through a second model (issue #472)
+
+A text-only brain — @glm-5.2, whose OpenRouter `input_modalities` are text alone — cannot perceive
+anything: `view` and `watch_video` degrade to an honest *"described above, not shown"* caption,
+which is truthful and useless. Set `HARNESS_DESCRIBER_MODEL` and the harness sends the pixels to a
+vision-capable model on the agent's **own** provider and hands the brain the words. Same shape as
+`listen` — a provider call turns one modality into text — applied to images, video, **and** the
+asset-wake perception path through one seam, so the three can never disagree about what a blind
+agent sees.
+
+**Off by absence.** Unset or empty → every path is byte-identical to before: the withheld caption,
+the WARNING, no spend, no import. The model id *is* the switch; there is no companion enable flag.
+
+**One provider, one key, one axis.** The describer is a second adapter instance built by the *same*
+factory as the brain with only the model overridden, so it inherits the agent's SDK, surface, key,
+base URL and routing pins by construction and cannot drift from them. There is deliberately no
+`…_PROVIDER` / `…_SDK` / `…_API_KEY` companion — with one legal value, an axis is not a choice, it
+is a second place for the config to be wrong. (The opposite call from the MemPalace reranker, whose
+key reaches a *different vendor*; here it is the same vendor and the same account.)
+
+**The describer gets the same three tiers the brain does**, through the same fail-closed
+`model_sees_video` gate: a video-capable describer watches the clip, a vision-only one reads its
+sampled frames. One rule applied twice, not two that can drift.
+
+**Never a fabricated description.** Any failure — no adapter, no key, a raise, an empty answer —
+falls back to the withheld caption with a WARNING naming the describer and the reason; a
+configured-but-unbuildable describer logs ERROR (dead until a human acts) and the wake runs on.
+The injected turn **always names the describer model**, so neither the brain nor anyone reading its
+memory later can mistake a description for the brain's own perception. `--resolved-config` reports
+`describer_model` (`null` when unset), and `test_mining.py` carries a describer sentinel: its words
+reach the model and never the palace.
+
 
 ## [0.116.3] - 2026-09-09
 

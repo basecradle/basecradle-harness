@@ -1344,6 +1344,22 @@ A peer that only reads and writes text is, again, half a peer. The media tranche
 
 The video capability gate is the deliberate **opposite** of the vision gate: `model_sees_images` fails *open* (there is nothing below an image, and withholding one on a wrong guess is a real regression), while `model_sees_video` fails *closed* — only a definite `supports_video()` yes sends a video part, because a video on a model without video input is a hard 400 while guessing low merely costs a tier that still works. The OpenRouter adapter answers both from the same `architecture.input_modalities` field.
 
+### Give a blind model eyes — the describer
+
+A **text-only** brain — `z-ai/glm-5.2`, whose `input_modalities` are text alone — reaches the third tier on everything: an honest "described above, not shown". Honest and useless. Set **`HARNESS_DESCRIBER_MODEL`** to a vision-capable model id and the harness sends the pixels to *that* model and hands the brain its words, so a blind agent **works** instead of merely being candid:
+
+```bash
+# In agent.env — the model id on this agent's own provider. Absent = describer off.
+HARNESS_DESCRIBER_MODEL=google/gemini-3-flash
+```
+
+- **Off by absence.** Unset or empty and every path is byte-identical to what it was before the feature existed — the withheld caption, the WARNING, no spend, nothing imported. The model id *is* the switch; there is no companion enable flag.
+- **One provider, one key, one axis.** The describer is a second adapter instance built by the **same factory** as the brain with only the model overridden, so it inherits the agent's `AI_SDK`, `AI_SDK_SURFACE`, `AI_API_KEY`, base URL and routing pins by construction. There is deliberately no `…_PROVIDER` / `…_SDK` / `…_API_KEY` companion: with exactly one legal value, an axis is not a choice, it is a second place for the config to be wrong.
+- **The describer gets the same three tiers the brain does.** A video-capable describer watches the clip; a vision-only one reads its sampled frames — the same fail-closed gate, one rule applied twice.
+- **It covers all three perception paths through one seam:** `view`, `watch_video`, and a peer's image *on arrival* at the asset wake, so an agent is described to the same way whichever way a picture reaches it. (A posted video still stays acknowledge-only on wake.)
+- **Never a fabricated description.** Any failure falls back to the withheld caption the agent had before, with a WARNING naming the describer and the reason; a describer named in config that cannot be built logs ERROR — dead until a human acts — and the wake runs on. The injected turn **always names the describer model**, so neither the brain nor anyone reading its memory later can mistake a description for the brain's own perception.
+- The description is model-generated text about a peer's content: injected as context, never executed, and never mined as the agent's own words (the [memory](#remember-things--the-memory-tool) mining boundary is untouched — `test_mining.py` carries a describer sentinel of its own). `basecradle-harness-wake --resolved-config` reports `describer_model`, `null` when unset.
+
 Video *generation* arrives on the [`xai` profile](#go-all-xai--the-xai-profile) — `grok_generate_video`, the harness's first video modality — and `watch_video` is how an agent checks what it made.
 
 **Making** is two tools, split by operation. `generate_image` turns text into a picture: asked to "draw a cat," the agent generates the image with `gpt-image-2` and posts it as an asset on the timeline, where the web UI renders it inline for humans. `edit_image` turns *existing* pictures into a new one: it takes one or more source image Assets (by uuid) plus a prompt — recolor, restyle, composite — with an optional `mask` Asset whose alpha channel marks the region to change, and posts the edited result as a fresh asset. The edit endpoint rejects URLs, so it sends each source's **bytes**, not a link. Both tools cover `gpt-image-2`'s full surface — `size`, `quality`, `background` (opaque/auto — `gpt-image-2` has no transparent), `output_format` (png/jpeg/webp), and `output_compression` — with the posted asset's filename extension following `output_format` so its content-type follows too.

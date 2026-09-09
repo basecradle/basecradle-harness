@@ -617,3 +617,55 @@ to ask a human to look.
 24 fps whose colour changes on each whole second — so a sampled frame's timestamp *and* which second
 it actually came from are both assertable, and no binary fixture lives in the repo. Nothing here
 touches a model or the network.
+
+---
+
+### The Blind-Model Describer — a second model's eyes (issue #472)
+
+**A text-only brain reaches the honest tier on everything, and honest is not the same as working.**
+@glm-5.2's OpenRouter `input_modalities` are text alone, so `view`, `watch_video` and a peer's
+posted picture all degrade to *"described above, not shown"* — truthful, and no help to a peer who
+asked *"what's in this photo?"*. The founder's ruling: give that model eyes through a second,
+vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
+
+- **The same shape `listen` already had, generalized.** A provider call turns one modality into
+  text the brain can read. What is new is that it covers **three** perception paths — `view`,
+  `watch_video`, and the asset wake's on-arrival perception — through **one** seam
+  (`Engine.describer`, memoized), so they cannot diverge on which model describes or how.
+- **Off by absence, and the model id is the only switch.** Unset → byte-identical to the pre-#472
+  behavior, down to the log lines; nothing is imported and no adapter is built. Same rule, and the
+  same reasoning, as the MemPalace reranker: two ways to say the same thing is one way to disagree
+  with yourself. `test_describer.py`'s first test is that regression bar.
+- **One factory, one model override.** `_provider_from_config(..., model=…)` builds the describer,
+  so it inherits the brain's SDK, surface, key, base URL and routing pins **by construction**. A
+  parallel factory would be a second place that wiring is spelled, and a describer routed
+  differently from its brain is a different bill and a different endpoint on the `llm` line.
+- **No second key, and that is the *opposite* call from the reranker — deliberately.** The rerank
+  key reaches a **different vendor** from the brain, so keeping the two credentials apart is the
+  whole point there. The describer is the same vendor and the same account, so a `…_API_KEY` would
+  be the same secret stored twice, and a `…_PROVIDER`/`…_SDK` with one legal value is not a choice,
+  it is a second place for the config to be wrong.
+- **The describer is put through the brain's own gates.** `model_sees_video` (fail-closed) decides
+  whether it watches a clip or reads its sampled frames — one rule applied twice rather than two
+  that can drift. A describer with tools would be an agent; this one is offered none.
+- **Never a fabricated description, and the failure classes are graded.** Any per-call failure —
+  a raise, an empty answer, a clip that will not decode — falls back to the withheld caption with a
+  **WARNING** naming the describer and the reason. A describer *named in config that cannot be
+  built* is **ERROR**: config-class, dead until a human acts, the level the fleet's "Error on AI
+  Server" alert fires on. The same split `_rerank.py` draws, in the same words. A working describer
+  logs **INFO** — the WARNING belongs to the degrade it replaced, and emitting one on every
+  successful description is how a real warning stops being read.
+- **The caption always names the describer.** `(This model has no image input. cat.png was
+  described by <model>:)`. Without that the brain reads a paragraph about a picture it never
+  received as its own perception — and so does anyone reading its memory a month later.
+- **A second model's prose gets a mining sentinel of its own.** The description is not the agent's
+  words and not a peer's; it is a third party's account of a peer's content. It holds outside the
+  #438 boundary *by construction* — it rides an engine-injected turn, and `_dialogue_of` mines an
+  asset's own dialogue and nothing else — which is exactly the kind of claim #438 proved a
+  docstring cannot be trusted to keep, so `test_mining.py` proves it on a real wake: the sentinel
+  reaches the model and reaches the palace never.
+
+**Boundary:** `--resolved-config` reports `describer_model` and deliberately nothing beside it —
+the describer's provider, SDK, surface and key are the agent's own and are already reported, so a
+second set of fields would be the same configuration twice. Live verification is the capital's, on
+@glm-5.2.
