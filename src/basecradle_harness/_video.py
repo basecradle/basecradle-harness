@@ -103,6 +103,35 @@ def probe(video_bytes: bytes) -> VideoInfo:
         )
 
 
+def window_note(sampling: FrameSampling) -> str | None:
+    """What to say when a clip goes to the model **whole** though a window was asked for.
+
+    ``start``/``end`` narrow the **sampled-frames** tier; a model that takes video is sent the clip
+    entire and the sampler never runs (`_engine._show_video`), so the window is not applied. Until
+    issue #481 nothing said so: the agent asked to look closely at one moment of a long clip, was
+    shown all of it, and had no way to learn which of those two things had happened. That is the
+    #479 shape in a different place — the model reasons about a perception it did not have — and
+    it costs one clause to close.
+
+    ``None`` when no window was asked for, which is the ordinary case: a note about a window nobody
+    named is noise on every caption forever.
+
+    The clause is deliberately **stated, not fixed**. Honoring a window natively would mean
+    trimming the clip, which re-encodes a file the harness has a standing rule never to modify, so
+    whether to do that at all is a decision above this module (issue #481). What is not a decision
+    is whether the agent gets told.
+    """
+    if sampling.start is None and sampling.end is None:
+        return None
+    if sampling.start is not None and sampling.end is not None:
+        span = f"{sampling.start:g}s-{sampling.end:g}s"
+    elif sampling.start is not None:
+        span = f"from {sampling.start:g}s"
+    else:
+        span = f"up to {sampling.end:g}s"
+    return f"the start/end window you asked for ({span}) narrows sampled frames only"
+
+
 def video_facts(info: VideoInfo) -> str:
     """A clip's header facts as one comma-joined phrase: how long, how fast, how big.
 
@@ -204,9 +233,10 @@ class WatchVideoTool(PlatformTool):
         "video is put in front of you to look at — the way 'view' shows you an image and "
         "'listen' reads you audio. This is how you check a video you generated yourself: watch "
         "it and see whether it is what you asked for. Optional 'every' sets the seconds between "
-        "the frames you are shown (default 1); 'start' and 'end' (seconds) narrow the window so "
-        "you can look closely at one moment of a long clip. A non-video file comes back with a "
-        "clean note, not an error."
+        "the frames you are shown (default 1); 'start' and 'end' (seconds) narrow the window of "
+        "frames so you can look closely at one moment of a long clip - if your model takes video "
+        "it is shown the whole clip instead, and the caption says so. A non-video file comes back "
+        "with a clean note, not an error."
     )
     parameters = {
         "type": "object",

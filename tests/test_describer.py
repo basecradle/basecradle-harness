@@ -437,6 +437,24 @@ def test_a_natively_watched_clip_carries_its_own_facts_ahead_of_the_description(
     assert note.index("Watched the whole of") < note.index(DESCRIPTION)
 
 
+def test_a_described_clip_names_a_window_the_native_tier_could_not_apply():
+    """Issue #481, on the describer's own native path — the same clause, from the same helper.
+
+    A blind brain has even less to go on than a sighted one: it cannot look and see it got the
+    whole clip.
+    """
+    clip = _clip()
+    clip.sampling = FrameSampling(start=1, end=2)
+    describer = Describer(FakeDescriberProvider(video=True), "d/video-model")
+
+    described = describer.describe_video(clip)
+
+    assert described.startswith(
+        "(Watched the whole of clip.mp4 (3.0s, 24 fps, 160x120) — the start/end window you asked "
+        "for (1s-2s) narrows sampled frames only.)"
+    )
+
+
 def test_an_unprobeable_clip_costs_the_facts_line_and_never_the_description():
     """A header that will not parse is a fact about this decoder, not about the clip.
 

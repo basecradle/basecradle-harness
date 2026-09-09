@@ -700,6 +700,17 @@ vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
   will not parse contributes **no line at all**: the description is the valuable half and it is
   already in hand, and a probe failure on a clip a vision model has just watched is a fact about
   this decoder, not about the clip.
+- **A window the native tier cannot apply is *named*, never dropped (issue #481).** `start`/`end`
+  narrow the sampled-frames tier; a model that takes video is sent the clip whole and the sampler
+  never runs, so the request cannot be honored there. Until #481 nothing said so — the agent asked
+  to look closely at one moment of a long clip, was shown all of it, and had no way to tell which
+  had happened, which is the #479 defect in a different place. One shared clause
+  (`_video.window_note`) now rides the native caption on both the sighted path (`_video_caption`)
+  and the described one (`_watched_facts`), and the tool's own description stops promising the
+  window unconditionally. It is deliberately a *statement*, not a fix: honoring the window natively
+  means trimming the clip, which re-encodes a file the harness has a standing rule never to modify
+  (#336), so **whether** to do that is a decision above this module — **whether the agent is told**
+  is not. With no window asked for the caption is byte-identical to what it always was.
 - **The video caption makes "not my own sight" structural.** `described_caption(..., video=True)`
   says the clip *was watched by* the describer and that what follows is **that model's description
   of the clip as a whole — its account of it, not your own sight**. @glm-5.2 got that right by
