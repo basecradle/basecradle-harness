@@ -184,7 +184,7 @@ def test_image_generates_and_posts_with_jpeg_extension_from_sniffed_bytes(image_
         result = image_tool.run(prompt="a neon Dallas skyline at dusk")
 
     sent = json.loads(gen.calls.last.request.content)
-    assert sent["model"] == "grok-imagine-image-quality"
+    assert sent["model"] == "grok-imagine-image-2.0"
     assert sent["prompt"] == "a neon Dallas skyline at dusk"
     assert sent["response_format"] == "b64_json"  # we ask for bytes inline
     assert "aspect_ratio" not in sent and "resolution" not in sent  # omitted when unset
@@ -258,7 +258,7 @@ def test_edit_single_source_sends_image_object_as_base64_data_uri(edit_tool):
         result = edit_tool.run(image=SOURCE_UUID, prompt="recolor the car red")
 
     sent = json.loads(edit.calls.last.request.content)
-    assert sent["model"] == "grok-imagine-image-quality"
+    assert sent["model"] == "grok-imagine-image-2.0"
     assert sent["prompt"] == "recolor the car red"
     assert sent["response_format"] == "b64_json"  # we ask for bytes inline
     # A single source rides the ``image`` object (not the ``images`` array), as a data URI —
@@ -285,6 +285,39 @@ def test_edit_multiple_sources_composite_into_the_images_array(edit_tool):
     assert "image" not in sent
     assert [obj["type"] for obj in sent["images"]] == ["image_url", "image_url"]
     assert len(sent["images"]) == 2
+    assert all(obj["url"].startswith("data:image/png;base64,") for obj in sent["images"])
+
+
+def test_the_composite_cap_is_one_constant_and_every_model_facing_mention_reads_it():
+    """xAI raised the cap 3 -> 5 and the tool went on saying 3 in five separate places (#477).
+
+    The number is now a constant every mention is composed from, so a vendor raising it again is a
+    one-line change and cannot leave a stale copy behind under-using a real capability.
+    """
+    from basecradle_harness._grok import MAX_EDIT_SOURCES
+
+    assert MAX_EDIT_SOURCES == 5
+    assert f"up to {MAX_EDIT_SOURCES}" in GrokEditImageTool.description
+    assert (
+        f"up to {MAX_EDIT_SOURCES}"
+        in GrokEditImageTool.parameters["properties"]["image"]["description"]
+    )
+    assert "up to 3" not in GrokEditImageTool.description
+
+
+def test_five_sources_all_composite_into_the_images_array(edit_tool):
+    """The cap raise is worth nothing if the request shape cannot carry it — so send five."""
+    uuids = [f"019e7754-7d4e-7f50-8162-00000000000{n}" for n in range(1, 6)]
+    with respx.mock(assert_all_called=True) as mock:
+        for uuid in uuids:
+            _mock_source(mock, uuid)
+        edit = mock.post(EDITS_URL).mock(return_value=httpx.Response(200, json=image_b64()))
+        _mock_upload(mock, {})
+        edit_tool.run(image=uuids, prompt="composite all five")
+
+    sent = json.loads(edit.calls.last.request.content)
+    assert "image" not in sent
+    assert len(sent["images"]) == 5
     assert all(obj["url"].startswith("data:image/png;base64,") for obj in sent["images"])
 
 
@@ -427,6 +460,54 @@ def test_video_image_to_video_survives_a_source_asset_with_no_content_type(video
     assert sent["image"]["url"].startswith("data:application/octet-stream;base64,")
 
 
+def test_image_to_video_needs_no_prompt(video_tool):
+    """xAI made `prompt` optional for image-to-video (#477): an image alone is a legal request.
+
+    The field is **omitted**, not sent empty — an absent field and an empty string are not the same
+    request, and "animate this still with no instruction" is the whole new mode.
+    """
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID)
+        submit = mock.post(VIDEOS_URL).mock(
+            return_value=httpx.Response(200, json={"request_id": REQUEST_ID})
+        )
+        mock.get(f"{XAI_BASE}/videos/{REQUEST_ID}").mock(
+            return_value=httpx.Response(
+                200, json={"status": "done", "video": {"url": f"{XAI_BASE}/clips/out.mp4"}}
+            )
+        )
+        mock.get(f"{XAI_BASE}/clips/out.mp4").mock(
+            return_value=httpx.Response(200, content=MP4_BYTES)
+        )
+        _mock_upload(mock, captured)
+        result = video_tool.run(image=SOURCE_UUID)
+
+    sent = json.loads(submit.calls.last.request.content)
+    assert "prompt" not in sent
+    assert sent["image"]["url"].startswith("data:image/png;base64,")
+    # With no prompt there is no phrase to name the file from, so it falls back to what the call
+    # actually was rather than to an empty name.
+    assert "animated" in captured["filename"]
+    assert "Generated and posted" in result
+
+
+def test_text_to_video_still_needs_a_prompt(video_tool):
+    """The rule is *one of* prompt or image; neither is still an error, said so the model can act."""
+    result = video_tool.run()
+
+    assert "needs a 'prompt'" in result and "'image' asset uuid" in result
+
+
+def test_the_video_schema_requires_neither_because_it_cannot_say_one_of(video_tool):
+    # JSON Schema can only express "one of these two" with an `anyOf` several vendors' validators
+    # reject, so the schema states no requirement and `run` carries the rule.
+    assert GrokGenerateVideoTool.parameters["required"] == []
+    assert (
+        "Required unless" in GrokGenerateVideoTool.parameters["properties"]["prompt"]["description"]
+    )
+
+
 def test_video_relays_a_failed_job_status_legibly(video_tool):
     with respx.mock(assert_all_called=True) as mock:
         mock.post(VIDEOS_URL).mock(
@@ -519,7 +600,7 @@ def test_a_grok_generation_logs_one_media_line(image_tool, caplog):
     line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
     assert "provider=xai" in line
     assert "kind=image.generate" in line
-    assert "model=grok-imagine-image-quality" in line
+    assert "model=grok-imagine-image-2.0" in line
 
 
 def test_a_video_generation_times_the_submit_and_poll_span(video_tool, caplog):
