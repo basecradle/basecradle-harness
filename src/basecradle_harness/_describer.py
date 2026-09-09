@@ -1,12 +1,12 @@
 """Eyes for a blind brain: a second, vision-capable model describes what the first cannot see.
 
 A text-only brain — @glm-5.2 today, whose OpenRouter ``input_modalities`` are text alone — cannot
-perceive anything. `view` and `watch_video` degrade to an honest *"described above, not shown"*
+perceive anything. `view` and `watch` degrade to an honest *"described above, not shown"*
 caption, which is truthful and useless: the agent still cannot answer "what is in this picture?".
 The founder's ruling (issue #472) is that such a model should **work**, not merely be honest — so
 the harness sends the pixels to a vision-capable model and hands the brain the words.
 
-This is the same shape `HearAudioTool` already has — a provider call turns one modality into text
+This is the same shape the assets tool's `listen` already has — a provider call turns one modality into text
 the brain can read — applied to images, video, and the asset-wake perception path through **one
 seam**, so the three can never disagree about what a blind agent sees.
 
@@ -43,7 +43,7 @@ The describer gets the same three tiers as the brain
 -----------------------------------------------------
 A describer is just a model, so it is asked the same capability questions: if it reports
 ``supports_video`` it watches the clip itself; otherwise the harness samples frames (the
-`watch_video` sampler, unchanged) and shows it those. So on OpenRouter a Gemini-class describer
+assets `watch` sampler, unchanged) and shows it those. So on OpenRouter a Gemini-class describer
 watches the real video for a GLM brain, while a vision-only describer reads its frames.
 
 Never a fabricated description, and the loudness is graded
@@ -246,15 +246,21 @@ class Describer:
         """
         name = clip.alt or "video"
         if model_sees_video(self.provider):
+            from basecradle_harness._video import native_watch
+
+            # The window the agent asked for is applied here exactly as it is on the brain's own
+            # native tier (issue #482) — one function, two callers, so a describer and a
+            # video-capable brain can never watch different halves of the same clip.
+            watched = native_watch(clip)
             described = self._ask(
                 DESCRIBE_PROMPT + DESCRIBE_VIDEO_SUFFIX,
-                videos=[clip],
+                videos=[watched.clip],
                 kind="video.describe",
                 subject=name,
             )
             if described is None:
                 return None
-            facts = _watched_facts(name, clip)
+            facts = _watched_facts(name, watched)
             return described if facts is None else f"{facts}\n{described}"
         try:
             from basecradle_harness._video import decode_data_url, sample_frames
@@ -454,7 +460,7 @@ def described_caption(subject: str, model: str, description: str, *, video: bool
     return f"(This model has no image input. {subject} was described by {model}:)\n{description}"
 
 
-def _watched_facts(name: str, clip: VideoContent) -> str | None:
+def _watched_facts(name: str, watched: Any) -> str | None:
     """The clip's own header facts, for the line that sits ahead of a natively-watched description.
 
     The frames path gets these free — `sample_frames` returns a summary naming duration, frame
@@ -463,7 +469,12 @@ def _watched_facts(name: str, clip: VideoContent) -> str | None:
     blind brain reads a paragraph about a clip whose length, rate and size it cannot state, which
     is half of what it could not answer on the live run.
 
-    The facts are formatted by `_video.video_facts`, the one spelling the `watch_video` result and
+    The probe reads the clip that was **sent**, so on a trimmed watch (issue #482) the facts
+    describe the window rather than the original file — which is the point: the brain is being told
+    what it was shown, not what exists on the timeline. The head says which of the two it is, and
+    the `_engine._video_caption` clause on the sighted path is the same three-state statement.
+
+    The facts are formatted by `_video.video_facts`, the one spelling the assets `watch` result and
     the frames summary also use, so the brain never reads two differently-worded accounts of one
     file.
 
@@ -472,15 +483,17 @@ def _watched_facts(name: str, clip: VideoContent) -> str | None:
     clip a vision model has just watched successfully is a fact about this decoder, not about the
     clip the brain is being told about.
     """
-    from basecradle_harness._video import decode_data_url, probe, video_facts, window_note
+    from basecradle_harness._video import decode_data_url, probe, video_facts
 
     try:
-        info = probe(decode_data_url(clip.url))
+        info = probe(decode_data_url(watched.clip.url))
     except ValueError:
         return None
-    note = window_note(clip.sampling)
-    tail = "" if note is None else f" — {note}"
-    return f"(Watched the whole of {name} ({video_facts(info)}){tail}.)"
+    head = "the whole of" if watched.span is None else f"{watched.span} of"
+    # A window that *was* applied is already named by `head`; only the #481 "not applied" clause
+    # still has something left to say.
+    tail = "" if watched.clause is None or watched.span is not None else f" — {watched.clause}"
+    return f"(Watched {head} {name} ({video_facts(info)}){tail}.)"
 
 
 def _fault_of(exc: ProviderError) -> str:

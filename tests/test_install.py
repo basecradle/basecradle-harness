@@ -26,6 +26,7 @@ from basecradle_harness._install import (
     PRUNED,
     REFRESHED,
     RESTORED,
+    RETIRED,
     REVOKED,
     UNCHANGED,
     charter_from_config,
@@ -80,9 +81,12 @@ def test_install_copies_the_benign_tool_defaults_but_not_the_opt_in_power_tools(
 
     tools = home / "tools"
     assert (tools / "web_fetch.py").exists()  # benign → scaffolded
-    # `watch_video` is benign too (no provider call, no spend, in-process decode) — a default
-    # tool for every agent, so it is scaffolded like `view`, not gated like the generators (#471).
-    assert (tools / "watch_video.py").exists()
+    # Perception is benign (no provider call, no spend, in-process decode) and rides `assets` as
+    # actions since issue #484 — so it arrives with that one file, not as tools of its own, and is
+    # never gated like the media *generators* (#471).
+    assert (tools / "assets.py").exists()
+    assert not (tools / "watch_video.py").exists()  # retired into `assets` (issue #484)
+    assert not (tools / "hear_audio.py").exists()
     assert not (
         tools / "generate_image.py"
     ).exists()  # powerful (media gen) → opt-in, not laid down
@@ -95,7 +99,7 @@ def test_install_copies_the_benign_tool_defaults_but_not_the_opt_in_power_tools(
 
 
 def test_a_new_default_tool_lands_on_an_already_installed_config_home(tmp_path):
-    """The upgrade path, not just the fresh one: an existing home gains `watch_video` (#471).
+    """The upgrade path, not just the fresh one: an existing home gains a new default tool.
 
     A default tool that only ever arrives on a *first* install would silently never reach the
     fleet, every one of whose agents already has a config home. So the new default is asserted on
@@ -104,15 +108,74 @@ def test_a_new_default_tool_lands_on_an_already_installed_config_home(tmp_path):
     """
     home = tmp_path / "cfg"
     install(home, defaults={"tools/assets.py": "# v1\n"})
-    assert not (home / "tools" / "watch_video.py").exists()
+    assert not (home / "tools" / "brand_new.py").exists()
 
-    report = install(
-        home, defaults={"tools/assets.py": "# v1\n", "tools/watch_video.py": "# new\n"}
-    )
+    report = install(home, defaults={"tools/assets.py": "# v1\n", "tools/brand_new.py": "# new\n"})
 
-    assert report.actions["tools/watch_video.py"] == INSTALLED
-    assert (home / "tools" / "watch_video.py").read_text() == "# new\n"
+    assert report.actions["tools/brand_new.py"] == INSTALLED
+    assert (home / "tools" / "brand_new.py").read_text() == "# new\n"
     assert report.actions["tools/assets.py"] == UNCHANGED  # the rest of the home is untouched
+
+
+# --- a retired default is pruned, never left to resurrect a dead tool (issue #484) ---
+
+
+def test_a_retired_default_is_removed_from_an_existing_overlay_on_upgrade(tmp_path):
+    """`watch_video` and `hear_audio` became actions on `assets`; their files must not survive.
+
+    The gap this closes: the conffile reconcile walks the *shipped* set, so a default that stops
+    being shipped is never visited and its copy stays in the overlay being loaded by every wake —
+    resurrecting a dead tool, or logging a load failure forever once its import target is gone.
+    """
+    home = tmp_path / "cfg"
+    install(home, defaults={"tools/assets.py": "# v1\n", "tools/watch_video.py": "# old\n"})
+    assert (home / "tools" / "watch_video.py").exists()
+
+    report = install(home, defaults={"tools/assets.py": "# v2\n"})
+
+    assert report.actions["tools/watch_video.py"] == RETIRED
+    assert not (home / "tools" / "watch_video.py").exists()
+    manifest = json.loads((home / _MANIFEST_NAME).read_text())
+    assert "tools/watch_video.py" not in manifest  # and we stop claiming to manage it
+
+
+def test_a_retired_default_the_operator_edited_is_kept_not_deleted(tmp_path):
+    """Their edit wins, exactly as the conffile rule keeps it — a reconcile never deletes work.
+
+    It stops being *managed* either way (the manifest entry goes), and the removal is loud: the
+    file may no longer import against this version, and an unexplained load failure on the next
+    wake is what the log line prevents.
+    """
+    home = tmp_path / "cfg"
+    install(home, defaults={"tools/assets.py": "# v1\n", "tools/watch_video.py": "# old\n"})
+    (home / "tools" / "watch_video.py").write_text("# mine\n")
+
+    report = install(home, defaults={"tools/assets.py": "# v1\n"})
+
+    assert report.actions["tools/watch_video.py"] == KEPT_EDITED
+    assert (home / "tools" / "watch_video.py").read_text() == "# mine\n"
+    assert "tools/watch_video.py" not in json.loads((home / _MANIFEST_NAME).read_text())
+
+
+def test_a_retired_default_already_deleted_just_loses_its_manifest_entry(tmp_path):
+    home = tmp_path / "cfg"
+    install(home, defaults={"tools/assets.py": "# v1\n", "tools/watch_video.py": "# old\n"})
+    (home / "tools" / "watch_video.py").unlink()
+
+    report = install(home, defaults={"tools/assets.py": "# v1\n"})
+
+    assert report.actions["tools/watch_video.py"] == RETIRED
+    assert "tools/watch_video.py" not in json.loads((home / _MANIFEST_NAME).read_text())
+
+
+def test_the_shipped_package_no_longer_carries_the_retired_tool_plugins():
+    """The other half of the prune: the package must not ship what the overlay is pruning."""
+    from importlib.resources import files
+
+    shipped = {p.name for p in files("basecradle_harness").joinpath("_defaults", "tools").iterdir()}
+
+    assert "watch_video.py" not in shipped and "hear_audio.py" not in shipped
+    assert "assets.py" in shipped
 
 
 def test_install_opt_in_scaffolds_a_named_power_tool(tmp_path):
@@ -218,14 +281,14 @@ def test_revoking_an_edited_power_tool_keeps_the_operators_file_and_warns(tmp_pa
 
 
 def test_opt_in_with_an_unknown_stem_warns_loudly(tmp_path, caplog):
-    # The stem-vs-name trap: --opt-in listen (the tool name, not the file stem hear_audio) matches
+    # The stem-vs-name trap: --opt-in x_search (a tool name, not the file stem xai_search) matches
     # nothing and would scaffold silently — so it warns, naming the known opt-in tools.
     import logging
 
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
-        install(tmp_path / "cfg", opt_in=["listen", "generate_image"])
+        install(tmp_path / "cfg", opt_in=["x_search", "generate_image"])
 
-    assert "listen" in caplog.text and "hear_audio" in caplog.text
+    assert "x_search" in caplog.text and "xai_search" in caplog.text
     assert (tmp_path / "cfg" / "tools" / "generate_image.py").exists()  # the valid one still lands
 
 
@@ -504,7 +567,6 @@ def test_every_shipped_power_tool_default_is_classified_opt_in():
     assert _shipped_power_stems() == {
         "generate_image",
         "edit_image",
-        "hear_audio",
         "web_search",
         "xai_search",  # declares both web_search + x_search built-ins, both opt_in
         "openrouter_search",  # OpenRouter web_search server tool (issue #237)
@@ -538,7 +600,7 @@ _XAI_DEFAULTS = {
     "grok_generate_video.py",
     "xai_search.py",
 }
-_OPENAI_DEFAULTS = {"generate_image.py", "edit_image.py", "hear_audio.py", "web_search.py"}
+_OPENAI_DEFAULTS = {"generate_image.py", "edit_image.py", "web_search.py"}
 # Every provider-affine default is now a powerful, opt-in tool (issue #168), so provider
 # affinity is observable at scaffold time only when the tool is explicitly opted in.
 #
@@ -621,7 +683,6 @@ _POWER_SCAFFOLD = {
         "code_execution.py",
         "edit_image.py",
         "generate_image.py",
-        "hear_audio.py",
         "openrouter_account_balance.py",
         "send_direct_message_to_origin.py",
         "shell.py",

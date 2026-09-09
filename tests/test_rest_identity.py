@@ -45,6 +45,18 @@ PLATFORM_TOOL_ROUTES = {
 GUARDED_TOOLS = {h.LockTool, h.DeleteTool}
 
 
+def described(tool: type) -> str:
+    """A tool class's model-facing description.
+
+    Most tools set it as a class attribute. The assets tool does not, and cannot: since issue #484
+    its description is built **per instance** from the actions that agent is configured for, so
+    that a sense the agent does not have is absent from the prose as well as from the enum. A
+    default instance carries the shape every agent has, which is what these invariants are about.
+    """
+    value = tool.__dict__.get("description")
+    return value if isinstance(value, str) else tool().description
+
+
 # Every other tool the package exports — vendor built-ins (media, search, code, shell),
 # self-authorship, and local tools (memory, web_fetch, xai balance) — is NOT a BaseCradle
 # REST resource and must carry no identity line. Derive the set from the exports rather
@@ -60,6 +72,8 @@ def _exported_tool_classes():
             and obj is not h.Tool
             # Abstract bases (PlatformTool, ConfirmedTimelineAction) never assign a
             # description, so this keeps only the concrete, model-facing tools.
+            # Abstract bases assign no description at all; the assets tool builds one per
+            # instance (issue #484) and is a *platform* tool, so it is covered above either way.
             and isinstance(getattr(obj, "description", None), str)
         ):
             classes.append(obj)
@@ -71,7 +85,7 @@ NON_PLATFORM_TOOLS = [c for c in _exported_tool_classes() if c not in PLATFORM_T
 
 def test_every_platform_tool_names_its_rest_route():
     for tool, route in PLATFORM_TOOL_ROUTES.items():
-        description = tool.description
+        description = described(tool)
         # Identity, never analogy — the exact wording the handoff locked.
         expected = f"Platform REST: {route} — this tool calls that same endpoint"
         assert expected in description, f"{tool.__name__} missing/incorrect REST identity line"
@@ -84,7 +98,7 @@ def test_multi_action_tools_point_at_the_docs_anchor():
     for tool in PLATFORM_TOOL_ROUTES:
         if tool in GUARDED_TOOLS:
             continue
-        assert "https://basecradle.com/docs/api.md#tools-and-the-http-api" in tool.description, (
+        assert "https://basecradle.com/docs/api.md#tools-and-the-http-api" in described(tool), (
             f"{tool.__name__} should point at the tools-and-the-http-api anchor"
         )
 

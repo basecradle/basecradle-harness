@@ -8,7 +8,8 @@ Why it exists
 A tool's *stem* — its plugin file's name, ``xai_search`` — is not its *resolved name*. One stem can
 fan out to several names (``xai_search`` → the ``web_search`` **and** ``x_search`` built-ins;
 ``code_execution`` → the ``code_interpreter`` built-in **and** the ``code_attach`` tool), and a name
-can differ from its stem (``hear_audio`` → ``listen``). The fleet inventory declares **stems**; a
+can differ from its stem (``xai_search`` → ``web_search``/``x_search``). The fleet inventory
+declares **stems**; a
 both-directions ``exact_tools`` pin asserts **names**. Every consumer that has had to bridge those
 two has bridged them by *transcribing prose*, and prose has been wrong about it in more than one
 repo — the near-miss in basecradle-noc#344 documented ``xai_search`` as resolving to ``x_search``
@@ -296,7 +297,8 @@ def resolve_stems(
         raise UnknownStemError(
             f"No shipped tool plugin is named: {', '.join(unknown)}. "
             f"The shipped stems are: {', '.join(sorted(sources))}. "
-            "(Pass the plugin *file stem*, e.g. 'hear_audio', not the tool name 'listen'.)"
+            "(Pass the plugin *file stem*, e.g. 'xai_search', not a tool name it "
+            "resolves to, like 'x_search'.)"
         )
 
     # Per stem, the two source-level classifications the installer makes at scaffold time, applied

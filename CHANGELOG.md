@@ -7,6 +7,86 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.118.0] - 2026-09-09
+
+### Changed: `assets` is the noun, the verb is the sense — `view` / `watch` / `listen` (issue #484)
+
+Images were an action on the assets tool, video was a standalone `watch_video` tool, and audio a
+standalone `hear_audio` tool. That split was implementation history, not design: all three are *the
+agent opening a file that is already on this timeline*. @origin's ruling, the DHH way — **one
+convention for all three senses**:
+
+| Action | What it does |
+|---|---|
+| `list` / `read` / `create` | unchanged |
+| **`view`** | look at an image |
+| **`watch`** | watch a video — `every`, `start`, `end`, the three engine tiers, eviction: moved, not changed |
+| **`listen`** | hear an audio file, transcribed |
+
+**`watch_video` and `hear_audio` are retired**, and their `_defaults/tools/` files are gone. The
+installer now prunes a **retired** default out of an existing overlay on upgrade (`RETIRED`) — the
+conffile reconcile walks the *shipped* set, so a default that stops being shipped was never visited
+and its copy sat there being loaded by every wake, resurrecting a dead tool or logging a load
+failure forever. A pristine copy is removed and its manifest entry dropped; an operator-**edited**
+copy is kept (their edit wins, as always) but stops being managed, loudly.
+
+**Don't show a locked door.** The assets action list is built when the tool is constructed, from
+what the agent is configured for. `listen` is the one sense that costs a provider call, so on an
+agent with no transcription provider it is absent from the schema *and* from the description —
+never present-and-failing. The gate is `assets_options`, reading the same `OpenAIKey()` requirement
+the retired `hear_audio` plugin declared, through the new `ToolPlugin.configure` hook (the one
+seam where a plugin's tool is built *to the active config*; any future gated verb goes there).
+
+**One capability changed hands, by founder decision.** `hear_audio` was an opt-in **powerful** tool;
+`listen` is an action on the benign default `assets` plugin. A configured OpenAI agent therefore has
+transcription without an overlay grant, where before it needed one — the gate is now *configuration*
+rather than opt-in. An agent that had `hear_audio` **granted** will find it in `.declared.json` and
+`basecradle-harness-verify` will report `grant-not-shipped`, remedy
+`basecradle-harness-install --revoke-opt-in hear_audio`; the reconcile deliberately does **not**
+withdraw the grant for it, because a reconcile that quietly drops a declared capability erases the
+evidence it ever existed (issue #374's asymmetry).
+
+**Public API:** `AssetsTool` gains `listen=` / `transcriber=` and builds its `description` and
+`parameters` per instance; `assets_options` and `Transcriber` are exported; `WatchVideoTool` and
+`HearAudioTool` are **removed**.
+
+### Added: `watch` honors `start`/`end` on the video-native tier by trimming the clip (issue #482)
+
+The founder's ruling, 2026-09-09: *the harness never modifies content, but this is a tool, and if
+the LLM only wants to watch part of a video the tool should let it — it saves money when only part
+matters, and lets an agent see a video longer than its model's maximum by watching it in pieces.*
+
+Until now `start`/`end` narrowed the **sampled-frames** tier only. A model that takes video was sent
+the clip **whole**, so an agent on a video-native brain was *less* capable than a vision-only peer
+making the identical call: it paid the whole clip's tokens on every look and got an account of all
+of it. 0.117.2 made that honest (issue #481); this makes it work.
+
+`_video.native_watch` now cuts the clip to the window before it is sent, in memory, on **both**
+native paths — the brain's (`_engine._show_video`) and the describer's (`_describer.describe_video`)
+— through one function, so the two can never watch different halves of the same clip. Two paths:
+
+- a lossless **container copy** where the window starts on a keyframe (always true of the common
+  "the first N seconds" request), with every video and audio stream carried across and timestamps
+  rebased to zero — the picture data is the original's, byte for byte;
+- a **re-encode** (H.264/MP4 via the libx264 PyAV's wheels bundle) where it does not, which is the
+  only thing that can begin mid-GOP — what "look closely at second 12" actually needs.
+
+The cut is **re-probed before it is sent**: a cut nobody can decode is never handed to a vendor. A
+trim that cannot be made falls back to the whole clip with 0.117.2's clause and a WARNING — never
+silently. Captions state the window that was **actually** sent, never the one that was asked for:
+
+```
+(Showing video: clip.mp4 — trimmed to the 10s-12s window you asked for.)
+(Watched 10s-12s of clip.mp4 (2.0s, 24 fps, 1280x720).)
+```
+
+**This is not an exception to issue #336's "no file bytes are ever modified" — it falls outside it,
+and the line is who asked.** That rule governs the harness quietly reshaping a file to fit a
+*vendor's* limit; here the **agent** requested a window in its own tool call. The Asset on the
+timeline is untouched and the cut is evicted with the rest of the turn's payload.
+
+New public API: `cut`, `native_watch`, `Cut`, `NativeWatch`.
+
 ## [0.117.2] - 2026-09-09
 
 ### Fixed: `watch_video`'s `start`/`end` were silently ignored on the video-native tier (issue #481)

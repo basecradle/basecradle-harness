@@ -168,7 +168,7 @@ One **stated gap**: the issue asks for `reasoning.exclude: true` (billed, not re
 A text-only brain (@glm-5.2, `input_modalities: ["text"]`) reaches the honest "described above, not
 shown" tier on every picture and every clip. Honest is not working. **`HARNESS_DESCRIBER_MODEL`** —
 a model id on the agent's *own* provider — makes the harness send the pixels to that model and hand
-the brain its words, across all three perception paths (`view`, `watch_video`, and a peer's image on
+the brain its words, across all three perception paths (`view`, `watch`, and a peer's image on
 arrival at the asset wake) through **one** seam (`Engine.describer`, memoized per wake), so they can
 never diverge on which model describes or how.
 
@@ -308,7 +308,7 @@ Beyond `chat`, the engine asks an adapter a handful of optional questions and re
 - **The non-transient faults split into two more classes, and neither retries — they *report to the timeline*** (issue #336, founder-decided 2026-07-21; `_exceptions.py`, `_report.py`, `_wake._report_provider_failure`). The recurrence guard this closes is the 2026-07-21 @briggs incident: a ~19 MB photo, base64-inflated past the `xai-sdk`'s 20 MiB gRPC send cap, mapped to `ProviderRateLimitError` and **re-driven 51 times** while the timeline stayed silent — the failure lived only in journald and the Alarm Bell. The fix is a **three-way taxonomy** where the drop-vs-duplicate axis is the wrong one; the right question is *what is the nature of the fault, and can the human do anything about it?*
   - **Permanent-for-the-*content*** (`ProviderPayloadTooLargeError` — a payload too large to ever accept): the identical bytes fail identically forever, and only the *human* changing the content (a smaller file) can resolve it. The wake posts the **verbatim vendor error** to the timeline once, marks the driving item handled (never re-driven), and exits clean (the router's retry never engages). `ProviderContextLengthError` is the *sibling* here: same nature of fault but a **better** remedy (compact + retry), so it routes through the reporter only in the residual case where that self-heal could not run. **A *generic* malformed-request 400/422/`INVALID_ARGUMENT` is deliberately NOT a reported class** — it is almost always a *fixable* harness/config defect (a bad `model_params.json` key, a serialization bug), not a permanent property of the peer's content, so marking the message handled would **lose it the moment the config is fixed** (a delivery-guarantee violation). Those stay a plain `ProviderAPIError` and **propagate** (this repo's settled rule, above: "a bad `model_params.json` key propagates"), leaving the peer's message re-drivable. `ProviderRequestError` is the category base; its only *shipped* member is `ProviderPayloadTooLargeError`. (Whether a generic config-400 should *also* report-but-leave-pending — visible AND recoverable — is a possible follow-up the founder can weigh; today it propagates.)
   - **Account-blocked** (`ProviderBillingError`): out of funds — a **sibling of the rate-limit class, never a variant of it.** A rate limit heals with *time*; this heals only when a **human funds the account**. So the wake posts a plain-language notice ("add money to this agent's vendor account"), **debounced** per timeline (one per outage — `BillingState`), leaves the pending work pending, fails the rest of the wake fast (no hammering an unfunded account), and **self-heals** the moment a call succeeds again.
-  - **Three non-negotiables** (founder decisions): (1) **no file bytes are ever modified** on any path — no downscaling, no recompression; the harness attempts the original honestly and relays the verdict (the Active Storage precedent). (2) **No vendor cap table** — a vendor's live rejection is the single source of truth for its limits; encoding a size/context limit locally is the same disease that made `MAX_IMAGE_BYTES` a *machine* memory bound (what this box will load), never a vendor prediction. (3) The reporter is **mechanical** — no LLM anywhere in the failure path (the model is the thing that failed); the post is the Unspoken Channel's second sanctioned harness-authored message (see above). Each reported failure emits a distinct, greppable `wake reported_failure kind=permanent|billing …` log line the NOC alarms on (basecradle-noc#317).
+  - **Three non-negotiables** (founder decisions): (1) **no file bytes are ever modified *to fit a limit*** on any path — no downscaling, no recompression; the harness attempts the original honestly and relays the verdict (the Active Storage precedent). *(Amended by the founder 2026-09-09, issue #482: a **window the agent itself requested** in its own tool call falls **outside** this rule — the assets `watch` action cuts a clip to `start`/`end` in memory before sending it, because "the harness never modifies content, but this is a tool, and if the LLM only wants to watch part of a video the tool should let it." The line is who asked: this rule governs the harness quietly reshaping a file to satisfy a **vendor**. The Asset on the timeline is untouched and the cut is evicted with the turn.)* (2) **No vendor cap table** — a vendor's live rejection is the single source of truth for its limits; encoding a size/context limit locally is the same disease that made `MAX_IMAGE_BYTES` a *machine* memory bound (what this box will load), never a vendor prediction. (3) The reporter is **mechanical** — no LLM anywhere in the failure path (the model is the thing that failed); the post is the Unspoken Channel's second sanctioned harness-authored message (see above). Each reported failure emits a distinct, greppable `wake reported_failure kind=permanent|billing …` log line the NOC alarms on (basecradle-noc#317).
 
 The engine's half is one uniform behavior, no vendor branches: on `explicit` it places **one breakpoint at the stable/volatile boundary** — the last frozen turn, immediately ahead of the per-wake brief (the same boundary Context Discipline turns on, which is not a coincidence: what is cacheable and what is byte-stable are the same question). Anchoring any further right buys a cache write over content that changes next wake and can never be read. The anchor is **copy-on-write and never persisted** — a `cache_anchor` stored in the transcript would still be there on the next wake, when that turn is no longer the boundary, and each wake would add another until it trips the vendor's four-breakpoint ceiling.
 
@@ -613,7 +613,7 @@ see the absence of.**
   **off-platform push to a human's phone** (issue #341) — is **off by
   default on every provider** and activates **only** when explicitly dropped into a persona's
   `tools/` overlay (the same "ships empty" stance as `mcp/`). The powerful defaults (by plugin
-  stem): `generate_image`, `edit_image`, `hear_audio`, `web_search` (OpenAI), `xai_search`
+  stem): `generate_image`, `edit_image`, `web_search` (OpenAI), `xai_search`
   (xAI `web_search`/`x_search`), `openrouter_search`, `code_execution`, `grok_generate_image`,
   `grok_edit_image`, `grok_generate_video`, `xai_account_balance` (issue #179 — xAI Management
   API credit read, `Vendor("xai")`-gated because it reads an *xAI* account),
@@ -656,6 +656,19 @@ see the absence of.**
   version already scaffolded is **kept, never silently stripped, and reported loudly**. *(Decided
   by the capital + founder; see [[classify-safety-by-capability-not-provider]]. Granting/pruning
   mechanics: the `config-home-install` skill.)*
+
+  **One capability left this set by founder decision, and it is recorded here rather than left to
+  be inferred from an absence** (issue #484, 2026-09-09). `hear_audio` was an opt-in powerful tool
+  — a provider-call media tool — and audio transcription is now the assets tool's **`listen`
+  action**, on the benign default `assets` plugin. So a *configured* agent (an `openai` provider
+  with `AI_API_KEY`) has it without an overlay grant, where before it needed one. The gate that
+  remains is **configuration**, not opt-in: `assets_options` reads the same `OpenAIKey()`
+  requirement the retired plugin declared, so on every other provider the action is absent from
+  the schema entirely (the ruling's "don't show a locked door"). This is the founder's ruling on a
+  **capability decision**, which is a founder decision to make; it is written down because a
+  silently-widened capability is exactly what the opt-in rule exists to prevent, and the difference
+  between a decision and an oversight is whether it is stated. `view` and `watch` are unaffected —
+  they were never powerful (no provider call, nothing spent, in-process decode).
 - **MCP is safe-by-default.** `mcp/` ships **empty** and the locked `Policy` denies shell/exec, so
   a fresh install is safe by default. Loading an MCP server — **or** a drop-in `tools/` tool
   that needs a policy-denied capability — is the operator *knowingly leaving the safe zone*, so the

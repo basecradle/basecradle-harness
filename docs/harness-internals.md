@@ -60,7 +60,7 @@ OpenAI, opt-in on xAI" split. *(Decided by the capital + founder, applying Optio
 see [[classify-safety-by-capability-not-provider]].)*
 
 - **The flag.** A `ToolPlugin` marks itself `opt_in=True` (the powerful defaults *as of #168*:
-  `generate_image`, `edit_image`, `hear_audio`, OpenAI `web_search`, xAI `web_search`/`x_search`,
+  `generate_image`, `edit_image`, OpenAI `web_search`, xAI `web_search`/`x_search`,
   `grok_generate_image`, `grok_generate_video` — the set has grown since; CLAUDE.md's Security
   invariants carries the current roster, and `tests/test_install.py` is what actually pins it
   against the shipped files). The packaged-default fallback **drops** opt-in
@@ -547,19 +547,20 @@ explicitly out of scope (founder).
 
 ---
 
-### Video Perception — `watch_video`, three tiers by capability (issue #471)
+### Video Perception — the assets `watch` action, three tiers by capability (issue #471)
 
 **No harness agent could perceive video at all.** `view` is images-only, a posted clip on an
 `asset.created` wake was acknowledged in text and never seen, and `_audio.py`'s docstring had
 deferred the whole modality ("when it comes, it gets its own pure-Python path"). On 2026-08-13
 @eddie-murphy generated three clips for @origin and asserted a first-frame match he had **no way to
 check** — which is the shape of the defect, not a mistake he made. The founder's ruling: agents get
-eyes for video, as a **default tool for every harness agent**, and the harness never tells a model
-to ask a human to look.
+eyes for video, on **every** harness agent, and the harness never tells a model to ask a human to
+look. (It shipped as a standalone `watch_video` tool and became the assets tool's `watch` action in
+issue #484 — one noun, three senses. What follows is unchanged by that move except the spelling.)
 
-- **The tool fetches; the engine perceives.** `WatchVideoTool` (`_video.py`) is a `PlatformTool`
-  read that returns a `VideoContent` and says nothing about perception (the issue #316 rule) — a
-  tool has no view of the provider. `_engine._show_media` routes it at one of three tiers read from
+- **The tool fetches; the engine perceives.** The `watch` action (`_assets._watch`, decoding in
+  `_video.py`) is a `PlatformTool` read that returns a `VideoContent` and says nothing about
+  perception (the issue #316 rule) — a tool has no view of the provider. `_engine._show_media` routes it at one of three tiers read from
   the provider's **own declared capabilities, never a vendor branch**: `supports_video` → the video
   itself; else `supports_vision` → frames sampled here; else the honest withheld caption plus the
   same WARNING an image gets. This extends the seam `view` already travels (`_split_result` →
@@ -573,9 +574,10 @@ to ask a human to look.
   fallback should copy the video gate; one without should copy the vision gate.
 - **Pure Python, no subprocess — and that is what makes it a *benign* tool.** PyAV's wheels bundle
   FFmpeg, so decoding happens in-process and `Policy.locked()`'s no-shell boundary is untouched. No
-  provider call, no spend, nothing created: `watch_video` sits beside `view` and `read` in the
-  default set rather than in the opt-in set with the media *generators*. `av` and `pillow` are
-  therefore **base** dependencies — a default tool with an optional dependency contradicts itself,
+  provider call, no spend, nothing created: `watch` sits beside `view` and `read` on the benign
+  assets tool rather than in the opt-in set with the media *generators*. `av` and `pillow` are
+  therefore **base** dependencies — a capability every agent has cannot depend on an optional
+  install,
   and an extra would force a NOC wrapper allow-list change plus a per-agent inventory edit across
   the fleet for a capability every agent is supposed to have.
 - **The `av` floor is 17, not the 18 the issue named, and the reason is this package's own Python
@@ -610,7 +612,7 @@ to ask a human to look.
   fail-closed gate — which is the point: silently dropping the clip would leave the model reading a
   caption for something it never received, the exact defect the vision gate ended (#316).
 - **A posted video is acknowledged, never auto-watched.** `_perceive_asset` stays as it was; the
-  asset hint names `watch_video` beside `view`/`listen`. Loading a clip and decoding frames is a
+  asset hint names `watch` beside `view`/`listen`. Loading a clip and decoding frames is a
   real cost, so it stays the agent's call, exactly as `read` and `listen` are.
 
 **Follow-up, founder-decided 2026-09-09 (issue #477).** Three vendor-drift corrections landed with
@@ -635,14 +637,14 @@ touches a model or the network.
 ### The Blind-Model Describer — a second model's eyes (issue #472)
 
 **A text-only brain reaches the honest tier on everything, and honest is not the same as working.**
-@glm-5.2's OpenRouter `input_modalities` are text alone, so `view`, `watch_video` and a peer's
+@glm-5.2's OpenRouter `input_modalities` are text alone, so `view`, `watch` and a peer's
 posted picture all degrade to *"described above, not shown"* — truthful, and no help to a peer who
 asked *"what's in this photo?"*. The founder's ruling: give that model eyes through a second,
 vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
 
 - **The same shape `listen` already had, generalized.** A provider call turns one modality into
   text the brain can read. What is new is that it covers **three** perception paths — `view`,
-  `watch_video`, and the asset wake's on-arrival perception — through **one** seam
+  `watch`, and the asset wake's on-arrival perception — through **one** seam
   (`Engine.describer`, memoized), so they cannot diverge on which model describes or how.
 - **Off by absence, and the model id is the only switch.** Unset → byte-identical to the pre-#472
   behavior, down to the log lines; nothing is imported and no adapter is built. Same rule, and the
@@ -695,7 +697,7 @@ vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
   timestamp it actually decoded); the native tier decoded nothing and therefore said nothing, so a
   brain asked *how long is it?* about a clip just described to it could only guess.
   `_watched_facts` costs one **header-only** probe of bytes already in memory, and formats them
-  through `_video.video_facts` — the one spelling the `watch_video` result and the frames summary
+  through `_video.video_facts` — the one spelling the assets `watch` result and the frames summary
   also use, so the brain never reads two differently-worded accounts of one file. A header that
   will not parse contributes **no line at all**: the description is the valuable half and it is
   already in hand, and a probe failure on a clip a vision model has just watched is a fact about

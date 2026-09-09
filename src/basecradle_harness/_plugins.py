@@ -40,11 +40,11 @@ import importlib.util
 import logging
 import sys
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from basecradle_harness._install import _read_manifest, config_home, plugin_relevant_to
 from basecradle_harness._tools import Tool
@@ -285,13 +285,31 @@ class ToolPlugin:
     name: str | None = None
     note: str | None = None
     opt_in: bool = False
+    configure: Callable[[ActivationContext], Mapping[str, Any]] | None = None
+    """How to build this plugin's tool **for the active config** — keyword arguments for `impl`.
+
+    ``None`` (the default, and every plugin but one) means ``impl()``: a tool whose shape is the
+    same on every agent. A plugin sets this when part of its tool depends on the config in a way
+    the all-or-nothing `requires` gate cannot express — the assets tool, whose ``listen`` action
+    exists only where a transcription provider does, while `view`, `watch`, `read` and `create`
+    exist everywhere (issue #484). Gating the *whole* plugin on `OpenAIKey` would take files away
+    from every non-OpenAI agent; shipping ``listen`` unconditionally would show every other agent a
+    door that does not open. This is the third answer: one plugin, a tool built to the config.
+
+    It is handed the same `ActivationContext` `requires` is checked against, so a configured shape
+    and an activation gate can never read two different environments — and it is **pure**: it
+    returns options, it does not construct, log, or touch the filesystem. The callable lives in the
+    tool's own module (`_assets.assets_options`), never inline in the plugin file, because the
+    installer classifies a plugin's provider affinity from its *source* (`plugin_source_providers`,
+    AST, no import) — an ``OpenAIKey()`` call written into ``tools/assets.py`` would mark the
+    universal assets plugin OpenAI-only and stop it loading on every other agent in the fleet."""
     stem: str | None = None
     """The source file's stem (``code_execution.py`` → ``code_execution``), stamped by the
     loader (`_plugins_in_file`) — **not** authored in the plugin file. It is the unit the
     fleet inventory keys an opt-in tool on, and is **not** the same as `resolved_name`: one
     stem can fan out to several names (``code_execution`` → the ``code_interpreter`` built-in
-    **+** the ``code_attach`` tool) and a name can differ from its stem (``hear_audio`` →
-    ``listen``). Reported (for active opt-in plugins) by `resolved_config` so the NOC's
+    **+** the ``code_attach`` tool) and a name can differ from its stem (``xai_search`` →
+    ``web_search`` + ``x_search``). Reported (for active opt-in plugins) by `resolved_config` so the NOC's
     fleet-drift audit compares declared inventory stems like-for-like, holding no local
     stem→name map of its own (issue #181). ``None`` for a plugin built directly via the API
     (a test), never loaded from a file."""
@@ -493,7 +511,10 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
             builtins.append(plugin.builtin)
         else:
             assert plugin.impl is not None
-            tools.append(plugin.impl())
+            # `configure` builds the tool *to this config* (issue #484) — the assets tool's
+            # action set is the shipped case. Absent (every other plugin), this is `impl()`.
+            options = plugin.configure(ctx) if plugin.configure is not None else {}
+            tools.append(plugin.impl(**options))
     # The active opt-in *stems* (issue #181): one per file-loaded opt-in plugin that activated,
     # deduped (a stem fanning out to several active names lists once) and sorted. A stem-less
     # opt-in plugin (built directly via the API, never loaded from a file) has no inventory key

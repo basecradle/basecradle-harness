@@ -131,9 +131,90 @@ def test_description_warns_assets_are_shared_and_never_editable():
     # workaround, one with live credentials visible to every viewer). The tool the model reads
     # must say plainly that assets are shared and permanent, and steer private/working files to
     # the agent's own storage — so the guidance rides with the tool, not only the brief.
-    description = AssetsTool.description
+    description = AssetsTool().description
     assert "shared with every viewer and can never be edited or deleted" in description
     assert "prefer your own storage for private or working files" in description
+
+
+# --- one noun, three senses: the configured action set (issue #484) -----------
+
+
+def test_the_action_set_is_every_verb_a_configured_agent_has():
+    """`assets` is the noun and the verb is the sense: `view`, `watch` and `listen` are actions.
+
+    Before issue #484 video was a standalone `watch_video` tool and audio a standalone
+    `hear_audio` tool, which was implementation history rather than design — all three are the
+    agent opening a file that is already on this timeline.
+    """
+    hearing = AssetsTool(listen=True).to_spec()
+
+    assert hearing.parameters["properties"]["action"]["enum"] == [
+        "list",
+        "read",
+        "view",
+        "watch",
+        "listen",
+        "create",
+        "post_image",
+    ]
+    for verb in ("view", "watch", "listen"):
+        assert f"action='{verb}'" in hearing.description
+
+
+def test_a_sense_the_agent_does_not_have_is_absent_everywhere_not_merely_refused():
+    """ "Don't show a locked door": absent from the enum, the prose, and the error's suggestions.
+
+    A tool offering a capability the agent does not have spends the model's attention on a door
+    that does not open, and teaches it to distrust the ones that do.
+    """
+    deaf = AssetsTool().to_spec()
+
+    assert "listen" not in deaf.parameters["properties"]["action"]["enum"]
+    assert "listen" not in deaf.description
+    assert "'listen'" not in AssetsTool().run(action="nonsense")
+
+
+def test_the_options_hook_reads_the_same_requirement_the_retired_plugin_declared():
+    """The gate is `OpenAIKey`, evaluated against the resolver's own `ActivationContext`.
+
+    Never a second reading of the environment: a configured shape and an activation gate that
+    disagreed about the same question is the drift this hook exists to prevent.
+    """
+    from basecradle_harness import ActivationContext, assets_options
+
+    def ctx(**env):
+        return ActivationContext(
+            provider=env.pop("provider", "openai"),
+            sdk="openai",
+            surface="responses",
+            model="gpt-5.4-mini",
+            env=env,
+        )
+
+    assert assets_options(ctx(AI_API_KEY="sk-test")) == {"listen": True}
+    assert assets_options(ctx()) == {"listen": False}  # no key
+    assert assets_options(ctx(provider="xai", AI_API_KEY="sk-test")) == {"listen": False}
+
+
+def test_a_default_riding_agent_resolves_the_assets_tool_with_the_senses_it_is_configured_for():
+    """End to end through the real plugin file, which is what `configure` is wired into."""
+    from basecradle_harness import ActivationContext, load_plugins, resolve_plugins
+
+    def resolve(**env):
+        ctx = ActivationContext(
+            provider=env.pop("provider", "openai"),
+            sdk="openai",
+            surface="responses",
+            model="gpt-5.4-mini",
+            env=env,
+        )
+        resolved = resolve_plugins(load_plugins(), ctx)
+        return next(t for t in resolved.tools if t.name == "assets")
+
+    assert "listen" in resolve(AI_API_KEY="sk-test").actions
+    assert "listen" not in resolve(provider="xai", AI_API_KEY="sk-test").actions
+    # ...and the senses that cost nothing are there either way.
+    assert {"view", "watch"} <= set(resolve(provider="openrouter").actions)
 
 
 # --- list --------------------------------------------------------------------

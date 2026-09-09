@@ -32,7 +32,7 @@ an image has to enter as model *input*. Once the model has answered, the engine
 not re-sent — and re-billed — on every later turn. Viewing is on-demand: cheap to
 do again, never a standing cost.
 
-A `ToolResult` may also carry **videos** (`watch_video`, issue #471), and the same
+A `ToolResult` may also carry **videos** (the assets `watch` action, issue #471), and the same
 seam serves them at three tiers chosen from the provider's own declared
 capabilities — never from a vendor name: a model that takes video gets the video,
 a model that takes images gets sampled frames, a model that takes neither gets an
@@ -398,7 +398,8 @@ class Engine:
         The three tiers are read from the **provider's own declared capabilities**, never from a
         vendor branch (issue #471), and the order is a strict fallback:
 
-        1. `model_sees_video` → the video itself, as a `videos`-bearing injected turn. That gate
+        1. `model_sees_video` → the video itself, as a `videos`-bearing injected turn, **cut to the
+           `start`/`end` window the agent asked for** (`_video.native_watch`, issue #482). That gate
            **fails closed** (`_assets.model_sees_video`): only a definite yes sends a video part,
            because sending one to a model without video input is a hard 400 that fails the whole
            wake, while guessing low merely costs a tier that still works.
@@ -409,10 +410,18 @@ class Engine:
 
         A **sampling failure** (a corrupt file, a decoder that cannot read the container) is not a
         crash and not a silent nothing: it degrades to a caption naming the reason, with a WARNING,
-        so a wake survives a bad file the way it survives a failed image fetch.
+        so a wake survives a bad file the way it survives a failed image fetch. A **trim failure**
+        degrades the same way, one notch quieter: the whole clip goes, and the caption says the
+        window was not applied.
         """
         if model_sees_video(self.provider):
-            turn = Message(role="user", content=_video_caption(clip), videos=[clip], injected=True)
+            watched = _native_watch(clip)
+            turn = Message(
+                role="user",
+                content=_video_caption(watched),
+                videos=[watched.clip],
+                injected=True,
+            )
             messages.append(turn)
             shown.append(turn)  # a payload-bearing turn is evicted after the reply
             return
@@ -929,20 +938,33 @@ def _media_name(clip: VideoContent) -> str:
     return clip.alt or "video"
 
 
-def _video_caption(clip: VideoContent) -> str:
+def _native_watch(clip: VideoContent) -> Any:
+    """The clip as the video-native tier sends it — cut to the agent's window where it can be.
+
+    Imported here rather than at module scope for the reason `_frames_of` is: the engine is the one
+    module every install loads, and it must not pull in the video decoder on a wake that never
+    watches anything.
+    """
+    from basecradle_harness._video import native_watch
+
+    return native_watch(clip)
+
+
+def _video_caption(watched: Any) -> str:
     """The caption on a natively-shown video turn — the breadcrumb left after eviction.
 
-    A clip the agent asked to narrow is still sent whole here (the sampler never runs on this
-    tier), so the caption says which of those two things happened — issue #481. With no window
-    asked for it is byte-identical to what it always was, which is the regression bar.
+    Three states, because there are three things that can have happened to a window the agent asked
+    for (`_video.NativeWatch`): none was asked for (byte-identical to what this always said, which
+    is the regression bar); one was asked for and **applied**, so the caption names the window that
+    was actually sent (issue #482); or one was asked for and could not be applied, which is the
+    #481 clause saying so rather than letting the model reason about a perception it did not have.
     """
-    from basecradle_harness._video import window_note
-
-    note = window_note(clip.sampling)
-    name = _media_name(clip)
-    if note is None:
+    name = _media_name(watched.clip)
+    if watched.clause is None:
         return f"(Showing video: {name})"
-    return f"(Showing video: {name} — the whole clip: {note}.)"
+    if watched.span is not None:
+        return f"(Showing video: {name} — {watched.clause}.)"
+    return f"(Showing video: {name} — the whole clip: {watched.clause}.)"
 
 
 def _unsampled_caption(clip: VideoContent, error: Exception) -> str:

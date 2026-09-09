@@ -1,4 +1,5 @@
-"""Video perception: the sampler, the size/type gates, and the `watch_video` tool (issue #471).
+"""Video perception: the sampler, the size/type gates, the window trim, and the assets `watch`
+action (issues #471, #482, #484).
 
 No model, no network, and no fixture file on disk: every test **encodes its own clip with PyAV**,
 five seconds at 24 fps whose colour changes on each whole second. That makes the two things worth
@@ -7,6 +8,7 @@ it actually came from* — so these tests pin that the sampler returns the momen
 rather than merely returning the right number of images.
 """
 
+import base64
 import io
 import json
 
@@ -17,10 +19,12 @@ from basecradle import BaseCradle
 from PIL import Image
 
 from basecradle_harness import (
+    AssetsTool,
     FrameSampling,
     ToolResult,
     VideoContent,
-    WatchVideoTool,
+    cut,
+    native_watch,
     probe,
     sample_frames,
 )
@@ -218,7 +222,7 @@ def test_video_input_refuses_a_non_video_and_points_at_the_right_tool():
     reason = video_input(_File(content_type="image/png"))
 
     assert isinstance(reason, str)
-    assert "not a video" in reason and "'view' for images" in reason
+    assert "not a video" in reason and "'view' for an image" in reason
 
 
 def test_video_input_refuses_an_unwatchable_container():
@@ -319,7 +323,7 @@ def asset_response(**kwargs):
 
 @pytest.fixture
 def tool():
-    watcher = WatchVideoTool()
+    watcher = AssetsTool()
     client = BaseCradle(token="bc_test_token", base_url=BC_URL)
     watcher.bind(PlatformContext(client=client, timeline=TIMELINE))
     return watcher
@@ -334,7 +338,7 @@ def test_watch_video_returns_the_clip_for_the_engine_to_route(tool):
         mock.get(f"{BC_URL}/blobs/{ASSET_UUID}").mock(
             return_value=httpx.Response(200, content=data)
         )
-        result = tool.run(uuid=ASSET_UUID, every=2, start=1, end=4)
+        result = tool.run(action="watch", uuid=ASSET_UUID, every=2, start=1, end=4)
 
     assert isinstance(result, ToolResult)
     assert len(result.videos) == 1
@@ -359,7 +363,7 @@ def test_watch_video_resolves_the_latest_alias(tool):
         mock.get(f"{BC_URL}/blobs/{ASSET_UUID}").mock(
             return_value=httpx.Response(200, content=data)
         )
-        result = tool.run(uuid="latest")
+        result = tool.run(action="watch", uuid="latest")
 
     # The case that needs the alias most: watching the clip the agent itself just generated, whose
     # uuid never reached its context (issue #161).
@@ -371,10 +375,10 @@ def test_watch_video_on_a_non_video_is_a_clean_note_not_a_failure(tool):
         mock.get(f"{BC_URL}/assets/{ASSET_UUID}").mock(
             return_value=httpx.Response(200, json=asset_response(content_type="image/png"))
         )
-        result = tool.run(uuid=ASSET_UUID)
+        result = tool.run(action="watch", uuid=ASSET_UUID)
 
     assert isinstance(result, str)
-    assert "not a video" in result and "'view' for images" in result
+    assert "not a video" in result and "'view' for an image" in result
 
 
 def test_watch_video_on_an_oversized_clip_says_so_without_fetching_it(tool):
@@ -383,14 +387,14 @@ def test_watch_video_on_an_oversized_clip_says_so_without_fetching_it(tool):
             return_value=httpx.Response(200, json=asset_response(byte_size=MAX_VIDEO_BYTES + 1))
         )
         blob = mock.get(f"{BC_URL}/blobs/{ASSET_UUID}")
-        result = tool.run(uuid=ASSET_UUID)
+        result = tool.run(action="watch", uuid=ASSET_UUID)
 
     assert isinstance(result, str) and "over the" in result
     assert not blob.called
 
 
-def test_watch_video_needs_a_uuid(tool):
-    assert "needs the video asset's uuid" in tool.run()
+def test_watch_needs_a_uuid(tool):
+    assert "'watch' needs the asset's uuid" in tool.run(action="watch")
 
 
 @pytest.mark.parametrize(
@@ -422,18 +426,175 @@ def test_no_window_asked_for_is_no_note_at_all():
     )  # `every` is frames-scoped in its own words
 
 
-def test_watch_videos_description_no_longer_promises_the_window_on_every_tier():
-    """The overpromise that made the silence a lie: it read as an unconditional narrowing."""
-    assert "if your model takes video it is shown the whole clip instead" in (
-        WatchVideoTool.description
+def test_watch_offers_the_window_but_never_a_frame_cap():
+    # The cap is a constant and the window is the knob (`_video.MAX_FRAMES`): an agent looks closer
+    # by narrowing, which is both cheaper and more informative than asking for more frames.
+    properties = AssetsTool().parameters["properties"]
+
+    assert {"every", "start", "end"} <= set(properties)
+    assert "frames" not in properties and "max_frames" not in properties
+    assert json.dumps(AssetsTool().parameters)  # a schema the wire can actually carry
+
+
+# --- the window trim on the video-native tier (issue #482) --------------------
+
+
+def _clip(**sampling) -> VideoContent:
+    """The fixture clip as a `VideoContent`, with a `FrameSampling` built from `sampling`."""
+    data = make_video()
+    return VideoContent(
+        url=f"data:video/mp4;base64,{base64.b64encode(data).decode('ascii')}",
+        alt="clip.mp4",
+        content_type="video/mp4",
+        sampling=FrameSampling(**sampling),
     )
 
 
-def test_watch_videos_parameters_offer_the_window_but_never_a_frame_cap():
-    # The cap is a constant and the window is the knob (`_video.MAX_FRAMES`): an agent looks closer
-    # by narrowing, which is both cheaper and more informative than asking for more frames.
-    properties = WatchVideoTool.parameters["properties"]
+def _colors_of(data: bytes) -> list[tuple[int, int, int]]:
+    """The dominant colour of every decoded frame of a clip — which second each frame came from.
 
-    assert set(properties) == {"uuid", "every", "start", "end", "timeline"}
-    assert WatchVideoTool.parameters["required"] == ["uuid"]
-    assert json.dumps(WatchVideoTool.parameters)  # a schema the wire can actually carry
+    The same trick the sampler tests use, and the only assertion that actually proves a *trim*: a
+    cut that returned the right duration from the wrong seconds would pass every other check.
+    """
+    import av
+
+    out = []
+    with av.open(io.BytesIO(data)) as container:
+        for frame in container.decode(container.streams.video[0]):
+            out.append(frame.to_image().resize((1, 1)).getpixel((0, 0)))
+    return out
+
+
+def _nearest(color):
+    """Which of the fixture's five per-second colours a decoded pixel is closest to."""
+    return min(
+        range(len(SECOND_COLORS)),
+        key=lambda i: sum((a - b) ** 2 for a, b in zip(SECOND_COLORS[i], color)),
+    )
+
+
+def test_cut_returns_the_seconds_that_were_asked_for():
+    """The founder's ruling (#482): a window the agent asked for is actually applied.
+
+    Asserted by *colour*, not duration: the fixture's second 2 is blue and second 3 is yellow, so a
+    cut of 2s-4s that came back green-and-red would still be 2 seconds long and still be wrong.
+    """
+    made = cut(decode_data_url(_clip().url), 2.0, 4.0)
+
+    assert 1.8 <= made.end - made.start <= 2.2
+    assert probe(made.data).duration_s > 0  # verified, decodable bytes — never a broken container
+    seconds = {_nearest(c) for c in _colors_of(made.data)}
+    assert seconds <= {2, 3, 4} and 2 in seconds
+
+
+def test_a_window_that_starts_on_a_keyframe_is_copied_not_re_encoded():
+    """The common "watch the first N seconds" shape: lossless, because 0 is always a keyframe."""
+    made = cut(decode_data_url(_clip().url), None, 2.0)
+
+    assert made.lossless is True
+    assert made.start == 0.0
+    assert {_nearest(c) for c in _colors_of(made.data)} <= {0, 1, 2}
+
+
+def test_a_window_that_starts_mid_gop_is_re_encoded_rather_than_widened():
+    """The case a container copy cannot answer — and the reason the re-encode path exists.
+
+    A copy can only begin at a keyframe, so honoring "second 3.4 onwards" by copying would hand
+    back seconds the agent did not ask for. Encoding costs a generation of quality and answers the
+    actual question; the caption then names the window that was really sent either way.
+    """
+    made = cut(decode_data_url(_clip().url), 3.4, 4.4)
+
+    assert made.lossless is False
+    assert 3.3 <= made.start <= 3.5
+    assert {_nearest(c) for c in _colors_of(made.data)} <= {3, 4}
+
+
+def test_a_window_covering_none_of_the_clip_is_refused_not_guessed():
+    with pytest.raises(ValueError):
+        cut(decode_data_url(_clip().url), 9.0, 9.5)
+
+
+def test_native_watch_sends_the_trimmed_clip_and_names_the_window():
+    watched = native_watch(_clip(start=2.0, end=4.0))
+
+    assert watched.span == "2s-4s"
+    assert watched.clause == "trimmed to the 2s-4s window you asked for"
+    assert watched.clip.url != _clip(start=2.0, end=4.0).url  # the cut, not the original
+    assert watched.clip.sampling.start == 2.0  # the request rides along, unchanged
+    assert probe(decode_data_url(watched.clip.url)).duration_s < 3.0
+
+
+def test_native_watch_with_no_window_is_byte_identical_to_the_whole_clip():
+    """The regression bar: an agent that named no window pays nothing and reads what it always did."""
+    clip = _clip()
+
+    watched = native_watch(clip)
+
+    assert watched.clip is clip and watched.span is None and watched.clause is None
+
+
+def test_a_trim_that_cannot_be_made_degrades_to_the_whole_clip_and_says_so(caplog):
+    """Never a silent failure: the #481 clause is the fallback, and it is loud in the log."""
+    broken = VideoContent(
+        url="data:video/mp4;base64,AAAAAA==", alt="bad.mp4", sampling=FrameSampling(start=1.0)
+    )
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        watched = native_watch(broken)
+
+    assert watched.clip is broken and watched.span is None
+    assert watched.clause == window_note(broken.sampling)
+    assert "window not applied" in caplog.text
+
+
+def test_a_keyframe_snapped_window_says_it_is_the_nearest_one_not_the_one_asked_for():
+    """A copy begins at a keyframe, so the clause must not claim the exact request (#479's shape).
+
+    Driven through `cut` + `_cut_clause` rather than a real snapped clip, because whether a given
+    encoder puts a keyframe at a given instant is the encoder's business, not this contract's.
+    """
+    from basecradle_harness._video import Cut, _cut_clause
+
+    made = Cut(data=b"", content_type="video/mp4", start=2.0, end=4.0, lossless=True)
+
+    exact = _cut_clause("2s-4s", "2s-4s", made, FrameSampling(start=2.0, end=4.0))
+    snapped = _cut_clause("3s-4s", "2s-4s", made, FrameSampling(start=3.0, end=4.0))
+
+    assert exact == "trimmed to the 2s-4s window you asked for"
+    assert snapped == "trimmed to 2s-4s, the nearest whole window to the 3s-4s you asked for"
+
+
+def test_the_span_a_caption_names_is_rounded_not_a_raw_float():
+    """A caption is a sentence a model reads, not a float it parses.
+
+    A re-encoded window ends on the last frame there is — 3.9583333333s — and naming that verbatim
+    is noise. Rounded to a **hundredth**, never a tenth: at a fine interval a tenth collapses two
+    different instants onto one number, which is the `_stamp` lesson in a second place.
+    """
+    from basecradle_harness._video import Cut, _span_of
+
+    made = Cut(data=b"", content_type="video/mp4", start=2.0, end=3.9583333333, lossless=False)
+
+    assert _span_of(made) == "2s-3.96s"
+
+
+def test_a_copied_window_reports_the_end_it_muxed_not_the_bound_it_was_given():
+    """The `sample_frames` discipline applied to the trim: report what happened, not what was asked.
+
+    A window is clamped to the clip, and packets land where they land — so the caption's end comes
+    off the last video packet actually written, never off the upper bound handed in.
+    """
+    made = cut(decode_data_url(_clip().url), None, 2.0)
+
+    assert made.end <= 2.0 + 1e-6
+    assert made.end > 1.5  # ...and it really did cover the window, not stop early
+
+
+def test_an_encoded_cut_keeps_the_sources_frame_rate():
+    """The clock has to match, or a long cut drifts against the timestamps the agent was given."""
+    source = probe(decode_data_url(_clip().url))
+
+    made = cut(decode_data_url(_clip().url), 3.4, 4.4)
+
+    assert abs(probe(made.data).fps - source.fps) < 0.01

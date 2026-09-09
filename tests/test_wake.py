@@ -3227,8 +3227,51 @@ def test_the_asset_hint_names_every_tool_that_opens_a_file():
 
     text = _incoming_asset_text(asset)
 
-    for tool in ("'read'", "'view'", "'listen'", "'watch_video'"):
+    for tool in ("'read'", "'view'", "'watch'", "'listen'"):
         assert tool in text
+
+
+def test_the_asset_hint_names_only_the_senses_this_agent_actually_has():
+    """The "don't show a locked door" rule, applied to the wake's own pointer (issue #484).
+
+    `listen` needs a transcription provider, so an agent without one has no such action — and
+    pointing it at ``'listen'`` is the same defect the ruling closed in the tool's schema: a door
+    that does not open, which spends the model's attention and teaches it to distrust the ones
+    that do. `read` is unconditional: it is the fallback for a file no sense opens.
+    """
+    from basecradle_harness._wake import asset_tool_hint
+
+    deaf = asset_tool_hint(("read", "view", "watch"))
+
+    assert "'listen'" not in deaf
+    assert "'view' an image" in deaf and "'watch' a video" in deaf
+    assert "'read' it" in deaf
+    # An assets tool with no senses at all still points at `read`, with no dangling "(or )".
+    assert (
+        asset_tool_hint(("read",))
+        == " Use the assets tool to 'read' it if you want to engage with it."
+    )
+
+
+def test_the_wake_reads_the_hints_action_set_off_the_bound_tool(tmp_path):
+    """Never re-derived from the environment: the tool is what answers the model.
+
+    Two parallel readings of "does this agent have transcription?" is one way for the pointer and
+    the schema to disagree, which is the whole failure mode reading the bound tool prevents.
+    """
+    from basecradle_harness import AssetsTool
+
+    def actions_of(*tools):
+        # The method reads only `self.harness.tools`, so a stub holding a real Harness exercises
+        # it without standing up a platform client.
+        harness = Harness(CountingProvider(), home=tmp_path, tools=list(tools))
+        return WakeAgent._asset_actions(SimpleNamespace(harness=harness))
+
+    assert "listen" not in actions_of(AssetsTool(listen=False))
+    assert "listen" in actions_of(AssetsTool(listen=True))
+    # An agent whose overlay pruned the assets tool entirely falls back to the full set, which
+    # costs nothing: there is no asset hint to render without an assets tool.
+    assert "listen" in actions_of()
 
 
 def test_incoming_event_is_timestamped():

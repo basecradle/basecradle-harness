@@ -1,20 +1,21 @@
-"""Let the agent watch: fetch a video asset and put it in front of the model.
+"""Let the agent watch: the sampler, the trim, and the facts behind the assets tool's `watch`.
 
-The video analog of the assets tool's `view` (see an image) and `HearAudioTool` (hear audio).
-Until this, no harness agent could perceive video at all: `view` is images-only, a posted clip
-on an `asset.created` wake was acknowledged in text and never seen, and an agent that generated
-a video had no way to check its own work. On 2026-08-13 @eddie-murphy generated three clips for
-@origin and asserted a first-frame match he had no way to verify — the founder's ruling is that
-agents get eyes for video, as a **default tool for every harness agent**, and that the harness
-never tells a model to ask a human to look (issue #471).
+The video half of the three senses the assets tool carries — `view` an image, `watch` a video,
+`listen` to audio (issue #484). Until video perception landed, no harness agent could perceive a
+clip at all: `view` is images-only, a posted clip on an `asset.created` wake was acknowledged in
+text and never seen, and an agent that generated a video had no way to check its own work. On
+2026-08-13 @eddie-murphy generated three clips for @origin and asserted a first-frame match he had
+no way to verify — the founder's ruling is that agents get eyes for video, on **every** harness
+agent, and that the harness never tells a model to ask a human to look (issue #471).
 
 Three tiers, chosen by capability — never by vendor
 ----------------------------------------------------
 The tool's job ends at *fetching the clip*; how the model perceives it is the **engine's** call,
-exactly as it is for an image. `WatchVideoTool` returns a `VideoContent` and the engine routes it
-(`_engine._show_media`):
+exactly as it is for an image. The assets tool's `watch` action returns a `VideoContent` and the
+engine routes it (`_engine._show_media`):
 
-1. **The model takes video** (`supports_video` answers a definite yes) → it gets the video.
+1. **The model takes video** (`supports_video` answers a definite yes) → it gets the video,
+   `native_watch`-trimmed to the window the agent asked for.
 2. **The model takes images** → `sample_frames` decodes frames here and the model gets those.
 3. **The model takes neither** → an honest caption saying the clip was described, not shown.
 
@@ -26,29 +27,32 @@ verify.
 
 Pure Python, no subprocess
 --------------------------
-Frames are decoded with **PyAV**, whose wheels bundle FFmpeg — so the decode happens *in this
-process*, and the locked profile's no-shell boundary is untouched. No `ffmpeg` subprocess, no apt
-package, nothing for `Policy.locked()` to have an opinion about. That is the whole reason
-`watch_video` can be a benign default tool rather than a powerful opt-in one: seeing a file that
-is already on the timeline costs no provider call and reaches nothing outside the process.
+Frames are decoded — and a window is cut — with **PyAV**, whose wheels bundle FFmpeg, so all of it
+happens *in this process* and the locked profile's no-shell boundary is untouched. No `ffmpeg`
+subprocess, no apt package, nothing for `Policy.locked()` to have an opinion about. That is the
+whole reason `watch` rides the benign assets tool rather than the powerful opt-in set: looking at
+a file already on the timeline costs no provider call and reaches nothing outside the process.
 
-Frames exist **in memory only** — never written to disk, never posted as assets, and evicted
-from the transcript after the turn that showed them, exactly like a viewed image.
+Frames — and a trimmed clip — exist **in memory only**: never written to disk, never posted as
+assets, never replacing the asset on the timeline, and evicted from the transcript after the turn
+that showed them, exactly like a viewed image.
 """
 
 from __future__ import annotations
 
 import base64
 import io
+import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
-from basecradle_harness._assets import _describe, resolve_uuid, video_input
-from basecradle_harness._messages import FrameSampling, ImageContent, ToolResult, VideoContent
-from basecradle_harness._platform import PlatformTool
+from basecradle_harness._assets import _data_url
+from basecradle_harness._messages import FrameSampling, ImageContent, VideoContent
 
-#: The most frames one `watch_video` call will put in front of the model. A cap, not a knob: an
+_log = logging.getLogger("basecradle_harness")
+
+#: The most frames one assets `watch` call will put in front of the model. A cap, not a knob: an
 #: agent that wants a closer look narrows the **window** (``start``/``end``), which is both cheaper
 #: and more informative than more frames over the same span. 24 frames at the default long edge is
 #: a few hundred KB of JPEG — a real but bounded cost, paid once (they are evicted after the turn).
@@ -66,6 +70,29 @@ FRAME_LONG_EDGE = 768
 #: JPEG quality for a sampled frame. 80 is the usual "visually clean, meaningfully smaller" point;
 #: a frame is evidence, not a deliverable, and the original clip is untouched on the timeline.
 FRAME_QUALITY = 80
+
+#: The container and codec a **re-encoded** cut is written into (`cut`). MP4/H.264 is the one
+#: pairing every vendor that accepts video takes, and PyAV's wheels bundle libx264 — so the
+#: re-encode stays in-process exactly as the frame sampler does, with no subprocess and nothing
+#: for the locked profile to have an opinion about.
+_CUT_FORMAT = "mp4"
+CUT_CONTENT_TYPE = "video/mp4"
+_CUT_CODEC = "h264"
+_CUT_PIX_FMT = "yuv420p"
+#: Constant-quality encode. 23 is x264's own default: visually clean, and a cut is evidence the
+#: model looks at once, not a deliverable that goes back on the timeline.
+_CUT_CRF = "23"
+#: Frame rate to fall back on when a container states none, so a cut of an rate-less stream still
+#: has a clock. Only reached for a clip whose header says nothing, which `video_facts` also
+#: reports as ``length unknown``.
+_CUT_FALLBACK_RATE = 24
+
+#: How near the requested start a keyframe must sit for a **lossless container copy** to be the
+#: honest answer to what the agent asked. A copy can only begin at a keyframe, so a copy whose
+#: nearest keyframe is further back than this would hand back seconds nobody asked for — at which
+#: point the re-encode, which can start on any frame, is the one that answers the question. A
+#: quarter of a second is under one sampled-frame interval at the default ``every``.
+_KEYFRAME_TOLERANCE = 0.25
 
 
 @dataclass
@@ -103,39 +130,48 @@ def probe(video_bytes: bytes) -> VideoInfo:
         )
 
 
-def window_note(sampling: FrameSampling) -> str | None:
-    """What to say when a clip goes to the model **whole** though a window was asked for.
+def asked_span(sampling: FrameSampling) -> str | None:
+    """The window the agent asked for, as the model reads it — ``None`` when it asked for none.
 
-    ``start``/``end`` narrow the **sampled-frames** tier; a model that takes video is sent the clip
-    entire and the sampler never runs (`_engine._show_video`), so the window is not applied. Until
-    issue #481 nothing said so: the agent asked to look closely at one moment of a long clip, was
-    shown all of it, and had no way to learn which of those two things had happened. That is the
-    #479 shape in a different place — the model reasons about a perception it did not have — and
-    it costs one clause to close.
-
-    ``None`` when no window was asked for, which is the ordinary case: a note about a window nobody
-    named is noise on every caption forever.
-
-    The clause is deliberately **stated, not fixed**. Honoring a window natively would mean
-    trimming the clip, which re-encodes a file the harness has a standing rule never to modify, so
-    whether to do that at all is a decision above this module (issue #481). What is not a decision
-    is whether the agent gets told.
+    The **single spelling** of a requested window, shared by every clause that names one, so a
+    caption saying a window *was* applied and one saying it was not can never word it differently.
     """
     if sampling.start is None and sampling.end is None:
         return None
     if sampling.start is not None and sampling.end is not None:
-        span = f"{sampling.start:g}s-{sampling.end:g}s"
-    elif sampling.start is not None:
-        span = f"from {sampling.start:g}s"
-    else:
-        span = f"up to {sampling.end:g}s"
+        return f"{sampling.start:g}s-{sampling.end:g}s"
+    if sampling.start is not None:
+        return f"from {sampling.start:g}s"
+    return f"up to {sampling.end:g}s"
+
+
+def window_note(sampling: FrameSampling) -> str | None:
+    """What to say when a clip goes to the model **whole** though a window was asked for.
+
+    Since issue #482 a window *is* applied on the video-native tier (`native_watch` cuts the clip
+    to it), so this is now the **fallback** clause: what a caption says when the cut could not be
+    made — an undecodable container, a codec PyAV cannot re-encode, a window that clamps to
+    nothing. The frames tier still honors the window itself, so the honest statement is that the
+    window narrowed frames and not this clip.
+
+    Before #482 it was the *only* answer, and it is worth remembering why it existed at all: until
+    issue #481 nothing said anything, so an agent that asked to look closely at one moment of a
+    long clip was shown all of it and had no way to learn which of those two things had happened
+    — the #479 shape in a different place, a model reasoning about a perception it did not have.
+
+    ``None`` when no window was asked for, which is the ordinary case: a note about a window nobody
+    named is noise on every caption forever.
+    """
+    span = asked_span(sampling)
+    if span is None:
+        return None
     return f"the start/end window you asked for ({span}) narrows sampled frames only"
 
 
 def video_facts(info: VideoInfo) -> str:
     """A clip's header facts as one comma-joined phrase: how long, how fast, how big.
 
-    The **single spelling** behind every line that states them — the `watch_video` tool result, the
+    The **single spelling** behind every line that states them — the assets `watch` result, the
     sampled-frames summary, and the describer's caption for a natively-watched clip (issue #479).
     Three copies of one format string is three chances for a model to read two differently-worded
     accounts of the same file and wonder which is the real one; ``length unknown`` rather than a
@@ -213,96 +249,149 @@ def sample_frames(
     return _summary(name, info, frames, stamps, interval, stretched), frames
 
 
-class WatchVideoTool(PlatformTool):
-    """``watch_video`` — put a video asset on the timeline in front of the model.
+# --- the native tier's window: cut the clip to what was asked for (issue #482) ---
 
-    A `PlatformTool` read, like the assets tool's `view`: it fetches the asset through the bound
-    SDK client and returns it. There is **no provider call and no idempotency key** — nothing is
-    created, nothing is spent, nothing is posted — which is why it is a benign default tool rather
-    than a powerful opt-in one.
 
-    It returns the clip and says nothing about perception (issue #316). What the model actually
-    receives — the video, sampled frames, or an honest caption — is decided by the engine from the
-    provider's own declared capabilities.
+@dataclass(frozen=True)
+class Cut:
+    """A clip narrowed to a window: the bytes to send, what they are, and what they cover.
+
+    `start`/`end` are the window the cut **actually** covers, in seconds from the original clip's
+    start — not the window that was requested. They can differ (a lossless copy can only begin on
+    a keyframe, and a window is clamped to the clip's real length), and the caption states these,
+    never the request, for the same reason `sample_frames` reports the timestamps it decoded rather
+    than the ones it aimed at: a model reasoning about "second 12" must be reasoning about what it
+    was actually shown.
+
+    `lossless` says which of the two paths produced it — a **container copy** (the packets moved
+    across untouched; the picture data is the original's, byte for byte) or a **re-encode**. It is
+    reported for the log line, never for the model: what the agent asked about is the window, and
+    the caption's job is to name that.
     """
 
-    name = "watch_video"
-    description = (
-        "Watch a video file on the timeline. Give the video asset's uuid (find it with the "
-        "assets tool's 'list', or say 'latest' for the newest file on the timeline) and the "
-        "video is put in front of you to look at — the way 'view' shows you an image and "
-        "'listen' reads you audio. This is how you check a video you generated yourself: watch "
-        "it and see whether it is what you asked for. Optional 'every' sets the seconds between "
-        "the frames you are shown (default 1); 'start' and 'end' (seconds) narrow the window of "
-        "frames so you can look closely at one moment of a long clip - if your model takes video "
-        "it is shown the whole clip instead, and the caption says so. A non-video file comes back "
-        "with a clean note, not an error."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "uuid": {
-                "type": "string",
-                "description": (
-                    "The video asset's uuid, or 'latest' for the newest file on the timeline "
-                    "(which is the video you just generated, if you just generated one)."
-                ),
-            },
-            "every": {
-                "type": "number",
-                "description": (
-                    "Optional seconds between sampled frames (default 1). Smaller sees more "
-                    "motion; the per-call frame cap still applies, so narrow the window with "
-                    "'start'/'end' to actually look closer."
-                ),
-            },
-            "start": {
-                "type": "number",
-                "description": "Optional start of the window to watch, in seconds from the clip's start.",
-            },
-            "end": {
-                "type": "number",
-                "description": "Optional end of the window to watch, in seconds from the clip's start.",
-            },
-            "timeline": {
-                "type": "string",
-                "description": "Optional timeline uuid to look on. Defaults to the current timeline.",
-            },
-        },
-        "required": ["uuid"],
-    }
+    data: bytes
+    content_type: str
+    start: float
+    end: float
+    lossless: bool
 
-    def run(
-        self,
-        uuid: str | None = None,
-        every: float | None = None,
-        start: float | None = None,
-        end: float | None = None,
-        timeline: str | None = None,
-    ) -> str | ToolResult:
-        """Fetch the video asset and hand it back for the model to actually watch."""
-        if not uuid or not uuid.strip():
-            return (
-                "Error: 'watch_video' needs the video asset's uuid. Use the assets tool's 'list'."
-            )
-        target = timeline or self.context.timeline
-        resolved = resolve_uuid(self.context.client, uuid, target)
-        if resolved is None:
-            return "No files on this timeline yet — nothing to watch."
 
-        asset = self.context.client.assets.get(resolved)
-        meta = _describe(asset)
-        file = asset.content.file
-        sampling = FrameSampling(
-            every=every if every and every > 0 else DEFAULT_EVERY, start=start, end=end
+@dataclass(frozen=True)
+class NativeWatch:
+    """What the video-native tier actually sends the model, and how the caption should say so.
+
+    Three states, and every caller renders all three (`_engine._video_caption`,
+    `_describer._watched_facts`):
+
+    - **no window asked for** — `span` and `clause` are both ``None``; the whole clip goes, and the
+      caption is byte-identical to what it was before any of this existed, which is the regression
+      bar;
+    - **window applied** — `span` names the window actually sent (e.g. ``"3s-5s"``) and `clause` is
+      the sentence explaining it; `clip` carries the cut bytes;
+    - **window not applied** — `span` is ``None`` and `clause` is `window_note`'s honest fallback;
+      `clip` is the original, whole.
+    """
+
+    clip: VideoContent
+    span: str | None = None
+    clause: str | None = None
+
+
+def native_watch(clip: VideoContent) -> NativeWatch:
+    """The clip as the video-native tier should send it, honoring the agent's `start`/`end`.
+
+    The founder's ruling, 2026-09-09 (issue #482, split out of #481): *the harness never modifies
+    content, but this is a tool, and if the LLM only wants to watch part of a video the tool should
+    let it — it saves money when only part matters, and lets an agent see a video longer than its
+    model's maximum by watching it in pieces.* Before it, `start`/`end` narrowed the **sampled-
+    frames** tier only: a model that takes video was sent the clip whole, the sampler never ran,
+    and an agent on a video-native brain was *less* capable than a vision-only peer making the
+    identical call — it paid the whole clip's tokens on every look and got an account of all of it.
+
+    **This is inside the tool's job and outside issue #336's rule, and the line between them is
+    who asked.** #336 forbids the harness modifying a file's bytes *to fit a vendor's limit* — no
+    downscaling, no recompression, attempt the original honestly and relay the verdict. Here the
+    **agent** asked for a window, in the call it made, and cutting to it is the tool doing what it
+    was told. Nothing on the timeline changes: the Asset is untouched, the cut lives in memory for
+    one turn and is evicted with the rest of the payload.
+
+    Never a silent failure and never a fabrication: a cut that cannot be made (an undecodable
+    container, a codec that will not re-encode, a window that clamps to nothing) degrades to the
+    whole clip plus `window_note`'s honest clause — exactly the behaviour #481 shipped — with a
+    ``WARNING``, because a window the agent asked for and did not get is a perception it must not
+    reason about as though it had.
+    """
+    sampling = clip.sampling
+    asked = asked_span(sampling)
+    if asked is None:
+        return NativeWatch(clip=clip)  # the ordinary case: whole clip, caption unchanged
+    try:
+        made = cut(decode_data_url(clip.url), sampling.start, sampling.end)
+    except ValueError as exc:
+        _log.warning(
+            "video window not applied to %s (%s): %s — sending the whole clip.",
+            clip.alt or "video",
+            asked,
+            exc,
         )
-        result = video_input(file, sampling)
-        if isinstance(result, str):
-            return f"{meta}\n({result})"  # a reason it can't be watched — never raw bytes
-        return ToolResult(text=f"{meta}\n({_facts(result)})", videos=[result])
+        return NativeWatch(clip=clip, clause=window_note(sampling))
+    span = _span_of(made)
+    _log.info(
+        "video trimmed to %s of %s (asked %s, %s).",
+        span,
+        clip.alt or "video",
+        asked,
+        "container copy" if made.lossless else "re-encoded",
+    )
+    trimmed = replace(
+        clip, url=_data_url(made.content_type, made.data), content_type=made.content_type
+    )
+    return NativeWatch(clip=trimmed, span=span, clause=_cut_clause(asked, span, made, sampling))
+
+
+def cut(video_bytes: bytes, start: float | None, end: float | None) -> Cut:
+    """Narrow a clip to ``[start, end]`` in memory, losslessly where the container allows.
+
+    Two paths, and the choice between them is about **accuracy, not speed**:
+
+    - **container copy** — the packets in the window are remuxed into a fresh container with their
+      timestamps rebased to zero. The picture data is the original's, byte for byte, so nothing is
+      recompressed. It is only available from a keyframe, so it is taken only when a keyframe sits
+      within `_KEYFRAME_TOLERANCE` of the requested start — which is always true of the common
+      ``end``-only request ("the first N seconds"), whose window starts at zero.
+    - **re-encode** — the frames in the window are decoded and encoded afresh (H.264 in MP4, via
+      the libx264 PyAV's wheels bundle). Costs a generation of quality, and is the only thing that
+      can start mid-GOP, which is what "watch seconds 12 to 18 of a long clip" needs.
+
+    **The result is verified before it is returned** (`probe` of the produced bytes). Every claim a
+    caption makes about the window rides on these bytes being a real, decodable clip, and a muxer
+    that silently produced something a vendor will reject would turn an honest degrade into a hard
+    provider failure on a founder-visible path. A verify failure raises, and the caller falls back
+    to the whole clip.
+
+    Raises `ValueError` — this module's uniform parse-boundary failure — on undecodable bytes, a
+    window that covers nothing, or a cut that will not verify.
+    """
+    info = probe(video_bytes)
+    lo, hi = _window(info, start, end)
+    if hi - lo <= _EPSILON:
+        raise ValueError(f"the {start!r}-{end!r} window covers none of the clip.")
+    keyframe = _keyframe_at_or_before(video_bytes, lo)
+    made = None
+    if keyframe is not None and lo - keyframe <= _KEYFRAME_TOLERANCE:
+        made = _copy_cut(video_bytes, keyframe, hi)
+    if made is None:
+        made = _encode_cut(video_bytes, lo, hi, info)
+    probe(made.data)  # a cut nobody can decode is not a cut — never hand one to a vendor
+    return made
 
 
 # --- internals ---------------------------------------------------------------
+
+#: FFmpeg's fixed container-level time base (``AV_TIME_BASE``, microseconds) — the unit a
+#: container-level `seek` offset is expressed in. A constant of the format rather than of a build,
+#: so it is spelled once here instead of reached for through an import at three call sites.
+_AV_TIME_BASE = 1_000_000
 
 #: Slack when comparing a frame's timestamp against a target. Frame times are rationals converted
 #: to float, so an exact-looking ``2.0`` can decode as ``1.9999999999999998`` — without this the
@@ -437,6 +526,182 @@ def _take(
     stamps.append(time)
 
 
+def _span_of(made: Cut) -> str:
+    """The window a cut actually covers, as the model reads it — hundredths, trailing zeros gone.
+
+    Rounded for the same reason a sampled frame's label is (`_stamp`): a re-encoded window ends on
+    the last frame there is, at ``3.9583333333`` seconds, and a caption is a sentence a model reads
+    rather than a float it parses. Rounded to a *hundredth*, never a tenth — at a fine interval a
+    tenth collapses two different instants onto one number.
+    """
+    return f"{round(made.start, 2):g}s-{round(made.end, 2):g}s"
+
+
+def _cut_clause(asked: str, span: str, made: Cut, sampling: FrameSampling) -> str:
+    """The caption's sentence for a clip that *was* cut to a window.
+
+    Two wordings, and the second exists because the two windows can honestly differ: a lossless
+    copy starts at the nearest keyframe at or before the request, so a caption claiming the exact
+    request would be the "reasons about a perception it did not have" defect in miniature. The
+    comparison is **numeric** — the strings are formatted differently by construction (``"up to
+    5s"`` versus ``"0s-5s"``), so comparing them would report every one-sided request as inexact.
+    """
+    exact = (
+        sampling.start is None or abs(sampling.start - made.start) <= _KEYFRAME_TOLERANCE
+    ) and (sampling.end is None or abs(sampling.end - made.end) <= _KEYFRAME_TOLERANCE)
+    if exact:
+        return f"trimmed to the {span} window you asked for"
+    return f"trimmed to {span}, the nearest whole window to the {asked} you asked for"
+
+
+def _keyframe_at_or_before(video_bytes: bytes, seconds: float) -> float | None:
+    """The timestamp of the last keyframe at or before `seconds`, or ``None`` if there is none.
+
+    A container seek lands on exactly that keyframe (``backward=True``), so this is a demux of one
+    packet, not a scan. ``None`` for a stream whose packets carry no timestamps — for which a copy
+    could not be rebased anyway, so the caller re-encodes.
+    """
+    try:
+        with _open(video_bytes) as source:
+            stream = _video_stream(source)
+            source.seek(int(max(seconds, 0.0) * _AV_TIME_BASE), backward=True, any_frame=False)
+            for packet in source.demux(stream):
+                if packet.pts is None or not packet.is_keyframe:
+                    continue
+                return float(packet.pts * packet.time_base)
+    except Exception:  # noqa: BLE001 - an unseekable stream is a re-encode, never a failure
+        return None
+    return None
+
+
+def _copy_cut(video_bytes: bytes, lo: float, hi: float) -> Cut | None:
+    """Remux the packets in ``[lo, hi]`` into a fresh container — no recompression at all.
+
+    `lo` is a **keyframe** timestamp (the caller found it), which is what makes a copy decodable:
+    a stream that begins mid-GOP references frames that are not there. Every video and audio
+    stream is carried across, so a clip's sound survives the cut; timestamps are rebased per stream
+    so the result starts at zero rather than at `lo`, which is what a player — and a vendor — reads
+    as the clip's own clock.
+
+    ``None`` (never an exception) when the copy cannot be built — a codec the output container will
+    not take, a muxer that refuses, no packets in the window — so the caller re-encodes instead.
+    """
+    out = io.BytesIO()
+    try:
+        with _open(video_bytes) as source:
+            streams = [s for s in source.streams if s.type in ("video", "audio")]
+            if not any(s.type == "video" for s in streams):
+                return None
+            source.seek(int(max(lo, 0.0) * _AV_TIME_BASE), backward=True, any_frame=False)
+            target = _open_output(out)
+            mapping = {s.index: target.add_stream_from_template(s) for s in streams}
+            offsets: dict[int, int] = {}
+            muxed = 0
+            last = lo  # the end reported is what was muxed, never the bound that was asked for
+            for packet in source.demux(streams):
+                if packet.pts is None or packet.dts is None:
+                    continue  # a flush packet, or one with no clock to rebase
+                time = float(packet.pts * packet.time_base)
+                if time < lo - _EPSILON or time > hi + _EPSILON:
+                    if packet.stream.type == "video" and time > hi:
+                        break  # past the window on the stream that defines it
+                    continue
+                index = packet.stream.index
+                offsets.setdefault(index, packet.pts)
+                packet.pts -= offsets[index]
+                packet.dts -= offsets[index]
+                if packet.stream.type == "video":
+                    last = time
+                packet.stream = mapping[index]
+                target.mux(packet)
+                muxed += 1
+            target.close()
+    except Exception:  # noqa: BLE001 - any muxer refusal is "copy unavailable", not a failure
+        return None
+    if not muxed:
+        return None
+    return Cut(
+        data=out.getvalue(), content_type=CUT_CONTENT_TYPE, start=lo, end=last, lossless=True
+    )
+
+
+def _encode_cut(video_bytes: bytes, lo: float, hi: float, info: VideoInfo) -> Cut:
+    """Decode the frames in ``[lo, hi]`` and encode them afresh — the any-start path.
+
+    The one thing a container copy cannot do is begin between keyframes, which is exactly what
+    "look closely at second 12 of a long clip" asks for. Memory stays flat for the same reason the
+    sampler's does: one decoded frame at a time.
+
+    **Audio is not carried.** Re-encoding a second modality would double this path's vendor surface
+    for a describer that reads pictures, and a *silent* drop is what would be wrong — so `Cut`
+    records `lossless=False` and the log line says which path ran. The copy path, which is the one
+    a whole-second-boundary window takes, keeps the audio.
+
+    Presentation timestamps are assigned sequentially at the source's own frame rate, so the cut's
+    clock matches the original's. Raises `ValueError` when the window decodes no frames or the
+    encoder refuses — the caller degrades to the whole clip.
+    """
+    from fractions import Fraction
+
+    out = io.BytesIO()
+    frames = 0
+    first: float | None = None
+    last: float = lo
+    try:
+        with _open(video_bytes) as source:
+            stream = _video_stream(source)
+            # The stream's own exact rate (a `Fraction`), never `info.fps` — that is a float, and
+            # 30000/1001 does not survive the round trip, which would drift a long cut's clock.
+            rate = stream.average_rate or stream.guessed_rate or Fraction(_CUT_FALLBACK_RATE)
+            source.seek(int(max(lo, 0.0) * _AV_TIME_BASE), backward=True, any_frame=False)
+            target = _open_output(out)
+            encoder = target.add_stream(_CUT_CODEC, rate=rate)
+            encoder.width = int(stream.codec_context.width or info.width)
+            encoder.height = int(stream.codec_context.height or info.height)
+            encoder.pix_fmt = _CUT_PIX_FMT
+            encoder.options = {"crf": _CUT_CRF}
+            for frame in source.decode(stream):
+                time = frame.time if frame.time is not None else 0.0
+                if time < lo - _EPSILON:
+                    continue
+                if time > hi + _EPSILON:
+                    break
+                if first is None:
+                    first = time
+                last = time
+                frame.pts = frames
+                frame.time_base = 1 / rate
+                for packet in encoder.encode(frame):
+                    target.mux(packet)
+                frames += 1
+            for packet in encoder.encode():
+                target.mux(packet)
+            target.close()
+    except Exception as exc:  # every encoder/muxer refusal is one thing: no cut
+        raise ValueError(f"could not trim the video: {exc}") from exc
+    if not frames:
+        raise ValueError("the window decoded no frames.")
+    return Cut(
+        data=out.getvalue(),
+        content_type=CUT_CONTENT_TYPE,
+        start=lo if first is None else first,
+        end=last,
+        lossless=False,
+    )
+
+
+def _open_output(buffer: io.BytesIO) -> Any:
+    """An in-memory output container for a cut, in `_CUT_FORMAT`.
+
+    The mirror of `_open`: PyAV is imported at the call rather than at module scope, so an install
+    with a broken wheel fails on the one call that needs it instead of taking every other tool down
+    with it.
+    """
+    import av
+
+    return av.open(buffer, mode="w", format=_CUT_FORMAT)
+
+
 def _jpeg_data_url(frame: Any, long_edge: int) -> str:
     """One decoded frame, scaled to the long edge and encoded as a JPEG ``data:`` URL.
 
@@ -455,8 +720,8 @@ def _jpeg_data_url(frame: Any, long_edge: int) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def _facts(clip: VideoContent) -> str:
-    """The one-line probe summary a `watch_video` result carries: how long, how fast, how big.
+def clip_facts(clip: VideoContent) -> str:
+    """The one-line probe summary an assets `watch` result carries: how long, how fast, how big.
 
     Read off the clip the tool actually fetched, so the model reasons about the real file rather
     than the metadata the platform recorded for it. A clip whose header cannot be parsed says so
