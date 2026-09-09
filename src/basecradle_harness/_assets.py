@@ -1,4 +1,4 @@
-"""Give the agent files: list, read, view, and create assets on a BaseCradle timeline.
+"""Give the agent files — and senses for them: `assets` is the noun, the verb is the sense.
 
 This is the first tool that acts *on* the platform, so it is the first
 `PlatformTool` — it reaches the SDK client and the current timeline through the
@@ -7,19 +7,35 @@ contract `MemoryTool` follows: an `action` enum, branching in `run`, a string
 back for the model to read. A contributor adds the next platform tranche (tasks,
 participants, …) by copying this shape.
 
-Four actions, the file equivalent of what a human peer does on a timeline:
+The actions, the file equivalent of what a human peer does on a timeline:
 
-- **list** — what files are here, with the uuids needed to read them.
+- **list** — what files are here, with the uuids needed to open them.
 - **read** — download one file and surface it. The model is text, so a text-ish
   file comes back decoded; a binary (or oversized) file comes back as metadata
   plus a "not inlined" note rather than a wall of bytes dumped into context.
 - **view** — *look at* an image file. Where `read` refuses a binary, `view`
   fetches an image and hands it back as a `ToolResult` carrying the picture, so a
-  vision-capable model (the Responses path) actually sees it. This is the
-  on-demand "look at this asset" step — images are never inlined eagerly, only
-  when the agent chooses to look.
+  vision-capable model actually sees it. This is the on-demand "look at this
+  asset" step — images are never inlined eagerly, only when the agent chooses to look.
+- **watch** — *watch* a video file, the same shape one tier down (`_video.py`).
+- **listen** — *hear* an audio file, transcribed to text (`_audio.py`).
 - **create** — upload content the agent produced (the common path: text → file),
   with an optional description.
+- **post_image** — put an image another tool returned (a browser screenshot) on the timeline.
+
+One noun, three senses — the founder's ruling, 2026-09-09 (issue #484)
+-----------------------------------------------------------------------
+`view` was an action here, video was a standalone ``watch_video`` tool, and audio a standalone
+``hear_audio`` tool. That split was implementation history, not design: all three are *the agent
+opening a file that is already on this timeline*, and they now spell it one way. The two standalone
+tools are retired, their plugin files removed, and an upgrade prunes a stale copy out of an
+existing overlay so a dead tool can never be resurrected from disk.
+
+**Don't show a locked door.** The action list is built when the tool is constructed, from what the
+agent is actually configured for — so `listen`, the one sense that needs a provider call, is absent
+from the schema *and* from the description on an agent with no transcription provider, rather than
+present and failing. `assets_options` is where that is decided, from the same
+`ActivationContext` every other activation gate reads, and any future gated verb goes through it.
 
 Ops default to the **current** timeline (the one the agent is engaged on); an
 explicit `timeline` uuid handles the rare cross-timeline case.
@@ -37,13 +53,20 @@ import base64
 import io
 import itertools
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
+from basecradle_harness._exceptions import ProviderConnectionError, ProviderError
 from basecradle_harness._idempotency import ASSET
 from basecradle_harness._messages import FrameSampling, ImageContent, ToolResult, VideoContent
 from basecradle_harness._platform import PlatformTool
+
+if TYPE_CHECKING:  # type-only: neither is a runtime dependency of this module
+    # `_audio` reaches the model provider, which reaches back here — so the transcriber is
+    # imported at the one call that needs it (`_listen`), never at module scope.
+    from basecradle_harness._audio import Transcriber
+    from basecradle_harness._plugins import ActivationContext
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -71,7 +94,7 @@ MAX_IMAGE_BYTES = 64 * 1024 * 1024
 # letting an unsupported type fail deep in the provider call.
 _VIEWABLE_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
-# The largest video `watch_video` will load. Exactly the same *kind* of number as
+# The largest video the assets tool's `watch` will load. Exactly the same *kind* of number as
 # `MAX_IMAGE_BYTES` above and for exactly the same reason: a **machine RAM sanity bound — what
 # this box will hold in memory — never a prediction of any vendor's input ceiling** (issue #336,
 # decision 2; the vendor's own rejection is relayed verbatim, so the harness has no business
@@ -80,12 +103,20 @@ _VIEWABLE_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "imag
 # streaming, so the frame count never enters the bound. A clip *at* the bound therefore costs
 # roughly 600 MB transiently, which is the figure to weigh when sizing a fleet box, and it is the
 # reason this is a knob-shaped constant rather than a number nobody wrote down. Over the bound the
-# asset is described, not fetched, with the same wording pattern an oversized image gets. The original bytes are never
-# modified — no transcoding, no re-encoding (decision 1).
+# asset is described, not fetched, with the same wording pattern an oversized image gets. The
+# original bytes are never modified *to fit a limit* — no transcoding, no re-encoding, here or on
+# any perception path (decision 1).
+#
+# **One thing does cut a clip's bytes, and it falls outside decision 1 because of who asked**
+# (issue #482, founder-decided 2026-09-09): the assets tool's `watch` narrows a clip to the window
+# **the agent itself requested**, in memory, for that one turn (`_video.native_watch`). Decision 1
+# is about the harness quietly reshaping a file to satisfy a *vendor*; a window the model asked for
+# in its own tool call is the tool doing what it was told, and nothing on the timeline changes —
+# the Asset is untouched and the cut is evicted with the rest of the turn's payload.
 MAX_VIDEO_BYTES = 256 * 1024 * 1024
 
 # Video content types a video-capable model can take as input, and that PyAV can decode for the
-# frames fallback. Kept to the container formats the providers document, so `watch_video` gives a
+# frames fallback. Kept to the container formats the providers document, so `watch` gives a
 # clean "can't show that" rather than failing deep in a decoder or a provider call.
 _VIEWABLE_VIDEO_TYPES = frozenset({"video/mp4", "video/webm", "video/quicktime", "video/mpeg"})
 
@@ -116,81 +147,98 @@ _TEXTUAL_APPLICATION_TYPES = frozenset(
 )
 
 
+#: Every action the assets tool can carry, in the order the model reads them: the file verbs, the
+#: three senses, then the two that put something *on* the timeline. The actual set a given agent
+#: sees is this filtered by `assets_options` — see `AssetsTool.__init__`.
+_ALL_ACTIONS = ("list", "read", "view", "watch", "listen", "create", "post_image")
+
+#: The sense actions that open a file rather than change the timeline. `read` joins them for the
+#: ``uuid`` parameter's wording, which is the one place all four are named together.
+_UUID_ACTIONS = ("read", "view", "watch", "listen")
+
+#: One clause per action, for the description built at construction. Kept as data rather than a
+#: paragraph so a configuration-dependent action can be dropped without leaving a dangling
+#: half-sentence behind it — the "don't show a locked door" rule applies to the prose the model
+#: reads as much as to the enum it calls.
+_ACTION_TEXT = {
+    "list": "action='list' shows the files here with their uuids",
+    "read": (
+        "action='read' downloads one file by uuid and returns its text (binary files come back "
+        "as a description, not raw bytes)"
+    ),
+    "view": (
+        "action='view' looks at an image file by uuid so you can actually see it and describe or "
+        "reason about it"
+    ),
+    "watch": (
+        "action='watch' watches a video file by uuid — optional 'every' sets the seconds between "
+        "the frames you are shown (default 1), and 'start'/'end' (seconds) narrow the window so "
+        "you can look closely at one moment of a long clip"
+    ),
+    "listen": (
+        "action='listen' hears an audio file by uuid and returns a transcript of what was said"
+    ),
+    "create": (
+        "action='create' uploads a new file from the text content you provide, with a filename "
+        "and an optional description"
+    ),
+    "post_image": (
+        "action='post_image' posts an image a tool just returned (such as a browser screenshot "
+        "from an MCP tool) to the timeline — pass its reference in 'image' (e.g. 'mcp-image-1', "
+        "shown in the tool result, or 'latest' for the most recent), so you can share what you "
+        "captured even if you cannot see it yourself"
+    ),
+}
+
+
+def assets_options(ctx: ActivationContext) -> dict[str, Any]:
+    """The assets tool's constructor options for one config — which senses this agent has.
+
+    The `ToolPlugin.configure` hook the shipped ``tools/assets.py`` names (issue #484). It answers
+    the one question the tool cannot: `view` and `watch` cost no provider call and are therefore
+    always there, while `listen` needs a transcription provider — so on an agent without one the
+    action is absent from the schema and the description rather than present and failing. That is
+    the "don't show a locked door" rule, and any future gated verb is decided here beside this one.
+
+    The gate is `OpenAIKey`, **the same requirement object** the retired ``hear_audio`` plugin
+    declared, evaluated against the same `ActivationContext` — never a second reading of the
+    environment that could drift from it. It is imported at the call rather than at module scope so
+    the tool module does not depend on the resolution machinery that configures it.
+    """
+    from basecradle_harness._plugins import OpenAIKey
+
+    return {"listen": OpenAIKey().met(ctx)}
+
+
 class AssetsTool(PlatformTool):
-    """List, read, view, and create files (assets) on the agent's current timeline.
+    """Open and exchange files (assets) on the agent's current timeline — and sense them.
 
     A `PlatformTool`: the hosting agent binds the SDK client and current-timeline
     uuid before the loop runs. Until bound, `run` reports it is not connected
     (via `PlatformError`) rather than failing obscurely.
+
+    Args:
+        listen: Whether this agent has a transcription provider, and so whether the ``listen``
+            action exists at all. The plugin path answers it from the active config
+            (`assets_options`); a library caller passes it directly.
+        transcriber: The transcription collaborator (`_audio.Transcriber`) — pass one to tune the
+            model, base URL or timeout. Passing one implies `listen`, so a caller never has to say
+            the same thing twice.
     """
 
     name = "assets"
-    description = (
-        "Exchange files on the timeline, the way a peer shares an attachment. "
-        "action='list' shows the files here with their uuids; action='read' "
-        "downloads one file by uuid and returns its text (binary files come back as "
-        "a description, not raw bytes); action='view' looks at an image file by uuid "
-        "(or pass uuid='latest' to view the most recent file on the timeline, such as "
-        "an image you just posted) so you can actually see it and describe or reason "
-        "about it; action='create' "
-        "uploads a new file from the text content you provide, with a filename and an "
-        "optional description; action='post_image' posts an image a tool just returned "
-        "(such as a browser screenshot from an MCP tool) to the timeline — pass its "
-        "reference in 'image' (e.g. 'mcp-image-1', shown in the tool result, or 'latest' "
-        "for the most recent), so you can share what you captured even if you cannot see it "
-        "yourself. Operations use the current timeline unless you pass a timeline uuid. "
-        "Assets are shared with every viewer and can never be edited or deleted — prefer "
-        "your own storage for private or working files; upload what is meant for the peers here. "
-        "Platform REST: POST /timelines/{timeline_uuid}/assets — this tool calls that same "
-        "endpoint; https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
-    )
-    parameters = {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["list", "read", "view", "create", "post_image"],
-                "description": "What to do.",
-            },
-            "uuid": {
-                "type": "string",
-                "description": (
-                    "The asset's uuid (read/view only). Get it from 'list', or pass "
-                    "'latest' for the most recent file on the timeline — e.g. an image "
-                    "you just generated and posted, so you can view it without being "
-                    "handed its uuid."
-                ),
-            },
-            "image": {
-                "type": "string",
-                "description": (
-                    "The reference of a captured image to post (post_image only) — e.g. "
-                    "'mcp-image-1' as shown in a tool result, or 'latest' for the most "
-                    "recently captured image. Defaults to the latest capture if omitted."
-                ),
-            },
-            "content": {
-                "type": "string",
-                "description": "The text content of the file to upload (create only).",
-            },
-            "filename": {
-                "type": "string",
-                "description": "The filename for the uploaded file, e.g. 'notes.md' (create only).",
-            },
-            "description": {
-                "type": "string",
-                "description": "An optional human-readable description of the file (create only).",
-            },
-            "timeline": {
-                "type": "string",
-                "description": (
-                    "Optional timeline uuid to act on instead of the current one. "
-                    "Omit to use the timeline you are engaged on."
-                ),
-            },
-        },
-        "required": ["action"],
-    }
+
+    def __init__(self, *, listen: bool = False, transcriber: Transcriber | None = None) -> None:
+        self._transcriber = transcriber
+        can_hear = listen or transcriber is not None
+        #: The actions this instance actually offers, in `_ALL_ACTIONS` order — and the **single**
+        #: answer to "does this agent have that sense?", read by `run`, by `_read`'s hint and by
+        #: `_unknown`. Instance state, not class state: two agents in one process (a test, a future
+        #: sub-agent) must be able to have different senses, and `Tool.to_spec` reads
+        #: `self.description`/`self.parameters`, which are built from this.
+        self.actions = tuple(a for a in _ALL_ACTIONS if a != "listen" or can_hear)
+        self.description = _description(self.actions)
+        self.parameters = _parameters(self.actions)
 
     def run(
         self,
@@ -201,29 +249,37 @@ class AssetsTool(PlatformTool):
         description: str | None = None,
         timeline: str | None = None,
         image: str | None = None,
+        every: float | None = None,
+        start: float | None = None,
+        end: float | None = None,
     ) -> str | ToolResult:
         """Dispatch on `action`. Returns a message written for the model to read.
 
-        `view` may return a `ToolResult` carrying the image for the model to see;
-        every other action returns a plain string.
+        `view` and `watch` may return a `ToolResult` carrying the picture or the clip for the model
+        to perceive; every other action returns a plain string.
         """
+        # Validate before reaching for the platform: an unknown action and a missing uuid are
+        # answerable without a client, and an unbound tool should say what is actually wrong.
+        if action not in self.actions:
+            return _unknown(action, self.actions)
+        if action in _UUID_ACTIONS and (not uuid or not uuid.strip()):
+            return f"Error: {action!r} needs the asset's uuid. Use 'list' to find it."
+
         target = timeline or self.context.timeline
         if action == "list":
             return self._list(target)
-        if action == "read":
-            if not uuid:
-                return "Error: 'read' needs the asset's uuid. Use 'list' to find it."
+        if action in _UUID_ACTIONS:
+            assert uuid is not None  # guaranteed above
             resolved = self._resolve_uuid(uuid, target)
             if resolved is None:
-                return "No files on this timeline yet — nothing to read."
-            return self._read(resolved)
-        if action == "view":
-            if not uuid:
-                return "Error: 'view' needs the asset's uuid. Use 'list' to find it."
-            resolved = self._resolve_uuid(uuid, target)
-            if resolved is None:
-                return "No files on this timeline yet — nothing to view."
-            return self._view(resolved)
+                return f"No files on this timeline yet — nothing to {action}."
+            if action == "read":
+                return self._read(resolved)
+            if action == "view":
+                return self._view(resolved)
+            if action == "watch":
+                return self._watch(resolved, every, start, end)
+            return self._listen(resolved)
         if action == "create":
             # Minted before the validation, never after: the ordinal is counted off the
             # transcript, which records this call either way (issue #297 — see `PlatformTool.key`).
@@ -231,12 +287,7 @@ class AssetsTool(PlatformTool):
             if content is None or not filename:
                 return "Error: 'create' needs both 'content' and a 'filename'."
             return self._create(target, content, filename, description, key)
-        if action == "post_image":
-            return self._post_image(target, image, filename, description)
-        return (
-            f"Error: unknown action {action!r}. Use 'list', 'read', 'view', "
-            "'create', or 'post_image'."
-        )
+        return self._post_image(target, image, filename, description)
 
     # --- uuid resolution -----------------------------------------------------
 
@@ -275,10 +326,15 @@ class AssetsTool(PlatformTool):
                 if not _is_text(file.content_type)
                 else f"{file.byte_size} bytes, over the {MAX_INLINE_BYTES}-byte inline limit"
             )
+            # The hint names the sense that opens *this* kind of file — and only when this agent
+            # actually has it, so a `listen`-less agent is never pointed at an action that is not
+            # in its schema (the "don't show a locked door" rule, issue #484).
             if _is_image(file.content_type):
                 hint = " Use action='view' to look at it."
-            elif _is_audio(file.content_type):
-                hint = " Use the 'listen' tool to hear what it says."
+            elif _is_video(file.content_type):
+                hint = " Use action='watch' to watch it."
+            elif _is_audio(file.content_type) and "listen" in self.actions:
+                hint = " Use action='listen' to hear what it says."
             else:
                 hint = ""
             return f"{meta}\n({why} — not inlined. The file is on the timeline by that uuid.{hint})"
@@ -316,6 +372,90 @@ class AssetsTool(PlatformTool):
         if isinstance(result, str):
             return f"{meta}\n({result})"  # a reason it can't be shown — not raw bytes
         return ToolResult(text=meta, images=[result])
+
+    # --- watch ---------------------------------------------------------------
+
+    def _watch(
+        self, uuid: str, every: float | None, start: float | None, end: float | None
+    ) -> str | ToolResult:
+        """Fetch a video asset and hand it back for the model to actually watch.
+
+        `view`'s video sibling, and the same division of labour: this fetches, and the **engine**
+        decides what the model receives — the clip itself (trimmed to `start`/`end`), sampled
+        frames, or an honest caption — from the provider's own declared capabilities
+        (`_engine._show_video`). A tool has no view of the provider, so it narrates no perception
+        (issue #316).
+
+        There is **no provider call and no idempotency key**: nothing is created, nothing is spent,
+        nothing is posted. The clip is decoded in-process by PyAV, whose wheels bundle FFmpeg, so
+        this stays inside the locked profile's no-shell boundary.
+
+        `every`/`start`/`end` ride along on the returned clip (`FrameSampling`) rather than being
+        acted on here, because the tier that honors them is chosen later, in the engine, by which
+        time the tool that knew what the agent asked for is long gone.
+        """
+        from basecradle_harness._video import DEFAULT_EVERY, clip_facts
+
+        asset = self.context.client.assets.get(uuid)
+        meta = _describe(asset)
+        sampling = FrameSampling(
+            every=every if every and every > 0 else DEFAULT_EVERY, start=start, end=end
+        )
+        result = video_input(asset.content.file, sampling)
+        if isinstance(result, str):
+            return f"{meta}\n({result})"  # a reason it can't be watched — never raw bytes
+        return ToolResult(text=f"{meta}\n({clip_facts(result)})", videos=[result])
+
+    # --- listen --------------------------------------------------------------
+
+    def _listen(self, uuid: str) -> str:
+        """Fetch an audio asset, transcribe it, and return the transcript for the model to read.
+
+        The one sense that costs a **provider call** (`_audio.Transcriber`), which is why it is the
+        one action an agent may not have at all — an agent with no transcription provider never
+        sees it in the schema, so reaching this method means the capability is configured.
+
+        The wrong kind of file (and an empty or oversized one) is refused *before* downloading or
+        calling the provider — the same discipline `view` and `watch` follow.
+        """
+        from basecradle_harness._audio import MAX_AUDIO_BYTES, Transcriber
+
+        asset = self.context.client.assets.get(uuid)
+        file = asset.content.file
+        meta = _describe(asset)
+
+        if not _is_audio(file.content_type):
+            return (
+                f"{meta}\n(not an audio file — 'listen' is for audio. Use 'read' for text, "
+                "'view' for images, 'watch' for video.)"
+            )
+        if file.byte_size <= 0:
+            return f"{meta}\n(empty file — nothing to hear.)"
+        if file.byte_size > MAX_AUDIO_BYTES:
+            return (
+                f"{meta}\n({file.byte_size} bytes, over the {MAX_AUDIO_BYTES}-byte "
+                "transcription limit — too large to listen to.)"
+            )
+
+        transcriber = self._transcriber or Transcriber()
+        key = transcriber.key
+        if not key:
+            return (
+                "Error: no API key for transcription. Set AI_API_KEY "
+                "(or pass a configured Transcriber to AssetsTool)."
+            )
+
+        data = _download(file.url)
+        try:
+            transcript = transcriber.transcribe(data, file.filename, file.content_type, key)
+        except ProviderConnectionError as exc:
+            return f"Error transcribing audio: could not reach the transcription API: {exc}"
+        except ProviderError as exc:
+            return f"Error transcribing audio: {exc}"
+
+        if not transcript.strip():
+            return f"{meta}\n(transcribed, but no speech was detected.)"
+        return f"{meta}\n\nTranscript:\n{transcript}"
 
     # --- create --------------------------------------------------------------
 
@@ -390,6 +530,135 @@ class AssetsTool(PlatformTool):
             f"Posted {name!r} ({asset.content.file.byte_size} bytes) from capture {ref!r}. "
             f"{_describe(asset)}"
         )
+
+
+# --- the configured action set: schema and description ------------------------
+
+
+def _unknown(action: str, actions: tuple[str, ...]) -> str:
+    """The error for an action this agent does not have — naming the ones it does.
+
+    Reads off the *configured* set, so an agent with no transcription never suggests `listen` even
+    when the model guessed it: an error message that offers a door that is not there is the same
+    defect as a schema that does.
+    """
+    offered = ", ".join(repr(name) for name in actions)
+    return f"Error: unknown action {action!r}. Use {offered}."
+
+
+def _description(actions: tuple[str, ...]) -> str:
+    """The model-facing description for one configured action set (issue #484).
+
+    Built from `_ACTION_TEXT` rather than written as a paragraph so that dropping a gated action
+    drops its clause with it. The senses are named together in one sentence at the end because
+    *"this is how you check what you made"* is the thing an agent most often needs told, and it is
+    exactly as true of a clip as of a picture.
+    """
+    clauses = "; ".join(_ACTION_TEXT[name] for name in actions)
+    senses = [name for name in ("view", "watch", "listen") if name in actions]
+    check = (
+        f" Use {_join(senses)} to check media you generated yourself — open it and see whether it "
+        "is what you asked for."
+        if senses
+        else ""
+    )
+    return (
+        "Exchange files on the timeline, the way a peer shares an attachment, and open the ones "
+        f"that are here. {clauses}. Anywhere a uuid is asked for you can pass 'latest' instead, "
+        "for the most recent file on the timeline — such as a file you just posted, so you can "
+        f"open it without being handed its uuid.{check} Operations use the current timeline "
+        "unless you pass a timeline uuid. Assets are shared with every viewer and can never be "
+        "edited or deleted — prefer your own storage for private or working files; upload what is "
+        "meant for the peers here. Platform REST: POST /timelines/{timeline_uuid}/assets — this "
+        "tool calls that same endpoint; "
+        "https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
+    )
+
+
+def _parameters(actions: tuple[str, ...]) -> dict[str, Any]:
+    """The JSON-Schema parameters for one configured action set.
+
+    Only the ``action`` enum and the ``uuid`` wording vary today (the gated verb is `listen`), but
+    the whole schema is built here rather than patched at one key, so a future action carrying a
+    parameter of its own has one obvious place to add it.
+    """
+    opens = _join([f"'{name}'" for name in _UUID_ACTIONS if name in actions])
+    return {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": list(actions),
+                "description": "What to do.",
+            },
+            "uuid": {
+                "type": "string",
+                "description": (
+                    f"The asset's uuid ({opens}). Get it from 'list', or pass "
+                    "'latest' for the most recent file on the timeline — e.g. an image "
+                    "you just generated and posted, so you can open it without being "
+                    "handed its uuid."
+                ),
+            },
+            "every": {
+                "type": "number",
+                "description": (
+                    "Optional seconds between the frames you are shown (watch only, default 1). "
+                    "Smaller sees more motion; a per-call frame cap still applies, so narrow the "
+                    "window with 'start'/'end' to actually look closer."
+                ),
+            },
+            "start": {
+                "type": "number",
+                "description": (
+                    "Optional start of the window to watch, in seconds from the clip's start "
+                    "(watch only)."
+                ),
+            },
+            "end": {
+                "type": "number",
+                "description": (
+                    "Optional end of the window to watch, in seconds from the clip's start "
+                    "(watch only)."
+                ),
+            },
+            "image": {
+                "type": "string",
+                "description": (
+                    "The reference of a captured image to post (post_image only) — e.g. "
+                    "'mcp-image-1' as shown in a tool result, or 'latest' for the most "
+                    "recently captured image. Defaults to the latest capture if omitted."
+                ),
+            },
+            "content": {
+                "type": "string",
+                "description": "The text content of the file to upload (create only).",
+            },
+            "filename": {
+                "type": "string",
+                "description": "The filename for the uploaded file, e.g. 'notes.md' (create only).",
+            },
+            "description": {
+                "type": "string",
+                "description": "An optional human-readable description of the file (create only).",
+            },
+            "timeline": {
+                "type": "string",
+                "description": (
+                    "Optional timeline uuid to act on instead of the current one. "
+                    "Omit to use the timeline you are engaged on."
+                ),
+            },
+        },
+        "required": ["action"],
+    }
+
+
+def _join(items: list[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c`` — for a clause whose length depends on the config."""
+    if len(items) <= 1:
+        return "".join(items)
+    return f"{', '.join(items[:-1])} and {items[-1]}"
 
 
 # --- shared rendering / type helpers -----------------------------------------
@@ -508,7 +777,7 @@ def _is_audio(content_type: str) -> bool:
 
 
 def _is_video(content_type: str) -> bool:
-    """Whether a file of this content type is video (a candidate for `watch_video`)."""
+    """Whether a file of this content type is video (a candidate for `watch`)."""
     if not content_type:
         return False
     return _media_type(content_type).startswith("video/")
@@ -527,8 +796,8 @@ def resolve_uuid(client: Any, uuid: str, timeline: str) -> str | None:
     turns that into a clean message); any other value is passed straight through as an explicit
     uuid.
 
-    Shared by the assets tool's `read`/`view` and by `watch_video` (`_video.py`), so an agent
-    that can say ``'latest'`` to one can say it to the other — a clip is the case that needs it
+    Shared by every uuid-taking assets action — `read`, `view`, `watch`, `listen` — so an agent
+    that can say ``'latest'`` to one can say it to all of them; a clip is the case that needs it
     most, since watching what it just generated is how the agent checks its own work.
     """
     if uuid.strip().lower() != "latest":
@@ -608,8 +877,8 @@ def video_input(file: Any, sampling: FrameSampling | None = None) -> VideoConten
     """
     if not _is_video(file.content_type):
         return (
-            "not a video — 'watch_video' is for videos. Use 'view' for images, 'read' for "
-            "text files, and 'listen' for audio."
+            "not a video — 'watch' is for videos. Use 'view' for an image and 'read' for a "
+            "text file."
         )
     if _media_type(file.content_type) not in _VIEWABLE_VIDEO_TYPES:
         return "video type not watchable; supported: MP4, WebM, QuickTime, MPEG."

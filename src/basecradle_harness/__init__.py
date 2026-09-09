@@ -6,8 +6,8 @@ core with clean extension points for human AI developers to fork and extend.
 https://basecradle.com · API docs: https://basecradle.com/docs/api
 """
 
-from basecradle_harness._assets import AssetsTool
-from basecradle_harness._audio import HearAudioTool
+from basecradle_harness._assets import AssetsTool, assets_options
+from basecradle_harness._audio import Transcriber
 from basecradle_harness._basecradle import TimelineAgent
 from basecradle_harness._brief import (
     compose_brief,
@@ -128,7 +128,15 @@ from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._verify import Finding, VerifyReport, claims, claims_document, verify
 from basecradle_harness._version import __version__
-from basecradle_harness._video import VideoInfo, WatchVideoTool, probe, sample_frames
+from basecradle_harness._video import (
+    Cut,
+    NativeWatch,
+    VideoInfo,
+    cut,
+    native_watch,
+    probe,
+    sample_frames,
+)
 from basecradle_harness._wake import (
     BreakerDecision,
     Claim,
@@ -237,8 +245,8 @@ __all__ = [
     "PlatformContext",
     "ConfirmedTimelineAction",
     "AssetsTool",
-    "HearAudioTool",
-    "WatchVideoTool",
+    "assets_options",
+    "Transcriber",
     "TasksTool",
     "TimelinesTool",
     "TrustTool",
@@ -261,12 +269,16 @@ __all__ = [
     "SystemPromptReadTool",
     "SystemPromptEditTool",
     "bind_platform_tools",
-    # Video perception (the sampler behind `watch_video`)
+    # Video perception (the sampler and the window trim behind the assets `watch` action)
     "VideoInfo",
+    "Cut",
+    "NativeWatch",
     "Describer",
     "describer_from_env",
     "probe",
     "sample_frames",
+    "cut",
+    "native_watch",
     # Message vocabulary
     "Message",
     "Role",

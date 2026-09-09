@@ -123,7 +123,7 @@ DEFAULT_POLL_MAX_WAIT = 600.0
 #: Appended to a generated clip's result. The agent produced a video it cannot see; this names the
 #: tool that lets it look, so self-verification is a step it can take rather than a favour it has
 #: to ask a human for.
-_WATCH_HINT = "Watch it with watch_video to check the result."
+_WATCH_HINT = "Watch it with the assets tool ('watch') to check the result."
 
 #: xAI states a media call's charged cost natively — an integer count of *ticks* in the response's
 #: ``usage`` object, where 1 tick = 1e-10 USD (docs.x.ai → Cost Tracking; the pinned ``xai_sdk``'s
@@ -636,7 +636,7 @@ class GrokGenerateVideoTool(_GrokMediaTool):
         # Point the model at its own eyes. A generated clip is the one asset whose *content* the
         # agent has never seen — it asked for motion and got back a uuid — so the result names the
         # tool that closes that loop. Never "ask the human to check": the agent verifies its own
-        # work (`watch_video`, issue #471).
+        # work (the assets tool's `watch` action, issue #471).
         return f"{posted} {_WATCH_HINT}"
 
     def _submit(self, key: str, payload: dict[str, Any]) -> str:

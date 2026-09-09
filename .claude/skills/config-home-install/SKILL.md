@@ -42,7 +42,7 @@ Only pristine defaults refresh; the operator's dir is never clobbered.
 
 ## Granting a powerful tool (`--opt-in`)
 
-Powerful tools (`generate_image`, `edit_image`, `hear_audio`, OpenAI `web_search`, xAI
+Powerful tools (`generate_image`, `edit_image`, OpenAI `web_search`, xAI
 `web_search`/`x_search`, `grok_generate_image`, `grok_generate_video`) fail closed and are
 **not scaffolded** by a plain install. To grant one:
 

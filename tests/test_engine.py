@@ -346,16 +346,42 @@ def test_a_video_model_is_handed_the_clip_itself():
     assert not turn.images  # a native-video turn carries no frames
 
 
-def test_a_native_video_caption_names_a_window_it_could_not_apply():
-    """Issue #481. The clip still goes whole — that is the tier — but the caption says so now."""
+def test_a_native_video_window_is_applied_and_the_caption_names_what_was_sent():
+    """Issue #482, the founder's ruling: the window an agent asks for is actually cut, not noted.
+
+    Before it, `start`/`end` narrowed the sampled-frames tier only — so an agent on a video-native
+    brain paid the whole clip's tokens on every look and got an account of all of it, which is
+    *less* capable than a vision-only peer making the identical call (#481 named that; this fixes
+    it). The caption states the window that was really sent, never the one that was asked for.
+    """
     provider = VideoProvider(*_watch_reply())
     engine = _engine(provider, WatchTool(FrameSampling(start=1, end=2)))
 
     engine.run([Message.user("watch it")])
 
     turn = next(m for m in provider.seen[1] if m.videos)
+    assert turn.content == "(Showing video: clip.mp4 — trimmed to the 1s-2s window you asked for.)"
+    # The clip on the wire is the cut, and it is shorter than the 3s fixture.
+    from basecradle_harness._video import decode_data_url, probe
+
+    assert probe(decode_data_url(turn.videos[0].url)).duration_s < 2.0
+
+
+def test_a_window_that_cannot_be_cut_falls_back_to_the_whole_clip_and_says_so():
+    """Issue #481's clause is the #482 fallback: never a silent whole-clip send.
+
+    `BrokenClipTool` returns bytes no decoder can read, so the trim cannot be made. The clip still
+    goes — that is what the tier can do — and the caption is explicit that the window was not
+    applied, rather than leaving the agent reasoning about a perception it did not have.
+    """
+    provider = VideoProvider(*_watch_reply())
+    engine = _engine(provider, BrokenClipTool(FrameSampling(start=1, end=2)))
+
+    engine.run([Message.user("watch it")])
+
+    turn = next(m for m in provider.seen[1] if m.videos)
     assert turn.content == (
-        "(Showing video: clip.mp4 — the whole clip: the start/end window you asked for (1s-2s) "
+        "(Showing video: broken.mp4 — the whole clip: the start/end window you asked for (1s-2s) "
         "narrows sampled frames only.)"
     )
 
@@ -406,15 +432,24 @@ def test_a_text_only_model_gets_the_honest_caption_and_a_loud_warning(caplog):
 
 
 class BrokenClipTool(Tool):
-    """A clip whose bytes will not decode — the sampling-failure path."""
+    """A clip whose bytes will not decode — the sampling-failure and trim-failure path."""
 
     name = "watch_video"
     description = "Watch a video."
 
+    def __init__(self, sampling: FrameSampling | None = None):
+        self._sampling = sampling or FrameSampling()
+
     def run(self, **kwargs):
         return ToolResult(
             text="broken.mp4",
-            videos=[VideoContent(url="data:video/mp4;base64,AAAA", alt="broken.mp4")],
+            videos=[
+                VideoContent(
+                    url="data:video/mp4;base64,AAAA",
+                    alt="broken.mp4",
+                    sampling=self._sampling,
+                )
+            ],
         )
 
 

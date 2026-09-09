@@ -434,7 +434,7 @@ def test_video_image_to_video_sends_the_image_object_as_a_base64_data_uri(video_
     assert sent["image"] == {"type": "image_url", "url": expected}
     assert "image_url" not in sent  # the key that silently made this text-to-video
     # The agent is pointed at its own eyes, never at a human's.
-    assert "Watch it with watch_video to check the result." in result
+    assert "Watch it with the assets tool ('watch') to check the result." in result
 
 
 def test_video_image_to_video_survives_a_source_asset_with_no_content_type(video_tool):

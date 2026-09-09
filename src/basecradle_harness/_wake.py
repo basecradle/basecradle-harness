@@ -75,6 +75,7 @@ import logging
 import os
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata
@@ -1707,7 +1708,8 @@ class WakeAgent:
         degrades to the text description (`_incoming_asset_text`), which names the file and
         its type and points at the tools, so the seam is graceful, never an error.
 
-        **A posted video is acknowledged, never auto-watched** (issue #471). `watch_video` exists
+        **A posted video is acknowledged, never auto-watched** (issue #471). The assets tool's
+        `watch` action exists
         and the hint names it, but loading a clip and decoding frames is a real cost, so it stays
         the *agent's* call the same way `read` and `listen` do — the wake says what arrived and
         the agent decides whether to look. Auto-watching would spend an agent's context on every
@@ -1744,7 +1746,7 @@ class WakeAgent:
                 )
                 return f"{intro} Looking at it now.", [shown]
         # Non-image, unviewable/oversized image, or a failed fetch: describe, don't show.
-        return _incoming_asset_text(asset), []
+        return _incoming_asset_text(asset, self._asset_actions()), []
 
     def _describe_on_arrival(self, asset: object, file: object) -> str:
         """A posted image, for a model with no vision: described by a describer, or said plainly.
@@ -1758,7 +1760,7 @@ class WakeAgent:
         here because a reader will otherwise take them for accidents:
 
         - It is wrapped in the **shared** `described_caption`, so the description **names the
-          describer** on this path exactly as it does on `view` and `watch_video`. Without that the
+          describer** on this path exactly as it does on `view` and `watch`. Without that the
           agent reads a paragraph about a picture it never received as its own perception — and so
           does anyone reading its memory a month later. One spelling, one place, three paths.
         - The `_ASSET_TOOL_HINT` is deliberately **not** appended. That pointer's whole job is
@@ -1776,7 +1778,21 @@ class WakeAgent:
             caption = described_caption(asset.content.file.filename, describer.model, described)
             return f"{_asset_dialogue(asset)}\n{caption}"
         self._log_image_degrade(asset)
-        return _incoming_asset_text(asset)  # no vision, no describer: the description, said plainly
+        # No vision, no describer: the description, said plainly.
+        return _incoming_asset_text(asset, self._asset_actions())
+
+    def _asset_actions(self) -> Sequence[str]:
+        """Which senses this agent's assets tool actually offers (issue #484).
+
+        Read off the **bound tool**, never re-derived from the environment: the tool is what
+        answers the model, so anything that tells the model what it can do has to be reading the
+        same object. An agent with no assets tool at all (a pruned overlay) falls back to the full
+        set, which costs nothing — there is no asset hint to render without an assets tool.
+        """
+        registry = self.harness.tools
+        if "assets" not in registry:
+            return ALL_ASSET_ACTIONS
+        return getattr(registry.get("assets"), "actions", ALL_ASSET_ACTIONS)
 
     def _described_image(self, describer: object, file: object) -> str | None:
         """The describer's words for a posted image, or ``None`` if it could not answer.
@@ -4090,7 +4106,41 @@ def _now_line() -> str:
     return f"{anchor}\n{_NOW_LINE_INSTRUCTION}"
 
 
-def _incoming_asset_text(asset: object) -> str:
+#: How each assets action reads in the hint. `read` is unconditional (every agent has it and it is
+#: the fallback for a file no sense opens); the three senses are named only where the agent has
+#: them — `listen` needs a transcription provider (issue #484).
+_ASSET_VERBS = {
+    "view": "'view' an image",
+    "watch": "'watch' a video",
+    "listen": "'listen' to audio",
+}
+
+#: The senses to name when the caller has no configured tool to read them off — the full set. Used
+#: by the mining tests' uniform `_*_text(item)` dispatch and by any caller outside a live wake; a
+#: real wake passes `WakeAgent._asset_actions()`, which is the agent's actual tool.
+ALL_ASSET_ACTIONS = ("read", "view", "watch", "listen")
+
+
+def asset_tool_hint(actions: Sequence[str] = ALL_ASSET_ACTIONS) -> str:
+    """What the harness appends to an asset line so the model knows how to open the file.
+
+    Framing, not dialogue: `_asset_dialogue` is the half that gets mined (issue #438), and this
+    half never is.
+
+    It names **only the senses this agent has** (issue #484). Pointing a `listen`-less agent at
+    ``'listen'`` is the same defect the ruling closed in the tool's own schema — a door that does
+    not open, which spends the model's attention and teaches it to distrust the doors that do.
+    """
+    named = [_ASSET_VERBS[a] for a in ("view", "watch", "listen") if a in actions]
+    tail = f" (or {' / '.join(named)})" if named else ""
+    return f" Use the assets tool to 'read' it{tail} if you want to engage with it."
+
+
+#: The full-set hint, for a reader that wants the shape at a glance.
+_ASSET_TOOL_HINT = asset_tool_hint()
+
+
+def _incoming_asset_text(asset: object, actions: Sequence[str] = ALL_ASSET_ACTIONS) -> str:
     """A peer's posted file as the agent hears it: who shared what, and how to open it.
 
     The description fallback for the asset-perception path: used for media the wake cannot
@@ -4101,16 +4151,12 @@ def _incoming_asset_text(asset: object) -> str:
 
     The leading ``[created_at]`` stamp is the asset item's own timeline timestamp, read
     against the brief's `Current Time:` anchor so the model can reason about its age.
+
+    `actions` is the agent's live assets action set, so the pointer names only the senses it
+    actually has (issue #484). It defaults to the full set for a caller with no tool to read —
+    which is a *default*, never a claim about a particular agent.
     """
-    return _asset_dialogue(asset) + _ASSET_TOOL_HINT
-
-
-#: What the harness appends to an asset line so the model knows how to open the file. Framing,
-#: not dialogue: `_asset_dialogue` is the half that gets mined (issue #438).
-_ASSET_TOOL_HINT = (
-    " Use the assets tool to 'read' it (or 'view' an image / 'listen' to audio / 'watch_video' a "
-    "video) if you want to engage with it."
-)
+    return _asset_dialogue(asset) + asset_tool_hint(actions)
 
 
 def _asset_dialogue(asset: object) -> str:
@@ -4328,7 +4374,8 @@ def resolved_config() -> dict[str, object]:
       (issue #181). The stem is the unit the fleet inventory keys a powerful tool on, and is
       **not** 1:1 with the resolved ``tools``/``builtins`` names (one stem can fan out — e.g.
       ``code_execution`` → the ``code_interpreter`` built-in **+** the ``code_attach`` tool —
-      and a name can differ from its stem — ``hear_audio`` → ``listen``). Reporting the stems
+      and a name can differ from its stem — ``xai_search`` → ``web_search``/``x_search``).
+      Reporting the stems
       lets the NOC's fleet-drift audit compare declared-vs-active inventory like-for-like,
       holding no stem→name map of its own. ``[]`` for a safe default config (no opt-in tool).
     - ``overlay_tool_stems`` — what this box's ``tools/`` overlay **contains**: the sorted stems

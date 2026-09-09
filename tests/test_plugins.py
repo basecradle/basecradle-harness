@@ -180,11 +180,12 @@ def test_exactly_one_of_two_same_named_variants_activates_per_config():
 # provider, not loaded here. See test_memory_provider.py.
 _DEFAULT_TOOLS = {
     "web_fetch",
+    # Every sense the agent has rides `assets` (issue #484): `view`, `watch` and — where a
+    # transcription provider is configured — `listen` are actions on this one tool, not tools of
+    # their own. They are benign for the reason they always were: no provider call, nothing spent,
+    # nothing created, and video decoded in-process (PyAV, no subprocess), unlike the media
+    # *generators*, which are opt-in (issues #168, #471).
     "assets",
-    # Benign, not powerful: `watch_video` makes no provider call, spends nothing, creates nothing,
-    # and decodes in-process (PyAV, no subprocess) — so it rides the default set beside `view`
-    # and `read`, unlike the media *generators*, which are opt-in (issue #471).
-    "watch_video",
     "tasks",
     "timelines",
     "trust",
@@ -199,7 +200,7 @@ _DEFAULT_TOOLS = {
 # Powerful tools are **opt-in everywhere** (issue #168): off by default on every provider,
 # activated only by an explicit `tools/` overlay. They are NOT in the packaged-default load.
 # OpenAI-coupled power *function* tools; `web_search` is a power *built-in* (tested separately).
-_OPENAI_POWER_TOOLS = {"generate_image", "edit_image", "listen"}
+_OPENAI_POWER_TOOLS = {"generate_image", "edit_image"}
 
 
 def test_packaged_defaults_are_benign_only_power_tools_are_opt_in():
@@ -208,7 +209,7 @@ def test_packaged_defaults_are_benign_only_power_tools_are_opt_in():
     resolved = resolve_plugins(load_plugins(), _ctx(AI_API_KEY="sk"))
     names = {t.name for t in resolved.tools}
     assert names == _DEFAULT_TOOLS
-    assert not (_OPENAI_POWER_TOOLS & names)  # no generate_image/edit_image/listen
+    assert not (_OPENAI_POWER_TOOLS & names)  # no generate_image/edit_image
     assert resolved.builtins == []  # web_search is a power built-in → opt-in, not auto-on
 
 
@@ -822,3 +823,62 @@ def test_an_uninstalled_config_home_reports_no_overlay_at_all(tmp_path):
 def test_load_default_plugins_reports_no_overlay(tmp_path):
     # The off-box question ("what does the package ship?") reads no config home by construction.
     assert load_default_plugins(provider="openai").overlay_stems is None
+
+
+# --- `configure`: a tool built to the active config (issue #484) --------------
+
+
+class _Configurable(Tool):
+    """A tool whose shape depends on the config, the way the assets tool's senses do."""
+
+    name = "configurable"
+    description = "Configurable."
+
+    def __init__(self, *, extra: bool = False) -> None:
+        self.extra = extra
+
+    def run(self, **kwargs):
+        return "ok"
+
+
+def test_configure_builds_the_tool_for_the_active_config():
+    """The third answer between "gate the whole plugin" and "ship it unconditionally".
+
+    Gating the assets plugin on `OpenAIKey` would take *files* away from every non-OpenAI agent;
+    shipping `listen` unconditionally would show them a door that does not open. `configure` keeps
+    one plugin and builds its tool to the config.
+    """
+    plugin = ToolPlugin(
+        impl=_Configurable, configure=lambda ctx: {"extra": bool(ctx.env.get("EXTRA"))}
+    )
+
+    with_extra = resolve_plugins([plugin], _ctx(EXTRA="1")).tools[0]
+    without = resolve_plugins([plugin], _ctx()).tools[0]
+
+    assert with_extra.extra is True and without.extra is False
+
+
+def test_a_plugin_with_no_configure_is_built_exactly_as_it_always_was():
+    """The regression bar: every other plugin is still `impl()`, with no options at all."""
+    tool = resolve_plugins([ToolPlugin(impl=_Configurable)], _ctx()).tools[0]
+
+    assert tool.extra is False
+
+
+def test_the_shipped_assets_plugin_declares_the_hook_and_no_provider_affinity():
+    """The trap the hook's *placement* avoids, pinned so a later edit cannot walk into it.
+
+    The installer reads a plugin file's provider affinity from its **source** (`OpenAIKey()` in the
+    text ⇒ OpenAI-only). Writing the gate inline in `tools/assets.py` would therefore mark the
+    universal assets plugin OpenAI-only and stop it loading on every other agent in the fleet —
+    which is why `assets_options` lives in `_assets.py` and the file merely names it.
+    """
+    from importlib.resources import files
+
+    from basecradle_harness._install import plugin_source_providers
+
+    source = files("basecradle_harness").joinpath("_defaults", "tools", "assets.py").read_text()
+
+    assert "configure=assets_options" in source
+    assert "OpenAIKey" not in source
+    assert plugin_source_providers(source) is None  # universal: relevant to every agent

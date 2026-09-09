@@ -61,7 +61,7 @@ def test_only_computes_a_pruned_personas_exact_tools_pin():
 @pytest.mark.parametrize(
     ("provider", "sdk", "opt_in"),
     [
-        ("openai", "openai", ["generate_image", "code_execution", "hear_audio"]),
+        ("openai", "openai", ["generate_image", "code_execution", "web_search"]),
         ("openai", "openai", []),
         ("xai", "xai-sdk", ["xai_search", "grok_generate_image", "xai_account_balance"]),
         ("openrouter", "openrouter", ["openrouter_search"]),
@@ -192,7 +192,7 @@ def test_credential_gated_tools_are_assumed_present_and_say_so():
     the vars assumed, and each resolved name that only exists because of one carries
     `assumes_credential`.
     """
-    report = resolve_stems(provider="openai", opt_in="generate_image,hear_audio,web_search")
+    report = resolve_stems(provider="openai", opt_in="generate_image,edit_image,web_search")
 
     assert report["credentials"] == {
         "mode": "assumed",
@@ -201,12 +201,11 @@ def test_credential_gated_tools_are_assumed_present_and_say_so():
         "wanted": ["AI_API_KEY"],
     }
     assert report["stems"]["generate_image"]["assumes_credential"] == ["AI_API_KEY"]
-    # `hear_audio` is the stem-vs-name trap in the same breath: its tool is called `listen`.
-    assert report["stems"]["hear_audio"]["tools"] == ["listen"]
-    assert report["stems"]["hear_audio"]["assumes_credential"] == ["AI_API_KEY"]
+    assert report["stems"]["edit_image"]["tools"] == ["edit_image"]
+    assert report["stems"]["edit_image"]["assumes_credential"] == ["AI_API_KEY"]
     # A powerful tool gated on the *provider*, not a credential, is unconditional — no marker.
     assert report["stems"]["web_search"]["assumes_credential"] == []
-    assert {"generate_image", "listen"} <= set(report["tools"])
+    assert {"generate_image", "edit_image"} <= set(report["tools"])
 
 
 def test_no_assume_credentials_reports_them_inactive_with_the_reason():

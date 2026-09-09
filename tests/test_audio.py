@@ -1,10 +1,14 @@
-"""The audio-perception tool, against a respx-mocked Audio API and platform.
+"""Audio perception — the assets tool's ``listen`` action, against a respx-mocked Audio API.
 
 No live calls: respx stands in for both the OpenAI Audio API (which returns a
 transcript) and the BaseCradle SDK transport (asset metadata + the blob fetch).
 The fictional cast: Nova Digital (``nova``, AI) listens to a voice note John Doe
 (``john``, human) shared on a timeline. The tool runs through a *real* `BaseCradle`
 client — only its HTTP is mocked — and a real httpx call to the (fake) Audio API.
+
+Hearing was a standalone ``hear_audio`` tool until issue #484 folded it into `assets` beside
+`view` and `watch`. These tests moved with the code: the provider call, the refusals and the log
+line are the same contract, reached through ``action='listen'``.
 """
 
 import httpx
@@ -12,7 +16,7 @@ import pytest
 import respx
 from basecradle import BaseCradle
 
-from basecradle_harness import HearAudioTool, PlatformContext, PlatformError
+from basecradle_harness import AssetsTool, PlatformContext, PlatformError, Transcriber
 
 BC_URL = "https://basecradle.com"
 AUDIO_BASE = "https://api.openai.test/v1"
@@ -57,10 +61,15 @@ def client():
     c.close()
 
 
+def hearing(**kwargs) -> AssetsTool:
+    """An assets tool that can hear, pointed at the fake Audio API."""
+    return AssetsTool(transcriber=Transcriber(base_url=AUDIO_BASE, **kwargs))
+
+
 @pytest.fixture
 def tool(client):
-    """A HearAudioTool bound to John's timeline, pointed at the fake Audio API."""
-    t = HearAudioTool(api_key=FAKE_KEY, base_url=AUDIO_BASE)
+    """A hearing assets tool bound to John's timeline, pointed at the fake Audio API."""
+    t = hearing(api_key=FAKE_KEY)
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     return t
 
@@ -82,7 +91,7 @@ def test_listen_transcribes_the_audio(tool):
         )
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(side_effect=transcribe)
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     # The audio rode as a multipart upload carrying the blob bytes and the model name.
     assert "multipart/form-data" in captured["content_type"]
@@ -107,12 +116,12 @@ def test_listen_passes_the_api_key_and_filename(tool):
         )
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(side_effect=transcribe)
-        tool.run(uuid=A_AUDIO)
+        tool.run(action="listen", uuid=A_AUDIO)
 
 
 def test_api_key_falls_back_to_env(client, monkeypatch):
     monkeypatch.setenv("AI_API_KEY", FAKE_KEY)
-    t = HearAudioTool(base_url=AUDIO_BASE)  # no key passed
+    t = hearing()  # no key passed
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/assets/{A_AUDIO}").mock(
@@ -122,7 +131,7 @@ def test_api_key_falls_back_to_env(client, monkeypatch):
         post = mock.post(AUDIO_URL).mock(
             return_value=httpx.Response(200, json={"text": TRANSCRIPT})
         )
-        t.run(uuid=A_AUDIO)
+        t.run(action="listen", uuid=A_AUDIO)
     assert post.calls.last.request.headers["Authorization"] == f"Bearer {FAKE_KEY}"
 
 
@@ -138,7 +147,7 @@ def test_listen_rejects_a_non_audio_file(tool):
                 200, json={"asset": audio_asset(content_type="image/png", filename="cat.png")}
             )
         )
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     assert "not an audio file" in result
     assert "Transcript" not in result
@@ -149,7 +158,7 @@ def test_listen_rejects_an_empty_file(tool):
         mock.get(f"{BC_URL}/assets/{A_AUDIO}").mock(
             return_value=httpx.Response(200, json={"asset": audio_asset(byte_size=0)})
         )
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     assert "empty file" in result
 
@@ -161,7 +170,7 @@ def test_listen_rejects_an_oversized_file(tool):
                 200, json={"asset": audio_asset(byte_size=30 * 1024 * 1024)}
             )
         )
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     assert "too large to listen to" in result
 
@@ -173,7 +182,7 @@ def test_no_speech_detected_is_a_clean_note(tool):
         )
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(return_value=httpx.Response(200, json={"text": "   "}))
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     assert "no speech was detected" in result
 
@@ -182,19 +191,19 @@ def test_no_speech_detected_is_a_clean_note(tool):
 
 
 def test_missing_uuid_is_a_friendly_error(tool):
-    assert "needs the audio asset's uuid" in tool.run(uuid="   ")
+    assert "'listen' needs the asset's uuid" in tool.run(action="listen", uuid="   ")
 
 
 def test_no_api_key_is_a_friendly_error(client, monkeypatch):
     monkeypatch.delenv("AI_API_KEY", raising=False)
-    t = HearAudioTool(base_url=AUDIO_BASE)  # no key passed, none in env
+    t = hearing()  # no key passed, none in env
     t.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
     with respx.mock(assert_all_called=True) as mock:
         # The asset is fetched (to learn it's audio); the provider is never reached.
         mock.get(f"{BC_URL}/assets/{A_AUDIO}").mock(
             return_value=httpx.Response(200, json={"asset": audio_asset()})
         )
-        result = t.run(uuid=A_AUDIO)
+        result = t.run(action="listen", uuid=A_AUDIO)
     assert "no API key" in result
 
 
@@ -205,7 +214,7 @@ def test_an_api_error_is_relayed_to_the_model(tool):
         )
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(return_value=httpx.Response(400, text="unsupported format"))
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     assert "Error transcribing audio" in result
 
@@ -217,7 +226,7 @@ def test_a_missing_text_field_is_a_friendly_error(tool):
         )
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(return_value=httpx.Response(200, json={}))
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     assert "no text" in result
 
@@ -230,7 +239,7 @@ def test_a_non_object_body_is_a_friendly_error(tool):
         )
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(return_value=httpx.Response(200, json="rate limited"))
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     assert "Error transcribing audio" in result
     assert "no text" in result
@@ -243,7 +252,7 @@ def test_a_transport_failure_is_relayed_to_the_model(tool):
         )
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(side_effect=httpx.ConnectError("no route"))
-        result = tool.run(uuid=A_AUDIO)
+        result = tool.run(action="listen", uuid=A_AUDIO)
 
     assert "could not reach the transcription API" in result
 
@@ -251,17 +260,36 @@ def test_a_transport_failure_is_relayed_to_the_model(tool):
 # --- the tool contract & binding ---------------------------------------------
 
 
-def test_spec_requires_a_uuid(tool):
+def test_listen_is_an_action_on_the_assets_tool(tool):
     spec = tool.to_spec()
-    assert spec.name == "listen"
-    assert spec.parameters["required"] == ["uuid"]
+    assert spec.name == "assets"
+    assert "listen" in spec.parameters["properties"]["action"]["enum"]
+    assert spec.parameters["required"] == ["action"]
+
+
+def test_an_agent_with_no_transcription_provider_is_shown_no_locked_door():
+    """Issue #484: `listen` is absent from the schema *and* the prose, never present-and-failing."""
+    deaf = AssetsTool()
+
+    spec = deaf.to_spec()
+    assert "listen" not in spec.parameters["properties"]["action"]["enum"]
+    assert "listen" not in spec.description
+    # ...and a model that guesses it anyway is told what this agent actually has.
+    assert "unknown action 'listen'" in deaf.run(action="listen", uuid=A_AUDIO)
+
+
+def test_a_transcriber_is_all_it_takes_to_hear():
+    """Passing one implies `listen`: a caller never says the same thing twice."""
+    assert "listen" in AssetsTool(transcriber=Transcriber()).actions
+    assert "listen" in AssetsTool(listen=True).actions
+    assert "listen" not in AssetsTool().actions
 
 
 def test_an_unbound_tool_raises_platform_error(monkeypatch):
     monkeypatch.setenv("AI_API_KEY", FAKE_KEY)
     with pytest.raises(PlatformError):
         # Even fetching the asset needs a bound platform context.
-        HearAudioTool(api_key=FAKE_KEY, base_url=AUDIO_BASE).run(uuid=A_AUDIO)
+        hearing(api_key=FAKE_KEY).run(action="listen", uuid=A_AUDIO)
 
 
 def test_listen_loads_under_the_locked_profile(client):
@@ -269,8 +297,8 @@ def test_listen_loads_under_the_locked_profile(client):
     from basecradle_harness import Policy, ToolRegistry
 
     registry = ToolRegistry(policy=Policy.locked())
-    registry.register(HearAudioTool())
-    assert "listen" in registry
+    registry.register(AssetsTool(listen=True))
+    assert "assets" in registry
 
 
 # --- the media log line (issue #272) -----------------------------------------
@@ -286,7 +314,7 @@ def test_a_transcription_logs_one_media_line(tool, caplog):
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(return_value=httpx.Response(200, json={"text": TRANSCRIPT}))
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            tool.run(uuid=A_AUDIO)
+            tool.run(action="listen", uuid=A_AUDIO)
 
     line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
     assert "provider=openai" in line and "kind=audio.transcribe" in line

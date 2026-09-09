@@ -289,6 +289,11 @@ UNCHANGED = "unchanged"  # shipped default unchanged since last install → left
 PRUNED = (
     "pruned"  # a previously-installed default is now provider-mismatched → removed (issue #160)
 )
+# A previously-installed default this package **no longer ships at all** → removed (issue #484).
+# Distinct from PRUNED, which is about a default that still exists but belongs to another provider:
+# a retired tool is gone for everyone, and the diagnosis an operator needs is "that capability moved
+# or went away", not "that capability is for a different provider".
+RETIRED = "retired"
 # A **granted** opt-in tool that had gone missing → laid back down (issue #374). The one case where
 # a reconcile writes a file the operator does not currently have: its presence is *declared*, so an
 # undeclared absence is a strip to heal, not a deletion to respect. `--revoke-opt-in` is how the
@@ -426,7 +431,7 @@ def install(
     # from the provider filter so the provider-prune below still keys on `shipped_provider`.
     shipped, grandfathered_rels = _opt_in_scaffold_set(shipped_provider, granted, explicit)
 
-    # A typo in --opt-in (the stem-vs-name trap, e.g. "listen" for the file "hear_audio") would
+    # A typo in --opt-in (the stem-vs-name trap, e.g. "x_search" for the file "xai_search") would
     # otherwise scaffold nothing, silently — so name any opt-in that matched no powerful default.
     _warn_unmatched_opt_in([*opt_in, *revoke_opt_in], shipped_all)
 
@@ -455,6 +460,10 @@ def install(
             len(report.grandfathered),
             ", ".join(report.grandfathered),
         )
+
+    # Always, and before the provider prune: a default this package no longer ships at all is a
+    # *retired* tool, and a copy left behind in the overlay would keep loading (issue #484).
+    _prune_retired_defaults(root, shipped_all, recorded, updated, report)
 
     if shipped_provider is not shipped_all:  # provider-aware: clean up now-mismatched defaults
         _prune_mismatched_defaults(root, shipped_all, shipped_provider, recorded, updated, report)
@@ -525,8 +534,8 @@ def _power_tool_stems(shipped: dict[str, str]) -> set[str]:
 def _warn_unmatched_opt_in(named: Sequence[str], shipped_all: dict[str, str]) -> None:
     """Warn (loudly, never silently) for any grant/revoke name that matches no powerful default.
 
-    Catches the stem-vs-name trap (issue #168): ``--opt-in listen`` names the *tool* but the file
-    stem is ``hear_audio``, so it would otherwise scaffold nothing with no diagnostic — the
+    Catches the stem-vs-name trap (issue #168): ``--opt-in x_search`` names a *tool* but the file
+    stem is ``xai_search``, so it would otherwise scaffold nothing with no diagnostic — the
     operator thinks they granted a tool that is silently absent. A name that matches a power tool
     which is merely provider-mismatched is *not* flagged here (it is a real tool, just unavailable
     for this provider); only a name matching no power tool at all is a likely typo. The same trap
@@ -538,8 +547,8 @@ def _warn_unmatched_opt_in(named: Sequence[str], shipped_all: dict[str, str]) ->
     if unknown:
         _log.warning(
             "--opt-in/--revoke-opt-in named no powerful tool default and did nothing for: %s. The "
-            "known opt-in tools are: %s. (Pass the plugin *file stem*, e.g. 'hear_audio', not "
-            "'listen'.)",
+            "known opt-in tools are: %s. (Pass the plugin *file stem*, e.g. 'xai_search', not "
+            "a tool name it resolves to, like 'x_search'.)",
             ", ".join(unknown),
             ", ".join(sorted(known)),
         )
@@ -649,6 +658,65 @@ def _revoke_grants(
                 stem,
                 target,
             )
+
+
+def _prune_retired_defaults(
+    root: Path,
+    shipped_all: dict[str, str],
+    recorded: dict[str, str],
+    updated: dict[str, str],
+    report: InstallReport,
+) -> None:
+    """Remove a previously-installed tool default this package **no longer ships** (issue #484).
+
+    The upgrade case a conffile reconcile has no opinion about: `_reconcile` walks the *shipped*
+    set, so a default that has been **retired** — ``watch_video.py`` and ``hear_audio.py``, whose
+    capabilities became actions on the assets tool — is never visited at all, and its copy sits in
+    the overlay being loaded by every wake. That is worse than clutter: a stale plugin file
+    resurrects a dead tool, or (once its import target is gone) logs a load failure forever.
+
+    The same three-way conffile courtesy `_prune_mismatched_defaults` applies, and for the same
+    reasons: a **pristine** copy is ours and is removed; an **already-absent** one just has its
+    stale manifest entry dropped; an **operator-edited** one is left on disk — their edit wins, and
+    a reconcile has never deleted an operator's work — but its manifest entry goes either way,
+    because this package no longer has a default to reconcile it against. That last case is logged
+    at WARNING: the file is now an operator-added plugin whose imports this version may not
+    satisfy, and an unexplained load failure on the next wake is exactly what a log line prevents.
+
+    **A grant is not withdrawn here.** A retired opt-in tool that was granted stays in
+    ``.declared.json`` and turns `basecradle-harness-verify` red as ``grant-not-shipped``, with
+    ``--revoke-opt-in <stem>`` as the remedy — which is the point of issue #374's asymmetry: a
+    reconcile that quietly dropped a declared capability would erase the evidence that it ever
+    existed, and a capability going away is exactly the thing an operator must be told about.
+    """
+    for rel in list(recorded):
+        if not _is_tool_plugin(rel) or rel in shipped_all:
+            continue  # still a shipped default (for some provider) → not our business here
+        target = root.joinpath(*rel.split("/"))
+        if not target.exists():
+            updated.pop(rel, None)  # already gone → drop the stale manifest entry
+            report.actions[rel] = RETIRED
+            continue
+        try:
+            pristine = _hash(target.read_text(encoding="utf-8")) == recorded.get(rel)
+        except OSError:
+            # Unreadable: keep the file *and* its manifest entry rather than act on a guess. The
+            # next reconcile re-reads it; a blind delete is the one outcome with no way back.
+            continue
+        if pristine:
+            target.unlink()  # ours, unedited, and no longer a tool this package has
+            updated.pop(rel, None)
+            report.actions[rel] = RETIRED
+            continue
+        updated.pop(rel, None)  # edited: theirs to keep, but no longer a default we track
+        report.actions[rel] = KEPT_EDITED
+        _log.warning(
+            "Tool plugin %s was retired in basecradle-harness %s but you have edited it, so it "
+            "has been left in place and is no longer managed. It may fail to load against this "
+            "version; delete it if you no longer want it.",
+            rel,
+            __version__,
+        )
 
 
 def _prune_mismatched_defaults(
