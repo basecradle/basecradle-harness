@@ -7,17 +7,17 @@ tools, split by operation, the tool-building discipline (full surface → covera
 split by operation → every option tested):
 
 - `GrokGenerateImageTool` (``grok_generate_image``) — text → image, via xAI's OpenAI-shaped
-  Images endpoint (``POST /v1/images/generations``, ``grok-imagine-image-quality``).
+  Images endpoint (``POST /v1/images/generations``, ``grok-imagine-image-2.0``).
 - `GrokEditImageTool` (``grok_edit_image``) — image(s) → image, via xAI's image-edit endpoint
-  (``POST /v1/images/edits``, ``grok-imagine-image-quality``). The xAI-native counterpart to
+  (``POST /v1/images/edits``, ``grok-imagine-image-2.0``). The xAI-native counterpart to
   the OpenAI `edit_image` (``_images.py``). Two asymmetries vs OpenAI, both deliberate and
   documented: (1) the OpenAI SDK's ``images.edit()`` is **not** usable — it sends
   ``multipart/form-data`` and xAI requires ``application/json`` (xAI's docs say so explicitly),
   so this tool posts JSON over the shared grok transport, sending each source image as a
   **base64 data URI** (the signed Asset URL is not assumed publicly fetchable by xAI); (2) xAI
   does **natural-language** editing with **no mask** (no mask-based inpainting), so — unlike
-  OpenAI `edit_image` — there is no ``mask`` parameter. xAI composites up to **3** source
-  images. The request shape is ``image`` (a single ``{"type":"image_url","url":…}`` object) for
+  OpenAI `edit_image` — there is no ``mask`` parameter. xAI composites up to
+  `MAX_EDIT_SOURCES` source images. The request shape is ``image`` (a single ``{"type":"image_url","url":…}`` object) for
   one source, or ``images`` (an array of them) for a composite (docs.x.ai images/editing +
   multi-image-editing) — the shape image-to-video now shares (see below).
 - `GrokGenerateVideoTool` (``grok_generate_video``) — text → video **or** image → video, via
@@ -87,8 +87,21 @@ from basecradle_harness._platform import PlatformTool, explain
 #: xAI's API root. These tools are xAI-native; this changes only for a proxy, never to reach
 #: another vendor (the key is the agent's xAI key).
 DEFAULT_BASE_URL = "https://api.x.ai/v1"
-#: The grok image model — xAI's quality image tier.
-DEFAULT_IMAGE_MODEL = "grok-imagine-image-quality"
+#: The grok image model. ``grok-imagine-image-2.0`` is xAI's current image model and heads its own
+#: listing — **newer and cheaper** than the ``grok-imagine-image-quality`` tier this replaced
+#: ($0.04 vs $0.05 an image), on the same two endpoints. Raised on the founder's standing rule
+#: (@origin, 2026-09-09, issue #477): *when a newer version has no downside, upgrade — and update
+#: every doc, instruction and cap to what is current for the new version in the same change.*
+#: xAI's own listing is the authority on both the lineup and the price.
+DEFAULT_IMAGE_MODEL = "grok-imagine-image-2.0"
+
+#: How many source images ``grok_edit_image`` may composite in one call, per docs.x.ai →
+#: Multi-Image Editing ("up to five source images"). It is a **constant rather than six copies of
+#: a number in prose**, because the number it replaced was wrong in exactly that way: xAI raised
+#: the cap from 3 to 5 and the tool went on telling the model 3 in its description, its schema, its
+#: module docstring, its plugin comment and the README — under-using a real capability with nothing
+#: to say so. Every model-facing mention is now composed from this name.
+MAX_EDIT_SOURCES = 5
 #: The grok video model. ``grok-imagine-video-1.5`` is xAI's current stable video model — the
 #: one carrying the rolling aliases (``-preview``, a dated alias). ``grok-imagine-video`` is the
 #: frozen original an operator can still pass: it has *no* aliases, so it is a pinned model and
@@ -97,7 +110,7 @@ DEFAULT_IMAGE_MODEL = "grok-imagine-image-quality"
 DEFAULT_VIDEO_MODEL = "grok-imagine-video-1.5"
 #: Per-request HTTP timeout. Generous — a generation submit/poll call is slower than a chat
 #: call, and ``grok_edit_image`` runs the same class of slow, high-fidelity image-edit work
-#: (``grok-imagine-image-quality``) that a measured ~133s ``gpt-image-2`` ``quality: high``
+#: (the grok image tier) that a measured ~133s ``gpt-image-2`` ``quality: high``
 #: edit timed out under a 120s ceiling (issue #222, sibling of #219). 300s clears that class
 #: of worst case with headroom; a timeout is a ceiling, not a fixed wait, so it costs nothing
 #: on fast calls.
@@ -345,7 +358,8 @@ class GrokEditImageTool(_GrokMediaTool):
     raw multipart bytes, xAI's takes **JSON** with each source as a base64 **data URI** — so the
     tool resolves each source Asset by uuid, downloads its bytes through the bound SDK client's
     signed blob URL, and inlines them as ``data:<type>;base64,…``. A single source rides the
-    ``image`` object; two or three composite via the ``images`` array. There is **no mask** —
+    ``image`` object; two or more (up to `MAX_EDIT_SOURCES`) composite via the ``images`` array.
+    There is **no mask** —
     xAI edits by natural language, not a mask-based region (documented asymmetry vs OpenAI).
     """
 
@@ -355,8 +369,8 @@ class GrokEditImageTool(_GrokMediaTool):
         "the result as a new file, the way a peer marks up or restyles a picture. Give one or "
         "more source asset uuids in 'image' (find them with the assets tool's 'list') and "
         "describe the change in 'prompt' (e.g. 'recolor the car red', or composite several "
-        "sources — up to 3). Unlike editing with a mask, grok edits by natural language, so "
-        "there is no mask region. To make a brand-new image from text instead, use "
+        f"sources — up to {MAX_EDIT_SOURCES}). Unlike editing with a mask, grok edits by natural "
+        "language, so there is no mask region. To make a brand-new image from text instead, use "
         "'grok_generate_image'. Returns the new asset's uuid."
     )
     parameters = {
@@ -367,7 +381,8 @@ class GrokEditImageTool(_GrokMediaTool):
                 "items": {"type": "string"},
                 "description": (
                     "One or more source image asset uuids to edit. Get them from the assets "
-                    "tool's 'list'. Pass several (up to 3) to composite them into one image."
+                    f"tool's 'list'. Pass several (up to {MAX_EDIT_SOURCES}) to composite them "
+                    "into one image."
                 ),
             },
             "prompt": {
@@ -423,7 +438,8 @@ class GrokEditImageTool(_GrokMediaTool):
         }
         try:
             sources = [self._source_image(uuid) for uuid in uuids]
-            # One source rides the ``image`` object; a composite (2-3) rides the ``images`` array
+            # One source rides the ``image`` object; a composite (2..MAX_EDIT_SOURCES) rides the
+            # ``images`` array
             # — the two request shapes xAI's single- and multi-image edit endpoints document.
             if len(sources) == 1:
                 payload["image"] = sources[0]
@@ -468,21 +484,28 @@ class GrokGenerateVideoTool(_GrokMediaTool):
     description = (
         "Create a short video with xAI's grok video model and post it as a file on the "
         "timeline, where it renders inline. Text-to-video from a 'prompt', or image-to-video "
-        "by also passing 'image' (a source image asset's uuid) to animate it. Generation takes "
-        "a minute or two. Returns the new asset's uuid."
+        "by also passing 'image' (a source image asset's uuid) to animate it. A 'prompt' is "
+        "required for text-to-video and optional for image-to-video — but give one anyway "
+        "unless you truly want whatever motion the model invents, because the prompt is how "
+        "you say what should happen. Generation takes a minute or two. Returns the new "
+        "asset's uuid."
     )
     parameters = {
         "type": "object",
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "What should happen in the video — motion, scene, camera.",
+                "description": (
+                    "What should happen in the video — motion, scene, camera. Required unless "
+                    "you pass 'image'; with an 'image' it is optional but strongly advised."
+                ),
             },
             "image": {
                 "type": "string",
                 "description": (
                     "Optional source image asset uuid to animate (image-to-video). The video "
-                    "starts from this frame; omit for text-to-video."
+                    "starts from this frame; omit for text-to-video. With an 'image' the "
+                    "'prompt' may be omitted and the model animates the still on its own."
                 ),
             },
             "duration": {
@@ -515,7 +538,12 @@ class GrokGenerateVideoTool(_GrokMediaTool):
                 "description": "Optional timeline uuid to post to. Defaults to the current timeline.",
             },
         },
-        "required": ["prompt"],
+        # Empty on purpose. The real rule is **one of** ``prompt`` or ``image`` — xAI made
+        # ``prompt`` optional for image-to-video (issue #477), and JSON Schema can only say that
+        # with an ``anyOf`` that several vendors' function-calling validators reject outright. So
+        # the schema states no requirement and `run` enforces the rule, which is where a violation
+        # can be answered with a sentence the model can act on rather than a 400 it cannot.
+        "required": [],
     }
 
     default_model = DEFAULT_VIDEO_MODEL
@@ -536,7 +564,7 @@ class GrokGenerateVideoTool(_GrokMediaTool):
 
     def run(
         self,
-        prompt: str,
+        prompt: str | None = None,
         image: str | None = None,
         duration: int | None = None,
         aspect_ratio: str | None = None,
@@ -546,13 +574,23 @@ class GrokGenerateVideoTool(_GrokMediaTool):
         timeline: str | None = None,
     ) -> str:
         """Submit the video job, poll it to completion, upload the clip, and report the asset."""
-        if not prompt or not prompt.strip():
-            return "Error: 'grok_generate_video' needs a 'prompt' describing the video."
+        # One of `prompt` or `image` — the schema cannot say it portably, so it is said here, and
+        # said in a sentence the model can act on. An `image` alone is legal image-to-video: xAI
+        # animates the still with no instruction (issue #477).
+        if not (prompt and prompt.strip()) and not (image and image.strip()):
+            return (
+                "Error: 'grok_generate_video' needs a 'prompt' describing the video, or an "
+                "'image' asset uuid to animate (or both)."
+            )
         key = self._key()
         if not key:
             return "Error: no API key for video generation. Set AI_API_KEY to the agent's xAI key."
 
-        payload: dict[str, Any] = {"model": self._model, "prompt": prompt}
+        # Send ``prompt`` only when there is one: an empty string is not the same request as an
+        # absent field, and image-to-video's whole new mode is *no instruction at all*.
+        payload: dict[str, Any] = {"model": self._model}
+        if prompt and prompt.strip():
+            payload["prompt"] = prompt
         if duration is not None:
             payload["duration"] = duration
         if aspect_ratio:
@@ -560,13 +598,14 @@ class GrokGenerateVideoTool(_GrokMediaTool):
         if resolution:
             payload["resolution"] = resolution
 
+        source = image.strip() if image else ""
         try:
-            if image:
+            if source:
                 # ``image`` — the documented request field (an object). NOT ``image_url``: that
                 # is the *xai_sdk* keyword argument, and sending it as a REST body key is the
                 # bug this replaced (issue #470) — xAI ignored the unknown key and silently ran
                 # plain text-to-video, at identical cost, for every image-to-video call.
-                payload["image"] = self._source_image(image)
+                payload["image"] = self._source_image(source)
             # The timed span is submit → done (the poll loop *is* the generation on this
             # endpoint); the clip download that follows is transfer, not model time. The charge
             # rides the completed `done` poll body, so cost comes back from `_await_video`.
@@ -583,12 +622,15 @@ class GrokGenerateVideoTool(_GrokMediaTool):
 
         target = timeline or self.context.timeline
         ext = sniff_media_ext(video_bytes, "mp4")
-        name = media_filename(filename, prompt, ext)
+        # With no prompt there is no phrase to name the file or describe it from, so both fall back
+        # to what the call actually was — an animation of a still.
+        subject = prompt.strip() if prompt and prompt.strip() else "animated image"
+        name = media_filename(filename, subject, ext)
         posted = self._post_asset(
             target,
             video_bytes,
             name,
-            description or f"Generated video: {prompt}",
+            description or f"Generated video: {subject}",
             "Generated and posted",
         )
         # Point the model at its own eyes. A generated clip is the one asset whose *content* the

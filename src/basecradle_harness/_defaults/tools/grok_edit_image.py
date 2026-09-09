@@ -1,6 +1,6 @@
 # Default tool plugin: grok_edit_image (xAI). Delete to disable; see memory.py for the contract.
 #
-# xAI-native image editing — natural-language edit of one or more existing image Assets (up to 3,
+# xAI-native image editing — natural-language edit of one or more existing image Assets (up to 5,
 # composited) into a new Asset. Requires the xAI provider (AI_PROVIDER=xai); self-excludes under
 # any other provider (the OpenAI edit_image tool covers that case instead), so an xAI agent's
 # media stack touches no OpenAI surface.

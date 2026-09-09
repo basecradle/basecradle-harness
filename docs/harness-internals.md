@@ -364,7 +364,7 @@ the **endpoint vendor** (`base_url`). Corrected facts:
   **not** accept OpenAI's `tools:[{type:web_search}]` entry. Citations ground the reply via the
   existing parsing. Both are **opt-in** powerful tools (#168) — per-persona, never provider-gated.
 - **grok media tools** (`_grok.py`, httpx `PlatformTool`s, independent of the chat SDK):
-  `grok_generate_image` (text → image, `grok-imagine-image-quality`) and `grok_generate_video` —
+  `grok_generate_image` (text → image, `grok-imagine-image-2.0`) and `grok_generate_video` —
   the harness's **first video capability**, text→video and image→video, over xAI's **asynchronous**
   endpoint (submit → poll `GET /v1/videos/{id}` until `done` → download → upload as an inline
   Asset). Full `duration`/`aspect_ratio`/`resolution` coverage; failures relay xAI's actual message.
@@ -612,6 +612,18 @@ to ask a human to look.
 - **A posted video is acknowledged, never auto-watched.** `_perceive_asset` stays as it was; the
   asset hint names `watch_video` beside `view`/`listen`. Loading a clip and decoding frames is a
   real cost, so it stays the agent's call, exactly as `read` and `listen` are.
+
+**Follow-up, founder-decided 2026-09-09 (issue #477).** Three vendor-drift corrections landed with
+this release, under a standing rule @origin stated with the decision: *when a newer version has no
+downside, upgrade — and update every doc, instruction and cap to what is current for the new version
+in the same change.* The grok image default moved to `grok-imagine-image-2.0` (newer **and** cheaper
+than the tier it replaced, same endpoints); the edit composite cap moved 3 → 5, and is now a
+**constant every model-facing mention is composed from** — the number it replaced was wrong in five
+separate copies at once, under-using a real capability with nothing to say so; and `prompt` became
+optional for image-to-video, where the tool's `run` carries the "one of `prompt` or `image`" rule
+because JSON Schema can only state it with an `anyOf` several vendors' function-calling validators
+reject. The empty `required: []` on that schema is therefore deliberate, and a later "tidy-up" that
+restores `["prompt"]` silently deletes the new mode.
 
 **Boundary:** the fixture clips are **encoded by the tests themselves** with PyAV — five seconds at
 24 fps whose colour changes on each whole second — so a sampled frame's timestamp *and* which second

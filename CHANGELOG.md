@@ -54,6 +54,30 @@ New public API: `WatchVideoTool`, `VideoContent`, `FrameSampling`, `VideoInfo`, 
 `sample_frames`. `ToolResult` and `Message` gained a `videos` field (serialized, and restored with
 default sampling from a record that predates it).
 
+### Changed: the grok image tools track xAI's current model and caps (issue #477)
+
+Three vendor-drift corrections, founder-decided 2026-09-09 under a standing rule @origin stated with
+the decision: **when a newer version has no downside, upgrade — and update every doc, instruction and
+cap to what is current for the new version in the same change.**
+
+- **`DEFAULT_IMAGE_MODEL` → `grok-imagine-image-2.0`** for `grok_generate_image` and
+  `grok_edit_image`. It heads xAI's own listing and is **cheaper** than the
+  `grok-imagine-image-quality` tier it replaces ($0.04 vs $0.05 an image), on the same endpoints.
+- **The edit composite cap is 5, not 3**, matching docs.x.ai → Multi-Image Editing. xAI raised it
+  and the tool went on telling the model 3 — in its description, its parameter schema, its module
+  docstring, its plugin comment and the README, five stale copies at once, under-using a real
+  capability with nothing to say so. It is now the constant `MAX_EDIT_SOURCES`, which every
+  model-facing mention is composed from, so the next raise is one line and cannot leave a copy
+  behind.
+- **`prompt` is optional for image-to-video.** An `image` alone is a legal request and grok animates
+  the still on its own; the field is **omitted** rather than sent empty, because an absent field and
+  an empty string are not the same request. The rule is *one of* `prompt` or `image`, and it lives
+  in the tool's `run` rather than the schema: JSON Schema can only say it with an `anyOf` that
+  several vendors' function-calling validators reject, and a violation answered in a sentence the
+  model can act on beats a 400 it cannot. `required: []` on that schema is therefore deliberate —
+  restoring `["prompt"]` would silently delete the new mode. With no prompt, the posted file's name
+  and description fall back to what the call actually was rather than to an empty string.
+
 ### Added: `HARNESS_DESCRIBER_MODEL` — a text-only brain gets eyes through a second model (issue #472)
 
 A text-only brain — @glm-5.2, whose OpenRouter `input_modalities` are text alone — cannot perceive
