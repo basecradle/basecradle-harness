@@ -3077,6 +3077,29 @@ def test_incoming_asset_is_timestamped():
     assert _incoming_asset_text(asset).startswith(f"[{TS}] john posted a file")
 
 
+def test_the_asset_hint_names_every_tool_that_opens_a_file():
+    """The hint is how an agent learns a capability exists — a tool missing from it is invisible.
+
+    `watch_video` joined it in issue #471, which is also why a posted **video** stays
+    acknowledge-only on wake: the hint says the tool is there, and the agent decides whether the
+    clip is worth loading, exactly as it decides for `read` and `listen`.
+    """
+    asset = SimpleNamespace(
+        created_at=TS,
+        user=SimpleNamespace(handle="john"),
+        content=SimpleNamespace(
+            uuid="019e7780-7777-7aaa-8bbb-728394051627",
+            description="",
+            file=SimpleNamespace(filename="clip.mp4", byte_size=4096, content_type="video/mp4"),
+        ),
+    )
+
+    text = _incoming_asset_text(asset)
+
+    for tool in ("'read'", "'view'", "'listen'", "'watch_video'"):
+        assert tool in text
+
+
 def test_incoming_event_is_timestamped():
     event = SimpleNamespace(
         created_at=TS,

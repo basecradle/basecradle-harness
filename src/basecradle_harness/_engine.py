@@ -31,6 +31,13 @@ an image has to enter as model *input*. Once the model has answered, the engine
 **evicts** those pixels (keeping a short text breadcrumb), so a viewed image is
 not re-sent — and re-billed — on every later turn. Viewing is on-demand: cheap to
 do again, never a standing cost.
+
+A `ToolResult` may also carry **videos** (`watch_video`, issue #471), and the same
+seam serves them at three tiers chosen from the provider's own declared
+capabilities — never from a vendor name: a model that takes video gets the video,
+a model that takes images gets sampled frames, a model that takes neither gets an
+honest caption saying so. Whichever tier fires, the payload is evicted after the
+turn exactly as pixels are.
 """
 
 from __future__ import annotations
@@ -40,13 +47,19 @@ import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 
-from basecradle_harness._assets import model_sees_images
+from basecradle_harness._assets import model_sees_images, model_sees_video
 from basecradle_harness._exceptions import (
     EngineError,
     ProviderResponseError,
     ProviderServerError,
 )
-from basecradle_harness._messages import ImageContent, Message, ToolResult, ToolSpec
+from basecradle_harness._messages import (
+    ImageContent,
+    Message,
+    ToolResult,
+    ToolSpec,
+    VideoContent,
+)
 from basecradle_harness._observability import describe_provider, kv
 from basecradle_harness._provider import Provider
 from basecradle_harness._tools import ToolRegistry
@@ -310,14 +323,16 @@ class Engine:
                 if on_progress is not None:
                     on_progress()
                 pictures: list[ImageContent] = []
+                clips: list[VideoContent] = []
                 for call in reply.tool_calls:
                     result = self._run_tool(call.name, call.arguments)
-                    text, images = _split_result(result)
+                    text, images, videos = _split_result(result)
                     messages.append(Message.tool(tool_call_id=call.id, content=text))
                     _progress(on_progress)
                     pictures.extend(images)
-                if pictures:
-                    self._show_images(pictures, messages, shown)
+                    clips.extend(videos)
+                if pictures or clips:
+                    self._show_media(pictures, clips, messages, shown)
                     _progress(on_progress)
                 # A post-turn hook may append follow-up turns (e.g. the code-exec bridge
                 # storing output files as Assets and feeding their uuids back) and ask the loop
@@ -348,6 +363,67 @@ class Engine:
             return self._reserve_summary(messages, on_progress)
         finally:
             _evict_images(shown)
+
+    def _show_media(
+        self,
+        pictures: list[ImageContent],
+        clips: list[VideoContent],
+        messages: list[Message],
+        shown: list[Message],
+    ) -> None:
+        """Place a turn's returned media as model input, at whatever tier the model can take.
+
+        The clips are routed first (each one to video, frames, or a caption), then the pictures,
+        so a turn that returned both ends with **one** injected turn per medium and never a `user`
+        turn spliced between two tool results — the 400 that shape produces is the reason images
+        were moved out of the per-call loop in the first place.
+        """
+        for clip in clips:
+            self._show_video(clip, messages, shown)
+        if pictures:
+            self._show_images(pictures, messages, shown)
+
+    def _show_video(
+        self, clip: VideoContent, messages: list[Message], shown: list[Message]
+    ) -> None:
+        """Show one clip at the best tier the model supports — video, frames, or an honest note.
+
+        The three tiers are read from the **provider's own declared capabilities**, never from a
+        vendor branch (issue #471), and the order is a strict fallback:
+
+        1. `model_sees_video` → the video itself, as a `videos`-bearing injected turn. That gate
+           **fails closed** (`_assets.model_sees_video`): only a definite yes sends a video part,
+           because sending one to a model without video input is a hard 400 that fails the whole
+           wake, while guessing low merely costs a tier that still works.
+        2. `model_sees_images` → frames decoded here and injected as images, honoring the
+           `every`/`start`/`end` the agent asked for.
+        3. Neither → the withheld caption, and the same WARNING an image gets. The clip's metadata
+           already rode the tool result, so the note only has to say what was not shown and why.
+
+        A **sampling failure** (a corrupt file, a decoder that cannot read the container) is not a
+        crash and not a silent nothing: it degrades to a caption naming the reason, with a WARNING,
+        so a wake survives a bad file the way it survives a failed image fetch.
+        """
+        if model_sees_video(self.provider):
+            turn = Message(role="user", content=_video_caption(clip), videos=[clip], injected=True)
+            messages.append(turn)
+            shown.append(turn)  # a payload-bearing turn is evicted after the reply
+            return
+        if model_sees_images(self.provider):
+            try:
+                caption, frames = _frames_of(clip)
+            except ValueError as exc:
+                self._log_video_withheld(clip, f"could not sample frames: {exc}")
+                messages.append(
+                    Message(role="user", content=_unsampled_caption(clip, exc), injected=True)
+                )
+                return
+            turn = Message(role="user", content=caption, images=frames, injected=True)
+            messages.append(turn)
+            shown.append(turn)
+            return
+        self._log_video_withheld(clip, "model has no image input")
+        messages.append(Message(role="user", content=_withheld_caption([clip]), injected=True))
 
     def _show_images(
         self, pictures: list[ImageContent], messages: list[Message], shown: list[Message]
@@ -401,12 +477,33 @@ class Engine:
         is a defect (#293's visibility law), so this is a WARNING too. The engine sees the image's
         filename (`alt`) and the model, not the asset uuid — coarser than the wake's line, but enough
         to see the swap happened and to whom.
+
+        **The head is byte-frozen.** A log head is a public interface the moment anything greps it,
+        and a fleet dashboard's query lives outside this repo where no test and no code search can
+        see it — #414 repainted two heads and silently broke both clauses of a founder-paged alarm.
+        So video got its own head (`_log_video_withheld`) rather than this one being generalized:
+        the two are different events and a consumer of either should not have to care about the
+        other's release.
         """
         names = _image_names(pictures)
         _, model = describe_provider(self.provider)
         _log.warning(
             "view image withheld from a model with no vision %s",
             kv(images=names, model=model, reason="model has no image input"),
+        )
+
+    def _log_video_withheld(self, clip: VideoContent, reason: str) -> None:
+        """The loud, greppable record that a watched clip did not reach the model (#471).
+
+        `_log_images_withheld`'s video sibling, and a separate line rather than a shared one — see
+        that method on why a head is frozen once written. `reason` distinguishes *cannot* (the model
+        takes no image input at all) from *failed* (the clip would not decode), because those want
+        different fixes: the first is a model choice, the second is a bad file.
+        """
+        _, model = describe_provider(self.provider)
+        _log.warning(
+            "watch video withheld from the model %s",
+            kv(video=_media_name(clip), model=model, reason=reason),
         )
 
     def _chat(self, messages: list[Message], tools: Sequence[ToolSpec] | None) -> Message:
@@ -560,7 +657,7 @@ class Engine:
         never as an exception — because the model reading it cannot tell, and must not need to tell,
         a call that failed live from one that failed on re-issue.
         """
-        text, _ = _split_result(self._run_tool(name, arguments))
+        text, _, _ = _split_result(self._run_tool(name, arguments))
         return text
 
     def _run_tool(self, name: str, arguments: dict) -> str | ToolResult:
@@ -719,11 +816,13 @@ def _server_builtin_guidance(name: str) -> str:
     )
 
 
-def _split_result(result: str | ToolResult) -> tuple[str, list[ImageContent]]:
-    """Normalize a tool's return into (text, images) — a plain `str` has no images."""
+def _split_result(
+    result: str | ToolResult,
+) -> tuple[str, list[ImageContent], list[VideoContent]]:
+    """Normalize a tool's return into (text, images, videos) — a plain `str` has neither."""
     if isinstance(result, ToolResult):
-        return result.text, result.images
-    return result, []
+        return result.text, result.images, result.videos
+    return result, [], []
 
 
 def _image_names(images: list[ImageContent]) -> str:
@@ -745,27 +844,75 @@ def _caption(images: list[ImageContent]) -> str:
     return f"(Showing image: {_image_names(images)})"
 
 
-def _withheld_caption(images: list[ImageContent]) -> str:
-    """`_caption`'s stand-in when the model has no image input (issue #316).
+def _withheld_caption(media: list[ImageContent] | list[VideoContent]) -> str:
+    """`_caption`'s stand-in when the model has no image input (issues #316, #471).
 
     Names the file(s) and says plainly they were described, not shown — so a text-only model
     reads an honest line instead of a caption promising a picture it never received. The
-    description itself rode the tool result (`_describe`), so this only has to say the image is
-    withheld and why.
+    description itself rode the tool result (`_describe`), so this only has to say the media is
+    withheld and why. Shared by the image path and the video path's last tier, deliberately: a
+    text-only model's experience of a still and of a clip is the same experience, and two
+    wordings for it would be two things to keep in step.
+    """
+    names = ", ".join(item.alt or "file" for item in media)
+    return f"(No image input on this model — {names} was described above, not shown.)"
+
+
+def _media_name(clip: VideoContent) -> str:
+    """A clip's display name for a caption or a log line."""
+    return clip.alt or "video"
+
+
+def _video_caption(clip: VideoContent) -> str:
+    """The caption on a natively-shown video turn — the breadcrumb left after eviction."""
+    return f"(Showing video: {_media_name(clip)})"
+
+
+def _unsampled_caption(clip: VideoContent, error: Exception) -> str:
+    """The caption when a clip reached a vision model but would not decode into frames.
+
+    Distinct from `_withheld_caption` on purpose: *"this model cannot see video"* and *"this file
+    would not open"* are different facts, and a model told the first when the second is true will
+    reason about its own capabilities instead of about a broken file.
     """
     return (
-        f"(No image input on this model — {_image_names(images)} was described above, not shown.)"
+        f"({_media_name(clip)} could not be sampled into frames — {error} "
+        "It was described above, not shown.)"
+    )
+
+
+def _frames_of(clip: VideoContent) -> tuple[str, list[ImageContent]]:
+    """Decode a clip into the frames a vision-only model is shown, honoring the agent's request.
+
+    Imported here rather than at module scope so the engine — the one module every install
+    loads — does not pull in the video decoder on a wake that never watches anything.
+    """
+    from basecradle_harness._video import decode_data_url, sample_frames
+
+    sampling = clip.sampling
+    return sample_frames(
+        decode_data_url(clip.url),
+        name=_media_name(clip),
+        every=sampling.every,
+        start=sampling.start,
+        end=sampling.end,
     )
 
 
 def _evict_images(shown: list[Message]) -> None:
-    """Drop the pixels from injected image turns once the model has answered.
+    """Drop the payload from injected media turns once the model has answered.
 
-    The model has already seen the image and folded it into its reply, so the raw
-    bytes need not persist into the transcript — keeping them would re-send and
-    re-bill the image on every later turn. The text caption stays as a breadcrumb,
-    so the conversation still reads coherently; viewing again is a fresh, bounded,
-    on-demand fetch.
+    The model has already seen the image (or the clip, or its frames) and folded it
+    into its reply, so the raw bytes need not persist into the transcript — keeping
+    them would re-send and re-bill the media on every later turn. The text caption
+    stays as a breadcrumb, so the conversation still reads coherently; looking again
+    is a fresh, bounded, on-demand fetch.
+
+    Video is evicted by exactly the same rule and for a sharper reason: a clip's
+    base64 is orders of magnitude larger than a still's, so a single un-evicted
+    video would dominate every later turn of that timeline's transcript, forever
+    (Context Discipline — nothing replayed per wake may be unbounded).
     """
     for turn in shown:
         turn.images = []
+        turn.videos = []

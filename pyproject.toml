@@ -29,6 +29,26 @@ dependencies = [
     # and stopped installing `httpx`), so what was an accident of somebody else's dependency
     # graph is now stated. Floor matches `basecradle`'s.
     "httpx>=0.28",
+    # Video perception (`watch_video`, issue #471) — **base** dependencies, deliberately not an
+    # extra. `watch_video` is a *default* tool for every harness agent, and a default tool with an
+    # optional dependency contradicts itself; an extra would also force a NOC wrapper allow-list
+    # change plus a per-agent inventory edit across the whole fleet for a capability every agent
+    # is supposed to have. PyAV is the whole reason this stays inside the locked profile's
+    # no-shell boundary: its wheels bundle FFmpeg, so frames are decoded **in-process** — no
+    # `ffmpeg` subprocess, no apt package, nothing for `Policy.locked()` to have an opinion about.
+    #
+    # The `av` floor is 17, not 18, and the reason is this package's own Python floor: `av` 18
+    # dropped Python 3.10 (`requires_python >=3.11`), which the Stack pins at 3.10+ and CI still
+    # exercises. A floor of 18 would make `basecradle-harness` uninstallable on 3.10. So the range
+    # spans the two majors the matrix actually resolves — 17.x on 3.10, 18.x on 3.11+ — and CI's
+    # 3.10→3.14 legs exercise **both**, which is what makes the wider range honest rather than
+    # hopeful. `<19` keeps the next major from arriving unreviewed. Raise the floor to 18 the day
+    # the Python floor moves to 3.11, not before.
+    "av>=17,<19",
+    # Pillow encodes the sampled frames as JPEG (`VideoFrame.to_image()` hands back a PIL image).
+    # Floor is the current major, major-capped in this repo's usual style; 12.x ships wheels for
+    # every Python in the CI matrix (cp310–cp315).
+    "pillow>=12,<13",
 ]
 
 # The harness reaches an LLM only through a vendor's official SDK — never hand-rolled HTTP.

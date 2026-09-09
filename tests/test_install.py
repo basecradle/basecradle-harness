@@ -80,6 +80,9 @@ def test_install_copies_the_benign_tool_defaults_but_not_the_opt_in_power_tools(
 
     tools = home / "tools"
     assert (tools / "web_fetch.py").exists()  # benign → scaffolded
+    # `watch_video` is benign too (no provider call, no spend, in-process decode) — a default
+    # tool for every agent, so it is scaffolded like `view`, not gated like the generators (#471).
+    assert (tools / "watch_video.py").exists()
     assert not (
         tools / "generate_image.py"
     ).exists()  # powerful (media gen) → opt-in, not laid down
@@ -89,6 +92,27 @@ def test_install_copies_the_benign_tool_defaults_but_not_the_opt_in_power_tools(
     manifest = json.loads((home / _MANIFEST_NAME).read_text())
     assert any(key.startswith("tools/") for key in manifest)
     assert "tools/generate_image.py" not in manifest  # not scaffolded → not tracked
+
+
+def test_a_new_default_tool_lands_on_an_already_installed_config_home(tmp_path):
+    """The upgrade path, not just the fresh one: an existing home gains `watch_video` (#471).
+
+    A default tool that only ever arrives on a *first* install would silently never reach the
+    fleet, every one of whose agents already has a config home. So the new default is asserted on
+    the INSTALLED path of a *second* run — the conffile upgrader's "shipped default the operator
+    has never seen" case.
+    """
+    home = tmp_path / "cfg"
+    install(home, defaults={"tools/assets.py": "# v1\n"})
+    assert not (home / "tools" / "watch_video.py").exists()
+
+    report = install(
+        home, defaults={"tools/assets.py": "# v1\n", "tools/watch_video.py": "# new\n"}
+    )
+
+    assert report.actions["tools/watch_video.py"] == INSTALLED
+    assert (home / "tools" / "watch_video.py").read_text() == "# new\n"
+    assert report.actions["tools/assets.py"] == UNCHANGED  # the rest of the home is untouched
 
 
 def test_install_opt_in_scaffolds_a_named_power_tool(tmp_path):

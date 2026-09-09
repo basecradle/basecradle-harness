@@ -42,7 +42,7 @@ from typing import Any
 import httpx
 
 from basecradle_harness._idempotency import ASSET
-from basecradle_harness._messages import ImageContent, ToolResult
+from basecradle_harness._messages import FrameSampling, ImageContent, ToolResult, VideoContent
 from basecradle_harness._platform import PlatformTool
 
 _log = logging.getLogger("basecradle_harness")
@@ -70,6 +70,24 @@ MAX_IMAGE_BYTES = 64 * 1024 * 1024
 # model providers document so `view` gives a clean "can't show that" rather than
 # letting an unsupported type fail deep in the provider call.
 _VIEWABLE_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+
+# The largest video `watch_video` will load. Exactly the same *kind* of number as
+# `MAX_IMAGE_BYTES` above and for exactly the same reason: a **machine RAM sanity bound — what
+# this box will hold in memory — never a prediction of any vendor's input ceiling** (issue #336,
+# decision 2; the vendor's own rejection is relayed verbatim, so the harness has no business
+# guessing it). A clip is held three ways at once, transiently: the downloaded bytes, the base64
+# data URL (~1.33x), and, on the frames path, one decoded frame at a time — the decode is
+# streaming, so the frame count never enters the bound. A clip *at* the bound therefore costs
+# roughly 600 MB transiently, which is the figure to weigh when sizing a fleet box, and it is the
+# reason this is a knob-shaped constant rather than a number nobody wrote down. Over the bound the
+# asset is described, not fetched, with the same wording pattern an oversized image gets. The original bytes are never
+# modified — no transcoding, no re-encoding (decision 1).
+MAX_VIDEO_BYTES = 256 * 1024 * 1024
+
+# Video content types a video-capable model can take as input, and that PyAV can decode for the
+# frames fallback. Kept to the container formats the providers document, so `watch_video` gives a
+# clean "can't show that" rather than failing deep in a decoder or a provider call.
+_VIEWABLE_VIDEO_TYPES = frozenset({"video/mp4", "video/webm", "video/quicktime", "video/mpeg"})
 
 # How many assets one `list` returns. A timeline rarely has more; the cap keeps a
 # pathological one from flooding context. When it bites, the reply says so.
@@ -223,22 +241,8 @@ class AssetsTool(PlatformTool):
     # --- uuid resolution -----------------------------------------------------
 
     def _resolve_uuid(self, uuid: str, timeline: str) -> str | None:
-        """Resolve a `read`/`view` uuid, mapping the ``'latest'`` alias to the newest asset.
-
-        An agent that just generated and posted an image cannot, on the same turn, view it
-        without being handed the new asset's uuid — its own post is self-filtered from the
-        wake's perception path, so the uuid never reaches its context (issue #161). The
-        ``'latest'`` alias closes that gap: it resolves to the **most recent file on the
-        target timeline** — which, right after a `generate_image`/`create`, is exactly the
-        file the agent just posted. The SDK's asset filter is newest-first and lazily
-        paginated, so this fetches only the first page's first item. Returns ``None`` when
-        the timeline has no files at all (the caller turns that into a clean message); any
-        other value is passed straight through as an explicit uuid.
-        """
-        if uuid.strip().lower() != "latest":
-            return uuid
-        newest = next(iter(self.context.client.assets.filter(timeline=timeline)), None)
-        return newest.content.uuid if newest is not None else None
+        """This tool's binding of the shared `resolve_uuid` (the ``'latest'`` alias)."""
+        return resolve_uuid(self.context.client, uuid, timeline)
 
     # --- list ----------------------------------------------------------------
 
@@ -503,6 +507,36 @@ def _is_audio(content_type: str) -> bool:
     return _media_type(content_type).startswith("audio/")
 
 
+def _is_video(content_type: str) -> bool:
+    """Whether a file of this content type is video (a candidate for `watch_video`)."""
+    if not content_type:
+        return False
+    return _media_type(content_type).startswith("video/")
+
+
+def resolve_uuid(client: Any, uuid: str, timeline: str) -> str | None:
+    """Resolve an asset uuid, mapping the ``'latest'`` alias to the newest file on the timeline.
+
+    An agent that just generated and posted a file cannot, on the same turn, open it without
+    being handed the new asset's uuid — its own post is self-filtered from the wake's perception
+    path, so the uuid never reaches its context (issue #161). The ``'latest'`` alias closes that
+    gap: it resolves to the **most recent file on the target timeline** — which, right after a
+    `generate_image` / `grok_generate_video` / `create`, is exactly the file the agent just
+    posted. The SDK's asset filter is newest-first and lazily paginated, so this fetches only the
+    first page's first item. Returns ``None`` when the timeline has no files at all (the caller
+    turns that into a clean message); any other value is passed straight through as an explicit
+    uuid.
+
+    Shared by the assets tool's `read`/`view` and by `watch_video` (`_video.py`), so an agent
+    that can say ``'latest'`` to one can say it to the other — a clip is the case that needs it
+    most, since watching what it just generated is how the agent checks its own work.
+    """
+    if uuid.strip().lower() != "latest":
+        return uuid
+    newest = next(iter(client.assets.filter(timeline=timeline)), None)
+    return newest.content.uuid if newest is not None else None
+
+
 def image_input(file: Any) -> ImageContent | str:
     """A viewable image file as self-contained model input, or a reason it can't be shown.
 
@@ -550,6 +584,78 @@ def model_sees_images(provider: object) -> bool:
         _log.warning("Could not read the model's vision capability from the provider: %s", exc)
         return True
     return answer is not False  # True/None/unknown → show the image; only a definite False degrades
+
+
+def video_input(file: Any, sampling: FrameSampling | None = None) -> VideoContent | str:
+    """A watchable video file as self-contained model input, or a reason it can't be shown.
+
+    `image_input`'s video sibling, and deliberately the same shape: a type gate, a size gate, one
+    download, and the bytes inlined as a ``data:`` URL so the input never depends on a vendor's
+    servers reaching a short-lived, access-controlled blob URL. Returns a `VideoContent` on
+    success, otherwise a short reason string the caller surfaces to the model.
+
+    The `VideoContent` is what the **engine** then routes by capability — natively to a model that
+    takes video, as sampled frames to one that takes only images, as an honest caption to one that
+    takes neither. This function does not know or care which; that is the engine's call, exactly as
+    it is for an image (`_engine._show_media`).
+
+    `sampling` is the agent's own request for how to look — every N seconds, over an optional
+    window — carried along so the frames tier can honor it. It rides on the `VideoContent` rather
+    than being passed separately because the tier is chosen *later*, in the engine, by which time
+    the tool that knew what the agent asked for is long gone.
+
+    A download failure propagates as an ``httpx`` error for the caller to handle.
+    """
+    if not _is_video(file.content_type):
+        return (
+            "not a video — 'watch_video' is for videos. Use 'view' for images, 'read' for "
+            "text files, and 'listen' for audio."
+        )
+    if _media_type(file.content_type) not in _VIEWABLE_VIDEO_TYPES:
+        return "video type not watchable; supported: MP4, WebM, QuickTime, MPEG."
+    if file.byte_size <= 0:
+        return "empty file — nothing to watch."
+    if file.byte_size > MAX_VIDEO_BYTES:
+        return (
+            f"{file.byte_size} bytes, over the {MAX_VIDEO_BYTES}-byte watch limit — "
+            "too large to load."
+        )
+    data = _download(file.url)
+    return VideoContent(
+        url=_data_url(file.content_type, data),
+        alt=file.filename,
+        content_type=_media_type(file.content_type),
+        sampling=sampling or FrameSampling(),
+    )
+
+
+def model_sees_video(provider: object) -> bool:
+    """Whether the configured model can take **video** input, read from `supports_video` (#471).
+
+    `model_sees_images`' sibling with the **opposite default, on purpose**, and the asymmetry is
+    the whole design — so it is stated here rather than left to be rediscovered:
+
+    - `model_sees_images` **fails open**. There is no fallback below an image: withholding one on
+      a wrong guess is a real regression, and every model the fleet runs on an image-serializing
+      surface can see. Only a *definite* ``False`` degrades.
+    - `model_sees_video` **fails closed**. There **is** a fallback below video — sampled frames,
+      which every vision model can take — so a wrong guess costs a tier, not the capability. And
+      the two errors are not symmetric: a video part sent to a model that cannot take one is a
+      hard 400 that fails the whole wake, where guessing low merely samples frames the model could
+      have watched natively. Guess toward the outcome that still works.
+
+    So only a capability that answers a definite ``True`` sends native video; absent, ``None``,
+    or a raise all mean frames.
+    """
+    capability = getattr(provider, "supports_video", None)
+    if not callable(capability):
+        return False
+    try:
+        answer = capability()
+    except Exception as exc:  # noqa: BLE001 - a metadata read must never break a wake
+        _log.warning("Could not read the model's video capability from the provider: %s", exc)
+        return False
+    return answer is True  # only a definite yes; everything else falls back to frames
 
 
 def _data_url(content_type: str, data: bytes) -> str:

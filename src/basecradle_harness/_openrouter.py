@@ -295,6 +295,12 @@ class OpenRouterProvider:
         #: means *not yet known* **or** last read was inconclusive — either way the next call retries,
         #: so a one-time metadata hiccup never permanently disables the gate in a long-lived process.
         self._sees_images: bool | None = None
+        #: Memoized answer to `supports_video` (issue #471), read from the same
+        #: ``architecture.input_modalities`` **field** as `supports_vision` — but its **own** memo
+        #: and its own read: two independent questions, so neither may be answered by the other's
+        #: cached verdict. ``None`` means *not yet known* **or** last read was inconclusive, exactly
+        #: as for vision, so a metadata hiccup never permanently pins a model to a lower tier.
+        self._sees_video: bool | None = None
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._default_params = default_params
         # Server-tool objects are config-time constant (they don't vary per turn), so build them
@@ -445,11 +451,31 @@ class OpenRouterProvider:
         memo ``None`` and simply retries next time.
         """
         if self._sees_images is None:
-            self._sees_images = self._read_vision()
+            self._sees_images = self._modality("image")
         return self._sees_images
 
-    def _read_vision(self) -> bool | None:
-        """One read of the model's ``input_modalities`` from OpenRouter, or ``None`` on any failure.
+    def supports_video(self) -> bool | None:
+        """Whether this model accepts **video** input — the same metadata, a different modality (#471).
+
+        Read from the identical ``architecture.input_modalities`` field `supports_vision` reads
+        (the SDK's ``InputModality`` literal already includes ``"video"``), so a model that
+        declares video gets the clip itself and one that declares only images gets sampled frames.
+
+        ``None`` is *unknown* — and unlike vision, unknown means **frames**, not video: the gate
+        above this (`_assets.model_sees_video`) fails closed, because a video part on a model
+        without video input is a hard 400 while the frames tier always works. Memoized, and an
+        inconclusive read simply retries next time.
+        """
+        if self._sees_video is None:
+            self._sees_video = self._modality("video")
+        return self._sees_video
+
+    def _modality(self, modality: str) -> bool | None:
+        """Whether the model declares `modality` as an input, or ``None`` on any failure.
+
+        One HTTP read per call; the *callers* memoize, one memo per modality. Sharing a single
+        cached response between them would couple two answers that are independently unknown —
+        a read that failed for vision would then also decide video, permanently.
 
         The routing ``:variant`` suffix is stripped exactly as `context_limit` does — the models API
         keys on the bare ``author/slug`` and would 404 on ``z-ai/glm-5.2:free``, silently reading a
@@ -463,14 +489,14 @@ class OpenRouterProvider:
             response = self._client.models.get(author=author, slug=slug)
         except Exception as exc:  # noqa: BLE001 - a metadata read must never break a wake
             _log.warning(
-                "Could not read %s's vision capability from OpenRouter: %s", self.model, exc
+                "Could not read %s's %s capability from OpenRouter: %s", self.model, modality, exc
             )
             return None
         architecture = getattr(getattr(response, "data", None), "architecture", None)
         modalities = getattr(architecture, "input_modalities", None)
         if not modalities:
-            return None  # the field was absent or empty — treat as unknown, not "no vision"
-        return "image" in {str(m).lower() for m in modalities}
+            return None  # the field was absent or empty — treat as unknown, not "no"
+        return modality in {str(m).lower() for m in modalities}
 
     def _restore_annotations(self, data: dict[str, Any]) -> None:
         """Graft the web-search ``url_citation`` annotations back onto the SDK's model_dump.

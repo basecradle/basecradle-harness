@@ -426,6 +426,17 @@ class XaiSdkProvider:
                 )
             return wire
         # user — text plus any images the engine injected for vision
+        if message.videos:
+            # Unreachable under the gate: this adapter declares no `supports_video`, so
+            # `_assets.model_sees_video` (fail-closed) never routes a clip here. It raises rather
+            # than dropping the payload, because a silently-dropped video leaves the model reading
+            # a caption for something it never received — the exact defect the vision gate ended
+            # (issues #316, #471).
+            raise ProviderError(
+                "a video reached the native xai-sdk surface, which has no video input part. This "
+                "is a harness wiring bug: only a provider whose supports_video() is True should "
+                "ever be handed a video."
+            )
         if message.images:
             parts = []
             if message.content:

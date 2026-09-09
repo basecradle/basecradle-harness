@@ -82,12 +82,14 @@ from basecradle_harness._memory_provider import (
 from basecradle_harness._messages import (
     CodeExecutionFile,
     CodeExecutionTrace,
+    FrameSampling,
     ImageContent,
     Message,
     Role,
     ToolCall,
     ToolResult,
     ToolSpec,
+    VideoContent,
 )
 from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openrouter import OpenRouterProvider
@@ -125,6 +127,7 @@ from basecradle_harness._tasks import TasksTool
 from basecradle_harness._tools import Tool, ToolRegistry
 from basecradle_harness._verify import Finding, VerifyReport, claims, claims_document, verify
 from basecradle_harness._version import __version__
+from basecradle_harness._video import VideoInfo, WatchVideoTool, probe, sample_frames
 from basecradle_harness._wake import (
     BreakerDecision,
     Claim,
@@ -234,6 +237,7 @@ __all__ = [
     "ConfirmedTimelineAction",
     "AssetsTool",
     "HearAudioTool",
+    "WatchVideoTool",
     "TasksTool",
     "TimelinesTool",
     "TrustTool",
@@ -256,6 +260,10 @@ __all__ = [
     "SystemPromptReadTool",
     "SystemPromptEditTool",
     "bind_platform_tools",
+    # Video perception (the sampler behind `watch_video`)
+    "VideoInfo",
+    "probe",
+    "sample_frames",
     # Message vocabulary
     "Message",
     "Role",
@@ -263,6 +271,8 @@ __all__ = [
     "ToolResult",
     "ToolSpec",
     "ImageContent",
+    "VideoContent",
+    "FrameSampling",
     "CodeExecutionTrace",
     "CodeExecutionFile",
     # Errors

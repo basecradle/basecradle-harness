@@ -270,6 +270,29 @@ def test_vision_image_becomes_an_image_part():
     assert image_part.image_url.image_url == "data:image/png;base64,AAAA"
 
 
+def test_a_video_turn_raises_rather_than_reaching_the_wire_without_one(monkeypatch):
+    """This adapter declares no `supports_video`, so the fail-closed gate never routes a clip here.
+
+    It raises rather than dropping the payload, for the same reason the Responses surface does: a
+    silently-dropped video leaves the model reading a caption for something it never received —
+    the exact defect the vision gate ended (issues #316, #471).
+    """
+    from basecradle_harness import ProviderError, VideoContent
+
+    provider = _provider(_response(content="never reached"))
+    turn = Message.user("watch this")
+    turn.videos = [VideoContent(url="data:video/mp4;base64,AAAA", alt="clip.mp4")]
+
+    with pytest.raises(ProviderError, match="native xai-sdk surface"):
+        provider.chat([turn])
+
+
+def test_the_adapter_declares_no_video_capability_so_the_gate_stays_closed():
+    provider = _provider(_response(content="ok"))
+
+    assert not hasattr(provider, "supports_video")
+
+
 def test_opted_in_search_builtins_become_agent_tools():
     # Issue #171: the search built-ins are xAI Agent Tools appended to the chat `tools` list (the
     # deprecated native `search_parameters` path is gone). Each is a real `chat_pb2.Tool` proto.

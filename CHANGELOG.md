@@ -7,6 +7,54 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.117.0] - 2026-09-09
+
+### Added: `watch_video` — every harness agent can see a video (issue #471)
+
+No harness agent could perceive video at all. `view` is images-only, a posted clip on an
+`asset.created` wake was acknowledged in text and never seen, and an agent that generated a clip had
+no way to check its own work — on 2026-08-13 @eddie-murphy asserted a first-frame match he had no
+way to verify. `watch_video` closes that, as a **default tool for every agent on every provider**.
+
+**Three tiers, read from the model's own declared capabilities and never from a vendor branch.** The
+tool fetches the clip and says nothing about perception (the #316 rule — a tool has no view of the
+provider); `_engine._show_media` routes it: a model that takes **video** gets the video, one that
+takes **images** gets **sampled frames**, one that takes **neither** gets an honest caption saying
+the clip was described, not shown. Defaults: one frame a second, at most 24 per call, 768 px long
+edge, JPEG, first and last frame always included. `every` sets the interval and `start`/`end` narrow
+the window — the window is the knob, the frame cap is a constant, so there is no `max_frames`
+parameter. Over the cap the interval is *stretched* to cover the whole window rather than truncating
+the clip, and the caption says so.
+
+**The two capability gates fail in opposite directions, on purpose.** `model_sees_images` fails open
+(nothing sits below an image, so withholding one on a wrong guess is a real regression);
+`model_sees_video` fails **closed** (frames are a working fallback, and a video part on a model
+without video input is a hard 400 that fails the whole wake). Only a definite `supports_video()` yes
+sends a video. The OpenRouter adapter answers both from the same `architecture.input_modalities`
+field, memoized independently. The Chat Completions surface gained the `video_url` part; the
+Responses surface and the native `xai-sdk` adapter **raise** rather than silently dropping a clip —
+unreachable under the gate, and loud if a future wiring change ever reaches it.
+
+**Pure Python, no subprocess** — which is what makes this a *benign* default tool rather than a
+powerful opt-in one. Frames are decoded in-process with PyAV, whose wheels bundle FFmpeg, so
+`Policy.locked()`'s no-shell boundary is untouched; there is no provider call, no spend, and nothing
+created. `av` and `pillow` are therefore **base dependencies**, not an extra: a default tool with an
+optional dependency contradicts itself. Two pins deviate from the issue's text and the reasons are
+recorded in `pyproject.toml` — `av>=17,<19` because `av` 18 dropped Python 3.10, which this package
+still supports and CI still runs (the range spans the two majors the matrix resolves, and CI
+exercises both), and `pillow>=12,<13` rather than `>=11,<12`, which would have pinned the fleet to a
+superseded major.
+
+Frames live in memory only — never written to disk, never posted as assets — and the payload is
+evicted from the transcript after the turn, exactly as a viewed image's pixels are. A posted video is
+**acknowledged, never auto-watched**: the asset hint names `watch_video` beside `view`/`listen` and
+the agent decides whether the clip is worth loading.
+
+New public API: `WatchVideoTool`, `VideoContent`, `FrameSampling`, `VideoInfo`, `probe`,
+`sample_frames`. `ToolResult` and `Message` gained a `videos` field (serialized, and restored with
+default sampling from a record that predates it).
+
+
 ## [0.116.3] - 2026-09-09
 
 ### Fixed: image-to-video sent the wrong body key, so every image-to-video was text-to-video (issue #470)

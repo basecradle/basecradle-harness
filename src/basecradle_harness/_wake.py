@@ -1699,9 +1699,14 @@ class WakeAgent:
         agent *sees* the shared picture on wake. Anything it cannot yet fully perceive —
         a non-image file, an unviewable/oversized image, or an image whose download fails —
         degrades to the text description (`_incoming_asset_text`), which names the file and
-        its type and points at the tools, so the seam is graceful, never an error. Audio/
-        video perception *depth* is out of scope here (it rides the perception done-bar
-        thread); this handles their seam by acknowledging the file rather than choking on it.
+        its type and points at the tools, so the seam is graceful, never an error.
+
+        **A posted video is acknowledged, never auto-watched** (issue #471). `watch_video` exists
+        and the hint names it, but loading a clip and decoding frames is a real cost, so it stays
+        the *agent's* call the same way `read` and `listen` do — the wake says what arrived and
+        the agent decides whether to look. Auto-watching would spend an agent's context on every
+        clip anyone posts, which is the opposite of the on-demand discipline every other heavy
+        perception path here follows.
 
         **A model with no vision input degrades the same way, but on purpose** (issue #228). A
         text-only model (e.g. ``z-ai/glm-5.2``) cannot take an image, so blind-sending one either
@@ -4041,8 +4046,8 @@ def _incoming_asset_text(asset: object) -> str:
 #: What the harness appends to an asset line so the model knows how to open the file. Framing,
 #: not dialogue: `_asset_dialogue` is the half that gets mined (issue #438).
 _ASSET_TOOL_HINT = (
-    " Use the assets tool to 'read' it (or 'view' an image / 'listen' to audio) if you want to "
-    "engage with it."
+    " Use the assets tool to 'read' it (or 'view' an image / 'listen' to audio / 'watch_video' a "
+    "video) if you want to engage with it."
 )
 
 

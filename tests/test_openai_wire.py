@@ -13,10 +13,13 @@ see a posted image even though the model could. These tests pin the vision conte
 its edges.
 """
 
-from basecradle_harness import ImageContent, Message
-from basecradle_harness._openai_wire import chat_message_to_wire
+import pytest
+
+from basecradle_harness import ImageContent, Message, ProviderError, VideoContent
+from basecradle_harness._openai_wire import chat_message_to_wire, message_to_input
 
 DATA_URL = "data:image/png;base64,AAAA"
+VIDEO_URL = "data:video/mp4;base64,BBBB"
 
 
 def _vision_turn(content, *images):
@@ -81,3 +84,59 @@ def test_a_turn_without_images_is_unchanged():
     """The image branch is guarded on ``message.images`` — a text turn stays a bare string, so no
     existing turn changes shape and no endpoint sees a parts list it didn't before."""
     assert chat_message_to_wire(Message.user("hello"))["content"] == "hello"
+
+
+# --- video parts (issue #471) -------------------------------------------------
+
+
+def _video_turn(content, *videos):
+    turn = Message(role="user", content=content)
+    turn.videos = list(videos)
+    return turn
+
+
+def test_a_video_turn_serializes_text_then_the_video_part_on_chat_completions():
+    """OpenRouter's ``video_url`` part, the exact mirror of ``image_url``."""
+    wire = chat_message_to_wire(_video_turn("(Showing video: clip.mp4)", VideoContent(VIDEO_URL)))
+
+    assert wire["content"] == [
+        {"type": "text", "text": "(Showing video: clip.mp4)"},
+        {"type": "video_url", "video_url": {"url": VIDEO_URL}},
+    ]
+
+
+def test_images_lead_videos_when_a_turn_carries_both():
+    wire = chat_message_to_wire(
+        Message(
+            role="user",
+            content="both",
+            images=[ImageContent(DATA_URL)],
+            videos=[VideoContent(VIDEO_URL)],
+        )
+    )
+
+    assert [part["type"] for part in wire["content"]] == ["text", "image_url", "video_url"]
+
+
+def test_a_turn_without_videos_is_unchanged():
+    """The video branch is guarded the same way the image branch is: no existing turn changes shape."""
+    assert chat_message_to_wire(Message.user("hello"))["content"] == "hello"
+
+
+def test_the_responses_surface_raises_rather_than_dropping_a_video():
+    """Unreachable under the gate — and loud if a future wiring change ever reaches it.
+
+    Silently dropping the clip is the alternative and it is worse: the model would read a caption
+    promising a video it never received, which is the exact defect the vision gate ended (#316).
+    """
+    with pytest.raises(ProviderError, match="Responses surface"):
+        message_to_input(_video_turn("(Showing video: clip.mp4)", VideoContent(VIDEO_URL)))
+
+
+def test_the_responses_surface_still_serializes_an_image_turn():
+    items = message_to_input(Message(role="user", content="look", images=[ImageContent(DATA_URL)]))
+
+    assert items[0]["content"] == [
+        {"type": "input_text", "text": "look"},
+        {"type": "input_image", "image_url": DATA_URL},
+    ]
