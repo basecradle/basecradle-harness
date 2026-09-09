@@ -893,6 +893,7 @@ def _provider_from_config(
     *,
     builtins: Sequence[str] = (),
     code_bridge: CodeExecutionBridge | None = None,
+    model: str | None = None,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -933,7 +934,13 @@ def _provider_from_config(
     overrides wiring; a malformed file raises here, failing the wake loudly at startup (the
     read-only introspection paths never build a provider, so they never touch it).
     """
-    model = os.environ.get("AI_MODEL")
+    # `model` overrides ``AI_MODEL`` for a **second** provider instance on the same stack — today
+    # the blind-model describer (issue #472), which is the agent's own SDK, surface, key, base URL
+    # and routing pins with a different model id. Overriding here rather than building a parallel
+    # factory is the whole point: a describer cannot drift from the brain's wiring, because there
+    # is only one place that wiring is spelled. ``AI_MODEL`` is still required either way, so a
+    # config missing it fails on the brain, where the error is actionable.
+    model = model or os.environ.get("AI_MODEL")
     if not model:
         raise ValueError("AI_MODEL is required — the model id to run (e.g. gpt-5.4-mini).")
 

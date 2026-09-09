@@ -71,6 +71,7 @@ RECALL_SENTINEL = "SENTINEL-RECALL-do-not-mine-this-recalled-memory"
 # The reranker's *own* output. Not a brief surface — a whole extra model whose text the boundary
 # has never had to account for (issue #464). It must reach neither the agent's model nor the palace.
 RERANK_SENTINEL = "SENTINEL-RERANK-do-not-show-or-mine-this-reranker-narration"
+DESCRIBER_SENTINEL = "SENTINEL-DESCRIBER-do-not-mine-this-description-as-the-agents-words"
 SENTINELS = (CHARTER_SENTINEL, MANIFEST_SENTINEL, DASHBOARD_SENTINEL, RECALL_SENTINEL)
 
 
@@ -542,3 +543,88 @@ def test_the_rerankers_output_never_reaches_the_model_or_the_palace(
     assert RERANK_SENTINEL not in mined
     for sentinel in SENTINELS:
         assert sentinel not in mined
+
+
+def test_the_describers_words_are_shown_to_the_model_and_never_mined(
+    platform, tmp_path, monkeypatch
+):
+    """The describer is a second model in the loop, so it gets a sentinel of its own (issue #472).
+
+    Its prose is *not* the agent's words and *not* a peer's — it is a third party's account of a
+    peer's picture. The brain must read it (or the feature does nothing), and the palace must never
+    file it as something the agent said (or the agent later "remembers" describing a picture it
+    never saw). Both halves are asserted, for the same reason the brief's proof asserts both: a
+    describer that never ran would pass a mining assertion for the wrong reason.
+
+    It holds by construction rather than by a filter — the description rides an engine-injected
+    turn, and `_dialogue_of` mines an asset's own dialogue and nothing else — which is exactly the
+    kind of claim #438 showed a docstring cannot be trusted to keep.
+    """
+    from basecradle_harness import Describer
+
+    platform.get("/assets").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "assets": [
+                    {
+                        "type": "asset",
+                        "created_at": "2026-08-29T12:00:00Z",
+                        "user": {
+                            "uuid": JOHN_UUID,
+                            "handle": "john",
+                            "name": "John Doe",
+                            "kind": "human",
+                        },
+                        "timeline": {"uuid": TIMELINE_UUID},
+                        "content": {
+                            "uuid": ASSET_UUID,
+                            "description": "",
+                            "file": {
+                                "filename": "diagram.png",
+                                "byte_size": 12,
+                                "content_type": "image/png",
+                                "checksum": "Yp9p9C8m6Xv2qS1nKQ0r3w==",
+                                "url": f"{BC_URL}/blobs/{ASSET_UUID}",
+                            },
+                        },
+                    }
+                ],
+                "next_cursor": None,
+            },
+        )
+    )
+    platform.get(f"/blobs/{ASSET_UUID}").mock(
+        return_value=httpx.Response(200, content=b"\x89PNG\r\n\x1a\n fake pixels")
+    )
+
+    class _Blind(_CannedModel):
+        def supports_vision(self):
+            return False
+
+    class _Vision:
+        provider = "openrouter"
+        model = "d/vision"
+
+        def supports_vision(self):
+            return True
+
+        def supports_video(self):
+            return False
+
+        def chat(self, messages, tools=None):
+            return Message.assistant(content=DESCRIBER_SENTINEL)
+
+    provider = Recorder()
+    model = _Blind(text="Thanks for the diagram.")
+    agent = _agent(tmp_path, provider, model, monkeypatch)
+    agent.harness.engine._describer = Describer(_Vision(), "d/vision")
+
+    agent.wake()
+
+    shown = "\n".join(m.content or "" for m in model.shown)
+    assert DESCRIBER_SENTINEL in shown, "the describer never ran — the test proves nothing"
+    mined = "\n".join(e.user + "\n" + e.assistant for e in provider.observed)
+    assert DESCRIBER_SENTINEL not in mined
+    # What *is* mined from the asset is the peer's own line: who shared what, when.
+    assert "diagram.png" in mined and "john" in mined

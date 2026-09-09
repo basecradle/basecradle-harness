@@ -118,6 +118,7 @@ from basecradle_harness._brief import (
     render_safety,
 )
 from basecradle_harness._code import CodeExecutionBridge
+from basecradle_harness._describer import described_caption, describer_model_from_env
 from basecradle_harness._engine import compose_hooks
 from basecradle_harness._exceptions import (
     EngineError,
@@ -1712,16 +1713,21 @@ class WakeAgent:
         text-only model (e.g. ``z-ai/glm-5.2``) cannot take an image, so blind-sending one either
         has the endpoint 404 the wake or — worse, and what actually happened before this — the image
         is silently dropped on the wire and the model reads a *"Looking at it now"* caption for a
-        picture it never received. So the vision gate runs first: no vision → the clean
-        `_incoming_asset_text` description and a **loud** degrade log line (`_log_image_degrade`),
-        never an image and never the misleading caption. The gate fails open (`model_sees_images`),
-        so a vision-capable agent, or one whose capability can't be read, is unaffected.
+        picture it never received. So the vision gate runs first: no vision → never an image and
+        never the misleading caption. The gate fails open (`model_sees_images`), so a vision-capable
+        agent, or one whose capability can't be read, is unaffected.
+
+        **What "degrades" means then depends on whether a describer is configured** (issue #472):
+        with one, the picture is *described on arrival* by a second, vision-capable model, so a
+        blind agent gets the content rather than only an honest note; without one — the shipped
+        default — it is exactly the #228 behavior, the clean `_incoming_asset_text` description and
+        a **loud** degrade log line. Either way this is `_describe_on_arrival`'s call, so the
+        asset-wake and the engine's `view` path degrade identically.
         """
         file = asset.content.file
         if _is_image(file.content_type):
             if not model_sees_images(self.harness.provider):
-                self._log_image_degrade(asset)
-                return _incoming_asset_text(asset), []  # no vision: the description, said plainly
+                return self._describe_on_arrival(asset, file), []
             try:
                 shown = image_input(file)
             except httpx.HTTPError:
@@ -1734,6 +1740,57 @@ class WakeAgent:
                 return f"{intro} Looking at it now.", [shown]
         # Non-image, unviewable/oversized image, or a failed fetch: describe, don't show.
         return _incoming_asset_text(asset), []
+
+    def _describe_on_arrival(self, asset: object, file: object) -> str:
+        """A posted image, for a model with no vision: described by a describer, or said plainly.
+
+        With a describer configured (issue #472) the picture is *described on arrival*, the same
+        way a sighted model is *shown* it on arrival — so the two perception paths, `view` and the
+        asset wake, degrade identically. Without one (the shipped default) this is byte-for-byte
+        the #228 behavior: the clean `_incoming_asset_text` description and the loud degrade line.
+
+        Two details of the described line are the same decisions the engine's path makes, spelled
+        here because a reader will otherwise take them for accidents:
+
+        - It is wrapped in the **shared** `described_caption`, so the description **names the
+          describer** on this path exactly as it does on `view` and `watch_video`. Without that the
+          agent reads a paragraph about a picture it never received as its own perception — and so
+          does anyone reading its memory a month later. One spelling, one place, three paths.
+        - The `_ASSET_TOOL_HINT` is deliberately **not** appended. That pointer's whole job is
+          *"here is how to open this file"*, and the file has just been opened for the agent; a
+          blind agent cannot `view` it anyway. It is harness framing either way (issue #438), so
+          nothing that gets mined changes — the mined half stays `_asset_dialogue` on both branches.
+
+        The describer's own failures are its business (it logs them and answers ``None``); every
+        outcome here still returns a real line for the model to read, so a wake never dies over a
+        picture.
+        """
+        describer = self.harness.engine.describer()
+        described = None if describer is None else self._described_image(describer, file)
+        if described is not None:
+            caption = described_caption(asset.content.file.filename, describer.model, described)
+            return f"{_asset_dialogue(asset)}\n{caption}"
+        self._log_image_degrade(asset)
+        return _incoming_asset_text(asset)  # no vision, no describer: the description, said plainly
+
+    def _described_image(self, describer: object, file: object) -> str | None:
+        """The describer's words for a posted image, or ``None`` if it could not answer.
+
+        The describer is the **engine's** (`Engine.describer`), memoized there — so an agent whose
+        wake perceives an asset *and* calls `view` builds one adapter instance, not two, and the
+        two paths can never end up describing with different models.
+
+        The fetch is `image_input`, the same viewability gate the engine's `view` path uses: an
+        oversized or unviewable file gets the plain description, exactly as before, rather than a
+        describer call that would only fail.
+        """
+        try:
+            shown = image_input(file)
+        except httpx.HTTPError:
+            return None  # the fetch failed: degrade to the description, never an error
+        if not isinstance(shown, ImageContent):
+            return None  # unviewable or oversized: the plain description says why
+        return describer.describe_images([shown])
 
     def _log_image_degrade(self, asset: object) -> None:
         """The loud, greppable record that a posted image was swapped for its text description (#228).
@@ -4361,6 +4418,15 @@ def resolved_config() -> dict[str, object]:
       **drops** as harness-owned collisions (plus ``extra_body`` on the SDKs that do not support
       it): the "warn and win" set (`resolved_model_params`). ``[]`` when nothing collides; the
       effective tuning the SDK receives is ``model_params`` minus these.
+    - ``describer_model`` — the blind-model **describer** (issue #472): the model id on this
+      agent's *own* provider that describes images and video for a brain with no image input,
+      ``null`` when unset (the shipped default, and byte-identical to the pre-#472 behavior).
+      Reported for the same reason the rerank fields are: a describer is configured in one env var,
+      costs money on every withheld picture, and is otherwise invisible from off the box — so a
+      drift pass could not tell a deliberately-blind agent from one whose describer was dropped.
+      No key or endpoint axis appears beside it, and that is the design rather than an omission:
+      the describer runs on the agent's own SDK/surface/key/base URL (already reported above), so
+      a second set of fields would be the same configuration reported twice.
     - ``mempalace_rerank_model`` / ``mempalace_rerank_providers`` /
       ``mempalace_rerank_sdk_version`` — the MemPalace **LLM reranker**'s configuration (issue
       #464): the OpenRouter model id that reranks (``null`` = rerank off, the shipped default), the
@@ -4411,6 +4477,7 @@ def resolved_config() -> dict[str, object]:
             providers_from_env(os.environ.get(RERANK_PROVIDERS_VAR))
         ),
         "mempalace_rerank_sdk_version": _dist_version(_RERANK_SDK_DISTRIBUTION),
+        "describer_model": describer_model_from_env(),
         "tools": sorted(tool.name for tool in resolved.tools),
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),

@@ -46,6 +46,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
+from typing import Any
 
 from basecradle_harness._assets import model_sees_images, model_sees_video
 from basecradle_harness._exceptions import (
@@ -245,6 +246,12 @@ class Engine:
         #: text `kind=reserve` — a step-capped turn and an ordinary one read very differently to
         #: anyone reconstructing a failure, and the journal is where they will look.
         self.reserve_used = False
+        #: The blind-model describer (issue #472), built lazily on first need and memoized for the
+        #: life of this engine — one adapter instance per wake, never one per picture. ``False`` is
+        #: *not yet asked*; ``None`` is *asked and there is none*, which is the ordinary case (no
+        #: `HARNESS_DESCRIBER_MODEL`). The two are distinguished so a describer-less agent pays the
+        #: env read once rather than on every withheld image.
+        self._describer: Any = False
         #: Steps spent across every `run` this engine has driven, and how many runs that was. A
         #: wake process runs one engine, so together these *are* the wake's model usage — what its
         #: end-of-wake log line reports. `max_steps` is a **per-run** budget, so `steps_used` may
@@ -422,6 +429,10 @@ class Engine:
             messages.append(turn)
             shown.append(turn)
             return
+        described = self._describe(_media_name(clip), lambda d: d.describe_video(clip))
+        if described is not None:
+            messages.append(Message(role="user", content=described, injected=True))
+            return
         self._log_video_withheld(clip, "model has no image input")
         messages.append(Message(role="user", content=_withheld_caption([clip]), injected=True))
 
@@ -463,12 +474,60 @@ class Engine:
             messages.append(shown_turn)
             shown.append(shown_turn)  # only a pixel-bearing turn needs eviction after the reply
             return
-        # No vision: withhold the pixels, and say so plainly rather than leave the model a caption
-        # that promises sight. The description already rode the tool result (`_describe`), so the
-        # note only has to name what was not shown and why. It carries no pixels, so it is not added
-        # to `shown` (nothing to evict) and stays as a permanent, bounded breadcrumb like the caption.
+        # No vision. If a describer is configured (issue #472), a second, vision-capable model
+        # reads the pixels and the brain gets its words — the agent *works* instead of merely being
+        # honest. Whether or not that succeeds, no pixels are injected here, so the turn is not
+        # added to `shown` (nothing to evict) and stays a permanent, bounded breadcrumb.
+        described = self._describe(_image_names(pictures), lambda d: d.describe_images(pictures))
+        if described is not None:
+            messages.append(Message(role="user", content=described, injected=True))
+            return
+        # No describer, or it failed: withhold the pixels and say so plainly rather than leave the
+        # model a caption that promises sight. The description already rode the tool result
+        # (`_describe`), so the note only has to name what was not shown and why.
         self._log_images_withheld(pictures)
         messages.append(Message(role="user", content=_withheld_caption(pictures), injected=True))
+
+    def describer(self) -> Any:
+        """The configured describer, built once per engine — or ``None`` when none is configured.
+
+        Lazy on **both** axes: the env is read only when a model actually goes blind on some media,
+        and the adapter is constructed only then too. A describer-less agent (the shipped default)
+        therefore pays exactly one dict lookup, ever, and no vendor SDK is touched.
+
+        The import is local because the factory lives in `_basecradle`, which imports this module.
+        """
+        if self._describer is False:
+            from basecradle_harness._describer import describer_from_env
+
+            self._describer = describer_from_env()
+        return self._describer
+
+    def _describe(self, subject: str, ask: Callable[[Any], str | None]) -> str | None:
+        """Run `ask` against the describer and wrap its answer as the injected turn's text.
+
+        ``None`` — no describer configured, or it could not answer — means the caller falls back to
+        the honest withheld caption. The caption this returns always **names the describer model**,
+        so the transcript never lets the brain (or anyone reading its memory later) believe it saw
+        pixels it never received.
+        """
+        describer = self.describer()
+        if describer is None:
+            return None
+        described = ask(describer)
+        if described is None:
+            return None
+        from basecradle_harness._describer import described_caption
+
+        _, model = describe_provider(self.provider)
+        # INFO, not WARNING: this is the feature *working*. The WARNING belongs to the degrade it
+        # replaced, and emitting one here would make a healthy described agent look broken on every
+        # picture — which is how a real warning stops being read.
+        _log.info(
+            "media described for a model with no vision %s",
+            kv(subject=subject, describer=describer.model, model=model),
+        )
+        return described_caption(subject, describer.model, described)
 
     def _log_images_withheld(self, pictures: list[ImageContent]) -> None:
         """The loud, greppable record that a viewed image was withheld from a no-vision model (#316).
