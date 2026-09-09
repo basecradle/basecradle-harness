@@ -7,6 +7,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.117.1] - 2026-09-09
+
+### Changed: a described video is described temporally — first frame / over time / last frame (issue #479)
+
+The live spot-verify of the describer on @glm-5.2 routed a 5 s clip **natively** to a Gemini-class
+describer — correct; its `supports_video()` was true — and the brain got back **one composite
+paragraph**: *"the entire image vibrates"*. No first frame, no last frame, no timestamps. Asked what
+was in frame 0, what changed across the clip, and whether frame 0 matched the source still,
+@glm-5.2 answered honestly that it could not say.
+
+**The defect was a shape, not a capability.** The frames tier hands a *sighted* brain exactly that
+structure — six captioned, timestamped stills — so a blind brain was getting strictly less for the
+same tool call. Both video paths now ask the describer for the same three labelled parts, in plain
+prose with no markdown: **`First frame:`** (the opening moment described as fully as a still, with
+visible text transcribed verbatim), **`Over time:`** (what moves, appears, disappears or is redrawn,
+with approximate timestamps in seconds), **`Last frame:`** (the final moment and how it differs from
+the first). The sampled-frames path keeps its per-frame timestamps and closes with the same
+three-part summary. The instruction is spelled **once** (`DESCRIBE_VIDEO_PARTS`) and shared by both
+tiers: a brain that learns to read one label natively and another from frames has learned nothing.
+
+**A still is untouched.** A photograph has no first frame and no clock, so `DESCRIBE_PROMPT` is
+byte-identical and a test pins the labels' *absence* there as well as their presence for video.
+
+**The clip's own facts now ride ahead of the description on both tiers.** The frames tier has
+carried them since #471 (`sample_frames` returns a summary naming duration, frame rate, resolution
+and every timestamp it actually decoded); the native tier decoded nothing and therefore said
+nothing, so a brain asked *how long is it?* about a clip just described to it could only guess. The
+native path now costs one **header-only** probe of bytes already in memory. A header that will not
+parse contributes **no line at all** rather than a note about the parse: the description is the
+valuable half and it is already in hand, and a probe failure on a clip a vision model has just
+watched successfully is a fact about this decoder, not about the clip. The facts are formatted by a
+new shared `_video.video_facts` — the one spelling the `watch_video` result and the frames summary
+also use, so the brain never reads two differently-worded accounts of one file.
+
+**The video caption makes "not my own sight" structural.** A described clip is now introduced as
+*"…was watched by `<model>`, and what follows is that model's description of the clip as a whole —
+its account of it, not your own sight"*, where a still keeps its existing wording. A still is a
+moment and *"was described by"* covers it; a clip is a span. @glm-5.2 got this right by instinct on
+the live run, and instinct is not a guarantee.
+
+Offline only: no new dependency, no new env var, no wire change. README and
+`docs/harness-internals.md` describer sections updated in the same PR.
+
 ## [0.117.0] - 2026-09-09
 
 ### Added: `watch_video` — every harness agent can see a video (issue #471)

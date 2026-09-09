@@ -135,12 +135,45 @@ DESCRIBE_PROMPT = (
     "bullet lists, no preamble such as 'This image shows'."
 )
 
+#: The three labelled parts **every** video description carries, spelled once and shared by both
+#: video paths — the natively-watched clip and the sampled frames (issue #479).
+#:
+#: The live run that forced this: a Gemini-class describer watched a 5 s clip natively and answered
+#: with one composite paragraph — *"the entire image vibrates"* — no first frame, no last frame, no
+#: timestamps. Asked "what is in frame 0, what changes, does frame 0 match the still?", @glm-5.2
+#: honestly could not say. The frames path hands a *sighted* brain six captioned stills and exactly
+#: that structure; a blind brain was getting strictly less for the same tool call. The fix is not a
+#: capability, it is a shape: **ask for the structure the frames path already has.**
+#:
+#: Shared rather than spelled twice because the two paths answer the same questions about the same
+#: clip: two wordings would be two things to keep in step, and a brain that learns to read "First
+#: frame:" on one path and something else on the other has learned nothing.
+DESCRIBE_VIDEO_PARTS = (
+    "Structure the description as three parts, in this order, each opening with its label exactly "
+    "as written here. 'First frame:' — describe the clip's first moment as fully as you would a "
+    "still: every subject, the layout, the colours, and any visible text transcribed verbatim. "
+    "'Over time:' — what moves, appears, disappears, or is redrawn, with approximate timestamps "
+    "in seconds. 'Last frame:' — what the final moment shows and how it differs from the first. "
+    "Plain prose throughout: no markdown headings and no bullet lists."
+)
+
+#: The extra clause for a clip the describer watches **natively**. It sees the real thing, so the
+#: only thing to say beyond the shared structure is that it is a clip and where its clock starts.
+DESCRIBE_VIDEO_SUFFIX = (
+    " This is a video, not a still: its first frame is at t=0.0s and it runs from there to its "
+    "end. " + DESCRIBE_VIDEO_PARTS
+)
+
 #: The extra clause for a set of sampled frames: they are moments of one clip, not separate
 #: pictures, and a describer told otherwise writes five unrelated paragraphs instead of an account
-#: of what happened.
+#: of what happened. The per-frame timestamps come first and the shared three-part summary closes,
+#: so a blind brain gets the frame-by-frame detail a sighted one would have seen **and** the same
+#: structure it can ask temporal questions of.
 DESCRIBE_FRAMES_SUFFIX = (
-    " These are frames sampled in order from a single video, each labelled with its timestamp. "
-    "Lead each frame's description with its timestamp, and say what changes between them."
+    " These are frames sampled in order from a single video, each labelled with its timestamp — "
+    "moments of one clip, not separate pictures. Lead each frame's description with its timestamp "
+    "and say what changes between them, then close with a summary of the clip as a whole. "
+    + DESCRIBE_VIDEO_PARTS
 )
 
 
@@ -201,15 +234,28 @@ class Describer:
         The describer is put through the **same** capability gate the brain is (`model_sees_video`,
         fail-closed), so this is one rule applied twice rather than two rules that can drift: a
         video-capable describer watches the clip, and every other describer reads its frames.
+
+        **Both paths ask for the same three-part structure** (`DESCRIBE_VIDEO_PARTS` — first frame,
+        over time, last frame) and **both return the clip's own facts ahead of the description**
+        (issue #479). That symmetry is the whole fix: a sighted brain reads captioned frames and
+        can answer *"what is in frame 0, and what changed?"*; before this, a blind brain on the
+        native path got one composite paragraph with no first frame, no last frame and no clock,
+        and had to say it could not. The frames path already carried its facts (`sample_frames`
+        returns the summary naming duration, rate, resolution and every timestamp it decoded); the
+        native path decoded nothing, so it probes for them.
         """
         name = clip.alt or "video"
         if model_sees_video(self.provider):
-            return self._ask(
-                DESCRIBE_PROMPT,
+            described = self._ask(
+                DESCRIBE_PROMPT + DESCRIBE_VIDEO_SUFFIX,
                 videos=[clip],
                 kind="video.describe",
                 subject=name,
             )
+            if described is None:
+                return None
+            facts = _watched_facts(name, clip)
+            return described if facts is None else f"{facts}\n{described}"
         try:
             from basecradle_harness._video import decode_data_url, sample_frames
 
@@ -384,15 +430,55 @@ def describer_from_env(env: Any = None) -> Describer | None:
     return Describer(provider, model)
 
 
-def described_caption(subject: str, model: str, description: str) -> str:
+def described_caption(subject: str, model: str, description: str, *, video: bool = False) -> str:
     """The injected turn's text: who described what, then the description.
 
     The caption **always names the describer**, and that is not a nicety. The brain is about to
     read a paragraph about a picture it never received; a transcript that did not say where those
     words came from would let the agent — and anyone reading its memory later — believe it saw
     something it did not.
+
+    ``video`` selects the one wording that differs, and it differs because the two claims are not
+    the same claim (issue #479). A still is one moment and *"was described by"* covers it; a clip
+    is a span, and what the brain holds is one model's account of **the whole of it** rather than a
+    look at any frame of it. Saying so structurally is what keeps an agent from relaying the
+    describer's sentences as its own sight — @glm-5.2 got that right by instinct on the live run,
+    and instinct is not a guarantee.
     """
+    if video:
+        return (
+            f"(This model has no video input. {subject} was watched by {model}, and what follows "
+            f"is that model's description of the clip as a whole — its account of it, not your "
+            f"own sight:)\n{description}"
+        )
     return f"(This model has no image input. {subject} was described by {model}:)\n{description}"
+
+
+def _watched_facts(name: str, clip: VideoContent) -> str | None:
+    """The clip's own header facts, for the line that sits ahead of a natively-watched description.
+
+    The frames path gets these free — `sample_frames` returns a summary naming duration, frame
+    rate, resolution and every timestamp it actually decoded — and the native path decoded nothing,
+    so it costs one **header-only** probe of bytes already in memory (issue #479). Without it a
+    blind brain reads a paragraph about a clip whose length, rate and size it cannot state, which
+    is half of what it could not answer on the live run.
+
+    The facts are formatted by `_video.video_facts`, the one spelling the `watch_video` result and
+    the frames summary also use, so the brain never reads two differently-worded accounts of one
+    file.
+
+    A header that will not parse contributes **no line at all**, rather than a note about the
+    parse. The description is the valuable half and it is already in hand; a probe failure on a
+    clip a vision model has just watched successfully is a fact about this decoder, not about the
+    clip the brain is being told about.
+    """
+    from basecradle_harness._video import decode_data_url, probe, video_facts
+
+    try:
+        info = probe(decode_data_url(clip.url))
+    except ValueError:
+        return None
+    return f"(Watched the whole of {name} ({video_facts(info)}).)"
 
 
 def _fault_of(exc: ProviderError) -> str:
