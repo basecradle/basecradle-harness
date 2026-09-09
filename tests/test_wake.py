@@ -1936,24 +1936,60 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     # additive contract so a verifier can rely on the keys existing.
     assert report["model_params"] == {}
     assert report["model_params_stripped"] == []
-    # The blind-model describer (issue #472): null on the shipped default, which is the state a
-    # drift pass has to be able to tell apart from "the describer was dropped".
+    # The blind-model describer (issue #472): the trio reads "off" on the shipped default, which
+    # is the state a drift pass has to be able to tell apart from "the describer was dropped".
     assert report["describer_model"] is None
+    assert report["describer_providers"] == []
+    assert report["describer_api_key_set"] is False
 
 
 def test_resolved_config_reports_the_configured_describer(wake_env, monkeypatch, capsys):
-    """A describer is one env var, costs money on every withheld picture, and is otherwise
-    invisible from off the box — so it is reported, exactly as the rerank model is."""
+    """A describer costs money on every withheld picture and is otherwise invisible from off the
+    box, so its trio is reported exactly as the rerank trio is — and the key never is."""
     monkeypatch.setenv("HARNESS_DESCRIBER_MODEL", "  google/gemini-3-flash  ")
+    monkeypatch.setenv("HARNESS_DESCRIBER_PROVIDERS", " google-vertex ,deepinfra")
+    monkeypatch.setenv("HARNESS_DESCRIBER_API_KEY", "sk-or-v1-describer-secret")
+
+    assert main(["--resolved-config"]) == 0
+    out = capsys.readouterr().out
+    report = json.loads(out)
+
+    assert report["describer_model"] == "google/gemini-3-flash"  # trimmed, never the raw value
+    assert report["describer_providers"] == ["google-vertex", "deepinfra"]  # order preserved
+    assert report["describer_api_key_set"] is True
+    assert "sk-or-v1-describer-secret" not in out  # presence only — this file is pasted into issues
+    # The key also rides `tool_env`: an ungated call-time read with no plugin to declare it, which
+    # is the surface issue #427 exists for. Two consumers of one fact, not the fact twice.
+    assert report["tool_env"]["HARNESS_DESCRIBER_API_KEY"] is True
+
+
+def test_a_configured_describer_with_no_key_reads_false_where_it_matters(
+    wake_env, monkeypatch, capsys
+):
+    """The configured-but-dead state a drift pass must tell apart from a deliberately blind agent."""
+    monkeypatch.setenv("HARNESS_DESCRIBER_MODEL", "google/gemini-3-flash")
+    monkeypatch.delenv("HARNESS_DESCRIBER_API_KEY", raising=False)
+    monkeypatch.delenv("HARNESS_DESCRIBER_PROVIDERS", raising=False)
 
     assert main(["--resolved-config"]) == 0
     report = json.loads(capsys.readouterr().out)
 
-    assert report["describer_model"] == "google/gemini-3-flash"  # trimmed, never the raw value
-    # No key or endpoint axis rides beside it, and that is the design: the describer runs on the
-    # agent's own SDK/surface/key/base URL, already reported above, so a second set of fields
-    # would be the same configuration reported twice — and a second place for it to be wrong.
-    assert not [key for key in report if key.startswith("describer_") and key != "describer_model"]
+    assert report["describer_api_key_set"] is False
+    assert report["describer_providers"] == []
+    # `tool_env`'s contract, held exactly: every `false` is an active capability that cannot do
+    # its job — this describer will fall back to the withheld caption on every picture.
+    assert report["tool_env"]["HARNESS_DESCRIBER_API_KEY"] is False
+
+
+def test_an_unconfigured_describer_puts_no_key_row_in_tool_env(wake_env, monkeypatch, capsys):
+    """A `false` for a variable nobody wants is the XAI_TEAM_ID noise this map deliberately avoids."""
+    monkeypatch.delenv("HARNESS_DESCRIBER_MODEL", raising=False)
+
+    assert main(["--resolved-config"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["describer_model"] is None
+    assert "HARNESS_DESCRIBER_API_KEY" not in report["tool_env"]
 
 
 def test_resolved_config_reports_loaded_model_params_and_collisions(

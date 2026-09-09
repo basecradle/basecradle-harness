@@ -30,8 +30,11 @@ from basecradle_harness import (
 from basecradle_harness._describer import (
     DESCRIBE_FRAMES_SUFFIX,
     DESCRIBE_PROMPT,
+    DESCRIBER_API_KEY_VAR,
     DESCRIBER_MODEL_VAR,
+    DESCRIBER_PROVIDERS_VAR,
     described_caption,
+    describer_providers_from_env,
 )
 
 DESCRIPTION = "A tabby cat asleep on a windowsill, with the word HELLO written on the glass."
@@ -158,24 +161,105 @@ def test_with_no_describer_configured_a_blind_model_gets_exactly_the_old_caption
 
 
 def test_the_model_id_is_the_only_switch(monkeypatch):
+    for value in ("", "   "):
+        monkeypatch.setenv(DESCRIBER_MODEL_VAR, value)
+        assert describer_from_env() is None  # whitespace is absence, not a model id
     monkeypatch.delenv(DESCRIBER_MODEL_VAR, raising=False)
     assert describer_from_env() is None
-    monkeypatch.setenv(DESCRIBER_MODEL_VAR, "")
-    assert describer_from_env() is None
-    monkeypatch.setenv(DESCRIBER_MODEL_VAR, "   ")
-    assert describer_from_env() is None  # whitespace is absence, not a model id
 
 
-def test_a_configured_but_unbuildable_describer_is_an_error_and_never_a_raise(monkeypatch, caplog):
-    """Config-class failure: dead until a human acts, so ERROR — and the wake still runs."""
-    monkeypatch.setenv(DESCRIBER_MODEL_VAR, "some/model")
+# --- the config trio: a model without its key or its routing is DEAD, not OFF -----------------
+
+
+def _env(**overrides):
+    base = {
+        DESCRIBER_MODEL_VAR: "google/gemini-3-flash",
+        DESCRIBER_API_KEY_VAR: "sk-or-v1-describer",
+        DESCRIBER_PROVIDERS_VAR: "google-vertex, deepinfra",
+    }
+    base.update(overrides)
+    return {k: v for k, v in base.items() if v is not None}
+
+
+@pytest.mark.parametrize(
+    ("missing", "reason"),
+    [
+        (DESCRIBER_API_KEY_VAR, "config:missing_api_key"),
+        (DESCRIBER_PROVIDERS_VAR, "config:missing_providers"),
+    ],
+)
+def test_a_model_without_its_key_or_routing_is_a_faulted_describer_not_none(missing, reason):
+    """Nobody configures a describer by accident — so configured-and-dead is a defect to page on.
+
+    Returning ``None`` here would make a half-configured describer indistinguishable from a
+    deliberately blind agent: the exact Green-While-Absent shape this repo names.
+    """
+    describer = describer_from_env(_env(**{missing: None}))
+
+    assert describer is not None
+    assert describer.fault == reason
+    assert describer.provider is None  # it never calls anything
+
+
+def test_a_faulted_describer_reports_at_error_and_answers_nothing(caplog):
+    describer = describer_from_env(_env(**{DESCRIBER_API_KEY_VAR: None}))
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert (
+            describer.describe_images([ImageContent(url="data:image/png;base64,A", alt="a.png")])
+            is None
+        )
+
+    records = [r for r in caplog.records if "describer failed" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.ERROR]  # config-class pages
+    assert "reason=config:missing_api_key" in records[0].getMessage()
+
+
+def test_a_config_fault_is_reported_once_per_wake_and_then_drops_to_debug(caplog):
+    """The object's life *is* the wake, so "once per wake" needs no clock — and one defect must
+    not become a storm on an agent that views ten pictures."""
+    describer = describer_from_env(_env(**{DESCRIBER_PROVIDERS_VAR: None}))
+    image = [ImageContent(url="data:image/png;base64,A", alt="a.png")]
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        for _ in range(3):
+            describer.describe_images(image)
+
+    levels = [r.levelno for r in caplog.records if "describer failed" in r.getMessage()]
+    assert levels == [logging.ERROR, logging.DEBUG, logging.DEBUG]
+
+
+def test_a_provider_that_will_not_build_is_a_config_fault_carrying_the_reason(monkeypatch, caplog):
+    # `AI_SDK` is the *brain's* axis, so it is read from the process environment and never from the
+    # mapping — the describer is defined as the brain's stack with a different model, key and pin.
     monkeypatch.setenv("AI_SDK", "a-sdk-that-does-not-exist")
+    describer = describer_from_env(_env())
 
+    assert describer.fault == "config:no_provider"
     with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
-        assert describer_from_env() is None
+        assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
+    line = next(r.getMessage() for r in caplog.records if "describer failed" in r.getMessage())
+    assert "reason=config:no_provider" in line
+    assert "a-sdk-that-does-not-exist" in line  # the vendor's/adapter's own words, relayed
 
-    line = next(r.getMessage() for r in caplog.records if "describer unavailable" in r.getMessage())
-    assert "some/model" in line
+
+def test_building_a_describer_logs_nothing(caplog):
+    """`describer_from_env` is side-effect-free: every fault reports at the point of *use*, so a
+    resolution-only read (`--resolved-config`) never writes a line."""
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        describer_from_env(_env(**{DESCRIBER_API_KEY_VAR: None}))
+        describer_from_env(_env(**{DESCRIBER_PROVIDERS_VAR: None}))
+
+    assert not [r for r in caplog.records if "describer" in r.getMessage()]
+
+
+def test_the_provider_list_is_parsed_like_the_reranks(monkeypatch):
+    monkeypatch.setenv(DESCRIBER_PROVIDERS_VAR, " google-vertex , ,DeepInfra,")
+    # Order preserved (OpenRouter reads `only` as a list), blanks dropped, case left as written —
+    # the value is sent to OpenRouter, not compared here.
+    assert describer_providers_from_env() == ("google-vertex", "DeepInfra")
+    monkeypatch.delenv(DESCRIBER_PROVIDERS_VAR)
+    assert describer_providers_from_env() == ()
 
 
 # --- images ------------------------------------------------------------------
@@ -240,7 +324,8 @@ def test_a_describer_that_raises_falls_back_to_the_withheld_caption(caplog):
         "(No image input on this model — cat.png was described above, not shown.)"
     )
     line = next(r.getMessage() for r in caplog.records if "describer failed" in r.getMessage())
-    assert "upstream 503" in line and "d/model" in line
+    # Runtime-class: WARNING, not ERROR — this can succeed next time unchanged.
+    assert "reason=provider_error" in line and "upstream 503" in line and "d/model" in line
 
 
 def test_an_empty_description_is_a_failure_not_a_blank_caption(caplog):
@@ -252,7 +337,7 @@ def test_an_empty_description_is_a_failure_not_a_blank_caption(caplog):
         engine.run(history)
 
     assert "described above, not shown" in next(m for m in history if m.injected).content
-    assert any("returned no text" in r.getMessage() for r in caplog.records)
+    assert any("reason=empty_response" in r.getMessage() for r in caplog.records)
 
 
 def test_a_working_describer_logs_at_info_not_warning(caplog):
@@ -339,3 +424,25 @@ def test_the_caption_names_the_describer_and_says_the_brain_could_not_see():
 @pytest.mark.parametrize("subject", ["cat.png", "clip.mp4", "a.png, b.png"])
 def test_the_caption_carries_whatever_subject_it_is_given(subject):
     assert f"{subject} was described by" in described_caption(subject, "d/model", "x")
+
+
+def test_a_vendor_error_carrying_the_key_is_redacted_before_it_is_logged(caplog):
+    """`detail` relays the vendor's own words, and a vendor may echo the credential back.
+
+    `kv` scrubs, bounds and quotes every value, so this holds by construction rather than by a
+    filter here — which is exactly why it is pinned: the guarantee lives in a module this one does
+    not own, and a change there would break it silently.
+    """
+    secret = "sk-or-v1-0123456789abcdef0123456789abcdef"
+
+    class _Leaky(FakeDescriberProvider):
+        def chat(self, messages, tools=None):
+            raise RuntimeError(f"401 from upstream for key {secret}")
+
+    describer = Describer(_Leaky(), "d/model")
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
+
+    line = next(r.getMessage() for r in caplog.records if "describer failed" in r.getMessage())
+    assert secret not in line
+    assert "[redacted]" in line

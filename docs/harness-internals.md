@@ -636,25 +636,46 @@ vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
   behavior, down to the log lines; nothing is imported and no adapter is built. Same rule, and the
   same reasoning, as the MemPalace reranker: two ways to say the same thing is one way to disagree
   with yourself. `test_describer.py`'s first test is that regression bar.
-- **One factory, one model override.** `_provider_from_config(..., model=…)` builds the describer,
-  so it inherits the brain's SDK, surface, key, base URL and routing pins **by construction**. A
-  parallel factory would be a second place that wiring is spelled, and a describer routed
-  differently from its brain is a different bill and a different endpoint on the `llm` line.
-- **No second key, and that is the *opposite* call from the reranker — deliberately.** The rerank
-  key reaches a **different vendor** from the brain, so keeping the two credentials apart is the
-  whole point there. The describer is the same vendor and the same account, so a `…_API_KEY` would
-  be the same secret stored twice, and a `…_PROVIDER`/`…_SDK` with one legal value is not a choice,
-  it is a second place for the config to be wrong.
+- **One factory, four overrides — and the split between them is the design.**
+  `_provider_from_config(..., model=, api_key=, routing=, inherit_params=False)`. What is *shared*
+  is the SDK, surface and endpoint, and sharing them through the brain's own factory is what stops
+  them drifting: one adapter family, one error taxonomy. What is *not* shared is everything that
+  says whose call it is — a different model, its **own** key (fleet rule: one key per agent per
+  purpose, so a rotated describer key never touches the brain's account), its **own** OpenRouter
+  pin, and no `model_params.json` at all.
+- **`inherit_params=False` is the amendment's whole point, not a tidiness flag.** @glm-5.2's
+  `model_params.json` pins `provider.only` to GLM hosts (novita, baidu, streamlake, …). Inherited,
+  a Gemini-class describer routed there fails **every** call with *no eligible provider* — the
+  feature dead on the one agent it was built for, and dead in a way that looks like a vendor blip.
+  That file is tuning for *this agent's brain*: at best irrelevant to a different model, at worst
+  exactly that pin. The first draft of #472 said "same key, same routing pins"; the amended body
+  reversed both, and this is the reversed form.
+- **`routing` is a list of slugs at the seam and a body field at the wire.** How a pin reaches a
+  given SDK — a `chat.send(provider=…)` keyword on the native OpenRouter adapter, an `extra_body`
+  entry on the openai SDK aimed at OpenRouter, nothing at all on the single-vendor `xai-sdk` — is
+  the factory's knowledge, spelled where every other vendor branch lives, so `_describer.py` never
+  learns a wire format. The object itself comes from the shared `_routing_pin`, so it cannot drift
+  from the reranker's.
+- **A model set without its key or its provider list is DEAD, not OFF.** `describer_from_env`
+  returns a describer carrying a *config fault*, never `None` — `None` would make a
+  half-configured describer indistinguishable from a deliberately blind agent, which is
+  Green-While-Absent exactly. It stays side-effect-free: **every** fault, born-with or per-call,
+  reports at the point of *use*, so one code path decides loudness and a resolution-only read
+  (`--resolved-config`) logs nothing.
 - **The describer is put through the brain's own gates.** `model_sees_video` (fail-closed) decides
   whether it watches a clip or reads its sampled frames — one rule applied twice rather than two
   that can drift. A describer with tools would be an agent; this one is offered none.
-- **Never a fabricated description, and the failure classes are graded.** Any per-call failure —
-  a raise, an empty answer, a clip that will not decode — falls back to the withheld caption with a
-  **WARNING** naming the describer and the reason. A describer *named in config that cannot be
-  built* is **ERROR**: config-class, dead until a human acts, the level the fleet's "Error on AI
-  Server" alert fires on. The same split `_rerank.py` draws, in the same words. A working describer
-  logs **INFO** — the WARNING belongs to the degrade it replaced, and emitting one on every
-  successful description is how a real warning stops being read.
+- **Never a fabricated description, and the failure classes are graded.** `_rerank._fault_of`'s
+  taxonomy, re-drawn here over the same exception classes: **config-class** (no key, no providers,
+  a provider that would not build, 401/403, 402, a model id that does not exist) is *dead until a
+  human acts* → **ERROR**, the level the fleet's "Error on AI Server" alert fires on, and **once
+  per wake** — the object's life *is* the wake, so that needs no clock, and repeats drop to DEBUG
+  so one defect cannot become a storm on an agent that views ten pictures. **Runtime-class**
+  (timeout, 429, 5xx, transport, unparseable or empty answer, an undecodable clip) can succeed
+  unchanged next time → **WARNING**. A generic 4xx is runtime-class deliberately: far likelier a
+  fixable defect than a permanent property of the pool, and paging a human for something the next
+  release fixes is how a page stops being answered. A working describer logs **INFO** — the WARNING
+  belongs to the degrade it replaced.
 - **The caption always names the describer.** `(This model has no image input. cat.png was
   described by <model>:)`. Without that the brain reads a paragraph about a picture it never
   received as its own perception — and so does anyone reading its memory a month later.
@@ -665,7 +686,9 @@ vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
   docstring cannot be trusted to keep, so `test_mining.py` proves it on a real wake: the sentinel
   reaches the model and reaches the palace never.
 
-**Boundary:** `--resolved-config` reports `describer_model` and deliberately nothing beside it —
-the describer's provider, SDK, surface and key are the agent's own and are already reported, so a
-second set of fields would be the same configuration twice. Live verification is the capital's, on
-@glm-5.2.
+**Boundary:** `--resolved-config` reports `describer_model`, `describer_providers` and
+`describer_api_key_set`, and **never the key** — that file is pasted into issues. The key also rides
+`tool_env`, but only when a model is configured: it is an ungated call-time read with no
+`ToolPlugin` to hang `needs_env` on (issue #427's shape without a plugin), and a `false` for a
+variable nobody wants is the `XAI_TEAM_ID` noise that map deliberately avoids. Live verification is
+the capital's, on @glm-5.2.

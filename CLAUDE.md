@@ -174,27 +174,34 @@ never diverge on which model describes or how.
 
 | Var | Meaning |
 |---|---|
-| `HARNESS_DESCRIBER_MODEL` | The describer's model id, on the agent's own provider/SDK/surface/key. **Absent or empty = describer off** — byte-identical to the pre-#472 behavior, down to the log lines, with nothing imported and no adapter built. |
+| `HARNESS_DESCRIBER_MODEL` | The describer's model id. **Absent or empty = describer off** — byte-identical to the pre-#472 behavior, down to the log lines, with nothing imported and no adapter built. |
+| `HARNESS_DESCRIBER_API_KEY` | A key **dedicated to describing on this agent** (fleet rule: one key per agent per purpose). Required when MODEL is set; **never** a fallback to `AI_API_KEY`. |
+| `HARNESS_DESCRIBER_PROVIDERS` | Comma-separated OpenRouter slugs → `provider: {only: [...], allow_fallbacks: true, data_collection: "deny"}` — the same object, built by the same helper, as the reranker's. Required when MODEL is set. **No default list in code**, for the reason `HARNESS_MEMPALACE_RERANK_PROVIDERS` has none. |
 
-There is deliberately **no** `…_PROVIDER` / `…_SDK` / `…_API_KEY` companion, and that is the
-*opposite* call from the MemPalace reranker's dedicated key — the difference is the reason. The
-rerank key reaches a **different vendor** from the brain, so keeping the credentials apart is the
-point; the describer is the same vendor and the same account, so a second key is the same secret
-twice and an axis with one legal value is not a choice, it is a second place for the config to be
-wrong. `_provider_from_config(..., model=…)` builds it — the **brain's own factory with the model
-overridden** — so it inherits the SDK, surface, key, base URL and routing pins by construction. A
-parallel factory would be a second place that wiring is spelled, and a describer routed differently
-from its brain is a different bill and a different endpoint on the `llm` line.
+**The describer shares the brain's stack and nothing else, and each half of that is load-bearing.**
+It is built by `_provider_from_config(..., model=, api_key=, routing=, inherit_params=False)` — the
+brain's own factory — so the **SDK, surface and endpoint** cannot drift: one adapter family, one
+error taxonomy. What it must **not** inherit is the brain's key (one key per agent per purpose, so a
+rotated or compromised describer key never touches the brain's account) or its routing pin:
+@glm-5.2's `model_params.json` pins `provider.only` to GLM hosts, and a Gemini-class describer
+routed there fails **every** call with *no eligible provider*. `inherit_params=False` drops that
+file whole, because it is tuning for **this agent's brain** — at best irrelevant to a different
+model, at worst exactly that pin. (This is the reverse of the first draft of #472, which said "same
+key, same pins"; the amendment is the law.)
 
 Four invariants, each with an "obviously fine" broken form:
 
 - **Off by absence, and the model id is the only switch** — no shadow mode, no `…_ENABLED`
   companion, for the same reason `_rerank.py` has none. The regression bar is a test.
-- **Never a fabricated description, and the failure classes are graded.** A per-call failure (a
-  raise, an empty answer, a clip that will not decode) falls back to the withheld caption with a
-  **WARNING** naming the describer and the reason; a describer *named in config that cannot be
-  built* logs **ERROR** — config-class, dead until a human acts, the level the fleet's "Error on AI
-  Server" alert fires on — and the wake runs on. A working describer logs **INFO**: the WARNING
+- **A model set without its key or its provider list is DEAD, not OFF** — `describer_from_env`
+  returns a describer carrying a *config fault*, never `None`. `None` would make a half-configured
+  describer indistinguishable from a deliberately blind agent, which is Green-While-Absent exactly.
+- **Never a fabricated description, and the failure classes are graded** — `_rerank.py`'s two, in
+  its words. **Config-class** (no key, no providers, a provider that would not build, 401/403, 402,
+  a model id that does not exist) → withheld caption + **ERROR**, *once per wake* (the object's life
+  **is** the wake, so this needs no clock; repeats drop to DEBUG so one defect cannot become a
+  storm). **Runtime-class** (timeout, 429, 5xx, transport, unparseable or empty answer, an
+  undecodable clip) → withheld caption + **WARNING**. A working describer logs **INFO**: the WARNING
   belongs to the degrade it replaced, and one on every successful description is how a real warning
   stops being read. Nothing here ever raises into a wake.
 - **The caption always names the describer.** Without it the brain reads a paragraph about a picture
@@ -208,9 +215,12 @@ Four invariants, each with an "obviously fine" broken form:
   asset's own dialogue and nothing else — which is precisely the kind of claim #438 proved a
   docstring cannot be trusted to keep, so `test_mining.py` proves it on a real wake.
 
-`--resolved-config` reports `describer_model` and **nothing beside it**: the describer's provider,
-SDK, surface and key are the agent's own and already reported, so a second set of fields would be
-the same configuration reported twice.
+`--resolved-config` reports `describer_model`, `describer_providers` and `describer_api_key_set` —
+**never the key itself**, here or anywhere; that file is pasted into issues. The key *also* rides
+`tool_env`, but **only when a model is configured**: it is an ungated call-time read with no plugin
+to hang `needs_env` on (issue #427's shape without a `ToolPlugin`), and a `false` for a variable
+nobody wants is the `XAI_TEAM_ID` noise that map deliberately avoids. With a describer configured
+the map's contract holds exactly — *every `false` is an active capability that cannot do its job*.
 
 ## The Unspoken Channel (Recurrence Guard)
 

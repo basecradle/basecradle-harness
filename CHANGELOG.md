@@ -67,24 +67,35 @@ agent sees.
 **Off by absence.** Unset or empty → every path is byte-identical to before: the withheld caption,
 the WARNING, no spend, no import. The model id *is* the switch; there is no companion enable flag.
 
-**One provider, one key, one axis.** The describer is a second adapter instance built by the *same*
-factory as the brain with only the model overridden, so it inherits the agent's SDK, surface, key,
-base URL and routing pins by construction and cannot drift from them. There is deliberately no
-`…_PROVIDER` / `…_SDK` / `…_API_KEY` companion — with one legal value, an axis is not a choice, it
-is a second place for the config to be wrong. (The opposite call from the MemPalace reranker, whose
-key reaches a *different vendor*; here it is the same vendor and the same account.)
+**It shares the brain's stack and nothing else.** Three vars configure it, spelled and required
+exactly as the MemPalace rerank trio is: `HARNESS_DESCRIBER_MODEL`, `HARNESS_DESCRIBER_API_KEY`
+(dedicated — fleet rule, one key per agent per purpose; **never** a fallback to `AI_API_KEY`) and
+`HARNESS_DESCRIBER_PROVIDERS` (OpenRouter slugs → `provider: {only, allow_fallbacks: true,
+data_collection: "deny"}`, no default list in code). It is built by the brain's own factory, so the
+SDK, surface and endpoint cannot drift — but it does **not** inherit the brain's key, its routing
+pin, or its `model_params.json`. That last one is the whole reason the provider list exists:
+@glm-5.2's brain pins `provider.only` to GLM hosts, and a Gemini-class describer routed there fails
+**every** call with *no eligible provider*.
+
+**A model set without its key or its provider list is DEAD, not OFF** — a describer carrying a
+config fault, never `None`, because `None` would make a half-configured describer indistinguishable
+from a deliberately blind agent.
 
 **The describer gets the same three tiers the brain does**, through the same fail-closed
 `model_sees_video` gate: a video-capable describer watches the clip, a vision-only one reads its
 sampled frames. One rule applied twice, not two that can drift.
 
-**Never a fabricated description.** Any failure — no adapter, no key, a raise, an empty answer —
-falls back to the withheld caption with a WARNING naming the describer and the reason; a
-configured-but-unbuildable describer logs ERROR (dead until a human acts) and the wake runs on.
-The injected turn **always names the describer model**, so neither the brain nor anyone reading its
-memory later can mistake a description for the brain's own perception. `--resolved-config` reports
-`describer_model` (`null` when unset), and `test_mining.py` carries a describer sentinel: its words
-reach the model and never the palace.
+**Never a fabricated description, and the loudness is graded** — the reranker's two classes, in its
+words. Config-class (no key, no providers, a provider that would not build, 401/403, 402, an unknown
+model id) → withheld caption + **ERROR**, once per wake, repeats at DEBUG. Runtime-class (timeout,
+429, 5xx, transport, unparseable or empty answer, an undecodable clip) → withheld caption +
+**WARNING**. A working describer logs INFO. Nothing raises into a wake.
+
+The injected turn **always names the describer model**, on every path, so neither the brain nor
+anyone reading its memory later can mistake a description for the brain's own perception.
+`--resolved-config` reports `describer_model`, `describer_providers` and `describer_api_key_set` —
+never the key — and the key rides `tool_env` when a model is configured. `test_mining.py` carries a
+describer sentinel: its words reach the model and never the palace.
 
 
 ## [0.116.3] - 2026-09-09

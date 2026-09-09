@@ -1349,16 +1349,24 @@ The video capability gate is the deliberate **opposite** of the vision gate: `mo
 A **text-only** brain — `z-ai/glm-5.2`, whose `input_modalities` are text alone — reaches the third tier on everything: an honest "described above, not shown". Honest and useless. Set **`HARNESS_DESCRIBER_MODEL`** to a vision-capable model id and the harness sends the pixels to *that* model and hands the brain its words, so a blind agent **works** instead of merely being candid:
 
 ```bash
-# In agent.env — the model id on this agent's own provider. Absent = describer off.
-HARNESS_DESCRIBER_MODEL=google/gemini-3-flash
+# In agent.env. Three vars, spelled and required exactly as the MemPalace rerank trio is.
+HARNESS_DESCRIBER_MODEL=google/gemini-3-flash          # absent = describer off
+HARNESS_DESCRIBER_API_KEY=sk-or-v1-...                 # dedicated; never falls back to AI_API_KEY
+HARNESS_DESCRIBER_PROVIDERS=google-vertex,deepinfra    # OpenRouter slugs; no default in code
 ```
 
-- **Off by absence.** Unset or empty and every path is byte-identical to what it was before the feature existed — the withheld caption, the WARNING, no spend, nothing imported. The model id *is* the switch; there is no companion enable flag.
-- **One provider, one key, one axis.** The describer is a second adapter instance built by the **same factory** as the brain with only the model overridden, so it inherits the agent's `AI_SDK`, `AI_SDK_SURFACE`, `AI_API_KEY`, base URL and routing pins by construction. There is deliberately no `…_PROVIDER` / `…_SDK` / `…_API_KEY` companion: with exactly one legal value, an axis is not a choice, it is a second place for the config to be wrong.
+| Var | Meaning |
+|---|---|
+| `HARNESS_DESCRIBER_MODEL` | The describer's model id. **Absent or empty = describer off** — byte-identical to the behavior before the feature existed. The model id is the only switch; there is no companion enable flag. |
+| `HARNESS_DESCRIBER_API_KEY` | A key **dedicated to describing on this agent** (fleet rule: one key per agent per purpose), so a rotated or compromised describer key never touches the brain's account. Required when the model is set; **never** a fallback to `AI_API_KEY`. |
+| `HARNESS_DESCRIBER_PROVIDERS` | Comma-separated OpenRouter provider slugs → `provider: {only: [...], allow_fallbacks: true, data_collection: "deny"}`, the same object the reranker sends. Required when the model is set. **No default list in code:** which endpoints are acceptable is a jurisdiction decision with a date on it, and a vendor list baked into a package rots the way a vendor cap table does. |
+
+- **The describer shares the brain's stack and nothing else.** It is a second adapter instance built by the **same factory**, so the `AI_SDK`, `AI_SDK_SURFACE` and endpoint cannot drift — one adapter family, one error taxonomy. It does **not** inherit the brain's key, its routing pin, or its `model_params.json`. That last one is the reason the provider list exists: @glm-5.2's brain pins `provider.only` to GLM hosts, and a Gemini-class describer routed there fails **every** call with *no eligible provider*.
+- **A model set without its key or its provider list is DEAD, not OFF.** It falls back to the withheld caption on every picture and says so at **ERROR** — once per wake, repeats at DEBUG so one defect cannot become a storm. Nobody configures a describer by accident, so a configured-and-dead one is a defect to page on while an unconfigured one is a choice. Runtime faults (a timeout, a 429, a 5xx, an unparseable answer) fall back the same way at **WARNING**: they can succeed unchanged next time.
 - **The describer gets the same three tiers the brain does.** A video-capable describer watches the clip; a vision-only one reads its sampled frames — the same fail-closed gate, one rule applied twice.
 - **It covers all three perception paths through one seam:** `view`, `watch_video`, and a peer's image *on arrival* at the asset wake, so an agent is described to the same way whichever way a picture reaches it. (A posted video still stays acknowledge-only on wake.)
-- **Never a fabricated description.** Any failure falls back to the withheld caption the agent had before, with a WARNING naming the describer and the reason; a describer named in config that cannot be built logs ERROR — dead until a human acts — and the wake runs on. The injected turn **always names the describer model**, so neither the brain nor anyone reading its memory later can mistake a description for the brain's own perception.
-- The description is model-generated text about a peer's content: injected as context, never executed, and never mined as the agent's own words (the [memory](#remember-things--the-memory-tool) mining boundary is untouched — `test_mining.py` carries a describer sentinel of its own). `basecradle-harness-wake --resolved-config` reports `describer_model`, `null` when unset.
+- **Never a fabricated description**, and the injected turn **always names the describer model**, so neither the brain nor anyone reading its memory later can mistake a description for the brain's own perception.
+- The description is model-generated text about a peer's content: injected as context, never executed, and never mined as the agent's own words (the [memory](#remember-things--the-memory-tool) mining boundary is untouched — `test_mining.py` carries a describer sentinel of its own). `basecradle-harness-wake --resolved-config` reports `describer_model`, `describer_providers` and `describer_api_key_set` — **never the key itself** — and the key also rides `tool_env` when a model is configured.
 
 Video *generation* arrives on the [`xai` profile](#go-all-xai--the-xai-profile) — `grok_generate_video`, the harness's first video modality — and `watch_video` is how an agent checks what it made.
 

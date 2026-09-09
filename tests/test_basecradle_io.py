@@ -822,48 +822,113 @@ def test_provider_from_config_openai_builds_the_sdk_adapter(monkeypatch):
     provider.close()
 
 
-def test_the_model_override_builds_a_second_instance_on_the_brains_own_wiring(monkeypatch):
-    """The describer's adapter path (issue #472): same SDK, surface, key, base URL — new model.
+def test_the_overrides_share_the_brains_stack_and_nothing_else(monkeypatch):
+    """The describer's adapter path (issue #472): same SDK, surface and endpoint — new everything
+    that identifies *whose* call it is.
 
-    Overriding the model on the *one* factory is what makes a describer unable to drift from the
-    brain's wiring; a parallel factory would be a second place for that wiring to be spelled.
+    Building it on the *one* factory is what stops the shared half drifting; the four overrides are
+    what stop the unshared half being inherited.
     """
     _set_model_key(monkeypatch)
     monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
     monkeypatch.setenv("AI_BASE_URL", "https://gateway.example.com/v1")
 
     brain = _provider_from_config("openai", "openai", "chat")
-    describer = _provider_from_config("openai", "openai", "chat", model="google/gemini-3-flash")
+    describer = _provider_from_config(
+        "openai", "openai", "chat", model="google/gemini-3-flash", api_key="sk-describer"
+    )
 
     assert brain.model == "z-ai/glm-5.2"
-    assert describer.model == "google/gemini-3-flash"  # the *only* difference
+    assert describer.model == "google/gemini-3-flash"
+    # Shared: the stack. One adapter family, one error taxonomy, one endpoint.
     assert describer.surface == brain.surface == "chat"
     assert describer.base_url == brain.base_url == "https://gateway.example.com/v1"
     assert describer.provider == brain.provider == "openai"
+    # Not shared: the credential. Fleet rule — one key per agent per purpose.
+    assert describer._client.api_key == "sk-describer"
+    assert brain._client.api_key != describer._client.api_key
     brain.close()
     describer.close()
 
 
-def test_the_model_override_carries_the_openrouter_routing_pins(monkeypatch):
-    """A pinned agent's describer must route the same way its brain does, or it is a different bill."""
+def test_the_describer_never_inherits_the_brains_routing_pin(monkeypatch, tmp_path):
+    """The whole reason the describer has its own provider list (issue #472's amendment).
+
+    @glm-5.2's `model_params.json` pins `provider.only` to GLM hosts. Inherited, a Gemini-class
+    describer routed there fails **every** call with no eligible provider — so `inherit_params`
+    drops that file entirely and `routing` supplies the describer's own pin.
+    """
+    _set_model_key(monkeypatch)
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "model_params.json").write_text(
+        json.dumps({"provider": {"only": ["novita", "baidu"], "allow_fallbacks": False}})
+    )
+
+    brain = _provider_from_config("openrouter", "openrouter", "chat")
+    describer = _provider_from_config(
+        "openrouter",
+        "openrouter",
+        "chat",
+        model="google/gemini-3-flash",
+        api_key="sk-describer",
+        routing=("google-vertex", "deepinfra"),
+        inherit_params=False,
+    )
+
+    assert brain._default_params["provider"]["only"] == ["novita", "baidu"]
+    # The describer's own pin, in the shared spelling: `only` is the jurisdiction guarantee,
+    # fallbacks route *inside* it (issue #468), and data collection is denied at the vendor.
+    assert describer._default_params["provider"] == {
+        "only": ["google-vertex", "deepinfra"],
+        "allow_fallbacks": True,
+        "data_collection": "deny",
+    }
+    # And nothing else of the brain's tuning came across.
+    assert set(describer._default_params) == {"provider"}
+
+
+def test_the_describer_keeps_the_openrouter_routing_metadata_header(monkeypatch):
+    """Header, not pin: this one *is* harness wiring on this endpoint, so it must still land."""
     _set_model_key(monkeypatch)
     monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
     monkeypatch.delenv("AI_BASE_URL", raising=False)
 
     brain = _provider_from_config("openrouter", "openai", "chat")
-    describer = _provider_from_config("openrouter", "openai", "chat", model="google/gemini-3-flash")
+    describer = _provider_from_config(
+        "openrouter",
+        "openai",
+        "chat",
+        model="google/gemini-3-flash",
+        api_key="sk-describer",
+        routing=("google-vertex",),
+        inherit_params=False,
+    )
 
-    # The routing-metadata header is harness wiring set on this endpoint, not tuning — a describer
-    # built any other way would silently lose it and report no endpoint on its own `llm` line. It
-    # lands as the SDK client's `default_headers`, which is where the wire actually reads it from.
+    # Without it the describer's own `llm` line would report no endpoint at all (issue #280).
     headers = dict(describer._client.default_headers)
     assert (
         headers["X-OpenRouter-Metadata"]
         == dict(brain._client.default_headers)["X-OpenRouter-Metadata"]
     )
+    # On this cell the pin is a body field, so it rides `extra_body` rather than a keyword.
+    assert describer._extra_body["provider"]["only"] == ["google-vertex"]
     assert describer.base_url == brain.base_url
     brain.close()
     describer.close()
+
+
+def test_a_routing_pin_is_dropped_for_a_single_vendor_sdk(monkeypatch):
+    """`routing` is an OpenRouter concept; xAI is one vendor reached directly, so it is not sent."""
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+
+    provider = _provider_from_config(
+        "xai", "xai-sdk", "native", model="grok-vision", routing=("nowhere",), inherit_params=False
+    )
+
+    assert provider.model == "grok-vision"
+    provider.close()
 
 
 def test_ai_model_is_still_required_even_when_a_model_is_overridden(monkeypatch):
