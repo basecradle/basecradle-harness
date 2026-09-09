@@ -103,6 +103,24 @@ def probe(video_bytes: bytes) -> VideoInfo:
         )
 
 
+def video_facts(info: VideoInfo) -> str:
+    """A clip's header facts as one comma-joined phrase: how long, how fast, how big.
+
+    The **single spelling** behind every line that states them — the `watch_video` tool result, the
+    sampled-frames summary, and the describer's caption for a natively-watched clip (issue #479).
+    Three copies of one format string is three chances for a model to read two differently-worded
+    accounts of the same file and wonder which is the real one; ``length unknown`` rather than a
+    fabricated ``0.0s`` is part of that spelling, because a container that states no duration is a
+    legitimately unknowable answer and not a zero-length clip.
+    """
+    parts = [f"{info.duration_s:.1f}s"] if info.duration_s > 0 else ["length unknown"]
+    if info.fps:
+        parts.append(f"{info.fps:.0f} fps")
+    if info.width and info.height:
+        parts.append(f"{info.width}x{info.height}")
+    return ", ".join(parts)
+
+
 def sample_frames(
     video_bytes: bytes,
     *,
@@ -419,12 +437,7 @@ def _facts(clip: VideoContent) -> str:
         info = probe(decode_data_url(clip.url))
     except ValueError as exc:
         return f"video — could not read its header: {exc}"
-    parts = [f"{info.duration_s:.1f}s"] if info.duration_s > 0 else ["length unknown"]
-    if info.fps:
-        parts.append(f"{info.fps:.0f} fps")
-    if info.width and info.height:
-        parts.append(f"{info.width}x{info.height}")
-    return "video — " + ", ".join(parts)
+    return "video — " + video_facts(info)
 
 
 def _summary(
@@ -436,15 +449,10 @@ def _summary(
     stretched: bool,
 ) -> str:
     """The caption for a sampled-frames turn: what the clip is, and exactly what was sampled."""
-    facts = [f"{info.duration_s:.1f}s"] if info.duration_s > 0 else ["length unknown"]
-    if info.fps:
-        facts.append(f"{info.fps:.0f} fps")
-    if info.width and info.height:
-        facts.append(f"{info.width}x{info.height}")
     times = ", ".join(f"t={_stamp(t)}s" for t in stamps)
     plural = "frame" if len(frames) == 1 else "frames"
     every = f" sampled every {interval:.1f}s" if interval > 0 else ""
-    line = f"(Showing {len(frames)} {plural} of {name} ({', '.join(facts)}){every}: {times})"
+    line = f"(Showing {len(frames)} {plural} of {name} ({video_facts(info)}){every}: {times})"
     if stretched:
         line += (
             f" {MAX_FRAMES} frames is the per-call cap, so the interval was stretched to cover "

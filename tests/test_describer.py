@@ -30,6 +30,7 @@ from basecradle_harness import (
 from basecradle_harness._describer import (
     DESCRIBE_FRAMES_SUFFIX,
     DESCRIBE_PROMPT,
+    DESCRIBE_VIDEO_SUFFIX,
     DESCRIBER_API_KEY_VAR,
     DESCRIBER_MODEL_VAR,
     DESCRIBER_PROVIDERS_VAR,
@@ -368,8 +369,85 @@ def test_a_video_describer_watches_the_clip_itself():
     (messages, _) = vision.seen[0]
     assert messages[0].videos[0].alt == "clip.mp4"
     assert not messages[0].images  # natively watched — never sampled
-    assert messages[0].content == DESCRIBE_PROMPT
-    assert "described by d/video-model" in next(m for m in history if m.injected).content
+    assert messages[0].content == DESCRIBE_PROMPT + DESCRIBE_VIDEO_SUFFIX
+    assert "watched by d/video-model" in next(m for m in history if m.injected).content
+
+
+# --- issue #479: a blind brain gets the structure a sighted one gets ---------
+
+
+@pytest.mark.parametrize("video", [True, False])
+def test_a_video_describer_is_asked_for_first_frame_over_time_and_last_frame(video):
+    """The fix in one assertion, on **both** video paths.
+
+    The live run's defect was shape, not capability: one composite paragraph ("the entire image
+    vibrates") with no first frame, no last frame and no clock, so the brain could not answer
+    "what is in frame 0, and what changed?" — a question the frames path answers for a *sighted*
+    brain by construction. Native and sampled must ask for the same three parts, or a blind agent's
+    answers depend on which tier its describer happened to land on.
+    """
+    brain = BlindProvider(*_turn("watch_video"))
+    vision = FakeDescriberProvider(video=video)
+    engine = _engine(brain, WatchTool(), Describer(vision, "d/model"))
+
+    engine.run([Message.user("watch it")])
+
+    prompt = vision.seen[0][0][0].content
+    assert "'First frame:'" in prompt
+    assert "'Over time:'" in prompt
+    assert "'Last frame:'" in prompt
+    assert "timestamps in seconds" in prompt
+
+
+def test_a_still_is_not_asked_for_the_video_structure():
+    """The other half of the pin: a photograph has no first frame, no last frame and no clock.
+
+    Without this, "add the labels to the prompt" quietly becomes "add them to *every* prompt", and
+    a describer asked for a clip's timeline over one still answers a question nobody asked.
+    """
+    brain = BlindProvider(*_turn("view"))
+    vision = FakeDescriberProvider()
+    engine = _engine(brain, ViewTool(), Describer(vision, "d/model"))
+
+    engine.run([Message.user("look")])
+
+    prompt = vision.seen[0][0][0].content
+    assert prompt == DESCRIBE_PROMPT
+    for label in ("First frame:", "Over time:", "Last frame:"):
+        assert label not in prompt
+
+
+def test_a_natively_watched_clip_carries_its_own_facts_ahead_of_the_description():
+    """Duration, frame rate and resolution — the other half of what the brain could not state.
+
+    The frames path has carried them since #471 (`sample_frames` returns the summary); the native
+    path decoded nothing and so said nothing, and a brain asked "how long is it?" about a clip it
+    had just been described could only guess.
+    """
+    brain = BlindProvider(*_turn("watch_video"))
+    vision = FakeDescriberProvider(video=True)
+    engine = _engine(brain, WatchTool(), Describer(vision, "d/video-model"))
+    history = [Message.user("watch it")]
+
+    engine.run(history)
+
+    note = next(m for m in history if m.injected).content
+    assert "(Watched the whole of clip.mp4 (3.0s, 24 fps, 160x120).)" in note
+    # Ahead of the description, so the brain reads what the clip *is* before what it shows.
+    assert note.index("Watched the whole of") < note.index(DESCRIPTION)
+
+
+def test_an_unprobeable_clip_costs_the_facts_line_and_never_the_description():
+    """A header that will not parse is a fact about this decoder, not about the clip.
+
+    The describer has already watched it and answered; dropping that answer over a probe — or
+    replacing it with a note about the parse — would spend the valuable half to report the cheap
+    one.
+    """
+    clip = VideoContent(url="data:video/mp4;base64,bm90YXZpZGVv", alt="broken.mp4")
+    describer = Describer(FakeDescriberProvider(video=True), "d/video-model")
+
+    assert describer.describe_video(clip) == DESCRIPTION
 
 
 def test_a_vision_only_describer_reads_sampled_frames_and_is_told_they_are_a_sequence():
@@ -424,6 +502,21 @@ def test_the_caption_names_the_describer_and_says_the_brain_could_not_see():
 @pytest.mark.parametrize("subject", ["cat.png", "clip.mp4", "a.png, b.png"])
 def test_the_caption_carries_whatever_subject_it_is_given(subject):
     assert f"{subject} was described by" in described_caption(subject, "d/model", "x")
+
+
+def test_the_video_caption_says_it_holds_an_account_of_the_whole_clip_not_the_brains_sight():
+    """A still is a moment; a clip is a span, and the brain holds one model's account of all of it.
+
+    Structural, not left to instinct: an agent that relays those sentences as its own sight is the
+    failure this wording forecloses (issue #479).
+    """
+    caption = described_caption("clip.mp4", "d/model", "First frame: a cat.", video=True)
+
+    assert caption == (
+        "(This model has no video input. clip.mp4 was watched by d/model, and what follows is "
+        "that model's description of the clip as a whole — its account of it, not your own "
+        "sight:)\nFirst frame: a cat."
+    )
 
 
 def test_a_vendor_error_carrying_the_key_is_redacted_before_it_is_logged(caplog):

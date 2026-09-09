@@ -429,7 +429,7 @@ class Engine:
             messages.append(turn)
             shown.append(turn)
             return
-        described = self._describe(_media_name(clip), lambda d: d.describe_video(clip))
+        described = self._describe(_media_name(clip), lambda d: d.describe_video(clip), video=True)
         if described is not None:
             messages.append(Message(role="user", content=described, injected=True))
             return
@@ -503,13 +503,20 @@ class Engine:
             self._describer = describer_from_env()
         return self._describer
 
-    def _describe(self, subject: str, ask: Callable[[Any], str | None]) -> str | None:
+    def _describe(
+        self, subject: str, ask: Callable[[Any], str | None], *, video: bool = False
+    ) -> str | None:
         """Run `ask` against the describer and wrap its answer as the injected turn's text.
 
         ``None`` — no describer configured, or it could not answer — means the caller falls back to
         the honest withheld caption. The caption this returns always **names the describer model**,
         so the transcript never lets the brain (or anyone reading its memory later) believe it saw
         pixels it never received.
+
+        `video` reaches `described_caption`, which says a *clip* was watched and described as a
+        whole rather than a still described (issue #479). The medium is the caller's knowledge —
+        this seam sees only a subject and a callable — so it is passed, never inferred from the
+        subject's file extension.
         """
         describer = self.describer()
         if describer is None:
@@ -527,7 +534,7 @@ class Engine:
             "media described for a model with no vision %s",
             kv(subject=subject, describer=describer.model, model=model),
         )
-        return described_caption(subject, describer.model, described)
+        return described_caption(subject, describer.model, described, video=video)
 
     def _log_images_withheld(self, pictures: list[ImageContent]) -> None:
         """The loud, greppable record that a viewed image was withheld from a no-vision model (#316).

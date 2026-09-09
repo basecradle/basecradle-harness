@@ -677,6 +677,35 @@ vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
 - **The describer is put through the brain's own gates.** `model_sees_video` (fail-closed) decides
   whether it watches a clip or reads its sampled frames — one rule applied twice rather than two
   that can drift. A describer with tools would be an agent; this one is offered none.
+- **A video is described *temporally*, and the fix was a shape rather than a capability (issue
+  #479).** The live spot-verify on @glm-5.2 routed a 5 s clip natively to a Gemini-class describer
+  — correct, `supports_video()` was true — and the brain got **one composite paragraph**: *"the
+  entire image vibrates"*, no first frame, no last frame, no clock. Asked "what is in frame 0,
+  what changes, does frame 0 match the still?", it honestly could not say. **The frames tier hands
+  a *sighted* brain exactly that structure** (six captioned, timestamped stills), so a blind brain
+  was getting strictly less for the same tool call. Both video paths now ask for the same three
+  labelled parts — `DESCRIBE_VIDEO_PARTS`: *First frame:* (the opening moment as fully as a still,
+  text verbatim), *Over time:* (what moves, appears, disappears or is redrawn, with approximate
+  timestamps), *Last frame:* (and how it differs from the first) — spelled **once** and shared,
+  because a brain that learns to read one label on the native path and another on the frames path
+  has learned nothing. The still prompt is untouched: a photograph has no first frame and no
+  clock, and asking for a timeline over one is asking a question nobody has.
+- **The clip's facts ride ahead of the description, on both tiers.** The frames tier had them free
+  since #471 (`sample_frames` returns a summary naming duration, rate, resolution and every
+  timestamp it actually decoded); the native tier decoded nothing and therefore said nothing, so a
+  brain asked *how long is it?* about a clip just described to it could only guess.
+  `_watched_facts` costs one **header-only** probe of bytes already in memory, and formats them
+  through `_video.video_facts` — the one spelling the `watch_video` result and the frames summary
+  also use, so the brain never reads two differently-worded accounts of one file. A header that
+  will not parse contributes **no line at all**: the description is the valuable half and it is
+  already in hand, and a probe failure on a clip a vision model has just watched is a fact about
+  this decoder, not about the clip.
+- **The video caption makes "not my own sight" structural.** `described_caption(..., video=True)`
+  says the clip *was watched by* the describer and that what follows is **that model's description
+  of the clip as a whole — its account of it, not your own sight**. @glm-5.2 got that right by
+  instinct on the live run; instinct is not a guarantee. The medium is passed down from
+  `_show_video`, never inferred from a file extension — the `_describe` seam sees only a subject
+  and a callable.
 - **Never a fabricated description, and the failure classes are graded.** `_rerank._fault_of`'s
   taxonomy, re-drawn here over the same exception classes: **config-class** (no key, no providers,
   a provider that would not build, 401/403, 402, a model id that does not exist) is *dead until a
