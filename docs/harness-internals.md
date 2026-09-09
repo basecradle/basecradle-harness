@@ -544,3 +544,76 @@ to the **existing** `openrouter` prober arm rather than a new file, so it is pro
 no NOC coordination — that file's own docstring says adding a case there needs none). Query rewriting,
 `closet_llm` regeneration, upstream's "hybrid v4" heuristics, and a `PROVIDER`/`SDK` env axis are
 explicitly out of scope (founder).
+
+---
+
+### Video Perception — `watch_video`, three tiers by capability (issue #471)
+
+**No harness agent could perceive video at all.** `view` is images-only, a posted clip on an
+`asset.created` wake was acknowledged in text and never seen, and `_audio.py`'s docstring had
+deferred the whole modality ("when it comes, it gets its own pure-Python path"). On 2026-08-13
+@eddie-murphy generated three clips for @origin and asserted a first-frame match he had **no way to
+check** — which is the shape of the defect, not a mistake he made. The founder's ruling: agents get
+eyes for video, as a **default tool for every harness agent**, and the harness never tells a model
+to ask a human to look.
+
+- **The tool fetches; the engine perceives.** `WatchVideoTool` (`_video.py`) is a `PlatformTool`
+  read that returns a `VideoContent` and says nothing about perception (the issue #316 rule) — a
+  tool has no view of the provider. `_engine._show_media` routes it at one of three tiers read from
+  the provider's **own declared capabilities, never a vendor branch**: `supports_video` → the video
+  itself; else `supports_vision` → frames sampled here; else the honest withheld caption plus the
+  same WARNING an image gets. This extends the seam `view` already travels (`_split_result` →
+  inject → evict) rather than standing a second one beside it.
+- **The two capability gates fail in *opposite* directions, and that is the design.**
+  `model_sees_images` fails **open**: there is nothing below an image, so withholding one on a wrong
+  guess is a real regression. `model_sees_video` fails **closed**: there *is* a tier below video
+  (frames, which every vision model takes), and the errors are not symmetric — a video part on a
+  model without video input is a hard 400 that fails the whole wake, where guessing low costs a tier
+  that still works. Only a definite `True` sends a video. A future capability with a working
+  fallback should copy the video gate; one without should copy the vision gate.
+- **Pure Python, no subprocess — and that is what makes it a *benign* tool.** PyAV's wheels bundle
+  FFmpeg, so decoding happens in-process and `Policy.locked()`'s no-shell boundary is untouched. No
+  provider call, no spend, nothing created: `watch_video` sits beside `view` and `read` in the
+  default set rather than in the opt-in set with the media *generators*. `av` and `pillow` are
+  therefore **base** dependencies — a default tool with an optional dependency contradicts itself,
+  and an extra would force a NOC wrapper allow-list change plus a per-agent inventory edit across
+  the fleet for a capability every agent is supposed to have.
+- **The `av` floor is 17, not the 18 the issue named, and the reason is this package's own Python
+  floor.** `av` 18 dropped Python 3.10 (`requires_python >=3.11`); the Stack pins 3.10+ and CI runs
+  it. A floor of 18 makes `basecradle-harness` uninstallable on 3.10 — so the range spans the two
+  majors the matrix actually resolves (17.x on 3.10, 18.x on 3.11+), and CI's 3.10→3.14 legs
+  exercise **both**. `pillow` is `>=12,<13` rather than the issue's `>=11,<12`, which would have
+  pinned the fleet to a superseded major; 12.x ships wheels for every Python in the matrix.
+- **The cap bends the interval, never the window.** Targets are the first frame of the window, then
+  one every `every` seconds, then the last — because "does frame 0 match the source still?" and
+  "does it end the way I asked?" are the two questions watching a generated clip is *for*. Over
+  `MAX_FRAMES` the interval stretches to `window / (max_frames - 1)` so the frames still span the
+  whole window, and the summary says so and names `start`/`end`. Truncating the tail instead would
+  silently answer a narrower question than the one asked. The cap is a constant and the window is
+  the knob: there is deliberately no `max_frames` parameter.
+- **Two label defects a test found, not a review.** A frame's timestamp is printed to one decimal
+  where that is exact and two where it is not (`_stamp`), because (a) the tail frame of a 5.0s clip
+  is at 4.958s and `t=5.0s` names an instant that has no frame — breaking the "measured, never
+  assumed" claim in the very case it matters most — and (b) at an interval finer than a tenth of a
+  second, one decimal collapses 0.042s and 0.083s onto `t=0.0s`, telling the model two different
+  stills are the same moment. A clean tenth still prints as one, so the ordinary caption is
+  unchanged. Frames are also de-duplicated by decoded timestamp: several targets can land on one
+  frame, and emitting it once per target spends the budget on duplicates while labelling them as
+  different moments.
+- **Everything is evicted, and for video the reason is sharper.** `_evict_images` clears `videos`
+  alongside `images`. A clip's base64 is orders of magnitude larger than a still's, so one
+  un-evicted video would dominate every later turn of that timeline's transcript forever — the
+  Context Discipline invariant, in its most expensive form. Frames are in-memory only: never written
+  to disk, never posted as assets.
+- **A surface with no video part raises rather than dropping.** The Responses surface and the native
+  `xai-sdk` adapter both raise a `ProviderError` naming the surface. Unreachable under the
+  fail-closed gate — which is the point: silently dropping the clip would leave the model reading a
+  caption for something it never received, the exact defect the vision gate ended (#316).
+- **A posted video is acknowledged, never auto-watched.** `_perceive_asset` stays as it was; the
+  asset hint names `watch_video` beside `view`/`listen`. Loading a clip and decoding frames is a
+  real cost, so it stays the agent's call, exactly as `read` and `listen` are.
+
+**Boundary:** the fixture clips are **encoded by the tests themselves** with PyAV — five seconds at
+24 fps whose colour changes on each whole second — so a sampled frame's timestamp *and* which second
+it actually came from are both assertable, and no binary fixture lives in the repo. Nothing here
+touches a model or the network.

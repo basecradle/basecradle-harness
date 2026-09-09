@@ -23,8 +23,11 @@ than a failure, and an oversized one is described, not force-fed. The transcript
 model is OpenAI's Audio API, sharing the agent's one key (``gpt-5.4-mini`` reasons,
 ``gpt-image-2`` paints, ``gpt-transcribe`` listens).
 
-Video is deliberately out of scope (heavier, and frame extraction would collide with
-the no-subprocess safety boundary) — when it comes, it gets its own pure-Python path.
+Video got exactly that treatment, and exactly that pure-Python path: `watch_video`
+(`_video.py`, issue #471) decodes frames in-process with PyAV — whose wheels bundle FFmpeg —
+so the no-subprocess safety boundary is untouched. It is `view`'s sibling rather than this
+tool's: perceiving a clip needs no provider call, so unlike transcription it is a benign
+default tool rather than a powerful opt-in one.
 """
 
 from __future__ import annotations

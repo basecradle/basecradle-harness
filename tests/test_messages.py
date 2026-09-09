@@ -1,6 +1,14 @@
 """The normalized message vocabulary: constructors and defaults."""
 
-from basecradle_harness import ImageContent, Message, ToolCall, ToolResult, ToolSpec
+from basecradle_harness import (
+    FrameSampling,
+    ImageContent,
+    Message,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
+    VideoContent,
+)
 
 
 def test_role_constructors_set_the_role():
@@ -71,3 +79,53 @@ def test_message_with_images_round_trips_through_dict():
 def test_to_dict_omits_images_when_there_are_none():
     # A plain turn stays clean — no empty `images` key cluttering the transcript.
     assert "images" not in Message.user("hi").to_dict()
+
+
+# --- videos (issue #471) ------------------------------------------------------
+
+
+def test_message_and_tool_result_carry_no_videos_by_default():
+    assert Message.user("hi").videos == []
+    assert ToolResult(text="done").videos == []
+
+
+def test_frame_sampling_defaults_to_one_frame_a_second_over_the_whole_clip():
+    sampling = FrameSampling()
+    assert (sampling.every, sampling.start, sampling.end) == (1.0, None, None)
+
+
+def test_message_with_videos_round_trips_through_dict():
+    """A save can land *mid-turn*, before eviction, so a video turn has to survive the disk."""
+    original = Message(
+        role="user",
+        content="(Showing video: clip.mp4)",
+        videos=[
+            VideoContent(
+                url="data:video/mp4;base64,AAAA",
+                alt="clip.mp4",
+                content_type="video/mp4",
+                sampling=FrameSampling(every=2, start=1, end=4),
+            )
+        ],
+        injected=True,
+    )
+
+    restored = Message.from_dict(original.to_dict())
+
+    assert restored.videos == original.videos
+    assert restored.injected is True
+
+
+def test_a_video_turn_restores_default_sampling_when_the_record_predates_it():
+    """An older transcript has no `sampling` key — it reads back as the defaults, never a crash."""
+    restored = Message.from_dict(
+        {"role": "user", "videos": [{"url": "data:video/mp4;base64,AAAA", "alt": "clip.mp4"}]}
+    )
+
+    assert restored.videos[0].sampling == FrameSampling()
+    assert restored.videos[0].content_type == "video/mp4"
+
+
+def test_to_dict_omits_videos_when_there_are_none():
+    assert "videos" not in Message.user("hi").to_dict()
+    assert "videos" not in Message(role="user", images=[ImageContent(url="x")]).to_dict()

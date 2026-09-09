@@ -24,7 +24,7 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from basecradle_harness._exceptions import ProviderResponseError
+from basecradle_harness._exceptions import ProviderError, ProviderResponseError
 from basecradle_harness._messages import (
     CodeExecutionFile,
     CodeExecutionTrace,
@@ -32,6 +32,18 @@ from basecradle_harness._messages import (
     ToolCall,
     ToolSpec,
 )
+
+#: What a surface with no video part says when a video reaches it anyway. **Unreachable under the
+#: gate** — `_assets.model_sees_video` fails closed and only an adapter that declared
+#: `supports_video` ever receives a `videos`-bearing turn — so this exists to make a future wiring
+#: mistake *loud*. Silently dropping the clip is the alternative and it is the worse one: the model
+#: would read a caption promising a video it never got, which is precisely the defect the vision
+#: gate was built to end (issue #316).
+_NO_VIDEO_SURFACE = (
+    "a video reached {surface}, which has no video input part. This is a harness wiring bug: only "
+    "a provider whose supports_video() is True should ever be handed a video."
+)
+
 
 # === Chat Completions =========================================================
 
@@ -46,7 +58,7 @@ def chat_message_to_wire(message: Message) -> dict[str, Any]:
         }
 
     wire: dict[str, Any] = {"role": message.role}
-    if message.images:
+    if message.images or message.videos:
         # A turn carrying images (the synthetic vision turn the engine injects) becomes a parts
         # list, so a vision-capable model reached over Chat Completions actually sees the picture.
         # Before this the images were dropped on the wire and the model read only the text caption
@@ -87,9 +99,11 @@ def _cached(text: str) -> list[dict[str, Any]]:
 
 
 def _chat_content_parts(message: Message) -> list[dict[str, Any]]:
-    """The Chat Completions multimodal ``content`` for a turn carrying images (issue #313).
+    """The Chat Completions multimodal ``content`` for a turn carrying media (issues #313, #471).
 
-    The text (if any) leads as a ``text`` part, then one ``image_url`` part per image. Chat
+    The text (if any) leads as a ``text`` part, then one ``image_url`` part per image and one
+    ``video_url`` part per video (OpenRouter's documented video part — reached only through a
+    provider that declared `supports_video`, so this stays a translator and never a gate). Chat
     Completions nests the reference under an ``image_url`` object —
     ``{"type": "image_url", "image_url": {"url": <data URL>}}`` — whereas the Responses surface
     (`_input_content`) uses ``input_image`` with ``image_url`` as the bare string. That nesting is
@@ -113,6 +127,12 @@ def _chat_content_parts(message: Message) -> list[dict[str, Any]]:
         parts.append(text)
     for image in message.images:
         parts.append({"type": "image_url", "image_url": {"url": image.url}})
+    for video in message.videos:
+        # OpenRouter's documented video part, the mirror of ``image_url``. Only ever reached for a
+        # provider whose `supports_video` answered a definite yes (`_assets.model_sees_video` fails
+        # closed), so this is a pure translator: it never re-decides the tier, exactly as the image
+        # loop above never re-decides vision.
+        parts.append({"type": "video_url", "video_url": {"url": video.url}})
     return parts
 
 
@@ -210,7 +230,7 @@ def message_to_input(message: Message) -> list[dict[str, Any]]:
         ]
 
     items: list[dict[str, Any]] = []
-    if message.content is not None or message.images:
+    if message.content is not None or message.images or message.videos:
         items.append({"role": _input_role(message.role), "content": _input_content(message)})
     for call in message.tool_calls:
         items.append(
@@ -232,6 +252,8 @@ def _input_content(message: Message) -> str | list[dict[str, Any]]:
     ``input_image`` part per image. In the Responses API ``image_url`` is the reference string
     itself (an ``https://`` or ``data:`` URL), not a nested object as in Chat Completions.
     """
+    if message.videos:
+        raise ProviderError(_NO_VIDEO_SURFACE.format(surface="the Responses surface"))
     if not message.images:
         return message.content or ""
     parts: list[dict[str, Any]] = []

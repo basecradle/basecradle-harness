@@ -181,6 +181,10 @@ def test_exactly_one_of_two_same_named_variants_activates_per_config():
 _DEFAULT_TOOLS = {
     "web_fetch",
     "assets",
+    # Benign, not powerful: `watch_video` makes no provider call, spends nothing, creates nothing,
+    # and decodes in-process (PyAV, no subprocess) — so it rides the default set beside `view`
+    # and `read`, unlike the media *generators*, which are opt-in (issue #471).
+    "watch_video",
     "tasks",
     "timelines",
     "trust",

@@ -1075,6 +1075,64 @@ def test_supports_vision_is_none_for_a_malformed_model_id():
     assert provider.supports_vision() is None
 
 
+# === supports_video — the same metadata, one modality over (issue #471) =======================
+
+
+def test_supports_video_is_true_for_a_model_that_declares_video_input(router):
+    router.get(MODEL_URL).mock(
+        return_value=httpx.Response(200, json=_model_body(["text", "image", "video"]))
+    )
+    assert _provider().supports_video() is True
+
+
+def test_supports_video_is_false_for_a_vision_only_model(router):
+    """The common case, and the one the frames tier exists for: images yes, video no."""
+    router.get(MODEL_URL).mock(
+        return_value=httpx.Response(200, json=_model_body(["text", "image"]))
+    )
+    provider = _provider()
+    assert provider.supports_video() is False
+    assert provider.supports_vision() is True
+
+
+def test_supports_video_is_none_when_the_metadata_is_unreadable(router):
+    """Unknown, not "no" — and the gate above turns unknown into frames, never a video part."""
+    router.get(MODEL_URL).mock(
+        return_value=httpx.Response(503, json={"error": {"message": "upstream", "code": 503}})
+    )
+    assert _provider(retries_disabled=True).supports_video() is None
+
+
+def test_supports_video_is_memoized_after_a_definite_answer(router):
+    route = router.get(MODEL_URL).mock(
+        return_value=httpx.Response(200, json=_model_body(["text", "image"]))
+    )
+    provider = _provider()
+    assert provider.supports_video() is False
+    assert provider.supports_video() is False
+    assert route.call_count == 1
+
+
+def test_the_two_modality_memos_are_independent(router):
+    """Vision and video are separate memos over the same field — one must not answer for the other."""
+    route = router.get(MODEL_URL).mock(
+        return_value=httpx.Response(200, json=_model_body(["text", "image"]))
+    )
+    provider = _provider()
+    assert provider.supports_vision() is True
+    assert provider.supports_video() is False
+    assert route.call_count == 2  # one read each; neither memo is filled by the other's answer
+
+
+def test_supports_video_strips_the_routing_variant(router):
+    router.get(MODEL_URL).mock(
+        return_value=httpx.Response(200, json=_model_body(["text", "image", "video"]))
+    )
+    client = OpenRouter(api_key=FAKE_KEY, server_url=BASE_URL)
+    provider = OpenRouterProvider("z-ai/glm-5.2:free", client=client, base_url=BASE_URL)
+    assert provider.supports_video() is True
+
+
 def test_an_over_length_400_maps_to_the_context_length_error(router):
     router.post(CHAT_URL).mock(
         return_value=httpx.Response(

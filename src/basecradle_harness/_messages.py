@@ -11,8 +11,12 @@ payload. A handful of small dataclasses are the whole vocabulary:
   JSON-Schema description of its parameters.
 - `ImageContent` — an image to place in the model's *input* (vision), so a peer
   can see a picture, not just read text about it.
-- `ToolResult` — a tool's richer return: text plus any images it wants shown to
-  the model. A tool that only has text just returns a `str`, as before.
+- `VideoContent` + `FrameSampling` — a video to place in the model's input, and
+  the agent's request for how to look at it if the model cannot take video and
+  the engine has to fall back to sampled frames.
+- `ToolResult` — a tool's richer return: text plus any images (or videos) it
+  wants shown to the model. A tool that only has text just returns a `str`, as
+  before.
 - `CodeExecutionTrace` — what a server-side code-execution turn did: the source
   it ran and the files it produced. Surfaced (transiently) on an assistant
   `Message` so the Asset bridge can harvest it; see `_code.py`.
@@ -46,17 +50,64 @@ class ImageContent:
 
 
 @dataclass
+class FrameSampling:
+    """How the agent asked to look at a clip, for the sampled-frames fallback.
+
+    Carried on a `VideoContent` rather than passed alongside it, because the tier a clip is
+    perceived at (native video / sampled frames / text) is decided in the **engine**, long after
+    the tool that knew what the agent asked for has returned.
+
+    `every` is the interval in seconds between sampled frames; `start` and `end` narrow the window
+    (``None`` meaning the clip's own start / end). Narrowing the window — not raising a frame cap
+    — is how an agent looks closer: the cap is a constant, the window is the knob.
+    """
+
+    every: float = 1.0
+    start: float | None = None
+    end: float | None = None
+
+
+@dataclass
+class VideoContent:
+    """A video placed in the model's input, for a model that can actually take one.
+
+    `url` is a ``data:<media-type>;base64,<...>`` data URL, exactly as `ImageContent` uses — the
+    bytes inlined so the input is self-contained and never depends on a vendor's servers reaching
+    a short-lived, access-controlled blob URL.
+
+    `alt` is a short human label (the filename), and it is what survives into the transcript once
+    the payload is evicted, so a stored conversation still reads coherently. `content_type` is the
+    bare media type (``video/mp4``), which the frames fallback and the wire serializers both read.
+
+    A `VideoContent` is **not** a promise that any model will watch it: the engine routes it by
+    capability — natively where `supports_video` says yes, as sampled frames where the model takes
+    only images, as an honest caption where it takes neither (`_engine._show_media`).
+    """
+
+    url: str
+    alt: str | None = None
+    content_type: str = "video/mp4"
+    sampling: FrameSampling = field(default_factory=FrameSampling)
+
+
+@dataclass
 class ToolResult:
-    """A tool's return when plain text is not enough: text plus images to show.
+    """A tool's return when plain text is not enough: text plus media to show.
 
     `text` is what a `tool` turn carries back to the model, exactly as a `str`
-    return would. `images` are placed into the model's *input* on the next turn —
-    the mechanism behind seeing an asset, since a function-tool *result* is
-    text-only on every provider. A tool with nothing to show just returns a `str`.
+    return would. `images` and `videos` are placed into the model's *input* on the
+    next turn — the mechanism behind seeing an asset, since a function-tool *result*
+    is text-only on every provider. A tool with nothing to show just returns a `str`.
+
+    A tool returns the media it fetched and says nothing about perception: whether
+    the pixels (or the clip, or frames of it) actually reach the model is the
+    **engine's** call, because a tool has no view of the provider (`_assets._view`,
+    `_engine._show_media`).
     """
 
     text: str
     images: list[ImageContent] = field(default_factory=list)
+    videos: list[VideoContent] = field(default_factory=list)
 
 
 @dataclass
@@ -121,7 +172,12 @@ class Message:
     is set only on a `tool` turn, linking a result back to the call it answers.
     `images` is populated only on the synthetic `user` turn the engine injects to
     *show* the model an image (vision); a provider that cannot render images
-    simply ignores it, so a text-only adapter is unaffected.
+    simply ignores it, so a text-only adapter is unaffected. `videos` is the same
+    turn's video half, and it is **only ever populated for a provider that answered
+    `supports_video` with a definite yes** (`_assets.model_sees_video` fails closed) —
+    a video part on a model without video input is a hard 400, so a surface that
+    cannot serialize one raises rather than silently dropping it. Like `images`, it
+    is evicted once the model has answered.
 
     `code_execution` is set only on an assistant turn whose adapter ran a hosted
     code-execution tool; it is **transient** (used by the Asset bridge within the
@@ -161,6 +217,7 @@ class Message:
     tool_calls: list[ToolCall] = field(default_factory=list)
     tool_call_id: str | None = None
     images: list[ImageContent] = field(default_factory=list)
+    videos: list[VideoContent] = field(default_factory=list)
     code_execution: CodeExecutionTrace | None = None
     cache_anchor: bool = False
     injected: bool = False
@@ -202,6 +259,20 @@ class Message:
             data["tool_call_id"] = self.tool_call_id
         if self.images:
             data["images"] = [{"url": i.url, "alt": i.alt} for i in self.images]
+        if self.videos:
+            data["videos"] = [
+                {
+                    "url": v.url,
+                    "alt": v.alt,
+                    "content_type": v.content_type,
+                    "sampling": {
+                        "every": v.sampling.every,
+                        "start": v.sampling.start,
+                        "end": v.sampling.end,
+                    },
+                }
+                for v in self.videos
+            ]
         if self.injected:
             data["injected"] = True
         if self.items:
@@ -220,9 +291,25 @@ class Message:
             ],
             tool_call_id=data.get("tool_call_id"),
             images=[ImageContent(url=i["url"], alt=i.get("alt")) for i in data.get("images", [])],
+            videos=[_video_from_dict(v) for v in data.get("videos", [])],
             injected=bool(data.get("injected", False)),
             items=list(data.get("items", [])),
         )
+
+
+def _video_from_dict(data: dict[str, Any]) -> VideoContent:
+    """Rebuild a `VideoContent` from `Message.to_dict` output."""
+    sampling = data.get("sampling") or {}
+    return VideoContent(
+        url=data["url"],
+        alt=data.get("alt"),
+        content_type=data.get("content_type", "video/mp4"),
+        sampling=FrameSampling(
+            every=sampling.get("every", 1.0),
+            start=sampling.get("start"),
+            end=sampling.get("end"),
+        ),
+    )
 
 
 @dataclass

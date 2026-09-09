@@ -7,6 +7,7 @@ model *input* on the next turn, then the pixels are evicted from the transcript
 once the model has answered, so a viewed image is never re-sent.
 """
 
+import json
 import logging
 import re
 
@@ -15,6 +16,7 @@ import pytest
 from basecradle_harness import (
     Engine,
     EngineError,
+    FrameSampling,
     ImageContent,
     Message,
     ProviderAuthError,
@@ -25,6 +27,7 @@ from basecradle_harness import (
     ToolCall,
     ToolRegistry,
     ToolResult,
+    VideoContent,
 )
 
 
@@ -52,6 +55,8 @@ def _clone(message: Message) -> Message:
         tool_calls=list(message.tool_calls),
         tool_call_id=message.tool_call_id,
         images=list(message.images),
+        videos=list(message.videos),
+        injected=message.injected,
     )
 
 
@@ -217,6 +222,9 @@ def test_a_no_vision_model_logs_the_withheld_image_loudly(caplog):
         engine.run([Message.user("look")])
 
     line = next(r.getMessage() for r in caplog.records if "withheld" in r.getMessage())
+    # The head is byte-frozen: a dashboard query greps it and lives outside this repo, where no
+    # test and no code search can see it (#414 repainted two heads and broke a paged alarm).
+    assert line.startswith("view image withheld from a model with no vision ")
     assert "cat.png" in line
     assert "z-ai/glm-5.2" in line
 
@@ -255,6 +263,220 @@ def test_the_gate_fails_open_when_vision_capability_cannot_be_read():
     image_turn = next(m for m in provider.seen[1] if m.images)
     assert image_turn.content == "(Showing image: cat.png)"
     assert image_turn.images[0].url == "data:image/png;base64,AAAA"
+
+
+# --- the three video tiers (issue #471) --------------------------------------
+
+
+def _clip_bytes():
+    """A real 3-second MP4, encoded here — the frames tier decodes what it is given, for real."""
+    from tests.test_video import make_video
+
+    return make_video(seconds=3)
+
+
+class WatchTool(Tool):
+    """A fake `watch_video`: returns text plus one clip, like the real tool."""
+
+    name = "watch_video"
+    description = "Watch a video."
+
+    def __init__(self, sampling=None):
+        self._sampling = sampling or FrameSampling()
+
+    def run(self, **kwargs):
+        import base64
+
+        return ToolResult(
+            text="clip.mp4 — 3.0s, 24 fps, 160x120",
+            videos=[
+                VideoContent(
+                    url="data:video/mp4;base64," + base64.b64encode(_clip_bytes()).decode(),
+                    alt="clip.mp4",
+                    content_type="video/mp4",
+                    sampling=self._sampling,
+                )
+            ],
+        )
+
+
+class VideoProvider(ScriptedProvider):
+    """A model that takes video natively — the only case that gets the clip itself."""
+
+    provider = "openrouter"
+    model = "google/gemini-video"
+
+    def supports_video(self):
+        return True
+
+    def supports_vision(self):
+        return True
+
+
+class VisionOnlyProvider(ScriptedProvider):
+    """A model that takes images but not video — the sampled-frames tier."""
+
+    provider = "openrouter"
+    model = "openai/gpt-vision"
+
+    def supports_video(self):
+        return False
+
+    def supports_vision(self):
+        return True
+
+
+def _watch_reply(*, text="described"):
+    return (
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="watch_video", arguments={})]),
+        Message.assistant(content=text),
+    )
+
+
+def test_a_video_model_is_handed_the_clip_itself():
+    provider = VideoProvider(*_watch_reply())
+    engine = _engine(provider, WatchTool())
+
+    engine.run([Message.user("watch it")])
+
+    turn = next(m for m in provider.seen[1] if m.videos)
+    assert turn.role == "user" and turn.injected is True
+    assert turn.content == "(Showing video: clip.mp4)"
+    assert turn.videos[0].url.startswith("data:video/mp4;base64,")
+    assert not turn.images  # a native-video turn carries no frames
+
+
+def test_a_vision_only_model_is_handed_sampled_frames_instead():
+    provider = VisionOnlyProvider(*_watch_reply())
+    engine = _engine(provider, WatchTool())
+
+    engine.run([Message.user("watch it")])
+
+    turn = next(m for m in provider.seen[1] if m.images)
+    assert not turn.videos  # the clip itself never reaches a model that cannot take one
+    # 3s at every=1 → t=0,1,2 and the tail.
+    assert len(turn.images) == 4
+    assert all(i.url.startswith("data:image/jpeg;base64,") for i in turn.images)
+    assert turn.content.startswith("(Showing 4 frames of clip.mp4")
+    assert "t=0.0s, t=1.0s, t=2.0s" in turn.content
+
+
+def test_the_frames_tier_honors_the_window_the_agent_asked_for():
+    provider = VisionOnlyProvider(*_watch_reply())
+    engine = _engine(provider, WatchTool(FrameSampling(every=1, start=1, end=2)))
+
+    engine.run([Message.user("watch the middle")])
+
+    turn = next(m for m in provider.seen[1] if m.images)
+    assert [i.alt for i in turn.images] == ["clip.mp4 t=1.0s", "clip.mp4 t=2.0s"]
+
+
+def test_a_text_only_model_gets_the_honest_caption_and_a_loud_warning(caplog):
+    provider = NoVisionProvider(*_watch_reply())
+    engine = _engine(provider, WatchTool())
+    history = [Message.user("watch it")]
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        engine.run(history)
+
+    assert not any(m.videos or m.images for m in provider.seen[1])
+    note = next(m for m in history if m.role == "user" and m.injected)
+    assert (
+        note.content == "(No image input on this model — clip.mp4 was described above, not shown.)"
+    )
+    line = next(r.getMessage() for r in caplog.records if "withheld" in r.getMessage())
+    # Its own head, not the image one generalized: two different events, two independent consumers.
+    assert line.startswith("watch video withheld from the model ")
+    assert "clip.mp4" in line and "z-ai/glm-5.2" in line
+    assert 'reason="model has no image input"' in line
+
+
+class BrokenClipTool(Tool):
+    """A clip whose bytes will not decode — the sampling-failure path."""
+
+    name = "watch_video"
+    description = "Watch a video."
+
+    def run(self, **kwargs):
+        return ToolResult(
+            text="broken.mp4",
+            videos=[VideoContent(url="data:video/mp4;base64,AAAA", alt="broken.mp4")],
+        )
+
+
+def test_a_clip_that_will_not_decode_degrades_to_a_caption_rather_than_crashing(caplog):
+    """A corrupt file costs the *frames*, never the wake — and it says which failure it was.
+
+    The caption is deliberately not the no-vision one: telling a vision-capable model that it
+    "has no image input" would have it reason about its own capabilities instead of a broken file.
+    """
+    provider = VisionOnlyProvider(*_watch_reply())
+    engine = _engine(provider, BrokenClipTool())
+    history = [Message.user("watch it")]
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        reply = engine.run(history)
+
+    assert reply.content == "described"
+    note = next(m for m in history if m.role == "user" and m.injected)
+    assert "broken.mp4 could not be sampled into frames" in note.content
+    assert "No image input" not in note.content
+    assert note.injected is True
+    line = next(r.getMessage() for r in caplog.records if "withheld" in r.getMessage())
+    assert line.startswith("watch video withheld from the model ")
+    assert "could not sample frames" in line  # a bad file, not a model without image input
+
+
+def test_video_payloads_are_evicted_after_the_reply_exactly_as_pixels_are():
+    """An un-evicted clip would dominate every later turn of the timeline, forever."""
+    provider = VideoProvider(*_watch_reply())
+    engine = _engine(provider, WatchTool())
+    history = [Message.user("watch it")]
+
+    engine.run(history)
+
+    turn = next(m for m in history if m.content == "(Showing video: clip.mp4)")
+    assert turn.videos == []
+    assert not any(m.videos or m.images for m in history)
+    assert '"videos"' not in json.dumps([m.to_dict() for m in history])  # nothing base64 persists
+
+
+def test_frames_are_evicted_after_the_reply_too():
+    provider = VisionOnlyProvider(*_watch_reply())
+    engine = _engine(provider, WatchTool())
+    history = [Message.user("watch it")]
+
+    engine.run(history)
+
+    assert not any(m.images or m.videos for m in history)
+
+
+def test_a_turn_returning_both_a_picture_and_a_clip_injects_one_turn_per_medium():
+    """Never a `user` turn spliced between two tool results — that shape is a provider 400."""
+    provider = VideoProvider(
+        Message.assistant(
+            tool_calls=[
+                ToolCall(id="c1", name="view", arguments={}),
+                ToolCall(id="c2", name="watch_video", arguments={}),
+            ]
+        ),
+        Message.assistant(content="both seen"),
+    )
+    registry = ToolRegistry()
+    registry.register(ViewTool())
+    registry.register(WatchTool())
+    engine = Engine(provider, registry)
+
+    engine.run([Message.user("look and watch")])
+
+    roles = [m.role for m in provider.seen[1]]
+    first_tool, last_tool = roles.index("tool"), len(roles) - 1 - roles[::-1].index("tool")
+    assert set(roles[first_tool : last_tool + 1]) == {"tool"}  # results are uninterrupted
+    injected = [m for m in provider.seen[1] if m.injected]
+    assert [m.content for m in injected] == [
+        "(Showing video: clip.mp4)",
+        "(Showing image: cat.png)",
+    ]
 
 
 class AlwaysViewProvider:
