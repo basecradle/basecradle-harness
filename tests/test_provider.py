@@ -1063,6 +1063,75 @@ def test_the_responses_surface_records_why_it_stopped_when_it_stopped_short(
     assert call.finish_reason == "max_output_tokens"
 
 
+def test_the_last_finish_reason_is_remembered_for_the_delivery_guarantee(router, provider):
+    """The same read the `llm` line takes, kept on the adapter where the **engine** can reach it.
+
+    Issue #490. `capture_llm_call` is the describer's seam — a *non-brain* caller writing its own
+    line — and wrapping every engine turn in one would move the brain's line out of the adapter.
+    The engine needs the fact, not the line, so it rides beside `last_tokens_in`.
+    """
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, json=completion(content="Half a sen", finish_reason="length")
+        )
+    )
+
+    assert provider.last_finish_reason is None  # nothing to report before the first call
+    provider.chat([Message.user("write me an essay")])
+
+    assert provider.last_finish_reason == "length"
+
+
+def test_the_responses_surface_remembers_it_too(router, responses_provider):
+    """One capability, two surfaces — the fact lives in a different place on each, and the adapter
+    answers the same question either way."""
+    body = responses_body(out_message("Half a sen"))
+    body["status"] = "incomplete"
+    body["incomplete_details"] = {"reason": "max_output_tokens"}
+    router.post(RESPONSES_URL).mock(return_value=httpx.Response(200, json=body))
+
+    responses_provider.chat([Message.user("write me an essay")])
+
+    assert responses_provider.last_finish_reason == "max_output_tokens"
+
+
+def test_a_turn_that_ran_to_a_natural_stop_remembers_that_instead(router, provider):
+    """The negative half: an ordinary turn records ``stop``, which `truncated` reads as False."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(200, json=completion(content="All of it."))
+    )
+
+    provider.chat([Message.user("hi")])
+
+    assert provider.last_finish_reason == "stop"
+
+
+def test_a_later_call_clears_it_rather_than_keeping_the_last_one_it_had(router, responses_provider):
+    """**Every call overwrites it, including a call that reports nothing.**
+
+    Asserted on the *Responses* surface because that is where "the turn completed" is spelled by
+    **absence** — the surface states a reason only once its ``status`` goes ``incomplete``. So the
+    natural-looking "don't clobber a good value with nothing" edit
+    (``self.last_finish_reason = reason or self.last_finish_reason``) would make one truncated turn
+    poison every turn after it: nothing would ever commit, the mark would never advance, and the
+    agent would resume the same timeline forever while answering nobody. A single-call test cannot
+    see that.
+    """
+    stopped_short = responses_body(out_message("Half a sen"))
+    stopped_short["status"] = "incomplete"
+    stopped_short["incomplete_details"] = {"reason": "max_output_tokens"}
+    router.post(RESPONSES_URL).mock(return_value=httpx.Response(200, json=stopped_short))
+    responses_provider.chat([Message.user("write me an essay")])
+    assert responses_provider.last_finish_reason == "max_output_tokens"
+
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("all of it")))
+    )
+    responses_provider.chat([Message.user("hi")])
+
+    assert responses_provider.last_finish_reason is None
+
+
 def test_a_completed_responses_turn_names_no_finish_reason(router, responses_provider):
     from basecradle_harness._observability import capture_llm_call
 

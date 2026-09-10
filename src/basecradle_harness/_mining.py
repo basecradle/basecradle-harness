@@ -265,9 +265,10 @@ def catalog() -> tuple[Scaffolding, ...]:
             why=(
                 "Markers the harness writes into the transcript about the transcript: the "
                 "result the loader lays over a tool call whose wake died before it answered, "
-                "and the note a turn that raised ends on. Never content."
+                "the note a turn that raised ends on, and the note a turn the vendor cut off "
+                "at its output budget ends on. Never content."
             ),
-            literals=(_session.INTERRUPTED,),
+            literals=(_session.INTERRUPTED, _engine._TRUNCATED_NOTE),
             prefixes=("[turn failed: ",),
         ),
     )

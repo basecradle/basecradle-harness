@@ -262,6 +262,11 @@ class OpenAIProvider:
         #: exact, free, tokenizer-free trigger the context budget compacts on (issue #276). ``None``
         #: until the first call answers.
         self.last_tokens_in: int | None = None
+        #: Why the endpoint stopped generating on that same call, in the vendor's own words —
+        #: the delivery guarantee's capability (issue #490). The engine asks one question of it, on
+        #: the reply that would end the turn: was the output budget spent mid-sentence? ``None``
+        #: until the first call answers, and whenever the vendor said nothing.
+        self.last_finish_reason: str | None = None
         self.surface = surface
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._builtin_tools = [builtin_to_responses(spec) for spec in builtin_tools]
@@ -405,6 +410,11 @@ class OpenAIProvider:
         # the same usage read that writes the log line feeds the compaction decision (issue #276).
         # Both surfaces are covered for free — `token_counts` already knows every spelling.
         self.last_tokens_in = token_counts(usage).get("tokens_in")
+        reason = finish_reason(data)
+        # And why it stopped, for the one reader that judges whether the turn *finished*
+        # (issue #490): the same `finish_reason` this line already hands `log_llm_call`, kept where
+        # the engine can reach it without a `capture_llm_call` around every brain call.
+        self.last_finish_reason = reason
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -415,7 +425,7 @@ class OpenAIProvider:
             # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
             # it got back is whole (issue #488). One reader covers both surfaces: Chat states it on
             # the choice, Responses only once its `status` goes `incomplete`.
-            finish_reason=finish_reason(data),
+            finish_reason=reason,
         )
 
     def context_limit(self) -> int | None:

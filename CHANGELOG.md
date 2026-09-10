@@ -7,6 +7,63 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.118.4] - 2026-09-09
+
+### Fixed: a truncated brain turn is unfinished, not terminal narration (issue #490)
+
+`Engine.run` returns on *no tool calls and no extension* — and a final text the vendor stopped at
+`length` is exactly that shape. The Delivery Guarantee reads a turn's terminal narration as its
+**commit record**, so a model cut off mid-thought was filed as a model that finished and chose what
+to say: the claim settled, the mark advanced, and no later wake ever looked at that message again.
+Nothing raised, nothing logged, on every provider. (Truncation *inside* tool-call arguments was
+already covered — undecodable JSON, retried under #259 — and a context overflow has its own
+compact-and-retry; the uncovered case was the final text.) Founder ruling, 2026-09-09: **mark it
+unfinished and let the existing resume path finish it.**
+
+- **`last_finish_reason` on every adapter**, beside `last_tokens_in` and read the same way — a
+  capability, never a vendor branch. It is the identical `_observability.finish_reason` read the
+  adapters have fed their `llm` line since #488, now kept where the engine can reach it without
+  wrapping every brain call in `capture_llm_call` (which is a *non-brain* caller's seam). An adapter
+  that answers nothing is unaffected: the capability fails safe, costing the detection and never the
+  turn.
+- **The engine unfinishes the turn**, in one place and with two writes: a trailing
+  `[the text above was cut off: …]` marker in the transcript — what the *recovery* reads, after this
+  process is gone — and `Engine.output_truncated`, what *this* wake reads. Written together so the
+  live verdict and the persisted one cannot disagree about one turn. `_turn_narration`, the single
+  definition of the commit record, needs no knowledge of vendors or budgets: a trailing `system`
+  turn already means *not finished*.
+- **The wake leaves the item pending** on all three paths a turn ends — the batched message reply,
+  `_act_on`'s one-item turn (so a task, an asset and a webhook delivery get the same verdict, per
+  #289), and a resume that truncates again. The claim stays in-flight, the mark holds behind it, and
+  the next wake finds an orphan whose turn is unfinished.
+- **…and it latches the wake, which is what keeps that resume's evidence alive.** An uncommitted
+  claim on a *still-running* wake is a new thing: every further turn the wake drives can compact the
+  transcript the resume reads, and a compaction that destroys the unfinished turn flips the next
+  wake's verdict from **resume** to **abandon** — the peer dropped by the machinery meant to answer
+  them. So a truncated turn stops this wake starting new model work, the shape the out-of-funds wall
+  already has. Items behind the latch are **deferred, never dropped**: unclaimed, unrecorded, re-read
+  next wake. The general rule, now written into the guard: *whatever declines to commit a claim must
+  also stop the wake from writing to the transcript that claim's recovery will be read from.*
+- **The turn is still mined.** A fragment is the model's own words, and the peer's half is real
+  whatever happened on our side — the call `_observe` already makes for a degraded turn. Withholding
+  it would bet the peer's message on a resume that has three documented ways never to happen
+  (`_drop` twice, `_abandon` once), and lose their words from every timeline when it does. One
+  duplicate drawer is a retrieval cost; an unmined peer message is unrecoverable.
+- **The recovery *resumes* it rather than re-driving it.** For a turn that ran tools the reason has
+  always been safety; for a cut-off pure-text turn the reason is **progress**: nothing fired, so a
+  re-drive would be perfectly safe — it just would not work, because the same input under the same
+  output budget truncates in the same place, forever. Continuing from the fragment converges.
+- **Loud, twice.** `turn truncated provider=… finish_reason=length outcome=unfinished …` from the
+  engine (WARNING) and `wake truncated_turn item=… kind=… …` from the wake (WARNING), plus a fourth
+  unspoken ending: `unspoken … kind=truncated`. The engine's line is written for a truncation it
+  does **not** mark, too (`outcome=continued`) — a turn hook extends on exactly the "no tool calls"
+  shape a cut-off narration has, so that is the common case and it used to be invisible.
+
+**No budget override.** The output budget is the operator's `model_params.json`, and a harness that
+quietly raised a number it does not own to paper over a truncation would be tuning the agent behind
+the operator's back. A turn that truncates every wake says so in the journal, every wake, and the
+remedy stays where it belongs.
+
 ## [0.118.3] - 2026-09-09
 
 ### Fixed: absent vendor usage is honest absence, not a broken answer (issue #491)
