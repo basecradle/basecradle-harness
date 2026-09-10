@@ -74,6 +74,7 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
+    finish_reason,
     log_llm_call,
     reported_cost,
     serving_endpoint,
@@ -369,6 +370,9 @@ class OpenRouterProvider:
             endpoint=serving_endpoint(data),
             # The dollar figure is OpenRouter's own (``usage.cost``), not harness arithmetic.
             cost=reported_cost(usage),
+            # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
+            # it got back is whole (issue #488).
+            finish_reason=finish_reason(data),
         )
         self._restore_annotations(data)
         return message_from_chat(data)

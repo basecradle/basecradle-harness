@@ -55,6 +55,7 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._faults import is_out_of_funds
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
+    finish_reason,
     log_llm_call,
     reported_cost,
     serving_endpoint,
@@ -411,6 +412,10 @@ class OpenAIProvider:
             usage=usage,
             endpoint=serving_endpoint(data),
             cost=reported_cost(usage),
+            # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
+            # it got back is whole (issue #488). One reader covers both surfaces: Chat states it on
+            # the choice, Responses only once its `status` goes `incomplete`.
+            finish_reason=finish_reason(data),
         )
 
     def context_limit(self) -> int | None:

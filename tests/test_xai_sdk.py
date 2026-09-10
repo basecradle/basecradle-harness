@@ -907,3 +907,36 @@ def test_an_unusable_key_warns_once_per_key_not_once_per_turn(caplog, rebuilding
         provider.bind_conversation("timeline:ｏｔｈｅｒ")
 
     assert caplog.text.count("cache affinity") == 2
+
+
+# === issue #488: the finish reason reaches the caller that has to judge the answer ===
+
+
+def test_the_native_response_finish_reason_is_recorded_for_a_capturing_caller():
+    """This SDK names its proto enum, so ``REASON_MAX_LEN`` is xAI's word for "out of room".
+
+    The shared reader knows it alongside the two chat-wire spellings, which is what lets one
+    describer work identically whatever brain stack the agent runs (issue #488).
+    """
+    from basecradle_harness._observability import capture_llm_call
+
+    response = _response(content="First frame: a poster")
+    response.finish_reason = "REASON_MAX_LEN"
+    provider = _provider(response)
+
+    with capture_llm_call() as call:
+        provider.chat([Message.user("describe it")])
+
+    assert call.finish_reason == "REASON_MAX_LEN"
+
+
+def test_a_response_that_names_no_finish_reason_records_none():
+    """An SDK too old to carry the property says nothing, and nothing is what is recorded."""
+    from basecradle_harness._observability import capture_llm_call
+
+    provider = _provider(_response(content="ok"))
+
+    with capture_llm_call() as call:
+        provider.chat([Message.user("hi")])
+
+    assert call.finish_reason is None

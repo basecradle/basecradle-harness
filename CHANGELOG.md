@@ -7,6 +7,62 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.118.2] - 2026-09-09
+
+### Fixed: a truncated or usage-less describer answer is no longer handed to the brain as sight (issue #488)
+
+@glm-5.2 ran `assets watch` on a 5 s clip with a `1`–`3` window. The trim worked; the description
+it was handed was **1,748 characters cut mid-word** — no `Over time:`, no `Last frame:` — and the
+wake logged `tokens_in=0 tokens_out=0 tokens_total=0 cached_tokens=0 cost=0 outcome=ok`. A broken
+stream passed for a successful, free call, and the agent read a fragment as its account of the
+whole clip. The caption says *"that model's description of the clip as a whole"*, and a brain has
+no way to notice the sentence stopped in the middle — so **a fragment is a fabrication by
+omission**, and the honest withheld caption it replaces is strictly better.
+
+- **A describer answer is now judged, not merely received** (`_describer._unusable`). Four checks,
+  in the order that makes the first true one the *cause* rather than the symptom: **`truncated`**
+  (the vendor's own `length`), **`empty_response`**, **`no_usage`** (an answer beside a usage block
+  of nothing but zeros — a call that generated text cannot have consumed zero input tokens), and
+  **`missing_parts`** (a video description lacking `First frame:` / `Over time:` / `Last frame:`).
+  Any of them → the honest caption, `outcome=fallback`, and `reason=` naming which one, at WARNING.
+  The labels are matched on **presence**, case-insensitively — the check catches a missing part, it
+  does not police layout.
+- **Only a truncation retries**, once, at **twice** the output budget — a bigger budget is the one
+  thing that fixes it — and only where there is more room to buy. A describer built from a library
+  caller's own `Provider` has one fixed cap, so it does not spend a second call on the same answer.
+- **The output budget is explicit rather than a vendor default**: 2,048 output tokens for a still,
+  **6,144** for a clip (three parts, three times the room). It bounds two things at once — enough
+  room for the structure that was asked for, and a cap on what one description costs the
+  transcript, since it rides an injected turn persisted for the life of the timeline. Spelled per
+  SDK inside `_provider_from_config` (`max_tokens` / `max_completion_tokens` /
+  `max_output_tokens`), where every other vendor spelling already lives.
+- **The labels the check reads are the tuple the prompt is composed from** (`VIDEO_PART_LABELS`),
+  so a reworded part cannot leave the check rejecting every answer the describer gives. They are
+  matched leniently (case-insensitively, past markdown emphasis and heading marks): the check
+  exists to catch a *missing part*, never to police formatting.
+
+### Fixed: a zero is not a measurement — an all-zero usage block is omitted, not printed
+
+`log_llm_call` now drops the token fields **and** the cost when a vendor's usage block reports
+nothing but zeros. `tokens_in=0 … cost=0 outcome=ok` reads on the fleet dashboard as a free call
+that worked; it was a stream that broke. The dollar goes with the counts because on every endpoint
+that states one it is read out of that same block — it is not an independent claim, it is the same
+absence spelled `0`. A genuinely free endpoint is unaffected: it reports real counts, so its
+`cost=0` is a fact and still prints, and a **non-zero** charge stated beside an unreported usage
+block survives too (the native xAI adapter reads `cost_usd` off the response, so that is an
+independent claim). This is the honest-absence rule `endpoint` and `cost` already keep, applied to
+the one shape that *looks* like an answer.
+
+### Added: `finish_reason` as a provider capability
+
+`_observability.finish_reason` reads why a vendor stopped generating from any of the three shapes a
+shipped adapter hands back — the chat wire's `choices[0].finish_reason`, the Responses surface's
+`incomplete_details.reason`, and the native `xai-sdk`'s `REASON_MAX_LEN` proto enum — a capability
+read, never a vendor branch. All three adapters record it onto the `LlmCall` a `capture_llm_call`
+caller holds. It is deliberately **not** rendered on the line: the line says `reason=truncated`,
+which is the fact worth grepping, and the `llm` grammar stays byte-frozen. Each adapter's wiring is
+pinned by a test that reads the value back out of a capture, not by a mock that defines it.
+
 ## [0.118.1] - 2026-09-09
 
 ### Changed: one `llm` line per model call, `purpose=` names the role (issue #485)

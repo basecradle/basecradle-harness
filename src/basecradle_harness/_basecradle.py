@@ -904,6 +904,23 @@ def _routing_pin(providers: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def _openai_budget_key(provider: str, surface: str) -> str:
+    """What this ``openai``-SDK cell calls a cap on the tokens a call may generate (issue #488).
+
+    One SDK, three endpoints, three spellings — which is exactly the knowledge this layer exists to
+    hold, so a caller asks for *a budget* and never for a field name:
+
+    - the **Responses** surface takes ``max_output_tokens`` on every endpoint that serves it;
+    - **OpenAI's** chat endpoint takes ``max_completion_tokens``. ``max_tokens`` is deprecated
+      there and is a hard *"Unsupported parameter"* on its reasoning models — which a describer or
+      any other helper may well be — so the modern spelling is the only safe one;
+    - **xAI** and **OpenRouter** over the chat wire take ``max_tokens``, the field each documents.
+    """
+    if surface == "responses":
+        return "max_output_tokens"
+    return "max_completion_tokens" if provider == "openai" else "max_tokens"
+
+
 def _provider_from_config(
     provider: str,
     sdk: str,
@@ -915,6 +932,7 @@ def _provider_from_config(
     api_key: str | None = None,
     routing: Sequence[str] | None = None,
     inherit_params: bool = True,
+    max_output_tokens: int | None = None,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -972,6 +990,12 @@ def _provider_from_config(
     # - ``inherit_params`` — ``False`` drops ``model_params.json`` entirely. That file is tuning
     #   for *this agent's brain* (its reasoning effort, its routing pin); inherited it is at best
     #   irrelevant to a different model and at worst exactly the pin above.
+    # - ``max_output_tokens`` — a cap on what the call may generate, spelled per SDK **here** for
+    #   the same reason ``routing`` is: three wires call it three things (``max_tokens``,
+    #   ``max_completion_tokens``, ``max_output_tokens``), and a caller that had to know which
+    #   would be a caller with a vendor branch in it. The describer sets it so a description has
+    #   room for the structure it was asked for and a bound on what the transcript keeps (issue
+    #   #488); ``None`` sends nothing at all, which is every other caller and the status quo.
     #
     # ``AI_MODEL`` is still required either way, so a config missing it fails on the brain, where
     # the error is actionable.
@@ -1001,6 +1025,8 @@ def _provider_from_config(
             )
         # `routing` is an OpenRouter concept; xAI is a single vendor reached directly, so a pin
         # here would be a body field its endpoint has never heard of. Dropped, not sent.
+        if max_output_tokens is not None:
+            params["max_tokens"] = max_output_tokens
         return XaiSdkProvider(model, api_key=api_key, builtin_tools=list(builtins), **params)
 
     if sdk == "openrouter":
@@ -1036,6 +1062,8 @@ def _provider_from_config(
             # the same path `model_params.json` uses — so an explicit `routing` **replaces** any
             # inherited pin rather than fighting it (and with `inherit_params=False` there is none).
             params["provider"] = _routing_pin(routing)
+        if max_output_tokens is not None:
+            params["max_tokens"] = max_output_tokens
         return OpenRouterProvider(
             model,
             api_key=api_key,
@@ -1076,6 +1104,8 @@ def _provider_from_config(
     # which is a raw crash, not the warned-and-dropped collision policy. Lifting keeps the operator's
     # headers working (they merge, below) instead of silently confiscating a key that works today.
     params_extra_headers = params.pop("extra_headers", None)
+    if max_output_tokens is not None:
+        params[_openai_budget_key(provider, surface)] = max_output_tokens
     if provider == "xai":
         # xAI's search built-ins ride `search_parameters`, not OpenAI tools entries — so they
         # go through `extra_body`, and nothing is offered as a `builtin_tools` tool here.

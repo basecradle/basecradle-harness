@@ -52,6 +52,16 @@ Any failure falls back to the withheld caption the agent had before this existed
 told *"I could not see it"* is in the state it was already in; a blind agent handed an invented
 description is worse than blind. Nothing here raises into a wake.
 
+**A fragment counts as fabricated** (issue #488). The caption tells the brain it is reading a
+description of the whole thing, and a brain has no way to notice that the sentence stopped in the
+middle — so an answer the harness cannot vouch for is discarded rather than passed off as sight.
+Four checks decide that (`_unusable`), and one of them — the vendor's own ``length`` — is retried
+once with more room before it falls back, because a bigger budget is the one thing that fixes it.
+The budget is explicit rather than a vendor default (`IMAGE_OUTPUT_BUDGET`, `VIDEO_OUTPUT_BUDGET`)
+and does double duty: enough room for the structure that was asked for, and a **bound on what a
+description costs the transcript**, which keeps a description inside Context Discipline's first
+invariant — it rides an injected turn, and an injected turn is persisted for the timeline's life.
+
 Which *level* it says so at is the taxonomy, not the volume — `_rerank.py`'s two classes, the same
 distinction and the same words:
 
@@ -59,8 +69,9 @@ distinction and the same words:
   unfunded account (402), a model id that does not exist. *Dead until a human acts*, so **ERROR**,
   and ERROR is what makes the fleet's "Error on AI Server" alert fire. **Once per wake**: the life
   of this object is the wake, and repeats drop to DEBUG so one defect cannot become a storm.
-- **Runtime-class** — a timeout, a 429, a 5xx, a transport blip, an unparseable or empty answer.
-  Transient and self-healing, so **WARNING** for that call.
+- **Runtime-class** — a timeout, a 429, a 5xx, a transport blip, an unparseable or empty answer,
+  and every one of #488's unusable-answer checks. Transient and self-healing, so **WARNING** for
+  that call.
 
 The describer's output is **model-generated text about peer content**. It is injected as context
 and nothing more: never executed, never a tool call, and never mined as the agent's own words — it
@@ -74,6 +85,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from basecradle_harness._assets import model_sees_video
@@ -97,6 +109,8 @@ from basecradle_harness._observability import (
     describe_provider,
     log_llm_call,
     reasoning_tokens,
+    truncated,
+    usage_reported,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -163,13 +177,20 @@ DESCRIBE_PROMPT = (
 #: Shared rather than spelled twice because the two paths answer the same questions about the same
 #: clip: two wordings would be two things to keep in step, and a brain that learns to read "First
 #: frame:" on one path and something else on the other has learned nothing.
+#: The three labels a video description opens its parts with. **The instruction below is composed
+#: from this tuple and the check reads the same tuple** (issue #488), so a wording that changed in
+#: one place cannot leave the other rejecting every answer the describer gave — which would be a
+#: blind agent paying full price for descriptions nobody ever sees.
+VIDEO_PART_LABELS = ("First frame:", "Over time:", "Last frame:")
+
 DESCRIBE_VIDEO_PARTS = (
     "Structure the description as three parts, in this order, each opening with its label exactly "
-    "as written here. 'First frame:' — describe the clip's first moment as fully as you would a "
-    "still: every subject, the layout, the colours, and any visible text transcribed verbatim. "
-    "'Over time:' — what moves, appears, disappears, or is redrawn, with approximate timestamps "
-    "in seconds. 'Last frame:' — what the final moment shows and how it differs from the first. "
-    "Plain prose throughout: no markdown headings and no bullet lists."
+    f"as written here. '{VIDEO_PART_LABELS[0]}' — describe the clip's first moment as fully as you "
+    "would a still: every subject, the layout, the colours, and any visible text transcribed "
+    f"verbatim. '{VIDEO_PART_LABELS[1]}' — what moves, appears, disappears, or is redrawn, with "
+    f"approximate timestamps in seconds. '{VIDEO_PART_LABELS[2]}' — what the final moment shows "
+    "and how it differs from the first. Plain prose throughout: no markdown headings and no "
+    "bullet lists."
 )
 
 #: The extra clause for a clip the describer watches **natively**. It sees the real thing, so the
@@ -191,6 +212,30 @@ DESCRIBE_FRAMES_SUFFIX = (
     + DESCRIBE_VIDEO_PARTS
 )
 
+#: The output-token budget one **still**'s description may spend, and the ceiling on what that
+#: description costs the transcript forever (it rides an injected turn, which is persisted).
+#:
+#: Sized from the live evidence rather than guessed: a thorough still came back at ~1,300 output
+#: tokens on @glm-5.2's describer, and a reasoning describer spends more of the same budget on
+#: thinking before it writes a word (every wire counts reasoning against this cap). 2,048 leaves
+#: that answer comfortable room without letting one picture write four pages into a timeline's
+#: memory.
+IMAGE_OUTPUT_BUDGET = 2048
+
+#: A video description is **three** of those parts — first frame, over time, last frame — so it
+#: gets three times the room, spelled as the multiplication rather than as a second magic number.
+#: The live defect this fixes is precisely a first-frame description that consumed everything
+#: available and stopped mid-sentence, with no `Over time:` and no `Last frame:` (issue #488).
+VIDEO_OUTPUT_BUDGET = 3 * IMAGE_OUTPUT_BUDGET
+
+#: What the **one** retry multiplies the budget by when the vendor says it stopped at ``length``.
+#:
+#: A retry exists because the first budget is a *bound*, not a promise: a describer that spends its
+#: allowance on reasoning, or one facing an unusually dense clip, genuinely needs more room, and
+#: the alternative to asking again is a blind agent. It happens once — a second ``length`` is the
+#: model telling us the budget is not the problem, and a third call would just be spending.
+RETRY_BUDGET_FACTOR = 2
+
 
 class Describer:
     """A vision-capable model that turns pixels into words for a brain that has none.
@@ -207,6 +252,8 @@ class Describer:
         *,
         fault: str | None = None,
         detail: str | None = None,
+        build: Callable[[int], Provider] | None = None,
+        budget: int | None = None,
     ) -> None:
         self.provider = provider
         #: The describer's model id, carried so every caption and every log line can **name** it.
@@ -227,6 +274,19 @@ class Describer:
         #: **is** the wake, so "once per wake" needs no clock: after the first report, repeats drop
         #: to DEBUG and one defect cannot become a storm.
         self._reported_config = False
+        #: How to build **this same describer at a different output budget** (issue #488) — the
+        #: adapters take a cap at construction, so a still, a clip and a retry are three caps and
+        #: therefore three adapter instances. It is a builder rather than three eager builds
+        #: because the common wake needs exactly one: an agent that only ever looks at pictures
+        #: never constructs the video one, and nobody constructs a retry until a vendor actually
+        #: says ``length``. ``None`` — a directly-constructed describer, as every test builds — uses
+        #: the one provider it was handed for every budget, which is the pre-#488 behaviour.
+        self._build = build
+        #: The providers built so far, keyed by their budget. Seeded with the one handed in, so the
+        #: ordinary path builds nothing at all.
+        self._providers: dict[int, Provider] = (
+            {} if budget is None or provider is None else {budget: provider}
+        )
 
     def describe_images(self, images: list[ImageContent]) -> str | None:
         """The pictures in words, or ``None`` if the describer could not answer.
@@ -241,6 +301,7 @@ class Describer:
             images=images,
             kind=IMAGE_KIND,
             subject=_names(images),
+            budget=IMAGE_OUTPUT_BUDGET,
         )
 
     def describe_video(self, clip: VideoContent) -> str | None:
@@ -272,6 +333,8 @@ class Describer:
                 videos=[watched.clip],
                 kind=VIDEO_KIND,
                 subject=name,
+                budget=VIDEO_OUTPUT_BUDGET,
+                parts=True,
             )
             if described is None:
                 return None
@@ -298,6 +361,8 @@ class Describer:
             images=frames,
             kind=VIDEO_KIND,
             subject=name,
+            budget=VIDEO_OUTPUT_BUDGET,
+            parts=True,
         )
         return None if described is None else f"{summary}\n{described}"
 
@@ -309,10 +374,12 @@ class Describer:
         *,
         kind: str,
         subject: str,
+        budget: int,
+        parts: bool = False,
         images: list[ImageContent] | None = None,
         videos: list[VideoContent] | None = None,
     ) -> str | None:
-        """One describer call: the media plus the fixed prompt, in, plain text out.
+        """One describe: the media plus the fixed prompt, in, plain text out — or ``None``.
 
         The media rides a single ``user`` turn carrying the prompt as its text — the one shape
         every surface serializes (`_openai_wire`, `_xai_sdk`), so this needs no vendor branch. No
@@ -320,6 +387,16 @@ class Describer:
 
         **Every failure is caught here**, because the alternative is a wake that dies over a
         picture. The result is ``None`` and the caller says so honestly.
+
+        One describe is **at most two attempts** (issue #488). A vendor that stopped at ``length``
+        did not answer the question — it ran out of room — and that is the one failure a *larger
+        budget* is the remedy for, so it is retried once at `RETRY_BUDGET_FACTOR` times the room and
+        then falls back like anything else. Each attempt writes its own `llm` line, because each
+        attempt is a call that was made and billed; that is the #485 grammar, not a duplicate.
+
+        The retry is conditioned on there being **more room to buy** (`_build`), never on the fault
+        alone. A describer built from a caller's own `Provider` has one fixed cap, so asking it the
+        identical question a second time would spend a second call to receive the identical answer.
         """
         if self.fault is not None or self.provider is None:
             # Born broken — a missing key or provider list, or a provider that would not build. No
@@ -328,6 +405,55 @@ class Describer:
                 subject, kind=kind, reason=self.fault or "config:no_provider", detail=self.detail
             )
             return None
+        text, reason = self._attempt(
+            prompt,
+            kind=kind,
+            subject=subject,
+            budget=budget,
+            parts=parts,
+            images=images,
+            videos=videos,
+        )
+        if reason == _TRUNCATED and self._build is not None:
+            text, reason = self._attempt(
+                prompt,
+                kind=kind,
+                subject=subject,
+                budget=budget * RETRY_BUDGET_FACTOR,
+                parts=parts,
+                images=images,
+                videos=videos,
+            )
+        return None if reason is not None else text
+
+    def _attempt(
+        self,
+        prompt: str,
+        *,
+        kind: str,
+        subject: str,
+        budget: int,
+        parts: bool,
+        images: list[ImageContent] | None,
+        videos: list[VideoContent] | None,
+    ) -> tuple[str | None, str | None]:
+        """One describer call and the one `llm` line it earns: ``(text, reason)``.
+
+        ``reason`` is ``None`` exactly when the answer is **usable**; anything else is the word the
+        line carries and the caller's cue to retry or fall back.
+        """
+        try:
+            provider = self._provider_for(budget)
+        except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
+            # Only a *retry*'s budget can land here — the base provider was built and checked at
+            # resolution time — so this is a describer that worked a moment ago and cannot be
+            # rebuilt. Runtime-class: the fallback caption is the honest answer and the next wake
+            # tries again.
+            self._report(subject, kind=kind, reason="provider_error", detail=str(exc))
+            return None, "provider_error"
+        if provider is None:  # pragma: no cover - `_ask` refuses a faulted describer first
+            self._report(subject, kind=kind, reason="config:no_provider", detail=self.detail)
+            return None, "config:no_provider"
         turn = Message(
             role="user", content=prompt, images=list(images or []), videos=list(videos or [])
         )
@@ -339,17 +465,13 @@ class Describer:
         # which a model call is not. One attempt, one line, one category.
         with capture_llm_call() as call:
             try:
-                reply = self.provider.chat([turn], None)
+                reply = provider.chat([turn], None)
             except ProviderError as exc:
+                fault = _fault_of(exc)
                 self._report(
-                    subject,
-                    kind=kind,
-                    call=call,
-                    reason=_fault_of(exc),
-                    detail=str(exc),
-                    started=started,
+                    subject, kind=kind, call=call, reason=fault, detail=str(exc), started=started
                 )
-                return None
+                return None, fault
             except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
                 # An adapter is allowed to raise something the taxonomy has never seen; that is a
                 # runtime-class unknown, not a reason to take the wake down over a picture.
@@ -361,18 +483,27 @@ class Describer:
                     detail=f"{type(exc).__name__}: {exc}",
                     started=started,
                 )
-                return None
+                return None, "provider_error"
         text = (getattr(reply, "content", None) or "").strip()
+        reason = _unusable(text, call, parts=parts)
         # A call that answered with nothing usable was still made and still billed, so its tokens
         # and cost ride this line exactly as a success's do — the reranker's rule, in its words.
-        self._report(
-            subject,
-            kind=kind,
-            call=call,
-            reason=None if text else "empty_response",
-            started=started,
-        )
-        return text or None
+        self._report(subject, kind=kind, call=call, reason=reason, started=started)
+        return (text or None), reason
+
+    def _provider_for(self, budget: int) -> Provider | None:
+        """This describer at `budget` output tokens — built once per budget, or the one it holds.
+
+        A describer with no builder (every directly-constructed one, which is every test and every
+        library caller) answers with the provider it was handed, whatever the budget: the cap is a
+        construction argument on every shipped adapter, so there is nothing to vary. That is the
+        pre-#488 behaviour exactly, which is the regression bar.
+        """
+        if self._build is None:
+            return self.provider
+        if budget not in self._providers:
+            self._providers[budget] = self._build(budget)
+        return self._providers[budget]
 
     def _report(
         self,
@@ -434,6 +565,73 @@ class Describer:
             extra={"subject": subject},
             level=level,
         )
+
+
+#: The ``reason=`` a truncated answer carries, named rather than spelled at three sites — it is
+#: both what the line says and the one value `_ask` retries on.
+_TRUNCATED = "truncated"
+
+
+def _unusable(text: str, call: LlmCall, *, parts: bool) -> str | None:
+    """Why this answer cannot be handed to the brain as sight — or ``None`` when it can (issue #488).
+
+    The describer's contract is *never a fabricated description*, and a **fragment presented as a
+    whole one is a fabrication by omission**: the caption tells the brain it is reading "that
+    model's description of the clip as a whole", and an agent has no way to tell that the sentence
+    it is reading stopped in the middle. The live case — a 5 s clip, a window the agent asked for,
+    1,748 characters cut mid-word, no ``Over time:``, no ``Last frame:``, and a line that said
+    ``outcome=ok`` — is exactly that, and the harness had no check that could have seen it.
+
+    Four things make an answer unusable, in the order they are asked, because the first that is
+    true is the one that *explains* the rest:
+
+    - **truncated** — the vendor itself says it stopped at ``length``. It is the only one a bigger
+      budget can fix, so it is the only one `_ask` retries on, and it is asked first because a
+      truncated answer is usually also missing its parts and would otherwise be reported as the
+      symptom rather than the cause.
+    - **empty_response** — nothing came back. The pre-#488 check, unchanged.
+    - **no_usage** — text came back and the vendor answered the usage question with **nothing but
+      zeros**. A call that generated 1,700 characters cannot have consumed zero input tokens, so
+      this is the signature of a **broken stream**: what arrived is whatever landed before the
+      connection did not. Nothing about a bigger budget helps, so it falls back rather than
+      retrying; the next wake simply tries again. It is deliberately keyed on a usage block that
+      *reported* zeros, never on the absence of one: an adapter that states no usage at all (a
+      surface that omits it, a third-party `Provider` that never instrumented) has told us nothing
+      about the answer, and condemning it on silence would blind an agent over a fact nobody
+      claimed.
+    - **missing_parts** — a video description that does not carry `VIDEO_PART_LABELS`. Since #479
+      the three parts *are* the contract of a video description, and an answer without them is
+      either cut short or an account of one frame wearing the caption of the whole clip. The
+      harness cannot tell which, and it must not guess in the direction of "close enough".
+
+    The labels are matched on **presence**, case-insensitively, because this check exists to catch a
+    **missing part** and never to police layout: a describer that answers in bold, or writes the
+    three parts inline in one paragraph, is answering.
+    """
+    if truncated(call.finish_reason):
+        return _TRUNCATED
+    if not text:
+        return "empty_response"
+    if call.usage is not None and not usage_reported(call.usage):
+        return "no_usage"
+    if parts and not _has_parts(text):
+        return "missing_parts"
+    return None
+
+
+def _has_parts(text: str) -> bool:
+    """Whether every one of `VIDEO_PART_LABELS` appears in `text`, case-insensitively.
+
+    **Presence, deliberately — never position.** The three labels are the parts the describer was
+    asked to cover, and *"is each part here?"* is the whole question. Requiring one to open a line,
+    or to arrive unadorned, would answer a different question — how the model laid its answer out —
+    and a describer told "plain prose, no markdown headings" will sometimes write the labels inline
+    in one paragraph, or in bold anyway. Discarding a complete description over either would blind
+    the agent to enforce a layout nobody reads, which is a strictly worse outcome than the one this
+    check exists to prevent.
+    """
+    lowered = text.lower()
+    return all(label.lower() in lowered for label in VIDEO_PART_LABELS)
 
 
 def describer_model_from_env(env: Any = None) -> str | None:
@@ -500,18 +698,33 @@ def describer_from_env(env: Any = None) -> Describer | None:
         from basecradle_harness._basecradle import _config_from_env, _provider_from_config
 
         provider_name, sdk, surface = _config_from_env()
-        provider = _provider_from_config(
-            provider_name,
-            sdk,
-            surface,
-            model=model,
-            api_key=api_key,
-            routing=providers,
-            inherit_params=False,
-        )
+
+        def build(budget: int) -> Provider:
+            """This describer's adapter, capped at `budget` output tokens (issue #488).
+
+            A builder rather than one instance because the cap is a **construction** argument on
+            every shipped adapter, and a still, a clip and a retry are three caps. The closure is
+            what keeps the whole vendor question — which of ``max_tokens`` /
+            ``max_completion_tokens`` / ``max_output_tokens`` this cell takes — inside
+            `_provider_from_config`, where every other vendor spelling already lives.
+            """
+            return _provider_from_config(
+                provider_name,
+                sdk,
+                surface,
+                model=model,
+                api_key=api_key,
+                routing=providers,
+                inherit_params=False,
+                max_output_tokens=budget,
+            )
+
+        provider = build(IMAGE_OUTPUT_BUDGET)
     except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
         return Describer(None, model, fault="config:no_provider", detail=str(exc))
-    return Describer(provider, model)
+    # Built eagerly at the still budget so a config fault is caught here, where it is reported once
+    # per wake; every other budget is built on the call that needs it, and most wakes need none.
+    return Describer(provider, model, build=build, budget=IMAGE_OUTPUT_BUDGET)
 
 
 def described_caption(subject: str, model: str, description: str, *, video: bool = False) -> str:

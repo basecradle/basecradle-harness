@@ -918,6 +918,74 @@ def test_the_describer_keeps_the_openrouter_routing_metadata_header(monkeypatch)
     describer.close()
 
 
+#: Every field name a shipped cell uses for "cap the tokens this call may generate".
+_BUDGET_KEYS = {"max_tokens", "max_completion_tokens", "max_output_tokens"}
+
+
+@pytest.mark.parametrize(
+    ("provider", "sdk", "surface", "key"),
+    [
+        ("openai", "openai", "responses", "max_output_tokens"),
+        ("openai", "openai", "chat", "max_completion_tokens"),
+        ("xai", "openai", "chat", "max_tokens"),
+        ("openrouter", "openai", "chat", "max_tokens"),
+        ("openrouter", "openrouter", "chat", "max_tokens"),
+    ],
+)
+def test_an_output_budget_is_spelled_the_way_the_cell_it_is_sent_to_spells_it(
+    monkeypatch, provider, sdk, surface, key
+):
+    """One SDK, three endpoints, three field names (issue #488) — and the caller asks for neither.
+
+    `max_tokens` is deprecated on OpenAI's chat endpoint and a hard *"Unsupported parameter"* on its
+    reasoning models, so the modern spelling is the only safe one there; xAI and OpenRouter document
+    `max_tokens`; the Responses surface takes `max_output_tokens` everywhere it is served. Getting
+    one wrong is a 400 on the describer's first call and a permanently blind agent.
+    """
+    _set_model_key(monkeypatch)
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+
+    built = _provider_from_config(
+        provider,
+        sdk,
+        surface,
+        model="google/gemini-3-flash",
+        api_key="sk-describer",
+        inherit_params=False,
+        max_output_tokens=1234,
+    )
+
+    assert built._default_params[key] == 1234
+    # ...and only that one: a second spelling on the wire is a 400 on some endpoint.
+    assert _BUDGET_KEYS & set(built._default_params) == {key}
+    close = getattr(built, "close", None)
+    if close is not None:
+        close()
+
+
+def test_the_native_xai_sdk_takes_the_budget_as_max_tokens(monkeypatch):
+    """Its `chat.create` signature is closed, so the field name is not a guess to get wrong."""
+    monkeypatch.setenv("AI_MODEL", "grok-4.3")
+    monkeypatch.setenv("AI_API_KEY", "xai-test-key")
+
+    provider = _provider_from_config(
+        "xai", "xai-sdk", "native", inherit_params=False, max_output_tokens=4096
+    )
+
+    assert provider._default_params["max_tokens"] == 4096
+    provider.close()
+
+
+def test_no_output_budget_sends_no_cap_at_all(monkeypatch):
+    """The regression bar: every caller but the describer passes nothing, and nothing goes out."""
+    _set_model_key(monkeypatch)
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+
+    provider = _provider_from_config("openrouter", "openrouter", "chat")
+
+    assert not _BUDGET_KEYS & set(provider._default_params)
+
+
 def test_a_routing_pin_is_dropped_for_a_single_vendor_sdk(monkeypatch):
     """`routing` is an OpenRouter concept; xAI is one vendor reached directly, so it is not sent."""
     monkeypatch.setenv("AI_MODEL", "grok-4.3")

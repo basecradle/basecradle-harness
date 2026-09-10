@@ -1021,3 +1021,56 @@ def test_an_ordinary_400_is_not_mistaken_for_the_wall(router, provider):
 
     # Fails safe in the other direction too: an unrelated 400 keeps behaving exactly as before.
     assert not isinstance(exc.value, ProviderContextLengthError)
+
+
+# === issue #488: the finish reason reaches the caller that has to judge the answer ===
+
+
+def test_the_chat_surface_records_the_finish_reason_for_a_capturing_caller(router, provider):
+    """One adapter, two surfaces, one reader — and the chat wire states it on the choice."""
+    from basecradle_harness._observability import capture_llm_call
+
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, json=completion(content="First frame: a poster", finish_reason="length")
+        )
+    )
+
+    with capture_llm_call() as call:
+        provider.chat([Message.user("describe it")])
+
+    assert call.finish_reason == "length"
+
+
+def test_the_responses_surface_records_why_it_stopped_when_it_stopped_short(
+    router, responses_provider
+):
+    """Responses says nothing while it is ``completed`` and names the cause once it is not.
+
+    So the fact lives somewhere else entirely from the chat wire's — which is exactly why the read
+    is a shared capability rather than a branch in each adapter (issue #488).
+    """
+    from basecradle_harness._observability import capture_llm_call
+
+    body = responses_body(out_message("First frame: a poster"))
+    body["status"] = "incomplete"
+    body["incomplete_details"] = {"reason": "max_output_tokens"}
+    router.post(RESPONSES_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with capture_llm_call() as call:
+        responses_provider.chat([Message.user("describe it")])
+
+    assert call.finish_reason == "max_output_tokens"
+
+
+def test_a_completed_responses_turn_names_no_finish_reason(router, responses_provider):
+    from basecradle_harness._observability import capture_llm_call
+
+    router.post(RESPONSES_URL).mock(
+        return_value=httpx.Response(200, json=responses_body(out_message("done")))
+    )
+
+    with capture_llm_call() as call:
+        responses_provider.chat([Message.user("hi")])
+
+    assert call.finish_reason is None
