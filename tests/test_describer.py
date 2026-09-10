@@ -35,12 +35,26 @@ from basecradle_harness._describer import (
     DESCRIBER_MODEL_VAR,
     DESCRIBER_PROVIDERS_VAR,
     IMAGE_KIND,
+    IMAGE_OUTPUT_BUDGET,
+    RETRY_BUDGET_FACTOR,
     VIDEO_KIND,
+    VIDEO_OUTPUT_BUDGET,
+    VIDEO_PART_LABELS,
     described_caption,
     describer_providers_from_env,
 )
 
 DESCRIPTION = "A tabby cat asleep on a windowsill, with the word HELLO written on the glass."
+
+#: What a describer that **followed the instruction** answers about a clip: the three labelled
+#: parts issue #479 asks for and issue #488 now checks for. A one-paragraph answer is no longer a
+#: usable video description, so a fake that gave one would fail every video test for the wrong
+#: reason — it would be pinning the check, not the plumbing the test is about.
+VIDEO_DESCRIPTION = (
+    "First frame: a tabby cat asleep on a windowsill, HELLO on the glass.\n"
+    "Over time: at about 1s the cat lifts its head; by 2s it has stood up.\n"
+    "Last frame: the windowsill is empty and the glass is fogged."
+)
 
 
 class FakeDescriberProvider:
@@ -49,7 +63,7 @@ class FakeDescriberProvider:
     provider = "openrouter"
     model = "google/gemini-3-flash"
 
-    def __init__(self, *, answer=DESCRIPTION, video=False, raises=None):
+    def __init__(self, *, answer=None, video=False, raises=None):
         self._answer = answer
         self._video = video
         self._raises = raises
@@ -65,7 +79,19 @@ class FakeDescriberProvider:
         self.seen.append((messages, tools))
         if self._raises is not None:
             raise self._raises
-        return Message.assistant(content=self._answer)
+        return Message.assistant(content=self._answer_for(messages))
+
+    def _answer_for(self, messages):
+        """An explicit `answer`, else one that answers the question actually asked.
+
+        The medium is read off the **prompt**, not off `supports_video`: the sampled-frames tier
+        asks a vision-only describer for the same three parts, so keying on the capability would
+        hand that path a still's answer and fail it on a check it should pass.
+        """
+        if self._answer is not None:
+            return self._answer
+        asked_for_parts = VIDEO_PART_LABELS[0] in (messages[0].content or "")
+        return VIDEO_DESCRIPTION if asked_for_parts else DESCRIPTION
 
 
 class BlindProvider:
@@ -452,7 +478,7 @@ def test_a_natively_watched_clip_carries_its_own_facts_ahead_of_the_description(
     note = next(m for m in history if m.injected).content
     assert "(Watched the whole of clip.mp4 (3.0s, 24 fps, 160x120).)" in note
     # Ahead of the description, so the brain reads what the clip *is* before what it shows.
-    assert note.index("Watched the whole of") < note.index(DESCRIPTION)
+    assert note.index("Watched the whole of") < note.index(VIDEO_DESCRIPTION)
 
 
 def test_a_described_clip_is_trimmed_to_the_window_and_the_line_says_which_seconds():
@@ -484,7 +510,7 @@ def test_a_described_clip_names_a_window_the_native_tier_could_not_apply():
 
     # The header will not parse either, so the facts line drops out entirely and the description
     # stands alone — a probe failure is a fact about this decoder, not about the clip (#479).
-    assert described == DESCRIPTION
+    assert described == VIDEO_DESCRIPTION
 
 
 def test_an_unprobeable_clip_costs_the_facts_line_and_never_the_description():
@@ -497,7 +523,7 @@ def test_an_unprobeable_clip_costs_the_facts_line_and_never_the_description():
     clip = VideoContent(url="data:video/mp4;base64,bm90YXZpZGVv", alt="broken.mp4")
     describer = Describer(FakeDescriberProvider(video=True), "d/video-model")
 
-    assert describer.describe_video(clip) == DESCRIPTION
+    assert describer.describe_video(clip) == VIDEO_DESCRIPTION
 
 
 def test_a_vision_only_describer_reads_sampled_frames_and_is_told_they_are_a_sequence():
@@ -521,7 +547,7 @@ def test_a_vision_only_describer_reads_sampled_frames_and_is_told_they_are_a_seq
     # The frames summary rides along, so the brain reads what was sampled as well as what was seen.
     note = next(m for m in history if m.injected)
     assert "Showing 4 frames of clip.mp4" in note.content
-    assert DESCRIPTION in note.content
+    assert VIDEO_DESCRIPTION in note.content
 
 
 def test_the_describers_video_gate_is_the_same_fail_closed_one_the_brain_uses():
@@ -739,3 +765,248 @@ def test_a_wake_that_describes_tells_the_two_models_spend_apart(caplog):
     assert all("cost=0.05" in m for m in main)
     assert "cost=0.0021" in helper[0] and "model=d/model" in helper[0]
     assert "z-ai/glm-5.2" not in helper[0]
+
+
+# === issue #488: a fragment is never handed to the brain as sight ============
+
+#: What a working call reports. Any non-zero count is a real measurement, which is exactly the
+#: thing the live failure did not have.
+USAGE = {"prompt_tokens": 812, "completion_tokens": 96}
+
+#: The live shape of a stream that broke: an answer arrived and the vendor counted nothing.
+NO_USAGE = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+#: The first-frame paragraph, cut mid-word, that @glm-5.2 was handed as its sight of a 5 s clip.
+CUT_OFF = "First frame: a poster on a wall; small black text reads \u201c#40\u201d above a"
+
+
+class WireDescriberProvider(FakeDescriberProvider):
+    """A describer adapter that reports what a real one reports — usage, cost, a finish reason.
+
+    The plain fake reports none of it, which is the one case where nothing needs judging: every
+    detection here is a judgement about what the *vendor said*, so it has to be said.
+    """
+
+    def __init__(self, *, finish=None, usage=USAGE, **kwargs):
+        super().__init__(**kwargs)
+        self.finish = finish
+        self.usage = usage
+
+    def chat(self, messages, tools=None):
+        from basecradle_harness._observability import log_llm_call
+
+        log_llm_call(
+            provider=self.provider,
+            model=self.model,
+            seconds=1.5,
+            usage=self.usage,
+            cost=0.0021,
+            finish_reason=self.finish,
+        )
+        return super().chat(messages, tools)
+
+
+def _describer(*providers, model="d/model"):
+    """A describer whose retry (or video) budget hands out the *next* provider, recording budgets.
+
+    Mirrors production exactly: the still budget's adapter is built eagerly and seeded, and every
+    other budget is built on the call that needs it.
+    """
+    asked = []
+    queue = list(providers[1:])
+
+    def build(budget):
+        asked.append(budget)
+        return queue.pop(0)
+
+    return Describer(providers[0], model, build=build, budget=IMAGE_OUTPUT_BUDGET), asked
+
+
+def _fallback_lines(caplog):
+    return [r for r in _helper_lines(caplog) if "outcome=fallback" in r.getMessage()]
+
+
+def test_a_truncated_answer_is_never_handed_to_the_brain_as_sight(caplog):
+    """The live defect (issue #488): 1,748 characters cut mid-sentence, logged ``outcome=ok``.
+
+    The caption tells the brain it is reading a description of the whole thing, and a brain has no
+    way to notice the sentence stopped in the middle — so a fragment presented as a whole one is a
+    fabrication by omission, and the honest caption it replaces is strictly better.
+    """
+    vision = WireDescriberProvider(finish="length", answer=CUT_OFF)
+    describer = Describer(vision, "d/model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) is None
+
+    lines = _fallback_lines(caplog)
+    assert len(lines) == 1
+    assert "reason=truncated" in lines[0].getMessage()
+    assert lines[0].levelno == logging.WARNING  # runtime-class: it can succeed next time
+
+
+def test_a_truncated_answer_is_retried_once_with_more_room(caplog):
+    """A vendor that stopped at ``length`` ran out of room, which a bigger budget is the fix for.
+
+    So the describe is two attempts, not one — and each writes its own `llm` line, because each is
+    a call that was made and billed (the #485 grammar, not a duplicate).
+    """
+    describer, asked = _describer(
+        WireDescriberProvider(finish="length", answer=CUT_OFF),
+        WireDescriberProvider(answer=DESCRIPTION),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) == DESCRIPTION
+
+    assert asked == [IMAGE_OUTPUT_BUDGET * RETRY_BUDGET_FACTOR]
+    lines = _helper_lines(caplog)
+    assert len(lines) == 2
+    assert "reason=truncated" in lines[0].getMessage()
+    assert "outcome=ok" in lines[1].getMessage() and lines[1].levelno == logging.INFO
+
+
+def test_a_second_truncation_falls_back_rather_than_spending_again(caplog):
+    """Once. A second ``length`` is the model saying the budget was never the problem."""
+    describer, asked = _describer(
+        WireDescriberProvider(finish="length", answer=CUT_OFF),
+        WireDescriberProvider(finish="length", answer=CUT_OFF),
+        WireDescriberProvider(answer=DESCRIPTION),  # never reached
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) is None
+
+    assert len(asked) == 1  # one retry, one extra adapter
+    assert [r.getMessage().count("reason=truncated") for r in _helper_lines(caplog)] == [1, 1]
+
+
+def test_an_answer_the_vendor_counted_nothing_for_is_a_broken_stream(caplog):
+    """`tokens_in=0 tokens_out=0 … cost=0` beside 1,748 characters is not a call that worked.
+
+    A completion cannot have consumed zero input tokens, so an all-zero usage block is the vendor
+    reporting *nothing* — the signature of a stream that ended before the answer did.
+    """
+    vision = WireDescriberProvider(usage=NO_USAGE, answer=CUT_OFF)
+    describer = Describer(vision, "d/model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) is None
+
+    message = _fallback_lines(caplog)[0].getMessage()
+    assert "reason=no_usage" in message
+    # And the contradiction is gone from the line itself: no zeros dressed up as measurements.
+    assert "tokens_" not in message
+
+
+def test_a_broken_stream_is_not_retried_because_room_was_never_the_problem(caplog):
+    """The retry is keyed on the one fault a bigger budget fixes, never on "something went wrong"."""
+    describer, asked = _describer(
+        WireDescriberProvider(usage=NO_USAGE, answer=CUT_OFF),
+        WireDescriberProvider(answer=DESCRIPTION),  # never reached
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) is None
+
+    assert asked == [] and len(_helper_lines(caplog)) == 1
+
+
+def test_a_video_description_missing_its_parts_is_not_a_video_description(caplog):
+    """Since #479 the three parts *are* the contract, and #488 is the check that was missing.
+
+    The live answer had `First frame:` and nothing after it. The harness cannot tell a clip
+    described in one paragraph from a clip whose description stopped after the first frame — and it
+    must not guess in the direction of "close enough".
+    """
+    vision = WireDescriberProvider(video=True, answer="The entire image vibrates throughout.")
+    describer = Describer(vision, "d/video-model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_video(_clip()) is None
+
+    assert "reason=missing_parts" in _fallback_lines(caplog)[0].getMessage()
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        "**First frame:** a cat\n**Over time:** it moves\n**Last frame:** it is gone",
+        "## First frame: a cat\n## Over time: it moves\n## Last frame: it is gone",
+        "- first frame: a cat\n- over time: it moves\n- last frame: it is gone",
+        "First frame: a cat. Over time: it moves. Last frame: it is gone.",
+    ],
+)
+def test_a_describer_that_answers_in_bold_is_still_answering(answer):
+    """The check catches a **missing part**; it does not police layout.
+
+    A model told "plain prose, no markdown headings" will sometimes use them anyway, and will
+    sometimes write the three labels inline in one paragraph — which is exactly what "plain prose"
+    invites. Discarding a complete description over a pair of asterisks or a line break would blind
+    the agent to enforce a style nobody reads.
+    """
+    describer = Describer(WireDescriberProvider(video=True, answer=answer), "d/video-model")
+
+    assert describer.describe_video(_clip()) is not None
+
+
+def test_a_still_is_never_judged_against_the_video_parts():
+    """A photograph has no first frame, so the check that guards a clip must not reach a picture."""
+    describer = Describer(WireDescriberProvider(answer=DESCRIPTION), "d/model")
+
+    assert describer.describe_images([ImageContent(url="x", alt="cat.png")]) == DESCRIPTION
+
+
+def test_a_clip_gets_three_parts_worth_of_room_and_a_still_gets_one():
+    """The budget is a bound on both ends: enough room for what was asked, and a cap on what the
+    transcript keeps — a description rides an injected turn, which is persisted for the timeline's
+    life (Context Discipline)."""
+    assert VIDEO_OUTPUT_BUDGET == 3 * IMAGE_OUTPUT_BUDGET
+
+    describer, asked = _describer(
+        WireDescriberProvider(video=True),
+        WireDescriberProvider(video=True),
+    )
+    describer.describe_video(_clip())
+
+    assert asked == [VIDEO_OUTPUT_BUDGET]
+
+
+def test_a_describer_with_no_builder_describes_and_never_retries_itself(caplog):
+    """The regression bar for the budget machinery: a library caller's own `Provider` still works.
+
+    Every shipped adapter takes its cap at **construction**, so a directly-built describer has no
+    larger budget to reach for. Asking it the identical question a second time would buy the
+    identical answer, so it does not — the retry is conditioned on there being more room, never on
+    the fault alone.
+    """
+    working = Describer(WireDescriberProvider(), "d/model")
+    stuck = Describer(WireDescriberProvider(finish="length", answer=CUT_OFF), "d/model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert working.describe_images([ImageContent(url="x", alt="cat.png")]) == DESCRIPTION
+        caplog.clear()
+        assert stuck.describe_images([ImageContent(url="x", alt="poster.png")]) is None
+
+    assert len(_helper_lines(caplog)) == 1
+
+
+def test_a_helper_line_never_says_a_free_successful_call_that_measured_nothing(caplog):
+    """The contradiction the live line carried, stated as the invariant it violates (issue #488).
+
+    ``outcome=ok`` and ``cost=0`` and ``tokens_*=0`` cannot all be true at once: a call that
+    answered was measured, and a call that measured nothing did not answer.
+    """
+    for vision in (
+        WireDescriberProvider(),
+        WireDescriberProvider(usage=NO_USAGE, answer=CUT_OFF),
+        WireDescriberProvider(finish="length", answer=CUT_OFF),
+        WireDescriberProvider(answer="   "),
+    ):
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+            Describer(vision, "d/model").describe_images([ImageContent(url="x", alt="a.png")])
+        for record in _helper_lines(caplog):
+            message = record.getMessage()
+            assert not ("outcome=ok" in message and "tokens_in=0" in message), message
+            assert not ("outcome=ok" in message and "cost=0 " in f"{message} "), message

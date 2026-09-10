@@ -405,10 +405,17 @@ HELPER = "helper"
 class LlmCall:
     """What an adapter recorded about a call whose line its **caller** will write.
 
-    Everything an `llm` line needs that only the adapter knows — the endpoint a router picked, the
-    usage the vendor reported, the cost it stated, how long the call took. Every field stays
-    ``None`` when the call raised before the adapter got that far, so the caller's line simply
-    carries less rather than carrying a guess.
+    Everything the caller needs that only the adapter knows — the endpoint a router picked, the
+    usage the vendor reported, the cost it stated, how long the call took, and **why the vendor
+    stopped generating**. Every field stays ``None`` when the call raised before the adapter got
+    that far, so the caller's line simply carries less rather than carrying a guess.
+
+    `finish_reason` is the one field here that is **not** rendered on the line, and that is
+    deliberate (issue #488). It is not an observation about the call, it is the evidence a caller
+    judges the *answer* with: a describer whose clip description stopped at ``length`` did not
+    describe the clip, and the line it writes says so as ``reason=truncated outcome=fallback``,
+    which is the fact worth grepping. Rendering the raw vendor word as well would add a field to a
+    byte-frozen grammar to say the same thing in three vendors' spellings.
     """
 
     provider: str | None = None
@@ -417,6 +424,7 @@ class LlmCall:
     usage: Any = None
     endpoint: str | None = None
     cost: float | None = None
+    finish_reason: str | None = None
 
 
 #: The capture handle for the model call currently in flight, or ``None`` — which is the ordinary
@@ -473,6 +481,7 @@ def log_llm_call(
     endpoint: str | None = None,
     cost: float | None = None,
     tokens_reasoning: int | None = None,
+    finish_reason: str | None = None,
     outcome: str | None = None,
     reason: str | None = None,
     detail: str | None = None,
@@ -512,6 +521,16 @@ def log_llm_call(
     provider that reports none of them still gets its provider/model/duration line, which is the
     part that is always true.
 
+    **A usage block of nothing but zeros is not usage** (issue #488), so the token fields and the
+    ``cost`` read out of it are omitted rather than printed as zeros. That is the same honest-absence
+    rule `endpoint` and `cost` already keep, applied to the one shape that *looks* like an answer:
+    a broken stream returned ``tokens_in=0 tokens_out=0 … cost=0`` beside ``outcome=ok``, which
+    reads on the dashboard as a free call that worked. A genuinely free call is unaffected — it
+    reports real token counts, so its ``cost=0`` is a fact and still prints.
+
+    `finish_reason` is recorded for a `capture_llm_call` caller and **never rendered**: see
+    `LlmCall` for why the line says ``reason=truncated`` instead.
+
     A call with no explicit `purpose` is the brain's (``purpose=main``, no ``kind``) — unless a
     `capture_llm_call` block is active, in which case this **records rather than emits** and its
     caller writes the line. `level` is the caller's, because severity is the *taxonomy* — a
@@ -525,9 +544,24 @@ def log_llm_call(
         # explicit `purpose` is a caller writing its own line and is never captured.
         captured.provider, captured.model, captured.seconds = provider, model, seconds
         captured.usage, captured.endpoint, captured.cost = usage, endpoint, cost
+        captured.finish_reason = finish_reason
         return
     if purpose is None:
         purpose = MAIN
+    counts = token_counts(usage)
+    if usage is not None and not usage_reported(usage):
+        # A usage block of nothing but zeros is not usage (issue #488) — it is the vendor reporting
+        # **nothing**, in a shape that renders as a fact. Printing it is worse than omitting it: a
+        # broken stream came back as ``tokens_in=0 … cost=0 outcome=ok``, which reads on the
+        # dashboard as a free call that worked.
+        #
+        # A **zero** dollar figure goes with the counts, because on the endpoint that states one it
+        # is read out of that same block (`_COST_FIELDS`) — it is not an independent claim, it is
+        # the same absence spelled ``0``. A **non-zero** one is kept: the xAI adapter reads its cost
+        # off the *response* rather than off usage, so a real charge beside an unreported usage
+        # block is a fact this line must not swallow. Honest absence cuts both ways.
+        counts, tokens_reasoning = {}, None
+        cost = cost if _charged(cost) else None
     _log.log(
         level,
         "llm %s",
@@ -538,7 +572,7 @@ def log_llm_call(
             endpoint=endpoint,
             model=model,
             duration=None if seconds is None else _secs(seconds),
-            **token_counts(usage),
+            **counts,
             tokens_reasoning=tokens_reasoning,
             cost=_money(cost),
             outcome=outcome,
@@ -631,6 +665,81 @@ def token_counts(usage: Any) -> dict[str, int]:
             continue
         counts[field] = value
     return counts
+
+
+def usage_reported(usage: Any) -> bool:
+    """Whether the vendor actually **stated** usage for this call (issue #488).
+
+    A usage block of nothing but zeros is not usage. A call that returned text cannot have consumed
+    zero input tokens, so an all-zero block is the vendor reporting nothing in a shape that renders
+    as a fact — the signature of a stream that broke rather than a call that worked. The live case:
+    a describer answered 1,748 characters cut mid-sentence and reported ``tokens_in=0 tokens_out=0
+    … cost=0``, and the line said ``outcome=ok``.
+
+    Read through `token_counts`, so it knows every vendor's spelling by construction and cannot
+    drift from what the line prints. ``False`` for ``None`` too, which is the same claim: nothing
+    was stated.
+
+    Two readers, one spelling: `log_llm_call` uses it to omit the fields rather than print zeros,
+    and a caller judging whether an *answer* is usable (`_describer`) uses it to say so.
+    """
+    return any(token_counts(usage).values())
+
+
+#: Every spelling of *"generation stopped because the output budget ran out"* — the one finish
+#: reason that means the answer in hand is a **fragment**, not an answer. OpenAI and OpenRouter's
+#: chat wire say ``length``; OpenAI's Responses surface says ``max_output_tokens`` (as
+#: ``incomplete_details.reason``); the native xAI SDK names its enum ``REASON_MAX_LEN``. Compared
+#: case-insensitively, because the harness is matching a vendor's vocabulary rather than defining
+#: one.
+TRUNCATED_FINISH_REASONS = frozenset(
+    {"length", "max_tokens", "max_output_tokens", "reason_max_len"}
+)
+
+
+def finish_reason(response: Any) -> str | None:
+    """Why the vendor stopped generating, in its own words — ``None`` when it did not say.
+
+    A **capability read, not a vendor branch** (`serving_endpoint`'s shape): one reader over the
+    three places a shipped adapter's SDK puts the fact, so an adapter answers it by handing over
+    whatever its SDK returned.
+
+    - the chat wire (OpenAI, xAI-over-``openai``, OpenRouter): ``choices[0].finish_reason``;
+    - the Responses surface: nothing while ``status`` is ``completed``, and
+      ``incomplete_details.reason`` once it is ``incomplete`` — the surface states *why it stopped*
+      only when stopping was not the plan;
+    - the native ``xai-sdk``: a top-level ``finish_reason`` property naming its proto enum.
+
+    ``None`` is *the vendor said nothing*, and it is also every failure mode here: this is read on
+    the logging path, where a surprise in a vendor object must never break a turn. A missing finish
+    reason costs a truncation nobody detected; a raise here would cost the wake.
+    """
+    try:
+        return _finish_reason(response)
+    except Exception:  # noqa: BLE001 - observability never breaks a turn over a vendor's surprise
+        return None
+
+
+def truncated(reason: str | None) -> bool:
+    """Whether `reason` is a vendor's way of saying *the output budget ran out*."""
+    return bool(reason) and str(reason).strip().lower() in TRUNCATED_FINISH_REASONS
+
+
+def _finish_reason(response: Any) -> str | None:
+    """`finish_reason`'s read, unguarded — see there for the shapes and why each one is looked at."""
+    if response is None:
+        return None
+    choices = _read(response, "choices")
+    if isinstance(choices, (list, tuple)) and choices:
+        value = _read(choices[0], "finish_reason")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    if _read(response, "status") == "incomplete":
+        value = _read(_read(response, "incomplete_details"), "reason")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    value = _read(response, "finish_reason")
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def reported_cost(usage: Any) -> float | None:
@@ -727,6 +836,16 @@ def _read(payload: Any, name: str) -> Any:
     if isinstance(payload, Mapping):
         return payload.get(name)
     return getattr(payload, name, None)
+
+
+def _charged(cost: Any) -> bool:
+    """Whether `cost` is a **stated charge** rather than the absence of one (issue #488).
+
+    Asked through `_money`, deliberately: it is already the one place that decides what a readable
+    dollar figure is, and a second numeric-shape opinion here would be a second thing to keep in
+    step with it. A figure it will not render is not a charge, and neither is a rendered zero.
+    """
+    return _money(cost) not in (None, "0")
 
 
 def _money(cost: Any) -> str | None:

@@ -204,6 +204,51 @@ Four invariants, each with an "obviously fine" broken form:
   undecodable clip) → withheld caption + **WARNING**. A working describer logs **INFO**: the WARNING
   belongs to the degrade it replaced, and one on every successful description is how a real warning
   stops being read. Nothing here ever raises into a wake.
+- **A fragment is a fabrication by omission, so the answer is *judged* and not merely received**
+  (issue #488). The caption tells the brain it is reading an account of the whole thing, and a brain
+  cannot notice that the sentence stopped in the middle — @glm-5.2 was handed 1,748 characters cut
+  mid-word as its sight of a 5 s clip, with no `Over time:`, no `Last frame:`, and a line reading
+  `outcome=ok`. Four checks now decide usability (`_unusable`), in the order that makes the *first*
+  true one the cause rather than the symptom: **truncated** (the vendor's own `length`, in any of
+  its three spellings — `_observability.finish_reason` is a capability read, never a vendor branch),
+  **empty_response**, **no_usage** (an answer beside a usage block of nothing but zeros — a call
+  that generated text cannot have consumed zero input tokens, so that is a broken stream), and
+  **missing_parts** (a video description lacking `VIDEO_PART_LABELS`, matched on **presence** and
+  never on position, because the check exists to catch a missing part and not to police a layout —
+  a model told "plain prose" may well write the three labels inline in one paragraph, and
+  discarding that would blind the agent to enforce a style nobody reads). Only **truncated** retries, once,
+  at `RETRY_BUDGET_FACTOR` the room — and only where there is more room to buy, since a describer
+  built from a caller's own `Provider` has one fixed cap and asking again would purchase the same
+  answer. Three corollaries a later "consistency" pass will otherwise undo: the retry is keyed on
+  the one fault a budget fixes, never on "something went wrong"; `no_usage` keys on a **reported**
+  all-zero block and never on the *absence* of one, or a third-party adapter that never instrumented
+  would blind its agent on a fact nobody claimed; and the labels the check reads are the same tuple
+  the prompt is **composed from**, so a reworded part cannot leave the check rejecting every answer
+  the describer gives.
+- **The output budget is explicit, and it bounds two different things at once.** A vendor default is
+  not a promise and can move under you; worse, a reasoning describer can spend the whole of it on
+  thinking before writing a word. So a still asks for `IMAGE_OUTPUT_BUDGET` (2,048) and a clip for
+  three times that — three parts, three times the room — spelled per SDK inside
+  `_provider_from_config` (`max_tokens` / `max_completion_tokens` / `max_output_tokens`), where every
+  other vendor spelling already lives, so the describer asks for *a budget* and never for a field
+  name. Getting that name wrong is a 400 on the first call and a permanently blind agent, which is
+  why it is parameterized by test. The second thing it bounds is **Context Discipline's first
+  invariant**: a description rides an *injected turn*, which is persisted for the life of the
+  timeline, so the cap on what the describer may generate is also the cap on what one picture costs
+  the transcript forever. The adapters take the cap at construction, so a still, a clip and a retry
+  are three caps and therefore three adapter instances — built lazily per budget from one closure, so
+  the ordinary wake builds exactly one.
+- **A zero is not a measurement** — `log_llm_call` omits the token fields *and* the cost when the
+  vendor's usage block reports nothing but zeros. Printing them is worse than omitting them: the
+  live line read `tokens_in=0 tokens_out=0 tokens_total=0 cached_tokens=0 cost=0 outcome=ok`, which
+  on the dashboard is a free call that worked. The dollar goes with the counts because on every
+  endpoint that states one it is read out of that same block (`_COST_FIELDS`) — it is not an
+  independent claim, it is the same absence spelled `0`. Two things survive, and both directions
+  matter: a genuinely free call reports real counts, so its `cost=0` is a fact; and a **non-zero**
+  charge stated beside an unreported usage block survives too, because the native xAI adapter reads
+  `cost_usd` off the *response* — swallowing that would lose real spend from the rollup to fix a
+  line that was only ever wrong about zeros. This is the honest-absence rule `endpoint` and `cost`
+  already keep, applied to the one shape that *looks* like an answer.
 - **The caption always names the describer.** Without it the brain reads a paragraph about a picture
   it never received as its own perception — and so does anyone reading its memory a month later. The
   describer is also put through the **brain's own** fail-closed `model_sees_video` gate, so a

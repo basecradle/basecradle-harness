@@ -87,7 +87,12 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._faults import is_out_of_funds, is_too_large
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
-from basecradle_harness._observability import log_llm_call, serving_endpoint, token_counts
+from basecradle_harness._observability import (
+    finish_reason,
+    log_llm_call,
+    serving_endpoint,
+    token_counts,
+)
 from basecradle_harness._openai_wire import format_citations
 
 _log = logging.getLogger("basecradle_harness")
@@ -298,6 +303,10 @@ class XaiSdkProvider:
             # an unreported call logs nothing rather than a fabricated ``cost=0``; an SDK too old to
             # carry the property does the same.
             cost=getattr(response, "cost_usd", None),
+            # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
+            # it got back is whole (issue #488). This SDK names its proto enum (`REASON_MAX_LEN`),
+            # which the shared reader knows alongside the two chat-wire spellings.
+            finish_reason=finish_reason(response),
         )
         return self._from_wire(response)
 

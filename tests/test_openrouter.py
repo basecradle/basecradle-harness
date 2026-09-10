@@ -1170,3 +1170,43 @@ def test_an_ordinary_400_is_not_mistaken_for_the_wall(router):
 
     assert not isinstance(exc.value, ProviderContextLengthError)
     provider.close()
+
+
+# === issue #488: the finish reason reaches the caller that has to judge the answer ===
+
+
+def test_the_finish_reason_is_recorded_for_a_capturing_caller(router):
+    """A truncated answer is only detectable if the adapter passes the vendor's own word along.
+
+    It never reaches the `llm` line — the line says `reason=truncated` instead — so the only proof
+    it left the adapter is a `capture_llm_call` caller reading it back, which is exactly the seam
+    the describer uses (issue #488).
+    """
+    from basecradle_harness._observability import capture_llm_call
+
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, json=completion(content="First frame: a poster", finish_reason="length")
+        )
+    )
+    provider = _provider()
+
+    with capture_llm_call() as call:
+        provider.chat([Message.user("describe it")])
+
+    assert call.finish_reason == "length"
+    provider.close()
+
+
+def test_an_ordinary_stop_is_recorded_as_itself(router):
+    """Nothing is normalized: the caller decides what a vendor's word means, not the adapter."""
+    from basecradle_harness._observability import capture_llm_call
+
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(content="ok")))
+    provider = _provider()
+
+    with capture_llm_call() as call:
+        provider.chat([Message.user("hi")])
+
+    assert call.finish_reason == "stop"
+    provider.close()

@@ -19,9 +19,11 @@ from basecradle_harness._observability import (
     RED,
     RESET,
     YELLOW,
+    capture_llm_call,
     color_enabled,
     delivery_id,
     describe_provider,
+    finish_reason,
     head,
     kv,
     log_llm_call,
@@ -31,6 +33,8 @@ from basecradle_harness._observability import (
     reported_cost,
     serving_endpoint,
     token_counts,
+    truncated,
+    usage_reported,
 )
 
 # --- the key=value formatter -------------------------------------------------
@@ -684,3 +688,138 @@ def test_a_colored_head_is_followed_by_the_reset_and_not_by_its_separator():
     # Across the gap: no longer. Both shapes below are live NOC patterns as of this change.
     assert not re.search(r"wake end .*outcome=error", line)
     assert not re.search(r"wake end timeline=", line)
+
+
+# === issue #488: a zero is not a measurement, and a fragment is not an answer =
+
+
+def _line(caplog):
+    return next(r.getMessage() for r in caplog.records if r.getMessage().startswith("llm "))
+
+
+def test_a_usage_block_of_nothing_but_zeros_is_not_usage():
+    """The live signature of a broken stream: an answer arrived, the vendor counted nothing."""
+    assert usage_reported({"prompt_tokens": 812, "completion_tokens": 96}) is True
+    assert usage_reported({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}) is False
+    assert usage_reported(None) is False
+    # One non-zero count is a report: a cached-prompt hit on a tiny call is a real measurement.
+    assert usage_reported({"prompt_tokens": 0, "completion_tokens": 4}) is True
+
+
+def test_an_all_zero_usage_block_is_omitted_rather_than_printed_as_zeros(caplog):
+    """`tokens_in=0 … cost=0 outcome=ok` reads on the dashboard as a free call that worked.
+
+    It was neither. The line the live describer wrote said exactly that beside a description cut
+    mid-sentence, which is how a broken stream passed for a success (issue #488).
+    """
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        log_llm_call(
+            provider="openrouter",
+            model="google/gemini-3.8-flash",
+            seconds=12.26,
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            cost=0.0,
+            tokens_reasoning=0,
+            outcome="ok",
+        )
+
+    line = _line(caplog)
+    assert "tokens_" not in line and "cost=" not in line
+    # What the vendor *did* say still rides the line — the absence is only of what it did not.
+    assert "provider=openrouter" in line and "duration=12.26s" in line
+
+
+def test_a_genuinely_free_call_still_reports_its_zero_cost(caplog):
+    """The other half of the rule: a `:free` endpoint counts real tokens, so `cost=0` is a fact."""
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        log_llm_call(
+            provider="openrouter",
+            model="z-ai/glm-5.2:free",
+            seconds=1.0,
+            usage={"prompt_tokens": 900, "completion_tokens": 12},
+            cost=0.0,
+            outcome="ok",
+        )
+
+    line = _line(caplog)
+    assert "tokens_in=900" in line and "cost=0" in line
+
+
+def test_a_real_charge_survives_a_usage_block_that_reported_nothing(caplog):
+    """The dollar is dropped as an *absence*, never as a rule about zeros.
+
+    The native xAI adapter reads its cost off the **response** (`cost_usd`), not off usage — so a
+    real charge beside an unreported usage block is an independent claim, and swallowing it would
+    lose spend from the rollup to fix a line that was only ever wrong about zeros.
+    """
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        log_llm_call(
+            provider="xai",
+            model="grok-4.3",
+            seconds=1.0,
+            usage={"prompt_tokens": 0, "completion_tokens": 0},
+            cost=0.004,
+            outcome="ok",
+        )
+
+    line = _line(caplog)
+    assert "cost=0.004" in line and "tokens_" not in line
+
+
+def test_a_usage_the_adapter_never_reported_leaves_the_cost_alone(caplog):
+    """``usage=None`` is *nothing was stated*, which is not the same claim as *zero*.
+
+    An adapter that reports a dollar figure without a usage block (the xAI SDK reads its cost off
+    the response, not off usage) is stating something it knows, and it must survive.
+    """
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        log_llm_call(provider="xai", model="grok-4.3", seconds=1.0, cost=0.004, outcome="ok")
+
+    assert "cost=0.004" in _line(caplog)
+
+
+def test_the_finish_reason_is_read_off_every_shape_a_shipped_adapter_hands_back():
+    """One reader, three wires — `serving_endpoint`'s shape, for the same reason (issue #488)."""
+
+    class _Native:  # the native xai-sdk Response: a property naming its proto enum
+        finish_reason = "REASON_MAX_LEN"
+
+    assert finish_reason({"choices": [{"finish_reason": "length"}]}) == "length"
+    assert finish_reason({"choices": [{"finish_reason": "stop"}]}) == "stop"
+    assert (
+        finish_reason(
+            {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}}
+        )
+        == "max_output_tokens"
+    )
+    assert finish_reason(_Native()) == "REASON_MAX_LEN"
+    # A Responses payload that completed states no finish reason, and neither does an empty one.
+    assert finish_reason({"status": "completed", "output": []}) is None
+    assert finish_reason({}) is None and finish_reason(None) is None
+
+
+def test_reading_a_finish_reason_never_breaks_a_turn():
+    """Observability's standing rule, applied to a vendor object that raises on attribute access."""
+
+    class _Hostile:
+        @property
+        def choices(self):
+            raise RuntimeError("the SDK changed under us")
+
+    assert finish_reason(_Hostile()) is None
+
+
+def test_every_vendors_spelling_of_out_of_room_is_recognized():
+    for spelling in ("length", "LENGTH", "max_output_tokens", "max_tokens", "REASON_MAX_LEN"):
+        assert truncated(spelling), spelling
+    for spelling in ("stop", "tool_calls", "REASON_STOP", "content_filter", None, ""):
+        assert not truncated(spelling), spelling
+
+
+def test_a_captured_call_carries_the_finish_reason_but_the_line_never_prints_it(caplog):
+    """It is evidence for the caller, not a field on a byte-frozen grammar (issue #488)."""
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"), capture_llm_call() as call:
+        log_llm_call(provider="openrouter", model="m", seconds=1.0, finish_reason="length")
+
+    assert call.finish_reason == "length"
+    assert not [r for r in caplog.records if r.getMessage().startswith("llm ")]
