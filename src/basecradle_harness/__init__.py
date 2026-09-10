@@ -40,6 +40,7 @@ from basecradle_harness._exceptions import (
     ProviderRequestError,
     ProviderResponseError,
     ProviderServerError,
+    ProviderToolSchemaError,
 )
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._grok import (
@@ -306,4 +307,5 @@ __all__ = [
     "ProviderRequestError",
     "ProviderRateLimitError",
     "ProviderServerError",
+    "ProviderToolSchemaError",
 ]

@@ -51,6 +51,31 @@ class ProviderConnectionError(ProviderError):
     """The provider could not be reached (DNS, TCP, TLS, timeout)."""
 
 
+class ProviderToolSchemaError(ProviderError):
+    """The provider refused **one tool's** JSON Schema, naming it (issue #496).
+
+    Deliberately its own class, and deliberately **not** a `ProviderRequestError`: nothing about the
+    peer's content is at fault, so this must never be reported to a timeline as a permanent property
+    of what someone sent. It is a fault of the *offer* — a schema a vendor's validator will not take
+    — and the remedy is entirely local: stop offering that tool.
+
+    So an adapter raises it, and its **own `chat` catches it**, drops the named tool, and re-issues
+    the identical turn with the rest (`XaiSdkProvider._sample`). It reaches the engine only in the
+    residual case where the vendor named no tool this call actually offered — and then it behaves
+    exactly like the plain `ProviderError` it descends from: it propagates, the wake fails visibly,
+    and the peer's message stays re-drivable rather than being marked answered.
+
+    `tool_name` is the tool the vendor named (``None`` when it named none); `reason` is the vendor's
+    own words for why, kept so the WARNING that records the drop quotes the authority on it rather
+    than the harness's guess.
+    """
+
+    def __init__(self, message: str, *, tool_name: str | None = None, reason: str = "") -> None:
+        super().__init__(message)
+        self.tool_name = tool_name
+        self.reason = reason
+
+
 class ProviderAPIError(ProviderError):
     """The provider returned an error status.
 

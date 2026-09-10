@@ -1,0 +1,779 @@
+{
+  "_provenance": {
+    "source": "mcp-mail-server@2.0.2 (npm), https://registry.npmjs.org/mcp-mail-server/-/mcp-mail-server-2.0.2.tgz",
+    "captured": "2026-09-10",
+    "how": "The published tarball's own dist/index.js was run over stdio and asked for tools/list; this is that response verbatim. It is NOT hand-written — the union-root shape it carries is what zod's .meta({anyOf: [...]}) actually emits, and the point of the fixture is that nobody re-types it.",
+    "why": "The schema that killed every wake of @briggs (xai-sdk, grok-4.6) with [invalid_client_tool_schema] ... tool parameter root must be an object type. See issue #496."
+  },
+  "tools": [
+    {
+      "name": "check_connection",
+      "description": "Connect to IMAP when needed, actively verify SMTP, then return structured status for both services.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "list_mailboxes",
+      "description": "List all available mailboxes (folders). Auto-connects to IMAP when needed.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "search_messages",
+      "description": "Search one or more mailboxes with combined filters. Defaults to INBOX and the detected sent mailbox. Returns message summaries unless includeBody is true; full-body hydration fails explicitly if a selected message disappears or the aggregate response-body budget would be exceeded.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "mailboxes": {
+            "uniqueItems": true,
+            "description": "Explicit mailbox names to search. Omit to search INBOX and the detected sent mailbox.",
+            "minItems": 1,
+            "maxItems": 20,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            }
+          },
+          "from": {
+            "description": "Match the From header",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "to": {
+            "description": "Match the To header",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "subject": {
+            "description": "Match text in the Subject header",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "body": {
+            "description": "Match text in the message body",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "keywords": {
+            "uniqueItems": true,
+            "description": "Atom-safe custom IMAP keywords to require. Whitespace, control characters, IMAP syntax characters, and system flags are rejected; use unread for the Seen state.",
+            "minItems": 1,
+            "maxItems": 10,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255
+            }
+          },
+          "unread": {
+            "description": "true matches unread messages; false matches read messages; omit for either",
+            "type": "boolean"
+          },
+          "since": {
+            "description": "Inclusive lower date/time bound, for example 2026-07-01 or an ISO date-time",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "before": {
+            "description": "Exclusive upper date/time bound, for example 2026-08-01 or an ISO date-time",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "limit": {
+            "description": "Maximum number of messages returned",
+            "default": 50,
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          },
+          "includeBody": {
+            "description": "Include text and HTML bodies in search results. Leave false and use get_message for full content.",
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "find_unreplied_messages",
+      "description": "Find messages from a sender that have no thread-header reply in the sent mailbox. Messages without Message-ID are returned separately as unknown.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "sender": {
+            "description": "Sender email address to inspect",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "mailboxes": {
+            "uniqueItems": true,
+            "description": "Source mailboxes containing received messages. Defaults to INBOX.",
+            "minItems": 1,
+            "maxItems": 20,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 1024
+            }
+          },
+          "since": {
+            "description": "Inclusive lower date/time bound for received messages",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "before": {
+            "description": "Exclusive upper date/time bound for received messages",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "limit": {
+            "description": "Maximum number of newest received-message candidates to analyze",
+            "default": 50,
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "sender"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "get_message",
+      "description": "Retrieve one message, including full bodies and attachment metadata. Set markSeen only when the message should be marked as read.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "mailbox": {
+            "description": "Mailbox containing the message, as returned in sourceMailbox",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "uidValidity": {
+            "description": "Optional UIDVALIDITY returned with the message reference",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uid": {
+            "description": "Message UID within the mailbox",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "markSeen": {
+            "description": "Mark the message as read while retrieving it",
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mailbox",
+          "uid"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "get_messages",
+      "description": "Retrieve multiple messages from one mailbox, including full bodies and attachment metadata. Fails if any requested UID is missing or the aggregate response-body budget would be exceeded.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "mailbox": {
+            "description": "Mailbox containing the message, as returned in sourceMailbox",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "uidValidity": {
+            "description": "Optional UIDVALIDITY returned with the message reference",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uids": {
+            "uniqueItems": true,
+            "description": "Message UIDs within the mailbox",
+            "minItems": 1,
+            "maxItems": 50,
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          "markSeen": {
+            "description": "Mark the messages as read while retrieving them",
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mailbox",
+          "uids"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "send_email",
+      "description": "Send a new email via SMTP and try to save a MIME-equivalent copy with the accepted Message-ID to the sent mailbox.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "anyOf": [
+          {
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "required": [
+              "html"
+            ]
+          }
+        ],
+        "type": "object",
+        "properties": {
+          "to": {
+            "description": "Recipient addresses, comma-separated",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "subject": {
+            "description": "Email subject",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 998
+          },
+          "text": {
+            "description": "Plain-text body",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000000
+          },
+          "html": {
+            "description": "HTML body",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000000
+          },
+          "signature": {
+            "description": "Optional signature appended after the new body. Provide text, html, or both.",
+            "anyOf": [
+              {
+                "required": [
+                  "text"
+                ]
+              },
+              {
+                "required": [
+                  "html"
+                ]
+              }
+            ],
+            "type": "object",
+            "properties": {
+              "text": {
+                "description": "Plain-text signature",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 10000000
+              },
+              "html": {
+                "description": "Trusted HTML signature",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 10000000
+              }
+            },
+            "additionalProperties": false
+          },
+          "cc": {
+            "description": "CC addresses, comma-separated",
+            "type": "string",
+            "maxLength": 8192
+          },
+          "bcc": {
+            "description": "BCC addresses, comma-separated",
+            "type": "string",
+            "maxLength": 8192
+          },
+          "attachments": {
+            "description": "Absolute paths to local files allowed by MAIL_ALLOWED_ROOTS",
+            "maxItems": 20,
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 4096
+            }
+          }
+        },
+        "required": [
+          "to",
+          "subject"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "reply_to_email",
+      "description": "Reply to a mailbox-scoped message with threading headers, optional reply-all recipients, signature, and quoted original content.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "anyOf": [
+          {
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "required": [
+              "html"
+            ]
+          }
+        ],
+        "type": "object",
+        "properties": {
+          "mailbox": {
+            "description": "Mailbox containing the message, as returned in sourceMailbox",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "uidValidity": {
+            "description": "Optional UIDVALIDITY returned with the message reference",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "originalUid": {
+            "description": "UID of the original message",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "text": {
+            "description": "Plain-text reply body",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000000
+          },
+          "html": {
+            "description": "HTML reply body",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000000
+          },
+          "signature": {
+            "description": "Optional signature appended after the new body. Provide text, html, or both.",
+            "anyOf": [
+              {
+                "required": [
+                  "text"
+                ]
+              },
+              {
+                "required": [
+                  "html"
+                ]
+              }
+            ],
+            "type": "object",
+            "properties": {
+              "text": {
+                "description": "Plain-text signature",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 10000000
+              },
+              "html": {
+                "description": "Trusted HTML signature",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 10000000
+              }
+            },
+            "additionalProperties": false
+          },
+          "replyToAll": {
+            "description": "Reply to the sender and all original To/CC recipients except this account",
+            "default": false,
+            "type": "boolean"
+          },
+          "includeOriginal": {
+            "description": "Quote the original message below the new reply",
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mailbox",
+          "originalUid"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "continue_email_thread",
+      "description": "Find the newest sent message with the same normalized subject, optionally narrowed by recipient and date, then continue its thread. Designed for recurring reports; reply-all and quoted history both default to true.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "anyOf": [
+          {
+            "required": [
+              "text"
+            ]
+          },
+          {
+            "required": [
+              "html"
+            ]
+          }
+        ],
+        "type": "object",
+        "properties": {
+          "subject": {
+            "description": "Exact thread subject after ignoring repeated Re:/回复:/答复: prefixes, case, and surrounding whitespace",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 998
+          },
+          "recipient": {
+            "description": "Optional To-header match used to narrow same-subject sent threads",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 8192
+          },
+          "since": {
+            "description": "Optional inclusive lower date/time bound for the sent-message lookup",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "text": {
+            "description": "Plain-text body for the new report or update",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000000
+          },
+          "html": {
+            "description": "HTML body for the new report or update",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 10000000
+          },
+          "signature": {
+            "description": "Optional signature appended after the new body. Provide text, html, or both.",
+            "anyOf": [
+              {
+                "required": [
+                  "text"
+                ]
+              },
+              {
+                "required": [
+                  "html"
+                ]
+              }
+            ],
+            "type": "object",
+            "properties": {
+              "text": {
+                "description": "Plain-text signature",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 10000000
+              },
+              "html": {
+                "description": "Trusted HTML signature",
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 10000000
+              }
+            },
+            "additionalProperties": false
+          },
+          "replyToAll": {
+            "description": "Preserve the latest sent message To/CC recipients except this account",
+            "default": true,
+            "type": "boolean"
+          },
+          "includeOriginal": {
+            "description": "Quote the complete previous sent-message body below the new content; subject to the configured body safety limit",
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "subject"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "move_message",
+      "description": "Move an existing mailbox-scoped message to another existing mailbox. If a move, copy, or source-cleanup outcome cannot be confirmed, returns a structured partial error that must be inspected before retrying.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "mailbox": {
+            "description": "Mailbox containing the message, as returned in sourceMailbox",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "uidValidity": {
+            "description": "Optional UIDVALIDITY returned with the message reference",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uid": {
+            "description": "UID in the source mailbox",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "targetMailbox": {
+            "description": "Existing destination mailbox returned by list_mailboxes",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          }
+        },
+        "required": [
+          "mailbox",
+          "uid",
+          "targetMailbox"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "delete_message",
+      "description": "Permanently delete one existing mailbox-scoped message using targeted UID EXPUNGE. Fails safely when the UID is missing or the IMAP server lacks UIDPLUS, and returns a structured unknown outcome when a transport failure prevents confirmation.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "mailbox": {
+            "description": "Mailbox containing the message, as returned in sourceMailbox",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "uidValidity": {
+            "description": "Optional UIDVALIDITY returned with the message reference",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uid": {
+            "description": "UID of the message to permanently delete",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "mailbox",
+          "uid"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    },
+    {
+      "name": "save_attachment",
+      "description": "Save one or all attachments from a mailbox-scoped message into an allowed local directory. If a later write fails, returns the files already saved as a structured partial result.",
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+          "mailbox": {
+            "description": "Mailbox containing the message, as returned in sourceMailbox",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "uidValidity": {
+            "description": "Optional UIDVALIDITY returned with the message reference",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "uid": {
+            "description": "UID of the message containing the attachments",
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "savePath": {
+            "description": "Absolute allowed directory where files will be created",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "attachmentIndex": {
+            "description": "Zero-based attachment index. Omit to save all attachments.",
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 9007199254740991
+          },
+          "returnBase64": {
+            "description": "Also include saved content as Base64 when within the configured size limit",
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mailbox",
+          "uid",
+          "savePath"
+        ],
+        "additionalProperties": false
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      },
+      "execution": {
+        "taskSupport": "forbidden"
+      }
+    }
+  ]
+}

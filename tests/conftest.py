@@ -7,6 +7,7 @@ responses follow the OpenAI chat-completions / Responses schemas.
 """
 
 import json
+import pathlib
 import re
 import sys
 import types
@@ -83,6 +84,20 @@ respx.mocks.DEFAULT_MOCKER = _HTTPCoreBothMocker.name
 # anything outside this set, so a kwarg the adapter invents (or one upstream renames) fails
 # the suite here rather than raising a TypeError against the real library in production.
 _SEARCH_KWARGS = {"n_results", "candidate_strategy", "max_distance"}
+
+
+#: The published ``mcp-mail-server@2.0.2`` ``tools/list`` response, captured verbatim by running
+#: the tarball's own server over stdio (issue #496). Its `send_email` schema is the one that killed
+#: every wake of @briggs on the native xAI adapter, so it is the fixture three test files reason
+#: about — and it lives here so nobody re-types it into a fourth. Provenance is inside the file.
+MAIL_SERVER_TOOLS = json.loads(
+    (pathlib.Path(__file__).parent / "data" / "mcp_mail_server_2_0_2_tools.json").read_text()
+)
+
+
+def mail_tool(name: str) -> dict:
+    """One tool from that capture, by its server-side name."""
+    return next(tool for tool in MAIL_SERVER_TOOLS["tools"] if tool["name"] == name)
 
 
 @pytest.fixture

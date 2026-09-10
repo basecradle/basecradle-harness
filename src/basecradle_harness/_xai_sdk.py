@@ -30,6 +30,17 @@ harness function registry as bogus ``no tool named`` bounces (issue #183). The g
 `PlatformTool`s over httpx (`basecradle_harness._grok`) — independent of the chat SDK, and granted
 only by opt-in. Exposing a capability is never granting it to a persona.
 
+One refused tool schema costs that tool, never the wake (issue #496)
+--------------------------------------------------------------------
+xAI validates a function tool's JSON Schema and demands an **object root**, which the other two
+adapters' endpoints do not — so a schema an MCP server writes perfectly legally can be accepted by
+OpenAI and OpenRouter and refused here, failing the *whole request*. `@briggs` died on every wake
+that way. `_wire_tools` therefore normalizes each schema through
+`basecradle_harness._schema.normalize_object_root` on the way to `chat_mod.tool`, and `_sample`
+drops a tool xAI refuses **by name** and re-issues the identical turn with the rest. The
+normalization lives here and nowhere else: every other adapter still sends a server's schema exactly
+as it wrote it.
+
 Cache affinity — ``x-grok-conv-id`` as gRPC metadata (issues #431, #433)
 ------------------------------------------------------------------------
 xAI's prompt cache is **per-server**, so a repeated prefix only pays out when the next call lands on
@@ -84,8 +95,9 @@ from basecradle_harness._exceptions import (
     ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderToolSchemaError,
 )
-from basecradle_harness._faults import is_out_of_funds, is_too_large
+from basecradle_harness._faults import is_out_of_funds, is_too_large, refused_tool_schema
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
 from basecradle_harness._observability import (
     finish_reason,
@@ -94,6 +106,7 @@ from basecradle_harness._observability import (
     token_counts,
 )
 from basecradle_harness._openai_wire import format_citations
+from basecradle_harness._schema import UnrepresentableSchema, normalize_object_root
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -112,6 +125,20 @@ PROVIDER = "xai"
 #: which is exactly why it belongs in the call's metadata and not in the request body, where the
 #: 1.19.0 wheel has no field to put it in (see the module docstring).
 CONVERSATION_METADATA_KEY = "x-grok-conv-id"
+
+
+def _described(description: str, notes: Sequence[str]) -> str:
+    """The function description, plus any constraint the schema rewrite could not express (#496).
+
+    The notes go **here**, on the function description, and not into the schema's own
+    ``description``: this is the one string every provider is guaranteed to put in front of the
+    model, so a rule that left the schema stays somewhere the model actually reads. A schema that
+    needed no rewrite produces no notes and this returns the description byte-for-byte — which is
+    what keeps a well-formed tool's offer identical to what it was before this existed.
+    """
+    if not notes:
+        return description
+    return "\n\n".join([description, *notes]) if description else "\n\n".join(notes)
 
 
 def _close_client(client: Any) -> None:
@@ -236,6 +263,13 @@ class XaiSdkProvider:
         #: The last conversation refused as unable to ride the wire, so the warning is emitted once
         #: per bad key rather than once per turn (a session rebinds before every turn).
         self._refused_conversation: str | None = None
+        #: Tool names this adapter will not offer xAI again, and why (issue #496). Filled two ways:
+        #: **ahead of the call** by `_wire_tools`, when `_schema.normalize_object_root` cannot make a
+        #: schema's root an object; and **by xAI itself**, when a schema the harness thought fine is
+        #: refused by name at ``chat.create``. Either way the entry is the reason string that went in
+        #: the WARNING, kept so the drop is logged once per adapter (its life **is** the wake) rather
+        #: than once per turn.
+        self._refused_tools: dict[str, str] = {}
         self._default_params = default_params
         self._xai = require_xai_sdk()
         if client is not None:
@@ -274,17 +308,16 @@ class XaiSdkProvider:
             payload["conversation_id"] = self._conversation
         # Function tools and the opted-in server-side built-ins (search, code execution) share
         # one ``tools`` list: all are native ``chat_pb2.Tool`` protos (issue #171 — Agent Tools).
-        wire_tools = [chat_mod.tool(t.name, t.description, t.parameters) for t in tools or ()]
-        wire_tools.extend(self._agent_tools())
-        if wire_tools:
-            payload["tools"] = wire_tools
+        offered = list(tools or ())
+        # Started before `_sample`, so a turn that had to re-issue after xAI refused one tool's
+        # schema (issue #496) reports the wall time the caller actually waited. The refused attempt
+        # bills nothing and logs no `llm` line — it never reached a model — so the one line below
+        # still describes exactly one model call, at its true latency.
         started = time.monotonic()
         # The client whose channel carries this session's `x-grok-conv-id` — the affinity key's
         # only route to the wire on this SDK (issue #433).
         client = self._bound_client()
-        with self._mapped_errors():
-            conversation = client.chat.create(**payload)
-            response = conversation.sample()
+        response = self._sample(client, chat_mod, payload, offered)
         # The native response carries usage as a proto (attributes, not keys); `log_llm_call`
         # reads either shape, so the gRPC path logs the same line as the HTTP ones — token counts
         # and the cached-prompt count (xAI spells it `cached_prompt_text_tokens`). A fake client
@@ -319,6 +352,122 @@ class XaiSdkProvider:
             finish_reason=reason,
         )
         return self._from_wire(response)
+
+    def _sample(
+        self,
+        client: Any,
+        chat_mod: Any,
+        payload: dict[str, Any],
+        offered: Sequence[ToolSpec],
+    ) -> Any:
+        """Issue the turn, letting a tool xAI refuses cost **that tool** and never the wake (#496).
+
+        The invariant this holds up: *fail per tool, never per wake.* One MCP tool whose schema xAI's
+        validator will not take used to kill every wake of the agent that loaded it — the router
+        re-drove it, ``posted=0`` every time, and the peer was answered never. That is the
+        "stall is a drop" class, and it is the worst outcome a tool list can produce.
+
+        Two lines of defense, and **this one is the guarantee** — `_wire_tools` refuses ahead of the
+        call only the two shapes xAI has itself named, because a pre-flight that guesses more takes
+        away tools the vendor would have accepted (see `_schema`). Everything else it cannot fold
+        goes to the wire as written, and this loop absorbs the verdict: a vendor's live rejection is
+        the only authority on its own validator, and a schema rule the harness has not met yet
+        arrives exactly here.
+
+        **It terminates**, and the argument is worth stating because a retry loop around a model call
+        is the one place an infinite loop is expensive: every pass either returns, raises, or adds a
+        name to `self._refused_tools` that was not already in it — and `_wire_tools` filters on that
+        set, so the offered list strictly shrinks. A vendor that names the same tool twice, or names
+        one this call never offered, is re-raised rather than looped on.
+        """
+        while True:
+            wire_tools = self._wire_tools(chat_mod, offered)
+            wire_tools.extend(self._agent_tools())
+            if wire_tools:
+                payload["tools"] = wire_tools
+            else:
+                # Every function tool refused and no built-ins: send **no** ``tools`` key at all
+                # rather than an empty list, which is what a toolless call has always looked like.
+                # The `pop` also settles the documented precedence — ``tools`` is harness-owned, so a
+                # value that reached `default_params` never wins, in this branch as in the other.
+                payload.pop("tools", None)
+            try:
+                with self._mapped_errors():
+                    conversation = client.chat.create(**payload)
+                    return conversation.sample()
+            except ProviderToolSchemaError as exc:
+                name = exc.tool_name
+                if not name or name in self._refused_tools:
+                    # Nothing new to learn: either xAI named no tool, or it named one already
+                    # dropped (so the refusal is not about the offer we just made). Propagating
+                    # leaves the wake failing visibly and the peer's message re-drivable — the
+                    # pre-#496 behavior, which is the right floor.
+                    raise
+                if name not in {spec.name for spec in offered}:
+                    # A name this call never offered. Dropping it would record a refusal for a tool
+                    # nobody asked about and leave the real fault unaddressed.
+                    raise
+                self._drop_tool(name, exc.reason or "xAI refused its schema")
+
+    def _wire_tools(self, chat_mod: Any, offered: Sequence[ToolSpec]) -> list[Any]:
+        """Translate the offered tools into native protos, normalizing each schema first (#496).
+
+        xAI's validator demands an **object root**, and an MCP server may legitimately emit something
+        else — `mcp-mail-server@2.0.2` states its "text or html" rule as an ``anyOf`` of
+        constraint-only branches beside the object root, which OpenAI and OpenRouter both accept.
+        `basecradle_harness._schema` folds that into the object it sits beside and hands back the
+        constraint as prose, which is appended to the **function description** — the one string every
+        vendor puts in front of the model — so the model still knows the rule and the MCP server
+        still enforces it.
+
+        A schema that cannot be made an object root is not a reason to lose the agent: that one tool
+        is dropped, loudly, and the rest of the wake proceeds ("don't show a locked door", at the
+        vendor boundary).
+
+        **The stated residual**: the wake's tool manifest is composed *before* any model call, so on
+        the wake that discovers a drop the model reads a manifest naming a tool it is not offered.
+        That is a door left visible for one wake — bounded, logged, and self-correcting the moment
+        the operator acts on the WARNING — and closing it would mean feeding an adapter's verdict
+        back into brief composition, which cannot be known before the first call anyway.
+
+        Anything raised out of normalization costs the tool and never the wake, including a fault
+        this module did not anticipate: the whole invariant is that a *tool list* can never be the
+        reason an agent goes silent, so the catch is deliberately broad and the log line names both
+        the tool and the error rather than hiding either.
+        """
+        wire: list[Any] = []
+        for spec in offered:
+            if spec.name in self._refused_tools:
+                continue
+            try:
+                parameters, notes = normalize_object_root(spec.parameters)
+                built = chat_mod.tool(spec.name, _described(spec.description, notes), parameters)
+            except UnrepresentableSchema as exc:
+                self._drop_tool(spec.name, str(exc))
+                continue
+            except Exception as exc:  # noqa: BLE001 - a tool list may never cost a wake (#496)
+                self._drop_tool(spec.name, f"its schema could not be prepared for xAI ({exc})")
+                continue
+            wire.append(built)
+        return wire
+
+    def _drop_tool(self, name: str, reason: str) -> None:
+        """Stop offering `name` to xAI on this adapter, saying so once (issue #496).
+
+        WARNING, not ERROR: the agent keeps working with the rest of its tools, and this is the
+        degrade the invariant exists to buy. Once per adapter rather than once per turn — the
+        adapter's life **is** the wake, so this needs no clock, the same shape `bind_conversation`'s
+        refusal and the describer's config-fault note already use.
+        """
+        if name in self._refused_tools:
+            return
+        self._refused_tools[name] = reason
+        _log.warning(
+            "Not offering tool %r to xAI: %s. The rest of this agent's tools are unaffected and "
+            "the wake continues; every other provider still receives this tool's schema unchanged.",
+            name,
+            reason,
+        )
 
     def bind_conversation(self, conversation: str | None) -> None:
         """Route this adapter's next calls to the server holding `conversation`'s prefix (#431).
@@ -587,6 +736,15 @@ class _grpc_error_context:
             # INVALID_ARGUMENT, the HTTP 400's analogue. Deterministic, so the session compacts and
             # retries the turn once rather than re-sending a request that fails identically forever.
             raise ProviderContextLengthError(message, status_code=400, body=detail) from exc
+        refused = refused_tool_schema(detail)
+        if refused is not None:
+            # xAI refused **one tool's** JSON Schema by name — the other INVALID_ARGUMENT that is not
+            # about the peer's content at all (issue #496). Raised as its own type so the adapter's
+            # own `chat` can drop that tool and re-issue the turn with the rest; unnamed or
+            # unrecognized, it never becomes this and falls through to the plain `ProviderError`
+            # below, exactly as it did before the per-tool drop existed.
+            name, reason = refused
+            raise ProviderToolSchemaError(message, tool_name=name, reason=reason) from exc
         if code == grpc.StatusCode.UNAUTHENTICATED:
             raise ProviderAuthError(message, status_code=401) from exc
         if code == grpc.StatusCode.RESOURCE_EXHAUSTED:

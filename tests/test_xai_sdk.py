@@ -29,11 +29,13 @@ from basecradle_harness import (
     ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderToolSchemaError,
     ToolCall,
     ToolSpec,
     XaiSdkProvider,
 )
 from basecradle_harness._xai_sdk import CONVERSATION_METADATA_KEY
+from tests.conftest import mail_tool
 
 _TYPE = chat_pb2.ToolCallType
 
@@ -983,3 +985,237 @@ def test_a_response_that_names_no_finish_reason_records_none():
         provider.chat([Message.user("hi")])
 
     assert call.finish_reason is None
+
+
+# --- refused tool schemas: fail per tool, never per wake (issue #496) ---------
+#
+# One MCP tool whose schema xAI's validator will not take used to kill *every* wake of the agent
+# that loaded it (`@briggs`, grok-4.6): the router re-drove it, `posted=0` every time, and the peer
+# was answered never. The schema in question is not invented here — it is the real
+# `mcp-mail-server@2.0.2` `send_email` shape, read out of the published tarball
+# (`tests/data/mcp_mail_server_2_0_2_tools.json`).
+
+
+def _mail_send_email_spec() -> ToolSpec:
+    tool = mail_tool("send_email")
+    # Namespaced exactly as `_mcp.mcp_tool_name` does, so the name in these tests is the name that
+    # appeared in xAI's own error text.
+    return ToolSpec(
+        name="workmail__send_email",
+        description=tool["description"],
+        parameters=tool["inputSchema"],
+    )
+
+
+def _wire_tool(provider, name):
+    return next(
+        t
+        for t in provider._client.chat.captured["tools"]
+        if t.WhichOneof("tool") == "function" and t.function.name == name
+    )
+
+
+def test_the_real_mail_server_schema_reaches_the_wire_with_an_object_root():
+    spec = _mail_send_email_spec()
+    provider = _provider(_response(content="sent"))
+
+    provider.chat([Message.user("email John")], tools=[spec])
+
+    sent = json.loads(_wire_tool(provider, "workmail__send_email").function.parameters)
+    assert sent["type"] == "object"
+    assert not any(k in sent for k in ("anyOf", "oneOf", "allOf"))
+    assert sent["properties"]["signature"].get("anyOf") is None
+    # Nothing the model can call with was lost on the way.
+    assert set(sent["properties"]) == set(spec.parameters["properties"])
+    assert sent["required"] == ["to", "subject"]
+
+
+def test_the_constraint_the_schema_lost_is_told_to_the_model_in_the_description():
+    provider = _provider(_response(content="sent"))
+
+    provider.chat([Message.user("email John")], tools=[_mail_send_email_spec()])
+
+    described = _wire_tool(provider, "workmail__send_email").function.description
+    assert "At least one of: (text) or (html)." in described
+    assert "`signature`: At least one of: (text) or (html)." in described
+    assert described.startswith("Send a new email via SMTP")  # the server's own words come first
+
+
+def test_a_well_formed_schema_is_offered_exactly_as_it_arrived():
+    """The regression bar: an ordinary tool's offer is byte-identical to the pre-#496 one."""
+    provider = _provider(_response(content="ok"))
+
+    provider.chat([Message.user("weather?")], tools=[WEATHER_TOOL])
+
+    sent = _wire_tool(provider, "get_weather")
+    assert json.loads(sent.function.parameters) == WEATHER_TOOL.parameters
+    assert sent.function.description == WEATHER_TOOL.description
+
+
+def test_an_unrepresentable_schema_drops_that_tool_and_the_wake_proceeds(caplog):
+    broken = ToolSpec(
+        name="broken", description="Takes a bare string.", parameters={"type": "string"}
+    )
+    provider = _provider(_response(content="ok"))
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        reply = provider.chat([Message.user("hi")], tools=[broken, WEATHER_TOOL])
+
+    assert reply.content == "ok"  # the wake survived
+    names = [t.function.name for t in provider._client.chat.captured["tools"]]
+    assert names == ["get_weather"]  # every other tool is untouched
+    assert "broken" in caplog.text and "not an object" in caplog.text
+
+
+def test_a_dropped_tool_is_reported_once_per_adapter_not_once_per_turn(caplog):
+    broken = ToolSpec(name="broken", description="x", parameters={"type": "string"})
+    provider = _provider(_response(content="ok"))
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        provider.chat([Message.user("hi")], tools=[broken])
+        provider.chat([Message.user("again")], tools=[broken])
+
+    assert caplog.text.count("Not offering tool") == 1
+
+
+def test_every_function_tool_refused_sends_no_tools_key_at_all():
+    broken = ToolSpec(name="broken", description="x", parameters={"type": "string"})
+    provider = _provider(_response(content="ok"))
+
+    provider.chat([Message.user("hi")], tools=[broken])
+
+    assert "tools" not in provider._client.chat.captured
+
+
+class _RefusingOnceClient:
+    """Refuses the first ``create`` by naming one tool's schema, then behaves normally.
+
+    xAI's live rejection is the only authority on its own validator, so this is the path that
+    matters most: a schema the harness thought fine, refused by name, must cost that tool and not
+    the wake.
+    """
+
+    def __init__(self, response, details):
+        self.chat = SimpleNamespace(create=self._create)
+        self._response = response
+        self._details = details
+        self.calls: list[dict] = []
+
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.calls) == 1:
+            raise _FakeRpcError(grpc.StatusCode.INVALID_ARGUMENT, details=self._details)
+        return _FakeConversation(self._response)
+
+    def close(self):
+        pass
+
+
+#: What the **live** xAI endpoint actually sends for this refusal, captured from `api.x.ai` while
+#: building the fix (`tests/test_xai_sdk_live.py` re-proves it on the NOC prober's cadence). It is
+#: deliberately this string and not the one the issue report quoted — that one carried a
+#: `[invalid_client_tool_schema]` code the live endpoint does not send, and a matcher written to it
+#: alone would have been dead against every real refusal. `test_faults` pins both shapes.
+_XAI_REFUSAL = (
+    "workmail__send_email: tool parameter root must be an object type "
+    "(root schema is an anyOf/oneOf union with a non-object branch)"
+)
+
+
+def test_a_tool_xai_refuses_by_name_is_dropped_and_the_turn_is_re_issued(caplog):
+    client = _RefusingOnceClient(_response(content="ok"), _XAI_REFUSAL)
+    provider = XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=client)
+    spec = _mail_send_email_spec()
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        reply = provider.chat([Message.user("email John")], tools=[spec, WEATHER_TOOL])
+
+    assert reply.content == "ok"
+    assert len(client.calls) == 2
+    first = [
+        t.function.name for t in client.calls[0]["tools"] if t.WhichOneof("tool") == "function"
+    ]
+    second = [
+        t.function.name for t in client.calls[1]["tools"] if t.WhichOneof("tool") == "function"
+    ]
+    assert first == ["workmail__send_email", "get_weather"]
+    assert second == ["get_weather"]  # only the refused one left
+    # The WARNING quotes the vendor, which is the authority on its own validator.
+    assert "workmail__send_email" in caplog.text
+    assert "tool parameter root must be an object type" in caplog.text
+
+
+def test_a_tool_xai_refuses_stays_dropped_on_the_next_turn():
+    client = _RefusingOnceClient(_response(content="ok"), _XAI_REFUSAL)
+    provider = XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=client)
+    spec = _mail_send_email_spec()
+
+    provider.chat([Message.user("email John")], tools=[spec, WEATHER_TOOL])
+    provider.chat([Message.user("again")], tools=[spec, WEATHER_TOOL])
+
+    last = [
+        t.function.name for t in client.calls[-1]["tools"] if t.WhichOneof("tool") == "function"
+    ]
+    assert last == ["get_weather"]
+    assert len(client.calls) == 3  # one retry on the first turn, one clean call on the second
+
+
+class _AlwaysRefusingClient(_RefusingOnceClient):
+    def _create(self, **kwargs):
+        self.calls.append(kwargs)
+        raise _FakeRpcError(grpc.StatusCode.INVALID_ARGUMENT, details=self._details)
+
+
+def test_a_refusal_that_names_no_offered_tool_propagates_rather_than_looping():
+    """The residual case, and the right floor: the wake fails **visibly** and the peer's message
+    stays re-drivable, exactly as it did before the per-tool drop existed."""
+    client = _AlwaysRefusingClient(
+        _response(content="ok"),
+        "Failed to start sampling: [invalid_client_tool_schema] someone_elses_tool: nope",
+    )
+    provider = XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=client)
+
+    with pytest.raises(ProviderToolSchemaError):
+        provider.chat([Message.user("hi")], tools=[WEATHER_TOOL])
+
+    assert len(client.calls) == 1  # never retried
+
+
+def test_a_vendor_that_keeps_refusing_the_same_tool_gives_up_instead_of_looping():
+    client = _AlwaysRefusingClient(_response(content="ok"), _XAI_REFUSAL)
+    provider = XaiSdkProvider("grok-4.3", api_key=FAKE_KEY, client=client)
+
+    with pytest.raises(ProviderToolSchemaError):
+        provider.chat([Message.user("email John")], tools=[_mail_send_email_spec()])
+
+    # One call, one drop, one re-issue — and then the same name comes back, so it stops.
+    assert len(client.calls) == 2
+
+
+def test_an_invalid_argument_that_is_not_a_tool_schema_refusal_is_unchanged():
+    """The class stays narrow: a generic malformed request is still a plain, propagating
+    ProviderError (a fixable harness/config defect, never permanent-for-content — issue #336)."""
+    with pytest.raises(ProviderError) as exc:
+        _provider_raising(grpc.StatusCode.INVALID_ARGUMENT).chat([Message.user("hi")])
+
+    assert type(exc.value) is ProviderError
+
+
+def test_a_tool_whose_schema_cannot_be_prepared_at_all_still_only_costs_that_tool(caplog):
+    """The invariant is about the *tool list*, not about one anticipated fault.
+
+    A schema the SDK's own tool builder chokes on (here: not JSON-serializable) must degrade the
+    same way an unrepresentable root does — one tool, one WARNING naming it and the error, and a
+    wake that keeps going.
+    """
+    unserializable = ToolSpec(
+        name="weird", description="x", parameters={"type": "object", "properties": {"a": object()}}
+    )
+    provider = _provider(_response(content="ok"))
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        reply = provider.chat([Message.user("hi")], tools=[unserializable, WEATHER_TOOL])
+
+    assert reply.content == "ok"
+    assert [t.function.name for t in provider._client.chat.captured["tools"]] == ["get_weather"]
+    assert "weird" in caplog.text

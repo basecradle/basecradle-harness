@@ -14,6 +14,10 @@ directly where they live. Two signals are not, and this module holds their heuri
 - `is_too_large` — the payload-too-large class, for the same xAI gRPC path, where the ``xai-sdk``'s
   own 20 MiB channel cap raises a *client-side* ``RESOURCE_EXHAUSTED`` reading ``Sent message larger
   than max`` before anything reaches the wire (the 2026-07-21 @briggs incident).
+- `refused_tool_schema` — the *one tool's schema was refused* class (issue #496), where the useful
+  content of the error is not merely its nature but **which tool**: xAI states an
+  ``INVALID_ARGUMENT`` naming the offending tool, and that name is what lets the adapter drop one
+  tool instead of losing the wake.
 
 Both are the sibling of `basecradle_harness._context.is_context_overflow` — a phrase match on a
 provider error string — and both **fail safe** exactly as it does: a phrasing they do not recognize
@@ -59,6 +63,67 @@ _TOO_LARGE_PHRASES = re.compile(
     r"|payload size exceeds",
     re.IGNORECASE,
 )
+
+
+#: *"I will not accept this tool's schema"* — and **xAI states it in two different shapes**, which is
+#: the whole reason this constant has a story (issue #496). The report that opened the issue quoted::
+#:
+#:     Failed to start sampling: [invalid_client_tool_schema] workmail__send_email: tool parameter
+#:     root must be an object type (root schema is an anyOf/oneOf union with a non-object branch)
+#:
+#: and the live endpoint, asked the same question with the same schema on the same day, answered::
+#:
+#:     workmail__send_email: tool parameter root must be an object type (root schema is an
+#:     anyOf/oneOf union with a non-object branch)
+#:
+#: — no ``Failed to start sampling:``, and **no bracketed code at all**. The first draft anchored on
+#: that code alone, on the reasoning that a machine-readable identifier is the part a vendor is least
+#: likely to reword. Sound reasoning, false premise: it does not always send one. Against the live
+#: text the matcher would have returned ``None`` on every refusal, the reactive drop would never have
+#: fired, and the mechanism built to keep one tool from costing a wake would have been **dead while
+#: reporting nothing** — this repo's own silently-dead-reranker shape, inside the fix for it. The
+#: live gate caught it, which is why that gate exists.
+#:
+#: So both shapes are matched, and the safety comes from a **two-part** test rather than from one
+#: literal: the text must carry a tool-schema *signal*, and the tool name must sit where the vendor
+#: puts it — right after the bracketed code, or at the very start of the detail. The name is matched
+#: against the character class a tool name can actually contain (providers require ``[A-Za-z0-9_-]``;
+#: `_mcp._sanitize` already coerces MCP names into it). The caller then checks the name against the
+#: tools it *actually offered*, so a false positive costs nothing.
+_TOOL_SCHEMA_SIGNAL = re.compile(
+    r"invalid_client_tool_schema|tool parameter|tool schema", re.IGNORECASE
+)
+_REFUSED_BY_CODE = re.compile(
+    r"\[invalid_client_tool_schema\]\s*(?P<name>[A-Za-z0-9_-]{1,64})\s*:\s*(?P<reason>\S.*)",
+    re.IGNORECASE | re.DOTALL,
+)
+_REFUSED_BY_LEAD = re.compile(
+    r"\A(?P<name>[A-Za-z0-9_-]{1,64})\s*:\s*(?P<reason>\S.*)",
+    re.DOTALL,
+)
+
+
+def refused_tool_schema(text: str) -> tuple[str, str] | None:
+    """Did the provider refuse one named tool's schema, and which one (issue #496)?
+
+    Returns ``(tool_name, reason)`` in the vendor's own words, or ``None`` when this error is not
+    that. Fails safe like its siblings: an unrecognized phrasing returns ``None`` and the adapter
+    keeps its existing classification, so the worst case is the behavior that existed before the
+    per-tool drop — the fault propagates and the wake fails visibly.
+    """
+    if not text:
+        return None
+    found = _REFUSED_BY_CODE.search(text)
+    if found is None:
+        # No bracketed code: accept the bare ``NAME: reason`` form, but only when the text also says
+        # it is about a tool's schema. Without that second half a generic ``model: not found`` would
+        # read as a tool refusal and change a plain `ProviderError`'s class for nothing.
+        if not _TOOL_SCHEMA_SIGNAL.search(text):
+            return None
+        found = _REFUSED_BY_LEAD.match(text)
+    if found is None:
+        return None
+    return found.group("name"), found.group("reason").strip()
 
 
 def is_out_of_funds(text: str) -> bool:
