@@ -1660,6 +1660,19 @@ A bare `command` is resolved against exactly the `PATH` the server is handed, an
 
 **An MCP tool that returns an image is handled like a first-class picture** (issue #318) — the case a browser-automation server (Playwright) makes real. The image reaches a vision-capable model as **model input**, exactly as the assets tool's [`view`](#give-your-agent-files--the-assets-tool) does, through the same vision gate: a text-only model is never blind-sent the pixels, it gets an honest placeholder naming the image's type and size. And on **every** model class the image is also stashed for the wake, so the agent can post it to the timeline with `assets action='post_image'` — a text-only agent can *show* a screenshot it cannot itself see. Any other non-text content block (an embedded resource, audio) is still noted by type rather than inlined.
 
+### One tool's schema a vendor won't take costs that tool, never the wake
+
+Providers do not validate a tool's JSON Schema alike, and an MCP server writes its schemas for none of them in particular. `mcp-mail-server@2.0.2` states its "give me `text` or `html`" rule the only way JSON Schema lets it — an `anyOf` of constraint-only branches beside the object root — which OpenAI and OpenRouter accept and **xAI refuses outright**, failing the whole request:
+
+```
+[invalid_client_tool_schema] workmail__send_email: tool parameter root must be an object type
+```
+
+Before [issue #496](https://github.com/basecradle/basecradle-harness/issues/496) that one tool killed **every wake** of the agent that loaded it. Now the harness does two things, both at the adapter boundary of the vendor that validates (today only xAI — every other provider still receives your server's schema byte-for-byte as it wrote it):
+
+- **It normalizes what it honestly can.** A combinator beside an object is folded into that object; a union of object branches is merged into one, with a disjunctive branch's keys kept **optional** (requiring them would reject calls that are legal). The constraint the merge can't express is appended to the tool's description in plain words — `At least one of: (text) or (html).` — so the model still knows the rule, and your server still enforces it.
+- **It drops one tool rather than the agent.** Any tool the vendor refuses *by name* at call time — the authority that actually matters — is dropped with a `WARNING` naming the tool and the vendor's own reason, and the turn is re-issued with the rest of your tools. The agent keeps working; you get a log line that says exactly what it lost and why. Ahead of the call the harness refuses only the two shapes xAI has itself named (a non-object root `type`; a root `anyOf`/`oneOf` branch declaring a non-object `type`) — guessing more would take away tools the vendor would have accepted.
+
 ### The X API through the `xurl` bridge — a worked example
 
 [X](https://x.com) publishes a hosted [MCP server](https://docs.x.com/tools/mcp) at `https://api.x.com/mcp` that lets an agent work X **as itself** — full-archive post search, user lookup, timelines and mentions, bookmarks, trends and news, and drafting Articles, all with its own account's scopes. It is a good end-to-end example of the drop-in above: a stdio server that owns an OAuth 2.0 login and injects a fresh Bearer token on every call, so the harness never sees a credential — only a `Popen`-spawned stdio process, exactly like any other local MCP server.

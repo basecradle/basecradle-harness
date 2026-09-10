@@ -15,8 +15,14 @@ its edges.
 
 import pytest
 
-from basecradle_harness import ImageContent, Message, ProviderError, VideoContent
-from basecradle_harness._openai_wire import chat_message_to_wire, message_to_input
+from basecradle_harness import ImageContent, Message, ProviderError, ToolSpec, VideoContent
+from basecradle_harness._openai_wire import (
+    chat_message_to_wire,
+    chat_tool_to_wire,
+    function_tool_to_responses,
+    message_to_input,
+)
+from tests.conftest import mail_tool
 
 DATA_URL = "data:image/png;base64,AAAA"
 VIDEO_URL = "data:video/mp4;base64,BBBB"
@@ -140,3 +146,29 @@ def test_the_responses_surface_still_serializes_an_image_turn():
         {"type": "input_text", "text": "look"},
         {"type": "input_image", "image_url": DATA_URL},
     ]
+
+
+# --- the OpenAI-wire tool serializers are untouched by the xAI fix (issue #496) ---
+
+
+def test_a_union_root_tool_schema_reaches_the_openai_wires_verbatim():
+    """The normalization is the *xAI adapter's*, and it stops there.
+
+    `mcp-mail-server@2.0.2`'s `send_email` schema — an object root carrying a sibling ``anyOf`` of
+    constraint-only branches — killed every wake of @briggs on the native xAI adapter and was
+    accepted, in the same live verify, by OpenAI (@jt) and OpenRouter (@glm-5.2). A schema a vendor
+    is happy with must keep reaching it exactly as the server wrote it, so the rewrite lives at the
+    one adapter boundary whose validator refuses it and nowhere else.
+    """
+    tool = mail_tool("send_email")
+    spec = ToolSpec(
+        name="workmail__send_email",
+        description=tool["description"],
+        parameters=tool["inputSchema"],
+    )
+
+    # Chat Completions (the shape the native OpenRouter SDK sends too) and Responses.
+    assert chat_tool_to_wire(spec)["function"]["parameters"] is spec.parameters
+    assert function_tool_to_responses(spec)["parameters"] is spec.parameters
+    # And the union the harness folded away for xAI is still there for these two.
+    assert spec.parameters["anyOf"] == [{"required": ["text"]}, {"required": ["html"]}]

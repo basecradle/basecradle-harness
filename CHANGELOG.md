@@ -7,6 +7,69 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.120.0] - 2026-09-10
+
+### Fixed: one MCP tool's schema xAI refuses no longer kills every wake (issue #496)
+
+`@briggs` (`xai-sdk`, `grok-4.6`) died on **every** wake — retried by the router, `posted=0` every
+time — with `[invalid_client_tool_schema] workmail__send_email: tool parameter root must be an
+object type (root schema is an anyOf/oneOf union with a non-object branch)`. The same MCP server
+(`mcp-mail-server@2.0.2`), the same schema, was accepted by OpenAI (`@jt`) and OpenRouter
+(`@glm-5.2`) in the same live verify: an adapter difference, not a broken server — and the harness's
+failure, because **one tool's schema took down the agent.** That is the "stall is a drop" class.
+
+The observed shape is narrower than "a union root", and the difference is the whole design: the root
+**is** `type: "object"` and carries a *sibling* `anyOf: [{"required": ["text"]}, {"required":
+["html"]}]` — `zod`'s `.refine()` has no JSON-Schema spelling, so the server states its "text or
+html" rule through `.meta({anyOf: […]})`, in branches that declare no `type`. The same shape appears
+again under `properties.signature`.
+
+- **New `_schema.normalize_object_root`** — vendor-neutral. A combinator is absorbed into the object
+  it sits beside; a union of object branches merges into one object, with a **disjunctive** branch's
+  `required` never promoted (requiring a key the model may legitimately omit would turn a schema the
+  vendor merely disliked into one that is wrong) and `allOf` merged whole. The constraint the merge
+  cannot express comes back as prose and is appended to the **function description** — the one string
+  every vendor puts in front of the model — so the model still reads the rule and the MCP server
+  still enforces it. A nested *type* union (`anyOf: [{"type":"string"},{"type":"number"}]`) is
+  ordinary schema and is left exactly as it is.
+- **Fail per tool, never per wake.** Two lines of defense in the `xai-sdk` adapter, and the second
+  is the guarantee: a tool xAI refuses **by name** at `chat.create` is dropped and the identical turn
+  re-issued with the rest, the vendor's live rejection being the only authority on its own validator.
+  Either way: one `WARNING` naming the tool and the vendor's own reason, once per wake, and the agent
+  keeps working. A refusal naming no tool this call offered still propagates, so the wake fails
+  visibly and the peer's message stays re-drivable.
+- **The pre-flight refuses only what xAI has itself named** — a root declaring a non-object `type`,
+  and a root `anyOf`/`oneOf` carrying a branch that declares a non-object `type`. Anything else it
+  cannot fold (a root `allOf` of `$ref`s — what Pydantic emits every day) goes to the wire as
+  written. The two failure directions are not close: refusing too eagerly silently narrows the agent
+  by taking away a tool the vendor would have accepted, while refusing too little costs one request
+  the reactive drop then settles. An unfoldable union root is also never stamped `type: "object"` —
+  that would hand the model a tool with no arguments.
+- **New `ProviderToolSchemaError`** — deliberately **not** a `ProviderRequestError`: nothing about a
+  peer's content is at fault, so this is never reported to a timeline.
+- **The live gate earned its keep, again.** The issue quoted an error carrying a
+  `[invalid_client_tool_schema]` code, and the first matcher anchored on it — a machine-readable
+  identifier being the part a vendor is least likely to reword. Sound reasoning, false premise: asked
+  the same question with the same schema on the same day, `api.x.ai` answers
+  `workmail__send_email: tool parameter root must be an object type (…)` with **no code at all**.
+  Anchored only on the code, `refused_tool_schema` would have returned `None` on every real refusal
+  and the reactive drop would have been dead while reporting nothing — the silently-dead-reranker
+  shape, inside the fix for it. Both shapes are matched now, safety coming from a two-part test (a
+  tool-schema signal *and* the name where the vendor puts it) plus the caller's check against the
+  tools it actually offered. Two new **live** cases in `tests/test_xai_sdk_live.py` (the NOC prober's
+  `xai` arm) prove the raw schema is still refused *and readable*, and that the normalized one is
+  accepted — both verified against `api.x.ai` before this shipped.
+- **Every other provider is byte-unchanged.** The rewrite lives at the one adapter boundary whose
+  validator refuses the schema; the OpenAI and OpenRouter wires still carry an MCP server's schema
+  exactly as it wrote it, `anyOf` and all — pinned by test.
+- **Nothing is wrapped under a synthetic property.** Wrapping a non-object root as
+  `{"input": <original>}` would make the adapter reshape the model's *arguments* on the return path,
+  where three other mechanisms read them (`_idempotency.create_kind`'s ordinal, the transcript's
+  replayability exception, the resume). Refusing that one tool, loudly, is the honest answer.
+- **The test fixture is the real thing**, not a hand-written approximation: `mcp-mail-server@2.0.2`'s
+  published tarball was run over stdio and its `tools/list` captured verbatim
+  (`tests/data/mcp_mail_server_2_0_2_tools.json`, provenance inside the file).
+
 ## [0.119.0] - 2026-09-09
 
 ### Changed: the image tools move to GPT Image 2.5 — Flare generates, Sunburst edits (issue #494)

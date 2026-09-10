@@ -38,14 +38,18 @@ cadence, and adding a case here needs no coordination at all.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 import uuid
+from pathlib import Path
 
 import pytest
+from xai_sdk.chat import tool as xai_tool
+from xai_sdk.chat import user as xai_user
 
-from basecradle_harness import Message, ToolSpec, XaiSdkProvider
+from basecradle_harness import Message, ProviderToolSchemaError, ToolSpec, XaiSdkProvider
 
 pytestmark = pytest.mark.live
 
@@ -168,3 +172,65 @@ def test_a_bound_conversation_earns_the_per_server_cache_hit():
     tokens_in = int(re.search(r"tokens_in=(\d+)", llm[1]).group(1))
     # Not "> 0" — a scattered call gets that by luck. Affinity means most of the prefix comes back.
     assert cached > tokens_in * 0.5, f"cached={cached} of tokens_in={tokens_in}: {llm[1]}"
+
+
+# --- the union-root tool schema xAI refuses (issue #496) ---------------------
+#
+# The offline suite injects a fake client, so it can only prove what the adapter *decided*. Whether
+# xAI takes the schema the adapter builds is a question only xAI can answer — and asking it here
+# caught a real defect before it shipped: the issue report quoted an error carrying an
+# `[invalid_client_tool_schema]` code, the live endpoint sends **no code at all**, and the first
+# matcher (anchored on that code) would have recognized nothing. Dead mechanism, no signal. So these
+# two are the fix's actual proof, on the prober's cadence.
+
+
+def _mail_send_email_schema() -> dict:
+    payload = json.loads(
+        (Path(__file__).parent / "data" / "mcp_mail_server_2_0_2_tools.json").read_text()
+    )
+    return next(t for t in payload["tools"] if t["name"] == "send_email")["inputSchema"]
+
+
+@pytest.mark.skipif(not KEY, reason="set XAI_API_KEY to run the live xAI tool-schema probe")
+def test_the_raw_union_root_schema_is_still_refused_and_we_can_read_which_tool():
+    """The defect, live — and the two halves that make the drop possible rather than fatal.
+
+    If xAI ever starts accepting this shape the assertion fails, which is exactly the news worth
+    having: the normalization would then be unnecessary work. Far more likely is that it reworded
+    the error, and then `refused_tool_schema` is what breaks here — loudly, in the one place that
+    can tell.
+    """
+    provider = XaiSdkProvider(model="grok-4.3", api_key=KEY)
+    # Built and sent **around** the adapter's normalization, so what is read here is the vendor's
+    # verdict on the raw shape and the harness's ability to name the tool from what it says back.
+    raw = xai_tool("workmail__send_email", "Send a new email via SMTP.", _mail_send_email_schema())
+    try:
+        with pytest.raises(ProviderToolSchemaError) as caught, provider._mapped_errors():
+            provider._client.chat.create(
+                model="grok-4.3", messages=[xai_user("Say OK.")], tools=[raw]
+            ).sample()
+    finally:
+        provider.close()
+
+    assert caught.value.tool_name == "workmail__send_email"
+    assert "must be an object type" in caught.value.reason
+
+
+@pytest.mark.skipif(not KEY, reason="set XAI_API_KEY to run the live xAI tool-schema probe")
+def test_the_normalized_schema_is_accepted_and_the_agent_answers():
+    """The fix, live: the same tool, offered through the adapter, and grok answers the turn."""
+    provider = XaiSdkProvider(model="grok-4.3", api_key=KEY)
+    spec = ToolSpec(
+        name="workmail__send_email",
+        description="Send a new email via SMTP.",
+        parameters=_mail_send_email_schema(),
+    )
+    try:
+        reply = provider.chat(
+            [Message.user("Reply with the single word: ok. Do not call any tool.")], tools=[spec]
+        )
+    finally:
+        provider.close()
+
+    assert reply.role == "assistant"
+    assert "ok" in (reply.content or "").lower()
