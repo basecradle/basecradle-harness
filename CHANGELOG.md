@@ -7,6 +7,59 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.119.0] - 2026-09-09
+
+### Changed: the image tools move to GPT Image 2.5 — Flare generates, Sunburst edits (issue #494)
+
+OpenAI shipped **GPT Image 2.5** on 2026-09-08 in two variants at the *same* per-token price as
+`gpt-image-2`, split by operation: `gpt-image-2.5-flare` for "fast, high-quality everyday image
+generation" (its stated default for most applications, higher quality than `gpt-image-2` at ~50%
+lower latency) and `gpt-image-2.5-sunburst` for "workflows where editing precision matters most."
+That is the vendor's own split, and it maps 1:1 onto the split this module already had — so
+`generate_image` moves to **Flare** and `edit_image` to **Sunburst**, each carrying its own `MODEL`
+rather than sharing one constant. Both use the **alias**, not the dated snapshot, so OpenAI's own
+default snapshot follows without a code change; the `media provider=openai kind=image.* model=…`
+line follows the per-tool model automatically. Founder direction, @origin 2026-09-09.
+
+- **`quality` gains `xhigh` and `max`** — the full 2.5 set is `low`/`medium`/`high`/`xhigh`/`max`/
+  `auto`. The schema tells the model plainly that the two new tiers are materially slower and
+  costlier than `high`, because it fills this field freely.
+- **`background: transparent` is now offered** — 2.5 supports transparency outright, where
+  `gpt-image-2` carried it as preview. Every "gpt-image-2 has no transparent" statement is gone
+  from the module, the README and the internals doc.
+- **`moderation` (`low`/`auto`) on both tools** — content-filter strictness, plain optional
+  pass-through. The founder's standing rule, amended into #494 mid-build: *when we update a tool,
+  our agents get every control the API offers.* It needs the SDK's own `extra_body` on the edit
+  path: the API accepts and validates `moderation` on `/v1/images/edits` (live-verified — a bad
+  value 400s naming the param), but the `openai` SDK types it only on `generate` and
+  `Images.edit()` raises `TypeError` on it at 3.7.0 and at current 3.11.0 alike. `extra_body` is
+  the vendor SDK's own escape hatch, so this stays inside the vendor-SDK rule — and per issue #433
+  the test asserts the field in the **real multipart body**, never merely that the SDK took the
+  kwarg.
+- **`background: transparent` + `output_format: jpeg` is neutralized, not passed through.** jpeg
+  has no alpha channel and OpenAI hard-400s the pair ("Transparent background is not supported for
+  JPEG output format" — live-verified on both 2.5 models). The model can name both fields freely,
+  so the impossible half is dropped, exactly as `output_compression` already is for png. The
+  *format* is the half that survives, because it also drives the posted Asset's filename extension
+  and content-type: overriding it instead would post png bytes under a name nobody chose.
+- **`input_fidelity` is deliberately *not* exposed, and that is a live finding rather than an
+  omission.** It is on the edits *endpoint* but not on these *models*: `gpt-image-2`,
+  `gpt-image-2.5-flare` and `gpt-image-2.5-sunburst` (alias **and** dated snapshot) every one
+  hard-400 with "does not support the 'input_fidelity' parameter", and only `gpt-image-1.5` accepts
+  it. A schema field that fails on every call is a locked door, so neither tool shows one; a test
+  pins its absence and the evidence is recorded in the module. Reaching it would be a *model*
+  decision, not a parameter one, and that sits above this repo — raised to the capital on #494.
+- **`DEFAULT_TIMEOUT` stays 300s, re-measured rather than assumed.** Live against
+  `api.openai.com`: generate/Flare `max` **48.4s** at 1024x1024 and **34.5s** at 1536x1024;
+  edit/Sunburst `max` **98.4s** at 1024x1024 (the worst case) and **67.5s** at 1536x1024, `xhigh`
+  **38.0s** at 1536x1024. The new ceiling-setter is under a third of 300s, so the constant sized to
+  the ~133s `gpt-image-2` edit (#219) stands with room to spare; the numbers are recorded in the
+  constant's own comment.
+- **SDK floor unchanged at `openai>=3.3.1,<4`, verified rather than assumed** — the suite passes on
+  3.3.1. The 2.5 ids and the new enum values are typing-only in the SDK (`model` is
+  `Union[str, ImageModel]`, and a `Literal` is not runtime-enforced), so the floor remains an honest
+  compatibility claim. The *deployment* pin is the NOC's, not this package's.
+
 ## [0.118.4] - 2026-09-09
 
 ### Fixed: a truncated brain turn is unfinished, not terminal narration (issue #490)

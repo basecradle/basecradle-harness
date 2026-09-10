@@ -119,7 +119,7 @@ def test_generate_posts_the_image_as_an_asset(tool):
 
     # The model named the image model and prompt to the Images API...
     sent = json.loads(gen.calls.last.request.content)
-    assert sent["model"] == "gpt-image-2"
+    assert sent["model"] == "gpt-image-2.5-flare"
     assert sent["prompt"] == "a red cube on a white table"
     # ...the decoded bytes were uploaded as multipart...
     assert PNG_BYTES in captured["body"]
@@ -161,7 +161,7 @@ def test_generate_honors_an_explicit_size(tool):
     assert json.loads(gen.calls.last.request.content)["size"] == "1536x1024"
 
 
-# --- Part A: full gpt-image-2 coverage on generate ---------------------------
+# --- Part A: full GPT Image 2.5 coverage on generate -------------------------
 
 
 def _mock_generate(mock, captured):
@@ -245,8 +245,98 @@ def test_generate_omits_unset_coverage_params(tool):
 
     sent = json.loads(gen.calls.last.request.content)
     assert "size" in sent
-    for absent in ("quality", "background", "output_format", "output_compression"):
+    for absent in ("quality", "background", "moderation", "output_format", "output_compression"):
         assert absent not in sent
+
+
+# --- GPT Image 2.5's new surface (issue #494) --------------------------------
+
+
+@pytest.mark.parametrize("quality", ["low", "medium", "high", "xhigh", "max", "auto"])
+def test_generate_passes_every_quality_tier(tool, quality):
+    # `xhigh` and `max` are new in 2.5. They ride through the *real* `openai` SDK here, so
+    # this also pins that the pinned SDK floor passes them through: the vendor's `Literal`
+    # typings are not runtime-enforced, and a floor that silently rejected a value would
+    # make the two top tiers unreachable on the deployed pin with nothing raising.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        gen = _mock_generate(mock, captured)
+        tool.run(prompt="a cat", quality=quality)
+
+    assert json.loads(gen.calls.last.request.content)["quality"] == quality
+
+
+@pytest.mark.parametrize("output_format", [None, "png", "webp"])
+def test_generate_passes_a_transparent_background(tool, output_format):
+    # 2.5 supports a transparent (cut-out) background outright, on png — the default when
+    # no format is named — and on webp. Both carry the request through untouched.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        gen = _mock_generate(mock, captured)
+        tool.run(prompt="a logo", background="transparent", output_format=output_format)
+
+    assert json.loads(gen.calls.last.request.content)["background"] == "transparent"
+
+
+def test_generate_drops_a_transparent_background_for_jpeg(tool):
+    # jpeg has no alpha channel, and OpenAI hard-400s the pair ("Transparent background is
+    # not supported for JPEG output format", live-verified on both 2.5 models). The model
+    # fills both fields freely, so the tool drops the impossible half rather than letting
+    # every such call fail — the same treatment png/`output_compression` gets. The *format*
+    # survives, because it also drives the posted file's extension and content-type.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        gen = _mock_generate(mock, captured)
+        tool.run(prompt="a logo", background="transparent", output_format="jpeg")
+
+    sent = json.loads(gen.calls.last.request.content)
+    assert "background" not in sent
+    assert sent["output_format"] == "jpeg"
+
+
+def test_generate_keeps_an_opaque_background_for_jpeg(tool):
+    # Only the impossible combination is dropped — an ordinary background still carries.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        gen = _mock_generate(mock, captured)
+        tool.run(prompt="a cat", background="opaque", output_format="jpeg")
+
+    assert json.loads(gen.calls.last.request.content)["background"] == "opaque"
+
+
+@pytest.mark.parametrize("moderation", ["low", "auto"])
+def test_generate_passes_moderation(tool, moderation):
+    # Content-filter strictness is a control the API offers, so the agent gets it — plain
+    # pass-through, unset means the API's own default.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        gen = _mock_generate(mock, captured)
+        tool.run(prompt="a cat", moderation=moderation)
+
+    assert json.loads(gen.calls.last.request.content)["moderation"] == moderation
+
+
+def test_neither_tool_offers_input_fidelity(tool, edit_tool):
+    # `input_fidelity` is on the edits *endpoint* but not on these *models*: live-verified,
+    # every gpt-image-2/2.5 model hard-400s it ("does not support the 'input_fidelity'
+    # parameter") and only gpt-image-1.5 accepts it (issue #494). A schema field that fails
+    # on every call is a locked door, so neither tool shows one.
+    assert "input_fidelity" not in tool.parameters["properties"]
+    assert "input_fidelity" not in edit_tool.parameters["properties"]
+
+
+def test_each_tool_carries_its_own_2_5_model():
+    # OpenAI ships one 2.5 variant per operation at the identical price — Flare for
+    # everyday generation, Sunburst for editing precision — so the vendor's split maps
+    # 1:1 onto this module's tool split, and neither tool inherits the other's model.
+    from basecradle_harness._images import EDIT_MODEL, GENERATE_MODEL
+
+    assert GENERATE_MODEL == "gpt-image-2.5-flare"
+    assert EDIT_MODEL == "gpt-image-2.5-sunburst"
+    assert GenerateImageTool()._model == GENERATE_MODEL
+    assert EditImageTool()._model == EDIT_MODEL
+    # An explicit model still overrides the per-tool default.
+    assert GenerateImageTool(model="gpt-image-2")._model == "gpt-image-2"
 
 
 # --- failures come back as model-readable text -------------------------------
@@ -328,9 +418,11 @@ def test_a_transport_failure_is_relayed_to_the_model(tool):
 # --- the request timeout (issue #219) ----------------------------------------
 
 
-def test_default_timeout_clears_the_measured_high_quality_latency():
-    # A `gpt-image-2` `quality: high` edit was measured at ~133s live; agents pick high
-    # naturally for fidelity work, so the ceiling must clear it with headroom (issue #219).
+def test_default_timeout_clears_the_measured_worst_case_latency():
+    # The ceiling is sized to a *measured* worst case, never a guess. gpt-image-2's
+    # ~133s `quality: high` edit set it at 300s (issue #219); GPT Image 2.5's new top
+    # tiers were re-measured live on both models at both landscape and square sizes
+    # (issue #494) and came in well under it, so 300s stands with room to spare.
     from basecradle_harness._images import DEFAULT_TIMEOUT
 
     assert DEFAULT_TIMEOUT >= 133.0
@@ -422,6 +514,21 @@ def _mock_source(mock, uuid, data):
     mock.get(f"{BC_URL}/blobs/{uuid}").mock(return_value=httpx.Response(200, content=data))
 
 
+def _form_field(body: bytes, name: str) -> bytes | None:
+    """The value httpx serialized for multipart form field `name`, or None if absent.
+
+    A `name="quality"` substring check passes whatever value rode with it — and the value
+    is the whole point of a coverage knob — so the edit-side assertions read the value out
+    of the real request body rather than settling for the field's presence.
+    """
+    marker = b'name="' + name.encode() + b'"\r\n\r\n'
+    start = body.find(marker)
+    if start == -1:
+        return None
+    start += len(marker)
+    return body[start : body.find(b"\r\n", start)]
+
+
 def _mock_edit_upload(mock, captured):
     """Wire the Images edit endpoint + the result upload, capturing both bodies."""
 
@@ -453,7 +560,7 @@ def test_edit_sends_source_bytes_not_a_url_and_posts_the_result(edit_tool):
     assert b'name="image[]"' in body
     # ...the prompt and model are sent as form fields...
     assert b"recolor the car red" in body
-    assert b"gpt-image-2" in body
+    assert b"gpt-image-2.5-sunburst" in body
     # ...and the edited result is posted as a new asset the model can read.
     assert "Edited and posted" in result
     assert A_IMG in result
@@ -504,9 +611,67 @@ def test_edit_output_format_is_passed_and_drives_the_filename(edit_tool):
         _mock_edit_upload(mock, captured)
         edit_tool.run(image=[SOURCE_UUID], prompt="recolor", output_format="jpeg")
 
-    assert b'name="output_format"' in captured["edit"]
-    assert b"jpeg" in captured["edit"]
+    assert _form_field(captured["edit"], "output_format") == b"jpeg"
     assert b".jpg" in captured["upload"]  # posted file's extension follows the format
+
+
+def test_edit_carries_the_new_quality_tiers_and_transparent_background(edit_tool):
+    # The shared coverage knobs reach the *multipart* edit body too, not just the JSON
+    # generate body — so 2.5's new surface is live on both tools, not one.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID, SOURCE_BYTES)
+        _mock_edit_upload(mock, captured)
+        edit_tool.run(
+            image=[SOURCE_UUID], prompt="cut it out", quality="max", background="transparent"
+        )
+
+    body = captured["edit"]
+    assert _form_field(body, "quality") == b"max"
+    assert _form_field(body, "background") == b"transparent"
+
+
+def test_edit_passes_moderation(edit_tool):
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID, SOURCE_BYTES)
+        _mock_edit_upload(mock, captured)
+        edit_tool.run(image=[SOURCE_UUID], prompt="recolor", moderation="low")
+
+    # `moderation` is API-supported on /v1/images/edits but the `openai` SDK types it only
+    # on `generate`, so it rides the SDK's own `extra_body`. A key the SDK accepts is not a
+    # key on the wire (issue #433) — so this reads it back out of the real multipart body.
+    assert _form_field(captured["edit"], "moderation") == b"low"
+
+
+def test_edit_omits_unset_moderation(edit_tool):
+    # An unset knob is left out entirely, so the API picks its own default.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID, SOURCE_BYTES)
+        _mock_edit_upload(mock, captured)
+        edit_tool.run(image=[SOURCE_UUID], prompt="recolor")
+
+    assert _form_field(captured["edit"], "moderation") is None
+
+
+def test_edit_drops_a_transparent_background_for_jpeg(edit_tool):
+    # The jpeg/transparent no-op is in the shared `_coverage_params`, so the edit path
+    # gets it identically — one rule, never two that can drift.
+    captured = {}
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_source(mock, SOURCE_UUID, SOURCE_BYTES)
+        _mock_edit_upload(mock, captured)
+        edit_tool.run(
+            image=[SOURCE_UUID],
+            prompt="cut it out",
+            background="transparent",
+            output_format="jpeg",
+        )
+
+    body = captured["edit"]
+    assert _form_field(body, "background") is None
+    assert _form_field(body, "output_format") == b"jpeg"
 
 
 # --- edit failures come back as model-readable text --------------------------
@@ -573,4 +738,4 @@ def test_a_generation_logs_one_media_line(tool, caplog):
     line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
     assert "provider=openai" in line
     assert "kind=image.generate" in line
-    assert "model=gpt-image-2" in line
+    assert "model=gpt-image-2.5-flare" in line
