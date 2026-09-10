@@ -279,34 +279,74 @@ the router still counts the wake and trips its own backstop. **The capital verif
 @jt** (drive a synthetic runaway, confirm the breaker trips + alerts once + makes no provider
 call, confirm reset) and **closes the handoff issue by hand** after that live verify.
 
-### Image Tools — full gpt-image-2 coverage
+### Image Tools — full GPT Image 2.5 coverage
 
-The media tranche, brought to the full ``gpt-image-2`` surface and built under the
+The media tranche, brought to the full **GPT Image 2.5** surface and built under the
 **tool-building discipline** (learn the full surface → decide coverage deliberately → split
 by operation → test every built option). Two tools, split by operation, both default plugins
 under `_defaults/tools/` requiring `OpenAIKey()` (they self-exclude with no OpenAI key), both
 `PlatformTool`s that own the OpenAI Images HTTP and upload the result through the bound SDK
 client — never the provider built-in, keeping the brain/body boundary clean (`_images.py`):
 
-- **`generate_image`** — text → image (`/v1/images/generations`, JSON body).
-- **`edit_image`** — image(s) → image (`/v1/images/edits`, **multipart**). It resolves each
+- **`generate_image`** — text → image (`/v1/images/generations`, JSON body), on
+  **`gpt-image-2.5-flare`** — OpenAI's fast, high-quality everyday generator (its stated
+  default for most applications; higher quality than `gpt-image-2` at ~50% lower latency).
+- **`edit_image`** — image(s) → image (`/v1/images/edits`, **multipart**), on
+  **`gpt-image-2.5-sunburst`**, OpenAI's variant for "workflows where editing precision
+  matters most." One model per operation is the vendor's own split, at the identical price,
+  so it maps 1:1 onto this module's tool split for free — each tool carries its own
+  `MODEL`, and the **alias** rather than the dated snapshot, so OpenAI's default snapshot
+  follows without a code change. It resolves each
   source Asset by uuid and sends its **bytes, not a URL** (the endpoint rejects URLs), plus
   an optional `mask` Asset (alpha channel marks the region to change). One or more sources —
   multi-source composites.
 
-- **Shared coverage** (both tools): `size`, `quality` (low/medium/high/auto), `background`
-  (**opaque/auto only — gpt-image-2 has no transparent**), `output_format` (png/jpeg/webp),
-  `output_compression` (0–100, jpeg/webp only). The posted Asset's **filename extension
-  follows `output_format`** so its content-type does too (the server infers type from the
-  name) — this fixed the old hard-coded `.png` bug. Enum/range constraints are documented in
+- **Shared coverage** (both tools): `size`, `quality`
+  (low/medium/high/**xhigh**/**max**/auto — the two top tiers are new in 2.5, and the
+  schema tells the model they are materially slower and costlier than `high`), `background`
+  (**transparent**/opaque/auto — 2.5 supports transparency outright, where `gpt-image-2`
+  carried it as preview), `moderation` (low/auto — content-filter strictness),
+  `output_format` (png/jpeg/webp), and `output_compression` (0–100, jpeg/webp only). The
+  posted Asset's **filename extension follows `output_format`** so its content-type does too
+  (the server infers type from the name) — this fixed the old hard-coded `.png` bug. Enum/range constraints are documented in
   the schema and **enforced by the API, not re-validated here**, so coverage never drifts as
   the model's surface evolves. **`output_compression` is dropped for png** (the default
   format): OpenAI hard-400s it there and the model fills the field in freely, so dropping it
   where the API ignores it anyway keeps png from failing in practice (capital live-verify).
+  **`background: transparent` is dropped for jpeg** by the same rule: jpeg has no alpha
+  channel and OpenAI hard-400s the pair ("Transparent background is not supported for JPEG
+  output format" — live-verified on both 2.5 models, issue #494), and the *format* is the
+  half that survives because it also drives the posted Asset's filename extension and
+  content-type. These two are the standing exception to "validation is the API's job": a
+  pair the model can name freely and the API refuses outright is neutralized here rather
+  than turned into a failed call.
+- **`moderation` reaches the edit endpoint through the SDK's own `extra_body`.** The API
+  accepts and validates it on `/v1/images/edits` (live-verified: a bad value 400s naming
+  the param), but the `openai` SDK types it only on `generate` — `Images.edit()` raises
+  `TypeError` on it at 3.7.0 and at current 3.11.0 alike. `extra_body` is the vendor SDK's
+  own escape hatch, so this stays inside the vendor-SDK rule, and per issue #433 the test
+  asserts the field in the **real multipart body** rather than that the SDK took the kwarg.
+- **`input_fidelity` is deliberately not exposed.** It is on the edits *endpoint* but not on
+  these *models*: live-verified, `gpt-image-2`, `gpt-image-2.5-flare` and
+  `gpt-image-2.5-sunburst` (alias and dated snapshot) all hard-400 with "does not support
+  the 'input_fidelity' parameter", and only `gpt-image-1.5` accepts it. A schema field that
+  fails on every call is a locked door; a test pins its absence.
+  **`background: transparent` is dropped for jpeg** for the same reason and by the same
+  rule: jpeg has no alpha channel and OpenAI hard-400s the pair ("Transparent background
+  is not supported for JPEG output format" — live-verified on both 2.5 models, issue #494),
+  and the *format* is the half that survives because it also drives the posted Asset's
+  filename extension and content-type. These two combinations are the standing exception
+  to "validation is the API's job": a pair the model can name freely and the API refuses
+  outright is neutralized here rather than turned into a failed call.
   Image-API failures relay the **provider's actual message** (dug out of the response body),
   not a generic `HTTP 400`, so the AI passes the true cause to the user (Principle 5).
 - **`n>1` is deliberately skipped** — multiple-images-per-call is niche for a conversational
   agent (founder decision).
+- **The 300s `DEFAULT_TIMEOUT` is a measured number, re-measured for 2.5's new top tiers**
+  (issue #494): generate/Flare `max` 48.4s at 1024x1024 and 34.5s at 1536x1024; edit/Sunburst
+  `max` **98.4s** at 1024x1024 (the worst case) and 67.5s at 1536x1024, `xhigh` 38.0s at
+  1536x1024. Well under a third of the ceiling, so it stands unchanged from the ~133s
+  `gpt-image-2` measurement that set it (#219).
 
 **Boundary:** offline tests assert the harness's half (params sent, filename extension). The
 ground-truth checks — the posted Asset's actual pixels / content-type / file magic, the full

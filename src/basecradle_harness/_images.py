@@ -6,11 +6,20 @@ the discipline the capital's tool-building memory asks for (full surface → cov
 decided → split by operation → every option tested):
 
 - `GenerateImageTool` (``generate_image``) — text → image. Asked to "draw a cat,"
-  the agent calls this tool, ``gpt-image-2`` renders the pixels, and the result is
-  uploaded as an Asset on the current timeline.
+  the agent calls this tool, ``gpt-image-2.5-flare`` renders the pixels, and the result
+  is uploaded as an Asset on the current timeline.
 - `EditImageTool` (``edit_image``) — image(s) → image. Asked to "recolor this photo"
   or "composite these," the agent points at one or more source Assets (and an
-  optional mask), the model edits them, and the result is uploaded the same way.
+  optional mask), ``gpt-image-2.5-sunburst`` edits them, and the result is uploaded the
+  same way.
+
+The model split is the vendor's own: OpenAI positions **Flare** as the fast,
+high-quality everyday generator (its stated default for most applications) and
+**Sunburst** for "workflows where editing precision matters most." That is one model per
+operation, which is exactly how this module is already split — and both bill at the
+identical per-token rate, so the choice costs nothing to make. Each tool carries its own
+default (`GENERATE_MODEL` / `EDIT_MODEL`), and the **alias** rather than the dated
+snapshot, so OpenAI's own default snapshot follows without a code change.
 
 Both reach the web UI as a normal attachment that renders inline, exactly like a
 human's.
@@ -30,19 +39,33 @@ a new capability is one small tool class.
 The image model is OpenAI's Images API, reached **through the ``openai`` SDK**
 (``client.images.generate`` / ``client.images.edit``) — never hand-rolled HTTP, the same
 vendor-SDK rule the model loop follows (issue #158). It shares the agent's ``AI_API_KEY``
-(``gpt-5.4-mini`` reasons, ``gpt-image-2`` paints, one key). A non-OpenAI key simply gets a
+(``gpt-5.4-mini`` reasons, ``gpt-image-2.5`` paints, one key). A non-OpenAI key simply gets a
 model-readable error back, like any tool failure.
 
-Coverage (audited to gpt-image-2's full surface)
--------------------------------------------------
-Both tools expose the shared knobs gpt-image-2 honors: ``size``, ``quality``,
-``background`` (opaque/auto — gpt-image-2 has **no** transparent), ``output_format``
-(png/jpeg/webp), and ``output_compression`` (0–100, jpeg/webp only). The posted
-Asset's filename extension follows ``output_format`` so its content-type does too
-(the server infers the type from the name). ``n>1`` is deliberately skipped —
-multiple-images-per-call is niche for a conversational agent (founder decision).
-Enum/range constraints are documented in the schema and enforced by the API rather
-than re-validated here, so this never drifts as the model's surface evolves.
+Coverage (audited to GPT Image 2.5's full surface)
+---------------------------------------------------
+The agent gets **every control these models offer** — the founder's rule: when we update a
+tool, the agent gets the whole surface. Shared by both tools: ``size``, ``quality``
+(low/medium/high/**xhigh**/**max**/auto — the two top tiers are new in 2.5), ``background``
+(**transparent**/opaque/auto — 2.5 supports transparency outright, where gpt-image-2 carried
+it as preview), ``moderation`` (low/auto — content-filter strictness), ``output_format``
+(png/jpeg/webp), and ``output_compression`` (0–100, jpeg/webp only). The posted Asset's
+filename extension follows ``output_format`` so its content-type does too (the server infers
+the type from the name).
+
+Three things on the endpoints are deliberately absent, and each for a stated reason rather
+than by oversight. ``n>1`` — multiple-images-per-call is niche for a conversational agent
+(founder decision). ``stream``/``partial_images``, ``response_format``, ``style`` and
+``user`` — none apply here (the tool posts a finished Asset, not a stream; the latter two are
+DALL·E-only). And ``input_fidelity`` is **not a control these models offer at all**:
+live-verified, ``gpt-image-2``, ``gpt-image-2.5-flare`` and ``gpt-image-2.5-sunburst`` (alias
+*and* dated snapshot) every one hard-400s with "does not support the 'input_fidelity'
+parameter", and only ``gpt-image-1.5`` accepts it — a field that fails on every call is a
+locked door, so neither tool shows one (issue #494).
+
+Enum/range constraints are documented in the schema and enforced by the API rather than
+re-validated here, so this never drifts as the model's surface evolves — with the two
+live-verified footguns below as the standing exception.
 """
 
 from __future__ import annotations
@@ -71,16 +94,26 @@ from basecradle_harness._platform import PlatformTool, explain
 #: OpenAI's Images API root. Image generation/editing is an OpenAI service; this
 #: changes only for a proxy, not to reach another vendor (the key is the OpenAI key).
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-#: The image model. ``gpt-image-2`` is what the live key carries; it returns the
-#: rendered image as base64, no separate download step.
-DEFAULT_MODEL = "gpt-image-2"
+#: The generate model. OpenAI positions ``gpt-image-2.5-flare`` as the fast, high-quality
+#: everyday generator — its stated default for most applications, higher quality than
+#: ``gpt-image-2`` at ~50% lower latency. The alias (not the dated snapshot) so OpenAI's own
+#: default snapshot follows. It returns the rendered image as base64, no separate download.
+GENERATE_MODEL = "gpt-image-2.5-flare"
+#: The edit model. ``gpt-image-2.5-sunburst`` is OpenAI's variant for "workflows where editing
+#: precision matters most" — tighter control across edits. Same price per token as Flare, so
+#: the vendor's own operation split maps onto this module's tool split for free.
+EDIT_MODEL = "gpt-image-2.5-sunburst"
 #: Default canvas. Square is universally supported; the model may pass another.
 DEFAULT_SIZE = "1024x1024"
 #: Generation/editing is slow next to a chat call — give it room before giving up.
 #: A ``gpt-image-2`` ``quality: high`` edit was measured at ~133s live (issue #219), which
 #: agents pick naturally for fidelity work, so the old 120s ceiling timed the common case
 #: out. 300s clears the measured worst case with headroom for larger sizes; the constraint
-#: is only that a normal ``quality: high`` request must not hit the ceiling.
+#: is only that a quality the agent will pick naturally must not hit the ceiling.
+#: Re-measured live on GPT Image 2.5 for its two new top tiers (issue #494): generate/Flare
+#: ``max`` 48.4s at 1024x1024 and 34.5s at 1536x1024; edit/Sunburst ``max`` **98.4s** at
+#: 1024x1024 (the worst case) and 67.5s at 1536x1024, ``xhigh`` 38.0s at 1536x1024. The new
+#: ceiling-setter is comfortably under a third of 300s, so the constant stands unchanged.
 DEFAULT_TIMEOUT = 300.0
 
 #: ``output_format`` → filename extension. The Asset's content-type is inferred from
@@ -100,15 +133,29 @@ _COVERAGE_PROPERTIES = {
     },
     "quality": {
         "type": "string",
-        "enum": ["low", "medium", "high", "auto"],
-        "description": "Optional render quality. Higher is slower and costlier; 'auto' lets the model decide.",
+        "enum": ["low", "medium", "high", "xhigh", "max", "auto"],
+        "description": (
+            "Optional render quality. Higher is slower and costlier; 'auto' lets the model "
+            "decide. 'high' is the usual choice for fidelity work — 'xhigh' and 'max' are "
+            "materially slower and more expensive than 'high', so pick them only when the "
+            "extra detail genuinely matters."
+        ),
     },
     "background": {
         "type": "string",
-        "enum": ["opaque", "auto"],
+        "enum": ["transparent", "opaque", "auto"],
         "description": (
-            "Optional background. 'opaque' or 'auto' only — this model has no "
-            "transparent background, so set this only if you specifically need opaque."
+            "Optional background. 'transparent' gives a cut-out with no backdrop (a logo, a "
+            "sticker) and needs 'output_format' png (the default) or webp — jpeg cannot carry "
+            "transparency, so asking for both drops the transparency rather than failing."
+        ),
+    },
+    "moderation": {
+        "type": "string",
+        "enum": ["low", "auto"],
+        "description": (
+            "Optional content-filter strictness. 'auto' is the API's default; 'low' is less "
+            "restrictive. Leave unset unless a legitimate request is being refused."
         ),
     },
     "output_format": {
@@ -145,23 +192,29 @@ class _ImageTool(PlatformTool):
             ``AI_API_KEY`` at call time, so constructing the tool needs no
             secret (a keyless construction just errors, readably, if used).
         base_url: The Images API root. Defaults to OpenAI.
-        model: The image model. Defaults to ``gpt-image-2``.
+        model: The image model. Defaults to the subclass's own `MODEL` —
+            ``gpt-image-2.5-flare`` to generate, ``gpt-image-2.5-sunburst`` to edit.
         size: The default canvas when a call does not name one.
         timeout: Per-request timeout in seconds (generation/editing is slow).
     """
+
+    #: The image model this tool calls. Named by each subclass rather than shared, because
+    #: OpenAI ships one 2.5 variant per operation at the identical price — Flare generates,
+    #: Sunburst edits. The ``media_timer(model=…)`` log line follows it.
+    MODEL: str
 
     def __init__(
         self,
         *,
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
-        model: str = DEFAULT_MODEL,
+        model: str | None = None,
         size: str = DEFAULT_SIZE,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
-        self._model = model
+        self._model = model or self.MODEL
         self._default_size = size
         self._timeout = timeout
 
@@ -187,6 +240,7 @@ class _ImageTool(PlatformTool):
         size: str | None,
         quality: str | None,
         background: str | None,
+        moderation: str | None,
         output_format: str | None,
         output_compression: int | None,
     ) -> dict[str, Any]:
@@ -195,13 +249,26 @@ class _ImageTool(PlatformTool):
         ``size`` always carries (the tool's default fills in); the rest are optional
         pass-through, so an unset knob lets the API choose its own default rather than
         the harness inventing one. Validation is the API's job (documented in the
-        schema), which keeps this from drifting as the model's surface changes.
+        schema), which keeps this from drifting as the model's surface changes — with
+        two live-verified exceptions, both the same shape: a *combination* the API
+        hard-400s on and the model can name freely is neutralized here rather than
+        turned into a failed call.
         """
+        fmt = (output_format or "png").lower()
         params: dict[str, Any] = {"size": size or self._default_size}
         if quality:
             params["quality"] = quality
-        if background:
+        # ``background: transparent`` is jpeg-incompatible: jpeg has no alpha channel, and
+        # OpenAI hard-400s the pair ("Transparent background is not supported for JPEG output
+        # format" — live-verified on both 2.5 models, issue #494). The model fills both fields
+        # freely, so honoring the format and dropping the impossible half turns a live footgun
+        # into a no-op, exactly as png/``output_compression`` below. The *format* is the half
+        # that wins because it also drives the posted Asset's filename extension and
+        # content-type: overriding it instead would post png bytes under a name nobody chose.
+        if background and not (background.lower() == "transparent" and fmt == "jpeg"):
             params["background"] = background
+        if moderation:
+            params["moderation"] = moderation
         if output_format:
             params["output_format"] = output_format
         # ``output_compression`` is jpeg/webp-only: OpenAI hard-400s it on png
@@ -210,7 +277,6 @@ class _ImageTool(PlatformTool):
         # in freely, so dropping it for png here — where the docs already say it's
         # ignored — turns a live footgun into a no-op rather than trusting the model to
         # avoid it. (Capital live-verify, #140.)
-        fmt = (output_format or "png").lower()
         if output_compression is not None and fmt != "png":
             params["output_compression"] = output_compression
         return params
@@ -246,13 +312,15 @@ class GenerateImageTool(_ImageTool):
     client and current-timeline uuid before the loop, exactly like the assets tool.
     """
 
+    MODEL = GENERATE_MODEL
     name = "generate_image"
     description = (
         "Create an image from a text prompt and post it as a file on the timeline, "
         "the way a peer shares a picture they made. Describe what to draw in 'prompt'; "
         "the image is generated and uploaded as an asset (it renders inline for humans). "
-        "Choose 'output_format' (png/jpeg/webp), 'size', 'quality', and 'background' to "
-        "control how it comes out. To change an image that already exists, use 'edit_image' "
+        "Choose 'output_format' (png/jpeg/webp), 'size', 'quality' (up to 'max'), and "
+        "'background' (including 'transparent' for a cut-out) to control how it comes out. "
+        "To change an image that already exists, use 'edit_image' "
         "instead. Optionally set a 'filename', a 'description', or a 'timeline' uuid to post "
         "somewhere other than the current one."
     )
@@ -289,6 +357,7 @@ class GenerateImageTool(_ImageTool):
         size: str | None = None,
         quality: str | None = None,
         background: str | None = None,
+        moderation: str | None = None,
         output_format: str | None = None,
         output_compression: int | None = None,
         filename: str | None = None,
@@ -309,6 +378,7 @@ class GenerateImageTool(_ImageTool):
             size=size,
             quality=quality,
             background=background,
+            moderation=moderation,
             output_format=output_format,
             output_compression=output_compression,
         )
@@ -350,6 +420,7 @@ class EditImageTool(_ImageTool):
     common recolor/inpaint case.
     """
 
+    MODEL = EDIT_MODEL
     name = "edit_image"
     description = (
         "Edit an image that already exists on the timeline and post the result as a new "
@@ -412,6 +483,7 @@ class EditImageTool(_ImageTool):
         size: str | None = None,
         quality: str | None = None,
         background: str | None = None,
+        moderation: str | None = None,
         output_format: str | None = None,
         output_compression: int | None = None,
         filename: str | None = None,
@@ -444,6 +516,7 @@ class EditImageTool(_ImageTool):
             size=size,
             quality=quality,
             background=background,
+            moderation=moderation,
             output_format=output_format,
             output_compression=output_compression,
         )
@@ -451,6 +524,15 @@ class EditImageTool(_ImageTool):
         # ``(filename, bytes, content_type)`` tuples — the bytes, not a URL (the edit endpoint
         # rejects URLs), which is why each source is downloaded inline above.
         extra: dict[str, Any] = {"mask": mask_part} if mask_part is not None else {}
+        # ``moderation`` *is* accepted on ``/v1/images/edits`` — live-verified: the endpoint
+        # validates it and rejects a bad value naming the param (issue #494) — but the
+        # ``openai`` SDK types it only on ``generate``, and ``Images.edit()`` raises TypeError
+        # on an unmodelled kwarg. So it rides the SDK's **own** escape hatch, ``extra_body``:
+        # still the vendor SDK, never harness-owned HTTP. Because a key the SDK accepts is not
+        # a key on the wire (issue #433), the test asserts the field in the real multipart body.
+        moderation_value = coverage.pop("moderation", None)
+        if moderation_value:
+            extra["extra_body"] = {"moderation": moderation_value}
         try:
             openai, client = self._client(key)
             with (

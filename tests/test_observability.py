@@ -329,18 +329,20 @@ def test_the_media_line_names_the_provider_kind_model_and_duration(caplog):
 def test_the_media_timer_logs_a_completed_generation(caplog):
     with (
         caplog.at_level(logging.INFO, logger="basecradle_harness"),
-        media_timer(provider="openai", kind="image.generate", model="gpt-image-2"),
+        media_timer(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"),
     ):
         pass
 
     line = caplog.records[0].getMessage()
-    assert line.startswith("media provider=openai kind=image.generate model=gpt-image-2 duration=")
+    assert line.startswith(
+        "media provider=openai kind=image.generate model=gpt-image-2.5-flare duration="
+    )
 
 
 def test_a_failed_generation_logs_nothing_and_lets_the_error_through(caplog):
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         try:
-            with media_timer(provider="openai", kind="image.generate", model="gpt-image-2"):
+            with media_timer(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"):
                 raise RuntimeError("the API said no")
         except RuntimeError:
             pass
@@ -378,7 +380,9 @@ def test_the_media_line_carries_the_cost_when_the_provider_states_it(caplog):
 def test_the_media_line_omits_cost_when_the_provider_states_none(caplog):
     """OpenAI reports no media cost on any endpoint — the field is absent, not a fabricated `cost=0`."""
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        log_media_call(provider="openai", kind="image.generate", model="gpt-image-2", seconds=3.4)
+        log_media_call(
+            provider="openai", kind="image.generate", model="gpt-image-2.5-flare", seconds=3.4
+        )
 
     assert "cost=" not in caplog.records[0].getMessage()
 
@@ -438,7 +442,7 @@ def test_the_media_timer_omits_cost_when_its_handle_is_left_unset(caplog):
     """Every OpenAI media path leaves the handle untouched — the line carries no `cost=`."""
     with (
         caplog.at_level(logging.INFO, logger="basecradle_harness"),
-        media_timer(provider="openai", kind="image.generate", model="gpt-image-2"),
+        media_timer(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"),
     ):
         pass
 

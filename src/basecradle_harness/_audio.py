@@ -24,7 +24,7 @@ always there.
 ephemeral shape: the agent listens only when it chooses (never eagerly inlined), a non-audio asset
 comes back as a clean note rather than a failure, and an oversized one is described, not force-fed.
 The transcription model is OpenAI's Audio API, sharing the agent's one key (``gpt-5.4-mini``
-reasons, ``gpt-image-2`` paints, ``gpt-transcribe`` listens).
+reasons, ``gpt-image-2.5`` paints, ``gpt-transcribe`` listens).
 """
 
 from __future__ import annotations
