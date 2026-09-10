@@ -732,6 +732,47 @@ vision-capable model. `HARNESS_DESCRIBER_MODEL` is the whole switch.
   fixable defect than a permanent property of the pool, and paging a human for something the next
   release fixes is how a page stops being answered. A working describer logs **INFO** — the WARNING
   belongs to the degrade it replaced.
+- **The answer is judged, not merely received (issue #488), and what is judged is the *answer*
+  (issue #491).** The caption tells the brain it is reading an account of the whole thing, and a
+  brain cannot notice that the sentence stopped in the middle — @glm-5.2 was handed 1,748
+  characters cut mid-word as its sight of a 5 s clip, with no `Over time:`, no `Last frame:`, and a
+  line reading `outcome=ok`. Three checks decide usability (`_unusable`), in the order that makes
+  the first true one the *cause* rather than the symptom: **truncated** (the vendor's own `length`,
+  in any of its three spellings — a capability read, never a vendor branch), **empty_response**,
+  **missing_parts** (a video description lacking `VIDEO_PART_LABELS`, matched on *presence* and
+  never on position: the check catches a missing part, it does not police a layout). Only
+  `truncated` retries — once, at `RETRY_BUDGET_FACTOR` the room, and only where there is more room
+  to buy, since a describer built from a library caller's own `Provider` has one fixed cap and
+  asking again would purchase the same answer.
+- **What the vendor said about the *bill* judges nothing — the correction that cost a working
+  describer two days (issue #491).** #488 shipped a fourth check, `no_usage`: an answer beside a
+  usage block of nothing but zeros was condemned as a broken stream, because a call that generated
+  1,700 characters cannot have consumed zero input tokens. The inference reads an **accounting**
+  fact as a **content** fact, and the live re-run on @glm-5.2 falsified it — on OpenRouter,
+  `google/gemini-3.8-flash` reports no usage at all for *video* calls, while the same model reports
+  it for images in the same wake and the older `gemini-3.1-flash-lite` reported it for video. Both
+  arms of that run (with a `start`/`end` window and without) failed identically, so the trim was
+  never the cause; complete three-part descriptions were being discarded and `assets watch` handed
+  back the withheld caption. The rule now: an unreported bill is reported as **absent** —
+  `log_llm_call` omits the token and cost fields rather than print zeros (a *non-zero* cost stated
+  beside them survives: honest absence cuts both ways) — and nothing more.
+- **A gap nobody can explain gets explained wrongly, so the gap says why it is there.**
+  `Describer._note_unreported_usage` writes one INFO line the first time a **model+kind** reports
+  nothing:
+
+  ```
+  INFO  usage unreported provider=openrouter purpose=helper kind=video.describe endpoint=Google model=google/gemini-3.8-flash
+  ```
+
+  Three properties are the design. It is keyed per **cell**, not per wake, because the vendor's
+  accounting is a property of the cell — this very model counts an `image.describe` and not a
+  `video.describe`, and a note that fired for whichever came first would describe the wrong half.
+  It fires on a **reported** all-zero block and never on the *absence* of one, for the same reason
+  `usage_reported` draws that line: an adapter that never instrumented has claimed nothing, and a
+  note about a claim nobody made is noise on every wake forever. And it is deliberately **not** on
+  the `llm` head — a note is not a call record, and sharing the head would enter it in every column
+  that counts model calls, spend included. "Once per wake" needs no clock: the object's life *is*
+  the wake, exactly as `_reported_config`'s does.
 - **The caption always names the describer.** `(This model has no image input. cat.png was
   described by <model>:)`. Without that the brain reads a paragraph about a picture it never
   received as its own perception — and so does anyone reading its memory a month later.

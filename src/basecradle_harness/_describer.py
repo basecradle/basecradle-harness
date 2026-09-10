@@ -55,8 +55,13 @@ description is worse than blind. Nothing here raises into a wake.
 **A fragment counts as fabricated** (issue #488). The caption tells the brain it is reading a
 description of the whole thing, and a brain has no way to notice that the sentence stopped in the
 middle — so an answer the harness cannot vouch for is discarded rather than passed off as sight.
-Four checks decide that (`_unusable`), and one of them — the vendor's own ``length`` — is retried
-once with more room before it falls back, because a bigger budget is the one thing that fixes it.
+Three checks decide that (`_unusable`) and all three read what the vendor said about the
+**answer**; one of them — the vendor's own ``length`` — is retried once with more room before it
+falls back, because a bigger budget is the one thing that fixes it. What the vendor said about the
+**bill** decides nothing (issue #491): OpenRouter/Google report no usage at all for a
+Gemini-class describer's *video* calls, and a complete three-part description is not made wrong by
+a vendor that did not count it. The missing counts are reported as absent and noted once per wake,
+never treated as a verdict on the text.
 The budget is explicit rather than a vendor default (`IMAGE_OUTPUT_BUDGET`, `VIDEO_OUTPUT_BUDGET`)
 and does double duty: enough room for the structure that was asked for, and a **bound on what a
 description costs the transcript**, which keeps a description inside Context Discipline's first
@@ -71,7 +76,8 @@ distinction and the same words:
   of this object is the wake, and repeats drop to DEBUG so one defect cannot become a storm.
 - **Runtime-class** — a timeout, a 429, a 5xx, a transport blip, an unparseable or empty answer,
   and every one of #488's unusable-answer checks. Transient and self-healing, so **WARNING** for
-  that call.
+  that call. A vendor that stated no usage is **neither** class: it is a fact about the bill, not
+  a fault, and it rides its own INFO note (`Describer._note_unreported_usage`).
 
 The describer's output is **model-generated text about peer content**. It is injected as context
 and nothing more: never executed, never a tool call, and never mined as the agent's own words — it
@@ -107,6 +113,7 @@ from basecradle_harness._observability import (
     LlmCall,
     capture_llm_call,
     describe_provider,
+    kv,
     log_llm_call,
     reasoning_tokens,
     truncated,
@@ -274,6 +281,13 @@ class Describer:
         #: **is** the wake, so "once per wake" needs no clock: after the first report, repeats drop
         #: to DEBUG and one defect cannot become a storm.
         self._reported_config = False
+        #: The ``(model, kind)`` pairs this describer has already noted an **unreported bill** for
+        #: (issue #491). Same "once per wake" reasoning as `_reported_config` and the same
+        #: mechanism — the object's life *is* the wake — but keyed per model+kind, because the
+        #: vendor's accounting is a fact about the *cell*: the live case reports usage for
+        #: ``image.describe`` and none for ``video.describe`` on one model in one wake, and a note
+        #: that fired for only whichever came first would describe the wrong half.
+        self._noted_unreported_usage: set[tuple[str, str]] = set()
         #: How to build **this same describer at a different output budget** (issue #488) — the
         #: adapters take a cap at construction, so a still, a clip and a retry are three caps and
         #: therefore three adapter instances. It is a builder rather than three eager builds
@@ -545,10 +559,14 @@ class Describer:
         seconds = call.seconds
         if seconds is None and started is not None:
             seconds = time.monotonic() - started
+        # The adapter's own provider name where there was a call, this describer's configured one
+        # otherwise — never a guess: a born-broken describer has no adapter to ask.
+        provider = call.provider or describe_provider(self.provider)[0]
+        # Ahead of the line it explains, so a human reading the journal top-down meets the reason
+        # before the hole.
+        self._note_unreported_usage(provider, kind=kind, call=call)
         log_llm_call(
-            # The adapter's own provider name where there was a call, this describer's configured
-            # one otherwise — never a guess: a born-broken describer has no adapter to ask.
-            provider=call.provider or describe_provider(self.provider)[0],
+            provider=provider,
             purpose=HELPER,
             kind=kind,
             endpoint=call.endpoint,
@@ -564,6 +582,45 @@ class Describer:
             detail=detail,
             extra={"subject": subject},
             level=level,
+        )
+
+    def _note_unreported_usage(self, provider: str, *, kind: str, call: LlmCall) -> None:
+        """One INFO note, once per wake per model+kind, when the vendor stated no usage (issue #491).
+
+        `log_llm_call` omits the token and cost fields rather than print zeros — honest absence,
+        and the right call. What it cannot do from inside one line is say *why* the field is
+        missing, and the difference matters to whoever is reading the dashboard: a helper series
+        with a hole in it is either a vendor that does not report usage for this cell, or an
+        instrument that has gone deaf. The first is a fact to record once; the second is a defect
+        to chase. **A gap nobody can explain gets explained wrongly**, and the wrong explanation
+        here is expensive — it is exactly the inference #488 made, and it cost a working describer
+        for two days.
+
+        Keyed on ``(model, kind)`` and not on the wake alone, because the vendor's accounting is a
+        property of the cell rather than of the agent: the live case
+        (``google/gemini-3.8-flash`` on OpenRouter) reports usage for ``image.describe`` and none
+        for ``video.describe``, so a wake that does both must say which half is unreported.
+
+        It fires on a *reported* all-zero block only — never on the absence of one — for the same
+        reason `usage_reported` draws that line: an adapter that states no usage at all has told us
+        nothing, and a note about a claim nobody made is noise. **INFO, always**: this is a fact,
+        not a fault; the attempt's own `llm` line carries whatever the outcome was.
+        """
+        if call.usage is None or usage_reported(call.usage):
+            return
+        cell = (self.model, kind)
+        if cell in self._noted_unreported_usage:
+            return
+        self._noted_unreported_usage.add(cell)
+        _log.info(
+            "usage unreported %s",
+            kv(
+                provider=provider,
+                purpose=HELPER,
+                kind=kind,
+                endpoint=call.endpoint,
+                model=self.model,
+            ),
         )
 
 
@@ -582,7 +639,7 @@ def _unusable(text: str, call: LlmCall, *, parts: bool) -> str | None:
     1,748 characters cut mid-word, no ``Over time:``, no ``Last frame:``, and a line that said
     ``outcome=ok`` — is exactly that, and the harness had no check that could have seen it.
 
-    Four things make an answer unusable, in the order they are asked, because the first that is
+    Three things make an answer unusable, in the order they are asked, because the first that is
     true is the one that *explains* the rest:
 
     - **truncated** — the vendor itself says it stopped at ``length``. It is the only one a bigger
@@ -590,15 +647,6 @@ def _unusable(text: str, call: LlmCall, *, parts: bool) -> str | None:
       truncated answer is usually also missing its parts and would otherwise be reported as the
       symptom rather than the cause.
     - **empty_response** — nothing came back. The pre-#488 check, unchanged.
-    - **no_usage** — text came back and the vendor answered the usage question with **nothing but
-      zeros**. A call that generated 1,700 characters cannot have consumed zero input tokens, so
-      this is the signature of a **broken stream**: what arrived is whatever landed before the
-      connection did not. Nothing about a bigger budget helps, so it falls back rather than
-      retrying; the next wake simply tries again. It is deliberately keyed on a usage block that
-      *reported* zeros, never on the absence of one: an adapter that states no usage at all (a
-      surface that omits it, a third-party `Provider` that never instrumented) has told us nothing
-      about the answer, and condemning it on silence would blind an agent over a fact nobody
-      claimed.
     - **missing_parts** — a video description that does not carry `VIDEO_PART_LABELS`. Since #479
       the three parts *are* the contract of a video description, and an answer without them is
       either cut short or an account of one frame wearing the caption of the whole clip. The
@@ -607,13 +655,24 @@ def _unusable(text: str, call: LlmCall, *, parts: bool) -> str | None:
     The labels are matched on **presence**, case-insensitively, because this check exists to catch a
     **missing part** and never to police layout: a describer that answers in bold, or writes the
     three parts inline in one paragraph, is answering.
+
+    **What is deliberately *not* a check: an absent usage block** (issue #491, and #488 shipped it
+    as one for two days). The reasoning was that a call which generated 1,700 characters cannot
+    have consumed zero input tokens, so an all-zero block had to be a broken stream. It is a fact
+    about the **vendor's accounting**, not about the answer, and the live re-run said so: on
+    OpenRouter, ``google/gemini-3.8-flash`` reports no usage at all for *video* calls — while the
+    same model, in the same wake, reports it for images, and the older ``gemini-3.1-flash-lite``
+    reported it for video. Every one of those video answers was complete, three-part, and
+    discarded. So the harness reads what the vendor said about the **answer** (its finish reason,
+    its text, its parts) and reads silence about the **bill** as silence: `log_llm_call` omits the
+    token and cost fields rather than printing zeros, and `Describer._note_unreported_usage` says
+    once per wake why that series has a hole in it. *Honest absence is this repo's own rule, and
+    condemning an answer over it was that rule pointed backwards.*
     """
     if truncated(call.finish_reason):
         return _TRUNCATED
     if not text:
         return "empty_response"
-    if call.usage is not None and not usage_reported(call.usage):
-        return "no_usage"
     if parts and not _has_parts(text):
         return "missing_parts"
     return None

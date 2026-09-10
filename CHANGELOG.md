@@ -7,6 +7,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.118.3] - 2026-09-09
+
+### Fixed: absent vendor usage is honest absence, not a broken answer (issue #491)
+
+0.118.2 shipped a fourth usability check, `no_usage`: a describer answer that arrived beside a usage
+block of nothing but zeros was discarded, on the reasoning that a call which generated 1,700
+characters cannot have consumed zero input tokens. The live re-run on @glm-5.2 falsified it. With
+helper `google/gemini-3.8-flash` on OpenRouter, `assets watch` on a 5 s clip returned
+`outcome=fallback reason=no_usage` **both** with a `start=1 end=3` window and without one — an 8–12
+second, complete answer thrown away each time — because **OpenRouter/Google report no usage at all
+for that model's video calls**, while the same model reports it for images in the same wake and the
+older `gemini-3.1-flash-lite` reported it for video. The trim was never the cause; the untrimmed
+control failed identically.
+
+- **`no_usage` is gone as a disqualifier.** Every remaining check reads what the vendor said about
+  the **answer** — `truncated` (its own `length`), `empty_response`, `missing_parts` (a video
+  description lacking `First frame:` / `Over time:` / `Last frame:`) — and a non-empty answer whose
+  bill went unreported is judged on exactly those. `truncated`, `empty_response`, `missing_parts`
+  and the single retry on `length` are unchanged from 0.118.2.
+- **The `llm` line carries no `tokens_*` and no `cost=` for such a call**, rather than a row of
+  zeros — the honest-absence rule 0.118.2 also shipped, and the half of it that was right. A
+  *non-zero* cost stated beside an unreported usage block still survives; absence cuts both ways.
+- **The gap says why it is there.** One INFO note, the first time per wake a given **model+kind**
+  reports nothing: `usage unreported provider=openrouter purpose=helper kind=video.describe
+  endpoint=Google model=google/gemini-3.8-flash`. Keyed per cell because the accounting is a
+  property of the cell (this model counts an `image.describe` and not a `video.describe`); fired on
+  a *reported* all-zero block and never on the absence of one; and deliberately **not** on the `llm`
+  head, because a note is not a call record and must join no column that counts them.
+
+*Silence about the price is never evidence about the goods.*
+
 ## [0.118.2] - 2026-09-09
 
 ### Fixed: a truncated or usage-less describer answer is no longer handed to the brain as sight (issue #488)

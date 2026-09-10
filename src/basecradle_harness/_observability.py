@@ -670,18 +670,22 @@ def token_counts(usage: Any) -> dict[str, int]:
 def usage_reported(usage: Any) -> bool:
     """Whether the vendor actually **stated** usage for this call (issue #488).
 
-    A usage block of nothing but zeros is not usage. A call that returned text cannot have consumed
-    zero input tokens, so an all-zero block is the vendor reporting nothing in a shape that renders
-    as a fact — the signature of a stream that broke rather than a call that worked. The live case:
-    a describer answered 1,748 characters cut mid-sentence and reported ``tokens_in=0 tokens_out=0
-    … cost=0``, and the line said ``outcome=ok``.
+    A usage block of nothing but zeros is not usage: it is the vendor reporting **nothing** in a
+    shape that renders as a fact. The live case: a describe logged ``tokens_in=0 tokens_out=0 …
+    cost=0 outcome=ok``, which reads on a dashboard as a free call that worked.
 
     Read through `token_counts`, so it knows every vendor's spelling by construction and cannot
     drift from what the line prints. ``False`` for ``None`` too, which is the same claim: nothing
     was stated.
 
-    Two readers, one spelling: `log_llm_call` uses it to omit the fields rather than print zeros,
-    and a caller judging whether an *answer* is usable (`_describer`) uses it to say so.
+    **It is a claim about the accounting and never about the answer** (issue #491). #488 read an
+    all-zero block as the signature of a broken stream — a call that returned 1,700 characters
+    cannot have consumed zero input tokens — and that inference is wrong: OpenRouter/Google report
+    no usage at all for ``google/gemini-3.8-flash``'s *video* calls, while the same model reports
+    it for images in the same wake. Complete answers were discarded over a vendor's bookkeeping.
+    So both readers use it for what it says: `log_llm_call` omits the token and cost fields rather
+    than print zeros, and `_describer` notes once per wake that the vendor stated none — neither
+    condemns the text.
     """
     return any(token_counts(usage).values())
 

@@ -787,10 +787,14 @@ class WireDescriberProvider(FakeDescriberProvider):
     detection here is a judgement about what the *vendor said*, so it has to be said.
     """
 
-    def __init__(self, *, finish=None, usage=USAGE, **kwargs):
+    def __init__(self, *, finish=None, usage=USAGE, cost=0.0021, **kwargs):
         super().__init__(**kwargs)
         self.finish = finish
         self.usage = usage
+        #: The dollar the vendor stated, if it stated one. A vendor that counted nothing usually
+        #: charges nothing either — the live line carried neither — and the two are separate
+        #: claims, so the fake lets a test say exactly which one it is making.
+        self.cost = cost
 
     def chat(self, messages, tools=None):
         from basecradle_harness._observability import log_llm_call
@@ -800,7 +804,7 @@ class WireDescriberProvider(FakeDescriberProvider):
             model=self.model,
             seconds=1.5,
             usage=self.usage,
-            cost=0.0021,
+            cost=self.cost,
             finish_reason=self.finish,
         )
         return super().chat(messages, tools)
@@ -824,6 +828,15 @@ def _describer(*providers, model="d/model"):
 
 def _fallback_lines(caplog):
     return [r for r in _helper_lines(caplog) if "outcome=fallback" in r.getMessage()]
+
+
+def _notes(caplog):
+    """The `usage unreported` notes — deliberately **not** on the `llm` head (issue #491).
+
+    A note is not a call record: it explains why one has a hole in it. Sharing the head would put
+    it in every column that counts model calls, spend included.
+    """
+    return [r for r in caplog.records if r.getMessage().startswith("usage unreported ")]
 
 
 def test_a_truncated_answer_is_never_handed_to_the_brain_as_sight(caplog):
@@ -881,35 +894,83 @@ def test_a_second_truncation_falls_back_rather_than_spending_again(caplog):
     assert [r.getMessage().count("reason=truncated") for r in _helper_lines(caplog)] == [1, 1]
 
 
-def test_an_answer_the_vendor_counted_nothing_for_is_a_broken_stream(caplog):
-    """`tokens_in=0 tokens_out=0 … cost=0` beside 1,748 characters is not a call that worked.
+def test_an_answer_the_vendor_counted_nothing_for_is_still_an_answer(caplog):
+    """Issue #491, and the rule #488 got backwards: absent usage is a fact about the **bill**.
 
-    A completion cannot have consumed zero input tokens, so an all-zero usage block is the vendor
-    reporting *nothing* — the signature of a stream that ended before the answer did.
+    Live, on 0.118.2: OpenRouter/Google report no usage at all for ``google/gemini-3.8-flash``'s
+    *video* calls — while the same model reports it for images in the same wake, and the older
+    ``gemini-3.1-flash-lite`` reported it for video. Complete, three-part descriptions were being
+    discarded over a vendor's bookkeeping. A vendor that did not count the call has said nothing
+    about the text it returned.
     """
-    vision = WireDescriberProvider(usage=NO_USAGE, answer=CUT_OFF)
+    vision = WireDescriberProvider(usage=NO_USAGE, cost=None, answer=DESCRIPTION)
     describer = Describer(vision, "d/model")
 
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
-        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) is None
+        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) == DESCRIPTION
 
-    message = _fallback_lines(caplog)[0].getMessage()
-    assert "reason=no_usage" in message
-    # And the contradiction is gone from the line itself: no zeros dressed up as measurements.
-    assert "tokens_" not in message
+    message = _helper_lines(caplog)[0].getMessage()
+    assert "outcome=ok" in message and "reason=" not in message
+    # Honest absence, both halves: no zeros dressed up as measurements, and no invented dollar.
+    assert "tokens_" not in message and "cost=" not in message
 
 
-def test_a_broken_stream_is_not_retried_because_room_was_never_the_problem(caplog):
-    """The retry is keyed on the one fault a bigger budget fixes, never on "something went wrong"."""
-    describer, asked = _describer(
-        WireDescriberProvider(usage=NO_USAGE, answer=CUT_OFF),
-        WireDescriberProvider(answer=DESCRIPTION),  # never reached
-    )
+def test_a_video_whose_usage_is_unreported_is_judged_on_its_parts_alone(caplog):
+    """The live cell exactly: a complete three-part clip description, and no usage beside it.
+
+    Both arms of the live re-run — with a `start`/`end` window and without — failed identically, so
+    the trim was never the cause. What is judged is the answer: its finish reason, its text, its
+    three parts.
+    """
+    vision = WireDescriberProvider(video=True, usage=NO_USAGE, answer=VIDEO_DESCRIPTION)
+    describer = Describer(vision, "d/video-model")
 
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
-        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) is None
+        assert VIDEO_DESCRIPTION in (describer.describe_video(_clip()) or "")
 
-    assert asked == [] and len(_helper_lines(caplog)) == 1
+    assert _fallback_lines(caplog) == []
+
+
+def test_the_unreported_bill_is_noted_once_per_wake_for_that_model_and_kind(caplog):
+    """A gap nobody can explain gets explained wrongly — which is how #488 happened.
+
+    So the hole in the helper cost series says why it is there: one INFO note naming the cell, the
+    first time that cell reports nothing. Once per wake, because the object's life *is* the wake;
+    per model+kind, because the vendor's accounting is a property of the cell — this very model
+    counts an ``image.describe`` and not a ``video.describe``.
+    """
+    vision = WireDescriberProvider(usage=NO_USAGE, cost=None, answer=DESCRIPTION)
+    describer = Describer(vision, "d/model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        for _ in range(3):
+            describer.describe_images([ImageContent(url="x", alt="poster.png")])
+
+    notes = _notes(caplog)
+    assert len(notes) == 1
+    assert notes[0].levelno == logging.INFO  # a fact, not a fault
+    message = notes[0].getMessage()
+    for field in ("provider=openrouter", "purpose=helper", "kind=image.describe", "model=d/model"):
+        assert field in message, message
+    # It explains a *missing* series; it must never look like a call record with zeros in it, and
+    # it is not one — three describes are three `llm` lines however many notes they earned, so the
+    # spend partition over that head counts exactly the calls that were made.
+    assert "tokens_" not in message and "cost=" not in message and "outcome=" not in message
+    assert not message.startswith("llm ") and len(_helper_lines(caplog)) == 3
+
+
+def test_a_vendor_that_states_no_usage_at_all_is_not_noted(caplog):
+    """The `usage_reported` line, kept: silence about a claim is not the claim.
+
+    An adapter that never instrumented — a surface that omits usage, a third-party `Provider` —
+    has told us nothing, and a note about a claim nobody made is noise on every wake forever.
+    """
+    describer = Describer(FakeDescriberProvider(answer=DESCRIPTION), "d/model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) == DESCRIPTION
+
+    assert _notes(caplog) == []
 
 
 def test_a_video_description_missing_its_parts_is_not_a_video_description(caplog):
@@ -994,8 +1055,11 @@ def test_a_describer_with_no_builder_describes_and_never_retries_itself(caplog):
 def test_a_helper_line_never_says_a_free_successful_call_that_measured_nothing(caplog):
     """The contradiction the live line carried, stated as the invariant it violates (issue #488).
 
-    ``outcome=ok`` and ``cost=0`` and ``tokens_*=0`` cannot all be true at once: a call that
-    answered was measured, and a call that measured nothing did not answer.
+    ``outcome=ok tokens_in=0 … cost=0`` reads on a dashboard as a free call that worked, and a
+    zero is not a measurement: whatever the outcome, an unreported count is **omitted** rather than
+    printed. Note that ``outcome=ok`` beside *no* token fields is entirely legitimate (issue #491)
+    — some vendors simply do not count some calls — which is why what is pinned here is the pairing
+    of a verdict with a **zero**, never the verdict itself.
     """
     for vision in (
         WireDescriberProvider(),
