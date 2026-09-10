@@ -208,23 +208,39 @@ Four invariants, each with an "obviously fine" broken form:
   (issue #488). The caption tells the brain it is reading an account of the whole thing, and a brain
   cannot notice that the sentence stopped in the middle — @glm-5.2 was handed 1,748 characters cut
   mid-word as its sight of a 5 s clip, with no `Over time:`, no `Last frame:`, and a line reading
-  `outcome=ok`. Four checks now decide usability (`_unusable`), in the order that makes the *first*
+  `outcome=ok`. Three checks now decide usability (`_unusable`), in the order that makes the *first*
   true one the cause rather than the symptom: **truncated** (the vendor's own `length`, in any of
   its three spellings — `_observability.finish_reason` is a capability read, never a vendor branch),
-  **empty_response**, **no_usage** (an answer beside a usage block of nothing but zeros — a call
-  that generated text cannot have consumed zero input tokens, so that is a broken stream), and
-  **missing_parts** (a video description lacking `VIDEO_PART_LABELS`, matched on **presence** and
-  never on position, because the check exists to catch a missing part and not to police a layout —
-  a model told "plain prose" may well write the three labels inline in one paragraph, and
-  discarding that would blind the agent to enforce a style nobody reads). Only **truncated** retries, once,
-  at `RETRY_BUDGET_FACTOR` the room — and only where there is more room to buy, since a describer
-  built from a caller's own `Provider` has one fixed cap and asking again would purchase the same
-  answer. Three corollaries a later "consistency" pass will otherwise undo: the retry is keyed on
-  the one fault a budget fixes, never on "something went wrong"; `no_usage` keys on a **reported**
-  all-zero block and never on the *absence* of one, or a third-party adapter that never instrumented
-  would blind its agent on a fact nobody claimed; and the labels the check reads are the same tuple
-  the prompt is **composed from**, so a reworded part cannot leave the check rejecting every answer
-  the describer gives.
+  **empty_response**, and **missing_parts** (a video description lacking `VIDEO_PART_LABELS`,
+  matched on **presence** and never on position, because the check exists to catch a missing part
+  and not to police a layout — a model told "plain prose" may well write the three labels inline in
+  one paragraph, and discarding that would blind the agent to enforce a style nobody reads). Only
+  **truncated** retries, once, at `RETRY_BUDGET_FACTOR` the room — and only where there is more room
+  to buy, since a describer built from a caller's own `Provider` has one fixed cap and asking again
+  would purchase the same answer. Two corollaries a later "consistency" pass will otherwise undo:
+  the retry is keyed on the one fault a budget fixes, never on "something went wrong"; and the
+  labels the check reads are the same tuple the prompt is **composed from**, so a reworded part
+  cannot leave the check rejecting every answer the describer gives.
+- **Every one of those checks reads what the vendor said about the *answer*; what it said about the
+  *bill* judges nothing — and the corrected rule is the more interesting one** (issue #491; #488
+  shipped the wrong version and it stood for two days). A fourth check, `no_usage`, condemned an
+  answer that arrived beside a usage block of nothing but zeros, on the reasoning that a call which
+  generated 1,700 characters cannot have consumed zero input tokens. That inference reads an
+  accounting fact as a content fact, and the live re-run falsified it: on OpenRouter,
+  `google/gemini-3.8-flash` reports **no usage at all** for *video* calls — while the same model,
+  in the same wake, reports it for images, and the older `gemini-3.1-flash-lite` reported it for
+  video. Complete, three-part descriptions were being thrown away, with `assets watch` returning
+  the withheld caption whether or not a window was asked for. So an unreported bill is reported as
+  **absent** and nothing more: `log_llm_call` already omits the token and cost fields rather than
+  print zeros (a **non-zero** cost stated beside them still survives — honest absence cuts both
+  ways), and `Describer._note_unreported_usage` writes one INFO note per wake per **model+kind**
+  (the cell, not the agent — this model counts an `image.describe` and not a `video.describe`), so
+  the hole in the helper spend series is explainable rather than mysterious. Two properties are
+  load-bearing: the note fires on a **reported** all-zero block and never on the *absence* of one
+  (an adapter that never instrumented has claimed nothing, and a note about a claim nobody made is
+  noise on every wake forever) — and it is deliberately **not** on the `llm` head, because a note is
+  not a call and must join no column that counts them. *This repo's own honest-absence rule, which
+  #488 had pointed backwards: silence about the price is never evidence about the goods.*
 - **The output budget is explicit, and it bounds two different things at once.** A vendor default is
   not a promise and can move under you; worse, a reasoning describer can spend the whole of it on
   thinking before writing a word. So a still asks for `IMAGE_OUTPUT_BUDGET` (2,048) and a clip for
