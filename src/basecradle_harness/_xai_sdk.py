@@ -213,6 +213,11 @@ class XaiSdkProvider:
         #: free, tokenizer-free trigger the context budget compacts on (issue #276). ``None``
         #: until the first call answers.
         self.last_tokens_in: int | None = None
+        #: Why the endpoint stopped generating on that same call, in the vendor's own words —
+        #: the delivery guarantee's capability (issue #490). The engine asks one question of it, on
+        #: the reply that would end the turn: was the output budget spent mid-sentence? ``None``
+        #: until the first call answers, and whenever the vendor said nothing.
+        self.last_finish_reason: str | None = None
         self._builtin_tools = list(builtin_tools)
         #: The conversation this adapter's next calls belong to — xAI's per-server cache-affinity
         #: routing key (issues #431, #433), set by `bind_conversation` and ``None`` until something
@@ -288,6 +293,11 @@ class XaiSdkProvider:
         # Remember what we just logged: the context budget triggers on the *provider's* count, so
         # the same read that writes the log line feeds the compaction decision (issue #276).
         self.last_tokens_in = token_counts(usage).get("tokens_in")
+        reason = finish_reason(response)
+        # And why it stopped, for the one reader that judges whether the turn *finished*
+        # (issue #490): the same `finish_reason` this line already hands `log_llm_call`, kept where
+        # the engine can reach it without a `capture_llm_call` around every brain call.
+        self.last_finish_reason = reason
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -306,7 +316,7 @@ class XaiSdkProvider:
             # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
             # it got back is whole (issue #488). This SDK names its proto enum (`REASON_MAX_LEN`),
             # which the shared reader knows alongside the two chat-wire spellings.
-            finish_reason=finish_reason(response),
+            finish_reason=reason,
         )
         return self._from_wire(response)
 

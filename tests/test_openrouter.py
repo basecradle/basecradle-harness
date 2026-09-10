@@ -1198,6 +1198,37 @@ def test_the_finish_reason_is_recorded_for_a_capturing_caller(router):
     provider.close()
 
 
+def test_the_last_finish_reason_is_remembered_for_the_delivery_guarantee(router):
+    """Issue #490: the same read, kept on the adapter where the **engine** can reach it.
+
+    `capture_llm_call` is a non-brain caller's seam; the engine needs the fact without taking the
+    brain's own `llm` line away from the adapter, so it rides beside `last_tokens_in`.
+    """
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            200, json=completion(content="Half a sen", finish_reason="length")
+        )
+    )
+    provider = _provider()
+
+    assert provider.last_finish_reason is None  # nothing to report before the first call
+    provider.chat([Message.user("write me an essay")])
+
+    assert provider.last_finish_reason == "length"
+    provider.close()
+
+
+def test_an_ordinary_stop_is_remembered_on_the_adapter_too(router):
+    """The negative half: an ordinary turn records ``stop``, which `truncated` reads as False."""
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(content="ok")))
+    provider = _provider()
+
+    provider.chat([Message.user("hi")])
+
+    assert provider.last_finish_reason == "stop"
+    provider.close()
+
+
 def test_an_ordinary_stop_is_recorded_as_itself(router):
     """Nothing is normalized: the caller decides what a vendor's word means, not the adapter."""
     from basecradle_harness._observability import capture_llm_call

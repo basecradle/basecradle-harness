@@ -61,7 +61,7 @@ from basecradle_harness._messages import (
     ToolSpec,
     VideoContent,
 )
-from basecradle_harness._observability import describe_provider, kv
+from basecradle_harness._observability import describe_provider, kv, truncated
 from basecradle_harness._provider import Provider
 from basecradle_harness._tools import ToolRegistry
 
@@ -126,6 +126,25 @@ DEFAULT_MAX_STEPS = 24
 #: spell it separately drifts the first time the wording is edited, silently, with nothing failing.
 _STEP_NOTE_HEADER = "Current Time: "
 _STEP_NOTE_MARKER = "\n\nStep "
+
+#: The trailing marker a turn gets when the model's **final text** was cut off mid-answer because
+#: the output budget ran out (issue #490). It does two jobs, and they are the same job seen from
+#: two sides:
+#:
+#: - **It unfinishes the turn.** `_wake._turn_narration` reads a turn's commit record as *the work
+#:   ends on an assistant turn with text and no tool calls*; a trailing `system` note is exactly
+#:   what a turn that failed already leaves (`_session._failure_note`), so the classifier sees a
+#:   turn still owing work rather than a model that finished and chose what to say.
+#: - **It is what the resumed turn reads.** A resume replays the transcript up to the interruption,
+#:   so this sentence is the model's own account of what happened to it — which is why it names the
+#:   budget rather than blaming the model, and why it says what finishing looks like.
+#:
+#: A constant rather than a literal in two places, for the reason `_STEP_NOTE_MARKER` is one.
+_TRUNCATED_NOTE = (
+    "[the text above was cut off: this turn's output budget ran out mid-answer. Nothing that "
+    "already ran was lost, and nothing has been repeated — the turn is simply unfinished. "
+    "Finish it: continue from where that text stops, and end on plain text.]"
+)
 
 #: Below this many steps *remaining* (counting the current one), the live counter switches from
 #: the terse "Step N of M." to strategic guidance — prioritize, summarize, self-schedule a
@@ -246,6 +265,12 @@ class Engine:
         #: text `kind=reserve` — a step-capped turn and an ordinary one read very differently to
         #: anyone reconstructing a failure, and the journal is where they will look.
         self.reserve_used = False
+        #: Whether the **last** `run` ended on a final text the vendor cut off at its output budget
+        #: (issue #490). Set in the one place the marker is appended, so the live verdict and the
+        #: transcript the recovery reads can never disagree about the same turn. The wake reads it
+        #: to leave the driving item **pending** instead of committing it — a fragment is not the
+        #: turn's terminal narration, and terminal narration is the commit record.
+        self.output_truncated = False
         #: The blind-model describer (issue #472), built lazily on first need and memoized for the
         #: life of this engine — one adapter instance per wake, never one per picture. ``False`` is
         #: *not yet asked*; ``None`` is *asked and there is none*, which is the ordinary case (no
@@ -300,10 +325,19 @@ class Engine:
         (see `_reserve_summary`), asking the model to write its own honest progress
         report, and returns that. `EngineError` is now only the fallback-of-fallback —
         the reserve call itself failing.
+
+        **A final text the vendor cut off is not the end of the turn** (issue #490). The loop still
+        returns it — the fragment is real, and the wake journals it — but the turn is marked
+        *unfinished*, in the transcript and in `output_truncated`, so the wake leaves its item
+        pending and the recovery finishes the turn on the next wake (`_note_truncation`). The
+        reserve summary is deliberately **not** covered by that: a step-capped turn is already at
+        the end of the budget it was promised, so continuing it is the one thing that must not
+        happen, and `reserve_used` is what says the turn ended that way.
         """
         specs = self.tools.specs() or None
         self.turns_run += 1
         self.reserve_used = False  # this run's verdict, until the budget says otherwise
+        self.output_truncated = False  # ditto, until a vendor says it stopped for want of room
         shown: list[Message] = []  # image turns injected this run, evicted before returning
         # The eviction must happen however the loop ends — including the reserve/error
         # path — or a viewed image's base64 lingers in the (mutated-in-place) transcript
@@ -317,6 +351,13 @@ class Engine:
                 # re-appended each step, never a mutation of the head of the context.
                 messages.append(Message.system(_step_note(step, self.max_steps, started)))
                 reply = self._chat(messages, specs)
+                # Read **here**, beside the call it describes, never at the return check below: the
+                # adapter's `last_finish_reason` is a *most recent call* field, and between this
+                # line and that check sits arbitrary work (tool dispatch, a turn hook) that a later
+                # change could give a model call of its own. Bound to its own reply, it stays right
+                # whatever grows in between.
+                stopped = getattr(self.provider, "last_finish_reason", None)
+                cut_off = stopped if truncated(stopped) else None
                 messages.append(reply)
                 # **Before the first dispatch, never after — and this one is allowed to fail the
                 # turn.** It is the write that turns "the model asked for these tools" into a
@@ -355,7 +396,20 @@ class Engine:
                     # mid-flight (issue #297).
                     _progress(on_progress)
                 self._log_step(step, reply, extend, started)
-                if not reply.tool_calls and not extend:
+                ending = not reply.tool_calls and not extend
+                if cut_off:
+                    # **Logged wherever it happens; marked only where it ends the turn.** A reply
+                    # cut off *mid*-turn is not the commit record — the loop runs its tools, or a
+                    # hook extends it, and some later reply is what settles the turn — so marking
+                    # it would stamp a turn that is still working. But it is still the model
+                    # running out of room, which is exactly the thing nothing could see before
+                    # issue #490, and the shape is common: a hook extends on precisely the
+                    # "no tool calls, no text" ending a truncated narration produces.
+                    self._note_truncation(messages, on_progress, step, cut_off, ending=ending)
+                if ending:
+                    # The step-usage line is emitted either way: a turn that was cut off still
+                    # spent the steps it spent, and a hole in that accounting is a hole in the
+                    # wake's own record of what it cost.
                     _log.info("wake used %d/%d steps", step, self.max_steps)
                     return reply
             # Budget spent with the model still working: the reserve summary is the harness's,
@@ -661,6 +715,78 @@ class Engine:
             "step %d/%d: %s (%.2fs)", step, self.max_steps, _step_action(reply, extend), elapsed
         )
 
+    def _note_truncation(
+        self,
+        messages: list[Message],
+        on_progress: Callable[[], None] | None,
+        step: int,
+        stopped: str,
+        *,
+        ending: bool,
+    ) -> None:
+        """Record that a reply ran out of output budget — and, if it *ended* the turn, unfinish it.
+
+        `Engine.run` returns on ``not reply.tool_calls and not extend`` — and a final text the
+        vendor stopped at ``length`` is exactly that shape. The Delivery Guarantee reads a turn's
+        terminal narration as its **commit record**: the turn finished, the claim settles, the mark
+        advances, and no later wake ever looks at that message again. So a model cut off mid-thought
+        was filed as a model that finished and chose what to say — silently, on every provider,
+        because nothing read the finish reason the adapters had been reporting since issue #488.
+
+        **The line is written whatever happened; the two writes below happen only when the turn is
+        ending.** A truncated reply the loop is going to carry on from — its tools still to run, or
+        a hook extending it — is not the commit record, and stamping it would mark a turn that is
+        still working. It is still worth saying out loud: it is the model running out of room, and
+        the extending case is not exotic, because both shipped hooks extend on exactly the "no tool
+        calls" shape a truncated narration has. ``outcome=`` is what tells the two apart.
+
+        When the turn *is* ending, two writes, and they are deliberately one act:
+
+        - **the marker into the transcript**, so the *recovery* sees an unfinished turn. The
+          classifier's whole vocabulary is the transcript, and it must reach the same verdict on the
+          next wake — after this process is gone — as this one did in memory. The append is
+          persisted immediately (`_progress`), because a marker that only ever lived in RAM would
+          leave the on-disk turn reading as finished, which is the bug with an extra step.
+        - **the flag for this wake**, so `_wake` leaves the item it is driving **pending** rather
+          than committing it. Both are set here, together, so the live verdict and the persisted one
+          cannot drift.
+
+        `stopped` is the vendor's own word, **passed in rather than re-read**. It is the very value
+        the verdict was computed from, back beside the call that produced it — and by the time this
+        runs, the tool loop and a turn hook have both had their turn, either of which a later change
+        could give a model call of its own. Re-reading the adapter here would then report *that*
+        call's reason (or drop the field, since `kv` elides ``None``) on the one line this change
+        exists to make greppable.
+
+        What it deliberately does **not** do is retry with more room. The output budget is the
+        operator's (`model_params.json`), and the harness silently raising a number it does not own
+        to paper over a truncation would be tuning the agent behind the operator's back. Nor does it
+        drive the model further here: finishing an interrupted turn is a thing this repo already
+        does, once, in one place (`_wake._resume_orphan`), and a second mechanism for it would be a
+        second thing to keep correct.
+
+        **WARNING, not INFO**, for the reason the step cap is: the turn still returns a good-looking
+        string, so nothing downstream *looks* wrong — which is exactly why the event has to be
+        findable by a severity filter rather than buried in the INFO stream.
+        """
+        if ending:
+            self.output_truncated = True
+            messages.append(Message.system(_TRUNCATED_NOTE))
+            _progress(on_progress)
+        provider, model = describe_provider(self.provider)
+        _log.warning(
+            "turn truncated %s",
+            kv(
+                provider=provider,
+                model=model,
+                finish_reason=stopped,
+                step=step,
+                max_steps=self.max_steps,
+                outcome="unfinished" if ending else "continued",
+                reason="the vendor stopped this reply at the output budget",
+            ),
+        )
+
     def _reserve_summary(
         self, messages: list[Message], on_progress: Callable[[], None] | None = None
     ) -> Message:
@@ -807,6 +933,21 @@ def _progress(on_progress: Callable[[], None] | None) -> None:
         on_progress()
     except Exception as exc:  # noqa: BLE001 - a failed persist degrades the turn; it never ends it
         _log.error("Could not persist a turn in progress; some of its work may be lost: %s", exc)
+
+
+def is_truncation_note(message: Message) -> bool:
+    """Is this system turn `_TRUNCATED_NOTE` — the marker that unfinishes a cut-off turn? (#490)
+
+    The recovery's reader for it, living beside the constant it is written from, for the reason
+    `is_step_note` does: a reader that spells the marker for itself drifts from the writer the
+    first time the wording is touched, and nothing fails when it does — here, the classifier would
+    simply, silently, stop recognizing a truncated turn and go back to re-driving it forever.
+
+    Matched whole, not by prefix: the note is one fixed sentence the harness composes, never a
+    template, so there is nothing for a prefix match to buy and a peer's message quoting it back
+    would be the only thing it could ever gain.
+    """
+    return message.role == "system" and (message.content or "").strip() == _TRUNCATED_NOTE
 
 
 def is_step_note(message: Message) -> bool:

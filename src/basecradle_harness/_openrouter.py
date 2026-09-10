@@ -291,6 +291,11 @@ class OpenRouterProvider:
         #: matters most here: GLM publishes no tokenizer, so a client-side count could not even be
         #: honest. ``None`` until the first call answers.
         self.last_tokens_in: int | None = None
+        #: Why the endpoint stopped generating on that same call, in the vendor's own words —
+        #: the delivery guarantee's capability (issue #490). The engine asks one question of it, on
+        #: the reply that would end the turn: was the output budget spent mid-sentence? ``None``
+        #: until the first call answers, and whenever the vendor said nothing.
+        self.last_finish_reason: str | None = None
         #: Memoized answer to `supports_vision` (issue #228): a model's vision capability is a
         #: property of the model, not the turn, so it is read from OpenRouter at most once. ``None``
         #: means *not yet known* **or** last read was inconclusive — either way the next call retries,
@@ -357,6 +362,11 @@ class OpenRouterProvider:
         # Remember what we just logged: the context budget triggers on the *provider's* count, so
         # the same usage read that writes the log line feeds the compaction decision (issue #276).
         self.last_tokens_in = token_counts(usage).get("tokens_in")
+        reason = finish_reason(data)
+        # And why it stopped, for the one reader that judges whether the turn *finished*
+        # (issue #490): the same `finish_reason` this line already hands `log_llm_call`, kept where
+        # the engine can reach it without a `capture_llm_call` around every brain call.
+        self.last_finish_reason = reason
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -372,7 +382,7 @@ class OpenRouterProvider:
             cost=reported_cost(usage),
             # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
             # it got back is whole (issue #488).
-            finish_reason=finish_reason(data),
+            finish_reason=reason,
         )
         self._restore_annotations(data)
         return message_from_chat(data)

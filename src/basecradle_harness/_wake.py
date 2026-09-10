@@ -125,7 +125,7 @@ from basecradle_harness._describer import (
     describer_model_from_env,
     describer_providers_from_env,
 )
-from basecradle_harness._engine import compose_hooks
+from basecradle_harness._engine import compose_hooks, is_truncation_note
 from basecradle_harness._exceptions import (
     EngineError,
     HarnessError,
@@ -1321,6 +1321,9 @@ class WakeAgent:
         # Reset at the start of every wake (`wake`), so the first model call always attempts (the
         # self-heal probe).
         self._billing_blocked = False
+        #: Has a turn this wake ended cut off at the model's output budget? (issue #490)
+        #: While set, no further model work starts — see `_turn_truncated` for why.
+        self._unfinished_turn = False
         if onboard:
             # The persistent brief rides every model call (see `_wake_brief`) and carries the
             # personality charter (`system-prompt.md`) itself, so a static turn-0 seed would
@@ -1506,6 +1509,10 @@ class WakeAgent:
         # always attempts, so a wake after a human tops up the account self-heals. Only a billing
         # failure *this* wake re-arms it, short-circuiting the remaining calls.
         self._billing_blocked = False
+        # Reset the unfinished-turn latch (issue #490): a wake that leaves a turn cut off mid-answer
+        # stops starting new model work, so the evidence that turn's resume depends on cannot be
+        # compacted away by a later turn of this same wake. See `_turn_truncated`.
+        self._unfinished_turn = False
         outcome = "error"  # only a clean return past the reconciles earns another verdict
         try:
             if self._breaker_short_circuits():
@@ -2202,10 +2209,19 @@ class WakeAgent:
                     posted.append(ack)
                 ledger.append((uuid, _FINAL if ack is not None else _PENDING))
                 continue
-            if self._billing_blocked:
-                # An out-of-funds wall was hit earlier this wake; every model call now fails the same
-                # way (issue #336). Fail fast — do not claim or engage — and leave the item pending so
-                # it resumes on the next wake after funding.
+            if self._billing_blocked or self._unfinished_turn:
+                # Two reasons not to start another turn, and the ledger entry is the same for both:
+                # leave the item **pending** so the record does not pass it and the next wake takes
+                # it. *Out of funds* (issue #336) — every model call now fails the same way, so fail
+                # fast rather than hammering an unfunded account. *An unfinished turn* (issue #490)
+                # — a turn this wake left cut off is waiting on a resume, and its evidence is the
+                # transcript; every further turn this wake runs can compact that evidence away
+                # (`Session.send` ends in `_compact_if_needed`, and an over-length rescue compacts
+                # hard), after which the next wake reads "no turn" and **abandons the item** rather
+                # than finishing it. Stopping is what keeps `_recover`'s answer available. The items
+                # left here are deferred, never dropped: unclaimed, unrecorded, and re-read next
+                # wake — the same outcome `_generate_settled` already gives a message that lands
+                # during its final build.
                 ledger.append((uuid, _PENDING))
                 continue
             if self.claims.claim(self.timeline_uuid, uuid, kind=kind):
@@ -2243,12 +2259,23 @@ class WakeAgent:
                 ledger.append((uuid, disposition))
                 continue
             self._unspoken(narration)
+            truncated_turn = self._turn_truncated(kind=kind, item=uuid)
             # **Memory observes every engaged turn — posted or silent** (issue #293). It used to
             # fire only when a reply posted, which under silence-default would quietly drop facts
             # arriving in items the agent chose not to answer: a peer's birthday mentioned in a
             # message the agent had no reason to reply to must still be recallable, from any
             # timeline, later. The exchange is real whether or not anyone else heard it.
             self._observe(_dialogue_of(item, kind), narration)
+            if truncated_turn:
+                # The turn is unfinished, so it is **not committed** (issue #490): the claim stays
+                # in-flight, the record stops here, and the next wake finishes the turn. It *is*
+                # mined, above — a fragment is still the model's own words, and the peer's half is
+                # real whatever happened on our side (`_observe`'s `_STUCK_NOTE` precedent). The
+                # duplicate the resume then writes is a retrieval cost; withholding the mine would
+                # bet the peer's words on a resume that has three documented ways never to happen
+                # (`_drop` twice, `_abandon` once), and lose them from every timeline when it does.
+                ledger.append((uuid, _PENDING))
+                continue
             # **The claim settles the instant its turn ends — not at `_settle`, and this is not
             # tidiness.** `_act_on` runs one turn *per item*, and a later item's turn can compact the
             # transcript (`Session.send` ends in `_compact_if_needed`, and an over-length rescue
@@ -2353,10 +2380,65 @@ class WakeAgent:
         log_unspoken(text, timeline=self.timeline_uuid, kind=self._narration_kind())
 
     def _narration_kind(self) -> str:
-        """Which of the three unspoken endings this turn produced (see `_unspoken`)."""
+        """Which of the four unspoken endings this turn produced (see `_unspoken`)."""
         if self._degraded:
             return "stuck"
-        return "reserve" if self.harness.engine.reserve_used else "narration"
+        if self.harness.engine.reserve_used:
+            return "reserve"
+        return "truncated" if self.harness.engine.output_truncated else "narration"
+
+    def _turn_truncated(self, *, kind: str, item: str | None) -> bool:
+        """Did the turn just run end on a final text the vendor cut off? (issue #490)
+
+        The engine's per-run verdict, read at the three places a turn ends — the batched message
+        reply, `_act_on`'s one-item turn, and a resume — because all three do the same thing with
+        it: **leave the item pending.** A truncated final text is a fragment, and the Delivery
+        Guarantee reads a turn's terminal narration as its commit record; committing a fragment
+        settles the claim, advances the mark, and the peer is never answered by anybody. Left
+        pending, the claim stays in-flight, the mark holds behind it, and the next wake finds an
+        orphan whose turn is unfinished and **finishes it** — the mechanism issue #297 already
+        built, rather than a second one.
+
+        The engine has already logged the truncation against the *provider*; this line names the
+        *item*, which is what a forensic dig starts from, and says what the harness decided to do
+        about it. Both are WARNING for the same reason: the turn produced a perfectly good-looking
+        string, so nothing downstream looks wrong.
+
+        **It never speaks.** A truncated turn is a harness-side fact about the model, not news the
+        harness may post — the Unspoken Channel's two sanctioned harness-authored posts are both
+        cases where the model could not be *reached*, and here it answered.
+
+        **It also latches the wake, and that is not tidiness — it is what keeps the resume's
+        evidence alive.** Leaving an item pending would otherwise reopen the one exposure #289
+        closed by committing a claim the instant its turn ends: this wake is still running, and
+        every further turn it drives can compact the transcript (`Session.send` ends in
+        `_compact_if_needed`, and an over-length rescue compacts *hard*). A compaction that destroys
+        the unfinished turn changes the next wake's verdict from **resume** to **abandon**
+        (`_evidence_lost`) — the peer dropped, by the machinery meant to answer them. So
+        `_unfinished_turn` stops this wake starting new model work, exactly as the out-of-funds wall
+        does, and the invariant #289 states holds unchanged: a wake leaves at most one in-flight
+        claim per kind. The items behind the latch are **deferred, never dropped** — unclaimed,
+        unrecorded, re-read next wake, the same outcome `_generate_settled` already gives a message
+        that lands during its final build.
+        """
+        if not self.harness.engine.output_truncated:
+            return False
+        self._unfinished_turn = True
+        _log.warning(
+            "%s %s",
+            head("wake truncated_turn", YELLOW),
+            kv(
+                item=item,
+                kind=kind,
+                timeline=self.timeline_uuid,
+                delivery=delivery_id(),
+                reason=(
+                    "the model's final text was cut off at the output budget, so the turn is "
+                    "unfinished; leaving it pending for the next wake to finish"
+                ),
+            ),
+        )
+        return True
 
     def _wake_brief(self, *, query: str | None = None) -> str | None:
         """This wake's persistent operating brief — composed once, handed to every model call.
@@ -2829,11 +2911,12 @@ class WakeAgent:
             # are not re-read forever.
             self._settle(_MESSAGES)
             return posted
-        if self._billing_blocked:
-            # A recovery resume above hit an out-of-funds wall (messages is the first reconcile, so
-            # this is the only way the latch is set here). Leave the claimed batch pending — mark it
-            # `_PENDING` and settle, so the claims stay in-flight, the mark is held behind them, and
-            # the bootstrap declines to baseline over them (issue #336). It re-drives after funding.
+        if self._billing_blocked or self._unfinished_turn:
+            # A recovery resume above hit an out-of-funds wall, or left a turn cut off at the output
+            # budget (messages is the first reconcile, so a resume is the only way either latch is
+            # set here). Leave the claimed batch pending — mark it `_PENDING` and settle, so the
+            # claims stay in-flight, the mark is held behind them, and the bootstrap declines to
+            # baseline over them (issues #336, #490). The next wake takes them.
             self._ledger[_MESSAGES] = [
                 (uuid, _PENDING if d == _OURS else d) for uuid, d in self._ledger[_MESSAGES]
             ]
@@ -2867,12 +2950,21 @@ class WakeAgent:
         # `messages` tool, mid-turn, because it chose to (issue #293). What is left is its final
         # text, and that is **unspoken**: written to its log and its memory, never posted.
         self._unspoken(narration)
+        truncated_turn = self._turn_truncated(kind=_MESSAGES, item=_uuid_of(batch[0]))
         # **Memory observes the turn unconditionally** — spoken or silent. The old guard
         # (`if reply.strip()`) is not merely unnecessary now, it would be *wrong*: under
         # silence-default the most valuable exchange to remember can be exactly the one that
         # produced no reply — a peer states a fact in passing, the agent rightly says nothing, and
         # the fact must still be recallable from another timeline a month later.
         self._observe(_render_batch(batch), narration)
+        if truncated_turn:
+            # The turn is unfinished (issue #490). Flip this batch's `_OURS` entries to `_PENDING`
+            # — exactly as the billing wall does — so `_settle` commits none of them, the mark holds
+            # behind the oldest, and the bootstrap declines to baseline over them. The next wake
+            # finds the orphan and finishes the turn.
+            self._ledger[_MESSAGES] = [
+                (uuid, _PENDING if d == _OURS else d) for uuid, d in self._ledger[_MESSAGES]
+            ]
         # The turn ran to completion, and its narration is journaled — which *is* the commit
         # record (issue #293). Commit the claims, then move the mark. A crash *before* this line
         # is the recoverable case, and the transcript says how far the turn got.
@@ -3032,12 +3124,17 @@ class WakeAgent:
            to say, it said itself, with its tools; everything it decided not to say was a decision.
            **Commit.** Tested before the tool check on purpose: a turn that ran tools *and* settled
            is a completed turn, not an interrupted one.
-        3. **The turn issued tool calls** → the wake died mid-chain. Its calls may have fired, so a
-           re-drive would fire them again — and it does not need one, because their results are on
-           disk. **Resume** it: let the model finish the turn it started (`_resume_orphan`). The
-           evidence is the *call*, not the result: a wake killed between the write and the POST is
-           resumed, not re-driven, because the alternative is a message posted twice.
-        4. **A turn, no calls, no narration** → it died inside the model call (the provider was
+        3. **The turn issued tool calls, or its final text was cut off** → it is unfinished, and
+           the answer is the same for both: **resume** it — let the model finish the turn it
+           started (`_resume_orphan`). For a tool-call turn the reason is *safety*: the calls may
+           have fired, so a re-drive would fire them again, and it needs none because their results
+           are on disk (the evidence is the *call*, not the result — a wake killed between the
+           write and the POST is resumed, not re-driven, because the alternative is a message
+           posted twice). For a turn the vendor cut off at its output budget (issue #490,
+           `_turn_cut_off`) the reason is *progress*: nothing fired, so a re-drive would be safe —
+           it just would not work, because the same input under the same budget truncates in the
+           same place, forever. Continuing from the fragment converges; repeating it does not.
+        4. **A turn, no calls, no text at all** → it died inside the model call (the provider was
            down, the box was killed). Nothing ran. **Re-drive**, after excising the dead turn's
            inert residue, so the transcript does not accumulate a duplicate user turn per crash.
 
@@ -3124,7 +3221,7 @@ class WakeAgent:
         if _turn_narration(work) is not None:
             return self._committed(item, kind)
 
-        if any(message.tool_calls for message in work):
+        if any(message.tool_calls for message in work) or _turn_cut_off(work):
             already = self._resumed_outcome(turn)
             if already is not None:
                 # This wake already finished (or failed to finish) this very turn for an older
@@ -3136,7 +3233,11 @@ class WakeAgent:
         # before re-driving — the user turn is on disk now (it was not, before incremental
         # persistence), so leaving it would stack a duplicate copy of the peer's message into the
         # transcript on every failed wake, forever. Safe precisely because we just proved the turn
-        # issued no tool calls: there is nothing in it but a step note and a failure marker.
+        # issued no tool calls: there is nothing in it that ran. (A turn *cut off* at the output
+        # budget went to the resume above — it has something worth continuing, and re-driving it
+        # would only reproduce it. What still lands here is a turn that produced nothing, or one
+        # whose model call **raised** after producing text and carries the `[turn failed: …]` note;
+        # both are re-driven for the same reason they always were — nothing in either one ran.)
         disposition = self._redrive(item, claim, "the wake died inside the model call", kind)
         if disposition == _OURS:
             session.excise(turn)
@@ -3173,10 +3274,11 @@ class WakeAgent:
         a second time.
         """
         uuid = item.content.uuid
-        if self._billing_blocked:
-            # An out-of-funds wall was hit earlier this wake; a resume is a model call and would fail
-            # the same way (issue #336). Leave the orphan for the next wake, which retries after
-            # funding — do not even take the claim over.
+        if self._billing_blocked or self._unfinished_turn:
+            # A resume is a model call, and this wake has a reason not to make one: it is out of
+            # funds (issue #336), or it has already left a turn cut off whose own evidence a further
+            # turn could compact away (issue #490). Leave the orphan for the next wake — do not even
+            # take the claim over.
             return _PENDING
         if not self.claims.reclaim(self.timeline_uuid, uuid, kind=kind, owner=claim.wake):
             return _PENDING  # another recovering wake won the take-over; let it finish the turn
@@ -3215,12 +3317,22 @@ class WakeAgent:
                 narration = self._stuck_note(error)
             self._model_ok()  # a call got through → clear any billing-blocked marker (issue #336)
             self._unspoken(narration)
+            truncated_turn = self._turn_truncated(kind=kind, item=uuid)
             # A resumed **message** turn is mined from `rendered`, not from the item: the dead
             # wake's turn may have carried a *batch* (`_render_batch`), and mining the one item
             # that owned the claim would forget the peers it was answered alongside. That
             # rendering is already dialogue — every other kind's is not (`_dialogue_of`).
             self._observe(rendered if kind == _MESSAGES else _dialogue_of(item, kind), narration)
-            self.claims.commit(self.timeline_uuid, uuid, kind=kind)
+            if truncated_turn:
+                # The continuation was itself cut off (issue #490). The turn is still unfinished, so
+                # it does not commit — the claim this wake just reclaimed stays in-flight, naming
+                # *this* wake, and the next one finds it orphaned and resumes again against a
+                # transcript carrying everything both attempts managed. Repeating means the output
+                # budget is too small for what this turn is trying to say; the WARNING is what says
+                # so, and the budget is the operator's to change, never the harness's.
+                disposition = _PENDING
+            else:
+                self.claims.commit(self.timeline_uuid, uuid, kind=kind)
         except ProviderContextLengthError as error:
             # The transcript has outgrown the model's window and **cannot be compacted** — the
             # session already tried, and declined. Retrying next wake would fail identically, and
@@ -3966,6 +4078,25 @@ def _turn_work(history: list[Message], turn: Message) -> list[Message]:
     return turn_work(history, turn)
 
 
+def _turn_cut_off(work: list[Message]) -> bool:
+    """Was this turn's final text cut off at the vendor's output budget? (issue #490)
+
+    The second shape of *unfinished*, and the classifier treats it exactly as it treats the first
+    (a turn that ran tools): **continue it, never re-drive it.** The reason is not safety here —
+    nothing fired, so a re-drive would be safe — it is that a re-drive would not *work*. The input
+    and the output budget are both unchanged, so the fresh turn truncates at the same place, and
+    the peer is answered by nobody, forever, one wake at a time. A resume makes progress: the
+    fragment is in the transcript, the model continues from where it stopped, and each continuation
+    has less left to say.
+
+    Read with `_engine.is_truncation_note` — the writer's own recognizer — and over the **whole**
+    turn rather than its last message, because a resume that then failed leaves its own residue
+    behind the marker (a step note, a failure marker), and that residue must not read as "nothing
+    to continue".
+    """
+    return any(is_truncation_note(message) for message in work)
+
+
 def _turn_narration(work: list[Message]) -> str | None:
     """The terminal narration a turn settled on, or ``None`` if it never got that far.
 
@@ -3988,6 +4119,13 @@ def _turn_narration(work: list[Message]) -> str | None:
 
     So: the work must **end** on an assistant turn with real content and no tool calls. That is what
     the engine leaves behind when — and only when — it actually returned.
+
+    **And "returned" is not the same as "finished"** (issue #490). A final text the vendor cut off
+    at its output budget is that exact shape — the engine returns it, because the fragment is real
+    — so the engine stamps `_engine._TRUNCATED_NOTE` onto the turn before returning, which puts a
+    `system` turn last and makes this function answer ``None`` without needing to know anything
+    about vendors or output budgets. The one definition of the commit record stays one definition;
+    what changed is what the engine leaves behind for it to read.
     """
     if not work:
         return None

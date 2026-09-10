@@ -22,6 +22,18 @@ vendor branch, and never fatally. Two belong to the context budget (issue #276):
   window anywhere and so answers ``None``. There is deliberately **no static model→limit table** —
   it cannot express a router's reality and it rots silently.
 
+One belongs to the delivery guarantee (issue #490):
+
+- **`last_finish_reason: str | None`** — why the endpoint stopped generating on the adapter's most
+  recent call, in the vendor's own words. Recorded beside `last_tokens_in`, off the one reader every
+  adapter already feeds its `llm` line (`_observability.finish_reason`), so no adapter grows a vendor
+  branch for it. The engine reads it at exactly one moment — the reply that would **end** the turn —
+  and asks one question of it (`_observability.truncated`): *did the output budget run out?* A final
+  text cut off at ``length`` is a **fragment**, and the Delivery Guarantee reads a turn's terminal
+  narration as its commit record — so a truncated one is filed as a model that finished and chose
+  what to say, its claim settles, and the peer is never answered. Unanswered by an adapter it costs
+  a truncation nobody detects, which is the pre-#490 behavior on every provider.
+
 Two more belong to prompt caching (issues #277, #431):
 
 - **`cache_mode: "automatic" | "explicit" | "none"`** — how this adapter's endpoint reaches its
@@ -71,8 +83,9 @@ A fifth belongs to perception (issue #228):
   explicit-cache vendor owns `cache_mode`.
 
 An adapter that implements none of them still works: the budget falls back to a conservative floor,
-with no usage to read it never triggers compaction, nothing is placed on the wire, no conversation is
-bound, and every image is shown. A capability is a question, not a contract.
+with no usage to read it never triggers compaction, a truncated turn goes undetected exactly as it
+did before #490, nothing is placed on the wire, no conversation is bound, and every image is shown.
+A capability is a question, not a contract.
 """
 
 from __future__ import annotations

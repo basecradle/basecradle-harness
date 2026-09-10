@@ -58,20 +58,28 @@ class _FakeConversation:
 
 
 class _FakeChatClient:
-    """Stands in for ``client.chat``: records the create() payload, returns a canned Response."""
+    """Stands in for ``client.chat``: records the create() payload, returns a canned Response.
 
-    def __init__(self, response):
-        self._response = response
+    Takes one response, or several — the last one repeats, so a single-response client answers
+    every call with it (what almost every test wants) while a test that needs to watch state
+    *change across calls* can hand over a sequence.
+    """
+
+    def __init__(self, *responses):
+        self._responses = list(responses)
         self.captured: dict | None = None
+        self.calls = 0
 
     def create(self, **kwargs):
         self.captured = kwargs
-        return _FakeConversation(self._response)
+        response = self._responses[min(self.calls, len(self._responses) - 1)]
+        self.calls += 1
+        return _FakeConversation(response)
 
 
 class _FakeClient:
-    def __init__(self, response):
-        self.chat = _FakeChatClient(response)
+    def __init__(self, *responses):
+        self.chat = _FakeChatClient(*responses)
         self.closed = False
 
     def close(self):
@@ -928,6 +936,41 @@ def test_the_native_response_finish_reason_is_recorded_for_a_capturing_caller():
         provider.chat([Message.user("describe it")])
 
     assert call.finish_reason == "REASON_MAX_LEN"
+
+
+def test_the_last_finish_reason_is_remembered_for_the_delivery_guarantee():
+    """Issue #490: the same read, kept on the adapter where the **engine** can reach it."""
+    response = _response(content="Half a sen")
+    response.finish_reason = "REASON_MAX_LEN"
+    provider = _provider(response)
+
+    assert provider.last_finish_reason is None  # nothing to report before the first call
+    provider.chat([Message.user("write me an essay")])
+
+    assert provider.last_finish_reason == "REASON_MAX_LEN"
+
+
+def test_a_later_call_clears_it_rather_than_keeping_the_last_one_it_had():
+    """**Every call overwrites it, including a call that reports nothing.**
+
+    The natural-looking "don't clobber a good value with nothing" edit
+    (``self.last_finish_reason = reason or self.last_finish_reason``) is the dangerous one: one
+    truncated turn would then make *every* later turn read as truncated, so no item would ever
+    commit, the mark would never advance, and the agent would resume the same timeline forever
+    while answering nobody. It is asserted here because a single-call test cannot see it.
+    """
+    truncated_reply = _response(content="Half a sen")
+    truncated_reply.finish_reason = "REASON_MAX_LEN"
+    silent_reply = _response(content="ok")  # no `finish_reason` attribute at all
+    provider = XaiSdkProvider(
+        "grok-4.3", api_key=FAKE_KEY, client=_FakeClient(truncated_reply, silent_reply)
+    )
+
+    provider.chat([Message.user("write me an essay")])
+    assert provider.last_finish_reason == "REASON_MAX_LEN"
+
+    provider.chat([Message.user("hi")])
+    assert provider.last_finish_reason is None
 
 
 def test_a_response_that_names_no_finish_reason_records_none():

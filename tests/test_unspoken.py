@@ -401,6 +401,7 @@ def _model_facing_strings():
     from basecradle_harness._brief import render_budget, render_defects, render_safety
     from basecradle_harness._engine import (
         _RESERVE_NUDGE,
+        _TRUNCATED_NOTE,
         _server_builtin_guidance,
         _step_note,
     )
@@ -417,6 +418,10 @@ def _model_facing_strings():
         "step note (terse)": _step_note(1, 24, now),
         "step note (escalated)": _step_note(23, 24, now),
         "builtin guidance": _server_builtin_guidance("web_search"),
+        # A resume replays the transcript up to the interruption, so the model reads this one as
+        # its own account of what happened to it (issue #490) — which puts it squarely on this
+        # surface, whatever its `system` role suggests.
+        "truncation note": _TRUNCATED_NOTE,
         "mention nudge": MENTION_NUDGE,
         "one-on-one nudge": ONE_ON_ONE_NUDGE,
     }
