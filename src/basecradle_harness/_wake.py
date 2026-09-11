@@ -4506,8 +4506,13 @@ def resolved_config() -> dict[str, object]:
     - ``tools`` — the resolved active **function** tool names, sorted.
     - ``builtins`` — the resolved active server-side **built-in** wire names, sorted (e.g. the
       Responses ``web_search``); a live capability the tool-set axis must count.
-    - ``skipped`` — the names of plugins that did **not** activate, sorted — the auditable "why
-      isn't this tool here?" trail (a diagnostic, not part of the active set).
+    - ``skipped`` — the names this config did **not** get, sorted — the auditable "why isn't this
+      tool here?" trail (a diagnostic, not part of the active set). It never names an active tool
+      (issue #497): two plugins may share one model-facing name under different `requires`, so on
+      every provider the other variant is unmet — @jt reported its live, working ``code_execution``
+      here on 6,776 consecutive introspect rows while drift read in-sync, the "declared but
+      silently not loaded" shape inverted. The invariant is held in `ResolvedTools` itself, so this
+      emitter simply prints what it is handed.
     - ``opt_in_tools`` — the active **opt-in** (powerful) tools' source-file **stems**, sorted
       (issue #181). The stem is the unit the fleet inventory keys a powerful tool on, and is
       **not** 1:1 with the resolved ``tools``/``builtins`` names (one stem can fan out — e.g.

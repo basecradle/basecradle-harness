@@ -361,6 +361,10 @@ def resolve_stems(
         claimed=claimed,
         refused=refused,
         broken=broken,
+        # The settled active **names** — the same `manifest` authority `ResolvedTools.__post_init__`
+        # filters its own `skipped` against, read off the resolution this report describes rather
+        # than recomputed here, so the two surfaces cannot disagree about what "active" means.
+        active=frozenset(name for name, _note in resolved.manifest),
         ctx=ctx,
     )
     return {
@@ -454,6 +458,7 @@ def _attribute(
     claimed: Mapping[str, ToolPlugin],
     refused: Mapping[str, str],
     broken: Sequence[Mapping[str, str]],
+    active: frozenset[str],
     ctx: ActivationContext,
 ) -> tuple[dict[str, dict[str, object]], list[dict[str, str]], list[dict[str, str]]]:
     """Attribute every resolved (and every unresolved) name back to the stem that produced it.
@@ -466,7 +471,12 @@ def _attribute(
       conditional on.
     - **skipped** — the flat, name-level "why isn't this tool here?" trail, each entry attributed
       to its stem. The counterpart of ``--resolved-config``'s ``skipped``, with the attribution
-      that surface has no way to carry.
+      that surface has no way to carry — and being its counterpart it holds the same invariant
+      (issue #497): **a name in `active` is never in it**, so a variant shadowed by another plugin
+      claiming the same model-facing name (``code_execution``'s two provider variants) does not
+      read as a capability the config failed to get. The *per-stem* ``skipped`` is unfiltered by
+      design: it is that stem's own trail, and an active stem carrying skips is the shape
+      `_StemReport.as_json` already documents.
     - **excluded_stems** — the stem-level exclusions decided *before* activation ran: not granted,
       or not relevant to this provider. A *name* is skipped; a *stem* is excluded — different
       things, so they are different lists.
@@ -533,7 +543,8 @@ def _attribute(
             report.credentials |= _plugin_credentials(plugin)
             continue
         report.skipped.append({"name": name, "reason": reason})
-        skipped.append({"name": name, "stem": stem, "reason": reason})
+        if name not in active:  # a name the config *got* is not a "why isn't this tool here?"
+            skipped.append({"name": name, "stem": stem, "reason": reason})
 
     skipped.sort(key=lambda item: (item["name"], item["stem"]))
     return {stem: report.as_json() for stem, report in reports.items()}, skipped, excluded

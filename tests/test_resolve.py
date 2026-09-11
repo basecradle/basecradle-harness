@@ -345,6 +345,40 @@ def test_code_execution_resolves_differently_under_xai():
     assert any(item["name"] == "code_attach" for item in entry["skipped"])
 
 
+def test_the_flat_skipped_trail_never_names_a_tool_the_config_got():
+    """`skipped` here is ``--resolved-config``'s counterpart, so it holds the same invariant (#497).
+
+    Both surfaces are read by the same fleet audit, so a name that is absent from one and present
+    in the other is worse than either answer alone. `code_execution` is active under both providers
+    — by the *model-facing* name, via a different built-in each time — so neither flat trail names
+    it, while the per-stem trail still carries the shadowed variant's reason, which is the surface
+    built to hold that attribution.
+    """
+    for provider, sdk in (("openai", "openai"), ("xai", "xai-sdk")):
+        report = resolve_stems(provider=provider, sdk=sdk, opt_in="code_execution")
+
+        assert not [item for item in report["skipped"] if item["name"] == "code_execution"]
+        entry = report["stems"]["code_execution"]
+        assert entry["status"] == "active"
+        assert any(item["name"] == "code_execution" for item in entry["skipped"])
+
+
+def test_the_flat_skipped_trail_still_names_what_this_config_never_got():
+    """The other direction: a name no plugin claims is as loud as it ever was.
+
+    Under xAI `code_attach` has no variant to activate — the input-file bridge is OpenAI-only — so
+    it is a genuine absence and belongs in the flat trail with its reason. A filter written against
+    the wrong authority (the claimed plugins before the policy gate, say) would have taken this
+    with it, turning a fix for a false positive into a false negative.
+    """
+    report = resolve_stems(provider="xai", sdk="xai-sdk", opt_in="code_execution")
+
+    absent = [item for item in report["skipped"] if item["name"] == "code_attach"]
+    assert len(absent) == 1
+    assert absent[0]["stem"] == "code_execution"
+    assert "openai" in absent[0]["reason"]
+
+
 def test_shell_is_refused_under_locked_and_resolves_under_unlocked():
     """The profile gate, both directions — the axis a shell-class enablement turns on.
 
