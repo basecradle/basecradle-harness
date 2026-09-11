@@ -8,6 +8,8 @@ of two same-named plugins activates per config, and the config-home overlay is a
 once installed (else the packaged defaults load).
 """
 
+from dataclasses import replace
+
 import pytest
 
 from basecradle_harness import (
@@ -170,6 +172,79 @@ def test_exactly_one_of_two_same_named_variants_activates_per_config():
 
     assert [type(t) for t in under_chat.tools] == [_Echo]
     assert [type(t) for t in under_responses.tools] == [_Other]
+
+
+def test_skipped_never_names_a_tool_the_config_actually_got():
+    """The invariant issue #497 closed: `skipped` means "this config did not get this name".
+
+    Two plugins sharing one model-facing name is the *supported* shape — it is how one stem serves
+    two providers (``code_execution`` is OpenAI's Code Interpreter **and** xAI's native executor).
+    So on every provider one variant activates and the other is unmet, and the unmet one used to be
+    appended under the **same name the agent is actively using**. @jt's ``--resolved-config``
+    reported its live, working ``code_execution`` as skipped on 6,776 consecutive introspect rows,
+    with fleet drift reading in-sync throughout: the exact "declared but silently not loaded" shape
+    the NOC's guards exist for, inverted into a false positive. The tool worked; the report lied.
+    """
+    openai_variant = ToolPlugin(
+        builtin="code_interpreter",
+        name="code_execution",
+        requires=(Vendor("openai"), OpenAISurface("responses")),
+    )
+    xai_variant = ToolPlugin(
+        builtin="code_execution", name="code_execution", requires=(Vendor("xai"),)
+    )
+    plugins = [openai_variant, xai_variant]
+
+    under_openai = resolve_plugins(plugins, _ctx())
+    under_xai = resolve_plugins(plugins, _ctx(provider="xai", sdk="xai-sdk", surface="native"))
+
+    # Active on both, by the *model-facing* name — which lives in the manifest, not in `builtins`
+    # (a built-in's wire name differs: `code_execution` is served by `code_interpreter` on OpenAI).
+    for resolved in (under_openai, under_xai):
+        assert [name for name, _note in resolved.manifest] == ["code_execution"]
+        assert [name for name, _reason in resolved.skipped] == []
+    assert under_openai.builtins == ["code_interpreter"]
+    assert under_xai.builtins == ["code_execution"]
+
+
+def test_a_name_no_plugin_claims_is_still_reported_skipped_with_its_reason():
+    """The other direction, which the filter must not swallow: neither variant met.
+
+    The trail is what it always was — every unmet variant, with the requirement that failed — so a
+    genuinely absent capability is as loud as before. Filtering an *active* name out of `skipped`
+    only narrows it where the name is present; it never makes an absence quieter.
+    """
+    plugins = [
+        ToolPlugin(builtin="code_interpreter", name="code_execution", requires=(Vendor("openai"),)),
+        ToolPlugin(builtin="code_execution", name="code_execution", requires=(Vendor("xai"),)),
+    ]
+
+    resolved = resolve_plugins(plugins, _ctx(provider="openrouter", sdk="openrouter"))
+
+    assert resolved.manifest == []
+    assert [name for name, _reason in resolved.skipped] == ["code_execution", "code_execution"]
+    assert all("provider" in reason for _name, reason in resolved.skipped)
+
+
+def test_a_refused_name_stays_skipped_because_the_manifest_loses_it_too():
+    """The invariant reads the manifest, and the manifest is why a *removal* still reports.
+
+    Every path that drops an active tool prunes its manifest entry in the same `replace` that
+    records the skip (`_apply_safe_policy`, `_resolve._apply_policy`, a failed MCP server), so the
+    filter sees the name as inactive and leaves the skip alone. A filter keyed on anything else —
+    the claimed plugins, the pre-policy set — would silently hide a policy refusal, which is the
+    one thing `skipped` most has to say.
+    """
+    resolved = resolve_plugins([ToolPlugin(impl=_Echo)], _ctx())
+    assert [name for name, _note in resolved.manifest] == ["echo"]
+
+    # What a policy filter does, in the one `replace` those paths use: drop the tool and its
+    # manifest entry, record the skip.
+    filtered = replace(
+        resolved, tools=[], manifest=[], skipped=[("echo", "refused by the safe-by-default policy")]
+    )
+
+    assert [name for name, _reason in filtered.skipped] == ["echo"]
 
 
 # --- behavior-preserving: the packaged defaults under each provider ----------

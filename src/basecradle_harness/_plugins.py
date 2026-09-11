@@ -356,8 +356,18 @@ class ResolvedTools:
             `Harness`/`ToolRegistry` (which still applies the policy gate on top).
         builtins: The active server-side built-in wire names — handed to the provider (e.g.
             the Responses adapter's ``builtin_tools``).
-        skipped: ``(name, reason)`` for every plugin that did **not** activate, for logging —
-            the visible "why isn't this tool here?" trail.
+        skipped: ``(name, reason)`` for every name this config did **not** get — the visible
+            "why isn't this tool here?" trail, and a diagnostic, never part of the active set.
+            **The invariant is that a name the agent *got* is never in it** (issue #497), held
+            in `__post_init__` against `manifest` so it survives every later appender and every
+            `dataclasses.replace` — the emitters (``--resolved-config``, the skip log) read it
+            and need know nothing. Without that it said the opposite of what its readers assume:
+            two plugins may share one model-facing name under different `requires`
+            (``code_execution`` is the OpenAI Code Interpreter **and** xAI's native executor), so on
+            either provider the *other* variant is unmet and appended — and @jt reported its live,
+            working ``code_execution`` as skipped on 6,776 consecutive introspect rows. A shadowed
+            variant's reason is not lost, it is simply not this list's question: it rides the
+            per-stem trail `basecradle-harness-resolve` exists to carry.
         manifest: ``(name, note)`` for every **active** tool — function tools and built-ins
             alike, in resolution order — the source the persistent Turn-0 brief renders into
             its "Your active tools right now" block. ``note`` is the plugin's optional gotcha,
@@ -435,6 +445,40 @@ class ResolvedTools:
     #: for any config with no active MCP image source (the common case).
     mcp_images: McpImageStore | None = None
 
+    def __post_init__(self) -> None:
+        """Hold `skipped`'s one invariant: it never names a tool this config actually got.
+
+        `manifest` is the authority, and deliberately so — it is the only field carrying the
+        **model-facing** names of *every* active entry, function tools and built-ins alike (a
+        built-in's `builtins` entry is its *wire* name: ``code_execution`` is served by
+        ``code_interpreter``). Every path that adds or removes an active tool keeps the two in
+        lockstep already (`_merge_memory_tools`, `_merge_mcp_tools`, `_apply_safe_policy`,
+        `_resolve._apply_policy`), so reading the filter off it is the same single source of truth
+        those paths maintain rather than a second model of "what is active" that could disagree
+        with them.
+
+        Enforced here rather than at each emitter because there are four appenders and one
+        invariant: a policy refusal prunes the manifest in the same ``replace`` that records the
+        skip, so it stays (correctly) reported, while a variant whose name another plugin claimed
+        drops out wherever it was added. A *duplicate MCP tool name* is filtered by the same rule
+        and for the same reason — the name **is** served, by the server that claimed it first — and
+        its loud `_log.warning` is untouched.
+
+        **One stated gap**, because `skipped` mixes three namespaces (tool names, MCP *server*
+        names, and broken-default *filenames*) and only the first is what this filters on: an MCP
+        server named exactly after an active function tool — ``mcp/assets.json`` — loses its
+        structured "did not load" entry here if it fails, though it still logs at ``WARNING`` and
+        still names ``mcp_servers`` in ``--resolved-config`` (which reports the *configured* set by
+        design). Closing it needs provenance on each entry, which is a shape change this fix does
+        not make; a filename cannot collide (it carries ``.py``), and a server name only can when
+        an operator names one after a shipped tool.
+        """
+        active = {name for name, _note in self.manifest}
+        if any(name in active for name, _reason in self.skipped):
+            object.__setattr__(
+                self, "skipped", [entry for entry in self.skipped if entry[0] not in active]
+            )
+
 
 def plugin_env_dependencies(plugin: ToolPlugin) -> list[str]:
     """Every environment variable `plugin` depends on, sorted — gated and ungated alike.
@@ -493,13 +537,12 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
     plugins are then split into instantiated function tools and built-in names.
 
     Inactive plugins are recorded in `skipped` with their unmet reason and logged once, so an
-    OpenAI-coupled tool dropping under the wrong provider is *visible*, not silent.
+    OpenAI-coupled tool dropping under the wrong provider is *visible*, not silent. The log is
+    emitted from the **settled** `ResolvedTools.skipped`, after its invariant has run, so the line
+    and the field can only ever say the same thing — a second "is this name claimed?" filter here
+    is exactly the parallel model that let the field and the log disagree (issue #497).
     """
     claimed, skipped = claim_plugins(plugins, ctx)
-
-    for name, reason in skipped:
-        if name not in claimed:  # only note a name that ends up with no active provider
-            _log.info("Tool plugin %r inactive: %s.", name, reason)
 
     tools: list[Tool] = []
     builtins: list[str] = []
@@ -528,7 +571,7 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
     env_dependencies = {
         name: deps for name, plugin in claimed.items() if (deps := plugin_env_dependencies(plugin))
     }
-    return ResolvedTools(
+    resolved = ResolvedTools(
         tools=tools,
         builtins=builtins,
         skipped=skipped,
@@ -536,6 +579,9 @@ def resolve_plugins(plugins: Iterable[ToolPlugin], ctx: ActivationContext) -> Re
         opt_in_stems=opt_in_stems,
         env_dependencies=env_dependencies,
     )
+    for name, reason in resolved.skipped:  # only a name that ends up with no active provider
+        _log.info("Tool plugin %r inactive: %s.", name, reason)
+    return resolved
 
 
 # --- loading plugin files -----------------------------------------------------

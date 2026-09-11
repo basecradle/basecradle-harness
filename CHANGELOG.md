@@ -7,6 +7,50 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.120.1] - 2026-09-10
+
+### Fixed: `skipped` no longer names a tool the agent is actively using (issue #497)
+
+The NOC reported that `@jt`'s declared opt-in `code_execution` sat in `--resolved-config`'s
+`skipped` list on **6,776 consecutive introspect rows since 2026-06-27**, with fleet drift reading
+in-sync throughout — the "declared but silently not loaded" shape its guards exist for. The tool was
+working the whole time. The *report* was lying.
+
+Two plugins share the one model-facing name `code_execution` under different `requires` — OpenAI's
+Code Interpreter (`openai` + `responses`) and xAI's native executor (`xai`) — which is the supported
+way one stem serves two providers, and exactly one activates per config. The other was recorded as a
+skip **under the name the agent was actively using**, so `skipped` said the opposite of what its
+readers assume. The same was true on any xAI agent with the opt-in, with the variants reversed.
+
+- **`ResolvedTools` now holds the invariant itself**: `skipped` never names an entry in `manifest`.
+  `manifest` is the authority because it is the only field carrying the **model-facing** name of
+  every active entry, function tools and built-ins alike — a built-in's `builtins` entry is its
+  *wire* name (`code_execution` is served by `code_interpreter`). Enforced in `__post_init__`, so it
+  survives every later appender and every `dataclasses.replace`, and the emitters need know nothing.
+- **A removal still reports, and that falls out of the same authority.** Every path that drops an
+  active tool prunes its manifest entry in the *same* `replace` that records the skip
+  (`_apply_safe_policy`, `_resolve._apply_policy`, a failed MCP server), so a policy-refused `shell`
+  — the thing `skipped` most has to say — is untouched. A filter keyed on anything else would have
+  silenced it.
+- **A duplicate MCP tool name is filtered by the same rule**, and correctly: that name *is*
+  served, by the server that claimed it first. Its `WARNING` is untouched. The stated gap the
+  filter leaves — `skipped` mixes tool names, MCP *server* names and broken-default *filenames*,
+  and only the first is filtered on, so a server named exactly after an active tool
+  (`mcp/assets.json`) loses its structured "did not load" entry while still logging at `WARNING`
+  and still naming `mcp_servers` — is written down in `ResolvedTools.__post_init__` rather than
+  left to be rediscovered. Closing it needs provenance per entry; this fix does not change that
+  shape.
+- **`basecradle-harness-resolve`'s flat `skipped` holds it too**, read off that same `manifest` and
+  never recomputed: the two surfaces are counterparts, read by one fleet audit, and a name absent
+  from one while present in the other is worse than either answer alone. The *per-stem* `skipped` is
+  deliberately unfiltered — it is that stem's own trail, and the shadowed variant's reason lives
+  there.
+- **The skip log is emitted from the settled `ResolvedTools.skipped`**, retiring the second
+  "is this name claimed?" filter that let the line and the field disagree in the first place.
+
+No behavior changes for any agent: the active tool set, the wire calls, and every other
+`--resolved-config` field are byte-identical. Only the diagnostic tells the truth now.
+
 ## [0.120.0] - 2026-09-10
 
 ### Fixed: one MCP tool's schema xAI refuses no longer kills every wake (issue #496)

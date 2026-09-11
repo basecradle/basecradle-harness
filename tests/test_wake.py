@@ -2264,6 +2264,47 @@ def test_resolved_config_unlocked_lists_an_opted_in_shell_under_tools(wake_env, 
     assert "shell" in report["opt_in_tools"]  # still an opt-in (powerful) tool
 
 
+def test_resolved_config_does_not_report_an_active_code_execution_as_skipped(wake_env, monkeypatch):
+    """@jt's live repro (issue #497): the opted-in `code_execution` is active and must not be
+    reported skipped.
+
+    The stem ships **two** built-ins under the one model-facing name `code_execution` — OpenAI's
+    Code Interpreter and xAI's native executor — so on an openai/responses agent the xAI variant is
+    unmet and used to be appended to `skipped` under the name the agent is actively using. The NOC
+    read that name off 6,776 consecutive introspect rows as a declared-but-not-loaded opt-in while
+    every drift axis stayed green. Evidence it is genuinely active: the `code_interpreter` wire
+    name in `builtins`, its `code_attach` bridge in `tools`, and the stem in `opt_in_tools`.
+    """
+    monkeypatch.setenv("AI_SDK_SURFACE", "responses")
+    install(os.environ["BASECRADLE_CONFIG_HOME"], provider="openai", opt_in=["code_execution"])
+
+    report = resolved_config()
+
+    assert "code_interpreter" in report["builtins"]
+    assert "code_attach" in report["tools"]
+    assert "code_execution" in report["opt_in_tools"]
+    assert "code_execution" not in report["skipped"]
+
+
+def test_resolved_config_still_skips_a_name_this_provider_never_got(wake_env, monkeypatch):
+    """The filter narrows `skipped` only where the name is *present*; a real absence stays loud.
+
+    `code_attach` is the OpenAI-only input-file half of the same stem, so under xAI it activates
+    nothing and no other plugin claims its name — exactly the state `skipped` exists to report, and
+    the direction a filter written against the wrong authority would have silenced.
+    """
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("AI_SDK", "xai-sdk")
+    monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
+    install(os.environ["BASECRADLE_CONFIG_HOME"], provider="xai", opt_in=["code_execution"])
+
+    report = resolved_config()
+
+    assert "code_execution" in report["builtins"]  # xAI's native executor, by its own wire name
+    assert "code_execution" not in report["skipped"]
+    assert "code_attach" in report["skipped"]  # genuinely absent here — still reported
+
+
 def test_resolved_config_locked_skips_an_opted_in_shell(wake_env, monkeypatch):
     """The safe default is unchanged: with the same opted-in shell but no HARNESS_PROFILE (locked),
     the policy filters shell to `skipped` and it never reaches the active `tools` set."""
