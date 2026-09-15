@@ -188,13 +188,25 @@ RERANK_MODEL = "z-ai/glm-5.3-flash"
 RERANK_PROVIDERS = ("deepinfra", "baseten", "fireworks", "together")
 
 
+def _rerank_record(caplog):
+    """The rerank call's record — the ``llm`` line whose category is ``purpose=memory kind=rerank``.
+
+    Issue #485 retired the reranker's private ``mempalace rerank`` head for the unified ``llm``
+    line, and this file (which CI never runs) kept selecting the old head until the NOC's live
+    smoke went red on it (issue #504). The selector is the offline suite's (``test_rerank.py``).
+    """
+    return next(
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("llm ")
+        and "purpose=memory" in r.getMessage()
+        and "kind=rerank" in r.getMessage()
+    )
+
+
 def _rerank_line(caplog) -> str:
     """The rerank line with its ANSI verdict color stripped — ``outcome=`` is a colored field."""
-    return plain(
-        next(
-            m for m in (r.getMessage() for r in caplog.records) if m.startswith("mempalace rerank")
-        )
-    )
+    return plain(_rerank_record(caplog).getMessage())
 
 
 @pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
@@ -275,7 +287,7 @@ def test_a_live_rerank_against_a_nonexistent_model_is_config_class(caplog):
 
     # It falls back rather than raising — a broken reranker never costs the agent its memories.
     assert [hit["text"] for hit in chosen] == ["a", "b"]
-    record = next(r for r in caplog.records if r.getMessage().startswith("mempalace rerank"))
+    record = _rerank_record(caplog)
     assert record.levelno == logging.ERROR, record.getMessage()
     assert _field(
         record.getMessage(),
