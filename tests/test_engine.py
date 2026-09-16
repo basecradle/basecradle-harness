@@ -29,6 +29,8 @@ from basecradle_harness import (
     ToolResult,
     VideoContent,
 )
+from basecradle_harness._observability import RETRY_HEAD
+from basecradle_harness._retry import RETRY_BUDGET_SECONDS
 
 
 class ScriptedProvider:
@@ -934,14 +936,26 @@ class AuthFailingProvider:
 
 
 class RateLimitedProvider:
-    """Raises 429 — an API error that is *not* in the transient set, and must not be retried."""
+    """Raises 429 on its first `fails` calls, then returns `reply` (issue #506).
 
-    def __init__(self) -> None:
+    A routed upstream momentarily at capacity — transient since #506, and the reversal of a
+    deliberate exclusion: OpenRouter re-routes on the re-issued request, so one pinned upstream's
+    429 is not a statement about the pool.
+    """
+
+    def __init__(self, fails: int = 99, reply: Message | None = None, retry_after=None) -> None:
+        self._fails = fails
+        self._reply = reply or Message.assistant(content="the real answer")
+        self._retry_after = retry_after
         self.calls = 0
 
     def chat(self, messages, tools=None):
         self.calls += 1
-        raise ProviderRateLimitError("slow down", status_code=429)
+        if self.calls <= self._fails:
+            raise ProviderRateLimitError(
+                "slow down", status_code=429, retry_after=self._retry_after
+            )
+        return self._reply
 
 
 def _no_sleep():
@@ -992,11 +1006,15 @@ def test_the_give_up_leaves_a_diagnosable_log_trail(caplog):
     ):
         engine.run([Message.user("hi")])
 
-    warnings = [
-        r for r in caplog.records if r.levelname == "WARNING" and "unparseable" in r.message
-    ]
+    warnings = [r for r in caplog.records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
     errors = [r for r in caplog.records if r.levelname == "ERROR" and "unparseable" in r.message]
     assert len(warnings) == 2  # one per retry attempt
+    assert [w.levelname for w in warnings] == ["WARNING", "WARNING"]
+    # The shared grammar since issue #506: a brain retry, a rerank retry and a describe retry read
+    # identically in one journal, and none of them wears the `llm provider=` head a dashboard counts
+    # calls on — a refused attempt generated nothing and was billed nothing.
+    assert "attempt=1/3 reason=invalid_response" in warnings[0].getMessage()
+    assert "attempt=2/3 reason=invalid_response" in warnings[1].getMessage()
     assert len(errors) == 1  # the final give-up
     assert "all 3 attempt(s)" in errors[0].message  # names the attempt count
 
@@ -1075,23 +1093,66 @@ def test_the_5xx_retry_says_which_fault_it_hit(caplog):
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
         Engine(provider, ToolRegistry(), sleep=spy).run([Message.user("hi")])
 
-    warnings = [r.message for r in caplog.records if r.levelname == "WARNING"]
-    assert any("own side (HTTP 503)" in m for m in warnings)
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("reason=server_error" in m for m in warnings), warnings
 
 
-def test_a_rate_limit_is_not_retried_even_though_it_is_an_api_error():
-    """429 shares a base class with 5xx but is *not* transient in the same way — hammering a
-    rate-limited endpoint only deepens the hole. The retryable set is chosen by the nature of the
-    fault, not by "is it a ProviderAPIError"."""
+def test_a_rate_limit_is_retried_and_recovers(caplog):
+    """429 is transient since issue #506 — and the reversal is the point.
+
+    It was excluded deliberately ("hammering a rate-limited endpoint only deepens the hole"), which
+    is right for an unbounded retry against one server and wrong for a *router*: OpenRouter
+    re-routes on the re-issued request. The live evidence came from the memory path — four reranks
+    lost to 429s that cleared in about a second — and this is the same taxonomy line, so the brain
+    call takes it too.
+    """
+    provider = RateLimitedProvider(fails=1)
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), sleep=spy)
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        reply = engine.run([Message.user("hi")])
+
+    assert reply.content == "the real answer"
+    assert provider.calls == 2
+    # The *shared* schedule, not the 0.5s server-hiccup beat: a rate limit is a capacity window a
+    # half-second does not outlast.
+    assert delays == [1.0]
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    assert "reason=rate_limited" in line and "next_in=1.00s" in line
+
+
+def test_a_rate_limits_own_retry_after_wins_and_is_clamped_to_the_budget():
+    """The vendor's number beats the schedule, and the budget beats the vendor's number.
+
+    A hint larger than the whole budget **still retries** rather than giving up: the re-issued
+    request is re-routed, so the wait one limited upstream asked for is not the wait a different
+    pinned upstream needs. Giving up there would hand one vendor's bad minute the power to fail the
+    wake.
+    """
+    provider = RateLimitedProvider(fails=1, retry_after=30)
+    delays, spy = _no_sleep()
+
+    assert Engine(provider, ToolRegistry(), sleep=spy).run([Message.user("hi")]).content
+    assert delays == [RETRY_BUDGET_SECONDS]
+
+
+def test_the_total_sleep_of_a_retry_loop_is_bounded_by_the_budget():
+    """Attempts bound the count; the budget bounds the **wall clock** — the half that used to grow.
+
+    An operator who raises `HARNESS_RESPONSE_RETRIES` used to buy an unbounded arithmetic backoff
+    (0.5s, 1.0s, 1.5s, …). The sleep total is now capped whatever the count, which is the
+    total-time deadline `_TRANSIENT`'s own note called for.
+    """
     provider = RateLimitedProvider()
     delays, spy = _no_sleep()
-    engine = Engine(provider, ToolRegistry(), response_retries=5, sleep=spy)
+    engine = Engine(provider, ToolRegistry(), response_retries=9, sleep=spy)
 
     with pytest.raises(ProviderRateLimitError):
         engine.run([Message.user("hi")])
 
-    assert provider.calls == 1
-    assert delays == []
+    assert provider.calls == 10
+    assert sum(delays) <= RETRY_BUDGET_SECONDS
 
 
 def test_a_permanent_provider_error_is_not_retried():

@@ -50,6 +50,7 @@ harness owns history — this adapter never sets ``stream`` (it is non-streaming
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import time
@@ -744,32 +745,39 @@ def _from_status_error(exc) -> ProviderError:
     message = getattr(exc, "message", None) or str(exc)
     if status < 400:
         return ProviderError(message)
+    # The vendor's own account of the fault, parsed once, here — the boundary of the vendor that
+    # wrote it (issue #506). Every constructed error below carries it, so the retry policy and the
+    # fallback line read attributes rather than re-deriving JSON at three call sites.
+    told = _diagnostics(exc, body)
     if status in (400, 413) and is_context_overflow(f"{message} {body}"):
         # The wall (issue #276): the transcript outgrew the serving endpoint's context window.
         # Deterministic, so it is classed apart from every other 400 — the session compacts and
         # retries the turn once instead of failing identically on every wake until a human intervenes.
-        return ProviderContextLengthError(message, status_code=status, body=body)
+        return ProviderContextLengthError(message, status_code=status, body=body, **told)
     if status in (401, 403):
         return ProviderAuthError(
-            f"OpenRouter rejected the API key (HTTP {status}).", status_code=status, body=body
+            f"OpenRouter rejected the API key (HTTP {status}).",
+            status_code=status,
+            body=body,
+            **told,
         )
     if status == 402:
         # OpenRouter signals **insufficient credits** with a distinct HTTP 402 Payment Required —
         # unlike OpenAI, it does not overload 429 for it. This is the account-blocked class: it heals
         # only when a human funds the account, so the wake reports it and debounces rather than
         # retrying a request that will fail identically until then (issue #336).
-        return ProviderBillingError(message, status_code=status, body=body)
+        return ProviderBillingError(message, status_code=status, body=body, **told)
     if status == 429:
         return ProviderRateLimitError(
             "OpenRouter rate-limited the request (HTTP 429).",
             status_code=status,
             body=body,
-            retry_after=_retry_after(exc),
+            **told,
         )
     if status == 413:
         # A 413 that is not a context overflow (checked above): the request body was too large.
         # Deterministic and file-shaped — reported once, never retried, never modified (issue #336).
-        return ProviderPayloadTooLargeError(message, status_code=status, body=body)
+        return ProviderPayloadTooLargeError(message, status_code=status, body=body, **told)
     if status >= 500:
         # OpenRouter (or the upstream it routed to) fell over on its own side — transient, so the
         # engine re-requests it (issue #284). It matters *most* here: this adapter disables the SDK's
@@ -777,14 +785,17 @@ def _from_status_error(exc) -> ProviderError:
         # before this class existed a 5xx was simply fatal on OpenRouter while the `openai` SDK
         # quietly retried the identical fault. Same failure, opposite outcome, decided by nobody.
         return ProviderServerError(
-            f"OpenRouter failed on its own side (HTTP {status}).", status_code=status, body=body
+            f"OpenRouter failed on its own side (HTTP {status}).",
+            status_code=status,
+            body=body,
+            **told,
         )
     # Carry OpenRouter's own message + body so a caller can relay the true cause — and so a generic
     # malformed-request 400/422 **propagates** rather than being reported: it is almost always a
     # fixable harness/config defect, not a permanent property of the peer's content, and marking the
     # peer's message handled would lose it the moment the config is fixed (issue #336; CLAUDE.md →
     # Provider Capabilities, "a bad model_params.json key propagates on the first raise").
-    return ProviderAPIError(message, status_code=status, body=body)
+    return ProviderAPIError(message, status_code=status, body=body, **told)
 
 
 def _retry_after(exc) -> float | None:
@@ -799,3 +810,89 @@ def _retry_after(exc) -> float | None:
         return float(raw)
     except (TypeError, ValueError):
         return None
+
+
+def _diagnostics(exc, body: Any) -> dict[str, Any]:
+    """What OpenRouter itself said about this failure, as `ProviderAPIError` kwargs (issue #506).
+
+    **Kwargs, not log fields** — the constructor's spelling, which is the vendor's own
+    (``openrouter_metadata.attempt`` / ``.attempts``). `basecradle_harness._retry.diagnostics` is the
+    other half of the pair: it reads these back off the exception and renames ``routing_attempts`` to
+    the line's ``attempts=``, because on the line the plural has to be told apart from the harness's
+    own ``attempt=1/3`` counter.
+
+    Three facts live in the error body and one in the headers, and every one of them was being
+    thrown away: the four live rerank fallbacks of 2026-09-16 all logged the adapter's own fixed
+    sentence — *"OpenRouter rate-limited the request (HTTP 429)."* — which names nobody. A 429 on a
+    paid model is the **upstream** limiting or at capacity (OpenRouter's own 429s are free-model
+    caps and DDoS protection), and OpenRouter excludes 429s from its published provider-uptime
+    statistics. So the log line is the only place the offending endpoint can ever be seen, and
+    without this nobody could say which of ``baseten, coreweave, parasail, modal`` refused.
+
+    Parsed **defensively at every hop**, because this is the failure path: a body that is not the
+    shape we expect must cost the diagnostics and never turn a rate limit into a ``TypeError``
+    inside a wake. Every field independently degrades to ``None``, which `kv` omits.
+
+    ``openrouter_metadata`` rides an error response only because the request already asks for it on
+    every call (`ROUTING_METADATA_HEADER`, issue #280) — it is the same block, in the same shape, as
+    on a success. OpenRouter documents it as omitted on a 500 along with ``provider_code``, so a
+    server error legitimately yields nothing here.
+    """
+    payload = _error_payload(body)
+    error = payload.get("error")
+    metadata = error.get("metadata") if isinstance(error, Mapping) else None
+    code = metadata.get("provider_code") if isinstance(metadata, Mapping) else None
+    routing = payload.get("openrouter_metadata")
+    routing = routing if isinstance(routing, Mapping) else {}
+    attempt = routing.get("attempt")
+    return {
+        "retry_after": _retry_after(exc),
+        # A vendor code can be a number (an upstream's own HTTP status) as easily as a word.
+        "provider_code": None if code is None else str(code),
+        # ``0`` is the *meaningful* value here — "the router reached no provider at all" — so this
+        # is an explicit type check and never a truthiness test.
+        "routing_attempt": attempt
+        if isinstance(attempt, int) and not isinstance(attempt, bool)
+        else None,
+        "routing_attempts": _routing_attempts(routing.get("attempts")),
+    }
+
+
+def _error_payload(body: Any) -> Mapping[str, Any]:
+    """An SDK error's ``.body`` as a mapping — it may arrive already parsed, or as raw text."""
+    if isinstance(body, Mapping):
+        return body
+    if isinstance(body, (str, bytes)) and body:
+        try:
+            parsed = json.loads(body)
+        except (ValueError, TypeError):
+            return {}
+        if isinstance(parsed, Mapping):
+            return parsed
+    return {}
+
+
+def _routing_attempts(attempts: Any) -> str | None:
+    """``openrouter_metadata.attempts`` as one compact ``provider:status`` token, or ``None``.
+
+    Rendered here, at the vendor boundary, rather than carried as structure: nothing downstream
+    computes on it — it is a breadcrumb naming who was tried and what each one answered — and one
+    rendering means the retry line and the final fallback line cannot spell it two ways.
+
+    The provider name is written **exactly as OpenRouter wrote it**, never slugified. This module
+    already carries the reason (`_endpoint_slug`): the name→slug transform is not mechanical
+    (*"AtlasCloud"* → ``atlas-cloud``, *"Io Net"* → ``io-net``), so a derived slug would be a
+    plausible-looking fabrication. A name holding a space simply makes `kv` quote the value, exactly
+    as it already does for ``endpoint=``.
+    """
+    if not isinstance(attempts, Sequence) or isinstance(attempts, (str, bytes)) or not attempts:
+        return None
+    rendered = []
+    for attempt in attempts:
+        if not isinstance(attempt, Mapping):
+            continue
+        name = attempt.get("provider")
+        status = attempt.get("status")
+        name = str(name).strip() if isinstance(name, str) and name.strip() else "?"
+        rendered.append(f"{name}:{status if isinstance(status, int) else '?'}")
+    return ",".join(rendered) or None

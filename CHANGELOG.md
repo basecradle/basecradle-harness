@@ -7,6 +7,60 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.121.0] - 2026-09-16
+
+### Added: provider 429s are waited out, and every failed attempt names who refused (issue #506)
+
+On 2026-09-16 the fleet's rerank-outcomes chart showed its first `fallback` bars since the reranker
+shipped: four of eighteen reranks that day fell back to unranked hybrid retrieval, every one of them
+a transient OpenRouter 429 — and every one recoverable. At 06:08:42 @briggs's rerank got a 429 and
+its **next** rerank succeeded on Parasail 1.3 seconds later; at 21:53:38 it got a 429 while
+@glm-5.2's rerank succeeded on Parasail *in the same second*. The founder's ruling: **a rerank that
+waits up to three seconds and works beats one that silently runs without the rerank.**
+
+Two defects, one class. There was no retry — the reranker and the describer each made exactly one
+attempt, and `ProviderRateLimitError.retry_after` had been parsed since the adapter shipped and read
+by nobody. And the fallback line was blind: all four logged the adapter's own fixed sentence,
+*"OpenRouter rate-limited the request (HTTP 429)."*, which names nobody. Nobody could say which of
+`baseten, coreweave, parasail, modal` refused.
+
+- **One bounded retry policy, three call sites** (`_retry.py`) — the brain, the MemPalace reranker
+  and the blind-model describer. At most **2 retries** and at most **3.0 seconds of total sleep per
+  call**: a cap, not an expected cost. The vendor's own `Retry-After` is preferred over the 1s/2s
+  schedule and **clamped to what is left**; a hint longer than the whole budget still retries rather
+  than giving up, because OpenRouter re-routes on the re-issue and one vendor's bad minute must not
+  defeat the call.
+- **A 429 joins the transient class, reversing a stated exclusion.** *"Hammering a rate-limited
+  endpoint only deepens the hole"* is sound about an unbounded retry against one server and wrong
+  about a **router**: a pinned upstream's 429 is not a statement about the pool. Retried alongside
+  the unparseable body (#259) and the provider's own 5xx (#284), by the nature of the fault and
+  never by vendor. Config-class faults (`config:auth`, `config:billing`, `config:model_not_found`),
+  the deterministic pair (`context_length`, `payload_too_large`) and a `parse` failure are still
+  never retried — none can be fixed by asking again.
+- **Every failed attempt carries the vendor's own diagnostics.** `ProviderAPIError` now carries
+  `provider_code`, `routing_attempt` and `routing_attempts` beside `retry_after`, parsed once by the
+  OpenRouter adapter from `error.metadata.provider_code` and the `openrouter_metadata` block the
+  request already asks for (#280) and read everywhere else as attributes. They ride each retry line
+  **and** the final `outcome=fallback` line, from one function, so the two can never disagree. A
+  429 on a paid model is the *upstream* refusing, and OpenRouter excludes 429s from its published
+  provider-uptime statistics — the log line is the only place that endpoint can ever be seen.
+- **A retried attempt logs a WARNING on its own head, `llm retry`** — `attempt=1/3 reason=…
+  retry_after=… next_in=… provider_code=… routing_attempt=… attempts=parasail:429,coreweave:429`.
+  Deliberately outside the `` llm provider=`` head the fleet keys every call, cost, duration and
+  outcome column on: a refused attempt generated nothing and was billed nothing, so counting it
+  would inflate call volume, drag a failure's wait into the duration average, and put a null on the
+  rerank-outcomes chart. `tests/test_retry.py` runs the NOC's own expressions against a real retry
+  line and a real `llm` line, because a head that *looks* safe is not one that has been checked
+  against the regex reading it (#414, #504). A rerank or describe still logs exactly **one** `llm`
+  line, with a `duration=` covering the whole wait.
+- **An answered attempt still keeps its own `llm` line.** The describer's `length` re-budget (#488)
+  asks a *different* question and its extra call was billed, so it is untouched — the rule is a line
+  per **billed call**, and a 429 is not one. Folding the two together to reach "one line per
+  describe" would delete real spend from `helper_cost`.
+- **The engine's retry loop is bounded in wall clock for the first time**, which `_TRANSIENT`'s own
+  note had called for. `HARNESS_RESPONSE_RETRIES` still sets the brain's attempt count and remains
+  the only env knob on this axis; at the shipped default the budget never binds on the 5xx path.
+
 ## [0.120.1] - 2026-09-10
 
 ### Fixed: `skipped` no longer names a tool the agent is actively using (issue #497)

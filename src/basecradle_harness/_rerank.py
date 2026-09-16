@@ -47,6 +47,16 @@ the searcher produced, so no model-authored text can enter them.
 - **Runtime-class** — a timeout, a 429, a 5xx, a transport blip, an unparseable or unusable
   response. Transient and self-healing, so it falls back for that call and logs at **WARNING**.
 
+**And a transient fault is now waited out before it is given up on** (issue #506). The runtime class
+is bounded-retried — at most two more attempts, at most three seconds of sleep in total, the
+vendor's own ``Retry-After`` preferred and clamped (`basecradle_harness._retry`). The four live
+fallbacks of 2026-09-16 were every one of them a 429 that cleared inside ~1.3 seconds, and the
+founder's ruling is that a rerank which waits three seconds and works beats one that silently runs
+without the rerank. Each waited attempt writes its own ``llm retry`` WARNING — deliberately **not**
+an ``llm`` line, because a refused call generated nothing and was billed nothing — while the one
+``llm`` line below still says *what happened to the rerank*, once, with a ``duration=`` that
+includes every sleep.
+
 Nothing raises into the wake or into a tool result: the worst outcome of a broken reranker is the
 retrieval the agent had before this module existed.
 """
@@ -57,7 +67,7 @@ import json
 import logging
 import os
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 import httpx
@@ -88,6 +98,7 @@ from basecradle_harness._openrouter import (
     _ErrorMapper,
     require_openrouter_sdk,
 )
+from basecradle_harness._retry import Retry, diagnostics
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -246,6 +257,8 @@ class MemPalaceReranker:
             brain adapter uses (`basecradle_harness._openrouter.DEFAULT_TIMEOUT`) — deliberately
             not tighter. Rerank is not chat: a slow, correct pool beats a fast, wrong one, and a
             shorter deadline here would invent a failure mode the brain does not have.
+        sleep: Injectable wait used only by the bounded retry (issue #506), so a test proves the
+            schedule without waiting it. Defaults to `time.sleep`, exactly as the engine's does.
     """
 
     def __init__(
@@ -257,6 +270,7 @@ class MemPalaceReranker:
         fault: str | None = None,
         client: Any | None = None,
         timeout: float = DEFAULT_TIMEOUT,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.model = model
         self.providers = tuple(providers)
@@ -264,6 +278,7 @@ class MemPalaceReranker:
         self._fault = fault
         self._client = client
         self._timeout = timeout
+        self._sleep = sleep
         self._openrouter: Any = None
         # "Once per wake" is exactly the life of this object: the memory provider is built once per
         # wake, so an instance flag is the whole mechanism — no timestamps, no global state.
@@ -319,6 +334,10 @@ class MemPalaceReranker:
         Every exit from this method is logged exactly once, on the one ``llm`` line —
         including the failures, and including a failure that still cost money (a call that answered
         with unusable JSON is billed, so its tokens and cost ride the line the same as a success).
+        **A retried attempt does not change that count** (issue #506): a refused call generated
+        nothing and was billed nothing, so it writes an ``llm retry`` WARNING and no ``llm`` line.
+        One rerank, one ``llm`` line, whatever it took to get there — which is also what keeps the
+        fleet's ``memory_calls`` an honest count and the rerank-outcomes chart one bar per rerank.
         """
         if self._fault:
             self._report_config(self._fault, surface)
@@ -330,42 +349,62 @@ class MemPalaceReranker:
             self._report_config("config:sdk_not_installed", surface, detail=str(exc))
             return []
 
-        try:
-            # The brain adapter's mapper, reused rather than re-derived. One branch of it is worded
-            # for that caller — an unexpected-keyword `TypeError` is reframed as "a key in
-            # model_params.json", which this call site does not read. It is left as is: the six
-            # kwargs below are a fixed, typed set pinned by a wire test in the default suite, so an
-            # SDK that dropped one turns the Dependabot bump red long before a box sees it, and the
-            # outcome even then is a WARNING and plain hybrid retrieval.
-            with _ErrorMapper(self._openrouter):
-                response = client.chat.send(
-                    http_headers=ROUTING_METADATA_HEADER,
-                    model=self.model,
-                    messages=_messages(query, hits, k),
-                    temperature=TEMPERATURE,
-                    reasoning={"effort": REASONING_EFFORT},
-                    response_format={"type": "json_object"},
-                    provider={
-                        "only": list(self.providers),
-                        # Fallbacks stay *inside* `only` — the jurisdiction guarantee is that list,
-                        # never this flag (issue #468). With them off, one pinned upstream's shared
-                        # pool returning a 429 defeated the whole reranker while three acceptable
-                        # endpoints sat idle.
-                        "allow_fallbacks": True,
-                        "data_collection": "deny",
-                    },
+        # One bounded retry for the whole rerank (issue #506): a transient 429 cost four live
+        # reranks their whole point, and every one of them cleared in about a second. `started` sits
+        # **outside** the loop on purpose — `duration=` on the one `llm` line below is what the
+        # agent actually waited, sleeps and dead attempts included.
+        retry = Retry(
+            provider=PROVIDER,
+            model=self.model,
+            purpose=MEMORY,
+            kind=RERANK_KIND,
+            sleep=self._sleep,
+            extra={"surface": surface},
+        )
+        while True:
+            try:
+                # The brain adapter's mapper, reused rather than re-derived. One branch of it is
+                # worded for that caller — an unexpected-keyword `TypeError` is reframed as "a key
+                # in model_params.json", which this call site does not read. It is left as is: the
+                # six kwargs below are a fixed, typed set pinned by a wire test in the default
+                # suite, so an SDK that dropped one turns the Dependabot bump red long before a box
+                # sees it, and the outcome even then is a WARNING and plain hybrid retrieval.
+                with _ErrorMapper(self._openrouter):
+                    response = client.chat.send(
+                        http_headers=ROUTING_METADATA_HEADER,
+                        model=self.model,
+                        messages=_messages(query, hits, k),
+                        temperature=TEMPERATURE,
+                        reasoning={"effort": REASONING_EFFORT},
+                        response_format={"type": "json_object"},
+                        provider={
+                            "only": list(self.providers),
+                            # Fallbacks stay *inside* `only` — the jurisdiction guarantee is that
+                            # list, never this flag (issue #468). With them off, one pinned
+                            # upstream's shared pool returning a 429 defeated the whole reranker
+                            # while three acceptable endpoints sat idle.
+                            "allow_fallbacks": True,
+                            "data_collection": "deny",
+                        },
+                    )
+            except ProviderError as exc:
+                reason, is_config = _fault_of(exc)
+                if retry.again(exc, reason=reason, is_config=is_config):
+                    continue
+                self._report(
+                    surface,
+                    reason=reason,
+                    is_config=is_config,
+                    seconds=time.monotonic() - started,
+                    pool=len(hits),
+                    detail=str(exc),
+                    # The same four fields the retry lines carried, from the same function — so the
+                    # final `outcome=fallback` line names the upstream that refused rather than
+                    # repeating the adapter's fixed sentence, which names nobody.
+                    diagnostics=diagnostics(exc),
                 )
-        except ProviderError as exc:
-            reason, is_config = _fault_of(exc)
-            self._report(
-                surface,
-                reason=reason,
-                is_config=is_config,
-                seconds=time.monotonic() - started,
-                pool=len(hits),
-                detail=str(exc),
-            )
-            return []
+                return []
+            break
 
         data = response.model_dump()
         picks = validated_picks(_reply_text(data), len(hits), k)
@@ -424,6 +463,7 @@ class MemPalaceReranker:
         usage: Any = None,
         endpoint: str | None = None,
         detail: str | None = None,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         """The reranker's ``llm`` line — one per rerank attempt, whatever the outcome.
 
@@ -464,7 +504,15 @@ class MemPalaceReranker:
             outcome="ok" if reason is None else "fallback",
             reason=reason,
             detail=detail,
-            extra={"surface": surface, "pool": pool, "picked": picked},
+            # The vendor's own account of the fault (issue #506) sits between the harness's `reason`
+            # and this purpose's own extras: it explains the reason, so it reads next to it, and it
+            # is absent on every line that has nothing to explain.
+            extra={
+                **(diagnostics or {}),
+                "surface": surface,
+                "pool": pool,
+                "picked": picked,
+            },
             level=level,
         )
 
