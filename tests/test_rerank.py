@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 
 import httpx
 import pytest
@@ -29,6 +30,7 @@ from basecradle_harness._mempalace import (
     DEFAULT_N_RESULTS,
     MemPalaceMemoryProvider,
 )
+from basecradle_harness._observability import RETRY_HEAD
 from basecradle_harness._rerank import (
     POOL_FLOOR,
     RERANK_API_KEY_VAR,
@@ -42,6 +44,7 @@ from basecradle_harness._rerank import (
     reranker_from_env,
     validated_picks,
 )
+from basecradle_harness._retry import RETRY_BUDGET_SECONDS
 
 # A fabricated OpenRouter endpoint and a correctly-shaped fake key — never a real credential.
 BASE_URL = "https://openrouter.test/api/v1"
@@ -116,12 +119,43 @@ def hits(n):
 
 
 def reranker(**kwargs):
-    """A reranker over a **real** SDK client whose transport respx intercepts."""
+    """A reranker over a **real** SDK client whose transport respx intercepts.
+
+    ``sleep`` defaults to a no-op recorder: since issue #506 a transient fault is *waited out*, so a
+    fault-class test would otherwise spend the real three-second budget proving a taxonomy that has
+    nothing to do with waiting. The tests that are about the wait pass their own spy and read it.
+    """
     client = OpenRouter(api_key=FAKE_KEY, server_url=BASE_URL, retry_config=None)
     kwargs.setdefault("model", MODEL)
     kwargs.setdefault("api_key", FAKE_KEY)
     kwargs.setdefault("providers", PROVIDERS)
+    kwargs.setdefault("sleep", lambda _seconds: None)
     return MemPalaceReranker(client=client, **kwargs)
+
+
+def _no_sleep():
+    """A sleep spy: records the waits it was asked for, and never actually waits."""
+    delays: list[float] = []
+    return delays, delays.append
+
+
+def llm_lines(records, purpose="purpose=memory"):
+    """The `llm` lines — **not** the `llm retry` ones, which is the whole head split (issue #506).
+
+    A retry line starts with ``llm`` too, and a helper that matched on that prefix would count a
+    refused attempt as a call. That is the fleet dashboard's own bug in miniature: its
+    ``memory_calls`` keys on `` llm provider=``, and the discriminator is the space-then-``provider=``
+    immediately after ``llm``.
+    """
+    return [
+        r
+        for r in records
+        if r.getMessage().startswith("llm provider=") and purpose in r.getMessage()
+    ]
+
+
+def retry_lines(records):
+    return [r for r in records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
 
 
 @pytest.fixture
@@ -424,11 +458,7 @@ def test_provider_slugs_keep_their_order_and_drop_the_blanks():
 
 
 def _reason_of(records):
-    line = next(
-        r
-        for r in records
-        if r.getMessage().startswith("llm ") and "purpose=memory" in r.getMessage()
-    )
+    line = llm_lines(records)[0]
     reason = line.getMessage().partition("reason=")[2].split(" ")[0]
     return line.levelno, reason
 
@@ -478,12 +508,7 @@ def test_an_unparseable_answer_is_runtime_class(router, caplog):
     level, reason = _reason_of(caplog.records)
     assert (level, reason) == (logging.WARNING, "parse")
     # It still cost money, so the line still carries what it cost.
-    line = next(
-        r
-        for r in caplog.records
-        if r.getMessage().startswith("llm ") and "purpose=memory" in r.getMessage()
-    )
-    assert "cost=0.000846" in line.getMessage()
+    assert "cost=0.000846" in llm_lines(caplog.records)[0].getMessage()
 
 
 def test_an_unexpected_internal_failure_still_falls_back(caplog):
@@ -607,3 +632,169 @@ def test_a_rerank_attempt_logs_exactly_one_llm_line_and_the_cost_only_once(route
     assert len(llm) == 1
     assert costed == llm  # the dollar is on that line and on no other
     assert not [r for r in caplog.records if "mempalace rerank" in r.getMessage()]
+
+
+# === The bounded retry (issue #506) ===========================================
+#
+# Four live reranks fell back to plain hybrid on 2026-09-16, every one of them a transient 429 that
+# cleared in about a second — one of them while a sibling agent's rerank succeeded on another
+# endpoint in the same second. The founder's ruling: a rerank that waits up to three seconds and
+# works beats one that silently runs without the rerank.
+
+
+def rate_limited(retry_after=None, *, upstream="Parasail", attempt=1):
+    """A 429 exactly as OpenRouter answers one, metadata block and all.
+
+    The body matters as much as the status here: ``error.metadata.provider_code`` and
+    ``openrouter_metadata`` are the fields the fallback line was missing, and the request already
+    asks for the metadata on every call (`ROUTING_METADATA_HEADER`).
+    """
+    headers = {} if retry_after is None else {"Retry-After": str(retry_after)}
+    body = {
+        "error": {"message": "rate limited", "code": 429, "metadata": {"provider_code": "429"}},
+        "openrouter_metadata": {
+            "attempt": attempt,
+            "attempts": [{"provider": upstream, "model": MODEL, "status": 429}],
+        },
+    }
+    return httpx.Response(429, json=body, headers=headers)
+
+
+def test_a_transient_429_is_waited_out_and_the_rerank_still_happens(router, caplog):
+    """The whole feature: one wait, and the agent gets its reranked memories instead of the hybrid's.
+
+    The first attempt is refused and the second answers, so the rerank *worked* — and the journal
+    says both things: one ``llm`` line with ``outcome=ok``, and one ``llm retry`` WARNING naming the
+    upstream that refused. A fallback that silently recovered would be indistinguishable from a
+    rerank that never stumbled.
+    """
+    router.post(CHAT_URL).mock(
+        side_effect=[rate_limited(), httpx.Response(200, json=completion(picks(11, 3)))]
+    )
+    delays, spy = _no_sleep()
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        chosen = reranker(sleep=spy).rerank("q", hits(20), 2, surface=SURFACE_TURN0)
+
+    assert [hit["text"] for hit in chosen] == ["memory 11", "memory 3"]
+    assert delays == [1.0]
+    assert len(llm_lines(caplog.records)) == 1  # one rerank, one call line, whatever it took
+    assert "outcome=ok" in llm_lines(caplog.records)[0].getMessage()
+    retried = retry_lines(caplog.records)
+    assert len(retried) == 1
+    assert retried[0].levelno == logging.WARNING
+    for field in (
+        "attempt=1/3",
+        "reason=rate_limited",
+        "provider_code=429",
+        "attempts=Parasail:429",
+    ):
+        assert field in retried[0].getMessage(), retried[0].getMessage()
+
+
+def test_the_duration_the_line_reports_is_what_the_agent_actually_waited(router, caplog):
+    """``duration=`` covers the sleeps and the dead attempt, because that is what a wake paid.
+
+    The one test here that uses the **real** `time.sleep` — the default this class takes when nobody
+    injects one — because an injected no-op would prove the schedule while leaving the question this
+    asserts (does the wait reach the line?) untested. ``Retry-After: 0.05`` keeps it honest and fast.
+    """
+    router.post(CHAT_URL).mock(
+        side_effect=[rate_limited(retry_after=0.05), httpx.Response(200, json=completion(picks(1)))]
+    )
+    started = time.monotonic()
+
+    subject = MemPalaceReranker(
+        client=OpenRouter(api_key=FAKE_KEY, server_url=BASE_URL, retry_config=None),
+        model=MODEL,
+        api_key=FAKE_KEY,
+        providers=PROVIDERS,
+    )
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        subject.rerank("q", hits(20), 1, surface=SURFACE_TURN0)
+
+    assert time.monotonic() - started >= 0.05  # it really slept
+    message = llm_lines(caplog.records)[0].getMessage()
+    duration = message.partition("duration=")[2].partition("s")[0]
+    assert float(duration) >= 0.05, message
+
+
+def test_a_vendors_retry_after_is_honored_over_the_schedule(router):
+    router.post(CHAT_URL).mock(
+        side_effect=[rate_limited(retry_after=1), httpx.Response(200, json=completion(picks(1)))]
+    )
+    delays, spy = _no_sleep()
+
+    reranker(sleep=spy).rerank("q", hits(20), 1, surface=SURFACE_TURN0)
+
+    assert delays == [1.0]
+
+
+def test_a_retry_after_past_the_budget_is_clamped_and_the_retry_still_goes(router):
+    """OpenRouter re-routes on the re-issue, so one limited upstream's 30 seconds is not our wait."""
+    router.post(CHAT_URL).mock(
+        side_effect=[rate_limited(retry_after=30), httpx.Response(200, json=completion(picks(1)))]
+    )
+    delays, spy = _no_sleep()
+
+    chosen = reranker(sleep=spy).rerank("q", hits(20), 1, surface=SURFACE_TURN0)
+
+    assert delays == [RETRY_BUDGET_SECONDS]
+    assert [hit["text"] for hit in chosen] == ["memory 1"]
+
+
+def test_three_429s_exhaust_the_bound_and_fall_back_naming_the_upstream(router, caplog):
+    """A genuinely refused rerank still degrades to hybrid — and now says *who* refused.
+
+    Every one of the four live fallbacks logged the adapter's own fixed sentence, which names
+    nobody; 429s are excluded from OpenRouter's published uptime statistics, so this line is the
+    only place the offending endpoint can ever be seen.
+    """
+    route = router.post(CHAT_URL).mock(return_value=rate_limited(upstream="CoreWeave", attempt=2))
+    delays, spy = _no_sleep()
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        chosen = reranker(sleep=spy).rerank("q", hits(20), 2, surface=SURFACE_TOOL)
+
+    assert [hit["text"] for hit in chosen] == ["memory 1", "memory 2"]  # the hybrid's own order
+    assert route.call_count == 3  # 1 + RETRY_ATTEMPTS
+    assert sum(delays) <= RETRY_BUDGET_SECONDS
+    assert len(retry_lines(caplog.records)) == 2  # one per *retried* attempt, not per attempt
+    final = llm_lines(caplog.records)
+    assert len(final) == 1
+    message = final[0].getMessage()
+    for field in (
+        "outcome=fallback",
+        "reason=rate_limited",
+        "provider_code=429",
+        "routing_attempt=2",
+        "attempts=CoreWeave:429",
+    ):
+        assert field in message, message
+
+
+def test_a_config_class_fault_is_never_waited_out(router, caplog):
+    """Dead until a human acts — so a retry spends a call *and delays the ERROR that pages*."""
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(401, json=error(401, "bad key")))
+    delays, spy = _no_sleep()
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        reranker(sleep=spy).rerank("q", hits(20), 2, surface=SURFACE_TOOL)
+
+    assert route.call_count == 1
+    assert delays == []
+    assert retry_lines(caplog.records) == []
+    assert _reason_of(caplog.records) == (logging.ERROR, "config:auth")
+
+
+def test_an_unusable_answer_is_not_retried(router, caplog):
+    """``parse`` is not a transport fault: the model answered, and asking again buys the same answer."""
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion("nope")))
+    delays, spy = _no_sleep()
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        reranker(sleep=spy).rerank("q", hits(20), 2, surface=SURFACE_TOOL)
+
+    assert route.call_count == 1
+    assert delays == []
+    assert retry_lines(caplog.records) == []

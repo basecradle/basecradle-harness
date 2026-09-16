@@ -20,6 +20,7 @@ from basecradle_harness import (
     FrameSampling,
     ImageContent,
     Message,
+    ProviderRateLimitError,
     Tool,
     ToolCall,
     ToolRegistry,
@@ -43,6 +44,8 @@ from basecradle_harness._describer import (
     described_caption,
     describer_providers_from_env,
 )
+from basecradle_harness._observability import RETRY_HEAD
+from basecradle_harness._retry import RETRY_BUDGET_SECONDS
 
 DESCRIPTION = "A tabby cat asleep on a windowsill, with the word HELLO written on the glass."
 
@@ -648,7 +651,24 @@ class LoggingDescriberProvider(FakeDescriberProvider):
 
 
 def _helper_lines(caplog):
-    return [r for r in caplog.records if r.getMessage().startswith("llm ")]
+    """The `llm` lines — **not** the `llm retry` ones (issue #506).
+
+    A retry line starts with ``llm`` too, and counting one as a call is exactly the mistake the head
+    split exists to prevent: a refused attempt generated nothing and was billed nothing, and the
+    fleet's ``helper_calls`` keys on `` llm provider=``, whose discriminator is the
+    space-then-``provider=`` immediately after ``llm``.
+    """
+    return [r for r in caplog.records if r.getMessage().startswith("llm provider=")]
+
+
+def _retry_lines(caplog):
+    return [r for r in caplog.records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
+
+
+def _no_sleep():
+    """A sleep spy: records the waits it was asked for, and never actually waits."""
+    delays: list[float] = []
+    return delays, delays.append
 
 
 def test_a_describe_logs_exactly_one_llm_line_carrying_purpose_helper(caplog):
@@ -755,7 +775,7 @@ def test_a_wake_that_describes_tells_the_two_models_spend_apart(caplog):
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
         engine.run([Message.user("look")])
 
-    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
+    lines = [r.getMessage() for r in _helper_lines(caplog)]
     main = [m for m in lines if "purpose=main" in m]
     helper = [m for m in lines if "purpose=helper" in m]
     assert len(main) == 2  # the brain's two turns
@@ -1074,3 +1094,129 @@ def test_a_helper_line_never_says_a_free_successful_call_that_measured_nothing(c
             message = record.getMessage()
             assert not ("outcome=ok" in message and "tokens_in=0" in message), message
             assert not ("outcome=ok" in message and "cost=0 " in f"{message} "), message
+
+
+# === The bounded retry (issue #506) ===========================================
+#
+# The same policy the reranker takes, at the other call site that had none. A describer that falls
+# back hands a blind brain the withheld caption — honest and useless — so a transient refusal is
+# worth waiting out for the same reason a rerank's is.
+
+
+class FlakyDescriberProvider(FakeDescriberProvider):
+    """Refuses its first `fails` calls with a 429, then answers."""
+
+    def __init__(self, *, fails=99, retry_after=None, **kwargs):
+        super().__init__(**kwargs)
+        self._fails = fails
+        self._retry_after = retry_after
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.calls <= self._fails:
+            raise ProviderRateLimitError(
+                "OpenRouter rate-limited the request (HTTP 429).",
+                status_code=429,
+                retry_after=self._retry_after,
+                provider_code="429",
+                routing_attempt=1,
+                routing_attempts="Parasail:429",
+            )
+        return super().chat(messages, tools)
+
+
+def test_a_transient_429_is_waited_out_and_the_brain_still_gets_its_eyes(caplog):
+    """One wait, and a blind agent sees — instead of reading "I could not see it" and stopping."""
+    vision = FlakyDescriberProvider(fails=1)
+    delays, spy = _no_sleep()
+    describer = Describer(vision, "d/model", sleep=spy)
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="cat.png")]) == DESCRIPTION
+
+    assert vision.calls == 2
+    assert delays == [1.0]
+    # One describe, one `llm` line — a refused attempt generated nothing and was billed nothing, so
+    # it is not a call to count. It gets an `llm retry` WARNING instead.
+    assert len(_helper_lines(caplog)) == 1
+    assert "outcome=ok" in _helper_lines(caplog)[0].getMessage()
+    retried = _retry_lines(caplog)
+    assert len(retried) == 1
+    for field in (
+        "purpose=helper",
+        "kind=image.describe",
+        "reason=rate_limited",
+        "subject=cat.png",
+    ):
+        assert field in retried[0].getMessage(), retried[0].getMessage()
+
+
+def test_a_describers_retry_after_is_honored_and_clamped():
+    vision = FlakyDescriberProvider(fails=1, retry_after=30)
+    delays, spy = _no_sleep()
+
+    assert Describer(vision, "d/model", sleep=spy).describe_images(
+        [ImageContent(url="x", alt="cat.png")]
+    )
+    assert delays == [RETRY_BUDGET_SECONDS]
+
+
+def test_three_429s_fall_back_to_the_withheld_caption_naming_the_upstream(caplog):
+    """The bound holds, the answer is `None`, and the line says which endpoint refused."""
+    vision = FlakyDescriberProvider()
+    delays, spy = _no_sleep()
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert (
+            Describer(vision, "d/model", sleep=spy).describe_images(
+                [ImageContent(url="x", alt="cat.png")]
+            )
+            is None
+        )
+
+    assert vision.calls == 3
+    assert sum(delays) <= RETRY_BUDGET_SECONDS
+    assert len(_retry_lines(caplog)) == 2
+    message = _helper_lines(caplog)[0].getMessage()
+    for field in (
+        "outcome=fallback",
+        "reason=rate_limited",
+        "provider_code=429",
+        "routing_attempt=1",
+        "attempts=Parasail:429",
+    ):
+        assert field in message, message
+
+
+def test_a_born_broken_describer_is_never_waited_out(caplog):
+    """A missing key is dead until a human acts — no call to retry, and no wait to spend."""
+    delays, spy = _no_sleep()
+    dead = Describer(None, "d/model", fault="config:missing_api_key", sleep=spy)
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert dead.describe_images([ImageContent(url="x", alt="cat.png")]) is None
+
+    assert delays == []
+    assert _retry_lines(caplog) == []
+
+
+def test_a_re_budget_is_not_a_retry_and_keeps_its_own_llm_line(caplog):
+    """The distinction the two mechanisms turn on, pinned (issues #488, #506).
+
+    A `length` re-budget asks a **different** question and its extra call answered and was billed,
+    so it writes its own `llm` line. A retry re-issues the **identical** question after a refusal
+    that generated nothing, so it writes an `llm retry` WARNING and no `llm` line at all. Folding
+    them together to reach "one line per describe" would delete real spend from ``helper_cost``;
+    folding them the other way would count a 429 as a call.
+    """
+    describer, _asked = _describer(
+        WireDescriberProvider(finish="length", answer=CUT_OFF),
+        WireDescriberProvider(answer=DESCRIPTION),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="poster.png")]) == DESCRIPTION
+
+    assert len(_helper_lines(caplog)) == 2  # both attempts answered; both were billed
+    assert _retry_lines(caplog) == []  # and neither was a *retry*

@@ -51,6 +51,8 @@ from typing import Any
 from basecradle_harness._assets import model_sees_images, model_sees_video
 from basecradle_harness._exceptions import (
     EngineError,
+    ProviderError,
+    ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
 )
@@ -61,56 +63,117 @@ from basecradle_harness._messages import (
     ToolSpec,
     VideoContent,
 )
-from basecradle_harness._observability import describe_provider, kv, truncated
+from basecradle_harness._observability import MAIN, describe_provider, kv, truncated
 from basecradle_harness._provider import Provider
+from basecradle_harness._retry import Retry, _default_backoff
 from basecradle_harness._tools import ToolRegistry
 
 _log = logging.getLogger("basecradle_harness")
 
 #: How many **extra** times the engine re-requests a provider call that failed *transiently* — an
-#: unparseable body (`ProviderResponseError`, issue #259) or the provider's own 5xx
-#: (`ProviderServerError`, issue #284) — before giving up. 2 → up to 3 total attempts. Both faults
-#: are momentary (the same call re-issued usually succeeds), so a small bound recovers the common
-#: case while a wake that is genuinely wedged still fails fast. 0 disables the retry (a single
-#: attempt). Per-persona override rides `HARNESS_RESPONSE_RETRIES` (see `_response_retries_from_env`).
+#: unparseable body (`ProviderResponseError`, issue #259), the provider's own 5xx
+#: (`ProviderServerError`, issue #284), or a routed upstream's 429 (`ProviderRateLimitError`, issue
+#: #506) — before giving up. 2 → up to 3 total attempts. All three faults are momentary (the same
+#: call re-issued usually succeeds), so a small bound recovers the common case while a wake that is
+#: genuinely wedged still fails fast. 0 disables the retry (a single attempt). Per-persona override
+#: rides `HARNESS_RESPONSE_RETRIES` (see `_response_retries_from_env`) — and it is the **only** knob
+#: on this axis: the total-sleep budget beside it is a constant, because two env vars governing one
+#: retry is one way to disagree with yourself.
 DEFAULT_RESPONSE_RETRIES = 2
 
-#: The provider faults worth trying again, and the *only* ones. Both mean "the request was fine;
-#: something momentary went wrong" — a body that arrived mangled, or a provider that fell over on its
-#: own side. Everything else (auth, rate-limit, context overflow, a bad model_params key) is either
-#: permanent or has its own handling, and re-issuing it would merely repeat it. Classified by the
-#: **nature of the fault**, never the vendor: each adapter maps its own SDK's failures onto these
-#: two, so one rule in one place governs every provider.
+#: The provider faults worth trying again, and the *only* ones. All three mean "the request was
+#: fine; something momentary went wrong" — a body that arrived mangled, a provider that fell over on
+#: its own side, or a router whose chosen upstream was momentarily at capacity. Everything else
+#: (auth, context overflow, a bad model_params key) is either permanent or has its own handling, and
+#: re-issuing it would merely repeat it. Classified by the **nature of the fault**, never the vendor:
+#: each adapter maps its own SDK's failures onto these three, so one rule in one place governs every
+#: provider.
+#:
+#: **The 429 joined in issue #506, reversing a deliberate exclusion, and the reversal is the
+#: interesting part.** It was excluded on the reasoning that hammering a rate-limited endpoint only
+#: deepens the hole — correct for an unbounded retry against a single server, and wrong for what the
+#: fleet runs: OpenRouter **re-routes** on the re-issued request, so one pinned upstream's 429 says
+#: nothing about the pool. The live evidence settled it on the *memory* path (four reranks lost to
+#: 429s that cleared in about a second, one while a sibling agent's rerank succeeded on another
+#: endpoint in the same second) and it is the same taxonomy line here, so the brain call takes it
+#: too — zero brain-call 429s in the 30 days before, which makes this a class closed before it bit
+#: rather than after. What keeps the old reasoning honest is the bound: the wait is capped and it is
+#: **the vendor's own ``Retry-After`` where one was given** (`basecradle_harness._retry`).
 #:
 #: **What is uniform here is the policy, not the attempt count — stated, because the last time this
 #: was left implicit it became issue #284.** Some vendor SDKs retry a 5xx themselves and some do not,
 #: so the retries *compose*: the `openai` SDK carries ``max_retries=2``, giving a 5xx up to 3 × 3 = 9
 #: HTTP attempts there, while the native `openrouter` adapter disables its SDK's retry (its default
 #: backs off for up to an hour and would hang a wake) and so takes exactly 3. The SDK's retry is
-#: deliberately left on where it exists, because it also covers connection errors and 429s — which
-#: the engine pointedly does **not** retry — and removing it to equalize a count would cost real
-#: resilience to buy a symmetry nobody benefits from.
+#: deliberately left on where it exists, because it also covers connection errors — which the engine
+#: pointedly does **not** retry — and removing it to equalize a count would cost real resilience to
+#: buy a symmetry nobody benefits from. Since #506 the 429 composes the same way where an SDK
+#: retries it (the `openai` SDK does, honoring ``Retry-After`` itself); the compounding is bounded on
+#: both sides, and the engine's own half now has a total-sleep budget the SDK's does not.
 #:
 #: **The bound worth knowing is wall-clock, not attempts.** A 5xx normally returns *fast*, so 9
 #: attempts is ~6s of backoff and irrelevant. The pathological shape is a **slow** 5xx — a gateway
 #: that burns the client timeout (``DEFAULT_TIMEOUT``, 60s) before answering — where the compounding
 #: is 9 × 60s rather than 9 × nothing. That is a genuinely-down provider, and the wake fails either
 #: way; but it fails *slowly*, which cuts against this repo's own "fail the wake fast and let the
-#: router re-wake" stance. It is bounded and it is known, not an accident — and if it ever bites, the
-#: fix is a total-time deadline on the retry loop, not a smaller attempt count.
-_TRANSIENT = (ProviderResponseError, ProviderServerError)
+#: router re-wake" stance. It is bounded and it is known, not an accident. The *sleep* half of that
+#: compounding now has the total-time deadline this note called for (`_retry.RETRY_BUDGET_SECONDS`,
+#: issue #506); the per-attempt client timeout is the half that remains, and it is the SDK's.
+_TRANSIENT = (ProviderResponseError, ProviderServerError, ProviderRateLimitError)
 
 #: The backoff before a transient retry, in seconds, scaled by attempt number (0.5s, then 1.0s, …).
 #: Deliberately sub-second-to-low: these are momentary server hiccups, so the retry should add a
 #: beat, not the SDK's old up-to-an-hour backoff (which would hang the wake).
+#:
+#: It applies to the two faults it was written for and **not** to a 429, which takes the shared
+#: schedule instead (`_backoff`): a server hiccup is over in a blink, while a rate limit is a
+#: capacity window that a half-second does not outlast.
 _RETRY_BACKOFF_BASE = 0.5
+
+#: A transient fault → the ``reason=`` word the shared retry line carries. Spelled as the same
+#: vocabulary `_rerank._fault_of` and `_describer._fault_of` emit, so one grep reads every retry on
+#: the box whatever purpose made the call, and so `_retry.RETRYABLE_REASONS` gates all three the
+#: same way. Ordered most-specific first, because these classes subclass one another.
+_REASONS: tuple[tuple[type[Exception], str], ...] = (
+    (ProviderRateLimitError, "rate_limited"),
+    (ProviderServerError, "server_error"),
+    (ProviderResponseError, "invalid_response"),
+)
+
+
+def _reason(exc: object) -> str:
+    """The retry vocabulary's word for a transient fault (`_REASONS`)."""
+    for kind, reason in _REASONS:
+        if isinstance(exc, kind):
+            return reason
+    return "provider_error"
 
 
 def _fault(exc: object) -> str:
-    """How the retry lines name the failure — so a journal says *which* transient fault it hit."""
+    """How the give-up line names the failure — so a journal says *which* transient fault it hit."""
+    if isinstance(exc, ProviderRateLimitError):
+        return f"Provider rate-limited the request (HTTP {exc.status_code})"
     if isinstance(exc, ProviderServerError):
         return f"Provider failed on its own side (HTTP {exc.status_code})"
     return "Provider returned an unparseable response"
+
+
+def _backoff(attempt: int, reason: str) -> float:
+    """The wait before the engine's nth retry, by fault class.
+
+    A 429 takes the shared schedule (1s, 2s) and, ahead of it, whatever ``Retry-After`` the vendor
+    stated; a 5xx or an unparseable body keeps the 0.5s/1s beat this file has always used. Both
+    draw on the one total-sleep budget, so the engine's own *wall-clock* exposure to a retry loop is
+    bounded for the first time — the fix this file's own `_TRANSIENT` note said was the right one if
+    the pathological slow-5xx case ever bit. At the shipped `DEFAULT_RESPONSE_RETRIES` the budget
+    never binds on the 5xx path (0.5 + 1.0 = 1.5s); it binds only where an operator raised
+    ``HARNESS_RESPONSE_RETRIES`` far enough to want bounding.
+    """
+    return (
+        _default_backoff(attempt, reason)
+        if reason == "rate_limited"
+        else _RETRY_BACKOFF_BASE * attempt
+    )
 
 
 #: The per-turn provider-call budget. A deliberate research-lab over-provision: a persona's
@@ -636,16 +699,21 @@ class Engine:
         )
 
     def _chat(self, messages: list[Message], tools: Sequence[ToolSpec] | None) -> Message:
-        """One provider call, retrying the **transient** provider faults (issues #259, #284).
+        """One provider call, retrying the **transient** provider faults (issues #259, #284, #506).
 
-        Two failures are transient — the same call, re-issued unchanged, usually succeeds — and both
-        are retried here, bounded by `response_retries` and a short backoff:
+        Three failures are transient — the same call, re-issued unchanged, usually succeeds — and
+        all three are retried here, bounded by `response_retries`, a short backoff, and a total
+        sleep budget:
 
         - **`ProviderResponseError`** — the provider *answered* but the SDK could not parse the body
           (the "EOF while parsing a value" class first seen on GLM-5.2/OpenRouter, issue #259).
         - **`ProviderServerError`** — the provider failed on its own side (HTTP 5xx). It is the
           provider saying *"my fault, not yours"*: nothing about the request will be improved by
           changing it (issue #284).
+        - **`ProviderRateLimitError`** — the upstream a router chose was momentarily at capacity
+          (issue #506). It was deliberately excluded until the live 429s on the memory path proved
+          the exclusion wrong for a *routed* provider; see `_TRANSIENT` for the whole reversal, and
+          `basecradle_harness._retry` for the bound that keeps the old reasoning honest.
 
         **Why retrying matters more than it looks.** A wake that aborts risks **dropping the peer's
         message** — the worst failure class this platform has — while a bounded retry costs cents.
@@ -659,41 +727,43 @@ class Engine:
         **one wake later**, whereas surviving the blip in-flight answers them **now**. Cheap
         insurance against a slow reply, on top of insurance against no reply at all.
 
-        **Both are classified by the nature of the fault, never by vendor** — every adapter maps its
-        own SDK's parse failure and its own 5xx onto these two shared classes, so the policy is one
-        rule in one place. That uniformity is the point: before it, whether a 5xx was retried was an
+        **All three are classified by the nature of the fault, never by vendor** — every adapter maps
+        its own SDK's parse failure, its own 5xx and its own 429 onto these shared classes, so the
+        policy is one rule in one place. That uniformity is the point: before it, whether a 5xx was retried was an
         accident of which SDK an agent ran (the ``openai`` SDK retries 5xx internally; the native
         ``openrouter`` adapter disables its SDK's retry, since that one backs off for up to an hour
         and would hang a wake) — the same fault, silently fatal on one provider and survivable on
         another, decided by nobody.
 
-        Everything else propagates on the first raise: a connection drop, an auth or rate-limit
-        error, a context-length overflow (the session compacts and retries *that* its own way), or a
-        permanent `ProviderError` such as a bad `model_params.json` key. Retrying a permanent fault
-        only repeats it.
+        Everything else propagates on the first raise: a connection drop, an auth error, a
+        context-length overflow (the session compacts and retries *that* its own way), or a permanent
+        `ProviderError` such as a bad `model_params.json` key. Retrying a permanent fault only
+        repeats it.
 
         On exhaustion the last error is re-raised (the wake aborts with a clean non-zero exit) — but
-        every attempt logs a WARNING and the final give-up logs an ERROR naming the failure and the
-        attempt count, so a dropped wake stays diagnosable from the logs alone.
+        every retried attempt logs a WARNING — the shared ``llm retry`` line, so a brain retry, a
+        rerank retry and a describe retry read identically in one journal (issue #506) — and the
+        final give-up logs an ERROR naming the failure and the attempt count, so a dropped wake
+        stays diagnosable from the logs alone.
         """
         attempts = max(1, self.response_retries + 1)
-        last_exc: ProviderResponseError | ProviderServerError | None = None
-        for attempt in range(1, attempts + 1):
+        provider, model = describe_provider(self.provider)
+        retry = Retry(
+            provider=provider,
+            model=model,
+            purpose=MAIN,
+            attempts=attempts,
+            backoff=_backoff,
+            sleep=self._sleep,
+        )
+        last_exc: ProviderError | None = None
+        for _ in range(attempts):
             try:
                 return self.provider.chat(messages, tools=tools)
             except _TRANSIENT as exc:
                 last_exc = exc
-                if attempt < attempts:
-                    delay = _RETRY_BACKOFF_BASE * attempt
-                    _log.warning(
-                        "%s (attempt %d/%d): %s — retrying in %.1fs",
-                        _fault(exc),
-                        attempt,
-                        attempts,
-                        exc,
-                        delay,
-                    )
-                    self._sleep(delay)
+                if not retry.again(exc, reason=_reason(exc)):
+                    break
         _log.error(
             "%s on all %d attempt(s); giving up: %s",
             _fault(last_exc),

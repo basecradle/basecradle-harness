@@ -81,18 +81,53 @@ class ProviderAPIError(ProviderError):
 
     `status_code` is the HTTP status; `body` is the raw response text, kept for
     debugging since provider error schemas are not standardized.
+
+    **The remaining four are the vendor's own account of the failure** (issue #506), parsed once by
+    whichever adapter understands its vendor's error shape and read as plain attributes everywhere
+    else — so a retry policy and a fallback line quote the authority on the fault rather than
+    re-deriving it from JSON at three call sites. Every one defaults to ``None``, which is what an
+    adapter with nothing to say carries, and what `kv` then omits from the line:
+
+    - `retry_after` — the seconds a ``Retry-After`` header hinted. It lives here rather than on
+      `ProviderRateLimitError` alone because a 5xx may carry one too, and a retry that ignored it
+      would be guessing beside an answer.
+    - `provider_code` — the **upstream's** own error code, where the router surfaced one
+      (OpenRouter: ``error.metadata.provider_code``). A 429 on a paid model is the upstream
+      limiting, not the router, so this is the field that names who actually refused.
+    - `routing_attempt` — how far the router itself got before giving up (OpenRouter:
+      ``openrouter_metadata.attempt``), where ``0`` means it reached **no** provider at all. A
+      genuine value, so it is never falsified by a truthiness test.
+    - `routing_attempts` — the per-upstream result, already rendered compactly as
+      ``parasail:429,coreweave:429``. Rendered at the adapter because the shape is one vendor's, and
+      because nothing downstream computes on it: it is a breadcrumb naming who was tried and what
+      each said, which is the one thing an excluded-from-uptime-stats 429 leaves nowhere else.
     """
 
-    def __init__(self, message: str, *, status_code: int, body: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int,
+        body: str = "",
+        retry_after: float | None = None,
+        provider_code: str | None = None,
+        routing_attempt: int | None = None,
+        routing_attempts: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.body = body
+        self.retry_after = retry_after
+        self.provider_code = provider_code
+        self.routing_attempt = routing_attempt
+        self.routing_attempts = routing_attempts
 
 
 class ProviderServerError(ProviderAPIError):
     """The provider failed on *its own side* (HTTP 5xx) — transient, and therefore retried.
 
-    The second member of the engine's retryable class, alongside `ProviderResponseError`. A 5xx is
+    One of three members of the retryable class, alongside `ProviderResponseError` and — since issue
+    #506 — `ProviderRateLimitError`. A 5xx is
     the provider saying *"my fault, not yours"*: the request was well-formed, nothing about it will
     be improved by changing it, and re-issuing the identical call is exactly the right response.
     That is the opposite of a 4xx, where repeating the request only repeats the rejection.
@@ -194,18 +229,20 @@ class ProviderBillingError(ProviderAPIError):
 
 
 class ProviderRateLimitError(ProviderAPIError):
-    """The provider rate-limited the request (HTTP 429).
+    """The provider rate-limited the request (HTTP 429) — transient, and therefore retried.
 
-    `retry_after` is the seconds hinted by the `Retry-After` header, if present.
+    The third member of the retryable class, and the newest (issue #506). It was deliberately
+    *excluded* until 2026-09-16 on the reasoning that hammering a rate-limited endpoint only deepens
+    the hole — sound for an unbounded retry against a single server, and wrong for what the fleet
+    actually runs: OpenRouter **re-routes** on the re-issued request, so a 429 from one pinned
+    upstream is not a statement about the pool. The live evidence settled it — four reranks fell
+    back to plain hybrid on 429s that cleared inside ~1.3 seconds, one of them while a sibling
+    agent's rerank succeeded on another endpoint *in the same second*.
+
+    What keeps the old reasoning honest is the bound: at most two retries and at most three seconds
+    of total sleep (`basecradle_harness._retry`), with the vendor's own ``Retry-After`` preferred
+    over the schedule and clamped to what is left. This is a wait, not a hammer.
+
+    `retry_after`, and the routing diagnostics beside it, are declared on `ProviderAPIError` — see
+    there for why they belong to every status error rather than to this one.
     """
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        status_code: int,
-        body: str = "",
-        retry_after: float | None = None,
-    ) -> None:
-        super().__init__(message, status_code=status_code, body=body)
-        self.retry_after = retry_after

@@ -40,7 +40,7 @@ from basecradle_harness import (
     ToolCall,
     ToolSpec,
 )
-from basecradle_harness._openrouter import _routable
+from basecradle_harness._openrouter import _diagnostics, _routable
 
 # A fabricated OpenRouter endpoint + a correctly-shaped fake key. The SDK posts to
 # ``<server_url>/chat/completions`` — verified against the real 0.11.3 SDK.
@@ -455,6 +455,127 @@ def test_429_maps_to_rate_limit_with_retry_after(router):
     assert exc.value.status_code == 429
     assert exc.value.retry_after == 12.0
     provider.close()
+
+
+def test_a_429_carries_openrouters_own_account_of_who_refused(router):
+    """The four fields the fallback line was missing (issue #506).
+
+    Every one of the four live rerank fallbacks logged the adapter's own fixed sentence —
+    *"OpenRouter rate-limited the request (HTTP 429)."* — which names nobody. A 429 on a paid model
+    is the **upstream** limiting, and OpenRouter excludes 429s from its published provider-uptime
+    statistics, so the log line is the only place the offending endpoint can ever be seen. The body
+    already carried them; nothing read it.
+
+    ``openrouter_metadata`` rides an error response because the request asks for it on every call
+    (issue #280) — the same block, in the same shape, as on a success.
+    """
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            429,
+            headers={"Retry-After": "1"},
+            json={
+                "error": {
+                    "message": "rate limited",
+                    "code": 429,
+                    "metadata": {"provider_code": "429"},
+                },
+                "openrouter_metadata": {
+                    "attempt": 2,
+                    "attempts": [
+                        {"provider": "Parasail", "model": MODEL, "status": 429},
+                        {"provider": "Sail Research", "model": MODEL, "status": 429},
+                    ],
+                },
+            },
+        )
+    )
+    provider = _provider(retries_disabled=True)
+    with pytest.raises(ProviderRateLimitError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert exc.value.retry_after == 1.0
+    assert exc.value.provider_code == "429"
+    assert exc.value.routing_attempt == 2
+    # Rendered at the vendor boundary, and the name is **OpenRouter's own** — never slugified. The
+    # name→slug transform is not mechanical ("AtlasCloud" → atlas-cloud, "Io Net" → io-net), so a
+    # derived slug would be a plausible-looking fabrication; a space just makes `kv` quote it.
+    assert exc.value.routing_attempts == "Parasail:429,Sail Research:429"
+    provider.close()
+
+
+def test_a_routing_attempt_of_zero_is_a_fact_and_not_an_absence(router):
+    """``0`` means the router reached **no** provider — the most diagnostic value the field has.
+
+    A truthiness test would drop exactly the case worth seeing: every candidate filtered out before
+    submission, which on a pinned agent means the pin excluded the last endpoint.
+    """
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(
+            429,
+            json={"error": {"message": "no", "code": 429}, "openrouter_metadata": {"attempt": 0}},
+        )
+    )
+    provider = _provider(retries_disabled=True)
+    with pytest.raises(ProviderRateLimitError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert exc.value.routing_attempt == 0
+    assert exc.value.routing_attempts is None  # the array is optional and was absent
+    provider.close()
+
+
+def test_a_500_that_omits_everything_simply_carries_nothing(router):
+    """OpenRouter documents ``provider_code`` and ``openrouter_metadata`` as omitted on a 500.
+
+    So "nothing to report" is an ordinary outcome rather than a defect, and the fields are absent
+    from the line rather than present and empty — the honest-absence rule `endpoint` and `cost`
+    already keep.
+    """
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(500, json={"error": {"message": "boom", "code": 500}})
+    )
+    provider = _provider(retries_disabled=True)
+    with pytest.raises(ProviderServerError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert exc.value.retry_after is None
+    assert exc.value.provider_code is None
+    assert exc.value.routing_attempt is None
+    assert exc.value.routing_attempts is None
+    provider.close()
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        ("not json at all", {}),
+        ("", {}),
+        ({"error": {"metadata": "not a mapping"}}, {}),
+        ({"openrouter_metadata": {"attempt": "two"}}, {}),
+        ({"openrouter_metadata": {"attempt": True}}, {}),  # a bool is an int in Python
+        ({"openrouter_metadata": {"attempts": "junk"}}, {}),
+        (
+            {"openrouter_metadata": {"attempts": [{"provider": 7}, "junk"]}},
+            {"routing_attempts": "?:?"},
+        ),
+        ({"error": {"metadata": {"provider_code": 503}}}, {"provider_code": "503"}),
+    ],
+)
+def test_a_surprising_error_body_costs_the_diagnostics_and_nothing_else(body, expected):
+    """This is the **failure path**: a body we did not expect must never become a `TypeError`.
+
+    Each field degrades on its own, so one unreadable hop does not take the others with it. The
+    ``provider_code`` case is the reverse reminder: a vendor code can be a number as easily as a
+    word, and reading only strings would drop the commonest shape there is.
+    """
+    told = _diagnostics(object(), body)
+
+    assert told == {
+        "retry_after": None,
+        "provider_code": expected.get("provider_code"),
+        "routing_attempt": expected.get("routing_attempt"),
+        "routing_attempts": expected.get("routing_attempts"),
+    }
 
 
 def test_500_maps_to_the_retryable_server_error_keeping_the_body(router):

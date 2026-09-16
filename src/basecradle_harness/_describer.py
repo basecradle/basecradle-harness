@@ -79,6 +79,14 @@ distinction and the same words:
   that call. A vendor that stated no usage is **neither** class: it is a fact about the bill, not
   a fault, and it rides its own INFO note (`Describer._note_unreported_usage`).
 
+The transport half of that class is now **waited out before it is given up on** (issue #506): the
+same bounded retry the reranker takes — at most two more attempts, at most three seconds of sleep,
+the vendor's ``Retry-After`` preferred and clamped (`basecradle_harness._retry`). It is a different
+thing from the ``length`` re-budget above and the two must not be merged: a re-budget asks a
+**different** question and its extra call answered and was billed, so it earns its own ``llm`` line;
+a retry re-issues the **identical** question after a refusal that generated nothing, so it earns an
+``llm retry`` WARNING and no ``llm`` line at all.
+
 The describer's output is **model-generated text about peer content**. It is injected as context
 and nothing more: never executed, never a tool call, and never mined as the agent's own words — it
 rides an engine-injected turn, which the memory seam does not mine, exactly as an image caption
@@ -91,7 +99,7 @@ from __future__ import annotations
 import logging
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from basecradle_harness._assets import model_sees_video
@@ -119,6 +127,7 @@ from basecradle_harness._observability import (
     truncated,
     usage_reported,
 )
+from basecradle_harness._retry import Retry, diagnostics
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from basecradle_harness._provider import Provider
@@ -261,8 +270,12 @@ class Describer:
         detail: str | None = None,
         build: Callable[[int], Provider] | None = None,
         budget: int | None = None,
+        sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.provider = provider
+        #: Injectable wait used only by the bounded retry (issue #506), so a test proves the
+        #: schedule without waiting it. ``None`` → `time.sleep`, exactly as the engine's does.
+        self._sleep = sleep
         #: The describer's model id, carried so every caption and every log line can **name** it.
         #: A description whose author is unnamed reads as the brain's own perception, which is the
         #: one thing this must never claim.
@@ -402,7 +415,7 @@ class Describer:
         **Every failure is caught here**, because the alternative is a wake that dies over a
         picture. The result is ``None`` and the caller says so honestly.
 
-        One describe is **at most two attempts** (issue #488). A vendor that stopped at ``length``
+        One describe is **at most two answered attempts** (issue #488). A vendor that stopped at ``length``
         did not answer the question — it ran out of room — and that is the one failure a *larger
         budget* is the remedy for, so it is retried once at `RETRY_BUDGET_FACTOR` times the room and
         then falls back like anything else. Each attempt writes its own `llm` line, because each
@@ -411,6 +424,9 @@ class Describer:
         The retry is conditioned on there being **more room to buy** (`_build`), never on the fault
         alone. A describer built from a caller's own `Provider` has one fixed cap, so asking it the
         identical question a second time would spend a second call to receive the identical answer.
+
+        The *transient*-fault retry is a different mechanism and lives a level down, inside
+        `_attempt` (issue #506) — see there for why the two must not be folded into one.
         """
         if self.fault is not None or self.provider is None:
             # Born broken — a missing key or provider list, or a provider that would not build. No
@@ -455,6 +471,12 @@ class Describer:
 
         ``reason`` is ``None`` exactly when the answer is **usable**; anything else is the word the
         line carries and the caller's cue to retry or fall back.
+
+        "One call" means **one answer**, not one request: a transient refusal (a 429, a 5xx, a
+        transport blip) is re-issued here under the shared bounded policy, and the ``llm`` line this
+        writes describes the attempt that finally answered — with a ``duration=`` covering the whole
+        wait. A refused attempt writes an ``llm retry`` WARNING instead, because it generated
+        nothing and was billed nothing, so it is not a call to count (issue #506).
         """
         try:
             provider = self._provider_for(budget)
@@ -472,37 +494,73 @@ class Describer:
             role="user", content=prompt, images=list(images or []), videos=list(videos or [])
         )
         started = time.monotonic()
-        # `capture_llm_call` holds back the adapter's own line, so the one `llm` line this attempt
-        # writes is written below — where the outcome is known (issue #485). Before it, a describe
-        # emitted an untagged `llm` line the dashboard read as the *brain's*, plus a
-        # `media provider=describer` line, and that head is the dashboard's **tools** category,
-        # which a model call is not. One attempt, one line, one category.
-        with capture_llm_call() as call:
-            try:
-                reply = provider.chat([turn], None)
-            except ProviderError as exc:
-                fault = _fault_of(exc)
-                self._report(
-                    subject, kind=kind, call=call, reason=fault, detail=str(exc), started=started
-                )
-                return None, fault
-            except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
-                # An adapter is allowed to raise something the taxonomy has never seen; that is a
-                # runtime-class unknown, not a reason to take the wake down over a picture.
-                self._report(
-                    subject,
-                    kind=kind,
-                    call=call,
-                    reason="provider_error",
-                    detail=f"{type(exc).__name__}: {exc}",
-                    started=started,
-                )
-                return None, "provider_error"
+        # One bounded retry for the transient faults (issue #506) — a 429, a 5xx, a transport blip.
+        # It is *inside* `_attempt` rather than beside the `length` re-budget in `_ask`, and the two
+        # are different things: a re-budget asks the model a **different** question (more room),
+        # which is a second call that answered and was billed and therefore earns its own `llm`
+        # line; a retry re-issues the **identical** question after a refusal that generated nothing,
+        # which earns an `llm retry` WARNING and no `llm` line at all.
+        retry = Retry(
+            provider=describe_provider(provider)[0],
+            model=self.model,
+            purpose=HELPER,
+            kind=kind,
+            sleep=self._sleep,
+            extra={"subject": subject},
+        )
+        while True:
+            # `capture_llm_call` holds back the adapter's own line, so the one `llm` line this
+            # attempt writes is written below — where the outcome is known (issue #485). Before it,
+            # a describe emitted an untagged `llm` line the dashboard read as the *brain's*, plus a
+            # `media provider=describer` line, and that head is the dashboard's **tools** category,
+            # which a model call is not. One attempt, one line, one category. It wraps **exactly
+            # one** model call by its own contract, so a retry gets a fresh block rather than a
+            # second call inside this one.
+            with capture_llm_call() as call:
+                try:
+                    reply = provider.chat([turn], None)
+                except ProviderError as exc:
+                    failure, fault = exc, _fault_of(exc)
+                except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
+                    # An adapter is allowed to raise something the taxonomy has never seen; that is
+                    # a runtime-class unknown, not a reason to take the wake down over a picture —
+                    # and not a reason to retry either: an unrecognised fault is one the policy
+                    # cannot say is transient.
+                    self._report(
+                        subject,
+                        kind=kind,
+                        call=call,
+                        reason="provider_error",
+                        detail=f"{type(exc).__name__}: {exc}",
+                        started=started,
+                        retried=retry.retried,
+                    )
+                    return None, "provider_error"
+                else:
+                    break
+            # Outside the capture block: the wait is not part of the call it follows.
+            if retry.again(failure, reason=fault, is_config=fault.startswith("config:")):
+                continue
+            self._report(
+                subject,
+                kind=kind,
+                call=call,
+                reason=fault,
+                detail=str(failure),
+                started=started,
+                retried=retry.retried,
+                # The same four fields the retry lines carried, from the same function — so the
+                # final `outcome=fallback` names the upstream that refused.
+                diagnostics=diagnostics(failure),
+            )
+            return None, fault
         text = (getattr(reply, "content", None) or "").strip()
         reason = _unusable(text, call, parts=parts)
         # A call that answered with nothing usable was still made and still billed, so its tokens
         # and cost ride this line exactly as a success's do — the reranker's rule, in its words.
-        self._report(subject, kind=kind, call=call, reason=reason, started=started)
+        self._report(
+            subject, kind=kind, call=call, reason=reason, started=started, retried=retry.retried
+        )
         return (text or None), reason
 
     def _provider_for(self, budget: int) -> Provider | None:
@@ -528,6 +586,8 @@ class Describer:
         call: LlmCall | None = None,
         detail: str | None = None,
         started: float | None = None,
+        retried: bool = False,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         """The one `llm` line this describe attempt writes, whatever happened (issue #485).
 
@@ -557,7 +617,11 @@ class Describer:
             self._reported_config = self._reported_config or is_config
         call = call or LlmCall()
         seconds = call.seconds
-        if seconds is None and started is not None:
+        # The adapter's own figure is the better one — it measured the HTTP call — right up until
+        # there were refused attempts and sleeps it knows nothing about (issue #506). Then the
+        # honest answer to *seconds per describe*, the question `helper_duration_s` asks, is the
+        # caller's wall clock: what the agent actually waited. Chosen, never blended.
+        if started is not None and (seconds is None or retried):
             seconds = time.monotonic() - started
         # The adapter's own provider name where there was a call, this describer's configured one
         # otherwise — never a guess: a born-broken describer has no adapter to ask.
@@ -580,7 +644,9 @@ class Describer:
             outcome="ok" if reason is None else "fallback",
             reason=reason,
             detail=detail,
-            extra={"subject": subject},
+            # The vendor's own account of the fault (issue #506) reads next to the `reason` it
+            # explains, and is absent on every line with nothing to explain.
+            extra={**(diagnostics or {}), "subject": subject},
             level=level,
         )
 

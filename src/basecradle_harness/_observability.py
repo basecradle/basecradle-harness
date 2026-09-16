@@ -583,6 +583,74 @@ def log_llm_call(
     )
 
 
+#: The head a **retry** line wears — and the one property of it that is load-bearing is what it is
+#: *not*: it does not contain `` llm provider=``, the literal the fleet's whole model-call family
+#: keys on (`basecradle-noc` ``observability/ai-box.json``: ``llm_calls``, ``memory_calls``,
+#: ``helper_calls``, and every cost / duration / outcome column hanging off them). The discriminator
+#: is the space-then-``provider=`` immediately after ``llm``; ``llm retry provider=`` has a word in
+#: between and matches none of them.
+#:
+#: That is deliberate rather than convenient. A failed attempt that never reached a model generated
+#: nothing and was billed nothing, so it is **not a call** — counting it would inflate *Calls by
+#: Model*, drag a failure's wait into the duration average, and put a NULL on the rerank-outcomes
+#: chart the founder reads. `tests/test_retry.py` runs the NOC's own expressions against a real
+#: retry line and a real `llm` line and asserts the split, because a head that *looks* safe is not
+#: the same as one checked against the regex that reads it.
+RETRY_HEAD = "llm retry"
+
+
+def log_llm_retry(
+    *,
+    provider: str,
+    model: str,
+    purpose: str,
+    attempt: str,
+    reason: str | None,
+    next_in: float,
+    kind: str | None = None,
+    diagnostics: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> None:
+    """One WARNING per **failed, about-to-be-retried** attempt (issue #506).
+
+    Its own head (`RETRY_HEAD`), never the `llm` one — see there for the whole reason, which is that
+    a 429 is not a call. What it *is* is the only record that a wake waited: the final `llm` line
+    carries ``outcome=ok`` and a ``duration=`` that silently includes the sleeps, so without this
+    line a recovered rerank is indistinguishable from a fast one and the fault that nearly cost the
+    agent its memories leaves no trace at all.
+
+    ``attempt`` arrives pre-rendered as ``"1/3"`` rather than as two numbers, because the *other*
+    counter on this line is OpenRouter's own (``routing_attempt=``) and two attempt counters under
+    one key is a line nobody can read.
+
+    ``diagnostics`` is `basecradle_harness._retry.diagnostics` — the vendor's own account of the
+    fault, built by one function so that these fields and the ones on the final ``outcome=fallback``
+    line can never disagree. ``extra`` is the call site's own trailing context (``surface=`` for a
+    rerank, ``subject=`` for a describe), so a retry is greppable beside the line it belongs to.
+
+    **WARNING, always.** A retry is a degradation that recovered; it is not an error (nothing was
+    lost) and it is not routine (something went wrong). Logging it at INFO would hide a rising 429
+    rate inside the ordinary chatter of a healthy wake, which is exactly how this class of fault
+    stayed invisible until a dashboard happened to show it.
+    """
+    # Merged as dicts rather than splatted as keywords: a call site whose `extra` happened to carry
+    # one of these names would otherwise raise `TypeError: got multiple values` from inside an
+    # `except` block in a wake — a logging call taking the wake down over a field name. A merge
+    # overrides instead, which is the right failure for an observability line.
+    fields: dict[str, Any] = {
+        "provider": provider,
+        "purpose": purpose,
+        "kind": kind,
+        "model": model,
+        "attempt": attempt,
+        "reason": reason,
+        **(diagnostics or {}),
+        "next_in": _secs(next_in),
+        **(extra or {}),
+    }
+    _log.warning("%s %s", RETRY_HEAD, kv(**fields))
+
+
 def log_media_call(
     *, provider: str, kind: str, model: str, seconds: float, cost: float | None = None
 ) -> None:

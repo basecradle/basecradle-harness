@@ -92,7 +92,15 @@ def test_live_model_params_reach_the_endpoint():
 
 
 def _llm_line(caplog) -> str:
-    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm "))
+    """The `llm` line — **never** an ``llm retry`` one (issue #506).
+
+    The retry head shares the first word, so the prefix must be the frozen `` llm provider=`` head
+    itself: a refused attempt is not a call, and selecting one here would read a retry's fields as
+    if they were a completed call's.
+    """
+    return next(
+        m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm provider=")
+    )
 
 
 def _field(line: str, key: str) -> str | None:
@@ -194,11 +202,15 @@ def _rerank_record(caplog):
     Issue #485 retired the reranker's private ``mempalace rerank`` head for the unified ``llm``
     line, and this file (which CI never runs) kept selecting the old head until the NOC's live
     smoke went red on it (issue #504). The selector is the offline suite's (``test_rerank.py``).
+
+    It anchors on the **frozen head** `` llm provider=`` rather than on ``llm ``, because issue #506
+    added an ``llm retry`` line that shares the first word: a 429 that was waited out and recovered
+    would otherwise be selected here as the rerank's own record.
     """
     return next(
         r
         for r in caplog.records
-        if r.getMessage().startswith("llm ")
+        if r.getMessage().startswith("llm provider=")
         and "purpose=memory" in r.getMessage()
         and "kind=rerank" in r.getMessage()
     )
