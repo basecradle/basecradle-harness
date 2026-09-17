@@ -33,6 +33,21 @@ The brief is composed, in order, of a current-time anchor followed by four parts
 Composition is pure (`compose_brief` / `render_manifest`); the one impure piece, the
 live dashboard fetch (`fetch_dashboard_md`), is isolated and tolerant by construction.
 
+**Every part is fenced in a named tag pair** (issue #509). The brief mixes authority levels
+inside one ~54 K-character system turn — `initialize.md` and `system-prompt.md` are
+*instructions*, the now/budget/manifest/defect/safety parts are *harness-generated*, the dashboard
+is *fetched live* and carries peer-authored strings (timeline names, handles, about text), and
+the memory part is *recalled excerpts of past conversation*. Input Security tells the agent its
+only instructions are this brief and its charter; without a boundary per part, the agent has no
+way to see inside the brief where instruction ends and fetched data begins. The recall block got
+a fence first, for exactly that reason (`_mempalace._fenced`); `BRIEF_TAGS` applies the same
+reasoning to all nine parts, uniformly — no part unfenced, no part special.
+
+The framing belongs to the **composer**, never to the content: a prompt file on disk that
+carried its own wrapper tag would be content claiming to be structure, and an operator editing
+`prompts/initialize.md` could break the fence without ever opening this module. So `brief_parts`
+returns the parts unwrapped and `join_brief` is where the tags are added.
+
 **The parts are named, and the names are reported** (issue #369). The brief is the one
 section of a wake's assembled context whose composition is invisible from the outside — it
 reaches the model as a single system turn, so a transcript-shaped measurement can only say
@@ -44,11 +59,74 @@ brief down by part without a second, drifting copy of the composition order (`_a
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 
 #: What separates two parts of the composed brief. Named because `brief_section_sizes` has to
 #: charge it to somebody for the sizes to be a true partition of the joined text.
 _JOIN = "\n\n"
+
+#: Each brief part's fence tag — the pair `join_brief` wraps that part in (issue #509).
+#:
+#: **The tag is the source's name.** A *file-backed* part is tagged with its filename, so an agent
+#: that can read its own config home sees the same names in its brief that it sees in
+#: ``<config-home>/prompts/`` and on the platform — `initialize.md`, `system-prompt.md`,
+#: `dashboard.md`. A *generated* part is tagged with its `brief_parts` name, which is also the
+#: name the context-attribution line reports it under, so a brief dump and a log line are read
+#: with one vocabulary rather than two.
+#:
+#: Every name `brief_parts` can emit must have an entry here (pinned by test): a missing one is a
+#: `KeyError` that degrades the whole wake to *no brief*, which is loud — where quietly emitting
+#: the part unfenced would be the silent defect this fence exists to remove.
+BRIEF_TAGS: dict[str, str] = {
+    "now": "now",
+    "budget": "budget",
+    "initialize": "initialize.md",
+    "manifest": "manifest",
+    "defects": "defects",
+    "safety": "safety",
+    "dashboard": "dashboard.md",
+    "memory": "memory",
+    "system_prompt": "system-prompt.md",
+}
+
+#: Every fence literal the composer writes, open and close. Exported because the mining boundary
+#: has to know them too: the model reads these tags every wake, so a reply that quotes one is
+#: genuine LLM output arriving on a path that is genuinely mined, and left alone it would be
+#: filed as something a peer once said and recalled back into the brief as "memory"
+#: (`_mining.strip_injected`). Derived from `BRIEF_TAGS`, never re-typed — a catalog that spells
+#: a marker for itself drifts from the writer the first time the wording is edited.
+BRIEF_FENCE_LITERALS: tuple[str, ...] = tuple(
+    literal for tag in BRIEF_TAGS.values() for literal in (f"<{tag}>", f"</{tag}>")
+)
+
+#: Any fence literal, in any casing — removed from a *peer-influenced* part before it is fenced.
+#: Unlike `_mining._INJECTED` this needs no longest-first ordering: every literal ends in ``>`` and
+#: no tag contains one, so no literal can be a proper prefix of another and leave a tail behind.
+_FENCE_LITERAL = re.compile(
+    "|".join(re.escape(literal) for literal in BRIEF_FENCE_LITERALS), re.IGNORECASE
+)
+
+#: The parts whose text a **peer** can influence, and which therefore carry the forgery strip.
+#:
+#: - ``dashboard`` is fetched live from the platform and is full of peer-authored strings —
+#:   timeline names, handles, about text. A peer who names a timeline ``</dashboard.md>`` would
+#:   end the data block early and have the rest of the dashboard read as instruction.
+#: - ``memory`` is mined excerpts of real conversations, so a peer can simply *type* a tag into a
+#:   message the palace later recalls. (`_mempalace._fenced` already strips its **own**
+#:   `<mempalace-recall>` pair for this reason; that strip covers only the provider's inner
+#:   fence, so the outer one is stripped here.)
+#:
+#: The other seven do not need it and deliberately do not get it: ``now``, ``budget``,
+#: ``manifest``, ``defects`` and ``safety`` are composed by the harness out of its own constants
+#: and the operator's config, and ``initialize`` / ``system_prompt`` are files only the operator
+#: writes. A strip there would be editing text nobody untrusted authored.
+#:
+#: **Both literals of every part's pair are stripped, not just the part's own closer.** A peer who
+#: plants another part's *opening* tag inside a data block does not break that block's boundary,
+#: but it does put an unmatched `<system-prompt.md>` in front of the model in the one turn where
+#: the tags are supposed to say what is instruction — which is the whole thing the fence buys.
+_PEER_INFLUENCED = frozenset({"dashboard", "memory"})
 
 
 def render_manifest(entries: Sequence[tuple[str, str | None]]) -> str | None:
@@ -169,6 +247,13 @@ def brief_parts(
 
     A part that is absent or blank is simply not in the list — which is why a section it would
     have named never appears on the attribution line either, rather than appearing as a zero.
+
+    The parts come back **unfenced**; `join_brief` adds each one's tag pair. What happens here is
+    the other half of the fence: a peer-influenced part (`_PEER_INFLUENCED`) has any fence literal
+    removed from its text first, so a peer cannot forge the framing by typing a tag into a
+    timeline name or a message the palace later recalls. It is done here rather than in the join
+    so the stripped text is what `brief_section_sizes` measures and what `join_brief` emits —
+    one composition, not two that can disagree.
     """
     named = (
         ("now", now),
@@ -181,12 +266,40 @@ def brief_parts(
         ("memory", memory),
         ("system_prompt", system_prompt),
     )
-    return [(name, part) for name, part in named if part and part.strip()]
+    parts: list[tuple[str, str]] = []
+    for name, part in named:
+        if not (part and part.strip()):
+            continue
+        if name in _PEER_INFLUENCED:
+            part = _FENCE_LITERAL.sub("", part)
+            # A part that was *nothing but* forged framing drops out rather than composing an
+            # empty tag pair — the same rule an absent part already follows.
+            if not part.strip():
+                continue
+        parts.append((name, part))
+    return parts
+
+
+def _fence(name: str, text: str) -> str:
+    """`text` inside its part's tag pair, each tag alone on its own line.
+
+    `BRIEF_TAGS[name]` on purpose: a part `brief_parts` can emit but this table does not name is
+    a `KeyError`, which `_wake._compose_brief` turns into a logged warning and a wake with no
+    brief. Loud and wrong beats quiet and wrong — an unfenced part is exactly the thing the fence
+    exists to make impossible.
+    """
+    tag = BRIEF_TAGS[name]
+    return f"<{tag}>\n{text}\n</{tag}>"
 
 
 def join_brief(parts: Sequence[tuple[str, str]]) -> str | None:
-    """The composed brief text from `brief_parts` output — ``None`` when there are no parts."""
-    return _JOIN.join(part for _, part in parts) if parts else None
+    """The composed brief text from `brief_parts` output — ``None`` when there are no parts.
+
+    Each part is wrapped in its `BRIEF_TAGS` pair on the way out (issue #509). The framing is
+    added *here*, never carried in the parts themselves, so a prompt file on disk stays pure
+    content and an operator cannot break a fence by editing one.
+    """
+    return _JOIN.join(_fence(name, part) for name, part in parts) if parts else None
 
 
 def brief_section_sizes(parts: Sequence[tuple[str, str]]) -> dict[str, int]:
@@ -197,9 +310,14 @@ def brief_section_sizes(parts: Sequence[tuple[str, str]]) -> dict[str, int]:
     unattributed characters per section. That matters more than the two characters do: the
     attribution line's whole claim is that its sections *add up*, and a reader who checks and
     finds they do not has no way to tell a rounding convention from a missing section.
+
+    A part's **fence tags are charged to that part** for the same reason, and by calling the very
+    function that writes them (`_fence`) rather than re-deriving their length: the partition is
+    then true by construction, not by two places agreeing about how long a tag is.
     """
     return {
-        name: len(part) + (len(_JOIN) if index else 0) for index, (name, part) in enumerate(parts)
+        name: len(_fence(name, part)) + (len(_JOIN) if index else 0)
+        for index, (name, part) in enumerate(parts)
     }
 
 
@@ -235,6 +353,12 @@ def compose_brief(
     provider case) composes exactly the brief it did before these seams existed. The **step
     budget** rides right after the time anchor and before the operating guidance — it is a
     standing fact about how the turn is bounded, so the model reads it up front (issue #243).
+
+    Every part that survives is **fenced in its own named tag pair** on the way out — the
+    filename for a file-backed part (`initialize.md`, `dashboard.md`, `system-prompt.md`), the
+    part name otherwise (see `BRIEF_TAGS`). The memory part nests whatever the active provider
+    returned *inside* `<memory>` unchanged, so MemPalace's own `<mempalace-recall>` block and its
+    framing sentence end up nested there rather than renamed or replaced.
 
     The order itself lives in `brief_parts`; this is the join over it. A caller that also needs
     the per-part sizes (the wake, for the context-attribution line) calls `brief_parts` once and

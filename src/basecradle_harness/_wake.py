@@ -2490,8 +2490,14 @@ class WakeAgent:
         **Never break the wake.** `fetch_dashboard_md` already swallows its (network) failures
         and `_memory_context` swallows the provider's, but the prompt-file reads can also raise
         (a permission/IO error on `prompts/*.md` mid-wake) — so the whole composition is
-        guarded too: any failure degrades to *no brief* and the wake carries on, the same
-        invariant the dashboard fetch is held to.
+        guarded too, **join included**: any failure degrades to *no brief* and the wake carries
+        on, the same invariant the dashboard fetch is held to.
+
+        Every part is **fenced in its own named tag pair** on the way out (`_brief.BRIEF_TAGS`,
+        issue #509), so the model can see inside one ~54 K-character system turn where an
+        instruction ends and fetched data begins. The two peer-influenced parts — the live
+        dashboard and the recalled memory — have any fence literal stripped first, so a peer who
+        names a timeline `</dashboard.md>` cannot end the data block early.
 
         Composed as a list of **named** parts (`brief_parts`) rather than straight to text, so the
         same single composition yields both the string the model reads and the per-part sizes the
@@ -2510,15 +2516,20 @@ class WakeAgent:
                 memory=self._memory_context(query),
                 system_prompt=system_prompt_text(),
             )
+            # Sizes and text off the *same* composition, so the attribution line can never report
+            # the parts of a brief the model was not shown — and so the live dashboard is fetched
+            # once. Both are *inside* the guard: the join stopped being a bare `str.join` when the
+            # parts gained fences (issue #509), and a part with no `BRIEF_TAGS` entry raises here.
+            # Outside it, that would take the wake down instead of costing it a brief.
+            sections = brief_section_sizes(parts)
+            brief = join_brief(parts)
         except Exception:  # noqa: BLE001 - the brief must never break the wake; degrade to none
             _log.warning(
                 "Failed to compose the persistent brief; proceeding without it.", exc_info=True
             )
             return None
-        # Sizes and text off the *same* composition, so the attribution line can never report the
-        # parts of a brief the model was not shown — and so the live dashboard is fetched once.
-        self._brief_sections = brief_section_sizes(parts)
-        return join_brief(parts)
+        self._brief_sections = sections
+        return brief
 
     def _memory_context(self, query: str | None) -> str | None:
         """The memory provider's recalled context for this turn, guarded — never breaks the wake.

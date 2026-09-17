@@ -28,6 +28,7 @@ from basecradle_harness import (
     _mining,
 )
 from basecradle_harness import _wake as wake_module
+from basecradle_harness._brief import BRIEF_FENCE_LITERALS
 from basecradle_harness._engine import EngineError
 from basecradle_harness._install import install
 from basecradle_harness._mempalace import (
@@ -39,6 +40,7 @@ from basecradle_harness._mempalace import (
 from basecradle_harness._messages import Message
 from basecradle_harness._mining import _LEGACY_RECALL_HEADING as LEGACY_HEADING
 from basecradle_harness._mining import (
+    INJECTED_RECALL_LITERALS,
     MIN_UNIT_CHARS,
     Verdict,
     catalog,
@@ -252,6 +254,30 @@ def test_a_reply_quoting_the_recall_block_is_stripped_of_its_framing(platform, t
         assert literal not in assistant
 
 
+def test_a_reply_quoting_a_brief_part_fence_is_stripped_of_it(platform, tmp_path):
+    """The same residue, one level out: the brief's *part* fences (issue #509).
+
+    The model reads `<initialize.md>` and `<dashboard.md>` on every wake now, so a reply that
+    quotes one is genuine LLM output on a path that is genuinely mined. Left in, the next recall
+    serves the harness's own structural tag back inside `<memory>` — where a stray `</memory>` is
+    exactly the forgery the composer strips the dashboard and the recall for.
+    """
+    provider = Recorder(injected=None)
+    quoted = (
+        "My brief starts with <now> and my charter is fenced in <system-prompt.md>.\n"
+        "</dashboard.md>\nJohn lives in Dallas."
+    )
+    agent = _agent(tmp_path, provider, _CannedModel(text=quoted))
+
+    agent.wake()
+
+    assistant = provider.observed[-1].assistant
+    assert "John lives in Dallas." in assistant  # removal, never rejection
+    assert "My brief starts with" in assistant
+    for literal in BRIEF_FENCE_LITERALS:
+        assert literal not in assistant
+
+
 def test_an_exchange_that_is_nothing_but_scaffolding_is_not_mined_at_all(platform, tmp_path):
     """Stripping can empty an exchange, and an empty drawer only ever dilutes retrieval."""
     provider = Recorder()
@@ -356,6 +382,29 @@ def test_strip_injected_is_case_insensitive_and_removes_only_the_recall_framing(
     assert "John lives in Dallas." in stripped
     assert "relevant memories" not in stripped.lower()
     assert "mempalace-recall" not in stripped.lower()
+
+
+def test_strip_injected_removes_every_brief_part_fence():
+    # Issue #509: the brief's part fences join the recall framing in the exclusion, or the next
+    # mining pass files `<initialize.md>` as something a peer once said.
+    text = "I read <INITIALIZE.MD> then </memory> then said something real."
+
+    stripped = strip_injected(text)
+
+    assert "said something real" in stripped
+    for literal in BRIEF_FENCE_LITERALS:
+        assert literal.lower() not in stripped.lower()
+
+
+def test_the_scrub_catalog_does_not_learn_the_brief_fences():
+    """Deliberate asymmetry: the fences are stripped forward, never scrubbed backward.
+
+    `INJECTED_RECALL_LITERALS` is also the backward-facing catalog's `recall-block` class, and a
+    fence literal cannot be in an already-polluted palace — it did not exist before this version.
+    In an old palace that text can *only* be genuine dialogue about this feature, so a catalog
+    entry would teach the scrub about real memories and nothing else.
+    """
+    assert not set(INJECTED_RECALL_LITERALS) & set(BRIEF_FENCE_LITERALS)
 
 
 def test_strip_injected_leaves_ordinary_prose_alone():

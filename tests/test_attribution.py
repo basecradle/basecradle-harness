@@ -23,7 +23,12 @@ from basecradle_harness import (
     ToolSpec,
 )
 from basecradle_harness._attribution import attribute, log_context_attribution
-from basecradle_harness._brief import brief_parts, brief_section_sizes, join_brief
+from basecradle_harness._brief import (
+    BRIEF_TAGS,
+    brief_parts,
+    brief_section_sizes,
+    join_brief,
+)
 from basecradle_harness._context import TOOL_RESULT_CAP
 from basecradle_harness._engine import _step_note, is_step_note
 from tests.test_session import ScriptedProvider, calls_tool, text
@@ -300,7 +305,9 @@ def test_a_real_send_reports_the_payload_it_assembled(tmp_path, caplog):
         )
     fields = sizes(lines(caplog)[0])
     assert fields["brief"] == len(join_brief(parts))
-    assert fields["brief_memory"] == len("You met John Doe on Tuesday.") + 2  # + its separator
+    # The part's text, its `<memory>` fence (issue #509), and the separator ahead of it — the
+    # three things `brief_section_sizes` charges it, which is what makes the sections partition.
+    assert fields["brief_memory"] == len("<memory>\nYou met John Doe on Tuesday.\n</memory>") + 2
     assert fields["tools"] == spec_chars(Weather().to_spec())
     assert fields["tools_count"] == 1
     assert fields["history_user"] == len("what's the weather?")
@@ -378,4 +385,6 @@ def test_each_composed_brief_part_reaches_the_line_under_its_own_name(tmp_path, 
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         session.send("hi", brief=join_brief(parts), brief_sections=brief_section_sizes(parts))
     line = lines(caplog)[0]
-    assert line[f"brief_{part}"] == str(len("content"))
+    tag = BRIEF_TAGS[part]
+    # The part's own fence is charged to the part (issue #509), so the sections still partition.
+    assert line[f"brief_{part}"] == str(len(f"<{tag}>\ncontent\n</{tag}>"))

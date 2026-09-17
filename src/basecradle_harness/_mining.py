@@ -18,9 +18,10 @@ his own brief and served back to him as memory.
 **Why a filter is not the fix, and is shipped anyway.** Enforcement lives at the leaking
 paths — the wake mines a *dialogue* rendering of an item rather than the model-facing one,
 never mines its own canned notes, and no longer mines a compaction summary (`_wake`). This
-module's `strip_injected` is a second line only: it removes the recall block's *own* framing
-literals, which are the one class of scaffolding that can round-trip through a legitimately
-mined turn (the model reads the block and quotes it back in its reply, which is genuinely
+module's `strip_injected` is a second line only: it removes the **brief's own framing** — the
+recall block's heading and fence, and (since issue #509) every part fence the composer writes —
+which is the one class of scaffolding that can round-trip through a legitimately mined turn (the
+model reads those tags on every wake and can quote them back in its reply, which is genuinely
 LLM output and genuinely minable). It removes nothing else, because a filter that reached
 further would start editing dialogue.
 
@@ -46,6 +47,7 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+from basecradle_harness._brief import BRIEF_FENCE_LITERALS
 from basecradle_harness._mempalace import _CLOSE_TAG, _INJECTED_HEADING, _OPEN_TAG
 
 #: The recall heading MemPalace's `context` hook injected **before** 0.112.0 (PR #135 through
@@ -62,12 +64,28 @@ _LEGACY_RECALL_HEADING = "Relevant memories from past conversations (across all 
 #: kept out at its source, which is why nothing else is listed here (see the module docstring).
 INJECTED_RECALL_LITERALS = (_INJECTED_HEADING, _LEGACY_RECALL_HEADING, _OPEN_TAG, _CLOSE_TAG)
 
-#: `INJECTED_RECALL_LITERALS` as one case-insensitive alternation, compiled once. Longest first, so
-#: an alternation never matches a shorter literal that is a prefix of a longer one and leaves its
-#: tail behind — the ordering is the correctness, not the speed.
+#: What `strip_injected` removes, as one case-insensitive alternation, compiled once: the recall
+#: block's framing plus **every Turn-0 part fence the composer writes** (issue #509). The fences
+#: are the same class of residue as the recall framing and arrive the same way — the model reads
+#: `<initialize.md>` on every wake, and a reply that quotes one is real LLM output on a path that
+#: is legitimately mined. Left in, the next pass files the harness's own structural tag as
+#: something a peer once said, and recall serves it back inside `<memory>`, where a stray
+#: `</memory>` is the very forgery `_brief` strips the dashboard and the recall for.
+#:
+#: They are kept **out of `INJECTED_RECALL_LITERALS`** rather than appended to it, because that
+#: tuple is also the backward-facing scrub catalog's `recall-block` class — and a fence literal
+#: cannot be in an already-polluted palace, since it did not exist before this version. A catalog
+#: entry would only teach the scrub about text that, in an old palace, can *only* be genuine
+#: dialogue about this feature.
+#:
+#: Longest first, so an alternation never matches a shorter literal that is a prefix of a longer
+#: one and leaves its tail behind — the ordering is the correctness, not the speed.
 _INJECTED = re.compile(
     "|".join(
-        re.escape(literal) for literal in sorted(INJECTED_RECALL_LITERALS, key=len, reverse=True)
+        re.escape(literal)
+        for literal in sorted(
+            (*INJECTED_RECALL_LITERALS, *BRIEF_FENCE_LITERALS), key=len, reverse=True
+        )
     ),
     re.IGNORECASE,
 )
@@ -150,8 +168,9 @@ def strip_injected(text: str) -> str:
     The defense-in-depth half of the boundary, applied at the harness's one mining chokepoint
     (`_wake._observe`). It is **not** the fix and must never become the only line of defense:
     the leaking paths are closed at their source, and this catches the single residue that
-    closure cannot reach — the model quoting its own Turn-0 recall back in a reply, which is
-    real LLM output arriving on a path that is supposed to be mined.
+    closure cannot reach — the model quoting its own Turn-0 framing back in a reply (the recall
+    block's heading or fence, or any of the brief's part fences), which is real LLM output
+    arriving on a path that is supposed to be mined.
 
     Removal, never rejection: a reply that quotes the heading and then says something real
     keeps the real part. An exchange that empties out entirely is dropped by the caller.

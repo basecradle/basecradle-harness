@@ -51,6 +51,7 @@ from basecradle_harness import (
     _wake,
     install,
 )
+from basecradle_harness import _wake as wake_module
 from basecradle_harness._basecradle import _incoming_text, _parse_created_at
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
@@ -2810,6 +2811,28 @@ def test_a_dashboard_fetch_failure_does_not_break_the_wake(platform, tmp_path):
     assert "How to Operate Here" in brief  # initialize.md present…
     assert "Your active tools right now:" in brief  # …and the manifest…
     assert "You are a helpful peer on BaseCradle." in brief  # …and the personality, sans dashboard
+
+
+def test_an_unfenceable_brief_part_costs_the_brief_and_not_the_wake(
+    platform, tmp_path, monkeypatch, caplog
+):
+    """The join can raise now (issue #509), so it has to sit inside the composer's guard.
+
+    A part with no `BRIEF_TAGS` entry is a deliberate `KeyError` — loud beats an unfenced part
+    reaching the model. But before #509 `join_brief` was a bare `str.join` that could not raise,
+    and it was called *outside* the try; left there, the same `KeyError` would have taken the
+    whole wake down rather than costing it its standing context.
+    """
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, model = build_wake(tmp_path, onboard=True, tool_manifest=[("memory", None)])
+    monkeypatch.setattr(wake_module, "brief_parts", lambda **_: [("no_such_part", "text")])
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        posted = agent.wake()
+
+    assert len(posted) == 1  # the peer was still answered
+    assert _brief_shown(model) == []  # …with no brief at all
+    assert "Failed to compose the persistent brief" in caplog.text  # and it said so
 
 
 def test_onboarding_off_shows_no_brief(platform, tmp_path):
