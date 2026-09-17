@@ -43,7 +43,8 @@ over-estimate of chars-per-token and errs in the safe direction, exactly as
 
 **The sections add up.** ``total`` is the sum of every section reported, exactly, which is what
 lets a reader trust a share they compute from it. Three consequences follow, and each is a
-decision: the brief's parts are charged their joining separators (`_brief.brief_section_sizes`);
+decision: the brief's parts are charged their joining separators **and their own fence tags**
+(`_brief.brief_section_sizes`, which measures them with the function that writes them);
 image payload is its own section rather than folded into the turn that carries it (base64 is
 enormous in characters and is *not* billed in text tokens — folding it in would inflate the one
 section a reader is most likely to misread); and what this measures is model-visible content, not

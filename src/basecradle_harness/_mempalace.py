@@ -623,6 +623,15 @@ def _fenced(body: str) -> str:
     `body` is mined conversation text, so both tag literals are stripped from it first
     (`_TAG_LITERAL`, case-insensitively): a peer who typed a closing tag into a message the palace
     later recalls must not be able to end the block early and have the rest read as charter.
+
+    **This fence nests inside the brief's `<memory>` part and is not replaced by it** (issue
+    #509). The composer fences every brief part in a tag pair naming its source; the memory
+    part's content is whatever the active memory provider returned, wrapped unchanged. So this
+    block — framing sentence included — ends up inside `<memory>`, which says *the harness put a
+    memory section here*, while `<mempalace-recall>` says *MemPalace generated this text*. Two
+    different facts; a provider that is not MemPalace nests its own inner fence the same way.
+    The composer strips the **outer** pair from this text for the same forgery reason this
+    function strips the inner one.
     """
     return f"{_INJECTED_HEADING}\n\n{_OPEN_TAG}\n{_TAG_LITERAL.sub('', body)}\n{_CLOSE_TAG}"
 
