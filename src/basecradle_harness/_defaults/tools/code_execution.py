@@ -27,7 +27,8 @@ PLUGINS = [
         note=(
             "Runs Python server-side in OpenAI's sandbox. Files it writes — and the source it "
             "ran — are stored back as BaseCradle Assets automatically; use code_attach to feed "
-            "an Asset in."
+            "an Asset in. Reference produced files by their Asset uuid, never by a sandbox "
+            "`/mnt/data` path — those are unreachable to anyone else."
         ),
         opt_in=True,
     ),

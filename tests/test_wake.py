@@ -253,7 +253,7 @@ def test_is_counter_does_not_swallow_the_onboarding_brief():
     brief = compose_brief(
         now=_now_line(),
         budget=render_budget(24),
-        initialize="How to operate here.",
+        initialize="How to Operate Here.",
         manifest="Your active tools right now:\n- memory",
         dashboard="DASH",
         system_prompt="You are Nova.",
@@ -427,7 +427,7 @@ def serve_dashboard_md(platform, text="# Dashboard\n\nTrust is mutual at the gat
 
 def _is_brief(m) -> bool:
     """A persistent-brief system turn, recognized by `initialize.md`'s heading."""
-    return m.role == "system" and "How to operate here" in (m.content or "")
+    return m.role == "system" and "How to Operate Here" in (m.content or "")
 
 
 def _brief_shown(provider):
@@ -2746,7 +2746,7 @@ def test_a_wake_persists_no_brief(platform, tmp_path):
     assert _brief_turns(agent2) == []  # …and neither wrote one to the transcript
     # Belt and braces: nothing brief-shaped survives on disk either (a fresh reader sees none).
     stored = json.loads((tmp_path / "sessions" / f"timeline%3A{TIMELINE_UUID}.json").read_text())
-    assert not [t for t in stored if "How to operate here" in (t.get("content") or "")]
+    assert not [t for t in stored if "How to Operate Here" in (t.get("content") or "")]
 
 
 def test_a_failed_wake_persists_no_brief(platform, tmp_path):
@@ -2789,7 +2789,7 @@ def test_the_brief_composes_all_four_parts(platform, tmp_path):
     agent.wake()
 
     brief = _brief_shown(model)[0].content
-    assert "How to operate here" in brief  # 1. initialize.md (provider-independent guidance)
+    assert "How to Operate Here" in brief  # 1. initialize.md (provider-independent guidance)
     assert "Trust is directional in storage, mutual at the gate." in brief  # the B6 trust note
     assert "Your active tools right now:" in brief  # 2. generated manifest…
     assert "- lock — one-way and irreversible." in brief  # …with the optional per-tool note
@@ -2807,7 +2807,7 @@ def test_a_dashboard_fetch_failure_does_not_break_the_wake(platform, tmp_path):
 
     assert len(posted) == 1  # the wake still replied — the fetch failure never broke it
     brief = _brief_shown(model)[0].content
-    assert "How to operate here" in brief  # initialize.md present…
+    assert "How to Operate Here" in brief  # initialize.md present…
     assert "Your active tools right now:" in brief  # …and the manifest…
     assert "You are a helpful peer on BaseCradle." in brief  # …and the personality, sans dashboard
 
