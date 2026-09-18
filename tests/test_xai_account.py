@@ -650,7 +650,7 @@ def _a_drifting_preview(prepaid_cents: str, drawn_cents: list[str]):
     """A preview whose `prepaidCreditsUsed` advances on every read — a live account, spending.
 
     The one condition the live suite runs under and no fixture used to reproduce: three xAI
-    personas draw on that account continuously, so two oracle reads seconds apart are two
+    agents draw on that account continuously, so two oracle reads seconds apart are two
     different numbers.
     """
     reads = iter(drawn_cents)

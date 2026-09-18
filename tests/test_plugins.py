@@ -451,7 +451,7 @@ def test_a_never_installed_config_home_falls_back_to_benign_defaults_only(tmp_pa
 
 
 def test_default_riding_xai_agent_is_benign_only_no_grok_tools_auto_armed():
-    # The safety crux (issue #168): a default-riding xai agent (e.g. an adversarial persona that
+    # The safety crux (issue #168): a default-riding xai agent (e.g. an adversarial agent that
     # was never given an overlay) gets ZERO powerful tools — the grok media tools and Live Search
     # do NOT auto-activate from `Vendor("xai")`. Provider gates availability, never the default.
     resolved = resolve_plugins(load_plugins(), _ctx(provider="xai", AI_API_KEY="xai-key"))
@@ -462,9 +462,9 @@ def test_default_riding_xai_agent_is_benign_only_no_grok_tools_auto_armed():
 
 
 def test_a_freshly_installed_home_loads_benign_tools_only_end_to_end(tmp_path):
-    # The headline safety property, end-to-end through install() + load(): a persona the installer
+    # The headline safety property, end-to-end through install() + load(): an agent the installer
     # scaffolded (overlay authoritative) comes up with the benign/platform set and ZERO powerful
-    # tools — no opt-in → none on disk → none loaded (the adversarial-persona guarantee).
+    # tools — no opt-in → none on disk → none loaded (the adversarial-agent guarantee).
     home = tmp_path / "cfg"
     install(home)  # no opt_in → benign defaults only on disk
 
@@ -475,7 +475,7 @@ def test_a_freshly_installed_home_loads_benign_tools_only_end_to_end(tmp_path):
 
 
 def test_opting_a_power_tool_into_the_overlay_activates_it_subject_to_availability(tmp_path):
-    # The opt-in path: a powerful tool present in the persona's overlay activates — gated only by
+    # The opt-in path: a powerful tool present in the agent's overlay activates — gated only by
     # its `requires` (availability). The grok tool runs under xai and self-excludes under openai.
     home = tmp_path / "cfg"
     install(home, provider="xai", opt_in=["grok_generate_image"])
@@ -681,7 +681,7 @@ def test_default_riding_openrouter_agent_is_benign_only(monkeypatch):
 
 
 def test_opted_in_power_tools_self_exclude_under_openrouter(tmp_path):
-    # Even a persona that explicitly opted powerful tools into its overlay gets none of them under
+    # Even an agent that explicitly opted powerful tools into its overlay gets none of them under
     # provider=openrouter: each `requires` gate (Vendor("openai")/Vendor("xai")/OpenAIKey) fails,
     # so the media/search/grok tools all deactivate while the universal tools stay.
     home = tmp_path / "cfg"
@@ -701,7 +701,7 @@ def test_opted_in_power_tools_self_exclude_under_openrouter(tmp_path):
 
 
 def test_openrouter_web_search_opts_in_under_the_native_sdk(tmp_path):
-    # Opted into the persona, the openrouter web_search built-in activates under the native SDK
+    # Opted into the agent, the openrouter web_search built-in activates under the native SDK
     # (provider=openrouter, sdk=openrouter) — claiming the shared `web_search` name — so the
     # resolver hands it to the provider as a builtin.
     home = tmp_path / "cfg"

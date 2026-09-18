@@ -245,7 +245,7 @@ def resolve_stems(
             and spelling ``basecradle-harness-install --opt-in`` takes.
         only: Restrict the candidate set to exactly these stems (benign and powerful alike; a
             powerful stem named here is thereby granted). ``None`` means the full shipped default
-            set — which is what a fresh install lays down. Use it to model a **pruned** persona,
+            set — which is what a fresh install lays down. Use it to model a **pruned** agent,
             whose operator deleted defaults from its overlay.
         memory_provider: ``HARNESS_MEMORY_PROVIDER`` — ``sqlite`` (default), ``mempalace``, or a
             ``module:Class`` path. Its tools are part of the resolved set (they are why a pin says
@@ -308,7 +308,7 @@ def resolve_stems(
 
     # The grant rule, mirroring `_install._opt_in_scaffold_set`: a benign default is laid down for
     # every agent; a powerful one only when named. `only` narrows the benign half on top of that,
-    # which is how a deliberately tool-restricted persona is modeled.
+    # which is how a deliberately tool-restricted agent is modeled.
     def _granted(stem: str) -> bool:
         if only_stems is not None:
             return stem in requested
@@ -608,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="NAMES",
         help=(
             "restrict the candidate set to exactly these stems (a powerful stem named here is "
-            "thereby granted) — how you model a persona whose overlay was pruned. Omitted: the "
+            "thereby granted) — how you model an agent whose overlay was pruned. Omitted: the "
             "full shipped default set, which is what a fresh install lays down."
         ),
     )

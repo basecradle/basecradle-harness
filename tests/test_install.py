@@ -952,7 +952,7 @@ def test_initialize_brief_warns_that_a_task_dies_with_its_timeline(tmp_path):
 
 def test_the_escalation_route_is_one_the_agent_can_actually_walk(tmp_path):
     # Issue #508: the old bullet said to report to @basecradle-ai "in a timeline you share" —
-    # but trust is mutual-consent and most personas share no timeline with the capital, so for
+    # but trust is mutual-consent and most agents share no timeline with the capital, so for
     # them the instruction could not be carried out at all. Every step of the replacement is a
     # default tool (`trust` grant, `timelines` create + add_participant, `messages` create), and
     # a refused add has a stated fallback rather than a dead end.
@@ -991,7 +991,7 @@ def test_the_brief_never_speaks_in_changelog_tense(tmp_path):
 
 
 def test_initialize_brief_carries_the_input_security_floor(tmp_path):
-    # Issue #239: every persona gets the input-security floor by default — it ships in the
+    # Issue #239: every agent gets the input-security floor by default — it ships in the
     # default initialize.md, so a fresh (or un-migrated) agent composes it into Turn 0 with
     # no opt-in. Pin the load-bearing pieces so a future edit can't silently drop them.
     text = prompt_text("initialize.md", tmp_path / "absent")
@@ -1124,7 +1124,7 @@ def test_cli_provider_flag_overrides_the_env(tmp_path, monkeypatch, capsys):
 # --- a pruned overlay survives an upgrade (issue #352) -----------------------
 #
 # Two fleet agents run **hand-pruned** overlays: an operator deleted benign default plugins at
-# provisioning time, as a deliberate containment boundary on an adversarial red-team persona.
+# provisioning time, as a deliberate containment boundary on an adversarial red-team agent.
 # That pruning survives every upgrade today only because `_reconcile` treats a deleted default
 # as a deleted conffile — behavior that was *documented* and *generic*, but never pinned for the
 # case that actually carries a security property. A future installer that helpfully re-laid

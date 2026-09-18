@@ -1,6 +1,6 @@
 """Self-authorship: an agent reads and edits its OWN ``system-prompt.md``, nothing else.
 
-The most powerful tool in the kit — a persona that can rewrite its own personality charter.
+The most powerful tool in the kit — an agent that can rewrite its own personality charter.
 The whole design is about making that power *structurally* narrow rather than validated-narrow,
 so a prompt-injected argument has nothing to grab:
 
@@ -34,7 +34,7 @@ so a prompt-injected argument has nothing to grab:
 
 Opt-in, off by default on every provider (issue #168): the shipped plugin file declares
 ``opt_in=True``, so it is never auto-scaffolded and never loaded from the packaged defaults —
-it activates only when an operator deliberately drops it into a persona's ``tools/`` overlay.
+it activates only when an operator deliberately drops it into an agent's ``tools/`` overlay.
 Enablement is a founder decision, per-agent; as of issue #241 no agent has it.
 
 Plain `Tool`s (not `PlatformTool`s): they need no SDK client and no bound context — only the

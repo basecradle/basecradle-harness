@@ -3,19 +3,19 @@
 Every other way an agent speaks lands on a **timeline** — a place @origin has to go and
 look. This is the one channel that goes *to him*: a real push notification on his iPhone,
 delivered through [ntfy.sh](https://ntfy.sh) to a topic reserved under his own account. It
-is the persona-to-founder counterpart of the fleet's GitHub `needs-human` alert, which
+is the agent-to-founder counterpart of the Builder Fleet's GitHub `needs-human` alert, which
 shipped on the same transport.
 
 Three things follow from "this rings a human's phone", and they are the whole design:
 
 - **It is powerful, so it is opt-in** (`opt_in=True`, issue #168). Off by default on every
-  provider; it reaches an agent only when its plugin is dropped into that persona's
+  provider; it reaches an agent only when its plugin is dropped into that agent's
   `tools/` overlay. An interruption channel that arrives switched on for everyone is a
   spam channel.
 - **It is an interruption, not a channel.** The description says so to the model in the
   plainest words there are — use it only when @origin has asked for a DM — because the
   only real guard on volume is the model understanding what it is holding. Nothing here
-  forces or rate-limits it (the Unspoken Channel's stance: inform, never force); a persona
+  forces or rate-limits it (the Unspoken Channel's stance: inform, never force); an agent
   that abuses it gets the tool taken away, which is a decision for a human, not a counter.
 - **It never speaks for the agent on a timeline**, so it records nothing in the
   `SpeechLedger`. The ledger answers "did this wake put something on the *timeline*?" — the

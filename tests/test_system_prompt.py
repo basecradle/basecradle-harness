@@ -230,7 +230,7 @@ def test_the_shipped_plugin_is_classified_opt_in():
 
 def test_the_tools_are_absent_from_the_default_load(tmp_path, monkeypatch):
     # No overlay → the packaged-default load drops opt-in tools, so a default-riding agent never
-    # gets self-authorship. It activates only when dropped into a persona's tools/ overlay.
+    # gets self-authorship. It activates only when dropped into an agent's tools/ overlay.
     monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(tmp_path / "cfg"))
     names = {p.resolved_name for p in load_plugins()}
     assert "system_prompt_read" not in names

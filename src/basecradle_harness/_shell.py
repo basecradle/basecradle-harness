@@ -46,7 +46,7 @@ oversight can never arm it:
   survives only under `Policy.unlocked()`.
 - Its plugin is ``opt_in`` (`_defaults/tools/shell.py`): off by default on every
   provider and dropped from the packaged fallback, so it loads only when an operator
-  deliberately drops it into a persona's ``tools/`` overlay.
+  deliberately drops it into an agent's ``tools/`` overlay.
 
 Implementation notes
 --------------------

@@ -12,7 +12,7 @@ The contract (stated so an operator can rely on it):
 
 - **Operator-owned, never installer-touched.** Like ``agent.env`` and ``model_params.json``,
   ``search_params.json`` is not a shipped default — the installer never writes, refreshes, or
-  prunes it. It is yours alone; opting the ``openrouter_search`` plugin into a persona turns web
+  prunes it. It is yours alone; opting the ``openrouter_search`` plugin into an agent turns web
   search *on*, this file *tunes* it.
 - **Verbatim keys.** Every key is passed through to OpenRouter's ``openrouter:web_search``
   ``parameters`` object unchanged, so the full documented surface is configurable and a parameter

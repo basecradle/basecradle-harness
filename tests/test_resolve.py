@@ -37,8 +37,8 @@ def test_xai_search_resolves_to_both_live_search_builtins():
     assert report["opt_in_tools"] == ["xai_search"]  # the stem lists once, though it fans out
 
 
-def test_only_computes_a_pruned_personas_exact_tools_pin():
-    """`--only` models a deliberately tool-restricted persona, so its pin is computable too.
+def test_only_computes_a_pruned_agents_exact_tools_pin():
+    """`--only` models a deliberately tool-restricted agent, so its pin is computable too.
 
     @the-brain's overlay carries `messages` and nothing else; NOC#344 granted it `xai_search`. The
     resulting `exact_tools` — the union of tools and built-ins — is exactly what this returns,
@@ -108,8 +108,8 @@ def test_matches_resolved_config_on_the_box(monkeypatch, tmp_path, provider, sdk
 def test_matches_resolved_config_for_a_pruned_overlay(monkeypatch, tmp_path):
     """`--only` matches the box too — the case a whole-default-set answer would get wrong.
 
-    The pruned persona is the one whose pin is easiest to compute wrongly, so it is pinned against
-    a real overlay with its benign defaults deleted, exactly as a restricted persona's is.
+    The pruned agent is the one whose pin is easiest to compute wrongly, so it is pinned against
+    a real overlay with its benign defaults deleted, exactly as a restricted agent's is.
     """
     cfg = tmp_path / "cfg"
     monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))

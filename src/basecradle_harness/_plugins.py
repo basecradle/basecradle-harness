@@ -236,8 +236,8 @@ class ToolPlugin:
     `opt_in` marks a **powerful/dangerous** tool — media generation (image, video, audio),
     web/X search, code execution, self-authorship, a full shell, an account/billing read, an
     off-platform push to a human's phone — that must **fail closed**: it is **off by default on every
-    provider** (issue #168) and activates **only** when the operator explicitly drops it into a
-    persona's ``tools/`` overlay (the same "ships empty" pattern as ``mcp/``). An opt-in plugin
+    provider** (issue #168) and activates **only** when the operator explicitly drops it into an
+    agent's ``tools/`` overlay (the same "ships empty" pattern as ``mcp/``). An opt-in plugin
     is **not** auto-loaded from the packaged defaults and **not** auto-scaffolded by the
     installer; a benign/platform plugin (the default, ``opt_in=False``) keeps the normal
     shipped-default → install-then-prune behavior. This is a **capability** classification,
@@ -663,7 +663,7 @@ def load_plugins_report(
     if tools_installed:
         # Installed → the overlay is authoritative; a removed dir/files is the operator's
         # deletion, honored (zero tools), never resurrected from the packaged defaults. A
-        # powerful (`opt_in`) plugin *present here* is an explicit per-persona opt-in — kept.
+        # powerful (`opt_in`) plugin *present here* is an explicit per-agent opt-in — kept.
         # The stems come back from that same walk, so what the box reports it carries and what
         # the box actually loads can never be two different answers (issue #352). A deleted
         # `tools/` dir is an overlay holding nothing — `[]`, never `None`.
@@ -673,8 +673,8 @@ def load_plugins_report(
     else:
         # Not yet installed for tools → load the packaged defaults straight from the package,
         # but **drop the opt-in (powerful) defaults**: they fail closed and activate only when
-        # explicitly dropped into a persona's overlay (issue #168), never from the packaged
-        # fallback. A default-riding persona thus resolves to benign/platform tools only.
+        # explicitly dropped into an agent's overlay (issue #168), never from the packaged
+        # fallback. A default-riding agent thus resolves to benign/platform tools only.
         with resources.as_file(
             resources.files("basecradle_harness").joinpath(*_DEFAULTS_TOOLS)
         ) as p:

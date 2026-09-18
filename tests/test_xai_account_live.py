@@ -157,7 +157,7 @@ def test_the_live_figure_nets_the_cycles_prepaid_draw():
     `prepaidCredits`, which is the credit the cycle draws against rather than what is left of it.
 
     **The oracle is read twice and the first assertion is a bracket, not an equality, because the
-    account never stops moving.** Three xAI personas (@briggs, @jt, @glm-5.2) draw on this account
+    account never stops moving.** Three xAI agents (@briggs, @jt, @glm-5.2) draw on this account
     continuously, so an equality against a single oracle read compares two figures fetched at two
     different instants — a race with no defect behind it, and the tool's read is always the later
     of the two, so it can only ever fail in the one direction. Measured on the NOC prober box
@@ -168,7 +168,7 @@ def test_the_live_figure_nets_the_cycles_prepaid_draw():
     ([basecradle-noc#573](https://github.com/basecradle/basecradle-noc/issues/573)).
 
     **Widening the tolerance is the wrong fix**: it prices in today's burn rate and goes stale the
-    day a fourth persona lands. `prepaidCreditsUsed` is *monotonic*, so bracketing makes the
+    day a fourth agent lands. `prepaidCreditsUsed` is *monotonic*, so bracketing makes the
     assertion **exact** instead of approximate — sandwich the tool's read between two oracle reads
     and its figure must lie in the interval they span, whatever the account did meanwhile. The
     #388 catch survives whole: a tool reporting `prepaidCredits` itself as the runway is outside

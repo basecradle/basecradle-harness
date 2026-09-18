@@ -6,7 +6,7 @@
 # tool that can only error.
 #
 # Powerful (media generation) → opt_in everywhere (issue #168): off by default on every
-# provider, activates only when dropped into a persona's tools/ overlay. `requires` gates
+# provider, activates only when dropped into an agent's tools/ overlay. `requires` gates
 # *availability* (openai + key), never the safety default.
 from basecradle_harness import GenerateImageTool, OpenAIKey, ToolPlugin
 

@@ -7,6 +7,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed: "persona" means an agent's personality, never the agent (issue #512)
+
+Vocabulary only — no behavior changes. Founder ruling (basecradle/basecradle#537, 2026-09-18): a
+**persona** is a property of an AI User, the personality carried in its harness prompt. It is never
+a class of agent and never a name for the Home Fleet. The docs, docstrings, CLI help and comments
+that said "a persona's `tools/` overlay", "per-persona" or "the Grok personas" now say "agent".
+Where the word means the prompt itself ("rewrites your OWN persona"), it stays. Two test functions
+were renamed to match.
+
+The comment headers of eight shipped default tool plugins changed (`code_execution`,
+`generate_image`, `openrouter_account_balance`, `openrouter_search`,
+`send_direct_message_to_origin`, `shell`, `system_prompt`, `xai_account_balance`). On the next
+`basecradle-harness-install`, an untouched copy in a config home is refreshed in place. An
+operator-edited copy is kept, and the new default is written beside it as `<name>.new`, which is
+the conffile upgrader working as designed. Nothing in either copy changes what the tool does.
+
 ## [0.123.0] - 2026-09-16
 
 ### Changed: every part of the Turn-0 brief is fenced in a named tag pair (issue #509)

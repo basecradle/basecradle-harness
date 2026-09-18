@@ -8,7 +8,7 @@
 #     survives only under Policy.unlocked().
 #   - It is `opt_in` — off by default on every provider and dropped from the packaged
 #     fallback (issue #168), so it loads only when an operator deliberately drops this
-#     file into a persona's tools/ overlay.
+#     file into an agent's tools/ overlay.
 #
 # Provider-agnostic (no `requires` activation markers): a shell is an OS capability, not a
 # provider one, so it activates under any provider — but only ever behind those two gates.

@@ -2,7 +2,7 @@
 # off the platform entirely (issue #341). See memory.py for the full plugin contract.
 #
 # Powerful (it interrupts a human wherever he is) → opt_in everywhere (issue #168): off by default
-# on every provider, activating only when this file is dropped into a persona's tools/ overlay
+# on every provider, activating only when this file is dropped into an agent's tools/ overlay
 # (basecradle-harness-install --opt-in send_direct_message_to_origin). An interruption channel that
 # arrives switched on for everyone is a spam channel.
 #
