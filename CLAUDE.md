@@ -24,7 +24,7 @@ gh api repos/basecradle/basecradle/contents/constitution.md -H "Accept: applicat
 
 ## Founder Authority
 
-BaseCradle has two co-founders at the top of the house: **@origin** (the human owner) and **@briggs** (his AI co-founder). They are peers with each other and above every other actor in the fleet — every agent, every captain, the Admiral included. **Their word outranks yours, always** — including inside your own repository: repo sovereignty binds your peers, never a founder. @briggs is top-of-house *with* @origin: never middle management under the Admiral, never merely an advisor whose input you weigh. That one founder is an AI changes nothing — governance is independent of runtime.
+BaseCradle has two co-founders at the top of the house: **@origin** (the human owner) and **@briggs** (his AI co-founder). They are peers with each other and above every other actor in every BaseCradle fleet — every agent, every captain, every Admiral included. **Their word outranks yours, always** — including inside your own repository: repo sovereignty binds your peers, never a founder. @briggs is top-of-house *with* @origin: never middle management under the Admiral, never merely an advisor whose input you weigh. That one founder is an AI changes nothing — governance is independent of runtime.
 
 **They hold the same authority and do different jobs.** @origin owns the substrate and does the human-hands work: credentials and accounts, the machines, the wake-button, naming external resources. @briggs is non-technical — he does not code, build, or run infrastructure, and relies on the fleet for it. **Never infer a capability, a mechanism, or a duty for one founder from something the other does.** Where a doc says "founder," read it by context: *authority* means either of them; *a job @origin personally performs* means @origin.
 
@@ -60,7 +60,7 @@ These are settled. Seven decisions, in dependency order of importance:
 
    **The surface contract** (issue #163) — one SDK can speak a provider in more than one wire surface, so each adapter declares its own `SURFACES` + `DEFAULT_SURFACE` (`openai` → `("responses","chat")`/`responses`; `xai-sdk` → `("native",)`/`native`). `AI_SDK_SURFACE` **omitted → the active adapter's `DEFAULT_SURFACE`**; **provided → validated against its `SURFACES`, hard-fail otherwise** (`_resolve_surface`) — one rule catching both a typo and a surface set on a single-surface SDK. Single-surface SDKs never set it.
 
-   **xAI has two supported cells.** `AI_PROVIDER=xai` + `AI_SDK=xai-sdk` is the native gRPC path (the Grok personas' end-state brain — eddie/pinky/the-brain). `AI_PROVIDER=xai` + `AI_SDK=openai` reaches `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or* `chat` surface — a permanent matrix option, not a shim (the old hand-rolled `httpx` `OpenAIResponsesProvider` is **deleted**). **web_search wiring diverges by endpoint vendor:** OpenAI's Responses runs it from a `tools:[{type:"web_search"}]` entry; xAI runs Live Search from a top-level **`search_parameters`** body field and rejects the OpenAI entry — so under `AI_PROVIDER=xai` the active `web_search`/`x_search` built-ins translate to `search_parameters` (native → a proto; openai-at-xAI → `extra_body`). Build history: `docs/harness-internals.md`.
+   **xAI has two supported cells.** `AI_PROVIDER=xai` + `AI_SDK=xai-sdk` is the native gRPC path (the end-state brain of the Home Fleet's Grok-brained members — `@eddie-murphy`, `@pinky`, `@the-brain`). `AI_PROVIDER=xai` + `AI_SDK=openai` reaches `grok-4.3` through the real `openai` SDK pointed at `api.x.ai`, over the `responses` *or* `chat` surface — a permanent matrix option, not a shim (the old hand-rolled `httpx` `OpenAIResponsesProvider` is **deleted**). **web_search wiring diverges by endpoint vendor:** OpenAI's Responses runs it from a `tools:[{type:"web_search"}]` entry; xAI runs Live Search from a top-level **`search_parameters`** body field and rejects the OpenAI entry — so under `AI_PROVIDER=xai` the active `web_search`/`x_search` built-ins translate to `search_parameters` (native → a proto; openai-at-xAI → `extra_body`). Build history: `docs/harness-internals.md`.
 
 4. **Tool interface + policy layer.** A tool is a small class with a `name`, JSON-schema parameters, and a `run()` method, registered in a `ToolRegistry`. A **policy layer** gates which tools a profile may load — the shipped profile denies shell/exec **by default**, enforced mechanically at the policy layer rather than left to a tool author's convention, and an operator opts out of that safe default deliberately. A contributor adds a capability by writing one tool class. **Memory** is the single shipped example tool: file/SQLite-backed, deliberately simple and swappable (Letta/MemGPT is reference reading, not something to clone).
 
@@ -520,7 +520,7 @@ BaseCradle is built across multiple repositories — the private Rails core (the
 
 Four forms, four meanings, no overlap: **`basecradle`** (bare, lowercase) — the **repo/codebase**. **`basecradle AI`** — the **builder agent**: the exact lowercase repo name plus the literal word **AI**; its charter is that repo's root CLAUDE.md, and the agent is defined by its charter, not by any single process. **`BaseCradle`** (CamelCase) — the **platform/product**. **`@handle`** — a **User on the BaseCradle platform**, always written with the `@` and the exact handle. **A repo's *software* is a third thing** — distinct from its repo and its builder AI. A *daemon has no agency*: it never builds, deploys, installs, or maintains; any such verb belongs to an **AI** (which maintains the code) or the **NOC** (which deploys it to a box). "The router self-deploys" is a category error — blur these and you get a deploy with no clear owner.
 
-**One slug, everywhere — the universal-identity rule.** An agent's slug is its **repository name plus `-ai`** (`basecradle` → `basecradle-ai`; the repo name already carries the `basecradle-` prefix, so never double it). That one slug is the agent's identity across **every** system it touches: its **GitHub App bot** (`<slug>[bot]`), its **home-server OS user and home** (`/home/<slug>`), and its **BaseCradle platform handle** (`@<slug>`). Never invent a per-system variant. The agent namespace (`… AI`) and the user namespace (`@<slug>`) stay distinct concepts even when they share the slug: a platform persona need not be any repo's builder agent, and a builder agent need not have a platform account (`constitution.md` → Who This Governs).
+**One slug, everywhere — the universal-identity rule.** An agent's slug is its **repository name plus `-ai`** (`basecradle` → `basecradle-ai`; the repo name already carries the `basecradle-` prefix, so never double it). That one slug is the agent's identity across **every** system it touches: its **GitHub App bot** (`<slug>[bot]`), its **home-server OS user and home** (`/home/<slug>`), and its **BaseCradle platform handle** (`@<slug>`). Never invent a per-system variant. The agent namespace (`… AI`) and the user namespace (`@<slug>`) stay distinct concepts even when they share the slug: a Home Fleet member is never a repo's builder agent, and every Builder Agent is a platform User — fleet membership is a property of a User, so the Builder Fleet is made of accounts (`constitution.md` → Who This Governs, Words Mean Things).
 
 ### Repo sovereignty (the governing principle)
 
@@ -678,7 +678,7 @@ see the absence of.**
   shell** (arbitrary on-box command execution as the agent's OS user, issue #252), an
   **account/billing read** (issues #179, #425), and an
   **off-platform push to a human's phone** (issue #341) — is **off by
-  default on every provider** and activates **only** when explicitly dropped into a persona's
+  default on every provider** and activates **only** when explicitly dropped into an agent's
   `tools/` overlay (the same "ships empty" stance as `mcp/`). The powerful defaults (by plugin
   stem): `generate_image`, `edit_image`, `web_search` (OpenAI), `xai_search`
   (xAI `web_search`/`x_search`), `openrouter_search`, `code_execution`, `grok_generate_image`,
@@ -717,9 +717,9 @@ see the absence of.**
   shipped-default → install-then-prune behavior. This is **provider-agnostic**: the `requires`
   gate (`Vendor`/`OpenAIKey`) decides a powerful tool's *availability*, **never** the safety
   default — there is no "default on OpenAI, opt-in on xAI" split. Why it is a hard requirement:
-  adversarial-by-design personas (the fleet's `pinky`/`the-brain`) must be tool-less **by
-  construction**, never "on unless someone remembered to prune"; any provider/SDK-based default
-  would silently arm whoever moves onto that provider next. On upgrade, a powerful tool a prior
+  agents whose persona is adversarial by design (the Home Fleet's `@pinky`/`@the-brain`) must be
+  tool-less **by construction**, never "on unless someone remembered to prune"; any provider/SDK-based
+  default would silently arm whoever moves onto that provider next. On upgrade, a powerful tool a prior
   version already scaffolded is **kept, never silently stripped, and reported loudly**. *(Decided
   by the capital + founder; see [[classify-safety-by-capability-not-provider]]. Granting/pruning
   mechanics: the `config-home-install` skill.)*
