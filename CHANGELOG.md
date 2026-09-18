@@ -7,6 +7,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.123.1] - 2026-09-18
+
 ### Changed: "persona" means an agent's personality, never the agent (issue #512)
 
 Vocabulary only — no behavior changes. Founder ruling (basecradle/basecradle#537, 2026-09-18): a
