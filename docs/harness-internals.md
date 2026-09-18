@@ -48,10 +48,10 @@ spine: harness owns the agent runtime, not the box).
 
 ### Powerful Tools Are Opt-In — the capability rule (issue #168)
 
-**Tool assignment is a per-persona axis, classified by *capability*, not by provider.** A
+**Tool assignment is a per-agent axis, classified by *capability*, not by provider.** A
 powerful/dangerous tool — media generation (image, **video**, audio), web/X search, code
 execution — **fails closed**: it is **off by default on every provider** and activates **only**
-when explicitly dropped into a persona's `tools/` overlay (the same "ships empty" stance as
+when explicitly dropped into an agent's `tools/` overlay (the same "ships empty" stance as
 `mcp/`). A benign/platform tool (memory, assets, messages, timelines, tasks, trust, lock,
 delete, users, webhooks, web_fetch) keeps the normal shipped-default → install-then-prune
 behavior. This is **provider-agnostic**: the `requires` gate (`Vendor`/`OpenAIKey`) decides a
@@ -73,14 +73,14 @@ see [[classify-safety-by-capability-not-provider]].)*
   into an existing config home is **kept, never silently stripped** (the founder's "tools stay
   the same" migration rule) and **reported loudly** (`InstallReport.grandfathered` →
   the CLI summary + a `WARNING`). New installs get the opt-in (off) default.
-- **Why it's a hard requirement.** Adversarial-by-design personas (the fleet's `pinky`/`the-brain`)
-  must be tool-less **by construction**, never "on unless someone remembered to prune." Any
-  provider/SDK-based default would silently arm whoever moves onto that provider next — the exact
-  safety violation this rule forecloses. *(The capital specifies those personas as explicitly
+- **Why it's a hard requirement.** Agents whose persona is adversarial by design (the Home Fleet's
+  `@pinky`/`@the-brain`) must be tool-less **by construction**, never "on unless someone
+  remembered to prune." Any provider/SDK-based default would silently arm whoever moves onto that provider next — the exact
+  safety violation this rule forecloses. *(The capital specifies those agents as explicitly
   tool-less and the NOC provisions them so at cutover; the loud grandfather report is what lets
   the capital confirm what to prune.)*
 
-**Boundary:** deciding each persona's target tool-set (cutting its overlay to spec) is the
+**Boundary:** deciding each agent's target tool-set (cutting its overlay to spec) is the
 **capital's** governance call; applying it on a box — provisioning/re-provisioning `jt`/`eddie`
 in lockstep with a release — is the **NOC's** deploy (it converges each box to the git-tracked
 desired config; no one hand-provisions a box). The harness ships the mechanism + the
@@ -357,16 +357,16 @@ matrix and **closes the handoff issue by hand** after that live verify).
 
 The **second `Provider` adapter** (`_xai_sdk.py`, `XaiSdkProvider`) and the first that is **not**
 OpenAI-wire: `AI_SDK=xai-sdk` reaches grok through xAI's own first-party SDK (`xai-sdk`, gRPC),
-no OpenAI-compat shim — the vendor-SDK spine for xAI's *native* path. It is the Grok personas'
+no OpenAI-compat shim — the vendor-SDK spine for xAI's *native* path. It is the Grok agents'
 end-state brain; `AI_SDK=openai` at `api.x.ai` (issue #163) stays a supported alternative cell.
 
-- **Brain only; tools stay per-persona.** The adapter is the chat `Provider` (chat + tool calling
+- **Brain only; tools stay per-agent.** The adapter is the chat `Provider` (chat + tool calling
   + vision). It maps the harness `Message`/`ToolSpec`/`ToolCall` vocabulary onto the SDK's own
   helpers (`system`/`user`/`assistant`/`tool_result`/`tool`, real `chat_pb2` protos) and parses
   the `Response` back (text, tool calls, citation footer). Live Search is wired here when the
-  persona has **opted its `web_search`/`x_search` built-ins in** (issue #168): they become a native
+  agent has **opted its `web_search`/`x_search` built-ins in** (issue #168): they become a native
   `SearchParameters` object (`web_source`/`x_source`), and grok searches itself. The grok **media**
-  tools stay their own httpx `PlatformTool`s (`_grok.py`), independent of the chat SDK, per-persona.
+  tools stay their own httpx `PlatformTool`s (`_grok.py`), independent of the chat SDK, per-agent.
 - **Single native surface.** Declares `SURFACES=("native",)` / `DEFAULT_SURFACE="native"`, so
   `AI_SDK_SURFACE` is unset and any other value fails clearly (the issue #163 surface contract).
 - **Routing.** `AI_SDK=xai-sdk` builds it (requires `AI_PROVIDER=xai` — the native endpoint);
@@ -375,11 +375,11 @@ end-state brain; `AI_SDK=openai` at `api.x.ai` (issue #163) stays a supported al
 - **Tested against the real SDK, offline.** No httpx transport to respx-mock, so tests build
   **real** protos and inject a **fake client** (no socket) — the openai adapter's "real SDK,
   mocked transport" discipline, gRPC-shaped. The tool-neutral migration is proven: an `xai-sdk`
-  persona with opted-in grok tools keeps them; an empty-overlay (adversarial) persona resolves
+  agent with opted-in grok tools keeps them; an empty-overlay (adversarial) agent resolves
   with **no** powerful and **no** platform tools — the SDK arms nothing.
 
 **Boundary:** live verification on the real grok endpoint (a measured chat turn, Live Search
-returning real citations, a tool round-trip) is **the capital's** job on the migrated personas;
+returning real citations, a tool round-trip) is **the capital's** job on the migrated agents;
 the offline tests assert the harness's half (the wire it sends, the response it parses).
 
 ### Eddie Murphy — the xAI-native profile (Live Search + grok media)
@@ -390,7 +390,7 @@ authoritative statement of the provider/SDK/surface matrix is `CLAUDE.md` → "A
 The Spine", point 3; the chat-brain adapter details are in "Native xAI Adapter" above and the
 image coverage in "Image Tools" above.)*
 
-Eddie is the fully-xAI persona — the "done-bar" acceptance work proving the whole grok stack
+Eddie is the fully-xAI agent — the "done-bar" acceptance work proving the whole grok stack
 end to end. Two axes stay straight: the **provider adapter** (harness code / wire format) vs.
 the **endpoint vendor** (`base_url`). Corrected facts:
 
@@ -402,7 +402,7 @@ the **endpoint vendor** (`base_url`). Corrected facts:
   `web_search` (live web) + `x_search` (live 𝕏). xAI runs it from a top-level `search_parameters`
   body field (native adapter → a `SearchParameters` proto; openai-at-xAI → `extra_body`) — it does
   **not** accept OpenAI's `tools:[{type:web_search}]` entry. Citations ground the reply via the
-  existing parsing. Both are **opt-in** powerful tools (#168) — per-persona, never provider-gated.
+  existing parsing. Both are **opt-in** powerful tools (#168) — per-agent, never provider-gated.
 - **grok media tools** (`_grok.py`, httpx `PlatformTool`s, independent of the chat SDK):
   `grok_generate_image` (text → image, `grok-imagine-image-2.0`) and `grok_generate_video` —
   the harness's **first video capability**, text→video and image→video, over xAI's **asynchronous**

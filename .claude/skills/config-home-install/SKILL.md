@@ -1,6 +1,6 @@
 ---
 name: config-home-install
-description: Step-by-step procedure for scaffolding and upgrading a Harness config home with basecradle-harness-install — the installer's per-file conffile-upgrade logic, granting powerful tools with --opt-in, retiring one with --revoke-opt-in, proving the result with basecradle-harness-verify, the loud grandfather report, and the per-agent fleet rollout. Use when installing or upgrading a config home, running or debugging basecradle-harness-install or basecradle-harness-verify, deciding how a shipped default reconciles against an operator's edits, or granting/retiring a persona's powerful tools. The config-home layout, resolution order, and the two security invariants (capability opt-in fails-closed, MCP safe-by-default) live in CLAUDE.md → Config Home; this skill carries the procedure.
+description: Step-by-step procedure for scaffolding and upgrading a Harness config home with basecradle-harness-install — the installer's per-file conffile-upgrade logic, granting powerful tools with --opt-in, retiring one with --revoke-opt-in, proving the result with basecradle-harness-verify, the loud grandfather report, and the per-agent fleet rollout. Use when installing or upgrading a config home, running or debugging basecradle-harness-install or basecradle-harness-verify, deciding how a shipped default reconciles against an operator's edits, or granting/retiring an agent's powerful tools. The config-home layout, resolution order, and the two security invariants (capability opt-in fails-closed, MCP safe-by-default) live in CLAUDE.md → Config Home; this skill carries the procedure.
 ---
 
 # Config Home — Install / Upgrade Procedure
@@ -50,9 +50,9 @@ Powerful tools (`generate_image`, `edit_image`, OpenAI `web_search`, xAI
 basecradle-harness-install --config-home <dir> --opt-in <stems>   # e.g. --opt-in generate_image edit_image
 ```
 
-This scaffolds the named powerful defaults into the persona's `tools/` overlay (equivalently,
+This scaffolds the named powerful defaults into the agent's `tools/` overlay (equivalently,
 drop the file in by hand). An opt-in plugin *present* in the overlay activates, gated only by
-its `requires` (an OpenAI key, the xAI vendor, etc.). Deciding a persona's target tool-set is
+its `requires` (an OpenAI key, the xAI vendor, etc.). Deciding an agent's target tool-set is
 the **capital's** governance call; applying it on a box is the **NOC's** deploy.
 
 The grant is **durable** (issue #374): it is recorded in `.declared.json` and carried across
@@ -94,7 +94,7 @@ On upgrade, a powerful tool a *prior* version had already scaffolded into an exi
 home is **kept, never silently stripped** (the founder's "tools stay the same" migration rule)
 and **reported loudly** — `InstallReport.grandfathered` surfaces in the CLI summary plus a
 `WARNING` log line. New installs get the opt-in (off) default. The loud report is what lets the
-capital confirm what to prune when cutting a persona's overlay to spec.
+capital confirm what to prune when cutting an agent's overlay to spec.
 
 ## No-import discipline
 

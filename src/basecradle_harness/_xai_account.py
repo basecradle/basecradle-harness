@@ -1,6 +1,6 @@
 """Read the agent's own xAI credit runway — cost self-awareness (issues #179, #384, #388).
 
-An xAI persona whose charter treats capital as a first-class concern can see its remaining
+An xAI agent whose charter treats capital as a first-class concern can see its remaining
 runway and reason about it — throttle, prioritize cheap experiments, or ask a human to top up
 *before* it runs dry as a hard API failure. This is the tool that gives it that sense.
 

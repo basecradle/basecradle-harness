@@ -1,7 +1,7 @@
 """Make media the xAI way: generate an image, or a video, with grok and post it as an asset.
 
 The xAI-native counterpart to the OpenAI image tools (`_images.py`). These are **Eddie
-Murphy's** media hands — a fully-xAI persona — so they live in their own module, talk only to
+Murphy's** media hands — a fully-xAI agent — so they live in their own module, talk only to
 ``api.x.ai``, and carry the agent's ``AI_API_KEY`` (an xAI key for an xAI agent). Two
 tools, split by operation, the tool-building discipline (full surface → coverage decided →
 split by operation → every option tested):

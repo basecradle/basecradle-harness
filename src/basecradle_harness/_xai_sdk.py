@@ -3,7 +3,7 @@
 The second `Provider` adapter (after `basecradle_harness._openai.OpenAIProvider`), and the first
 that is **not** OpenAI-wire: it reaches grok through xAI's own first-party SDK (`xai-sdk` on PyPI,
 ``xai-org/xai-sdk-python``), a **gRPC** client — no OpenAI-compatibility shim, no harness-owned
-HTTP. Selected by ``AI_SDK=xai-sdk`` (the package name), it is the Grok personas' end-state brain
+HTTP. Selected by ``AI_SDK=xai-sdk`` (the package name), it is the Grok agents' end-state brain
 (issue #165); ``AI_SDK=openai`` pointed at ``api.x.ai`` remains a fully supported alternative cell
 (issue #163).
 
@@ -13,10 +13,10 @@ The native SDK speaks **one** wire (its gRPC chat service), so this adapter decl
 `SURFACES` / `DEFAULT_SURFACE` and ``AI_SDK_SURFACE`` is left unset for it — a value other than
 the native surface is rejected by `basecradle_harness._basecradle._resolve_surface`.
 
-Brain only — tools are per-persona
-----------------------------------
+Brain only — tools are per-agent
+--------------------------------
 This adapter is the **chat brain** (the `Provider` contract: chat + tool calling). Live Search is
-wired here, server-side, when the persona has opted its search built-ins in (issue #168): the
+wired here, server-side, when the agent has opted its search built-ins in (issue #168): the
 ``web_search`` / ``x_search`` built-in names become xAI **Agent Tool** entries
 (`xai_sdk.tools.web_search()` / `x_search()`) appended to the request's ``tools`` list, and grok
 autonomously runs the search server-side and returns sourced answers with citations. (This replaced
@@ -26,9 +26,9 @@ the deprecated native ``SearchParameters`` path — the live gRPC endpoint now r
 server-side ones included — in ``Response.tool_calls``, each tagged by a ``ToolCallType``; the
 adapter drops the server-side calls (`_is_client_side`) so they are never re-dispatched to the
 harness function registry as bogus ``no tool named`` bounces (issue #183). The grok
-**media** tools (`grok_generate_image` / `grok_generate_video`) stay their own per-persona
+**media** tools (`grok_generate_image` / `grok_generate_video`) stay their own per-agent
 `PlatformTool`s over httpx (`basecradle_harness._grok`) — independent of the chat SDK, and granted
-only by opt-in. Exposing a capability is never granting it to a persona.
+only by opt-in. Exposing a capability is never granting it to an agent.
 
 One refused tool schema costs that tool, never the wake (issue #496)
 --------------------------------------------------------------------
@@ -199,7 +199,7 @@ class XaiSdkProvider:
         api_key: The xAI bearer token. Falls back to ``AI_API_KEY`` when omitted.
         api_host: The gRPC host. Defaults to the SDK's own (``api.x.ai``).
         timeout: Per-request timeout in seconds (passed to the SDK client).
-        builtin_tools: The server-side built-ins a persona has opted in — ``"web_search"`` /
+        builtin_tools: The server-side built-ins an agent has opted in — ``"web_search"`` /
             ``"x_search"`` (issue #168). They are translated to xAI **Agent Tool** entries
             (`xai_sdk.tools`) appended to the request's ``tools`` list so grok runs the search
             itself; a name that maps to no Agent Tool is ignored.

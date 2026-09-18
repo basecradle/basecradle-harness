@@ -601,7 +601,7 @@ def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatc
     # surface changes the active set: web_search (a Responses-only built-in) is on under
     # `responses` and gone under `chat`. The function tools stay the same — behavior-preserving.
     # web_search and generate_image are powerful → opt-in (issue #168), so this opts them into the
-    # persona's overlay to exercise the wiring.
+    # agent's overlay to exercise the wiring.
     monkeypatch.setenv("AI_MODEL", "gpt-5.4-mini")
     monkeypatch.setenv("AI_API_KEY", "sk-test-key")
     install(os.environ["BASECRADLE_CONFIG_HOME"], opt_in=["web_search", "generate_image"])
@@ -716,7 +716,7 @@ def test_max_steps_from_env_parses_default_override_and_rejects_non_positive(mon
     assert _max_steps_from_env() == DEFAULT_MAX_STEPS  # blank → default too
 
     monkeypatch.setenv("HARNESS_MAX_STEPS", "40")
-    assert _max_steps_from_env() == 40  # the operator's per-persona override
+    assert _max_steps_from_env() == 40  # the operator's per-agent override
 
     monkeypatch.setenv("HARNESS_MAX_STEPS", "0")
     with pytest.raises(ValueError, match="positive integer"):
@@ -731,7 +731,7 @@ def test_response_retries_from_env_parses_default_override_zero_and_rejects_nega
     assert _response_retries_from_env() == DEFAULT_RESPONSE_RETRIES  # blank → default too
 
     monkeypatch.setenv("HARNESS_RESPONSE_RETRIES", "5")
-    assert _response_retries_from_env() == 5  # the operator's per-persona override
+    assert _response_retries_from_env() == 5  # the operator's per-agent override
 
     monkeypatch.setenv("HARNESS_RESPONSE_RETRIES", "0")
     assert _response_retries_from_env() == 0  # zero is valid — disable the retry (a single attempt)
@@ -1573,7 +1573,7 @@ def test_from_env_native_xai_sdk_eddie_keeps_his_opted_in_grok_tools(platform, m
     """Eddie's end state (issue #165): AI_SDK=xai-sdk → the native gRPC brain, his grok tools kept.
 
     The tool-neutral migration: the *brain* moves to the native SDK, but Eddie's tool-set is his
-    own per-persona overlay — opt-in grok tools, unchanged by the SDK swap.
+    own per-agent overlay — opt-in grok tools, unchanged by the SDK swap.
     """
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
@@ -1595,8 +1595,8 @@ def test_from_env_native_xai_sdk_eddie_keeps_his_opted_in_grok_tools(platform, m
     assert {"grok_generate_image", "grok_generate_video"} <= names  # his opted-in tools, kept
 
 
-def test_from_env_native_xai_sdk_adversarial_persona_resolves_tool_less(platform, monkeypatch):
-    """The safety crux (issues #165 + #168): an xai-sdk persona with an empty overlay gets the
+def test_from_env_native_xai_sdk_adversarial_agent_resolves_tool_less(platform, monkeypatch):
+    """The safety crux (issues #165 + #168): an xai-sdk agent with an empty overlay gets the
     native brain and is NOT armed by the SDK — no powerful tools, no platform tools."""
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
@@ -1618,7 +1618,7 @@ def test_from_env_native_xai_sdk_adversarial_persona_resolves_tool_less(platform
     # Not armed: no grok media, no Live Search, no platform tools — the SDK granted nothing.
     assert not ({"grok_generate_image", "grok_generate_video"} & names)
     assert not ({"assets", "messages", "timelines", "tasks", "trust", "lock", "delete"} & names)
-    assert names <= {"memory"}  # only its private mind remains (itself per-persona configurable)
+    assert names <= {"memory"}  # only its private mind remains (itself per-agent configurable)
 
 
 def test_from_env_wires_the_openai_sdk_provider_by_default(platform, monkeypatch):
@@ -1637,7 +1637,7 @@ def test_from_env_wires_the_openai_sdk_provider_by_default(platform, monkeypatch
 
 def test_from_env_unlocked_profile_admits_the_opted_in_shell(platform, monkeypatch):
     """End to end (issue #256): `HARNESS_PROFILE=unlocked` builds the registry on the unlocked
-    profile, so a persona's opted-in shell actually loads — the poll path wires the same
+    profile, so an agent's opted-in shell actually loads — the poll path wires the same
     `_profile_from_env` decision into `Harness(policy=…)` that the wake path does."""
     monkeypatch.setattr(os, "geteuid", lambda: 1000, raising=False)  # deterministic non-root
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)

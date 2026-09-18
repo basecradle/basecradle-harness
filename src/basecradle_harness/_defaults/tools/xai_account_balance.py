@@ -4,7 +4,7 @@
 # A plain read-only function Tool (not a server-side built-in): it calls the xAI *Management API*
 # (management-api.x.ai) with a dedicated read-only Management Key (XAI_MANAGEMENT_KEY), a
 # billing/account surface distinct from the inference endpoint and its AI_API_KEY. So an xAI
-# persona whose charter treats capital as first-class can see its own remaining runway.
+# agent whose charter treats capital as first-class can see its own remaining runway.
 #
 # The figure is the *live* one — the invoice preview's prepaid credit less what this billing cycle
 # has already drawn from it (issue #388). It is neither the posted prepaid ledger, which settles at
@@ -12,7 +12,7 @@
 #
 # Powerful (it reaches an account/billing surface with a dedicated credential) → opt_in
 # everywhere (issue #168): off by default on every provider, activates only when this file is
-# dropped into a persona's tools/ overlay (basecradle-harness-install --opt-in xai_account_balance).
+# dropped into an agent's tools/ overlay (basecradle-harness-install --opt-in xai_account_balance).
 # `requires=(Vendor("xai"),)` gates *availability* to the xAI provider — it self-excludes
 # elsewhere, because this endpoint reads an *xAI* account and nothing else — never the safety
 # default. An agent that also holds an OpenRouter account reads that one with the separate,

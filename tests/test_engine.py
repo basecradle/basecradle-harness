@@ -586,7 +586,7 @@ def test_reserve_failure_still_evicts_images_and_raises():
 class ReserveReturnsToolCallProvider:
     """Never stops calling a tool — even the reserve call answers with a lone tool call, no text.
 
-    Models a server-tool persona: `tools=None` withholds the harness's function tools but a
+    Models a server-tool agent: `tools=None` withholds the harness's function tools but a
     server-side built-in can still resolve, and the model can come back with no usable text.
     """
 

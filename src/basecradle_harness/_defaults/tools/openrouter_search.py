@@ -17,7 +17,7 @@
 # documented limit), so there the plugin self-excludes rather than activating inert.
 #
 # Powerful (web search) → opt_in everywhere (issue #168): off by default on every provider,
-# activates only when this file is dropped into a persona's tools/ overlay. `requires` gates
+# activates only when this file is dropped into an agent's tools/ overlay. `requires` gates
 # *availability* (provider + SDK), never the safety default.
 from basecradle_harness import Sdk, ToolPlugin, Vendor
 

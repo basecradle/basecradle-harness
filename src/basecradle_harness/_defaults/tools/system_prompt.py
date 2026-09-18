@@ -5,7 +5,7 @@
 # The MOST powerful tool in the kit — an agent that can rewrite its own personality charter
 # (issue #241). So both tools are opt_in=True: off by default on EVERY provider, never
 # auto-scaffolded and never loaded from the packaged defaults, active only when an operator
-# deliberately drops this file into a persona's tools/ overlay. Enablement is a founder decision,
+# deliberately drops this file into an agent's tools/ overlay. Enablement is a founder decision,
 # per-agent; as of #241 no agent has it. `requires` is empty because availability is universal;
 # per issue #168 the opt_in safety default is capability-based, never gated on availability.
 #

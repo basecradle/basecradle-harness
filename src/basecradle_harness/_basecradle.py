@@ -647,7 +647,7 @@ def _config_from_env() -> tuple[str, str, str]:
     return provider, sdk, surface
 
 
-#: A provider's canonical endpoint, supplied as the **default** ``base_url`` so a persona's
+#: A provider's canonical endpoint, supplied as the **default** ``base_url`` so an agent's
 #: ``.env`` needn't hardcode it (``AI_BASE_URL`` always overrides for a proxy/gateway/self-host).
 #: ``openai`` is absent → the SDK targets OpenAI's own default. xAI's compat endpoint speaks the
 #: Responses **and** Chat wire, so the ``openai`` SDK reaches grok here over either surface.
@@ -669,13 +669,13 @@ def _xai_search_parameters(builtins: Sequence[str]) -> dict[str, Any] | None:
     docs.x.ai): OpenAI's Responses runs web search from a ``tools:[{"type":"web_search"}]``
     entry, but xAI's endpoint runs Live Search from a top-level ``search_parameters`` object on
     **both** its Responses and Chat surfaces — it does *not* accept the OpenAI tools entry. So a
-    Grok-via-``openai``-SDK persona's ``web_search``/``x_search`` built-ins are translated here
+    Grok-via-``openai``-SDK agent's ``web_search``/``x_search`` built-ins are translated here
     into ``search_parameters`` and forwarded through the SDK's ``extra_body`` (see
     `_provider_from_config`), rather than offered as tools. Returns ``None`` when no search
     built-in is active, so nothing is sent.
 
     NOTE: the harness asserts *what it sends*; the exact ``search_parameters`` sub-shape is
-    xAI's and is ground-truthed by the capital's live verification on the Grok persona.
+    xAI's and is ground-truthed by the capital's live verification on the Grok agent.
     """
     sources = [src for name in builtins if (src := _XAI_SEARCH_SOURCES.get(name)) is not None]
     # De-dup while preserving order (web before x), in case a built-in is listed twice.
@@ -813,7 +813,7 @@ def _merge_extra_body(params_extra_body: Any, harness_extra_body: Any) -> Any:
     """Combine the operator's ``extra_body`` with one the harness composes (D4) — harness wins.
 
     When both are present (an ``model_params.json`` ``extra_body`` *and* a harness-built one — e.g.
-    xAI's ``search_parameters`` when a Grok-via-openai persona has search opted in), they merge
+    xAI's ``search_parameters`` when a Grok-via-openai agent has search opted in), they merge
     key-by-key with the **harness value winning** any overlapping key, and each overlap logs a
     WARNING. When only one exists, it is used as-is; when neither, the result is ``None`` so nothing
     is sent.
@@ -947,7 +947,7 @@ def _provider_from_config(
         ``grok-4.3`` over the ``responses`` *or* ``chat`` surface). xAI's Live-Search built-ins
         (``web_search`` / ``x_search``) are translated to a ``search_parameters`` body field
         (`_xai_search_parameters`) sent via ``extra_body`` — xAI's wiring, not OpenAI's.
-    - ``AI_SDK=xai-sdk`` → `XaiSdkProvider`, the **native** xAI SDK (gRPC), the Grok personas'
+    - ``AI_SDK=xai-sdk`` → `XaiSdkProvider`, the **native** xAI SDK (gRPC), the Grok agents'
       end-state brain (issue #165). It talks **only** to ``AI_PROVIDER=xai``; the opted-in search
       built-ins become xAI **Agent Tool** entries on the chat ``tools`` list inside the adapter
       (issue #171 — the native ``SearchParameters`` object is deprecated). Its single native
@@ -1488,7 +1488,7 @@ def _profile_from_env() -> tuple[str, Policy]:
     Selecting ``unlocked`` is *only* the deploy lever, and it never weakens the safety enforced
     around it: the NOC sets the var only after its unprivileged-account preflight passes
     (constitution Operational Baselines), the shell tool's own in-process root-refusal backstop
-    still fires (issue #253), and a powerful tool like ``shell`` is still opt-in per persona.
+    still fires (issue #253), and a powerful tool like ``shell`` is still opt-in per agent.
     """
     raw = (os.environ.get(HARNESS_PROFILE_ENV) or "").strip().lower()
     if raw == "unlocked":
@@ -1528,7 +1528,7 @@ def _max_steps_from_env() -> int:
     """Read ``HARNESS_MAX_STEPS`` into the engine's per-turn step budget.
 
     Unset or blank → `DEFAULT_MAX_STEPS` (the shipped 24 — a deliberate research-lab
-    over-provision, see `basecradle_harness._engine`). Set → the operator's per-persona
+    over-provision, see `basecradle_harness._engine`). Set → the operator's per-agent
     override, parsed as an int; a positive value is the budget, and a non-positive value
     fails loudly here rather than producing an engine that can never make a call. This is
     the single-integer operational knob (like ``HARNESS_WAKE_BREAKER_MAX``), not a
@@ -1547,7 +1547,7 @@ def _response_retries_from_env() -> int:
     """Read ``HARNESS_RESPONSE_RETRIES`` into the engine's unparseable-response retry bound.
 
     Unset or blank → `DEFAULT_RESPONSE_RETRIES` (the shipped 2 — up to 3 total attempts on the
-    truncated / EOF-mid-JSON class, issue #259). Set → the operator's per-persona override, parsed
+    truncated / EOF-mid-JSON class, issue #259). Set → the operator's per-agent override, parsed
     as an int; **zero is valid** (disable the retry — a single attempt), so the floor is 0, not 1,
     and a negative value fails loudly here rather than silently meaning "no attempts". This is a
     single-integer operational knob (like ``HARNESS_MAX_STEPS``), not a ``model_params.json`` key.
@@ -1589,7 +1589,7 @@ def _max_context_tokens_from_env() -> int | None:
 def _compactor_from_env(provider: Provider) -> Compactor:
     """The agent's context budget + compactor, wired to the model it will run against.
 
-    Built for every deployed agent — this is the invariant, not a per-persona feature: *nothing
+    Built for every deployed agent — this is the invariant, not a per-agent feature: *nothing
     replayed per wake may be unbounded*. It costs a quiet agent nothing (no extra API call is ever
     made until a call's reported usage is large enough that some ceiling could be in play), and it
     is what keeps a standing agent from walking into its context wall.

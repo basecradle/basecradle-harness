@@ -8,7 +8,7 @@
 #
 # Powerful (it reaches an account/billing surface with a dedicated credential) → opt_in
 # everywhere (issue #168): off by default on every provider, activates only when this file is
-# dropped into a persona's tools/ overlay
+# dropped into an agent's tools/ overlay
 # (basecradle-harness-install --opt-in openrouter_account_balance).
 #
 # `requires=()` — NO Vendor gate, and that is deliberate (issue #425). Its xAI sibling gates on

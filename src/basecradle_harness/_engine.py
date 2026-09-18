@@ -75,7 +75,7 @@ _log = logging.getLogger("basecradle_harness")
 #: (`ProviderServerError`, issue #284), or a routed upstream's 429 (`ProviderRateLimitError`, issue
 #: #506) — before giving up. 2 → up to 3 total attempts. All three faults are momentary (the same
 #: call re-issued usually succeeds), so a small bound recovers the common case while a wake that is
-#: genuinely wedged still fails fast. 0 disables the retry (a single attempt). Per-persona override
+#: genuinely wedged still fails fast. 0 disables the retry (a single attempt). Per-agent override
 #: rides `HARNESS_RESPONSE_RETRIES` (see `_response_retries_from_env`) — and it is the **only** knob
 #: on this axis: the total-sleep budget beside it is a constant, because two env vars governing one
 #: retry is one way to disagree with yourself.
@@ -176,11 +176,11 @@ def _backoff(attempt: int, reason: str) -> float:
     )
 
 
-#: The per-turn provider-call budget. A deliberate research-lab over-provision: a persona's
+#: The per-turn provider-call budget. A deliberate research-lab over-provision: an agent's
 #: self-scheduled task legitimately fans out into several sub-actions (read the timeline, check
 #: mail, research, upload an asset, reply), which 8 calls could not fit — the cap @glm-5.2 hit
 #: twice on 2026-07-04 (issue #243). Tune down later from the `wake used X/N steps` log data.
-#: Per-persona override rides `HARNESS_MAX_STEPS` (see `_max_steps_from_env`).
+#: Per-agent override rides `HARNESS_MAX_STEPS` (see `_max_steps_from_env`).
 DEFAULT_MAX_STEPS = 24
 
 #: How every step-counter note opens, and the fixed part of its counter line (`_step_note`) —
