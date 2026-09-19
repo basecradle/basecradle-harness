@@ -598,7 +598,9 @@ for the location: `--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.conf
   default; **user-edited** → keep theirs, write the new default beside it as `<name>.new`,
   log one line; **user-deleted** → respect it, never resurrect; **user-added** (not a
   shipped default) → never touched. The operator's dir is never clobbered; only pristine
-  defaults refresh.
+  defaults refresh. A `.new` is retired once moot (its file matches the default, is gone,
+  or lost its default) — and only while it still hashes to the pre-run manifest entry, so
+  an operator-edited `.new` is never removed (issue #526).
 - **Charter sourcing.** The Turn-0 operator charter is composed from
   `prompts/system-prompt.md` + `prompts/initialize.md` (HTML comments, which are
   operator-facing notes, stripped). `HARNESS_SYSTEM_PROMPT` is a **legacy fallback** only,

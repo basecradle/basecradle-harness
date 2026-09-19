@@ -40,6 +40,11 @@ Each shipped default is compared dpkg-conffile style against the manifest hash
 
 Only pristine defaults refresh; the operator's dir is never clobbered.
 
+A `<name>.new` is retired by a later run once it is moot — its file now equals the shipped default,
+is gone, or has no shipped default any more — and only while its hash still equals the pre-run
+manifest entry (the bytes the installer wrote). An operator-edited `.new` is never removed. Each
+removal is listed in the summary as `removed <rel>.new` (issue #526).
+
 ## Granting a powerful tool (`--opt-in`)
 
 Powerful tools (`generate_image`, `edit_image`, OpenAI `web_search`, xAI

@@ -34,6 +34,11 @@ and against the on-disk file:
   reconcile only ever walks the *shipped* default set; it never enumerates the operator's
   directory to prune or judge extras.
 
+A ``<name>.new`` is one fixed-name slot, overwritten each time a new default is offered, and it
+is **removed once it has nothing left to offer** (issue #526) — the file it shadowed now equals
+the shipped default, is gone, or its default was retired — but only while it still holds the
+exact bytes the installer wrote (`_retire_moot_offers`). One the operator has touched is theirs.
+
 The operator's config dir is never clobbered; only pristine defaults refresh. This
 per-agent reconcile is exactly what a fleet rollout loops over a pinned version.
 
@@ -311,6 +316,9 @@ class InstallReport:
     created_dirs: list[str] = field(default_factory=list)
     actions: dict[str, str] = field(default_factory=dict)
     new_files: list[str] = field(default_factory=list)  # the `.new` files written this run
+    # The moot `.new` files removed this run (issue #526): each one's offer had been taken up,
+    # made pointless, or retired, and it still held exactly the bytes we wrote.
+    retired_offers: list[str] = field(default_factory=list)
     # Power tools (now opt-in, issue #168) a *prior* version had scaffolded into this config home
     # and that the upgrade KEPT rather than silently strip — the grandfather list, surfaced loudly.
     grandfathered: list[str] = field(default_factory=list)
@@ -333,6 +341,8 @@ class InstallReport:
         lines = [head, tally]
         for rel in self.new_files:
             lines.append(f"  kept your edited {rel} — new default written to {rel}.new")
+        for rel in self.retired_offers:
+            lines.append(f"  removed {rel}.new — nothing left in it to merge")
         if restored := self.of(RESTORED):
             # Loud, never a silent heal: a *granted* opt-in tool was missing and has been laid
             # back down. Something removed it between reconciles (issue #374's whole subject), and
@@ -467,6 +477,10 @@ def install(
 
     if shipped_provider is not shipped_all:  # provider-aware: clean up now-mismatched defaults
         _prune_mismatched_defaults(root, shipped_all, shipped_provider, recorded, updated, report)
+
+    # Last of the file work, so it judges each `.new` against where its file actually ended up —
+    # after the refreshes, restores, revocations and prunes above.
+    _retire_moot_offers(root, shipped_all, recorded, report)
 
     _write_manifest(root, updated)
     # The declaration (issue #374): what this agent *claims* — the grants, the provider filtered
@@ -758,6 +772,60 @@ def _prune_mismatched_defaults(
             updated.pop(rel, None)
             report.actions[rel] = PRUNED
         # else: the operator edited this mismatched default → keep theirs, keep tracking it.
+
+
+def _retire_moot_offers(
+    root: Path, shipped_all: dict[str, str], recorded: dict[str, str], report: InstallReport
+) -> None:
+    """Remove a ``<name>.new`` once it has nothing left to offer (issue #526).
+
+    `_reconcile` writes the new default beside an operator-edited file as ``<name>.new``, and
+    nothing used to take it away again. So after the operator merged it — or deleted the file, or
+    the default was retired — it stayed, on every agent, indefinitely, looking exactly like an
+    open merge task. This retires it, and only when **both** of these can be shown:
+
+    - **It is still the bytes we wrote.** Every ``.new`` is written with the shipped default whose
+      hash the same run records in the manifest. A later run that moves that entry either
+      rewrites the ``.new`` too (the file is still edited) or leaves a ``.new`` that is moot in
+      that very run (the file was refreshed, is already current, or is gone), which is why the
+      test reads the *pre-run* entry. So a ``.new`` that hashes to it is the installer's own
+      untouched copy — no bookkeeping beyond the manifest is needed to prove it. Anything else is kept: the operator has edited it (their
+      work, never ours to delete), it was written by some other hand, or it is a leftover from
+      before a crash between the ``.new`` and the manifest write. The same test holds a ``.new``
+      written earlier *this* run, which carries the new hash, not the recorded one — and that one
+      is a live offer by construction.
+    - **Its file no longer needs it.** The file now equals the shipped default (merged, refreshed,
+      already current, restored), is gone (deleted, pruned, revoked, retired), or has no shipped
+      default left to be offered at all (retired, kept because the operator edited it). A file
+      that still differs from its default keeps its ``.new``: that offer is still open.
+
+    Only paths with a manifest record are visited — which is what keeps it off an operator-added
+    file, exactly as the reconcile itself is. A ``.new`` that cannot be read or removed is left
+    for the next run, never guessed at: this is a de-clutter, and its only irreversible act is a
+    delete.
+    """
+    for rel, was in sorted(recorded.items()):
+        target = root.joinpath(*rel.split("/"))
+        offer = target.parent / f"{target.name}.new"
+        default = shipped_all.get(rel)
+        try:
+            if _hash(offer.read_text(encoding="utf-8")) != was:
+                continue  # not the bytes we wrote, or not there at all
+            still_open = (
+                default is not None
+                and target.exists()
+                and _hash(target.read_text(encoding="utf-8")) != _hash(default)
+            )
+            if still_open:
+                continue  # the file still differs from its default: the offer is open
+            offer.unlink()
+        except FileNotFoundError:
+            continue  # no `.new` here (the common case)
+        except (OSError, UnicodeDecodeError) as error:
+            _log.warning("Left %s in place: it could not be checked or removed (%s).", offer, error)
+            continue
+        report.retired_offers.append(rel)
+        _log.info("Removed %s: its file no longer needs the default it offered.", offer)
 
 
 def reconcile_on_upgrade(
