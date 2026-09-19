@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.125.1] - 2026-09-19
+
+### Fixed: the high-water mark stops the scan at its position, even when its item is gone (issue #526)
+
+`_messages_since` walked a timeline newest-first and stopped only when it met the mark's own uuid.
+While that item is listed, that is the same as stopping at the mark's position. When it is not, the
+walk ran on through every page of the timeline and handed back everything the agent had ever
+seen as unseen, and the next `_settle` could then move the mark *backward*. The platform lists every
+kind by `ORDER BY uuid DESC`, so the scan now stops at the first item at or below the mark in uuid
+order, which is exactly where the mark stands whether or not its item is still there. Nothing can
+delete a message or an asset through the API today, but a webhook endpoint's events are destroyed
+with it. A mark that does not parse as a UUID keeps the old equality-only stop.
+
+Five recovery tests set a mark of M1 while re-reading M0, under a comment saying the mark was
+"older than M0". It was newer, and they passed only because the absent mark re-yielded the whole
+listing. They now set a mark that really is older, so they exercise what they say they do.
+
 ## [0.125.0] - 2026-09-19
 
 ### Changed: the cleanup sweep removes stranded temps on live timelines too (issue #526)

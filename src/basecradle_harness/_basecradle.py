@@ -66,6 +66,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID
 
 from basecradle import BaseCradle
 
@@ -394,15 +395,40 @@ def _messages_since(messages: object, mark: str | None) -> list[object]:
 
     Walks newest-first and stops at the high-water mark (`mark`), so it reads only
     the unseen head of the timeline, then reverses to chronological order. A `mark`
-    of `None` (or one no longer present) yields everything it iterates.
+    of `None` yields everything it iterates.
+
+    **It stops at the mark's *position*, not only at the mark itself.** The platform lists every
+    kind newest-first by its UUIDv7 (``ORDER BY uuid DESC``), so the first item at or below the
+    mark in uuid order is exactly where the mark sits. Stopping only on *equality* was the same
+    thing while the mark item is listed, and something very different when it is not: the walk
+    ran on through the whole paginated timeline, handing every item the agent ever saw back to
+    the wake as unseen — and a cursor that is supposed to mean "everything at or before this is
+    handled" (`MarkStore`) meant nothing at all, and the wake's `_settle` could then move the mark
+    backward. No API deletes a message or an asset today, but a webhook endpoint's events go with
+    it, so the path is reachable (issue #526). A mark that is not a UUID keeps the old
+    equality-only stop: an order read off a value that has none would be a guess.
     """
+    floor = _as_uuid(mark)
     fresh = []
     for message in messages:
-        if message.content.uuid == mark:
+        uuid = message.content.uuid
+        if uuid == mark:
+            break
+        if floor is not None and (item := _as_uuid(uuid)) is not None and item < floor:
             break
         fresh.append(message)
     fresh.reverse()
     return fresh
+
+
+def _as_uuid(value: object) -> UUID | None:
+    """`value` as a `UUID` (whose ordering is the platform's byte order), or `None` if it is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return UUID(value)
+    except ValueError:
+        return None
 
 
 def _parse_created_at(value: str) -> datetime:
