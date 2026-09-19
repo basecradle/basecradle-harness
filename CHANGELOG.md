@@ -7,6 +7,68 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.126.1] - 2026-09-19
+
+### Fixed: a claim held by a wake that is still working can no longer be judged orphaned (issue #532)
+
+Decided by the capital on @origin's delegation, 2026-09-19. `_orphaned`'s backstop treats a claim
+whose pid still answers "alive" as orphaned anyway once it is more than six hours old
+(`_CLAIM_STALE_AFTER`), for the case where the kernel handed a dead wake's pid to something else.
+Its docstring promised it "can never fire on a wake that is genuinely still working", because a
+wake is bounded by `max_steps` model calls. That was false:
+
+- a step dispatches any number of tool calls;
+- a `shell` call runs up to ten minutes;
+- `HARNESS_MAX_STEPS` is raisable;
+- the router sets no timeout on a wake.
+
+So one turn could outlast six hours, and a concurrent wake would then take the item over and
+answer it a second time.
+
+The fix is a heartbeat. A wake refreshes the `at` of every claim it holds (`ClaimStore.beat`)
+through the session's progress hook, which the engine already calls on every step and on every
+tool completion. Beating on tool completions matters: a step-only beat would leave one step of
+back-to-back long tool calls unbeaten. With the heartbeat, "older than six hours" means "no
+progress for six hours", and the docstring now says so.
+
+- **The write is time-gated:** at most once per held claim per five minutes (`_CLAIM_BEAT_EVERY`).
+  A batch claimed up front therefore costs a number of writes bounded by wall clock, not by step
+  count. A refresh is due when either the monotonic or the wall clock says so, since `_orphaned`
+  measures age on the wall clock and a monotonic clock stops across a host suspend.
+- **The read-pacer beats too**, after each read, since a message batch is claimed before a read
+  that can take minutes.
+- **A refresh never raises.** A failure is logged and retried after the interval, and the turn
+  carries on.
+- **A refresh rewrites only a claim that is still in flight and still names this wake.** It
+  compares and writes under the claims directory's exclusive lock, the same lock `reclaim` holds,
+  so a refresh never writes over a take-over that has written its record. It keeps beating when a
+  take-over token merely exists, and that is deliberate. `reclaim` re-checks under the lock
+  whether the claim is still an orphan, and a fresh `at` is what makes a recoverer that judged
+  too early back off.
+- **A claims directory purged mid-wake** (its timeline was deleted) drops out of the heartbeat
+  instead of warning on every beat.
+- **The session's heartbeat is cleared when the wake ends.**
+- **A new wake id clears what the store holds.** What an earlier wake of the process left in
+  flight is an orphan to recover, never a claim to keep alive.
+
+An adversarial review of the first build found that it stopped beating at the sight of a
+take-over token, which is backwards. It also found the suspend-clock gap, the purged-directory
+loop and five unpinned behaviors. All of these are fixed and pinned.
+
+The bound, stated honestly: at the shipped settings no single uninterrupted phase comes near six
+hours (one model call with its retries, one tool call, one pacing read). An operator who raises
+the uncapped knobs (`HARNESS_MCP_TIMEOUT`, `HARNESS_RESPONSE_RETRIES`, a very slow
+`HARNESS_PACE_CHARS_PER_SEC`) far enough can still stretch one phase past it.
+
+How the pieces around it read `at`:
+
+- `reclaim` still decides by `_orphaned`, which now sees a fresh `at` for any claim whose owner is
+  making progress.
+- The settled-claim prune from 0.126.0 is unaffected. It removes only `done`, `abandoned` and
+  legacy claims, never an `in-flight` one, and the heartbeat only ever rewrites an in-flight claim
+  its own wake holds. So nothing the heartbeat touches is ever a prune candidate, and nothing the
+  prune removes is ever beaten.
+
 ## [0.126.0] - 2026-09-19
 
 ### Changed: the cleanup sweep prunes settled claims on live timelines (issue #526)

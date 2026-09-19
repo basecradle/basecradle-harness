@@ -20,6 +20,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
@@ -59,10 +61,13 @@ from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
 from basecradle_harness._report import billing_onset_line
 from basecradle_harness._wake import (
+    _CLAIM_BEAT_EVERY,
+    _CLAIM_STALE_AFTER,
     _activated_task_text,
     _incoming_asset_text,
     _incoming_event_text,
     _now_line,
+    _orphaned,
     _pace_chars_per_sec_from_env,
     _pace_enabled_from_env,
     _pace_floor_seconds_from_env,
@@ -5371,3 +5376,341 @@ def test_resolved_config_distinguishes_an_empty_overlay_from_no_overlay(
     assert report["opt_in_tools"] == []
     # `[]` here really does mean zero *plugin* tools; the memory provider's tool is not one.
     assert [name for name in report["tools"] if name != "memory"] == []
+
+
+# --- the claim heartbeat (issue #532) -------------------------------------------------------
+#
+# `_orphaned`'s age rule used to rest on "a wake is bounded by `max_steps` model calls", and it is
+# not: a step runs any number of tools, a shell call runs ten minutes, the router sets no timeout.
+# So a working wake keeps its claims young, and a claim's age means "no progress for this long".
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Wall and monotonic time, both moved by hand."""
+    now = [1_800_000_000.0]
+    monkeypatch.setattr(time, "time", lambda: now[0])
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    return now
+
+
+def _judged_orphaned(store, clock_now, uuid=M0):
+    """Would *another* live wake (another pid, another wake id) call this claim orphaned now?"""
+    claim = store.read(TIMELINE_UUID, uuid, kind="messages")
+    return _orphaned(claim, pid=os.getpid() + 1, wake="another-wake", now=clock_now)
+
+
+def test_a_claim_whose_owner_keeps_making_progress_is_never_orphaned_at_any_age(tmp_path, clock):
+    owner = ClaimStore(tmp_path)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+
+    for _ in range(12 * 30):  # thirty hours of progress, a step every five minutes
+        clock[0] += 5 * 60
+        owner.beat()
+
+    assert _judged_orphaned(owner, clock[0]) is False
+
+
+def test_a_claim_whose_owner_stopped_beating_is_orphaned_after_the_stale_bound(tmp_path, clock):
+    owner = ClaimStore(tmp_path)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    clock[0] += 60 * 60
+    owner.beat()  # progress an hour in …
+
+    clock[0] += _CLAIM_STALE_AFTER - 1  # … then none
+    assert _judged_orphaned(owner, clock[0]) is False
+    clock[0] += 2
+    assert _judged_orphaned(owner, clock[0]) is True
+
+
+def test_the_heartbeat_writes_at_most_once_per_interval_per_claim(tmp_path, clock, monkeypatch):
+    owner = ClaimStore(tmp_path)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    owner.claim(TIMELINE_UUID, M1, kind="messages")  # a batch claimed up front
+    writes = []
+    real_write = ClaimStore._write
+    monkeypatch.setattr(
+        ClaimStore,
+        "_write",
+        lambda self, path, claim: (writes.append(path.name), real_write(self, path, claim)),
+    )
+
+    for _ in range(100):  # a hundred steps inside one interval: nothing is due
+        clock[0] += 1
+        owner.beat()
+    assert writes == []
+    clock[0] += _CLAIM_BEAT_EVERY
+    for _ in range(100):
+        owner.beat()
+
+    assert sorted(writes) == sorted([f"{M0}.claim", f"{M1}.claim"])  # one each, however many beats
+
+
+def test_a_refresh_that_fails_never_raises_and_is_said(tmp_path, clock, monkeypatch, caplog):
+    owner = ClaimStore(tmp_path)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    before = owner.read(TIMELINE_UUID, M0, kind="messages").at
+
+    def refuse(self, path, claim):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ClaimStore, "_write", refuse)
+    clock[0] += _CLAIM_BEAT_EVERY
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        owner.beat()  # must not raise
+
+    assert owner.read(TIMELINE_UUID, M0, kind="messages").at == before
+    assert "Could not refresh the claim" in caplog.text
+
+
+def test_the_heartbeat_never_writes_over_a_take_over(tmp_path, clock):
+    owner = ClaimStore(tmp_path, wake="a" * 32)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    successor = ClaimStore(tmp_path, wake="b" * 32)
+
+    # A take-over the owner could not see coming (it stalled past the stale bound): the token is
+    # won and the claim rewritten. Its next beat must leave that alone.
+    folder = owner._folder(TIMELINE_UUID, "messages")
+    (folder / f".{M0}.takeover.{'a' * 32}").write_text("{}")
+    successor._write(
+        successor._path(TIMELINE_UUID, "messages", M0),
+        Claim(phase="in-flight", pid=os.getpid(), wake="b" * 32, at=time.time()),
+    )
+    clock[0] += _CLAIM_BEAT_EVERY
+    owner.beat()
+
+    assert owner.read(TIMELINE_UUID, M0, kind="messages").wake == "b" * 32
+
+
+def test_a_new_wake_never_keeps_the_last_wakes_claims_alive(tmp_path, clock):
+    # A process runs its wakes one at a time; what the last one left in flight is an orphan for
+    # this one to recover (`_orphaned` rule 2), never a claim to refresh under a new identity.
+    store = ClaimStore(tmp_path, wake="a" * 32)
+    store.claim(TIMELINE_UUID, M0, kind="messages")
+    stamped = store.read(TIMELINE_UUID, M0, kind="messages")
+    store.wake = "c" * 32  # the next wake of this process
+    assert store._held == {}  # it holds nothing yet
+
+    clock[0] += _CLAIM_BEAT_EVERY
+    store.beat()
+
+    assert store.read(TIMELINE_UUID, M0, kind="messages") == stamped
+    assert store.orphaned(stamped) is True
+
+
+def test_a_wake_beats_on_every_tool_completion_not_only_on_every_step(
+    platform, tmp_path, monkeypatch
+):
+    """One step, three tools: each tool must see a fresher claim than the one before it.
+
+    A step-only heartbeat would reproduce the bug at a larger scale — three ten-minute shell calls
+    back to back are thirty minutes with no beat, and nothing bounds how many a step dispatches.
+    """
+    monkeypatch.setattr("basecradle_harness._wake._CLAIM_BEAT_EVERY", 0)
+    serve_messages(platform, page(message(uuid=M0, body="run three things")))
+    seen: list[float] = []
+
+    class ReadsItsOwnClaim(Tool):
+        name = "probe"
+        description = "Reads the age of the claim its wake holds."
+        parameters = {"type": "object", "properties": {}}
+
+        def run(self, **kwargs):
+            seen.append(ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").at)
+            time.sleep(0.01)
+            return "ok"
+
+    class ThreeToolsThenDone:
+        def __init__(self):
+            self.calls = 0
+
+        def chat(self, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return Message.assistant(
+                    tool_calls=[ToolCall(id=f"c{n}", name="probe", arguments={}) for n in range(3)]
+                )
+            return Message.assistant(content="done")
+
+    agent, _ = build_wake(tmp_path, ThreeToolsThenDone(), tools=[ReadsItsOwnClaim()])
+    agent.wake()
+
+    assert len(seen) == 3
+    assert seen[0] < seen[1] < seen[2]
+
+
+def test_a_heartbeat_that_raises_never_ends_a_turn(tmp_path, caplog):
+    session = Harness(CountingProvider(speak=False), home=tmp_path).session("timeline:x")
+
+    def broken():
+        raise RuntimeError("the claims directory went away")
+
+    session.heartbeat = broken
+    with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+        reply = session.send("hello")
+
+    assert reply  # the turn finished
+    assert "The claim heartbeat failed" in caplog.text
+
+
+def test_the_owner_keeps_beating_while_a_take_over_token_merely_exists(tmp_path, clock):
+    """A recoverer links its token first and checks orphanhood second, under the lock.
+
+    A fresh `at` is what makes it back off. An owner that went quiet at the sight of the token
+    would hand a live item away — and if that recoverer died after linking, the owner would never
+    beat again and be taken over for real six hours later, while still working.
+    """
+    owner = ClaimStore(tmp_path, wake="a" * 32)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    folder = owner._folder(TIMELINE_UUID, "messages")
+    (folder / f".{M0}.takeover.{'a' * 32}").write_text("{}")  # won; its record not written yet
+
+    for _ in range(12 * 7):
+        clock[0] += 5 * 60
+        owner.beat()
+
+    assert owner.read(TIMELINE_UUID, M0, kind="messages").wake == "a" * 32
+    assert _judged_orphaned(owner, clock[0]) is False  # so the recoverer's re-check backs off
+
+
+def test_a_refresh_and_a_take_over_never_interleave(tmp_path, clock, monkeypatch):
+    """The owner reads its claim; a take-over writes; the owner must not then write over it.
+
+    Both hold the claims directory's exclusive lock for their read-and-write, so either the
+    refresh finishes first (and the recoverer judges what it wrote), or the take-over does (and
+    the refresh sees a claim that no longer names its owner). Never both.
+    """
+    owner = ClaimStore(tmp_path, wake="a" * 32)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    recoverer = ClaimStore(tmp_path, wake="b" * 32)  # same process: rule 2 calls "a" orphaned
+    real_read = ClaimStore.read
+    read_once, go = threading.Event(), threading.Event()
+
+    def slow_owner_read(self, timeline, uuid, *, kind):
+        current = real_read(self, timeline, uuid, kind=kind)
+        if self is owner and not read_once.is_set():
+            read_once.set()
+            go.wait(5)
+        return current
+
+    monkeypatch.setattr(ClaimStore, "read", slow_owner_read)
+    clock[0] += _CLAIM_BEAT_EVERY
+    beating = threading.Thread(target=owner.beat)
+    beating.start()
+    assert read_once.wait(5)
+    won = []
+    taking = threading.Thread(
+        target=lambda: won.append(
+            recoverer.reclaim(TIMELINE_UUID, M0, kind="messages", owner="a" * 32)
+        )
+    )
+    taking.start()
+    taking.join(0.5)  # with the lock, the take-over waits here for the refresh
+    go.set()
+    beating.join(5)
+    taking.join(5)
+
+    holder = real_read(owner, TIMELINE_UUID, M0, kind="messages").wake
+    assert won == [True] and holder == "b" * 32  # the take-over wrote last, and its record stands
+
+
+def test_a_taken_over_orphan_is_kept_alive_by_the_wake_that_took_it(tmp_path, clock):
+    dead = ClaimStore(tmp_path, wake="d" * 32)
+    dead.claim(TIMELINE_UUID, M0, kind="messages")
+    recoverer = ClaimStore(tmp_path, wake="b" * 32)
+    assert recoverer.reclaim(TIMELINE_UUID, M0, kind="messages", owner="d" * 32)
+    taken = recoverer.read(TIMELINE_UUID, M0, kind="messages").at
+
+    clock[0] += _CLAIM_BEAT_EVERY
+    recoverer.beat()
+
+    assert recoverer.read(TIMELINE_UUID, M0, kind="messages").at > taken
+
+
+def test_the_heartbeat_never_puts_a_settled_claim_back_in_flight(tmp_path, clock):
+    owner = ClaimStore(tmp_path, wake="a" * 32)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    ClaimStore(tmp_path, wake="b" * 32).commit(TIMELINE_UUID, M0, kind="messages")  # not via owner
+
+    clock[0] += _CLAIM_BEAT_EVERY
+    owner.beat()
+
+    assert owner.read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+
+
+def test_a_failed_refresh_is_retried_after_the_interval(tmp_path, clock, monkeypatch):
+    owner = ClaimStore(tmp_path)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    real_write = ClaimStore._write
+    failures = [1]
+
+    def once_then_ok(self, path, claim):
+        if failures:
+            failures.pop()
+            raise OSError(5, "Input/output error")
+        return real_write(self, path, claim)
+
+    monkeypatch.setattr(ClaimStore, "_write", once_then_ok)
+    clock[0] += _CLAIM_BEAT_EVERY
+    owner.beat()  # fails
+    clock[0] += _CLAIM_BEAT_EVERY
+    owner.beat()  # retried
+
+    assert owner.read(TIMELINE_UUID, M0, kind="messages").at == clock[0]
+
+
+def test_a_claims_directory_purged_mid_wake_drops_out_of_the_heartbeat(tmp_path, clock, caplog):
+    owner = ClaimStore(tmp_path)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+    shutil.rmtree(owner._folder(TIMELINE_UUID, "messages"))  # the timeline was deleted and purged
+
+    clock[0] += _CLAIM_BEAT_EVERY
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        owner.beat()
+
+    assert owner._held == {}
+    assert "Could not refresh" not in caplog.text
+
+
+def test_a_suspended_host_is_beaten_on_the_wall_clock(tmp_path, monkeypatch):
+    # Monotonic time stops while a host is suspended; `_orphaned` measures on the wall clock. After
+    # a long suspend the first beat must be due at once, not five monotonic minutes later.
+    mono, wall = [1000.0], [1_800_000_000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: mono[0])
+    monkeypatch.setattr(time, "time", lambda: wall[0])
+    owner = ClaimStore(tmp_path)
+    owner.claim(TIMELINE_UUID, M0, kind="messages")
+
+    wall[0] += 7 * 60 * 60  # suspended for seven hours
+    mono[0] += 1  # and awake for a second
+    owner.beat()
+
+    assert _judged_orphaned(owner, wall[0]) is False
+
+
+def test_a_wake_leaves_no_heartbeat_on_its_session_when_it_ends(platform, tmp_path):
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, _ = build_wake(tmp_path)
+    agent.wake()
+
+    assert agent.harness.session(agent.source).heartbeat is None
+
+
+def test_a_paced_read_beats_before_the_turn_that_follows_it(platform, tmp_path, monkeypatch):
+    # The message batch is claimed before the read-pace, and a read of a long message sleeps for
+    # minutes; the claim must be kept young across it, before the model is ever called.
+    serve_messages(platform, page(peer_ai_message(uuid=M0, body="x" * 510)))
+    pacer, _ = _pacer()
+    provider = CountingProvider()
+    agent, _ = build_wake(tmp_path, provider, pacer=pacer)
+    real_beat = ClaimStore.beat
+    beats_before_the_model: list[int] = []
+
+    def recording(self):
+        beats_before_the_model.append(provider._calls)
+        return real_beat(self)
+
+    monkeypatch.setattr(ClaimStore, "beat", recording)
+    agent.wake()
+
+    assert beats_before_the_model and beats_before_the_model[0] == 0
