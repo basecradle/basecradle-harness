@@ -42,6 +42,15 @@ Wake-breaker      ``breaker/<uuid>.wakes``, ``breaker/<uuid>.tripped``
 Billing-blocked   ``billing/<uuid>.blocked``  (out-of-funds debounce, issue #336)
 ================  ==========================================================
 
+**Stranded temps are swept on every run, whatever their timeline** (issue #526). Each atomic
+write stages a temp, and a writer killed inside the write window leaves it behind with nothing to
+remove it: a copy of a conversation beside a live transcript, a copy of a live token beside
+``agent.env``. `prune_stranded_temps` removes those — by exact name, in the exact places the
+harness stages writes, and only once `STRANDED_AFTER` has passed and any pid the writer stamped is
+dead — so no live writer's temp is ever touched. It reaches outside ``$HARNESS_HOME`` in two places
+and only by name: the env file's directory and the top level of ``~/.mempalace`` (never the palace
+beneath it).
+
 The sweep is idempotent and crash-safe: a re-run re-derives the artifact set from
 disk, and a half-done purge finishes on the next run. There is no concurrency
 hazard — a 404 timeline is terminal, so no live wake for it can be in flight (a
@@ -58,6 +67,7 @@ import os
 import re
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote
@@ -65,8 +75,12 @@ from urllib.parse import unquote
 from basecradle._exceptions import BaseCradleError, ForbiddenError, NotFoundError
 
 from basecradle_harness._basecradle import _client_from_env, _configure_logging
+from basecradle_harness._install import config_home
+from basecradle_harness._mempalace import _CLI_CONFIG_DIR, _CLI_CONFIG_FILE
 from basecradle_harness._observability import RED, head, kv
+from basecradle_harness._token import TEMP_PREFIX, TEMP_SUFFIX
 from basecradle_harness._version import __version__
+from basecradle_harness._wake import _process_alive
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -84,7 +98,35 @@ _TIMELINE_SOURCE_PREFIX = "timeline:"
 #: it then holds **the entire conversation**. A sweep that purged `…json` and walked past
 #: `…json.4213-9f2c.tmp` would report a deleted timeline as purged while leaving its transcript on
 #: the box forever, which is precisely the outcome this module exists to prevent.
-_SESSION_TEMP = re.compile(r"^(?P<source>.+)\.json\.[^.]+\.tmp$")
+_SESSION_TEMP = re.compile(r"^(?P<source>.+)\.json\.(?P<stamp>[^.]+)\.tmp$")
+
+#: How long a staged temp must sit untouched before the sweep calls it **stranded** (issue #526).
+#:
+#: Every temp below lives for one atomic write: stage, (fsync), rename or link, and a handler removes
+#: it on an exception. Only a writer killed *inside* that window — `SIGKILL`, the OOM killer, a power
+#: loss, where no handler runs — leaves one behind, and then nothing ever removes it: the orphan
+#: sweep reaches a session temp only once its timeline is deleted, and nothing reaches the rest at
+#: all. A write takes milliseconds, so an hour is far past any live one. Where the writer stamps its
+#: pid, the pid must also be dead: a temp is removed only when **both** say its writer is gone, so a
+#: live writer's temp is never touched even if the two clocks or pid namespaces disagree.
+STRANDED_AFTER = 60 * 60
+
+#: ``claims/<kind>/<timeline>/<uuid>.claim.<pid>.tmp`` — `ClaimStore._write`, staging a commit,
+#: an abandon, or the claim a take-over writes.
+_CLAIM_WRITE_TEMP = re.compile(r"^.+\.claim\.(?P<pid>\d+)\.tmp$")
+
+#: ``claims/<kind>/<timeline>/.<uuid>.<wake>.new`` and ``….takeover.new`` — the populated records
+#: `ClaimStore.claim` and `ClaimStore.reclaim` link into place. A take-over *token*
+#: (``.<uuid>.takeover.<owner>``) never ends in ``.new``, so it can never match.
+_CLAIM_LINK_TEMP = re.compile(r"^\..+\.new$")
+
+#: ``.basecradle-env.<random>.tmp`` beside the env file — `_token._atomic_write`. It holds a copy of
+#: the whole env file, **live ``BASECRADLE_TOKEN`` included** (mode 600).
+_ENV_TEMP = re.compile(rf"^{re.escape(TEMP_PREFIX)}.+{re.escape(TEMP_SUFFIX)}$")
+
+#: ``~/.mempalace/.config.json.<hex>.tmp`` — `_mempalace._write_cli_config`. It holds the MemPalace
+#: CLI config, which can carry an embeddings API key.
+_MEMPALACE_TEMP = re.compile(rf"^\.{re.escape(_CLI_CONFIG_FILE)}\.[0-9a-f]+\.tmp$")
 
 
 @dataclass
@@ -100,12 +142,15 @@ class SweepSummary:
     kept: int = 0
     kept_forbidden: int = 0
     skipped_transient: int = 0
+    #: Stranded temps removed this run, on any timeline or none (`prune_stranded_temps`).
+    stranded_temps: int = 0
 
     def __str__(self) -> str:
         return (
             f"cleanup sweep: checked {self.checked} timeline(s) — "
             f"purged {self.purged}, kept {self.kept}, "
-            f"kept-forbidden {self.kept_forbidden}, skipped-transient {self.skipped_transient}"
+            f"kept-forbidden {self.kept_forbidden}, skipped-transient {self.skipped_transient}; "
+            f"removed {self.stranded_temps} stranded temp(s)"
         )
 
 
@@ -211,6 +256,95 @@ def purge(paths: list[Path]) -> None:
             _log.warning("cleanup: could not remove %s: %s", path, error)
 
 
+def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
+    """Remove every temp a killed write left behind, on live timelines too (issue #526).
+
+    The orphan sweep removes a *session* temp only once its timeline is deleted, and nothing else
+    ever removed a stranded temp at all. So a wake killed mid-save left a full copy of the
+    conversation beside the live transcript for the life of the timeline, and a killed token
+    refresh left a copy of a live ``BASECRADLE_TOKEN`` beside ``agent.env`` forever. This pass looks
+    in exactly the places the harness stages writes, for exactly the names it stages them under:
+
+    ==============================================  ===================================  =======
+    Temp                                            Writer                               Pid
+    ==============================================  ===================================  =======
+    ``sessions/<source>.json.<pid>-<token>.tmp``    `Session._save`                      yes
+    ``claims/…/<uuid>.claim.<pid>.tmp``             `ClaimStore._write`                  yes
+    ``claims/…/.<uuid>.<wake>[.takeover].new``      `ClaimStore.claim` / ``reclaim``     no
+    ``.basecradle-env.<random>.tmp``                `_token._atomic_write`               no
+    ``~/.mempalace/.config.json.<hex>.tmp``         `_mempalace._write_cli_config`       no
+    ==============================================  ===================================  =======
+
+    A temp is removed when it is older than `STRANDED_AFTER` **and**, where it carries one, its pid
+    is not a live process. The env temp is looked for beside ``BASECRADLE_ENV_FILE`` and in the
+    config home (where ``agent.env`` lives); the MemPalace one only at the top level of
+    ``~/.mempalace``, which is never walked, so the palace beneath it is never reached. Nothing that
+    does not match one of those names is ever touched, and a temp that cannot be read or removed is
+    logged and left for the next run.
+    """
+    now = time.time() if now is None else now
+    removed: list[Path] = []
+
+    def consider(path: Path, pid: int | None) -> None:
+        try:
+            age = now - path.stat().st_mtime
+        except OSError:
+            return  # gone already, or unreadable: nothing to decide
+        if age < STRANDED_AFTER or (pid is not None and _writer_alive(pid)):
+            return  # young enough to be mid-write, or its writer is still alive
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as error:
+            _log.warning("cleanup: could not remove stranded temp %s: %s", path, error)
+            return
+        removed.append(path)
+        _log.info("cleanup: removed stranded temp %s (untouched %.0fs)", path, age)
+
+    for path in _entries(home / "sessions"):
+        if staged := _SESSION_TEMP.match(path.name):
+            pid, _, _ = staged.group("stamp").partition("-")
+            consider(path, int(pid) if pid.isdigit() else None)
+
+    for kind in _entries(home / "claims"):
+        for folder in _entries(kind):
+            for path in _entries(folder):
+                if written := _CLAIM_WRITE_TEMP.match(path.name):
+                    consider(path, int(written.group("pid")))
+                elif _CLAIM_LINK_TEMP.match(path.name):
+                    consider(path, None)
+
+    env_dirs = {config_home()}
+    if env_file := os.environ.get("BASECRADLE_ENV_FILE"):
+        env_dirs.add(Path(env_file).expanduser().parent)
+    for folder in sorted(env_dirs):
+        for path in _entries(folder):
+            if _ENV_TEMP.match(path.name):
+                consider(path, None)
+
+    for path in _entries(Path.home() / _CLI_CONFIG_DIR):
+        if _MEMPALACE_TEMP.match(path.name):
+            consider(path, None)
+
+    return removed
+
+
+def _entries(folder: Path) -> list[Path]:
+    """The entries of `folder`, or none — a missing or unreadable directory never stops the pass."""
+    try:
+        return list(folder.iterdir()) if folder.is_dir() else []
+    except OSError as error:
+        _log.warning("cleanup: could not list %s: %s", folder, error)
+        return []
+
+
+def _writer_alive(pid: int) -> bool:
+    """Is the writer that stamped `pid` still running? A number no process can hold is not alive."""
+    try:
+        return _process_alive(pid)
+    except (OverflowError, ValueError):
+        return False  # `os.kill` rejects it outright: nothing by that pid can be writing
+
+
 def classify(client: object, uuid: str) -> str:
     """Classify one timeline by a single ``timeline.get`` — the safety switch of the sweep.
 
@@ -263,6 +397,7 @@ def sweep(home: Path, client: object) -> SweepSummary:
             _log.warning("cleanup: skipped timeline %s this run (transient error)", uuid)
         else:
             summary.kept += 1
+    summary.stranded_temps = len(prune_stranded_temps(home))
     return summary
 
 

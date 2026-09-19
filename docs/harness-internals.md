@@ -443,6 +443,14 @@ Rails change; we don't consume `timeline.deleted`.
 - Idempotent + crash-safe (re-derives the set from disk each run; a half-done purge finishes
   next run); reuses `_client_from_env` and the stores' `quote(..., safe='')` filename
   convention. `--timeline <uuid>` is a manual unconditional ops purge.
+- **Stranded temps, on every timeline (issue #526).** `prune_stranded_temps` runs at the end of
+  every `--sweep`. A temp exists for one atomic write, and only a writer killed inside that window
+  leaves one; before this, only a *deleted* timeline's session temp was ever removed. It matches the
+  five staged-write names exactly (`Session._save`, `ClaimStore._write`, the `claim()`/`reclaim()`
+  link records, `_token._atomic_write`, `_mempalace._write_cli_config`), in the places they are
+  staged, and removes one only when it is older than `STRANDED_AFTER` (1 h) **and** any pid it
+  carries is dead. The tests strand each one with its real writer, killed at the publish instant,
+  so a writer that renames its temp fails them rather than escaping the sweep.
 
 **Boundary:** the schedule unit lives in `deploy/` (captain authors it); the **NOC deploys it**
 (sole deployer) per agent, scoped to that agent's `$HARNESS_HOME` + `BASECRADLE_TOKEN`. Live

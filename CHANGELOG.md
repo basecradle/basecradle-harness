@@ -7,6 +7,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.125.0] - 2026-09-19
+
+### Changed: the cleanup sweep removes stranded temps on live timelines too (issue #526)
+
+Founder-approved, 2026-09-19. Every atomic write the harness makes stages a temp and removes it on
+an exception. A writer killed inside the window (`SIGKILL`, the OOM killer, a power loss) runs no
+handler and strands it, and nothing removed it afterwards: the orphan sweep reached a session temp
+only once its timeline was deleted, and reached the others not at all. That left a copy of a whole
+conversation beside a live transcript, and a copy of a live `BASECRADLE_TOKEN` beside `agent.env`,
+with no end.
+
+`basecradle-harness-cleanup --sweep` now ends with `prune_stranded_temps`. It matches the harness's
+own staged-write names exactly, in the places they are staged:
+
+- `sessions/<source>.json.<pid>-<token>.tmp` (`Session._save`)
+- `claims/…/<uuid>.claim.<pid>.tmp` (`ClaimStore._write`)
+- `claims/…/.<uuid>.<wake>.new` and `….takeover.new` (`ClaimStore.claim` / `reclaim`)
+- `.basecradle-env.<random>.tmp` beside `BASECRADLE_ENV_FILE` and in the config home
+  (`_token._atomic_write`)
+- `.config.json.<hex>.tmp` at the top level of `~/.mempalace` (`_mempalace._write_cli_config`),
+  never the palace beneath it
+
+A temp is removed only when it is older than `STRANDED_AFTER` (one hour) **and**, where the writer
+stamped its pid, that process is gone. The proposal allowed either test alone for a pid-stamped
+temp. Requiring both means a pid-namespace mismatch or a clock skew can never make a live write's
+temp look stranded, at the cost of an hour's delay. The summary line now ends
+`removed N stranded temp(s)`, and each removal logs one INFO line naming the path.
+
+### Fixed: `ClaimStore._write` removes its staged record when the write fails
+
+It was the one atomic write that did not: a refused `os.replace` (`ENOSPC`, say) left
+`<uuid>.claim.<pid>.tmp` behind. It now cleans up in a `finally`, exactly as `Session._save` does.
+
 ## [0.124.0] - 2026-09-19
 
 ### Changed: the installer removes a `<name>.new` once it has nothing left to offer (issue #526)
