@@ -1146,7 +1146,7 @@ It reports measurements and renders no verdict — nothing here is labelled bloa
 
 ### Clean up deleted timelines — `basecradle-harness-cleanup`
 
-Each wake persists per-timeline state under `HARNESS_HOME` — the session transcript (the full conversation), plus the marks/seen/claims/breaker index files. When a timeline is **destroyed** on the platform, nothing on the box cleans that up by itself, so a destroyed timeline's content would linger indefinitely. `basecradle-harness-cleanup --sweep` is the periodic **orphan sweep** that GCs it:
+Each wake persists per-timeline state under `HARNESS_HOME` — the session transcript (the full conversation), plus the marks/seen/claims/breaker/billing index files. When a timeline is **destroyed** on the platform, nothing on the box cleans that up by itself, so a destroyed timeline's content would linger indefinitely. `basecradle-harness-cleanup --sweep` is the periodic **orphan sweep** that GCs it:
 
 ```bash
 HARNESS_HOME=/path/to/home basecradle-harness-cleanup --sweep
