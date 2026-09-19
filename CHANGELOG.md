@@ -7,6 +7,73 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.126.0] - 2026-09-19
+
+### Changed: the cleanup sweep prunes settled claims on live timelines (issue #526)
+
+Founder-approved, 2026-09-19. `ClaimStore` writes one claim file per message, asset, webhook
+delivery and task an agent handles, and nothing removed one until its timeline was deleted.
+`basecradle-harness-cleanup --sweep` now runs `prune_settled_claims` on every timeline it did not
+purge. A claim goes when it is final (`done`, `abandoned`, or a legacy empty file) **and** its item
+is covered by its kind's record: at or below the high-water mark in uuid order, or in the task
+seen-set. Its take-over tokens go with it. An `in-flight` claim is never touched, and neither is a
+record that cannot be parsed. The summary line reports how many were pruned.
+
+**What makes it safe is not the sweep alone.** A covered item looked provably unreadable, so the
+first draft pruned after a six-hour grace. An adversarial review broke that three ways, each of
+which re-drives a turn that already spoke:
+
+- A mark could read as missing (0.125.2 fixed the torn write; an operator can still delete one),
+  which sends the message bootstrap back to the agent's last post.
+- A long wake settling an older ledger writes its older mark back over a newer one.
+- A wake's lifetime is not bounded, so a wake that listed an item before the mark passed it can
+  reach `claim` for it at any later time.
+
+So the refusal lives where acting starts:
+
+- **`ClaimStore.claim` refuses a covered item** and links a `done` record in its place, so the
+  item is judged final. It holds the claims directory's advisory lock *shared* across its
+  coverage check and its link, and the sweep holds it *exclusive* while it raises the watermark
+  and while it unlinks. So no claim is removed between a wake's check and its link, and a covered
+  item is never in flight. Wakes never wait on each other. A second check after the link stands
+  behind a wake that has to run unlocked (no `fcntl`, or a filesystem that refuses a lock); the
+  sweep refuses to prune unlocked. Every refusal logs a WARNING, `claim refused … reason=covered`.
+- **`reclaim` re-reads the claim** under the exclusive lock after winning its take-over token, and
+  backs off unless it is still an orphan. The prune removes the tokens that used to stop a
+  recoverer who judged an orphan too early. A token a recoverer left when it was killed backing
+  off is removed by the next prune.
+- **The evidence for a mark-backed kind is a new pruned-through watermark**
+  (`claims/<kind>/<timeline>/.pruned-through`). The sweep raises it under the exclusive lock, so
+  two sweeps cannot write a lower value over a higher one, and writes it durably (temp, fsync,
+  replace, directory fsync on every path) before unlinking anything under it. It is never
+  lowered.
+- **The evidence for tasks is the append-only seen-set**, whose file and directory are fsynced
+  before the prune.
+- A watermark or seen-set that `claim` cannot read is logged and treated as "not covered", never
+  raised, since raising would fail every claim on that timeline. The sweep never overwrites a
+  watermark it cannot read.
+
+Two more adversarial reviews, of the built code, found what the list above closes. The first:
+two concurrent sweeps could lower the watermark; an `OSError` reading it escaped `claim`; a kill
+between the link and the `done` rewrite left an orphan recovery could re-drive; and `reclaim`
+could bring a pruned item back. The second: those fixes only narrowed two of the windows (hence
+the directory lock and the orphan guard), and a top-level `import fcntl` made
+`import basecradle_harness` fail on Windows (now imported where available). Every fix has a test
+that fails without it.
+
+`_readmit` also now reads the record again after losing the race for a claim whose file vanished,
+so a pruned item comes back final instead of pending for one wake.
+
+Stated limits:
+
+- Once a task's claim is pruned, its seen-set line is the only record that the task was handled.
+  If that file is deleted, the task is re-driven, where before its claim would have stopped it.
+- The platform mints an item's UUIDv7 before the row commits, so an item can commit after the
+  mark has passed its uuid. If a regressed or missing mark ever lists such an item, it is now
+  refused (and logged), where before it was answered by accident. Reported upward as
+  basecradle/basecradle#554.
+- The fsyncs are not covered by a test.
+
 ## [0.125.2] - 2026-09-19
 
 ### Fixed: a high-water mark can no longer be read as empty (issue #526)

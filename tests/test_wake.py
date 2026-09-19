@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from importlib import metadata
 from types import SimpleNamespace
+from uuid import UUID
 
 import httpx
 import pytest
@@ -53,6 +54,7 @@ from basecradle_harness import (
 )
 from basecradle_harness import _wake as wake_module
 from basecradle_harness._basecradle import _incoming_text, _messages_since, _parse_created_at
+from basecradle_harness._cleanup import prune_settled_claims
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
 from basecradle_harness._report import billing_onset_line
@@ -4837,6 +4839,78 @@ def test_a_live_concurrent_wake_still_owns_its_claim(platform, tmp_path):
     # And the mark must NOT pass it. If that wake dies, the message has to stay findable — a mark
     # that sailed past an in-flight item would hide it forever, which is the bug #285 exists to fix.
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == PRIOR
+
+
+@pytest.mark.parametrize("mark_after_prune", ["regressed", "lost"])
+def test_a_pruned_message_is_never_re_driven_when_it_is_listed_again(
+    platform, tmp_path, mark_after_prune
+):
+    """The cleanup sweep prunes M0's settled claim; a later wake lists M0 again (issue #526).
+
+    That happens when the mark moves backward (a long concurrent wake writes its older ledger
+    back) or reads as missing (a torn write, an operator), and a wake that listed M0 before the
+    prune gets there the same way. With the claim file gone, the exclusive create *wins*, so
+    `claim` itself must refuse: the watermark the sweep wrote before unlinking says M0 is settled.
+    """
+    store = ClaimStore(tmp_path)
+    store.claim(TIMELINE_UUID, M0, kind="messages")
+    store.commit(TIMELINE_UUID, M0, kind="messages")
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    assert prune_settled_claims(tmp_path) == 1
+    if mark_after_prune == "regressed":
+        MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)
+    else:
+        MarkStore(tmp_path)._path(TIMELINE_UUID).unlink()  # the next wake bootstraps
+    serve_messages(platform, page(message(uuid=M0, body="answered long ago")))
+
+    agent, provider = build_wake(tmp_path)
+
+    assert agent.wake() == []
+    assert provider.prompts == []  # never put in front of the model again
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+
+
+def test_a_claim_that_vanishes_under_a_readmit_is_judged_by_what_replaces_it(
+    platform, tmp_path, monkeypatch
+):
+    """`_readmit` found no record after losing the create: the sweep pruned it in between.
+
+    It races for the claim, and a pruned item is refused and put back `done` — which must then
+    read as *final*, not as pending. Pending would hold the mark behind an item settled long ago.
+    """
+    store = ClaimStore(tmp_path)
+    store.claim(TIMELINE_UUID, M0, kind="messages")
+    store.commit(TIMELINE_UUID, M0, kind="messages")
+    MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)
+    serve_messages(platform, page(message(uuid=M0, body="answered long ago")))
+    real_read, real_claim = ClaimStore.read, ClaimStore.claim
+    lost, vanished = [], []
+
+    def claim(self, timeline, uuid, *, kind):
+        won = real_claim(self, timeline, uuid, kind=kind)
+        if uuid == M0 and not won:
+            lost.append(True)
+        return won
+
+    def pruned_mid_read(self, timeline, uuid, *, kind):
+        # Only the read `_readmit` makes after losing the create: that is the window under test.
+        if uuid == M0 and lost and not vanished:
+            vanished.append(True)
+            self.advance_pruned_through(
+                timeline, kind=kind, mark=UUID(M0)
+            )  # as the sweep orders it
+            self._path(timeline, kind, uuid).unlink()
+            return None
+        return real_read(self, timeline, uuid, kind=kind)
+
+    monkeypatch.setattr(ClaimStore, "claim", claim)
+    monkeypatch.setattr(ClaimStore, "read", pruned_mid_read)
+    agent, provider = build_wake(tmp_path)
+
+    assert agent.wake() == []
+    assert provider.prompts == []
+    assert vanished  # the path under test really ran
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # final, so the mark moved past it
 
 
 def test_a_legacy_empty_claim_reads_as_done_and_is_never_re_driven(platform, tmp_path):
