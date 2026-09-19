@@ -443,14 +443,23 @@ Rails change; we don't consume `timeline.deleted`.
 - Idempotent + crash-safe (re-derives the set from disk each run; a half-done purge finishes
   next run); reuses `_client_from_env` and the stores' `quote(..., safe='')` filename
   convention. `--timeline <uuid>` is a manual unconditional ops purge.
+- **Settled claims, on live timelines (issue #526).** `prune_settled_claims` runs after the
+  classify loop. It removes a claim that is final and whose item is covered by its kind's record
+  (at or below the mark in uuid order; in the task seen-set), with its take-over tokens. Safety is
+  not in the sweep: `ClaimStore.claim` refuses a covered item, holding the claims directory's lock
+  shared across its check and its link while the prune holds it exclusive, and `reclaim` backs
+  off a claim that is final, gone, or no longer an orphan. The evidence is the `.pruned-through`
+  watermark, which the sweep raises under that lock, writes durably, never lowers, and syncs
+  before any unlink. See CLAUDE.md → Delivery Guarantee for why a grace period was rejected.
 - **Stranded temps, on every timeline (issue #526).** `prune_stranded_temps` runs at the end of
   every `--sweep`. A temp exists for one atomic write, and only a writer killed inside that window
   leaves one; before this, only a *deleted* timeline's session temp was ever removed. It matches
   each staged-write name exactly (`Session._save`, `MarkStore.set`, `ClaimStore._write`, the
-  `claim()`/`reclaim()` link records, `_token._atomic_write`, `_mempalace._write_cli_config`), in
-  the places they are staged, and removes one only when it is older than `STRANDED_AFTER` (1 h)
-  **and** any pid it carries is dead. The tests strand each one with its real writer, killed at the publish instant,
-  so a writer that renames its temp fails them rather than escaping the sweep.
+  `claim()`/`reclaim()` link records, the watermark's own temp, `_token._atomic_write`,
+  `_mempalace._write_cli_config`), in the places they are staged, and removes one only when it is
+  older than `STRANDED_AFTER` (1 h) **and** any pid it carries is dead. The tests strand each one
+  with its real writer, killed at the publish instant, so a writer that renames its temp fails
+  them rather than escaping the sweep.
 
 **Boundary:** the schedule unit lives in `deploy/` (captain authors it); the **NOC deploys it**
 (sole deployer) per agent, scoped to that agent's `$HARNESS_HOME` + `BASECRADLE_TOKEN`. Live

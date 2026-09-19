@@ -75,21 +75,28 @@ import logging
 import os
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
 from urllib.parse import quote, unquote
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
+
+try:  # advisory locks: POSIX only, and only the claim store uses them (see `_locked`)
+    import fcntl
+except ImportError:  # pragma: no cover - Windows; the package must still import there
+    fcntl = None  # type: ignore[assignment]
 from basecradle import BaseCradle, BaseCradleError, NotFoundError
 
 from basecradle_harness._assets import _describe, _is_image, image_input, model_sees_images
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
+    _as_uuid,
     _client_from_env,
     _compactor_from_env,
     _config_from_env,
@@ -411,6 +418,14 @@ def _orphaned(claim: Claim, *, pid: int, wake: str, now: float | None = None) ->
 #: than the stalled item they describe.
 _TAKEOVER_HOPS = 16
 
+#: The file in a mark-backed kind's claims directory that records how far the cleanup sweep has
+#: pruned it (issue #526): every item at or below this uuid has had a *final* claim, and its claim
+#: file may be gone. `ClaimStore.claim` reads it, so a pruned claim can never be won again.
+_PRUNED_THROUGH = ".pruned-through"
+
+#: The claim phases the sweep may prune: an item in one of them will never be acted on again.
+_PRUNABLE = frozenset({_DONE, _ABANDONED})
+
 
 def _read_claim(path: Path) -> Claim | None:
     """Read a claim record from `path` — the one parser, shared by the claim and its take-over token.
@@ -456,6 +471,63 @@ def _payload(claim: Claim) -> dict[str, object]:
     return payload
 
 
+#: Set once a directory lock has failed and the store fell back to working without one, so the
+#: WARNING is said once per process rather than on every claim.
+_LOCK_FALLBACK_SAID = False
+
+
+@contextmanager
+def _locked(folder: Path, *, shared: bool, required: bool) -> Iterator[int]:
+    """Hold an advisory `flock` on a claims directory; yield its descriptor (issue #526).
+
+    **What it serializes.** `claim` holds it *shared* across its coverage check and its link;
+    the cleanup sweep holds it *exclusive* while it raises the watermark and while it unlinks
+    settled claims; `reclaim` holds it *exclusive* while it re-reads a claim and writes over it.
+    So a sweep can never remove a claim between a wake's "is this covered?" and its link, and two
+    sweeps can never interleave a watermark read with a write. Wakes do not exclude each other:
+    the exclusive link still decides every race between them, exactly as before.
+
+    **When it cannot be had.** Without `fcntl` (Windows) there is no lock, and a directory whose
+    filesystem refuses one (some NFS mounts) raises. `required` decides what that means: the
+    sweep passes True and skips the directory, because pruning unlocked is the thing the lock
+    exists to prevent; a wake passes False and carries on unlocked, logging it once, because
+    refusing to claim would stall every item on the timeline — and `claim`'s post-link check
+    still stands behind it.
+    """
+    global _LOCK_FALLBACK_SAID
+    fd = os.open(folder, os.O_RDONLY)
+    try:
+        if fcntl is None:
+            if required:
+                raise OSError("advisory file locks are unavailable on this platform")
+        else:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
+            except OSError as error:
+                if required:
+                    raise
+                if not _LOCK_FALLBACK_SAID:
+                    _LOCK_FALLBACK_SAID = True
+                    _log.warning("Claims run without a directory lock on %s: %s", folder, error)
+        yield fd
+    finally:
+        os.close(fd)  # releases the lock
+
+
+def _prunable(path: Path) -> bool:
+    """Is the claim at `path` final by its own record — empty (legacy), `done`, or `abandoned`?"""
+    try:
+        raw = path.read_text().strip()
+    except OSError:
+        return False
+    if not raw:
+        return True
+    try:
+        return json.loads(raw).get("phase") in _PRUNABLE
+    except (ValueError, AttributeError):
+        return False
+
+
 class ClaimStore:
     """Per-item atomic claims, so concurrent wakes handle each item exactly once — and so a
     **crashed** wake's item can be re-driven instead of silently dropped (issue #285).
@@ -490,10 +562,21 @@ class ClaimStore:
     the old behavior exactly and can never re-drive history on the upgrade wake. This is
     load-bearing for the fleet rollout: @jt and @glm-5.2 have live claim dirs.
 
-    **Known bound — claims are not pruned.** One tiny file accrues per handled item, the same
-    unbounded-growth shape the task `SeenStore` already has. If it ever matters, claims at or
-    below a kind's high-water mark are dead (that item is never re-scanned) and prunable by
-    UUIDv7 order. Out of scope here.
+    **Settled claims are pruned, and a pruned claim can never be won again** (issue #526). One file
+    per handled item used to accrue for the life of the timeline. The cleanup sweep now removes a
+    claim once it is final **and** its item is covered by the kind's record: at or below the
+    high-water mark in uuid order, or in the task seen-set (`prune_settled`). Being covered is
+    not, by itself, a proof that nothing will read the claim again — a wake that listed the item
+    before the record moved can still reach `claim` for it hours later, and a mark can read as
+    missing or move backward under a concurrent wake. So the proof is not left to timing: `claim`
+    itself refuses a covered item (`_covered`). For a mark-backed kind that reads the
+    **pruned-through watermark**, which the sweep writes durably *before* it unlinks anything and
+    never lowers; for tasks it reads the seen-set, which is append-only. `claim` holds the claims
+    directory's lock *shared* across that check and its link, and the sweep holds it *exclusive*
+    while it prunes (`_locked`), so nothing is removed in between and a covered item is never in
+    flight; a second check after the link stands behind a wake that must run unlocked. `reclaim`,
+    the only other way to act on an item, backs off a claim that is final, gone, or no longer an
+    orphan.
     """
 
     def __init__(self, root: str | Path, *, wake: str | None = None) -> None:
@@ -517,10 +600,42 @@ class ClaimStore:
         claim as **settled**, let the high-water mark pass it, and — if its owner then died — lose
         the peer's message forever. The bug this file exists to fix, reintroduced by the mechanism
         meant to fix it.
+
+        **A covered item is refused** (issue #526): one whose settled claim the cleanup sweep may
+        have pruned, per `_covered`. It gets a `done` record back and the caller a False, so it is
+        judged final — never re-answered because its file is gone. The check and the link happen
+        under the directory's shared lock, which the sweep's prune excludes. See the class
+        docstring.
         """
         path = self._path(timeline, kind, uuid)
         path.parent.mkdir(parents=True, exist_ok=True)
-        record = Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time())
+        # Shared, so wakes never wait on each other; the sweep takes it exclusively, so it cannot
+        # remove a claim between our coverage check and our link (`_locked`).
+        with _locked(path.parent, shared=True, required=False):
+            if self._covered(timeline, uuid, kind=kind):
+                # The sweep may have pruned this item's settled claim (issue #526). Put a final
+                # record back — linked into place, so it is never in flight — and lose. A record
+                # already there (EEXIST) is whatever it is, and the caller judges it.
+                if self._publish(path, uuid, Claim(phase=_DONE, at=time.time())):
+                    self._refused(timeline, uuid, kind=kind)
+                return False
+            if not self._publish(
+                path,
+                uuid,
+                Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time()),
+            ):
+                return False
+            if self._covered(timeline, uuid, kind=kind):
+                # Unreachable while the lock holds. It is for the unlocked fallback: a sweep that
+                # pruned it between the check above and the link. The watermark was on disk before
+                # the file was removed, so this second look sees it. Put `done` back and lose.
+                self._write(path, Claim(phase=_DONE, at=time.time()))
+                self._refused(timeline, uuid, kind=kind)
+                return False
+            return True
+
+    def _publish(self, path: Path, uuid: str, record: Claim) -> bool:
+        """Link `record` into place at `path` if nothing is there. False if something already is."""
         temp = path.parent / f".{quote(uuid, safe='')}.{self.wake}.new"
         temp.write_text(json.dumps(_payload(record)))
         try:
@@ -530,6 +645,143 @@ class ClaimStore:
         finally:
             temp.unlink(missing_ok=True)
         return True
+
+    def _refused(self, timeline: str, uuid: str, *, kind: str) -> None:
+        """Log a refusal — the one decision here that could drop an item if the evidence were wrong.
+
+        WARNING, because reaching it means something listed an item at or below the record: a
+        mark that moved backward or went missing, or a wake that listed it before the mark passed
+        it. The reason says what is known and no more: the item is *covered*. Whether it was ever
+        claimed cannot be told from here, since a pruned claim and a never-claimed one both leave
+        no file.
+        """
+        _log.warning(
+            "claim refused %s", kv(item=uuid, kind=kind, timeline=timeline, reason="covered")
+        )
+
+    def _covered(self, timeline: str, uuid: str, *, kind: str) -> bool:
+        """Has the cleanup sweep been allowed to prune this item's claim? (issue #526)
+
+        For a task, the seen-set says so — it is the task kind's own record, append-only, and the
+        sweep prunes a task claim only when its uuid is in it. For a mark-backed kind, the
+        pruned-through watermark does. A watermark that exists but cannot be read is logged and
+        read as *not covered*: that can re-answer an item (at-least-once for the read), where the
+        other reading would refuse every item on the timeline forever, and a stall is a drop.
+        """
+        try:
+            if kind in _SEEN_KINDS:
+                return uuid in SeenStore(self.root).all(timeline, kind=kind)
+            through = self.pruned_through(timeline, kind=kind)
+        except (OSError, ValueError) as error:
+            # Raising here would do worse than either answer: `claim` would fail on every item of
+            # this kind on this timeline, wake after wake — a stall, and a stall is a drop.
+            _log.error(
+                "Could not read what the sweep pruned for %s/%s (%s); treating %s as unpruned.",
+                kind,
+                timeline,
+                error,
+                uuid,
+            )
+            return False
+        item = _as_uuid(uuid)
+        return through is not None and item is not None and item <= through
+
+    def pruned_through(self, timeline: str, *, kind: str) -> UUID | None:
+        """How far the sweep has pruned `(kind, timeline)`: ``None`` if never. Raises if unreadable."""
+        path = self._folder(timeline, kind) / _PRUNED_THROUGH
+        try:
+            raw = path.read_text().strip()
+        except FileNotFoundError:
+            return None
+        through = _as_uuid(raw)
+        if through is None:
+            raise ValueError(f"{path} does not hold a uuid: {raw[:64]!r}")
+        return through
+
+    def advance_pruned_through(self, timeline: str, *, kind: str, mark: UUID) -> UUID:
+        """Raise the watermark to `mark` — never lower it — durably, and return where it stands.
+
+        **Never lowered**, because a mark *can* move backward (a long concurrent wake settling an
+        older ledger); the watermark says everything at or below it was final, and that stays true
+        once it has been true. The read, the comparison and the replace happen under an exclusive
+        `flock` on the claims directory, because two sweeps (a manual ``--sweep`` over the timer's)
+        would otherwise each read the old value and the slower one would write its lower mark
+        over the faster one's — after the faster one had already pruned under it.
+
+        **Durable before anything is pruned under it.** Temp, `fsync`, `os.replace`, then `fsync`
+        the directory — and the directory is synced on the no-change path too, because a sweep
+        killed between an earlier replace and its sync left a watermark that only the page cache
+        holds. A claim unlinked under a watermark a power loss then took back would be a pruned
+        claim nothing covers. Raises `ValueError` on an unreadable watermark rather than overwrite
+        a value it cannot read.
+        """
+        folder = self._folder(timeline, kind)
+        with _locked(folder, shared=False, required=True) as directory:
+            current = self.pruned_through(timeline, kind=kind)
+            if current is None or current < mark:
+                temp = folder / f"{_PRUNED_THROUGH}.{os.getpid()}.tmp"
+                try:
+                    with open(temp, "w") as handle:
+                        handle.write(str(mark))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(temp, folder / _PRUNED_THROUGH)
+                finally:
+                    temp.unlink(missing_ok=True)
+                current = mark
+            os.fsync(directory)
+            return current
+
+    def prune_settled(self, timeline: str, *, kind: str, covered) -> list[str]:
+        """Remove every claim of `(kind, timeline)` that is final and `covered(uuid)`. Returns the uuids.
+
+        The caller establishes coverage *first* — the watermark written, or the seen-set read — so
+        that `claim` refuses anything this removes (see the class docstring). "Final" is read
+        strictly here, not through `_read_claim`: an empty file (the legacy form) or a record whose
+        phase is `done` or `abandoned`. An unparseable record is kept; the store reads it as done so
+        as never to re-drive on it, but deleting what cannot be read is a different decision.
+        An `in-flight` claim is never touched, however old and however covered.
+
+        Its take-over tokens go first and the claim last, so a prune cut short always leaves the
+        claim, and the next sweep finishes the job. A token is dead once its claim is final: only
+        an in-flight claim's owner is ever followed, and `reclaim` backs off a claim that is final,
+        gone, or no longer an orphan even when it wins a token this removed. It all happens under
+        the directory's exclusive lock, so no wake is between its coverage check and its link.
+        """
+        folder = self._folder(timeline, kind)
+        if not folder.is_dir():
+            return []
+        # Exclusive: no wake is between its coverage check and its link while this runs.
+        with _locked(folder, shared=False, required=True):
+            entries = list(folder.iterdir())
+            tokens = [
+                path
+                for path in entries
+                if path.name.startswith(".")
+                and ".takeover." in path.name
+                and not path.name.endswith(".new")
+            ]
+            names = {path.name for path in entries}
+            pruned = []
+            for path in entries:
+                if not path.name.endswith(".claim"):
+                    continue
+                uuid = unquote(path.name[: -len(".claim")])
+                if not covered(uuid) or not _prunable(path):
+                    continue
+                prefix = f".{quote(uuid, safe='')}.takeover."
+                for token in tokens:
+                    if token.name.startswith(prefix):
+                        token.unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
+                pruned.append(uuid)
+            # A token whose claim is already gone, on a covered item, is one a `reclaim` left when
+            # it was killed backing off. Nothing else would ever remove it.
+            for token in tokens:
+                quoted = token.name[1 : token.name.index(".takeover.")]
+                if f"{quoted}.claim" not in names and covered(unquote(quoted)):
+                    token.unlink(missing_ok=True)
+        return pruned
 
     def orphaned(self, claim: Claim) -> bool:
         """Is `claim` held by a wake that died? (`_orphaned`, bound to this store's identity.)"""
@@ -584,7 +836,19 @@ class ClaimStore:
             return False  # another wake already took this orphan over — it owns it now
         finally:
             temp.unlink(missing_ok=True)
-        self._write(path, record)
+        with _locked(path.parent, shared=False, required=False):
+            current = self.read(timeline, uuid, kind=kind)
+            if current is None or current.settled or not self.orphaned(current):
+                # **The orphan was finished — and then pruned — while we were judging it** (issue
+                # #526). Another wake took it over and settled it, and the sweep removed the claim
+                # and the token that would have stopped us here; or something live holds it now.
+                # Writing our record would put an item back in flight that is not ours to drive.
+                # What is checked is that the claim is *still an orphan*, not whose name it bears:
+                # a take-over that died before writing leaves the claim naming the previous
+                # owner, and that is exactly the orphan this is for.
+                token.unlink(missing_ok=True)
+                return False
+            self._write(path, record)
         return True
 
     def effective_owner(self, timeline: str, uuid: str, *, kind: str, claim: Claim) -> Claim:
@@ -661,7 +925,7 @@ class ClaimStore:
         this timeline, so there are at most a handful of claims to read. (Once the record exists the
         scan is incremental and this is never needed: the mark itself is the guard.)
         """
-        folder = self.root / "claims" / kind / quote(timeline, safe="")
+        folder = self._folder(timeline, kind)
         if not folder.is_dir():
             return []
         found = []
@@ -695,8 +959,10 @@ class ClaimStore:
             temp.unlink(missing_ok=True)
 
     def _path(self, timeline: str, kind: str, uuid: str) -> Path:
-        folder = self.root / "claims" / kind / quote(timeline, safe="")
-        return folder / f"{quote(uuid, safe='')}.claim"
+        return self._folder(timeline, kind) / f"{quote(uuid, safe='')}.claim"
+
+    def _folder(self, timeline: str, kind: str) -> Path:
+        return self.root / "claims" / kind / quote(timeline, safe="")
 
 
 # The wake-breaker's generous safe defaults (Phase 2 · Group 6). A genuine cross-wake
@@ -3125,8 +3391,14 @@ class WakeAgent:
             return recovered
         claim = self.claims.read(self.timeline_uuid, uuid, kind=kind)
         if claim is None:
-            # The record vanished between our failed create and this read. Race for it; loser skips.
-            return _OURS if self.claims.claim(self.timeline_uuid, uuid, kind=kind) else _PENDING
+            # The record vanished between our failed create and this read — the cleanup sweep
+            # prunes settled claims (issue #526). Race for it, then judge whatever holds it now: a
+            # pruned claim comes back `done` from `claim`, and that is final.
+            if self.claims.claim(self.timeline_uuid, uuid, kind=kind):
+                return _OURS
+            claim = self.claims.read(self.timeline_uuid, uuid, kind=kind)
+            if claim is None:
+                return _PENDING
         if claim.settled:
             return _FINAL
         if not self.claims.orphaned(claim):

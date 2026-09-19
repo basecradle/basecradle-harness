@@ -42,6 +42,10 @@ Wake-breaker      ``breaker/<uuid>.wakes``, ``breaker/<uuid>.tripped``
 Billing-blocked   ``billing/<uuid>.blocked``  (out-of-funds debounce, issue #336)
 ================  ==========================================================
 
+**Settled claims are pruned on timelines that still exist** (issue #526). A claim is
+removed once it is final and its item is covered by its kind's record, and `ClaimStore.claim`
+refuses a covered item, so a pruned claim can never be won again (`prune_settled_claims`).
+
 **Stranded temps are swept on every run, whatever their timeline** (issue #526). Each atomic
 write stages a temp, and a writer killed inside the write window leaves it behind with nothing to
 remove it: a copy of a conversation beside a live transcript, a copy of a live token beside
@@ -52,9 +56,11 @@ and only by name: the env file's directory and the top level of ``~/.mempalace``
 beneath it).
 
 The sweep is idempotent and crash-safe: a re-run re-derives the artifact set from
-disk, and a half-done purge finishes on the next run. There is no concurrency
+disk, and a half-done purge finishes on the next run. The *purge* has no concurrency
 hazard — a 404 timeline is terminal, so no live wake for it can be in flight (a
-wake on a deleted timeline already errors in ``WakeAgent.__init__``). And it makes
+wake on a deleted timeline already errors in ``WakeAgent.__init__``). The claim
+*prune* does run beside live wakes, and its safety is `ClaimStore.claim` refusing
+what it removed (see `prune_settled_claims`), never the absence of a wake. And it makes
 **no provider/LLM call anywhere** (the "zero token burn at rest" fleet rule); the
 only cost is one ``timelines.get`` per referenced UUID.
 """
@@ -74,13 +80,20 @@ from urllib.parse import unquote
 
 from basecradle._exceptions import BaseCradleError, ForbiddenError, NotFoundError
 
-from basecradle_harness._basecradle import _client_from_env, _configure_logging
+from basecradle_harness._basecradle import _as_uuid, _client_from_env, _configure_logging
 from basecradle_harness._install import config_home
 from basecradle_harness._mempalace import _CLI_CONFIG_DIR, _CLI_CONFIG_FILE
 from basecradle_harness._observability import RED, head, kv
 from basecradle_harness._token import TEMP_PREFIX, TEMP_SUFFIX
 from basecradle_harness._version import __version__
-from basecradle_harness._wake import _process_alive
+from basecradle_harness._wake import (
+    _PRUNED_THROUGH,
+    _SEEN_KINDS,
+    ClaimStore,
+    MarkStore,
+    SeenStore,
+    _process_alive,
+)
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -120,6 +133,9 @@ STRANDED_AFTER = 60 * 60
 #: an abandon, or the claim a take-over writes.
 _CLAIM_WRITE_TEMP = re.compile(r"^.+\.claim\.(?P<pid>\d+)\.tmp$")
 
+#: ``claims/<kind>/<timeline>/.pruned-through.<pid>.tmp`` — `ClaimStore.advance_pruned_through`.
+_WATERMARK_TEMP = re.compile(rf"^{re.escape(_PRUNED_THROUGH)}\.(?P<pid>\d+)\.tmp$")
+
 #: ``claims/<kind>/<timeline>/.<uuid>.<wake>.new`` and ``….takeover.new`` — the populated records
 #: `ClaimStore.claim` and `ClaimStore.reclaim` link into place. A take-over *token*
 #: (``.<uuid>.takeover.<owner>``) never ends in ``.new``, so it can never match.
@@ -147,6 +163,8 @@ class SweepSummary:
     kept: int = 0
     kept_forbidden: int = 0
     skipped_transient: int = 0
+    #: Settled claims removed this run from timelines that still exist (`prune_settled_claims`).
+    pruned_claims: int = 0
     #: Stranded temps removed this run, on any timeline or none (`prune_stranded_temps`).
     stranded_temps: int = 0
 
@@ -155,6 +173,7 @@ class SweepSummary:
             f"cleanup sweep: checked {self.checked} timeline(s) — "
             f"purged {self.purged}, kept {self.kept}, "
             f"kept-forbidden {self.kept_forbidden}, skipped-transient {self.skipped_transient}; "
+            f"pruned {self.pruned_claims} settled claim(s), "
             f"removed {self.stranded_temps} stranded temp(s)"
         )
 
@@ -264,6 +283,82 @@ def purge(paths: list[Path]) -> None:
             _log.warning("cleanup: could not remove %s: %s", path, error)
 
 
+def prune_settled_claims(home: Path) -> int:
+    """Remove the settled claims of timelines that still exist; return how many (issue #526).
+
+    A claim used to outlive its purpose by the life of its timeline: one file per message, asset,
+    delivery and task the agent ever handled. This removes one when its item is **covered** —
+    at or below its kind's high-water mark in uuid order, or in the task seen-set — and its record
+    is final (`ClaimStore.prune_settled`). An `in-flight` claim is never touched.
+
+    Coverage alone is not what makes it safe, and the reason is the design. A wake that listed an
+    item before the mark passed it can still reach `claim` for it, hours later: a wake's lifetime
+    is not bounded (it drains every item one turn at a time, and the router sets no timeout), and a
+    mark can move backward under a concurrent wake or go missing altogether. So
+    `ClaimStore.claim` refuses a covered item itself. For a mark-backed kind the sweep first raises
+    the **pruned-through watermark** to the mark, durably and never downward, and only then
+    unlinks under it; for tasks the seen-set is already that record. Either way, anything removed
+    here was refusable before it was removed. Both steps hold the claims directory's exclusive
+    lock, which `claim` holds shared across its check and its link, so a wake deciding whether to
+    take an item is never overtaken by the unlink.
+
+    A kind with no record yet (no mark, an empty seen-set) is left alone, and so is a timeline
+    whose watermark cannot be read: an unreadable watermark is logged and never overwritten.
+    """
+    claims = ClaimStore(home)
+    marks = MarkStore(home)
+    seen = SeenStore(home)
+    pruned = 0
+    for kind_dir in _entries(home / "claims"):
+        kind = kind_dir.name
+        for folder in _entries(kind_dir):
+            if not folder.is_dir():
+                continue
+            timeline = unquote(folder.name)
+            try:
+                if kind in _SEEN_KINDS:
+                    handled = seen.all(timeline, kind=kind)
+                    if not handled:
+                        continue  # no record yet: nothing here is provably settled
+                    record = seen._path(timeline, kind)
+                    _fsync(record)  # the record, and its name, are on disk before any unlink
+                    _fsync(record.parent)
+                    covered = handled.__contains__
+                else:
+                    mark = _as_uuid(marks.get(timeline, kind=kind))
+                    if mark is None:
+                        continue  # no mark to stand on: nothing here is provably settled
+                    through = claims.advance_pruned_through(timeline, kind=kind, mark=mark)
+
+                    def covered(uuid: str, through=through) -> bool:
+                        item = _as_uuid(uuid)
+                        return item is not None and item <= through
+
+                gone = claims.prune_settled(timeline, kind=kind, covered=covered)
+            except (OSError, ValueError) as error:
+                _log.warning("cleanup: left %s claims on %s unpruned: %s", kind, timeline, error)
+                continue
+            if gone:
+                pruned += len(gone)
+                _log.info(
+                    "cleanup: pruned %d settled %s claim(s) on timeline %s",
+                    len(gone),
+                    kind,
+                    timeline,
+                )
+    return pruned
+
+
+def _fsync(path: Path) -> None:
+    """Flush `path` (a file or a directory) to disk: a seen-set appended without one must not be
+    lost to a power loss that keeps the unlinks of the claims it covers."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
     """Remove every temp a killed write left behind, on live timelines too (issue #526).
 
@@ -279,6 +374,7 @@ def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
     ``sessions/<source>.json.<pid>-<token>.tmp``    `Session._save`                      yes
     ``marks/[<kind>/]<timeline>.txt.<pid>.tmp``     `MarkStore.set`                      yes
     ``claims/…/<uuid>.claim.<pid>.tmp``             `ClaimStore._write`                  yes
+    ``claims/…/.pruned-through.<pid>.tmp``          `ClaimStore.advance_pruned_through`  yes
     ``claims/…/.<uuid>.<wake>[.takeover].new``      `ClaimStore.claim` / ``reclaim``     no
     ``.basecradle-env.<random>.tmp``                `_token._atomic_write`               no
     ``~/.mempalace/.config.json.<hex>.tmp``         `_mempalace._write_cli_config`       no
@@ -322,7 +418,9 @@ def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
     for kind in _entries(home / "claims"):
         for folder in _entries(kind):
             for path in _entries(folder):
-                if written := _CLAIM_WRITE_TEMP.match(path.name):
+                if written := _CLAIM_WRITE_TEMP.match(path.name) or _WATERMARK_TEMP.match(
+                    path.name
+                ):
                     consider(path, int(written.group("pid")))
                 elif _CLAIM_LINK_TEMP.match(path.name):
                     consider(path, None)
@@ -411,6 +509,7 @@ def sweep(home: Path, client: object) -> SweepSummary:
             _log.warning("cleanup: skipped timeline %s this run (transient error)", uuid)
         else:
             summary.kept += 1
+    summary.pruned_claims = prune_settled_claims(home)
     summary.stranded_temps = len(prune_stranded_temps(home))
     return summary
 

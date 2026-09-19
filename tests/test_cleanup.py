@@ -14,11 +14,15 @@ never enumerated, so a purge can never reach them.
 
 import logging
 import os
+import subprocess
+import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
+from uuid import UUID
 
 import pytest
 from basecradle._exceptions import (
@@ -36,6 +40,7 @@ from basecradle_harness._cleanup import (
     STRANDED_AFTER,
     enumerate_artifacts,
     main,
+    prune_settled_claims,
     prune_stranded_temps,
     purge_one,
     sweep,
@@ -46,6 +51,7 @@ from basecradle_harness._observability import RED, RESET
 from basecradle_harness._report import BillingState
 from basecradle_harness._session import Session
 from basecradle_harness._token import write_token_to_env_file
+from basecradle_harness._wake import Claim
 
 # Real, well-formed UUIDv7 values (never `1111…` junk), per the test-data rule.
 DELETED = "0190a8c1-7f3e-7c2a-9b1d-3e4f5a6b7c8d"
@@ -448,6 +454,9 @@ def _strand_every_kind(home: Path) -> dict[str, Path]:
     with _killed_at_publish():
         claims.reclaim(LIVE, OTHER, kind="messages", owner="0f1e2d3c4b5a69788796a5b4c3d2e1f0")
     stranded["claim_takeover"] = left_behind(folder)
+    with _killed_at_publish():
+        claims.advance_pruned_through(LIVE, kind="messages", mark=UUID(OTHER))
+    stranded["watermark"] = left_behind(folder)
 
     env_file = config_home() / "agent.env"
     env_file.parent.mkdir(parents=True, exist_ok=True)
@@ -505,6 +514,7 @@ def test_a_temp_whose_writer_is_still_alive_is_kept_however_old(tmp_path):
     assert stranded["session"].exists()
     assert stranded["mark"].exists()
     assert stranded["claim_write"].exists()
+    assert stranded["watermark"].exists()
     # The unstamped ones have only their age to go on, and it is far past any live write.
     assert set(removed) == {
         stranded[kind] for kind in ("claim_link", "claim_takeover", "env", "mempalace")
@@ -578,3 +588,372 @@ def test_a_pid_no_process_could_hold_and_an_unreadable_dir_never_stop_the_pass(t
         assert prune_stranded_temps(tmp_path) == [impossible]
     finally:
         locked.chmod(0o700)
+
+
+# --- settled claims are pruned on live timelines (issue #526) ------------------------------
+#
+# The prune is only as safe as the refusal behind it: `ClaimStore.claim` must never hand a
+# pruned item back to a wake, whatever the mark says by then.
+
+# Items of one timeline in uuid order, oldest first.
+X = [f"0190a8c2-1a2b-7d3e-8f4a-00000000000{n}" for n in range(6)]
+
+
+def _settled(home: Path, uuid: str, *, kind: str = "messages") -> Path:
+    store = ClaimStore(home)
+    assert store.claim(LIVE, uuid, kind=kind)
+    store.commit(LIVE, uuid, kind=kind)
+    return store._path(LIVE, kind, uuid)
+
+
+def _claim_files(home: Path, kind: str = "messages") -> set[str]:
+    folder = home / "claims" / kind / quote(LIVE, safe="")
+    return {path.name for path in folder.iterdir()}
+
+
+def test_a_settled_claim_at_or_below_the_mark_is_pruned_and_can_never_be_won_again(tmp_path):
+    store = ClaimStore(tmp_path)
+    below = _settled(tmp_path, X[0])
+    store.claim(LIVE, X[1], kind="messages")  # in flight, below the mark: never touched
+    legacy = store._path(LIVE, "messages", X[2])
+    legacy.write_text("")  # a pre-#285 claim, which reads as done
+    unreadable = store._path(LIVE, "messages", X[3])
+    unreadable.write_text("{not json")  # read as done so as never to re-drive, but not deleted
+    at = _settled(tmp_path, X[4])
+    above = _settled(tmp_path, X[5])
+    token = below.parent / f".{X[0]}.takeover.0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+    token.write_text("{}")
+    MarkStore(tmp_path).set(LIVE, X[4])
+
+    assert prune_settled_claims(tmp_path) == 3
+
+    assert not any(path.exists() for path in (below, legacy, at, token))
+    assert unreadable.exists() and above.exists()
+    assert store.read(LIVE, X[1], kind="messages").phase == "in-flight"
+    assert store.pruned_through(LIVE, kind="messages") == UUID(X[4])
+    # The whole point: a wake that listed X[0] before it was pruned still cannot act on it.
+    late = ClaimStore(tmp_path)
+    assert late.claim(LIVE, X[0], kind="messages") is False
+    assert late.read(LIVE, X[0], kind="messages").phase == "done"
+
+
+def test_the_watermark_never_moves_backward_with_the_mark(tmp_path):
+    # A long wake settling an older ledger can write its older mark back over a newer one. The
+    # items between the two were final when the watermark passed them, and still are.
+    marks = MarkStore(tmp_path)
+    _settled(tmp_path, X[0])
+    _settled(tmp_path, X[2])
+    marks.set(LIVE, X[3])
+    assert prune_settled_claims(tmp_path) == 2
+    marks.set(LIVE, X[1])  # the regression: X[2] is above the mark again
+
+    prune_settled_claims(tmp_path)
+
+    assert ClaimStore(tmp_path).pruned_through(LIVE, kind="messages") == UUID(X[3])
+    assert ClaimStore(tmp_path).claim(LIVE, X[2], kind="messages") is False  # re-listed, refused
+
+
+def test_an_item_above_the_watermark_is_claimed_as_ever(tmp_path):
+    _settled(tmp_path, X[0])
+    MarkStore(tmp_path).set(LIVE, X[0])
+    prune_settled_claims(tmp_path)
+
+    assert ClaimStore(tmp_path).claim(LIVE, X[1], kind="messages") is True
+
+
+def test_nothing_is_pruned_or_written_without_a_mark(tmp_path):
+    path = _settled(tmp_path, X[0])
+
+    assert prune_settled_claims(tmp_path) == 0
+    assert path.exists()
+    assert ".pruned-through" not in _claim_files(tmp_path)
+
+
+def test_a_task_claim_is_pruned_once_the_seen_set_holds_it(tmp_path):
+    handled = _settled(tmp_path, X[0], kind="tasks")
+    unrecorded = _settled(tmp_path, X[1], kind="tasks")  # settled, but not yet in the seen-set
+    SeenStore(tmp_path).add(LIVE, X[0], kind="tasks")
+
+    assert prune_settled_claims(tmp_path) == 1
+
+    assert not handled.exists() and unrecorded.exists()
+    assert ".pruned-through" not in _claim_files(tmp_path, "tasks")  # the seen-set is the record
+    assert ClaimStore(tmp_path).claim(LIVE, X[0], kind="tasks") is False
+
+
+def test_an_unreadable_watermark_is_never_overwritten_and_prunes_nothing(tmp_path, caplog):
+    path = _settled(tmp_path, X[0])
+    (path.parent / ".pruned-through").write_text("garbage")
+    MarkStore(tmp_path).set(LIVE, X[3])
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert prune_settled_claims(tmp_path) == 0
+
+    assert path.exists()
+    assert (path.parent / ".pruned-through").read_text() == "garbage"
+    assert "left messages claims" in caplog.text
+
+
+def test_the_sweep_prunes_settled_claims_on_a_live_timeline_and_counts_them(tmp_path):
+    _settled(tmp_path, X[0])
+    _settled(tmp_path, X[1])
+    MarkStore(tmp_path).set(LIVE, X[1])
+
+    summary = sweep(tmp_path, _FakeClient({LIVE: object()}))
+
+    assert summary.kept == 1
+    assert summary.pruned_claims == 2
+    assert "pruned 2 settled claim(s)" in str(summary)
+
+
+def test_two_sweeps_racing_never_lower_the_watermark(tmp_path, monkeypatch):
+    """A manual `--sweep` over the timer's: the slower one must not write its older mark back.
+
+    S1 reads the watermark and stalls; S2 advances it further and would prune under it. Without
+    the lock, S1 then replaces it with its own lower value, uncovering what S2 pruned.
+    """
+    _settled(tmp_path, X[0])  # the claims dir exists
+    store = ClaimStore(tmp_path)
+    real = ClaimStore.pruned_through
+    s1_read, go = threading.Event(), threading.Event()
+    stalled = []
+
+    def slow_first_read(self, timeline, *, kind):
+        value = real(self, timeline, kind=kind)
+        if not stalled:
+            stalled.append(True)
+            s1_read.set()
+            go.wait(5)
+        return value
+
+    monkeypatch.setattr(ClaimStore, "pruned_through", slow_first_read)
+    s1 = threading.Thread(
+        target=store.advance_pruned_through,
+        args=(LIVE,),
+        kwargs={"kind": "messages", "mark": UUID(X[1])},
+    )
+    s2 = threading.Thread(
+        target=ClaimStore(tmp_path).advance_pruned_through,
+        args=(LIVE,),
+        kwargs={"kind": "messages", "mark": UUID(X[3])},
+    )
+    s1.start()
+    assert s1_read.wait(5)
+    s2.start()
+    s2.join(0.5)  # with the lock, S2 waits for S1 here; without it, S2 finishes first
+    go.set()
+    s1.join(5)
+    s2.join(5)
+
+    assert real(store, LIVE, kind="messages") == UUID(X[3])
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="chmod 0 does not stop root from reading")
+def test_a_watermark_that_cannot_be_read_never_stops_a_claim(tmp_path, caplog):
+    _settled(tmp_path, X[0])
+    watermark = ClaimStore(tmp_path)._folder(LIVE, "messages") / ".pruned-through"
+    watermark.write_text(X[3])
+    watermark.chmod(0)  # e.g. written by a root-run sweep under umask 077
+    try:
+        with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+            assert ClaimStore(tmp_path).claim(LIVE, X[1], kind="messages") is True
+    finally:
+        watermark.chmod(0o600)
+    assert "treating" in caplog.text and "as unpruned" in caplog.text
+
+
+def test_a_garbage_watermark_is_read_as_not_covered_and_said_out_loud(tmp_path, caplog):
+    _settled(tmp_path, X[0])
+    (ClaimStore(tmp_path)._folder(LIVE, "messages") / ".pruned-through").write_text("garbage")
+
+    with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+        assert ClaimStore(tmp_path).claim(LIVE, X[1], kind="messages") is True
+    assert "as unpruned" in caplog.text
+
+
+def test_a_refused_claim_is_never_in_flight_even_for_an_instant(tmp_path, monkeypatch, caplog):
+    # A kill between an in-flight link and the `done` rewrite would leave an orphan on an item
+    # settled long ago, which recovery could re-drive. A covered item is refused *before* linking.
+    _settled(tmp_path, X[0])
+    MarkStore(tmp_path).set(LIVE, X[0])
+    prune_settled_claims(tmp_path)
+    linked: list[str] = []
+    real_link = os.link
+
+    def watching(src, dst, *args, **kwargs):
+        linked.append(Path(src).read_text())
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, "link", watching)
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert ClaimStore(tmp_path).claim(LIVE, X[0], kind="messages") is False
+
+    assert linked and all('"in-flight"' not in record for record in linked)
+    assert "claim refused" in caplog.text and "reason=covered" in caplog.text
+
+
+def test_a_stale_recoverer_cannot_bring_a_pruned_orphan_back(tmp_path):
+    """The prune removes the take-over token that used to stop a recoverer who judged too early.
+
+    D died holding X[0]. A judged it orphaned, then stalled. B took it over, finished it, and the
+    sweep pruned the claim and B's token. A's take-over must now lose, not re-drive X[0].
+    """
+    dead = ClaimStore(tmp_path, wake="d" * 32)
+    assert dead.claim(LIVE, X[0], kind="messages")
+    recoverer = ClaimStore(tmp_path, wake="b" * 32)
+    assert recoverer.reclaim(LIVE, X[0], kind="messages", owner="d" * 32)
+    recoverer.commit(LIVE, X[0], kind="messages")
+    MarkStore(tmp_path).set(LIVE, X[0])
+    assert prune_settled_claims(tmp_path) == 1
+
+    stale = ClaimStore(tmp_path, wake="a" * 32)
+    assert stale.reclaim(LIVE, X[0], kind="messages", owner="d" * 32) is False
+
+    assert stale.read(LIVE, X[0], kind="messages") is None
+    assert _claim_files(tmp_path) == {".pruned-through"}  # its losing token did not stay behind
+
+
+def test_a_stale_recoverer_backs_off_a_prune_that_was_cut_short(tmp_path):
+    # The sweep removed the token and died before the claim: the claim is still there, `done`.
+    dead = ClaimStore(tmp_path, wake="d" * 32)
+    dead.claim(LIVE, X[0], kind="messages")
+    recoverer = ClaimStore(tmp_path, wake="b" * 32)
+    recoverer.reclaim(LIVE, X[0], kind="messages", owner="d" * 32)
+    recoverer.commit(LIVE, X[0], kind="messages")
+    folder = recoverer._folder(LIVE, "messages")
+    (folder / f".{X[0]}.takeover.{'d' * 32}").unlink()
+
+    assert (
+        ClaimStore(tmp_path, wake="a" * 32).reclaim(LIVE, X[0], kind="messages", owner="d" * 32)
+        is False
+    )
+    assert recoverer.read(LIVE, X[0], kind="messages").phase == "done"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="chmod 0 does not stop root from reading")
+def test_a_seen_set_that_cannot_be_read_never_stops_a_task_claim(tmp_path, caplog):
+    SeenStore(tmp_path).add(LIVE, X[0], kind="tasks")
+    seen = SeenStore(tmp_path)._path(LIVE, "tasks")
+    seen.chmod(0)
+    try:
+        with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+            assert ClaimStore(tmp_path).claim(LIVE, X[1], kind="tasks") is True
+    finally:
+        seen.chmod(0o600)
+    assert "as unpruned" in caplog.text
+
+
+def test_the_second_look_after_the_link_catches_a_prune_that_landed_in_between(
+    tmp_path, monkeypatch
+):
+    # The lock makes this unreachable; the check is what stands behind a wake running unlocked
+    # (no `fcntl`, or a filesystem that refuses a lock). So the prune is simulated *between* the
+    # pre-check and the link, the way it would land without the lock.
+    path = _settled(tmp_path, X[0])
+    store = ClaimStore(tmp_path)
+    real_publish = ClaimStore._publish
+
+    def pruned_just_before_the_link(self, target, uuid, record):
+        if record.phase == "in-flight":
+            (target.parent / ".pruned-through").write_text(X[0])
+            target.unlink()
+        return real_publish(self, target, uuid, record)
+
+    monkeypatch.setattr(ClaimStore, "_publish", pruned_just_before_the_link)
+
+    assert store.claim(LIVE, X[0], kind="messages") is False
+    assert store.read(LIVE, X[0], kind="messages").phase == "done"
+    assert path.exists()
+
+
+def test_a_prune_takes_the_tokens_before_the_claim(tmp_path, monkeypatch):
+    # Cut short between the two, a prune must leave the claim, so the next sweep finishes it.
+    claim = _settled(tmp_path, X[0])
+    token = claim.parent / f".{X[0]}.takeover.{'d' * 32}"
+    token.write_text("{}")
+    MarkStore(tmp_path).set(LIVE, X[0])
+    order: list[str] = []
+    real_unlink = Path.unlink
+
+    def recording(self, missing_ok=False):
+        order.append(self.name)
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", recording)
+    prune_settled_claims(tmp_path)
+
+    assert order.index(token.name) < order.index(claim.name)
+
+
+def test_a_sweep_waits_for_a_claim_between_its_check_and_its_link(tmp_path, monkeypatch):
+    """The exclusive lock the prune takes is what stops it landing inside `claim`."""
+    _settled(tmp_path, X[0])
+    store = ClaimStore(tmp_path)
+    real_covered = ClaimStore._covered
+    inside, go = threading.Event(), threading.Event()
+
+    def paused(self, timeline, uuid, *, kind):
+        answer = real_covered(self, timeline, uuid, kind=kind)
+        if uuid == X[1] and not inside.is_set():
+            inside.set()
+            go.wait(5)
+        return answer
+
+    monkeypatch.setattr(ClaimStore, "_covered", paused)
+    claimer = threading.Thread(target=store.claim, args=(LIVE, X[1]), kwargs={"kind": "messages"})
+    claimer.start()
+    assert inside.wait(5)
+    sweep_done = threading.Event()
+    prune = ClaimStore(tmp_path).prune_settled
+    sweeper = threading.Thread(
+        target=lambda: (prune(LIVE, kind="messages", covered=lambda uuid: True), sweep_done.set())
+    )
+    sweeper.start()
+
+    assert not sweep_done.wait(0.5)  # blocked behind the claim's shared lock
+    go.set()
+    claimer.join(5)
+    sweeper.join(5)
+    assert sweep_done.is_set()
+
+
+def test_a_token_a_killed_recoverer_left_on_a_pruned_item_is_removed(tmp_path):
+    _settled(tmp_path, X[0])
+    MarkStore(tmp_path).set(LIVE, X[0])
+    prune_settled_claims(tmp_path)
+    folder = ClaimStore(tmp_path)._folder(LIVE, "messages")
+    stray = folder / f".{X[0]}.takeover.{'d' * 32}"
+    stray.write_text("{}")  # won, then killed before it could back off and remove it
+    live = folder / f".{X[1]}.takeover.{'d' * 32}"
+    live.write_text("{}")  # above the watermark: not provably dead, so kept
+
+    prune_settled_claims(tmp_path)
+
+    assert not stray.exists() and live.exists()
+
+
+def test_a_recoverer_backs_off_a_claim_something_live_now_holds(tmp_path):
+    # D died holding X[0]; a stale recoverer won D's token after the prune removed it, but a
+    # live wake (another pid, this very moment) holds the claim. It is not an orphan any more.
+    dead = ClaimStore(tmp_path, wake="d" * 32)
+    dead.claim(LIVE, X[0], kind="messages")
+    holder = ClaimStore(tmp_path, wake="c" * 32)
+    holder._write(
+        holder._path(LIVE, "messages", X[0]),
+        Claim(phase="in-flight", pid=os.getppid(), wake="c" * 32, at=time.time()),
+    )
+
+    assert (
+        ClaimStore(tmp_path, wake="a" * 32).reclaim(LIVE, X[0], kind="messages", owner="d" * 32)
+        is False
+    )
+    assert holder.read(LIVE, X[0], kind="messages").wake == "c" * 32
+
+
+def test_the_package_imports_where_there_is_no_fcntl():
+    probe = "import sys; sys.modules['fcntl'] = None; import basecradle_harness; print('ok')"
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, check=False
+    )
+
+    assert result.stdout.strip() == "ok", result.stderr
