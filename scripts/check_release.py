@@ -14,10 +14,13 @@ to see what they had found nothing. The diff of such a PR looks like an ordinary
 only the whole file, read against the tag list, shows the erasure. `check_repo` fails that PR.
 
 **A release cut while its headline fix still sat under `[Unreleased]`** (`preflight` mode,
-issue #308). `[Unreleased]` is a legitimate staging area here — a PR may land content there
-without bumping, and a later release commit promotes it — so this state is perfectly legal
-mid-cycle and a lie the instant a tag is pushed. `check_release` runs before anything is built
-and fails the release rather than publishing a wheel whose own changelog calls its headline fix
+issue #308). Keep a Changelog treats `[Unreleased]` as a staging area, and `check_repo` on its own
+tolerates content there, because a staged entry names no version yet. This repository holds a
+stricter line: `main` is always releasable as one coherent version, so `[Unreleased]` stays
+empty on `main`. `TestTheRealFilesAgree` pins that on every PR, and a change worth a CHANGELOG
+entry ships with its version bump. Staged content is a lie the instant a tag is pushed, so
+`check_release` is the backstop at that moment. It runs before anything is built and fails the
+release rather than publishing a wheel whose own changelog calls its headline fix
 unreleased. It also pins the tag to `_version.py`: hatchling reads the version from the code,
 not from the tag, so a `v0.72.0` tag on a commit that still says `0.71.0` publishes a wheel
 under the wrong number entirely.

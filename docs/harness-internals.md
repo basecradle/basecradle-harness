@@ -419,7 +419,7 @@ runs the live matrix and closes the handoff.
 
 When a Timeline is destroyed on the platform, **nothing on the fleet server is cleaned up by
 itself.** The harness persists per-timeline state under `$HARNESS_HOME` — chiefly the session
-transcript (the full conversation), plus marks/seen/claims/breaker index files — and had no
+transcript (the full conversation), plus marks/seen/claims/breaker/billing index files — and had no
 deletion handler, so a destroyed timeline's content would survive on the box indefinitely. The
 `basecradle-harness-cleanup` entrypoint (`_cleanup.py`) is the periodic **orphan sweep** that
 GCs it. **Sweep-only by design (founder-settled):** the platform's `timeline.deleted` event is
@@ -435,17 +435,18 @@ Rails change; we don't consume `timeline.deleted`.
   `BaseCradleError`) keeps and retries next run. *A platform outage must never read as
   "everything deleted" and trigger a mass purge — default to keep on anything but a 404.*
 - **The invariant — memory deliberately persists across timeline deletion and is never swept.**
-  The sweep operates *only* on the five artifact dirs (`sessions/`, `marks/`, `seen/`, `claims/`,
-  `breaker/`) and **never touches** `memory.db` (+ `-wal`/`-shm`) or the MemPalace palace dir. If
-  a peer told the agent its birthday on a since-deleted timeline, the agent must still remember
-  it. (By construction: memory is never enumerated, so a purge can't reach it.)
+  The sweep operates *only* on the six artifact dirs (`sessions/`, `marks/`, `seen/`, `claims/`,
+  `breaker/`, `billing/` — the last added by issue #336) and **never touches** `memory.db`
+  (+ `-wal`/`-shm`) or the MemPalace palace dir. If a peer told the agent its birthday on a
+  since-deleted timeline, the agent must still remember it. (By construction: memory is never
+  enumerated, so a purge can't reach it.)
 - Idempotent + crash-safe (re-derives the set from disk each run; a half-done purge finishes
   next run); reuses `_client_from_env` and the stores' `quote(..., safe='')` filename
   convention. `--timeline <uuid>` is a manual unconditional ops purge.
 
 **Boundary:** the schedule unit lives in `deploy/` (captain authors it); the **NOC deploys it**
 (sole deployer) per agent, scoped to that agent's `$HARNESS_HOME` + `BASECRADLE_TOKEN`. Live
-verification (drive a wake, delete the timeline, sweep, confirm the five artifacts go and memory
+verification (drive a wake, delete the timeline, sweep, confirm the six artifact kinds go and memory
 stays) is **the capital's** job, post-ship.
 
 ### Native OpenRouter Adapter + `model_params.json` passthrough (issue #234)
