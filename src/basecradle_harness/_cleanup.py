@@ -23,12 +23,12 @@ the artifacts. A platform outage must never be read as "everything deleted" and
 trigger a mass purge: we default to **keep** on anything that is not a 404.
 
 **Memory is deliberately out of scope and is never touched.** The sweep operates
-only on the five artifact dirs below; it never enumerates, and so never deletes,
+only on the six artifact dirs below; it never enumerates, and so never deletes,
 ``memory.db`` (+ ``-wal``/``-shm``) or the MemPalace palace dir. If a peer told
 the agent its birthday on a since-deleted timeline, the agent must still remember
-it. See the CLAUDE.md "Gotchas" invariant.
+it. See the CLAUDE.md "Security invariants" section.
 
-The five artifact kinds, all under ``$HARNESS_HOME``, keyed by timeline UUID with
+The six artifact kinds, all under ``$HARNESS_HOME``, keyed by timeline UUID with
 the same ``quote(..., safe='')`` filename convention the stores already use:
 
 ================  ==========================================================
@@ -112,14 +112,14 @@ class SweepSummary:
 def enumerate_artifacts(home: Path) -> dict[str, list[Path]]:
     """Map each referenced timeline UUID to the on-disk paths that belong to it.
 
-    Scans the five artifact dirs under ``home``, parsing each timeline UUID out of a
+    Scans the six artifact dirs under ``home``, parsing each timeline UUID out of a
     filename/dirname and URL-decoding it (``unquote``), the exact inverse of the
     ``quote(..., safe='')`` the stores write with — so encode/decode round-trips. The
     returned paths are what a purge deletes, so this is the single source of truth for
     *what exists* (re-deriving it each run is what makes the sweep idempotent).
 
     A path is a plain file for every kind except claims, where the per-UUID *directory*
-    ``claims/<kind>/<uuid>/`` (holding the empty ``.claim`` files) is the unit to remove.
+    ``claims/<kind>/<uuid>/`` (holding its items' ``.claim`` records) is the unit to remove.
     """
     artifacts: dict[str, list[Path]] = {}
 
@@ -159,7 +159,7 @@ def enumerate_artifacts(home: Path) -> dict[str, list[Path]]:
         for path in seen.rglob("*.txt"):
             add(unquote(path.stem), path)
 
-    # Claims — a per-uuid directory `claims/<kind>/<uuid>/` of empty `.claim` files.
+    # Claims — a per-uuid directory `claims/<kind>/<uuid>/` of the timeline's `.claim` records.
     # The directory is the unit to purge, so track it (not its individual files).
     claims = home / "claims"
     if claims.is_dir():

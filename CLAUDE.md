@@ -748,7 +748,7 @@ see the absence of.**
   `Popen(env=…)` — never shell-sourced (`shell=False` always; the basecradle-router#109 lesson).
 - **Memory persists across timeline deletion; the orphan sweep purges only on a clean 404.** The
   `basecradle-harness-cleanup` sweep GCs a deleted timeline's on-box artifacts (`sessions/`,
-  `marks/`, `seen/`, `claims/`, `breaker/`) but **never touches** `memory.db` (+ `-wal`/`-shm`) or
+  `marks/`, `seen/`, `claims/`, `breaker/`, `billing/`) but **never touches** `memory.db` (+ `-wal`/`-shm`) or
   the MemPalace palace dir — memory is the agent's durable mind and outlives any timeline. The
   classify switch is the whole safety: **only a clean `NotFoundError` (404) purges**; success (200)
   and `Forbidden`/`NotAViewer` (403) keep, and **any** transient error (connection / rate-limit /
