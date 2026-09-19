@@ -798,8 +798,11 @@ see the absence of.**
   for all three passes) and **exits the run non-zero**, and one refusal never aborts the rest of
   the sweep. Where a removal is the unit of judgement the bound is **errno-agnostic** — every
   `OSError` counts, because enumerating the ways an OS can refuse is the disease a vendor cap table
-  is, and the observable fact is simply that the artifact is still on the box (asked with
-  `lexists`, so a dangling symlink cannot read as removed). **But the thing judged is a refused
+  is, and the observable fact is simply that the artifact is still on the box. **That fact is
+  asked by `_present`, because both stdlib spellings answer it wrongly**: `exists` is False for a
+  dangling symlink, and `lexists` swallows every `OSError` and answers False for a path it was
+  refused a look at — the exact shape a wrong sandbox makes — so only `ENOENT`/`ENOTDIR` count as
+  an answer and **a removal we cannot confirm is a removal we do not claim**. **But the thing judged is a refused
   *write*, and everything else is a `WARNING` and a clean exit** — this is the half a later
   "consistency" pass will flatten, and each exclusion is load-bearing: reading a mark or a seen-set
   is a *read*, which `ProtectHome=read-only` never refuses, so reporting it would name a writable
@@ -809,9 +812,11 @@ see the absence of.**
   *every* claims directory on the box as un-cleanable, on every run, forever; a path that is merely
   gone is a concurrent purge, not a fault; and an unparseable watermark stays a `WARNING` because
   promoting it would fail the unit forever over one corrupt file. Two more a refactor will undo:
-  **looking can be refused too** — on Python 3.10 `Path.is_dir` re-raises everything but
-  `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an unguarded `stat` escapes the sweep and abandons every
-  orphan behind it with nothing in `blocked` — and `shutil.rmtree` **abandons its walk on the first
+  **looking can be refused too, and the version matrix splits on how** — up to 3.12 `Path.is_dir`
+  re-raises everything but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an unguarded `stat` escapes the
+  sweep and abandons every orphan behind it with nothing in `blocked`, while from 3.13 it swallows
+  the same error and the refusal only shows up at the `unlink`, where `_present` has to catch it
+  (miss either and the sweep is silently green on half the matrix) — and `shutil.rmtree` **abandons its walk on the first
   error**, a vanished sibling included, so the best-effort salvage pass has to run for every error
   class or a half-purged directory reads as gone. The honest limit: **a run with nothing to remove
   attempts no write**, so a green run is evidence about that run and never a proof that the

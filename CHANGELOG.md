@@ -53,9 +53,13 @@ cleanup blocked path=/home/jt/harness/breaker/<uuid>.wakes error="[Errno 30] Rea
 - **A denied *directory* purge used to be invisible even at `WARNING`.** `shutil.rmtree` was called
   with `ignore_errors=True`, which swallowed the refusal and its errno. The walk is strict now, a
   second best-effort pass takes whatever the refusal did not cover, and the directory is reported
-  only if it is still there — asked with `lexists`, because a **dangling symlink** does not
-  `exists`, so the wrong question would read a refused unlink of one as a removal that worked. A
-  symlink is unlinked rather than walked.
+  only if it is still there. A symlink is unlinked rather than walked.
+- **"Still there" is a question two stdlib answers get wrong**, so it is asked by `_present`.
+  `Path.exists()` is *False* for a **dangling symlink**, which is still an entry to remove; and
+  `os.path.lexists` swallows every `OSError` and answers *False*, so a path inside a directory
+  this process may not search — the exact shape a wrong sandbox produces — would read as removed.
+  Only `ENOENT`/`ENOTDIR` are taken as an answer: **a removal we cannot confirm is a removal we do
+  not claim.**
 - **Only a refused *write* is a broken sandbox**, and the claims prune reports nothing else. An
   unreadable watermark stays a `WARNING` (nothing is refused there — the prune correctly declines
   to overwrite a value it cannot parse — and promoting it would fail the unit forever over one
@@ -65,11 +69,14 @@ cleanup blocked path=/home/jt/harness/breaker/<uuid>.wakes error="[Errno 30] Rea
   `_locked(required=True)` has always treated as a skip and now raises as its own
   `LockUnavailable` — without that, an NFS home would report *every* claims directory on the box
   as un-cleanable, on every run, forever, under a message blaming a sandbox that is correct.
-- **Looking can be refused too, and on Python 3.10 it raises.** `Path.is_dir` re-raises every
-  `OSError` but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an `EACCES` from the `stat` that decides
-  file-or-directory escaped the sweep entirely — abandoning every orphan behind it, with nothing
-  in `blocked`. The look is now its own guarded step, and a path that cannot be stat'd is reported
-  rather than skipped, because neither `exists` nor `lexists` can answer for it.
+- **Looking can be refused too, and the two Python versions fail differently** — which is why
+  both halves are needed and why one of them was only caught by CI. Up to 3.12 `Path.is_dir`
+  re-raises every `OSError` but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an `EACCES` from the `stat`
+  that decides file-or-directory escaped the sweep entirely, abandoning every orphan behind it
+  with nothing in `blocked`; the look is now its own guarded step. From 3.13 the same call
+  swallows that error and answers *False*, so the path falls through to `unlink`, is refused
+  there, and it is `_present` that has to refuse to call it a removal. Get either wrong and the
+  sweep is silently green on half the version matrix.
 - **A vanished sibling no longer makes a half-purged directory read as gone.** `shutil.rmtree`
   re-raises on the first error and abandons the rest of the walk, so a child removed by a
   concurrent `--timeline` purge would leave the directory standing while the run reported it

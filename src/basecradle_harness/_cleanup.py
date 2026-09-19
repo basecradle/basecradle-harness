@@ -335,15 +335,18 @@ def _remove(path: Path, *, blocked: list[Path]) -> bool:
     walk, so a `FileNotFoundError` from a sibling removed by a concurrent ``--timeline`` purge
     would otherwise leave the directory standing while this reported it gone. A symlink is
     unlinked rather than walked, because `rmtree` refuses one outright, and "still there" is
-    `lexists` rather than `exists`: a **dangling** symlink does not `exists`, so asking the wrong
-    question would report a refused unlink of one as a removal that worked.
+    `_present`, which is neither `exists` (a **dangling** symlink is still an entry to remove) nor
+    `lexists` (which answers *False* for a path it was refused a look at — the very shape a wrong
+    sandbox produces).
 
-    **Looking is its own step, because looking can be refused too.** On Python 3.10 `Path.is_dir`
-    re-raises every `OSError` but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so a `stat` that comes back
-    `EACCES` would escape this function, escape `sweep`, and abandon every orphan timeline behind
-    it — with nothing in `blocked` and a raw traceback where the one-line diagnosis should be.
-    Neither `exists` nor `lexists` can answer for a path we could not stat, so the honest report
-    is the one this makes: not removed.
+    **Looking is its own step, because looking can be refused too — and the two halves of that
+    cover different Python versions, which is why both are needed.** Up to 3.12 `Path.is_dir`
+    re-raises every `OSError` but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an `EACCES` from that
+    `stat` escapes this function, escapes `sweep`, and abandons every orphan timeline behind it —
+    with nothing in `blocked` and a raw traceback where the one-line diagnosis should be. From
+    3.13 it swallows the same error and answers *False*, so the path falls through to `unlink`,
+    is refused there, and it is `_present` that has to refuse to call that a removal. Get either
+    one wrong and the sweep is silently green on half the version matrix.
 
     **The honest limit: this can only see a denial it actually attempts.** A run with nothing to
     remove cannot tell a correct sandbox from a broken one, so a green run is evidence about this
@@ -364,10 +367,30 @@ def _remove(path: Path, *, blocked: list[Path]) -> bool:
     except OSError as error:
         if directory:
             shutil.rmtree(path, ignore_errors=True)  # take what the refusal did not cover
-        if os.path.lexists(path):  # `lexists`: a dangling symlink is still an entry to remove
+        if _present(path):
             _note_blocked(path, error, blocked=blocked)
             return False
     return True  # gone, or the salvage pass finished the job, or it raced away under us
+
+
+def _present(path: Path) -> bool:
+    """Is there still an entry at `path`? **Unknown counts as yes** (issue #536).
+
+    `os.path.lexists` cannot answer this question: it swallows *every* `OSError` and returns
+    ``False``, so a path inside a directory this process may not search — exactly what a sandbox
+    narrower than the sweep produces — would read as removed, and a refused unlink would be
+    reported as a job well done. Only the two errnos that actually mean "nothing is there" are
+    taken as an answer; anything else is the box refusing to tell us, and **a removal we cannot
+    confirm is a removal we do not claim**. `lstat` rather than `stat`, so a dangling symlink is
+    still an entry to remove.
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True  # refused a look: we cannot say it went, so we say it did not
+    return True
 
 
 def _note_blocked(path: Path, error: OSError, *, blocked: list[Path]) -> None:
