@@ -55,6 +55,17 @@ dead — so no live writer's temp is ever touched. It reaches outside ``$HARNESS
 and only by name: the env file's directory and the top level of ``~/.mempalace`` (never the palace
 beneath it).
 
+**A refused write fails the run, loudly** (issue #536). The fleet unit sandboxes this sweep to
+exactly the three places it writes — ``ProtectHome=read-only`` plus three ``ReadWritePaths``, so
+the OS enforces the founder's boundary that an agent's own property in its home is never ours to
+touch. That fence can only be *wrong* in the safe direction: a sweep that cannot write, never one
+that writes too much. But a cleanup that silently stops cleaning is the Green-While-Absent shape
+this repo names elsewhere, and nothing else on the box would ever notice — reads are deliberately
+unrestricted, so a wrong sandbox still enumerates every artifact and still classifies it deleted,
+and only the unlink comes back ``EROFS``. So every removal this module decides to make and cannot
+is logged at **ERROR naming the path** (`_note_blocked`) and makes the run **exit non-zero**, which
+is what systemd turns into a failed unit. One refusal never aborts the rest of the sweep.
+
 The sweep is idempotent and crash-safe: a re-run re-derives the artifact set from
 disk, and a half-done purge finishes on the next run. The *purge* has no concurrency
 hazard — a 404 timeline is terminal, so no live wake for it can be in flight (a
@@ -74,7 +85,7 @@ import re
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -90,6 +101,7 @@ from basecradle_harness._wake import (
     _PRUNED_THROUGH,
     _SEEN_KINDS,
     ClaimStore,
+    LockUnavailable,
     MarkStore,
     SeenStore,
     _process_alive,
@@ -155,7 +167,10 @@ class SweepSummary:
     """The one-line outcome of a sweep: how each referenced timeline was classified.
 
     ``checked`` is every distinct UUID enumerated from the artifact dirs;
-    ``purged`` + ``kept`` + ``kept_forbidden`` + ``skipped_transient`` partition it.
+    ``purged`` + ``kept`` + ``kept_forbidden`` + ``skipped_transient`` partition it. ``purged``
+    counts a timeline the sweep *acted on*, which is why `blocked` is a separate list and not a
+    fifth bucket: a purge that could not remove everything is still the purge of that timeline,
+    and what went wrong is a property of the **paths**, not of the classification.
     """
 
     checked: int = 0
@@ -167,6 +182,9 @@ class SweepSummary:
     pruned_claims: int = 0
     #: Stranded temps removed this run, on any timeline or none (`prune_stranded_temps`).
     stranded_temps: int = 0
+    #: Every path this run decided to remove and could not (`_remove`, issue #536). Each one was
+    #: logged at ERROR when it happened; a non-empty list is what makes `main` exit non-zero.
+    blocked: list[Path] = field(default_factory=list)
 
     def __str__(self) -> str:
         return (
@@ -174,7 +192,8 @@ class SweepSummary:
             f"purged {self.purged}, kept {self.kept}, "
             f"kept-forbidden {self.kept_forbidden}, skipped-transient {self.skipped_transient}; "
             f"pruned {self.pruned_claims} settled claim(s), "
-            f"removed {self.stranded_temps} stranded temp(s)"
+            f"removed {self.stranded_temps} stranded temp(s); "
+            f"blocked on {len(self.blocked)} path(s)"
         )
 
 
@@ -260,30 +279,117 @@ def enumerate_artifacts(home: Path) -> dict[str, list[Path]]:
     return artifacts
 
 
-def purge(paths: list[Path]) -> None:
+def purge(paths: list[Path], *, blocked: list[Path]) -> list[Path]:
     """Delete the artifact paths for one timeline — files unlinked, dirs removed wholesale.
 
     Tolerant of a missing path (a concurrent or prior partial purge) **and of a per-path
-    failure**: a single un-deletable artifact (a permission error, a TOCTOU vanish) is logged
-    and stepped over, never raised — so one bad file can't abort the sweep and strand every
-    other orphan timeline this run. Files and dirs are handled symmetrically here (both
-    error-tolerant), which is also what makes ``sweep`` resilient and the re-run idempotent.
-    Only ever called with paths that ``enumerate_artifacts`` produced, so it can never reach
-    ``memory.db`` or the palace.
+    failure**: a single un-deletable artifact is stepped over, never raised — so one bad file
+    can't abort the sweep and strand every other orphan timeline this run, which is what makes
+    ``sweep`` resilient and the re-run idempotent. Only ever called with paths that
+    ``enumerate_artifacts`` produced, so it can never reach ``memory.db`` or the palace.
+
+    Stepping over is not the same as saying nothing: each failure is recorded in `blocked`, and
+    a run that blocked on anything exits non-zero (`_remove`, `main`).
+
+    It also **returns what it was refused on this call**, which the shared `blocked` list cannot
+    answer: that list is de-duplicated across the whole run, so "did anything change in it?" is
+    not the same question as "did this purge go through?" — and a caller that asked the first one
+    would tell an operator a timeline was purged on the run where a second pass had already named
+    the same path.
     """
-    for path in paths:
-        try:
-            if path.is_dir():
-                shutil.rmtree(path, ignore_errors=True)
-            else:
-                # `missing_ok` closes the exists()->unlink() TOCTOU (a concurrent --timeline
-                # purge, a crash-recovery overlap) without a raise.
-                path.unlink(missing_ok=True)
-        except OSError as error:
-            _log.warning("cleanup: could not remove %s: %s", path, error)
+    return [path for path in paths if not _remove(path, blocked=blocked)]
 
 
-def prune_settled_claims(home: Path) -> int:
+def _remove(path: Path, *, blocked: list[Path]) -> bool:
+    """Remove one artifact — a file, or a directory with everything under it — or say why not.
+
+    True when the path is gone, **including when it was never there**; False when the box refused
+    it. The return is the caller's only honest signal (see `purge`), because `blocked` is shared
+    across the run and de-duplicated.
+
+    **A removal the sweep decided to make and could not is a failure of the run** (issue #536),
+    and this is the one function that decides so. The fleet's cleanup unit is sandboxed to
+    exactly the three places this module writes — ``ProtectHome=read-only`` plus three
+    ``ReadWritePaths`` (``deploy/basecradle-harness-cleanup@.service``) — so a sandbox that is
+    *wrong*, because ``$HARNESS_HOME`` moved or the path list went stale, surfaces here and
+    nowhere else: reads are deliberately unrestricted, so the enumeration still finds every
+    artifact and the classify still says "deleted", and only the unlink comes back ``EROFS``.
+    Logged at ``WARNING`` with a zero exit, as it was before #536, that is a sweep reporting
+    success having deleted nothing, for as long as nobody reads the journal — the
+    Green-While-Absent shape. So the path is named at **ERROR** and recorded in `blocked`, which
+    is what makes the run exit non-zero and systemd mark the unit failed.
+
+    **Every `OSError` counts; there is no allow-list of errnos.** ``EROFS`` and ``EACCES`` are
+    what a systemd sandbox produces today, but enumerating the ways an OS can refuse is the same
+    disease as a vendor cap table — the observable fact is that the artifact is still on the box,
+    and that is what is reported. A path that is merely *gone* is the opposite and is never a
+    failure: a concurrent ``--timeline`` purge or a half-done prior run is the ordinary case, and
+    ``missing_ok`` covers it.
+
+    The strict `rmtree` is deliberate where the old code passed ``ignore_errors=True``: that
+    swallowed the refusal *and* its errno, so a denied directory purge was previously invisible
+    even at ``WARNING``. A refusal now stops the walk with a real error, a second best-effort
+    pass takes whatever the refusal did not cover, and the directory is reported only if it is
+    still there. **The salvage pass is not optional and applies to every error class**, a
+    vanished child included: `rmtree` re-raises on the first failure and abandons the rest of the
+    walk, so a `FileNotFoundError` from a sibling removed by a concurrent ``--timeline`` purge
+    would otherwise leave the directory standing while this reported it gone. A symlink is
+    unlinked rather than walked, because `rmtree` refuses one outright, and "still there" is
+    `lexists` rather than `exists`: a **dangling** symlink does not `exists`, so asking the wrong
+    question would report a refused unlink of one as a removal that worked.
+
+    **Looking is its own step, because looking can be refused too.** On Python 3.10 `Path.is_dir`
+    re-raises every `OSError` but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so a `stat` that comes back
+    `EACCES` would escape this function, escape `sweep`, and abandon every orphan timeline behind
+    it — with nothing in `blocked` and a raw traceback where the one-line diagnosis should be.
+    Neither `exists` nor `lexists` can answer for a path we could not stat, so the honest report
+    is the one this makes: not removed.
+
+    **The honest limit: this can only see a denial it actually attempts.** A run with nothing to
+    remove cannot tell a correct sandbox from a broken one, so a green run is evidence about this
+    run and never a proof of the unit's `ReadWritePaths`.
+    """
+    try:
+        directory = path.is_dir() and not path.is_symlink()
+    except OSError as error:
+        _note_blocked(path, error, blocked=blocked)  # we could not even look
+        return False
+    try:
+        if directory:
+            shutil.rmtree(path)
+        else:
+            # `missing_ok` closes the exists()->unlink() TOCTOU (a concurrent --timeline
+            # purge, a crash-recovery overlap) without a raise.
+            path.unlink(missing_ok=True)
+    except OSError as error:
+        if directory:
+            shutil.rmtree(path, ignore_errors=True)  # take what the refusal did not cover
+        if os.path.lexists(path):  # `lexists`: a dangling symlink is still an entry to remove
+            _note_blocked(path, error, blocked=blocked)
+            return False
+    return True  # gone, or the salvage pass finished the job, or it raced away under us
+
+
+def _note_blocked(path: Path, error: OSError, *, blocked: list[Path]) -> None:
+    """Record a path the sweep was designed to clean and could not: ERROR, by name (issue #536).
+
+    One spelling for all three passes — a purge, a settled-claim prune, a stranded-temp removal —
+    so a new pass cannot invent a quieter one. The head is a verdict about a unit of work, so it
+    is colored (`head`); the path is the field an operator needs to fix the sandbox.
+
+    **A path is recorded once per run.** Two passes can reach the same file — a deleted timeline's
+    stranded session temp is both an artifact to purge and a temp to sweep — and if the first is
+    refused the second will be too. Counting that path twice would put "blocked on 2 path(s)" in
+    front of an operator who has one file to fix, and saying it twice at ERROR adds nothing to the
+    first line, which already named it.
+    """
+    if path in blocked:
+        return
+    blocked.append(path)
+    _log.error("%s %s", head("cleanup blocked", RED), kv(path=str(path), error=str(error)))
+
+
+def prune_settled_claims(home: Path, *, blocked: list[Path]) -> int:
     """Remove the settled claims of timelines that still exist; return how many (issue #526).
 
     A claim used to outlive its purpose by the life of its timeline: one file per message, asset,
@@ -304,6 +410,28 @@ def prune_settled_claims(home: Path) -> int:
 
     A kind with no record yet (no mark, an empty seen-set) is left alone, and so is a timeline
     whose watermark cannot be read: an unreadable watermark is logged and never overwritten.
+
+    **The ways this pass can fail are graded, because they are different facts** (issue #536),
+    and only one of them is a broken sandbox. Exactly one is: an `OSError` out of the two calls
+    that **write** — the watermark `advance_pruned_through` replaces, the claims `prune_settled`
+    unlinks — puts the claims directory in `blocked` and exits the run non-zero. Everything else
+    is a `WARNING` and a clean exit, and each exclusion is load-bearing rather than defensive:
+
+    - **Reading the record is not a write, so it is a separate step** (`marks.get`, `seen.all`,
+      the `_fsync` that makes the seen-set durable). Under `ProtectHome=read-only` a read is never
+      refused, so a failure here is *not* a sandbox symptom — and reporting it would name the
+      claims directory, which is writable and is not the file that failed, under a message telling
+      the operator their `ReadWritePaths` are too narrow.
+    - **A lock that cannot be had is the designed skip**, not a refusal (`LockUnavailable`). A
+      filesystem that does not do `flock` (some NFS mounts) would otherwise put *every* claims
+      directory on the box in `blocked`, on *every* run, forever — the exact failure the watermark
+      exclusion below exists to avoid, at the scale of the whole host.
+    - **A path that is merely gone is never a failure** (`FileNotFoundError`): a concurrent
+      ``--timeline`` purge, or the timer sweep overlapping a manual one, is the ordinary case
+      `advance_pruned_through`'s own docstring contemplates. This is `_remove`'s rule, here.
+    - **An unparseable watermark stays a `WARNING`** (`ValueError`): the prune correctly declines
+      to overwrite a value it cannot read, nothing is denied us, and promoting it would turn one
+      corrupt file into a unit that fails on every run forever.
     """
     claims = ClaimStore(home)
     marks = MarkStore(home)
@@ -315,6 +443,8 @@ def prune_settled_claims(home: Path) -> int:
             if not folder.is_dir():
                 continue
             timeline = unquote(folder.name)
+            # Step one: read the record coverage stands on. Nothing here writes, so nothing here
+            # can be refused by the sandbox, and a failure is never reported as one.
             try:
                 if kind in _SEEN_KINDS:
                     handled = seen.all(timeline, kind=kind)
@@ -323,11 +453,21 @@ def prune_settled_claims(home: Path) -> int:
                     record = seen._path(timeline, kind)
                     _fsync(record)  # the record, and its name, are on disk before any unlink
                     _fsync(record.parent)
-                    covered = handled.__contains__
+                    mark = None
                 else:
+                    handled = None
                     mark = _as_uuid(marks.get(timeline, kind=kind))
                     if mark is None:
                         continue  # no mark to stand on: nothing here is provably settled
+            except (OSError, ValueError) as error:
+                _log.warning("cleanup: left %s claims on %s unread: %s", kind, timeline, error)
+                continue
+
+            # Step two: the writes — raise the watermark, then unlink under it.
+            try:
+                if handled is not None:
+                    covered = handled.__contains__
+                else:
                     through = claims.advance_pruned_through(timeline, kind=kind, mark=mark)
 
                     def covered(uuid: str, through=through) -> bool:
@@ -335,8 +475,14 @@ def prune_settled_claims(home: Path) -> int:
                         return item is not None and item <= through
 
                 gone = claims.prune_settled(timeline, kind=kind, covered=covered)
-            except (OSError, ValueError) as error:
+            except (LockUnavailable, FileNotFoundError, ValueError) as error:
+                # Declined, not refused: no lock to be had, the directory went under us, or a
+                # watermark that does not hold a uuid. Nothing about the box is wrong.
                 _log.warning("cleanup: left %s claims on %s unpruned: %s", kind, timeline, error)
+                continue
+            except OSError as error:
+                # Refused a write it was designed to make: name the directory and fail the run.
+                _note_blocked(folder, error, blocked=blocked)
                 continue
             if gone:
                 pruned += len(gone)
@@ -359,7 +505,9 @@ def _fsync(path: Path) -> None:
         os.close(fd)
 
 
-def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
+def prune_stranded_temps(
+    home: Path, *, blocked: list[Path], now: float | None = None
+) -> list[Path]:
     """Remove every temp a killed write left behind, on live timelines too (issue #526).
 
     The orphan sweep removes a *session* temp only once its timeline is deleted, and nothing else
@@ -384,8 +532,9 @@ def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
     is not a live process. The env temp is looked for beside ``BASECRADLE_ENV_FILE`` and in the
     config home (where ``agent.env`` lives); the MemPalace one only at the top level of
     ``~/.mempalace``, which is never walked, so the palace beneath it is never reached. Nothing that
-    does not match one of those names is ever touched, and a temp that cannot be read or removed is
-    logged and left for the next run.
+    does not match one of those names is ever touched, and a temp that cannot be *read* is left for
+    the next run — while one that cannot be **removed** is a refused write, so it is named at ERROR
+    and recorded in `blocked`, exactly as a purge is (issue #536).
     """
     now = time.time() if now is None else now
     removed: list[Path] = []
@@ -400,7 +549,7 @@ def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
         try:
             path.unlink(missing_ok=True)
         except OSError as error:
-            _log.warning("cleanup: could not remove stranded temp %s: %s", path, error)
+            _note_blocked(path, error, blocked=blocked)
             return
         removed.append(path)
         _log.info("cleanup: removed stranded temp %s (untouched %.0fs)", path, age)
@@ -498,9 +647,12 @@ def sweep(home: Path, client: object) -> SweepSummary:
         summary.checked += 1
         verdict = classify(client, uuid)
         if verdict == "purge":
-            purge(artifacts[uuid])
+            refused = purge(artifacts[uuid], blocked=summary.blocked)
             summary.purged += 1
-            _log.info("cleanup: purged artifacts for deleted timeline %s", uuid)
+            if not refused:
+                _log.info("cleanup: purged artifacts for deleted timeline %s", uuid)
+            # else `_remove` named every path it could not remove, at ERROR: saying "purged"
+            # here as well would be the line an operator reads and believes.
         elif verdict == "keep_forbidden":
             summary.kept_forbidden += 1
             _log.info("cleanup: kept timeline %s (403 — exists, agent not a viewer)", uuid)
@@ -509,22 +661,24 @@ def sweep(home: Path, client: object) -> SweepSummary:
             _log.warning("cleanup: skipped timeline %s this run (transient error)", uuid)
         else:
             summary.kept += 1
-    summary.pruned_claims = prune_settled_claims(home)
-    summary.stranded_temps = len(prune_stranded_temps(home))
+    summary.pruned_claims = prune_settled_claims(home, blocked=summary.blocked)
+    summary.stranded_temps = len(prune_stranded_temps(home, blocked=summary.blocked))
     return summary
 
 
-def purge_one(home: Path, uuid: str) -> list[Path]:
+def purge_one(home: Path, uuid: str, *, blocked: list[Path]) -> list[Path]:
     """Unconditionally purge a single timeline's artifacts — the manual ``--timeline`` ops path.
 
     No ``timelines.get`` and no classify: the operator has asserted this timeline is gone, so
-    its enumerated artifacts are removed outright. Returns the paths purged (empty if the box
-    held nothing for it). The encode-decode round-trip means the operator passes a *plain*
-    UUID and it still matches the percent-encoded on-disk names.
+    its enumerated artifacts are removed outright. Returns the paths it **removed** — empty if
+    the box held nothing for it, and short of what was enumerated if anything was refused, which
+    goes to `blocked` and exits the run non-zero exactly as it does in a sweep. The encode-decode
+    round-trip means the operator passes a *plain* UUID and it still matches the percent-encoded
+    on-disk names.
     """
     paths = enumerate_artifacts(home).get(uuid, [])
-    purge(paths)
-    return paths
+    refused = set(purge(paths, blocked=blocked))
+    return [path for path in paths if path not in refused]
 
 
 def _resolve_home() -> Path:
@@ -542,7 +696,13 @@ def main(argv: list[str] | None = None) -> int:
     """The ``basecradle-harness-cleanup`` entrypoint: GC deleted timelines' on-box artifacts.
 
     ``--sweep`` is the scheduled GC (and the first-run backfill); ``--timeline <uuid>`` is a
-    manual one-off purge for ops. Exit 0 on success; non-zero on a hard config/auth failure.
+    manual one-off purge for ops. Exit 0 on success; non-zero on a hard config/auth failure, and
+    non-zero on a run that could not remove something it decided to remove (issue #536) — the
+    signal systemd turns into a failed unit and the NOC's unit-health reads already watch for.
+
+    The two are deliberately the same exit code, because they are the same fact to whoever is
+    paged: the cleanup did not happen. Which one it was is in the journal, where the hard failure
+    carries the ``cleanup failed`` head and a refused path carries ``cleanup blocked``.
     """
     parser = argparse.ArgumentParser(
         prog="basecradle-harness-cleanup",
@@ -584,10 +744,11 @@ def main(argv: list[str] | None = None) -> int:
     # default to INFO and honor HARNESS_LOG_LEVEL (raising it past INFO quiets the summary).
     _configure_logging()
 
+    blocked: list[Path] = []
     try:
         home = _resolve_home()
         if args.timeline:
-            purged = purge_one(home, args.timeline)
+            purged = purge_one(home, args.timeline, blocked=blocked)
             _log.info(
                 "cleanup: manually purged %d artifact path(s) for timeline %s",
                 len(purged),
@@ -595,12 +756,20 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             summary = sweep(home, _client_from_env())
+            blocked = summary.blocked
             _log.info("%s", summary)
-    except (BaseCradleError, ValueError, KeyError) as error:
+    except (BaseCradleError, OSError, ValueError, KeyError) as error:
         # A hard setup failure — no/expired credentials (`_client_from_env` or a mint),
         # an unreadable home — surfaces as a clean non-zero exit with a one-line message
         # for the NOC's journal, never a raw traceback. (Per-UUID platform errors during
         # the sweep are already absorbed by `classify` as transient-keep.)
+        #
+        # `OSError` is in that list because the promise in the sentence above was not true
+        # without it (issue #536): the enumeration walks the artifact dirs with a bare
+        # `iterdir`, so an unreadable one gave a traceback rather than the one-line
+        # diagnosis, and `cleanup failed` — the head the journal is read for — never got
+        # said. It is deliberately *not* the `cleanup blocked` path: that one names a
+        # specific artifact the sandbox refused, while this is the whole run falling over.
         #
         # It goes through the logger as an ERROR as well as to stderr, for the same reason the
         # wake CLI's does (issue #272): a bare print is unleveled, so the sweep that never ran is
@@ -608,6 +777,17 @@ def main(argv: list[str] | None = None) -> int:
         # sweep with nothing to do.
         _log.error("%s %s", head("cleanup failed", RED), kv(error=str(error)))
         print(f"basecradle-harness-cleanup: {error}", file=sys.stderr)
+        return 1
+
+    if blocked:
+        # Every one of these was already logged at ERROR, by name. This last line is for
+        # `systemctl status`, which shows the tail of the unit's output and is where an operator
+        # looks first when the timer goes red.
+        print(
+            f"basecradle-harness-cleanup: could not remove {len(blocked)} path(s), "
+            f"starting with {blocked[0]} — the write sandbox may be narrower than the sweep",
+            file=sys.stderr,
+        )
         return 1
     return 0
 

@@ -494,6 +494,22 @@ def _payload(claim: Claim) -> dict[str, object]:
 _LOCK_FALLBACK_SAID = False
 
 
+class LockUnavailable(OSError):
+    """A claims directory's advisory lock could not be had, so a caller that *required* one
+    declined to run (issue #536).
+
+    Its own class rather than the bare `OSError` `_locked` used to raise, because the cleanup
+    sweep grades the two differently and cannot tell them apart by errno. A refused **write** is a
+    sandbox narrower than the sweep, and it fails the run. A refused **lock** is the designed skip
+    this contract has always specified — a filesystem that does not do `flock` (some NFS mounts),
+    or a platform with no `fcntl` at all — and nothing is wrong with the box. Left
+    indistinguishable, every claims directory on such a host would be reported un-cleanable on
+    every run, forever, under a diagnosis naming a sandbox that is perfectly correct.
+
+    It subclasses `OSError` so every existing handler still catches it.
+    """
+
+
 @contextmanager
 def _locked(folder: Path, *, shared: bool, required: bool) -> Iterator[int]:
     """Hold an advisory `flock` on a claims directory; yield its descriptor (issue #526).
@@ -511,19 +527,23 @@ def _locked(folder: Path, *, shared: bool, required: bool) -> Iterator[int]:
     exists to prevent; a wake passes False and carries on unlocked, logging it once, because
     refusing to claim would stall every item on the timeline — and `claim`'s post-link check
     still stands behind it.
+
+    A required lock that cannot be had raises `LockUnavailable`, not a bare `OSError`, so that the
+    skip this docstring promises is distinguishable from a write the box refused (issue #536).
     """
     global _LOCK_FALLBACK_SAID
     fd = os.open(folder, os.O_RDONLY)
     try:
         if fcntl is None:
             if required:
-                raise OSError("advisory file locks are unavailable on this platform")
+                raise LockUnavailable("advisory file locks are unavailable on this platform")
         else:
             try:
                 fcntl.flock(fd, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
             except OSError as error:
                 if required:
-                    raise
+                    # `*error.args` keeps the errno and strerror; only the class changes.
+                    raise LockUnavailable(*error.args) from error
                 if not _LOCK_FALLBACK_SAID:
                     _LOCK_FALLBACK_SAID = True
                     _log.warning("Claims run without a directory lock on %s: %s", folder, error)

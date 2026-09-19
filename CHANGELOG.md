@@ -7,6 +7,100 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.127.0] - 2026-09-19
+
+### Added: the orphan sweep fails loudly when the box refuses a write it was designed to make (issue #536)
+
+Approved by @origin, 2026-09-19, and paired with the NOC's narrowed systemd unit
+(basecradle-noc#735/#736), whose fleet install is parked on this release.
+
+The founder's boundary on the cleanup rule — *we clean what we created; an agent's own property in
+its home is never ours to touch* — is now enforced by the operating system as well as by the
+sweep's code. The fleet unit sandboxes the sweep to the three directories
+`basecradle_harness._cleanup` writes in (`$HARNESS_HOME`, the config home, `~/.mempalace`), so a
+periodic root-launched unit whose one job is deleting files can no longer reach the agent's
+workspace, its scratch, its repos, its wallets or its `.ssh` at all.
+
+**Stated precisely, because the overclaim is tempting: the OS fence is a fence around the *home*,
+not around every file the code declines to touch.** `ReadWritePaths=` grants a directory *and
+everything beneath it*, and both `memory.db` and — in the default configuration — the MemPalace
+palace live under `$HARNESS_HOME`, which is granted. **The code is still the only thing that keeps
+the sweep off the agent's memory**, exactly as it was before this release; the unit narrows the
+blast radius of a bug, it does not make one impossible. The same goes for `~/.mempalace`: the sweep
+restricts *itself* to that directory's top level, and the grant is the whole subtree.
+
+That fence can only be *wrong* in the safe direction — a sweep that cannot write, never one that
+writes too much — but a cleanup that silently stops cleaning is invisible from everywhere. Reads
+are deliberately unrestricted, so a wrong sandbox still enumerates every artifact, still asks the
+platform, and still classifies a timeline deleted; only the unlink comes back `EROFS`. At the old
+`WARNING` and exit 0, that is a unit reporting success having deleted nothing, for as long as
+nobody reads the journal.
+
+So every removal the sweep decides to make and cannot — a purge, a settled-claim prune, a
+stranded-temp removal — is now logged at **`ERROR` naming the path** and makes the run **exit
+non-zero**, which systemd turns into a failed unit and the NOC's unit-health reads already watch:
+
+```
+cleanup blocked path=/home/jt/harness/breaker/<uuid>.wakes error="[Errno 30] Read-only file system: '/home/jt/harness/breaker/<uuid>.wakes'"
+```
+
+- **One refusal never aborts the rest of the sweep.** Every other orphan timeline is still purged,
+  the run's verdict is accumulated in one list (`SweepSummary.blocked`), and the summary line now
+  ends `blocked on N path(s)`.
+- **The bound is errno-agnostic.** `EROFS` and `EACCES` are what a systemd sandbox produces today,
+  but enumerating the ways an OS can refuse is the disease a vendor cap table is; the observable
+  fact is that the artifact is still on the box.
+- **A denied *directory* purge used to be invisible even at `WARNING`.** `shutil.rmtree` was called
+  with `ignore_errors=True`, which swallowed the refusal and its errno. The walk is strict now, a
+  second best-effort pass takes whatever the refusal did not cover, and the directory is reported
+  only if it is still there — asked with `lexists`, because a **dangling symlink** does not
+  `exists`, so the wrong question would read a refused unlink of one as a removal that worked. A
+  symlink is unlinked rather than walked.
+- **Only a refused *write* is a broken sandbox**, and the claims prune reports nothing else. An
+  unreadable watermark stays a `WARNING` (nothing is refused there — the prune correctly declines
+  to overwrite a value it cannot parse — and promoting it would fail the unit forever over one
+  corrupt file); so does reading the mark or the seen-set, which no read-only sandbox can refuse
+  and which would be reported under the wrong path; so does a claims directory that vanished under
+  a concurrent purge; and so does an advisory lock the filesystem will not give, which
+  `_locked(required=True)` has always treated as a skip and now raises as its own
+  `LockUnavailable` — without that, an NFS home would report *every* claims directory on the box
+  as un-cleanable, on every run, forever, under a message blaming a sandbox that is correct.
+- **Looking can be refused too, and on Python 3.10 it raises.** `Path.is_dir` re-raises every
+  `OSError` but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an `EACCES` from the `stat` that decides
+  file-or-directory escaped the sweep entirely — abandoning every orphan behind it, with nothing
+  in `blocked`. The look is now its own guarded step, and a path that cannot be stat'd is reported
+  rather than skipped, because neither `exists` nor `lexists` can answer for it.
+- **A vanished sibling no longer makes a half-purged directory read as gone.** `shutil.rmtree`
+  re-raises on the first error and abandons the rest of the walk, so a child removed by a
+  concurrent `--timeline` purge would leave the directory standing while the run reported it
+  removed. The salvage pass now runs for every error class.
+- **`main` catches `OSError`**, so an artifact directory that cannot be listed exits 1 with the
+  `cleanup failed` line the journal is read for, rather than the raw traceback its own docstring
+  had promised it would never print.
+- **A path that is merely gone is never a failure.** A concurrent `--timeline` purge or a half-done
+  prior run is the ordinary case.
+- **`--timeline` gets the same treatment**, and both paths print a final line to stderr naming the
+  first blocked path, because `systemctl status` shows the tail of a unit's output.
+
+The refusals are proven against directories the OS genuinely will not let the test process write,
+not against patched exceptions: a mocked refusal proves the handler runs, never that anything
+reaches it. The `EROFS` a real `ProtectHome=read-only` answers with — which no test can produce
+without a mount — is pinned separately, so the one errno the fleet will actually see cannot become
+a special case a later edit drops.
+
+The honest limit, stated in the code and the docs: a run with nothing to remove attempts no write,
+so a green run is evidence about that run and never a proof that the `ReadWritePaths` list is right.
+
+### Changed: `deploy/basecradle-harness-cleanup@.service` matches the NOC's canonical unit
+
+Brought byte-in-line with the bytes the fleet stamps: `ProtectHome=read-only` (measured on systemd
+255 — `ProtectSystem=strict` does *not* cover `/home`, so narrowing `ReadWritePaths` under
+`ProtectHome=false` was byte-identical to granting the whole home), the three `ReadWritePaths`, and
+the `-` prefix on `/home/%i/.mempalace` (an entry naming a missing path fails the unit at namespace
+setup, and agents on the SQLite memory provider have no palace dir). `deploy/README.md` now says
+which paths the unit grants, why each one, and that the NOC's copies are canonical. The `.timer`
+was already byte-identical.
+
 ## [0.126.1] - 2026-09-19
 
 ### Fixed: a claim held by a wake that is still working can no longer be judged orphaned (issue #532)
