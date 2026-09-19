@@ -172,6 +172,17 @@ def test_enumerate_finds_a_transcript_stranded_by_a_killed_save(tmp_path):
     assert stranded in set(enumerate_artifacts(tmp_path)[DELETED])
 
 
+def test_enumerate_finds_a_mark_stranded_by_a_killed_write(tmp_path):
+    """A mark staged by `MarkStore.set` and orphaned by a kill goes with its deleted timeline."""
+    marks = MarkStore(tmp_path)
+    marks.set(DELETED, OTHER)
+    with _killed_at_publish():
+        marks.set(DELETED, LIVE)
+    (stranded,) = [p for p in (tmp_path / "marks").iterdir() if p.name.endswith(".tmp")]
+
+    assert stranded in set(enumerate_artifacts(tmp_path)[DELETED])
+
+
 def test_enumerate_ignores_a_stranded_save_from_another_channel(tmp_path):
     """…and the `github:` exclusion holds for the temp exactly as it does for the transcript."""
     sessions = tmp_path / "sessions"
@@ -417,6 +428,13 @@ def _strand_every_kind(home: Path) -> dict[str, Path]:
         session.persist()
     stranded = {"session": left_behind(session_file.parent)}
 
+    marks = MarkStore(home)
+    marks.set(LIVE, OTHER, kind="assets")
+    before.update(marks._path(LIVE, "assets").parent.iterdir())
+    with _killed_at_publish():
+        marks.set(LIVE, DELETED, kind="assets")
+    stranded["mark"] = left_behind(marks._path(LIVE, "assets").parent)
+
     claims = ClaimStore(home)
     claims.claim(LIVE, OTHER, kind="messages")
     folder = home / "claims" / "messages" / quote(LIVE, safe="")
@@ -463,6 +481,7 @@ def test_every_stranded_temp_kind_is_removed_once_its_writer_is_gone(tmp_path, m
     assert _session_path(tmp_path, LIVE).exists()
     assert (config_home() / "agent.env").read_text() == "BASECRADLE_TOKEN=bc_live_old\n"
     assert ClaimStore(tmp_path).read(LIVE, OTHER, kind="messages").phase == "in-flight"
+    assert MarkStore(tmp_path).get(LIVE, kind="assets") == OTHER  # the mark it would have replaced
 
 
 def test_a_temp_younger_than_the_floor_is_kept_whatever_its_pid(tmp_path, monkeypatch):
@@ -484,6 +503,7 @@ def test_a_temp_whose_writer_is_still_alive_is_kept_however_old(tmp_path):
     removed = prune_stranded_temps(tmp_path)
 
     assert stranded["session"].exists()
+    assert stranded["mark"].exists()
     assert stranded["claim_write"].exists()
     # The unstamped ones have only their age to go on, and it is far past any live write.
     assert set(removed) == {
@@ -513,7 +533,7 @@ def test_nothing_but_a_named_temp_in_its_own_place_is_ever_touched(tmp_path, mon
         folder / f".{OTHER}.takeover.0f1e2d3c4b5a69788796a5b4c3d2e1f0",  # a take-over token
         folder / f"{OTHER}.claim",
         tmp_path / "sessions" / "notes.tmp",
-        tmp_path / "marks" / f"{LIVE}.txt.1234.tmp",
+        tmp_path / "marks" / f"{LIVE}.txt.bak",
         config_home() / "agent.env.bak",
         Path.home() / ".mempalace" / "palace" / ".config.json.0f1e2d3c.tmp",  # beneath the top
         Path.home() / ".mempalace" / "config.json",

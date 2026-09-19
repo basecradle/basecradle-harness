@@ -100,6 +100,11 @@ _TIMELINE_SOURCE_PREFIX = "timeline:"
 #: the box forever, which is precisely the outcome this module exists to prevent.
 _SESSION_TEMP = re.compile(r"^(?P<source>.+)\.json\.(?P<stamp>[^.]+)\.tmp$")
 
+#: A mark staged by `MarkStore.set` and left behind by a process killed mid-write:
+#: ``marks/<quoted-timeline>.txt.<pid>.tmp`` (messages) or ``marks/<kind>/…`` (issue #526). It is
+#: purged with its timeline, and swept as a stranded temp on a live one.
+_MARK_TEMP = re.compile(r"^(?P<timeline>.+)\.txt\.(?P<pid>\d+)\.tmp$")
+
 #: How long a staged temp must sit untouched before the sweep calls it **stranded** (issue #526).
 #:
 #: Every temp below lives for one atomic write: stage, (fsync), rename or link, and a handler removes
@@ -197,6 +202,9 @@ def enumerate_artifacts(home: Path) -> dict[str, list[Path]]:
     if marks.is_dir():
         for path in marks.rglob("*.txt"):
             add(unquote(path.stem), path)
+        for path in marks.rglob("*.tmp"):  # …and a mark a killed write staged (`_MARK_TEMP`)
+            if staged := _MARK_TEMP.match(path.name):
+                add(unquote(staged.group("timeline")), path)
 
     # Seen-sets — `seen/<kind>/<uuid>.txt` (tasks today; any future kind for free).
     seen = home / "seen"
@@ -269,6 +277,7 @@ def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
     Temp                                            Writer                               Pid
     ==============================================  ===================================  =======
     ``sessions/<source>.json.<pid>-<token>.tmp``    `Session._save`                      yes
+    ``marks/[<kind>/]<timeline>.txt.<pid>.tmp``     `MarkStore.set`                      yes
     ``claims/…/<uuid>.claim.<pid>.tmp``             `ClaimStore._write`                  yes
     ``claims/…/.<uuid>.<wake>[.takeover].new``      `ClaimStore.claim` / ``reclaim``     no
     ``.basecradle-env.<random>.tmp``                `_token._atomic_write`               no
@@ -304,6 +313,11 @@ def prune_stranded_temps(home: Path, *, now: float | None = None) -> list[Path]:
         if staged := _SESSION_TEMP.match(path.name):
             pid, _, _ = staged.group("stamp").partition("-")
             consider(path, int(pid) if pid.isdigit() else None)
+
+    for folder in [home / "marks", *_entries(home / "marks")]:
+        for path in _entries(folder):
+            if staged := _MARK_TEMP.match(path.name):
+                consider(path, int(staged.group("pid")))
 
     for kind in _entries(home / "claims"):
         for folder in _entries(kind):
