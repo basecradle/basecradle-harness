@@ -4861,7 +4861,7 @@ def test_a_pruned_message_is_never_re_driven_when_it_is_listed_again(
     store.claim(TIMELINE_UUID, M0, kind="messages")
     store.commit(TIMELINE_UUID, M0, kind="messages")
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
-    assert prune_settled_claims(tmp_path) == 1
+    assert prune_settled_claims(tmp_path, blocked=[]) == 1
     if mark_after_prune == "regressed":
         MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)
     else:

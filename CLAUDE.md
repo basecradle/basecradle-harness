@@ -772,6 +772,55 @@ see the absence of.**
   staged, once older than `STRANDED_AFTER` **and** (when the writer stamped one) with a dead pid —
   so a live writer's temp is never touched, and the palace is never walked. *(Mechanics:
   `docs/harness-internals.md`.)*
+- **The OS fences the sweep too, and a refused write fails the run** (issue #536, founder-approved
+  2026-09-19). The fleet unit sandboxes it to exactly the three directories this module writes —
+  `ProtectHome=read-only` plus `ReadWritePaths` for `$HARNESS_HOME`, the config home, and
+  `-/home/%i/.mempalace` — so the boundary above ("only what it staged or wrote") is enforced by
+  the operating system and not only by an allow-list of filenames. **Three facts about that are
+  the NOC's measurements on systemd 255 (basecradle-noc#736), recorded rather than re-derived,
+  and each was got wrong first:** `ProtectSystem=strict` does *not* cover `/home` (it defers it to
+  `ProtectHome=` entirely, so narrowing `ReadWritePaths` under `ProtectHome=false` is
+  byte-identical to granting the whole home — this reads against `systemd.exec(5)`'s own summary
+  of `strict`, which is exactly why it was measured); `ProtectHome=true` is never right, because
+  it makes `/home` empty and blinds both the sweep and the founder's read-everything supervision;
+  and a `ReadWritePaths` entry naming a **missing** path fails the unit at namespace setup
+  (exit 226), so `.mempalace` carries the `-` prefix — four of seven fleet agents run the SQLite
+  provider and have none. **The fence is around the *home*, never around every file the code
+  declines to touch:** a grant is a whole subtree, so `memory.db` and (by default) the palace sit
+  *inside* `$HARNESS_HOME` and the code remains the only thing keeping the sweep off them — the
+  unit narrows a bug's blast radius, it does not make one impossible, and a doc that says
+  otherwise is the overclaim to strike. The sandbox can only be wrong in the safe
+  direction, so what matters here is that being wrong is **loud**: reads are deliberately
+  unrestricted, so a wrong sandbox still enumerates every artifact and still classifies it
+  deleted, and *only the unlink* comes back `EROFS` — a `WARNING` and a zero exit would be a
+  cleanup that reports success having deleted nothing, forever. Every removal the sweep decides to
+  make and cannot is therefore logged at **ERROR naming the path** (`_note_blocked`, one spelling
+  for all three passes) and **exits the run non-zero**, and one refusal never aborts the rest of
+  the sweep. Where a removal is the unit of judgement the bound is **errno-agnostic** — every
+  `OSError` counts, because enumerating the ways an OS can refuse is the disease a vendor cap table
+  is, and the observable fact is simply that the artifact is still on the box. **That fact is
+  asked by `_present`, because both stdlib spellings answer it wrongly**: `exists` is False for a
+  dangling symlink, and `lexists` swallows every `OSError` and answers False for a path it was
+  refused a look at — the exact shape a wrong sandbox makes — so only `ENOENT`/`ENOTDIR` count as
+  an answer and **a removal we cannot confirm is a removal we do not claim**. **But the thing judged is a refused
+  *write*, and everything else is a `WARNING` and a clean exit** — this is the half a later
+  "consistency" pass will flatten, and each exclusion is load-bearing: reading a mark or a seen-set
+  is a *read*, which `ProtectHome=read-only` never refuses, so reporting it would name a writable
+  directory under a message blaming the sandbox; an advisory lock the filesystem will not give is
+  the skip `_locked(required=True)` has always specified, and left indistinguishable from a
+  refusal (it raised a bare `OSError`; it now raises `LockUnavailable`) an NFS home would report
+  *every* claims directory on the box as un-cleanable, on every run, forever; a path that is merely
+  gone is a concurrent purge, not a fault; and an unparseable watermark stays a `WARNING` because
+  promoting it would fail the unit forever over one corrupt file. Two more a refactor will undo:
+  **looking can be refused too, and the version matrix splits on how** — up to 3.12 `Path.is_dir`
+  re-raises everything but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an unguarded `stat` escapes the
+  sweep and abandons every orphan behind it with nothing in `blocked`, while from 3.13 it swallows
+  the same error and the refusal only shows up at the `unlink`, where `_present` has to catch it
+  (miss either and the sweep is silently green on half the matrix) — and `shutil.rmtree` **abandons its walk on the first
+  error**, a vanished sibling included, so the best-effort salvage pass has to run for every error
+  class or a half-purged directory reads as gone. The honest limit: **a run with nothing to remove
+  attempts no write**, so a green run is evidence about that run and never a proof that the
+  `ReadWritePaths` list is right.
 
 
 ## Development Commands

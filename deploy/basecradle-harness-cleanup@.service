@@ -33,13 +33,48 @@ EnvironmentFile=/home/%i/.config/basecradle/agent.env
 # The installed console-script in the agent's venv (e.g. /home/jt/venv). NOC-tunable.
 ExecStart=/home/%i/venv/bin/basecradle-harness-cleanup --sweep
 
-# Sandboxing — the sweep only reads the BaseCradle API and deletes files under $HARNESS_HOME.
-# It needs no new privileges, no shell, and writes nowhere outside the agent's home. The NOC
-# narrows ReadWritePaths to the exact $HARNESS_HOME if it lives outside /home/%i.
+# Sandboxing — the OS bounds this sweep, not only its code (basecradle-noc#735). The founder's
+# rule: we clean what WE created; an agent's own property in its home — workspace/, scratch/,
+# scripts, repos, wallets, vaults — is never ours to touch, whatever its age. So the write
+# sandbox is EXACTLY the three places `basecradle_harness._cleanup` reaches, read off the
+# harness source at the fleet's pinned version, and re-verified per agent against that agent's
+# own agent.env by `install-cleanup-timer` before these bytes are ever stamped:
+#
+#   /home/%i/harness            $HARNESS_HOME — the six per-timeline artifact dirs it purges
+#                               (sessions, marks, seen, claims, breaker, billing) and the settled
+#                               claims + `.pruned-through` records it prunes.
+#   /home/%i/.config/basecradle $BASECRADLE_ENV_FILE's directory — the stranded
+#                               `.basecradle-env.*.tmp` it removes (it holds a live
+#                               BASECRADLE_TOKEN), and the in-place token re-mint
+#                               `_token.write_token_to_env_file` performs on a 401.
+#   /home/%i/.mempalace         ONLY its top level, for the stranded `.config.json.<hex>.tmp`
+#                               `_mempalace._write_cli_config` leaves behind. The sweep never
+#                               walks beneath it, and the palace itself lives under harness/.
+#
+# Everything else in the home — workspace/, scratch/, wallets/, .ssh/, the venv, the home
+# directory itself — is READ-ONLY to this unit: a write there fails EROFS. READS stay
+# unrestricted, deliberately: the sweep must read what it classifies, and full transparency
+# is the founder's rule — it is touching, not reading, that is fenced. The `-` prefix makes a
+# missing ~/.mempalace ignored rather than a unit that refuses to start (agents on the sqlite
+# memory provider have none).
+#
+# `ProtectHome=read-only` IS THE DIRECTIVE THAT ENFORCES ALL OF THAT, and it is not an extra
+# belt beside ReadWritePaths — it is the whole fence. MEASURED on systemd 255, not assumed:
+# `ProtectSystem=strict` does NOT cover /home, /root or /run/user; it defers those three to
+# ProtectHome= entirely. So with `ProtectHome=false`, /home stays fully read-write and
+# ReadWritePaths — which only ever ADDS write access, never removes it — changes nothing at
+# all. Narrowing the ReadWritePaths list alone was byte-identical to the whole home: all six
+# probe writes (harness/, .config/, .mempalace/, workspace/, the home root, the venv) still
+# succeeded. With `read-only` the same three succeed and the other three fail EROFS, while
+# `cat` and `ls` over ~/workspace keep working — which is why it is `read-only` and never
+# `true` (`true` makes /home inaccessible and EMPTY, blinding the supervision the founder's
+# rule requires, and would hide the artifacts the sweep must classify).
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=false
-ReadWritePaths=/home/%i
+ProtectHome=read-only
+ReadWritePaths=/home/%i/harness
+ReadWritePaths=/home/%i/.config/basecradle
+ReadWritePaths=-/home/%i/.mempalace
 PrivateTmp=true
 ProtectControlGroups=true
 ProtectKernelModules=true

@@ -12,8 +12,11 @@ The load-bearing case is **transient-error-keeps**: a platform outage must never
 never enumerated, so a purge can never reach them.
 """
 
+import errno
 import logging
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -36,6 +39,7 @@ from basecradle._exceptions import (
 
 from basecradle_harness import ClaimStore, MarkStore, SeenStore, WakeBreaker
 from basecradle_harness import _cleanup as cleanup
+from basecradle_harness import _wake as wake
 from basecradle_harness._cleanup import (
     STRANDED_AFTER,
     enumerate_artifacts,
@@ -52,6 +56,7 @@ from basecradle_harness._report import BillingState
 from basecradle_harness._session import Session
 from basecradle_harness._token import write_token_to_env_file
 from basecradle_harness._wake import Claim
+from tests.conftest import plain
 
 # Real, well-formed UUIDv7 values (never `1111…` junk), per the test-data rule.
 DELETED = "0190a8c1-7f3e-7c2a-9b1d-3e4f5a6b7c8d"
@@ -336,14 +341,14 @@ def test_one_undeletable_artifact_does_not_strand_the_rest(tmp_path, monkeypatch
 def test_purge_one_removes_unconditionally_without_a_client(tmp_path):
     paths = lay_down_all_kinds(tmp_path, DELETED)
 
-    purged = purge_one(tmp_path, DELETED)
+    purged = purge_one(tmp_path, DELETED, blocked=[])
 
     assert set(purged) == set(paths.values())
     assert all(not p.exists() for p in paths.values())
 
 
 def test_purge_one_on_unknown_uuid_is_empty(tmp_path):
-    assert purge_one(tmp_path, OTHER) == []
+    assert purge_one(tmp_path, OTHER, blocked=[]) == []
 
 
 # --- the CLI surface ----------------------------------------------------------------------
@@ -482,7 +487,7 @@ def test_every_stranded_temp_kind_is_removed_once_its_writer_is_gone(tmp_path, m
         _age(path, STRANDED_AFTER + 60)
     monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
 
-    removed = prune_stranded_temps(tmp_path)
+    removed = prune_stranded_temps(tmp_path, blocked=[])
 
     assert set(removed) == set(stranded.values())
     assert not any(path.exists() for path in stranded.values())
@@ -499,7 +504,7 @@ def test_a_temp_younger_than_the_floor_is_kept_whatever_its_pid(tmp_path, monkey
         _age(path, STRANDED_AFTER - 60)
     monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
 
-    assert prune_stranded_temps(tmp_path) == []
+    assert prune_stranded_temps(tmp_path, blocked=[]) == []
     assert all(path.exists() for path in stranded.values())
 
 
@@ -509,7 +514,7 @@ def test_a_temp_whose_writer_is_still_alive_is_kept_however_old(tmp_path):
     for path in stranded.values():
         _age(path, STRANDED_AFTER * 24)
 
-    removed = prune_stranded_temps(tmp_path)
+    removed = prune_stranded_temps(tmp_path, blocked=[])
 
     assert stranded["session"].exists()
     assert stranded["mark"].exists()
@@ -531,7 +536,7 @@ def test_the_env_temp_is_found_beside_an_env_file_outside_the_config_home(tmp_pa
     (temp,) = [p for p in env_file.parent.iterdir() if p != env_file]
     _age(temp, STRANDED_AFTER + 60)
 
-    assert prune_stranded_temps(tmp_path / "harness-home") == [temp]
+    assert prune_stranded_temps(tmp_path / "harness-home", blocked=[]) == [temp]
     assert env_file.read_text() == "BASECRADLE_TOKEN=bc_live_old\n"
 
 
@@ -553,7 +558,7 @@ def test_nothing_but_a_named_temp_in_its_own_place_is_ever_touched(tmp_path, mon
         path.write_text("x")
         _age(path, STRANDED_AFTER * 24)
 
-    assert prune_stranded_temps(tmp_path) == []
+    assert prune_stranded_temps(tmp_path, blocked=[]) == []
     assert all(path.exists() for path in bystanders)
 
 
@@ -585,7 +590,7 @@ def test_a_pid_no_process_could_hold_and_an_unreadable_dir_never_stop_the_pass(t
     locked.mkdir()
     locked.chmod(0)
     try:
-        assert prune_stranded_temps(tmp_path) == [impossible]
+        assert prune_stranded_temps(tmp_path, blocked=[]) == [impossible]
     finally:
         locked.chmod(0o700)
 
@@ -625,7 +630,7 @@ def test_a_settled_claim_at_or_below_the_mark_is_pruned_and_can_never_be_won_aga
     token.write_text("{}")
     MarkStore(tmp_path).set(LIVE, X[4])
 
-    assert prune_settled_claims(tmp_path) == 3
+    assert prune_settled_claims(tmp_path, blocked=[]) == 3
 
     assert not any(path.exists() for path in (below, legacy, at, token))
     assert unreadable.exists() and above.exists()
@@ -644,10 +649,10 @@ def test_the_watermark_never_moves_backward_with_the_mark(tmp_path):
     _settled(tmp_path, X[0])
     _settled(tmp_path, X[2])
     marks.set(LIVE, X[3])
-    assert prune_settled_claims(tmp_path) == 2
+    assert prune_settled_claims(tmp_path, blocked=[]) == 2
     marks.set(LIVE, X[1])  # the regression: X[2] is above the mark again
 
-    prune_settled_claims(tmp_path)
+    prune_settled_claims(tmp_path, blocked=[])
 
     assert ClaimStore(tmp_path).pruned_through(LIVE, kind="messages") == UUID(X[3])
     assert ClaimStore(tmp_path).claim(LIVE, X[2], kind="messages") is False  # re-listed, refused
@@ -656,7 +661,7 @@ def test_the_watermark_never_moves_backward_with_the_mark(tmp_path):
 def test_an_item_above_the_watermark_is_claimed_as_ever(tmp_path):
     _settled(tmp_path, X[0])
     MarkStore(tmp_path).set(LIVE, X[0])
-    prune_settled_claims(tmp_path)
+    prune_settled_claims(tmp_path, blocked=[])
 
     assert ClaimStore(tmp_path).claim(LIVE, X[1], kind="messages") is True
 
@@ -664,7 +669,7 @@ def test_an_item_above_the_watermark_is_claimed_as_ever(tmp_path):
 def test_nothing_is_pruned_or_written_without_a_mark(tmp_path):
     path = _settled(tmp_path, X[0])
 
-    assert prune_settled_claims(tmp_path) == 0
+    assert prune_settled_claims(tmp_path, blocked=[]) == 0
     assert path.exists()
     assert ".pruned-through" not in _claim_files(tmp_path)
 
@@ -674,7 +679,7 @@ def test_a_task_claim_is_pruned_once_the_seen_set_holds_it(tmp_path):
     unrecorded = _settled(tmp_path, X[1], kind="tasks")  # settled, but not yet in the seen-set
     SeenStore(tmp_path).add(LIVE, X[0], kind="tasks")
 
-    assert prune_settled_claims(tmp_path) == 1
+    assert prune_settled_claims(tmp_path, blocked=[]) == 1
 
     assert not handled.exists() and unrecorded.exists()
     assert ".pruned-through" not in _claim_files(tmp_path, "tasks")  # the seen-set is the record
@@ -687,7 +692,7 @@ def test_an_unreadable_watermark_is_never_overwritten_and_prunes_nothing(tmp_pat
     MarkStore(tmp_path).set(LIVE, X[3])
 
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
-        assert prune_settled_claims(tmp_path) == 0
+        assert prune_settled_claims(tmp_path, blocked=[]) == 0
 
     assert path.exists()
     assert (path.parent / ".pruned-through").read_text() == "garbage"
@@ -776,7 +781,7 @@ def test_a_refused_claim_is_never_in_flight_even_for_an_instant(tmp_path, monkey
     # settled long ago, which recovery could re-drive. A covered item is refused *before* linking.
     _settled(tmp_path, X[0])
     MarkStore(tmp_path).set(LIVE, X[0])
-    prune_settled_claims(tmp_path)
+    prune_settled_claims(tmp_path, blocked=[])
     linked: list[str] = []
     real_link = os.link
 
@@ -804,7 +809,7 @@ def test_a_stale_recoverer_cannot_bring_a_pruned_orphan_back(tmp_path):
     assert recoverer.reclaim(LIVE, X[0], kind="messages", owner="d" * 32)
     recoverer.commit(LIVE, X[0], kind="messages")
     MarkStore(tmp_path).set(LIVE, X[0])
-    assert prune_settled_claims(tmp_path) == 1
+    assert prune_settled_claims(tmp_path, blocked=[]) == 1
 
     stale = ClaimStore(tmp_path, wake="a" * 32)
     assert stale.reclaim(LIVE, X[0], kind="messages", owner="d" * 32) is False
@@ -880,7 +885,7 @@ def test_a_prune_takes_the_tokens_before_the_claim(tmp_path, monkeypatch):
         return real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", recording)
-    prune_settled_claims(tmp_path)
+    prune_settled_claims(tmp_path, blocked=[])
 
     assert order.index(token.name) < order.index(claim.name)
 
@@ -920,14 +925,14 @@ def test_a_sweep_waits_for_a_claim_between_its_check_and_its_link(tmp_path, monk
 def test_a_token_a_killed_recoverer_left_on_a_pruned_item_is_removed(tmp_path):
     _settled(tmp_path, X[0])
     MarkStore(tmp_path).set(LIVE, X[0])
-    prune_settled_claims(tmp_path)
+    prune_settled_claims(tmp_path, blocked=[])
     folder = ClaimStore(tmp_path)._folder(LIVE, "messages")
     stray = folder / f".{X[0]}.takeover.{'d' * 32}"
     stray.write_text("{}")  # won, then killed before it could back off and remove it
     live = folder / f".{X[1]}.takeover.{'d' * 32}"
     live.write_text("{}")  # above the watermark: not provably dead, so kept
 
-    prune_settled_claims(tmp_path)
+    prune_settled_claims(tmp_path, blocked=[])
 
     assert not stray.exists() and live.exists()
 
@@ -957,3 +962,383 @@ def test_the_package_imports_where_there_is_no_fcntl():
     )
 
     assert result.stdout.strip() == "ok", result.stderr
+
+
+# --- a refused write fails the run, loudly (issue #536) ------------------------------------
+#
+# The fleet unit sandboxes this sweep to exactly the three places it writes — `ProtectHome=read-only`
+# plus three `ReadWritePaths` — so a sandbox that is wrong surfaces here and *only* here: reads stay
+# unrestricted by design, so the enumeration still finds every artifact and the classify still says
+# "deleted", and only the unlink is refused. Every refusal below is one the OS genuinely raised
+# against a directory this process cannot write, not a patched exception: a mocked refusal proves
+# the handler runs, never that anything reaches it.
+
+_not_root = pytest.mark.skipif(
+    os.geteuid() == 0, reason="root bypasses the directory permissions these refusals rest on"
+)
+
+
+@contextmanager
+def _read_only(folder: Path):
+    """Make `folder` genuinely un-writable for the duration — the OS refuses; nothing is mocked."""
+    mode = stat.S_IMODE(folder.stat().st_mode)
+    folder.chmod(0o500)
+    try:
+        yield folder
+    finally:
+        folder.chmod(mode)
+
+
+def _blocked_lines(caplog) -> list[str]:
+    return [m for m in (r.getMessage() for r in caplog.records) if "cleanup blocked" in m]
+
+
+@_not_root
+def test_a_refused_purge_is_named_at_error_and_never_stops_the_rest_of_the_sweep(tmp_path, caplog):
+    paths = lay_down_all_kinds(tmp_path, DELETED)
+
+    with _read_only(tmp_path / "breaker"), caplog.at_level(logging.INFO, "basecradle_harness"):
+        summary = sweep(tmp_path, _FakeClient({DELETED: NotFoundError("gone")}))
+
+    # The artifact behind the refusal survives; every other one is purged exactly as ever.
+    assert paths["breaker_wakes"].exists()
+    assert all(not path.exists() for name, path in paths.items() if name != "breaker_wakes")
+
+    assert summary.blocked == [paths["breaker_wakes"]]
+    assert "blocked on 1 path(s)" in str(summary)
+    # A verdict about a unit of work, so the head is RED — and still one greppable token.
+    line = _blocked_lines(caplog)[0]
+    assert line.startswith(f"{RED}cleanup blocked{RESET} ")
+    assert str(paths["breaker_wakes"]) in line
+    # …and the INFO line an operator would read as "this timeline is gone" is withheld.
+    assert "purged artifacts for deleted timeline" not in plain(caplog.text)
+
+
+@_not_root
+def test_a_directory_purge_the_box_refuses_is_reported_rather_than_swallowed(tmp_path, caplog):
+    # `shutil.rmtree(..., ignore_errors=True)` swallowed the refusal *and* its errno, so a denied
+    # claims-directory purge was invisible even at WARNING. It is the strict walk that sees it.
+    folder = lay_down_all_kinds(tmp_path, DELETED)["claims_dir"]
+
+    with _read_only(folder.parent), caplog.at_level(logging.ERROR, "basecradle_harness"):
+        summary = sweep(tmp_path, _FakeClient({DELETED: NotFoundError("gone")}))
+
+    assert folder.is_dir()
+    assert summary.blocked == [folder]
+    assert str(folder) in _blocked_lines(caplog)[0]
+
+
+@_not_root
+def test_a_refused_stranded_temp_removal_is_named_at_error(tmp_path, monkeypatch, caplog):
+    stranded = _strand_every_kind(tmp_path)
+    for path in stranded.values():
+        _age(path, STRANDED_AFTER + 60)
+    monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
+    blocked: list[Path] = []
+
+    with _read_only(tmp_path / "sessions"), caplog.at_level(logging.ERROR, "basecradle_harness"):
+        removed = prune_stranded_temps(tmp_path, blocked=blocked)
+
+    assert stranded["session"].exists() and blocked == [stranded["session"]]
+    assert set(removed) == set(stranded.values()) - {stranded["session"]}  # the pass went on
+    assert str(stranded["session"]) in _blocked_lines(caplog)[0]
+
+
+@_not_root
+def test_a_refused_claims_prune_is_named_at_error(tmp_path, caplog):
+    claim = _settled(tmp_path, X[0])
+    MarkStore(tmp_path).set(LIVE, X[0])
+    folder = ClaimStore(tmp_path)._folder(LIVE, "messages")
+    blocked: list[Path] = []
+
+    with _read_only(folder), caplog.at_level(logging.ERROR, "basecradle_harness"):
+        assert prune_settled_claims(tmp_path, blocked=blocked) == 0
+
+    assert claim.exists() and blocked == [folder]
+    assert str(folder) in _blocked_lines(caplog)[0]
+
+
+def test_a_watermark_that_cannot_be_read_stays_a_warning_and_blocks_nothing(tmp_path, caplog):
+    # The other half of the grading: nothing was *refused* us here — the prune correctly declines
+    # to overwrite a watermark it cannot parse. Promoting it would fail the unit forever over one
+    # corrupt file.
+    claim = _settled(tmp_path, X[0])
+    (claim.parent / ".pruned-through").write_text("garbage")
+    MarkStore(tmp_path).set(LIVE, X[3])
+    blocked: list[Path] = []
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert prune_settled_claims(tmp_path, blocked=blocked) == 0
+
+    assert blocked == [] and _blocked_lines(caplog) == []
+    assert "left messages claims" in plain(caplog.text)
+
+
+@_not_root
+def test_main_exits_non_zero_and_names_the_path_it_could_not_remove(tmp_path, monkeypatch, capsys):
+    paths = lay_down_all_kinds(tmp_path, DELETED)
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+
+    with _read_only(tmp_path / "breaker"):
+        assert main(["--timeline", DELETED]) == 1
+
+    assert paths["breaker_wakes"].exists()
+    # `systemctl status` shows the tail of the unit's output; the path has to be in it.
+    assert str(paths["breaker_wakes"]) in capsys.readouterr().err
+
+
+def test_a_run_that_removed_everything_it_meant_to_exits_zero_and_says_nothing(
+    tmp_path, monkeypatch, caplog
+):
+    paths = lay_down_all_kinds(tmp_path, DELETED)
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+
+    with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+        assert main(["--timeline", DELETED]) == 0
+
+    assert all(not path.exists() for path in paths.values())
+    assert caplog.records == []
+
+
+def test_a_clean_sweep_blocks_on_nothing(tmp_path):
+    lay_down_all_kinds(tmp_path, DELETED)
+
+    summary = sweep(tmp_path, _FakeClient({DELETED: NotFoundError("gone")}))
+
+    assert summary.blocked == [] and "blocked on 0 path(s)" in str(summary)
+
+
+def test_the_read_only_filesystem_a_sandbox_produces_is_no_special_case(
+    tmp_path, monkeypatch, caplog
+):
+    # `ProtectHome=read-only` answers EROFS, which no test can produce without a real mount. The
+    # bound is errno-agnostic by construction — every `OSError` counts, because enumerating the
+    # ways an OS can refuse is the disease a vendor cap table is — and this pins that the one
+    # errno the fleet will actually see is not a special case a later edit could drop.
+    target = lay_down_all_kinds(tmp_path, DELETED)["billing_blocked"]
+    unlink = Path.unlink
+
+    def refuse(self, *args, **kwargs):
+        if self == target:
+            raise OSError(errno.EROFS, "Read-only file system")
+        return unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", refuse)
+    with caplog.at_level(logging.ERROR, "basecradle_harness"):
+        summary = sweep(tmp_path, _FakeClient({DELETED: NotFoundError("gone")}))
+
+    assert target.exists() and summary.blocked == [target]
+    assert "Read-only file system" in _blocked_lines(caplog)[0]
+
+
+@_not_root
+def test_a_path_two_passes_both_refuse_is_counted_and_named_once(tmp_path, monkeypatch, caplog):
+    # A deleted timeline's stranded session temp is both an artifact to purge and a temp to sweep,
+    # so a refusal reaches it twice. An operator with one file to fix must not read "blocked on
+    # 2 path(s)", and the second ERROR would add nothing the first did not already say.
+    transcript = lay_down_all_kinds(tmp_path, DELETED)["session"]
+    before = set(transcript.parent.iterdir())
+    with _killed_at_publish():
+        Session(f"timeline:{DELETED}", engine=None, path=transcript).persist()
+    (temp,) = set(transcript.parent.iterdir()) - before
+    _age(temp, STRANDED_AFTER + 60)
+    monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
+
+    with _read_only(tmp_path / "sessions"), caplog.at_level(logging.ERROR, "basecradle_harness"):
+        summary = sweep(tmp_path, _FakeClient({DELETED: NotFoundError("gone")}))
+
+    assert summary.blocked.count(temp) == 1
+    assert sorted(summary.blocked) == sorted([transcript, temp])
+    assert len([line for line in _blocked_lines(caplog) if str(temp) in line]) == 1
+
+
+@_not_root
+def test_a_purge_reports_its_own_refusal_even_when_the_path_is_already_recorded(tmp_path):
+    # `blocked` is de-duplicated across the whole run, so "did that list grow?" is a different
+    # question from "did this purge go through?". A caller that asked the first one would log
+    # "purged artifacts for deleted timeline …" over a purge the box had just refused.
+    paths = lay_down_all_kinds(tmp_path, DELETED)
+    target = paths["breaker_wakes"]
+    already = [target]  # an earlier pass named it; `_note_blocked` will not name it twice
+
+    with _read_only(tmp_path / "breaker"):
+        refused = cleanup.purge(list(paths.values()), blocked=already)
+
+    assert refused == [target]
+    assert already == [target]  # reported to the caller, never counted twice for the operator
+
+
+@_not_root
+def test_a_refused_dangling_symlink_is_not_mistaken_for_a_removal(tmp_path):
+    # The harness writes no symlinks, so one among the artifacts is somebody else's doing — but
+    # `Path.exists()` is False for a dangling link, so "is it still there?" has to be asked with
+    # `lexists` or a refused unlink of one reads as a job well done.
+    folder = tmp_path / "breaker"
+    folder.mkdir()
+    link = folder / "0190a8c1-7f3e-7c2a-9b1d-3e4f5a6b7c8d.wakes"
+    link.symlink_to(tmp_path / "nothing-here")
+    blocked: list[Path] = []
+
+    with _read_only(folder):
+        assert cleanup.purge([link], blocked=blocked) == [link]
+
+    assert link.is_symlink() and blocked == [link]
+
+
+@_not_root
+def test_an_artifact_the_box_will_not_even_stat_is_reported_and_never_ends_the_sweep(
+    tmp_path, caplog
+):
+    # On Python 3.10 `Path.is_dir` re-raises every OSError but ENOENT/ENOTDIR/EBADF/ELOOP, so a
+    # `stat` refused EACCES escapes an unguarded look — out of `_remove`, out of `sweep`, past
+    # `main`'s handler — abandoning every orphan behind it with nothing in `blocked` and a raw
+    # traceback where the one-line diagnosis belongs.
+    first = lay_down_all_kinds(tmp_path, DELETED)
+    second = lay_down_all_kinds(tmp_path, OTHER)
+    client = _FakeClient({DELETED: NotFoundError("gone"), OTHER: NotFoundError("gone")})
+    # Readable but not searchable: the enumeration's listing still works, and every `stat` of a
+    # child comes back EACCES — the shape a look can be refused in without the walk noticing.
+    with _read_only(tmp_path / "breaker") as folder:
+        folder.chmod(0o400)
+        with caplog.at_level(logging.ERROR, "basecradle_harness"):
+            summary = sweep(tmp_path, client)
+
+    assert summary.checked == 2 and summary.purged == 2  # neither timeline was abandoned
+    blocked = {first["breaker_wakes"], second["breaker_wakes"]}
+    assert set(summary.blocked) == blocked
+    # Everything the sweep *could* remove, it removed.
+    assert all(
+        not path.exists()
+        for paths in (first, second)
+        for path in paths.values()
+        if path not in blocked
+    )
+    assert len(_blocked_lines(caplog)) == 2
+
+
+@_not_root
+def test_a_sibling_that_vanishes_mid_walk_does_not_make_a_half_purged_directory_read_as_gone(
+    tmp_path, monkeypatch
+):
+    # `shutil.rmtree` re-raises on the first error and abandons the rest of the walk, so a child
+    # removed by a concurrent `--timeline` purge used to leave the directory standing while
+    # `_remove` reported it removed: exit 0, "purged artifacts for deleted timeline", nothing
+    # blocked. The salvage pass has to run for *every* error class, a vanished child included.
+    folder = lay_down_all_kinds(tmp_path, DELETED)["claims_dir"]
+    (folder / "second.claim").write_text("{}")
+    real = os.unlink
+    vanished = {"done": False}
+
+    def unlink_and_vanish(path, *args, **kwargs):
+        real(path, *args, **kwargs)
+        if not vanished["done"]:  # the very next entry goes out from under the walk
+            vanished["done"] = True
+            for sibling in list(Path(folder).iterdir()):
+                real(sibling)
+            raise FileNotFoundError(2, "No such file or directory", str(folder / "gone.claim"))
+
+    monkeypatch.setattr(os, "unlink", unlink_and_vanish)
+    summary = sweep(tmp_path, _FakeClient({DELETED: NotFoundError("gone")}))
+
+    assert not folder.exists()  # the salvage pass finished what the walk abandoned
+    assert summary.blocked == []
+
+
+@_not_root
+def test_main_sweep_exits_non_zero_when_a_removal_is_refused(tmp_path, monkeypatch, capsys):
+    # `--timeline` and `--sweep` are separate paths through `main`; only one of them was pinned.
+    paths = lay_down_all_kinds(tmp_path, DELETED)
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        cleanup, "_client_from_env", lambda: _FakeClient({DELETED: NotFoundError("gone")})
+    )
+
+    with _read_only(tmp_path / "breaker"):
+        assert main(["--sweep"]) == 1
+
+    assert paths["breaker_wakes"].exists()
+    assert str(paths["breaker_wakes"]) in capsys.readouterr().err
+
+
+def test_a_lock_the_filesystem_will_not_give_is_a_skip_and_never_fails_the_run(
+    tmp_path, monkeypatch, caplog
+):
+    # An NFS home that refuses `flock` would otherwise put every claims directory on the box in
+    # `blocked`, on every run, forever — under a message telling the operator their write sandbox
+    # is too narrow, when nothing was refused a write at all.
+    claim = _settled(tmp_path, X[0])
+    MarkStore(tmp_path).set(LIVE, X[0])
+    monkeypatch.setattr(wake, "fcntl", None)  # the platform has no advisory locks
+    blocked: list[Path] = []
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert prune_settled_claims(tmp_path, blocked=blocked) == 0
+
+    assert claim.exists() and blocked == [] and _blocked_lines(caplog) == []
+    assert "left messages claims" in plain(caplog.text)
+
+
+def test_a_claims_directory_that_vanishes_under_the_prune_is_not_a_failure(
+    tmp_path, monkeypatch, caplog
+):
+    # A concurrent `--timeline` purge, or the timer sweep overlapping a manual one: the folder is
+    # gone between the listing and the prune. `_remove`'s rule — a path that is merely gone is
+    # never a failure — has to hold here too.
+    _settled(tmp_path, X[0])
+    MarkStore(tmp_path).set(LIVE, X[0])
+    folder = ClaimStore(tmp_path)._folder(LIVE, "messages")
+    real = ClaimStore.advance_pruned_through
+
+    def vanish(self, timeline, **kwargs):
+        shutil.rmtree(folder)
+        return real(self, timeline, **kwargs)
+
+    monkeypatch.setattr(ClaimStore, "advance_pruned_through", vanish)
+    blocked: list[Path] = []
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert prune_settled_claims(tmp_path, blocked=blocked) == 0
+
+    assert blocked == [] and _blocked_lines(caplog) == []
+
+
+@_not_root
+def test_a_record_the_box_will_not_read_is_a_warning_naming_no_sandbox(tmp_path, caplog):
+    # Reading the mark is not a write, and `ProtectHome=read-only` never refuses a read — so a
+    # failure here is not a sandbox symptom, and reporting it would name the claims directory,
+    # which is writable and is not the file that failed.
+    claim = _settled(tmp_path, X[0])
+    MarkStore(tmp_path).set(LIVE, X[0])
+    MarkStore(tmp_path)._path(LIVE).chmod(0)
+    blocked: list[Path] = []
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+            assert prune_settled_claims(tmp_path, blocked=blocked) == 0
+    finally:
+        MarkStore(tmp_path)._path(LIVE).chmod(0o600)
+
+    assert claim.exists() and blocked == [] and _blocked_lines(caplog) == []
+    assert "left messages claims" in plain(caplog.text)
+
+
+@_not_root
+def test_an_artifact_dir_the_box_will_not_list_fails_cleanly_rather_than_with_a_traceback(
+    tmp_path, monkeypatch, caplog, capsys
+):
+    # The enumeration walks the artifact dirs with a bare `iterdir`, so one that cannot be listed
+    # raises out of `sweep`. `main`'s handler promises "never a raw traceback"; without `OSError`
+    # in it, the promise was false and `cleanup failed` — the head the journal is read for — was
+    # never said.
+    lay_down_all_kinds(tmp_path, DELETED)
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setattr(cleanup, "_client_from_env", lambda: _FakeClient({}))
+
+    with _read_only(tmp_path / "claims" / "messages") as folder:
+        folder.chmod(0)
+        with caplog.at_level(logging.ERROR, "basecradle_harness"):
+            assert main(["--sweep"]) == 1
+
+    line = next(m for m in (r.getMessage() for r in caplog.records) if "cleanup failed" in m)
+    assert line.startswith(f"{RED}cleanup failed{RESET} ")
+    assert "basecradle-harness-cleanup:" in capsys.readouterr().err
