@@ -667,8 +667,14 @@ class ClaimStore:
         """
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
-        temp.write_text(json.dumps(_payload(claim)))
-        os.replace(temp, path)
+        try:
+            temp.write_text(json.dumps(_payload(claim)))
+            os.replace(temp, path)
+        finally:
+            # Success renamed it away; a failure (`ENOSPC`, a refused replace) must not leave a
+            # stray record behind, exactly as `Session._save` does (issue #526). A *kill* inside
+            # the window still can, and the cleanup sweep removes those.
+            temp.unlink(missing_ok=True)
 
     def _path(self, timeline: str, kind: str, uuid: str) -> Path:
         folder = self.root / "claims" / kind / quote(timeline, safe="")

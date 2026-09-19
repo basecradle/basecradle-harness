@@ -13,6 +13,9 @@ never enumerated, so a purge can never reach them.
 """
 
 import logging
+import os
+import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote
@@ -28,14 +31,21 @@ from basecradle._exceptions import (
 )
 
 from basecradle_harness import ClaimStore, MarkStore, SeenStore, WakeBreaker
+from basecradle_harness import _cleanup as cleanup
 from basecradle_harness._cleanup import (
+    STRANDED_AFTER,
     enumerate_artifacts,
     main,
+    prune_stranded_temps,
     purge_one,
     sweep,
 )
+from basecradle_harness._install import config_home
+from basecradle_harness._mempalace import _write_cli_config
 from basecradle_harness._observability import RED, RESET
 from basecradle_harness._report import BillingState
+from basecradle_harness._session import Session
+from basecradle_harness._token import write_token_to_env_file
 
 # Real, well-formed UUIDv7 values (never `1111…` junk), per the test-data rule.
 DELETED = "0190a8c1-7f3e-7c2a-9b1d-3e4f5a6b7c8d"
@@ -345,3 +355,206 @@ def test_main_timeline_purges_via_cli(tmp_path, monkeypatch):
 
     assert main(["--timeline", DELETED]) == 0
     assert all(not p.exists() for p in paths.values())
+
+
+# --- stranded temps (issue #526) ----------------------------------------------------------
+#
+# Every temp here is produced by the **real writer**, killed at the publish instant, so a writer
+# that renames its temp breaks these tests rather than silently escaping the sweep.
+
+
+class _Killed(BaseException):
+    """The process dying at the publish instant: no handler after this point takes effect."""
+
+
+@contextmanager
+def _killed_at_publish():
+    """Run a write as if SIGKILL landed between staging the temp and publishing it.
+
+    `os.replace` and `os.link` die, and every unlink is a no-op for the duration, so the writers'
+    own exception handlers (which remove the temp on an ordinary error) cannot clean up: exactly
+    the case where nothing runs a handler, which is the only way a temp is ever stranded.
+    """
+
+    def die(*args, **kwargs):
+        raise _Killed
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(os, "replace", die)
+        mp.setattr(os, "link", die)
+        mp.setattr(os, "unlink", lambda *args, **kwargs: None)
+        mp.setattr(Path, "unlink", lambda self, missing_ok=False: None)
+        with pytest.raises(_Killed):
+            yield
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory, monkeypatch):
+    """The temp pass looks in `~/.mempalace` and beside the env file, so neither may be the real one."""
+    monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+    monkeypatch.delenv("BASECRADLE_ENV_FILE", raising=False)
+
+
+def _age(path: Path, seconds: float) -> None:
+    then = time.time() - seconds
+    os.utime(path, (then, then))
+
+
+def _strand_every_kind(home: Path) -> dict[str, Path]:
+    """One stranded temp of every kind, each left by its real writer killed mid-publish."""
+    before: set[Path] = set()
+
+    def left_behind(folder: Path) -> Path:
+        (found,) = set(folder.iterdir()) - before
+        before.add(found)
+        return found
+
+    session_file = _session_path(home, LIVE)
+    session = Session(f"timeline:{LIVE}", engine=None, path=session_file)
+    session.persist()  # the transcript itself, published normally
+    before.update(session_file.parent.iterdir())
+    with _killed_at_publish():
+        session.persist()
+    stranded = {"session": left_behind(session_file.parent)}
+
+    claims = ClaimStore(home)
+    claims.claim(LIVE, OTHER, kind="messages")
+    folder = home / "claims" / "messages" / quote(LIVE, safe="")
+    before.update(folder.iterdir())
+    with _killed_at_publish():
+        claims.commit(LIVE, OTHER, kind="messages")
+    stranded["claim_write"] = left_behind(folder)
+    with _killed_at_publish():
+        claims.claim(LIVE, DELETED, kind="messages")
+    stranded["claim_link"] = left_behind(folder)
+    with _killed_at_publish():
+        claims.reclaim(LIVE, OTHER, kind="messages", owner="0f1e2d3c4b5a69788796a5b4c3d2e1f0")
+    stranded["claim_takeover"] = left_behind(folder)
+
+    env_file = config_home() / "agent.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("BASECRADLE_TOKEN=bc_live_old\n")
+    before.update(env_file.parent.iterdir())
+    with _killed_at_publish():
+        write_token_to_env_file("bc_live_0123456789abcdef", str(env_file))
+    stranded["env"] = left_behind(env_file.parent)
+
+    mempalace = Path.home() / ".mempalace"
+    mempalace.mkdir()
+    with _killed_at_publish():
+        _write_cli_config(mempalace, mempalace / "config.json", {"palace_path": "/p"})
+    stranded["mempalace"] = left_behind(mempalace)
+
+    return stranded
+
+
+def test_every_stranded_temp_kind_is_removed_once_its_writer_is_gone(tmp_path, monkeypatch):
+    stranded = _strand_every_kind(tmp_path)
+    assert all(path.exists() for path in stranded.values())  # the fixture is real
+    for path in stranded.values():
+        _age(path, STRANDED_AFTER + 60)
+    monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
+
+    removed = prune_stranded_temps(tmp_path)
+
+    assert set(removed) == set(stranded.values())
+    assert not any(path.exists() for path in stranded.values())
+    # What each write was *for* is untouched.
+    assert _session_path(tmp_path, LIVE).exists()
+    assert (config_home() / "agent.env").read_text() == "BASECRADLE_TOKEN=bc_live_old\n"
+    assert ClaimStore(tmp_path).read(LIVE, OTHER, kind="messages").phase == "in-flight"
+
+
+def test_a_temp_younger_than_the_floor_is_kept_whatever_its_pid(tmp_path, monkeypatch):
+    stranded = _strand_every_kind(tmp_path)
+    for path in stranded.values():
+        _age(path, STRANDED_AFTER - 60)
+    monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
+
+    assert prune_stranded_temps(tmp_path) == []
+    assert all(path.exists() for path in stranded.values())
+
+
+def test_a_temp_whose_writer_is_still_alive_is_kept_however_old(tmp_path):
+    # The pid-stamped temps name this very test process, which is alive.
+    stranded = _strand_every_kind(tmp_path)
+    for path in stranded.values():
+        _age(path, STRANDED_AFTER * 24)
+
+    removed = prune_stranded_temps(tmp_path)
+
+    assert stranded["session"].exists()
+    assert stranded["claim_write"].exists()
+    # The unstamped ones have only their age to go on, and it is far past any live write.
+    assert set(removed) == {
+        stranded[kind] for kind in ("claim_link", "claim_takeover", "env", "mempalace")
+    }
+
+
+def test_the_env_temp_is_found_beside_an_env_file_outside_the_config_home(tmp_path, monkeypatch):
+    env_file = tmp_path / "elsewhere" / "agent.env"
+    env_file.parent.mkdir()
+    env_file.write_text("BASECRADLE_TOKEN=bc_live_old\n")
+    monkeypatch.setenv("BASECRADLE_ENV_FILE", str(env_file))
+    with _killed_at_publish():
+        write_token_to_env_file("bc_live_0123456789abcdef", str(env_file))
+    (temp,) = [p for p in env_file.parent.iterdir() if p != env_file]
+    _age(temp, STRANDED_AFTER + 60)
+
+    assert prune_stranded_temps(tmp_path / "harness-home") == [temp]
+    assert env_file.read_text() == "BASECRADLE_TOKEN=bc_live_old\n"
+
+
+def test_nothing_but_a_named_temp_in_its_own_place_is_ever_touched(tmp_path, monkeypatch):
+    monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
+    folder = tmp_path / "claims" / "messages" / quote(LIVE, safe="")
+    folder.mkdir(parents=True)
+    bystanders = [
+        folder / f".{OTHER}.takeover.0f1e2d3c4b5a69788796a5b4c3d2e1f0",  # a take-over token
+        folder / f"{OTHER}.claim",
+        tmp_path / "sessions" / "notes.tmp",
+        tmp_path / "marks" / f"{LIVE}.txt.1234.tmp",
+        config_home() / "agent.env.bak",
+        Path.home() / ".mempalace" / "palace" / ".config.json.0f1e2d3c.tmp",  # beneath the top
+        Path.home() / ".mempalace" / "config.json",
+    ]
+    for path in bystanders:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x")
+        _age(path, STRANDED_AFTER * 24)
+
+    assert prune_stranded_temps(tmp_path) == []
+    assert all(path.exists() for path in bystanders)
+
+
+def test_the_sweep_removes_stranded_temps_on_live_timelines_and_counts_them(
+    tmp_path, monkeypatch, caplog
+):
+    stranded = _strand_every_kind(tmp_path)
+    for path in stranded.values():
+        _age(path, STRANDED_AFTER + 60)
+    monkeypatch.setattr(cleanup, "_process_alive", lambda pid: False)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        summary = sweep(tmp_path, _FakeClient({LIVE: object()}))
+
+    assert summary.kept == 1 and summary.purged == 0  # the timeline is live and kept
+    assert summary.stranded_temps == len(stranded)
+    assert not any(path.exists() for path in stranded.values())
+    assert f"removed {len(stranded)} stranded temp(s)" in str(summary)
+    assert "removed stranded temp" in caplog.text
+
+
+def test_a_pid_no_process_could_hold_and_an_unreadable_dir_never_stop_the_pass(tmp_path):
+    folder = tmp_path / "claims" / "messages" / quote(LIVE, safe="")
+    folder.mkdir(parents=True)
+    impossible = folder / f"{OTHER}.claim.{'9' * 30}.tmp"  # `os.kill` would raise, not answer
+    impossible.write_text("{}")
+    _age(impossible, STRANDED_AFTER + 60)
+    locked = tmp_path / "claims" / "assets"
+    locked.mkdir()
+    locked.chmod(0)
+    try:
+        assert prune_stranded_temps(tmp_path) == [impossible]
+    finally:
+        locked.chmod(0o700)

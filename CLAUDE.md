@@ -756,7 +756,12 @@ see the absence of.**
   classify switch is the whole safety: **only a clean `NotFoundError` (404) purges**; success (200)
   and `Forbidden`/`NotAViewer` (403) keep, and **any** transient error (connection / rate-limit /
   5xx) keeps and retries next run. A platform outage must never read as "everything deleted" and
-  trigger a mass purge — default to keep on anything but a 404. *(Mechanics: `docs/harness-internals.md`.)*
+  trigger a mass purge — default to keep on anything but a 404. The sweep's **stranded-temp pass**
+  (issue #526) is the one part that runs on live timelines, and it is bounded the other way: it
+  removes only the harness's own staged-write temps, matched by exact name in the places they are
+  staged, once older than `STRANDED_AFTER` **and** (when the writer stamped one) with a dead pid —
+  so a live writer's temp is never touched, and the palace is never walked. *(Mechanics:
+  `docs/harness-internals.md`.)*
 
 
 ## Development Commands

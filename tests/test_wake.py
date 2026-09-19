@@ -845,6 +845,23 @@ def test_claim_store_is_atomic_exactly_once(tmp_path):
     assert claims.claim(TIMELINE_UUID, M1, kind="assets") is True
 
 
+def test_a_failed_claim_write_leaves_no_temp_behind(tmp_path, monkeypatch):
+    """A refused replace keeps the previous record and removes its staged copy (issue #526)."""
+    claims = ClaimStore(tmp_path)
+    claims.claim(TIMELINE_UUID, M1, kind="messages")
+    folder = next((tmp_path / "claims" / "messages").iterdir())
+
+    def refuse(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(OSError):
+        claims.commit(TIMELINE_UUID, M1, kind="messages")
+
+    assert [path.name for path in folder.iterdir()] == [f"{M1}.claim"]
+    assert claims.read(TIMELINE_UUID, M1, kind="messages").phase == "in-flight"
+
+
 # --- the conversation persists across wakes ----------------------------------
 
 

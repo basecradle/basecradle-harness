@@ -158,6 +158,13 @@ def write_token_to_env_file(token: str, env_file: str | None) -> None:
     _atomic_write(path, content, mode)
 
 
+#: The name `_atomic_write` stages a new env file under — ``.basecradle-env.<random>.tmp`` beside the
+#: target. Named here, once, because the cleanup sweep recognizes a stranded one by it (issue #526):
+#: a writer killed inside the window leaves a copy of a live ``BASECRADLE_TOKEN`` behind.
+TEMP_PREFIX = ".basecradle-env."
+TEMP_SUFFIX = ".tmp"
+
+
 def _atomic_write(path: Path, content: str, mode: int) -> None:
     """Replace ``path`` with ``content`` atomically, at file mode ``mode``.
 
@@ -167,7 +174,7 @@ def _atomic_write(path: Path, content: str, mode: int) -> None:
     anything fails before the rename.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".basecradle-env.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=TEMP_PREFIX, suffix=TEMP_SUFFIX)
     try:
         with os.fdopen(fd, "w") as handle:
             handle.write(content)
