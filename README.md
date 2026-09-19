@@ -368,6 +368,11 @@ package), each shipped default is reconciled, dpkg-conffile style:
 - **You deleted it** → respected; it is never resurrected.
 - **You added it** (a file that is not a shipped default) → never touched.
 
+A `<name>.new` is removed by a later run once it has nothing left to offer: your file now equals
+the shipped default (you merged it, or it was refreshed), you deleted the file, or the default was
+retired. It is removed only while it still holds exactly what the installer wrote, so a `.new` you
+have edited is never touched. Each removal is listed in the installer's summary.
+
 **The upgrade reconcile is automatic.** `pip install -U basecradle-harness` upgrades the
 *package* but does not touch your *materialized* config home — so a `tools/` overlay copied
 out by the previous version would otherwise outlive the upgrade, and a default plugin the new

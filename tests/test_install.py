@@ -426,6 +426,122 @@ def test_an_edited_file_is_re_offered_on_each_genuinely_new_default_version(tmp_
     assert (home / "prompts" / "system-prompt.md.new").read_text() == "v3\n"  # re-offered, fresh
 
 
+# --- a moot `.new` is retired (issue #526) -----------------------------------
+#
+# A `.new` is an offer. Once it has nothing left to offer, it goes, but only while it still
+# holds exactly the bytes the installer wrote. These drive it from an edited file that got its
+# `.new` at v2, then change what happens to the file.
+
+PROMPT = "prompts/system-prompt.md"
+
+
+def _offered(tmp_path):
+    """An install at v1, an operator edit, and a v2 upgrade that wrote the `.new` beside it."""
+    home = tmp_path / "cfg"
+    install(home, defaults=V1)
+    (home / PROMPT).write_text("MY charter\n")
+    report = install(home, defaults=V2)
+    assert report.actions[PROMPT] == KEPT_EDITED
+    offer = home / "prompts" / "system-prompt.md.new"
+    assert offer.read_text() == "v2 charter\n"
+    return home, offer
+
+
+def test_a_merged_offer_is_removed_on_the_next_run(tmp_path):
+    home, offer = _offered(tmp_path)
+    (home / PROMPT).write_text("v2 charter\n")  # the operator took the new default
+
+    report = install(home, defaults=V2)  # the same version again, as a converge re-runs it
+
+    assert not offer.exists()
+    assert report.retired_offers == [PROMPT]
+    assert f"removed {PROMPT}.new" in report.summary()
+
+
+def test_an_offer_is_removed_when_the_file_it_shadowed_is_deleted(tmp_path):
+    home, offer = _offered(tmp_path)
+    (home / PROMPT).unlink()
+
+    report = install(home, defaults=V2)
+
+    assert not offer.exists()
+    assert report.retired_offers == [PROMPT]
+
+
+def test_an_offer_is_removed_when_the_next_version_refreshes_the_file(tmp_path):
+    # The operator restored the old default (so the file reads as pristine), and v3 refreshes it:
+    # the v2 `.new` offers nothing the file does not now have.
+    home, offer = _offered(tmp_path)
+    (home / PROMPT).write_text("v2 charter\n")
+
+    report = install(home, defaults={**V2, PROMPT: "v3 charter\n"})
+
+    assert report.actions[PROMPT] == REFRESHED
+    assert (home / PROMPT).read_text() == "v3 charter\n"
+    assert not offer.exists()
+    assert report.retired_offers == [PROMPT]
+
+
+def test_an_offer_is_removed_when_its_default_is_retired(tmp_path):
+    home = tmp_path / "cfg"
+    install(home, defaults={"tools/old.py": "# v1\n"})
+    (home / "tools" / "old.py").write_text("# mine\n")
+    install(home, defaults={"tools/old.py": "# v2\n"})
+    offer = home / "tools" / "old.py.new"
+    assert offer.exists()
+
+    report = install(home, defaults={"tools/other.py": "# v1\n"})  # old.py no longer ships
+
+    assert report.actions["tools/old.py"] == KEPT_EDITED  # the operator's file stays theirs
+    assert (home / "tools" / "old.py").read_text() == "# mine\n"
+    assert not offer.exists()  # but the offer of a default that no longer exists goes
+    assert report.retired_offers == ["tools/old.py"]
+
+
+def test_an_open_offer_is_kept(tmp_path):
+    # The file still differs from the default, so the `.new` is still something to merge.
+    home, offer = _offered(tmp_path)
+
+    report = install(home, defaults=V2)
+
+    assert offer.read_text() == "v2 charter\n"
+    assert report.retired_offers == []
+
+
+def test_an_offer_the_operator_edited_is_never_removed(tmp_path):
+    home, offer = _offered(tmp_path)
+    offer.write_text("v2 charter\nplus my notes on merging it\n")
+    (home / PROMPT).unlink()  # even with its file gone, the edit is theirs
+
+    report = install(home, defaults=V2)
+
+    assert offer.read_text() == "v2 charter\nplus my notes on merging it\n"
+    assert report.retired_offers == []
+
+
+def test_a_new_file_beside_a_file_the_installer_does_not_manage_is_never_touched(tmp_path):
+    home = tmp_path / "cfg"
+    install(home, defaults=V1)
+    (home / "tools" / "my_tool.py.new").write_text("v1 notes\n")  # happens to match a default
+
+    install(home, defaults=V1)
+
+    assert (home / "tools" / "my_tool.py.new").exists()
+
+
+def test_an_offer_that_differs_from_the_recorded_default_is_kept(tmp_path):
+    # A `.new` from an older default than the manifest records cannot be shown to be our own
+    # copy (the bytes are not the ones the record names), so it is kept, not guessed at.
+    home, offer = _offered(tmp_path)
+    offer.write_text("v1 charter\n")
+    (home / PROMPT).unlink()
+
+    report = install(home, defaults=V2)
+
+    assert offer.exists()
+    assert report.retired_offers == []
+
+
 # --- version stamp + upgrade reconcile (issue #160) --------------------------
 
 

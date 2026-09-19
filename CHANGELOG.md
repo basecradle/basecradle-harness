@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.124.0] - 2026-09-19
+
+### Changed: the installer removes a `<name>.new` once it has nothing left to offer (issue #526)
+
+Founder-approved, 2026-09-19. When an operator has edited a shipped default,
+`basecradle-harness-install` writes the new default beside it as `<name>.new`. Nothing ever took
+that file away again: after the operator merged it, deleted the file, or the default was retired,
+the `.new` stayed on every agent indefinitely, looking exactly like an open merge task. It is now
+removed by the next run once it is moot, meaning its file equals the shipped default, is gone, or
+has no shipped default any more.
+
+A `.new` is removed only while it still holds exactly the bytes the installer wrote. The proof is
+the manifest the installer already keeps: every `.new` is written with the default whose hash that
+same run records, so a `.new` that hashes to the pre-run manifest entry is the installer's own
+untouched copy. No new bookkeeping, no change to `.manifest.json`'s shape, and a `.new` written by
+an earlier version is covered too. A `.new` the operator has edited, one that does not match the
+record, one beside a file the installer does not manage, and one whose file still differs from its
+default (an open offer) are all kept. Each removal is listed in the summary as
+`removed <rel>.new`.
+
 ## [0.123.1] - 2026-09-18
 
 ### Changed: "persona" means an agent's personality, never the agent (issue #512)
