@@ -43,10 +43,16 @@ jobs:
       - uses: astral-sh/setup-uv@v10.1.0
       - name: Build the wheel and sdist
         run: uv build
+      # The artifact only carries dist/ from this job to the two publish jobs; the published wheel
+      # and sdist on PyPI are the durable copy. It must outlive the pypi gate, which fails a job
+      # left unapproved for 30 days, so 30 is the shortest safe retention (the repo default is 90).
+      # Deleting it in-workflow after the publish would need `actions: write` on the one workflow
+      # that holds the OIDC publish grant, which costs more than the storage it would save.
       - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
+          retention-days: 30
 
   publish-testpypi:
     name: publish to TestPyPI (rehearsal)
