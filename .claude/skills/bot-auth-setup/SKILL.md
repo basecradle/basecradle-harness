@@ -49,16 +49,29 @@ prints it, so never call it. Hand git the token through a credential helper that
 **On the laptop** (where this agent runs today — no helper installed, so set it per command):
 
 ```bash
-git -c credential.helper= \
-    -c credential.helper='!f() { if [ "$1" = get ]; then echo username=x-access-token; echo "password=$GH_TOKEN"; fi; }; f' \
+git -c 'credential.https://github.com.helper=' \
+    -c 'credential.https://github.com.helper=!f() { if [ "$1" = get ]; then if [ -z "$GH_TOKEN" ]; then echo quit=1; else echo username=x-access-token; echo "password=$GH_TOKEN"; fi; fi; }; f' \
     push origin <branch>
 ```
 
 The single quotes keep `$GH_TOKEN` literal in argv — the helper's own shell expands it from the
-environment. **The empty `credential.helper=` first is load-bearing**: it resets the helper
-list, and without it the laptop's system `osxkeychain` helper is asked **first** (measured, git
-2.55) — it can answer with the `drawkkwast` credential (the silent fallback again, one layer
-down) and, after a successful push, would **store** the bot token in the keychain.
+environment. Three properties are load-bearing (`basecradle#544`; each verified with
+`git credential fill` and a fake token, git 2.55):
+
+- **Both entries are scoped to `https://github.com`.** An unscoped helper answers for **every**
+  host, so any non-GitHub URL the same command touches — a submodule, a redirect, a mistyped
+  remote — would be handed a live installation token. Scoped, a `gitlab.com` fill never reaches
+  it.
+- **The scoped empty `credential.https://github.com.helper=` first resets the helper list** for
+  github.com. Without it the laptop's system `osxkeychain` helper is asked **first** — it can
+  answer with the `drawkkwast` credential (the silent fallback again, one layer down) and, after
+  a successful push, would **store** the bot token in the keychain. The reset works because
+  git reads system config before `-c`, so the empty value clears the `osxkeychain` entry
+  already collected (`GIT_TRACE` shows it is never invoked for github.com).
+- **An unset `GH_TOKEN` emits `quit=1`**, so git stops without sending a credential, naming the
+  helper as the reason (`credential helper … told us to quit`). The unguarded helper answered
+  with an empty password and exit 0, so git sent it and the push failed with a generic auth
+  error that named nothing.
 
 (The `http.extraheader="AUTHORIZATION: bearer $TOKEN"` form **fails** — "invalid credentials" —
 for App installation tokens, and is argv besides.)
