@@ -52,7 +52,7 @@ from basecradle_harness import (
     install,
 )
 from basecradle_harness import _wake as wake_module
-from basecradle_harness._basecradle import _incoming_text, _parse_created_at
+from basecradle_harness._basecradle import _incoming_text, _messages_since, _parse_created_at
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
 from basecradle_harness._report import billing_onset_line
@@ -86,6 +86,9 @@ PEER_AI_UUID = "019e7756-9f60-7a80-93a4-6f7081920314"
 TIMELINE_UUID = "019e7750-66ee-7f53-829f-13a8a710b6da"
 
 # Well-formed UUIDv7 message ids, oldest → newest.
+#: A message older than every `Mn`: a mark set here leaves M0 onward unseen, because the scan stops
+#: at the mark's *position* in uuid order (`_messages_since`), whether or not the item is listed.
+PRIOR = "019e7751-0000-7000-8000-00000000a0a0"
 M0 = "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"
 M1 = "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70"
 M2 = "019e7753-6c3d-7e4f-8051-3c4d5e6f7081"
@@ -512,6 +515,38 @@ def test_no_new_messages_makes_no_provider_call(platform, tmp_path):
 
     assert agent.wake() == []
     assert provider.prompts == []
+
+
+def test_a_mark_whose_item_is_gone_still_hides_everything_at_or_before_it(platform, tmp_path):
+    """The mark is a *position* in uuid order, not an item that must still be listed (issue #526).
+
+    The mark names M1, and M1 is no longer on the timeline. Stopping only on equality used to walk
+    straight past where it stood and hand M0 (and, on a real timeline, every page of history) back
+    as unseen. The platform lists by uuid, so the scan stops where M1 would have been.
+    """
+    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+    serve_messages(
+        platform, page(message(uuid=M2, body="new question"), message(uuid=M0, body="answered"))
+    )
+    agent, provider = build_wake(tmp_path)
+
+    agent.wake()
+
+    assert provider.prompts == ["[2026-06-04T00:00:00.000Z] john: new question"]
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
+
+
+def test_the_scan_stops_at_the_marks_position_and_nowhere_else():
+    def item(uuid):
+        return SimpleNamespace(content=SimpleNamespace(uuid=uuid))
+
+    newest_first = [item(M3), item(M2), item(M0)]
+
+    assert [m.content.uuid for m in _messages_since(newest_first, M1)] == [M2, M3]  # M1 is gone
+    assert [m.content.uuid for m in _messages_since(newest_first, M2)] == [M3]  # M2 is listed
+    assert [m.content.uuid for m in _messages_since(newest_first, None)] == [M0, M2, M3]
+    # A mark with no order to read keeps the equality-only stop rather than guess at one.
+    assert [m.content.uuid for m in _messages_since(newest_first, "not-a-uuid")] == [M0, M2, M3]
 
 
 def test_new_message_after_a_mark_is_answered(platform, tmp_path):
@@ -4682,7 +4717,7 @@ def test_a_completed_turn_is_committed_never_re_driven(platform, tmp_path, caplo
             message(uuid=M0, body="what's up?"),
         ),
     )
-    MarkStore(tmp_path).set(TIMELINE_UUID, M1)  # a mark older than M0, so M0 is re-read
+    MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)  # a mark older than M0, so M0 is re-read
 
     agent, provider = build_wake(tmp_path)
     with caplog.at_level(logging.INFO):
@@ -4712,7 +4747,7 @@ def test_a_silent_completed_turn_is_committed_too(platform, tmp_path):
     session.history.append(Message.assistant(content="Small talk, wrapping up. No reply needed."))
     session._save()
     serve_messages(platform, page(message(uuid=M0, body="what's up?")))
-    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+    MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)
 
     agent, provider = build_wake(tmp_path)
     posted = agent.wake()
@@ -4746,7 +4781,7 @@ def test_recovery_reads_the_transcript_never_the_timeline(platform, tmp_path):
             message(uuid=M0, body="a peer's real question"),
         ),
     )
-    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+    MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)
 
     agent, provider = build_wake(tmp_path)
     posted = agent.wake()
@@ -4771,7 +4806,7 @@ def test_a_live_concurrent_wake_still_owns_its_claim(platform, tmp_path):
         Claim(phase="in-flight", pid=os.getppid(), wake="a-live-wake", at=time.time()),
     )
     serve_messages(platform, page(message(uuid=M0, body="mine, hands off")))
-    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+    MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)
 
     agent, provider = build_wake(tmp_path)
     posted = agent.wake()
@@ -4781,7 +4816,7 @@ def test_a_live_concurrent_wake_still_owns_its_claim(platform, tmp_path):
     assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "in-flight"
     # And the mark must NOT pass it. If that wake dies, the message has to stay findable — a mark
     # that sailed past an in-flight item would hide it forever, which is the bug #285 exists to fix.
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == PRIOR
 
 
 def test_a_legacy_empty_claim_reads_as_done_and_is_never_re_driven(platform, tmp_path):
@@ -4799,7 +4834,7 @@ def test_a_legacy_empty_claim_reads_as_done_and_is_never_re_driven(platform, tmp
     assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
 
     serve_messages(platform, page(message(uuid=M0, body="answered long ago")))
-    MarkStore(tmp_path).set(TIMELINE_UUID, M1)
+    MarkStore(tmp_path).set(TIMELINE_UUID, PRIOR)
     agent, provider = build_wake(tmp_path)
 
     assert agent.wake() == []
