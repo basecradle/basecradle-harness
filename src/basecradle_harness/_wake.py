@@ -322,15 +322,32 @@ _IN_FLIGHT = "in-flight"
 _DONE = "done"
 _ABANDONED = "abandoned"
 
-#: How long an `in-flight` claim whose recorded pid *still resolves to a live process* may sit
-#: before it is treated as orphaned anyway. It exists for exactly one case: the box rebooted (or
-#: the process died long ago) and the kernel handed that pid to an unrelated process, so the
-#: liveness check answers "alive" about a wake that is long gone. Six hours is orders of magnitude
-#: beyond any real wake — a wake is bounded by `max_steps` model calls, each bounded by the SDK's
-#: own timeout — so this can never fire on a wake that is genuinely still working, which is the
-#: one thing it must never do (that would re-drive an item a live wake is mid-way through
-#: answering, and post twice).
+#: How long an `in-flight` claim whose recorded pid *still resolves to a live process* may go
+#: **without its owner making progress** before it is treated as orphaned anyway. It exists for
+#: exactly one case: the box rebooted (or the process died long ago) and the kernel handed that
+#: pid to an unrelated process, so the liveness check answers "alive" about a wake that is long
+#: gone. It must never fire on a wake that is genuinely still working — that would re-drive an
+#: item a live wake is mid-way through answering, and post twice.
+#:
+#: **What keeps that true is the heartbeat, not the number** (issue #532). This used to argue that
+#: a wake is bounded by `max_steps` model calls, so six hours could never pass inside one. It is
+#: not: a step dispatches any number of tool calls, a `shell` call runs up to ten minutes, the step
+#: budget is raisable, and the router sets no timeout on a wake — one turn can outlast six hours.
+#: So a wake refreshes the `at` of every claim it holds as it makes progress (`ClaimStore.beat`,
+#: driven by the engine on every step and every tool completion, and after each read-pace), and
+#: "older than six hours" now means "no progress for six hours". At the shipped settings no single
+#: uninterrupted phase comes near that — one model call with its retries, one tool call (a `shell`
+#: call is capped at ten minutes), one pacing read. An operator who raises the uncapped knobs
+#: (`HARNESS_MCP_TIMEOUT`, `HARNESS_RESPONSE_RETRIES`, a very slow `HARNESS_PACE_CHARS_PER_SEC`)
+#: far enough can still stretch one phase past it; the bound is theirs to keep.
 _CLAIM_STALE_AFTER = 6 * 60 * 60
+
+#: The least time between two refreshes of one held claim (issue #532). The heartbeat fires on every
+#: step and every tool completion, and a message batch is claimed up front, so without a gate its
+#: write cost would scale with the step count times the batch. Gated, it is bounded by wall clock:
+#: at most one small atomic write per held claim per interval — and an interval this far below
+#: `_CLAIM_STALE_AFTER` leaves a live wake hours of margin even across the longest single call.
+_CLAIM_BEAT_EVERY = 5 * 60
 
 
 @dataclass(frozen=True)
@@ -395,7 +412,8 @@ def _orphaned(claim: Claim, *, pid: int, wake: str, now: float | None = None) ->
        and never recover it — which is exactly what a single-process poll loop would hit.
     3. **Another process owns it** → ask the OS whether that process still exists.
     4. **It says alive, but the claim is ancient** → the pid was reused (the box rebooted and the
-       kernel handed the number to something unrelated). `_CLAIM_STALE_AFTER` catches it.
+       kernel handed the number to something unrelated). `_CLAIM_STALE_AFTER` catches it — and the
+       owner's heartbeat keeps a *working* wake's claim younger than that (issue #532).
 
     Note pid reuse can only ever make step 3 answer "alive" about a *dead* wake, so it delays a
     recovery rather than causing a duplicate — the safe direction, with step 4 as the backstop.
@@ -585,6 +603,88 @@ class ClaimStore:
         #: fresh one so a store built ad hoc (a test, a script) still writes a well-formed record.
         self.wake = wake or uuid4().hex
 
+    @property
+    def wake(self) -> str:
+        return self._wake
+
+    @wake.setter
+    def wake(self, value: str) -> None:
+        """A new wake holds nothing yet (issue #532).
+
+        What the last wake of this process still held is *its* business: an orphan for this wake
+        to recover (`_orphaned` rule 2), never a claim to keep alive. Refreshing it under the new
+        identity would make it read as this wake's own, and it would never be recovered at all.
+        """
+        self._wake = value
+        #: Every in-flight claim this wake holds, keyed ``(timeline, kind, uuid)``, with when it was
+        #: last refreshed on both clocks (monotonic, wall) — what `beat` keeps young.
+        self._held: dict[tuple[str, str, str], tuple[float, float]] = {}
+
+    def _hold(self, timeline: str, kind: str, uuid: str) -> None:
+        """Start keeping a claim this wake just took alive — `claim` and `reclaim` both call it."""
+        self._held[(timeline, kind, uuid)] = (time.monotonic(), time.time())
+
+    def beat(self) -> None:
+        """Refresh every in-flight claim this wake holds, at most once per `_CLAIM_BEAT_EVERY`.
+
+        The heartbeat (issue #532). The engine calls it through the session's progress hook on
+        every step and every tool completion, so a claim's age means *time since its owner last
+        made progress* — which is what `_orphaned`'s age rule has always claimed to measure. It
+        **never raises**: a refresh that fails is logged and retried after the next interval, and
+        the turn carries on, because the worst a missed refresh can do is let a claim age, which
+        is where it stood before the heartbeat existed.
+        """
+        mono, wall = time.monotonic(), time.time()
+        for key, (last_mono, last_wall) in list(self._held.items()):
+            # Due by **either** clock. The gate wants a monotonic clock (a wall clock can jump), but
+            # `_orphaned` measures age on the wall clock, and a monotonic one stops across a host
+            # suspend or a VM pause — after six hours paused, a claim is already stale by the wall
+            # clock while the monotonic gate still says the last beat was a moment ago.
+            if mono - last_mono < _CLAIM_BEAT_EVERY and wall - last_wall < _CLAIM_BEAT_EVERY:
+                continue
+            self._held[key] = (mono, wall)  # attempted: a failure retries after the interval
+            timeline, kind, uuid = key
+            try:
+                if not self._refresh(timeline, kind, uuid):
+                    del self._held[key]
+            except OSError as error:
+                _log.warning(
+                    "Could not refresh the claim on %s %s; it keeps aging until the next beat: %s",
+                    kind,
+                    uuid,
+                    error,
+                )
+
+    def _refresh(self, timeline: str, kind: str, uuid: str) -> bool:
+        """Rewrite one held claim with a fresh `at`. False if it is no longer this wake's to keep.
+
+        Compare, then write, under the directory's exclusive lock — the same one `reclaim` holds to
+        re-read and write — so a take-over and a refresh can never interleave. It refreshes only a
+        claim that is still `in-flight` **and** still names this wake; once a take-over has written
+        its own record the claim names someone else, and this leaves it alone. Only `at` changes.
+
+        **A take-over *token* is not a reason to stop, and stopping there would be the bug.** A
+        recoverer links its token without the lock and only then re-reads, under it, whether the
+        claim is still an orphan — and a fresh `at` is what makes it answer no and back off. An
+        owner that went quiet at the sight of the token would hand a live item to that recoverer,
+        and one whose recoverer died after linking would stop beating for good and be taken over
+        six hours later while still working.
+
+        A claims directory that is gone (the timeline was deleted and purged mid-wake) holds
+        nothing to keep alive.
+        """
+        path = self._path(timeline, kind, uuid)
+        if not path.parent.is_dir():
+            return False
+        with _locked(path.parent, shared=False, required=False):
+            current = self.read(timeline, uuid, kind=kind)
+            if current is None or current.phase != _IN_FLIGHT or current.wake != self.wake:
+                return False  # settled, pruned, or not ours: nothing to keep alive
+            self._write(
+                path, Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time())
+            )
+        return True
+
     def claim(self, timeline: str, uuid: str, *, kind: str) -> bool:
         """Atomically claim `(kind, timeline, uuid)` as **in-flight**. True if this wake won it.
 
@@ -632,7 +732,8 @@ class ClaimStore:
                 self._write(path, Claim(phase=_DONE, at=time.time()))
                 self._refused(timeline, uuid, kind=kind)
                 return False
-            return True
+        self._hold(timeline, kind, uuid)
+        return True
 
     def _publish(self, path: Path, uuid: str, record: Claim) -> bool:
         """Link `record` into place at `path` if nothing is there. False if something already is."""
@@ -849,6 +950,7 @@ class ClaimStore:
                 token.unlink(missing_ok=True)
                 return False
             self._write(path, record)
+        self._hold(timeline, kind, uuid)
         return True
 
     def effective_owner(self, timeline: str, uuid: str, *, kind: str, claim: Claim) -> Claim:
@@ -895,6 +997,7 @@ class ClaimStore:
     def commit(self, timeline: str, uuid: str, *, kind: str) -> None:
         """Mark the item **done** — acted on, disposition final. The mark may now pass it."""
         self._write(self._path(timeline, kind, uuid), Claim(phase=_DONE, at=time.time()))
+        self._held.pop((timeline, kind, uuid), None)
 
     def abandon(self, timeline: str, uuid: str, *, kind: str, reason: str) -> None:
         """Mark the item **abandoned** — it will never be acted on, and we know why.
@@ -908,6 +1011,7 @@ class ClaimStore:
             self._path(timeline, kind, uuid),
             Claim(phase=_ABANDONED, at=time.time(), reason=reason),
         )
+        self._held.pop((timeline, kind, uuid), None)
 
     def unsettled(self, timeline: str, *, kind: str) -> list[str]:
         """The uuids of every item of `kind` on `timeline` whose claim is not yet final.
@@ -1804,11 +1908,14 @@ class WakeAgent:
         # compacted away by a later turn of this same wake. See `_turn_truncated`.
         self._unfinished_turn = False
         outcome = "error"  # only a clean return past the reconciles earns another verdict
+        session: Session | None = None
         try:
             if self._breaker_short_circuits():
                 outcome = "declined"
                 return []  # a tripped timeline self-declines: no session, no provider call
             session = self.harness.session(self.source)
+            # The claims this wake holds stay young while it makes progress (issue #532).
+            session.heartbeat = self.claims.beat
             self._brief = None  # compose the brief once this wake, lazily, before the model
             self._brief_composed = False
             self._brief_sections = {}
@@ -1851,6 +1958,10 @@ class WakeAgent:
             outcome = "ok"
             return posted + self.speech.posts
         finally:
+            # This wake is over; its claims are no longer its to keep alive (issue #532). A session
+            # reused after it must not go on refreshing what it left in flight.
+            if session is not None:
+                session.heartbeat = None
             # `max_steps` is a **per-turn** budget and a wake may take several turns — one per
             # activated task, posted asset, or webhook delivery (unseen messages batch into a
             # single turn), *plus* one for every mid-generation rebuild the staleness guard makes
@@ -3997,6 +4108,7 @@ class WakeAgent:
             restarts = 0
             while True:
                 self.pacer.pace(newest)
+                self.claims.beat()  # the batch is claimed and a read can take minutes (issue #532)
                 new_peers, _ = self._absorb(session, self._fetch_fresh(), posted)
                 batch.extend(new_peers)
                 if not (new_peers and getattr(new_peers[-1].user, "kind", None) == "ai"):

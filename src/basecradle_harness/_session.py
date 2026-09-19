@@ -185,6 +185,9 @@ class Session:
         self.engine = engine
         self.path = Path(path) if path is not None else None
         self.compactor = compactor
+        #: Called on every step and tool completion of a turn (`_progress_hook`): the owning wake's
+        #: claim heartbeat (issue #532). ``None`` outside a wake.
+        self.heartbeat: Callable[[], None] | None = None
         #: This session's private staging token for the atomic save (`_save`). Per *instance*, not
         #: per process: two `Harness` instances over one home hold two `Session`s on the same path
         #: in the same process, and they must not share a temp file.
@@ -558,8 +561,30 @@ class Session:
         self._save()
 
     def _progress_hook(self) -> Callable[[], None] | None:
-        """The engine's per-append persist callback — ``None`` for an in-memory session."""
-        return self._persist_progress if self.path is not None else None
+        """The engine's per-append callback: persist the turn, then beat — ``None`` if neither.
+
+        The engine calls it on every step (before any of that step's tools run) and after every
+        tool result, which is exactly the cadence a liveness signal wants — so the owner's
+        `heartbeat` rides it (issue #532). The persist keeps its contract: if the pre-dispatch
+        persist raises, the turn still fails, and the beat still runs first thing in the
+        `finally`. The beat itself can never fail the turn.
+        """
+        persist = self._persist_progress if self.path is not None else None
+        beat = self.heartbeat
+        if beat is None:
+            return persist
+
+        def progress() -> None:
+            try:
+                if persist is not None:
+                    persist()
+            finally:
+                try:
+                    beat()
+                except Exception:  # noqa: BLE001 - a liveness signal must never end a turn
+                    _log.exception("The claim heartbeat failed; the turn carries on.")
+
+        return progress
 
     def _persist_progress(self) -> None:
         """Write the turn *in progress*: the frozen transcript with the work so far spliced in.
