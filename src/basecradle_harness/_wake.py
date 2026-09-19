@@ -207,6 +207,14 @@ class MarkStore:
     the next wake reads the mark and skips everything at or before it. Messages and
     webhook events advance their marks independently, so reconciling one never
     re-surfaces the other.
+
+    **A mark is written atomically** (issue #526). It used to be a plain `write_text`: truncate,
+    then write. A reader landing between the two — a concurrent wake, or the cleanup sweep — read
+    an empty file, and `get` reads empty as **no mark**, which sends the message path into its
+    first-wake bootstrap and a reply reaching back to the agent's last post. A kill between them
+    (or `ENOSPC` after the truncate) left it that way for every later wake. Temp, `fsync`,
+    `os.replace` — the discipline `Session._save` already keeps — means a reader sees the old mark
+    or the new one, and nothing else.
     """
 
     def __init__(self, root: str | Path) -> None:
@@ -221,7 +229,17 @@ class MarkStore:
     def set(self, timeline: str, uuid: str, *, kind: str = _MESSAGES) -> None:
         path = self._path(timeline, kind)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(uuid)
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            with open(temp, "w") as handle:
+                handle.write(uuid)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        finally:
+            # Success renamed it away; a failure must not leave a stray copy. A *kill* inside the
+            # window still can, and the cleanup sweep removes those (`_cleanup._MARK_TEMP`).
+            temp.unlink(missing_ok=True)
 
     def _path(self, timeline: str, kind: str = _MESSAGES) -> Path:
         # Messages live directly under `marks/` (the original layout); every other

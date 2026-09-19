@@ -7,6 +7,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.125.2] - 2026-09-19
+
+### Fixed: a high-water mark can no longer be read as empty (issue #526)
+
+`MarkStore.set` was a plain `write_text`: truncate, then write. A reader landing between the two (a
+concurrent wake, or the cleanup sweep) read an empty file, and `MarkStore.get` reads an empty file
+as **no mark**. On the message path that means the first-wake bootstrap, which replies to
+everything since the agent's own last post. A kill between the two, or `ENOSPC` after the
+truncate, left the file empty for every later wake. Found by the adversarial review of the claim
+prune, where it measured an empty read on about one in nine reads against a writer in a tight
+loop. The mark is now written the way `Session._save` writes a transcript: temp, `fsync`,
+`os.replace`, so a reader sees the old mark or the new one. A failed write keeps the old mark and
+removes its temp.
+
+The staged mark (`marks/[<kind>/]<timeline>.txt.<pid>.tmp`) is covered where the others are: the
+orphan sweep purges one with its deleted timeline, and the stranded-temp pass removes one on a live
+timeline once it is an hour old and its pid is dead.
+
 ## [0.125.1] - 2026-09-19
 
 ### Fixed: the high-water mark stops the scan at its position, even when its item is gone (issue #526)

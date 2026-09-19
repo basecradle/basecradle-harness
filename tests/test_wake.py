@@ -880,6 +880,26 @@ def test_claim_store_is_atomic_exactly_once(tmp_path):
     assert claims.claim(TIMELINE_UUID, M1, kind="assets") is True
 
 
+def test_a_failed_mark_write_keeps_the_old_mark_and_leaves_no_temp(tmp_path, monkeypatch):
+    """A failed mark write keeps the old mark whole, and leaves no staged copy (issue #526).
+
+    The old write truncated before it wrote, so a failure after the truncate (or a reader in the
+    gap) saw an empty file, and `get` reads empty as *no mark* — a first-wake bootstrap.
+    """
+    marks = MarkStore(tmp_path)
+    marks.set(TIMELINE_UUID, M0)
+
+    def refuse(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(os, "replace", refuse)
+    with pytest.raises(OSError):
+        marks.set(TIMELINE_UUID, M1)
+
+    assert marks.get(TIMELINE_UUID) == M0
+    assert [path.name for path in (tmp_path / "marks").iterdir()] == [f"{TIMELINE_UUID}.txt"]
+
+
 def test_a_failed_claim_write_leaves_no_temp_behind(tmp_path, monkeypatch):
     """A refused replace keeps the previous record and removes its staged copy (issue #526)."""
     claims = ClaimStore(tmp_path)
