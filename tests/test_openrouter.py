@@ -40,7 +40,9 @@ from basecradle_harness import (
     ToolCall,
     ToolSpec,
 )
+from basecradle_harness._engine import _TRANSIENT
 from basecradle_harness._openrouter import _diagnostics, _routable
+from basecradle_harness._retry import connection_reason
 
 # A fabricated OpenRouter endpoint + a correctly-shaped fake key. The SDK posts to
 # ``<server_url>/chat/completions`` — verified against the real 0.11.3 SDK.
@@ -653,6 +655,47 @@ def test_transport_failure_maps_to_connection_error(router):
     provider = _provider(retries_disabled=True)
     with pytest.raises(ProviderConnectionError):
         provider.chat([Message.user("Hi")])
+    provider.close()
+
+
+def test_a_real_read_timeout_through_this_sdk_is_named_a_timeout(router):
+    """The taxonomy word, proven against **this** SDK's own chain (issues #545, #433).
+
+    This is the adapter the live incident happened on, so its chain is the one that has to be read
+    right: `Could not reach OpenRouter: The read operation timed out` must log `reason=timeout` and
+    be retried, not read as a bare transport drop. The `openrouter` SDK lets `httpx` propagate, so
+    the fact sits one hop down — the *other* depth from the `openai` adapter, whose own chain is
+    pinned the same way in `test_provider.py`.
+
+    **Both adapters are pinned because assuming either one is how the first draft of #545 shipped
+    a wrong word**: the `openai` path runs on HTTPX2 and read `transport` for a genuine timeout,
+    invisibly, because the only test of it chained an `httpx` exception by hand. A mock that defines
+    the fact it verifies has verified nothing; a vendor's real chain is the authority on its own
+    shape.
+    """
+    router.post(CHAT_URL).mock(side_effect=httpx.ReadTimeout("The read operation timed out"))
+    provider = _provider(retries_disabled=True)
+
+    with pytest.raises(ProviderConnectionError) as raised:
+        provider.chat([Message.user("Hi")])
+
+    assert connection_reason(raised.value) == "timeout"
+    assert isinstance(
+        raised.value, _TRANSIENT
+    )  # caught by the engine's retry, not propagated on first raise
+    provider.close()
+
+
+def test_a_connect_failure_through_this_sdk_keeps_the_other_word(router):
+    """The half that really did not reach the model — retried too, named apart so a journal can
+    tell a dead network from a slow vendor."""
+    router.post(CHAT_URL).mock(side_effect=httpx.ConnectError("no route to host"))
+    provider = _provider(retries_disabled=True)
+
+    with pytest.raises(ProviderConnectionError) as raised:
+        provider.chat([Message.user("Hi")])
+
+    assert connection_reason(raised.value) == "transport"
     provider.close()
 
 
