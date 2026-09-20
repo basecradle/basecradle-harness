@@ -51,10 +51,10 @@ class Weather(Tool):
         return f"Clear in {city}."
 
 
-class Firehose(Tool):
+class Oversized(Tool):
     """A tool whose result is far past `TOOL_RESULT_CAP`, so persistence has to elide it."""
 
-    name = "firehose"
+    name = "oversized"
     description = "Return more than anyone asked for."
 
     def run(self) -> str:
@@ -345,17 +345,17 @@ def test_the_transcript_is_measured_as_it_now_stands_not_as_it_arrived(tmp_path,
     """
     session = build(
         tmp_path,
-        calls_tool("c1", "firehose"),
+        calls_tool("c1", "oversized"),
         text("done"),
         text("second done"),
-        tools=(Firehose(),),
+        tools=(Oversized(),),
     )
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         session.send("go")
         session.send("and now?")
     first, second = (sizes(line) for line in lines(caplog))
     assert first["history_tool"] == 0  # nothing had run yet
-    assert 0 < second["history_tool"] < TOOL_RESULT_CAP  # the excerpt, not the 16 KB firehose
+    assert 0 < second["history_tool"] < TOOL_RESULT_CAP  # the excerpt, not the 16 KB result
 
 
 def test_a_session_with_no_brief_reports_no_brief(tmp_path, caplog):

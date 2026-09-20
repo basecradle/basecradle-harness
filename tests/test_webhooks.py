@@ -67,7 +67,7 @@ def endpoint(
             "ingest_url": ingest_url,
             "verification": {
                 "enabled": verification_enabled,
-                "signature_header": "X-BaseCradle-Signature",
+                "signature_header": "X-Signature",
                 "verifier": "hmac_sha256_hex",
             },
         },

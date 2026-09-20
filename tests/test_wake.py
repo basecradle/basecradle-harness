@@ -1207,7 +1207,7 @@ def test_trigger_past_the_fetch_window_is_fetched_not_dropped(platform, tmp_path
 
 
 def test_large_event_payload_is_truncated_with_a_pointer(platform, tmp_path):
-    """A firehose payload is truncated, with a pointer to the webhook_events tool."""
+    """An oversized payload is truncated, with a pointer to the webhook_events tool."""
     serve_messages(platform, page())
     big = "x" * (9 * 1024)
     serve_events(platform, event_page(event(uuid=E0, payload=big)))
