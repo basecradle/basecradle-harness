@@ -20,7 +20,7 @@ This repository is built under the **BaseCradle Constitution** — the principle
 gh api repos/basecradle/basecradle/contents/constitution.md -H "Accept: application/vnd.github.raw"
 ```
 
-(or read a local checkout of `basecradle/basecradle` if you have one). Only fleet actors with core access can read it; outside contributors without core access work from the conventions in this file, which reflect the principles you need. This CLAUDE.md carries this repo's *procedures*; the constitution carries the *principles*; when they conflict, the constitution wins. **Read it before non-trivial work.**
+This session is **fail-closed** (see "Fail-Closed Session GitHub Auth"), so that read needs a minted token like every other `gh` call — reads included — and refuses without one. Prefix it with the mint from the **`bot-auth-setup` skill** (§2); the minter's path and arguments differ between the laptop and a fleet box, which is why the literal command lives in that one place and is never spelled a second time here. (Or read a local checkout of `basecradle/basecradle` if you have one.) Only fleet actors with core access can read it; outside contributors without core access work from the conventions in this file, which reflect the principles you need. This CLAUDE.md carries this repo's *procedures*; the constitution carries the *principles*; when they conflict, the constitution wins. **Read it before non-trivial work.**
 
 ## Founder Authority
 
@@ -470,6 +470,8 @@ The v0 build is mapped in this repo's **GitHub Issues**, each one PR-sized, in d
 gh issue list --repo basecradle/basecradle-harness --state open
 ```
 
+Like every `gh` call in this repo, that one mints its own token in the same shell call — see "Fail-Closed Session GitHub Auth" and the **`bot-auth-setup` skill** (§2). Tokenless, it refuses; it can never fall back to a human's stored login.
+
 ## An Issue Is a Commitment to Work, Never an Escape From It
 
 Shared law (`constitution.md` → The Workflow). The founder's correction, verbatim: *"Creating an Issue doesn't get you out of work; it ensures you do MORE work and you do it ASAP"* — and *"If you create more Issues than you solved and closed, something is very fucking wrong."* An issue exists so work is never **forgotten**; it does not exist so work can be **postponed**. The failure mode: a session works its issue, tickets every discovery it makes along the way, closes the original, and reports success — while the backlog grows. That is half-finished work with a paper trail.
@@ -491,6 +493,23 @@ This repo's builder agent — **basecradle-harness AI** — acts on GitHub under
 | Commit-author | `basecradle-harness-ai[bot] <290979505+basecradle-harness-ai[bot]@users.noreply.github.com>` |
 
 The operational setup for a session that will push or post as the bot — the local `git config`, minting a short-lived installation token with the `gh-app-token` fleet helper, and routing both `gh` and `git push` through it — lives in the **`bot-auth-setup` skill**. Invoke it at the start of any session that will write to GitHub as the bot.
+
+## Fail-Closed Session GitHub Auth
+
+Every rule above is an *instruction*, and an instruction only holds while it is followed. On 2026-09-20 a laptop builder's `picked up — working` comment posted under **@origin's personal account** because `gh`, handed no token, silently fell back to the login stored on the laptop (`basecradle#579` — the fifth occurrence of that class). The mint recipe was fixed the same day; issue #550 removed the *fallback itself*. **A laptop builder session cannot reach @origin's stored GitHub login at all** — a forgotten mint is an error, never a post under his name. Founder-approved (@origin, 2026-09-20, `basecradle-harness#550`); changing it back is a founder decision, not a captain's.
+
+The fence is `.claude/settings.json` → `env`, **committed and git-tracked** so it survives a fresh checkout rather than living in a per-machine file someone has to remember to write. `settings.json` is JSON and carries no comments, so *this section is the authority* on why each variable is what it is.
+
+- **`GH_CONFIG_DIR=/var/empty`** — the `gh` half. `/var/empty` exists on macOS, is root-owned and unwritable, so `gh` finds no `hosts.yml` and can never be logged in there by accident. `gh auth status` reports not logged in, and every API call — **reads included** — exits 4 without a `GH_TOKEN`. That reads mint too is the accepted cost.
+- **`GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>`** — the `git` half, and it is a **separate hole, not the same one**. `GH_CONFIG_DIR` does not close it: `gh auth git-credential` reads the macOS **keyring** directly and hands a bare `git push` @origin's 40-character token *while `gh auth status` in the very same environment reports not logged in* (measured, gh 2.100.0, 2026-09-20). The pair injects a scoped empty reset plus one helper that can only ever hand out `GH_TOKEN`, so a tokenless `git push` quits with exit 128 and names the helper as the reason.
+
+**The two halves are why a single-mechanism fix is not enough, and that is the shape to reason from:** `gh`'s own answer about whether it is logged in is an answer about *one* of its code paths. A fence is proven by what the other end receives, never by what the tool says about itself — which is why the git half is verified with `git credential fill` and `GIT_TRACE` rather than with `gh auth status`.
+
+Three properties are load-bearing, each with an "obviously fine" broken form. **The injected entries are scoped to `https://github.com`** — an unscoped helper answers for *every* host, so a submodule, a redirect, or a mistyped remote the same command touches would be handed a live installation token. **The empty reset comes first, and the environment pairs must be read last** — git reads system, then global, then local config, and only *then* `GIT_CONFIG_*`, which is exactly what lets the reset clear Homebrew's system `credential.helper=osxkeychain` *and* @origin's global `!gh auth git-credential`; move the identical pair into any config **file** and that ordering is no longer guaranteed, so the fence silently stops being first. **An unset `GH_TOKEN` emits `quit=1`**, never an empty password — an unguarded helper answers with exit 0, git sends it, and the push fails with a generic auth error naming nothing: the silent failure again, one layer down.
+
+**Do not reach around it.** `gh auth login`, unsetting either variable, or a `-c credential.helper=…` that installs a different helper each hand the session @origin's account back. The refusal *is* the feature; the fix is always the mint prefix.
+
+**Scope: laptop.** Like `.claude/self-exit.sh` (see "Laptop Builder Self-Exit"), this belongs to the laptop-builder contract and is revisited on migration to the fleet server. `GH_CONFIG_DIR=/var/empty` is harmless there — a fleet box has no stored human login, and a `GH_CONFIG_DIR` naming a directory that does not exist behaves identically (verified: *"not logged into any GitHub hosts"*), so nothing breaks where Linux has no `/var/empty`. The git half makes exactly **one** behavioral change on a fleet box: the NOC registers `gh-app-token --git-credential` as the agent's github.com helper, and the injected reset removes it, so a *bare, tokenless* `git push` there quits instead of auto-minting. Every documented fleet recipe already sets `GH_TOKEN` on the push (`basecradle-noc` `deploy/README.md` §7c), which the injected helper answers identically — so the change is a loud, fail-closed refusal on an undocumented path, never a broken documented one. On migration, delete this section and the `GIT_CONFIG_*` entries, or re-scope them then.
 
 ## Polling GitHub (or any shared external API) — rate-limit floor
 
@@ -584,7 +603,7 @@ When your work is done **and verified live**, post your completion comment, clos
 
 `self-exit.sh` is bounded: it SIGTERMs only this session's own `claude` process (found by walking its own ancestry) and can target nothing else. The capital observes the session end and marks your work complete.
 
-**Laptop-only — removed on migration.** On migration to the fleet server, remove this section and `.claude/self-exit.sh`; the router manages server-agent lifecycle (it wakes you on a handoff label — you neither self-spawn nor self-exit). The self-exit permission is laptop-user-scoped and does not travel to the server.
+**Laptop-only — removed on migration.** On migration to the fleet server, remove this section and `.claude/self-exit.sh`; the router manages server-agent lifecycle (it wakes you on a handoff label — you neither self-spawn nor self-exit). The self-exit permission is laptop-user-scoped and does not travel to the server. **The same migration retires the `GIT_CONFIG_*` half of the auth fence** — see "Fail-Closed Session GitHub Auth" for what it does on a fleet box and why the `GH_CONFIG_DIR` half stays. Both obligations are named here so neither is the one that gets forgotten.
 
 ## Config Home (Install / Upgrade)
 
