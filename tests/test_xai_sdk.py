@@ -34,6 +34,8 @@ from basecradle_harness import (
     ToolSpec,
     XaiSdkProvider,
 )
+from basecradle_harness._engine import _TRANSIENT
+from basecradle_harness._retry import connection_reason
 from basecradle_harness._xai_sdk import CONVERSATION_METADATA_KEY
 from tests.conftest import mail_tool
 
@@ -432,6 +434,25 @@ def test_grpc_resource_exhausted_maps_to_rate_limit():
 def test_grpc_unavailable_maps_to_connection_error():
     with pytest.raises(ProviderConnectionError):
         _provider_raising(grpc.StatusCode.UNAVAILABLE).chat([Message.user("hi")])
+
+
+@pytest.mark.parametrize("code", [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED])
+def test_a_grpc_transport_fault_is_retried_and_reads_transport(code):
+    """Both gRPC transport codes are transient — and both read ``transport``, which is the
+    **documented imprecision** rather than an accident (issue #545).
+
+    `_retry.connection_reason` tells ``timeout`` from ``transport`` by asking what the chained
+    cause *calls itself*, and this path chains a `grpc.RpcError`, which names no timeout class —
+    so a `DEADLINE_EXCEEDED` reads `transport`. That costs a less precise log word and **never a
+    retry**, because both words are in `RETRYABLE_REASONS` and both take the same backoff. It is
+    pinned here so that the day the word changes, the three places that state the gap are updated
+    with it instead of quietly becoming wrong.
+    """
+    with pytest.raises(ProviderConnectionError) as raised:
+        _provider_raising(code).chat([Message.user("hi")])
+
+    assert isinstance(raised.value, _TRANSIENT)  # retried by the engine, whatever the word
+    assert connection_reason(raised.value) == "transport"
 
 
 def test_grpc_internal_maps_to_the_retryable_response_error():
