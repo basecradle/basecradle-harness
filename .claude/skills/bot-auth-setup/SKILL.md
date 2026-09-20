@@ -1,6 +1,6 @@
 ---
 name: bot-auth-setup
-description: Operational setup so this session's git commits, pushes, and GitHub API writes act as the basecradle-harness-ai[bot] identity rather than falling through to the ambient gh login (@origin's). Covers the local git author and tokenless HTTPS origin, minting a short-lived installation token with the fleet gh-app-token helper, routing gh through it, and pushing with the token in the environment (never a URL/argv). Use at the start of any session that will push a branch, open/merge a PR, or comment on an issue as the bot, or when a write unexpectedly lands as drawkkwast. The identity table + post-as-your-own-bot invariant live in CLAUDE.md → Fleet Bot Identity.
+description: Operational setup so this session's git commits, pushes, and GitHub API writes act as the basecradle-harness-ai[bot] identity rather than falling through to the ambient gh login (@origin's). Covers the local git author and tokenless HTTPS origin, minting a short-lived installation token with the fleet gh-app-token helper in the same shell call as every gh write (a Bash call inherits nothing from the one before it), guarding a failed mint, verifying the author field on the first write, and pushing with the token in the environment (never a URL/argv). Use before every gh write and every push as the bot, and when a write unexpectedly lands as drawkkwast. The identity table + post-as-your-own-bot invariant live in CLAUDE.md → Fleet Bot Identity.
 ---
 
 # Bot Auth Setup — basecradle-harness-ai[bot]
@@ -26,15 +26,44 @@ consults a credential helper: the push authenticates with the SSH key as `drawkk
 recipe would push as @origin with nothing to say it did. The URL carries no credential, ever,
 and fetching this public repo needs none.
 
-## 2. Mint a token and route gh through it
+## 2. Every `gh` write mints its own token, in the same call
 
-Mint a short-lived (~1h) installation token with the shared fleet helper — otherwise `gh` falls
-through to the ambient login (@origin's) and the write lands as `drawkkwast`:
+**There is no "do it once at the start" step here.** Each Claude Code Bash call starts a fresh
+shell and inherits nothing from the call before it, so a token exported in one call is *gone* in
+the next — and `gh` does not fail when it is missing. It falls silently through to the laptop's
+stored `drawkkwast` login, and the write lands under @origin's personal account looking exactly
+like a success (`basecradle#579`, 2026-09-20: a builder's `picked up — working` comment posted as
+the founder). So the mint is a **prefix on the write itself** — every comment, `pr create`,
+`pr merge`, label, and close — never a session-level setup step:
 
 ```bash
-export GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-harness-ai)"
-# With GH_TOKEN exported, `gh issue comment` / `gh pr create` / `gh pr merge` all act as the bot.
+GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+gh issue comment <n> --repo basecradle/basecradle-harness --body "…"
 ```
+
+Both lines go in **one** Bash call; two calls is the bug above. (Reads are harmless either way,
+but minting on them too costs nothing and keeps the habit uniform — a mint you only reach for on
+writes is one you can forget you needed.)
+
+**Why the guard, and not `export GH_TOKEN="$(…)"`:** `export` is a command in its own right and
+returns *its* exit status, never that of the command substitution inside it, so a mint that failed
+leaves an empty token behind a zero exit and the next line posts as `drawkkwast` (the
+`harness#331` class). A **plain** assignment does propagate the substitution's status (checked in
+both zsh and bash), so assign first and let `|| exit 1` see the *helper's* status; check non-empty
+for a mint that "succeeded" with no output; only then `export`.
+
+**Check the author field on the first write of a session.** The fallback is silent, so the only
+proof is what GitHub recorded — read it back (`gh issue comment` prints the URL, whose
+`#issuecomment-<id>` fragment is the id):
+
+```bash
+GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+gh api repos/basecradle/basecradle-harness/issues/comments/<comment-id> --jq '.user.login'
+# → basecradle-harness-ai[bot]
+```
+
+Anything else — `drawkkwast` above all — means the mint did not reach that call. Delete the write,
+fix the call, redo it, and say so on the issue.
 
 ## 3. `git push` as the bot — the token rides the environment, never argv
 
@@ -72,6 +101,11 @@ environment. Three properties are load-bearing (`basecradle#544`; each verified 
   helper as the reason (`credential helper … told us to quit`). The unguarded helper answered
   with an empty password and exit 0, so git sent it and the push failed with a generic auth
   error that named nothing.
+
+The helper reads `GH_TOKEN` out of **this call's** environment, so §2's mint prefix rides here
+too, in the same Bash call as the push. The difference from `gh` is the failure mode, not the
+requirement: a forgotten mint here is a loud refusal (the `quit=1` bullet above), where `gh`
+would have posted as `drawkkwast` and said nothing.
 
 (The `http.extraheader="AUTHORIZATION: bearer $TOKEN"` form **fails** — "invalid credentials" —
 for App installation tokens, and is argv besides.)
