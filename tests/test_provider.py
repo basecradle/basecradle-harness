@@ -37,6 +37,7 @@ from basecradle_harness import (
     ToolSpec,
 )
 from basecradle_harness._openai import DEFAULT_BASE_URL
+from basecradle_harness._retry import connection_reason
 from tests.conftest import (
     BASE_URL,
     CHAT_URL,
@@ -614,6 +615,41 @@ def test_transport_failure_raises_connection_error(router, provider):
 
     with pytest.raises(ProviderConnectionError):
         provider.chat([Message.user("Hi")])
+
+
+def test_a_real_read_timeout_through_this_sdk_is_named_a_timeout(router, provider):
+    """The taxonomy word, proven against the **real SDK's own chain** rather than an assumption.
+
+    `_retry.connection_reason` reads ``timeout`` versus ``transport`` off the cause, and the shape
+    it has to read here is this adapter's alone: the `openai` SDK wraps the transport failure in its
+    own ``APITimeoutError`` and chains it, so the fact sits two hops down instead of one.
+
+    **This test exists because the first draft of issue #545 got it wrong and passed anyway.** That
+    draft spelled the check ``isinstance(cause, httpx.TimeoutException)`` — which is what the
+    reranker had, and which is right for the `openrouter` adapter and **wrong here**: since its 3.0
+    the `openai` SDK runs on HTTPX2, so the real cause is an `httpx2.ReadTimeout`, a different
+    distribution's class and no subclass of `httpx`'s. A genuine OpenAI read timeout logged
+    ``reason=transport``, nothing errored, and the engine test proved only the assumption it was
+    written from, because its double chained an `httpx` exception by hand. A mock that defines the
+    fact it verifies has verified nothing (the issue #433 rule, applied to an exception chain).
+    """
+    router.post(CHAT_URL).mock(side_effect=httpx2.ReadTimeout("The read operation timed out"))
+
+    with pytest.raises(ProviderConnectionError) as raised:
+        provider.chat([Message.user("Hi")])
+
+    # The SDK's wrapper is what this adapter caught; the transport failure is under it.
+    assert type(raised.value.__cause__).__name__ == "APITimeoutError"
+    assert connection_reason(raised.value) == "timeout"
+    assert connection_reason(_connect_failure(router, provider)) == "transport"
+
+
+def _connect_failure(router, provider) -> ProviderConnectionError:
+    """The same adapter's *connect* failure — the half that really did not reach the model."""
+    router.post(CHAT_URL).mock(side_effect=httpx2.ConnectError("no route to host"))
+    with pytest.raises(ProviderConnectionError) as raised:
+        provider.chat([Message.user("Hi")])
+    return raised.value
 
 
 def test_malformed_response_raises_the_retryable_response_error(router, provider):

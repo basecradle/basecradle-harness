@@ -505,7 +505,10 @@ class _ErrorMapper:
             return False
         openai = self._openai
         if isinstance(exc, openai.APIConnectionError):
-            # Covers APITimeoutError too — DNS/TCP/TLS/timeout, nothing reached the model.
+            # Covers APITimeoutError too: DNS/TCP/TLS, a connect timeout, or a **read** timeout —
+            # the last of which *did* reach the model, whatever this comment claimed before issue
+            # #545. ``from exc`` keeps the SDK's own cause, which is where
+            # `_retry.connection_reason` reads ``timeout`` versus ``transport`` from.
             raise ProviderConnectionError(f"Could not reach the provider: {exc}") from exc
         if isinstance(exc, openai.APIStatusError):
             raise _from_status_error(exc) from exc

@@ -22,9 +22,11 @@ from __future__ import annotations
 import logging
 import re
 
+import httpx
 import pytest
 
 from basecradle_harness._describer import _fault_of as describer_fault_of
+from basecradle_harness._engine import _reason as engine_reason
 from basecradle_harness._exceptions import (
     ProviderAuthError,
     ProviderBillingError,
@@ -51,6 +53,7 @@ from basecradle_harness._retry import (
     RETRY_BUDGET_SECONDS,
     RETRYABLE_REASONS,
     Retry,
+    connection_reason,
     diagnostics,
     retryable,
 )
@@ -121,6 +124,12 @@ def retry(**kwargs):
 # === The gate: what is retried, and what is never ============================
 
 
+def _chained(exc: ProviderConnectionError, cause: BaseException) -> ProviderConnectionError:
+    """A transport error carrying the cause its adapter chained — the shape `connection_reason` reads."""
+    exc.__cause__ = cause
+    return exc
+
+
 @pytest.mark.parametrize(
     ("exc", "reason"),
     [
@@ -128,19 +137,95 @@ def retry(**kwargs):
         (ProviderServerError("oops", status_code=503), "server_error"),
         (ProviderResponseError("EOF while parsing a value"), "invalid_response"),
         (ProviderConnectionError("no route"), "transport"),
+        (
+            _chained(ProviderConnectionError("timed out"), httpx.ReadTimeout("read")),
+            "timeout",
+        ),
     ],
 )
 def test_every_retryable_reason_is_one_a_producer_actually_emits(exc, reason):
-    """The set is pinned against the taxonomy it gates, in both spellings of it.
+    """The set is pinned against the taxonomy it gates, in **all three** spellings of it.
 
     `RETRYABLE_REASONS` is words, and words drift. A reason a `_fault_of` stopped emitting would
     leave this policy describing retries that can never happen — a dead mechanism that fails no
     test, which is this repo's Green-While-Absent shape one level down.
+
+    **The engine is in this list now, and that is the whole of issue #545.** It was absent because
+    it had no producer to pin: it caught three exception classes and `ProviderConnectionError` was
+    not one, so ``timeout`` and ``transport`` sat in the gate above with nothing on the brain path
+    able to reach them — the set describing a policy two call sites implemented and the third could
+    not. A word is only retryable if some ``except`` can hand it over.
     """
     assert rerank_fault_of(exc) == (reason, False)
-    assert describer_fault_of(exc) in (reason, "transport")  # the describer does not split timeout
+    assert describer_fault_of(exc) == reason
+    assert engine_reason(exc) == reason
     assert reason in RETRYABLE_REASONS
     assert retryable(reason)
+
+
+def test_one_fault_gets_one_word_however_deep_its_adapter_buried_the_cause():
+    """The adapters chain at different depths; the word must not.
+
+    `openrouter` chains the raw transport failure, `openai` chains its SDK's own wrapper around one.
+    A read at depth 1 answers correctly on one provider and calls the other a ``transport`` fault —
+    the decided-by-nobody asymmetry between adapters that issue #545 exists to remove, reappearing
+    inside the fix for it. (The real chains are pinned against the SDKs in `test_provider.py`.)
+    """
+    wrapped = RuntimeError("the SDK's own wrapper, which names no timeout")
+    wrapped.__cause__ = httpx.ReadTimeout("The read operation timed out")
+
+    assert connection_reason(_chained(ProviderConnectionError("x"), wrapped)) == "timeout"
+    assert (
+        connection_reason(_chained(ProviderConnectionError("x"), httpx.ReadTimeout("y")))
+        == "timeout"
+    )
+
+
+def test_a_timeout_is_recognized_by_what_it_calls_itself_not_by_which_package_defines_it():
+    """The bug the first draft of issue #545 shipped, pinned so it cannot come back.
+
+    ``isinstance(cause, httpx.TimeoutException)`` is the obvious spelling and it is **wrong for the
+    `openai` path**: since its 3.0 that SDK runs on HTTPX2, whose `ReadTimeout` is a different
+    distribution's class and no subclass of `httpx`'s. A real OpenAI read timeout therefore logged
+    ``reason=transport`` with nothing failing anywhere. Importing every family instead would put a
+    list of HTTP client packages in the core, one of them an optional extra, and a fourth family
+    would drop out of it silently — so the test is what a timeout **calls itself**.
+    """
+
+    class Timeout(Exception):
+        """A fourth family's base class, spelled bare — the way ``requests`` spells its own."""
+
+    class ReadTimeout(Timeout):
+        """Its concrete leaf, which is what an adapter would actually chain."""
+
+    class ConnectionRefused(Exception):
+        """A transport failure that is not a timeout — the other half of the distinction."""
+
+    assert connection_reason(_chained(ProviderConnectionError("x"), ReadTimeout())) == "timeout"
+    assert connection_reason(_chained(ProviderConnectionError("x"), TimeoutError())) == "timeout"
+    assert (
+        connection_reason(_chained(ProviderConnectionError("x"), ConnectionRefused()))
+        == "transport"
+    )
+
+
+def test_a_cause_chain_that_says_nothing_reads_as_transport_and_always_terminates():
+    """The fallback is the broader, safer word — and both are retryable, so a misread costs a less
+    precise line and never a lost retry. The walk is bounded because a cause chain can be circular,
+    and a log word is not worth an infinite loop (the native xAI gRPC path has no ``httpx`` in its
+    chain at all, which is the one stated case that reads ``transport`` by omission)."""
+    assert connection_reason(ProviderConnectionError("no cause")) == "transport"
+    assert (
+        connection_reason(_chained(ProviderConnectionError("x"), OSError("no route")))
+        == "transport"
+    )
+
+    loop = ProviderConnectionError("a")
+    other = ProviderConnectionError("b")
+    loop.__cause__ = other
+    other.__cause__ = loop
+
+    assert connection_reason(loop) == "transport"  # terminates rather than spinning
 
 
 def test_the_reason_set_is_exactly_the_runtime_faults_a_second_request_can_fix():

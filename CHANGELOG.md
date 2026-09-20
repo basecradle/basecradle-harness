@@ -7,6 +7,70 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.128.0] - 2026-09-20
+
+### Fixed: a transport failure no longer costs the whole wake (issue #545)
+
+At 05:54:43 UTC on 2026-09-20 @glm-5.2 lost a wake mid-work to
+`Could not reach OpenRouter: The read operation timed out`, with **no `llm retry` line anywhere in
+it**. The router relaunched the same delivery, the rerun recovered everything, and it cost ~12
+minutes, a second full step budget, and three founder pages.
+
+**The policy already said to retry it.** `RETRYABLE_REASONS` has listed `timeout` and `transport`
+since the shared retry shipped, and both are exactly what `_rerank._fault_of` and
+`_describer._fault_of` emit for this class — so the memory path and the describe path retried this
+fault all along. The engine caught three exception classes and `ProviderConnectionError` was not
+one of them, so the *same* fault was survivable on two paths and fatal on the third: the one where
+giving up costs a peer their reply. A word in the gate that no `except` can reach is a policy
+nothing implements.
+
+It was also the pre-#284 shape, in the class that note itself names: the `openai` SDK retries
+`APITimeoutError` internally (`max_retries=2`), while the `openrouter` adapter disables its SDK's
+retry outright — so a read timeout was survivable three times over on one provider and fatal on the
+first raise on another, **decided by nobody**.
+
+`ProviderConnectionError` is now transient, under the same bounded policy as the other three
+classes: at most `HARNESS_RESPONSE_RETRIES` extra attempts, at most 3 seconds of total sleep.
+
+**A retry can double-spend; it cannot double-act.** The harness acts only on a *parsed* response, so
+a call that never returned dispatched no tools and wrote nothing to the transcript — re-issuing it
+is invisible to the platform, to the delivery guarantee, and to its idempotency ordinals. A read
+timeout may buy one duplicate *generation* at the vendor, bounded by the attempt count, and that is
+the exposure every `openai`-SDK agent in the fleet has always taken.
+
+**A timeout keeps the short beat.** A 429 earns the patient 1s/2s schedule because a rate limit is a
+capacity window a half-second does not outlast; a call that timed out has already waited the whole
+client timeout, and what it needs next is a re-route rather than more waiting — so it takes the
+0.5s/1s server-hiccup schedule.
+
+### Fixed: one fault, one word — the `timeout` / `transport` split is spelled once
+
+The distinction the adapters erase — *we waited* versus *we never got there* — was read off the
+exception's cause in two places and answered differently in each: `_rerank._fault_of` split the
+class while `_describer._fault_of` returned `transport` flat, so the same read timeout was
+`reason=timeout` in one journal line and `reason=transport` in the next. The test that pinned the
+vocabulary carried a comment tolerating it, which is a comment standing in for a rule.
+
+It is now `_retry.connection_reason`, read by all three call sites, and it **walks** the cause chain
+rather than reading one level: the `openrouter` adapter chains the raw transport failure while the
+`openai` adapter chains its SDK's wrapper around one, so a depth-1 read would have answered
+correctly on one provider and wrongly on the other — the same decided-by-nobody asymmetry
+reappearing inside the fix for it.
+
+It also asks what a timeout **calls itself** rather than `isinstance`-ing an imported class. The
+obvious spelling — `isinstance(cause, httpx.TimeoutException)`, which is what the reranker had — is
+wrong for the `openai` path: since its 3.0 that SDK runs on HTTPX2, whose `ReadTimeout` is a
+different distribution's class and no subclass of `httpx`'s, so a real OpenAI read timeout read
+`transport` with nothing erroring. The real chain each SDK produces is now pinned against the SDK
+itself, because a double that chains the exception this module expects proves only the assumption it
+was written from. Two stated imprecisions, each costing a word and never a retry: the native xAI
+gRPC path's `DEADLINE_EXCEEDED` names no timeout class and reads `transport`, and a class
+deliberately named to end in `Timeout` without being one would read `timeout`.
+
+Three comments asserting that a `ProviderConnectionError` means "nothing reached the model" are
+corrected in the same change: true of the connect half, false of the read half, and the whole reason
+the distinction is worth drawing.
+
 ## [0.127.0] - 2026-09-19
 
 ### Added: the orphan sweep fails loudly when the box refuses a write it was designed to make (issue #536)

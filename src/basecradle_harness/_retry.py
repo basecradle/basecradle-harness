@@ -12,19 +12,38 @@ engine's own brain call — had three different answers to the same question (tw
 engine had one that excluded 429 by design). One policy, in one module, is the point: a fault class
 is retried because of **what it is**, never because of which caller happened to hit it.
 
-**The reason set is a ceiling, and each caller's own `except` is its floor** — worth knowing, because
-the two are not the same and the difference is deliberate. `Retry` never sees a fault its caller did
-not catch, and the engine catches `_TRANSIENT` only, so a **connection drop** on the brain call still
-propagates on the first raise while the same fault on a rerank or a describe is retried. That is not
-an oversight: an aborted wake is *recovered* — the claim is two-phase and the router re-wakes (#285),
-so the peer is answered one wake later — whereas a rerank or a describe has no second chance at all,
-and a fallback is permanent for that turn. Where the cost of giving up differs, the floor differs.
+**The reason set is a ceiling, and each caller's own `except` is its floor** — worth knowing,
+because the two are not the same and the gap between them is where a class goes missing. `Retry`
+never sees a fault its caller did not catch, so a word in `RETRYABLE_REASONS` that no call site's
+``except`` can reach is a policy nothing implements. **Issue #545 is that sentence happening**: this
+module has declared ``timeout`` and ``transport`` retryable since it shipped, and the engine caught
+`_TRANSIENT` — which did not name `ProviderConnectionError` — so @glm-5.2's *rerank* would have
+retried the read timeout that killed its wake and its *brain* did not. The floor is now the ceiling
+on all three call sites, which is what the paragraph above actually asks for.
+
+**The argument that used to sit here was that an aborted wake is *recovered*** — the claim is
+two-phase and the router re-wakes (#285), so the peer is answered one wake later, whereas a rerank
+has no second chance at all. Both halves are still true and neither is a reason to skip the retry.
+Recovery is the floor under a *lost* wake, not a substitute for surviving a blip: the live event
+cost ~12 minutes and a second full step budget where a ≤3s wait would have cost nothing, and the
+recovery path is not itself free of risk — a compaction inside its window turns a **resume** into an
+*abandon, loudly* (#289, #490), which is the peer genuinely dropped. Cheap insurance is still worth
+buying when the fallback works.
+
+**And the objection worth answering out loud, because it is the reason to hesitate: a timed-out call
+may have run and been billed.** True, and it buys at most one duplicate *generation* — never a
+duplicate *act*. The harness's side effects are tool dispatches, and a tool is dispatched only from
+a parsed response: a call that never returned dispatched nothing and persisted nothing (the
+assistant turn is written after the reply arrives and before any tool runs, `_engine.run`), so a
+retry inside `_chat` is invisible to the transcript, to the claim, and to the idempotency ordinal.
+The double-spend is real, bounded by the attempt count, and **already paid on every `openai`-SDK
+agent in the fleet**, whose SDK has retried `APITimeoutError` internally all along.
 
 What is retried, and what is not
 --------------------------------
 `RETRYABLE_REASONS` is the whole gate, read off the taxonomy the call sites already speak
-(`_rerank._fault_of` / `_describer._fault_of`): the **runtime** class, and only its members that a
-second identical request can actually fix. Deliberately **out**:
+(`_rerank._fault_of`, `_describer._fault_of`, `_engine._reason`): the **runtime** class, and only
+its members that a second identical request can actually fix. Deliberately **out**:
 
 - **config-class** (``config:auth``, ``config:billing``, ``config:model_not_found``) — dead until a
   human acts, so a retry spends a call to receive the identical refusal and delays the ERROR that
@@ -95,12 +114,93 @@ RETRY_BACKOFF: tuple[float, ...] = (1.0, 2.0)
 #: vocabulary the call sites already log rather than as a tuple of exception classes, because the
 #: taxonomy is what the fleet's dashboards read and an exception class is not.
 #:
-#: Pinned against both producers by test (`tests/test_retry.py`): a reason a `_fault_of` stops
+#: Pinned against **all three** producers by test (`tests/test_retry.py`): a reason a producer stops
 #: emitting, or starts emitting for a different class, must not quietly leave this set describing a
-#: policy nothing implements.
+#: policy nothing implements — and a producer missing from that pin is how issue #545 hid, since the
+#: engine was not in it and its ``except`` could reach neither of the transport words.
 RETRYABLE_REASONS = frozenset(
     {"rate_limited", "server_error", "transport", "timeout", "invalid_response"}
 )
+
+
+#: How far `connection_reason` walks an exception's cause chain. An adapter chains what its SDK
+#: raised, and an SDK chains what *its* transport raised, so the fact being looked for is one or two
+#: hops down — never deeper in practice. The bound exists because a chain can be circular, and a log
+#: word is not worth an infinite loop.
+_CAUSE_DEPTH = 5
+
+#: What a class is called when it means *this call ran out of time*. Matched as a **suffix** against
+#: every class in an exception's MRO, which is the only test that works across the families
+#: involved: the stdlib spells it ``TimeoutError``, both HTTPX distributions spell it
+#: ``TimeoutException``, the `openai` SDK's own wrapper is ``APITimeoutError``, and ``requests``
+#: spells its base class bare. Matching the MRO rather than the leaf is what makes a concrete
+#: ``ReadTimeout`` answer through whichever of these its family derives from. See `connection_reason`
+#: for why this is a name test rather than an `isinstance` against imported classes.
+_TIMEOUT_NAMES = ("Timeout", "TimeoutError", "TimeoutException")
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """Does any class this exception inherits from name itself a timeout?"""
+    return any(base.__name__.endswith(_TIMEOUT_NAMES) for base in type(exc).__mro__)
+
+
+def connection_reason(exc: object) -> str:
+    """``timeout`` or ``transport`` — the taxonomy's word for one `ProviderConnectionError`.
+
+    **It lives here, alone, because it is the one fault whose word is not fixed by its class.**
+    Every other member of the taxonomy is answered by an ``isinstance`` the producers can each spell
+    for themselves; this one has to be read off the cause, and the moment a second call site spells
+    that read, a third answer appears. It did: `_rerank._fault_of` split the class while
+    `_describer._fault_of` returned ``transport`` flat, so the *same* read timeout was ``timeout`` in
+    one line of the journal and ``transport`` in the next — and `tests/test_retry.py` carried a
+    comment tolerating the drift, which is a comment standing in for a rule. One spelling, three
+    readers, for exactly the reason `diagnostics` is one function: so they cannot disagree about what
+    a failure looked like.
+
+    **The distinction it draws is the one the adapters erase, and it is not cosmetic.** An adapter
+    maps DNS, TCP, TLS, connect timeouts, read timeouts and mid-body transport failures onto the one
+    `ProviderConnectionError`, under a comment that read *"nothing reached the model"* — true of the
+    connect half and **false of the read half**. A read timeout means the request was accepted and
+    the answer did not come back in time: the model may well have run, and may well have been
+    billed. Both are worth retrying and neither can double-*act* (a call that never returned
+    dispatched no tools and persisted nothing), but a journal that cannot tell them apart cannot
+    tell a network that is down from a vendor that is slow — which was the first question asked of
+    the wake that opened issue #545.
+
+    **The cause is *walked*, not read one level deep, because an SDK is a layer.** The `openrouter`
+    adapter chains the raw transport failure; the `openai` adapter chains its SDK's
+    ``APITimeoutError``, whose *own* cause is the transport one. A read at depth 1 would answer
+    correctly on one provider and wrongly on the other — the same decided-by-nobody asymmetry
+    between adapters that issue #545 exists to remove, reappearing inside the fix for it.
+
+    **And it is a *name* test rather than an ``isinstance``, which is deliberate and was learned the
+    hard way.** The obvious spelling — ``isinstance(cause, httpx.TimeoutException)``, which is what
+    `_rerank._fault_of` had — is **wrong for the `openai` path**, because since its 3.0 that SDK
+    runs on **HTTPX2**: `httpx2.ReadTimeout` is a different distribution's class and no subclass of
+    `httpx`'s, so a real OpenAI read timeout read ``transport``. Nothing errored, no test failed
+    (the first draft's double chained an `httpx` exception, which only ever proved the assumption),
+    and the word was wrong on one provider and right on another — this fix reproducing its own
+    defect. Importing every family instead would put a list of HTTP client packages in the core, one
+    of which is an optional extra, and a fourth family would fall out of it silently. A class that
+    calls itself a timeout is the fact all of them share.
+
+    Anything else reads as ``transport``: the fallback is the broader, safer word, and both are in
+    `RETRYABLE_REASONS`, so a misread in **either** direction costs a less precise line and never a
+    lost retry — which is what makes a suffix match the right precision for this question. Two known
+    imprecisions, stated rather than left to be discovered: the native xAI gRPC path's
+    ``DEADLINE_EXCEEDED`` names no timeout class at all and reads ``transport``, and a class
+    deliberately named so as to end in ``Timeout`` without being one would read ``timeout`` (no
+    library names an exception that way; a test written to be adversarial does).
+    """
+    seen = exc
+    for _ in range(_CAUSE_DEPTH):
+        cause = getattr(seen, "__cause__", None)
+        if cause is None:
+            break
+        if isinstance(cause, BaseException) and _is_timeout(cause):
+            return "timeout"
+        seen = cause
+    return "transport"
 
 
 def retryable(reason: str | None, *, is_config: bool = False) -> bool:

@@ -70,8 +70,6 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-import httpx
-
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
@@ -98,7 +96,7 @@ from basecradle_harness._openrouter import (
     _ErrorMapper,
     require_openrouter_sdk,
 )
-from basecradle_harness._retry import Retry, diagnostics
+from basecradle_harness._retry import Retry, connection_reason, diagnostics
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -633,10 +631,10 @@ def _fault_of(exc: ProviderError) -> tuple[str, bool]:
         return "invalid_response", False
     if isinstance(exc, ProviderConnectionError):
         # The SDK mapper collapses every transport failure into one class, so the distinction the
-        # taxonomy wants — *we waited* versus *we never got there* — is read off the cause.
-        return (
-            "timeout" if isinstance(exc.__cause__, httpx.TimeoutException) else "transport"
-        ), False
+        # taxonomy wants — *we waited* versus *we never got there* — is read off the cause. Shared
+        # with the describer and the engine (issue #545): this read used to live here alone and the
+        # describer answered `transport` flat, so one fault had two words in one journal.
+        return connection_reason(exc), False
     if isinstance(exc, ProviderAPIError):
         if getattr(exc, "status_code", None) == 404 or _is_unknown_model(exc):
             return "config:model_not_found", True

@@ -11,6 +11,7 @@ import json
 import logging
 import re
 
+import httpx
 import pytest
 
 from basecradle_harness import (
@@ -20,6 +21,7 @@ from basecradle_harness import (
     ImageContent,
     Message,
     ProviderAuthError,
+    ProviderConnectionError,
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
@@ -1177,6 +1179,159 @@ def test_response_retries_zero_disables_the_retry():
 
     with pytest.raises(ProviderResponseError):
         engine.run([Message.user("hi")])
+
+    assert provider.calls == 1
+    assert delays == []
+
+
+# === The transport class: a read timeout is a blip, not the end of a wake (issue #545) ========
+
+
+def _transport_error(message: str, cause: BaseException | None) -> ProviderConnectionError:
+    """A `ProviderConnectionError` chained exactly as an adapter chains one.
+
+    The chaining is the fixture, not decoration: `_retry.connection_reason` reads ``timeout`` versus
+    ``transport`` off the cause, so a double that raises an unchained error would prove the retry
+    and quietly fail to prove the word.
+    """
+    exc = ProviderConnectionError(message)
+    exc.__cause__ = cause
+    return exc
+
+
+class TransportFailingProvider:
+    """Fails in transport on its first `fails` calls, then answers (issue #545).
+
+    `cause` is what the adapter chained — a raw ``httpx`` failure for the `openrouter` shape, a
+    vendor wrapper around one for the `openai` shape, ``None`` for a bare connect drop.
+    """
+
+    def __init__(self, cause, *, fails: int = 1, reply: Message | None = None) -> None:
+        self._cause = cause
+        self._fails = fails
+        self._reply = reply or Message.assistant(content="the real answer")
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.calls <= self._fails:
+            raise _transport_error(
+                "Could not reach OpenRouter: The read operation timed out", self._cause
+            )
+        return self._reply
+
+
+def test_a_read_timeout_is_retried_then_succeeds(caplog):
+    """The wake @glm-5.2 lost on 2026-09-20, survived.
+
+    `Retry`'s own reason set has named ``timeout`` retryable since it shipped, and the reranker and
+    the describer both honored it — only the engine's ``except`` could not reach the exception that
+    carries it, so the *same* fault was survivable on two paths and fatal on the one where giving up
+    costs a peer their reply. Recovering here answers them **now**; the two-phase claim answers them
+    ~12 minutes and a second step budget later.
+    """
+    provider = TransportFailingProvider(httpx.ReadTimeout("The read operation timed out"))
+    delays, spy = _no_sleep()
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        reply = Engine(provider, ToolRegistry(), sleep=spy).run([Message.user("hi")])
+
+    assert reply.content == "the real answer"
+    assert provider.calls == 2  # failed once, retried, succeeded
+    # The 0.5s server-hiccup beat, not the rate limit's patient schedule: this call already waited
+    # out the whole client timeout, so what it needs next is a re-route rather than more waiting.
+    assert delays == [0.5]
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    assert "reason=timeout" in line, line
+
+
+def test_a_bare_connect_failure_is_retried_and_named_transport(caplog):
+    """The half where nothing reached the model — the safest of all to re-issue, and the one whose
+    word must stay distinct so a journal can tell a dead network from a slow vendor."""
+    provider = TransportFailingProvider(httpx.ConnectError("[Errno 8] nodename nor servname"))
+    delays, spy = _no_sleep()
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert Engine(provider, ToolRegistry(), sleep=spy).run([Message.user("hi")]).content
+
+    assert provider.calls == 2
+    assert delays == [0.5]
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    assert "reason=transport" in line, line
+
+
+def test_a_timeout_an_sdk_wrapped_reads_the_same_word_as_a_bare_one(caplog):
+    """A depth-1 read would answer correctly on one adapter and wrongly on the other.
+
+    The `openrouter` adapter chains the raw transport failure; the `openai` adapter chains its SDK's
+    own wrapper around one. Reading only `__cause__` would call the second a ``transport`` fault —
+    the same decided-by-nobody asymmetry between adapters that this whole fix exists to remove,
+    reappearing in the fix for it.
+
+    This pins the *walk*, with a non-timeout wrapper so only the depth is under test. The **real**
+    chain each SDK produces is pinned against the SDK itself in `tests/test_provider.py`, because a
+    double that chains the exception this module expects proves nothing about what the vendor sends.
+    """
+    wrapper = RuntimeError("the SDK's own wrapper, which names no timeout")
+    wrapper.__cause__ = httpx.ReadTimeout("The read operation timed out")
+    provider = TransportFailingProvider(wrapper)
+    _, spy = _no_sleep()
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert Engine(provider, ToolRegistry(), sleep=spy).run([Message.user("hi")]).content
+
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    assert "reason=timeout" in line, line
+
+
+def test_a_transport_that_never_clears_is_still_bounded():
+    """A genuinely-unreachable provider must not be retried forever: the wake still aborts, with the
+    transport error, after exactly `response_retries` extra attempts."""
+    provider = TransportFailingProvider(httpx.ReadTimeout("gone"), fails=99)
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), response_retries=2, sleep=spy)
+
+    with pytest.raises(ProviderConnectionError):
+        engine.run([Message.user("hi")])
+
+    assert provider.calls == 3  # response_retries + 1
+    assert delays == [0.5, 1.0]
+
+
+def test_the_give_up_line_names_a_timeout_apart_from_a_transport_drop(caplog):
+    """The two send an operator to different places, so the final ERROR must not blur them into the
+    unparseable-response fallback every non-429, non-5xx fault used to land in."""
+    _, spy = _no_sleep()
+
+    with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
+        with pytest.raises(ProviderConnectionError):
+            Engine(
+                TransportFailingProvider(httpx.ReadTimeout("gone"), fails=99),
+                ToolRegistry(),
+                response_retries=0,
+                sleep=spy,
+            ).run([Message.user("hi")])
+        with pytest.raises(ProviderConnectionError):
+            Engine(
+                TransportFailingProvider(httpx.ConnectError("gone"), fails=99),
+                ToolRegistry(),
+                response_retries=0,
+                sleep=spy,
+            ).run([Message.user("hi")])
+
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert any("Provider call timed out" in m for m in errors), errors
+    assert any("Could not reach the provider" in m for m in errors), errors
+    assert not any("unparseable" in m for m in errors), errors
+
+
+def test_response_retries_zero_still_disables_the_transport_retry():
+    """The one knob on this axis governs the new class exactly as it governs the other three."""
+    provider = TransportFailingProvider(httpx.ReadTimeout("gone"), fails=99)
+    delays, spy = _no_sleep()
+
+    with pytest.raises(ProviderConnectionError):
+        Engine(provider, ToolRegistry(), response_retries=0, sleep=spy).run([Message.user("hi")])
 
     assert provider.calls == 1
     assert delays == []

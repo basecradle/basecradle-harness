@@ -608,7 +608,10 @@ class _ErrorMapper:
         if isinstance(exc, errors.NoResponseError):
             raise ProviderConnectionError(f"Could not reach OpenRouter: {exc}") from exc
         if isinstance(exc, httpx.RequestError):
-            # DNS/TCP/TLS/timeout — nothing reached the model.
+            # A transport failure: DNS/TCP/TLS, a connect timeout, or a **read** timeout. Chained
+            # with ``from exc`` deliberately — `_retry.connection_reason` reads the cause to tell
+            # ``timeout`` from ``transport``, because this line cannot: a read timeout did reach
+            # the model (this comment said otherwise until issue #545).
             raise ProviderConnectionError(f"Could not reach OpenRouter: {exc}") from exc
         if isinstance(exc, TypeError) and "unexpected keyword argument" in str(exc):
             # ``chat.send`` is typed with no ``**kwargs``; an unknown key came from model_params.
