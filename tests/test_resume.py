@@ -50,6 +50,7 @@ from basecradle_harness import (
     Tool,
     ToolCall,
 )
+from basecradle_harness._exceptions import ProviderConnectionError
 from basecradle_harness._idempotency import MESSAGE, IdempotencyKeys, key
 from basecradle_harness._session import INTERRUPTED, TOOL_ARGS_CAP, _json_size, turn_work
 from basecradle_harness._wake import Claim, ClaimStore, _turn_narration
@@ -833,3 +834,140 @@ def test_a_dead_turn_carrying_a_batch_is_resumed_once_not_once_per_message(platf
     claims = ClaimStore(tmp_path)
     assert claims.read(TIMELINE_UUID, M0, kind="messages").phase == "done"
     assert claims.read(TIMELINE_UUID, M1, kind="messages").phase == "done"
+
+
+# --- the shape that actually happened: a transport fault, not a signal (issue #545) -----------
+
+
+class _SpeaksThenTimesOut:
+    """Posts through the `messages` tool, then every later call fails in transport.
+
+    @glm-5.2's wake on 2026-09-20: ``posted=1``, then ``Could not reach OpenRouter: The read
+    operation timed out`` at ``steps=10/24``. It differs from `_Speaks` in the one way that makes
+    it worth its own test — the failure is an **exception that propagates normally**, so
+    `Session._persist` in `_drive`'s ``finally`` *does* run, where a signal skips it. The recovery
+    must reach the same verdict from the richer evidence, and `_chat`'s retry must not change it.
+    """
+
+    provider, model = "openrouter", "z-ai/glm-5.2"
+
+    def __init__(self, body: str = "Here is your owl.") -> None:
+        self.body = body
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.calls == 1:
+            return Message.assistant(
+                tool_calls=[
+                    ToolCall(
+                        id="call_1",
+                        name="messages",
+                        arguments={"action": "create", "body": self.body},
+                    )
+                ]
+            )
+        exc = ProviderConnectionError("Could not reach OpenRouter: The read operation timed out")
+        exc.__cause__ = httpx.ReadTimeout("The read operation timed out")
+        raise exc
+
+
+def _without_backoff(agent):
+    """Neuter the engine's retry backoff so a transport test costs no wall clock.
+
+    A wake builds its own `Engine`, so there is no `sleep=` to pass through `build_wake`. What is
+    under test here is the *classification* of an exhausted retry, never its schedule —
+    `tests/test_engine.py` pins the delays against a spy.
+    """
+    agent.harness.engine._sleep = lambda _seconds: None
+    return agent
+
+
+def test_a_wake_lost_to_a_read_timeout_after_posting_is_resumed_and_posts_once(
+    platform, tmp_path, caplog
+):
+    """The live event, end to end: one post survives it, and the peer is answered exactly once.
+
+    Two properties, and they are one test because the second is what makes the first non-obvious.
+
+    **The turn is retried where the retry can help.** Since issue #545 a transport fault is
+    transient, so the second model call is re-issued up to `DEFAULT_RESPONSE_RETRIES` more times
+    before the wake gives up — three calls after the post, not one. A transport failure that
+    *clears* never reaches the wake-level path at all; this double never clears, which is the only
+    way to exercise what happens when the retry is genuinely exhausted.
+
+    **And exhausting it changes nothing about the recovery.** The dead turn issued a tool call, so
+    the next wake **resumes** it rather than re-driving it — zero tools re-fire and the `messages`
+    create is never re-issued (its result is on disk, so it is not an interrupted create). The trap
+    to guard against is the `_redrive` branch immediately below the resume: a turn whose model call
+    *raised* **is** re-driven — but only when it issued no tool calls, and "the wake died inside the
+    model call" must never be allowed to mean "re-run the turn that already spoke".
+    """
+    serve_messages(platform, page(message(uuid=M0, body=MULTILINE)))
+    first, brain = build_wake(tmp_path, _SpeaksThenTimesOut())
+    _without_backoff(first)
+
+    with pytest.raises(ProviderConnectionError):
+        first.wake()
+
+    assert _posts(platform) == ["Here is your owl."]  # the dying wake did speak, once
+    assert brain.calls == 4  # the post, then 1 + DEFAULT_RESPONSE_RETRIES exhausted attempts
+
+    serve_messages(platform, page(message(uuid=M0, body=MULTILINE)))
+    second, live = build_wake(tmp_path, _Finishes(), tools=[MessagesTool()])
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        second.wake()
+
+    assert _posts(platform) == ["Here is your owl."]  # ONE post on the timeline, not two
+    assert live.seen, "the turn was never resumed — the peer was dropped, not recovered"
+    replayed = live.seen[0]
+    assert sum(1 for m in replayed if m.role == "user" and not m.injected) == 1
+    assert any(m.tool_calls and m.tool_calls[0].name == "messages" for m in replayed)
+    # Positively a *resume*, never a re-drive — the two are one `if` apart in `_recover`.
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any(m.startswith("resuming ") for m in warnings), warnings
+    assert not any(m.startswith("re-driving ") for m in warnings), warnings
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"
+
+
+def test_a_read_timeout_that_clears_never_reaches_the_recovery_path_at_all(platform, tmp_path):
+    """What issue #545 actually buys: the wake finishes, and there is nothing to recover.
+
+    The dead-wake path above is the *floor*. This is the ordinary case — the transport blips once,
+    the re-issued call succeeds, and the peer is answered inside the same wake instead of ~12
+    minutes and a second full step budget later.
+    """
+
+    class _SpeaksThenBlipsOnce:
+        provider, model = "openrouter", "z-ai/glm-5.2"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def chat(self, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return Message.assistant(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_1",
+                            name="messages",
+                            arguments={"action": "create", "body": "Here is your owl."},
+                        )
+                    ]
+                )
+            if self.calls == 2:
+                exc = ProviderConnectionError("Could not reach OpenRouter: read timed out")
+                exc.__cause__ = httpx.ReadTimeout("The read operation timed out")
+                raise exc
+            return Message.assistant(content="Done.")
+
+    serve_messages(platform, page(message(uuid=M0, body=MULTILINE)))
+    agent, brain = build_wake(tmp_path, _SpeaksThenBlipsOnce())
+    _without_backoff(agent)
+
+    agent.wake()
+
+    assert brain.calls == 3  # post, blip, recovery — all inside the one wake
+    assert _posts(platform) == ["Here is your owl."]
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "done"

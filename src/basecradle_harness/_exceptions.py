@@ -48,7 +48,20 @@ class ProviderResponseError(ProviderError):
 
 
 class ProviderConnectionError(ProviderError):
-    """The provider could not be reached (DNS, TCP, TLS, timeout)."""
+    """The call failed in transport — DNS, TCP, TLS, a connect timeout, or a **read** timeout.
+
+    Transient, and therefore retried on every model call the harness makes (issue #545): a
+    transport that failed once usually succeeds when re-issued, and behind a router the re-issue is
+    re-routed besides.
+
+    **It covers two genuinely different events and the adapters cannot tell them apart**, which is
+    why the taxonomy reads the distinction off the ``__cause__`` instead
+    (`basecradle_harness._retry.connection_reason` → ``transport`` or ``timeout``). A *connect*
+    failure means nothing reached the model. A *read* timeout means the request was accepted and
+    the answer did not come back in time — the model may have run, and may have been billed. Both
+    are safe to retry, because neither can have dispatched a tool: the harness acts only on a
+    parsed response.
+    """
 
 
 class ProviderToolSchemaError(ProviderError):

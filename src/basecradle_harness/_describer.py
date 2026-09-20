@@ -127,7 +127,7 @@ from basecradle_harness._observability import (
     truncated,
     usage_reported,
 )
-from basecradle_harness._retry import Retry, diagnostics
+from basecradle_harness._retry import Retry, connection_reason, diagnostics
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from basecradle_harness._provider import Provider
@@ -942,7 +942,10 @@ def _fault_of(exc: ProviderError) -> str:
     if isinstance(exc, ProviderResponseError):
         return "invalid_response"
     if isinstance(exc, ProviderConnectionError):
-        return "transport"
+        # ``timeout`` or ``transport``, off the cause — the shared read, not a flat word. This
+        # returned ``transport`` unconditionally until issue #545, so a describe that timed out and
+        # a rerank that timed out named the same fault differently on the same box.
+        return connection_reason(exc)
     if isinstance(exc, ProviderAPIError):
         return "config:model_not_found" if getattr(exc, "status_code", None) == 404 else "api_error"
     return "provider_error"

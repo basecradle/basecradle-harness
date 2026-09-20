@@ -51,6 +51,7 @@ from typing import Any
 from basecradle_harness._assets import model_sees_images, model_sees_video
 from basecradle_harness._exceptions import (
     EngineError,
+    ProviderConnectionError,
     ProviderError,
     ProviderRateLimitError,
     ProviderResponseError,
@@ -65,7 +66,7 @@ from basecradle_harness._messages import (
 )
 from basecradle_harness._observability import MAIN, describe_provider, kv, truncated
 from basecradle_harness._provider import Provider
-from basecradle_harness._retry import Retry, _default_backoff
+from basecradle_harness._retry import Retry, _default_backoff, connection_reason
 from basecradle_harness._tools import ToolRegistry
 
 _log = logging.getLogger("basecradle_harness")
@@ -81,13 +82,42 @@ _log = logging.getLogger("basecradle_harness")
 #: retry is one way to disagree with yourself.
 DEFAULT_RESPONSE_RETRIES = 2
 
-#: The provider faults worth trying again, and the *only* ones. All three mean "the request was
+#: The provider faults worth trying again, and the *only* ones. All four mean "the request was
 #: fine; something momentary went wrong" — a body that arrived mangled, a provider that fell over on
-#: its own side, or a router whose chosen upstream was momentarily at capacity. Everything else
-#: (auth, context overflow, a bad model_params key) is either permanent or has its own handling, and
-#: re-issuing it would merely repeat it. Classified by the **nature of the fault**, never the vendor:
-#: each adapter maps its own SDK's failures onto these three, so one rule in one place governs every
-#: provider.
+#: its own side, a router whose chosen upstream was momentarily at capacity, or a transport that
+#: dropped or timed out. Everything else (auth, context overflow, a bad model_params key) is either
+#: permanent or has its own handling, and re-issuing it would merely repeat it. Classified by the
+#: **nature of the fault**, never the vendor: each adapter maps its own SDK's failures onto these
+#: four, so one rule in one place governs every provider.
+#:
+#: **`ProviderConnectionError` joined in issue #545, and it is the same story as the 429 one
+#: paragraph down — with the aggravation that the policy already said so.**
+#: `_retry.RETRYABLE_REASONS` has listed ``timeout`` and ``transport`` since it shipped, and both
+#: are what `_rerank._fault_of` and `_describer._fault_of` emit for this class; the engine simply
+#: never caught the exception that carries them, so the *same* fault was retried on the memory and
+#: describe paths and fatal on the brain's. On 2026-09-20 @glm-5.2 lost a whole wake to
+#: ``The read operation timed out`` with no ``llm retry`` line anywhere in it: ~12 minutes and a
+#: second full step budget to recover what a ≤3s wait would have survived.
+#:
+#: **It was also the pre-#284 shape, in the class #284's own note names.** The `openai` SDK retries
+#: `APITimeoutError` and `APIConnectionError` internally (the adapter leaves ``max_retries`` on)
+#: while the `openrouter` adapter sets ``retry_config=None`` — so a read timeout was survivable
+#: three times over on one provider and fatal on the first raise on another, decided by nobody. That
+#: is the sentence below condemning the state this constant was in.
+#:
+#: **What the retry cannot do is double-act, and that is what makes it safe** (the objection is
+#: answered in full in `basecradle_harness._retry`): a call that never returned dispatched no tools
+#: and persisted nothing, so nothing on the platform and nothing in the transcript can happen twice.
+#: A read timeout *can* buy a duplicate generation at the vendor — bounded by the attempt count, and
+#: the exposure every `openai`-SDK agent has always taken.
+#:
+#: **The cost it does carry is wall clock, and it is the slow-5xx shape below becoming ordinary.**
+#: A *timeout* burns the whole client timeout before it raises, so a genuinely-unreachable provider
+#: now fails a wake in ~3 × ``DEFAULT_TIMEOUT`` rather than one — ~180s against ~60s at the shipped
+#: constants. That is worth it and the arithmetic is why: the alternative to waiting is the router
+#: re-waking, which replays the whole transcript and spends a fresh step budget (the live event cost
+#: 691s), so three minutes of patience is cheap against twelve of recovery. It is also the shape the
+#: NOC's Wake Duration Outlier alert watches, which is a reason to have written the number down.
 #:
 #: **The 429 joined in issue #506, reversing a deliberate exclusion, and the reversal is the
 #: interesting part.** It was excluded on the reasoning that hammering a rate-limited endpoint only
@@ -119,7 +149,12 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: router re-wake" stance. It is bounded and it is known, not an accident. The *sleep* half of that
 #: compounding now has the total-time deadline this note called for (`_retry.RETRY_BUDGET_SECONDS`,
 #: issue #506); the per-attempt client timeout is the half that remains, and it is the SDK's.
-_TRANSIENT = (ProviderResponseError, ProviderServerError, ProviderRateLimitError)
+_TRANSIENT = (
+    ProviderResponseError,
+    ProviderServerError,
+    ProviderRateLimitError,
+    ProviderConnectionError,
+)
 
 #: The backoff before a transient retry, in seconds, scaled by attempt number (0.5s, then 1.0s, …).
 #: Deliberately sub-second-to-low: these are momentary server hiccups, so the retry should add a
@@ -134,6 +169,10 @@ _RETRY_BACKOFF_BASE = 0.5
 #: vocabulary `_rerank._fault_of` and `_describer._fault_of` emit, so one grep reads every retry on
 #: the box whatever purpose made the call, and so `_retry.RETRYABLE_REASONS` gates all three the
 #: same way. Ordered most-specific first, because these classes subclass one another.
+#:
+#: `ProviderConnectionError` is deliberately **not** in this table: its word is not fixed by its
+#: class (``timeout`` or ``transport``, read off the cause), so it is answered by the one shared
+#: `_retry.connection_reason` that every call site reads — see `_reason`.
 _REASONS: tuple[tuple[type[Exception], str], ...] = (
     (ProviderRateLimitError, "rate_limited"),
     (ProviderServerError, "server_error"),
@@ -143,6 +182,12 @@ _REASONS: tuple[tuple[type[Exception], str], ...] = (
 
 def _reason(exc: object) -> str:
     """The retry vocabulary's word for a transient fault (`_REASONS`)."""
+    if isinstance(exc, ProviderConnectionError):
+        # The one class a lookup table cannot answer: the adapters collapse every transport failure
+        # into it, so *we waited* versus *we never got there* has to be read off the cause. Shared,
+        # never spelled here, so a read timeout reads the same in a brain line, a rerank line and a
+        # describe line (issue #545).
+        return connection_reason(exc)
     for kind, reason in _REASONS:
         if isinstance(exc, kind):
             return reason
@@ -155,6 +200,14 @@ def _fault(exc: object) -> str:
         return f"Provider rate-limited the request (HTTP {exc.status_code})"
     if isinstance(exc, ProviderServerError):
         return f"Provider failed on its own side (HTTP {exc.status_code})"
+    if isinstance(exc, ProviderConnectionError):
+        # Named apart, because the two send an operator to different places: a timeout is a call
+        # that ran out of time, and everything else here is the network or the endpoint refusing.
+        return (
+            "Provider call timed out"
+            if connection_reason(exc) == "timeout"
+            else "Could not reach the provider"
+        )
     return "Provider returned an unparseable response"
 
 
@@ -162,12 +215,19 @@ def _backoff(attempt: int, reason: str) -> float:
     """The wait before the engine's nth retry, by fault class.
 
     A 429 takes the shared schedule (1s, 2s) and, ahead of it, whatever ``Retry-After`` the vendor
-    stated; a 5xx or an unparseable body keeps the 0.5s/1s beat this file has always used. Both
-    draw on the one total-sleep budget, so the engine's own *wall-clock* exposure to a retry loop is
-    bounded for the first time — the fix this file's own `_TRANSIENT` note said was the right one if
+    stated; a 5xx, an unparseable body, or a transport fault keeps the 0.5s/1s beat this file has
+    always used. Both draw on the one total-sleep budget, so the engine's own *wall-clock* exposure
+    to a retry loop is bounded — the fix this file's own `_TRANSIENT` note said was the right one if
     the pathological slow-5xx case ever bit. At the shipped `DEFAULT_RESPONSE_RETRIES` the budget
     never binds on the 5xx path (0.5 + 1.0 = 1.5s); it binds only where an operator raised
     ``HARNESS_RESPONSE_RETRIES`` far enough to want bounding.
+
+    **A timeout stays on the short beat on purpose, and it is worth saying why the long one looks
+    right**: a rate limit is a *capacity window* that a half-second does not outlast, so it earns
+    the patient schedule — but a call that timed out has already waited the whole client timeout
+    (`DEFAULT_TIMEOUT`, 60s), and the thing to buy after that is a re-route, not more waiting. The
+    sleep is the only part of this the engine controls; the per-attempt timeout is the SDK's, and it
+    is what actually bounds a timeout retry's wall clock.
     """
     return (
         _default_backoff(attempt, reason)
@@ -288,8 +348,8 @@ class Engine:
             re-requested before the failure propagates — an unparseable response
             (`ProviderResponseError`, the truncated/EOF-mid-JSON class, issue #259) or the
             provider's own 5xx (`ProviderServerError`, issue #284). Defaults to
-            `DEFAULT_RESPONSE_RETRIES`; 0 disables the retry. Only those two classes are retried
-            (`_TRANSIENT`) — a connection, auth, rate-limit, or permanent error is never re-tried
+            `DEFAULT_RESPONSE_RETRIES`; 0 disables the retry. Only the transient classes are
+            retried (`_TRANSIENT`) — an auth or permanent error is never re-tried
             here, because re-issuing it would only repeat it.
         clock: Injectable source of the current UTC time, used to stamp each step-counter
             note and to measure per-step elapsed time. Defaults to the wall clock; a test
@@ -699,10 +759,10 @@ class Engine:
         )
 
     def _chat(self, messages: list[Message], tools: Sequence[ToolSpec] | None) -> Message:
-        """One provider call, retrying the **transient** provider faults (issues #259, #284, #506).
+        """One provider call, retrying the **transient** faults (issues #259, #284, #506, #545).
 
-        Three failures are transient — the same call, re-issued unchanged, usually succeeds — and
-        all three are retried here, bounded by `response_retries`, a short backoff, and a total
+        Four failures are transient — the same call, re-issued unchanged, usually succeeds — and
+        all four are retried here, bounded by `response_retries`, a short backoff, and a total
         sleep budget:
 
         - **`ProviderResponseError`** — the provider *answered* but the SDK could not parse the body
@@ -714,6 +774,12 @@ class Engine:
           (issue #506). It was deliberately excluded until the live 429s on the memory path proved
           the exclusion wrong for a *routed* provider; see `_TRANSIENT` for the whole reversal, and
           `basecradle_harness._retry` for the bound that keeps the old reasoning honest.
+        - **`ProviderConnectionError`** — the transport failed: DNS, TCP, TLS, a connect timeout, or
+          (the shape that opened issue #545) a **read** timeout, where the request was accepted and
+          the answer never came back. `_retry.RETRYABLE_REASONS` had named both its words since it
+          shipped, so the reranker and the describer already retried it; only this ``except`` could
+          not reach it, which made the same fault survivable on two paths and fatal on the one where
+          giving up costs a peer their reply.
 
         **Why retrying matters more than it looks.** A wake that aborts risks **dropping the peer's
         message** — the worst failure class this platform has — while a bounded retry costs cents.
@@ -735,10 +801,9 @@ class Engine:
         and would hang a wake) — the same fault, silently fatal on one provider and survivable on
         another, decided by nobody.
 
-        Everything else propagates on the first raise: a connection drop, an auth error, a
-        context-length overflow (the session compacts and retries *that* its own way), or a permanent
-        `ProviderError` such as a bad `model_params.json` key. Retrying a permanent fault only
-        repeats it.
+        Everything else propagates on the first raise: an auth error, a context-length overflow
+        (the session compacts and retries *that* its own way), or a permanent `ProviderError` such
+        as a bad `model_params.json` key. Retrying a permanent fault only repeats it.
 
         On exhaustion the last error is re-raised (the wake aborts with a clean non-zero exit) — but
         every retried attempt logs a WARNING — the shared ``llm retry`` line, so a brain retry, a
