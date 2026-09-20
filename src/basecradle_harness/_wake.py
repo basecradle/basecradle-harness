@@ -1093,7 +1093,7 @@ class ClaimStore:
 # runaway fires continuously — many wakes per second — so over a 60 s window it racks up
 # far more than this cap, while a human-paced multi-peer conversation almost never reaches
 # 10 *inbound* items to one timeline in a minute (the agent's own replies are self-filtered
-# and never wake it, so only peer items count). Tunable via env for the rare firehose
+# and never wake it, so only peer items count). Tunable via env for the rare high-volume
 # timeline; the router's cross-agent breaker (basecradle-router) is the complementary layer.
 _DEFAULT_BREAKER_MAX = 10
 _DEFAULT_BREAKER_WINDOW = 60.0
@@ -4754,7 +4754,7 @@ def _incoming_event_text(event: object) -> str:
     """An inbound webhook delivery as the agent hears it: what arrived, and its payload.
 
     A large payload is truncated with a pointer to the `webhook_events` tool (which
-    reads the full headers and body by uuid), so a firehose delivery cannot blow up
+    reads the full headers and body by uuid), so a delivery cannot blow up
     the model's context.
 
     The leading ``[created_at]`` stamp is the event item's own timeline timestamp, read

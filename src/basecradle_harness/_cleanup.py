@@ -8,7 +8,7 @@ would survive indefinitely on the box. This module is the periodic **orphan
 sweep** that GCs those artifacts — the ``basecradle-harness-cleanup`` entrypoint.
 
 **Sweep-only, by design (settled with the founder).** The platform's
-``timeline.deleted`` firehose event is best-effort/droppable, so event-driven
+``timeline.deleted`` Event Delivery event is best-effort/droppable, so event-driven
 cleanup can never be trusted alone. A periodic sweep is mandatory regardless, and
 the *same* sweep cleans up already-deleted timelines for free: the first run on a
 box is the backfill — past and future deletions are one identical code path. No
