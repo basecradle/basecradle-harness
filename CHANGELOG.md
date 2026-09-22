@@ -7,6 +7,85 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.129.0] - 2026-09-22
+
+### Fixed: a screenshot the model names is postable again (issue #552)
+
+Found live on 2026-09-22 during the Steel browser verify: @jt took a browser screenshot, then
+`assets action='post_image'` answered *"no captured images to post"* — in the same wake. The NOC
+reproduced it with this package's own MCP client against real `@playwright/mcp@0.0.80`:
+
+```
+browser_take_screenshot args={}                          → ToolResult, image store 0→1
+browser_take_screenshot args={'filename': 'example.png'} → str,        image store 1→1
+```
+
+The cause is Playwright's screenshot handler, which saves the file, prints a link to it, and sends
+the picture as an image block **only when the model did not name the file**
+(`if (!params.filename) registerImageResult(…)`). The harness stashed image blocks and nothing else,
+so a model that named its screenshot — which is exactly what a model does when it means to post it —
+lost the ability to post it, on every backend.
+
+**A file the call named, wrote, and linked is now read from the server's working directory** and
+rendered exactly as an inline image: vision input for a model that can see, and a `post_image`
+handle for every model. The placeholder names the file (`[image mcp-image-1: image/png, 9.7 KB,
+saved as 'example.png' — …]`). The store's per-wake lifecycle is unchanged. Verified against the
+real `@playwright/mcp@0.0.80` through `StdioMcpClient` → `McpTool` → `McpImageStore`: the named call
+now takes the store 0→1 with the real PNG, a named JPEG in a subdirectory with spaces and
+parentheses in its name works, and the unnamed call is untouched and stashes once.
+
+**The rule is keyed to the call's own arguments, never to the result's text — and that was a
+review finding, not the first draft.** The first draft followed any whole-line `- [title](path)`
+link, on the reasoning that an accessibility snapshot renders page text behind a role (`- text: …`)
+so a page cannot produce one. That is true of the snapshot and false of the result: playwright-mcp
+emits a page error's stack, a network response body and storage values verbatim, at the start of a
+line, and so does every other stdio server that relays third-party text. A link in a result proves
+nothing about who asked, and following one would have let a web page choose which of the agent's
+image files the harness opens, shows the model, and offers to post. The model's arguments are the
+one input no page writes. So a file is read only when all of these hold, and each fails toward
+"not shared":
+
+- **Only a stdio server has a root.** It is the directory the harness spawned the server in, now
+  **pinned** on the `Popen` rather than inherited (`StdioMcpClient.workdir`). An HTTP server's
+  paths name files on *its* host and are never read. The harness advertises no MCP `roots` — now
+  pinned by test — which is what makes Playwright resolve a file against that same directory.
+- **The model named it and the result links it.** The path is one of the call's own top-level
+  string arguments (any key — `filename` is Playwright's spelling), and some line of the result ends
+  in a markdown link that resolves to the same place. Paths are compared where they land, never as
+  spelled, and every `](` on a line is tried as the split, so an element screenshot titled with the
+  model's own `](`-bearing description — or a filename carrying one — still matches.
+- **The call wrote it.** The file's `lstat` before the call and after must differ (inode, size,
+  mtime, ctime). Clock-free, so a file server's drifting clock cannot defeat it, and it is what stops
+  a stale file of the same name — a server that wrote somewhere else — being passed off as the
+  capture. Its one blind spot fails closed: an identical rewrite inside one timestamp tick (a second,
+  on some filesystems) reads as "not written".
+- **It is a regular file inside the root** — the working directory only, so a file saved under an
+  operator's `--output-dir` elsewhere is refused with a note — symlinks followed first, then a path test
+  (`Path.is_relative_to`), never a string prefix, so `work-evil` is not inside `work`. A FIFO or a
+  device is judged on its `lstat` and never opened; the open is `O_NOFOLLOW | O_NONBLOCK |
+  O_NOCTTY` against a final-component swap. (A same-user actor racing an intermediate directory is
+  not defended against: anything able to do that could as easily have sent the bytes inline.)
+- **The bytes are a PNG, JPEG, GIF, or WebP** (magic bytes, never the extension) within
+  `MAX_IMAGE_BYTES`, checked on the `fstat` before reading and again on what was read. A secret
+  saved as `disguised.png` is refused, not stashed.
+
+**It is bounded in cost, because every string argument of every stdio MCP call is a candidate.** A
+string longer than `PATH_MAX` or spanning lines is never resolved (a mail body or a base64
+attachment is full of slashes, and resolving one cost seconds on 3.12+); containment is a linear test
+on path parts rather than `Path.is_relative_to`, which is quadratic in depth on 3.12+; and a
+result's link lines — which a page can fill — are resolved only when their final component is one
+the call's arguments spelled, so a thousand page-written links cost string compares.
+
+Nothing on this path raises into the tool call: a NUL byte in a path, a symlink loop, a directory,
+an unreadable file — each is a reason in the result, because an exception would replace a call that
+*finished* (its side effect happened) with an error and invite the model to do it again. A named
+file that looks like an image and fails a guard gets a one-line note saying why (and a `WARNING`);
+a named file that is not meant as a picture — a saved PDF, a storage state — passes in silence. A
+failed call's files are never read. A named image is shown to a vision model even from a server
+configured to omit image responses (`--image-responses omit`): that setting governs what the server
+sends, and the model asked for this file by name. The harness only reads the file; it is the
+agent's, written at the model's request, and never ours to remove.
+
 ## [0.128.0] - 2026-09-20
 
 ### Fixed: a transport failure no longer costs the whole wake (issue #545)

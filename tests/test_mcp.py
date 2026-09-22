@@ -8,9 +8,13 @@ pure: config parsing, the SSE/result helpers, name sanitization, resolution merg
 policy filter, and the brief's safety section.
 """
 
+import base64
 import json
+import os
 import shlex
+import stat
 import sys
+import time
 
 import httpx
 import pytest
@@ -38,6 +42,7 @@ from basecradle_harness._mcp import (
     HttpMcpClient,
     McpError,
     McpImageStore,
+    _named_files,
     _render_tool_result,
     _sse_response,
     mcp_tool_name,
@@ -229,6 +234,497 @@ def test_stdio_image_result_becomes_a_toolresult_and_is_stashed_for_posting(tmp_
             client.close()
 
 
+# playwright-mcp@0.0.80's screenshot tool, reduced to what it does with a file (issue #552): it
+# always saves the capture and prints a link to it, relative to its own working directory, and it
+# sends the picture as an image block **only when the model did not name the file** —
+# `if (!params.filename) await response.registerImageResult(data, type)`.
+_PLAYWRIGHT_LIKE_SERVER = r"""
+import base64, json, os, sys
+
+PNG = base64.b64decode(sys.argv[1])
+
+def send(msg):
+    sys.stdout.write(json.dumps(msg) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    rid = req.get("id")
+    if rid is None:
+        continue
+    if req["method"] == "initialize":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-06-18"}})
+    elif req["method"] == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": [{
+            "name": "browser_take_screenshot", "description": "shot", "inputSchema": {}}]}})
+    elif req["method"] == "tools/call":
+        filename = req["params"]["arguments"].get("filename")
+        name = filename or os.path.join(".playwright-mcp", "page-1.png")
+        os.makedirs(os.path.dirname(name) or ".", exist_ok=True)
+        with open(name, "wb") as out:
+            out.write(PNG)
+        link = name if os.path.dirname(name) else "./" + name
+        content = [{"type": "text", "text": (
+            "### Result\n- [Screenshot of viewport](" + link + ")\n"
+            "### Ran Playwright code\n```js\n// Screenshot viewport and save it as " + link + "\n```"
+        )}]
+        if not filename:
+            content.append({"type": "image", "data": sys.argv[1], "mimeType": "image/png"})
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": content}})
+"""
+
+
+def test_a_named_screenshot_is_postable_like_an_unnamed_one(tmp_path, monkeypatch):
+    """A file-link-only result is stashed from the server's working directory (issue #552).
+
+    The live defect, end to end through the real stdio client: the unnamed call stashed, the named
+    one did not. Now both do, and the unnamed one — which carries an image block *and* a link to
+    its saved copy — still stashes exactly once.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.chdir(work)  # the harness's cwd is the directory the server is spawned in
+    script = tmp_path / "playwright_like.py"
+    script.write_text(_PLAYWRIGHT_LIKE_SERVER, encoding="utf-8")
+    home = tmp_path / "home"
+    _drop_config(home, "pw", {"command": sys.executable, "args": [str(script), _PNG_B64]})
+    resolution = load_mcp_tools(home, timeout=10)
+    try:
+        (tool,) = resolution.tools
+        store = resolution.images
+        assert store is not None and len(store) == 0
+        assert resolution.clients[0].workdir == work.resolve()
+
+        named = tool.run(filename="example.png")
+        assert (work / "example.png").is_file()  # the server wrote it in the directory we pinned
+        assert isinstance(named, ToolResult)  # vision inlining, exactly as for an image block
+        assert len(named.images) == 1
+        assert len(store) == 1  # the defect: this stayed 0
+        assert store.get("latest").data == base64.b64decode(_PNG_B64)
+        assert store.get("latest").mimetype == "image/png"
+        assert "image mcp-image-1: image/png" in named.text
+        assert "saved as 'example.png'" in named.text
+        assert "action='post_image', image='mcp-image-1'" in named.text
+
+        unnamed = tool.run()
+        assert isinstance(unnamed, ToolResult)
+        assert len(unnamed.images) == 1
+        assert len(store) == 2  # the image block, and not the link to its saved copy as well
+    finally:
+        for client in resolution.clients:
+            client.close()
+
+
+def _png_file(path):
+    path.write_bytes(base64.b64decode(_PNG_B64))
+    return path
+
+
+def _linking(*targets, is_error=False):
+    """A result that links `targets` the way playwright-mcp prints a saved file, and no image."""
+    lines = "\n".join(f"- [Screenshot of viewport]({target})" for target in targets)
+    return {"content": [{"type": "text", "text": f"### Result\n{lines}"}], "isError": is_error}
+
+
+@pytest.mark.parametrize("shape", ["relative", "absolute", "symlink"])
+def test_a_named_file_outside_the_servers_working_directory_is_refused(tmp_path, shape):
+    """The server's working directory is the root, and a path is judged where it really lands.
+
+    A real PNG outside the root, named and linked three ways — climbing out, naming it absolutely,
+    and a symlink *inside* the root pointing at it — is never read: nothing stashed, nothing shown,
+    and the model told why.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    outside = _png_file(tmp_path / "outside.png")
+    target = {"relative": "../outside.png", "absolute": str(outside), "symlink": "inside.png"}[
+        shape
+    ]
+    if shape == "symlink":
+        (work / "inside.png").symlink_to(outside)
+    named = _named_files({"filename": target}, work)
+    outside.write_bytes(
+        outside.read_bytes()
+    )  # "the call wrote it" holds; containment still refuses
+    store = McpImageStore()
+    result = _render_tool_result(_linking(target), store, named)
+    assert isinstance(result, str)  # no ToolResult: no pixels reached the model
+    assert len(store) == 0
+    assert f"[image file {str(outside)!r} not shared: it is outside the MCP server's working " in (
+        result
+    )
+
+
+def test_a_sibling_directory_sharing_the_roots_prefix_is_outside_it(tmp_path):
+    """Containment is a path test, never a string prefix: ``work-evil`` is not inside ``work``."""
+    work = tmp_path / "work"
+    work.mkdir()
+    (tmp_path / "work-evil").mkdir()
+    named = _named_files({"filename": "../work-evil/shot.png"}, work)
+    _png_file(tmp_path / "work-evil" / "shot.png")
+    store = McpImageStore()
+    result = _render_tool_result(_linking("../work-evil/shot.png"), store, named)
+    assert len(store) == 0
+    assert "outside the MCP server's working directory" in result
+
+
+def test_text_a_page_wrote_can_never_choose_what_is_read(tmp_path):
+    """The read is keyed to the call's arguments, never to link-shaped text in its result.
+
+    playwright-mcp emits page-authored strings verbatim at the start of a line — a page error's
+    stack, a response body, a storage value — so a page *can* write ``- [x](photo.png)`` into a
+    result. An image already in the root, linked that way, is not opened unless the model named it;
+    named, it is still not shared unless the call wrote it; and only then is it shown.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    photo = _png_file(work / "photo.png")
+    injected = {
+        "content": [
+            {
+                "type": "text",
+                "text": "### Events\n- [ERROR] Error: boom\n- [x](photo.png)\n    at page.js:1",
+            }
+        ]
+    }
+    store = McpImageStore()
+    unasked = _render_tool_result(injected, store, _named_files({"url": "https://h/"}, work))
+    assert unasked == injected["content"][0]["text"]  # untouched: no read, no note
+    assert len(store) == 0
+
+    unwritten = _render_tool_result(
+        _linking("photo.png"), store, _named_files({"filename": "photo.png"}, work)
+    )
+    assert "[image file 'photo.png' not shared: this call did not write it]" in unwritten
+    assert len(store) == 0
+
+    named = _named_files({"filename": "photo.png"}, work)
+    # The call writes it. A different size, so the stamp moves however coarse this filesystem's
+    # clock is — a same-size rewrite inside one tick is the one write a stamp cannot see.
+    photo.write_bytes(base64.b64decode(_PNG_B64) + b"\0" * 8)
+    shared = _render_tool_result(_linking("./photo.png"), store, named)
+    assert isinstance(shared, ToolResult)
+    assert len(store) == 1
+
+
+def test_the_bytes_decide_what_is_an_image_never_the_extension(tmp_path):
+    """Whatever was named, nothing that is not a picture reaches the store.
+
+    A secret written under a screenshot's name is refused with a note; one written under its own
+    name is passed over in silence (a call that saves a non-image — a PDF, a storage state — is
+    ordinary); and a real capture saved with no extension at all is shared, because its bytes say
+    it is a PNG.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    secret = "AI_API_KEY=sk-fake-0000000000000000\n"
+    store = McpImageStore()
+
+    named = _named_files({"filename": "disguised.png"}, work)
+    (work / "disguised.png").write_text(secret, encoding="utf-8")
+    disguised = _render_tool_result(_linking("./disguised.png"), store, named)
+    assert "not shared: it is not a recognizable image" in disguised
+
+    named = _named_files({"filename": "agent.env"}, work)
+    (work / "agent.env").write_text(secret, encoding="utf-8")
+    plain = _render_tool_result(_linking("./agent.env"), store, named)
+    assert plain == "### Result\n- [Screenshot of viewport](./agent.env)"  # untouched, no note
+    assert len(store) == 0
+    assert "sk-fake" not in disguised + plain
+
+    named = _named_files({"filename": "capture"}, work)
+    _png_file(work / "capture")
+    shared = _render_tool_result(_linking("./capture"), store, named)
+    assert isinstance(shared, ToolResult)
+    assert len(store) == 1
+
+
+def test_a_named_file_is_read_only_with_a_root_and_only_on_success(tmp_path):
+    """No root (an HTTP server, the library path) or a failed call: the link stays text."""
+    work = tmp_path / "work"
+    work.mkdir()
+    named = _named_files({"filename": "shot.png"}, work)
+    _png_file(work / "shot.png")
+    store = McpImageStore()
+    assert _render_tool_result(_linking("./shot.png"), store) == (
+        "### Result\n- [Screenshot of viewport](./shot.png)"
+    )
+    failed = _render_tool_result(_linking("./shot.png", is_error=True), store, named)
+    assert failed.startswith("Error: ")
+    assert len(store) == 0
+
+
+def test_a_named_file_the_store_cannot_hold_is_described_never_raised(tmp_path, monkeypatch):
+    """Every way a named file can be unreadable is a reason in the result, never an exception.
+
+    An exception here would replace a call that *finished* — whose side effect happened — with an
+    error, and invite the model to do it again.
+    """
+    import basecradle_harness._mcp as mcp
+
+    work = tmp_path / "work"
+    work.mkdir()
+    store = McpImageStore()
+
+    def run(filename, make=None, link=None):
+        named = _named_files({"filename": filename}, work)
+        if make is not None:
+            make(work / filename)
+        return _render_tool_result(_linking(link or filename), store, named)
+
+    assert "not shared: it is not a regular file" in run("pipe.png", os.mkfifo)
+    assert "not shared: it is not a regular file" in run("dir.png", os.mkdir)
+    assert "not shared: it was not found" in run("gone.png")
+    # A saved directory that is not meant as a picture (playwright's trace resources) is silent.
+    assert run("traces", os.mkdir) == "### Result\n- [Screenshot of viewport](traces)"
+    # A NUL byte names no file on any Python, and must not raise out of resolve or open.
+    assert "\x00" in run("a\x00.png", link="a\x00.png")
+    monkeypatch.setattr(mcp, "MAX_IMAGE_BYTES", 8)
+    assert "not shared: it is too large to show or share" in run("big.png", _png_file)
+    assert len(store) == 0
+
+
+def test_a_named_file_is_read_only_when_the_result_links_it(tmp_path):
+    """The call must name the file *and* the server must say it saved it there.
+
+    A tool that writes a named image as a side effect and never mentions it is not a screenshot
+    tool, and its file is left alone.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    named = _named_files({"filename": "shot.png"}, work)
+    _png_file(work / "shot.png")
+    store = McpImageStore()
+    quiet = {"content": [{"type": "text", "text": "done"}]}
+    assert _render_tool_result(quiet, store, named) == "done"
+    assert len(store) == 0
+
+
+def test_an_image_block_and_a_named_file_stash_the_picture_once(tmp_path):
+    """A result that sent the picture inline is not read back from disk as well."""
+    work = tmp_path / "work"
+    work.mkdir()
+    named = _named_files({"filename": "shot.png"}, work)
+    _png_file(work / "shot.png")
+    result = _linking("./shot.png")
+    result["content"].append({"type": "image", "data": _PNG_B64, "mimeType": "image/png"})
+    store = McpImageStore()
+    rendered = _render_tool_result(result, store, named)
+    assert isinstance(rendered, ToolResult)
+    assert len(rendered.images) == 1
+    assert len(store) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "- [Screenshot of the ](odd) button](./shot.png)",
+        "- [Screenshot of line one\nline two](shot.png)  ",
+        "- [Screenshot of viewport](./shot.png)\n- [Screenshot of viewport](shots/../shot.png)",
+    ],
+    ids=["bracket-in-title", "newline-in-title", "linked-twice"],
+)
+def test_a_link_is_matched_by_where_it_lands_not_how_it_is_spelled(tmp_path, text):
+    """Titles, spellings and a symlinked root cannot hide the file the call named.
+
+    An element screenshot is titled with the model's own description of the element, which may
+    carry ``](`` or a line break; a file may be linked twice under two spellings; and the root may
+    be reached through a symlink (macOS ``/var`` → ``/private/var``). It is shared, once.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    root = tmp_path / "root-link"
+    root.symlink_to(work)
+    named = _named_files({"element": "the ](odd) button", "filename": "./shot.png"}, root)
+    _png_file(work / "shot.png")
+    store = McpImageStore()
+    result = _render_tool_result({"content": [{"type": "text", "text": text}]}, store, named)
+    assert isinstance(result, ToolResult)
+    assert len(result.images) == 1
+    assert len(store) == 1
+    assert "saved as 'shot.png'" in result.text
+
+
+def test_a_name_with_spaces_and_parentheses_survives(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    named = _named_files({"filename": "sub/shot two (1).png"}, work)
+    (work / "sub").mkdir()
+    _png_file(work / "sub" / "shot two (1).png")
+    store = McpImageStore()
+    result = _render_tool_result(_linking("sub/shot two (1).png"), store, named)
+    assert isinstance(result, ToolResult)
+    assert "saved as 'sub/shot two (1).png'" in result.text
+
+
+def test_nothing_but_a_regular_file_is_ever_opened(tmp_path, monkeypatch):
+    """A FIFO or a device is judged on its ``lstat`` and never opened — opening one can block or act."""
+    import basecradle_harness._mcp as mcp
+
+    work = tmp_path / "work"
+    work.mkdir()
+    named = _named_files({"filename": "pipe.png"}, work)
+    os.mkfifo(work / "pipe.png")
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a non-regular file was opened")
+
+    monkeypatch.setattr(mcp.os, "open", refuse)
+    result = _render_tool_result(_linking("pipe.png"), McpImageStore(), named)
+    assert "not shared: it is not a regular file" in result
+
+
+def test_the_size_bound_holds_on_what_was_read_not_only_on_the_fstat(tmp_path, monkeypatch):
+    """A file that grows between the ``fstat`` and the read is still held to the ceiling."""
+    import basecradle_harness._mcp as mcp
+
+    work = tmp_path / "work"
+    work.mkdir()
+    named = _named_files({"filename": "shot.png"}, work)
+    _png_file(work / "shot.png")
+    monkeypatch.setattr(mcp, "MAX_IMAGE_BYTES", 32)
+    real_fstat = os.fstat
+
+    def shrunk(fd):
+        info = real_fstat(fd)
+        return os.stat_result((*info[:6], 0, *info[7:10]))  # st_size reads 0
+
+    monkeypatch.setattr(mcp.os, "fstat", shrunk)
+    store = McpImageStore()
+    result = _render_tool_result(_linking("shot.png"), store, named)
+    assert "not shared: it is too large to show or share" in result
+    assert len(store) == 0
+
+
+def test_a_re_shot_of_an_unchanged_page_is_still_written(tmp_path):
+    """Identical bytes into the same file move only its write times — and that is enough.
+
+    A second screenshot of a page that has not changed keeps the inode and the size; only
+    ``st_mtime_ns``/``st_ctime_ns`` move. The pause is longer than any filesystem clock tick this
+    suite runs on; inside one tick the rewrite would read as unwritten, which fails closed.
+    """
+    work = tmp_path / "work"
+    work.mkdir()
+    shot = _png_file(work / "shot.png")
+    named = _named_files({"filename": "shot.png"}, work)
+    time.sleep(0.05)
+    shot.write_bytes(shot.read_bytes())
+    store = McpImageStore()
+    assert isinstance(_render_tool_result(_linking("shot.png"), store, named), ToolResult)
+    assert len(store) == 1
+
+
+def test_a_filename_carrying_the_link_separator_still_matches(tmp_path):
+    work = tmp_path / "work"
+    work.mkdir()
+    named = _named_files({"filename": "a](b).png"}, work)
+    _png_file(work / "a](b).png")
+    store = McpImageStore()
+    result = _render_tool_result(_linking("./a](b).png"), store, named)
+    assert isinstance(result, ToolResult)
+    assert len(store) == 1
+
+
+def test_what_names_no_file_costs_no_resolve(tmp_path, monkeypatch):
+    """Every string argument of every call is a candidate, so the cost has to be bounded.
+
+    A mail body or a base64 attachment past `PATH_MAX`, or a multi-line string, is never resolved;
+    and a result's link lines — which a page can fill — are resolved only when their final component
+    is one the call's arguments spelled.
+    """
+    import basecradle_harness._mcp as mcp
+
+    work = tmp_path / "work"
+    work.mkdir()
+    assert _named_files({"body": "a/" * 3000, "text": "one\ntwo/x.png"}, work).before == {}
+
+    named = _named_files({"filename": "shot.png"}, work)
+    resolved = []
+    real = mcp._resolve
+    monkeypatch.setattr(
+        mcp, "_resolve", lambda root, target: resolved.append(target) or real(root, target)
+    )
+    page = "\n".join(f"- [x](asset-{n}.png)" for n in range(1000)) + "\n- " + "[y](z" * 50000 + ")"
+    _render_tool_result({"content": [{"type": "text", "text": page}]}, McpImageStore(), named)
+    assert resolved == []
+
+
+def test_the_open_and_the_read_are_fenced(tmp_path, monkeypatch):
+    """The open refuses a swapped-in link and cannot block or take a terminal; the fd always closes;
+    a read error is a reason; an oversized file is never read past its magic bytes; and a file that
+    turned into something else between the ``lstat`` and the open is refused on the ``fstat``.
+    """
+    import errno
+
+    import basecradle_harness._mcp as mcp
+
+    work = tmp_path / "work"
+    work.mkdir()
+    opened, closed = [], []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(path, flags, *args):
+        fd = real_open(path, flags, *args)
+        opened.append((fd, flags))
+        return fd
+
+    def spy_close(fd):
+        closed.append(fd)
+        real_close(fd)
+
+    monkeypatch.setattr(mcp.os, "open", spy_open)
+    monkeypatch.setattr(mcp.os, "close", spy_close)
+
+    def render(name):
+        named = _named_files({"filename": name}, work)
+        _png_file(work / name)
+        return _render_tool_result(_linking(name), McpImageStore(), named)
+
+    assert isinstance(render("ok.png"), ToolResult)
+    ((fd, flags),) = opened
+    for flag in (os.O_NOFOLLOW, os.O_NONBLOCK, os.O_NOCTTY):
+        assert flags & flag
+    assert closed == [fd]
+
+    reads = []
+
+    class _Handle:
+        def __init__(self, fail):
+            self._fail = fail
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n):
+            reads.append(n)
+            if self._fail:
+                raise OSError(errno.EIO, "Input/output error")
+            return base64.b64decode(_PNG_B64)[:n]
+
+    monkeypatch.setattr(mcp, "open", lambda *a, **k: _Handle(fail=True), raising=False)
+    assert "not shared: it could not be read (Input/output error)" in render("eio.png")
+    assert len(closed) == 2  # closed on the error path too
+
+    monkeypatch.setattr(mcp, "open", lambda *a, **k: _Handle(fail=False), raising=False)
+    monkeypatch.setattr(mcp, "MAX_IMAGE_BYTES", 32)
+    reads.clear()
+    assert "too large to show or share" in render("big.png")
+    assert reads == [mcp._SNIFF_BYTES]  # the magic bytes, and not one byte of the body
+
+    fifo_mode = stat.S_IFIFO | 0o644
+    real_fstat = os.fstat
+    monkeypatch.setattr(
+        mcp.os, "fstat", lambda fd: os.stat_result((fifo_mode, *real_fstat(fd)[1:10]))
+    )
+    assert "not shared: it is not a regular file" in render("swapped.png")
+
+
 def test_colliding_sanitized_tool_names_dedup_not_crash(tmp_path):
     # Two distinct remote names that sanitize to the same final name ("a.b" and "a b" both
     # → "dup__a_b"). The second must self-exclude with a reason, never produce two tools of
@@ -412,6 +908,13 @@ def test_http_transport_lists_and_calls(tmp_path):
         # The session id from initialize is echoed on later requests.
         later = route.calls[-1].request
         assert later.headers.get("mcp-session-id") == "sess-1"
+        # A remote server's paths name files on its host, never ours (issue #552)...
+        assert client.workdir is None
+        # ...and the handshake advertises no MCP `roots`, which is what makes playwright-mcp resolve
+        # a named file against its own cwd — the directory a stdio server's files are read from.
+        initialize = json.loads(route.calls[0].request.content)
+        assert initialize["method"] == "initialize"
+        assert "roots" not in initialize["params"]["capabilities"]
     finally:
         client.close()
 
