@@ -299,6 +299,7 @@ class TimelineAgent:
             max_steps=_max_steps_from_env(),
             response_retries=_response_retries_from_env(),
             server_builtins=resolved.builtins,
+            withheld_tools=resolved.withheld,
             turn_hook=bridge.on_reply if bridge is not None else None,
             # The context budget (issue #276): the poll loop's session is as long-lived as a
             # wake-mode one — it is the same transcript — so it is bounded the same way.
@@ -1420,6 +1421,7 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
     failed server's ``(name, reason)`` rides ``.skipped`` like a Group-2 activation skip.
     With ``mcp/`` empty the `McpResolution` is empty and this returns ``resolved`` unchanged.
     """
+    # A withheld tool or a server's self-description implies a server loaded, so its notice is here.
     if not mcp.tools and not mcp.skipped and not mcp.notices:
         return resolved
     existing = {tool.name for tool in resolved.tools}
@@ -1434,6 +1436,11 @@ def _merge_mcp_tools(resolved: ResolvedTools, mcp: McpResolution) -> ResolvedToo
         # The per-wake image store (issue #318): carried so the assets ``post_image`` action can
         # reach it via the `PlatformContext`. ``None`` unless an MCP server's tools loaded.
         mcp_images=mcp.images,
+        # The tools this agent's configuration withholds, and what each server says about itself
+        # (issue #553): the engine answers a call to a withheld one with its refusal, and the
+        # brief's ``mcp`` part carries the self-descriptions.
+        withheld={**resolved.withheld, **mcp.withheld},
+        mcp_about=resolved.mcp_about + mcp.about,
     )
 
 

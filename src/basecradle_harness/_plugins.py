@@ -423,6 +423,13 @@ class ResolvedTools:
             loaded. It rides the resolved set from `_merge_mcp_tools` to the hosting agent, which
             threads it into the `PlatformContext` so the assets ``post_image`` action can post an
             image an MCP tool returned. ``None`` for any config with no active MCP image source.
+        withheld: ``model-facing name → refusal`` for every MCP tool an active server offered
+            and this agent's configuration withholds (issue #553). Handed to the engine, which
+            answers a call to one with the refusal. Deliberately **not** in `skipped`: a withheld
+            tool is not a tool that failed to activate, it is a documented exception, and its
+            names are reported on their own (``--resolved-config`` → ``mcp_withheld_tools``).
+        mcp_about: What each active MCP server says about itself and its operator's note on it
+            (issue #553), one block per server that has either — the brief's ``mcp`` part.
     """
 
     tools: list[Tool] = field(default_factory=list)
@@ -444,6 +451,10 @@ class ResolvedTools:
     #: the `PlatformContext` so the assets ``post_image`` action can post a returned image. ``None``
     #: for any config with no active MCP image source (the common case).
     mcp_images: McpImageStore | None = None
+    #: MCP tools withheld by this agent's configuration, ``model-facing name → refusal`` (#553).
+    withheld: dict[str, str] = field(default_factory=dict)
+    #: Each active MCP server's self-description and operator note, for the brief (issue #553).
+    mcp_about: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         """Hold `skipped`'s one invariant: it never names a tool this config actually got.

@@ -7,6 +7,101 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.130.0] - 2026-09-22
+
+### Added: `browser_run_code_unsafe` is withheld by default, and the agent is told what it has and why (issue #553)
+
+**The exception, stated where it is built.** Playwright MCP's `browser_run_code_unsafe` is
+**withheld from every agent by default**, by @origin's ruling of 2026-09-22 (basecradle/basecradle#582,
+ruling 4, *"approve both (for now)"* — provisional). The tool runs arbitrary JavaScript inside the
+playwright-mcp **process**, not the page; its own description calls it "RCE-equivalent", and Node's
+`vm` is no boundary. On a local browser that is code execution as the agent's OS user, which walks
+around the `shell` tool's opt-in and the NOC's `verify_unprivileged` gate. Behind the Steel launcher
+it is the process holding the Steel key. Playwright MCP 0.0.80 has no flag to turn it off.
+`browser_evaluate`, which runs JavaScript in the page, is kept: that is the browsing capability a
+human has. The reason, the decider, the date and "for now" live in one table,
+`_mcp.WITHHOLDABLE`, and every word of it reaches the agent.
+
+**It is per-agent configuration, never a constant**, because the ruling is a default a founder can
+waive — *"@briggs is the exception, meaning if he wants access, he gets it."* Three keys in
+`mcp/<name>.json` mirror the Steel launcher's `STEEL_WITHHELD_TOOLS` / `STEEL_WITHHELD_WAIVABLE`, so
+handing the tool back is one inventory edit and no release:
+
+- `withheld_tools`: absent means `["browser_run_code_unsafe"]`, and `[]` means withhold nothing. The
+  default is keyed by tool name, so it is a no-op on any server that does not offer the tool.
+- `withheld_waivable`: adds *"That is a default, not a lock: @origin has said it is yours whenever
+  you ask."*
+- `note`: the operator's own words about the server (below).
+
+Only names in `WITHHOLDABLE` are accepted, so withholding a new tool needs a stated reason in code
+review. A config naming anything else, or giving a key the wrong type (`null` is not `[]`), **fails
+closed**: the server does not load, rather than loading on a guess that could hand the agent the
+very tool its operator meant to withhold. A `"true"` string is not read as a boolean either way.
+The keys belong inside an `mcpServers` wrapper's server entry; beside the wrapper they are refused
+rather than silently ignored.
+
+**A rejected config is now visible, and that fixes an older gap too.** A file that failed to parse
+used to vanish: it dropped out of `--resolved-config`'s `mcp_servers` (documented as "independent of
+whether each one loaded") and never reached `skipped`, so the NOC saw "never configured" where the
+truth was "rejected, because …". Every rejected file — a bad withholding or plain malformed JSON —
+now keeps its stem in `mcp_servers` and lands in `skipped` with its reason (`load_mcp_configs_report`).
+
+`withheld_waivable` speaks in the decider's name ("@origin has said it is yours whenever you ask"),
+so setting it asserts that ruling for the agent. It is the fleet's record-keeper's to set, not a
+convenience flag.
+
+**Withheld means gone and refused, and both states are disclosed:**
+
+- The tool is dropped from the tool list: 24 tools become 23 on the real `@playwright/mcp@0.0.80`.
+- A model that calls it by name anyway gets an ordinary tool error from the engine that says what
+  the tool is, why it is withheld, who decided, and — when the server offers it under a name of its
+  own — to use `…__browser_evaluate` instead. It is never "no tool named", which reads as a broken
+  tool and invites a retry.
+- The MCP client refuses the name too, before anything is sent: the second fence, at the one call
+  every path to the server goes through.
+- The server's line in the brief says it in the refusal's own words, spelled once so the two cannot
+  disagree.
+- An agent whose list is empty is told the tool is **present**, and why agents do not get it by
+  default.
+
+`--resolved-config` reports `mcp_withheld_tools` — the off-box proof that a withholding landed, or
+that a waiver did. It names only tools a server *offered*. The NOC's Steel launcher already filters
+the tool itself, from its own `STEEL_WITHHELD_TOOLS`, so on a Steel agent the harness never sees it,
+the field reads `[]`, and a waiver takes both settings.
+
+**The `initialize` result is no longer discarded.** The client used to send `initialize` and never
+read the answer, so no server's `instructions` ever reached a model. The Steel launcher had to hide
+its disclosure in `browser_navigate`'s description for that reason. Each server's `serverInfo` and
+`instructions` now reach the model in a new fenced **`mcp` part of the Turn-0 brief**, beside the
+operator's `note`, each labelled with whose words it is. Because a server is external code:
+
+- its instructions are capped at 4,096 characters, with a marker naming what was cut;
+- they are **quoted line by line**, because attribution by a leading label is a claim a server can
+  forge: instructions carrying a line that begins `Configuration note for this server:`, or a whole
+  `MCP server 'x' …` heading, would otherwise read as the more-trusted voice or as another server;
+- the part carries the brief's fence-forgery strip, so a server cannot close the part early;
+- it has its own context-attribution section;
+- it has a mining sentinel, proving it is shown and never mined.
+
+Tool descriptions are still passed through untouched. The harness does not rewrite a server's
+descriptions.
+
+**The harness stays backend-blind, and that is a decision.** It does not write "local headless
+Chromium, persistent profile, no proxy…" itself. Those facts belong to the launch config the NOC
+owns, and hard-coding them would be false for the Steel agent, for any `--isolated`,
+`--proxy-server` or `--cdp-endpoint` config, and for a developer running stock `@playwright/mcp`
+with a visible browser. A browser's backend is a per-agent inventory choice, so its description is
+declared beside it, as the overlay's `note`, and changes with it without a release.
+
+### Fixed: the brief's fence-forgery strip ran once, so a nested literal rebuilt the fence
+
+`brief_parts` removed every fence literal from a peer-influenced part in **one** pass, and one pass
+is a forgery kit: removing `</dashboard.md>` from `</dash</dashboard.md>board.md>` *assembles* the
+literal it just removed. A peer who named a timeline that way ended the dashboard's data block early
+(issue #509's exact threat), and the same held for recalled memory — and for the new `mcp` part,
+whose safety rests on it. The strip now repeats until the text stops changing (`_strip_fences`),
+pinned for all three parts.
+
 ## [0.129.0] - 2026-09-22
 
 ### Fixed: a screenshot the model names is postable again (issue #552)

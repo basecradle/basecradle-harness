@@ -774,6 +774,21 @@ see the absence of.**
   silently-widened capability is exactly what the opt-in rule exists to prevent, and the difference
   between a decision and an oversight is whether it is stated. `view` and `watch` are unaffected —
   they were never powerful (no provider call, nothing spent, in-process decode).
+
+  **And one MCP tool is withheld by founder decision, recorded the same way** (issue #553,
+  @origin, 2026-09-22, *"approve both (for now)"* — provisional). Playwright MCP's
+  `browser_run_code_unsafe` runs arbitrary JavaScript in the playwright-mcp **process**, not the
+  page: code execution as the agent's OS user, around the `shell` opt-in and the NOC's
+  `verify_unprivileged` gate. So every server withholds it unless its `mcp/<name>.json` says
+  otherwise (`_mcp.WITHHOLDABLE`, the one place the reason, decider and date live, all of which the
+  agent is told). Two properties are the ruling, not details: the list is **per-agent
+  configuration** the NOC declares (`withheld_tools`, `[]` = hand it back — *"@briggs is the
+  exception, meaning if he wants access, he gets it"*), never a constant, so a founder's waiver is
+  an inventory edit and no release; and **both states are disclosed** — withheld, with why and the
+  waiver sentence when `withheld_waivable`; or handed back, with why agents do not get it by
+  default. Only `WITHHOLDABLE` names are accepted, so withholding a new tool needs a stated reason
+  in code review, and a config naming anything else fails closed (the server does not load) and
+  visibly (its stem stays in `mcp_servers`, its reason lands in `skipped`).
 - **MCP is safe-by-default.** `mcp/` ships **empty** and the locked `Policy` denies shell/exec, so
   a fresh install is safe by default. Loading an MCP server — **or** a drop-in `tools/` tool
   that needs a policy-denied capability — is the operator *knowingly leaving the safe zone*, so the

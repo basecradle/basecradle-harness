@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import shutil
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -2218,6 +2219,77 @@ def test_resolved_config_reports_configured_mcp_servers_regardless_of_load(
     # And the failed load is honestly recorded in `skipped` (the loaded set diverges from the
     # configured set) — proving `mcp_servers` reports configuration, not liveness.
     assert "workmail" in report["skipped"]
+
+
+def test_resolved_config_reports_the_withheld_mcp_tools(wake_env, monkeypatch, tmp_path):
+    """Off-box proof a withholding landed, and that a waiver did (issue #553): the withheld tool is
+    absent from `tools` and named in `mcp_withheld_tools`; handed back, the reverse."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    cfg.mkdir()
+    assert resolved_config()["mcp_withheld_tools"] == []
+
+    script = tmp_path / "pw.py"
+    script.write_text(
+        "import json, sys\n"
+        "for line in sys.stdin:\n"
+        "    req = json.loads(line) if line.strip() else {}\n"
+        "    rid = req.get('id')\n"
+        "    if rid is None: continue\n"
+        "    result = {'protocolVersion': '2025-06-18'} if req['method'] == 'initialize' else "
+        "{'tools': [{'name': n, 'inputSchema': {}} for n in "
+        "('browser_evaluate', 'browser_run_code_unsafe')]}\n"
+        "    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': rid, 'result': result}) + '\\n')\n"
+        "    sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    (cfg / "mcp").mkdir()
+    config = cfg / "mcp" / "playwright.json"
+    config.write_text(json.dumps({"command": sys.executable, "args": [str(script)]}))
+
+    report = resolved_config()
+    assert report["mcp_withheld_tools"] == ["playwright__browser_run_code_unsafe"]
+    assert "playwright__browser_run_code_unsafe" not in report["tools"]
+    assert "playwright__browser_evaluate" in report["tools"]
+
+    config.write_text(
+        json.dumps({"command": sys.executable, "args": [str(script)], "withheld_tools": []})
+    )
+    report = resolved_config()
+    assert report["mcp_withheld_tools"] == []
+    assert "playwright__browser_run_code_unsafe" in report["tools"]
+
+
+def test_resolved_config_keeps_a_rejected_mcp_config_visible(wake_env, monkeypatch, tmp_path):
+    """A file the harness refused is a server its operator declared (issue #553): its stem stays in
+    `mcp_servers`, and `skipped` says it did not load — never "never configured"."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    (cfg / "mcp").mkdir(parents=True)
+    (cfg / "mcp" / "playwright.json").write_text(
+        json.dumps({"command": "x", "withheld_tools": ["browser_run_code"]})
+    )
+    report = resolved_config()
+    assert report["mcp_servers"] == ["playwright"]
+    assert "playwright" in report["skipped"]
+
+
+def test_from_env_hands_the_withheld_tools_and_server_notes_on(platform, wake_env, monkeypatch):
+    """The wiring from resolution to the engine and the brief (issue #553), which no other test
+    reaches: `test_mining` injects `mcp_about` into the constructor directly."""
+    from dataclasses import replace
+
+    real = wake_module._resolve_tools_and_provider
+
+    def resolved_with_mcp():
+        provider, resolved, memory, bridge = real()
+        mcp = replace(resolved, withheld={"pw__x": "pw__x is withheld."}, mcp_about=["about pw"])
+        return provider, mcp, memory, bridge
+
+    monkeypatch.setattr(wake_module, "_resolve_tools_and_provider", resolved_with_mcp)
+    agent = WakeAgent.from_env(timeline=TIMELINE_UUID)
+    assert agent.harness.engine.withheld_tools == {"pw__x": "pw__x is withheld."}
+    assert agent.mcp_about == ["about pw"]
 
 
 def test_resolved_config_reports_the_resolved_mcp_request_timeout(wake_env, monkeypatch):
