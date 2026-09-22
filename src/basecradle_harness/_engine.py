@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
@@ -344,6 +344,12 @@ class Engine:
             only to answer a model that mistakenly *calls one as a function* with targeted
             guidance instead of the generic "no tool named X" error (issue #245); the
             generic error still stands for a genuinely unknown name. Empty by default.
+        withheld_tools: ``name → refusal`` for tools deliberately **not** offered to the model
+            (issue #553 — an MCP tool withheld by a documented, dated exception). A model that
+            calls one anyway gets that refusal — what the tool is, why it is withheld, who
+            decided, what to use instead — rather than "no tool named X", which reads as a tool
+            that broke and invites a retry. Never consulted for a tool that *is* registered.
+            Empty by default.
         response_retries: How many extra times a provider call that failed **transiently** is
             re-requested before the failure propagates — an unparseable response
             (`ProviderResponseError`, the truncated/EOF-mid-JSON class, issue #259) or the
@@ -366,6 +372,7 @@ class Engine:
         max_steps: int = DEFAULT_MAX_STEPS,
         turn_hook: TurnHook | None = None,
         server_builtins: Sequence[str] = (),
+        withheld_tools: Mapping[str, str] | None = None,
         response_retries: int = DEFAULT_RESPONSE_RETRIES,
         clock: Callable[[], datetime] | None = None,
         sleep: Callable[[float], None] | None = None,
@@ -382,6 +389,7 @@ class Engine:
         self.base_turn_hook = turn_hook
         self.turn_hook = turn_hook
         self.server_builtins = frozenset(server_builtins)
+        self.withheld_tools = dict(withheld_tools or {})
         self.response_retries = response_retries
         #: Whether the **last** `run` ended in the out-of-budget reserve call rather than the model
         #: settling on its own (`_reserve_summary`). Read by the wake to label that turn's unspoken
@@ -1020,6 +1028,9 @@ class Engine:
             if name in self.server_builtins:
                 self._log_tool(name, started, error=f"{name!r} is server-side, not a function")
                 return _server_builtin_guidance(name)
+            if name in self.withheld_tools:
+                self._log_tool(name, started, error=f"{name!r} is withheld")
+                return f"Error: {self.withheld_tools[name]}"
             self._log_tool(name, started, error=f"no tool named {name!r}")
             return f"Error: no tool named {name!r}."
         try:

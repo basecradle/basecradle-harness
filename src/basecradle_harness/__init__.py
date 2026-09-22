@@ -15,6 +15,7 @@ from basecradle_harness._brief import (
     render_budget,
     render_defects,
     render_manifest,
+    render_mcp,
     render_safety,
 )
 from basecradle_harness._code import CodeAttachTool, CodeExecutionBridge
@@ -192,6 +193,7 @@ __all__ = [
     # The persistent Turn-0 operating brief
     "compose_brief",
     "render_manifest",
+    "render_mcp",
     "render_safety",
     "render_defects",
     "render_budget",

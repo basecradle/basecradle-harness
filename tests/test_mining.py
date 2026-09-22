@@ -70,11 +70,18 @@ CHARTER_SENTINEL = "SENTINEL-CHARTER-do-not-mine-this-personality-charter-line"
 MANIFEST_SENTINEL = "SENTINEL-MANIFEST-do-not-mine-this-tool-note"
 DASHBOARD_SENTINEL = "SENTINEL-DASHBOARD-do-not-mine-this-platform-primer"
 RECALL_SENTINEL = "SENTINEL-RECALL-do-not-mine-this-recalled-memory"
+MCP_SENTINEL = "SENTINEL-MCP-do-not-mine-this-servers-own-instructions"
 # The reranker's *own* output. Not a brief surface — a whole extra model whose text the boundary
 # has never had to account for (issue #464). It must reach neither the agent's model nor the palace.
 RERANK_SENTINEL = "SENTINEL-RERANK-do-not-show-or-mine-this-reranker-narration"
 DESCRIBER_SENTINEL = "SENTINEL-DESCRIBER-do-not-mine-this-description-as-the-agents-words"
-SENTINELS = (CHARTER_SENTINEL, MANIFEST_SENTINEL, DASHBOARD_SENTINEL, RECALL_SENTINEL)
+SENTINELS = (
+    CHARTER_SENTINEL,
+    MANIFEST_SENTINEL,
+    DASHBOARD_SENTINEL,
+    RECALL_SENTINEL,
+    MCP_SENTINEL,
+)
 
 
 class Recorder(MemoryProvider):
@@ -187,6 +194,8 @@ def _agent(home, provider, model=None, monkeypatch=None):
         onboard=True,
         memory_provider=provider,
         tool_manifest=[("memory", MANIFEST_SENTINEL)],
+        # What an MCP server says about itself (issue #553): external text inside the brief.
+        mcp_about=[f"MCP server 'pw': What the server says about itself: {MCP_SENTINEL}"],
     )
 
 
@@ -194,7 +203,8 @@ def _agent(home, provider, model=None, monkeypatch=None):
 
 
 def test_no_part_of_the_brief_reaches_the_mined_exchange(platform, tmp_path, monkeypatch):
-    """The issue's acceptance test: sentinels in charter, manifest, dashboard and recall.
+    """The issue's acceptance test: sentinels in charter, manifest, dashboard, recall and — since
+    issue #553 — an MCP server's own instructions.
 
     Both halves matter and both are asserted. If the sentinels never reached the *model*, this
     would pass for the wrong reason — a brief that composed empty proves nothing about a

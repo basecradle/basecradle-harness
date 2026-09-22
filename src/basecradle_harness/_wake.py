@@ -123,6 +123,7 @@ from basecradle_harness._brief import (
     render_budget,
     render_defects,
     render_manifest,
+    render_mcp,
     render_safety,
 )
 from basecradle_harness._code import CodeExecutionBridge
@@ -144,7 +145,7 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._harness import Harness
 from basecradle_harness._idempotency import IdempotencyKeys, interrupted
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
-from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs
+from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs_report
 from basecradle_harness._memory_provider import (
     MemoryExchange,
     MemoryProvider,
@@ -1560,6 +1561,7 @@ class WakeAgent:
         tool_manifest: list[tuple[str, str | None]] | None = None,
         memory_provider: MemoryProvider | None = None,
         safety_notices: list[str] | None = None,
+        mcp_about: list[str] | None = None,
         defect_notices: list[str] | None = None,
         breaker: WakeBreaker | None = None,
         pacer: ReadPacer | None = None,
@@ -1593,6 +1595,9 @@ class WakeAgent:
         # the notice sanctions an active tool to the model while keeping that audit tail loud
         # (issue #322) — empty for a pure-Harness config.
         self.safety_notices = safety_notices
+        # What each active MCP server says about itself (its ``initialize`` instructions) and the
+        # operator's note on it, shown in the brief's own fenced ``mcp`` part (issue #553).
+        self.mcp_about = mcp_about
         # Broken-shipped-default defect notices surfaced into the brief under their own loud
         # heading (issue #160), so a capability silently disabled by a stale overlay or a
         # packaging bug is impossible to miss — empty when every shipped default loaded.
@@ -1796,6 +1801,9 @@ class WakeAgent:
             # The active server-side built-ins (e.g. web_search), so a model that calls one as a
             # function gets targeted guidance instead of the generic error (issue #245).
             server_builtins=resolved.builtins,
+            # MCP tools this agent's configuration withholds (issue #553): a model that calls one
+            # by name gets its refusal — what, why, who decided — rather than "no tool named".
+            withheld_tools=resolved.withheld,
             home=home,
             # The code-execution Asset bridge (when active) harvests a run's output files +
             # source into Assets after each code-exec turn, then feeds their uuids back. None
@@ -1827,6 +1835,9 @@ class WakeAgent:
             # Safe-by-default opt-out notices from tool resolution (active MCP servers,
             # policy-refused drop-ins). Empty by default → no safety section in the brief.
             safety_notices=resolved.notices,
+            # What each active MCP server says about itself, and its operator's note (issue
+            # #553). Empty unless a server has either → no ``mcp`` part in the brief.
+            mcp_about=resolved.mcp_about,
             # Broken-shipped-default defects from tool resolution (issue #160). Empty when
             # every shipped default loaded → no defect section in the brief.
             defect_notices=resolved.broken,
@@ -2933,6 +2944,7 @@ class WakeAgent:
                 manifest=render_manifest(self._manifest_entries()),
                 defects=render_defects(self.defect_notices),
                 safety=render_safety(self.safety_notices),
+                mcp=render_mcp(self.mcp_about),
                 dashboard=fetch_dashboard_md(self.client),
                 memory=self._memory_context(query),
                 system_prompt=system_prompt_text(),
@@ -5023,7 +5035,8 @@ def resolved_config() -> dict[str, object]:
       present-vs-activated split that verify states in its ``notes`` is unchanged. ``{}`` for a
       config whose active tool plugins read no environment, which is the ordinary case.
     - ``mcp_servers`` — the sorted **names** of the **configured** MCP servers, one per
-      ``mcp/<name>.json`` drop-in (`load_mcp_configs`), independent of whether each one loaded
+      ``mcp/<name>.json`` drop-in (`load_mcp_configs_report`, a file the harness rejected
+      included, by its stem — issue #553), independent of whether each one loaded
       this run (issue #261). The MCP-overlay analogue of ``opt_in_tools`` / ``active_profile``:
       the NOC's fleet-drift audit compares inventory-declared-vs-configured on this axis, both
       directions, holding **no** model of the harness's ``<server>__<tool>`` naming internals —
@@ -5032,6 +5045,13 @@ def resolved_config() -> dict[str, object]:
       self-excludes a server into ``skipped`` this run never reads as desired-state drift. Names
       only, never a server's ``env``/``headers`` (non-secret by contract, like the opt-in stems).
       ``[]`` for the default empty ``mcp/`` dir.
+    - ``mcp_withheld_tools`` — the sorted **model-facing** names of the MCP tools an active server
+      offered and this agent's configuration withholds (issue #553: ``withheld_tools`` in
+      ``mcp/<name>.json``, default ``browser_run_code_unsafe``). The one way to confirm off-box that
+      a withholding landed *and* that a founder's waiver did: the name is absent from ``tools`` and
+      present here, or — handed back — present in ``tools`` and absent here. Read off the loaded
+      servers, so a server that did not load this run withholds nothing it can report. ``[]`` for a
+      config with no MCP server, or none that offers a withholdable tool.
     - ``mcp_request_timeout`` — the **resolved** per-request MCP timeout in seconds
       (`_timeout_from_env`: ``HARNESS_MCP_TIMEOUT`` if set to a positive number, else the ``20.0``
       default), the ceiling a wake gives any single MCP request — the handshake, ``tools/list``, or
@@ -5097,6 +5117,9 @@ def resolved_config() -> dict[str, object]:
     resolved, memory = _resolve_tools(provider_name, sdk, surface)
     memory_name, memory_version = describe_memory_provider(memory)
     model_params, stripped = resolved_model_params(sdk)
+    # The configured servers, rejected files included (issue #553): a file the harness refused is
+    # a server its operator declared, and dropping its name here would read as "never configured".
+    mcp_configs, mcp_rejected = load_mcp_configs_report()
     return {
         "harness_version": __version__,
         "ai_provider": provider_name,
@@ -5137,7 +5160,10 @@ def resolved_config() -> dict[str, object]:
                 | ({DESCRIBER_API_KEY_VAR} if describer_model_from_env() else set())
             )
         },
-        "mcp_servers": sorted({config.name for config in load_mcp_configs()}),
+        "mcp_servers": sorted(
+            {config.name for config in mcp_configs} | {stem for stem, _reason in mcp_rejected}
+        ),
+        "mcp_withheld_tools": sorted(resolved.withheld),
         "mcp_request_timeout": _timeout_from_env(),
         "model_params": model_params,
         "model_params_stripped": stripped,

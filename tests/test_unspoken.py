@@ -398,7 +398,7 @@ def _model_facing_strings():
     other surface — the brief, the nudges, the guidance the engine feeds back — where the word
     would be a lie the model then reasons from.
     """
-    from basecradle_harness._brief import render_budget, render_defects, render_safety
+    from basecradle_harness._brief import render_budget, render_defects, render_mcp, render_safety
     from basecradle_harness._engine import (
         _RESERVE_NUDGE,
         _TRUNCATED_NOTE,
@@ -406,14 +406,30 @@ def _model_facing_strings():
         _step_note,
     )
     from basecradle_harness._install import prompt_text
+    from basecradle_harness._mcp import McpServerConfig, _about, _withholding, withheld_refusal
 
     now = __import__("datetime").datetime(2026, 7, 14, tzinfo=__import__("datetime").timezone.utc)
+    noted = McpServerConfig(name="pw", command="x", note="Headless Chromium on this box.")
+    handed_back = McpServerConfig(name="pw", command="x", withheld_tools=())
+    unsafe = ["browser_run_code_unsafe"]
+
+    class _Client:
+        server_label = "Playwright 1.0"
+        instructions = "This browser runs locally."
+
     return {
         "initialize.md": prompt_text("initialize.md") or "",
         "system-prompt.md": prompt_text("system-prompt.md") or "",
         "step budget": render_budget(24) or "",
         "tool defect": render_defects(["memory — failed to load"]) or "",
         "safety opt-out": render_safety(["mcp: filesystem"]) or "",
+        # Issue #553: what the model is told about its MCP servers and the tools it does not get.
+        "mcp part": render_mcp([_about(noted, _Client())]) or "",
+        "withheld refusal": withheld_refusal(
+            "pw", "browser_run_code_unsafe", waivable=True, offered=["browser_evaluate"]
+        ),
+        "withheld disclosure": " ".join(_withholding(noted, unsafe, unsafe)),
+        "handed-back disclosure": " ".join(_withholding(handed_back, unsafe, [])),
         "reserve nudge": _RESERVE_NUDGE,
         "step note (terse)": _step_note(1, 24, now),
         "step note (escalated)": _step_note(23, 24, now),

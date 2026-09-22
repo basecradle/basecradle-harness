@@ -596,6 +596,28 @@ def test_from_env_wires_a_full_agent(platform, monkeypatch):
     assert "listen" not in agent.harness.tools
 
 
+def test_from_env_hands_the_withheld_tools_to_the_engine(platform, monkeypatch):
+    """The poll loop's agent refuses a withheld MCP tool by name too (issue #553)."""
+    from dataclasses import replace
+
+    import basecradle_harness._basecradle as basecradle_module
+
+    monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
+    monkeypatch.setenv("AI_MODEL", "gpt-4o")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
+    real = basecradle_module._resolve_tools_and_provider
+
+    def resolved_with_withheld():
+        provider, resolved, memory, bridge = real()
+        return provider, replace(resolved, withheld={"pw__x": "no."}), memory, bridge
+
+    monkeypatch.setattr(basecradle_module, "_resolve_tools_and_provider", resolved_with_withheld)
+    agent = TimelineAgent.from_env()
+    assert agent.harness.engine.withheld_tools == {"pw__x": "no."}
+
+
 def test_resolve_tools_and_provider_flips_web_search_with_the_surface(monkeypatch):
     # The tool set + provider built-ins are plugin-resolved, so flipping the openai adapter's
     # surface changes the active set: web_search (a Responses-only built-in) is on under

@@ -84,6 +84,9 @@ class Harness:
             the provider runs itself. Passed to the engine so a model that mistakenly
             calls one as a function gets targeted guidance rather than a generic error
             (issue #245). Empty by default (a config with no server-side built-ins).
+        withheld_tools: ``name → refusal`` for tools deliberately withheld from the model (issue
+            #553). Passed to the engine, which answers a call to one with its refusal rather than
+            "no tool named". Empty by default.
         home: An optional directory under which session transcripts persist
             (`<home>/sessions/<source>.json`), making a past session's reasoning
             readable across restarts. `None` (the default) keeps sessions in
@@ -109,6 +112,7 @@ class Harness:
         max_steps: int = DEFAULT_MAX_STEPS,
         response_retries: int = DEFAULT_RESPONSE_RETRIES,
         server_builtins: Sequence[str] = (),
+        withheld_tools: Mapping[str, str] | None = None,
         home: str | Path | None = None,
         turn_hook: TurnHook | None = None,
         compactor: Compactor | None = None,
@@ -124,6 +128,7 @@ class Harness:
             response_retries=response_retries,
             turn_hook=turn_hook,
             server_builtins=server_builtins,
+            withheld_tools=withheld_tools,
         )
         self.system_prompt = system_prompt
         self.home = Path(home) if home is not None else None

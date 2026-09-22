@@ -119,7 +119,7 @@ import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -191,6 +191,15 @@ _SNIFF_BYTES = 16
 # the filesystem's timestamp resolution.
 _Stamp = tuple[int, int, int, int, int, int]
 
+# The most of a server's own ``instructions`` the model is shown (issue #553). They ride the Turn-0
+# brief, which is re-sent on every step of every wake, and a server is external code: a bound is
+# what makes "nothing replayed per wake may be unbounded" true of them. Generous — the Steel
+# launcher's whole disclosure is about 1 KB — and an elision says how much was not shown.
+_INSTRUCTIONS_CAP = 4096
+
+# The most of a server's ``serverInfo`` name + version shown, on one line.
+_LABEL_CAP = 120
+
 # The longest string treated as a path: Linux's PATH_MAX, and more than any path macOS opens. The
 # bound is about *cost*: every string argument of every stdio MCP call is a candidate, a mail body
 # or a base64 attachment is full of slashes, and resolving one walks every one of them — seconds,
@@ -202,7 +211,99 @@ class McpError(Exception):
     """An MCP transport or protocol failure — a failed handshake, a JSON-RPC error, a timeout."""
 
 
+# --- the withheld tools (issue #553) --------------------------------------------
+
+
+@dataclass(frozen=True)
+class Withholding:
+    """One MCP tool the harness withholds by default, and the documented exception that says why.
+
+    Human–AI parity is the default, so a capability withheld from an agent is legal only as an
+    **explicit, dated exception naming its decider** — never by oversight. Each entry is that record,
+    in the one place the withholding is built, and every word of it reaches the model: the agent is
+    told what it does not have, why, who decided, and what to use instead (@origin, 2026-09-22:
+    *"agents need to know what they have and why!"*).
+    """
+
+    #: What the tool does that makes it withheld — completes "it is withheld because …".
+    reason: str
+    #: The server's tool that covers the legitimate need, named in every refusal.
+    instead: str
+    decider: str
+    decided: str
+    #: The ruling's own word for how long it stands.
+    standing: str
+
+
+#: Every MCP tool the harness can withhold, by the tool's name on its server. **Only these can be
+#: named in ``withheld_tools``**: withholding a tool from an agent needs a stated reason, so adding
+#: one is an entry here, in code review, with its decider and date — never a free string in config.
+#:
+#: ``browser_run_code_unsafe`` (Playwright MCP) runs arbitrary JavaScript inside the playwright-mcp
+#: **process** — its own description says "RCE-equivalent", and Node's ``vm`` is no boundary, so
+#: ``process`` is reachable. On a local browser that is code execution as the agent's OS user, which
+#: walks around the ``shell`` tool's opt-in and the NOC's ``verify_unprivileged`` gate; behind the
+#: Steel launcher it is the process holding the Steel key, which reaches every profile in the
+#: organization. Playwright MCP 0.0.80 has no flag to turn it off. ``browser_evaluate`` is kept: it
+#: runs JavaScript in the *page*, which is the browsing capability a human has. Withheld fleet-wide
+#: by @origin's ruling of 2026-09-22 (basecradle/basecradle#582, ruling 4: *"approve both (for
+#: now)"*), and a default he can waive per agent — *"@briggs is the exception, meaning if he wants
+#: access, he gets it"* — which is why the list is per-server configuration and not a constant.
+WITHHOLDABLE: Mapping[str, Withholding] = {
+    "browser_run_code_unsafe": Withholding(
+        reason=(
+            "it runs arbitrary code inside the browser server's own process rather than in the "
+            "page — code execution on this machine as you, outside the shell tool's opt-in and "
+            "its checks, and on a cloud browser the process that holds its credential"
+        ),
+        instead="browser_evaluate",
+        decider="@origin",
+        decided="2026-09-22",
+        standing="for now",
+    ),
+}
+
+#: What a server withholds when its config names nothing: every withholdable tool. Keyed by tool
+#: name, so on a server that does not offer the tool it is a no-op.
+DEFAULT_WITHHELD: tuple[str, ...] = tuple(WITHHOLDABLE)
+
+
+def withheld_refusal(server: str, tool: str, *, waivable: bool, offered: Iterable[str] = ()) -> str:
+    """What the model is told when it calls a withheld tool by name anyway: what, why, instead.
+
+    The tool to use instead is named only when the server `offered` it under a name of its own —
+    a refusal pointing at a tool that is not there, or (past the 64-character truncation) at the
+    withheld tool's own name, would be a second wrong answer inside the right one.
+    """
+    rule = WITHHOLDABLE[tool]
+    name = mcp_tool_name(server, tool)
+    waiver = f" {_waiver(rule)}" if waivable else ""
+    instead = mcp_tool_name(server, rule.instead)
+    use = (
+        f" Use {instead} to run JavaScript in the page itself."
+        if rule.instead in set(offered) and instead != name
+        else ""
+    )
+    return (
+        f"{name} is withheld from you: {rule.reason}. Withheld by {rule.decider}'s ruling of "
+        f"{rule.decided}, {rule.standing}.{waiver}{use}"
+    )
+
+
+def _waiver(rule: Withholding) -> str:
+    """The sentence that tells an agent a withheld tool is its for the asking.
+
+    It speaks for the decider, which is why ``withheld_waivable`` is not a convenience flag: setting
+    it asserts that the decider has said this agent may have the tool on request (@origin's ruling
+    named @briggs). Only whoever records founder decisions for the fleet sets it.
+    """
+    return f"That is a default, not a lock: {rule.decider} has said it is yours whenever you ask."
+
+
 # --- config -------------------------------------------------------------------
+
+#: The keys in a server's config that are the operator's, not the transport's (issue #553).
+_OPERATOR_KEYS = frozenset({"withheld_tools", "withheld_waivable", "note"})
 
 
 @dataclass(frozen=True)
@@ -212,6 +313,12 @@ class McpServerConfig:
     Exactly one transport is configured: ``command`` (stdio) or ``url`` (HTTP). `name` is
     the filename stem, used to namespace the server's tools and to label it in logs and the
     opt-out notice.
+
+    Three keys are the operator's, not the transport's (issue #553). ``withheld_tools`` names the
+    server's tools the agent does not get — absent means `DEFAULT_WITHHELD`, ``[]`` means none, and
+    only `WITHHOLDABLE` names are accepted. ``withheld_waivable`` tells the agent the withholding is
+    a default it may ask to have lifted. ``note`` is the operator's own words to the model about this
+    server — what it is and what backs it — shown beside whatever the server says about itself.
     """
 
     name: str
@@ -220,6 +327,9 @@ class McpServerConfig:
     env: Mapping[str, str] = field(default_factory=dict)
     url: str | None = None
     headers: Mapping[str, str] = field(default_factory=dict)
+    withheld_tools: tuple[str, ...] = DEFAULT_WITHHELD
+    withheld_waivable: bool = False
+    note: str | None = None
 
     @property
     def transport(self) -> str:
@@ -232,18 +342,36 @@ def load_mcp_configs(home: str | os.PathLike[str] | None = None) -> list[McpServ
 
     The ``mcp/`` dir ships empty (safe by default), so a missing dir or an empty one yields
     no servers. A file that fails to parse is logged and skipped — one malformed operator
-    file never takes the agent down, the same robustness the ``tools/`` overlay has.
+    file never takes the agent down, the same robustness the ``tools/`` overlay has. The
+    rejected files are reported by `load_mcp_configs_report`.
+    """
+    return load_mcp_configs_report(home)[0]
+
+
+def load_mcp_configs_report(
+    home: str | os.PathLike[str] | None = None,
+) -> tuple[list[McpServerConfig], list[tuple[str, str]]]:
+    """The parsed configs, and ``(file stem, reason)`` for every file that was rejected.
+
+    A rejected file is a server its operator declared and the agent does not have, so it must be as
+    visible as one that failed to connect (issue #553): `load_mcp_tools` puts it in ``skipped`` and
+    ``--resolved-config`` keeps its stem in ``mcp_servers`` — reported from disk, loaded or not. A
+    config the harness cannot honor still **fails closed**: loading it on a guess — the default
+    withholding, say, in place of a list with a typo in it — could hand the agent the very tool its
+    operator meant to withhold.
     """
     mcp_dir = config_home(home) / "mcp"
     if not mcp_dir.is_dir():
-        return []
+        return [], []
     configs: list[McpServerConfig] = []
+    rejected: list[tuple[str, str]] = []
     for path in sorted(mcp_dir.glob("*.json")):
         try:
             configs.append(_parse_config(path))
         except Exception as exc:  # noqa: BLE001 - a bad operator file is skipped, not fatal
             _log.warning("Skipping MCP server config %s: %s", path.name, exc)
-    return configs
+            rejected.append((path.stem, f"MCP server config {path.name} was rejected: {exc}"))
+    return configs, rejected
 
 
 def _parse_config(path: Path) -> McpServerConfig:
@@ -261,6 +389,11 @@ def _parse_config(path: Path) -> McpServerConfig:
     if isinstance(servers, dict):
         if len(servers) != 1:
             raise ValueError("a 'mcpServers' wrapper must hold exactly one server")
+        misplaced = sorted(set(data) & _OPERATOR_KEYS)
+        if misplaced:
+            # Outside the wrapper they would be silently ignored — and a waiver that does not land,
+            # or a withholding that does not, is exactly what an operator must be told about.
+            raise ValueError(f"{misplaced} belong inside the server entry, not beside 'mcpServers'")
         name, data = next(iter(servers.items()))
         if not isinstance(data, dict):
             raise ValueError("the server entry must be a JSON object")
@@ -276,7 +409,48 @@ def _parse_config(path: Path) -> McpServerConfig:
         env={str(k): str(v) for k, v in (data.get("env") or {}).items()},
         url=str(url) if url else None,
         headers={str(k): str(v) for k, v in (data.get("headers") or {}).items()},
+        withheld_tools=_withheld_tools(data.get("withheld_tools", DEFAULT_WITHHELD)),
+        withheld_waivable=_flag(data.get("withheld_waivable", False), "withheld_waivable"),
+        note=_note(data.get("note")),
     )
+
+
+def _withheld_tools(value: object) -> tuple[str, ...]:
+    """``withheld_tools`` validated: a list of `WITHHOLDABLE` names (issue #553).
+
+    A config the harness cannot honor **fails closed**: the file is skipped like any malformed one,
+    so the server does not load — rather than loading with the very tool its operator meant to
+    withhold. A name with no documented reason is refused for the same reason and one more: a
+    capability withheld from an agent needs its exception written down, and a free string in config
+    is not one.
+    """
+    if isinstance(value, tuple):
+        value = list(value)
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise ValueError("'withheld_tools' must be a list of tool names")
+    unknown = sorted(set(value) - set(WITHHOLDABLE))
+    if unknown:
+        raise ValueError(
+            f"'withheld_tools' names {unknown}, which the harness has no documented reason to "
+            f"withhold; it can withhold {sorted(WITHHOLDABLE)}"
+        )
+    return tuple(dict.fromkeys(value))
+
+
+def _flag(value: object, key: str) -> bool:
+    """A JSON boolean, or a `ValueError` naming `key` — never a truthy guess at ``"false"``."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{key!r} must be true or false")
+    return value
+
+
+def _note(value: object) -> str | None:
+    """The operator's ``note``: a string, or absent."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("'note' must be a string")
+    return value.strip() or None
 
 
 # --- the per-wake image store (issue #318) ------------------------------------
@@ -363,10 +537,23 @@ class McpClient(ABC):
     #: files are not ours to read, so a file its calls save is never read back (issue #552).
     workdir: Path | None = None
 
+    #: What the server said about itself in its ``initialize`` result (issue #553): its
+    #: ``serverInfo`` name and version, and its ``instructions`` — the protocol's channel for
+    #: telling the model how to use the server. Read in the handshake; the harness used to discard
+    #: the whole result, so no server's instructions ever reached a model.
+    server_label: str | None = None
+    instructions: str | None = None
+
     def __init__(self, config: McpServerConfig, timeout: float) -> None:
         self.config = config
         self.timeout = timeout
         self._ids = itertools.count(1)
+        #: The server's tools this client refuses to call (issue #553). The tool list never offers
+        #: them, so a model cannot reach one through a registered tool; this is the second fence,
+        #: at the one call every path to the server goes through.
+        self.withheld = frozenset(config.withheld_tools)
+        #: The tool names the server's last ``tools/list`` offered — what a refusal may point to.
+        self.listed: frozenset[str] = frozenset()
 
     @abstractmethod
     def start(self) -> None:
@@ -385,8 +572,15 @@ class McpClient(ABC):
         """Release the transport (terminate the subprocess / close the HTTP client)."""
 
     def _handshake(self) -> None:
-        """The MCP initialize handshake: ``initialize`` then ``notifications/initialized``."""
-        self._request(
+        """The MCP initialize handshake: ``initialize`` then ``notifications/initialized``.
+
+        The result's ``serverInfo`` and ``instructions`` are kept (issue #553) — each bounded,
+        because a server is external code and both are shown to the model on every step of every
+        wake. The ``capabilities`` sent stay empty, and that is load-bearing: advertising ``roots``
+        would move the directory a server like playwright-mcp resolves a named file against, which
+        is the directory `workdir` names (issue #552).
+        """
+        result = self._request(
             "initialize",
             {
                 "protocolVersion": _PROTOCOL_VERSION,
@@ -394,13 +588,21 @@ class McpClient(ABC):
                 "clientInfo": {"name": "basecradle-harness", "version": __version__},
             },
         )
+        self.server_label = _server_label(result.get("serverInfo"))
+        instructions = result.get("instructions")
+        if isinstance(instructions, str) and instructions.strip():
+            self.instructions = _bounded(instructions.strip(), _INSTRUCTIONS_CAP)
         self._notify("notifications/initialized")
 
     def list_tools(self) -> list[dict]:
         """The server's tools (``tools/list``): each a dict with ``name``/``description``/``inputSchema``."""
         result = self._request("tools/list")
         tools = result.get("tools")
-        return list(tools) if isinstance(tools, list) else []
+        listed = list(tools) if isinstance(tools, list) else []
+        self.listed = frozenset(
+            str(spec.get("name", "")) for spec in listed if isinstance(spec, dict)
+        )
+        return listed
 
     def call_tool(self, name: str, arguments: dict) -> dict:
         """Invoke ``tools/call`` and return the raw JSON-RPC ``result`` dict.
@@ -408,8 +610,18 @@ class McpClient(ABC):
         The client speaks the protocol; rendering the result into what the *model* reads —
         joining text blocks, and (issue #318) turning an image block into a `ToolResult` plus a
         stashed capture — is `McpTool.run`'s job, because only the tool holds the per-wake
-        `McpImageStore`. Raises `McpError` if the call returned a JSON-RPC error.
+        `McpImageStore`. Raises `McpError` if the call returned a JSON-RPC error, or if `name` is a
+        tool this agent's configuration withholds — refused here, before anything is sent.
         """
+        if name in self.withheld:
+            raise McpError(
+                withheld_refusal(
+                    self.config.name,
+                    name,
+                    waivable=self.config.withheld_waivable,
+                    offered=self.listed,
+                )
+            )
         return self._request("tools/call", {"name": name, "arguments": arguments})
 
     @staticmethod
@@ -1055,6 +1267,11 @@ class McpResolution:
         images: The per-wake `McpImageStore` shared by every active server's tools (issue #318),
             carried to the assets tool via the `PlatformContext` so a returned image can be posted
             to the timeline. ``None`` when no server loaded (nothing to stash).
+        withheld: ``model-facing name → refusal`` for every tool an active server offered and this
+            agent's configuration withholds (issue #553) — what the engine answers a call to a tool
+            the model was never offered, so the model is told why rather than "no tool named".
+        about: One block per active server that said something about itself or carries an
+            operator's ``note`` (issue #553), for the brief's ``mcp`` part.
     """
 
     tools: list[Tool] = field(default_factory=list)
@@ -1063,6 +1280,8 @@ class McpResolution:
     notices: list[str] = field(default_factory=list)
     clients: list[McpClient] = field(default_factory=list)
     images: McpImageStore | None = None
+    withheld: dict[str, str] = field(default_factory=dict)
+    about: list[str] = field(default_factory=list)
 
 
 def _timeout_from_env() -> float:
@@ -1120,7 +1339,9 @@ def load_mcp_tools(
     # the resolution only if a tool actually loads (below) — no MCP tools, nothing to stash.
     store = McpImageStore()
     seen: set[str] = set()  # final tool names already claimed, across all servers
-    for config in load_mcp_configs(home):
+    configs, rejected = load_mcp_configs_report(home)
+    resolution.skipped.extend(rejected)
+    for config in configs:
         client: McpClient | None = None
         try:
             client = _connect(config, timeout)
@@ -1132,7 +1353,10 @@ def load_mcp_tools(
             _safe_close(client)
             continue
         loaded = 0
+        offered = [str(spec.get("name", "")) for spec in discovered]
         for spec in discovered:
+            if str(spec.get("name", "")) in config.withheld_tools:
+                continue
             tool = McpTool(
                 server=config.name,
                 remote_name=str(spec.get("name", "")),
@@ -1155,7 +1379,34 @@ def load_mcp_tools(
             resolution.tools.append(tool)
             resolution.manifest.append((tool.name, _tool_note(config.name)))
             loaded += 1
-        resolution.notices.append(_opt_out_notice(config.name, loaded))
+        # The withheld tools, settled only now that every name this server registered is known: a
+        # sibling whose name sanitizes or truncates onto a withheld tool's is a real, registered tool
+        # the engine will dispatch, so a refusal filed under that name would contradict it — in the
+        # brief, in the engine, and in `--resolved-config`. (No shipped server does this; the name is
+        # the harness's, so the harness keeps it consistent.)
+        withheld = [
+            remote
+            for remote in dict.fromkeys(offered)
+            if remote in config.withheld_tools and mcp_tool_name(config.name, remote) not in seen
+        ]
+        for remote in withheld:
+            resolution.withheld[mcp_tool_name(config.name, remote)] = withheld_refusal(
+                config.name, remote, waivable=config.withheld_waivable, offered=offered
+            )
+        resolution.notices.append(
+            " ".join(
+                [_opt_out_notice(config.name, loaded), *_withholding(config, offered, withheld)]
+            )
+        )
+        about = _about(config, client)
+        if about is not None:
+            resolution.about.append(about)
+        if withheld:
+            _log.info(
+                "MCP server %r: withheld %s by its configuration (issue #553).",
+                config.name,
+                ", ".join(withheld),
+            )
         resolution.clients.append(client)
         atexit.register(client.close)
         _log.warning(
@@ -1178,6 +1429,82 @@ def _safe_close(client: McpClient | None) -> None:
         client.close()
     except Exception:  # noqa: BLE001, S110 - teardown of a failed server must not raise
         pass
+
+
+def _withholding(
+    config: McpServerConfig, offered: Sequence[str], withheld: Sequence[str]
+) -> list[str]:
+    """What the server's safety line says about each withholdable tool it offers (issue #553).
+
+    Both states are disclosed, because the agent needs to know what it has **and** why. A withheld
+    tool gets the refusal the model would get calling it — what, why, who, instead, and the waiver
+    when the operator marked it waivable — spelled once, so the brief and the refusal cannot
+    disagree. One this agent's configuration hands back is named as present, with why agents do
+    not get it by default: a capability deliberately returned is as much a decision as one kept.
+    """
+    lines = []
+    for remote in dict.fromkeys(offered):
+        if remote not in WITHHOLDABLE:
+            continue
+        if remote in withheld:
+            lines.append(
+                withheld_refusal(
+                    config.name, remote, waivable=config.withheld_waivable, offered=offered
+                )
+            )
+            continue
+        if remote in config.withheld_tools:
+            continue  # its name went to a registered sibling; the tool it names is not this one
+        rule = WITHHOLDABLE[remote]
+        lines.append(
+            f"{mcp_tool_name(config.name, remote)} is available to you, although agents do not get "
+            f"it by default: {rule.reason} — withheld by {rule.decider}'s ruling of "
+            f"{rule.decided}, {rule.standing}. This agent's configuration hands it back to you."
+        )
+    return lines
+
+
+def _about(config: McpServerConfig, client: McpClient) -> str | None:
+    """This server's block for the brief's ``mcp`` part, or ``None`` when it has nothing to say.
+
+    Two voices, each labelled with whose it is, because they carry different authority: the config's
+    ``note`` describes this box's own setup (a browser's backend, a mailbox's address), and the
+    server's ``instructions`` are external text describing the server — worth reading, and no
+    instruction from anyone.
+
+    **The server's text is quoted, every line of it.** Attribution by a leading label alone is a
+    claim a server can forge: instructions carrying a line that *begins* ``Configuration note`` —
+    or a whole ``MCP server 'x' …`` heading — would read as the more-trusted voice, or as another
+    server. Inside a ``> `` quote nothing it writes can start a line of the harness's own.
+    """
+    if config.note is None and client.instructions is None:
+        return None
+    heading = f"MCP server {config.name!r}"
+    if client.server_label:
+        heading += f" ({client.server_label})"
+    lines = [f"{heading}, whose tools are named {_sanitize(config.name)}__…:"]
+    if config.note is not None:
+        lines.append(f"Configuration note for this server: {config.note}")
+    if client.instructions is not None:
+        lines.append("What the server says about itself, quoted:")
+        lines.extend(f"> {line}" for line in client.instructions.splitlines())
+    return "\n".join(lines)
+
+
+def _server_label(info: object) -> str | None:
+    """``serverInfo``'s name and version as one short line, or ``None`` if it gave neither."""
+    if not isinstance(info, dict):
+        return None
+    words = [str(info[key]).strip() for key in ("name", "version") if info.get(key)]
+    label = " ".join(" ".join(word.split()) for word in words if word)
+    return _bounded(label, _LABEL_CAP) if label else None
+
+
+def _bounded(text: str, cap: int) -> str:
+    """`text` whole if it fits `cap` characters, else its head and a marker naming the full size."""
+    if len(text) <= cap:
+        return text
+    return f"{text[:cap]} […{len(text) - cap} more characters not shown]"
 
 
 def _tool_note(server: str) -> str:
