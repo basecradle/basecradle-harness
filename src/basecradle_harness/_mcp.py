@@ -51,6 +51,58 @@ Failure never crashes the wake
 A server that fails to start, handshake, or list its tools **self-excludes**: its tools
 are dropped from the active set and recorded in `skipped` with a reason, exactly the
 Group-2 activation robustness bar. One flaky server never takes the wake down.
+
+A named screenshot is still a screenshot (issue #552)
+-----------------------------------------------------
+An image reaches the model and the ``post_image`` store two ways. The obvious one is an
+``image`` content block. The other is a **file**: playwright-mcp's screenshot tool, handed a
+``filename``, saves the file, prints ``- [Screenshot of viewport](./shot.png)``, and sends *no*
+image block (``if (!params.filename) registerImageResult(…)``). A model that names its screenshot
+— which is exactly what a model does when it means to post it — used to lose the ability to post
+it. So a file the call **named, wrote, and linked** is read from the server's working directory
+and rendered as if it had arrived inline (`_render_file_links`).
+
+**The rule is keyed to the call's own arguments, never to what the result's text says** — and
+that is the design, not a detail. A result's text carries third-party strings verbatim and at the
+start of a line: a page's error stack, a response body, a storage value, a mail's body. A link in
+it therefore proves nothing about who asked, and a rule that followed any link-shaped line would
+let a web page choose which of the agent's files the harness opens. The model's arguments are the
+one input no page writes. So the harness reads a file only when every one of these holds, and the
+failure direction of each is "not shared", never "read anyway":
+
+- **Only a stdio server has a working directory we know.** It is the directory this process
+  spawned it in, pinned on the ``Popen`` (`StdioMcpClient.workdir`). An HTTP server's paths name
+  a file on *its* host, so they are never read. The harness advertises no MCP ``roots``, and that
+  is load-bearing: without them playwright-mcp resolves a file against its own ``process.cwd()``,
+  which is therefore the same directory.
+- **The model named it** — the path is one of the call's own string arguments (`_named_files`) —
+  **and the result links it**: some line ends in a markdown link that resolves to that same path.
+  Paths are compared where they land, never as spelled, so ``./a.png``, ``a.png`` and
+  ``sub/../a.png`` are one file.
+- **The call wrote it.** Its ``lstat`` before the call and after must differ (`_stamp`: inode,
+  size, mtime and ctime — a write moves the last two even when it puts back identical bytes, at
+  the filesystem's timestamp resolution). This is clock-free, so it holds on a home whose file
+  server's clock drifts, and it is what stops a stale file of the same name — a server that wrote
+  somewhere else — being passed off as the capture. Its one blind spot fails closed: an identical
+  rewrite inside one timestamp tick (a second on some filesystems) reads as "not written".
+- **It sits inside that directory** — the working directory, and only that: a file playwright
+  saves under an operator's ``--output-dir`` elsewhere is refused, with a note — **and is a regular
+  file** — symlinks followed first, then a
+  containment test on the result, never a string prefix — opened ``O_NOFOLLOW | O_NONBLOCK |
+  O_NOCTTY``, so a final-component link swapped in cannot redirect the read and a FIFO or device
+  cannot wedge it. (A same-user actor racing an *intermediate* directory is not defended against:
+  anything able to do that could as easily have sent the bytes inline.)
+- **The bytes are an image** — read off their magic bytes (`sniff_media_ext`), never the
+  extension — within `MAX_IMAGE_BYTES`. Whatever was named, nothing that is not a picture reaches
+  the store.
+
+A named-and-linked file that looks like an image (by extension) and fails a check gets a one-line
+note saying why, so the model learns the reason rather than meeting it as a failed ``post_image``;
+a named file that is not meant as a picture (a saved PDF, a storage-state ``.json``) passes
+silently. A named image is shown to a vision model even from a server configured to omit image
+responses (playwright's ``--image-responses omit``): that setting governs what the *server* sends,
+and the model asked for this file by name. The harness only ever **reads** the file — it is the
+agent's, written at the model's request, and never ours to clean up.
 """
 
 from __future__ import annotations
@@ -62,11 +114,12 @@ import json
 import logging
 import os
 import queue
+import stat
 import subprocess
 import threading
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -77,6 +130,7 @@ from basecradle_harness._assets import (
     _media_type,
 )
 from basecradle_harness._install import config_home
+from basecradle_harness._media import sniff_media_ext
 from basecradle_harness._messages import ImageContent, ToolResult
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 from basecradle_harness._venv import with_interpreter_bin
@@ -115,6 +169,33 @@ _IMAGE_STORE_CAP = 8
 
 # The alias that resolves to the most recent capture, mirroring the assets tool's ``'latest'``.
 _LATEST = "latest"
+
+# The extensions that make a file *look like* an image — which decides only whether one that could
+# not be shared earns a note (issue #552). Whether a file is shared is decided by its bytes.
+_IMAGE_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp"})
+
+# The media type for each image format `sniff_media_ext` recognizes. Its video formats are absent on
+# purpose: an MP4 is not a picture, and a clip saved to a named file is not a screenshot.
+_SNIFFED_IMAGE_TYPES = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
+
+# Enough leading bytes for every signature `sniff_media_ext` reads (WebP's is at offset 8–12).
+_SNIFF_BYTES = 16
+
+# What `_stamp` records of a file: its type and identity, and enough to tell that something wrote to
+# it — a write moves ``st_mtime_ns`` and ``st_ctime_ns`` even when it puts back identical bytes, at
+# the filesystem's timestamp resolution.
+_Stamp = tuple[int, int, int, int, int, int]
+
+# The longest string treated as a path: Linux's PATH_MAX, and more than any path macOS opens. The
+# bound is about *cost*: every string argument of every stdio MCP call is a candidate, a mail body
+# or a base64 attachment is full of slashes, and resolving one walks every one of them — seconds,
+# on the 3.12+ pathlib, for an argument that names no file at all.
+_PATH_MAX = 4096
 
 
 class McpError(Exception):
@@ -219,7 +300,8 @@ class McpImageStore:
     The "show me what you see" half of MCP image support, and it is **independent of the model's
     vision** — the point being that a text-only agent (e.g. @glm-5.2) can still *post* a browser
     screenshot to the timeline even though it cannot itself see it. When an MCP tool result carries
-    an image, `_render_tool_result` stashes the decoded bytes here under a short handle
+    an image — inline, or saved to a file the call named (issue #552) —
+    `_render_tool_result` stashes the bytes here under a short handle
     (``mcp-image-N``) and names that handle in the model-readable placeholder; the assets tool's
     ``post_image`` action then looks the bytes back up by handle and uploads them through the
     existing asset-create path.
@@ -275,6 +357,11 @@ class McpClient(ABC):
     server-initiated streaming. `start` performs the initialize handshake; after it,
     `list_tools` and `call_tool` are plain blocking round-trips bounded by `timeout`.
     """
+
+    #: The directory the server resolves a relative file against, when this process knows it —
+    #: which is only for a server it spawned itself (`StdioMcpClient`). ``None`` means the server's
+    #: files are not ours to read, so a file its calls save is never read back (issue #552).
+    workdir: Path | None = None
 
     def __init__(self, config: McpServerConfig, timeout: float) -> None:
         self.config = config
@@ -348,6 +435,12 @@ class StdioMcpClient(McpClient):
     installed *into the agent's venv* is launchable by name rather than only by absolute path.
     It is applied under the config's ``env``, so an operator who sets ``PATH`` explicitly still
     wins outright.
+
+    The child runs in this process's working directory, and it is **pinned** on the ``Popen``
+    rather than inherited, so `workdir` is the directory the server was actually handed — the root
+    a file its calls save is resolved and contained against (issue #552). If this process's own
+    directory is gone, the server still launches (inheriting it, as it always did); it simply has no
+    root, and its saved files are not read back.
     """
 
     def __init__(self, config: McpServerConfig, timeout: float) -> None:
@@ -359,12 +452,17 @@ class StdioMcpClient(McpClient):
     def start(self) -> None:
         assert self.config.command is not None
         try:
+            self.workdir = Path.cwd().resolve()
+        except OSError:  # this process's own directory was removed under it
+            self.workdir = None
+        try:
             self._proc = subprocess.Popen(  # args are an explicit list, shell=False
                 [self.config.command, *self.config.args],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
                 env={**with_interpreter_bin(os.environ), **self.config.env},
+                cwd=self.workdir,
                 text=True,
                 bufsize=1,
             )
@@ -566,7 +664,9 @@ def _error_text(error: object) -> str:
     return str(error)
 
 
-def _render_tool_result(result: dict, store: McpImageStore | None = None) -> str | ToolResult:
+def _render_tool_result(
+    result: dict, store: McpImageStore | None = None, named: _NamedFiles | None = None
+) -> str | ToolResult:
     """An MCP ``tools/call`` result as what the model reads — text, and any images (issue #318).
 
     Joins the ``text`` content blocks. An **image** block is no longer collapsed to a bare
@@ -587,12 +687,22 @@ def _render_tool_result(result: dict, store: McpImageStore | None = None) -> str
     other non-text block (an embedded resource, audio) keeps the by-type placeholder — inlining
     those is out of scope. An ``isError`` result is prefixed so the model sees it failed.
 
+    A result with **no** image block gets each file the call `named` — and wrote, and linked —
+    rendered exactly as an inline image would be (issue #552), under the checks the module
+    docstring lists. With no `named` (an HTTP server, the library path) nothing is read; a failed
+    call's files are never read, because a call that failed wrote nothing we can vouch for. The two
+    paths are exclusive by construction: playwright-mcp's *unnamed* screenshot carries an image
+    block **and** a link to its saved copy, and reading the copy as well would stash the one picture
+    twice.
+
     Returns a plain ``str`` when there is nothing to show (the common case, unchanged), and a
     `ToolResult` only when at least one image was inlined as vision input.
     """
     blocks = result.get("content")
     parts: list[str] = []
+    texts: list[str] = []
     images: list[ImageContent] = []
+    saw_image = False
     if isinstance(blocks, list):
         for block in blocks:
             if not isinstance(block, dict):
@@ -600,13 +710,20 @@ def _render_tool_result(result: dict, store: McpImageStore | None = None) -> str
             block_type = block.get("type")
             if block_type == "text":
                 parts.append(str(block.get("text", "")))
+                texts.append(parts[-1])
             elif block_type == "image":
+                saw_image = True
                 text, image = _render_image_block(block, store)
                 parts.append(text)
                 if image is not None:
                     images.append(image)
             else:
                 parts.append(f"[{block.get('type', 'non-text')} content]")
+    if named is not None and not saw_image and not result.get("isError"):
+        for text, image in _render_file_links(texts, named, store):
+            parts.append(text)
+            if image is not None:
+                images.append(image)
     text = "\n".join(p for p in parts if p) or "(the tool returned no content)"
     text = f"Error: {text}" if result.get("isError") else text
     return ToolResult(text=text, images=images) if images else text
@@ -617,11 +734,8 @@ def _render_image_block(
 ) -> tuple[str, ImageContent | None]:
     """Render one MCP ``image`` content block into (placeholder text, vision image-or-None).
 
-    Decodes the base64 ``data``, stashes the bytes in `store` for the ``post_image`` path (when a
-    store is bound), and — for a viewable type within the size ceiling — builds an `ImageContent`
-    for vision input. The placeholder always names the type and size (cheap), and, when stashed,
-    the handle plus how to post it. A missing/undecodable payload, or one over the ceiling, yields
-    a describing placeholder and no image rather than a crash.
+    Decodes the base64 ``data`` and hands the bytes to `_render_image_bytes`. A missing or
+    undecodable payload yields a describing placeholder and no image rather than a crash.
     """
     raw_b64 = block.get("data")
     mimetype = _media_type(str(block.get("mimeType") or "")) or "image/png"
@@ -631,6 +745,20 @@ def _render_image_block(
         data = base64.b64decode(raw_b64, validate=True)
     except (ValueError, TypeError):
         return f"[image content ({mimetype}, could not decode)]", None
+    return _render_image_bytes(mimetype, data, store)
+
+
+def _render_image_bytes(
+    mimetype: str, data: bytes, store: McpImageStore | None, source: str | None = None
+) -> tuple[str, ImageContent | None]:
+    """Render one image's bytes into (placeholder text, vision image-or-None) — both arrival paths.
+
+    Stashes the bytes in `store` for the ``post_image`` path (when a store is bound), and — for a
+    viewable type within the size ceiling — builds an `ImageContent` for vision input. The
+    placeholder always names the type and size (cheap), `source` (the file a linked image was read
+    from, issue #552) when there is one, and, when stashed, the handle plus how to post it. An
+    empty image, or one over the ceiling, is described and neither stashed nor shown.
+    """
     size = len(data)
     if size <= 0:
         return f"[image content ({mimetype}, empty)]", None
@@ -644,6 +772,7 @@ def _render_image_block(
     viewable = mimetype in _VIEWABLE_IMAGE_TYPES
     image = ImageContent(url=_data_url(mimetype, data), alt=handle or "image") if viewable else None
     prefix = f"image {handle}" if handle else "image"
+    origin = f", saved as {source!r}" if source else ""
     note = "" if viewable else " (type not viewable to a model; described only)"
     share = (
         f" — to share it on this timeline, use the assets tool with "
@@ -651,7 +780,190 @@ def _render_image_block(
         if handle is not None
         else ""
     )
-    return f"[{prefix}: {mimetype}, {_human_bytes(size)}{note}{share}]", image
+    return f"[{prefix}: {mimetype}, {_human_bytes(size)}{origin}{note}{share}]", image
+
+
+@dataclass(frozen=True)
+class _NamedFiles:
+    """The files one call's own arguments name, as they stood before it ran (issue #552).
+
+    `root` is the server's working directory, resolved. `before` maps each named path — resolved,
+    symlinks followed — to its `_stamp` from before the call: ``None`` when it did not exist, or
+    when it lies outside `root`, where the harness never looks. `names` is every final path
+    component those arguments spell, as written and as resolved — the cheap filter that keeps a
+    result's link lines, which a page can fill, from each costing a resolve.
+    """
+
+    root: Path
+    before: Mapping[Path, _Stamp | None]
+    names: frozenset[str]
+
+
+def _named_files(arguments: Mapping[str, object], root: Path) -> _NamedFiles:
+    """Stamp every file a call's top-level string `arguments` name under `root`, before it runs.
+
+    Every string argument is a candidate, whatever its key is called — ``filename`` is
+    playwright-mcp's spelling, and another server's is its own — because a candidate costs one
+    ``lstat`` and is read only if the result then links it *and* the call wrote it. A string that
+    is not a path (a URL, a sentence) names no file that changes, and is never read; one longer than
+    `_PATH_MAX`, or spanning lines, is not even resolved — no link line could name it.
+    """
+    root = root.resolve()
+    before: dict[Path, _Stamp | None] = {}
+    names: set[str] = set()
+    for value in arguments.values():
+        if not isinstance(value, str) or not value or len(value) > _PATH_MAX or "\n" in value:
+            continue
+        path = _resolve(root, value)
+        if path is not None and path not in before:
+            before[path] = _stamp(path) if _inside(path, root) else None
+            names.update((_basename(value), path.name))
+    return _NamedFiles(root=root, before=before, names=frozenset(names))
+
+
+def _resolve(root: Path, target: str) -> Path | None:
+    """`target` resolved against `root`, symlinks followed; ``None`` for a path the OS rejects.
+
+    Before 3.13 a symlink loop raises `RuntimeError` (after, the path comes back unresolved and the
+    open fails ``ELOOP``), and a NUL byte raises `ValueError` on every version — none of them may
+    reach the tool call, which would replace a finished call's result with an error.
+    """
+    try:
+        return (root / target).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _inside(path: Path, root: Path) -> bool:
+    """Whether resolved `path` is `root` or below it — a test on path *parts*, never a string prefix.
+
+    A prefix would let ``/home/nova-evil`` pass for ``/home/nova``. `Path.is_relative_to` gets that
+    right and costs the square of the path's depth on 3.12+ (it walks ``parents``); this is linear.
+    """
+    return path.parts[: len(root.parts)] == root.parts
+
+
+def _basename(target: str) -> str:
+    """The final component `target` spells, without building a path — a filter, not a resolution."""
+    return target.rstrip("/").rpartition("/")[2]
+
+
+def _stamp(path: Path) -> _Stamp | None:
+    """`path`'s type, identity, size and write times (``lstat``), or ``None`` if it is not there."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return (
+        info.st_mode,
+        info.st_dev,
+        info.st_ino,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+def _linked_paths(texts: Iterable[str], named: _NamedFiles) -> set[Path]:
+    """Which of the `named` files some line-ending markdown link in `texts` resolves to (#552).
+
+    Read for *membership* only, so it is lenient about everything the safety does not rest on: every
+    ``](`` on a line that ends in ``)`` is tried as the split, so a title carrying ``](`` (an element
+    screenshot is titled with the model's own description of the element), a filename carrying one,
+    or a title broken across lines cannot hide the link. And it is cheap about everything a page can
+    fill: a target is resolved only if it fits `_PATH_MAX` and its final component is one the call's
+    arguments spelled, so a result of a thousand link lines the page wrote costs string compares.
+    """
+    linked: set[Path] = set()
+    for text in texts:
+        for line in text.splitlines():
+            line = line.rstrip()
+            if not line.endswith(")"):
+                continue
+            start = line.find("](", max(0, len(line) - _PATH_MAX - 3))
+            while start >= 0:
+                target = line[start + 2 : -1]
+                if _basename(target) in named.names:
+                    path = _resolve(named.root, target)
+                    if path in named.before:
+                        linked.add(path)
+                start = line.find("](", start + 1)
+    return linked
+
+
+def _render_file_links(
+    texts: Iterable[str], named: _NamedFiles, store: McpImageStore | None
+) -> Iterator[tuple[str, ImageContent | None]]:
+    """Render each file the call named and the result links, as if it had arrived inline (#552).
+
+    A named file the result does not link is passed over. One it does link is read by
+    `_read_written_image`; an image is rendered by `_render_image_bytes`, exactly as an inline block
+    is, naming the file. A linked file that *looks* like an image but could not be shared yields a
+    one-line note saying why and a ``WARNING``, so the model is not left to discover it from a failed
+    ``post_image``; one that does not (a saved PDF) yields nothing.
+    """
+    if not named.before:
+        return
+    linked = _linked_paths(texts, named)
+    for path, before in named.before.items():
+        if path not in linked:
+            continue
+        inside = _inside(path, named.root)
+        label = str(Path(*path.parts[len(named.root.parts) :])) if inside else str(path)
+        outcome = _read_written_image(path, named.root, before)
+        if isinstance(outcome, tuple):
+            yield _render_image_bytes(*outcome, store, source=label)
+        elif path.suffix.lower() in _IMAGE_SUFFIXES:
+            _log.warning("MCP tool saved image %r; not shared: %s.", label, outcome)
+            yield f"[image file {label!r} not shared: {outcome}]", None
+
+
+def _read_written_image(path: Path, root: Path, before: _Stamp | None) -> tuple[str, bytes] | str:
+    """``(mimetype, bytes)`` for the image the call wrote at `path`, or why it is not shared (#552).
+
+    `path` and `root` are already resolved, so containment (`_inside`) is a test on the real
+    location. The ``lstat`` must show a regular file that is not what it was `before` the call,
+    so nothing is opened that is not a file this call wrote; the open refuses a final symlink
+    swapped in since (``O_NOFOLLOW``) and cannot block or take a terminal (``O_NONBLOCK``,
+    ``O_NOCTTY``), and what it opened must still be a regular file. Then the **bytes** decide: the
+    leading magic must be a picture format, and the whole must fit `MAX_IMAGE_BYTES` — checked on the
+    ``fstat`` so an oversized file is never read, and again on what was read, so one that grew since
+    is still bounded. Every OS error is a reason, never a raise.
+    """
+    if not _inside(path, root):
+        return "it is outside the MCP server's working directory"
+    after = _stamp(path)
+    if after is None:
+        return "it was not found"
+    if not stat.S_ISREG(after[0]):
+        return "it is not a regular file"
+    if after == before:
+        return "this call did not write it"
+    flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        return f"it could not be opened ({exc.strerror or exc})"
+    too_large = f"it is too large to show or share (over the {MAX_IMAGE_BYTES}-byte limit)"
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return "it is not a regular file"
+        with open(fd, "rb", closefd=False) as handle:
+            head = handle.read(_SNIFF_BYTES)
+            mimetype = _SNIFFED_IMAGE_TYPES.get(sniff_media_ext(head, ""))
+            if mimetype is None:
+                return "it is not a recognizable image"
+            if info.st_size > MAX_IMAGE_BYTES:
+                return too_large
+            data = head + handle.read(max(0, MAX_IMAGE_BYTES + 1 - len(head)))
+    except OSError as exc:
+        return f"it could not be read ({exc.strerror or exc})"
+    finally:
+        os.close(fd)
+    if len(data) > MAX_IMAGE_BYTES:
+        return too_large
+    return mimetype, data
 
 
 def _human_bytes(n: int) -> str:
@@ -704,10 +1016,14 @@ class McpTool(Tool):
 
         Returns a `ToolResult` (text + vision images) when the server returned an image; a plain
         ``str`` otherwise. Any returned image is also stashed in the per-wake store for the
-        ``post_image`` path (issue #318).
+        ``post_image`` path (issue #318) — including one saved to a file the call itself named, read
+        from the server's working directory (issue #552). The named files are stamped *before* the
+        call, which is what lets the render tell a file this call wrote from one already there.
         """
+        root = self._client.workdir
+        named = _named_files(kwargs, root) if root is not None else None
         result = self._client.call_tool(self._remote_name, dict(kwargs))
-        return _render_tool_result(result, self._images)
+        return _render_tool_result(result, self._images, named)
 
 
 def mcp_tool_name(server: str, tool: str) -> str:
