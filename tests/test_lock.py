@@ -69,13 +69,19 @@ def lock(client):
     return t
 
 
-def test_confirm_uuid_freezes_the_current_timeline_and_says_it_is_one_way(lock):
+@pytest.mark.parametrize("enveloped", [False, True], ids=["stub", "enveloped"])
+def test_confirm_uuid_freezes_the_current_timeline_and_says_it_is_one_way(lock, enveloped):
+    """The lock response is read in both shapes — today's `{uuid, locked}` stub and the
+    `{"timeline": {…}}` envelope of basecradle/basecradle#585 — through the SDK's
+    tolerance (`basecradle>=0.8.1`, issue #556); unread, a lock that landed reads as a failure."""
+    stub = {"uuid": TIMELINE_UUID, "locked": True}
+    confirmed = {"timeline": timeline_envelope(locked=True)["timeline"]} if enveloped else stub
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
             return_value=httpx.Response(200, json=timeline_envelope())
         )
         route = mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/lock").mock(
-            return_value=httpx.Response(200, json={"locked": True})
+            return_value=httpx.Response(200, json=confirmed)
         )
         result = lock.run(confirm=TIMELINE_UUID)
 
