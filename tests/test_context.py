@@ -304,6 +304,54 @@ def test_the_summary_is_asked_for_the_work_not_just_the_words():
     assert "called: memory" in excerpt.content
 
 
+def test_the_summarizer_reads_what_the_agent_said_not_only_that_it_spoke():
+    """Since issue #293 an agent speaks only through tool calls, so its words live in the arguments.
+
+    `messages create` answers with a uuid and nothing else — a render of names alone showed the
+    summarizer every peer's words and none of the agent's, and the harvest could never keep a URL
+    the agent itself sent.
+    """
+    said = "The report is at https://example.com/reports/weekly.pdf. I'll send the rest Friday."
+    speak = ToolCall(id="call_0", name="messages", arguments={"action": "create", "body": said})
+    history = conversation(20)
+    history[1:1] = [
+        Message.assistant(tool_calls=[speak]),
+        Message.tool(tool_call_id=speak.id, content=f"Posted. The new message's uuid is {ASSET}."),
+    ]
+    provider = ScriptedProvider(Message.assistant(content="SUMMARY"))
+    # Over the threshold, and small enough that the whole dropped region fits one summarize call —
+    # so what the summarizer is shown is the rendering itself, not a trimmed tail of it.
+    provider.last_tokens_in = 70_000
+
+    assert compactor(provider).maybe_compact(history) is True
+
+    excerpt = provider.calls[0][1].content
+    assert "I'll send the rest Friday." in excerpt  # the agent's promise reaches the summarizer
+    assert "https://example.com/reports/weekly.pdf" in history[0].content.splitlines()
+
+
+def test_a_huge_argument_costs_the_summarizer_an_excerpt_not_its_budget():
+    """Arguments are rendered as the transcript would persist them: one step, one `TOOL_ARGS_CAP`."""
+    blob = ToolCall(
+        id="call_0", name="assets", arguments={"action": "create", "content": "x" * 200_000}
+    )
+    history = conversation(20)
+    history[1:1] = [
+        Message.assistant(tool_calls=[blob]),
+        Message.tool(tool_call_id=blob.id, content="Created."),
+    ]
+    provider = ScriptedProvider(Message.assistant(content="SUMMARY"))
+    provider.last_tokens_in = 100_000
+
+    compactor(provider).maybe_compact(history)
+
+    excerpt = provider.calls[0][1].content
+    line = next(line for line in excerpt.splitlines() if line.startswith("assets {"))
+    assert len(line) <= TOOL_ARGS_CAP + len("assets ")
+    assert '"action": "create"' in line  # the short arguments survive whole
+    assert blob.arguments["content"] == "x" * 200_000  # and the live call is never touched
+
+
 def test_the_summary_headings_are_operational_and_in_order():
     """Continuity, not a recap (issue #561): what happened, what holds, what is underway, what next."""
     provider = ScriptedProvider(Message.assistant(content="SUMMARY"))
@@ -511,6 +559,8 @@ def test_a_region_with_no_identifiers_adds_no_heading():
         # A fragment the harness itself cut short is dropped, never kept as a wrong identifier.
         ("https://example.com/some/long/pa… @nova-dig…", []),
         ("head https://example.com/lo\n\n[... 9000 chars elided of 12000 — tail", []),
+        # The same marker on an elided *argument*, which reaches the render JSON-escaped.
+        (r'messages {"body": "see https://example.com/lo\n\n[... elided from 9000 chars"}', []),
     ],
 )
 def test_identifiers_are_harvested_in_the_shape_they_actually_have(text, expected):

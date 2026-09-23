@@ -7,6 +7,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.131.1] - 2026-09-23
+
+### Fixed: the compaction summarizer reads what the agent said, not only that it spoke
+
+Since the final-text auto-post was removed (issue #293), everything an agent says reaches a timeline
+as the `body` of a `messages` call, and that call's result is only "Posted to timeline T. The new
+message's uuid is U." The summarizer's rendering of the dropped region (`_context._render`) named
+each tool call but never showed its arguments — so it saw every peer's words and **none of the
+agent's own**. A summary could record that a message went out, never what it said or what it
+promised, which the DECISIONS AND FACTS heading exists to carry; and the identifier harvest, which
+reads the same rendering, could never keep a URL or uuid the agent itself sent.
+
+Each call is now rendered on its own line as `name {arguments}`, bounded exactly as the transcript
+bounds them on disk — the step's calls share one `TOOL_ARGS_CAP`, water-filled (`_session._fill`) —
+so a 200 KB document an agent posted costs the summarizer a head-and-tail excerpt, not its budget,
+and the live call is never modified. An identifier cut short by that elision reaches the harvest
+JSON-escaped, and is recognized as a fragment in that spelling too, so it is dropped rather than
+kept wrong.
+
 ## [0.131.0] - 2026-09-23
 
 ### Removed: a compaction summary no longer reaches memory, on any provider — compaction is a transcript concern (issue #561)
