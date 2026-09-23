@@ -132,12 +132,33 @@ E0 = "019e7761-2222-7bbb-8ccc-2d3e4f506172"
 E1 = "019e7762-3333-7ccc-8ddd-3e4f50617283"
 
 
-def event(*, uuid, payload, content_type="application/json"):
+def event(*, uuid, payload, content_type="application/json", embedded=False):
+    """A delivery; `embedded` is the post-basecradle#585 shape (the full endpoint, uuid under
+    `content`) where the default is today's bare reference (issue #556)."""
+    reference = {"uuid": EP}
+    if embedded:
+        reference = {
+            "type": "webhook_endpoint",
+            "created_at": "2026-06-03T00:00:00.000Z",
+            "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+            "timeline": {"uuid": TIMELINE_UUID},
+            "content": {
+                "uuid": EP,
+                "description": "GitHub deliveries",
+                "enabled": True,
+                "ingest_url": "https://basecradle.com/webhooks/019e7760-9999-7aaa-8bbb-1c2d3e4f5061",
+                "verification": {
+                    "enabled": False,
+                    "signature_header": "X-Signature",
+                    "verifier": "hmac_sha256_hex",
+                },
+            },
+        }
     return {
         "type": "webhook_event",
         "created_at": "2026-06-04T00:00:00.000Z",
         "timeline": {"uuid": TIMELINE_UUID},
-        "webhook_endpoint": {"uuid": EP},
+        "webhook_endpoint": reference,
         "content": {
             "uuid": uuid,
             "content_type": content_type,
@@ -1083,6 +1104,22 @@ def test_first_wake_acts_on_the_triggering_event(platform, tmp_path):
     assert len(provider.prompts) == 1
     assert "inbound webhook" in provider.prompts[0]
     assert '{"action":"opened"}' in provider.prompts[0]  # the payload reached the model
+    assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0
+
+
+@pytest.mark.parametrize("embedded", [False, True], ids=["reference", "embedded"])
+def test_a_delivery_is_perceived_in_either_endpoint_wire_shape(platform, tmp_path, embedded):
+    """The core's breaking release (basecradle/basecradle#585) embeds the full endpoint in an
+    event where it used to send a reference, and the harness must read whichever arrives
+    (issue #556): unread, the first delivery after the core deploys kills the wake path."""
+    serve_messages(platform, page())
+    serve_events(platform, event_page(event(uuid=E0, payload="KIWI-7", embedded=embedded)))
+    agent, provider = build_wake(tmp_path)
+
+    posted = agent.wake(event_trigger=E0)
+
+    assert len(posted) == 1
+    assert f"endpoint {EP}," in provider.prompts[0]  # the endpoint uuid, not a crash
     assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0
 
 

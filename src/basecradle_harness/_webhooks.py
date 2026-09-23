@@ -310,12 +310,31 @@ class WebhookEventsTool(PlatformTool):
         return (
             f"uuid={content.uuid} · received={event.created_at} · "
             f"content_type={content.content_type} · "
-            f"endpoint={event.webhook_endpoint.uuid}\n\n"
+            f"endpoint={endpoint_uuid(event)}\n\n"
             f"Headers:\n{headers or '  (none)'}\n\nPayload:\n{content.payload}"
         )
 
 
 # --- shared rendering / error helpers ----------------------------------------
+
+
+def endpoint_uuid(event) -> str:
+    """The uuid of the endpoint an event was delivered to, in either wire shape (issue #556).
+
+    The platform's breaking release (basecradle/basecradle#585) turns an event's
+    `webhook_endpoint` from a reference (`{"uuid": …}`) into the endpoint's full subject
+    form, which carries its uuid under `content`. Across that release either shape may
+    arrive, so both are read: `content.uuid` when the event carries the full endpoint, else
+    the reference's own `uuid`. `content` is a plain dict while the SDK types the field as a
+    bare reference and a model once it types it as an endpoint, so both spellings of it are
+    read too. Every reader of an event's endpoint goes through here: the wake path
+    (`_wake._event_dialogue`) and the events tool's `list` and `read`.
+    """
+    ref = event.webhook_endpoint
+    content = getattr(ref, "content", None)
+    if content is None:
+        return ref.uuid
+    return content["uuid"] if isinstance(content, dict) else content.uuid
 
 
 def _describe_endpoint(endpoint) -> str:
@@ -337,6 +356,6 @@ def _describe_event(event) -> str:
         payload = payload[:_PAYLOAD_PREVIEW].rstrip() + "…"
     return (
         f"uuid={content.uuid} · received={event.created_at} · "
-        f"content_type={content.content_type} · endpoint={event.webhook_endpoint.uuid} "
+        f"content_type={content.content_type} · endpoint={endpoint_uuid(event)} "
         f"— {payload}"
     )

@@ -163,6 +163,36 @@ def test_read_reports_participants_lock_state_and_item_count(timelines):
     assert "Items: 0" in result  # the envelope ships no items
 
 
+def test_read_counts_a_webhook_event_item_that_carries_no_user(timelines):
+    """Issue #556: after basecradle/basecradle#585 a timeline page's `webhook_event` item has
+    no `user` (a delivery has no author) and every item gains a `timeline` reference. The
+    read counts items and never reads an item's author, so both shapes render identically."""
+    envelope = timeline_envelope()
+    envelope["items"] = [
+        {
+            "type": "message",
+            "created_at": "2026-06-03T00:00:00.000Z",
+            "user": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
+            "timeline": {"uuid": TIMELINE_UUID},
+            "content": {"uuid": "019e7753-6c3d-7e4f-9051-3c4d5e6f7081", "body": "Deploy is out."},
+        },
+        {
+            "type": "webhook_event",
+            "created_at": "2026-06-04T00:00:00.000Z",
+            "timeline": {"uuid": TIMELINE_UUID},
+            "webhook_endpoint": {"uuid": "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"},
+            "content": {"uuid": "019e7754-7d4e-7f50-a162-4d5e6f708192", "payload": "{}"},
+        },
+    ]
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
+            return_value=httpx.Response(200, json=envelope)
+        )
+        result = timelines.run(action="read")
+
+    assert "Items: 2" in result
+
+
 def test_read_can_target_an_explicit_timeline(timelines):
     with respx.mock(assert_all_called=True) as mock:
         route = mock.get(f"{BC_URL}/timelines/{OTHER_TIMELINE}").mock(

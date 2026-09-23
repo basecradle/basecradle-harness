@@ -185,6 +185,7 @@ from basecradle_harness._rerank import (
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
+from basecradle_harness._webhooks import endpoint_uuid
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -4790,7 +4791,7 @@ def _event_dialogue(event: object) -> str:
     content = event.content
     return (
         f"[{event.created_at}] An inbound webhook was delivered to this timeline "
-        f"(event {content.uuid}, endpoint {event.webhook_endpoint.uuid}, "
+        f"(event {content.uuid}, endpoint {endpoint_uuid(event)}, "
         f"content_type {content.content_type})."
     )
 
