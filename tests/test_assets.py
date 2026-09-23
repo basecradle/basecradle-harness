@@ -51,6 +51,7 @@ def asset(*, uuid, filename, content_type, byte_size, description="", url=BLOB_U
     return {
         "type": "asset",
         "created_at": "2026-06-04T00:00:00.000Z",
+        "updated_at": "2026-06-04T00:00:00.000Z",
         "user": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {

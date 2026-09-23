@@ -301,6 +301,7 @@ def asset_body(uuid=ASSET_UUID, content_type="video/mp4", byte_size=1234, filena
     return {
         "type": "asset",
         "created_at": "2026-09-09T12:00:00.000Z",
+        "updated_at": "2026-09-09T12:00:00.000Z",
         "user": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
         "timeline": {"uuid": TIMELINE},
         "content": {

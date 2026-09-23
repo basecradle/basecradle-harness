@@ -268,6 +268,7 @@ def _message(*, uuid, body, mine=False):
     return {
         "type": "message",
         "created_at": "2026-06-04T00:00:00.000Z",
+        "updated_at": "2026-06-04T00:00:00.000Z",
         "user": actor,
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {"uuid": uuid, "body": body},

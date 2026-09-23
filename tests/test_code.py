@@ -104,6 +104,7 @@ def _asset_response(*, uuid, filename, content_type, description, user_uuid=JOHN
         "asset": {
             "type": "asset",
             "created_at": "2026-06-24T00:00:00.000Z",
+            "updated_at": "2026-06-24T00:00:00.000Z",
             "user": {"uuid": user_uuid, "handle": "john", "name": "John Doe", "kind": "human"},
             "timeline": {"uuid": TIMELINE_UUID},
             "content": {

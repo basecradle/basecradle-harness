@@ -676,6 +676,7 @@ def _wire(router, *, body="What's the status?", mine=False, room="solo", task=No
             {
                 "type": "message",
                 "created_at": "2026-06-04T00:00:00.000Z",
+                "updated_at": "2026-06-04T00:00:00.000Z",
                 "user": actor,
                 "timeline": {"uuid": TIMELINE_UUID},
                 "content": {"uuid": M0, "body": body},
@@ -692,6 +693,7 @@ def _wire(router, *, body="What's the status?", mine=False, room="solo", task=No
                 "message": {
                     "type": "message",
                     "created_at": "2026-06-04T00:00:01.000Z",
+                    "updated_at": "2026-06-04T00:00:01.000Z",
                     "user": NOVA_ACTOR,
                     "timeline": {"uuid": TIMELINE_UUID},
                     "content": {"uuid": REPLY, "body": "posted"},
@@ -712,6 +714,7 @@ def _wire(router, *, body="What's the status?", mine=False, room="solo", task=No
             {
                 "type": "task",
                 "created_at": "2026-06-10T00:00:00.000Z",
+                "updated_at": "2026-06-10T00:00:00.000Z",
                 "user": NOVA_ACTOR,  # a task the agent scheduled for itself — its own alarm
                 "timeline": {"uuid": TIMELINE_UUID},
                 "content": {

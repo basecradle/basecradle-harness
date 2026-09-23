@@ -164,14 +164,15 @@ def test_read_reports_participants_lock_state_and_item_count(timelines):
 
 
 def test_read_counts_a_webhook_event_item_that_carries_no_user(timelines):
-    """Issue #556: after basecradle/basecradle#585 a timeline page's `webhook_event` item has
-    no `user` (a delivery has no author) and every item gains a `timeline` reference. The
-    read counts items and never reads an item's author, so both shapes render identically."""
+    """A timeline page's `webhook_event` item has no `user` — a delivery has no author; its
+    endpoint does, embedded in full — so the read, which counts items, never reaches for an
+    item's author (basecradle/basecradle#585)."""
     envelope = timeline_envelope()
     envelope["items"] = [
         {
             "type": "message",
             "created_at": "2026-06-03T00:00:00.000Z",
+            "updated_at": "2026-06-03T00:00:00.000Z",
             "user": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
             "timeline": {"uuid": TIMELINE_UUID},
             "content": {"uuid": "019e7753-6c3d-7e4f-9051-3c4d5e6f7081", "body": "Deploy is out."},
@@ -179,9 +180,34 @@ def test_read_counts_a_webhook_event_item_that_carries_no_user(timelines):
         {
             "type": "webhook_event",
             "created_at": "2026-06-04T00:00:00.000Z",
+            "updated_at": "2026-06-04T00:00:00.000Z",
             "timeline": {"uuid": TIMELINE_UUID},
-            "webhook_endpoint": {"uuid": "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"},
-            "content": {"uuid": "019e7754-7d4e-7f50-a162-4d5e6f708192", "payload": "{}"},
+            "webhook_endpoint": {
+                "type": "webhook_endpoint",
+                "created_at": "2026-06-02T00:00:00.000Z",
+                "updated_at": "2026-06-02T00:00:00.000Z",
+                "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+                "timeline": {"uuid": TIMELINE_UUID},
+                "content": {
+                    "uuid": "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f",
+                    "description": "CI deploys",
+                    "enabled": True,
+                    "ingest_url": "https://basecradle.com/webhooks/019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70",
+                    "verification": {
+                        "enabled": False,
+                        "signature_header": "X-Signature",
+                        "verifier": "hmac_sha256_hex",
+                    },
+                },
+            },
+            "content": {
+                "uuid": "019e7754-7d4e-7f50-a162-4d5e6f708192",
+                "content_type": "application/json",
+                "headers": {},
+                "payload": "{}",
+                "ingest_token_at_receipt": "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70",
+                "verified_at_receipt": False,
+            },
         },
     ]
     with respx.mock(assert_all_called=True) as mock:
@@ -251,16 +277,24 @@ def test_timelines_no_longer_locks(timelines):
 # --- timelines: add / remove participant -------------------------------------
 
 
-@pytest.mark.parametrize("enveloped", [False, True], ids=["bare", "enveloped"])
-def test_add_participant_resolves_a_handle_and_adds_them(timelines, enveloped):
-    """The added user is read in both shapes — today's bare user and the `{"user": {…}}`
-    envelope of basecradle/basecradle#585 — through the SDK's tolerance (`basecradle>=0.8.1`,
-    issue #556); unread, an add that landed reads as a failure."""
+def test_add_participant_resolves_a_handle_and_adds_them(timelines):
+    """The platform answers with the added user in a `{"user": {…}}` envelope
+    (basecradle/basecradle#585); unread, an add that landed would read as a failure. Adding
+    requires mutual trust, so the added user always carries the trusted-peer cluster."""
     captured = {}
+    added = user(you_trust=True, trusts_you=True) | {
+        "roles": [],
+        "suspended": False,
+        "max_timelines": 15,
+        "max_participants": 1,
+        "max_pending_tasks": 3,
+        "about": None,
+        "time_zone": "UTC",
+    }
 
     def capture(request):
         captured["body"] = json.loads(request.content)
-        return httpx.Response(201, json={"user": user()} if enveloped else user())
+        return httpx.Response(201, json={"user": added})
 
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/users").mock(return_value=httpx.Response(200, json=directory()))

@@ -39,7 +39,17 @@ def timeline_envelope(*, uuid=TIMELINE_UUID, name="Incident response", locked=Fa
             "owner": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
             "participants": [],
         },
-        "items": [{"uuid": f"019e7751-0000-7000-8000-00000000000{i}"} for i in range(items)],
+        "items": [
+            {
+                "type": "message",
+                "created_at": "2026-06-02T00:00:00.000Z",
+                "updated_at": "2026-06-02T00:00:00.000Z",
+                "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+                "timeline": {"uuid": uuid},
+                "content": {"uuid": f"019e7751-0000-7000-8000-00000000000{i}", "body": "Noted."},
+            }
+            for i in range(items)
+        ],
     }
 
 

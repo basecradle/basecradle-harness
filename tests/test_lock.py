@@ -40,7 +40,17 @@ def timeline_envelope(*, uuid=TIMELINE_UUID, name="Incident response", locked=Fa
             "owner": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
             "participants": [],
         },
-        "items": [{"uuid": f"019e7751-0000-7000-8000-00000000000{i}"} for i in range(items)],
+        "items": [
+            {
+                "type": "message",
+                "created_at": "2026-06-02T00:00:00.000Z",
+                "updated_at": "2026-06-02T00:00:00.000Z",
+                "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
+                "timeline": {"uuid": uuid},
+                "content": {"uuid": f"019e7751-0000-7000-8000-00000000000{i}", "body": "Noted."},
+            }
+            for i in range(items)
+        ],
     }
 
 
@@ -69,19 +79,19 @@ def lock(client):
     return t
 
 
-@pytest.mark.parametrize("enveloped", [False, True], ids=["stub", "enveloped"])
-def test_confirm_uuid_freezes_the_current_timeline_and_says_it_is_one_way(lock, enveloped):
-    """The lock response is read in both shapes — today's `{uuid, locked}` stub and the
-    `{"timeline": {…}}` envelope of basecradle/basecradle#585 — through the SDK's
-    tolerance (`basecradle>=0.8.1`, issue #556); unread, a lock that landed reads as a failure."""
-    stub = {"uuid": TIMELINE_UUID, "locked": True}
-    confirmed = {"timeline": timeline_envelope(locked=True)["timeline"]} if enveloped else stub
+def locked(*, uuid=TIMELINE_UUID):
+    """What a lock returns: the whole timeline, locked, in a `{"timeline": {…}}` envelope
+    (basecradle/basecradle#585) — never an `items` list, since locking changes no content."""
+    return {"timeline": timeline_envelope(uuid=uuid, locked=True)["timeline"]}
+
+
+def test_confirm_uuid_freezes_the_current_timeline_and_says_it_is_one_way(lock):
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
             return_value=httpx.Response(200, json=timeline_envelope())
         )
         route = mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/lock").mock(
-            return_value=httpx.Response(200, json=confirmed)
+            return_value=httpx.Response(200, json=locked())
         )
         result = lock.run(confirm=TIMELINE_UUID)
 
@@ -132,7 +142,7 @@ def test_confirm_uuid_can_target_an_explicit_timeline(lock):
             return_value=httpx.Response(200, json=timeline_envelope(uuid=OTHER_TIMELINE))
         )
         route = mock.post(f"{BC_URL}/timelines/{OTHER_TIMELINE}/lock").mock(
-            return_value=httpx.Response(200, json={"locked": True})
+            return_value=httpx.Response(200, json=locked(uuid=OTHER_TIMELINE))
         )
         lock.run(confirm=OTHER_TIMELINE, timeline=OTHER_TIMELINE)
 

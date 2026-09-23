@@ -44,7 +44,26 @@ def unauthorized():
 
 def minted():
     """A 201 from `POST /session` — a freshly minted token."""
-    return httpx.Response(201, json={"token": NEW_TOKEN, "start_here": None})
+    return httpx.Response(201, json=session(NEW_TOKEN))
+
+
+def session(token):
+    """A 201 from `POST /session`: the token, once, beside the session it minted — the same
+    shape `GET /users/sessions` lists, `current` because it is now the credential in use."""
+    return {
+        "token": token,
+        "session": {
+            "uuid": "019e7750-66ee-7d0e-8b1a-6c1f0e3f5a21",
+            "name": "nova-harness",
+            "ip_address": "203.0.113.10",
+            "user_agent": "basecradle-python",
+            "created_at": "2026-06-04T00:00:00.000Z",
+            "last_used_at": None,
+            "kind": "api",
+            "current": True,
+        },
+        "start_here": "https://basecradle.com/users/dashboard.md",
+    }
 
 
 @pytest.fixture

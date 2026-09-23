@@ -44,6 +44,7 @@ def task(*, uuid, instructions, activate_at="2026-06-10T15:00:00Z", status="pend
     return {
         "type": "task",
         "created_at": "2026-06-04T00:00:00.000Z",
+        "updated_at": "2026-06-04T00:00:00.000Z",
         "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {

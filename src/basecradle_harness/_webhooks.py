@@ -18,7 +18,8 @@ focused tools, one resource each — the shape governance set:
   **rotate** one's ingest URL (the move when a URL leaks — the old one dies at once).
 - `WebhookEventsTool` — inspect what is arriving: **list** the inbound deliveries on
   a timeline (optionally narrowed to one endpoint), and **read** one in full by uuid
-  (its headers and raw payload).
+  (its headers and raw payload). Both name each delivery's endpoint, that endpoint's
+  author, and whether its signature was verified on arrival (`verified_at_receipt`).
 
 Ops default to the **current** timeline (the one the agent is engaged on); an
 explicit `timeline` uuid handles the rare cross-timeline case. (A `read`, and the
@@ -75,8 +76,8 @@ class WebhookEndpointsTool(PlatformTool):
         "Manage inbound webhook endpoints — URLs external services POST to so their "
         "activity lands on the timeline. action='create' makes an endpoint from a "
         "description and reports its ingest URL (the secret URL you hand the external "
-        "service); action='list' shows the endpoints here with their uuids, ingest "
-        "URL, and enabled state; action='enable' / action='disable' turns one on or "
+        "service); action='list' shows the endpoints here with their uuids, author, "
+        "ingest URL, and enabled state; action='enable' / action='disable' turns one on or "
         "off (disable is a reversible soft stop — deliveries get 410 Gone, history is "
         "kept); action='rotate' regenerates an endpoint's ingest URL, killing the old "
         "one immediately (do this if a URL leaks). enable/disable/rotate take the "
@@ -230,7 +231,10 @@ class WebhookEventsTool(PlatformTool):
         "this timeline's endpoints. action='list' shows the events here with their "
         "uuids, time, content type, and a payload preview (optionally narrowed to one "
         "endpoint via 'endpoint'); action='read' returns one event in full by uuid — "
-        "its headers and the raw payload exactly as delivered. Events are read-only. "
+        "its headers and the raw payload exactly as delivered. Both name the endpoint a "
+        "delivery arrived on, that endpoint's author (an event has none of its own), and "
+        "verified_at_receipt: whether the delivery's signature was verified when it "
+        "arrived. Events are read-only. "
         "Operations use the current timeline unless you pass a timeline uuid. "
         "Platform REST: GET /webhook_events — this tool calls that same endpoint; "
         "https://basecradle.com/docs/api.md#tools-and-the-http-api has the full API."
@@ -309,8 +313,7 @@ class WebhookEventsTool(PlatformTool):
         headers = "\n".join(f"  {key}: {value}" for key, value in content.headers.items())
         return (
             f"uuid={content.uuid} · received={event.created_at} · "
-            f"content_type={content.content_type} · "
-            f"endpoint={endpoint_uuid(event)}\n\n"
+            f"content_type={content.content_type} · {_provenance(event)}\n\n"
             f"Headers:\n{headers or '  (none)'}\n\nPayload:\n{content.payload}"
         )
 
@@ -318,44 +321,43 @@ class WebhookEventsTool(PlatformTool):
 # --- shared rendering / error helpers ----------------------------------------
 
 
-def endpoint_uuid(event) -> str:
-    """The uuid of the endpoint an event was delivered to, in either wire shape (issue #556).
+def _provenance(event) -> str:
+    """Where a delivery came in, and whether it proved its sender: the facts a trust call needs.
 
-    The platform's breaking release (basecradle/basecradle#585) turns an event's
-    `webhook_endpoint` from a reference (`{"uuid": …}`) into the endpoint's full subject
-    form, which carries its uuid under `content`. Across that release either shape may
-    arrive, so both are read: `content.uuid` when the event carries the full endpoint, else
-    the reference's own `uuid`. `content` is a plain dict while the SDK types the field as a
-    bare reference and a model once it types it as an endpoint, so both spellings of it are
-    read too. Every reader of an event's endpoint goes through here: the wake path
-    (`_wake._event_dialogue`) and the events tool's `list` and `read`.
+    The endpoint it arrived on, that endpoint's **author** (an event has none of its own; it
+    inherits the peer who created the endpoint — who wired the URL up, not necessarily who holds
+    it now), and `verified_at_receipt`: whether the delivery's signature was verified when it
+    arrived. That last one is the event's own **historical** fact, where everything in the
+    embedded endpoint is **current** state — so an endpoint that requires signatures today says
+    nothing about a delivery that arrived before it did. One renderer for both of this tool's
+    lines, so `list` and `read` cannot disagree.
     """
-    ref = event.webhook_endpoint
-    content = getattr(ref, "content", None)
-    if content is None:
-        return ref.uuid
-    return content["uuid"] if isinstance(content, dict) else content.uuid
+    endpoint = event.webhook_endpoint
+    verified = "true" if event.content.verified_at_receipt else "false"
+    return (
+        f"endpoint={endpoint.content.uuid} · endpoint_author=@{endpoint.user.handle} · "
+        f"verified_at_receipt={verified}"
+    )
 
 
 def _describe_endpoint(endpoint) -> str:
-    """One endpoint as a compact line: uuid, enabled state, ingest URL, verification."""
+    """One endpoint as a compact line: uuid, author, enabled state, verification, ingest URL."""
     content = endpoint.content
     state = "enabled" if content.enabled else "disabled"
     verification = "signed" if content.verification.enabled else "unsigned"
     return (
-        f"uuid={content.uuid} · {state} · {verification} · "
+        f"uuid={content.uuid} · author=@{endpoint.user.handle} · {state} · {verification} · "
         f"ingest_url={content.ingest_url} — {content.description}"
     )
 
 
 def _describe_event(event) -> str:
-    """One event as a compact line: uuid, time, content type, endpoint, payload preview."""
+    """One event as a compact line: uuid, time, content type, provenance, payload preview."""
     content = event.content
     payload = content.payload
     if len(payload) > _PAYLOAD_PREVIEW:
         payload = payload[:_PAYLOAD_PREVIEW].rstrip() + "…"
     return (
         f"uuid={content.uuid} · received={event.created_at} · "
-        f"content_type={content.content_type} · endpoint={endpoint_uuid(event)} "
-        f"— {payload}"
+        f"content_type={content.content_type} · {_provenance(event)} — {payload}"
     )

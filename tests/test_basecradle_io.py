@@ -77,6 +77,7 @@ def message(*, uuid, body, mine=False):
     return {
         "type": "message",
         "created_at": "2026-06-04T00:00:00.000Z",
+        "updated_at": "2026-06-04T00:00:00.000Z",
         "user": actor,
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {"uuid": uuid, "body": body},
@@ -86,6 +87,25 @@ def message(*, uuid, body, mine=False):
 def page(*messages, next_cursor=None):
     """One page of a cursor-paginated message list (last page unless given a cursor)."""
     return {"messages": list(messages), "next_cursor": next_cursor}
+
+
+def minted(token=MINTED_TOKEN):
+    """A 201 from `POST /session`: the token, once, beside the session it minted — the same
+    shape `GET /users/sessions` lists, `current` because it is now the credential in use."""
+    return {
+        "token": token,
+        "session": {
+            "uuid": "019e7750-66ee-7d0e-8b1a-6c1f0e3f5a21",
+            "name": "nova-harness",
+            "ip_address": "203.0.113.10",
+            "user_agent": "basecradle-python",
+            "created_at": "2026-06-04T00:00:00.000Z",
+            "last_used_at": None,
+            "kind": "api",
+            "current": True,
+        },
+        "start_here": "https://basecradle.com/users/dashboard.md",
+    }
 
 
 def dashboard():
@@ -1707,7 +1727,7 @@ def test_client_from_env_prefers_the_token(no_credentials, monkeypatch, platform
     monkeypatch.setenv("BASECRADLE_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("BASECRADLE_EMAIL", "nova@example.com")  # present but ignored
     monkeypatch.setenv("BASECRADLE_PASSWORD", "hunter2-not-used")
-    login = platform.post("/session").mock(return_value=httpx.Response(201, json={}))
+    login = platform.post("/session").mock(return_value=httpx.Response(201, json=minted()))
 
     client = _client_from_env()
 
@@ -1727,9 +1747,7 @@ def test_client_from_env_mints_a_token_from_credentials(
         "BASECRADLE_EMAIL=nova@example.com\nBASECRADLE_PASSWORD=correct-horse-battery-staple\n"
     )
     monkeypatch.setenv("BASECRADLE_ENV_FILE", str(env))
-    login = platform.post("/session").mock(
-        return_value=httpx.Response(201, json={"token": MINTED_TOKEN, "start_here": None})
-    )
+    login = platform.post("/session").mock(return_value=httpx.Response(201, json=minted()))
 
     client = _client_from_env()
 
@@ -1765,9 +1783,7 @@ def test_from_env_bootstraps_from_credentials_end_to_end(no_credentials, monkeyp
     monkeypatch.setenv("BASECRADLE_TIMELINE", TIMELINE_UUID)
     monkeypatch.setenv("AI_MODEL", "gpt-4o")
     monkeypatch.setenv("AI_API_KEY", "sk-test-key")
-    platform.post("/session").mock(
-        return_value=httpx.Response(201, json={"token": MINTED_TOKEN, "start_here": None})
-    )
+    platform.post("/session").mock(return_value=httpx.Response(201, json=minted()))
     wire(platform, message_pages=[page(message(uuid=M0, body="hi"))])
 
     agent = TimelineAgent.from_env()

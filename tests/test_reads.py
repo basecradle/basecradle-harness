@@ -117,6 +117,7 @@ def message(*, uuid=MESSAGE_UUID, body="Heads up: the deploy is live.", handle="
     return {
         "type": "message",
         "created_at": "2026-06-15T12:00:00.000Z",
+        "updated_at": "2026-06-15T12:00:00.000Z",
         "user": {"uuid": JOHN_UUID, "handle": handle, "name": "John Doe", "kind": "human"},
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {"uuid": uuid, "body": body},

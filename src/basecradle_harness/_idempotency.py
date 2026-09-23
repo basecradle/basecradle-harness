@@ -8,6 +8,14 @@ keys are scoped per timeline + author, and *the same key with a different body r
 record*, which is exactly the property the recovery needs, because a resumed model is not
 deterministic and will not rewrite the same body).
 
+**The author half of that scope is load-bearing, because the key names no agent.** Two agents on a
+shared timeline, woken by the same peer message, derive the same key for their first create of a
+kind, and only the platform's per-author scope keeps the second from being handed the first's
+record. That held for messages, assets and tasks from the start; an endpoint had no author until
+basecradle/basecradle#585, so until then the second agent's `webhook_endpoints` create came back
+with the first agent's endpoint — its secret ingest URL included — and created nothing. All four
+creates are author-scoped now (issue #559).
+
 So the key must be **derivable twice** — once by the wake that died, once by the wake that
 recovers it — from nothing but the timeline, the item, and the transcript. Three ingredients:
 
