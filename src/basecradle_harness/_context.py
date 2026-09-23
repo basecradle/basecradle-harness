@@ -324,9 +324,11 @@ _IDENTIFIER = re.compile(
 
 #: What follows an identifier the harness itself cut short: the ellipsis a list preview ends on
 #: (``_reads``, ``_tasks``, ``_webhooks``) and the head of an archived excerpt's elision marker
-#: (``_session``). A match that runs into one is a **fragment** — ``https://example.com/some/pa`` or
-#: ``@nova-dig`` — and is dropped: a missing identifier is a gap, a truncated one is a wrong answer.
-_CUT_SHORT = ("…", "\n\n[... ")
+#: (``_session``) — in both spellings, because an elided *argument* reaches `_render` inside JSON,
+#: where its blank line is the four characters ``\n\n``. A match that runs into one is a
+#: **fragment** — ``https://example.com/some/pa`` or ``@nova-dig`` — and is dropped: a missing
+#: identifier is a gap, a truncated one is a wrong answer.
+_CUT_SHORT = ("…", "\n\n[... ", "\\n\\n[... ")
 
 #: Punctuation a URL match may have swallowed from the prose around it — ``see https://x.com/a.``,
 #: ``'https://x.com/a'`` in a Python repr — and the closer that is part of the URL only when the URL
@@ -932,18 +934,50 @@ def _carried_items(dropped: Sequence[Message]) -> list[str]:
 
 
 def _render(messages: Sequence[Message]) -> str:
-    """The dropped region as plain text for the summarizer — roles named, tool calls named.
+    """The dropped region as plain text for the summarizer — roles named, tool calls in full.
 
     The tool *names* ride along (``assistant → called: web_search``) because the summary is required
     to record the work, and a bare assistant turn often does not say which tool it drove.
+
+    **And so do their arguments, one line per call — because that is where the agent speaks.** Since
+    the final-text auto-post was removed (issue #293), everything an agent says to anyone is the
+    ``body`` of a ``messages`` call, and the call's result says only that it posted and the new uuid.
+    Rendering names alone therefore showed the summarizer every peer's words and **none of the
+    agent's own**: it could record that a message went out, never what it said or promised — and the
+    identifier harvest, which reads this same text, could never keep a URL the agent sent. Arguments
+    are bounded exactly as the transcript bounds them on disk (`_session._fill` over `TOOL_ARGS_CAP`
+    per step), so a 200 KB document an agent posted costs the summarizer an excerpt, not its budget.
     """
     blocks = []
     for message in messages:
         header = message.role
         if message.tool_calls:
             header += " → called: " + ", ".join(call.name for call in message.tool_calls)
-        blocks.append(f"### {header}\n{(message.content or '').strip()}")
+        lines = [f"### {header}", (message.content or "").strip()]
+        lines += [
+            f"{call.name} {json.dumps(arguments, ensure_ascii=False, default=str)}"
+            for call, arguments in zip(message.tool_calls, _bounded_arguments(message))
+        ]
+        blocks.append("\n".join(line for line in lines if line))
     return "\n\n".join(blocks)
+
+
+def _bounded_arguments(message: Message) -> list[dict]:
+    """A turn's call arguments as the transcript would persist them — one step, one shared budget.
+
+    Imported at call time: `_session` imports this module for the caps, so a module-level import back
+    would be a cycle, and the summarizer is the only caller.
+    """
+    if not message.tool_calls:
+        return []
+    from basecradle_harness._session import _cap_arguments, _fill, _json_size
+
+    return _fill(
+        [call.arguments for call in message.tool_calls],
+        TOOL_ARGS_CAP,
+        size=_json_size,
+        elide=_cap_arguments,
+    )
 
 
 def _summary_note(dropped: int, summary: str, identifiers: str = "") -> str:
