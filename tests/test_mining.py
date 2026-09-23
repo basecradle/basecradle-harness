@@ -331,8 +331,15 @@ def _task():
 def _event():
     return _Content(
         created_at="2026-08-29T12:00:00Z",
-        webhook_endpoint=_Content(uuid=ENDPOINT_UUID),
-        content=_Content(uuid=EVENT_UUID, content_type="application/json", payload='{"ok":true}'),
+        webhook_endpoint=_Content(
+            user=_Content(handle="nova"), content=_Content(uuid=ENDPOINT_UUID)
+        ),
+        content=_Content(
+            uuid=EVENT_UUID,
+            content_type="application/json",
+            payload='{"ok":true}',
+            verified_at_receipt=False,
+        ),
     )
 
 
@@ -629,6 +636,7 @@ def test_the_describers_words_are_shown_to_the_model_and_never_mined(
                     {
                         "type": "asset",
                         "created_at": "2026-08-29T12:00:00Z",
+                        "updated_at": "2026-08-29T12:00:00Z",
                         "user": {
                             "uuid": JOHN_UUID,
                             "handle": "john",

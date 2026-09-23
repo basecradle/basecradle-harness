@@ -94,6 +94,7 @@ def asset_response(*, filename, content_type):
         "asset": {
             "type": "asset",
             "created_at": "2026-06-17T00:00:00.000Z",
+            "updated_at": "2026-06-17T00:00:00.000Z",
             "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
             "timeline": {"uuid": TIMELINE_UUID},
             "content": {
@@ -133,6 +134,7 @@ def source_asset_response(uuid, content_type="image/png"):
         "asset": {
             "type": "asset",
             "created_at": "2026-06-04T00:00:00.000Z",
+            "updated_at": "2026-06-04T00:00:00.000Z",
             "user": {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"},
             "timeline": {"uuid": TIMELINE_UUID},
             "content": {

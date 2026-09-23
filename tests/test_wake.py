@@ -33,7 +33,7 @@ from uuid import UUID
 import httpx
 import pytest
 import respx
-from basecradle import BaseCradle
+from basecradle import BaseCradle, WebhookEvent
 
 from basecradle_harness import (
     BreakerDecision,
@@ -61,6 +61,7 @@ from basecradle_harness._cleanup import prune_settled_claims
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
 from basecradle_harness._report import billing_onset_line
+from basecradle_harness._unspoken import addressed
 from basecradle_harness._wake import (
     _CLAIM_BEAT_EVERY,
     _CLAIM_STALE_AFTER,
@@ -116,6 +117,7 @@ def message(*, uuid, body, mine=False):
     return {
         "type": "message",
         "created_at": "2026-06-04T00:00:00.000Z",
+        "updated_at": "2026-06-04T00:00:00.000Z",
         "user": actor,
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {"uuid": uuid, "body": body},
@@ -132,39 +134,43 @@ E0 = "019e7761-2222-7bbb-8ccc-2d3e4f506172"
 E1 = "019e7762-3333-7ccc-8ddd-3e4f50617283"
 
 
-def event(*, uuid, payload, content_type="application/json", embedded=False):
-    """A delivery; `embedded` is the post-basecradle#585 shape (the full endpoint, uuid under
-    `content`) where the default is today's bare reference (issue #556)."""
-    reference = {"uuid": EP}
-    if embedded:
-        reference = {
+INGEST_TOKEN = "019e7760-9999-7aaa-8bbb-1c2d3e4f5061"
+
+
+def event(*, uuid, payload, content_type="application/json", verified=False):
+    """A delivery: no `user` of its own, the endpoint it arrived on embedded in full — authored
+    by the agent itself, the usual case (it wires its own timeline up) — and its two historical
+    facts, the ingest token it arrived on and whether its signature was verified then."""
+    return {
+        "type": "webhook_event",
+        "created_at": "2026-06-04T00:00:00.000Z",
+        "updated_at": "2026-06-04T00:00:00.000Z",
+        "timeline": {"uuid": TIMELINE_UUID},
+        "webhook_endpoint": {
             "type": "webhook_endpoint",
             "created_at": "2026-06-03T00:00:00.000Z",
+            "updated_at": "2026-06-03T00:00:00.000Z",
             "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
             "timeline": {"uuid": TIMELINE_UUID},
             "content": {
                 "uuid": EP,
                 "description": "GitHub deliveries",
                 "enabled": True,
-                "ingest_url": "https://basecradle.com/webhooks/019e7760-9999-7aaa-8bbb-1c2d3e4f5061",
+                "ingest_url": f"https://basecradle.com/webhooks/{INGEST_TOKEN}",
                 "verification": {
                     "enabled": False,
                     "signature_header": "X-Signature",
                     "verifier": "hmac_sha256_hex",
                 },
             },
-        }
-    return {
-        "type": "webhook_event",
-        "created_at": "2026-06-04T00:00:00.000Z",
-        "timeline": {"uuid": TIMELINE_UUID},
-        "webhook_endpoint": reference,
+        },
         "content": {
             "uuid": uuid,
             "content_type": content_type,
             "headers": {"x-source": "github"},
             "payload": payload,
-            "ingest_token_at_receipt": "tok_abc",
+            "ingest_token_at_receipt": INGEST_TOKEN,
+            "verified_at_receipt": verified,
         },
     }
 
@@ -182,6 +188,7 @@ def task(*, uuid, instructions, status="activated", activate_at="2026-06-11T06:0
     return {
         "type": "task",
         "created_at": "2026-06-10T00:00:00.000Z",
+        "updated_at": "2026-06-10T00:00:00.000Z",
         "user": {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"},
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {
@@ -211,6 +218,7 @@ def asset(*, uuid, filename="photo.png", content_type="image/png", description="
     return {
         "type": "asset",
         "created_at": "2026-06-04T00:00:00.000Z",
+        "updated_at": "2026-06-04T00:00:00.000Z",
         "user": actor,
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {
@@ -1107,19 +1115,25 @@ def test_first_wake_acts_on_the_triggering_event(platform, tmp_path):
     assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0
 
 
-@pytest.mark.parametrize("embedded", [False, True], ids=["reference", "embedded"])
-def test_a_delivery_is_perceived_in_either_endpoint_wire_shape(platform, tmp_path, embedded):
-    """The core's breaking release (basecradle/basecradle#585) embeds the full endpoint in an
-    event where it used to send a reference, and the harness must read whichever arrives
-    (issue #556): unread, the first delivery after the core deploys kills the wake path."""
+@pytest.mark.parametrize(("verified", "said"), [(True, "verified"), (False, "not verified")])
+def test_a_delivery_names_its_endpoints_author_and_whether_it_was_verified(
+    platform, tmp_path, verified, said
+):
+    """Issue #559: an agent deciding whether to trust a delivery needs to know who wired the
+    endpoint up and whether the delivery proved its sender, so the header the model reads says
+    both — read off the embedded endpoint (`content.uuid`, `user`) and the event's own
+    `verified_at_receipt`."""
     serve_messages(platform, page())
-    serve_events(platform, event_page(event(uuid=E0, payload="KIWI-7", embedded=embedded)))
+    serve_events(platform, event_page(event(uuid=E0, payload="KIWI-7", verified=verified)))
     agent, provider = build_wake(tmp_path)
 
     posted = agent.wake(event_trigger=E0)
 
     assert len(posted) == 1
-    assert f"endpoint {EP}," in provider.prompts[0]  # the endpoint uuid, not a crash
+    assert (
+        f"(event {E0}, endpoint {EP} created by nova, content_type application/json, "
+        f"signature {said} on arrival)."
+    ) in provider.prompts[0]
     assert MarkStore(tmp_path).get(TIMELINE_UUID, kind="webhook_events") == E0
 
 
@@ -3527,18 +3541,22 @@ def test_the_wake_reads_the_hints_action_set_off_the_bound_tool(tmp_path):
 
 
 def test_incoming_event_is_timestamped():
-    event = SimpleNamespace(
-        created_at=TS,
-        webhook_endpoint=SimpleNamespace(uuid="019e7760-1111-7aaa-8bbb-1c2d3e4f5061"),
-        content=SimpleNamespace(
-            uuid="019e7761-2222-7bbb-8ccc-2d3e4f506172",
-            content_type="application/json",
-            payload='{"ok": true}',
-        ),
-    )
-    text = _incoming_event_text(event)
+    text = _incoming_event_text(WebhookEvent(event(uuid=E0, payload='{"ok": true}')))
     assert text.startswith(f"[{TS}] An inbound webhook was delivered")
     assert "was just delivered" not in text  # the now-redundant "just" is dropped
+
+
+def test_a_delivery_on_the_agents_own_endpoint_is_not_a_mention_of_it():
+    """The header names the endpoint's author as a bare handle, never `@handle` (issue #559).
+
+    An agent usually created the endpoint it is woken on, and the no-reply informer arms on an
+    exact `@handle` in the item's text — so an `@nova` in the header would read every delivery
+    on Nova's own endpoint as Nova being mentioned, and nudge a turn that rightly stayed silent.
+    """
+    text = _incoming_event_text(WebhookEvent(event(uuid=E0, payload='{"ok": true}')))
+
+    assert "created by nova," in text  # the author is named…
+    assert not addressed(text, "nova")  # …without addressing the agent
 
 
 def test_activated_task_is_timestamped():
@@ -3601,6 +3619,7 @@ def peer_ai_message(*, uuid, body, created_at="2026-06-04T00:00:00.000Z"):
     return {
         "type": "message",
         "created_at": created_at,
+        "updated_at": created_at,
         "user": {"uuid": PEER_AI_UUID, "handle": "briggs", "name": "Briggs", "kind": "ai"},
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {"uuid": uuid, "body": body},

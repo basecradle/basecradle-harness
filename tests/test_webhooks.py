@@ -18,7 +18,7 @@ import json
 import httpx
 import pytest
 import respx
-from basecradle import BaseCradle, WebhookEndpoint, WebhookEvent
+from basecradle import BaseCradle
 
 from basecradle_harness import (
     PlatformContext,
@@ -26,12 +26,14 @@ from basecradle_harness import (
     WebhookEndpointsTool,
     WebhookEventsTool,
 )
-from basecradle_harness._webhooks import endpoint_uuid
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
 
 NOVA_UUID = "019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"  # the agent
+JOHN_UUID = "019e7750-66ee-7e50-9e54-3bf8c3d6a8f1"  # a human peer who wires an endpoint up
+NOVA = {"uuid": NOVA_UUID, "handle": "nova", "name": "Nova Digital", "kind": "ai"}
+JOHN = {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "human"}
 TIMELINE_UUID = "019e7750-66ee-7f53-829f-13a8a710b6da"  # the current timeline
 OTHER_TIMELINE = "019e7760-1234-7abc-8def-0123456789ab"  # an explicit override
 
@@ -41,8 +43,9 @@ EP_TWO = "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70"
 EV_ONE = "019e7753-6c3d-7e4f-9051-3c4d5e6f7081"
 EV_TWO = "019e7754-7d4e-7f50-a162-4d5e6f708192"
 
-INGEST_URL = "https://basecradle.com/wh/ingest/wh_abc123def456"
-ROTATED_URL = "https://basecradle.com/wh/ingest/wh_xyz789ghi012"
+INGEST_TOKEN = "019e7755-8e5f-7061-b273-5e6f708192a3"
+INGEST_URL = f"https://basecradle.com/webhooks/{INGEST_TOKEN}"
+ROTATED_URL = "https://basecradle.com/webhooks/019e7756-9f60-7172-8384-6f708192a3b4"
 
 
 # --- wire payload builders ---------------------------------------------------
@@ -55,11 +58,14 @@ def endpoint(
     enabled=True,
     ingest_url=INGEST_URL,
     verification_enabled=False,
+    author=NOVA,
 ):
-    """A webhook endpoint in subject form (the SDK's documented shape)."""
+    """A webhook endpoint in subject form (the SDK's documented shape), `user` its author."""
     return {
         "type": "webhook_endpoint",
         "created_at": "2026-06-04T00:00:00.000Z",
+        "updated_at": "2026-06-04T00:00:00.000Z",
+        "user": author,
         "timeline": {"uuid": TIMELINE_UUID},
         "content": {
             "uuid": uuid,
@@ -82,24 +88,28 @@ def event(
     headers=None,
     payload='{"event":"payment.succeeded"}',
     endpoint_uuid=EP_ONE,
-    embedded=False,
+    author=NOVA,
+    verified=False,
 ):
     """A webhook event in subject form — one inbound delivery.
 
-    `embedded` selects the post-basecradle#585 wire shape, where `webhook_endpoint` is the
-    endpoint's full subject form (uuid under `content`) instead of a bare reference.
+    An event has no `user`: it embeds the endpoint it arrived on in full (author included), and
+    carries its two historical facts — the ingest token it arrived on, and whether its signature
+    was verified then.
     """
     return {
         "type": "webhook_event",
         "created_at": "2026-06-05T00:00:00.000Z",
+        "updated_at": "2026-06-05T00:00:00.000Z",
         "timeline": {"uuid": TIMELINE_UUID},
-        "webhook_endpoint": endpoint(uuid=endpoint_uuid) if embedded else {"uuid": endpoint_uuid},
+        "webhook_endpoint": endpoint(uuid=endpoint_uuid, author=author),
         "content": {
             "uuid": uuid,
             "content_type": content_type,
             "headers": headers if headers is not None else {"User-Agent": "Stripe/1.0"},
             "payload": payload,
-            "ingest_token_at_receipt": "wh_abc123def456",
+            "ingest_token_at_receipt": INGEST_TOKEN,
+            "verified_at_receipt": verified,
         },
     }
 
@@ -231,7 +241,7 @@ def test_create_surfaces_a_refusal_as_a_clean_explanation(endpoints):
 # --- endpoints: list ---------------------------------------------------------
 
 
-def test_list_renders_each_endpoint_with_uuid_state_and_ingest_url(endpoints):
+def test_list_renders_each_endpoint_with_uuid_author_state_and_ingest_url(endpoints):
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/webhook_endpoints").mock(
             return_value=httpx.Response(
@@ -239,7 +249,7 @@ def test_list_renders_each_endpoint_with_uuid_state_and_ingest_url(endpoints):
                 json={
                     "webhook_endpoints": [
                         endpoint(),
-                        endpoint(uuid=EP_TWO, description="GitHub", enabled=False),
+                        endpoint(uuid=EP_TWO, description="GitHub", enabled=False, author=JOHN),
                     ],
                     "next_cursor": None,
                 },
@@ -250,6 +260,8 @@ def test_list_renders_each_endpoint_with_uuid_state_and_ingest_url(endpoints):
     assert EP_ONE in result and EP_TWO in result
     assert INGEST_URL in result
     assert "enabled" in result and "disabled" in result  # both states rendered
+    assert f"uuid={EP_ONE} · author=@nova ·" in result  # each endpoint names its own author
+    assert f"uuid={EP_TWO} · author=@john ·" in result
 
 
 def test_list_on_an_empty_timeline_says_so(endpoints):
@@ -354,16 +366,15 @@ def test_endpoints_unbound_tool_raises_platform_error():
 # --- events: list ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("embedded", [False, True], ids=["reference", "embedded"])
-def test_list_events_renders_each_with_uuid_type_endpoint_and_preview(events, embedded):
+def test_list_events_renders_each_with_uuid_type_provenance_and_preview(events):
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/webhook_events").mock(
             return_value=httpx.Response(
                 200,
                 json={
                     "webhook_events": [
-                        event(embedded=embedded),
-                        event(uuid=EV_TWO, content_type="text/plain", embedded=embedded),
+                        event(verified=True),
+                        event(uuid=EV_TWO, content_type="text/plain", author=JOHN),
                     ],
                     "next_cursor": None,
                 },
@@ -373,7 +384,11 @@ def test_list_events_renders_each_with_uuid_type_endpoint_and_preview(events, em
 
     assert EV_ONE in result and EV_TWO in result
     assert "application/json" in result and "text/plain" in result
-    assert result.count(f"endpoint={EP_ONE}") == 2  # the originating endpoint, either shape
+    # Each line names the endpoint a delivery arrived on, that endpoint's author, and whether
+    # the delivery's signature was verified on arrival — the facts a trust call turns on.
+    first, second = result.splitlines()[1:]
+    assert f"endpoint={EP_ONE} · endpoint_author=@nova · verified_at_receipt=true" in first
+    assert f"endpoint={EP_ONE} · endpoint_author=@john · verified_at_receipt=false" in second
 
 
 def test_list_events_narrows_to_one_endpoint(events):
@@ -412,15 +427,14 @@ def test_list_events_truncates_a_long_payload_in_the_preview(events):
 # --- events: read ------------------------------------------------------------
 
 
-@pytest.mark.parametrize("embedded", [False, True], ids=["reference", "embedded"])
-def test_read_event_returns_headers_and_the_full_payload(events, embedded):
+def test_read_event_returns_headers_and_the_full_payload(events):
     payload = json.dumps({"event": "payment.succeeded", "amount": 4200})
     headers = {"User-Agent": "Stripe/1.0", "Content-Type": "application/json"}
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/webhook_events/{EV_ONE}").mock(
             return_value=httpx.Response(
                 200,
-                json={"webhook_event": event(payload=payload, headers=headers, embedded=embedded)},
+                json={"webhook_event": event(payload=payload, headers=headers, author=JOHN)},
             )
         )
         result = events.run(action="read", uuid=EV_ONE)
@@ -428,26 +442,25 @@ def test_read_event_returns_headers_and_the_full_payload(events, embedded):
     assert payload in result  # the whole body, not a preview
     assert EV_ONE in result
     assert "User-Agent: Stripe/1.0" in result  # headers rendered
-    assert f"endpoint={EP_ONE}" in result  # the originating endpoint, in either wire shape
+    # The same provenance the list line carries — `read` and `list` share one renderer.
+    assert f"endpoint={EP_ONE} · endpoint_author=@john · verified_at_receipt=false" in result
 
 
-def test_endpoint_uuid_reads_every_shape_the_sdk_can_hand_back():
-    """Issue #556: one reader for an event's endpoint across the core's breaking release.
+def test_verified_at_receipt_is_the_events_own_fact_not_the_endpoints_current_setting(events):
+    """`verified_at_receipt` is historical; the embedded endpoint's `verification` is current.
 
-    Three shapes, because two things move independently: the wire (a reference today, the
-    full endpoint once basecradle/basecradle#585 deploys) and the SDK's typing of it (a bare
-    reference whose `content` is a plain dict today, an endpoint model whose `content` is a
-    model once the SDK adopts the embed). A reader correct on only some of them breaks on
-    whichever release lands second.
+    An endpoint that requires signatures *now* says nothing about a delivery that arrived before
+    it did, so the line reports the event's fact even when the two disagree (issue #559).
     """
-    reference = WebhookEvent(event())
-    embedded = WebhookEvent(event(embedded=True))
-    typed = WebhookEvent(event(embedded=True))
-    typed._data["webhook_endpoint"] = WebhookEndpoint(endpoint())  # the SDK's future typing
+    delivered_unsigned = event(verified=False)
+    delivered_unsigned["webhook_endpoint"]["content"]["verification"]["enabled"] = True
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/webhook_events/{EV_ONE}").mock(
+            return_value=httpx.Response(200, json={"webhook_event": delivered_unsigned})
+        )
+        result = events.run(action="read", uuid=EV_ONE)
 
-    assert endpoint_uuid(reference) == EP_ONE
-    assert endpoint_uuid(embedded) == EP_ONE
-    assert endpoint_uuid(typed) == EP_ONE
+    assert "verified_at_receipt=false" in result
 
 
 def test_read_event_without_a_uuid_is_a_friendly_error(events):

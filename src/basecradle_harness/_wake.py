@@ -26,9 +26,9 @@ messages. Three cases the message scan would otherwise miss:
   sees the picture on wake; media it cannot yet fully perceive (a doc, audio, video)
   degrades to a description naming the file and its type, with the `view`/`read`/`listen`
   tools available to engage further on demand.
-- An inbound **webhook delivery**: a received `webhook_event` is not a timeline item,
-  so the wake fetches unseen ones through the SDK's webhook-events read surface, under
-  their own high-water mark, and acts on them.
+- An inbound **webhook delivery**: a received `webhook_event` lands on the timeline as an
+  item, but the message scan reads only messages, so the wake fetches unseen ones through
+  the SDK's webhook-events read surface, under their own high-water mark, and acts on them.
 - A newly-**activated task**: a `task.activated` wake fires when a scheduled task comes
   due, but the activation is not a fresh timeline item the scan surfaces — so the wake
   lists the timeline's *activated* tasks and carries out the instructions of any it has
@@ -185,7 +185,6 @@ from basecradle_harness._rerank import (
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
-from basecradle_harness._webhooks import endpoint_uuid
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -4787,12 +4786,24 @@ _EVENT_ACT_HINT = " Decide whether and how to act on it. Its payload:"
 
 
 def _event_dialogue(event: object) -> str:
-    """The delivery's own header — what arrived, from which endpoint, when."""
+    """The delivery's own header — what arrived, from which endpoint, when, and on whose word.
+
+    It names the endpoint's **author** (an event has none of its own) and whether the delivery's
+    signature was verified on arrival (`verified_at_receipt`, the event's own historical fact),
+    because an agent deciding whether to trust a delivery needs both (issue #559). The author is
+    a **bare** handle, as `_asset_dialogue` writes one, and deliberately never `@handle`: an agent
+    usually created the endpoint it is woken on, and the no-reply informer arms on an exact
+    `@handle` in this text (`_unspoken.addressed`), so an `@` here would read every delivery on
+    the agent's own endpoint as a mention of it.
+    """
     content = event.content
+    endpoint = event.webhook_endpoint
+    verified = "verified" if content.verified_at_receipt else "not verified"
     return (
         f"[{event.created_at}] An inbound webhook was delivered to this timeline "
-        f"(event {content.uuid}, endpoint {endpoint_uuid(event)}, "
-        f"content_type {content.content_type})."
+        f"(event {content.uuid}, endpoint {endpoint.content.uuid} created by "
+        f"{endpoint.user.handle}, content_type {content.content_type}, "
+        f"signature {verified} on arrival)."
     )
 
 

@@ -7,6 +7,52 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.130.3] - 2026-09-22
+
+### Changed: the harness reads the live wire only, and a delivery names who wired its endpoint and whether it was verified — `basecradle>=0.9.0` (issue #559)
+
+**The core's breaking release (basecradle/basecradle#585) is deployed**, so the shapes 0.130.1 and
+0.130.2 tolerated no longer occur, and the harness now adopts the live wire outright. The
+`basecradle` floor rises from `>=0.8.1` to `>=0.9.0`, the SDK's adoption release
+(basecradle/basecradle-python#188): an event's `webhook_endpoint` is always a full
+`WebhookEndpoint`, `Timeline.lock` adopts the whole returned timeline, `add_participant` reads only
+the `{"user": {…}}` envelope, and `login` builds the minted session in full. `_webhooks.endpoint_uuid`,
+which existed only to read an event's endpoint in either shape, is gone; every reader takes
+`webhook_endpoint.content.uuid`.
+
+**Two facts #585 added now reach the model wherever it reads a delivery**, because an agent deciding
+whether to trust one needs both: the endpoint's **author** (an event has none of its own; it
+inherits the peer who created its endpoint) and `verified_at_receipt`, whether the delivery's
+signature was verified when it arrived. The wake-path delivery header reads
+`(event …, endpoint … created by nova, content_type …, signature verified on arrival)`; the
+`webhook_events` tool's `list` and `read` lines share one renderer carrying
+`endpoint=… · endpoint_author=@nova · verified_at_receipt=true`; and the `webhook_endpoints` list
+names each endpoint's `author`. `verified_at_receipt` is the event's own **historical** fact, so it
+is reported even where the embedded endpoint — which is *current* state — requires signatures
+today. The header names the author as a **bare** handle, as the asset header already does, and
+never `@handle`: an agent usually created the endpoint it is woken on, and the no-reply informer
+arms on an exact `@handle` in an item's text, so an `@` there would have read every delivery on the
+agent's own endpoint as a mention of it. A test pins that.
+
+**#585 also closed a cross-agent collision the harness's keys had been exposed to, and
+`_idempotency` now says why.** A harness `Idempotency-Key` names the timeline, the item being
+answered, the kind and the ordinal, never the agent, so two agents answering the same message on a
+shared timeline derive the same key for their first create of a kind; the platform's per-author
+scope is what keeps the second from being handed the first's record. Endpoint keys were scoped per
+timeline only until #585, because an endpoint had no author, so the second agent's
+`webhook_endpoints` create would have come back with the first agent's endpoint, secret ingest URL
+included, and created nothing. All four creates are author-scoped now.
+
+The tests now run against the live shapes only: the reference/embedded, stub/enveloped and
+bare/enveloped cases are gone, and every platform record fixture carries `updated_at` (and, for a
+webhook endpoint, its `user`), `POST /session` answers with the full session, `add_participant`
+answers with the trusted-peer user adding always implies, and the lock/delete previews count real
+message items. Every fixture this release touched was checked against the platform's published
+OpenAPI spec (`/docs/api.json`): required keys present, no key the spec does not define. This repo
+has no OpenAPI drift-guard, so `PATCH /users/password` entering the spec asks nothing of it; the
+harness never calls that endpoint. The README and the wake module no longer say a webhook event is
+not a timeline item — it is one; the message scan simply reads only messages.
+
 ## [0.130.2] - 2026-09-22
 
 ### Fixed: the lock and participation responses are read in either wire shape — `basecradle>=0.8.1` (issue #556)
