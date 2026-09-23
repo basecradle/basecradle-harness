@@ -7,6 +7,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.130.2] - 2026-09-22
+
+### Fixed: the lock and participation responses are read in either wire shape — `basecradle>=0.8.1` (issue #556)
+
+**The second half of the core's breaking release (basecradle/basecradle#585).** `POST
+/timelines/{uuid}/lock` now wraps its answer in `{"timeline": {…}}` where it used to be a bare
+`{uuid, locked}`, and `POST /timelines/{uuid}/participations` wraps the added user in `{"user": {…}}`.
+Both are parsed inside the SDK (`Timeline.lock`, `Timeline.add_participant`), the harness's only
+platform I/O. So the fix is the SDK's own tolerance release, `basecradle` 0.8.1
+(basecradle/basecradle-python#183), which reads either shape, and the harness now **requires** it.
+The dependency floor rises from `>=0.6` to `>=0.8.1`. Without it, against the new core, the `lock`
+tool and the timelines tool's `add_participant` would carry out the action and then report a parse
+failure to the model: a lock that landed would read as one that had not, on a one-way action.
+
+The `lock` and `add_participant` success tests now run against both shapes. The enveloped cases
+fail on `basecradle` 0.8.0, so the floor is what they pin. 0.8.1 also types an event's
+`webhook_endpoint` as a `WebhookEndpoint`, the third spelling `_webhooks.endpoint_uuid` (0.130.1)
+already reads. With this release the harness reads every shape #585 changes.
+
 ## [0.130.1] - 2026-09-22
 
 ### Fixed: a webhook delivery is read in either endpoint wire shape, ahead of the core's breaking release (issue #556)

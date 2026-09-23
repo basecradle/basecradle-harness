@@ -251,12 +251,16 @@ def test_timelines_no_longer_locks(timelines):
 # --- timelines: add / remove participant -------------------------------------
 
 
-def test_add_participant_resolves_a_handle_and_adds_them(timelines):
+@pytest.mark.parametrize("enveloped", [False, True], ids=["bare", "enveloped"])
+def test_add_participant_resolves_a_handle_and_adds_them(timelines, enveloped):
+    """The added user is read in both shapes — today's bare user and the `{"user": {…}}`
+    envelope of basecradle/basecradle#585 — through the SDK's tolerance (`basecradle>=0.8.1`,
+    issue #556); unread, an add that landed reads as a failure."""
     captured = {}
 
     def capture(request):
         captured["body"] = json.loads(request.content)
-        return httpx.Response(201, json=user())
+        return httpx.Response(201, json={"user": user()} if enveloped else user())
 
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/users").mock(return_value=httpx.Response(200, json=directory()))

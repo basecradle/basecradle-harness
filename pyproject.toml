@@ -21,7 +21,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "basecradle>=0.6",
+    "basecradle>=0.8.1",
     # Declared because the package **imports it directly** — `_webfetch`, `_grok`, `_images`,
     # `_assets`, `_direct_message`, `_xai_account`, `_openrouter_account`, `_mcp`, `_http`,
     # `_wake`. It was never a new install: `basecradle` requires `httpx>=0.28` and, until
