@@ -18,7 +18,7 @@ import json
 import httpx
 import pytest
 import respx
-from basecradle import BaseCradle
+from basecradle import BaseCradle, WebhookEndpoint, WebhookEvent
 
 from basecradle_harness import (
     PlatformContext,
@@ -26,6 +26,7 @@ from basecradle_harness import (
     WebhookEndpointsTool,
     WebhookEventsTool,
 )
+from basecradle_harness._webhooks import endpoint_uuid
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -81,13 +82,18 @@ def event(
     headers=None,
     payload='{"event":"payment.succeeded"}',
     endpoint_uuid=EP_ONE,
+    embedded=False,
 ):
-    """A webhook event in subject form — one inbound delivery."""
+    """A webhook event in subject form — one inbound delivery.
+
+    `embedded` selects the post-basecradle#585 wire shape, where `webhook_endpoint` is the
+    endpoint's full subject form (uuid under `content`) instead of a bare reference.
+    """
     return {
         "type": "webhook_event",
         "created_at": "2026-06-05T00:00:00.000Z",
         "timeline": {"uuid": TIMELINE_UUID},
-        "webhook_endpoint": {"uuid": endpoint_uuid},
+        "webhook_endpoint": endpoint(uuid=endpoint_uuid) if embedded else {"uuid": endpoint_uuid},
         "content": {
             "uuid": uuid,
             "content_type": content_type,
@@ -348,13 +354,17 @@ def test_endpoints_unbound_tool_raises_platform_error():
 # --- events: list ------------------------------------------------------------
 
 
-def test_list_events_renders_each_with_uuid_type_endpoint_and_preview(events):
+@pytest.mark.parametrize("embedded", [False, True], ids=["reference", "embedded"])
+def test_list_events_renders_each_with_uuid_type_endpoint_and_preview(events, embedded):
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/webhook_events").mock(
             return_value=httpx.Response(
                 200,
                 json={
-                    "webhook_events": [event(), event(uuid=EV_TWO, content_type="text/plain")],
+                    "webhook_events": [
+                        event(embedded=embedded),
+                        event(uuid=EV_TWO, content_type="text/plain", embedded=embedded),
+                    ],
                     "next_cursor": None,
                 },
             )
@@ -363,7 +373,7 @@ def test_list_events_renders_each_with_uuid_type_endpoint_and_preview(events):
 
     assert EV_ONE in result and EV_TWO in result
     assert "application/json" in result and "text/plain" in result
-    assert EP_ONE in result  # the originating endpoint is shown
+    assert result.count(f"endpoint={EP_ONE}") == 2  # the originating endpoint, either shape
 
 
 def test_list_events_narrows_to_one_endpoint(events):
@@ -402,13 +412,15 @@ def test_list_events_truncates_a_long_payload_in_the_preview(events):
 # --- events: read ------------------------------------------------------------
 
 
-def test_read_event_returns_headers_and_the_full_payload(events):
+@pytest.mark.parametrize("embedded", [False, True], ids=["reference", "embedded"])
+def test_read_event_returns_headers_and_the_full_payload(events, embedded):
     payload = json.dumps({"event": "payment.succeeded", "amount": 4200})
     headers = {"User-Agent": "Stripe/1.0", "Content-Type": "application/json"}
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/webhook_events/{EV_ONE}").mock(
             return_value=httpx.Response(
-                200, json={"webhook_event": event(payload=payload, headers=headers)}
+                200,
+                json={"webhook_event": event(payload=payload, headers=headers, embedded=embedded)},
             )
         )
         result = events.run(action="read", uuid=EV_ONE)
@@ -416,7 +428,26 @@ def test_read_event_returns_headers_and_the_full_payload(events):
     assert payload in result  # the whole body, not a preview
     assert EV_ONE in result
     assert "User-Agent: Stripe/1.0" in result  # headers rendered
-    assert EP_ONE in result  # the originating endpoint
+    assert f"endpoint={EP_ONE}" in result  # the originating endpoint, in either wire shape
+
+
+def test_endpoint_uuid_reads_every_shape_the_sdk_can_hand_back():
+    """Issue #556: one reader for an event's endpoint across the core's breaking release.
+
+    Three shapes, because two things move independently: the wire (a reference today, the
+    full endpoint once basecradle/basecradle#585 deploys) and the SDK's typing of it (a bare
+    reference whose `content` is a plain dict today, an endpoint model whose `content` is a
+    model once the SDK adopts the embed). A reader correct on only some of them breaks on
+    whichever release lands second.
+    """
+    reference = WebhookEvent(event())
+    embedded = WebhookEvent(event(embedded=True))
+    typed = WebhookEvent(event(embedded=True))
+    typed._data["webhook_endpoint"] = WebhookEndpoint(endpoint())  # the SDK's future typing
+
+    assert endpoint_uuid(reference) == EP_ONE
+    assert endpoint_uuid(embedded) == EP_ONE
+    assert endpoint_uuid(typed) == EP_ONE
 
 
 def test_read_event_without_a_uuid_is_a_friendly_error(events):

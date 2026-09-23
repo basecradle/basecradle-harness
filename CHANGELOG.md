@@ -7,6 +7,35 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.130.1] - 2026-09-22
+
+### Fixed: a webhook delivery is read in either endpoint wire shape, ahead of the core's breaking release (issue #556)
+
+**The pending core release (basecradle/basecradle#585) changes what a webhook event carries**:
+`webhook_endpoint` becomes the endpoint's full subject form, with its uuid under
+`webhook_endpoint.content.uuid` rather than `webhook_endpoint.uuid`. Three sites read the old
+spelling, and one of them is on the wake path (`_wake._event_dialogue`, the header every inbound
+delivery is rendered with), so the first delivery after the core deployed would have killed the
+wake on that timeline. The other two are the `webhook_events` tool's `list` and `read`. All three
+now go through one reader, `_webhooks.endpoint_uuid`, which takes `content.uuid` when the event
+carries the full endpoint and the reference's own `uuid` otherwise — and reads `content` whether
+the SDK hands it back as a plain dict (today's typing of a bare reference) or as a model (once the
+SDK types the field as an endpoint), because the wire and the SDK change on separate releases and
+a reader right about only one of them breaks on whichever lands second.
+
+**The other half of #585 needed no harness change, and that is stated rather than left to be
+inferred.** A timeline page's `webhook_event` items lose `user`: the harness never reads an item's
+author off a timeline page (it counts items, in the timelines `read` and the lock/delete preview;
+its own-item filter runs only on messages and assets, from their own endpoints, which keep `user`),
+and a test now pins that count against a user-less item. The lock and participation response
+envelopes are parsed **inside the SDK** (`Timeline.lock`, `Timeline.add_participant`), which is
+the harness's only platform I/O, so they close with the SDK's own tolerance release
+(basecradle/basecradle-python#183) and a raised `basecradle` floor here, not by reaching around
+the SDK. That floor is **not in this release**, because the tolerant SDK is not yet published:
+until it is, a `lock` or `add_participant` against the new core performs the action and then
+reports a parse failure to the model (the engine turns a tool exception into a tool result, so
+the wake survives). The password change is not a call the harness makes.
+
 ## [0.130.0] - 2026-09-22
 
 ### Added: `browser_run_code_unsafe` is withheld by default, and the agent is told what it has and why (issue #553)
