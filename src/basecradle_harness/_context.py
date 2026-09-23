@@ -88,6 +88,18 @@ of the budget and fire at 50%, so the context must roughly double before the nex
 the new prefix is byte-stable from the moment it is written. Compaction happens *inside* the stable
 prefix; it never moves the volatile tail (the per-wake brief stays spliced immediately before the
 newest user turn), so the caching invariant is untouched.
+
+**Compaction is a transcript concern, and it never touches memory** (founder decision, issue #561).
+The transcript is *outside* the agent: the harness owns it, shows it to the model, compacts it when it
+is too big, and deletes it with its timeline — the summary is part of the transcript and goes with it.
+Memory is *inside* the agent: what it chose to write, or (on a mining provider) what was said. The two
+systems are never connected, so nothing here calls, reads, or holds a memory provider. The summary
+records the work first because the model's *next turn on this timeline* needs to know what it did; the
+durable trace of tool work lives outside the agent entirely (the per-call ``tool`` log line, and the
+platform itself). A summary is **validated before it is committed** — it must be smaller than what it
+replaces, or the compaction declines — and the identifiers in the dropped region are **harvested by
+code** and appended to it (`_identifier_block`), so a uuid, a URL or a handle survives whether or not
+the summarizer copied it.
 """
 
 from __future__ import annotations
@@ -96,7 +108,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from basecradle_harness._engine import DEFAULT_MAX_STEPS
@@ -199,9 +211,18 @@ WORST_CASE_CHARS_PER_TOKEN = 3.0
 #: The most of an over-ceiling transcript the emergency path may retain, as a fraction of what is
 #: actually there. The provider has just *refused* this transcript, so any conclusion our token
 #: arithmetic reaches about it is already known to be wrong — including, dangerously, "it fits."
-#: Capping the tail against the transcript's real size guarantees the rescue always makes progress
-#: instead of declining and leaving the agent bricked. The provider's word beats our estimate.
+#: Capping the tail against the transcript's real size guarantees the rescue always finds a region
+#: worth replacing instead of declining and leaving the agent bricked — it can still decline if the
+#: summarizer answers with notes no smaller than that region (issue #561), which a rescue must never
+#: commit. The provider's word beats our estimate.
 EMERGENCY_KEEP_RATIO = 0.25
+
+#: The most characters the harvested-identifier block may add to a summary note, heading included
+#: (`_identifier_block`). The same 4 KB as `TOOL_RESULT_CAP`, and for the same reason: the note is
+#: replayed on every wake until the next compaction, so what it carries is bounded, never "small".
+#: Over it, the identifiers **mentioned least recently** are the ones left out, and the block says how
+#: many — compaction keeps the recent verbatim and lets the old go, and the harvest follows that grain.
+IDENTIFIER_CAP = 4096
 
 #: The opening of the system turn a compaction leaves behind. It is a *marker*, not decoration:
 #: `_prelude_end` reads it to tell a previous summary (compacted conversation, which the next
@@ -229,26 +250,89 @@ _OVERFLOW_PHRASES = re.compile(
 )
 
 #: What the summarizer is asked for. Written as notes-to-self, and **work-first on purpose**: the
-#: memory seam's `observe` hook captures only user+assistant text, so tool-driven work leaves no
-#: durable trace unless something writes it down (issue #276, requirement 7). Compaction is where
-#: that work would otherwise be lost, so this is where it is recorded — and the resulting summary is
-#: also handed to durable memory (`Compactor.on_summary`). Raw tool output is *not* preserved: the
-#: point is a record of what was done, not a second copy of the bytes we are dropping.
+#: dropped region takes its tool results with it, and the model's next turn on this timeline has
+#: to know what it already did — what it posted, what it produced, what failed — or it repeats the
+#: work or contradicts it. That is a *transcript* concern, not a memory one (issue #561): the summary
+#: lives in the transcript and nowhere else. Raw tool output is *not* preserved: the point is a
+#: record of what was done, not a second copy of the bytes we are dropping.
+#:
+#: The headings are **operational** — what happened, what holds, what is underway, what comes next —
+#: rather than a recap of what was said, which invites transcription instead of continuity. And the
+#: cumulative case is spelled out: the previous summary rides in with the excerpt, and an item carried
+#: forward only because it was written down before is how a summary fills up with resolved work.
+#:
+#: Rewording this does not orphan an already-polluted palace: the scrub catalog names the wording
+#: that was mined before issue #438 closed the path, as a historical literal (`_mining`).
 _SUMMARIZE_INSTRUCTION = """You are compacting your own conversation transcript to stay inside your context window. \
 The excerpt below is about to be deleted and replaced by what you write now. Write dense, factual \
-notes to your future self, in the first person, under these three headings:
+notes to your future self, in the first person, under these five headings, in this order:
 
 1. WORK DONE — the actions you actually took, the tools you used, and what came of them: artifacts \
 produced (asset uuids, URLs, file paths, task uuids), things posted, things changed, things that \
-failed. Tool results are deleted along with the excerpt, so an action you do not write down here \
-leaves no trace that it ever happened.
-2. WHAT WAS SAID — the substance of the conversation: who said what, what was decided, what was \
-promised.
-3. OPEN THREADS — what is unfinished, what you owe someone, and what you meant to do next.
+failed. Tool results are deleted along with the excerpt, so an action you do not write down here is \
+one your next turn will not know you took.
+2. DECISIONS AND FACTS — what was decided and by whom, what was promised, and the facts you learned \
+that you will still need.
+3. IN PROGRESS — what you were in the middle of when the excerpt ends.
+4. NEXT ACTION — what you should do next, if anything.
+5. OPEN THREADS — what is unfinished, what you owe someone, and what is waiting on someone else.
 
-Preserve identifiers (uuids, URLs, handles, numbers) verbatim — they are unrecoverable once the \
-excerpt is gone. Do not speculate, do not pad, and do not address anyone: these are your own notes, \
-not a message. Everything you leave out is forgotten."""
+If the excerpt opens with your notes from an earlier compaction, fold them in: carry forward what \
+still matters, and drop what is resolved or obsolete. Do not keep an item only because it was \
+written down before.
+
+Preserve identifiers (uuids, URLs, handles, numbers) verbatim. The identifiers in the excerpt are \
+also listed, automatically, after your notes — so do not list them bare; name the ones that matter \
+next to what they are. Do not speculate, do not pad, and do not address anyone: these are your own \
+notes, not a message. Everything you leave out is forgotten."""
+
+#: The heading the harvested identifiers ride under, below the model's summary and inside the same
+#: system turn (`_identifier_block`). Fixed text, so the model can tell code-kept identifiers from
+#: the notes it wrote itself.
+_IDENTIFIER_HEADING = "IDENTIFIERS (harvested, verbatim):"
+
+#: What `_identifier_block` harvests from the dropped region, in one alternation so a match's
+#: position is its first-seen order and a URL claims the uuid or handle inside it. Three classes, each
+#: the shape the thing *actually* has, because a harvested identifier that is not verbatim is worse
+#: than none — it is a confident wrong answer the model will act on:
+#:
+#: - **URLs** are a *positive* class: the ASCII characters RFC 3986 allows in a URL, less the square
+#:   brackets (legal only around an IPv6 host, and the seam of every Markdown link). Anything else ends
+#:   the match — a backslash (``\n`` or ``\"`` in a JSON-escaped body), a pipe, a quote, a CJK
+#:   character or an em dash the URL runs straight into. Trailing prose punctuation is trimmed after
+#:   the match (`_trim_url`).
+#: - **UUIDs**, lowercase, as the platform writes them.
+#: - **Handles** in the platform's own grammar (`HandleValidator`: a letter or digit, then segments of
+#:   ``[a-z0-9_-]`` joined by single periods). A narrower class reads ``@glm-5.2`` as ``@glm-5`` — a
+#:   real fleet handle, cut into a wrong one. The lookbehind skips the domain half of an email; the
+#:   lookahead refuses a match that stops inside a longer word (``@johnDoe`` is not ``@john``).
+#:   Spelled ``[a-z0-9][a-z0-9_-]*(?:\.[a-z0-9_-]+)*`` — the same language as the validator's
+#:   ``(?:\.?[a-z0-9_-]+)*`` and never that spelling, which is the ``(a+)*`` shape: when the lookahead
+#:   refuses, the engine retries every way of splitting a run of letters into segments, so a peer's
+#:   ``@`` and forty lowercase letters followed by a capital would hang the compaction for hours. Every
+#:   repetition here must open on a period, so a run splits exactly one way.
+#:
+#: **Every boundary is ASCII, never ``\b`` or ``\w``.** Python's are Unicode-aware, so a kana or a
+#: CJK ideograph counts as a word character, and ``アセット019e…を確認`` or ``请@john看`` — ordinary
+#: Japanese and Chinese, which put no space there — harvested nothing. An agent that keeps a peer's
+#: identifiers in English and loses them in Japanese is the defect `_session._json_size` records.
+_IDENTIFIER = re.compile(
+    r"https?://[A-Za-z0-9\-._~:/?#@!$&'()*+,;=%]+"
+    r"|(?<![0-9A-Za-z_])[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![0-9A-Za-z_])"
+    r"|(?<![A-Za-z0-9_.+-])@[a-z0-9][a-z0-9_-]*(?:\.[a-z0-9_-]+)*(?![A-Za-z0-9_])"
+)
+
+#: What follows an identifier the harness itself cut short: the ellipsis a list preview ends on
+#: (``_reads``, ``_tasks``, ``_webhooks``) and the head of an archived excerpt's elision marker
+#: (``_session``). A match that runs into one is a **fragment** — ``https://example.com/some/pa`` or
+#: ``@nova-dig`` — and is dropped: a missing identifier is a gap, a truncated one is a wrong answer.
+_CUT_SHORT = ("…", "\n\n[... ")
+
+#: Punctuation a URL match may have swallowed from the prose around it — ``see https://x.com/a.``,
+#: ``'https://x.com/a'`` in a Python repr — and the closer that is part of the URL only when the URL
+#: also opened one.
+_URL_TRAILING = ".,;:!?*')"
+_URL_PAIRS = {")": "("}
 
 
 def persisted_step_cap() -> int:
@@ -538,27 +622,19 @@ class ContextBudget:
 class Compactor:
     """Rewrites a transcript in place: recent window verbatim, everything older summarized.
 
+    It touches the transcript and nothing else — never a memory provider (issue #561; see the module
+    docstring). The summary it writes lives in the transcript, is replayed with it, and is deleted
+    with it when the timeline goes.
+
     Args:
         provider: The model. Used for the summarization call (`tools=None` — the summarizer needs
             no tools) and for reading back the usage it reported (`provider_tokens_in`).
         budget: The resolved ceiling and threshold (`ContextBudget`).
-        on_summary: Called with each summary the moment it is written, so the summary reaches
-            **durable memory** and the work it records outlives the turns being dropped (issue #276,
-            requirement 7). Wired by the wake to the agent's bound memory provider; ``None`` in the
-            plain library API, where compaction still works and only the memory write is absent.
-            It is guarded — a memory failure logs and never blocks the compaction.
     """
 
-    def __init__(
-        self,
-        provider: Provider,
-        budget: ContextBudget,
-        *,
-        on_summary: Callable[[str], None] | None = None,
-    ) -> None:
+    def __init__(self, provider: Provider, budget: ContextBudget) -> None:
         self.provider = provider
         self.budget = budget
-        self.on_summary = on_summary
 
     def maybe_compact(self, history: list[Message]) -> bool:
         """Compact `history` if the provider's last call crossed the threshold. Returns whether it did.
@@ -640,15 +716,44 @@ class Compactor:
             return False
         dropped = history[head:cut]
         before_chars = _chars(history)
+        replaced = _chars(dropped)
+        # **A replacement that is not smaller is not a compaction.** A summarizer that echoes the
+        # excerpt back, or pads, would grow the very transcript this exists to shrink — and on the
+        # emergency path hand the retry a request *longer* than the one the provider just refused.
+        # Measured in this file's own unit. Checked first against the note's fixed opening, which
+        # costs nothing to know: a region that cannot beat even that is not worth a summarize call.
+        if len(_summary_note(len(dropped), "")) >= replaced:
+            _log.warning(
+                "Context compaction declined: the %d chars it would replace are no more than the "
+                "summary note's own heading. The transcript is unchanged.",
+                replaced,
+            )
+            return False
         summary = self._summarize(dropped, limit=limit, chars_per_token=chars_per_token)
         if summary is None:
             return (
                 False  # the summarize call failed; _summarize logged it. Leave the transcript be.
             )
-        note = Message.system(_summary_note(len(dropped), summary))
+        bare = _summary_note(len(dropped), summary)
+        # The identifier block is part of the note, so it counts — and it **degrades before the
+        # compaction declines**: it gets whatever room the region leaves under the summary (at most
+        # `IDENTIFIER_CAP`), because an optional appendix must never be the reason a transcript that
+        # needs compacting stays long. The two characters are the blank line that joins it.
+        identifiers = _identifier_block(
+            _render(dropped), cap=min(IDENTIFIER_CAP, replaced - 1 - len(bare) - 2)
+        )
+        note = Message.system(_summary_note(len(dropped), summary, identifiers))
+        written = message_chars(note)
+        if written >= replaced:
+            _log.warning(
+                "Context compaction declined: the summary (%d chars) is not smaller than the %d "
+                "chars it would replace. The transcript is unchanged.",
+                written,
+                replaced,
+            )
+            return False
         note.items = _carried_items(dropped)
         history[head:cut] = [note]
-        self._remember(summary)
         _log.info(
             "context compact %s",
             kv(
@@ -720,15 +825,6 @@ class Compactor:
             _log.warning("Context compaction failed: the summarization call produced no text.")
             return None
         return summary
-
-    def _remember(self, summary: str) -> None:
-        """Hand the summary to durable memory — guarded, and never a reason to abort a compaction."""
-        if self.on_summary is None:
-            return
-        try:
-            self.on_summary(summary)
-        except Exception as exc:  # noqa: BLE001 - memory is best-effort; the transcript still compacts
-            _log.warning("Could not write the compaction summary to memory: %s", exc)
 
 
 def _prelude_end(history: list[Message]) -> int:
@@ -850,13 +946,98 @@ def _render(messages: Sequence[Message]) -> str:
     return "\n\n".join(blocks)
 
 
-def _summary_note(dropped: int, summary: str) -> str:
-    """The single system turn that replaces the region — labelled, so the model knows what it is."""
-    return (
+def _summary_note(dropped: int, summary: str, identifiers: str = "") -> str:
+    """The single system turn that replaces the region — labelled, so the model knows what it is.
+
+    The harvested identifiers ride **below** the model's summary and inside this same turn, so the
+    transcript's shape is exactly what it was without them: one system message per compaction, opening
+    on `_SUMMARY_MARKER`.
+    """
+    note = (
         f"{_SUMMARY_MARKER}: {dropped} messages replaced by these notes, so this conversation stays "
         f"inside the model's context window. The detail is gone; what follows is what was kept.]"
         f"\n\n{summary}"
     )
+    return f"{note}\n\n{identifiers}" if identifiers else note
+
+
+def _identifier_block(rendered: str, cap: int = IDENTIFIER_CAP) -> str:
+    """The identifiers in the dropped region, harvested by code — ``""`` when there are none.
+
+    `_SUMMARIZE_INSTRUCTION` asks the model to keep identifiers verbatim, and a prompt is a request,
+    not a guarantee: a uuid the summarizer paraphrased, truncated or left out is gone for good, and it
+    is exactly the thing the next turn needs to act on (the asset to read, the task to finish, the
+    peer to answer). So the identifiers are also kept **deterministically** — a regex over the same
+    rendering the summarizer read, no second model call, nothing to retry — and appended under
+    `_IDENTIFIER_HEADING`, one per line, deduplicated, in the order they first appeared.
+
+    **Bounded at `cap`, heading and all** — `IDENTIFIER_CAP`, or less when the note has only that
+    much room left under the size of the region it replaces (`Compactor._compact`). A busy region
+    (mailbox listings, timeline reads) carries hundreds of uuids, so the cap is expected to bite, and
+    what it gives up is chosen rather than truncated: the list is filled **most recently mentioned
+    first** (an identifier's last position in the region; one carried in a previous block counts as
+    mentioned where that block lists it), an identifier too long for the room left is passed over for
+    shorter ones behind it, the kept ones are written in first-seen order, and a closing line says how
+    many are missing. A cap too small to hold the heading and that closing line yields ``""`` — an
+    unannounced partial list is the one outcome this never produces.
+    """
+    last: dict[str, int] = {}  # identifier → where it was last seen; insertion order is first-seen
+    for match in _IDENTIFIER.finditer(rendered):
+        if rendered.startswith(_CUT_SHORT, match.end()):
+            continue  # a fragment the harness itself truncated — see `_CUT_SHORT`
+        found = match.group()
+        if found.startswith("http"):
+            found = _trim_url(found)
+            if found.partition("://")[2] == "":
+                continue
+        last[found] = match.start()
+    if not last:
+        return ""
+    block = "\n".join((_IDENTIFIER_HEADING, *last))
+    if len(block) <= cap:
+        return block
+    # Room for the identifier lines once the heading and the worst-case closing line are paid for;
+    # every kept line costs its length plus the newline that joins it.
+    room = cap - len(_IDENTIFIER_HEADING) - len(_not_kept(len(last), cap)) - 1
+    if room < 0:
+        return ""
+    kept: set[str] = set()
+    for found in sorted(last, key=last.__getitem__, reverse=True):
+        if len(found) + 1 <= room:
+            kept.add(found)
+            room -= len(found) + 1
+    lines = [found for found in last if found in kept]
+    return "\n".join((_IDENTIFIER_HEADING, *lines, _not_kept(len(last) - len(lines), cap)))
+
+
+def _not_kept(count: int, cap: int) -> str:
+    """The closing line of a capped identifier block — the cap says what it cost, never silently."""
+    noun = "identifier" if count == 1 else "identifiers"
+    return (
+        f"[{count} {noun} not kept: this list is capped at {cap} characters, and the least recently "
+        f"mentioned are left out first.]"
+    )
+
+
+def _trim_url(url: str) -> str:
+    """A matched URL without the prose punctuation it swallowed — ``https://x.com/a).`` → the URL.
+
+    A closing bracket is kept only when the URL also opened one (``…/Foo_(bar)`` is a real path),
+    so a Markdown link's ``)`` goes and a Wikipedia title's stays.
+    """
+    # Counted once and walked by index: the tail is peer-controlled, and re-counting (or re-slicing)
+    # per stripped character is quadratic in a URL followed by a hundred thousand ``)``.
+    opened = {closer: url.count(opener) for closer, opener in _URL_PAIRS.items()}
+    closed = {closer: url.count(closer) for closer in _URL_PAIRS}
+    end = len(url)
+    while end and url[end - 1] in _URL_TRAILING:
+        tail = url[end - 1]
+        if tail in closed:
+            if closed[tail] <= opened[tail]:
+                break
+            closed[tail] -= 1
+        end -= 1
+    return url[:end]
 
 
 def message_chars(message: Message) -> int:

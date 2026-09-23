@@ -25,6 +25,7 @@ from basecradle_harness import (
     MemoryProvider,
     MemoryScope,
     WakeAgent,
+    _context,
     _mining,
 )
 from basecradle_harness import _wake as wake_module
@@ -40,6 +41,7 @@ from basecradle_harness._mempalace import (
 from basecradle_harness._messages import Message
 from basecradle_harness._mining import _LEGACY_RECALL_HEADING as LEGACY_HEADING
 from basecradle_harness._mining import (
+    _LEGACY_SUMMARIZE_INSTRUCTION,
     INJECTED_RECALL_LITERALS,
     MIN_UNIT_CHARS,
     Verdict,
@@ -520,6 +522,24 @@ def test_the_catalog_is_read_from_the_constants_the_harness_writes():
     assert wake_module._COMPACTION_OBSERVE_NOTE in literals
     assert wake_module._NOW_LINE_INSTRUCTION in literals
     assert _INJECTED_HEADING in literals
+
+
+def test_the_scrub_still_knows_the_summarizer_instruction_that_was_actually_mined():
+    """Rewording the summarizer (issue #561) must not orphan a palace polluted before #438.
+
+    The wording a pre-0.114.0 palace can hold is the one the summarizer read then, so the catalog
+    keeps it as a historical literal — and leaves the current wording out, since it was never mined
+    and a match on it in an old palace could only be genuine dialogue about compaction.
+    """
+    literals = {literal for entry in catalog() for literal in entry.literals}
+    assert _LEGACY_SUMMARIZE_INSTRUCTION in literals
+    assert _context._SUMMARIZE_INSTRUCTION not in literals
+    assert _LEGACY_SUMMARIZE_INSTRUCTION != _context._SUMMARIZE_INSTRUCTION
+
+    # Whole, and one paragraph of it on its own — a chunker splits where it likes.
+    assert classify(_LEGACY_SUMMARIZE_INSTRUCTION)[0] is Verdict.SCRUB
+    recap = next(p for p in _LEGACY_SUMMARIZE_INSTRUCTION.split("\n") if "WHAT WAS SAID" in p)
+    assert classify(recap)[0] is Verdict.SCRUB
 
 
 def test_scope_is_the_agent_not_the_timeline(platform, tmp_path):

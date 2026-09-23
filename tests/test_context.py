@@ -15,6 +15,8 @@ the test tells it to.
 from __future__ import annotations
 
 import logging
+import re
+import time
 
 import pytest
 
@@ -29,15 +31,22 @@ from basecradle_harness import (
     ToolRegistry,
 )
 from basecradle_harness._context import (
+    _IDENTIFIER_HEADING,
+    _SUMMARY_MARKER,
     COMPACT_AT,
     DEFAULT_CONTEXT_LIMIT,
+    IDENTIFIER_CAP,
     TOOL_ARGS_CAP,
     TOOL_RESULT_CAP,
     WORST_CASE_CHARS_PER_TOKEN,
     Compactor,
     ContextBudget,
+    _identifier_block,
+    _summary_note,
     is_context_overflow,
+    is_summary,
     max_safe_steps,
+    message_chars,
     min_safe_limit,
     persisted_step_cap,
     worst_case_turn_tokens,
@@ -90,8 +99,8 @@ def budget(provider, *, override=None, max_steps=DEFAULT_MAX_STEPS) -> ContextBu
     return ContextBudget(provider, override=override, max_steps=max_steps)
 
 
-def compactor(provider, *, override=None, on_summary=None) -> Compactor:
-    return Compactor(provider, budget(provider, override=override), on_summary=on_summary)
+def compactor(provider, *, override=None) -> Compactor:
+    return Compactor(provider, budget(provider, override=override))
 
 
 def conversation(exchanges: int, *, chars: int = 400) -> list[Message]:
@@ -280,7 +289,7 @@ def test_a_cut_never_strands_a_tool_result_from_its_call():
 
 
 def test_the_summary_is_asked_for_the_work_not_just_the_words():
-    """Requirement 7: tool-driven work must survive the turns that carried it."""
+    """The next turn on this timeline must know what it already did — the tool results go too."""
     provider = ScriptedProvider(Message.assistant(content="SUMMARY"))
     provider.last_tokens_in = 100_000
     history = [m for i in range(10) for m in tool_exchange(i)]
@@ -289,33 +298,26 @@ def test_the_summary_is_asked_for_the_work_not_just_the_words():
 
     instruction, excerpt = provider.calls[0]
     assert "WORK DONE" in instruction.content
-    assert "no trace that it ever happened" in instruction.content
+    assert "your next turn will not know you took" in instruction.content
     # The excerpt names the tools that ran, so the summary can record what was actually done —
     # an assistant turn that only *called* a tool says nothing on its own.
     assert "called: memory" in excerpt.content
 
 
-def test_the_summary_is_written_to_durable_memory():
-    written: list[str] = []
-    provider = ScriptedProvider(Message.assistant(content="SUMMARY: I posted the report."))
-    provider.last_tokens_in = 100_000
-    history = conversation(20)
-
-    compactor(provider, on_summary=written.append).maybe_compact(history)
-
-    assert written == ["SUMMARY: I posted the report."]
-
-
-def test_a_memory_failure_never_blocks_the_compaction():
-    def explode(summary):
-        raise RuntimeError("the palace is on fire")
-
+def test_the_summary_headings_are_operational_and_in_order():
+    """Continuity, not a recap (issue #561): what happened, what holds, what is underway, what next."""
     provider = ScriptedProvider(Message.assistant(content="SUMMARY"))
     provider.last_tokens_in = 100_000
-    history = conversation(20)
 
-    assert compactor(provider, on_summary=explode).maybe_compact(history) is True
-    assert "SUMMARY" in history[0].content  # memory is best-effort; the transcript bound is not
+    compactor(provider).maybe_compact(conversation(20))
+
+    instruction = provider.calls[0][0].content
+    headings = ["WORK DONE", "DECISIONS AND FACTS", "IN PROGRESS", "NEXT ACTION", "OPEN THREADS"]
+    positions = [instruction.index(f"{n}. {heading} — ") for n, heading in enumerate(headings, 1)]
+    assert positions == sorted(positions)
+    assert "WHAT WAS SAID" not in instruction  # the recap target is gone
+    # The cumulative case: the carried summary is pruned, not preserved wholesale.
+    assert "drop what is resolved or obsolete" in instruction
 
 
 def test_compaction_is_cumulative_the_previous_summary_folds_into_the_next():
@@ -336,6 +338,228 @@ def test_compaction_is_cumulative_the_previous_summary_folds_into_the_next():
     assert "FIRST SUMMARY" in provider.calls[1][1].content
     assert len([m for m in history if m.role == "system" and "compacted" in (m.content or "")]) == 1
     assert "SECOND SUMMARY" in history[0].content
+
+
+def test_a_summary_no_smaller_than_what_it_replaces_is_declined(caplog):
+    """A replacement that is not smaller is not a compaction — the transcript stays byte-identical."""
+    history = conversation(20)
+    before = [m.to_dict() for m in history]
+    provider = ScriptedProvider(
+        Message.assistant(content="z" * sum(len(m.content) for m in history))
+    )
+    provider.last_tokens_in = 100_000
+
+    with caplog.at_level(logging.WARNING):
+        assert compactor(provider).maybe_compact(history) is False
+
+    assert [m.to_dict() for m in history] == before
+    assert "is not smaller than" in caplog.text
+
+
+def _region(history: list[Message]) -> list[Message]:
+    """The messages a compaction of `history` replaces — found by running one on a copy.
+
+    The cut depends only on the transcript and the reported usage, so the copy's region is exactly the
+    region the real run will replace; the count is read back off the note the compaction writes.
+    """
+    probe = ScriptedProvider(Message.assistant(content="S"))
+    probe.last_tokens_in = 100_000
+    copy = [Message.from_dict(m.to_dict()) for m in history]
+    assert compactor(probe).maybe_compact(copy)
+    return history[: int(re.search(r"(\d+) messages replaced", copy[0].content).group(1))]
+
+
+def test_a_summary_exactly_the_size_of_what_it_replaces_is_declined_and_one_smaller_is_not():
+    history = conversation(20)
+    region = _region(history)
+    room = sum(message_chars(m) for m in region) - len(_summary_note(len(region), ""))
+
+    for size, compacts in ((room, False), (room - 1, True)):
+        provider = ScriptedProvider(Message.assistant(content="z" * size))
+        provider.last_tokens_in = 100_000
+        live = [Message.from_dict(m.to_dict()) for m in history]
+        assert compactor(provider).maybe_compact(live) is compacts, f"summary of {size} chars"
+
+
+def test_the_identifier_block_counts_toward_the_size_check_and_shrinks_to_fit():
+    """The block is part of the note, and an optional appendix must never be why compaction fails."""
+    uuids = [f"019e7751-4a1b-7c2d-8e3f-{i:012x}" for i in range(120)]  # ~4.4 KB of identifiers
+    history = conversation(20)
+    history[0] = Message.user(" ".join(uuids))
+    region = _region(history)
+    replaced = sum(message_chars(m) for m in region)
+    # A summary that leaves ~600 characters under the region: the whole block would not fit.
+    summary = "z" * (replaced - len(_summary_note(len(region), "")) - 600)
+    provider = ScriptedProvider(Message.assistant(content=summary))
+    provider.last_tokens_in = 100_000
+
+    assert compactor(provider).maybe_compact(history) is True
+
+    note = history[0].content
+    assert message_chars(history[0]) < replaced
+    block = note[note.index(_IDENTIFIER_HEADING) :]
+    assert len(block) < 600
+    assert block.splitlines()[-1].endswith("are left out first.]")  # and it says what it cost
+
+
+def test_a_region_smaller_than_the_notes_own_heading_is_declined_before_the_model_is_asked(caplog):
+    provider = ScriptedProvider(Message.assistant(content="S"))
+    provider.last_tokens_in = 100_000
+    history = [Message.user("hi"), Message.assistant(content="yo"), Message.user("x" * 5_000)]
+    before = [m.to_dict() for m in history]
+
+    with caplog.at_level(logging.WARNING):
+        assert compactor(provider).maybe_compact(history) is False
+
+    assert provider.calls == []  # no summarize call was paid for
+    assert [m.to_dict() for m in history] == before
+    assert "no more than the summary note's own heading" in caplog.text
+
+
+def test_a_declined_rescue_still_lets_the_overflow_out(tmp_path):
+    """The emergency path's contract: a rescue that rewrote nothing must not retry — it propagates."""
+    padding = "z" * 200_000  # longer than anything the rescue could drop
+    provider = ScriptedProvider(
+        ProviderContextLengthError("maximum context length exceeded", status_code=400),
+        Message.assistant(content=padding),
+    )
+    session = session_for(provider, tmp_path)
+    session.history.extend([m for i in range(12) for m in tool_exchange(i)])
+
+    with pytest.raises(ProviderContextLengthError):
+        session.send("are you still there?")
+
+    assert not any(is_summary(m) for m in session.history)
+    assert len(provider.calls) == 2  # the failed turn and the summarize call — never a retry
+
+
+def test_the_summary_marker_is_unchanged():
+    """Every standing transcript opens its summary on this text; changing it strands them all.
+
+    `_prelude_end` tells a previous summary (conversation to fold in) from the charter (never
+    summarized) by this marker alone, so a new spelling would read every existing summary as charter
+    and it would never be compacted again.
+    """
+    assert _SUMMARY_MARKER == "[Earlier conversation compacted"
+
+
+# --- identifiers are kept by code, not by prompt (issue #561) -----------------
+
+ASSET = "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"
+REPORT_URL = "https://example.com/reports/weekly.pdf"
+
+
+def test_the_identifiers_in_the_dropped_region_survive_even_when_the_summary_drops_them():
+    provider = ScriptedProvider(Message.assistant(content="SUMMARY: I posted a report."))
+    provider.last_tokens_in = 100_000
+    history = conversation(20)
+    history[0] = Message.user(f"@john asked for {REPORT_URL} as asset {ASSET}. " + "x" * 400)
+
+    assert compactor(provider).maybe_compact(history) is True
+
+    note = history[0].content
+    summary_at, heading_at = note.index("SUMMARY: I posted"), note.index(_IDENTIFIER_HEADING)
+    assert summary_at < heading_at  # below the model's notes, inside the same one system turn
+    block = note[heading_at:].splitlines()
+    assert block == [_IDENTIFIER_HEADING, "@john", REPORT_URL, ASSET]  # verbatim, first-seen order
+    assert sum(1 for m in history if is_summary(m)) == 1
+
+
+def test_a_region_with_no_identifiers_adds_no_heading():
+    provider = ScriptedProvider(Message.assistant(content="SUMMARY"))
+    provider.last_tokens_in = 100_000
+    history = conversation(20)
+
+    compactor(provider).maybe_compact(history)
+
+    assert _IDENTIFIER_HEADING not in history[0].content
+    assert _identifier_block("nothing to see here") == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # A JSON tool result's quote and comma are not part of the URL.
+        ('{"url": "https://example.com/a?b=1", "ok": true}', ["https://example.com/a?b=1"]),
+        # Prose punctuation and a Markdown link's closer are trimmed; a balanced paren is kept.
+        ("see https://example.com/a).", ["https://example.com/a"]),
+        ("[the page](https://example.com/wiki/Foo_(bar))", ["https://example.com/wiki/Foo_(bar)"]),
+        # The platform's handle grammar: periods and underscores inside, never a trailing period.
+        ("ask @nova-5.2 and @john_doe.", ["@nova-5.2", "@john_doe"]),
+        # The domain half of an email is not a handle, and a handle never stops inside a word.
+        ("mail john@example.com or @johnDoe", []),
+        # A uuid inside a URL rides with the URL rather than being counted twice.
+        (f"https://example.com/assets/{ASSET}", [f"https://example.com/assets/{ASSET}"]),
+        # The seam of a Markdown link whose text is the URL itself.
+        ("[https://example.com/a](https://example.com/a)", ["https://example.com/a"]),
+        # A JSON-escaped body: the escape is not part of the URL.
+        (
+            r'{"body": "see https://example.com/a\nthanks \"https://example.com/b\""}',
+            ["https://example.com/a", "https://example.com/b"],
+        ),
+        # A pipe table, and an apostrophe that is part of the path versus one that quotes it.
+        ("|https://example.com/a|next|", ["https://example.com/a"]),
+        ("https://example.com/wiki/Nova's_Page", ["https://example.com/wiki/Nova's_Page"]),
+        (
+            "['https://example.com/a', 'https://example.com/b']",
+            ["https://example.com/a", "https://example.com/b"],
+        ),
+        # Written straight against Japanese or Chinese, which put no space there.
+        (f"アセット{ASSET}を確認", [ASSET]),
+        ("https://example.com/a。ありがとう", ["https://example.com/a"]),
+        ("请@john看", ["@john"]),
+        # A fragment the harness itself cut short is dropped, never kept as a wrong identifier.
+        ("https://example.com/some/long/pa… @nova-dig…", []),
+        ("head https://example.com/lo\n\n[... 9000 chars elided of 12000 — tail", []),
+    ],
+)
+def test_identifiers_are_harvested_in_the_shape_they_actually_have(text, expected):
+    block = _identifier_block(text)
+    assert (block.splitlines()[1:] if block else []) == expected
+
+
+def test_the_identifier_block_never_crosses_the_cap_at_its_edge():
+    """Walk the longest identifier across the boundary, so the room arithmetic is tested at the edge."""
+    uuids = " ".join(f"019e7751-4a1b-7c2d-8e3f-{i:012x}" for i in range(20))
+    for length in range(IDENTIFIER_CAP - 300, IDENTIFIER_CAP + 10):
+        url = "https://example.com/" + "a" * (length - len("https://example.com/"))
+        block = _identifier_block(f"{uuids} {url}")
+        assert len(block) <= IDENTIFIER_CAP, f"{len(block)} chars with a {length}-char URL"
+
+
+def test_the_identifier_block_is_capped_and_keeps_the_most_recently_mentioned():
+    uuids = [f"019e7751-4a1b-7c2d-8e3f-{i:012x}" for i in range(400)]  # ~15 KB of uuids
+    # The oldest one is mentioned again at the very end, so it is *recent*, whatever its first sight.
+    text = " ".join(uuids) + f" and again {uuids[0]}"
+
+    block = _identifier_block(text)
+    lines = block.splitlines()
+
+    assert len(block) <= IDENTIFIER_CAP
+    assert lines[0] == _IDENTIFIER_HEADING
+    kept = lines[1:-1]
+    assert uuids[0] in kept and uuids[-1] in kept  # recency decides, not first sight
+    assert uuids[1] not in kept  # the least recently mentioned go first
+    assert kept == [u for u in uuids if u in kept]  # and what stays keeps first-seen order
+    assert lines[-1].startswith(f"[{len(uuids) - len(kept)} identifiers not kept")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # The `(a+)*` shape: a handle-like run the lookahead refuses. Exponential in the validator's
+        # own spelling of the grammar (~6 s at this length, doubling every character after).
+        "@" + "a" * 28 + "A",
+        # Brackets after a URL: quadratic if the trim re-counts per stripped character.
+        "https://example.com/a" + ")" * 100_000,
+    ],
+    ids=["nested-quantifier-handle", "url-closing-brackets"],
+)
+def test_the_harvest_is_linear_in_peer_controlled_text(text):
+    """The dropped region is full of text peers wrote; the harvest must never be the slow part."""
+    started = time.perf_counter()
+    _identifier_block(text)
+    assert time.perf_counter() - started < 1.0
 
 
 def test_a_failed_summarization_leaves_the_transcript_untouched(caplog):

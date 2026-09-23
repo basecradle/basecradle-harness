@@ -30,6 +30,7 @@ from basecradle_harness import (
     WakeAgent,
     memory_provider_from_env,
 )
+from basecradle_harness._context import Compactor, ContextBudget
 from basecradle_harness._memory_provider import describe_memory_provider
 from basecradle_harness._mempalace import MemPalaceMemoryProvider
 from basecradle_harness._messages import Message
@@ -506,63 +507,53 @@ def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):
     assert agent.marks.get(TIMELINE_UUID) == M0
 
 
-# === Compaction summaries reach durable memory (issue #276, requirement 7) ===
+# === Compaction never touches memory (issue #561) ===
 #
-# `observe` is handed the *dialogue* only — which is right, and is what keeps the palace worth
-# searching. But it means tool-driven work leaves no durable trace unless the agent narrated it.
-# That is harmless while the turns are still in the transcript, and stops being harmless the moment
-# compaction drops them. So the boundary is where the work is captured.
-#
-# ...for a provider with a **store**. Issue #438 took the other half away on purpose: a store-less
-# provider is a *miner*, `observe` is the only way to hand it anything, and this summary is the one
-# piece of model text in the harness that is not the agent's reply — it is distilled from a region
-# carrying step notes, nudges, tool results, and (before issue #275) whole persisted briefs. That is
-# how the pre-0.112.0 recall heading reached @briggs's palace.
+# The transcript is outside the agent — the harness owns it, compacts it, and deletes it with its
+# timeline, summary included. Memory is inside the agent. The two are never connected: the summary
+# is a transcript concern, and nothing about compacting one may reach a memory provider by any route
+# (a write to its store, a mined exchange, even a read of an attribute).
 
 
-def test_a_compaction_summary_is_written_to_a_providers_store(platform, tmp_path):
-    """The default SQLite provider: `observe` is a no-op, so the summary goes to the store."""
-    memory = SqliteMemoryProvider(tmp_path / "memory.db")
-    agent = _wake(tmp_path, memory)
+class _SummarizingModel:
+    """A model that answers every call with a summary and reports a call big enough to compact."""
 
-    agent._remember_compaction("WORK DONE: I posted the weekly report, asset 0198…")
+    last_tokens_in = 100_000  # over half of the 128 K floor
 
-    stored = memory.store.list()
-    assert "compaction/timeline:" in stored
-    # The agent can read its own past back — nothing is dropped from a transcript without a record.
-    key = next(k for k in stored.splitlines() if "compaction/" in k).strip("- ").strip()
-    assert "I posted the weekly report" in memory.store.read(key)
-    memory.close()
+    def chat(self, messages, tools=None):
+        return Message.assistant(content="WORK DONE: I posted the weekly report, asset 0198…")
 
 
-def test_a_storeless_provider_is_never_mined_a_compaction_summary(platform, tmp_path):
-    """A miner gets nothing: the summary is harness-composed, and `observe` is mining (issue #438).
+def test_a_compaction_touches_no_memory_surface(platform, tmp_path):
+    touched: list[str] = []
 
-    The inverse of the test above, and the one that pins the boundary. A store-less provider
-    (MemPalace) has no surface but `observe`, so "write the summary somewhere durable" and "file
-    the summary as a remembered exchange" are the same act — and the second one is the leak.
-    """
-    memory = RecordingProvider()
-    memory.store = None
-    agent = _wake(tmp_path, memory)
+    class Untouchable(MemoryProvider):
+        """Every surface raises, and every attempt is recorded — a guard cannot swallow the proof."""
 
-    agent._remember_compaction("WORK DONE: I filed the issue.")
+        def __getattribute__(self, name):
+            if name.startswith("__"):
+                return object.__getattribute__(self, name)
+            touched.append(name)
+            raise AssertionError(f"compaction reached the memory provider: .{name}")
 
-    assert memory.observed == []
+    model = _SummarizingModel()
+    harness = Harness(model, home=tmp_path, compactor=Compactor(model, ContextBudget(model)))
+    # A real wake agent, bound to the provider exactly as the entry point binds it — so a route
+    # from the compactor to memory wired at construction is inside what this proves.
+    WakeAgent(
+        harness,
+        timeline=TIMELINE_UUID,
+        client=BaseCradle(token=FAKE_TOKEN),
+        onboard=True,
+        memory_provider=Untouchable(),
+    )
+    history = [
+        m
+        for i in range(20)
+        for m in (Message.user(f"[{i}] hi " + "x" * 400), Message.assistant(content="y" * 400))
+    ]
 
+    assert harness.compactor.maybe_compact(history) is True
 
-def test_a_memory_failure_never_undoes_a_compaction(platform, tmp_path):
-    class Exploding(RecordingProvider):
-        store = None
-
-        def observe(self, exchange):
-            raise RuntimeError("the palace is on fire")
-
-    agent = _wake(tmp_path, Exploding())
-    compactor = agent.harness.compactor
-
-    # The wake wires the hook; the compactor guards it. Memory is best-effort — the transcript
-    # bound is not, and a failed write must never leave a transcript uncompacted.
-    if compactor is not None:
-        compactor.on_summary = agent._remember_compaction
-        compactor._remember("SUMMARY")  # must not raise
+    assert "WORK DONE" in history[0].content  # the summary landed in the transcript…
+    assert touched == []  # …and nowhere else

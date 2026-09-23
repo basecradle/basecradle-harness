@@ -1116,10 +1116,10 @@ _NOW_LINE_INSTRUCTION = (
 
 #: The "user" side of the exchange a compaction summary *used to* be observed as, on a memory
 #: provider with no store of its own (issue #276). **Historical**: the mining boundary retired that
-#: path (`_remember_compaction`, issue #438) — the harness wrote this sentence, so mining it was
-#: itself a boundary violation. It survives as a constant because every palace mined before the fix
-#: is full of copies of it, and the scrub catalog (`_mining`) must name the exact string the harness
-#: wrote rather than a second copy of it.
+#: path (issue #438) — the harness wrote this sentence, so mining it was itself a boundary
+#: violation — and issue #561 removed compaction's route into memory altogether. It survives as a
+#: constant because every palace mined before the fix is full of copies of it, and the scrub catalog
+#: (`_mining`) must name the exact string the harness wrote rather than a second copy of it.
 _COMPACTION_OBSERVE_NOTE = (
     "[Context compaction] Summarize the work and conversation about to be dropped from my "
     "transcript, so it survives in memory."
@@ -1584,12 +1584,6 @@ class WakeAgent:
         self.onboard = onboard
         self.tool_manifest = tool_manifest
         self.memory_provider = memory_provider
-        # Route every compaction summary into durable memory (issue #276, requirement 7). The
-        # compactor is built with the provider, before there is a memory provider to hand it, so
-        # the two are joined here — the one place that holds both. Without this the agent's
-        # tool-driven work would vanish with the turns compaction drops (see `_remember_compaction`).
-        if harness.compactor is not None:
-            harness.compactor.on_summary = self._remember_compaction
         # Safe-by-default opt-out notices (active MCP servers, policy-refused drop-in tools)
         # surfaced into the persistent brief, so leaving the safe zone is stated and auditable —
         # the notice sanctions an active tool to the model while keeping that audit tail loud
@@ -1812,8 +1806,9 @@ class WakeAgent:
             # The context budget (issue #276). A wake replays the *whole* persisted transcript, so
             # without this a standing agent grows monotonically into its model's context ceiling and
             # bricks. `HARNESS_MAX_CONTEXT_TOKENS` overrides the ceiling (0 disables compaction);
-            # otherwise the adapter is asked and, failing that, a conservative floor is assumed. The
-            # summary's route into durable memory is wired below, once the memory provider is bound.
+            # otherwise the adapter is asked and, failing that, a conservative floor is assumed.
+            # Compaction is a transcript concern and is never joined to the memory provider
+            # (issue #561): the summary lives in the transcript and is deleted with it.
             compactor=_compactor_from_env(provider),
         )
         return cls(
@@ -3008,9 +3003,9 @@ class WakeAgent:
         pre-0.112.0 recall heading, mined out of a brief and served back to him as memory).
 
         The paths are closed at their sources, not here — `user` now arrives from an item's
-        **dialogue** rendering rather than the model-facing one (`_dialogue_of`), the compaction
-        summary is no longer mined at all (`_remember_compaction`), and the two things this
-        method does itself are:
+        **dialogue** rendering rather than the model-facing one (`_dialogue_of`), a compaction
+        summary never reaches memory at all (compaction is a transcript concern, issue #561), and
+        the two things this method does itself are:
 
         - **A canned narration is not the model's output.** When the turn degraded, `assistant`
           is `_STUCK_NOTE` — a sentence the *harness* wrote. It is dropped, and the peer's
@@ -3047,63 +3042,6 @@ class WakeAgent:
             _log.warning("Memory provider observe() failed; continuing.", exc_info=True)
             return
         _log.debug("memory %s", kv(op="observe", chars=len(user) + len(assistant)))
-
-    def _remember_compaction(self, summary: str) -> None:
-        """Write a compaction summary to durable memory — issue #276's requirement 7, **bounded
-        by the mining boundary** (issue #438).
-
-        **The gap this closes.** `_observe` captures the *dialogue* only, which is right: it is
-        what keeps a mined palace worth searching. But it means tool-driven work leaves no
-        durable trace unless the agent happened to narrate it. Before compaction that is
-        harmless — the tool results are still in the live transcript. At compaction it stops
-        being harmless: the turns go, and with them any record that the work ever happened. So
-        the boundary is where it is captured, because the boundary is where it would be lost.
-        The summarizer is instructed to record the work first
-        (`_context._SUMMARIZE_INSTRUCTION`), and that summary is written here — to a provider
-        that has a durable **store** of its own:
-
-        - a provider with a `store` (the default SQLite one, whose `observe` is a no-op) → a
-          write under an append-only, timestamped key, readable by the agent's own memory tool.
-
-        What is *not* written is raw tool output: the point is a record of what was done, not a
-        second copy of the bytes being dropped — that would re-create this very bloat inside
-        memory.
-
-        **A provider with no store is no longer written to at all, and that is the fix, not a
-        regression** (issue #438). A store-less provider (MemPalace) is a *miner*: the only way
-        to hand it anything is `observe`, which files what it is given as a remembered exchange.
-        And this summary is the one thing in the harness that is guaranteed **not** to be one.
-        It is model text, but not the agent's reply: it is composed by a summarization call the
-        harness prompts, over a harness-composed rendering of a transcript region that carries
-        step notes, nudges, failure markers, injected captions, raw tool results — and, on any
-        agent whose transcript predates issue #275, whole persisted copies of the Turn-0 brief.
-        That is the route by which the pre-0.112.0 recall heading reached @briggs's palace, and
-        no filter over the *output* can close it, because the leak is in the input.
-
-        Nothing is mined in its place, deliberately: every user and assistant turn in the
-        dropped region **was already mined when it happened**, turn by turn, by `_observe`. A
-        dialogue-only re-mine at compaction would write a second copy of memories the palace
-        already holds — paid for in retrieval quality, which is the thing memory exists for.
-        What is genuinely not carried over for a mining provider is the *tool-work* half of the
-        summary, and that is the trade the boundary asks for: the transcript still gets the
-        summary in full (`Compactor`), so nothing is lost to the agent's own next turn.
-
-        Its caller (`Compactor._remember`) guards it, like every memory hook: a failure here
-        logs and the compaction still stands. Memory is best-effort; the transcript bound is not.
-        """
-        if self.memory_provider is None:
-            return
-        store = getattr(self.memory_provider, "store", None)
-        write = getattr(store, "write", None)
-        if not callable(write):
-            _log.debug(
-                "memory %s",
-                kv(op="skip", source="compaction", reason="mining provider; boundary #438"),
-            )
-            return
-        key = f"compaction/{self.source}/{datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}"
-        write(key, summary)
-        _log.info("memory %s", kv(op="write", key=key, chars=len(summary)))
 
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
         """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.

@@ -17,7 +17,8 @@ his own brief and served back to him as memory.
 
 **Why a filter is not the fix, and is shipped anyway.** Enforcement lives at the leaking
 paths — the wake mines a *dialogue* rendering of an item rather than the model-facing one,
-never mines its own canned notes, and no longer mines a compaction summary (`_wake`). This
+never mines its own canned notes (`_wake`), and never hands memory a compaction summary at all
+(`_context`, issue #561). This
 module's `strip_injected` is a second line only: it removes the **brief's own framing** — the
 recall block's heading and fence, and (since issue #509) every part fence the composer writes —
 which is the one class of scaffolding that can round-trip through a legitimately mined turn (the
@@ -31,9 +32,9 @@ harness-composed text that *could* have crossed the boundary before it was close
 polluted. It is deliberately **assembled from the constants the harness composes from**,
 never re-typed here: a catalog that spells a marker for itself drifts from the writer the
 first time the wording is edited, silently, with nothing failing — the same reason
-`_context._SUMMARY_MARKER` and `is_summary` live together. The one exception is
-`_LEGACY_RECALL_HEADING`, a constant that no longer exists in the code at all: it is
-recorded here with its provenance because a palace mined before 0.112.0 is full of it.
+`_context._SUMMARY_MARKER` and `is_summary` live together. The exceptions are the
+`_LEGACY_*` constants — wordings that no longer exist in the code at all, recorded here with
+their provenance because a palace mined before the boundary closed is full of them.
 
 **Matching is exact-literal and never fuzzy** (`classify`). A chunk is scrubbable only when
 *every* line in it is scaffolding — so a real memory that merely mentions memory, tools, or
@@ -56,6 +57,28 @@ from basecradle_harness._mempalace import _CLOSE_TAG, _INJECTED_HEADING, _OPEN_T
 #: has copies of it, and nothing in the code would name it. Recorded with its provenance rather
 #: than as a bare string, so a later reader can tell a historical literal from a live one.
 _LEGACY_RECALL_HEADING = "Relevant memories from past conversations (across all your timelines):"
+
+#: The compaction summarizer's instruction as it read from issue #276 until issue #561 reworded it.
+#: A historical literal for the same reason `_LEGACY_RECALL_HEADING` is one: the summary it produced
+#: was mined into palaces until 0.114.0 (issue #438), and the wording that can be sitting in a polluted
+#: palace is this one, not whatever `_context._SUMMARIZE_INSTRUCTION` says today. The current wording
+#: is deliberately *not* catalogued — it was never mined, so in an old palace a match on it could only
+#: be genuine dialogue about compaction (the reasoning `_INJECTED` records for the brief's fences).
+_LEGACY_SUMMARIZE_INSTRUCTION = """You are compacting your own conversation transcript to stay inside your context window. \
+The excerpt below is about to be deleted and replaced by what you write now. Write dense, factual \
+notes to your future self, in the first person, under these three headings:
+
+1. WORK DONE — the actions you actually took, the tools you used, and what came of them: artifacts \
+produced (asset uuids, URLs, file paths, task uuids), things posted, things changed, things that \
+failed. Tool results are deleted along with the excerpt, so an action you do not write down here \
+leaves no trace that it ever happened.
+2. WHAT WAS SAID — the substance of the conversation: who said what, what was decided, what was \
+promised.
+3. OPEN THREADS — what is unfinished, what you owe someone, and what you meant to do next.
+
+Preserve identifiers (uuids, URLs, handles, numbers) verbatim — they are unrecoverable once the \
+excerpt is gone. Do not speculate, do not pad, and do not address anyone: these are your own notes, \
+not a message. Everything you leave out is forgotten."""
 
 #: The literals `strip_injected` removes from text on its way into a mining provider. Deliberately
 #: **only** the recall block's own framing: the model reads this block every wake, and a reply that
@@ -220,7 +243,7 @@ def catalog() -> tuple[Scaffolding, ...]:
                 "as, and the instruction the summarizer was given. Never dialogue: the harness "
                 "wrote both."
             ),
-            literals=(_wake._COMPACTION_OBSERVE_NOTE, _context._SUMMARIZE_INSTRUCTION),
+            literals=(_wake._COMPACTION_OBSERVE_NOTE, _LEGACY_SUMMARIZE_INSTRUCTION),
             prefixes=(_context._SUMMARY_MARKER,),
         ),
         Scaffolding(

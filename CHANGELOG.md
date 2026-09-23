@@ -7,6 +7,69 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.131.0] - 2026-09-23
+
+### Removed: a compaction summary no longer reaches memory, on any provider — compaction is a transcript concern (issue #561)
+
+**Founder decision (@origin, 2026-09-23): the transcript is outside the agent, memory is inside it,
+and the two systems are never connected.** The harness owns the transcript, shows it to the model,
+compacts it when it is too big, and deletes it with its timeline; the compaction summary is part of
+the transcript and goes with it. Memory is what the agent chose to write (SQLite) or what was said
+(MemPalace). `Compactor.on_summary` was the one line that joined them, and it is gone with no
+replacement: the constructor parameter and attribute, `Compactor._remember`, and
+`WakeAgent._remember_compaction` with its `compaction/<source>/<timestamp>` store key. **Breaking for
+the library API:** `Compactor(provider, budget)` no longer accepts `on_summary=`. On a SQLite agent
+this stops a write the agent never asked for; on MemPalace nothing changes (issue #438 had already
+stopped mining the summary). Keys an older version wrote stay in `memory.db` — they are the agent's
+memory now, and nothing deletes them.
+
+Issue #276's "requirement 7" — the reason the hook existed — was a premise error: the durable trace
+of tool work already lives outside the agent, in the per-call `tool name= duration= outcome=` log
+line and on the platform. Every mature harness reviewed keeps compaction and long-term memory
+separate. A test now pins the invariant: with a real wake agent bound to a memory provider whose
+every attribute raises and records the attempt, a compaction completes and the provider records
+nothing — which fails against the old code, whose guard swallowed the raise.
+
+### Changed: a compaction summary is validated, carries its identifiers by code, and is written under operational headings (issue #561)
+
+- **A summary must be smaller than what it replaces.** `Compactor` measures the note (in the file's
+  own unit, `message_chars`) against the region it would replace and **declines** when it is not
+  smaller: WARNING, transcript untouched, `False` — the same shape as the existing "no safe cut" and
+  "summarize call failed" declines. On the emergency path a declined rescue lets the original
+  over-length error propagate, as `emergency_compact` always has. The identifier block (below)
+  counts toward the size and **shrinks to fit before the check can fail**, so an optional appendix is
+  never why a transcript stays long; and a region no larger than the note's own fixed heading is
+  declined before the summarize call is made, so a compaction that cannot succeed costs nothing.
+- **Identifiers are harvested by code, not trusted to the prompt.** Every uuid, URL and `@handle` in
+  the dropped region's rendering is appended below the model's summary, inside the same single
+  system turn, under `IDENTIFIERS (harvested, verbatim):` — deduplicated, in first-seen order, no
+  second model call. Bounded at the new `IDENTIFIER_CAP` (4,096 characters, heading included); when
+  a busy region carries more, the **least recently mentioned** are left out and a closing line says
+  how many. No identifiers, no heading. The patterns are the shapes the identifiers actually have,
+  because a harvested identifier that is not verbatim is worse than none:
+  - URLs are a *positive* ASCII class (RFC 3986, less the square brackets), so a Markdown link, a
+    JSON-escaped `\n` or `\"`, a pipe table or a CJK character ends the URL rather than joining it,
+    and trailing prose punctuation is trimmed.
+  - Handles use the platform's own grammar (`[a-z0-9](?:\.?[a-z0-9_-]+)*`), so `@nova-5.2` is
+    harvested whole rather than as `@nova-5`, and the domain half of an email is not a handle. The
+    grammar is written in an equivalent unambiguous form, because the validator's own spelling is
+    exponential on a peer's `@` followed by a long lowercase run.
+  - Every boundary is ASCII, so an identifier written straight against Japanese or Chinese text
+    (`アセット019e…を確認`, `请@john看`) is harvested, where Unicode `\b`/`\w` harvested nothing.
+  - A fragment the harness itself truncated (a list preview ending in `…`, the head of an archived
+    excerpt) is dropped rather than kept as a wrong identifier.
+- **Operational headings.** The summarizer writes under *WORK DONE / DECISIONS AND FACTS / IN
+  PROGRESS / NEXT ACTION / OPEN THREADS*; "WHAT WAS SAID" is gone as a target (it invited a recap
+  rather than continuity). The carried summary is now pruned, not preserved: the model is told to
+  drop what is resolved or obsolete.
+- **The summary marker is unchanged** (`[Earlier conversation compacted`), pinned by test, so every
+  existing transcript's summary is recognized and folds into its next compaction exactly as before.
+- **The scrub catalog keeps the old wording.** `basecradle-harness-scrub-palace` matched the
+  summarizer instruction by its live constant; rewording it would have left pre-0.114.0 palaces with
+  copies of text the scrub no longer recognized. The old instruction is now a historical literal
+  (`_mining._LEGACY_SUMMARIZE_INSTRUCTION`, byte-identical, recorded with its provenance), beside
+  `_LEGACY_RECALL_HEADING`.
+
 ## [0.130.3] - 2026-09-22
 
 ### Changed: the harness reads the live wire only, and a delivery names who wired its endpoint and whether it was verified — `basecradle>=0.9.0` (issue #559)
