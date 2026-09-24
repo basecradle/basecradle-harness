@@ -476,8 +476,9 @@ def compose_brief(
     (issue #564), then the step budget, then operating guidance (how to act), then the tools the
     agent has, then any **tool defect** (a shipped default that failed to load — issue #160 —
     right after the manifest it contradicts, so the agent reads "you have these tools, but this
-    one is broken" together), then the **safe-by-default opt-out
-    notice** (Group 5), then the live dashboard (where it is), then any recalled **memory**
+    one is broken" together), then the **safe-by-default opt-out notice** (Group 5), then what
+    each **MCP server** is (issue #553 — right after the notice that names them), then the live
+    dashboard (where it is), then any recalled **memory**
     relevant to the turn (the memory provider's `context` hook — injected just before the
     charter, the way middleware memory systems inject retrieved context before the system
     prompt), then the personality charter. Any part may be absent — a missing dashboard (fetch
