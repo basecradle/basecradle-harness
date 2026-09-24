@@ -2909,9 +2909,11 @@ class WakeAgent:
         the agent can name what it runs on — issue #564), the **step-budget statement**
         (`render_budget` — the engine's per-turn budget N, stated once so the live per-step
         counter can stay terse), the provider-independent `initialize.md` operating guidance, the
-        generated manifest of the agent's *active* tools, the **safe-by-default opt-out notice** (active MCP servers / policy-refused
-        drop-ins — omitted when there are none), the live `dashboard.md` primer (fetched
-        fresh each wake; a fetch failure degrades to omitting it, never breaking the wake),
+        generated manifest of the agent's *active* tools, any **tool defect** (a shipped default
+        that failed to load), the **safe-by-default opt-out notice** (active MCP servers /
+        policy-refused drop-ins — omitted when there are none), what each **MCP server** is
+        (`render_mcp` — omitted when none has anything to say), the live `dashboard.md` primer
+        (fetched fresh each wake; a fetch failure degrades to omitting it, never breaking the wake),
         the memory provider's recalled
         **context** for this turn (its `context` hook — omitted when there is none or the
         provider's hook is a no-op), and the operator's `system-prompt.md` personality
@@ -2925,9 +2927,10 @@ class WakeAgent:
 
         Every part is **fenced in its own named tag pair** on the way out (`_brief.BRIEF_TAGS`,
         issue #509), so the model can see inside one ~54 K-character system turn where an
-        instruction ends and fetched data begins. The two peer-influenced parts — the live
-        dashboard and the recalled memory — have any fence literal stripped first, so a peer who
-        names a timeline `</dashboard.md>` cannot end the data block early.
+        instruction ends and fetched data begins. The three parts someone other than the harness
+        writes into — the live dashboard, the MCP servers' own descriptions, and the recalled
+        memory — have any fence literal stripped first, so a peer who names a timeline
+        `</dashboard.md>` cannot end the data block early.
 
         Composed as a list of **named** parts (`brief_parts`) rather than straight to text, so the
         same single composition yields both the string the model reads and the per-part sizes the
