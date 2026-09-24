@@ -54,6 +54,7 @@ from basecradle_harness import (
     WakeBreaker,
     _wake,
     install,
+    render_brain,
 )
 from basecradle_harness import _wake as wake_module
 from basecradle_harness._basecradle import _incoming_text, _messages_since, _parse_created_at
@@ -2998,6 +2999,83 @@ def test_the_brief_composes_all_four_parts(platform, tmp_path):
     assert "- lock — one-way and irreversible." in brief  # …with the optional per-tool note
     assert "# Live Dashboard" in brief  # 3. the live dashboard.md primer
     assert "You are a helpful peer on BaseCradle." in brief  # 4. the packaged personality
+
+
+class _ConfiguredBrain(CountingProvider):
+    """A canned brain that also answers every question the brief's ``brain`` part asks (#564)."""
+
+    model = "gpt-6-sol"
+    sdk = "openai"
+    surface = "responses"
+    tuning = {"reasoning": {"effort": "xhigh"}}
+
+
+def test_the_brief_names_the_brain_the_wake_calls(platform, tmp_path, caplog):
+    """Issue #564, end to end: the model is shown its own brain, read off the adapter it runs on.
+
+    Two agents asked which model they ran said they could not tell, while the journal named it on
+    every wake. So the part is read off `harness.provider` — the very object the engine calls —
+    sits right after the time anchor, and is measured on the attribution line under its own name.
+    """
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="Which model are you running?")))
+    agent, model = build_wake(
+        tmp_path, provider=_ConfiguredBrain(), onboard=True, tool_manifest=[("memory", None)]
+    )
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    brief = _brief_shown(model)[0].content
+    block = brief.split("<brain>\n", 1)[1].split("\n</brain>", 1)[0]
+    assert block == render_brain(model)
+    assert block.splitlines()[1:] == [
+        "- Model: `gpt-6-sol`",
+        "- Provider: `openai`",
+        "- SDK: `openai`",
+        "- Surface: `responses`",
+        "- Tuning, applied to every call:",
+        '  - reasoning = {"effort": "xhigh"}',
+    ]
+    assert brief.index("</now>") < brief.index("<brain>") < brief.index("<budget>")
+    # Measured, not folded into `brief`: the part, its fence, and the separator ahead of it.
+    attribution = next(
+        r.getMessage() for r in caplog.records if "context attribution" in r.getMessage()
+    )
+    fenced_part = f"<brain>\n{block}\n</brain>"
+    assert re.search(r"\bbrief_brain=(\d+)", plain(attribution)).group(1) == str(
+        len(fenced_part) + 2
+    )
+
+
+def test_an_adapter_that_cannot_describe_itself_costs_the_brain_and_not_the_brief(
+    platform, tmp_path, caplog
+):
+    """A library caller's adapter is their own code; a property of theirs that raises costs one part.
+
+    The same rule `_memory_context` keeps for a memory provider's hook: the rest of the brief — and
+    the wake — go on, and the failure is said out loud.
+    """
+
+    class _Unreadable(CountingProvider):
+        @property
+        def tuning(self):
+            raise RuntimeError("the adapter's own config store is down")
+
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, model = build_wake(
+        tmp_path, provider=_Unreadable(), onboard=True, tool_manifest=[("memory", None)]
+    )
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        posted = agent.wake()
+
+    assert len(posted) == 1
+    brief = _brief_shown(model)[0].content
+    assert "<brain>" not in brief
+    assert "<now>" in brief and "Your active tools right now:" in brief  # everything else stands
+    assert "omitting the brain part" in caplog.text
 
 
 def test_a_dashboard_fetch_failure_does_not_break_the_wake(platform, tmp_path):

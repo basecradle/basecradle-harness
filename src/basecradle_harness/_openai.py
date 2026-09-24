@@ -30,6 +30,7 @@ harness owns history, so Responses' server-side state (``previous_response_id``)
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -210,6 +211,11 @@ class OpenAIProvider:
             fact behind a request header rather than a body field. Today's use is OpenRouter's
             ``X-OpenRouter-Metadata``, which is what makes it state the endpoint it actually routed
             to (issue #280). The config layer decides what to send; the adapter just carries it.
+        reported_tuning: What `tuning` names, when the caller knows better than this adapter can.
+            **Nothing here is sent.** Left out, `tuning` is everything this adapter adds to every
+            call — ``default_params``, ``extra_body``, ``extra_headers``. The config layer passes it
+            because it merges the harness's own wiring (xAI's ``search_parameters``, OpenRouter's
+            routing header) into those two seams, and only it can still tell whose key is whose.
         code_container: An optional callback supplying the ``container`` config for the
             ``code_interpreter`` built-in, evaluated **per turn** (the container handle changes
             as the Asset bridge stages files / pins a session — see `_code.py`). Returns a
@@ -232,6 +238,10 @@ class OpenAIProvider:
     #: which is the natural shape of the native Anthropic adapter this capability exists to unblock.
     cache_mode = AUTOMATIC
 
+    #: The ``AI_SDK`` this adapter is: the package every call goes through. Read with `surface`,
+    #: `provider`, `model` and `tuning` into the brief's ``brain`` part (issue #564).
+    sdk = "openai"
+
     def __init__(
         self,
         model: str,
@@ -246,6 +256,7 @@ class OpenAIProvider:
         extra_body: Mapping[str, Any] | None = None,
         extra_headers: Mapping[str, str] | None = None,
         code_container: Callable[[], dict[str, Any] | str | None] | None = None,
+        reported_tuning: Mapping[str, Any] | None = None,
         **default_params: Any,
     ) -> None:
         if surface not in SURFACES:
@@ -272,7 +283,9 @@ class OpenAIProvider:
         self._builtin_tools = [builtin_to_responses(spec) for spec in builtin_tools]
         self._code_container = code_container
         self._extra_body = dict(extra_body) if extra_body else None
+        self._extra_headers = dict(extra_headers) if extra_headers else None
         self._default_params = default_params
+        self._reported_tuning = dict(reported_tuning) if reported_tuning is not None else None
         #: How *this* endpoint takes a cache-affinity routing key — a body field, a header, or
         #: (for a cell absent from `_AFFINITY`, and for any `provider` label the operator invented)
         #: nothing at all. Resolved once: the carrier is a fixed property of the endpoint this
@@ -292,6 +305,26 @@ class OpenAIProvider:
             # adapter stays vendor-neutral (the header seam, exactly as `extra_body` is the body one).
             default_headers=dict(extra_headers) if extra_headers else None,
         )
+
+    @property
+    def tuning(self) -> dict[str, Any]:
+        """What this adapter is tuned with on every call — for a brain, its ``model_params.json``.
+
+        What the brief's ``brain`` part tells the agent (issue #564). The caller's `reported_tuning`
+        when it passed one, which the config layer always does: ``extra_body`` and ``extra_headers``
+        are sent on every call, but on this adapter they also carry the harness's own wiring, so
+        the operator's part of each is named and the wiring is not. Otherwise everything this adapter
+        adds to every call. A deep copy, because the fleet's tuning is nested
+        (``reasoning: {"effort": …}``) and a reader must never reach what the next call sends.
+        """
+        if self._reported_tuning is not None:
+            return copy.deepcopy(self._reported_tuning)
+        tuning = dict(self._default_params)
+        if self._extra_body:
+            tuning["extra_body"] = self._extra_body
+        if self._extra_headers:
+            tuning["extra_headers"] = self._extra_headers
+        return copy.deepcopy(tuning)
 
     def bind_conversation(self, conversation: str | None) -> None:
         """Route this adapter's next calls to the cache holding `conversation`'s prefix (issue #435).

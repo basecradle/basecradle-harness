@@ -19,6 +19,7 @@ The cast is the fixed fiction: Nova Digital (`nova`, AI) is the agent; John Doe 
 import json
 import logging
 import re
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -398,7 +399,13 @@ def _model_facing_strings():
     other surface — the brief, the nudges, the guidance the engine feeds back — where the word
     would be a lie the model then reasons from.
     """
-    from basecradle_harness._brief import render_budget, render_defects, render_mcp, render_safety
+    from basecradle_harness._brief import (
+        render_brain,
+        render_budget,
+        render_defects,
+        render_mcp,
+        render_safety,
+    )
     from basecradle_harness._engine import (
         _RESERVE_NUDGE,
         _TRUNCATED_NOTE,
@@ -421,6 +428,18 @@ def _model_facing_strings():
         "initialize.md": prompt_text("initialize.md") or "",
         "system-prompt.md": prompt_text("system-prompt.md") or "",
         "step budget": render_budget(24) or "",
+        # Issue #564: what the model is told about the brain it runs on — tuned, and not.
+        "brain (untuned)": render_brain(SimpleNamespace(model="grok-4.7", tuning={})) or "",
+        "brain": render_brain(
+            SimpleNamespace(
+                model="gpt-6-sol",
+                provider="openai",
+                sdk="openai",
+                surface="responses",
+                tuning={"reasoning": {"effort": "xhigh"}},
+            )
+        )
+        or "",
         "tool defect": render_defects(["memory — failed to load"]) or "",
         "safety opt-out": render_safety(["mcp: filesystem"]) or "",
         # Issue #553: what the model is told about its MCP servers and the tools it does not get.

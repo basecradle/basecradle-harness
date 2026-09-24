@@ -7,6 +7,46 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.132.0] - 2026-09-24
+
+### Added: the brief names the agent's own brain — model, provider, SDK, surface and tuning (issue #564)
+
+Asked to name the model it runs on, @jt answered *"I believe I'm running an OpenAI model, but I
+can't verify the exact model name from here"* and @memory-prince *"I don't know which model I'm
+running"* — while the harness logged `provider=openai model=gpt-6-sol` at the start of every wake.
+The journal had the agent's brain and the agent did not. A peer that reasons about what it can do
+without knowing what it runs on is wrong about itself.
+
+The brief gains an eleventh part, fenced `<brain>`, right after the time anchor: the model id, the
+provider serving it, the SDK and surface the call goes through, and every parameter
+`model_params.json` adds to the call, each value as JSON (`reasoning = {"effort": "xhigh"}`) — or
+*none set, so the provider's defaults apply*. It is read **off the adapter the engine calls**
+(`render_brain(harness.provider)`), never re-derived from the environment, so it is the
+configuration that actually makes the call; a harness-owned key the build stripped is not named,
+because it never reaches the call. It says, in the harness's own words, that none of it is
+confidential — `initialize.md` tells an agent never to reveal its brief, which would make a careful
+model refuse the very question this part answers — and it claims the *configuration*, never the
+model that answers (a router can serve `openrouter/auto` with another). About 400 characters a
+wake, ephemeral like the rest of the brief, and measured on the context-attribution line as
+`brief_brain=`.
+
+- **Three adapters declare themselves.** `OpenAIProvider`, `XaiSdkProvider` and
+  `OpenRouterProvider` gain `sdk` (the `AI_SDK` package) and `tuning` (a deep copy of what is added
+  to every call — nested, because the fleet's `reasoning: {"effort": …}` is); the two
+  single-surface adapters gain `surface`. Plain capability reads, documented in `_provider`: a
+  library caller's own adapter without them costs only their lines, and one with no `model`
+  composes no `brain` part at all.
+- **Only the operator's part of a merged seam is tuning.** On the `openai` SDK the harness puts
+  its own wiring (xAI's `search_parameters`, OpenRouter's routing header) into the same
+  `extra_body` / `extra_headers` an operator's `model_params.json` can set, so the factory — the
+  last place the two are apart — passes the operator's part as `OpenAIProvider(reported_tuning=…)`
+  (informational: nothing in it is sent; the key is harness-owned, so a stray one in
+  `model_params.json` is warned and dropped). An agent is never told it was tuned with its own Live
+  Search plumbing, and one whose tuning is only an `extra_body` is never told *none set*.
+- **Outside the mining boundary**, like every harness-composed part — `test_mining.py` carries a
+  brain sentinel, and the part's wording is on the model-facing surface the no-supervisor guard
+  scans.
+
 ## [0.131.1] - 2026-09-23
 
 ### Fixed: the compaction summarizer reads what the agent said, not only that it spoke

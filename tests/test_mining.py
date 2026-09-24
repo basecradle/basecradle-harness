@@ -73,6 +73,9 @@ MANIFEST_SENTINEL = "SENTINEL-MANIFEST-do-not-mine-this-tool-note"
 DASHBOARD_SENTINEL = "SENTINEL-DASHBOARD-do-not-mine-this-platform-primer"
 RECALL_SENTINEL = "SENTINEL-RECALL-do-not-mine-this-recalled-memory"
 MCP_SENTINEL = "SENTINEL-MCP-do-not-mine-this-servers-own-instructions"
+# The brief's `brain` part (issue #564): the model id is read off the live adapter every wake, so the
+# canned model below carries it as its own `model` — the path a real adapter's id takes.
+BRAIN_SENTINEL = "SENTINEL-BRAIN-do-not-mine-this-model-id"
 # The reranker's *own* output. Not a brief surface — a whole extra model whose text the boundary
 # has never had to account for (issue #464). It must reach neither the agent's model nor the palace.
 RERANK_SENTINEL = "SENTINEL-RERANK-do-not-show-or-mine-this-reranker-narration"
@@ -83,6 +86,7 @@ SENTINELS = (
     DASHBOARD_SENTINEL,
     RECALL_SENTINEL,
     MCP_SENTINEL,
+    BRAIN_SENTINEL,
 )
 
 
@@ -102,6 +106,10 @@ class Recorder(MemoryProvider):
 
 class _CannedModel:
     """A model that answers with fixed text, and remembers everything it was shown."""
+
+    # What the brief's `brain` part reads off an adapter; the id carries the part's sentinel.
+    provider = "openai"
+    model = BRAIN_SENTINEL
 
     def __init__(self, text="Hello, John.", raises=False):
         self.text = text
@@ -206,7 +214,7 @@ def _agent(home, provider, model=None, monkeypatch=None):
 
 def test_no_part_of_the_brief_reaches_the_mined_exchange(platform, tmp_path, monkeypatch):
     """The issue's acceptance test: sentinels in charter, manifest, dashboard, recall and — since
-    issue #553 — an MCP server's own instructions.
+    issue #553 — an MCP server's own instructions, and since issue #564 the brain part.
 
     Both halves matter and both are asserted. If the sentinels never reached the *model*, this
     would pass for the wrong reason — a brief that composed empty proves nothing about a

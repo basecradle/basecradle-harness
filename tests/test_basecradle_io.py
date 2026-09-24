@@ -28,8 +28,10 @@ from basecradle_harness import (
     XaiSdkProvider,
     config_home,
     install,
+    render_brain,
 )
 from basecradle_harness._basecradle import (
+    _SDK_SURFACES,
     DEFAULT_CONTEXT_MESSAGES,
     DEFAULT_MAX_STEPS,
     DEFAULT_RESPONSE_RETRIES,
@@ -45,6 +47,7 @@ from basecradle_harness._basecradle import (
     _response_retries_from_env,
     resolved_model_params,
 )
+from basecradle_harness._brief import BRAIN_HEADER
 from basecradle_harness._model_params import MODEL_PARAMS_NAME
 from basecradle_harness._search_params import SEARCH_PARAMS_NAME
 from basecradle_harness._version import __version__
@@ -1489,6 +1492,186 @@ def test_model_params_malformed_file_fails_the_build(monkeypatch):
     (config_home() / MODEL_PARAMS_NAME).write_text("{not json", encoding="utf-8")
     with pytest.raises(ValueError, match=MODEL_PARAMS_NAME):
         _provider_from_config("openai", "openai", "responses")
+
+
+# --- the brain the brief names, read off the adapter the factory built (issue #564) ---
+
+#: Every cell a fleet agent runs, plus the ``openai`` SDK aimed at xAI — the cell where the provider
+#: and the SDK differ, which is exactly where naming both is the point.
+_BRAIN_CELLS = [
+    ("openai", "openai", "responses", "gpt-6-sol"),
+    ("openai", "openai", "chat", "gpt-6-sol"),
+    ("xai", "openai", "chat", "grok-4.7"),
+    ("xai", "xai-sdk", "native", "grok-4.7"),
+    ("openrouter", "openrouter", "chat", "z-ai/glm-5.2"),
+]
+
+
+def _built_brain(monkeypatch, provider, sdk, surface, model, **build):
+    """The brief's ``brain`` part for an agent configured with this cell — through the real factory."""
+    monkeypatch.setenv("AI_MODEL", model)
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    monkeypatch.delenv("AI_BASE_URL", raising=False)
+    adapter = _provider_from_config(provider, sdk, surface, **build)
+    try:
+        return render_brain(adapter)
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize(("provider", "sdk", "surface", "model"), _BRAIN_CELLS)
+def test_the_brain_names_the_configured_model_and_stack(monkeypatch, provider, sdk, surface, model):
+    """The issue's first pin: the brief names the configured model id — and the stack it rides.
+
+    Through `_provider_from_config`, the factory every wake builds its brain with, so the values are
+    the ones the adapter will actually call with rather than ones a test handed a renderer.
+    """
+    brain = _built_brain(monkeypatch, provider, sdk, surface, model)
+    assert brain.splitlines() == [
+        BRAIN_HEADER,
+        f"- Model: `{model}`",
+        f"- Provider: `{provider}`",
+        f"- SDK: `{sdk}`",
+        f"- Surface: `{surface}`",
+        "- Tuning: none set, so the provider's defaults apply",
+    ]
+
+
+@pytest.mark.parametrize(("provider", "sdk", "surface", "model"), _BRAIN_CELLS)
+def test_the_brain_names_a_model_params_value_only_when_one_is_set(
+    monkeypatch, provider, sdk, surface, model
+):
+    """The issue's second pin: a ``model_params.json`` value shows when set, and is absent unset."""
+    unset = _built_brain(monkeypatch, provider, sdk, surface, model)
+    _write_model_params({"reasoning_effort": "xhigh"})
+    tuned = _built_brain(monkeypatch, provider, sdk, surface, model)
+
+    assert "reasoning_effort" not in unset
+    assert tuned.splitlines()[-2:] == [
+        "- Tuning, applied to every call:",
+        '  - reasoning_effort = "xhigh"',
+    ]
+    assert "defaults apply" not in tuned
+
+
+def test_the_brain_never_names_a_key_the_build_stripped(monkeypatch, caplog):
+    """What the brief calls tuning is what reaches the call — a warned-and-dropped key is not it."""
+    _write_model_params({"model": "hacker/override", "tools": ["nope"], "temperature": 0.3})
+    with caplog.at_level("WARNING"):
+        brain = _built_brain(monkeypatch, "openai", "openai", "responses", "gpt-6-sol")
+
+    assert "- Model: `gpt-6-sol`" in brain.splitlines()  # AI_MODEL, never the params `model`
+    assert brain.splitlines()[-2:] == ["- Tuning, applied to every call:", "  - temperature = 0.3"]
+    assert "hacker/override" not in brain and "tools" not in brain
+
+
+def test_the_harness_wiring_is_never_named_as_tuning_and_the_operators_part_is(monkeypatch):
+    """On the ``openai`` SDK, ``extra_body`` carries both — and only the operator's part is tuning.
+
+    Aimed at xAI with Live Search opted in, the harness puts ``search_parameters`` in that body on
+    every call. An agent told it was tuned with its own tool's plumbing would be told something
+    false; an agent whose ``model_params.json`` sets only ``extra_body`` and is told "none set"
+    would be told something false too. The factory is the last place the two are apart.
+    """
+    _write_model_params(
+        {
+            "extra_body": {"reasoning": {"effort": "high"}, "search_parameters": {"mode": "off"}},
+            "temperature": 0.2,
+        }
+    )
+    monkeypatch.setenv("AI_MODEL", "grok-4.7")
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    adapter = _provider_from_config("xai", "openai", "chat", builtins=["web_search"])
+    try:
+        # The premise, or the test proves nothing: the wiring is on every call, over the
+        # operator's own `search_parameters`, beside the operator's `reasoning`.
+        assert adapter._extra_body["search_parameters"] != {"mode": "off"}
+        assert adapter._extra_body["reasoning"] == {"effort": "high"}
+        brain = render_brain(adapter)
+    finally:
+        adapter.close()
+
+    assert brain.splitlines()[-3:] == [
+        "- Tuning, applied to every call:",
+        "  - temperature = 0.2",
+        '  - extra_body = {"reasoning": {"effort": "high"}}',
+    ]
+
+
+def test_an_operator_header_is_tuning_and_the_routing_header_is_not(monkeypatch):
+    # OpenRouter over the openai SDK: the harness sends its routing-metadata header on every call.
+    _write_model_params({"extra_headers": {"X-Title": "Nova Digital"}})
+    brain = _built_brain(monkeypatch, "openrouter", "openai", "chat", "z-ai/glm-5.2")
+    assert brain.splitlines()[-2:] == [
+        "- Tuning, applied to every call:",
+        '  - extra_headers = {"X-Title": "Nova Digital"}',
+    ]
+    assert "X-OpenRouter-Metadata" not in brain
+
+
+def test_the_brains_own_bookkeeping_key_is_warned_and_dropped(monkeypatch, caplog):
+    """``reported_tuning`` is a real constructor arg, so it is owned: a warning, never a TypeError."""
+    _write_model_params({"reported_tuning": {"temperature": 9}, "temperature": 0.3})
+    with caplog.at_level("WARNING"):
+        brain = _built_brain(monkeypatch, "openai", "openai", "responses", "gpt-6-sol")
+    assert "'reported_tuning'" in caplog.text
+    assert brain.splitlines()[-2:] == ["- Tuning, applied to every call:", "  - temperature = 0.3"]
+
+
+def test_a_library_openai_adapter_names_everything_it_was_handed():
+    """No config layer, no wiring to tell apart: the caller's extras are all the caller's tuning."""
+    adapter = OpenAIProvider(
+        "gpt-6-sol",
+        api_key="sk-test-key",
+        extra_body={"reasoning": {"effort": "low"}},
+        extra_headers={"X-Title": "Nova Digital"},
+        temperature=0.2,
+    )
+    try:
+        assert adapter.tuning == {
+            "temperature": 0.2,
+            "extra_body": {"reasoning": {"effort": "low"}},
+            "extra_headers": {"X-Title": "Nova Digital"},
+        }
+    finally:
+        adapter.close()
+
+
+def test_every_shipped_sdk_has_an_adapter_that_declares_it():
+    """A new ``AI_SDK`` row without an adapter saying it is that SDK would name no SDK in the brief.
+
+    `_SDK_SURFACES` is the one list of SDKs the config accepts, so it is what the declarations are
+    checked against — and a single-surface adapter's `surface` is that SDK's one surface.
+    """
+    adapters = {cls.sdk: cls for cls in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider)}
+    assert set(adapters) == set(_SDK_SURFACES)
+    for sdk, (surfaces, default) in _SDK_SURFACES.items():
+        declared = getattr(adapters[sdk], "surface", None)  # the openai one is per instance
+        if len(surfaces) == 1:
+            assert declared == default
+
+
+@pytest.mark.parametrize(("provider", "sdk", "surface", "model"), _BRAIN_CELLS)
+def test_tuning_is_a_deep_copy_the_next_call_never_sees_changed(
+    monkeypatch, provider, sdk, surface, model
+):
+    """A reader of the brain must not reach what the adapter sends — at any depth.
+
+    Nested on purpose: ``reasoning: {"effort": …}`` is the fleet's own shape, and a shallow copy
+    passes a flat test while handing the caller the very dict the next call spreads.
+    """
+    monkeypatch.setenv("AI_MODEL", model)
+    monkeypatch.setenv("AI_API_KEY", "sk-test-key")
+    _write_model_params({"reasoning": {"effort": "xhigh"}, "temperature": 0.3})
+    adapter = _provider_from_config(provider, sdk, surface)
+    try:
+        leaked = adapter.tuning
+        leaked["reasoning"]["effort"] = "low"
+        leaked["temperature"] = 2.0
+        assert adapter.tuning == {"reasoning": {"effort": "xhigh"}, "temperature": 0.3}
+        assert adapter._default_params == {"reasoning": {"effort": "xhigh"}, "temperature": 0.3}
+    finally:
+        adapter.close()
 
 
 # --- resolved_model_params: the read-only introspection twin of the collision policy (issue #236) ---

@@ -120,6 +120,7 @@ from basecradle_harness._brief import (
     brief_section_sizes,
     fetch_dashboard_md,
     join_brief,
+    render_brain,
     render_budget,
     render_defects,
     render_manifest,
@@ -2899,14 +2900,16 @@ class WakeAgent:
         return self._brief
 
     def _compose_brief(self, query: str | None = None) -> str | None:
-        """Compose the persistent brief: now + initialize + manifest + defects + safety + dashboard + memory + charter.
+        """Compose the persistent brief: now + brain + budget + initialize + manifest + … + charter.
 
         The parts, in order (see `basecradle_harness._brief`): the **current-time anchor**
         (`_now_line` — the absolute "now" the model reasons every item's age against, fresh
-        each wake since the brief is re-composed per wake), the **step-budget statement**
+        each wake since the brief is re-composed per wake), the **brain** (`render_brain` — the
+        model, provider, SDK, surface and tuning, read off the very adapter the engine calls, so
+        the agent can name what it runs on — issue #564), the **step-budget statement**
         (`render_budget` — the engine's per-turn budget N, stated once so the live per-step
-        counter can stay terse), the provider-independent `initialize.md` operating guidance, the generated manifest of the agent's *active*
-        tools, the **safe-by-default opt-out notice** (active MCP servers / policy-refused
+        counter can stay terse), the provider-independent `initialize.md` operating guidance, the
+        generated manifest of the agent's *active* tools, the **safe-by-default opt-out notice** (active MCP servers / policy-refused
         drop-ins — omitted when there are none), the live `dashboard.md` primer (fetched
         fresh each wake; a fetch failure degrades to omitting it, never breaking the wake),
         the memory provider's recalled
@@ -2934,6 +2937,7 @@ class WakeAgent:
         try:
             parts = brief_parts(
                 now=_now_line(),
+                brain=self._brain(),
                 budget=render_budget(self.harness.engine.max_steps),
                 initialize=prompt_text("initialize.md"),
                 manifest=render_manifest(self._manifest_entries()),
@@ -2958,6 +2962,21 @@ class WakeAgent:
             return None
         self._brief_sections = sections
         return brief
+
+    def _brain(self) -> str | None:
+        """The brief's ``brain`` part, guarded — an adapter's own attributes never cost the brief.
+
+        A shipped adapter answers with plain values that cannot raise. A library caller's adapter
+        is their own code, though, and a property of theirs that raises must cost this one part
+        rather than the whole brief: the rule `_memory_context` keeps for the memory provider.
+        """
+        try:
+            return render_brain(self.harness.provider)
+        except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
+            _log.warning(
+                "Could not describe the model provider; omitting the brain part.", exc_info=True
+            )
+            return None
 
     def _memory_context(self, query: str | None) -> str | None:
         """The memory provider's recalled context for this turn, guarded — never breaks the wake.

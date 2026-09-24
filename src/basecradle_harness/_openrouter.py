@@ -50,6 +50,7 @@ harness owns history — this adapter never sets ``stream`` (it is non-streaming
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -273,6 +274,11 @@ class OpenRouterProvider:
     #: be wrong. Not a live cell; closing it means answering from the routed model, not the adapter.
     cache_mode = AUTOMATIC
 
+    #: The ``AI_SDK`` this adapter is, and the one surface it speaks. Read with `provider`, `model`
+    #: and `tuning` into the brief's ``brain`` part (issue #564).
+    sdk = "openrouter"
+    surface = DEFAULT_SURFACE
+
     def __init__(
         self,
         model: str,
@@ -339,6 +345,17 @@ class OpenRouterProvider:
         # against a model call measured in seconds.
         self._capture = _ResponseCapture()
         _watch_responses(self._client, self._capture)
+
+    @property
+    def tuning(self) -> dict[str, Any]:
+        """The keyword parameters this adapter adds to every call — for an agent's brain, its
+        ``model_params.json``.
+
+        What the brief's ``brain`` part tells the agent it is tuned with (issue #564). A deep copy,
+        because the fleet's tuning is nested (``reasoning: {"effort": …}``) and a reader must never
+        reach what the next call sends.
+        """
+        return copy.deepcopy(self._default_params)
 
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:
         """Run one model turn through the SDK and return the assistant's reply."""

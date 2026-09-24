@@ -82,10 +82,31 @@ A fifth belongs to perception (issue #228):
   surface is thus the future gap that owns implementing this for its adapter, the same way an
   explicit-cache vendor owns `cache_mode`.
 
+And five describe the brain to the agent running on it (issue #564) — plain attributes, read into
+the brief's ``brain`` part every wake (`_brief.render_brain`), so an agent asked which model it runs
+answers from the call's own configuration rather than from a guess:
+
+- **`model: str`** and **`provider: str`** — the model id and the endpoint vendor. Every shipped
+  adapter has always carried both; the wake's bookend log line reads the same two
+  (`_observability.describe_provider`), so the agent and its journal cannot disagree about them.
+- **`sdk: str`** and **`surface: str`** — the ``AI_SDK`` package the adapter is and the wire surface
+  it speaks (``openai`` + ``responses``/``chat``, ``xai-sdk`` + ``native``, ``openrouter`` +
+  ``chat``).
+- **`tuning: Mapping[str, Any]`** — what the adapter is tuned with on every call, which in a
+  deployment is the operator's ``model_params.json`` after the harness-owned keys are stripped —
+  on the ``openai`` SDK including the operator's part of ``extra_body``/``extra_headers`` and never
+  the harness's wiring in them (`_basecradle._reported_tuning`). An empty mapping is a statement
+  (*nothing is tuned*); an absent attribute is not, and the brief says nothing about tuning rather
+  than claim the defaults apply.
+
+Each is read alone, and a missing one costs only its own line; an adapter with no ``model`` gets no
+``brain`` part at all, because naming a brain whose model is unknown would be the confabulation
+this part exists to stop.
+
 An adapter that implements none of them still works: the budget falls back to a conservative floor,
 with no usage to read it never triggers compaction, a truncated turn goes undetected exactly as it
-did before #490, nothing is placed on the wire, no conversation is bound, and every image is shown.
-A capability is a question, not a contract.
+did before #490, nothing is placed on the wire, no conversation is bound, every image is shown, and
+the brief simply names no brain. A capability is a question, not a contract.
 """
 
 from __future__ import annotations
