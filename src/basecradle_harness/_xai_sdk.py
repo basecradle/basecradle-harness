@@ -77,6 +77,7 @@ Stateless per turn: the full conversation is sent every call and the harness own
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -222,6 +223,11 @@ class XaiSdkProvider:
     #: endpoint it can reach, and grok's cache is automatic. It does carry a routed-*server* one —
     #: the cache is per-server, which `bind_conversation` addresses (issue #431).
     cache_mode = AUTOMATIC
+
+    #: The ``AI_SDK`` this adapter is, and the one surface it speaks. Read with `provider`, `model`
+    #: and `tuning` into the brief's ``brain`` part (issue #564).
+    sdk = "xai-sdk"
+    surface = DEFAULT_SURFACE
 
     def __init__(
         self,
@@ -468,6 +474,17 @@ class XaiSdkProvider:
             name,
             reason,
         )
+
+    @property
+    def tuning(self) -> dict[str, Any]:
+        """The keyword parameters this adapter adds to every call — for an agent's brain, its
+        ``model_params.json``.
+
+        What the brief's ``brain`` part tells the agent it is tuned with (issue #564). A deep copy,
+        because the fleet's tuning is nested (``reasoning: {"effort": …}``) and a reader must never
+        reach what the next call sends.
+        """
+        return copy.deepcopy(self._default_params)
 
     def bind_conversation(self, conversation: str | None) -> None:
         """Route this adapter's next calls to the server holding `conversation`'s prefix (#431).

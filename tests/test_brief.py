@@ -13,6 +13,7 @@ only ever re-derives the tags from the table under test would agree with any tab
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -22,12 +23,14 @@ from basecradle import BaseCradle
 from basecradle_harness import (
     compose_brief,
     fetch_dashboard_md,
+    render_brain,
     render_budget,
     render_defects,
     render_manifest,
     render_mcp,
 )
 from basecradle_harness._brief import (
+    BRAIN_HEADER,
     BRIEF_FENCE_LITERALS,
     BRIEF_TAGS,
     brief_parts,
@@ -98,6 +101,119 @@ def test_render_budget_is_none_without_a_budget():
     assert render_budget(0) is None
 
 
+# --- render_brain (issue #564) --------------------------------------------------
+
+
+def _adapter(**capabilities):
+    """An adapter as `render_brain` sees one: nothing but the attributes it declares."""
+    return SimpleNamespace(**capabilities)
+
+
+def test_render_brain_names_the_model_and_the_stack_that_calls_it():
+    """The trigger, answered: an agent asked which model it runs reads the id off its own brief."""
+    text = render_brain(
+        _adapter(model="gpt-6-sol", provider="openai", sdk="openai", surface="responses", tuning={})
+    )
+    assert text.splitlines() == [
+        BRAIN_HEADER,
+        "- Model: `gpt-6-sol`",
+        "- Provider: `openai`",
+        "- SDK: `openai`",
+        "- Surface: `responses`",
+        "- Tuning: none set, so the provider's defaults apply",
+    ]
+
+
+def test_render_brain_names_every_tuning_value_as_json():
+    """Set tuning shows each key with its value as JSON — nested objects and lists included.
+
+    The shapes are the fleet's own: a top-level effort (@briggs), and a nested effort beside a
+    routing pin (@glm-5.2). JSON keeps a string, a number and an object each unambiguous.
+    """
+    text = render_brain(
+        _adapter(
+            model="z-ai/glm-5.2",
+            provider="openrouter",
+            sdk="openrouter",
+            surface="chat",
+            tuning={
+                "provider": {"only": ["novita", "baidu"]},
+                "reasoning": {"effort": "xhigh"},
+                "temperature": 0.2,
+            },
+        )
+    )
+    assert text.splitlines()[-4:] == [
+        "- Tuning, applied to every call:",
+        '  - provider = {"only": ["novita", "baidu"]}',
+        '  - reasoning = {"effort": "xhigh"}',
+        "  - temperature = 0.2",
+    ]
+    assert "none set" not in text
+
+
+def test_render_brain_says_the_defaults_apply_only_when_nothing_is_tuned():
+    """An empty mapping is a statement — nothing is tuned — and it answers "what effort am I at?"."""
+    untuned = render_brain(_adapter(model="grok-4.7", tuning={}))
+    tuned = render_brain(_adapter(model="grok-4.7", tuning={"reasoning_effort": "xhigh"}))
+
+    assert "- Tuning: none set, so the provider's defaults apply" in untuned.splitlines()
+    assert "reasoning_effort" not in untuned
+    assert '  - reasoning_effort = "xhigh"' in tuned.splitlines()
+    assert "defaults apply" not in tuned
+
+
+def test_render_brain_claims_nothing_about_tuning_an_adapter_does_not_declare():
+    """No `tuning` attribute is not "none set": the adapter said nothing, so neither does the part."""
+    text = render_brain(_adapter(model="gpt-4o", provider="openai"))
+    assert text.splitlines() == [BRAIN_HEADER, "- Model: `gpt-4o`", "- Provider: `openai`"]
+
+
+def test_a_missing_capability_costs_only_its_own_line():
+    # A third-party adapter answers what it can; each field is read alone.
+    text = render_brain(_adapter(model="local-llama", surface="chat", tuning={"top_p": 0.9}))
+    assert text.splitlines() == [
+        BRAIN_HEADER,
+        "- Model: `local-llama`",
+        "- Surface: `chat`",
+        "- Tuning, applied to every call:",
+        "  - top_p = 0.9",
+    ]
+
+
+@pytest.mark.parametrize("model", [None, ""])
+def test_render_brain_is_none_without_a_model(model):
+    """Told it has a brain and not which, an agent is invited to guess — so there is no part."""
+    assert render_brain(_adapter(model=model, provider="openai", tuning={})) is None
+    assert render_brain(object()) is None
+
+
+def test_a_tuning_value_json_cannot_spell_does_not_cost_the_brief():
+    """A library caller's adapter may carry any object; the part says what it is, never raises."""
+
+    class Sentinel:
+        def __str__(self):
+            return "custom-sampler"
+
+    looped: list = []
+    looped.append(looped)  # a value that contains itself, which JSON cannot spell at all
+    text = render_brain(
+        _adapter(
+            model="gpt-4o",
+            tuning={
+                "sampler": Sentinel(),
+                "stop": ["»"],
+                "bias": {(1, 2): 0.5},  # a key JSON will not take, which `default` never sees
+                "looped": looped,
+            },
+        )
+    )
+    assert '  - sampler = "custom-sampler"' in text.splitlines()
+    assert "  - bias = {(1, 2): 0.5}" in text.splitlines()
+    assert "  - looped = [[...]]" in text.splitlines()
+    assert '  - stop = ["»"]' in text.splitlines()  # the character the model reads, not \u00bb
+
+
 # --- compose_brief ------------------------------------------------------------
 
 
@@ -114,6 +230,29 @@ def test_compose_brief_places_the_budget_after_the_now_anchor():
     )
     assert brief == fenced(
         ("now", "NOW"),
+        ("budget", "BUDGET"),
+        ("initialize", "INIT"),
+        ("manifest", "MANIFEST"),
+        ("dashboard", "DASH"),
+        ("system_prompt", "CHARTER"),
+    )
+
+
+def test_compose_brief_places_the_brain_between_the_now_anchor_and_the_budget():
+    # What runs the turn is a standing fact, like how long it may run: both are read up front,
+    # right after "now" (issue #564).
+    brief = compose_brief(
+        now="NOW",
+        brain="BRAIN",
+        budget="BUDGET",
+        initialize="INIT",
+        manifest="MANIFEST",
+        dashboard="DASH",
+        system_prompt="CHARTER",
+    )
+    assert brief == fenced(
+        ("now", "NOW"),
+        ("brain", "BRAIN"),
         ("budget", "BUDGET"),
         ("initialize", "INIT"),
         ("manifest", "MANIFEST"),
@@ -235,7 +374,7 @@ def test_compose_brief_is_none_when_nothing_to_say():
 
 
 def test_every_part_is_fenced_with_the_name_of_its_source():
-    """The whole rule in one assertion: all nine parts, each in its own named tag pair.
+    """The whole rule in one assertion: every part, each in its own named tag pair.
 
     Tag text is spelled **literally** here rather than read off `BRIEF_TAGS`, because this is the
     test that says what the tags *are*. A file-backed part is tagged with its filename, so a
@@ -245,11 +384,13 @@ def test_every_part_is_fenced_with_the_name_of_its_source():
     """
     brief = compose_brief(
         now="NOW",
+        brain="BRAIN",
         budget="BUDGET",
         initialize="INIT",
         manifest="MANIFEST",
         defects="DEFECT",
         safety="SAFETY",
+        mcp="MCP",
         dashboard="DASH",
         memory="MEM",
         system_prompt="CHARTER",
@@ -257,11 +398,13 @@ def test_every_part_is_fenced_with_the_name_of_its_source():
 
     assert brief == (
         "<now>\nNOW\n</now>\n\n"
+        "<brain>\nBRAIN\n</brain>\n\n"
         "<budget>\nBUDGET\n</budget>\n\n"
         "<initialize.md>\nINIT\n</initialize.md>\n\n"
         "<manifest>\nMANIFEST\n</manifest>\n\n"
         "<defects>\nDEFECT\n</defects>\n\n"
         "<safety>\nSAFETY\n</safety>\n\n"
+        "<mcp>\nMCP\n</mcp>\n\n"
         "<dashboard.md>\nDASH\n</dashboard.md>\n\n"
         "<memory>\nMEM\n</memory>\n\n"
         "<system-prompt.md>\nCHARTER\n</system-prompt.md>"
@@ -460,6 +603,7 @@ def test_the_parts_still_partition_the_brief_with_their_tags_charged():
     """
     parts = brief_parts(
         now="Current Time: 2026-07-26 12:00:00 UTC (+00:00, Sunday)",
+        brain=render_brain(_adapter(model="gpt-6-sol", provider="openai", tuning={})),
         budget="Step budget: 24 steps.",
         initialize="Operate like this.",
         manifest="Your active tools right now:\n- weather",

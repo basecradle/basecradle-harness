@@ -370,14 +370,15 @@ def test_a_session_with_no_brief_reports_no_brief(tmp_path, caplog):
     assert fields["tools"] + fields["history"] + fields["images"] == fields["total"]
 
 
-@pytest.mark.parametrize(
-    "part", ["now", "budget", "initialize", "manifest", "defects", "safety", "dashboard", "memory"]
-)
+@pytest.mark.parametrize("part", tuple(BRIEF_TAGS))
 def test_each_composed_brief_part_reaches_the_line_under_its_own_name(tmp_path, caplog, part):
     """The trigger's actual question, part by part — charter vs. manifest vs. dashboard vs. memory.
 
     Every seam `compose_brief` has, so a part added to the brief without a name on this line is a
-    part the attribution silently folds into ``brief`` and nobody can see.
+    part the attribution silently folds into ``brief`` and nobody can see. Read off `BRIEF_TAGS`
+    rather than spelled here, because a spelled list is exactly how ``mcp`` went unchecked: a part
+    added to the composer (and, by `test_brief`, necessarily to that table) is covered the day it
+    lands — the brain included (issue #564).
     """
     absent = dict.fromkeys(("initialize", "manifest", "dashboard", "system_prompt"))
     parts = brief_parts(**{**absent, part: "content"})

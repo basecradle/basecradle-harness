@@ -753,6 +753,10 @@ _OWNED_OPENAI = frozenset(
         # the same thing, herding unrelated prefixes onto one server and defeating the affinity it
         # looks like it is asking for. The warning is the point.
         "prompt_cache_key",
+        # What the adapter's `tuning` names (issue #564) — set by this layer, which alone can still
+        # tell the operator's keys from the harness's inside the merged `extra_body`/`extra_headers`.
+        # A real constructor arg, so owning it is what makes a stray key a warning, not a TypeError.
+        "reported_tuning",
     }
 )
 _OWNED_XAI_SDK = frozenset(
@@ -854,6 +858,37 @@ def _merge_extra_body(params_extra_body: Any, harness_extra_body: Any) -> Any:
             )
         return {**params_extra_body, **harness_extra_body}
     return harness_extra_body or params_extra_body or None
+
+
+def _reported_tuning(
+    params: Mapping[str, Any],
+    *,
+    extra_body: Any = None,
+    extra_headers: Any = None,
+    harness_body: Any = None,
+    harness_headers: Any = None,
+) -> dict[str, Any]:
+    """What an ``openai``-SDK agent is told it is tuned with: the operator's part of every call.
+
+    The keyword params, plus the operator's own ``extra_body`` and ``extra_headers`` from
+    ``model_params.json`` minus any key the harness set over them (`_merge_extra_body`,
+    `_merge_extra_headers` — harness wins, so the operator's value for that key is never sent). The
+    harness's wiring in those two seams is not tuning and is not named: an agent told it was tuned
+    with its own Live Search plumbing would be told something false (issue #564).
+
+    Built here because this is the last place the two are still apart; the adapter receives one
+    merged dict per seam. A seam that is not a mapping is reported as the operator wrote it.
+    """
+    reported = dict(params)
+    for key, own, harness in (
+        ("extra_body", extra_body, harness_body),
+        ("extra_headers", extra_headers, harness_headers),
+    ):
+        if isinstance(own, Mapping):
+            own = {k: v for k, v in own.items() if k not in (harness or {})}
+        if own:
+            reported[key] = own
+    return reported
 
 
 def _merge_extra_headers(params_headers: Any, harness_headers: Any) -> Any:
@@ -1147,6 +1182,12 @@ def _provider_from_config(
             surface=surface,
             extra_body=extra_body,
             extra_headers=params_extra_headers,
+            reported_tuning=_reported_tuning(
+                params,
+                extra_body=params_extra_body,
+                extra_headers=params_extra_headers,
+                harness_body=harness_extra_body,
+            ),
             **params,
         )
     if provider == "openrouter":
@@ -1163,9 +1204,8 @@ def _provider_from_config(
         # On this cell the pin is a **body** field, so it rides `extra_body` — the openai SDK's
         # escape hatch — rather than a keyword. Same pin, different spelling: which one a wire
         # takes is this layer's knowledge, which is why `routing` is a list of slugs at the seam.
-        routed = _merge_extra_body(
-            params_extra_body, {"provider": _routing_pin(routing)} if routing else None
-        )
+        harness_extra_body = {"provider": _routing_pin(routing)} if routing else None
+        routed = _merge_extra_body(params_extra_body, harness_extra_body)
         return OpenAIProvider(
             model,
             api_key=api_key,
@@ -1175,6 +1215,13 @@ def _provider_from_config(
             extra_body=routed,
             extra_headers=_merge_extra_headers(
                 params_extra_headers, OPENROUTER_ROUTING_METADATA_HEADER
+            ),
+            reported_tuning=_reported_tuning(
+                params,
+                extra_body=params_extra_body,
+                extra_headers=params_extra_headers,
+                harness_body=harness_extra_body,
+                harness_headers=OPENROUTER_ROUTING_METADATA_HEADER,
             ),
             **params,
         )
@@ -1191,6 +1238,9 @@ def _provider_from_config(
         code_container=code_container,
         extra_body=params_extra_body,
         extra_headers=params_extra_headers,
+        reported_tuning=_reported_tuning(
+            params, extra_body=params_extra_body, extra_headers=params_extra_headers
+        ),
         **params,
     )
 
