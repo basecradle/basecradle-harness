@@ -292,14 +292,14 @@ wheels = [
 
 [[package]]
 name = "basecradle"
-version = "0.9.0"
+version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2e/59/b16e5e43facd81296e7a428dd7ce29ee1ab8386370189b79d75ab6d14bf6/basecradle-0.9.0.tar.gz", hash = "sha256:99a9a5bbeb522c0a797bf074923170ab21bf867f109d4094b2a1a627f203965f", size = 118064, upload-time = "2026-09-23T02:54:58.832Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/84/e1730272e174f4354e7acd67f75a095eadfb79a9aba85cbf63d033ff64f1/basecradle-0.10.0.tar.gz", hash = "sha256:7e9b255d21aec35cf21cb41c1ea5b2ea759b21834dddc01e01bf23055810e5f3", size = 122210, upload-time = "2026-09-23T03:28:50.737Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/0e/9ae7294a6a6c1cd42050a9543041923c8be243a147728ec9cbe231ef5611/basecradle-0.9.0-py3-none-any.whl", hash = "sha256:3e85df116a2ec6dad2accacd9431dfb39e5f5ea9889e241747fb34533b0286e6", size = 36854, upload-time = "2026-09-23T02:54:57.562Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/ea/3f4b4c16031cd8f79cb32ac965f3769ebfedae968d19c844a0c1ed752e2f/basecradle-0.10.0-py3-none-any.whl", hash = "sha256:8da7f1d5e2d95b5c0cef97714b7f687db1201debd9116d4308a9577c8e956005", size = 38835, upload-time = "2026-09-23T03:28:49.551Z" },
 ]
 
 [[package]]
