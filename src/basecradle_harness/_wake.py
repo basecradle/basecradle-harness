@@ -126,6 +126,7 @@ from basecradle_harness._brief import (
     render_manifest,
     render_mcp,
     render_safety,
+    render_your_home,
 )
 from basecradle_harness._code import CodeExecutionBridge
 from basecradle_harness._describer import (
@@ -1524,10 +1525,11 @@ class WakeAgent:
             seeds the whole backlog.
         onboard: Show the persistent operating brief on every wake (see
             `_wake_brief`). On by default. When on, the brief — `initialize.md`
-            + the live tool manifest + the live `dashboard.md` + `system-prompt.md`
-            — supersedes a static turn-0 charter, so the agent's standing context
-            stays recent in a long transcript rather than aging out at turn 1. Off
-            wakes with only the operator's charter, seeded once at turn 0.
+            + the live tool manifest + "Your Home" for a shell agent + the live
+            `dashboard.md` + `system-prompt.md` — supersedes a static turn-0
+            charter, so the agent's standing context stays recent in a long
+            transcript rather than aging out at turn 1. Off wakes with only the
+            operator's charter, seeded once at turn 0.
         tool_manifest: ``(name, note)`` for the agent's active tools, rendered into
             the brief so it names exactly what the model can call. Defaults to the
             harness's registered function tools (no notes) when not supplied;
@@ -2912,7 +2914,9 @@ class WakeAgent:
         generated manifest of the agent's *active* tools, any **tool defect** (a shipped default
         that failed to load), the **safe-by-default opt-out notice** (active MCP servers /
         policy-refused drop-ins — omitted when there are none), what each **MCP server** is
-        (`render_mcp` — omitted when none has anything to say), the live `dashboard.md` primer
+        (`render_mcp` — omitted when none has anything to say), **Your Home** (`render_your_home` —
+        the six standing folders and their law, composed for every agent holding the ``SHELL``
+        capability and for no other, issue #571), the live `dashboard.md` primer
         (fetched fresh each wake; a fetch failure degrades to omitting it, never breaking the wake),
         the memory provider's recalled
         **context** for this turn (its `context` hook — omitted when there is none or the
@@ -2947,6 +2951,7 @@ class WakeAgent:
                 defects=render_defects(self.defect_notices),
                 safety=render_safety(self.safety_notices),
                 mcp=render_mcp(self.mcp_about),
+                your_home=self._your_home(),
                 dashboard=fetch_dashboard_md(self.client),
                 memory=self._memory_context(query),
                 system_prompt=system_prompt_text(),
@@ -2978,6 +2983,27 @@ class WakeAgent:
         except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
             _log.warning(
                 "Could not describe the model provider; omitting the brain part.", exc_info=True
+            )
+            return None
+
+    def _your_home(self) -> str | None:
+        """The brief's ``your_home`` part, guarded — a broken install costs this part, loudly.
+
+        Keyed on the tools the harness actually registered (`render_your_home`), never on the
+        resolver's manifest or the persona prompt: the registry is what the policy admitted, so a
+        tool that requires ``SHELL`` there is a shell the model can really call.
+
+        The only way this raises is a package whose own data file is missing or unreadable, which is
+        a defect rather than a transient: a shell agent would lose the law for its folders on every
+        wake until someone reinstalls. So it logs at **ERROR** — the level that pages — and costs
+        this one part, never the rest of the brief.
+        """
+        try:
+            return render_your_home(self.harness.tools)
+        except Exception:  # noqa: BLE001 - one part's failure must not cost the whole brief
+            _log.error(
+                "Could not compose the Your Home section; omitting it from the brief.",
+                exc_info=True,
             )
             return None
 

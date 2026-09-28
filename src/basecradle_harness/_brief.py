@@ -34,6 +34,12 @@ The brief is composed, in order, of a current-time anchor followed by four parts
    described itself in its ``initialize`` ``instructions`` or carries an operator's ``note``, both,
    each labelled with whose words it is. Right after the safe-by-default notice that names the
    servers, so an agent reads which servers it has, then what they are.
+2c. **Your Home** (`render_your_home`, issue #571) — the agent's home directory, its six standing
+   folders and the law that governs each, and the binding for `~/vault`. Composed for every agent
+   that holds the ``SHELL`` capability — the only way to reach those folders — from the same
+   packaged bytes (`_agent_home/your-home.md`, a verbatim copy of the NOC's canonical) on the same
+   code path, and for no other agent. It is the harness's text, never the agent's: nothing reads
+   the persona prompt to decide whether to compose it, and nothing edits the persona prompt.
 3. **The live `dashboard.md`** — the platform's *maintained* primer (identity, surfaces,
    the concept map — including how trust works), fetched fresh from ``/users/dashboard.md``.
    A fetch failure degrades gracefully: the brief is composed without it, never broken.
@@ -44,13 +50,13 @@ live dashboard fetch (`fetch_dashboard_md`), is isolated and tolerant by constru
 
 **Every part is fenced in a named tag pair** (issue #509). The brief mixes authority levels
 inside one ~54 K-character system turn — `initialize.md` and `system-prompt.md` are
-*instructions*, the now/brain/budget/manifest/defect/safety parts are *harness-generated*, the
+*instructions*, and so is a shell agent's `your-home.md` (the harness's own binding), the now/brain/budget/manifest/defect/safety parts are *harness-generated*, the
 dashboard is *fetched live* and carries peer-authored strings (timeline names, handles, about
 text), and the memory part is *recalled excerpts of past conversation*. Input Security tells the
 agent its only instructions are this brief and its charter; without a boundary per part, the agent
 has no way to see inside the brief where instruction ends and fetched data begins. The recall
 block got a fence first, for exactly that reason (`_mempalace._fenced`); `BRIEF_TAGS` applies the
-same reasoning to all eleven parts, uniformly — no part unfenced, no part special.
+same reasoning to all twelve parts, uniformly — no part unfenced, no part special.
 
 The framing belongs to the **composer**, never to the content: a prompt file on disk that
 carried its own wrapper tag would be content claiming to be structure, and an operator editing
@@ -70,7 +76,10 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
+from importlib import resources
+
+from basecradle_harness._policy import SHELL
 
 #: What separates two parts of the composed brief. Named because `brief_section_sizes` has to
 #: charge it to somebody for the sizes to be a true partition of the joined text.
@@ -81,7 +90,8 @@ _JOIN = "\n\n"
 #: **The tag is the source's name.** A *file-backed* part is tagged with its filename, so an agent
 #: that can read its own config home sees the same names in its brief that it sees in
 #: ``<config-home>/prompts/`` and on the platform — `initialize.md`, `system-prompt.md`,
-#: `dashboard.md`. A *generated* part is tagged with its `brief_parts` name, which is also the
+#: `dashboard.md` — and `your-home.md` is the name of the package's own copy, which the installer
+#: deliberately never places in the config home (see `YOUR_HOME_RESOURCE`). A *generated* part is tagged with its `brief_parts` name, which is also the
 #: name the context-attribution line reports it under, so a brief dump and a log line are read
 #: with one vocabulary rather than two.
 #:
@@ -97,6 +107,7 @@ BRIEF_TAGS: dict[str, str] = {
     "defects": "defects",
     "safety": "safety",
     "mcp": "mcp",
+    "your_home": "your-home.md",
     "dashboard": "dashboard.md",
     "memory": "memory",
     "system_prompt": "system-prompt.md",
@@ -132,10 +143,11 @@ _FENCE_LITERAL = re.compile(
 #:   `<mempalace-recall>` pair for this reason; that strip covers only the provider's inner
 #:   fence, so the outer one is stripped here.)
 #:
-#: The other eight do not need it and deliberately do not get it: ``now``, ``brain``, ``budget``,
+#: The other nine do not need it and deliberately do not get it: ``now``, ``brain``, ``budget``,
 #: ``manifest``, ``defects`` and ``safety`` are composed by the harness out of its own constants
-#: and the operator's config, and ``initialize`` / ``system_prompt`` are files only the operator
-#: writes. A strip there would be editing text nobody untrusted authored.
+#: and the operator's config, ``your_home`` is a file the harness itself ships, and ``initialize``
+#: / ``system_prompt`` are files only the operator writes. A strip there would be editing text
+#: nobody untrusted authored.
 #:
 #: **Both literals of every part's pair are stripped, not just the part's own closer.** A peer who
 #: plants another part's *opening* tag inside a data block does not break that block's boundary,
@@ -213,6 +225,63 @@ def render_mcp(about: Sequence[str] | None) -> str | None:
         "instructions."
     )
     return "\n\n".join([header, *blocks])
+
+
+#: Where the harness's copy of the "Your Home" section lives inside the package (issue #571).
+#:
+#: **Outside `_defaults/`, deliberately.** The installer copies everything under `_defaults/` into
+#: the config home, where the operator owns it and may edit it — which is right for a charter and
+#: wrong for this text. "Your Home" is the harness's, and the founder's ruling is that every shell
+#: agent receives it in full, the same bytes, on the same code path; a copy an operator can edit is
+#: a copy that can differ per agent.
+#:
+#: **A copy, never an original.** The canonical text is the NOC's (`basecradle-noc`
+#: ``deploy/agent-home/your-home.md``), which provisions the same bytes onto every fleet box and
+#: byte-diffs this file against it. An edit here is therefore always a re-sync from the NOC, never
+#: a local rewording — which is why `test_brief` pins its checksum.
+YOUR_HOME_RESOURCE = ("_agent_home", "your-home.md")
+
+
+def your_home_text() -> str:
+    """The "Your Home" section exactly as the package ships it — the file's text, unmodified.
+
+    Read on demand rather than at import: a package missing its own data file is a broken install,
+    and the wake reports that loudly as one missing part (`_wake.WakeAgent._your_home`) rather than
+    as an import error that would take every wake down with it.
+    """
+    return (
+        resources.files("basecradle_harness")
+        .joinpath(*YOUR_HOME_RESOURCE)
+        .read_text(encoding="utf-8")
+    )
+
+
+def render_your_home(tools: Iterable[object]) -> str | None:
+    """The brief's ``your_home`` part for an agent with a shell, or ``None`` (issue #571).
+
+    **One question decides it, and it is about the agent's capability, never its words:** does a
+    registered tool require ``SHELL``? The six folders are reachable only through a shell on the
+    agent's own machine, so an agent that has one needs their law, and an agent that does not would
+    be reading rules about places it cannot go. The policy layer is what grants ``SHELL`` (the
+    unlocked profile, plus the ``shell`` opt-in), so a tool that holds it is the fact of a shell
+    agent — the same fact the ``shell`` tool's note depends on when it points here.
+
+    Three things are the founder's ruling, not details, and each has a tempting broken form:
+
+    - **The same bytes for every shell agent.** No switch, no paragraph skipped. The text is never
+      assembled from pieces, so there is nothing to leave out.
+    - **Nothing reads the persona prompt.** A section the agent's own letter already covered is
+      still composed: whether it is composed depends on ``tools`` and nothing else, which is why
+      this function is not handed the charter at all.
+    - **Nothing writes the persona prompt.** The letter is the agent's and this section is the
+      harness's — two files, two owners.
+
+    The file's closing newline is dropped because the fence supplies one (`_fence`), so the text
+    between ``<your-home.md>`` and ``</your-home.md>`` is the shipped file byte for byte.
+    """
+    if not any(SHELL in getattr(tool, "requires", frozenset()) for tool in tools):
+        return None
+    return your_home_text().rstrip("\n")
 
 
 def render_defects(notices: Sequence[str] | None) -> str | None:
@@ -352,6 +421,7 @@ def brief_parts(
     defects: str | None = None,
     safety: str | None = None,
     mcp: str | None = None,
+    your_home: str | None = None,
     dashboard: str | None,
     memory: str | None = None,
     system_prompt: str | None,
@@ -382,6 +452,7 @@ def brief_parts(
         ("defects", defects),
         ("safety", safety),
         ("mcp", mcp),
+        ("your_home", your_home),
         ("dashboard", dashboard),
         ("memory", memory),
         ("system_prompt", system_prompt),
@@ -465,6 +536,7 @@ def compose_brief(
     defects: str | None = None,
     safety: str | None = None,
     mcp: str | None = None,
+    your_home: str | None = None,
     dashboard: str | None,
     memory: str | None = None,
     system_prompt: str | None,
@@ -477,27 +549,31 @@ def compose_brief(
     agent has, then any **tool defect** (a shipped default that failed to load — issue #160 —
     right after the manifest it contradicts, so the agent reads "you have these tools, but this
     one is broken" together), then the **safe-by-default opt-out notice** (Group 5), then what
-    each **MCP server** is (issue #553 — right after the notice that names them), then the live
-    dashboard (where it is), then any recalled **memory**
+    each **MCP server** is (issue #553 — right after the notice that names them), then **Your
+    Home** for an agent with a shell (issue #571 — its folders and their law, after the tools that
+    reach them), then the live dashboard (where it is), then any recalled **memory**
     relevant to the turn (the memory provider's `context` hook — injected just before the
     charter, the way middleware memory systems inject retrieved context before the system
     prompt), then the personality charter. Any part may be absent — a missing dashboard (fetch
-    failed), a memory provider that recalled nothing, no MCP/policy opt-out, no broken default,
-    an operator who blanked their charter — and the brief is composed from whatever remains.
+    failed), a memory provider that recalled nothing, no MCP/policy opt-out, no broken default, an
+    agent with no shell, an operator who blanked their charter — and the brief is composed from
+    whatever remains.
     With nothing at all, returns ``None``.
 
-    ``now``, ``brain``, ``budget``, ``defects``, ``safety``, ``mcp``, and ``memory`` default to
-    ``None`` so a caller with none of them (a test exercising composition, or the common no-MCP /
-    default-SQLite-provider case) composes exactly the brief it did before these seams existed.
+    ``now``, ``brain``, ``budget``, ``defects``, ``safety``, ``mcp``, ``your_home`` and ``memory``
+    default to ``None`` so a caller with none of them (a test exercising composition, or the common
+    no-MCP / no-shell / default-SQLite-provider case) composes exactly the brief it did before
+    these seams existed.
     The **brain** and the **step budget** ride right after the time anchor and before the
     operating guidance — standing facts about what runs the turn and how it is bounded, so the
     model reads them up front (issues #564, #243).
 
     Every part that survives is **fenced in its own named tag pair** on the way out — the
-    filename for a file-backed part (`initialize.md`, `dashboard.md`, `system-prompt.md`), the
-    part name otherwise (see `BRIEF_TAGS`). The memory part nests whatever the active provider
-    returned *inside* `<memory>` unchanged, so MemPalace's own `<mempalace-recall>` block and its
-    framing sentence end up nested there rather than renamed or replaced.
+    filename for a file-backed part (`initialize.md`, `your-home.md`, `dashboard.md`,
+    `system-prompt.md`), the part name otherwise (see `BRIEF_TAGS`). The memory part nests
+    whatever the active provider returned *inside* `<memory>` unchanged, so MemPalace's own
+    `<mempalace-recall>` block and its framing sentence end up nested there rather than renamed or
+    replaced.
 
     The order itself lives in `brief_parts`; this is the join over it. A caller that also needs
     the per-part sizes (the wake, for the context-attribution line) calls `brief_parts` once and
@@ -514,6 +590,7 @@ def compose_brief(
             defects=defects,
             safety=safety,
             mcp=mcp,
+            your_home=your_home,
             dashboard=dashboard,
             memory=memory,
             system_prompt=system_prompt,

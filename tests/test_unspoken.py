@@ -391,6 +391,20 @@ def test_the_two_nudges_are_identical_after_their_opening_clause():
 # === the standing guard: nothing the model reads may invent a supervisor =======
 
 
+def _shipped_note(filename):
+    """A shipped tool plugin's manifest ``note``, loaded the way the plugin loader loads it.
+
+    Through `_plugins._import_file`, never a plain import: that is what keeps a load from leaving
+    bytecode inside the package's `_defaults/` tree, which the installer walks as text.
+    """
+    from importlib.resources import as_file, files
+
+    from basecradle_harness._plugins import _import_file
+
+    with as_file(files("basecradle_harness").joinpath("_defaults", "tools", filename)) as path:
+        return _import_file(path).PLUGIN.note
+
+
 def _model_facing_strings():
     """Every shipped string the *model* reads — the surface the operator frame must stay out of.
 
@@ -405,6 +419,7 @@ def _model_facing_strings():
         render_defects,
         render_mcp,
         render_safety,
+        render_your_home,
     )
     from basecradle_harness._engine import (
         _RESERVE_NUDGE,
@@ -414,6 +429,7 @@ def _model_facing_strings():
     )
     from basecradle_harness._install import prompt_text
     from basecradle_harness._mcp import McpServerConfig, _about, _withholding, withheld_refusal
+    from basecradle_harness._policy import SHELL
 
     now = __import__("datetime").datetime(2026, 7, 14, tzinfo=__import__("datetime").timezone.utc)
     noted = McpServerConfig(name="pw", command="x", note="Headless Chromium on this box.")
@@ -444,6 +460,9 @@ def _model_facing_strings():
         "safety opt-out": render_safety(["mcp: filesystem"]) or "",
         # Issue #553: what the model is told about its MCP servers and the tools it does not get.
         "mcp part": render_mcp([_about(noted, _Client())]) or "",
+        # Issue #571: the home section every shell agent reads, and the note that points it there.
+        "your home": render_your_home([SimpleNamespace(requires=frozenset({SHELL}))]),
+        "shell note": _shipped_note("shell.py"),
         "withheld refusal": withheld_refusal(
             "pw", "browser_run_code_unsafe", waivable=True, offered=["browser_evaluate"]
         ),

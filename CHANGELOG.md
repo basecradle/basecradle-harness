@@ -7,6 +7,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.133.0] - 2026-09-28
+
+### Added: Your Home — one brief part teaches every shell agent its six standing folders (issue #571)
+
+Every agent home on a fleet box now carries six standing folders — `~/scratch`, `~/workspace`,
+`~/repos`, `~/scripts`, `~/vault`, `~/wallets` — each with a `README.md` that is its law
+(basecradle-noc#832 provisions them). Until now the only place an agent learned about any of them
+was two sentences in the `shell` tool's note, which named two folders and nothing else. The brief
+gains a twelfth part, fenced `<your-home.md>`, after the tool parts and before the dashboard: the
+home directory, what each folder is for, the one test for where a secret lives (*can it be revoked
+without moving the funds?*), and the binding for `~/vault`.
+
+The text is a founder-approved standard (@origin, 2026-09-28), and three properties are the ruling
+rather than details:
+
+- **One plumbing, no exceptions.** Every agent holding the `SHELL` capability — the `shell` opt-in
+  under the unlocked profile — gets the whole section, the same bytes, on the same code path
+  (`render_your_home(harness.tools)`). There is no per-agent switch and no paragraph is ever
+  skipped. Nothing reads the persona prompt to decide what to include: the renderer is handed the
+  registered tools and nothing else, and a persona that already carries its own vault binding still
+  gets the section in full. An agent without a shell cannot reach the folders, so it gets nothing.
+- **The harness never edits a persona prompt.** The letter is the agent's; this section is the
+  harness's. Two files, two owners.
+- **The text is the NOC's, carried verbatim.** The canonical copy is `deploy/agent-home/your-home.md`
+  in basecradle-noc; the package ships a byte-for-byte copy at
+  `basecradle_harness/_agent_home/your-home.md` (sha256 `44d39fb6…d290ec4`). It sits outside
+  `_defaults/` on purpose, so the installer never copies it into a config home where an operator
+  could edit it per agent. The NOC's drift guard byte-diffs the two, and a test pins the checksum,
+  so an edit is always a re-sync from the NOC and never a local rewording.
+
+The text between the fence tags is the shipped file byte for byte. A package missing its own copy
+costs that one part and logs at **ERROR**, because it is a broken install that recurs on every wake,
+never the rest of the brief. It is measured on the context-attribution line as `brief_your_home=`,
+never persisted, and never mined — `test_mining.py` carries a line of the real section as its
+sentinel, and `test_unspoken.py` checks it for the supervisor frame.
+
+### Changed: the `shell` tool's note is a pointer to Your Home
+
+The note no longer describes `~/scratch` and `~/workspace` itself; it says the home directory and
+its six standing folders are described under "Your Home", and that each folder's README is its law.
+The steer toward keeping private work in the home rather than on a timeline (issue #263) moved with
+it and still reaches exactly the agents that carry the note. `_defaults/tools/shell.py` is a shipped
+default, so the next `basecradle-harness-install` refreshes an untouched copy and writes
+`shell.py.new` beside an edited one.
+
 ## [0.132.0] - 2026-09-24
 
 ### Added: the brief names the agent's own brain — model, provider, SDK, surface and tuning (issue #564)
