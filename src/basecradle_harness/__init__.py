@@ -18,6 +18,7 @@ from basecradle_harness._brief import (
     render_manifest,
     render_mcp,
     render_safety,
+    render_your_home,
 )
 from basecradle_harness._code import CodeAttachTool, CodeExecutionBridge
 from basecradle_harness._confirmed import ConfirmedTimelineAction
@@ -199,6 +200,7 @@ __all__ = [
     "render_defects",
     "render_brain",
     "render_budget",
+    "render_your_home",
     "fetch_dashboard_md",
     # Provider contract + adapters
     "Provider",

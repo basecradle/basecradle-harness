@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from importlib import metadata
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -43,11 +44,13 @@ from basecradle_harness import (
     MarkStore,
     Message,
     MessagesTool,
+    Policy,
     ProviderBillingError,
     ProviderContextLengthError,
     ProviderPayloadTooLargeError,
     ReadPacer,
     SeenStore,
+    ShellTool,
     StaleTimelineError,
     Tool,
     WakeAgent,
@@ -56,8 +59,10 @@ from basecradle_harness import (
     install,
     render_brain,
 )
+from basecradle_harness import _brief as brief_module
 from basecradle_harness import _wake as wake_module
 from basecradle_harness._basecradle import _incoming_text, _messages_since, _parse_created_at
+from basecradle_harness._brief import your_home_text
 from basecradle_harness._cleanup import prune_settled_claims
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
@@ -493,13 +498,16 @@ def _brief_turns(agent):
     return [m for m in history if _is_brief(m)]
 
 
-def build_wake(home, provider=None, *, system_prompt=None, onboard=False, tools=None, **kwargs):
+def build_wake(
+    home, provider=None, *, system_prompt=None, onboard=False, tools=None, policy=None, **kwargs
+):
     """A fresh WakeAgent over `home` — a stand-in for one router-spawned process.
 
     The agent gets a `MessagesTool` by default, because since issue #293 that is the **only** way
     an agent can speak: a harness with no messages tool is a mute agent, and every test that
     asserts a post would be asserting the absence of a tool rather than the presence of a
-    decision. `tools=[]` builds the mute agent deliberately.
+    decision. `tools=[]` builds the mute agent deliberately. `policy` defaults to the harness's
+    own (locked); a shell agent passes `Policy.unlocked()`, the one profile that admits a shell.
     """
     provider = provider or CountingProvider()
     client = BaseCradle(token=FAKE_TOKEN)
@@ -508,6 +516,7 @@ def build_wake(home, provider=None, *, system_prompt=None, onboard=False, tools=
         system_prompt=system_prompt,
         home=home,
         tools=[MessagesTool()] if tools is None else tools,
+        policy=policy,
     )
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=onboard, **kwargs)
     return agent, provider
@@ -2344,6 +2353,37 @@ def test_from_env_hands_the_withheld_tools_and_server_notes_on(platform, wake_en
     assert agent.mcp_about == ["about pw"]
 
 
+@pytest.mark.parametrize(
+    ("profile", "opt_in"),
+    [("unlocked", ["shell"]), ("locked", ["shell"]), ("unlocked", [])],
+    ids=["unlocked-opted-in", "locked-opted-in", "unlocked-not-opted-in"],
+)
+def test_from_env_composes_your_home_exactly_for_the_shell_profile(
+    platform, wake_env, monkeypatch, profile, opt_in
+):
+    """Issue #571 on the production path: a real config home, under each half of the double gate.
+
+    Opted in and unlocked, the shipped shell plugin loads and the brief carries the section and the
+    note that points at it. Either gate alone — the opt-in under the locked profile, or the
+    unlocked profile with no opt-in — leaves the agent without a shell, and with it goes the
+    section: it cannot reach the folders, so it is told nothing about them.
+    """
+    install(os.environ["BASECRADLE_CONFIG_HOME"], opt_in=opt_in)
+    monkeypatch.setenv("HARNESS_PROFILE", profile)
+    monkeypatch.setenv("HARNESS_ONBOARD", "1")
+    serve_dashboard_md(platform)
+
+    agent = WakeAgent.from_env(timeline=TIMELINE_UUID)
+    brief = agent._compose_brief()
+
+    if profile == "unlocked" and opt_in:
+        assert _home_section(brief) == your_home_text()
+        assert 'described under "Your Home" in your instructions' in brief  # the shell note
+    else:
+        assert _home_section(brief) is None
+        assert '"Your Home"' not in brief
+
+
 def test_resolved_config_reports_the_resolved_mcp_request_timeout(wake_env, monkeypatch):
     """The MCP-timeout axis (issue #320): `--resolved-config` emits the **resolved** per-request
     MCP timeout — the exact value a wake would use, not a re-read of the raw env — so the NOC can
@@ -3076,6 +3116,130 @@ def test_an_adapter_that_cannot_describe_itself_costs_the_brain_and_not_the_brie
     assert "<brain>" not in brief
     assert "<now>" in brief and "Your active tools right now:" in brief  # everything else stands
     assert "omitting the brain part" in caplog.text
+
+
+def _home_section(brief: str) -> str | None:
+    """The text between the ``your-home.md`` fence tags, or ``None`` when the part is absent."""
+    if "<your-home.md>\n" not in brief:
+        return None
+    return brief.split("<your-home.md>\n", 1)[1].split("</your-home.md>", 1)[0]
+
+
+def _build_shell_wake(home, **kwargs):
+    """A shell agent: the unlocked profile plus the real, shipped `ShellTool` (issue #571)."""
+    return build_wake(
+        home,
+        tools=[MessagesTool(), ShellTool()],
+        policy=Policy.unlocked(),
+        onboard=True,
+        tool_manifest=[("messages", None), ("shell", None)],
+        **kwargs,
+    )
+
+
+def test_a_shell_agent_is_shown_your_home_byte_for_byte(platform, tmp_path, caplog):
+    """Issue #571, end to end: the packaged file, exactly, after the tools and before the dashboard.
+
+    The bytes between the fence tags are compared with the file itself rather than a phrase from
+    it — "byte-identical to the canonical" is the definition of done, and the canonical's checksum
+    is pinned against that same file in `test_brief`.
+    """
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="Where should I keep my notes?")))
+    agent, model = _build_shell_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    brief = _brief_shown(model)[0].content
+    assert _home_section(brief) == your_home_text()
+    assert brief.count("## Your Home") == 1
+    assert (
+        brief.index("</manifest>") < brief.index("<your-home.md>") < brief.index("<dashboard.md>")
+    )
+    # Measured under its own name on the attribution line, never folded into `brief`.
+    attribution = next(
+        r.getMessage() for r in caplog.records if "context attribution" in r.getMessage()
+    )
+    fenced_part = f"<your-home.md>\n{your_home_text()}</your-home.md>"
+    assert re.search(r"\bbrief_your_home=(\d+)", plain(attribution)).group(1) == str(
+        len(fenced_part) + 2
+    )
+
+
+def test_an_agent_without_a_shell_is_shown_no_home_section(platform, tmp_path):
+    """The locked profile cannot hold a shell, so it cannot reach the folders: no section at all."""
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="Where should I keep my notes?")))
+    agent, model = build_wake(tmp_path, onboard=True, tool_manifest=[("messages", None)])
+
+    agent.wake()
+
+    brief = _brief_shown(model)[0].content
+    assert _home_section(brief) is None
+    assert "## Your Home" not in brief
+    assert "Your active tools right now:" in brief  # the brief itself was composed
+
+
+@pytest.mark.parametrize(
+    "persona",
+    [
+        "You are Nova Digital.",
+        "You are Nova Digital.\n\n### The Vault (Binding)\n\nMy vault holds what I was entrusted.",
+        "You are Nova Digital.\n\n" + your_home_text(),
+    ],
+    ids=["silent-on-home", "own-vault-binding", "carries-the-whole-section"],
+)
+def test_your_home_is_composed_whatever_the_persona_prompt_says(platform, tmp_path, persona):
+    """The founder's ruling: one plumbing, no detection, and the persona letter is never touched.
+
+    A letter that already carries a vault binding — or the whole section — still gets the harness's
+    section, in full, from the same code path; and the letter reaches the model exactly as its owner
+    wrote it, with the file on disk byte-identical after the wake.
+    """
+    cfg = Path(os.environ["BASECRADLE_CONFIG_HOME"])
+    install(cfg)
+    letter = cfg / "prompts" / "system-prompt.md"
+    letter.write_text(persona, encoding="utf-8")
+    before = letter.read_bytes()
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, model = _build_shell_wake(tmp_path)
+
+    agent.wake()
+
+    brief = _brief_shown(model)[0].content
+    assert _home_section(brief) == your_home_text()
+    # Trimmed, as every prompt file always is on its way into the brief — and otherwise untouched.
+    assert f"<system-prompt.md>\n{persona.strip()}\n</system-prompt.md>" in brief
+    assert letter.read_bytes() == before  # the letter is the agent's: read, never written
+
+
+def test_a_missing_your_home_file_costs_that_part_loudly(platform, tmp_path, monkeypatch, caplog):
+    """A package without its own data file is a broken install: the part goes, and it pages.
+
+    ERROR rather than the brain part's WARNING, because this is not a caller's adapter having a bad
+    moment — it is a defect that recurs on every wake until someone reinstalls, and the shell agent
+    loses the law for its folders the whole time. Everything else in the brief stands.
+    """
+
+    def missing():
+        raise FileNotFoundError("_agent_home/your-home.md")
+
+    monkeypatch.setattr(brief_module, "your_home_text", missing)
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, model = _build_shell_wake(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        posted = agent.wake()
+
+    assert len(posted) == 1  # the peer was still answered
+    brief = _brief_shown(model)[0].content
+    assert _home_section(brief) is None
+    assert "Your active tools right now:" in brief and "<dashboard.md>" in brief
+    records = [r for r in caplog.records if "Your Home" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.ERROR]
 
 
 def test_a_dashboard_fetch_failure_does_not_break_the_wake(platform, tmp_path):

@@ -123,7 +123,7 @@ Two things follow from the compaction half that are easy to break by accident, s
 
 ## The Mining Boundary (Recurrence Guard)
 
-**A mining memory provider stores exactly two things: the text sent *into* the harness (a peer's message, a task's instructions, a delivered payload) and the *model's* output. Nothing the harness composes may ever reach the palace** — not the charter, not any part of the Turn-0 brief (the now line, the step budget, `initialize.md`, the tool manifest, the defect/safety notices, the dashboard, the recalled-memory section itself), not tool results (founder-stated 2026-08-29, issue #438; `_mining.py`, `_wake._observe`).
+**A mining memory provider stores exactly two things: the text sent *into* the harness (a peer's message, a task's instructions, a delivered payload) and the *model's* output. Nothing the harness composes may ever reach the palace** — not the charter, not any part of the Turn-0 brief (the now line, the brain, the step budget, `initialize.md`, the tool manifest, the defect/safety notices, what each MCP server says about itself, Your Home, the dashboard, the recalled-memory section itself), not tool results (founder-stated 2026-08-29, issue #438; `_mining.py`, `_wake._observe`).
 
 The defect this guards against is **a claim in a docstring standing in for a rule in the code**. `_observe` had *promised* the dialogue-only boundary since the memory seam shipped (#135) and nothing enforced it, so it was false on four paths at once and no test could fail. @briggs read the proof off his own Turn-0 recall: two of five injected hits were copies of the **recall block's own heading**, mined out of his brief and served back to him as memory, holding top-K slots real memories should have had. A boundary nothing measures is a comment.
 
@@ -282,6 +282,14 @@ Four invariants, each with an "obviously fine" broken form:
 to hang `needs_env` on (issue #427's shape without a `ToolPlugin`), and a `false` for a variable
 nobody wants is the `XAI_TEAM_ID` noise that map deliberately avoids. With a describer configured
 the map's contract holds exactly — *every `false` is an active capability that cannot do its job*.
+
+## Your Home — One Plumbing, No Exceptions (issue #571)
+
+Every fleet agent home carries six standing folders (`~/scratch`, `~/workspace`, `~/repos`, `~/scripts`, `~/vault`, `~/wallets`), each with a `README.md` that is its law, provisioned by the NOC (basecradle-noc#832). The harness teaches a shell agent about them in **one** brief part, `your_home` (`<your-home.md>`, `_brief.render_your_home`), and the `shell` tool's note is only a pointer to it. The founder's ruling (@origin, 2026-09-28) is the design, and each clause has a tempting broken form:
+
+- **Every agent holding `SHELL` gets the whole section, the same bytes, the same code path — and no other agent gets any of it.** The decision reads the registered tools and nothing else (`render_your_home(tools)` is never handed the charter). A per-agent switch, a scan of the persona prompt for a heading, or a paragraph skipped because "this agent's letter already says it" was proposed and **withdrawn** by the founder's order; do not build one.
+- **The harness never edits, rewrites or provisions a persona prompt.** The letter is the agent's; Your Home is the harness's. Two files, two owners.
+- **The text is the NOC's canonical, carried verbatim** (`basecradle-noc` `deploy/agent-home/your-home.md` → `src/basecradle_harness/_agent_home/your-home.md`). It lives **outside `_defaults/`** because the installer copies everything there into an operator-editable config home, and a copy an operator can edit is a copy that can differ per agent. The NOC's drift guard byte-diffs it and `test_brief.py` pins its sha256, so an edit here is always a re-sync from the NOC with the checksum updated in the same change, never a local rewording — which also means a conflict between it and `initialize.md` is raised to the capital, never resolved by editing the section.
 
 ## The Unspoken Channel (Recurrence Guard)
 
