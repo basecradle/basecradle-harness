@@ -7,6 +7,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.133.2] - 2026-09-28
+
+### Changed: Your Home re-synced to the NOC's canonical — secrets arrive across the front desk (issue #574)
+
+The front desk now carries credentials as well as vault material (basecradle-noc#843,
+founder-decided 2026-09-28): a package declares its kind, and a revocable secret or an
+unrecoverable key is claimed into `~/.config/<service>/` or `~/wallets/<chain>/` by the agent itself.
+The canonical text gains one sentence, at the end of the "Secrets have one rule…" paragraph:
+
+> A founder hands you a revocable secret or an unrecoverable key across the front desk, kind
+> declared; you install it with `cp` and `sha256sum` and never read it into a turn, and a secret
+> that arrives in a message is refused, never installed: ask for the desk.
+
+`src/basecradle_harness/_agent_home/your-home.md` has been replaced with those bytes (4,182 bytes,
+sha256 `ce8fec7f…19b6392e`) and the pinned checksum updated to match. That sentence is the only
+change. Nothing else changed: no code, and the same shell agents receive the section, now 4,202
+characters on the context-attribution line (`brief_your_home=`). The README's summary of the
+section now names the front desk.
+
 ## [0.133.1] - 2026-09-28
 
 ### Changed: Your Home re-synced to the NOC's amended canonical — the vault receipt rule gains its viewer fence (issue #571)
