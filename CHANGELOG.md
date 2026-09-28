@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.133.1] - 2026-09-28
+
+### Changed: Your Home re-synced to the NOC's amended canonical — the vault receipt rule gains its viewer fence (issue #571)
+
+@briggs found this on his own 0.133.0 live-verify wake. The vault binding's receipt rule said to
+confirm a deposit "only in the timeline the package names" and to post nothing if it names none, but
+it left out the viewer fence that `~/vault/README.md` carries. The binding wins over the README by
+its own terms, so the rule that won was the weaker one. The canonical text (basecradle-noc#832,
+amendment 2) now reads:
+
+> Confirm a deposit by filename, size, and checksum only, and only in the timeline the package
+> names, and only if that timeline's viewers are you and the depositor. If it names none, post
+> nothing. If it names a wider room, post nothing and report it. A named uuid is not a license to
+> widen the audience. Never by quoting the text.
+
+`src/basecradle_harness/_agent_home/your-home.md` has been replaced with those bytes (3,923 bytes,
+sha256 `33deb88f…eedab8a`) and the pinned checksum updated to match. That bullet is the only change.
+Nothing else changed: no code, and the same shell agents receive the section, now 3,943 characters
+on the context-attribution line (`brief_your_home=`).
+
 ## [0.133.0] - 2026-09-28
 
 ### Added: Your Home — one brief part teaches every shell agent its six standing folders (issue #571)
