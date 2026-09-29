@@ -34,6 +34,22 @@ One belongs to the delivery guarantee (issue #490):
   what to say, its claim settles, and the peer is never answered. Unanswered by an adapter it costs
   a truncation nobody detects, which is the pre-#490 behavior on every provider.
 
+Two belong to the timeout policy (issue #589, `_timeouts`):
+
+- **`bind_timeout_scale(scale: float) -> None`** — how much of its fitted generation budget the
+  adapter's next calls get. Every shipped adapter fits each call's budget to the call (a fixed
+  connect, and a generation budget from the request's size and output cap); ``1.0`` is that fit,
+  and the engine and the describer bind `_timeouts.TIMEOUT_RETRY_SCALE` for the one retry a timeout
+  earns, then ``1.0`` again (the reranker fits its own call, so it binds nothing). Sticky until the
+  next bind, like `bind_conversation`.
+- **`last_timeout: float | None`** — the generation budget, in seconds, applied to the most recent
+  call, so the retry and give-up lines name the budget a timeout ran out of.
+
+Unanswered, both fail safe: the adapter keeps whatever timeout it has, a timeout is still retried
+once (without the larger budget), and the lines name no budget. An adapter that fits its timeouts
+should also raise `ProviderTimeoutError` for one, so it is retried as a timeout — once, with more
+time — rather than as a dropped connection.
+
 Two more belong to prompt caching (issues #277, #431):
 
 - **`cache_mode: "automatic" | "explicit" | "none"`** — how this adapter's endpoint reaches its
@@ -105,8 +121,8 @@ this part exists to stop.
 
 An adapter that implements none of them still works: the budget falls back to a conservative floor,
 with no usage to read it never triggers compaction, a truncated turn goes undetected exactly as it
-did before #490, nothing is placed on the wire, no conversation is bound, every image is shown, and
-the brief simply names no brain. A capability is a question, not a contract.
+did before #490, its own timeout stands, nothing is placed on the wire, no conversation is bound,
+every image is shown, and the brief simply names no brain. A capability is a question, not a contract.
 """
 
 from __future__ import annotations

@@ -128,6 +128,7 @@ from basecradle_harness._observability import (
     usage_reported,
 )
 from basecradle_harness._retry import Retry, connection_reason, diagnostics
+from basecradle_harness._timeouts import bind_scale, last_timeout
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from basecradle_harness._provider import Provider
@@ -493,7 +494,6 @@ class Describer:
         turn = Message(
             role="user", content=prompt, images=list(images or []), videos=list(videos or [])
         )
-        started = time.monotonic()
         # One bounded retry for the transient faults (issue #506) — a 429, a 5xx, a transport blip.
         # It is *inside* `_attempt` rather than beside the `length` re-budget in `_ask`, and the two
         # are different things: a re-budget asks the model a **different** question (more room),
@@ -508,7 +508,29 @@ class Describer:
             sleep=self._sleep,
             extra={"subject": subject},
         )
+        try:
+            return self._attempts(provider, turn, retry, subject, kind=kind, parts=parts)
+        finally:
+            if retry.timeout_scale != 1.0:
+                # The larger budget was this describe's one timeout retry; the next describe on the
+                # same adapter runs at the ordinary fit again (issue #589).
+                bind_scale(provider, 1.0)
+
+    def _attempts(
+        self,
+        provider: Provider,
+        turn: Message,
+        retry: Retry,
+        subject: str,
+        *,
+        kind: str,
+        parts: bool,
+    ) -> tuple[str | None, str | None]:
+        """The retry loop of one `_attempt` — split out so the timeout scale is always lowered."""
+        started = time.monotonic()
         while True:
+            # The budget this attempt gets: the fit, or twice it on a timeout's one retry (#589).
+            bind_scale(provider, retry.timeout_scale)
             # `capture_llm_call` holds back the adapter's own line, so the one `llm` line this
             # attempt writes is written below — where the outcome is known (issue #485). Before it,
             # a describe emitted an untagged `llm` line the dashboard read as the *brain's*, plus a
@@ -539,7 +561,12 @@ class Describer:
                 else:
                     break
             # Outside the capture block: the wait is not part of the call it follows.
-            if retry.again(failure, reason=fault, is_config=fault.startswith("config:")):
+            if retry.again(
+                failure,
+                reason=fault,
+                is_config=fault.startswith("config:"),
+                timed_out_after=last_timeout(provider),
+            ):
                 continue
             self._report(
                 subject,

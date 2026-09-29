@@ -29,6 +29,7 @@ from basecradle_harness import (
     ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderTimeoutError,
     ProviderToolSchemaError,
     ToolCall,
     ToolSpec,
@@ -436,23 +437,30 @@ def test_grpc_unavailable_maps_to_connection_error():
         _provider_raising(grpc.StatusCode.UNAVAILABLE).chat([Message.user("hi")])
 
 
-@pytest.mark.parametrize("code", [grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED])
-def test_a_grpc_transport_fault_is_retried_and_reads_transport(code):
-    """Both gRPC transport codes are transient — and both read ``transport``, which is the
-    **documented imprecision** rather than an accident (issue #545).
-
-    `_retry.connection_reason` tells ``timeout`` from ``transport`` by asking what the chained
-    cause *calls itself*, and this path chains a `grpc.RpcError`, which names no timeout class —
-    so a `DEADLINE_EXCEEDED` reads `transport`. That costs a less precise log word and **never a
-    retry**, because both words are in `RETRYABLE_REASONS` and both take the same backoff. It is
-    pinned here so that the day the word changes, the three places that state the gap are updated
-    with it instead of quietly becoming wrong.
-    """
+def test_an_unavailable_endpoint_is_retried_and_reads_transport():
+    """``UNAVAILABLE`` is gRPC's could-not-reach: transient, and re-issued as it was."""
     with pytest.raises(ProviderConnectionError) as raised:
-        _provider_raising(code).chat([Message.user("hi")])
+        _provider_raising(grpc.StatusCode.UNAVAILABLE).chat([Message.user("hi")])
 
-    assert isinstance(raised.value, _TRANSIENT)  # retried by the engine, whatever the word
+    assert isinstance(raised.value, _TRANSIENT)
+    assert not isinstance(raised.value, ProviderTimeoutError)
     assert connection_reason(raised.value) == "transport"
+
+
+def test_a_deadline_exceeded_is_a_timeout_on_this_adapter_too():
+    """A gRPC deadline is the native spelling of a read timeout, and it reads ``timeout`` (#589).
+
+    It used to read ``transport`` — the documented imprecision of issue #545, which cost a less
+    precise log word and nothing else while both words took the same retry. Issue #589 made them
+    take *different* retries (a timeout is retried once, with a larger budget; a transport failure
+    as it was), so the imprecision became a behavior difference between adapters: an xAI deadline
+    would have been re-sent into the same wall. The adapter now types it where it is known.
+    """
+    with pytest.raises(ProviderTimeoutError) as raised:
+        _provider_raising(grpc.StatusCode.DEADLINE_EXCEEDED).chat([Message.user("hi")])
+
+    assert isinstance(raised.value, _TRANSIENT)  # still a transport failure to every `except`
+    assert connection_reason(raised.value) == "timeout"
 
 
 def test_grpc_internal_maps_to_the_retryable_response_error():
@@ -857,7 +865,9 @@ def test_a_conversation_grpc_could_not_carry_is_refused_at_bind_time(caplog, reb
         provider.bind_conversation("timeline:ｕｎｉｃｏｄｅ")
     provider.chat([Message.user("Hi")])
 
-    assert clients.keys == [None]  # no rebuild, and nothing grpc would have thrown on
+    # No client ever carried the key grpc would have thrown on. (The one construction the call made
+    # is for its deadline, issue #589 — the SDK fixes that per client too.)
+    assert set(clients.keys) == {None}
     assert "cache affinity" in caplog.text
 
 
@@ -880,7 +890,7 @@ def test_a_failed_rebuild_costs_the_hit_and_not_the_wake(caplog, rebuilding):
 
     assert reply.content == "ok"  # answered, on the client it already had
     assert provider._client is original
-    assert "continuing unbound" in caplog.text
+    assert "continuing on the existing client" in caplog.text
 
 
 def test_a_failed_rebuild_is_not_reattempted_every_turn(caplog, rebuilding):
@@ -903,7 +913,7 @@ def test_a_failed_rebuild_is_not_reattempted_every_turn(caplog, rebuilding):
         provider.chat([Message.user("Hi")])
 
     assert len(attempts) == 2  # one per conversation, not one per turn
-    assert caplog.text.count("continuing unbound") == 2
+    assert caplog.text.count("continuing on the existing client") == 2
 
 
 def test_a_client_that_refuses_to_close_does_not_strand_its_replacement(rebuilding):
@@ -1240,3 +1250,24 @@ def test_a_tool_whose_schema_cannot_be_prepared_at_all_still_only_costs_that_too
     assert reply.content == "ok"
     assert [t.function.name for t in provider._client.chat.captured["tools"]] == ["get_weather"]
     assert "weird" in caplog.text
+
+
+def test_a_failed_rebuild_reports_the_deadline_that_runs_not_the_one_asked_for(rebuilding):
+    """The deadline is the other thing a rebuild carries (issue #589). When the rebuild fails the
+    old client keeps its old deadline, so `last_timeout` must name that one — on this call and on
+    every later one that finds the same deadline already "reconciled" — or the retry and give-up
+    lines would report a budget no call ever ran on."""
+    provider, clients = rebuilding
+    provider.chat([Message.user("Hi")])
+    applied = provider.last_timeout
+    assert clients.built[-1]["timeout"] == applied
+
+    def refuse(**kwargs):
+        raise OSError("too many open files")
+
+    provider._xai.Client = refuse
+    provider.bind_timeout_scale(2.0)  # the one retry a timeout earns: a new deadline, a rebuild
+    provider.chat([Message.user("Hi")])
+    assert provider.last_timeout == applied
+    provider.chat([Message.user("Hi")])  # the same deadline again: the fast path
+    assert provider.last_timeout == applied

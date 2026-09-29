@@ -86,7 +86,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from basecradle_harness._caching import AUTOMATIC
-from basecradle_harness._context import is_context_overflow
+from basecradle_harness._context import is_context_overflow, request_chars
 from basecradle_harness._exceptions import (
     ProviderAuthError,
     ProviderBillingError,
@@ -96,6 +96,7 @@ from basecradle_harness._exceptions import (
     ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
+    ProviderTimeoutError,
     ProviderToolSchemaError,
 )
 from basecradle_harness._faults import is_out_of_funds, is_too_large, refused_tool_schema
@@ -108,6 +109,7 @@ from basecradle_harness._observability import (
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._schema import UnrepresentableSchema, normalize_object_root
+from basecradle_harness._timeouts import call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -199,7 +201,11 @@ class XaiSdkProvider:
         model: The grok model id (e.g. ``"grok-4.3"``).
         api_key: The xAI bearer token. Falls back to ``AI_API_KEY`` when omitted.
         api_host: The gRPC host. Defaults to the SDK's own (``api.x.ai``).
-        timeout: Per-request timeout in seconds (passed to the SDK client).
+        timeout: A **fixed** generation deadline in seconds, overriding the fit — for a library
+            caller that knows its calls. ``None`` (the default, and every deployment: the config
+            layer owns this key) fits every call's deadline to its size and output cap
+            (`basecradle_harness._timeouts`, issue #589) — where it used to leave the SDK's own
+            27 minutes in force, one harness with two rules.
         builtin_tools: The server-side built-ins an agent has opted in — ``"web_search"`` /
             ``"x_search"`` (issue #168). They are translated to xAI **Agent Tool** entries
             (`xai_sdk.tools`) appended to the request's ``tools`` list so grok runs the search
@@ -266,6 +272,24 @@ class XaiSdkProvider:
         #: the key its metadata carries, and on a rebuild that failed, the key it gave up on. Either
         #: way it is what makes the work happen on a genuine change and not once per turn.
         self._client_conversation: str | None = None
+        #: The deadline `self._client` was reconciled against — the other thing the SDK fixes per
+        #: client (issue #589). ``None`` until the first call fits one. Like `_client_conversation`
+        #: it is also what a failed rebuild gave up on, so it says what was *asked*, not what runs.
+        self._client_deadline: float | None = None
+        #: The deadline `self._client` was actually **built** with — what it applies. ``None`` for
+        #: the construction-time client, which runs on the SDK's own default. Kept apart from
+        #: `_client_deadline` because a failed rebuild leaves the two different, and `last_timeout`
+        #: must report the one that runs.
+        self._applied_deadline: float | None = None
+        #: The generation deadline, in seconds, this adapter applied to its most recent call — read
+        #: for the retry and give-up lines, so a timeout names the budget it ran out of (#589).
+        #: ``None`` for an injected client, which is used as given and so has no deadline of ours.
+        self.last_timeout: float | None = None
+        #: The deadline the next call wants, fitted in `chat` just before `_bound_client` reads it.
+        self._deadline: float | None = None
+        #: How much of its fitted budget the next call gets (`bind_timeout_scale`).
+        self._timeout_scale = 1.0
+        self._fixed_timeout = timeout
         #: The last conversation refused as unable to ride the wire, so the warning is emitted once
         #: per bad key rather than once per turn (a session rebinds before every turn).
         self._refused_conversation: str | None = None
@@ -289,8 +313,9 @@ class XaiSdkProvider:
             kwargs: dict[str, Any] = {"api_key": key}
             if api_host:
                 kwargs["api_host"] = api_host
-            if timeout is not None:
-                kwargs["timeout"] = timeout
+            # No ``timeout`` here: the deadline is fitted per call and set by `_bound_client`, which
+            # rebuilds the client when it changes. Until the first call this client runs on the
+            # SDK's own default — which only the non-turn reads (`context_limit`) ever see.
             self._client_kwargs = kwargs
             self._client = self._xai.Client(**kwargs)
 
@@ -320,8 +345,16 @@ class XaiSdkProvider:
         # bills nothing and logs no `llm` line — it never reached a model — so the one line below
         # still describes exactly one model call, at its true latency.
         started = time.monotonic()
+        # This call's deadline, fitted before the client is chosen because the SDK fixes a deadline
+        # per client exactly as it fixes metadata (issue #589): `_bound_client` rebuilds on either.
+        self._deadline = call_timeout(
+            request_chars(messages, tools),
+            output_tokens=output_cap(self._default_params),
+            scale=self._timeout_scale,
+            fixed=self._fixed_timeout,
+        ).generation
         # The client whose channel carries this session's `x-grok-conv-id` — the affinity key's
-        # only route to the wire on this SDK (issue #433).
+        # only route to the wire on this SDK (issue #433) — and this call's deadline.
         client = self._bound_client()
         response = self._sample(client, chat_mod, payload, offered)
         # The native response carries usage as a proto (attributes, not keys); `log_llm_call`
@@ -517,8 +550,16 @@ class XaiSdkProvider:
             self._refused_conversation = None
         self._conversation = key
 
+    def bind_timeout_scale(self, scale: float) -> None:
+        """How much of its fitted deadline this adapter's next calls get (issue #589).
+
+        The `_timeouts.bind_scale` capability: ``1.0`` is the fit itself, and the one retry a
+        timeout earns binds `_timeouts.TIMEOUT_RETRY_SCALE`. Sticky until the next bind.
+        """
+        self._timeout_scale = max(1.0, float(scale))
+
     def _bound_client(self) -> Any:
-        """The client whose gRPC metadata carries the currently-bound conversation (issue #433).
+        """The client carrying the bound conversation (issue #433) and this call's deadline (#589).
 
         ``xai_sdk`` fixes a client's metadata **at construction** — it is closed over by the
         channel's ``_APIAuthPlugin`` (TLS) or ``AuthInterceptor`` (insecure), and the SDK's stub
@@ -532,12 +573,31 @@ class XaiSdkProvider:
         **injected** client (the test seam, a library caller supplying their own) is returned
         untouched — there are no kwargs to rebuild it from, and silently replacing a client someone
         handed us would discard whatever they configured it with.
+
+        **The deadline is the second thing it is rebuilt for** (issue #589), for the same reason:
+        the SDK's ``TimeoutInterceptor`` stamps one ``timeout`` on every call a channel makes, and
+        there is no per-call seam to override it. The fit is rounded to whole minutes
+        (`_timeouts.GENERATION_STEP`) precisely so this stays rare — a context growing a few
+        thousand tokens a step changes it every few dozen steps, and the one retry a timeout earns
+        changes it twice. What the deadline is **not** is a connect bound: gRPC's own connection
+        machinery fails a call that cannot reach the endpoint (a non-``wait_for_ready`` call gets
+        ``UNAVAILABLE``), and the SDK's keepalive pings notice a connection that dies mid-call — the
+        two jobs the HTTP adapters' short connect budget does, done natively.
         """
-        if self._client_kwargs is None or self._client_conversation == self._conversation:
+        if self._client_kwargs is None:
+            self.last_timeout = None
+            return self._client
+        if (
+            self._client_conversation == self._conversation
+            and self._client_deadline == self._deadline
+        ):
+            self.last_timeout = self._applied_deadline
             return self._client
         kwargs = dict(self._client_kwargs)
         if self._conversation:
             kwargs["metadata"] = ((CONVERSATION_METADATA_KEY, self._conversation),)
+        if self._deadline is not None:
+            kwargs["timeout"] = self._deadline
         stale = self._client
         try:
             fresh = self._xai.Client(**kwargs)
@@ -548,22 +608,29 @@ class XaiSdkProvider:
             # A raw failure here would kill the wake for an optimization. Worse, it would kill
             # *every* wake: the session rebinds the same id before every turn, so an unguarded
             # rebuild would re-attempt the identical failure forever. So the adapter **gives up on
-            # this conversation** — marking it reconciled below is what makes that once, not
-            # per-turn — and keeps running on the client it already has, unbound and lucky, exactly
-            # where #431 found it. A *different* conversation gets its own fresh attempt.
+            # this conversation and deadline** — marking them reconciled below is what makes that
+            # once, not per-turn — and keeps running on the client it already has, with whatever key
+            # and deadline that client was built with. A *different* one gets a fresh attempt.
             _log.warning(
-                "Could not rebuild the xAI client for cache affinity (%s); continuing unbound on "
-                "the existing client. Calls will run without x-grok-conv-id, which costs the "
-                "per-server cache hit but never a wake.",
+                "Could not rebuild the xAI client (%s); continuing on the existing client, with "
+                "the cache-affinity key and deadline it was built with. That can cost the "
+                "per-server cache hit or a fitted deadline, never a wake.",
                 exc,
             )
             self._client_conversation = self._conversation
+            self._client_deadline = self._deadline
+            # The client kept is the old one, so the deadline it applies is the one it was built
+            # with — never the fit this call asked for. Report that one, or nothing.
+            self.last_timeout = self._applied_deadline
             return stale
         # Publish the new client *before* releasing the old one. The other order leaves a window
         # where a throwing `close` strands `fresh` unreferenced with its channel still open — the
         # very per-switch socket leak this close exists to prevent, reached through the other door.
         self._client = fresh
         self._client_conversation = self._conversation
+        self._client_deadline = self._deadline
+        self._applied_deadline = self._deadline
+        self.last_timeout = self._applied_deadline
         _close_client(stale)
         return fresh
 
@@ -786,7 +853,13 @@ class _grpc_error_context:
                 raise ProviderBillingError(message, status_code=402, body=detail) from exc
             # A genuine rate limit — heals with time, so transient, exactly as before.
             raise ProviderRateLimitError(message, status_code=429) from exc
-        if code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED):
+        if code == grpc.StatusCode.DEADLINE_EXCEEDED:
+            # The call ran out of its deadline — the gRPC spelling of a read timeout, and the one
+            # the cause walk could never recognize, since no gRPC class names itself a timeout. So
+            # it is typed here (issue #589): a timeout is retried once with a larger deadline,
+            # never re-sent into the same one, and it must read the same on every adapter.
+            raise ProviderTimeoutError(message) from exc
+        if code == grpc.StatusCode.UNAVAILABLE:
             raise ProviderConnectionError(message) from exc
         if code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.DATA_LOSS):
             # A broken/undecodable response payload — gRPC's analogue of the truncated-JSON class

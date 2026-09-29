@@ -77,7 +77,7 @@ import sys
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from importlib import metadata
 from pathlib import Path
@@ -143,9 +143,11 @@ from basecradle_harness._exceptions import (
     ProviderContextLengthError,
     ProviderError,
     ProviderPayloadTooLargeError,
+    ProviderTimeoutError,
 )
 from basecradle_harness._harness import Harness
-from basecradle_harness._idempotency import IdempotencyKeys, interrupted
+from basecradle_harness._idempotency import STALL_NOTE, IdempotencyKeys, interrupted
+from basecradle_harness._idempotency import key as mint_key
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
 from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs_report
 from basecradle_harness._memory_provider import (
@@ -172,11 +174,15 @@ from basecradle_harness._probe import ack_line, verify_probe
 from basecradle_harness._report import (
     BILLING,
     PERMANENT,
+    STALL_NOTHING_WRITTEN,
+    STALL_UNREPORTED,
     BillingState,
     billing_onset_line,
     billing_repeat_line,
     classify,
     report_body,
+    stall_body,
+    stall_detail,
     verbatim,
 )
 from basecradle_harness._rerank import (
@@ -345,6 +351,39 @@ _ABANDONED = "abandoned"
 #: far enough can still stretch one phase past it; the bound is theirs to keep.
 _CLAIM_STALE_AFTER = 6 * 60 * 60
 
+#: How many times the recovery will **resume** one item before it stops and says so (issue #589).
+#:
+#: A resume replays the dead turn's whole accumulated context into the model, and a turn that died
+#: because it was too heavy — or too slow, or on a provider that was failing — dies the same way,
+#: only heavier, since each failed attempt leaves its partial work in the transcript. Nothing used
+#: to count that: on 2026-09-29 @glm-5.2 resumed one item four times in a row, and the loop broke
+#: only because the peer changed the ask. The founder's ruling: *a bad ask should cost one wasted
+#: wake and a visible stall, never a crash loop.*
+#:
+#: **What counts is a failure of the turn, never of the environment.** Three things say this turn
+#: cannot be finished: a resume that **timed out** (the in-wake retry already doubled its budget),
+#: a resume the box **killed** (the crash loop itself — `Claim.resumes` is written when a resume
+#: starts, so a kill needs no one to report it), and a continuation cut off at the output budget
+#: **having written nothing** (a reasoning model spending its whole cap on thinking — "progress"
+#: that grows nothing but the truncation notes). Everything else is put back (`ClaimStore.recount`):
+#: an out-of-funds refusal, an exhausted 5xx or 429, a dropped connection, a platform error, a
+#: harness fault. Those say nothing about this turn, they are the path an outage takes, and issue
+#: #336 decided an outage must leave the peer's message answerable once it clears — the reason a
+#: **re-drive** is not counted either. A continuation that *did* write clears the count: a long
+#: answer continued again and again is converging (issue #490).
+#:
+#: Two, not one: a single resume can be spent on bad luck that outlasted the in-wake retries — a
+#: provider slow at the wrong moment, a box restarted mid-resume — and the second is what tells a
+#: pattern from luck. After the second, the harness posts a stall note and abandons the item
+#: (`WakeAgent._stall`); when the second was a kill, the next wake stalls it before calling the
+#: model at all.
+RESUME_CEILING = 2
+
+#: The internal outcome a stalled resume records in `WakeAgent._resumed`, so the other messages of
+#: the batch that turn carried are abandoned with it — never committed as if it had finished, and
+#: never resumed again. Not a disposition: `_recover_orphan` turns it into `_FINAL`.
+_STALLED = "stalled"
+
 #: The least time between two refreshes of one held claim (issue #532). The heartbeat fires on every
 #: step and every tool completion, and a message batch is claimed up front, so without a gate its
 #: write cost would scale with the step count times the batch. Gated, it is bounded by wall clock:
@@ -370,6 +409,14 @@ class Claim:
     wake: str | None = None
     at: float | None = None
     reason: str | None = None
+    #: How many resumes of this item have failed **on the turn itself** since it last made progress
+    #: (issue #589). Counted when a resume *starts* — written into the take-over record before the
+    #: model is called — so a resume the box killed counts, and then settled by how it reported back
+    #: (`ClaimStore.recount`): a timeout keeps it, progress clears it, and a fault of the provider,
+    #: the platform or the harness puts it back. `RESUME_CEILING` reads it; a record written before
+    #: it existed reads ``0``, which is where it stood. On an in-flight claim, `reason` is the last
+    #: counted failure in the words a stall note would quote.
+    resumes: int = 0
 
     @property
     def settled(self) -> bool:
@@ -469,6 +516,7 @@ def _read_claim(path: Path) -> Claim | None:
             wake=data.get("wake"),
             at=data.get("at"),
             reason=data.get("reason"),
+            resumes=_resumes_of(data.get("resumes")),
         )
     except (ValueError, KeyError, TypeError):
         _log.warning(
@@ -477,6 +525,18 @@ def _read_claim(path: Path) -> Claim | None:
             path,
         )
         return Claim(phase=_DONE)
+
+
+def _resumes_of(raw: object) -> int:
+    """A claim's resume count from its record — ``0`` for anything that is not a count.
+
+    ``0`` is the conservative reading in the one direction that matters: it is exactly what every
+    record said before the count existed, so an unreadable value costs at most the resumes the
+    ceiling would have spared, never a stall note posted over a turn that had one resume in it.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return 0
+    return raw
 
 
 def _payload(claim: Claim) -> dict[str, object]:
@@ -489,6 +549,10 @@ def _payload(claim: Claim) -> dict[str, object]:
     }
     if claim.reason is not None:
         payload["reason"] = claim.reason
+    if claim.resumes:
+        # Written only when there is one, so every record that never needed it is byte-identical
+        # to what it was before issue #589.
+        payload["resumes"] = claim.resumes
     return payload
 
 
@@ -703,9 +767,9 @@ class ClaimStore:
             current = self.read(timeline, uuid, kind=kind)
             if current is None or current.phase != _IN_FLIGHT or current.wake != self.wake:
                 return False  # settled, pruned, or not ours: nothing to keep alive
-            self._write(
-                path, Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time())
-            )
+            # `replace`, never a fresh record: the resume count (issue #589) rides along, or a
+            # heartbeat mid-resume would reset the ceiling the crash loop is counted against.
+            self._write(path, replace(current, pid=os.getpid(), at=time.time()))
         return True
 
     def claim(self, timeline: str, uuid: str, *, kind: str) -> bool:
@@ -911,8 +975,16 @@ class ClaimStore:
         """Is `claim` held by a wake that died? (`_orphaned`, bound to this store's identity.)"""
         return _orphaned(claim, pid=os.getpid(), wake=self.wake)
 
-    def reclaim(self, timeline: str, uuid: str, *, kind: str, owner: str | None) -> bool:
+    def reclaim(
+        self, timeline: str, uuid: str, *, kind: str, owner: str | None, resumes: int = 0
+    ) -> bool:
         """Take over the orphaned claim **held by `owner`**. True if this wake won the take-over.
+
+        `resumes` is the count the new record carries (`Claim.resumes`, issue #589): the resume
+        that is about to start, for `WakeAgent._resume_orphan`; zero for every other take-over,
+        which is a re-drive or an abandon and never continues a turn. It rides the token as well as
+        the claim, so a take-over that dies before writing the claim still counts — the next wake
+        judges the token's record (`effective_owner`), and reads the attempt that was made.
 
         A take-over is a **compare-and-swap**, not an overwrite: it must succeed only if the claim
         is still the very one the caller judged orphaned. The swap is decided by an exclusive
@@ -950,7 +1022,9 @@ class ClaimStore:
         """
         path = self._path(timeline, kind, uuid)
         path.parent.mkdir(parents=True, exist_ok=True)
-        record = Claim(phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time())
+        record = Claim(
+            phase=_IN_FLIGHT, pid=os.getpid(), wake=self.wake, at=time.time(), resumes=resumes
+        )
         token = self._token(path, uuid, owner)
         temp = path.parent / f".{quote(uuid, safe='')}.{self.wake}.takeover.new"
         temp.write_text(json.dumps(_payload(record)))
@@ -1016,6 +1090,41 @@ class ClaimStore:
           cannot read.
         """
         return _read_claim(self._path(timeline, kind, uuid))
+
+    def recount(
+        self, timeline: str, uuid: str, *, kind: str, resumes: int, reason: str | None = None
+    ) -> None:
+        """Set the resume count on a claim this wake holds in flight, and why (issue #589).
+
+        `reclaim` counts a resume the moment it starts, so a resume the box kills still counts.
+        Every way a resume *reports back* then settles what the count should be:
+
+        - **a fault of the turn** (a timeout, a continuation that wrote nothing) keeps it, and
+          records `reason` — the words the stall note will quote if the next wake has to post it;
+        - **progress** (a continuation cut off at the output budget, issue #490) clears it, because
+          continuing a long answer converges and counting it would stall an agent for being
+          thorough;
+        - **a fault of the provider, the platform or the harness** (an out-of-funds refusal, an
+          exhausted 5xx, a platform error) puts it back where it was: it says nothing about whether
+          this turn can be finished, and it is the path an outage takes, which must leave the item
+          answerable once the outage clears.
+
+        Compare, then write, under the exclusive lock, exactly as the heartbeat does: only a claim
+        still in flight and still naming this wake is ours to change. Best-effort — a count left
+        wrong costs an early or a late stall note, never a lost item.
+        """
+        path = self._path(timeline, kind, uuid)
+        try:
+            with _locked(path.parent, shared=False, required=False):
+                current = self.read(timeline, uuid, kind=kind)
+                if current is None or current.phase != _IN_FLIGHT or current.wake != self.wake:
+                    return
+                if (current.resumes, current.reason) != (resumes, reason):
+                    self._write(
+                        path, replace(current, resumes=resumes, reason=reason, at=time.time())
+                    )
+        except OSError as error:
+            _log.warning("Could not record the resume count on %s %s: %s", kind, uuid, error)
 
     def commit(self, timeline: str, uuid: str, *, kind: str) -> None:
         """Mark the item **done** — acted on, disposition final. The mark may now pass it."""
@@ -3103,14 +3212,16 @@ class WakeAgent:
             return list(self.tool_manifest)
         return [(tool.name, None) for tool in self.harness.tools]
 
-    def _post(self, body: str, *, kind: str) -> object | None:
+    def _post(self, body: str, *, kind: str, idempotency_key: str | None = None) -> object | None:
         """The **harness's own** post — degrading any SDK refusal instead of crashing.
 
-        Since the Unspoken Channel (issue #293) there is exactly one caller: the NOC probe ack.
-        That is not the agent talking — it is a machine contract (a signed nonce, acked
-        model-free, so the fleet's seam heartbeats run token-free at rest), which is precisely
-        why it survived an inversion that removed every other harness-authored post. **The agent's
-        speech goes through the `messages` tool**, and nowhere else.
+        Since the Unspoken Channel (issue #293) its callers are the model-unreachable ones only:
+        the NOC probe ack — not the agent talking, but a machine contract (a signed nonce, acked
+        model-free, so the fleet's seam heartbeats run token-free at rest) — the provider-failure
+        report (issue #336), and the stall note (issue #589), both posted because the model is the
+        thing that failed. **The agent's speech goes through the `messages` tool**, and nowhere
+        else. `idempotency_key` makes a post safe to repeat across a wake that died after it; only
+        the stall note needs one today.
 
         Refusals still degrade rather than raise: a locked timeline raises `TimelineLockedError`
         from the SDK and, unguarded, would kill the whole wake (`exit 1`) — the live failure this
@@ -3122,7 +3233,7 @@ class WakeAgent:
         created. `kind` says what it was, so a heartbeat ack never reads as the agent talking.
         """
         try:
-            sent = self.timeline.messages.create(body=body)
+            sent = self.timeline.messages.create(body=body, idempotency_key=idempotency_key)
         except BaseCradleError as error:
             _log.error(
                 "post failed %s",
@@ -3626,7 +3737,7 @@ class WakeAgent:
         # not evidence about what *this* one did.
         already = self._resumed_carrying(item)
         if already is not None:
-            return self._committed(item, kind) if already == _FINAL else _PENDING
+            return self._as_resumed(item, claim, kind, already)
 
         turn = _turn_of(session.history, item, text)
         if turn is None:
@@ -3660,9 +3771,9 @@ class WakeAgent:
         if any(message.tool_calls for message in work) or _turn_cut_off(work):
             already = self._resumed_outcome(turn)
             if already is not None:
-                # This wake already finished (or failed to finish) this very turn for an older
-                # message of the same batch. Never run it twice.
-                return self._committed(item, kind) if already == _FINAL else _PENDING
+                # This wake already finished (or failed to finish, or stalled) this very turn for an
+                # older message of the same batch. Never run it twice.
+                return self._as_resumed(item, claim, kind, already)
             return self._resume_orphan(session, item, turn, claim, kind=kind, text=text)
 
         # A turn with nothing in it: the model was called and never answered. Excise the residue
@@ -3716,7 +3827,31 @@ class WakeAgent:
             # turn could compact away (issue #490). Leave the orphan for the next wake — do not even
             # take the claim over.
             return _PENDING
-        if not self.claims.reclaim(self.timeline_uuid, uuid, kind=kind, owner=claim.wake):
+        if claim.resumes >= RESUME_CEILING:
+            # The ceiling was reached and nobody stalled the item: the last resume never reported
+            # back (the wake running it was killed), or its stall note was refused by the platform —
+            # in which case the words it would have posted are on the claim (issue #589). Stall it
+            # now, before the model is called, rather than replay it again. The count rides the
+            # take-over, so a wake that dies stalling it leaves it for the next.
+            if not self.claims.reclaim(
+                self.timeline_uuid, uuid, kind=kind, owner=claim.wake, resumes=claim.resumes
+            ):
+                return _PENDING
+            disposition = self._stall(
+                session,
+                item,
+                turn,
+                kind=kind,
+                text=text,
+                resumes=claim.resumes,
+                detail=claim.reason or STALL_UNREPORTED,
+            )
+            self._resumed.append((turn, _STALLED if disposition == _FINAL else disposition))
+            return disposition
+        attempt = claim.resumes + 1
+        if not self.claims.reclaim(
+            self.timeline_uuid, uuid, kind=kind, owner=claim.wake, resumes=attempt
+        ):
             return _PENDING  # another recovering wake won the take-over; let it finish the turn
         _log.warning(
             "resuming %s",
@@ -3725,6 +3860,7 @@ class WakeAgent:
                 kind=kind,
                 timeline=self.timeline_uuid,
                 handle=_handle_of(item),
+                resume=f"{attempt}/{RESUME_CEILING}",
                 reason="the wake died mid-tool-chain; finishing the turn it started",
             ),
         )
@@ -3767,6 +3903,33 @@ class WakeAgent:
                 # budget is too small for what this turn is trying to say; the WARNING is what says
                 # so, and the budget is the operator's to change, never the harness's.
                 disposition = _PENDING
+                if narration.strip():
+                    # It wrote something, so it *progressed*: a long answer continued three times
+                    # is converging, not looping, and it clears the resume count (issue #589).
+                    self.claims.recount(self.timeline_uuid, uuid, kind=kind, resumes=0)
+                elif attempt < RESUME_CEILING:
+                    # Cut off having written nothing — the whole budget spent before a word. That is
+                    # not progress, and the next continuation will do the same; it counts.
+                    self.claims.recount(
+                        self.timeline_uuid,
+                        uuid,
+                        kind=kind,
+                        resumes=attempt,
+                        reason=STALL_NOTHING_WRITTEN,
+                    )
+                else:
+                    disposition = self._stall(
+                        session,
+                        item,
+                        turn,
+                        kind=kind,
+                        text=text,
+                        resumes=attempt,
+                        detail=STALL_NOTHING_WRITTEN,
+                        mine=False,  # this exchange was mined a moment ago
+                    )
+                    self._resumed.append((turn, _STALLED if disposition == _FINAL else disposition))
+                    return disposition
             else:
                 self.claims.commit(self.timeline_uuid, uuid, kind=kind)
         except ProviderContextLengthError as error:
@@ -3795,6 +3958,12 @@ class WakeAgent:
         except ProviderBillingError as exc:
             # Out of funds during recovery: report once (debounced) and set the fail-fast latch, then
             # leave the reclaimed claim in-flight so the next wake retries after funding (issue #336).
+            # An empty account says nothing about whether this turn can be finished, so the resume
+            # this was is not counted against it (issue #589) — or a funding gap two wakes long would
+            # stall every unfinished turn on the box.
+            self.claims.recount(
+                self.timeline_uuid, uuid, kind=kind, resumes=claim.resumes, reason=claim.reason
+            )
             disposition = self._report_provider_failure(
                 exc,
                 kind=kind,
@@ -3818,15 +3987,184 @@ class WakeAgent:
             disposition = self._drop(
                 item, kind, f"the resumed turn hit a permanent provider failure: {verbatim(exc)}"
             )
-        except Exception:  # noqa: BLE001 - one item's failure must not take the wake down
-            # Anything else — the provider is down, the box is unhappy. Nothing lost: this wake's
-            # claim on the item is in-flight, so the next wake finds it orphaned again and resumes
-            # against a transcript carrying whatever this attempt managed. Do not take the whole
-            # wake down over it; the other items on this timeline still deserve an answer.
-            _log.exception("Resuming the interrupted turn failed; the next wake will try again.")
-            disposition = _PENDING
+        except Exception as exc:  # noqa: BLE001 - one item's failure must not take the wake down
+            # Anything else — the provider is down or too slow, the box is unhappy. Do not take the
+            # whole wake down over it; the other items on this timeline still deserve an answer.
+            # Nothing is lost: this wake's claim on the item is in-flight, so the next wake finds it
+            # orphaned again and resumes against a transcript carrying whatever this attempt managed.
+            if not isinstance(exc, ProviderTimeoutError):
+                # A fault of the provider, the platform or the harness — an exhausted 5xx or 429, a
+                # dropped connection, a platform refusal, a bug. It says nothing about whether this
+                # turn can be finished, and it is the path an outage takes, so it does not count
+                # toward the resume ceiling (issue #589): the item waits for the cause to clear.
+                self.claims.recount(
+                    self.timeline_uuid, uuid, kind=kind, resumes=claim.resumes, reason=claim.reason
+                )
+                _log.exception(
+                    "Resuming the interrupted turn failed (%s, not a fault of the turn, so not "
+                    "counted toward the resume ceiling); the next wake will try again.",
+                    type(exc).__name__,
+                )
+                disposition = _PENDING
+            elif attempt < RESUME_CEILING:
+                # It timed out — twice over, since the in-wake retry already doubled its budget.
+                # That is this turn being too much to finish in time, and it counts; the words the
+                # stall note would quote ride the claim in case the next wake has to post it.
+                self.claims.recount(
+                    self.timeline_uuid, uuid, kind=kind, resumes=attempt, reason=stall_detail(exc)
+                )
+                _log.exception(
+                    "Resuming the interrupted turn timed out (resume %d of %d); the next wake will "
+                    "try again.",
+                    attempt,
+                    RESUME_CEILING,
+                )
+                disposition = _PENDING
+            else:
+                # The last resume the ceiling allows, and it timed out too (issue #589). Replaying it
+                # again would send the same — now larger — context into the same failure, wake
+                # after wake. Stop, and say so where the peer will see it.
+                _log.exception(
+                    "Resuming the interrupted turn timed out (resume %d of %d); stalling it.",
+                    attempt,
+                    RESUME_CEILING,
+                )
+                disposition = self._stall(
+                    session,
+                    item,
+                    turn,
+                    kind=kind,
+                    text=text,
+                    resumes=attempt,
+                    detail=stall_detail(exc),
+                )
+                self._resumed.append((turn, _STALLED if disposition == _FINAL else disposition))
+                return disposition
         self._resumed.append((turn, disposition))
         return disposition
+
+    def _stall(
+        self,
+        session: Session,
+        item: object,
+        turn: Message,
+        *,
+        kind: str,
+        text,
+        resumes: int,
+        detail: str,
+        mine: bool = True,
+    ) -> str:
+        """Stop resuming an item that cannot be finished — post a stall note, and mark it (#589).
+
+        The ruling: *a bad ask should cost one wasted wake and a visible stall, never a crash loop.*
+        So the note goes to the timeline, **in the harness's own words** (`_report.stall_body`):
+        what was being worked on, that it could not finish, what would help. It is the
+        provider-failure report's case reached by repetition — the model cannot get this done, so
+        there is no agent to ask — and it is mechanical, with no model anywhere in it, because the
+        model is the thing that keeps failing.
+
+        Then the item is **abandoned** — settled, so the record passes it and nothing stalls
+        behind it — and a WARNING says so (``wake stalled``). The caller must already own the
+        claim. Four properties hold it together:
+
+        - **The note is posted first, and only a posted note licenses the abandon.** A platform
+          that refuses the post (``_post`` returns ``None`` and logs its ERROR) leaves the item in
+          flight with its count at the ceiling and `detail` on the claim, so the next wake stalls it
+          again *without* a model call and says the same thing. An abandon with no note would be a
+          silent drop, which is the one outcome worse than the loop.
+        - **The note is keyed on the turn**, not the item (`_idempotency.STALL_NOTE`, anchored like
+          every other key the turn mints, `_anchor_of`), so a wake that dies after posting it costs
+          nothing — whichever of the turn's messages the next wake stalls it through, the platform
+          returns the same note.
+        - **The batch is settled before the item that owns the resume.** That item's claim carries
+          the count; its batch-mates' do not. Abandoned first, it would leave a mate that a wake
+          dying here hands to the next one as a fresh orphan — resumed again, after the note said
+          nothing more would happen. Settled last, it keeps the count until the mates are done.
+        - **The peer's half is still mined** — their message is real whatever happened to ours
+          (`_observe`'s own rule) — and the harness's note never is.
+        """
+        uuid = item.content.uuid
+        work = _turn_work(session.history, turn)
+        tool_calls = sum(len(message.tool_calls) for message in work)
+        described = self._report_item_desc(item, kind)
+        if kind == _MESSAGES and len(turn.items) > 1:
+            described = f"your last {len(turn.items)} messages"
+        body = stall_body(item=described, resumes=resumes, tool_calls=tool_calls, detail=detail)
+        note = self._post(
+            body,
+            kind="stall-note",
+            idempotency_key=mint_key(
+                timeline=self.timeline_uuid,
+                anchor=_anchor_of(turn, item),
+                kind=STALL_NOTE,
+                ordinal=1,
+            ),
+        )
+        if note is None:
+            self.claims.recount(self.timeline_uuid, uuid, kind=kind, resumes=resumes, reason=detail)
+            return _PENDING
+        if mine:
+            rendered = turn.content or text(item)
+            self._observe(rendered if kind == _MESSAGES else _dialogue_of(item, kind), "")
+        for mate in turn.items:
+            if mate != uuid:
+                self._stall_mate(mate, kind)
+        reason = f"stalled after {resumes} failed resume(s): {detail}"
+        self.claims.abandon(self.timeline_uuid, uuid, kind=kind, reason=reason)
+        _log.warning(
+            "%s %s",
+            head("wake stalled", YELLOW),
+            kv(
+                item=uuid,
+                kind=kind,
+                timeline=self.timeline_uuid,
+                handle=_handle_of(item),
+                resumes=resumes,
+                tool_calls=tool_calls,
+                note=_uuid_of(note),
+                reason=reason,
+            ),
+        )
+        return _FINAL
+
+    def _stall_mate(self, uuid: str, kind: str, claim: Claim | None = None) -> bool:
+        """Abandon one batch-mate of a stalled turn — taken over first, never from a live wake.
+
+        The stall note spoke for the whole batch, so resuming the turn again for this message is the
+        loop the ceiling just broke. The take-over is the same compare-and-swap every recovery
+        verdict uses: a mate still held by a live wake is left to it (that wake is resuming the same
+        turn through it, and will reach its own verdict). ``False`` when it was not ours to settle.
+        """
+        claim = claim or self.claims.read(self.timeline_uuid, uuid, kind=kind)
+        if claim is None or claim.settled:
+            return claim is not None
+        claim = self.claims.effective_owner(self.timeline_uuid, uuid, kind=kind, claim=claim)
+        if not self.claims.orphaned(claim) or not self.claims.reclaim(
+            self.timeline_uuid, uuid, kind=kind, owner=claim.wake
+        ):
+            return False
+        reason = "stalled with the turn that carried it"
+        self.claims.abandon(self.timeline_uuid, uuid, kind=kind, reason=reason)
+        _log.warning(
+            "%s %s",
+            head("wake stalled", YELLOW),
+            kv(item=uuid, kind=kind, timeline=self.timeline_uuid, reason=reason),
+        )
+        return True
+
+    def _as_resumed(self, item: object, claim: Claim, kind: str, outcome: str) -> str:
+        """Settle a batch-mate of a turn this wake has already resumed, the way that resume went.
+
+        Finished → commit it. Stalled → abandon it with the turn (issue #589) — normally `_stall`
+        has already done so and this is never reached, but a mate it could not take over then may
+        be orphaned now. Anything else → it stays pending, as its turn did.
+        """
+        if outcome == _FINAL:
+            return self._committed(item, kind)
+        if outcome == _STALLED:
+            return _FINAL if self._stall_mate(item.content.uuid, kind, claim) else _PENDING
+        return _PENDING
 
     def _resumed_outcome(self, turn: Message) -> str | None:
         """How this wake's resume of `turn` went, or ``None`` if it has not resumed it.

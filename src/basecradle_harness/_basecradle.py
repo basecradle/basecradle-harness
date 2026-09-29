@@ -801,6 +801,13 @@ _OWNED_OPENROUTER = frozenset(
         # same keyword — ``TypeError: got multiple values for keyword argument`` — which is not the
         # "unexpected keyword" shape `_ErrorMapper` reframes, so it would crash a wake raw.
         "http_headers",
+        # Real `chat.send` keywords both, and each would quietly undo a harness policy (issue #589):
+        # `timeout_ms` spreads one number across every phase of the request — connect and read
+        # alike — putting back the flat wall that the fitted per-call budget replaced, while
+        # `last_timeout` went on reporting the fit; `retries` turns the SDK's own retry back on
+        # under the engine's, which re-sends a timed-out request with the identical budget.
+        "timeout_ms",
+        "retries",
     }
 )
 
