@@ -7,6 +7,100 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.134.0] - 2026-09-29
+
+### Fixed: a slow model answer no longer crashes the wake — timeouts fit the call, a timeout is retried once with more time, and a resume that keeps failing stalls visibly (issue #589)
+
+On 2026-09-29 @glm-5.2 was given a six-step job. By its ninth step the context was ~40 K tokens with
+2–3 K-token replies, and one generation legitimately needed more than a minute. Every call on the
+`openrouter` and `openai` adapters got a flat 60 s for every phase of the request, so the answer was
+cut off; the retry re-sent the identical request into the identical wall twice more (three minutes
+per step); the wake died; and the recovery resumed the same turn, with the same accumulated context,
+into the same failure — four wakes in a row, fifteen timeouts, on a provider whose uptime for that
+model was 100% the whole time. The native xAI adapter passed no timeout at all (the SDK's 27
+minutes), which is why @briggs never saw one: one harness, two rules. Four design errors, four fixes.
+
+**Timeouts fit the call** (`_timeouts.py`, one policy on every adapter). Each call gets two budgets:
+
+- **Connect: 10 s, fixed**, on the HTTP adapters. Reaching an endpoint does not get slower as a
+  conversation grows. The native xAI adapter speaks gRPC, which fails an unreachable call fast on
+  its own, so there the fitted budget is the whole call's deadline.
+- **Generation: fitted.** `60 s + request tokens ÷ 1,000/s + output tokens ÷ 20/s`, rounded up to whole
+  minutes and capped at 15 minutes. Request tokens are the characters the model reads — messages and
+  tool schemas — at 3 characters a token; output tokens are the call's own cap (`max_tokens` /
+  `max_completion_tokens` / `max_output_tokens`) or 8,192 when it has none. The rates are
+  slow-but-alive floors, not predictions: the incident's own successful call ran ~55 tok/s end to end.
+  The 60 s floor is the old wall, so no call gets less time than it had.
+
+| The call | Before | Now |
+|---|---|---|
+| ~10 K-token request, uncapped | 60 s | 480 s |
+| ~40 K-token request (the incident), uncapped | 60 s | 540 s |
+| ~200 K-token request, uncapped | 60 s | 720 s |
+| a described image (2,048-token cap) | 60 s | 180 s |
+| a memory rerank (typical pool) | 60 s, ×3 on a timeout | 120 s, then once at 240 s |
+| any call on the native xAI adapter | 1,620 s (SDK default) | as above |
+
+The `openai` adapter passes the budget as the SDK's per-request `Timeout`; the `openrouter` adapter
+sets it on the SDK's own `httpx` client per call (the SDK's `timeout_ms` spreads one number across
+every phase, so it is no longer passed); the native xAI adapter rebuilds its client when the fitted
+deadline changes — the SDK fixes a deadline per client, and the whole-minute rounding keeps that
+rare. Streaming was considered and not taken: every adapter is non-streaming by contract, and the
+`openrouter` SDK ships no accumulator, so it would mean rewriting three adapters' wire handling to fix
+a number. The stated price: a provider that accepts a request and never answers now costs one budget
+plus twice it before the wake fails (~27 minutes at the incident's size), paid only on a genuine hang.
+
+**A timeout is its own retry class.** It is retried **once, at twice the budget** — every phase, connect
+included (`Retry.timeout_scale`, bound on the adapter by the engine and the describer; the reranker
+fits its own call with it) — and a second timeout gives up. The `llm retry` line says which: beside
+`reason=timeout` it carries `timeout=540.00s timeout_scale=2 next_timeout=1080.00s`.
+Every adapter now raises the new `ProviderTimeoutError` (a `ProviderConnectionError` subclass, so
+every existing `except` still holds) where its SDK timed out — including the native xAI
+`DEADLINE_EXCEEDED`, which used to read `reason=transport` and would have been retried as a dropped
+connection. The engine's give-up line names the budget a timeout ran out of.
+
+**No adapter retries inside its SDK.** `OpenAIProvider(max_retries=)` now defaults to **0** (was 2): the
+SDK's own retry composed with the engine's (nine attempts on a 5xx) and re-sent a timed-out request
+with the identical budget. The one SDK-level retry left is gRPC's own on the native xAI path, which
+re-sends only `UNAVAILABLE` and never a deadline. The config layer now also owns the `openrouter` SDK's
+`timeout_ms` and `retries` keywords: set in `model_params.json`, either would quietly put the flat
+wall or the SDK's own retry back, so each is dropped with a WARNING like every other owned key.
+
+**A resume that keeps failing stalls instead of looping.** After **2** resumes of one item fail on the
+turn itself (`RESUME_CEILING`) the harness posts a stall note to the timeline in its own words, marks
+the item (abandoned, so nothing waits behind it), and logs `wake stalled` at WARNING:
+
+> Automatic notice from this agent's harness — its model did not write this. The model could not
+> finish working on your message: the turn stopped partway, and 2 attempts to resume it failed (last
+> error: OpenRouter did not answer in time: The read operation timed out). It had made 8 tool calls
+> toward it. The harness has stopped retrying so it does not loop, and nothing more will happen on
+> it by itself. What would help: send it again, ideally split into smaller steps. If this keeps
+> happening, the model provider may be having trouble.
+
+What counts is a failure **of the turn**: a resume that timed out (after its in-wake retry at twice
+the budget), a resume the box killed (the count lives on the claim, `Claim.resumes`, and is written
+when a resume *starts*, so its successor stalls it without calling the model), and a continuation
+cut off at the output budget having written nothing. An outage never counts — an out-of-funds
+refusal, an exhausted 5xx or 429, a dropped connection, a platform error or a harness fault puts the
+count back (`ClaimStore.recount`), so the item waits for the cause to clear, exactly as a re-drive
+does. A continuation that wrote something clears it (#490's long answers converge). The note carries
+an `Idempotency-Key` minted for the turn, so a wake that dies after posting it never posts a second;
+a stalled batch is settled whole, batch-mates before the item holding the count, with one note; and
+a platform that refuses the post leaves the item in flight with the note's words on its claim, so
+the next wake posts them — a stall is never a silent drop. Provider errors are quoted as the adapter
+reported them; an internal fault is named by class only, because a timeline is read by third
+parties. Founder-approved (@origin, 2026-09-29): *"a bad ask should cost one wasted wake and a
+visible stall, never a crash loop."*
+
+**For a library caller:** `OpenAIProvider`, `OpenRouterProvider` and `XaiSdkProvider` take `timeout=None`
+by default, meaning *fit each call*; a number is a fixed generation budget (still doubled for the one
+timeout retry). `OpenAIProvider(max_retries=)` defaults to 0. Adapters gain two optional capabilities,
+`bind_timeout_scale(scale)` and `last_timeout`; an adapter without them keeps its own timeout.
+
+**For the NOC:** two new journal heads, both WARNING — `wake stalled item=… kind=… resumes=… reason=…`
+(a stall note was posted and the item marked) and `resuming … resume=N/2` (the count on the existing
+line). The `llm retry` line gains `timeout=`, `timeout_scale=` and `next_timeout=` on a timeout.
+
 ## [0.133.5] - 2026-09-29
 
 ### Changed: Your Home re-synced to the NOC's canonical — the vault's viewer fence names a timeline, not a room (issue #583)

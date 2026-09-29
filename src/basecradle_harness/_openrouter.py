@@ -61,7 +61,7 @@ from typing import Any
 import httpx
 
 from basecradle_harness._caching import AUTOMATIC
-from basecradle_harness._context import is_context_overflow
+from basecradle_harness._context import is_context_overflow, request_chars
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
@@ -73,6 +73,7 @@ from basecradle_harness._exceptions import (
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
+    ProviderTimeoutError,
 )
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
@@ -87,13 +88,13 @@ from basecradle_harness._openai_wire import (
     chat_tool_to_wire,
     message_from_chat,
 )
+from basecradle_harness._timeouts import METADATA_TIMEOUT, CallTimeout, call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
 
 #: OpenRouter's API root — supplied as the SDK ``server_url`` (its own default is the same host,
 #: but the harness passes it explicitly so the config layer's ``AI_BASE_URL`` override flows here).
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_TIMEOUT = 60.0
 #: This adapter's single surface — declared for the SDK-scoped surface contract (issue #163).
 #: OpenRouter's Responses API is beta upstream, so only the OpenAI-compatible ``chat`` wire ships;
 #: ``AI_SDK_SURFACE`` is left unset for it.
@@ -181,6 +182,26 @@ def _watch_responses(client: Any, capture: _ResponseCapture) -> None:
         }
 
 
+def apply_timeout(client: Any, budget: CallTimeout) -> bool:
+    """Set `budget` on the ``httpx`` client an ``openrouter`` SDK client drives (issue #589).
+
+    Through the client's public ``timeout`` property — the same handle `_watch_responses` sets its
+    event hooks through, never the SDK's internals. The SDK builds each request with its client's
+    default when no ``timeout_ms`` is in play, so what is set here is what the next request carries,
+    phase by phase: the fixed connect, and the generation fitted to the call. The SDK's own
+    ``timeout_ms`` cannot say that — it spreads one number across every phase.
+
+    Shared by the brain adapter and the reranker, the two callers of this SDK, so the mapping from
+    a budget to the wire is spelled once. ``False`` when there is no ``httpx`` client underneath (a
+    test double): nothing was applied, and the caller must not claim a budget it did not set.
+    """
+    http_client = getattr(getattr(client, "sdk_configuration", None), "client", None)
+    if not isinstance(http_client, httpx.Client):
+        return False
+    http_client.timeout = httpx.Timeout(**budget.phases())
+    return True
+
+
 def _server_tool_objects(
     builtins: Sequence[str], web_search_params: Mapping[str, Any] | None
 ) -> list[dict[str, Any]]:
@@ -236,7 +257,10 @@ class OpenRouterProvider:
         model: The OpenRouter model id, vendor-prefixed (e.g. ``"z-ai/glm-5.2"``).
         api_key: The OpenRouter bearer token. Falls back to ``AI_API_KEY`` when omitted.
         base_url: The API root, passed to the SDK as ``server_url``. Defaults to OpenRouter's own.
-        timeout: Per-request timeout in seconds (passed to the SDK as ``timeout_ms``).
+        timeout: A **fixed** generation budget in seconds, overriding the fit — for a library
+            caller that knows its calls. ``None`` (the default, and every deployment: the config
+            layer owns this key) fits every call to its size and output cap
+            (`basecradle_harness._timeouts`, issue #589). The connect budget is fixed either way.
         client: An already-built ``openrouter.OpenRouter`` (or compatible). The seam tests inject a
             client through, so the httpx client need not be constructed; built when omitted.
         builtin_tools: The active server-side built-ins to enable, as model-facing names
@@ -285,7 +309,7 @@ class OpenRouterProvider:
         *,
         api_key: str | None = None,
         base_url: str | None = None,
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         client: Any | None = None,
         builtin_tools: Sequence[str] = (),
         web_search_params: Mapping[str, Any] | None = None,
@@ -314,6 +338,13 @@ class OpenRouterProvider:
         #: cached verdict. ``None`` means *not yet known* **or** last read was inconclusive, exactly
         #: as for vision, so a metadata hiccup never permanently pins a model to a lower tier.
         self._sees_video: bool | None = None
+        #: The generation budget, in seconds, this adapter applied to its most recent call — read
+        #: for the retry and give-up lines, so a timeout names the budget it ran out of (#589).
+        #: ``None`` until the first call, and whenever the client offered no way to apply one.
+        self.last_timeout: float | None = None
+        #: How much of its fitted budget the next call gets (`bind_timeout_scale`).
+        self._timeout_scale = 1.0
+        self._fixed_timeout = timeout
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._default_params = default_params
         # Server-tool objects are config-time constant (they don't vary per turn), so build them
@@ -331,13 +362,18 @@ class OpenRouterProvider:
             self._client = self._openrouter.OpenRouter(
                 api_key=key,
                 server_url=base_url or None,
-                timeout_ms=int(timeout * 1000),
+                # **No `timeout_ms`**, on purpose (issue #589). The SDK spreads that one number
+                # across every phase of the request — connect and read alike — so it cannot say
+                # "ten seconds to reach the endpoint, as long as the answer needs to arrive". Left
+                # unset, each request takes its client's own `httpx.Timeout`, which `_apply_timeout`
+                # sets per call from the fit.
+                #
                 # Disable the SDK's default 5xx retry. Its Speakeasy default backs off up to
                 # ~1 hour (BackoffStrategy max_elapsed 3_600_000ms) on a persistent 5xx, which
-                # would hang a wake far past ``timeout`` (that is per-attempt, not total). The
-                # harness fails a wake fast and lets the router re-wake on the next event —
-                # matching the other adapters' bounded behavior (openai ``max_retries``, the
-                # xAI gRPC deadline). This also makes production match what the tests exercise.
+                # would hang a wake far past the per-attempt timeout. The engine's bounded retry is
+                # the one policy for every adapter (`basecradle_harness._retry`); a second one
+                # inside the SDK would compose with it, and would re-send a timed-out request into
+                # the same wall.
                 retry_config=None,
             )
         # Watch every response: the raw body is the only place the web-search citations live (the
@@ -357,8 +393,31 @@ class OpenRouterProvider:
         """
         return copy.deepcopy(self._default_params)
 
+    def bind_timeout_scale(self, scale: float) -> None:
+        """How much of its fitted generation budget this adapter's next calls get (issue #589).
+
+        The `_timeouts.bind_scale` capability: ``1.0`` is the fit itself, and the one retry a
+        timeout earns binds `_timeouts.TIMEOUT_RETRY_SCALE`. Sticky until the next bind.
+        """
+        self._timeout_scale = max(1.0, float(scale))
+
+    def _apply_timeout(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None) -> None:
+        """Fit this call's budget and set it on the SDK's own ``httpx`` client (issue #589).
+
+        A client double with no ``httpx`` client underneath keeps whatever it has, and
+        `last_timeout` stays ``None`` rather than claiming a budget nothing applied.
+        """
+        budget = call_timeout(
+            request_chars(messages, tools),
+            output_tokens=output_cap(self._default_params),
+            scale=self._timeout_scale,
+            fixed=self._fixed_timeout,
+        )
+        self.last_timeout = budget.generation if apply_timeout(self._client, budget) else None
+
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:
         """Run one model turn through the SDK and return the assistant's reply."""
+        self._apply_timeout(messages, tools)
         payload: dict[str, Any] = dict(self._default_params)
         payload["model"] = self.model
         payload["messages"] = [chat_message_to_wire(m) for m in messages]
@@ -452,7 +511,9 @@ class OpenRouterProvider:
         if not author or not slug:
             return None
         try:
-            response = self._client.endpoints.list(author=author, slug=slug)
+            response = self._client.endpoints.list(
+                author=author, slug=slug, timeout_ms=int(METADATA_TIMEOUT * 1000)
+            )
         except Exception as exc:  # noqa: BLE001 - degrade to the floor; never break a wake
             _log.warning("Could not read %s's context limit from OpenRouter: %s", self.model, exc)
             return None
@@ -518,7 +579,9 @@ class OpenRouterProvider:
         if not author or not slug:
             return None
         try:
-            response = self._client.models.get(author=author, slug=slug)
+            response = self._client.models.get(
+                author=author, slug=slug, timeout_ms=int(METADATA_TIMEOUT * 1000)
+            )
         except Exception as exc:  # noqa: BLE001 - a metadata read must never break a wake
             _log.warning(
                 "Could not read %s's %s capability from OpenRouter: %s", self.model, modality, exc
@@ -624,11 +687,14 @@ class _ErrorMapper:
             raise _from_status_error(exc) from exc
         if isinstance(exc, errors.NoResponseError):
             raise ProviderConnectionError(f"Could not reach OpenRouter: {exc}") from exc
+        if isinstance(exc, httpx.TimeoutException):
+            # The call ran out of time — to connect, or (the shape of issue #589) to answer. Typed
+            # here, where it is known, because a timeout is retried differently from every other
+            # transport failure: once, with a larger budget, never into the same wall again.
+            raise ProviderTimeoutError(f"OpenRouter did not answer in time: {exc}") from exc
         if isinstance(exc, httpx.RequestError):
-            # A transport failure: DNS/TCP/TLS, a connect timeout, or a **read** timeout. Chained
-            # with ``from exc`` deliberately — `_retry.connection_reason` reads the cause to tell
-            # ``timeout`` from ``transport``, because this line cannot: a read timeout did reach
-            # the model (this comment said otherwise until issue #545).
+            # A transport failure: DNS/TCP/TLS, or the connection dropping mid-response. Chained
+            # with ``from exc`` deliberately, so the cause is on the record.
             raise ProviderConnectionError(f"Could not reach OpenRouter: {exc}") from exc
         if isinstance(exc, TypeError) and "unexpected keyword argument" in str(exc):
             # ``chat.send`` is typed with no ``**kwargs``; an unknown key came from model_params.

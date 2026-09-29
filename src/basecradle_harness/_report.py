@@ -33,6 +33,20 @@ Two report shapes, one per handled class:
   funds it. The report says so in plain language, the notice is **debounced** (one per outage per
   timeline — `BillingState`), and the pending work is left pending so it resumes on the first
   successful call after funding.
+
+And one note that is not a vendor verdict at all (issue #589, founder-approved 2026-09-29: *"a bad
+ask should cost one wasted wake and a visible stall, never a crash loop"*):
+
+- **Stall** (`stall_body`): a turn whose resumes have failed on the turn itself
+  `_wake.RESUME_CEILING` times — timed out, killed mid-resume, or cut off having written nothing;
+  never an outage, which only delays. No single failure was permanent, but the *item* has proven
+  itself unfinishable, and resuming it again would replay the same accumulated context into the same
+  failure forever. It is the provider-failure report's own case,
+  reached by repetition rather than by a vendor's word: the model cannot get this done, so there is
+  no agent to ask. It is written **in the harness's own words**, as the ruling asks, and says so —
+  what was being worked on, that it could not finish, and what would help — because a note in the
+  agent's voice about work its model never did would be the harness speaking *for* the agent,
+  which the Unspoken Channel forbids.
 """
 
 from __future__ import annotations
@@ -122,6 +136,65 @@ def provider_label(provider: str | None) -> str:
     if not provider:
         return "the model provider"
     return _PROVIDER_LABELS.get(provider, provider)
+
+
+#: The most of an error's text a stall note quotes. An adapter's message is short; the cap is for
+#: the one that is not (an HTML error page, a stack of nested causes), which on a timeline would bury
+#: the sentence that says what to do.
+STALL_DETAIL_CAP = 500
+
+#: What a stall note says when the last resume never reported back — the wake running it was killed
+#: (issue #589). Only the *last* one: an earlier one may well have reported, and saying "each attempt
+#: was interrupted" when one of them timed out would be a claim the harness cannot back.
+STALL_UNREPORTED = "the last of them never reported back, because the wake running it stopped"
+
+#: What a stall note says when the resumes were cut off at the output budget having written nothing
+#: — a model spending its whole cap before a word. Not the vendor's words, because the vendor said
+#: nothing wrong; it stopped where it was told to.
+STALL_NOTHING_WRITTEN = "each ran out of its output budget before writing anything"
+
+
+def stall_detail(error: BaseException) -> str:
+    """What a stall note says about the failure that ended the last resume — safe to post publicly.
+
+    A **provider** failure is quoted as its adapter reported it — the vendor's own words where the
+    vendor spoke (`verbatim`, decision 3 of issue #336) — because that is the fact a human can act
+    on. Anything else is the harness's own fault, and its text is **not** posted: an internal
+    exception can carry a path on the box, a variable's contents, a stack of causes — nothing a peer
+    on the timeline is owed, and something a third party should not read. It is named by class, and
+    the text stays in the log where it belongs.
+    """
+    if isinstance(error, ProviderError):
+        detail = verbatim(error).strip() or type(error).__name__
+        if len(detail) > STALL_DETAIL_CAP:
+            detail = detail[: STALL_DETAIL_CAP - 1].rstrip() + "…"
+        return f"last error: {detail}"
+    return f"last error: an internal fault ({type(error).__name__}); the details are in its log"
+
+
+def stall_body(*, item: str, resumes: int, tool_calls: int, detail: str) -> str:
+    """The stall note (issue #589) — the harness speaking for itself, never as the agent.
+
+    Three things, in the order a reader needs them: **what was being worked on** (the item, and how
+    far the turn got — the tool calls it had made are the one measure of progress the transcript
+    holds), **that it could not finish** (how many resumes failed on the turn itself, and how), and
+    **what would help** (ask again, smaller). Every clause is one the harness can back: it counts
+    only the resumes that failed on the turn (`_wake.RESUME_CEILING`), so it says that many failed
+    and makes no claim about how many tries there were in all.
+    """
+    progress = (
+        f" It had made {tool_calls} tool call{'s' if tool_calls != 1 else ''} toward it."
+        if tool_calls
+        else ""
+    )
+    return (
+        "Automatic notice from this agent's harness — its model did not write this. "
+        f"The model could not finish working on {item}: the turn stopped partway, and {resumes} "
+        f"attempt{'s' if resumes != 1 else ''} to resume it failed ({detail}).{progress} The "
+        "harness has stopped retrying so it does not loop, and nothing more will happen on it by "
+        "itself. What would help: send it again, ideally split into smaller steps. If this keeps "
+        "happening, the model provider may be having trouble."
+    )
 
 
 def report_body(rc: ReportClass, *, item: str, provider: str | None, exc: ProviderError) -> str:

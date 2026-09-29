@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from basecradle_harness._caching import AUTOMATIC
-from basecradle_harness._context import is_context_overflow
+from basecradle_harness._context import is_context_overflow, request_chars
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
@@ -52,6 +52,7 @@ from basecradle_harness._exceptions import (
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
+    ProviderTimeoutError,
 )
 from basecradle_harness._faults import is_out_of_funds
 from basecradle_harness._messages import Message, ToolSpec
@@ -71,12 +72,12 @@ from basecradle_harness._openai_wire import (
     message_from_responses,
     message_to_input,
 )
+from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
 
 #: OpenAI's default API root — what the SDK targets when no ``base_url`` is given.
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_TIMEOUT = 60.0
 #: This adapter's surfaces (see the module docstring), as an **SDK-scoped** declaration: the
 #: harness reads ``AI_SDK_SURFACE`` against the *active SDK adapter's* ``SURFACES`` (omitted →
 #: ``DEFAULT_SURFACE``; provided-but-unlisted → hard fail). ``responses`` is @jt's default.
@@ -195,9 +196,16 @@ class OpenAIProvider:
         surface: ``"responses"`` (default) or ``"chat"`` — this adapter's internal wire
             surface (see the module docstring). Server-side built-ins and vision require
             ``"responses"``.
-        timeout: Per-request timeout in seconds.
-        max_retries: How many times the SDK retries a transient failure. Defaults to the SDK's
-            own resilience (2); set 0 for a single-shot call.
+        timeout: A **fixed** generation budget in seconds, overriding the fit — for a library
+            caller that knows its calls. ``None`` (the default, and every deployment: the config
+            layer owns this key) fits every call to its size and output cap
+            (`basecradle_harness._timeouts`, issue #589). The connect budget is fixed either way.
+        max_retries: How many times the **SDK** retries on its own. ``0`` by default (issue #589):
+            the engine's bounded retry is the one policy for every adapter
+            (`basecradle_harness._retry`), and the SDK's composed with it — nine HTTP attempts on
+            a 5xx here against three on the native adapters, and, worse, it re-sent a timed-out
+            request with the **identical** budget, which is the wall that issue exists to remove.
+            A library caller driving this adapter without the engine may want it back.
         builtin_tools: The server-side built-ins to enable on the Responses surface, as type
             names (``"web_search"``) or full tool dicts. Resolved from the active tool plugins
             and merged with the custom function tools each turn. Ignored on the chat surface.
@@ -250,8 +258,8 @@ class OpenAIProvider:
         base_url: str | None = None,
         provider: str = "openai",
         surface: str = DEFAULT_SURFACE,
-        timeout: float = DEFAULT_TIMEOUT,
-        max_retries: int = 2,
+        timeout: float | None = None,
+        max_retries: int = 0,
         builtin_tools: Sequence[str | Mapping[str, Any]] = (),
         extra_body: Mapping[str, Any] | None = None,
         extra_headers: Mapping[str, str] | None = None,
@@ -278,6 +286,12 @@ class OpenAIProvider:
         #: the reply that would end the turn: was the output budget spent mid-sentence? ``None``
         #: until the first call answers, and whenever the vendor said nothing.
         self.last_finish_reason: str | None = None
+        #: The generation budget, in seconds, this adapter applied to its most recent call — read
+        #: for the retry and give-up lines, so a timeout names the budget it ran out of (#589).
+        self.last_timeout: float | None = None
+        #: How much of its fitted budget the next call gets (`bind_timeout_scale`).
+        self._timeout_scale = 1.0
+        self._fixed_timeout = timeout
         self.surface = surface
         self.base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._builtin_tools = [builtin_to_responses(spec) for spec in builtin_tools]
@@ -298,7 +312,8 @@ class OpenAIProvider:
         self._client = openai.OpenAI(
             api_key=key,
             base_url=base_url or None,
-            timeout=timeout,
+            # No client-wide timeout: every request passes its own — a model turn the one fitted to
+            # it (`_timeout_args`), a metadata read `METADATA_TIMEOUT` (`context_limit`).
             max_retries=max_retries,
             # Sent on every request the client makes. The endpoint this one adapter is aimed at
             # decides whether there is anything to send — the config layer answers that, so the
@@ -361,6 +376,34 @@ class OpenAIProvider:
             return {"extra_headers": {self._affinity.header: self._conversation}}
         return {self._affinity.field: self._conversation}
 
+    def bind_timeout_scale(self, scale: float) -> None:
+        """How much of its fitted generation budget this adapter's next calls get (issue #589).
+
+        The `_timeouts.bind_scale` capability: ``1.0`` is the fit itself, and the one retry a
+        timeout earns binds `_timeouts.TIMEOUT_RETRY_SCALE`. Sticky until the next bind.
+        """
+        self._timeout_scale = max(1.0, float(scale))
+
+    def _timeout_args(
+        self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None
+    ) -> dict[str, Any]:
+        """This call's budget as the SDK's per-request ``timeout`` (issue #589).
+
+        Per request rather than per client, because the fit is a property of the call: the SDK
+        takes a phase-by-phase ``Timeout`` on every ``create``, so a fixed short connect and a
+        generation fitted to this request's size ride the same call. Spread last into the payload,
+        after the operator's tuning — the config layer already strips ``timeout`` from it, and a
+        library caller's ``default_params`` must not undo the fit either.
+        """
+        budget = call_timeout(
+            request_chars(messages, tools),
+            output_tokens=output_cap(self._default_params),
+            scale=self._timeout_scale,
+            fixed=self._fixed_timeout,
+        )
+        self.last_timeout = budget.generation
+        return {"timeout": self._openai.Timeout(**budget.phases())}
+
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:
         """Run one model turn through the SDK and return the assistant's reply."""
         if self.surface == "responses":
@@ -386,6 +429,7 @@ class OpenAIProvider:
         # over anything a library caller passed at construction (the operator's `model_params.json`
         # never gets this far — `_basecradle._OWNED_OPENAI` strips it with a warning first).
         payload.update(self._affinity_args())
+        payload.update(self._timeout_args(messages, tools))
         started = time.monotonic()
         with self._mapped_errors():
             response = self._client.responses.create(**payload)
@@ -416,6 +460,7 @@ class OpenAIProvider:
         if self._extra_body:
             payload["extra_body"] = dict(self._extra_body)
         payload.update(self._affinity_args())  # see `_responses_turn` on why it lands last
+        payload.update(self._timeout_args(messages, tools))
         started = time.monotonic()
         with self._mapped_errors():
             response = self._client.chat.completions.create(**payload)
@@ -478,7 +523,7 @@ class OpenAIProvider:
         Never fatal: any failure degrades to ``None``, and the wake runs exactly as before.
         """
         try:
-            model = self._client.models.retrieve(self.model)
+            model = self._client.models.retrieve(self.model, timeout=METADATA_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - degrade to the floor; never break a wake
             _log.warning("Could not read %s's context limit from the provider: %s", self.model, exc)
             return None
@@ -537,11 +582,15 @@ class _ErrorMapper:
         if exc is None:
             return False
         openai = self._openai
+        if isinstance(exc, openai.APITimeoutError):
+            # The call ran out of time — to connect, or (the shape of issue #589) to answer. Typed
+            # here, where it is known, because a timeout is retried differently from every other
+            # transport failure: once, with a larger budget, never into the same wall again.
+            # Checked first: the SDK's `APITimeoutError` subclasses `APIConnectionError`.
+            raise ProviderTimeoutError(f"The provider did not answer in time: {exc}") from exc
         if isinstance(exc, openai.APIConnectionError):
-            # Covers APITimeoutError too: DNS/TCP/TLS, a connect timeout, or a **read** timeout —
-            # the last of which *did* reach the model, whatever this comment claimed before issue
-            # #545. ``from exc`` keeps the SDK's own cause, which is where
-            # `_retry.connection_reason` reads ``timeout`` versus ``transport`` from.
+            # DNS/TCP/TLS, or the connection dropping mid-response. ``from exc`` keeps the SDK's
+            # own cause on the record.
             raise ProviderConnectionError(f"Could not reach the provider: {exc}") from exc
         if isinstance(exc, openai.APIStatusError):
             raise _from_status_error(exc) from exc

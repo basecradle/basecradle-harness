@@ -90,13 +90,14 @@ from basecradle_harness._observability import (
     serving_endpoint,
 )
 from basecradle_harness._openrouter import (
-    DEFAULT_TIMEOUT,
     PROVIDER,
     ROUTING_METADATA_HEADER,
     _ErrorMapper,
+    apply_timeout,
     require_openrouter_sdk,
 )
 from basecradle_harness._retry import Retry, connection_reason, diagnostics
+from basecradle_harness._timeouts import call_timeout
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -134,6 +135,13 @@ REASONING_EFFORT = "low"
 
 #: Deterministic ranking: the same pool and the same query should pick the same memories.
 TEMPERATURE = 0
+
+#: What a rerank is expected to write — low-effort reasoning and a JSON list of ``k`` indices — for
+#: the **timeout's** fit and nothing else (issue #589). It is never sent: the call carries no output
+#: cap, and adding one would change what the model is asked. The fit it buys is 120 s against a
+#: typical pool, retried once at 240 s on a timeout — where it used to be the brain's flat 60 s, the
+#: very wall that issue removed from the brain.
+RERANK_OUTPUT_TOKENS = 1_024
 
 #: How large a candidate pool to fetch for a request of ``k``: ``max(POOL_FLOOR, POOL_FACTOR × k)``.
 #: The whole gain is lifting a hit the hybrid ranked *below* the cut into the injected set, so the
@@ -251,10 +259,12 @@ class MemPalaceReranker:
             `reranker_from_env`).
         client: An already-built ``openrouter.OpenRouter`` (or compatible). Tests inject one; in
             production it is built lazily on the first call.
-        timeout: Per-request timeout in seconds. Defaults to the **same** value the OpenRouter
-            brain adapter uses (`basecradle_harness._openrouter.DEFAULT_TIMEOUT`) — deliberately
-            not tighter. Rerank is not chat: a slow, correct pool beats a fast, wrong one, and a
-            shorter deadline here would invent a failure mode the brain does not have.
+        timeout: A **fixed** generation budget in seconds, overriding the fit. ``None`` (the
+            default, and every deployment) fits each call the way the brain's are fitted
+            (`basecradle_harness._timeouts`, issue #589): the same policy, with
+            `RERANK_OUTPUT_TOKENS` as what a rerank writes. Deliberately not a tighter rule than
+            the brain's: a slow, correct pool beats a fast, wrong one, and a shorter deadline here
+            would invent a failure mode the brain does not have.
         sleep: Injectable wait used only by the bounded retry (issue #506), so a test proves the
             schedule without waiting it. Defaults to `time.sleep`, exactly as the engine's does.
     """
@@ -267,7 +277,7 @@ class MemPalaceReranker:
         providers: Sequence[str] = (),
         fault: str | None = None,
         client: Any | None = None,
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.model = model
@@ -359,7 +369,18 @@ class MemPalaceReranker:
             sleep=self._sleep,
             extra={"surface": surface},
         )
+        messages = _messages(query, hits, k)
+        chars = sum(len(message["content"]) for message in messages)
         while True:
+            # Fitted per attempt, so the one retry a timeout earns runs at the larger budget
+            # (`retry.timeout_scale`, issue #589) — the same shape as every brain call.
+            budget = call_timeout(
+                chars,
+                output_tokens=RERANK_OUTPUT_TOKENS,
+                scale=retry.timeout_scale,
+                fixed=self._timeout,
+            )
+            applied = budget.generation if apply_timeout(client, budget) else None
             try:
                 # The brain adapter's mapper, reused rather than re-derived. One branch of it is
                 # worded for that caller — an unexpected-keyword `TypeError` is reframed as "a key
@@ -371,7 +392,7 @@ class MemPalaceReranker:
                     response = client.chat.send(
                         http_headers=ROUTING_METADATA_HEADER,
                         model=self.model,
-                        messages=_messages(query, hits, k),
+                        messages=messages,
                         temperature=TEMPERATURE,
                         reasoning={"effort": REASONING_EFFORT},
                         response_format={"type": "json_object"},
@@ -387,7 +408,7 @@ class MemPalaceReranker:
                     )
             except ProviderError as exc:
                 reason, is_config = _fault_of(exc)
-                if retry.again(exc, reason=reason, is_config=is_config):
+                if retry.again(exc, reason=reason, is_config=is_config, timed_out_after=applied):
                     continue
                 self._report(
                     surface,
@@ -430,7 +451,9 @@ class MemPalaceReranker:
             self._openrouter = require_openrouter_sdk()
             self._client = self._openrouter.OpenRouter(
                 api_key=self._api_key,
-                timeout_ms=int(self._timeout * 1000),
+                # No `timeout_ms`, for the brain adapter's reason: the SDK spreads it across every
+                # phase, so each attempt's fitted budget is set on the client instead (`_pick`).
+                #
                 # Same reason the brain adapter disables it: the SDK's Speakeasy default backs off
                 # for up to an hour on a persistent 5xx, which would hang a wake far past the
                 # per-attempt timeout. A rerank fault falls back to hybrid instead — the agent gets

@@ -1018,7 +1018,7 @@ def test_the_give_up_leaves_a_diagnosable_log_trail(caplog):
     assert "attempt=1/3 reason=invalid_response" in warnings[0].getMessage()
     assert "attempt=2/3 reason=invalid_response" in warnings[1].getMessage()
     assert len(errors) == 1  # the final give-up
-    assert "all 3 attempt(s)" in errors[0].message  # names the attempt count
+    assert "on 3 attempt(s)" in errors[0].message  # names the attempt count
 
 
 class ServerErrorProvider:
@@ -1287,7 +1287,7 @@ def test_a_timeout_an_sdk_wrapped_reads_the_same_word_as_a_bare_one(caplog):
 def test_a_transport_that_never_clears_is_still_bounded():
     """A genuinely-unreachable provider must not be retried forever: the wake still aborts, with the
     transport error, after exactly `response_retries` extra attempts."""
-    provider = TransportFailingProvider(httpx.ReadTimeout("gone"), fails=99)
+    provider = TransportFailingProvider(httpx.ConnectError("connection refused"), fails=99)
     delays, spy = _no_sleep()
     engine = Engine(provider, ToolRegistry(), response_retries=2, sleep=spy)
 
@@ -1296,6 +1296,25 @@ def test_a_transport_that_never_clears_is_still_bounded():
 
     assert provider.calls == 3  # response_retries + 1
     assert delays == [0.5, 1.0]
+
+
+def test_a_timeout_that_never_clears_is_retried_once_and_no_more():
+    """Issue #589's second defect, closed: a timeout is never re-sent into the same wall twice.
+
+    The engine used to spend every one of its `response_retries` on a read timeout — the identical
+    request with the identical budget, 0.5 s and 1 s after it failed — which on 2026-09-29 burned
+    three minutes per step for @glm-5.2 and then failed the wake anyway. A timeout now earns one
+    retry, at a larger budget, whatever `response_retries` allows; a second timeout gives up.
+    """
+    provider = TransportFailingProvider(httpx.ReadTimeout("gone"), fails=99)
+    delays, spy = _no_sleep()
+    engine = Engine(provider, ToolRegistry(), response_retries=5, sleep=spy)
+
+    with pytest.raises(ProviderConnectionError):
+        engine.run([Message.user("hi")])
+
+    assert provider.calls == 2  # the attempt and its one retry, not response_retries + 1
+    assert delays == [0.5]
 
 
 def test_the_give_up_line_names_a_timeout_apart_from_a_transport_drop(caplog):

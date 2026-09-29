@@ -79,6 +79,14 @@ ASSET = "asset"
 TASK = "task"
 WEBHOOK_ENDPOINT = "webhook_endpoint"
 
+#: The one keyed create the **harness** issues rather than a tool: the stall note (issue #589). It is
+#: posted once per stalled turn and the turn's items are then abandoned — several writes, and a wake
+#: that dies between them leaves the turn for the next wake to stall again, possibly through another
+#: of its messages. Keyed on the turn's anchor like every key the turn mints (ordinal 1, there is only
+#: ever one), so that second stall returns the first note instead of posting another. Deliberately
+#: absent from `CREATE_CALLS`: no tool call issues it, so no transcript ordinal counts it.
+STALL_NOTE = "stall_note"
+
 CREATE_CALLS: dict[tuple[str, str], str] = {
     ("messages", "create"): MESSAGE,
     ("assets", "create"): ASSET,

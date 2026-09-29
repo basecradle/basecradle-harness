@@ -113,7 +113,7 @@ from dataclasses import dataclass
 
 from basecradle_harness._elision import EXCERPT_OPENING
 from basecradle_harness._engine import DEFAULT_MAX_STEPS
-from basecradle_harness._messages import Message
+from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import kv
 from basecradle_harness._provider import Provider
 
@@ -1101,3 +1101,23 @@ def message_chars(message: Message) -> int:
 def _chars(messages: Sequence[Message]) -> int:
     """The whole transcript's cost in characters — the quantity the token estimate scales."""
     return sum(message_chars(message) for message in messages)
+
+
+def request_chars(messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> int:
+    """One model request's size in characters: every message, plus the tool schemas offered.
+
+    What a call's generation timeout is fitted to (`_timeouts.generation_timeout`, issue #589) —
+    measured in **this** module's unit for the reason `message_chars` gives: a second function
+    answering "how big is this?" is a second unit. The tool schemas count because the vendor reads
+    them on every call, and an agent with a large MCP tool set carries tens of thousands of
+    characters of them. Images and clips are not counted, for the reason `message_chars` gives and
+    one more: a timeout's floor and output term already dwarf what a picture adds to reading.
+    """
+    total = _chars(messages)
+    for tool in tools or ():
+        total += (
+            len(tool.name)
+            + len(tool.description or "")
+            + len(json.dumps(tool.parameters, ensure_ascii=False, default=str))
+        )
+    return total

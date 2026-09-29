@@ -932,10 +932,10 @@ def test_a_wake_lost_to_a_read_timeout_after_posting_is_resumed_and_posts_once(
     Two properties, and they are one test because the second is what makes the first non-obvious.
 
     **The turn is retried where the retry can help.** Since issue #545 a transport fault is
-    transient, so the second model call is re-issued up to `DEFAULT_RESPONSE_RETRIES` more times
-    before the wake gives up — three calls after the post, not one. A transport failure that
-    *clears* never reaches the wake-level path at all; this double never clears, which is the only
-    way to exercise what happens when the retry is genuinely exhausted.
+    transient, and since issue #589 a *timeout* is retried exactly once, with twice the budget —
+    two calls after the post, never the three identical ones that burned three minutes a step. A
+    timeout that *clears* never reaches the wake-level path at all; this double never clears, which
+    is the only way to exercise what happens when the retry is genuinely exhausted.
 
     **And exhausting it changes nothing about the recovery.** The dead turn issued a tool call, so
     the next wake **resumes** it rather than re-driving it — zero tools re-fire and the `messages`
@@ -952,7 +952,7 @@ def test_a_wake_lost_to_a_read_timeout_after_posting_is_resumed_and_posts_once(
         first.wake()
 
     assert _posts(platform) == ["Here is your owl."]  # the dying wake did speak, once
-    assert brain.calls == 4  # the post, then 1 + DEFAULT_RESPONSE_RETRIES exhausted attempts
+    assert brain.calls == 3  # the post, then the timed-out call and its one larger-budget retry
 
     serve_messages(platform, page(message(uuid=M0, body=MULTILINE)))
     second, live = build_wake(tmp_path, _Finishes(), tools=[MessagesTool()])
