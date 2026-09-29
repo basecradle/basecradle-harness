@@ -3191,17 +3191,17 @@ def test_an_agent_without_a_shell_is_shown_no_home_section(platform, tmp_path):
     ids=["silent-on-home", "own-vault-binding", "carries-the-whole-section"],
 )
 def test_your_home_is_composed_whatever_the_persona_prompt_says(platform, tmp_path, persona):
-    """The founder's ruling: one plumbing, no detection, and the persona letter is never touched.
+    """The founder's ruling: one plumbing, no detection, and the system prompt is never touched.
 
-    A letter that already carries a vault binding — or the whole section — still gets the harness's
-    section, in full, from the same code path; and the letter reaches the model exactly as its owner
-    wrote it, with the file on disk byte-identical after the wake.
+    A system prompt that already carries a vault binding — or the whole section — still gets the
+    harness's section, in full, from the same code path; and the system prompt reaches the model
+    exactly as its owner wrote it, with the file on disk byte-identical after the wake.
     """
     cfg = Path(os.environ["BASECRADLE_CONFIG_HOME"])
     install(cfg)
-    letter = cfg / "prompts" / "system-prompt.md"
-    letter.write_text(persona, encoding="utf-8")
-    before = letter.read_bytes()
+    system_prompt = cfg / "prompts" / "system-prompt.md"
+    system_prompt.write_text(persona, encoding="utf-8")
+    before = system_prompt.read_bytes()
     serve_dashboard_md(platform)
     serve_messages(platform, page(message(uuid=M0, body="hi")))
     agent, model = _build_shell_wake(tmp_path)
@@ -3212,7 +3212,8 @@ def test_your_home_is_composed_whatever_the_persona_prompt_says(platform, tmp_pa
     assert _home_section(brief) == your_home_text()
     # Trimmed, as every prompt file always is on its way into the brief — and otherwise untouched.
     assert f"<system-prompt.md>\n{persona.strip()}\n</system-prompt.md>" in brief
-    assert letter.read_bytes() == before  # the letter is the agent's: read, never written
+    # The system prompt is the agent's: read, never written.
+    assert system_prompt.read_bytes() == before
 
 
 def test_a_missing_your_home_file_costs_that_part_loudly(platform, tmp_path, monkeypatch, caplog):
