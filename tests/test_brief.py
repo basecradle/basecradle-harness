@@ -630,11 +630,11 @@ def test_the_parts_still_partition_the_brief_with_their_tags_charged():
 # --- Your Home (issue #571) ---------------------------------------------------
 
 #: The sha256 of the canonical `your-home.md` as the capital's handoff and basecradle-noc both carry
-#: it (4,182 bytes, the front-desk sentence of basecradle-noc#843). The NOC owns the text and
+#: it (4,226 bytes, the viewer-fence sentence of basecradle-harness#583). The NOC owns the text and
 #: byte-diffs this package's copy against its own; pinning the checksum here makes a *local*
 #: rewording fail CI, so an edit can only ever arrive as a deliberate re-sync from the NOC — with
 #: this constant updated to match in the same change.
-CANONICAL_YOUR_HOME_SHA256 = "ce8fec7fbb8d291778af6a12fc3c07fc6e53d09c8c5f35083edcae7b19b6392e"
+CANONICAL_YOUR_HOME_SHA256 = "dad0e3011357535824dbc500e81666267671a7abf515623d5e4a0b67dc394991"
 
 
 def _tool(*requires: str) -> SimpleNamespace:
