@@ -270,10 +270,10 @@ def render_your_home(tools: Iterable[object]) -> str | None:
 
     - **The same bytes for every shell agent.** No switch, no paragraph skipped. The text is never
       assembled from pieces, so there is nothing to leave out.
-    - **Nothing reads the persona prompt.** A section the agent's own letter already covered is
+    - **Nothing reads the persona prompt.** A section the agent's own system prompt already covered is
       still composed: whether it is composed depends on ``tools`` and nothing else, which is why
       this function is not handed the charter at all.
-    - **Nothing writes the persona prompt.** The letter is the agent's and this section is the
+    - **Nothing writes the persona prompt.** The system prompt is the agent's and this section is the
       harness's — two files, two owners.
 
     The file's closing newline is dropped because the fence supplies one (`_fence`), so the text
