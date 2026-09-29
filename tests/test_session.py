@@ -33,6 +33,7 @@ from basecradle_harness._session import (
     _cap_arguments,
     _elide_argument,
     _json_size,
+    _within,
     turn_work,
 )
 
@@ -705,6 +706,71 @@ def test_a_call_is_capped_by_the_language_it_is_written_in_never_by_the_script()
     assert _json_size(capped) <= TOOL_ARGS_CAP
     assert capped["action"] == "create" and capped["timeline"] == TIMELINE
     assert capped["body"].startswith("日本語の長い本文です。")
+
+
+#: Long bodies whose serialized size is bigger than their length, each the way real speech gets there:
+#: paragraphs, quotation, a script with its own line breaks, source code, and the worst case, control
+#: characters, which serialize at six apiece.
+_ESCAPE_HEAVY = [
+    pytest.param(("A paragraph of the plan, carried over. " * 6 + "\n\n") * 15, id="paragraphs"),
+    pytest.param('He said "yes", and she said "not yet". ' * 90, id="quotation"),
+    pytest.param("日本語の文章です。\n" * 400, id="japanese-lines"),
+    pytest.param('path = "C:\\\\agents\\\\nova"\nprint(path)\n' * 90, id="source"),
+    pytest.param("a\x01b" * 1_500, id="control-characters"),
+]
+
+
+@pytest.mark.parametrize("body", _ESCAPE_HEAVY)
+def test_an_argument_that_escapes_still_gets_its_whole_share(body):
+    """**The first fit is the right one**, however the text serializes.
+
+    The excerpt used to be cut at `room` *characters* against a budget measured *serialized*, so every
+    newline or quote in the head overshot it by one, and past the two characters of slack per argument
+    the fit failed and `_cap_arguments` halved the entire budget to recover. That is the cost of
+    escaping, paid at 50%.
+
+    Now the share is spent: the call serializes within the cap and nowhere near half of it, the tail
+    stays within its ceiling, and re-saving the result changes nothing.
+    """
+    arguments = {"action": "create", "timeline": TIMELINE, "body": body}
+    assert _json_size(arguments) > TOOL_ARGS_CAP  # genuinely over, or this proves nothing
+
+    capped = _cap_arguments(arguments, TOOL_ARGS_CAP)
+
+    # Within the cap, and nowhere near half of it (every shape here serialized to 1,001-1,188 before).
+    assert TOOL_ARGS_CAP * 3 // 4 < _json_size(capped) <= TOOL_ARGS_CAP
+    assert capped["action"] == "create" and capped["timeline"] == TIMELINE
+    kept = capped["body"]
+    assert kept.startswith(body[:40])
+    marker_end = kept.index("...]\n\n") + len("...]\n\n")
+    assert len(kept) - marker_end <= 128  # the tail keeps its ceiling, in characters too
+    assert _cap_arguments(capped, TOOL_ARGS_CAP) == capped  # a fixed point on every later save
+
+
+def test_a_multi_paragraph_reply_keeps_most_of_its_share_not_half():
+    """The live shape: a 2,413-character reply in paragraphs. It kept 811 characters of its text."""
+    reply = ("The plan holds; the next step is ours, and we take it together. " * 4 + "\n\n") * 10
+    reply = reply[:2413]
+
+    capped = _cap_arguments(
+        {"action": "create", "timeline": TIMELINE, "body": reply}, TOOL_ARGS_CAP
+    )
+
+    kept = capped["body"]
+    marker = kept[kept.index("\n\n[... elided") : kept.index("...]\n\n") + len("...]\n\n")]
+    assert len(kept) - len(marker) > 1_700  # of the message's own text, not the marker
+
+
+def test_an_excerpt_is_the_longest_that_fits_its_room():
+    """`_within` returns the longest head or tail within `room`, measured serialized."""
+    text = 'line one\nline "two"\n' * 50
+    for room in (0, 1, 7, 64, 333, 999):
+        for from_end in (False, True):
+            piece = _within(text, room, from_end=from_end)
+            assert _json_size(piece) - 2 <= room
+            assert text.endswith(piece) if from_end else text.startswith(piece)
+            longer = text[len(text) - len(piece) - 1 :] if from_end else text[: len(piece) + 1]
+            assert _json_size(longer) - 2 > room  # one more character would not have fit
 
 
 def test_a_call_of_several_medium_arguments_keeps_all_of_them(tmp_path):

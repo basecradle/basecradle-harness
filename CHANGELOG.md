@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.133.4] - 2026-09-29
+
+### Fixed: a capped argument keeps its whole share, not half of it, when its text has line breaks or quotes
+
+The argument cap measures its budget in serialized characters (`_json_size`), where a newline or a
+quote costs two. `_elide_argument` cut the excerpt's head and tail by plain character count, so every
+escape in the head overshot the share by one. The only slack was two characters per argument, so a
+call whose excerpt held more than a handful of escapes (seven, for an ordinary three-argument create;
+one, for a single-argument call) missed its fit. `_cap_arguments` then recovered by halving the
+entire budget. Characters of the message's own text kept, against a 2,048 budget, on 0.133.3 and now:
+
+| Body | Before | Now |
+|---|---|---|
+| Unbroken prose, 3,000 characters | 1,835 | 1,835 |
+| Paragraphs, 3,030 characters | 811 | 1,817 |
+| Quotation, 3,250 characters | 811 | 1,590 |
+| A 2,413-character reply in paragraphs | 811 | 1,821 |
+
+Now each excerpt is cut by what it costs serialized (`_session._within`, measured by binary search
+rather than computed), so the first fit is the right one for every script and every escape. The
+halving loop remains as the backstop for calls whose keys, or whose many large values, are the
+problem. The bound, the tail's 128-character ceiling, the fixed point and `create_kind` are unchanged.
+Where a call already fit within that slack, its excerpt is now a few characters shorter, because the
+head and tail are cut by cost rather than by count.
+
 ## [0.133.3] - 2026-09-29
 
 ### Fixed: a tool call carrying the harness's own elision marker is refused, never run (issue #576)
