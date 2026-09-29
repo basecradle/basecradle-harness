@@ -92,7 +92,7 @@ from uuid import uuid4
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._caching import anchor_cacheable_prefix, bind_conversation, cache_mode
 from basecradle_harness._context import TOOL_ARGS_CAP, TOOL_RESULT_CAP, Compactor
-from basecradle_harness._elision import argument_marker, gone, result_marker
+from basecradle_harness._elision import argument_marker, gone, is_marker, result_marker
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._idempotency import create_kind
@@ -1222,7 +1222,7 @@ def _cap_arguments(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
     assuming a worst-case escape factor, would cut every ordinary argument to a fraction of the budget
     it is actually entitled to.
     """
-    if _json_size(arguments) <= budget:
+    if _json_size(arguments) <= budget or _is_stub(arguments):
         return arguments
     attempt = budget
     for _ in range(_ARG_FIT_ATTEMPTS):
@@ -1321,6 +1321,28 @@ def _within(text: str, room: int, *, from_end: bool = False) -> str:
     return text[len(text) - low :] if from_end else text[:low]
 
 
+#: The key a stubbed call keeps its floor marker under (`_arguments_stub`).
+_STUB_KEY = "[elided]"
+
+
+def _is_stub(arguments: dict[str, Any]) -> bool:
+    """Is this call **already** its stub? Then it is the floor, and the floor is never cut again.
+
+    The stub is the one bound that is not hard (see `gone`): at a fan-out of about fifty calls, or a
+    share small enough, it is bigger than its share, so the next save found it over budget and stubbed
+    it *again*, this time naming the size of the stub. `[... 3984 chars elided ...]` became `[... 63
+    chars elided ...]` on the second save and stayed wrong forever: the marker of a marker, naming a
+    size that is no longer true, which the fixed point exists to rule out. A stub is recognized by its
+    shape (`action` at most, plus the floor marker, whole), so a stub from 0.70.0, whose wording
+    differs, is recognized too.
+    """
+    return (
+        _STUB_KEY in arguments
+        and set(arguments) <= {"action", _STUB_KEY}
+        and is_marker(arguments[_STUB_KEY])
+    )
+
+
 def _arguments_stub(arguments: dict[str, Any]) -> dict[str, Any]:
     """The backstop for a call too big to bound by cutting its values — the hard end of the bound.
 
@@ -1333,7 +1355,7 @@ def _arguments_stub(arguments: dict[str, Any]) -> dict[str, Any]:
     action = arguments.get("action")
     if isinstance(action, str) and len(action) <= _ARG_ACTION_MAX:
         stub["action"] = action
-    stub["[elided]"] = gone(_json_size(arguments))
+    stub[_STUB_KEY] = gone(_json_size(arguments))
     return stub
 
 
