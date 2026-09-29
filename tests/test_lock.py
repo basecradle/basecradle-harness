@@ -124,7 +124,7 @@ def test_a_mismatched_confirm_is_refused_with_a_preview(lock):
     """The old boolean confirm=true no longer locks — it does not match the uuid, so it previews.
 
     This is the wrong-target gap the boolean left open: a confirm aimed at nothing (or the
-    wrong room) must not lock the current one."""
+    wrong timeline) must not lock the current one."""
     with respx.mock(assert_all_called=True) as mock:
         mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
             return_value=httpx.Response(200, json=timeline_envelope())

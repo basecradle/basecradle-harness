@@ -10,7 +10,7 @@ declares *what* the irreversible op is (`lock` vs `delete`) and the words around
 
 - **Confirm by uuid, not a boolean.** The `confirm` argument must equal the **target
   timeline's uuid** — a deliberate, target-specific yes that a reflexive tool-grab cannot
-  fake, and that cannot be aimed at the wrong room (an earlier boolean `confirm=true`
+  fake, and that cannot be aimed at the wrong timeline (an earlier boolean `confirm=true`
   could). A bare or mismatched confirm performs **no** destructive call.
 - **Preview-on-refuse.** A refusal is not a dead end: the base does one **benign GET** to
   fetch the timeline's name and item count, then returns a refusal that *names what would

@@ -26,6 +26,20 @@ sha256 `dad0e301…96fb56b1`) and the pinned checksum updated to match. That sen
 change. Nothing else changed: no code, and the same shell agents receive the section, now 4,246
 characters on the context-attribution line (`brief_your_home=`).
 
+### Changed: the shipped `initialize.md` says "timeline" where it said "room"
+
+The same ruling, applied to the one other place the agent read "room" for a timeline. Two sentences
+of the shipped operating guidance change a word each, and mean exactly what they meant:
+
+- "Never schedule your own future in a ~~room~~ **timeline** you are about to delete."
+- "Then report it to @basecradle-ai in a ~~room~~ **timeline** the attacker cannot see: …"
+
+`prompts/initialize.md` is a shipped default, so a config home whose copy is untouched is refreshed
+on the next `basecradle-harness-install`. One an operator edited is kept, with the new default
+written beside it as `initialize.md.new`. The README's governance section, a handful of docstrings,
+and one log line (the read-pace restart-cap WARNING now reads "a runaway multi-peer timeline?") use
+the same noun. No behavior changed.
+
 ### Fixed: an arguments stub is the floor, and a later save leaves it alone instead of re-stubbing it under a false size
 
 Found by the adversarial review of 0.133.4, and present since the stub took its current form in

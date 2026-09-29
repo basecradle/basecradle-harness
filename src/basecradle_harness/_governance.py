@@ -7,7 +7,7 @@ and `TasksTool` do. Governance spans two resource domains, so it ships as two
 focused tools rather than one muddy catch-all — one resource per tool, the shape
 assets and tasks established:
 
-- `TimelinesTool` — a peer running its own rooms: **create** a timeline it owns,
+- `TimelinesTool` — a peer running its own timelines: **create** a timeline it owns,
   **read** one (its participants, item count, and lock state), **list** the ones it
   can see, and **add** / **remove** a participant. It is pure benign management and
   reads — no irreversible action. (Locking moved to its own guarded `LockTool`, in
