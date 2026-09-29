@@ -1,4 +1,4 @@
-"""Prove the *billing* log lines still exist — the log-grammar probe (basecradle-noc#509).
+"""Prove the *needle* log lines still exist — the log-grammar probe (basecradle-noc#509).
 
 The fleet's **LLM Vendor Payment Failed** alert (basecradle-noc#317) is founder-named and pages a
 human: an agent's model account runs out of prepaid credit, the agent goes silent, and only a
@@ -39,6 +39,20 @@ Neither repo ever holds the other's artifact, which is the whole point:
 The harness never sees the regex; the NOC never sees the emitter. A probe that tried to assert
 extraction would need the ClickHouse tables, which is exactly the second spelling of another
 repo's contract this design exists to avoid.
+
+The second column: ``breaker_tripped``
+--------------------------------------
+
+The same shape, one alarm over (issue #592). The fleet's **Circuit Breaker Tripped** alert reads
+``breaker_tripped``, whose three clauses cover two layers' runaway backstops: the router's
+``event=breaker_tripped`` (and its retired prose), and this package's ``Wake breaker TRIPPED``
+(`_breaker.breaker_tripped_line`). The router proves its own clause with a probe of its own; this
+one proves the harness's, which the NOC had to carry as an *unwitnessed clause* until now — and a
+needle collapses to a single verdict, so the router's witness kept the column reading
+``populating`` while nothing anywhere said whether the harness's spelling still matched. One line,
+because the harness has one clause. Its ``Wake breaker RESET`` partner is rendered by the same
+module but proven by nothing here: a claim names a NOC column by its exact spelling, and no column
+reads the reset.
 
 Why it does not page the founder
 --------------------------------
@@ -114,6 +128,7 @@ import subprocess
 import sys
 import time
 
+from basecradle_harness._breaker import breaker_tripped_line
 from basecradle_harness._observability import LOG_FORMAT, agent_slug
 from basecradle_harness._report import (
     PROBE_SOURCE,
@@ -132,7 +147,8 @@ IDENTIFIER = "basecradle-log-grammar"
 #: sanctioned meeting point between an emitter and the monitor, and a claim id is shared vocabulary
 #: by design — the same way ``overlay-tool:shell`` is.
 BILLING_BLOCKED = "billing_blocked"
-COLUMNS = (BILLING_BLOCKED,)
+BREAKER_TRIPPED = "breaker_tripped"
+COLUMNS = (BILLING_BLOCKED, BREAKER_TRIPPED)
 
 #: The console script's own name, so the claims emitter and this module cannot disagree about what
 #: the manifest's ``cmd`` should invoke.
@@ -143,11 +159,11 @@ SCRIPT = "basecradle-harness-log-grammar"
 #: older than the hourly drift pass that reports it, and the NOC's extraction guard needs these
 #: lines arriving often enough to judge inside a window. The exerciser's own arithmetic holds at
 #: this value (``ttl - CLAIM_REFRESH_MARGIN + period`` = 1 − 0.75 + 0.5 = 0.75 h < 1 h). The NOC
-#: owns the guard's constants and may re-set this number in its wiring phase; a fire costs two log
-#: lines — no model call, no vendor credit, no platform I/O.
+#: owns the guard's constants and may re-set this number in its wiring phase; a fire costs one log
+#: line per clause — no model call, no vendor credit, no platform I/O.
 TTL_HOURS = 1
 
-#: The ``reason=`` slug the synthetic lines carry. Deliberately *not* the production slug
+#: The ``reason=`` slug the synthetic billing lines carry. Deliberately *not* the production slug
 #: (``out_of_funds``): ``reason`` populates no derived column, so it is free to say what is true,
 #: and a human in a Live Tail should need no lookup to know what they are looking at. A bare token
 #: by construction — see the module docstring on quoted values.
@@ -188,14 +204,18 @@ def lines(column: str, *, agent: str) -> list[str]:
     """The synthetic lines for `column` — one per clause, rendered by the production renderers.
 
     Every line is stamped ``source=probe`` unconditionally: the stamp is what keeps a synthetic out
-    of the founder's page, so it is not a parameter a caller can omit.
+    of an alarm (the founder's page for ``billing_blocked``, *Circuit Breaker Tripped* for
+    ``breaker_tripped``), so it is not a parameter a caller can omit. The breaker line carries
+    nothing else: its production fields describe one real trip, and a synthetic has none to report.
     """
-    if column != BILLING_BLOCKED:  # pragma: no cover - `main` validates before reaching here
-        raise Unprovable(f"unknown column: {column}")
-    return [
-        billing_onset_line(reason=REASON, source=PROBE_SOURCE, agent=agent),
-        billing_repeat_line(reason=REASON, source=PROBE_SOURCE, agent=agent),
-    ]
+    if column == BILLING_BLOCKED:
+        return [
+            billing_onset_line(reason=REASON, source=PROBE_SOURCE, agent=agent),
+            billing_repeat_line(reason=REASON, source=PROBE_SOURCE, agent=agent),
+        ]
+    if column == BREAKER_TRIPPED:
+        return [breaker_tripped_line(source=PROBE_SOURCE, agent=agent)]
+    raise Unprovable(f"unknown column: {column}")  # pragma: no cover - `main` validates first
 
 
 def record(line: str, *, level: str = "INFO") -> str:
@@ -326,7 +346,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    print(f"proven: {column} ({len(messages)} clause lines) emitted as {agent} under {IDENTIFIER}")
+    clauses = f"{len(messages)} clause line{'' if len(messages) == 1 else 's'}"
+    print(f"proven: {column} ({clauses}) emitted as {agent} under {IDENTIFIER}")
     return 0
 
 

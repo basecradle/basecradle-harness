@@ -115,6 +115,12 @@ from basecradle_harness._basecradle import (
     _response_retries_from_env,
     resolved_model_params,
 )
+from basecradle_harness._breaker import (
+    WakeBreaker,
+    breaker_reset_line,
+    breaker_settings_from_env,
+    breaker_tripped_line,
+)
 from basecradle_harness._brief import (
     brief_parts,
     brief_section_sizes,
@@ -1201,15 +1207,6 @@ class ClaimStore:
         return self.root / "claims" / kind / quote(timeline, safe="")
 
 
-# The wake-breaker's generous safe defaults (Phase 2 · Group 6). A genuine cross-wake
-# runaway fires continuously — many wakes per second — so over a 60 s window it racks up
-# far more than this cap, while a human-paced multi-peer conversation almost never reaches
-# 10 *inbound* items to one timeline in a minute (the agent's own replies are self-filtered
-# and never wake it, so only peer items count). Tunable via env for the rare high-volume
-# timeline; the router's cross-agent breaker (basecradle-router) is the complementary layer.
-_DEFAULT_BREAKER_MAX = 10
-_DEFAULT_BREAKER_WINDOW = 60.0
-
 #: The canned narration a turn falls back on when the engine's own reserve summary failed too
 #: (`WakeAgent._stuck_note`). Named because two readers need it by value: the note itself, and the
 #: mining boundary — the harness wrote this sentence, so it is never handed to a mining memory
@@ -1237,201 +1234,6 @@ _COMPACTION_OBSERVE_NOTE = (
 )
 
 
-@dataclass(frozen=True)
-class BreakerDecision:
-    """The wake-breaker's verdict for one wake: what it decided, and why.
-
-    `short_circuit` is the load-bearing field — when True this wake **self-declines**: it
-    makes no provider call and acts on nothing. `tripped` and `reset` flag the one-time
-    state *transitions* (a trip or an auto-reset happened on *this* wake), so the caller
-    alerts exactly once per cycle rather than on every tripped wake. `count` is the number
-    of wakes counted in the rolling window, for the alert and the log line.
-    """
-
-    short_circuit: bool
-    tripped: bool
-    reset: bool
-    count: int
-
-
-class WakeBreaker:
-    """Per-timeline cross-wake circuit-breaker — the backstop for an *unknown* runaway loop.
-
-    The runaway this defends against is a **cross-wake loop**: the agent is woken, it posts,
-    the post fires a platform event, the router wakes it again → a tight cycle burning
-    provider tokens and box resources. The in-wake `max_steps` cap, the actor self-filter,
-    and the known B3/B8 fixes each stop a *specific* loop; this is the generic backstop for a
-    *novel* one — most plausibly introduced by a custom `tools/` plugin (Group 2) or a
-    drop-in MCP server (Group 5).
-
-    It is a rolling-window rate limiter on **wakes per timeline**, persisted beside the
-    `marks/`/`seen/`/`claims/` stores under the agent's home so it survives the
-    process-per-wake model:
-
-    - `breaker/<timeline>.wakes` — the timestamps of recent wakes, pruned to the window on
-      every wake (so the file stays bounded even under a fast runaway).
-    - `breaker/<timeline>.tripped` — the durable **trip marker**: present iff the timeline is
-      currently tripped, holding the trip timestamp.
-
-    On each wake `record_and_check` records the wake and returns a `BreakerDecision`:
-
-    - Over the cap within the window → **TRIP**: write the marker, return `short_circuit`
-      (the wake self-declines, **no provider call** — the whole point is to stop the burn)
-      with `tripped=True` so the caller alerts once.
-    - Already tripped → keep short-circuiting (every wake is still *counted*, so a runaway
-      that keeps firing keeps the window saturated and stays tripped).
-    - **Auto-reset** (the preferred reset, stated in CLAUDE.md): once the burst subsides —
-      the window clears back under the cap *and* the cooldown has elapsed since the trip —
-      clear the marker, restart the window from now, and return `reset=True` (normal
-      operation resumes; the caller logs the recovery alert). A transient burst self-heals
-      while the loud WARNING still leaves the operator a breadcrumb. Clearing the marker by
-      hand is the equivalent operator reset.
-
-    Disabled by setting the cap to 0 (or below) — an operator escape hatch; the default is a
-    generous always-on sanity cap.
-    """
-
-    def __init__(
-        self,
-        root: str | Path,
-        *,
-        max_wakes: int = _DEFAULT_BREAKER_MAX,
-        window: float = _DEFAULT_BREAKER_WINDOW,
-        cooldown: float | None = None,
-        now=None,
-    ) -> None:
-        self.root = Path(root)
-        self.max_wakes = max_wakes
-        self.window = float(window)
-        # The cooldown defaults to the window: hysteresis so a trip cannot reset until at
-        # least one clear window has passed, which prevents flapping at the threshold.
-        self.cooldown = float(cooldown) if cooldown is not None else float(window)
-        # An injectable clock keeps the breaker deterministically testable; production uses
-        # the wall clock (a synthetic burst in a test drives `now` directly).
-        self._now = now or time.time
-
-    @classmethod
-    def from_env(cls, root: str | Path, *, now=None) -> WakeBreaker:
-        """Build a breaker from `HARNESS_WAKE_BREAKER_MAX`/`_WINDOW`/`_COOLDOWN` (generous defaults)."""
-        return cls(
-            root,
-            max_wakes=_breaker_max_from_env(),
-            window=_breaker_window_from_env(),
-            cooldown=_breaker_cooldown_from_env(),
-            now=now,
-        )
-
-    @property
-    def enabled(self) -> bool:
-        """Off when the cap is 0 or below — the operator escape hatch."""
-        return self.max_wakes > 0
-
-    def tripped(self, timeline: str) -> bool:
-        """Whether this timeline currently holds a durable trip marker."""
-        return self._read_trip(timeline) is not None
-
-    def record_and_check(self, timeline: str) -> BreakerDecision:
-        """Record this wake for `timeline` and decide whether it must self-decline.
-
-        Always appends the wake to the rolling window first (a tripped wake is still counted,
-        so a continuing runaway keeps the window saturated and stays tripped), then evaluates
-        trip/reset state. See the class docstring for the state machine.
-        """
-        if not self.enabled:
-            return BreakerDecision(short_circuit=False, tripped=False, reset=False, count=0)
-        now = self._now()
-        recent = [t for t in self._read_window(timeline) if t > now - self.window]
-        recent.append(now)
-        self._write_window(timeline, recent)
-        count = len(recent)
-
-        trip_at = self._read_trip(timeline)
-        if trip_at is not None:
-            # Currently tripped. Auto-reset only once the burst has genuinely subsided — the
-            # window cleared back under the cap — *and* the cooldown has elapsed since the
-            # trip, so a runaway still firing every few seconds keeps it tripped.
-            if count <= self.max_wakes and now - trip_at >= self.cooldown:
-                self._clear_trip(timeline)
-                self._write_window(timeline, [now])  # fresh window: re-measure from here
-                return BreakerDecision(short_circuit=False, tripped=False, reset=True, count=count)
-            return BreakerDecision(short_circuit=True, tripped=False, reset=False, count=count)
-
-        if count > self.max_wakes:
-            self._write_trip(timeline, now)
-            return BreakerDecision(short_circuit=True, tripped=True, reset=False, count=count)
-        return BreakerDecision(short_circuit=False, tripped=False, reset=False, count=count)
-
-    # --- storage -------------------------------------------------------------
-
-    def _window_path(self, timeline: str) -> Path:
-        return self.root / "breaker" / f"{quote(timeline, safe='')}.wakes"
-
-    def _trip_path(self, timeline: str) -> Path:
-        return self.root / "breaker" / f"{quote(timeline, safe='')}.tripped"
-
-    def _read_window(self, timeline: str) -> list[float]:
-        path = self._window_path(timeline)
-        if not path.exists():
-            return []
-        out: list[float] = []
-        for line in path.read_text().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(float(line))
-            except ValueError:
-                continue  # a corrupt line is dropped, never crashes the wake
-        return out
-
-    def _write_window(self, timeline: str, times: list[float]) -> None:
-        path = self._window_path(timeline)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # `repr` round-trips a float exactly, so a re-read window is byte-faithful.
-        path.write_text("".join(f"{t!r}\n" for t in times))
-
-    def _read_trip(self, timeline: str) -> float | None:
-        path = self._trip_path(timeline)
-        if not path.exists():
-            return None
-        try:
-            return float(path.read_text().strip())
-        except ValueError:
-            return None
-
-    def _write_trip(self, timeline: str, when: float) -> None:
-        path = self._trip_path(timeline)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(repr(when))
-
-    def _clear_trip(self, timeline: str) -> None:
-        self._trip_path(timeline).unlink(missing_ok=True)
-
-
-def _breaker_max_from_env() -> int:
-    """`HARNESS_WAKE_BREAKER_MAX` → the wake cap; unset/blank → the generous default."""
-    raw = os.environ.get("HARNESS_WAKE_BREAKER_MAX")
-    if raw is None or not raw.strip():
-        return _DEFAULT_BREAKER_MAX
-    return int(raw)
-
-
-def _breaker_window_from_env() -> float:
-    """`HARNESS_WAKE_BREAKER_WINDOW` → the rolling-window seconds; unset/blank → the default."""
-    raw = os.environ.get("HARNESS_WAKE_BREAKER_WINDOW")
-    if raw is None or not raw.strip():
-        return _DEFAULT_BREAKER_WINDOW
-    return float(raw)
-
-
-def _breaker_cooldown_from_env() -> float | None:
-    """`HARNESS_WAKE_BREAKER_COOLDOWN` → the reset cooldown seconds; unset/blank → the window."""
-    raw = os.environ.get("HARNESS_WAKE_BREAKER_COOLDOWN")
-    if raw is None or not raw.strip():
-        return None  # default: tie the cooldown to the window length
-    return float(raw)
-
-
 # Read-speed pacing (issue #224, reworked in #226; tracks basecradle#334). Simulate a human
 # reading a peer AI's message before replying, so an AI↔AI exchange is watchable and stays
 # well under the wake-breaker's trip line instead of slamming into it. ~1,020 chars/min ≈ 17
@@ -1452,7 +1254,7 @@ class ReadPacer:
     """Receiver-side read-speed pacing for AI↔AI conversations — the pacing layer, not a backstop.
 
     The fleet's runaway guards (this repo's `WakeBreaker`, the router's `WakeRateBreaker`, the
-    engine's `max_steps`) *trip and halt*; none of them **pace**. Two AIs in a timeline can
+    engine's `max_steps`) *trip*; none of them **pace**. Two AIs in a timeline can
     cross-wake each other into a runaway (the 2026-06-18 Pinky × The Brain run: ~16 messages in
     ~16 s). This is the missing pacing layer: before a wake answers a **peer AI's** message it
     sleeps to *simulate a human reading that message*, which makes the exchange watchable and
@@ -1493,7 +1295,7 @@ class ReadPacer:
         self.enabled = enabled
         self.chars_per_sec = float(chars_per_sec)
         self.floor_seconds = float(floor_seconds)
-        # Injectable seams (mirror `WakeBreaker.now`): production uses the wall clock and a real
+        # Injectable seams (mirror `WakeBreaker`'s): production uses the wall clock and a real
         # sleep; a test drives `clock` directly and records `sleep` so it asserts without waiting.
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._sleep = sleep or time.sleep
@@ -1734,9 +1536,10 @@ class WakeAgent:
         # Lives beside the marks and the seen-set, under the same home root.
         self.claims = ClaimStore(self.marks.root)
         # Cross-wake circuit-breaker (see `WakeBreaker`): the generic backstop for an unknown
-        # runaway wake loop. Records every wake and self-declines (no provider call) over the
-        # cap. Lives beside the other stores, under the same home root. A directly-constructed
-        # wake gets the generous defaults; `from_env` threads the env-tuned breaker.
+        # runaway wake loop. Counts a wake at its first model work (`_admit`) and, over the cap,
+        # holds it for the cooldown before letting it proceed. Lives beside the other stores, under
+        # the same home root. A directly-constructed wake gets the generous defaults; `from_env`
+        # threads the env-tuned breaker.
         self.breaker = breaker or WakeBreaker(self.marks.root)
         # Out-of-funds debounce + self-heal state (issue #336): one billing notice per outage per
         # timeline, cleared on the first successful model call. Lives beside the other stores, under
@@ -1849,6 +1652,10 @@ class WakeAgent:
         #: Has a turn this wake ended cut off at the model's output budget? (issue #490)
         #: While set, no further model work starts — see `_turn_truncated` for why.
         self._unfinished_turn = False
+        #: Has this wake been admitted to model work by the breaker yet, and did the breaker hold it?
+        #: (issue #592) A wake is counted once, at its first model work — see `_admit`.
+        self._admitted = False
+        self._breaker_held = False
         if onboard:
             # The persistent brief rides every model call (see `_wake_brief`) and carries the
             # personality charter (`system-prompt.md`) itself, so a static turn-0 seed would
@@ -1991,12 +1798,11 @@ class WakeAgent:
         silence", and the two are told apart by the journal, not by this return value: the second
         leaves an `unspoken` line carrying the reasoning.
 
-        **The cross-wake circuit-breaker runs first.** Before any reconcile, this wake is
-        recorded on the per-timeline `WakeBreaker`; if this timeline is in a runaway wake
-        loop (too many wakes in the rolling window), the wake **self-declines** — it makes no
-        provider call, logs a single loud WARNING on the trip transition, and returns nothing.
-        It auto-resets once the burst clears. This is the backstop the in-wake `max_steps`
-        cap and the actor self-filter don't cover: an *unknown* cross-wake loop.
+        **The cross-wake circuit-breaker admits the first model work** (`_admit`), never the
+        process: a wake that finds nothing to do is not counted, and one that finds work in a
+        runaway burst (too many engaged wakes in the rolling window) **holds** for the cooldown,
+        then does that work — it never drops it (issue #592). This is the backstop the in-wake
+        `max_steps` cap and the actor self-filter don't cover: an *unknown* cross-wake loop.
 
         `trigger`, `event_trigger`, and `asset_trigger` are the optional uuids of the
         message, webhook event, or asset that fired the wake. **The router never passes
@@ -2033,8 +1839,8 @@ class WakeAgent:
         # `posted` is what the *harness* put on the timeline (today: NOC probe acks). What the
         # *agent* said is in `self.speech` — it speaks only through its tools now — so the two are
         # summed at the end rather than merged as they go, which is what keeps the bookend's count
-        # honest without double-counting. Reset before the breaker check, so a second wake in one
-        # process can never report the first one's posts.
+        # honest without double-counting. Reset before any work, so a second wake in one process can
+        # never report the first one's posts.
         posted: list[object] = []
         self.speech.reset()
         # Reset the in-memory out-of-funds latch (issue #336): the first model call of *this* wake
@@ -2045,12 +1851,13 @@ class WakeAgent:
         # stops starting new model work, so the evidence that turn's resume depends on cannot be
         # compacted away by a later turn of this same wake. See `_turn_truncated`.
         self._unfinished_turn = False
+        # Every wake is admitted to model work afresh (issue #592): a second wake in one process is
+        # a second wake, and the breaker must count it.
+        self._admitted = False
+        self._breaker_held = False
         outcome = "error"  # only a clean return past the reconciles earns another verdict
         session: Session | None = None
         try:
-            if self._breaker_short_circuits():
-                outcome = "declined"
-                return []  # a tripped timeline self-declines: no session, no provider call
             session = self.harness.session(self.source)
             # The claims this wake holds stay young while it makes progress (issue #532).
             session.heartbeat = self.claims.beat
@@ -2128,53 +1935,77 @@ class WakeAgent:
 
     # --- the cross-wake circuit-breaker --------------------------------------
 
-    def _breaker_short_circuits(self) -> bool:
-        """Record this wake on the breaker; trip/reset loudly, and report whether to decline.
+    def _admit(self) -> bool:
+        """Admit this wake to model work on the breaker — once — and report whether this call held.
 
-        The first thing a wake does — *before* the session is loaded or the model is ever
-        engaged — so a tripped timeline self-declines token-free, exactly like the NOC probe
-        ack short-circuit. Logs the loud WARNING **once** on each state transition (the
-        durable trip marker is the one-time guard), then returns the breaker's verdict: True →
-        this wake makes no provider call. A reset transition does *not* short-circuit — it
-        alerts that the burst cleared, then the wake proceeds normally (`record_and_check`
-        already restarted the window).
+        Called at the head of every path about to reach a model: `_respond` (the message batch),
+        `_act_on` (an asset, a webhook delivery, an activated task — before the item is rendered,
+        because rendering a picture for a blind brain is itself a describer call), and
+        `_resume_orphan` (before the take-over, so a kill mid-hold never reads as a failed resume
+        against #589's ceiling). Only the first call of a wake does anything: the breaker counts
+        *wakes*, so one that runs several turns is counted once.
 
-        **The alert is a log line, not a timeline post** (issue #293). It used to be both: a
-        WARNING *and* a message posted in the agent's voice ("I appear to be in a wake loop
-        here…"), which the agent never wrote and never chose to send. Under the Unspoken Channel
-        the harness does not speak for the agent — every timeline message is an intentional tool
-        call — and this was the last place it did. Nothing is lost: the breadcrumb was always for
-        the **operator**, who reads the journal, and the NOC alerts on this exact WARNING string
-        (`Wake breaker TRIPPED`), never on the posted message. The peers, meanwhile, now see what
-        the mechanism actually means: an agent that has gone quiet.
+        **Why here and not at process start** (issue #592). The breaker exists to stop a loop that
+        burns model calls, and a wake that found nothing to do burned none. Counted at start, the
+        router's replay of a long wake's backlog — ten empty wakes in 25 seconds — tripped it, and
+        the wake that tripped it was carrying a founder's question.
 
-        **Known bound — a tripped timeline also stops acking NOC probes.** The probe ack
-        lives per-item inside `_act_on`, downstream of this early return, so a tripped wake
-        skips it along with everything else. That is acceptable: a probe timeline is quiet
-        and low-cadence, so it never reaches the cap in practice, and a timeline genuinely in
-        a runaway *failing* its heartbeat is honest signal, not a false FAIL — the loud trip
-        alert is itself the louder out-of-band notice. We do **not** read the timeline to
-        rescue a probe before deciding, because that would forfeit the whole point: a
-        token-free decline before any platform work.
+        **A trip holds; it never drops.** Over the cap, the trip line is logged at once (it is what
+        the fleet's *Circuit Breaker Tripped* alert reads), the wake waits out the cooldown with its
+        items still claimed, then logs the reset and does its work — so the burst's last event,
+        usually the live one, is answered by the wake that carried it, not by whichever wake a third
+        party's next post happens to start. A trip found already standing (its holder was killed
+        mid-hold) is finished the same way, with what is left of its cooldown.
+
+        **Every line is a log line, never a timeline post** (issue #293). The breaker once also
+        posted in the agent's voice ("I appear to be in a wake loop here…"), words the agent never
+        wrote; under the Unspoken Channel the harness does not speak for the agent. A NOC probe is
+        never skipped by a hold, only delayed by one: a message probe already in the batch is acked
+        in `_absorb` before a hold taken at the batch, but a resume held ahead of the batch, a hold
+        on another item, or a hold on another timeline delays its ack by up to a cooldown (see
+        `_breaker`).
+
+        Returns True when *this* call held, and `_breaker_held` records that the wake did, so the
+        message path can fold in what landed meanwhile (`_absorb_after_hold`) whether the hold
+        happened ahead of its batch (in a resume) or at it.
         """
-        decision = self.breaker.record_and_check(self.timeline_uuid)
+        if self._admitted:
+            return False
+        self._admitted = True
+        decision = self.breaker.admit(self.timeline_uuid)
         if decision.tripped:
             _log.warning(
-                "Wake breaker TRIPPED for timeline %s: %d wakes within %ss exceeds the cap "
-                "of %d. Self-declining (no provider call) until the burst clears; an operator "
-                "can reset by clearing the trip marker under HARNESS_HOME.",
-                self.timeline_uuid,
-                decision.count,
-                self.breaker.window,
-                self.breaker.max_wakes,
+                "%s",
+                breaker_tripped_line(
+                    timeline=self.timeline_uuid,
+                    count=decision.count,
+                    threshold=self.breaker.max_wakes,
+                    window=self.breaker.window,
+                    cooldown=self.breaker.cooldown,
+                    hold=decision.hold,
+                ),
             )
-        elif decision.reset:
-            _log.warning(
-                "Wake breaker RESET for timeline %s: the wake burst cleared; resuming normal "
-                "operation.",
-                self.timeline_uuid,
-            )
-        return decision.short_circuit
+        self._breaker_hold(decision.hold)
+        self._breaker_held = decision.hold > 0
+        if decision.reset:
+            self.breaker.release(self.timeline_uuid)
+            _log.warning("%s", breaker_reset_line(timeline=self.timeline_uuid, held=decision.hold))
+        return self._breaker_held
+
+    def _breaker_hold(self, seconds: float) -> None:
+        """Wait `seconds` for the breaker, keeping this wake's claims alive while it does.
+
+        A holding wake has already claimed what it is about to answer, so it beats those claims
+        (issue #532) at least every `_CLAIM_BEAT_EVERY`: a claim's age must mean the time since its
+        owner last made progress, and a wake deliberately waiting is alive, not orphaned. The
+        default hold fits inside one interval; an operator's cooldown need not.
+        """
+        remaining = seconds
+        while remaining > 0:
+            step = min(remaining, _CLAIM_BEAT_EVERY)
+            self.breaker.wait(step)
+            remaining -= step
+            self.claims.beat()
 
     # --- messages ------------------------------------------------------------
 
@@ -2773,6 +2604,9 @@ class WakeAgent:
             if disposition != _OURS:
                 ledger.append((uuid, disposition))
                 continue
+            # The breaker counts this wake here, at its first model work — before `render`, which
+            # for a blind brain is itself a describer call (issue #592).
+            self._admit()
             # `render` returns the text the model reads, or a (text, images) pair when the
             # item carries pictures to *show* the model (the asset-perception path). Images
             # ride into the model's input on this turn and are evicted after (see `Session`).
@@ -3446,6 +3280,12 @@ class WakeAgent:
         self._cursor = self.marks.get(self.timeline_uuid)
         self._recover(session, messages, kind=_MESSAGES, text=_incoming_text)
         batch, probe_seen = self._absorb(session, messages, posted)
+        if self._breaker_held and not (self._billing_blocked or self._unfinished_turn):
+            # A resume above was held by the breaker (issue #592), and `messages` was read before
+            # it waited — so fold in what landed meanwhile before deciding there is nothing to do.
+            # Not under a latch: this wake will answer nothing more, and what landed has deliveries
+            # of its own, so claiming it here would only hand the next wake an orphan to recover.
+            probe_seen = self._absorb_after_hold(session, batch, posted) or probe_seen
         if not batch:
             # Self-only / probe-only / empty: any probe acked, nothing to engage on. The model is
             # never engaged (and the brief never fetched) — but the mark still advances, so these
@@ -3463,6 +3303,10 @@ class WakeAgent:
             ]
             self._settle(_MESSAGES)
             return posted
+        if self._admit():
+            # The breaker held this wake here (issue #592). Fold in what landed while it waited, as
+            # the read-pacer does after its own sleep, so one turn answers the lot.
+            probe_seen = self._absorb_after_hold(session, batch, posted) or probe_seen
         self._pace_and_settle(session, batch, posted, probe_seen)
         try:
             narration = self._generate_settled(session, batch, posted)
@@ -3848,6 +3692,10 @@ class WakeAgent:
             )
             self._resumed.append((turn, _STALLED if disposition == _FINAL else disposition))
             return disposition
+        # Admitted before the take-over, never after: the take-over counts this resume against the
+        # ceiling above, and a wake killed while the breaker holds it has not resumed anything
+        # (issues #589, #592).
+        self._admit()
         attempt = claim.resumes + 1
         if not self.claims.reclaim(
             self.timeline_uuid, uuid, kind=kind, owner=claim.wake, resumes=attempt
@@ -4423,6 +4271,32 @@ class WakeAgent:
             newest = uuid
         if newest is not None:
             self.marks.set(self.timeline_uuid, newest, kind=kind)
+
+    def _absorb_after_hold(
+        self, session: Session, batch: list[object], posted: list[object]
+    ) -> bool:
+        """Fold into `batch` the messages that landed while the breaker held this wake (issue #592).
+
+        Returns whether a NOC probe was among them (acked by `_absorb`, as ever), so the caller
+        skips read-pacing for it. Only the *read* may degrade: a platform that will not answer after
+        the hold leaves the batch as it was, and nothing is lost by answering what is in hand —
+        the router queued a delivery for every message that landed, and the next wake reads past
+        the mark. The fold itself is never guarded, because `_absorb` claims as it goes, and a
+        half-finished fold swallowed as though it were none would leave claimed messages out of the
+        turn that is about to commit them.
+        """
+        try:
+            fresh = self._fetch_fresh()
+        except Exception:  # noqa: BLE001 - the fold is an economy; it must never break the wake
+            _log.warning(
+                "Could not re-read timeline %s after the breaker hold; answering the batch in hand.",
+                self.timeline_uuid,
+                exc_info=True,
+            )
+            return False
+        new, probe_seen = self._absorb(session, fresh, posted)
+        batch.extend(new)
+        return probe_seen
 
     def _pace_and_settle(
         self, session: Session, batch: list[object], posted: list[object], probe_seen: bool
@@ -5444,15 +5318,24 @@ def resolved_config() -> dict[str, object]:
       would be a guess — and a guessed field in the file the drift audit trusts is worse than an
       absent one. The wake logs the resolved limit and its source (``context limit limit=… source=…``)
       on the run that actually resolves it.
+    - ``wake_breaker_max`` / ``wake_breaker_window`` / ``wake_breaker_cooldown`` — the cross-wake
+      breaker's tunables as the wake resolves them (`_breaker.breaker_settings_from_env`, issue
+      #592), the cooldown already defaulted to the window. A value that would make every wake fail
+      (a window that is not a positive finite number, a cooldown that is not a finite one ≥ 0)
+      fails this report the same way, so the deploy verifier is red exactly when the wakes would be.
+      A disabled breaker (max ``0`` or below) reports ``null`` for the other two: they mean nothing
+      then, and are not validated.
 
-    A malformed ``model_params.json`` makes this raise `ValueError` — the same failure a wake would
-    hit, surfaced here at verify time (the caller turns it into a clean non-zero exit).
+    A malformed ``model_params.json`` or breaker tunable makes this raise `ValueError` — the same
+    failure a wake would hit, surfaced here at verify time (the caller turns it into a clean
+    non-zero exit).
     """
     provider_name, sdk, surface = _config_from_env()
     profile_name, _policy = _profile_from_env()
     resolved, memory = _resolve_tools(provider_name, sdk, surface)
     memory_name, memory_version = describe_memory_provider(memory)
     model_params, stripped = resolved_model_params(sdk)
+    breaker_max, breaker_window, breaker_cooldown = breaker_settings_from_env()
     # The configured servers, rejected files included (issue #553): a file the harness refused is
     # a server its operator declared, and dropping its name here would read as "never configured".
     mcp_configs, mcp_rejected = load_mcp_configs_report()
@@ -5466,6 +5349,9 @@ def resolved_config() -> dict[str, object]:
         "ai_model": os.environ.get("AI_MODEL") or None,
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
+        "wake_breaker_max": breaker_max,
+        "wake_breaker_window": breaker_window if breaker_max > 0 else None,
+        "wake_breaker_cooldown": breaker_cooldown if breaker_max > 0 else None,
         "memory_provider": memory_name,
         "memory_provider_version": memory_version,
         "mempalace_rerank_model": (os.environ.get(RERANK_MODEL_VAR) or "").strip() or None,

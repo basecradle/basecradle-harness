@@ -7,6 +7,85 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.135.0] - 2026-09-29
+
+### Fixed: the wake breaker counts only wakes that reach a model, and a trip holds the wake instead of dropping what it carried (issue #592)
+
+On 2026-09-29 at 07:14Z @briggs's timeline drained a long wake's backlog: ten wakes in 25 seconds,
+every one `turns=0 steps=0/24` — replays of events the long wakes had already answered. The
+eleventh process start tripped the breaker, and the four deliveries behind it were declined. The
+last was @origin's direct question. Nothing answered it for twelve minutes, until a third party
+posted and the lazy reset ran inside that wake. The breaker was defending against a token-burning
+runaway, and it tripped on eleven wakes that made **zero** provider calls.
+
+**A wake is counted at its first model work, never at process start.** The breaker's premise was
+that only peer items wake an agent; in production the router delivers the agent's own echoes and
+replays whatever queued behind a long wake, and every delivery is a process start. The count now
+happens where the thing the breaker exists to stop begins: before a message batch is answered,
+before an asset, webhook delivery or activated task is rendered (rendering a picture for a blind
+brain is itself a describer call), and before a dead turn's resume is taken over (so a wake killed
+mid-hold is never counted as a failed resume against #589's ceiling). A wake that finds nothing to
+do costs the breaker nothing, and a wake of several turns is counted once.
+
+**A trip holds the wake; it never drops what the wake found.** Over the cap, the wake that tripped
+it logs the trip, waits out the cooldown with its items still claimed (beating the claims so they
+never read as orphaned), then resets the breaker and does its work. On the message path it first
+folds in any message that landed while it waited (whether the hold came before the batch or in a
+resume ahead of it), so one turn answers the lot; anything else that landed is read by the wake its
+own delivery starts. The burst's last event, usually the live one, is answered by the wake that
+carried it. There is no `outcome=declined` any more; a held wake ends `ok`. A trip whose holder was
+killed mid-hold is finished by the next wake with work, with what is left of the cooldown. A NOC
+probe is never skipped any more (a tripped wake used to decline its ack along with everything
+else); at worst its ack waits one cooldown, behind a hold on another timeline, on another item, or
+on a resume held ahead of the batch it sits in.
+
+The hold is in-process because the alternatives each break something. A platform task scheduled for
+the cooldown's end would be a harness-authored item in the agent's name, which the Unspoken Channel
+forbids while the model is reachable. A wake launched outside the router (a timer, a detached
+process) breaks the one-writer guarantee the transcript depends on. A deferred re-wake in the router
+would be a contract the router does not offer. **What it costs:** the router runs one wake per agent
+at a time, so while a wake holds, the agent's other timelines — NOC probes on them included — wait
+behind it: a minute at the default. The hold is part of the wake's wall-clock, so a long turn that
+also held can cross the wake-duration outlier line and page a second time for the same trip. And a
+genuine runaway is now throttled (at most the cap per window, then a cooldown) rather than stopped
+until somebody else posts; every trip is logged and alerted on.
+
+**The tunables are validated.** With the breaker enabled, `HARNESS_WAKE_BREAKER_WINDOW` must be a
+positive, finite number of seconds and `HARNESS_WAKE_BREAKER_COOLDOWN` a finite one that is not
+negative; anything else fails the wake loudly (`wake failed`, naming the variable) instead of
+yielding a breaker that reports itself on and never trips (a zero or `nan` window) or a hold that
+never ends (`inf`). A negative cooldown, which used to act as zero, now fails the same way. A
+disabled breaker (`HARNESS_WAKE_BREAKER_MAX` of 0) validates nothing, so the escape hatch always
+works. `--resolved-config` reports `wake_breaker_max`, `wake_breaker_window` and
+`wake_breaker_cooldown` through the same resolution, so the deploy verifier fails exactly when the
+wakes would. A stamp from before a backwards clock step no longer counts as recent, and a trip
+standing across one holds no longer than the cooldown.
+
+**The trip line is one function and is proven.** The fleet's `breaker_tripped` column already
+matched `Wake breaker TRIPPED` and powers *Circuit Breaker Tripped*, but like every needle line it
+exists only on the failure path, and the harness had no probe for its clause — the NOC carried it
+as an *unwitnessed clause*. `_breaker.breaker_tripped_line` is now the only author of those bytes,
+and `basecradle-harness-log-grammar breaker_tripped` renders them through it, stamped
+`source=probe`, so the claims manifest gains a `log-grammar:breaker_tripped` row. The consumed
+literal is unchanged; the fields after it now mirror the router's own trip line:
+
+```text
+WARNING Wake breaker TRIPPED timeline=… count=11 threshold=10 window=60s cooldown=60s hold=60.00s
+WARNING Wake breaker RESET timeline=… held=60.00s
+INFO PROBE Wake breaker TRIPPED source=probe agent=<slug>  # the probe, under basecradle-log-grammar
+```
+
+The heads are painted as whole tokens (TRIPPED yellow, RESET green), so the literal stays
+contiguous in color, and the probe leads with `PROBE` from the same switch as its stamp (0.134.1).
+No column reads the reset line, so it has no claim; it has one author for the day one does.
+
+**API.** `WakeBreaker` and `BreakerDecision` move to `_breaker.py` (still exported from
+`basecradle_harness`). `WakeBreaker.record_and_check` is replaced by `admit` / `release` / `wait`,
+and `BreakerDecision` is now `tripped, hold, reset, count` (`short_circuit` is gone, because nothing
+short-circuits). `WakeBreaker` takes an injectable `sleep` beside its clock, and its constructor
+raises `ValueError` for an enabled breaker's invalid window or cooldown. The `outcome=` color
+vocabulary drops `declined`, which nothing emits.
+
 ## [0.134.1] - 2026-09-29
 
 ### Fixed: a log-grammar probe line now leads with `PROBE`, so a person cannot read it as a real failure (issue #593)
