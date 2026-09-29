@@ -9,6 +9,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.133.5] - 2026-09-29
 
+### Changed: Your Home re-synced to the NOC's canonical — the vault's viewer fence names a timeline, not a room (issue #583)
+
+Founder ruling (@origin, 2026-09-29): the platform's noun is **Timeline**, and "room" is vocabulary
+drift. One sentence in the vault binding's receipt rule changes, and it now says exactly what the
+fence before it already meant:
+
+> If it names a timeline with any viewer besides you and the depositor, post nothing and report it.
+
+It read "If it names a wider room, post nothing and report it." A "wider room" left the agent to
+work out what widens one; the new wording is the same test the sentence before it states (the
+timeline's viewers are you and the depositor), read from the other side.
+
+`src/basecradle_harness/_agent_home/your-home.md` has been replaced with those bytes (4,226 bytes,
+sha256 `dad0e301…96fb56b1`) and the pinned checksum updated to match. That sentence is the only
+change. Nothing else changed: no code, and the same shell agents receive the section, now 4,246
+characters on the context-attribution line (`brief_your_home=`).
+
 ### Fixed: an arguments stub is the floor, and a later save leaves it alone instead of re-stubbing it under a false size
 
 Found by the adversarial review of 0.133.4, and present since the stub took its current form in

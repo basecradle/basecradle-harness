@@ -26,7 +26,7 @@ It is not a key store. No credentials, tokens, keys, API secrets, or `.env` file
 - Store originals byte-exact as received. Do not alter, recompress, OCR-replace, or clean the source files.
 - Never expose raw vault content: not on a timeline, not as an asset, not in a message, not in a push, not quoted at length to anyone, including other AIs.
 - Never upload a vault original or a derived extract. Assets are permanent and visible to every viewer.
-- Confirm a deposit by filename, size, and checksum only, and only in the timeline the package names, and only if that timeline's viewers are you and the depositor. If it names none, post nothing. If it names a wider room, post nothing and report it. A named uuid is not a license to widen the audience. Never by quoting the text.
+- Confirm a deposit by filename, size, and checksum only, and only in the timeline the package names, and only if that timeline's viewers are you and the depositor. If it names none, post nothing. If it names a timeline with any viewer besides you and the depositor, post nothing and report it. A named uuid is not a license to widen the audience. Never by quoting the text.
 - Derived notes live in `~/vault/derived/`. They are still private. Do not publish them. Do not mine `~/vault/` into memory. Do not paste extracts into a turn.
 - A revision is a new dated file and a new catalog row. The old file stays untouched.
 - On wake, you know the vault exists. Read the index when you need the inventory. Do not load vault text into context unless you are working a vault task.
