@@ -32,6 +32,7 @@ from basecradle_harness._session import (
     TOOL_RESULT_CAP,
     _cap_arguments,
     _elide_argument,
+    _fill,
     _json_size,
     _within,
     heal_interrupted_calls,
@@ -772,6 +773,35 @@ def test_an_excerpt_is_the_longest_that_fits_its_room():
             assert text.endswith(piece) if from_end else text.startswith(piece)
             longer = text[len(text) - len(piece) - 1 :] if from_end else text[: len(piece) + 1]
             assert _json_size(longer) - 2 > room  # one more character would not have fit
+
+
+def test_a_stub_is_the_floor_and_every_later_save_leaves_it_alone():
+    """The stub is bigger than its share at a wide enough fan-out, and that must not re-stub it.
+
+    Found by the adversarial review of 0.133.4. At about fifty calls in a step, each call's share of
+    `TOOL_ARGS_CAP` is smaller than its own stub, so the next save found the stub over budget and
+    stubbed it again, naming the size *of the stub*: `[... 3984 chars elided ...]` became
+    `[... 63 chars elided ...]` and stayed that way, a marker of a marker naming a size that is no
+    longer true. A save is made every turn for the life of the timeline, so a bound that is not a
+    fixed point rewrites history on every one of them.
+    """
+    call = {"action": "create", "timeline": TIMELINE, "body": "para one.\n\n" * 300}
+    once = _fill([call] * 50, TOOL_ARGS_CAP, size=_json_size, elide=_cap_arguments)
+    assert once[0] == {"action": "create", "[elided]": f"[... {_json_size(call)} chars elided ...]"}
+    assert _fill(once, TOOL_ARGS_CAP, size=_json_size, elide=_cap_arguments) == once
+
+    # A share too small for any stub, and a stub from 0.70.0 (whose wording differs): both left alone.
+    assert _cap_arguments(once[0], 10) == once[0]
+    legacy = {
+        "action": "create",
+        "[elided]": "[... the 3 arguments of this call (9120 chars) were archived out of the "
+        "transcript; they were sent in full when the call ran. ...]",
+    }
+    assert _cap_arguments(legacy, 40) == legacy
+
+    # And a value that merely *contains* a marker is an excerpt, not a stub: still the cap's to cut.
+    not_a_stub = {"action": "create", "[elided]": "x" * 3_000 + "[... 5 chars elided ...]"}
+    assert _json_size(_cap_arguments(not_a_stub, 1_000)) <= 1_000
 
 
 def test_a_call_of_several_medium_arguments_keeps_all_of_them(tmp_path):

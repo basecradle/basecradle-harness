@@ -7,6 +7,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.133.5] - 2026-09-29
+
+### Fixed: an arguments stub is the floor, and a later save leaves it alone instead of re-stubbing it under a false size
+
+Found by the adversarial review of 0.133.4, and present since the stub took its current form in
+0.72.0 (issue #304). When a step fans out wide enough (about fifty calls), or a share is small
+enough, a call's arguments are reduced to their stub: `action` and one floor marker naming the size
+that was cut. The stub is the one part of the cap that can be bigger than its share (see `gone`), so
+the next save found it over budget and stubbed it *again*, this time naming the size of the stub.
+`[... 3984 chars elided ...]` became `[... 63 chars elided ...]` on the second save and stayed wrong
+on every save after. That is the marker of a marker, naming a size that is no longer true, which the
+fixed point exists to rule out.
+
+`_cap_arguments` now recognizes a call that is already its stub (`action` at most, plus a marker
+that is whole, `_elision.is_marker`) and returns it unchanged. That includes a stub written by
+0.70.0, whose wording differs. A value that merely *contains* a marker is still an excerpt, and the
+cap still cuts it.
+
 ## [0.133.4] - 2026-09-29
 
 ### Fixed: tool calls that share an id in one response are made unique where the reply enters (issue #578)

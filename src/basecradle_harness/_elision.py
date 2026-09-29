@@ -153,6 +153,16 @@ def archive_marker(arguments: Any) -> str | None:
     return None
 
 
+def is_marker(value: Any) -> bool:
+    """Is `value` one of the harness's elision markers, **whole** — nothing before it, nothing after?
+
+    What `_session` asks of a call it has already reduced to its stub, so that it is never reduced
+    again (see `_session._cap_arguments`). Whole, because a value that merely *contains* a marker is an
+    excerpt, and an excerpt is still something the cap may cut.
+    """
+    return isinstance(value, str) and _MARKER.fullmatch(value) is not None
+
+
 def refusal(marker: str, *, reissue: bool = False) -> str:
     """What the model is told instead of a result, when its call carried `marker` (see the module).
 
