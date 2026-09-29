@@ -218,7 +218,7 @@ rather than details:
   skipped. Nothing reads the persona prompt to decide what to include: the renderer is handed the
   registered tools and nothing else, and a persona that already carries its own vault binding still
   gets the section in full. An agent without a shell cannot reach the folders, so it gets nothing.
-- **The harness never edits a persona prompt.** The letter is the agent's; this section is the
+- **The harness never edits a persona prompt.** The system prompt is the agent's; this section is the
   harness's. Two files, two owners.
 - **The text is the NOC's, carried verbatim.** The canonical copy is `deploy/agent-home/your-home.md`
   in basecradle-noc; the package ships a byte-for-byte copy at
