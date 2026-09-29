@@ -3,7 +3,7 @@
 Locking permanently freezes a timeline's content, and there is no unlock (reopening is
 an operator-only console action). The capital's @jt test surfaced the failure this guards
 against (finding B1): a model that meant to *list* or *delete* a timeline reflexively
-grabbed `lock`, the cheapest matching action, and froze a room it never meant to touch.
+grabbed `lock`, the cheapest matching action, and froze a timeline it never meant to touch.
 
 The structural fix was to pull lock **out of the timelines tool entirely** and stand it up
 as its own tool, so it can never be the accidental default of a benign management call. The
@@ -11,7 +11,7 @@ as its own tool, so it can never be the accidental default of a benign managemen
 
 The gate itself is the shared `ConfirmedTimelineAction` convention (`_confirmed.py`): lock
 runs only when `confirm` equals the **target timeline's uuid** — a deliberate, target-specific
-yes a reflexive grab cannot fake and cannot aim at the wrong room — and a bare or mismatched
+yes a reflexive grab cannot fake and cannot aim at the wrong timeline — and a bare or mismatched
 call gets a **preview** of what would be frozen plus the exact uuid to confirm with, touching
 nothing destructive. Lock and its sibling `delete` (`_delete.py`) share this one gate; there
 is no per-tool snowflake. (An earlier change had relaxed lock to a boolean `confirm=true`;

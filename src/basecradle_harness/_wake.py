@@ -4111,7 +4111,7 @@ class WakeAgent:
         count is capped at `max_builds` (the same worst-case bound Loop 2 uses); once hit, the
         wake stops settling and proceeds to generate against the batch it has, folding any later
         arrivals through Loop 2 instead (and the rest drive the next wake). A WARNING is logged so
-        a genuinely runaway room is visible.
+        a genuinely runaway timeline is visible.
 
         **Never crash the wake (B2).** A bad `created_at` or any hiccup in the pacer degrades to
         *no further delay* and proceeds with the current batch, never propagating — the same
@@ -4135,7 +4135,7 @@ class WakeAgent:
                 if restarts >= self.max_builds:
                     _log.warning(
                         "Read-pace settle hit the %d-restart cap for timeline %s (a runaway "
-                        "multi-peer room?); proceeding to generate against the current batch.",
+                        "multi-peer timeline?); proceeding to generate against the current batch.",
                         self.max_builds,
                         self.timeline_uuid,
                     )
@@ -4170,7 +4170,7 @@ class WakeAgent:
         never lands in the transcript and never needs rolling back. Intermediate (stale) pure-text
         builds *are* rolled back out of the transcript so only the surviving turn persists. Loop 2
         does **not** re-pace — Loop 1 already simulated the read, and re-pacing could stall a reply
-        indefinitely in a chatty room. With pacing disabled it collapses to a single build (the
+        indefinitely in a chatty timeline. With pacing disabled it collapses to a single build (the
         pre-#226 single-shot behavior).
         """
         brief = self._wake_brief(query=_incoming_text(batch[-1]))

@@ -3,7 +3,7 @@
 BaseCradle's first rule is human–AI parity: any platform power a human owner holds, an AI
 peer holds too. A human timeline owner can delete a timeline they own
 (`DELETE /timelines/:uuid`, owner-or-admin), and the SDK exposes `timeline.delete()` — but
-the harness shipped no delete tool, so a harnessed peer could not delete a room it owned. A
+the harness shipped no delete tool, so a harnessed peer could not delete a timeline it owned. A
 silent parity violation. This tool closes that gap.
 
 Deletion is the second irreversible/destructive timeline action (locking is the first), so it

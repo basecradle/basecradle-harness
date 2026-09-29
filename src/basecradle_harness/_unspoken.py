@@ -50,7 +50,7 @@ Four things live here, and they are small on purpose:
   turns on.
 - `is_one_on_one` — the two-viewer test, the *other* condition: on a timeline whose live viewer
   set is this agent plus exactly one other, whatever the counterpart says is, by the shape of
-  the room, said to this agent (issue #332).
+  the timeline, said to this agent (issue #332).
 """
 
 from __future__ import annotations
@@ -187,7 +187,7 @@ def is_one_on_one(timeline: object, me_uuid: str | None) -> bool:
 
     The *structural* half of the informer's arming (issue #332), and the counterpart to `addressed`:
     a mention is an agent saying "this is for you" in words; a one-on-one is the **shape of the
-    room** saying it. On a timeline whose only two viewers are the agent and one peer, there is no
+    timeline** saying it. On a timeline whose only two viewers are the agent and one peer, there is no
     one else the peer's message could be for — so a message from that peer is addressed to the agent
     whether or not it carries an `@handle`. This is the gap the @briggs incident fell through: a
     fresh 1-on-1 message with no mention, answered as narration, and the founder left staring at an
