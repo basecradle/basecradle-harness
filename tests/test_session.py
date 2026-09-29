@@ -988,7 +988,7 @@ def test_a_steps_growth_is_bounded_by_what_the_model_wrote_never_by_what_its_too
     """The bound underneath the bound — and the one that holds at **every** fan-out, without exception.
 
     Above ~50 parallel calls the total creeps past `persisted_step_cap()`, and that is not a leak: it
-    is the floor (`_gone`). A result cannot be dropped (its call would dangle, permanently) and neither
+    is the floor (`_elision.gone`). A result cannot be dropped (its call would dangle, permanently) and neither
     can a call's arguments (`create_kind` reads them), so each call keeps one short record saying how
     much is gone — of the same order as the `id`+`name` envelope the transcript must keep for that call
     anyway. **That residue scales with what the model emitted, never with what its tools returned**,

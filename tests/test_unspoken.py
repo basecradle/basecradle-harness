@@ -421,6 +421,7 @@ def _model_facing_strings():
         render_safety,
         render_your_home,
     )
+    from basecradle_harness._elision import gone, refusal
     from basecradle_harness._engine import (
         _RESERVE_NUDGE,
         _TRUNCATED_NOTE,
@@ -472,6 +473,9 @@ def _model_facing_strings():
         "step note (terse)": _step_note(1, 24, now),
         "step note (escalated)": _step_note(23, 24, now),
         "builtin guidance": _server_builtin_guidance("web_search"),
+        # Issue #576: what a call carrying a harness elision marker gets back, live and on recovery.
+        "elision refusal": refusal(gone(900)),
+        "elision refusal (re-issue)": refusal(gone(900), reissue=True),
         # A resume replays the transcript up to the interruption, so the model reads this one as
         # its own account of what happened to it (issue #490) — which puts it squarely on this
         # surface, whatever its `system` role suggests.

@@ -92,6 +92,7 @@ from uuid import uuid4
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._caching import anchor_cacheable_prefix, bind_conversation, cache_mode
 from basecradle_harness._context import TOOL_ARGS_CAP, TOOL_RESULT_CAP, Compactor
+from basecradle_harness._elision import argument_marker, gone, result_marker
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._idempotency import create_kind
@@ -1175,7 +1176,7 @@ def _elide(text: str, budget: int) -> str:
     """
     if len(text) <= max(budget, _MIN_EXCERPT):
         # Under its share, or too small for cutting to be worth the marker that says so. The second
-        # is also what makes this a **fixed point**: `_gone` is well under `_MIN_EXCERPT`, so a value
+        # is also what makes this a **fixed point**: `gone` is well under `_MIN_EXCERPT`, so a value
         # already at the floor is never elided again — no marker of a marker, each naming a size that
         # is no longer true, on every save for the life of the timeline.
         return text
@@ -1183,44 +1184,14 @@ def _elide(text: str, budget: int) -> str:
     # smaller, so the real marker is never longer than this one, and the excerpt below therefore
     # cannot overrun the share. (The marker's length depends on the numbers printed in it, which
     # depend on the excerpt, which depends on the marker: measuring the worst case breaks the circle.)
-    room = budget - len(_result_marker(len(text), len(text)))
+    room = budget - len(result_marker(len(text), len(text)))
     if room < _MIN_EXCERPT:
-        return _gone(len(text))  # no room for an excerpt worth reading; the floor is all that fits
+        return gone(len(text))  # no room for an excerpt worth reading; the floor is all that fits
     room = min(room, _ELISION_HEAD + _ELISION_TAIL)  # a share may shrink the excerpt, never grow it
     tail = room * _ELISION_TAIL // (_ELISION_HEAD + _ELISION_TAIL)
     head = room - tail
     cut = len(text) - head - tail
-    return text[:head] + _result_marker(cut, len(text)) + (text[-tail:] if tail else "")
-
-
-def _gone(size: int) -> str:
-    """What an elision says when there is no room even for an excerpt: how much there was, and nothing.
-
-    **The floor of the whole cap, and the one place the bound stops being hard** — so it is worth
-    saying exactly what it is. A tool result cannot be *dropped* (its call would dangle, and a dangling
-    `tool_call_id` is malformed permanently) and neither can a call's arguments (`create_kind` reads
-    them, and a create the recovery cannot count is a message posted twice). A thing that cannot be
-    dropped must be allowed to say that it is gone — so a step that fans out wider than its budget has
-    characters for pays one of these per call, and the total creeps past `TOOL_RESULT_CAP` at a fan-out
-    of ~140 (or `TOOL_ARGS_CAP` at ~50).
-
-    That residue is bounded by **what the model emitted, never by what its tools returned** — one
-    short record per call it chose to make, of the same order as the `id`+`name` envelope the transcript
-    must keep for that call anyway, and bounded the same way (the provider's max-output-tokens). It is
-    the excerpt *markers* that are chatty, and deliberately: they accompany content worth reading. Here
-    there is none, and their prose ("re-run it if you need it in full") would cost five times the fact
-    it decorates — per call, on the one shape where every call is already down to its last few dozen
-    characters.
-    """
-    return f"[... {size} chars elided ...]"
-
-
-def _result_marker(cut: int, total: int) -> str:
-    """What stands in for the elided middle of a tool result."""
-    return (
-        f"\n\n[... {cut} chars elided of {total} — this is an archived excerpt; the full "
-        f"result was shown when the tool ran. Re-run it if you need it in full. ...]\n\n"
-    )
+    return text[:head] + result_marker(cut, len(text)) + (text[-tail:] if tail else "")
 
 
 def _cap_arguments(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
@@ -1295,21 +1266,18 @@ def _elide_argument(value: Any, budget: int) -> Any:
     size = _json_size(value)
     if size <= _MIN_EXCERPT:
         # Too small for cutting to be worth the marker that says so — and the fixed point that keeps a
-        # floor marker (`_gone`, well under this) from being ground into a shorter one on every save.
+        # floor marker (`gone`, well under this) from being ground into a shorter one on every save.
         return value
     if not isinstance(value, str):
         # A structure has no honest head-and-tail, so there is nothing to excerpt: it is the floor or
         # it is whole.
-        elided: Any = _gone(size)
+        elided: Any = gone(size)
         return elided if _json_size(elided) < size else value
 
-    marker = (
-        f"\n\n[... elided from {len(value)} chars — this argument is an archived excerpt; the full "
-        f"value was sent when the call ran. ...]\n\n"
-    )
+    marker = argument_marker(len(value))
     room = budget - _json_size(marker)
     if room < _MIN_EXCERPT:
-        elided = _gone(size)  # no room for an excerpt worth reading; the floor is all that fits
+        elided = gone(size)  # no room for an excerpt worth reading; the floor is all that fits
         return elided if _json_size(elided) < size else value
     tail = min(room // 5, _ARG_ELISION_TAIL)
     head = room - tail
@@ -1329,7 +1297,7 @@ def _arguments_stub(arguments: dict[str, Any]) -> dict[str, Any]:
     action = arguments.get("action")
     if isinstance(action, str) and len(action) <= _ARG_ACTION_MAX:
         stub["action"] = action
-    stub["[elided]"] = _gone(_json_size(arguments))
+    stub["[elided]"] = gone(_json_size(arguments))
     return stub
 
 

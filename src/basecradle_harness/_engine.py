@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from basecradle_harness._assets import model_sees_images, model_sees_video
+from basecradle_harness._elision import archive_marker, refusal
 from basecradle_harness._exceptions import (
     EngineError,
     ProviderConnectionError,
@@ -1001,10 +1002,10 @@ class Engine:
         never as an exception — because the model reading it cannot tell, and must not need to tell,
         a call that failed live from one that failed on re-issue.
         """
-        text, _, _ = _split_result(self._run_tool(name, arguments))
+        text, _, _ = _split_result(self._run_tool(name, arguments, reissue=True))
         return text
 
-    def _run_tool(self, name: str, arguments: dict) -> str | ToolResult:
+    def _run_tool(self, name: str, arguments: dict, *, reissue: bool = False) -> str | ToolResult:
         """Run one tool call, turning any failure into a result the model can read.
 
         Errors are fed back as the tool's output rather than raised: a model that
@@ -1033,6 +1034,14 @@ class Engine:
                 return f"Error: {self.withheld_tools[name]}"
             self._log_tool(name, started, error=f"no tool named {name!r}")
             return f"Error: no tool named {name!r}."
+        # The harness's own elision marker, copied out of the model's context into a call it is
+        # making (issue #576): run it, and a fragment goes out saying "the full value was sent".
+        # Refused on both seams, the live dispatch and the recovery's `run_tool`, because both
+        # arrive here — told apart only in what the model is told happened (`refusal`).
+        marker = archive_marker(arguments)
+        if marker is not None:
+            self._log_tool(name, started, error="arguments carry a harness elision marker")
+            return refusal(marker, reissue=reissue)
         try:
             result = tool.run(**arguments)
         except Exception as exc:  # noqa: BLE001 - any tool failure becomes model-readable

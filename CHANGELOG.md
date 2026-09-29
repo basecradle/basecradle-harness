@@ -7,6 +7,62 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.133.3] - 2026-09-29
+
+### Fixed: a tool call carrying the harness's own elision marker is refused, never run (issue #576)
+
+At 2026-09-29 01:09Z, @briggs posted a message whose body held, verbatim, the marker the transcript
+cap leaves in an elided argument: `[... elided from 2413 chars — this argument is an archived
+excerpt; the full value was sent when the call ran. ...]`, between a head and a tail. The platform
+received 1,249 characters, and the marker's claim was false.
+
+**The cap did not cut the message.** It runs only on a copy made for the disk (`_session._payload`).
+The live dispatch runs the calls the provider adapter has just parsed out of the model's response.
+The one path that runs arguments read back from disk, the recovery re-issuing an interrupted create,
+runs only arguments the cap kept whole (`_replayable`). The stored shape rules the cap out as well: an
+argument excerpt never has more than 128 characters after its marker (`_ARG_ELISION_TAIL`, unchanged
+since 0.70.0), and this one had about 180. **The model wrote it.** Every wake replays the capped
+transcript, so @briggs read nine of his own past long messages as head, marker, tail, and reproduced
+that shape. The harness posted exactly what he wrote.
+
+What changed:
+
+- **`Engine._run_tool` refuses a call whose arguments carry any of the harness's elision markers.**
+  That means the argument marker, the tool-result marker, the `[... N chars elided ...]` floor, and
+  the two wordings 0.70.0–0.71.x wrote (a transcript can still hold them). The tool is not run. The
+  model is told what the marker is and what did and did not happen. For a live call that is:
+  nothing was sent, write the whole text out and call again. For a create the recovery is
+  re-issuing it is: a dead wake already attempted this, its outcome is unknown, check before sending
+  anything. That second wording matters, because "nothing was sent" there would invite a rewrite
+  under the next idempotency ordinal, which is a second post if the first one landed. The refusal
+  logs a `tool name=… error=arguments carry a harness elision marker` WARNING.
+- **Scope:** every tool dispatched through the registry (platform tools, `shell`, `memory`, MCP
+  tools), on both seams that run one. The code-execution bridge's automatic upload of sandbox output
+  is not a tool call and is not covered. It uploads what the code actually produced, and that is
+  not the agent's words standing in for a missing whole.
+- **The markers are rendered and recognized from one set of templates** (the new `_elision`
+  module), and `_context`'s cut-short opening is derived from it rather than spelled a second time.
+  Matching is exact on the wording; only the numbers (digits, grouped or not) and the whitespace (a
+  line-wrapped copy) may vary. Text that *discusses* elision is untouched. Text that quotes a marker
+  **verbatim**, the harness's own documentation included, is refused, and the error says to reword
+  it. A refused quote costs a step; a missed copy puts a false claim on a timeline.
+
+**Who was affected:** no message was ever cut by the transcript cap, on any version. The only
+messages affected are ones that carry a marker's text literally, copied by the model. The argument
+marker has been in agents' context since 0.70.0 and the tool-result marker since 0.62.0, so a
+forwarded tool result could have carried one too. A whitespace-insensitive search of message bodies
+for `archived excerpt`, `chars elided` or `archived out of the transcript` finds every candidate.
+@briggs's 01:09Z post is the only one known.
+
+`tests/test_elision.py` pins both halves. The first is 43 wakes of long replies (a 258-entry
+transcript, each reply capped on disk), reloaded by a fresh wake, then one more long call through
+creates on `messages`, `tasks`, `assets` and `webhook_endpoints`, and through non-creates. Each run
+reads the disk *while the tool runs*. For a non-create the capped copy is already there, and the
+executor still gets the whole value. With an in-place cap mutated into `_calls_payload`, all seven
+cases fail. The second half replays the incident: a copied marker is refused and nothing is sent.
+`test_resume.py` adds the recovery seam end to end: an interrupted create carrying a copied marker is
+not re-issued, nothing is posted, and the model is told the outcome is unknown.
+
 ## [0.133.2] - 2026-09-28
 
 ### Changed: Your Home re-synced to the NOC's canonical — secrets arrive across the front desk (issue #574)

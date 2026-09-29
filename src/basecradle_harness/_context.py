@@ -111,6 +111,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from basecradle_harness._elision import EXCERPT_OPENING
 from basecradle_harness._engine import DEFAULT_MAX_STEPS
 from basecradle_harness._messages import Message
 from basecradle_harness._observability import kv
@@ -323,12 +324,13 @@ _IDENTIFIER = re.compile(
 )
 
 #: What follows an identifier the harness itself cut short: the ellipsis a list preview ends on
-#: (``_reads``, ``_tasks``, ``_webhooks``) and the head of an archived excerpt's elision marker
-#: (``_session``) — in both spellings, because an elided *argument* reaches `_render` inside JSON,
-#: where its blank line is the four characters ``\n\n``. A match that runs into one is a
+#: (``_reads``, ``_tasks``, ``_webhooks``) and the opening of an archived excerpt's elision marker
+#: (``_elision.EXCERPT_OPENING``) — in both spellings, because an elided *argument* reaches `_render`
+#: inside JSON, where its blank line is the four characters ``\n\n``. A match that runs into one is a
 #: **fragment** — ``https://example.com/some/pa`` or ``@nova-dig`` — and is dropped: a missing
-#: identifier is a gap, a truncated one is a wrong answer.
-_CUT_SHORT = ("…", "\n\n[... ", "\\n\\n[... ")
+#: identifier is a gap, a truncated one is a wrong answer. Derived, never re-spelled, so a reworded
+#: marker cannot leave this matching an opening the harness no longer writes (issue #576).
+_CUT_SHORT = ("…", EXCERPT_OPENING, json.dumps(EXCERPT_OPENING)[1:-1])
 
 #: Punctuation a URL match may have swallowed from the prose around it — ``see https://x.com/a.``,
 #: ``'https://x.com/a'`` in a Python repr — and the closer that is part of the URL only when the URL
