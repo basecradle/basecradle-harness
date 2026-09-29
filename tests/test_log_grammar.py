@@ -31,13 +31,16 @@ from basecradle_harness._log_grammar import (
     main,
     record,
 )
-from basecradle_harness._observability import LOG_FORMAT
+from basecradle_harness._observability import LOG_FORMAT, RED, YELLOW
 from basecradle_harness._report import (
     PROBE_SOURCE,
+    PROBE_TOKEN,
     billing_onset_line,
     billing_repeat_line,
+    probe_prefix,
 )
 from basecradle_harness._verify import claims
+from tests.conftest import plain
 
 #: The NOC's `billing_blocked` column, clause by clause, exactly as `observability/ai-box.json`
 #: spells it (basecradle-noc#501 re-pointed both to cross the colour gap with `.*`). The column ORs
@@ -136,6 +139,59 @@ def test_every_synthetic_line_carries_the_probe_stamp():
     for column in COLUMNS:
         for line in lines(column, agent="jt"):
             assert re.search(SOURCE_LABEL, line).group(1) == PROBE_SOURCE, line
+
+
+def test_every_probe_line_leads_with_the_probe_token():
+    """The token is for the person, where the stamp is for the machine (issue #593).
+
+    On 2026-09-29 the founder read the probe's red ``wake reported_failure`` in a Live Tail as a
+    real billing block on @briggs mid-task. ``source=probe`` was on the line — at the end, where the
+    eye does not go — so every synthetic line now *starts* with ``PROBE``, envelope and all.
+    """
+    for column in COLUMNS:
+        for line in lines(column, agent="jt"):
+            assert line.startswith(f"{PROBE_TOKEN} "), line
+            assert record(line).startswith(f"INFO {PROBE_TOKEN} "), line
+
+
+def test_a_real_line_never_wears_the_probe_token():
+    """The mirror, and the one that pages: a genuine out-of-funds line reading ``PROBE`` would be a
+    real failure a human waves away."""
+    for line in (
+        billing_onset_line(reason="out_of_funds", provider="xai", timeline="T", delivery="D"),
+        billing_repeat_line(reason="out_of_funds", provider="xai", timeline="T", delivery="D"),
+    ):
+        assert PROBE_TOKEN not in line, line
+
+
+def test_the_token_and_the_stamp_are_one_switch():
+    """Rendered from the same value, so they can never disagree (the capital's amended ruling): a
+    line leads with ``PROBE`` exactly when it carries ``source=probe``."""
+    for source in (None, "", PROBE_SOURCE, "basecradle", "github"):
+        for line in (
+            billing_onset_line(reason="r", source=source),
+            billing_repeat_line(reason="r", source=source),
+        ):
+            stamped = re.search(SOURCE_LABEL, line)
+            assert line.startswith(f"{PROBE_TOKEN} ") == bool(
+                stamped and stamped.group(1) == PROBE_SOURCE
+            ), line
+    assert probe_prefix(PROBE_SOURCE) == "PROBE " and probe_prefix(None) == ""
+
+
+def test_the_token_never_touches_the_bytes_under_proof():
+    """The token precedes the grammar and nothing else moves: the head is still painted whole, in
+    its own colour, and the rest of the line is byte-for-byte what it was before issue #593."""
+    onset, repeat = probe_lines(agent="jt")
+
+    assert onset.startswith(f"PROBE {RED}wake reported_failure")
+    assert repeat.startswith(f"PROBE {YELLOW}wake billing_blocked")
+    assert plain(onset) == (
+        "PROBE wake reported_failure kind=billing reason=log_grammar_probe source=probe agent=jt"
+    )
+    assert plain(repeat) == (
+        "PROBE wake billing_blocked reason=log_grammar_probe source=probe agent=jt"
+    )
 
 
 def test_a_synthetic_line_moves_no_other_columns_witness_parent():

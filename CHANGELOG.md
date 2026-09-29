@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.134.1] - 2026-09-29
+
+### Fixed: a log-grammar probe line now leads with `PROBE`, so a person cannot read it as a real failure (issue #593)
+
+At 07:42Z the founder read the hourly log-grammar probe's pair for @briggs in a Live Tail —
+`[basecradle-log-grammar] INFO wake reported_failure kind=billing reason=log_grammar_probe
+source=probe agent=briggs` — as a real out-of-funds block mid-task. The line was stamped
+`source=probe`, but the stamp trails it, and the eye lands on the red `wake reported_failure`, not on
+the identifier column or the last field. The module's own premise, that a reader "sees
+`[basecradle-log-grammar]` and knows at a glance", was false.
+
+Every probe line now **leads** with a bare `PROBE` token:
+
+```text
+[basecradle-log-grammar] INFO PROBE wake reported_failure kind=billing reason=log_grammar_probe source=probe agent=briggs
+[basecradle-log-grammar] INFO PROBE wake billing_blocked reason=log_grammar_probe source=probe agent=briggs
+```
+
+It is rendered from the same switch as the stamp (`_report.probe_prefix`, keyed on `PROBE_SOURCE`),
+so a line carries both or neither, under the capital's ruling as amended on 2026-09-29 (it supersedes
+ruling 3 of 2026-08-18, which said only that probe fields trail). The token precedes the grammar
+under proof and touches none of it: the painted head, the fields and `source=probe` are
+byte-for-byte what they were, and a real failure line never carries the token. The NOC measured the
+token against all 42 live derived columns with the engine Better Stack runs and it changes none
+(basecradle-noc#857); `level` still reads `INFO` and `source` still reads `probe`.
+
 ## [0.134.0] - 2026-09-29
 
 ### Fixed: a slow model answer no longer crashes the wake — timeouts fit the call, a timeout is retried once with more time, and a resume that keeps failing stalls visibly (issue #589)
