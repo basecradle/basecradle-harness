@@ -7,6 +7,51 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.136.0] - 2026-09-29
+
+### Fixed: a turn cut off at the output budget is finished in the same wake, and the out-of-funds notice asks for the post that resumes it (issue #596)
+
+Two paths deferred work to "the next wake" with nothing to guarantee one. The router wakes an
+agent only on an event, and both paths exit clean, so when the deferred item was the last event on
+the timeline the agent went quiet until somebody else spoke — the shape of #592's second defect.
+
+**A truncated turn is finished where it was cut off.** When a pass ends latched on a turn the vendor
+cut off at the output budget (#490), the wake now runs its reconciles again, immediately: the next
+wake, started early (`wake continuing … pass=N`). Each pass runs under a fresh claims identity, so
+the unfinished turn is an orphan of "another wake of this process", and the recovery that already
+finishes a dead wake's turn finishes it (`_resume_orphan`) — the count, the batch-mates and the stall
+mechanics are unchanged. It is not a second mechanism for continuing a turn. What the latch held back is
+answered by the next pass.
+
+**Inside one wake, every continuation counts** (the capital's ruling on the issue). A turn gets its
+fresh attempt plus two continuations; still cut off, it stalls with the note, whose detail now says
+*"each was cut off at its output budget before the answer was complete"*, and whose closing
+sentence now names the output budget rather than the provider. Across wakes, #589's rule stands: the
+first continuation a wake makes of an earlier wake's turn is progress if it writes something, so a
+long answer spread over wakes is never stalled for being long. The price is one visible note asking
+to split a request whose honest answer runs past three budgets; the operator's output budget is the
+knob. A stall settles the turn and clears the latch in its own pass, so that pass goes on to answer
+what the latch held back. A NOC probe a later pass re-reads is not acked twice.
+
+**`wake deferred item=… kind=… reason=…`** (WARNING) is logged at the end of the wake, by name, for
+each item still unsettled then and waiting for a wake nothing is scheduled to start: `resume_failed` (a resume hit an outage, or a timeout below
+the ceiling), `stall_note_refused` (the ceiling was reached and the platform refused the note), and —
+only if the wake ever hits its pass backstop, which ordinary work does not — `truncated` and
+`held_back`.
+
+**Out of funds: the notice asks for a post.** Funding an account raises no platform event, so
+nothing wakes the agent when the money lands. The notice used to promise that "pending messages will
+be handled then"; it now says *"When the account is funded, post here and I will pick up where I
+stopped."* The person who funds the account is the person reading the notice. No re-wake source was
+added (the capital's decision).
+
+**Fixed alongside: a resume never nudges a turn that already spoke.** The no-reply informer reads
+its baseline off the wake's speech ledger, which never saw what a turn did before it was cut off or
+killed. A resume of a turn that had posted, and whose continuation ended on plain text, could be told
+it posted nothing — an invitation to post again. It was reachable on every cross-wake resume, and the
+in-wake finish would have made it common. A resume of a turn whose work holds a timeline create now
+does not arm the nudge.
+
 ## [0.135.1] - 2026-09-29
 
 ### Fixed: a failure while the read-pacer folds in new messages fails the wake instead of committing a message the model never saw

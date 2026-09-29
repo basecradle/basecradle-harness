@@ -31,7 +31,13 @@ from basecradle_harness import (
     WakeBreaker,
 )
 from basecradle_harness._idempotency import STALL_NOTE, key
-from basecradle_harness._report import STALL_DETAIL_CAP, stall_body, stall_detail
+from basecradle_harness._report import (
+    STALL_DETAIL_CAP,
+    STALL_NOTHING_WRITTEN,
+    STALL_PAST_BUDGET,
+    stall_body,
+    stall_detail,
+)
 from basecradle_harness._wake import (
     RESUME_CEILING,
     Claim,
@@ -40,7 +46,7 @@ from basecradle_harness._wake import (
     _payload,
     _read_claim,
 )
-from tests.test_truncation import _CutOff
+from tests.test_truncation import _CutOff, _CutOffThenDown
 from tests.test_wake import (
     BC_URL,
     M0,
@@ -160,11 +166,18 @@ def test_a_turn_that_cannot_be_finished_stalls_instead_of_looping(platform, tmp_
     for resume in range(1, RESUME_CEILING):
         serve_messages(platform, page(message(uuid=M0, body=BODY)))
         brain = _WorksThenStalls(speaks=False)
-        _wake(tmp_path, brain).wake()  # the failed resume never takes the wake down
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+            _wake(tmp_path, brain).wake()  # the failed resume never takes the wake down
         assert brain.calls >= 1, "it did resume"
         claim = _claim(tmp_path)
         assert (claim.phase, claim.resumes) == ("in-flight", resume)
         assert not _stall_posts(platform)
+        # Left waiting on a wake nothing is scheduled to start, and the journal says so (#596).
+        assert any(
+            "wake deferred" in r.getMessage() and "reason=resume_failed" in r.getMessage()
+            for r in caplog.records
+        )
 
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
@@ -362,16 +375,15 @@ def test_an_outage_during_a_resume_never_counts_toward_the_ceiling(platform, tmp
 def test_a_continuation_that_writes_nothing_is_not_progress(platform, tmp_path):
     """A model that spends its whole output budget before a word — a reasoning model thinking to
     the cap — is cut off with nothing written, every time. Clearing the count for that would loop
-    for as long as the truncation notes took to fill the context; it counts, and it stalls."""
+    for as long as the truncation notes took to fill the context; it counts, and it stalls — inside
+    the wake that cut it off, since #596 finishes a turn where it was cut off."""
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    build_wake(tmp_path, _CutOff())[0].wake()
+    agent, _ = build_wake(tmp_path, _CutOff(Message.assistant(content="")), tools=[MessagesTool()])
+    brain = agent.harness.provider
 
-    for resume in range(1, RESUME_CEILING + 1):
-        serve_messages(platform, page(message(uuid=M0, body=BODY)))
-        agent, brain = build_wake(tmp_path, _CutOff(Message.assistant(content="")))
-        agent.wake()
-        assert brain.calls == 1
+    agent.wake()
 
+    assert brain.calls == 1 + RESUME_CEILING  # the fresh turn, then two continuations
     (note,) = _stall_posts(platform)
     assert (
         "ran out of its output budget before writing anything"
@@ -380,9 +392,11 @@ def test_a_continuation_that_writes_nothing_is_not_progress(platform, tmp_path):
     assert _claim(tmp_path).phase == "abandoned"
 
 
-def test_a_stall_note_the_platform_refuses_is_never_a_silent_drop(platform, tmp_path):
+def test_a_stall_note_the_platform_refuses_is_never_a_silent_drop(platform, tmp_path, caplog):
     """Only a posted note licenses the abandon. Refused, the item stays in flight at the ceiling,
-    and the next wake stalls it again — without a model call — once the timeline takes the post."""
+    and the next wake stalls it again — without a model call — once the timeline takes the post.
+    Meanwhile it is waiting on a wake nothing is scheduled to start, and the journal says so
+    (`wake deferred … reason=stall_note_refused`, issue #596)."""
     _died_mid_tool_chain(platform, tmp_path, M0)
     for _ in range(RESUME_CEILING - 1):
         serve_messages(platform, page(message(uuid=M0, body=BODY)))
@@ -392,8 +406,15 @@ def test_a_stall_note_the_platform_refuses_is_never_a_silent_drop(platform, tmp_
     )
 
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    _wake(tmp_path, _WorksThenStalls(speaks=False)).wake()  # the last resume, and a refused note
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        _wake(tmp_path, _WorksThenStalls(speaks=False)).wake()  # the last resume, a refused note
 
+    refused = [
+        r.getMessage()
+        for r in caplog.records
+        if "wake deferred" in r.getMessage() and "reason=stall_note_refused" in r.getMessage()
+    ]
+    assert len(refused) == 1 and f"item={M0}" in refused[0]
     claim = _claim(tmp_path)
     assert (claim.phase, claim.resumes) == ("in-flight", RESUME_CEILING)
     assert TIMED_OUT in claim.reason  # what the refused note said, kept for the next one
@@ -486,21 +507,42 @@ def test_a_wake_that_dies_mid_stall_leaves_one_note_and_nothing_resumed(
 
 
 def test_a_continuation_cut_off_at_the_budget_is_progress_not_a_failure(platform, tmp_path):
-    """Issue #490's resume is not what the ceiling counts. A long answer continued again and again
-    is converging — each continuation carries more of it — so it clears the count, and it is never
-    stalled for being long."""
+    """Issue #490's resume is not what the ceiling counts *across wakes*. A long answer continued
+    once per wake is converging — each continuation carries more of it — so the resume a wake makes
+    of an earlier wake's turn clears the count, and it is never stalled for being long. (Inside one
+    wake the capital ruled otherwise, #596; here each wake's own continuation is unreachable, so
+    only the cross-wake resumes run.)"""
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    build_wake(tmp_path, _CutOff())[0].wake()
+    build_wake(tmp_path, _CutOffThenDown())[0].wake()
 
     for _ in range(RESUME_CEILING + 1):
         serve_messages(platform, page(message(uuid=M0, body=BODY)))
-        agent, brain = build_wake(tmp_path, _CutOff(Message.assistant(content="…and more of it")))
-        agent.wake()
-        assert brain.calls == 1  # resumed, every time
+        brain = _CutOffThenDown(Message.assistant(content="…and more of it"))
+        build_wake(tmp_path, brain)[0].wake()
+        assert brain.calls == 2  # resumed (and progressed), then its in-wake continuation failed
         claim = _claim(tmp_path)
         assert (claim.phase, claim.resumes) == ("in-flight", 0)
 
     assert not _stall_posts(platform)
+
+
+def test_a_continuation_the_box_kills_inside_the_wake_still_counts(platform, tmp_path):
+    """The in-wake continuation is a resume like any other: its count is written when it *starts*,
+    so a kill there counts toward the ceiling exactly as a killed cross-wake resume does (#589)."""
+
+    class _CutOffThenKilled(_CutOff):
+        def chat(self, messages, tools=None):
+            if self.calls >= 1:
+                self.calls += 1
+                raise _Killed
+            return super().chat(messages, tools)
+
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    with pytest.raises(_Killed):
+        build_wake(tmp_path, _CutOffThenKilled())[0].wake()
+
+    claim = _claim(tmp_path)
+    assert (claim.phase, claim.resumes) == ("in-flight", 1)
 
 
 # --- the count, on the claim --------------------------------------------------------------------
@@ -590,6 +632,19 @@ def test_the_note_says_what_it_was_doing_that_it_could_not_finish_and_what_would
     assert "8 tool calls toward it" in body
     assert f"last error: {TIMED_OUT}" in body
     assert "What would help: send it again, ideally split into smaller steps." in body
+    assert body.endswith("If this keeps happening, the model provider may be having trouble.")
+
+
+@pytest.mark.parametrize("detail", [STALL_PAST_BUDGET, STALL_NOTHING_WRITTEN])
+def test_a_budget_stall_names_the_budget_not_the_provider(detail):
+    """A turn that kept running out of its output budget is not the provider having trouble, and a
+    note that said so would send the reader looking in the wrong place (issue #596)."""
+    body = stall_body(item="your message", resumes=2, tool_calls=0, detail=detail)
+    assert body.endswith(
+        "If this keeps happening, this agent's output budget may be too small for answers like "
+        "this one."
+    )
+    assert "provider" not in body
 
 
 def test_an_internal_fault_is_named_never_quoted():

@@ -938,6 +938,48 @@ def test_a_one_on_one_message_with_no_mention_is_informed_once(platform, tmp_pat
     assert [m for m in brain.shown if m.content == MENTION_NUDGE] == []  # not the mention wording
 
 
+class _CutOffBrain(_Brain):
+    """A scripted brain that also reports the vendor's finish reason — ``length`` cuts a turn off."""
+
+    def __init__(self, *replies, reasons):
+        super().__init__(*replies)
+        self.reasons = list(reasons)
+        self.last_finish_reason = None
+        self.all_shown: list[list[Message]] = []
+
+    def chat(self, messages, tools=None):
+        self.last_finish_reason = self.reasons[min(self.calls, len(self.reasons) - 1)]
+        self.all_shown.append(list(messages))
+        return super().chat(messages, tools)
+
+
+def test_a_resumed_turn_that_already_spoke_is_never_told_it_said_nothing(platform, tmp_path):
+    """A turn that posted and was then cut off must not be nudged when its continuation ends.
+
+    Arming reads its baseline off the wake's speech ledger, and a resume re-arms — so the post the
+    turn made *before* it was cut off sat under the baseline, the continuation ended on plain text
+    (as the truncation note asks it to), and the one-on-one arm told the agent it had posted
+    nothing: an invitation to say it all again. The transcript is the record of what the turn did,
+    so a resume of a turn whose work holds a timeline action does not arm (issue #596).
+    """
+    _wire(platform, body="What version are you running?", room="one_on_one")
+    brain = _CutOffBrain(
+        _speak("0.135.1."),  # answers through the tool…
+        Message.assistant(content="Told them the versi"),  # …and its narration is cut off
+        Message.assistant(content="on. Nothing else outstanding."),  # the continuation finishes
+        reasons=("stop", "length", "stop"),
+    )
+    harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+
+    agent.wake()
+
+    assert brain.calls == 3  # no fourth, nudged pass
+    shown = [m for turn in brain.all_shown for m in turn]
+    assert [m for m in shown if m.content in (MENTION_NUDGE, ONE_ON_ONE_NUDGE)] == []
+    assert _posts(platform) == ["0.135.1."]  # said once
+
+
 def test_a_one_on_one_agent_that_speaks_is_not_nudged(platform, tmp_path):
     """It answered the one-on-one through the tool → it acted, so there is nothing to inform it of."""
     _wire(platform, body="what's our status?", room="one_on_one")

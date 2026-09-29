@@ -152,7 +152,15 @@ from basecradle_harness._exceptions import (
     ProviderTimeoutError,
 )
 from basecradle_harness._harness import Harness
-from basecradle_harness._idempotency import STALL_NOTE, IdempotencyKeys, interrupted
+from basecradle_harness._idempotency import (
+    ASSET,
+    MESSAGE,
+    STALL_NOTE,
+    TASK,
+    IdempotencyKeys,
+    creates,
+    interrupted,
+)
 from basecradle_harness._idempotency import key as mint_key
 from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
 from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs_report
@@ -181,6 +189,7 @@ from basecradle_harness._report import (
     BILLING,
     PERMANENT,
     STALL_NOTHING_WRITTEN,
+    STALL_PAST_BUDGET,
     STALL_UNREPORTED,
     BillingState,
     billing_onset_line,
@@ -385,6 +394,16 @@ _CLAIM_STALE_AFTER = 6 * 60 * 60
 #: model at all.
 RESUME_CEILING = 2
 
+#: The most passes one wake runs (issue #596). A turn cut off at the output budget costs at most
+#: `RESUME_CEILING` passes beyond the one that cut it off before it is finished or stalls — a stall
+#: settles it and clears the latch within its own pass — so this allows four such turns in one wake.
+#: It is a backstop against a defect, never the thing that ends an ordinary loop; reaching it logs
+#: `wake deferred` for whatever is still waiting.
+_MAX_WAKE_PASSES = 1 + 4 * RESUME_CEILING
+
+#: The two stall details that say a turn kept running out of its output budget (issue #596).
+_BUDGET_DETAILS = frozenset({STALL_PAST_BUDGET, STALL_NOTHING_WRITTEN})
+
 #: The internal outcome a stalled resume records in `WakeAgent._resumed`, so the other messages of
 #: the batch that turn carried are abandoned with it — never committed as if it had finished, and
 #: never resumed again. Not a disposition: `_recover_orphan` turns it into `_FINAL`.
@@ -403,7 +422,8 @@ class Claim:
     """What a wake wrote down about an item it took: which phase it reached, and who took it.
 
     The owner is identified by **both** the process (`pid`) and the *wake* (`wake`, unique per
-    `WakeAgent.wake()` call). The pid alone is not enough: a process can run several wakes in
+    pass of a `WakeAgent.wake()` call — `_reconcile`; a wake that finishes its own cut-off turn runs
+    more than one, issue #596). The pid alone is not enough: a process can run several wakes in
     sequence (the poll loop does), and a claim left `in-flight` by an *earlier* wake of the
     **same** process is unambiguously orphaned — that wake is over, whatever happened to it —
     even though its pid is very much alive. Keying liveness on the pid alone would read that as
@@ -1650,8 +1670,21 @@ class WakeAgent:
         # self-heal probe).
         self._billing_blocked = False
         #: Has a turn this wake ended cut off at the model's output budget? (issue #490)
-        #: While set, no further model work starts — see `_turn_truncated` for why.
+        #: While set, no further model work starts — see `_turn_truncated` for why. `_truncated`
+        #: names the item whose turn it was, and `_pass` counts this wake's passes (issue #596).
         self._unfinished_turn = False
+        self._truncated: tuple[str, str | None] | None = None
+        self._pass = 1
+        #: Per wake (issue #596): the items whose turns were cut off in this wake — a resume clears
+        #: its count on progress only the first time this wake continues a turn — the NOC probes
+        #: this wake has already acked, so a later pass re-reading them does not ack twice, and the
+        #: work the latch held back in the current pass.
+        self._cut_off_this_wake: set[str] = set()
+        self._acked_probes: set[str] = set()
+        self._held_back: list[tuple[str, str]] = []
+        #: Items this wake saw left waiting, and why — reported at the end of the wake, and only
+        #: for the ones still unsettled then, since a later pass may yet finish them (#596).
+        self._deferred: dict[tuple[str, str], str] = {}
         #: Has this wake been admitted to model work by the breaker yet, and did the breaker hold it?
         #: (issue #592) A wake is counted once, at its first model work — see `_admit`.
         self._admitted = False
@@ -1864,38 +1897,35 @@ class WakeAgent:
             self._brief = None  # compose the brief once this wake, lazily, before the model
             self._brief_composed = False
             self._brief_sections = {}
-            # The per-wake bookkeeping, **per kind** (issues #285, #289). `_ledger[kind]` is every
-            # item of that kind this wake looked at, in timeline order, with what it decided —
-            # `_settle` reads it to move that kind's record, and may never move it past an item that
-            # is not settled. Keyed by kind because the four records are independent: a message a
-            # concurrent wake still holds must not pin the *asset* mark. `_cursor` is the message
-            # path's in-wake read cursor (distinct from the persisted mark, which no longer advances
-            # at claim time).
-            self._ledger: dict[str, list[tuple[str, str]]] = {
-                kind: [] for kind in (_MESSAGES, _ASSETS, _EVENTS, _TASKS)
-            }
-            self._cursor: str | None = None
-            # What `_recover` decided about each orphaned message, before this wake called the
-            # model at all (issue #297). `_readmit` reads it rather than recomputing: recovery
-            # reasons from the transcript, and the transcript stops being pristine evidence the
-            # moment this wake writes to it — which it does from inside `_absorb`'s own re-read
-            # loops. An orphan with no entry here is one recovery declined; it stays `_PENDING`.
-            self._recovered: dict[str, str] = {}
-            # Turns this wake has already resumed, and how that went. A dead wake's turn carried a
-            # *batch*, so several of its messages arrive here as orphans of the same turn — and a
-            # turn is finished **once**. On the happy path the transcript says so by itself (the
-            # resumed turn now has a narration, so the rest commit), but a resume that failed leaves
-            # the turn looking exactly as unfinished as it did before, and without this the next
-            # message of the same batch would resume it *again* — a second full step budget, and a
-            # second post under the next ordinal, which no key dedupes.
-            self._resumed: list[tuple[Message, str]] = []
-            # A fresh identity per *wake*, not per process: an agent that wakes twice in one
-            # process must see its own earlier wake's abandoned claims as orphaned, not as "mine".
-            self.claims.wake = uuid4().hex
-            posted += self._wake_messages(session, trigger)
-            posted += self._wake_assets(session, asset_trigger)
-            posted += self._wake_events(session, event_trigger)
-            posted += self._wake_tasks(session)
+            self._pass = 1
+            self._cut_off_this_wake = set()
+            self._acked_probes = set()
+            self._deferred = {}
+            posted += self._reconcile(session, trigger, event_trigger, asset_trigger)
+            # A turn cut off at the output budget latched the wake to keep its evidence safe (#490),
+            # and nothing else stopped it — so finish it *now*, rather than on a next wake that no
+            # event may ever start (issue #596). Each pass is exactly what the next wake would have
+            # done (a fresh claims identity, so the unfinished turn is an orphan `_recover` resumes
+            # through `_resume_orphan`), under #589's ceiling: the continuations of one wake all
+            # count, so a turn that cannot finish stalls — visibly — within this wake, and a stall
+            # settles it and clears the latch in its own pass, which then answers what came after.
+            # `_MAX_WAKE_PASSES` is a backstop only; the ceiling ends each turn's run of passes.
+            while self._truncation_latched() and self._pass < _MAX_WAKE_PASSES:
+                self._pass += 1
+                kind, item = self._truncated or (None, None)
+                _log.info(
+                    "%s %s",
+                    head("wake continuing", GREEN),
+                    kv(item=item, kind=kind, timeline=self.timeline_uuid, **{"pass": self._pass}),
+                )
+                posted += self._reconcile(session, trigger, event_trigger, asset_trigger)
+            if self._truncation_latched():
+                # Out of passes with the latch still set: name what is left waiting.
+                if self._truncated is not None and self._truncated[1] is not None:
+                    self._log_deferred(*self._truncated, reason="truncated")
+                for kind, uuid in self._held_back:
+                    self._deferred.setdefault((kind, uuid), "held_back")
+            self._report_deferred()
             # Everything this wake could decide, it has decided — so release the recovery evidence
             # a compaction is holding for items that are no longer in flight (issue #289). Last,
             # because it reads the claims the four reconciles have just settled.
@@ -1931,6 +1961,104 @@ class WakeAgent:
                     duration=f"{time.monotonic() - started:.2f}s",
                     delivery=delivery,
                 ),
+            )
+
+    def _reconcile(
+        self,
+        session: Session,
+        trigger: str | None,
+        event_trigger: str | None,
+        asset_trigger: str | None,
+    ) -> list[object]:
+        """One pass over the four kinds — what a wake does, and what a repass does again (#596).
+
+        Everything here is per *pass*. A repass is the next wake run early, so it starts the way a
+        wake does: a fresh ledger, a fresh read cursor, no recovery verdicts, and — the one that
+        makes it work — a **fresh claims identity**, so the turn the previous pass left unfinished
+        is an orphan of "another wake of this process" (`_orphaned` rule 2) and is finished by the
+        recovery path that already finishes a dead wake's turn, count and all. What is per *wake*
+        is kept: the breaker's admission (one wake, counted once), the speech ledger (the bookend
+        counts the whole wake) and the composed brief.
+        """
+        posted: list[object] = []
+        # The per-wake bookkeeping, **per kind** (issues #285, #289). `_ledger[kind]` is every
+        # item of that kind this wake looked at, in timeline order, with what it decided —
+        # `_settle` reads it to move that kind's record, and may never move it past an item that
+        # is not settled. Keyed by kind because the four records are independent: a message a
+        # concurrent wake still holds must not pin the *asset* mark. `_cursor` is the message
+        # path's in-wake read cursor (distinct from the persisted mark, which no longer advances
+        # at claim time).
+        self._ledger: dict[str, list[tuple[str, str]]] = {
+            kind: [] for kind in (_MESSAGES, _ASSETS, _EVENTS, _TASKS)
+        }
+        self._cursor: str | None = None
+        # What `_recover` decided about each orphaned message, before this wake called the
+        # model at all (issue #297). `_readmit` reads it rather than recomputing: recovery
+        # reasons from the transcript, and the transcript stops being pristine evidence the
+        # moment this wake writes to it — which it does from inside `_absorb`'s own re-read
+        # loops. An orphan with no entry here is one recovery declined; it stays `_PENDING`.
+        self._recovered: dict[str, str] = {}
+        # Turns this wake has already resumed, and how that went. A dead wake's turn carried a
+        # *batch*, so several of its messages arrive here as orphans of the same turn — and a
+        # turn is finished **once**. On the happy path the transcript says so by itself (the
+        # resumed turn now has a narration, so the rest commit), but a resume that failed leaves
+        # the turn looking exactly as unfinished as it did before, and without this the next
+        # message of the same batch would resume it *again* — a second full step budget, and a
+        # second post under the next ordinal, which no key dedupes.
+        self._resumed: list[tuple[Message, str]] = []
+        # The latch a truncated turn sets (issue #490), and which item's turn set it — per pass,
+        # because a repass exists to clear it.
+        self._unfinished_turn = False
+        self._truncated: tuple[str, str | None] | None = None
+        self._held_back = []
+        # A hold the breaker served belongs to the pass whose message list predates it.
+        self._breaker_held = False
+        # A fresh identity per *pass*, not per process: an agent that wakes twice in one
+        # process must see its own earlier wake's abandoned claims as orphaned, not as "mine".
+        self.claims.wake = uuid4().hex
+        posted += self._wake_messages(session, trigger)
+        posted += self._wake_assets(session, asset_trigger)
+        posted += self._wake_events(session, event_trigger)
+        posted += self._wake_tasks(session)
+        return posted
+
+    def _truncation_latched(self) -> bool:
+        """Did this pass stop early only because a turn was cut off at the output budget? (#596)
+
+        Out of funds is a different wall: another pass would hit it again, and the billing notice
+        is what tells the human. Only the truncation latch is one a repass can clear — and it is
+        read even when the truncated turn has since stalled (`_truncated` cleared), because the
+        latch still held back whatever came after it in the pass, and the next pass answers that.
+        """
+        return self._unfinished_turn and not self._billing_blocked
+
+    def _log_deferred(self, kind: str, item: str | None, *, reason: str) -> None:
+        """Note that an item may be left waiting for a later wake that nothing is scheduled to start.
+
+        Noted, not yet logged: a later pass of this wake may still settle it (a stall note refused
+        on one pass and posted on the next, a resume that failed on an outage and was retried after
+        another cut-off turn kept the wake going). `_report_deferred` decides at the end.
+        """
+        if item is not None:
+            self._deferred[(kind, item)] = reason
+
+    def _report_deferred(self) -> None:
+        """Log `wake deferred` for every noted item still unsettled as the wake ends (issue #596).
+
+        The capital's line: with finishing done in-wake, an item still waiting here is waiting on a
+        wake no event may ever start — a resume that hit an outage, a stall note the platform
+        refused, or (only past the pass backstop) a cut-off turn or the work its latch held back.
+        Greppable, so the fleet can decide later whether it pages. An item a later pass settled is
+        not reported: the line must never claim something is stuck that this wake finished.
+        """
+        for (kind, uuid), reason in self._deferred.items():
+            claim = self.claims.read(self.timeline_uuid, uuid, kind=kind)
+            if claim is not None and claim.settled:
+                continue
+            _log.warning(
+                "%s %s",
+                head("wake deferred", YELLOW),
+                kv(item=uuid, kind=kind, timeline=self.timeline_uuid, reason=reason),
             )
 
     # --- the cross-wake circuit-breaker --------------------------------------
@@ -2573,11 +2701,21 @@ class WakeAgent:
             if probe is not None and (nonce := probe(item)) is not None:
                 # A verified NOC probe: ack token-free (no model call), never claimed. A refused
                 # ack degrades *silently* (`note=False` keeps the probe seam trace-free) and stays
-                # undecided, so the next wake re-acks.
+                # undecided, so the next wake re-acks. Acked once per wake: a later pass re-reads
+                # it while the record is held behind an older item, and must not ack again (#596).
+                if uuid in self._acked_probes:
+                    ledger.append((uuid, _FINAL))
+                    continue
                 ack = self._post(ack_line(nonce), kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
+                    self._acked_probes.add(uuid)
                 ledger.append((uuid, _FINAL if ack is not None else _PENDING))
+                continue
+            if self._recovered.get(uuid) == _FINAL:
+                # `_recover` settled this item already (committed a finished turn, or stalled one),
+                # so no latch holds it back and the record may pass it.
+                ledger.append((uuid, _FINAL))
                 continue
             if self._billing_blocked or self._unfinished_turn:
                 # Two reasons not to start another turn, and the ledger entry is the same for both:
@@ -2589,10 +2727,12 @@ class WakeAgent:
                 # (`Session.send` ends in `_compact_if_needed`, and an over-length rescue compacts
                 # hard), after which the next wake reads "no turn" and **abandons the item** rather
                 # than finishing it. Stopping is what keeps `_recover`'s answer available. The items
-                # left here are deferred, never dropped: unclaimed, unrecorded, and re-read next
-                # wake — the same outcome `_generate_settled` already gives a message that lands
-                # during its final build.
+                # left here are deferred, never dropped: unclaimed, unrecorded, and re-read by the
+                # next pass (issue #596) — the same outcome `_generate_settled` already gives a
+                # message that lands during its final build.
                 ledger.append((uuid, _PENDING))
+                if self._unfinished_turn:
+                    self._held_back.append((kind, uuid))
                 continue
             if self.claims.claim(self.timeline_uuid, uuid, kind=kind):
                 disposition = _OURS
@@ -2768,9 +2908,12 @@ class WakeAgent:
         it: **leave the item pending.** A truncated final text is a fragment, and the Delivery
         Guarantee reads a turn's terminal narration as its commit record; committing a fragment
         settles the claim, advances the mark, and the peer is never answered by anybody. Left
-        pending, the claim stays in-flight, the mark holds behind it, and the next wake finds an
+        pending, the claim stays in-flight, the mark holds behind it, and the recovery finds an
         orphan whose turn is unfinished and **finishes it** — the mechanism issue #297 already
-        built, rather than a second one.
+        built, rather than a second one. Since issue #596 that recovery runs **in this wake**: once
+        the pass ends, `wake` runs another (`_reconcile`), which is exactly the next wake started
+        early — no event may ever start the real one, and a peer's half-answered question would sit
+        until somebody else spoke.
 
         The engine has already logged the truncation against the *provider*; this line names the
         *item*, which is what a forensic dig starts from, and says what the harness decided to do
@@ -2791,12 +2934,15 @@ class WakeAgent:
         `_unfinished_turn` stops this wake starting new model work, exactly as the out-of-funds wall
         does, and the invariant #289 states holds unchanged: a wake leaves at most one in-flight
         claim per kind. The items behind the latch are **deferred, never dropped** — unclaimed,
-        unrecorded, re-read next wake, the same outcome `_generate_settled` already gives a message
-        that lands during its final build.
+        unrecorded, and re-read by the next pass, the same outcome `_generate_settled` already gives a
+        message that lands during its final build.
         """
         if not self.harness.engine.output_truncated:
             return False
         self._unfinished_turn = True
+        self._truncated = (kind, item)
+        if item is not None:
+            self._cut_off_this_wake.add(item)
         _log.warning(
             "%s %s",
             head("wake truncated_turn", YELLOW),
@@ -2807,7 +2953,7 @@ class WakeAgent:
                 delivery=delivery_id(),
                 reason=(
                     "the model's final text was cut off at the output budget, so the turn is "
-                    "unfinished; leaving it pending for the next wake to finish"
+                    "unfinished; leaving it pending, and this wake resumes it once the pass ends"
                 ),
             ),
         )
@@ -3298,6 +3444,10 @@ class WakeAgent:
             # set here). Leave the claimed batch pending — mark it `_PENDING` and settle, so the
             # claims stay in-flight, the mark is held behind them, and the bootstrap declines to
             # baseline over them (issues #336, #490). The next wake takes them.
+            if self._unfinished_turn:
+                self._held_back.extend(
+                    (_MESSAGES, uuid) for uuid, d in self._ledger[_MESSAGES] if d == _OURS
+                )
             self._ledger[_MESSAGES] = [
                 (uuid, _PENDING if d == _OURS else d) for uuid, d in self._ledger[_MESSAGES]
             ]
@@ -3407,10 +3557,14 @@ class WakeAgent:
                 continue
             nonce = self._probe_nonce(item.content.body)
             if nonce is not None:
+                if uuid in self._acked_probes:  # acked by an earlier pass of this wake (#596)
+                    ledger.append((uuid, _FINAL))
+                    continue
                 probe_seen = True
                 ack = self._post(ack_line(nonce), kind="probe-ack")
                 if ack is not None:
                     posted.append(ack)
+                    self._acked_probes.add(uuid)
                 ledger.append((uuid, _FINAL if ack is not None else _PENDING))
                 continue
             if self.claims.claim(self.timeline_uuid, uuid, kind=_MESSAGES):
@@ -3668,8 +3822,10 @@ class WakeAgent:
         if self._billing_blocked or self._unfinished_turn:
             # A resume is a model call, and this wake has a reason not to make one: it is out of
             # funds (issue #336), or it has already left a turn cut off whose own evidence a further
-            # turn could compact away (issue #490). Leave the orphan for the next wake — do not even
-            # take the claim over.
+            # turn could compact away (issue #490). Leave the orphan for the next pass or wake — do
+            # not even take the claim over.
+            if self._unfinished_turn:
+                self._held_back.append((kind, uuid))
             return _PENDING
         if claim.resumes >= RESUME_CEILING:
             # The ceiling was reached and nobody stalled the item: the last resume never reported
@@ -3717,6 +3873,9 @@ class WakeAgent:
         # never the perception renderer, because a resume has no use for an asset's pixels (the
         # model already saw them; the session evicted them after that turn).
         rendered = turn.content or text(item)
+        # Whether this is the first continuation this wake makes of the turn (issue #596): only then
+        # can words written count as progress. Read before the continuation, which may add it.
+        first_this_wake = not (set(turn.items or [uuid]) & self._cut_off_this_wake)
         disposition = _FINAL
         try:
             self.keys.begin(session, timeline=self.timeline_uuid, anchor=_anchor_of(turn, item))
@@ -3725,9 +3884,16 @@ class WakeAgent:
             # fresh one would; a resumed asset/task/webhook turn does not (issue #332). The kind is
             # known here, so the gate is exact — and `not self._is_own(item)` keeps it to a peer's
             # message, though the message reconcile only ever batches peer messages to begin with.
+            #
+            # **Not when the turn already acted on the timeline** (issue #596). Arming reads its
+            # baseline off this wake's speech ledger, which never saw what the turn did before it
+            # was cut off or killed — so a turn that *posted* and was then interrupted would end its
+            # continuation on plain text and be told it posted nothing, inviting a second post. The
+            # transcript is the record of what the turn did; a create in its work is an action.
+            acted = _turn_acted(_turn_work(session.history, turn))
             self.informer.arm(
-                rendered,
-                counterpart_message=kind == _MESSAGES and not self._is_own(item),
+                None if acted else rendered,
+                counterpart_message=not acted and kind == _MESSAGES and not self._is_own(item),
             )
             self._degraded = False
             try:
@@ -3751,19 +3917,30 @@ class WakeAgent:
                 # budget is too small for what this turn is trying to say; the WARNING is what says
                 # so, and the budget is the operator's to change, never the harness's.
                 disposition = _PENDING
-                if narration.strip():
+                # Wrote something, on a turn this wake has already continued or cut off (issue #596):
+                # inside one wake every continuation counts, so a turn this wake cannot finish stalls
+                # here, visibly, rather than sitting half-answered until an event nobody may send.
+                # The first continuation a wake makes of an earlier wake's turn is still progress
+                # when it writes something, exactly as #589 ruled for resumes spread over wakes.
+                detail = STALL_PAST_BUDGET if narration.strip() else STALL_NOTHING_WRITTEN
+                if claim.reason in _BUDGET_DETAILS and claim.reason != detail:
+                    # One attempt wrote something and one did not: both were cut off at the budget,
+                    # which is the one sentence true of each — the note says "each".
+                    detail = STALL_PAST_BUDGET
+                if narration.strip() and first_this_wake:
                     # It wrote something, so it *progressed*: a long answer continued three times
                     # is converging, not looping, and it clears the resume count (issue #589).
                     self.claims.recount(self.timeline_uuid, uuid, kind=kind, resumes=0)
                 elif attempt < RESUME_CEILING:
-                    # Cut off having written nothing — the whole budget spent before a word. That is
-                    # not progress, and the next continuation will do the same; it counts.
+                    # Cut off having written nothing — the whole budget spent before a word — or cut
+                    # off again inside the wake that is finishing it. Either way the next
+                    # continuation is not converging on its own; it counts.
                     self.claims.recount(
                         self.timeline_uuid,
                         uuid,
                         kind=kind,
                         resumes=attempt,
-                        reason=STALL_NOTHING_WRITTEN,
+                        reason=detail,
                     )
                 else:
                     disposition = self._stall(
@@ -3773,9 +3950,16 @@ class WakeAgent:
                         kind=kind,
                         text=text,
                         resumes=attempt,
-                        detail=STALL_NOTHING_WRITTEN,
+                        detail=detail,
                         mine=False,  # this exchange was mined a moment ago
                     )
+                    # Settled: the latch protected this turn's evidence, and there is none left to
+                    # protect, so the pass carries on with what came after it (issue #596). Refused:
+                    # the evidence is still needed and the latch stays, but `_stall` has already
+                    # said the item is waiting, so it is not reported a second time as truncated.
+                    self._truncated = None
+                    if disposition == _FINAL:
+                        self._unfinished_turn = False
                     self._resumed.append((turn, _STALLED if disposition == _FINAL else disposition))
                     return disposition
             else:
@@ -3853,6 +4037,7 @@ class WakeAgent:
                     "counted toward the resume ceiling); the next wake will try again.",
                     type(exc).__name__,
                 )
+                self._log_deferred(kind, uuid, reason="resume_failed")
                 disposition = _PENDING
             elif attempt < RESUME_CEILING:
                 # It timed out — twice over, since the in-wake retry already doubled its budget.
@@ -3867,6 +4052,7 @@ class WakeAgent:
                     attempt,
                     RESUME_CEILING,
                 )
+                self._log_deferred(kind, uuid, reason="resume_failed")
                 disposition = _PENDING
             else:
                 # The last resume the ceiling allows, and it timed out too (issue #589). Replaying it
@@ -3951,6 +4137,9 @@ class WakeAgent:
         )
         if note is None:
             self.claims.recount(self.timeline_uuid, uuid, kind=kind, resumes=resumes, reason=detail)
+            # The ceiling reached and the note refused: the item stays in flight with the words on
+            # its claim, for a wake nothing is scheduled to start (issue #596) — say so, greppably.
+            self._log_deferred(kind, uuid, reason="stall_note_refused")
             return _PENDING
         if mine:
             rendered = turn.content or text(item)
@@ -4644,6 +4833,24 @@ def _evidence_lost(history: list[Message], item: object) -> bool:
     if uuid is None:
         return False
     return any(message.role == "system" and uuid in message.items for message in history)
+
+
+#: The creates that are a *visible timeline action* — the ones the speech ledger counts and the
+#: no-reply informer is asking about. A webhook endpoint is a create, but not something a peer sees.
+_TIMELINE_ACTIONS = frozenset({MESSAGE, ASSET, TASK})
+
+
+def _turn_acted(work: list[Message]) -> bool:
+    """Did this turn's work already make a visible timeline action? Read off the transcript (#596).
+
+    **Any attempt counts, not only a success — a deliberate asymmetry with a fresh turn**, whose
+    speech ledger counts only successes. After a refused post the two differ: a fresh turn is
+    nudged, a resumed one is not. The transcript records the attempt, not a machine-readable
+    verdict, and telling success apart would mean parsing each tool's own prose. The error this
+    side of the line costs is one missed nudge whose news the model already read in its refused
+    call's result; the error on the other side is a second post.
+    """
+    return any(create.kind in _TIMELINE_ACTIONS for create in creates(work))
 
 
 def _turn_of(history: list[Message], item: object, text) -> Message | None:

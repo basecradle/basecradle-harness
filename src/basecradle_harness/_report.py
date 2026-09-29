@@ -153,6 +153,11 @@ STALL_UNREPORTED = "the last of them never reported back, because the wake runni
 #: nothing wrong; it stopped where it was told to.
 STALL_NOTHING_WRITTEN = "each ran out of its output budget before writing anything"
 
+#: What a stall note says when the resumes kept writing and kept being cut off at the output budget
+#: inside one wake (issue #596): the answer is longer than the budget lets the model finish, and
+#: continuing it again would spend another budget on the same outcome.
+STALL_PAST_BUDGET = "each was cut off at its output budget before the answer was complete"
+
 
 def stall_detail(error: BaseException) -> str:
     """What a stall note says about the failure that ended the last resume — safe to post publicly.
@@ -187,13 +192,19 @@ def stall_body(*, item: str, resumes: int, tool_calls: int, detail: str) -> str:
         if tool_calls
         else ""
     )
+    # The closing sentence names the likely cause, so it follows the failure: a turn that kept
+    # running out of its output budget is not the provider having trouble (issue #596).
+    if detail in (STALL_PAST_BUDGET, STALL_NOTHING_WRITTEN):
+        cause = "this agent's output budget may be too small for answers like this one."
+    else:
+        cause = "the model provider may be having trouble."
     return (
         "Automatic notice from this agent's harness — its model did not write this. "
         f"The model could not finish working on {item}: the turn stopped partway, and {resumes} "
         f"attempt{'s' if resumes != 1 else ''} to resume it failed ({detail}).{progress} The "
         "harness has stopped retrying so it does not loop, and nothing more will happen on it by "
         "itself. What would help: send it again, ideally split into smaller steps. If this keeps "
-        "happening, the model provider may be having trouble."
+        f"happening, {cause}"
     )
 
 
@@ -204,13 +215,20 @@ def report_body(rc: ReportClass, *, item: str, provider: str | None, exc: Provid
     says plainly to add funds; the permanent notice names what could not be processed and, for a
     too-large payload, that the original is untouched and a smaller version may work (decision 1). The
     vendor's own words ride inside, unchanged.
+
+    **The billing notice asks for a post, and that is the whole re-wake** (issue #596, the capital's
+    ruling). Funding an account raises no platform event, so nothing wakes the agent when the money
+    lands; the notice used to promise "pending messages will be handled then", which was true only
+    if somebody happened to speak again. The person who funds the account is the person reading this
+    notice, so it tells them the one thing that makes the promise true: post here once it is funded.
     """
     name = provider_label(provider)
     detail = verbatim(exc)
     if rc.kind == BILLING:
         return (
             f"I can't respond right now — my {name} account is out of credit ({detail}). "
-            f"Add funds to the {name} account to resume; pending messages will be handled then."
+            f"Add funds to the {name} account to resume. When the account is funded, post here "
+            "and I will pick up where I stopped."
         )
     base = f"I couldn't process {item}: {name} rejected the request — {detail}."
     if rc.reason == _PAYLOAD_TOO_LARGE:
