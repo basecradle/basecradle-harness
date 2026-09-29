@@ -1211,12 +1211,14 @@ def _cap_arguments(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
     dropped is one no `CREATE_CALLS` entry could match anyway, so `create_kind` answers ``None`` before
     the cap and ``None`` after it.
 
-    **The fit is measured, never computed**, and that is why this loop exists rather than one pass of
-    arithmetic: how many characters a string costs once serialized depends on the string (a quote or a
-    backslash escapes to two), so a budget that is exactly right on prose can be exceeded by the same
-    length of JSON or source code. Halving and re-measuring converges in one or two passes and cannot
-    lie about the result; the alternative — assuming a worst-case escape factor — would cut every
-    ordinary argument to a fraction of the budget it is actually entitled to.
+    **The fit is measured, never computed**: how many characters a string costs once serialized
+    depends on the string (a quote or a backslash escapes to two), so a budget that is exactly right on
+    prose can be exceeded by the same length of JSON or source code. Each excerpt is measured as it is
+    cut (`_within`), so the first attempt fits whenever the values are what is large. This loop is the
+    backstop for when they are not: so many keys, or keys so long, that the share left for the values
+    is itself the problem. Halving and re-measuring cannot lie about the result, and the alternative,
+    assuming a worst-case escape factor, would cut every ordinary argument to a fraction of the budget
+    it is actually entitled to.
     """
     if _json_size(arguments) <= budget:
         return arguments
@@ -1262,6 +1264,14 @@ def _elide_argument(value: Any, budget: int) -> Any:
     the cap a **fixed point** when a value is already down at the marker's own size: without it, a
     transcript re-saved every turn would grind a marker into a marker of a marker, each one naming a
     size that is no longer true.
+
+    **The excerpt is cut by what it costs serialized, never by how many characters it has.** `budget`
+    is a serialized size (`_json_size`), and a newline or a quote costs two there. Cutting the head at
+    `room` *characters* therefore overshot the share by one character per escape, so every
+    multi-paragraph message missed its fit and `_cap_arguments` halved the whole budget to recover:
+    a 2,413-character reply kept 930 characters of a 2,048 budget, where prose with no line breaks
+    kept 1,954. Measuring the head and the tail (`_within`) makes the first fit the right one, for
+    every script and every escape.
     """
     size = _json_size(value)
     if size <= _MIN_EXCERPT:
@@ -1279,10 +1289,34 @@ def _elide_argument(value: Any, budget: int) -> Any:
     if room < _MIN_EXCERPT:
         elided = gone(size)  # no room for an excerpt worth reading; the floor is all that fits
         return elided if _json_size(elided) < size else value
-    tail = min(room // 5, _ARG_ELISION_TAIL)
-    head = room - tail
-    elided = value[:head] + marker + (value[-tail:] if tail else "")
+    tail_room = min(room // 5, _ARG_ELISION_TAIL)
+    head = _within(value, room - tail_room)
+    tail = _within(value, tail_room, from_end=True)
+    elided = head + marker + tail
     return elided if _json_size(elided) < size else value
+
+
+def _within(text: str, room: int, *, from_end: bool = False) -> str:
+    """The longest head (or tail) of `text` whose **serialized** cost is at most `room`.
+
+    Measured, never computed, for `_cap_arguments`'s reason: what a character costs once serialized
+    depends on the character (one for a letter, whatever its script; two for a newline or a quote;
+    six for a control character), so the only honest answer is to serialize and look. A binary search
+    does it in a dozen measurements, which is what makes measuring affordable. A cost is never below a
+    character count, so no excerpt is longer than `room` characters, and a tail keeps its
+    `_ARG_ELISION_TAIL` ceiling in characters as well as in cost.
+    """
+    low, high = 0, min(len(text), max(room, 0))
+    while low < high:
+        middle = (low + high + 1) // 2
+        piece = text[len(text) - middle :] if from_end else text[:middle]
+        if _json_size(piece) - 2 <= room:  # the two quotes are the joined value's, paid once
+            low = middle
+        else:
+            high = middle - 1
+    if not low:
+        return ""
+    return text[len(text) - low :] if from_end else text[:low]
 
 
 def _arguments_stub(arguments: dict[str, Any]) -> dict[str, Any]:

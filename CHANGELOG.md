@@ -7,6 +7,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.133.4] - 2026-09-29
+
+### Fixed: a capped argument keeps its whole share, not half of it, when its text contains a line break or a quote
+
+The argument cap measures its budget in serialized characters (`_json_size`), where a newline or a
+quote costs two. `_elide_argument` cut the excerpt's head and tail by plain character count, so every
+escape in the head overshot the share by one character. The fit therefore failed on nearly every
+real long message (anything with a paragraph break), and `_cap_arguments` recovered by halving the
+entire budget. Measured on 0.133.3, against a 2,048 budget:
+
+| Body (about 3,000 characters) | Kept before | Kept now |
+|---|---|---|
+| Unbroken prose | 1,954 | 1,954 |
+| Paragraphs | 930 | 1,936 |
+| Quotation | 930 | 1,709 |
+
+Now each excerpt is cut by what it costs serialized (`_session._within`, measured by binary search
+rather than computed), so the first fit is the right one for every script and every escape. The
+halving loop remains as the backstop for calls whose *keys* are what is large. Nothing else moves.
+The call still serializes within the cap, the tail keeps its 128-character ceiling, a re-save is a
+fixed point, and what an agent's transcript keeps of each long message it sent roughly doubles, back
+to the share it was always meant to have.
+
 ## [0.133.3] - 2026-09-29
 
 ### Fixed: a tool call carrying the harness's own elision marker is refused, never run (issue #576)
