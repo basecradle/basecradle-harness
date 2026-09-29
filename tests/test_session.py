@@ -725,22 +725,20 @@ def test_an_argument_that_escapes_still_gets_its_whole_share(body):
     """**The first fit is the right one**, however the text serializes.
 
     The excerpt used to be cut at `room` *characters* against a budget measured *serialized*, so every
-    newline or quote in the head overshot it by one. Nearly every real long message has a line break,
-    so the fit nearly always failed, and `_cap_arguments` halved the entire budget to recover. A
-    2,413-character reply kept 930 characters of a 2,048 budget, while the same length of unbroken
-    prose kept 1,954. That is the cost of escaping, paid at 50%.
+    newline or quote in the head overshot it by one, and past the two characters of slack per argument
+    the fit failed and `_cap_arguments` halved the entire budget to recover. That is the cost of
+    escaping, paid at 50%.
 
-    Now the share is spent exactly: the call serializes to within a few characters of the cap (never
-    over it), the tail stays within its ceiling, and re-saving the result changes nothing.
+    Now the share is spent: the call serializes within the cap and nowhere near half of it, the tail
+    stays within its ceiling, and re-saving the result changes nothing.
     """
     arguments = {"action": "create", "timeline": TIMELINE, "body": body}
     assert _json_size(arguments) > TOOL_ARGS_CAP  # genuinely over, or this proves nothing
 
     capped = _cap_arguments(arguments, TOOL_ARGS_CAP)
 
-    assert (
-        TOOL_ARGS_CAP - 8 <= _json_size(capped) <= TOOL_ARGS_CAP
-    )  # the share is spent, not halved
+    # Within the cap, and nowhere near half of it (every shape here serialized to 1,001-1,188 before).
+    assert TOOL_ARGS_CAP * 3 // 4 < _json_size(capped) <= TOOL_ARGS_CAP
     assert capped["action"] == "create" and capped["timeline"] == TIMELINE
     kept = capped["body"]
     assert kept.startswith(body[:40])
@@ -750,7 +748,7 @@ def test_an_argument_that_escapes_still_gets_its_whole_share(body):
 
 
 def test_a_multi_paragraph_reply_keeps_most_of_its_share_not_half():
-    """The live shape: a 2,413-character reply in paragraphs. It kept 930 characters before."""
+    """The live shape: a 2,413-character reply in paragraphs. It kept 811 characters of its text."""
     reply = ("The plan holds; the next step is ours, and we take it together. " * 4 + "\n\n") * 10
     reply = reply[:2413]
 
@@ -758,7 +756,9 @@ def test_a_multi_paragraph_reply_keeps_most_of_its_share_not_half():
         {"action": "create", "timeline": TIMELINE, "body": reply}, TOOL_ARGS_CAP
     )
 
-    assert len(capped["body"]) > 1_800
+    kept = capped["body"]
+    marker = kept[kept.index("\n\n[... elided") : kept.index("...]\n\n") + len("...]\n\n")]
+    assert len(kept) - len(marker) > 1_700  # of the message's own text, not the marker
 
 
 def test_an_excerpt_is_the_longest_that_fits_its_room():

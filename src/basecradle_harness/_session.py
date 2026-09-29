@@ -1216,7 +1216,7 @@ def _cap_arguments(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
     prose can be exceeded by the same length of JSON or source code. Each excerpt is measured as it is
     cut (`_within`), so the first attempt fits whenever the values are what is large. This loop is the
     backstop for when they are not: so many keys, or keys so long, that the share left for the values
-    is itself the problem. Halving and re-measuring cannot lie about the result, and the alternative,
+    is itself the problem, or so many large values that their floors (`gone`) overrun a tiny share. Halving and re-measuring cannot lie about the result, and the alternative,
     assuming a worst-case escape factor, would cut every ordinary argument to a fraction of the budget
     it is actually entitled to.
     """
@@ -1267,11 +1267,13 @@ def _elide_argument(value: Any, budget: int) -> Any:
 
     **The excerpt is cut by what it costs serialized, never by how many characters it has.** `budget`
     is a serialized size (`_json_size`), and a newline or a quote costs two there. Cutting the head at
-    `room` *characters* therefore overshot the share by one character per escape, so every
-    multi-paragraph message missed its fit and `_cap_arguments` halved the whole budget to recover:
-    a 2,413-character reply kept 930 characters of a 2,048 budget, where prose with no line breaks
-    kept 1,954. Measuring the head and the tail (`_within`) makes the first fit the right one, for
-    every script and every escape.
+    `room` *characters* overshot the share by one character per escape, and the only slack was two
+    characters per argument (`_fit` charges each value's quotes twice). So a call whose excerpt held
+    more than a handful of escapes (seven, for an ordinary three-argument create; one, for a
+    single-argument call) missed its fit, and `_cap_arguments` halved the whole budget to recover. A
+    2,413-character reply in paragraphs kept 811 characters of its text where it had room for 1,821.
+    Measuring the head and the tail (`_within`) makes the first fit the right one, for every script
+    and every escape.
     """
     size = _json_size(value)
     if size <= _MIN_EXCERPT:
@@ -1314,8 +1316,6 @@ def _within(text: str, room: int, *, from_end: bool = False) -> str:
             low = middle
         else:
             high = middle - 1
-    if not low:
-        return ""
     return text[len(text) - low :] if from_end else text[:low]
 
 

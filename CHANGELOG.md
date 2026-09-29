@@ -9,26 +9,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.133.4] - 2026-09-29
 
-### Fixed: a capped argument keeps its whole share, not half of it, when its text contains a line break or a quote
+### Fixed: a capped argument keeps its whole share, not half of it, when its text has line breaks or quotes
 
 The argument cap measures its budget in serialized characters (`_json_size`), where a newline or a
 quote costs two. `_elide_argument` cut the excerpt's head and tail by plain character count, so every
-escape in the head overshot the share by one character. The fit therefore failed on nearly every
-real long message (anything with a paragraph break), and `_cap_arguments` recovered by halving the
-entire budget. Measured on 0.133.3, against a 2,048 budget:
+escape in the head overshot the share by one. The only slack was two characters per argument, so a
+call whose excerpt held more than a handful of escapes (seven, for an ordinary three-argument create;
+one, for a single-argument call) missed its fit. `_cap_arguments` then recovered by halving the
+entire budget. Characters of the message's own text kept, against a 2,048 budget, on 0.133.3 and now:
 
-| Body (about 3,000 characters) | Kept before | Kept now |
+| Body | Before | Now |
 |---|---|---|
-| Unbroken prose | 1,954 | 1,954 |
-| Paragraphs | 930 | 1,936 |
-| Quotation | 930 | 1,709 |
+| Unbroken prose, 3,000 characters | 1,835 | 1,835 |
+| Paragraphs, 3,030 characters | 811 | 1,817 |
+| Quotation, 3,250 characters | 811 | 1,590 |
+| A 2,413-character reply in paragraphs | 811 | 1,821 |
 
 Now each excerpt is cut by what it costs serialized (`_session._within`, measured by binary search
 rather than computed), so the first fit is the right one for every script and every escape. The
-halving loop remains as the backstop for calls whose *keys* are what is large. Nothing else moves.
-The call still serializes within the cap, the tail keeps its 128-character ceiling, a re-save is a
-fixed point, and what an agent's transcript keeps of each long message it sent roughly doubles, back
-to the share it was always meant to have.
+halving loop remains as the backstop for calls whose keys, or whose many large values, are the
+problem. The bound, the tail's 128-character ceiling, the fixed point and `create_kind` are unchanged.
+Where a call already fit within that slack, its excerpt is now a few characters shorter, because the
+head and tail are cut by cost rather than by count.
 
 ## [0.133.3] - 2026-09-29
 
