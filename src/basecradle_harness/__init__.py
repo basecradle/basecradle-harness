@@ -9,6 +9,7 @@ https://basecradle.com · API docs: https://basecradle.com/docs/api
 from basecradle_harness._assets import AssetsTool, assets_options
 from basecradle_harness._audio import Transcriber
 from basecradle_harness._basecradle import TimelineAgent
+from basecradle_harness._breaker import BreakerDecision, WakeBreaker
 from basecradle_harness._brief import (
     compose_brief,
     fetch_dashboard_md,
@@ -143,7 +144,6 @@ from basecradle_harness._video import (
     sample_frames,
 )
 from basecradle_harness._wake import (
-    BreakerDecision,
     Claim,
     ClaimStore,
     MarkStore,
@@ -151,7 +151,6 @@ from basecradle_harness._wake import (
     SeenStore,
     StaleTimelineError,
     WakeAgent,
-    WakeBreaker,
 )
 from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool

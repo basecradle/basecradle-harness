@@ -28,6 +28,7 @@ from basecradle_harness import (
     ProviderServerError,
     ProviderTimeoutError,
     ToolCall,
+    WakeBreaker,
 )
 from basecradle_harness._idempotency import STALL_NOTE, key
 from basecradle_harness._report import STALL_DETAIL_CAP, stall_body, stall_detail
@@ -48,6 +49,8 @@ from tests.test_wake import (
     PNG_BYTES,
     REPLY,
     TIMELINE_UUID,
+    CountingProvider,
+    ScriptedMessages,
     _posts,
     asset_page,
     build_wake,
@@ -238,6 +241,91 @@ def test_a_resume_the_box_killed_counts_and_the_next_wake_stalls_without_the_mod
     body = json.loads(note.content)["message"]["body"]
     assert "the last of them never reported back" in body
     assert _claim(tmp_path).phase == "abandoned"
+
+
+def test_a_wake_killed_while_the_breaker_holds_it_has_not_resumed_anything(platform, tmp_path):
+    """The breaker admits a resume *before* the take-over, never after (issue #592). The take-over
+    is what counts a resume against the ceiling, and a wake the box kills while it waits out a trip
+    never reached the model — counted, a trip during a bad hour would stall a turn no resume had
+    ever tried to finish. The next wake, finishing the trip, still has the whole ceiling."""
+
+    def killed(_seconds):
+        raise _Killed
+
+    def resume_with(brain, *, sleep):
+        breaker = WakeBreaker(tmp_path, max_wakes=1, sleep=sleep)
+        agent, _ = build_wake(tmp_path, brain, tools=[MessagesTool()], breaker=breaker)
+        agent.harness.engine._sleep = lambda _seconds: None
+        serve_messages(platform, page(message(uuid=M0, body=BODY)))
+        return agent
+
+    _died_mid_tool_chain(platform, tmp_path, M0)
+    standing = WakeBreaker(tmp_path, max_wakes=1)
+    assert standing.admit(TIMELINE_UUID).tripped  # the dead wake was the first; this, the second
+
+    brain = _DiesMidResume()
+    with pytest.raises(_Killed):
+        resume_with(brain, sleep=killed).wake()
+    assert brain.calls == 0
+    assert (_claim(tmp_path).phase, _claim(tmp_path).resumes) == ("in-flight", 0)
+
+    with pytest.raises(_Killed):
+        resume_with(_DiesMidResume(), sleep=lambda _seconds: None).wake()
+    assert _claim(tmp_path).resumes == 1  # the first resume that reached the model
+    assert not standing.tripped(TIMELINE_UUID)
+
+
+def test_a_hold_in_a_resume_still_folds_in_what_landed_meanwhile(platform, tmp_path):
+    """A resume that `_recover` runs ahead of the batch can be the wake's first model work, so the
+    breaker can hold it there — after the message list was read (issue #592). A message that lands
+    during that hold must still be answered by this wake, even when everything in the list was the
+    turn being resumed and the batch would otherwise be empty."""
+    _died_mid_tool_chain(platform, tmp_path, M0)
+    assert WakeBreaker(tmp_path, max_wakes=1).admit(TIMELINE_UUID).tripped
+
+    scripted = ScriptedMessages(platform, message(uuid=M0, body=BODY))
+
+    def arrive(_seconds):  # the hold's sleep: a message lands while the resume waits
+        scripted.arrive(message(uuid=M1, body="are you there?"))
+
+    brain = CountingProvider()
+    agent, _ = build_wake(
+        tmp_path, brain, tools=[MessagesTool()], breaker=WakeBreaker(tmp_path, sleep=arrive)
+    )
+    agent.harness.engine._sleep = lambda _seconds: None
+
+    agent.wake()
+
+    assert _claim(tmp_path).phase == "done"  # the resumed turn finished…
+    assert brain.prompts == ["[2026-06-04T00:00:00.000Z] john: are you there?"]  # …and M1 answered
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+
+
+def test_a_resume_hold_that_ends_in_a_latch_claims_nothing_more(platform, tmp_path):
+    """The fold after a resume's hold is for a wake that will go on to answer. When the resume hits
+    a wall that latches the wake (out of funds here), nothing more is answered this wake, so the
+    message that landed mid-hold is left unclaimed for its own delivery — never claimed only to be
+    handed to the next wake as an orphan."""
+    _died_mid_tool_chain(platform, tmp_path, M0)
+    assert WakeBreaker(tmp_path, max_wakes=1).admit(TIMELINE_UUID).tripped
+    scripted = ScriptedMessages(platform, message(uuid=M0, body=BODY))
+
+    def arrive(_seconds):
+        scripted.arrive(message(uuid=M1, body="are you there?"))
+
+    class _Unfunded:
+        provider, model = "openrouter", "z-ai/glm-5.2"
+
+        def chat(self, messages, tools=None):
+            raise ProviderBillingError("Insufficient credits", status_code=402)
+
+    agent, _ = build_wake(
+        tmp_path, _Unfunded(), tools=[MessagesTool()], breaker=WakeBreaker(tmp_path, sleep=arrive)
+    )
+    agent.harness.engine._sleep = lambda _seconds: None
+    agent.wake()
+
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M1, kind="messages") is None
 
 
 @pytest.mark.parametrize(

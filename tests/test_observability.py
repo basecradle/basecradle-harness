@@ -581,7 +581,6 @@ def test_a_verdict_pair_is_colored_whole_so_outcome_ok_still_greps():
 def test_each_outcome_word_gets_its_own_color():
     assert f"{GREEN}outcome=ok{RESET}" in kv(outcome="ok")
     assert f"{RED}outcome=error{RESET}" in kv(outcome="error")
-    assert f"{YELLOW}outcome=declined{RESET}" in kv(outcome="declined")
 
 
 def test_an_unrecognized_outcome_is_left_plain_rather_than_guessed():

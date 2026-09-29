@@ -96,7 +96,7 @@ def lay_down_all_kinds(home: Path, uuid: str) -> dict[str, Path]:
     claims.claim(uuid, "0190a8c1-0000-7000-8000-000000000005", kind="messages")
 
     breaker = WakeBreaker(home)
-    breaker.record_and_check(uuid)  # writes breaker/<uuid>.wakes
+    breaker.admit(uuid)  # writes breaker/<uuid>.wakes
 
     billing = BillingState(home)
     billing.note_and_check(uuid)  # writes billing/<uuid>.blocked (issue #336)

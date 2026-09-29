@@ -279,6 +279,16 @@ the router still counts the wake and trips its own backstop. **The capital verif
 @jt** (drive a synthetic runaway, confirm the breaker trips + alerts once + makes no provider
 call, confirm reset) and **closes the handoff issue by hand** after that live verify.
 
+**Superseded in part by issue #592 (2026-09-29).** Two of the choices above failed live on
+@briggs: counting every process start *first* let ten empty backlog replays trip the breaker, and
+the self-decline plus lazy reset dropped @origin's direct question — the burst's last event — with
+nothing to re-wake the agent until a third party posted. The breaker now lives in `_breaker.py`,
+counts a wake at its **first model work** (`WakeAgent._admit`), and a trip **holds** the wake for
+the cooldown and then lets it do its work, so nothing a tripped wake finds is dropped. The alert
+was already a log line rather than a post (issue #293); `Wake breaker TRIPPED` is now rendered by
+one function and proven by the `log-grammar:breaker_tripped` probe. The module docstring carries
+the design and the alternatives weighed.
+
 ### Image Tools — full GPT Image 2.5 coverage
 
 The media tranche, brought to the full **GPT Image 2.5** surface and built under the

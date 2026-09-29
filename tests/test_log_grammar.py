@@ -1,9 +1,10 @@
-"""The log-grammar probe (basecradle-noc#509) — the pins that keep a founder's page alive.
+"""The log-grammar probe (basecradle-noc#509) — the pins that keep a needle alarm hearing.
 
 Every test here exists because the thing it pins fails **silently**: the agent keeps working, no
-log line moves, and the only witness is an alarm that has quietly stopped hearing. The two lines
-under proof appear only when a vendor account runs out of money, so nothing in production
-exercises them and no behaviour test covers them.
+log line moves, and the only witness is an alarm that has quietly stopped hearing. The lines under
+proof appear only on a failure path — a vendor account out of money (`billing_blocked`, the
+founder's page) or a wake-loop breaker tripping (`breaker_tripped`, issue #592) — so nothing in
+production exercises them and no behaviour test covers the bytes an alarm reads.
 """
 
 from __future__ import annotations
@@ -17,8 +18,10 @@ from pathlib import Path
 import pytest
 
 from basecradle_harness import _log_grammar, _verify
+from basecradle_harness._breaker import breaker_reset_line, breaker_tripped_line
 from basecradle_harness._log_grammar import (
     BILLING_BLOCKED,
+    BREAKER_TRIPPED,
     COLUMNS,
     EX_TEMPFAIL,
     IDENTIFIER,
@@ -50,6 +53,18 @@ from tests.conftest import plain
 ONSET_CLAUSE = r"wake reported_failure.*kind=billing"
 REPEAT_CLAUSE = r"wake billing_blocked"
 
+#: The NOC's `breaker_tripped` column, whole, exactly as `observability/ai-box.json` spells it —
+#: three clauses over two layers' runaway backstops, powering *Circuit Breaker Tripped*. The router
+#: owns the first two and proves them with its own probe; this package owns the third.
+BREAKER_NEEDLE = r"event=breaker_tripped|CIRCUIT BREAKER TRIPPED|Wake breaker TRIPPED"
+HARNESS_BREAKER_CLAUSE = r"Wake breaker TRIPPED"
+
+#: Every column's clauses, so a synthetic can be held to landing on its own column and no other.
+NEEDLES = {
+    BILLING_BLOCKED: (ONSET_CLAUSE, REPEAT_CLAUSE),
+    BREAKER_TRIPPED: (BREAKER_NEEDLE,),
+}
+
 #: The fleet's `source` label column, and the block-list predicate the alarm charts carry. A probe
 #: line must satisfy the first and be excluded by the second; a production line must do neither.
 SOURCE_LABEL = r"source=([A-Za-z0-9_-]+)"
@@ -67,7 +82,7 @@ FORBIDDEN_ON_A_SYNTHETIC = (
     r"cost=([0-9.]+)",  # llm_cost / tool_cost
     r"tokens_(?:in|out)=[0-9]+",  # the token metrics
     r"model=([A-Za-z0-9._/:-]+)",  # model label
-    r"event=breaker_tripped|CIRCUIT BREAKER TRIPPED|Wake breaker TRIPPED",  # the router's needle
+    r"duration=([0-9.]+)s",  # wake_duration_s / llm_duration_s and the per-purpose durations
 )
 
 
@@ -155,11 +170,13 @@ def test_every_probe_line_leads_with_the_probe_token():
 
 
 def test_a_real_line_never_wears_the_probe_token():
-    """The mirror, and the one that pages: a genuine out-of-funds line reading ``PROBE`` would be a
-    real failure a human waves away."""
+    """The mirror, and the one that pages: a genuine out-of-funds line, or a genuine trip, reading
+    ``PROBE`` would be a real failure a human waves away."""
     for line in (
         billing_onset_line(reason="out_of_funds", provider="xai", timeline="T", delivery="D"),
         billing_repeat_line(reason="out_of_funds", provider="xai", timeline="T", delivery="D"),
+        _real_trip(),
+        breaker_reset_line(timeline="T", held=60.0),
     ):
         assert PROBE_TOKEN not in line, line
 
@@ -194,7 +211,8 @@ def test_the_token_never_touches_the_bytes_under_proof():
     )
 
 
-def test_a_synthetic_line_moves_no_other_columns_witness_parent():
+@pytest.mark.parametrize("column", COLUMNS)
+def test_a_synthetic_line_moves_no_other_columns_witness_parent(column):
     """The contamination audit, as a test.
 
     A monitor that manufactures false positives in the instrument beside it is worse than the gap
@@ -203,20 +221,91 @@ def test_a_synthetic_line_moves_no_other_columns_witness_parent():
     but the fleet's label extractors are naive regexes over the whole message, so a
     ``reason="… provider=x …"`` would populate ``provider`` from inside the quotes.
     """
-    for line in probe_lines():
+    for line in lines(column, agent="jt"):
         for pattern in FORBIDDEN_ON_A_SYNTHETIC:
             assert not re.search(pattern, line), f"{pattern!r} matched {line!r}"
         assert '"' not in line  # no quoted value, so no extractor can read inside one
 
 
-def test_a_synthetic_line_populates_exactly_the_three_intended_labels():
-    """`billing_blocked` (the proof), `source` (the discriminator) and `agent` (the alarm's series)
-    — and, once Vector prefixes the identifier, `level`. Nothing else."""
-    for line in probe_lines(agent="jt"):
+@pytest.mark.parametrize("column", COLUMNS)
+def test_a_synthetic_line_lands_on_its_own_column_and_no_other(column):
+    """Each probe proves one column. A line that also matched a *neighbour's* clause would feed an
+    alarm it was never meant to reach — and would let that column read ``populating`` off a probe
+    that says nothing about its own spelling."""
+    for line in lines(column, agent="jt"):
+        assert any(re.search(clause, line) for clause in NEEDLES[column]), line
+        for other, clauses in NEEDLES.items():
+            if other != column:
+                assert not any(re.search(clause, line) for clause in clauses), (other, line)
+
+
+@pytest.mark.parametrize("column", COLUMNS)
+def test_a_synthetic_line_populates_exactly_the_three_intended_labels(column):
+    """The column (the proof), `source` (the discriminator) and `agent` (the alarm's series) — and,
+    once Vector prefixes the identifier, `level`. Nothing else."""
+    for line in lines(column, agent="jt"):
         shipped = f"[{IDENTIFIER}] " + record(line)  # what Vector's `ai_scrub` transform ships
         assert re.search(r" (CRITICAL|ERROR|WARNING|INFO|DEBUG) ", shipped).group(1) == "INFO"
         assert re.search(r"agent=([A-Za-z0-9._-]+)", shipped).group(1) == "jt"
         assert re.search(SOURCE_LABEL, shipped).group(1) == PROBE_SOURCE
+
+
+# --- the breaker clause (issue #592) ----------------------------------------------------------
+
+
+def _real_trip() -> str:
+    return breaker_tripped_line(
+        timeline="019e7750-66ee-7f53-829f-13a8a710b6da",
+        count=11,
+        threshold=10,
+        window=60.0,
+        cooldown=60.0,
+        hold=60.0,
+    )
+
+
+def test_the_breaker_probe_is_the_production_trip_line_with_only_the_probe_fields():
+    """Rendered by the function the real trip is rendered by — and carrying nothing else, because
+    every production field describes one real trip and a synthetic has none to report. A
+    ``timeline=`` or ``count=`` on a probe would be a made-up fact in the fleet's journal."""
+    (line,) = lines(BREAKER_TRIPPED, agent="nova")
+
+    assert line == breaker_tripped_line(source=PROBE_SOURCE, agent="nova")
+    assert plain(line) == "PROBE Wake breaker TRIPPED source=probe agent=nova"
+    assert line.startswith(f"PROBE {YELLOW}Wake breaker TRIPPED")  # the head, painted whole
+
+
+def test_the_production_trip_line_matches_the_harness_clause_colored_and_plain(monkeypatch):
+    """The real trip, against the live needle, both ways it can reach the journal. The head is
+    painted as one span (the token-integrity rule), so the consumed literal stays contiguous in
+    color; ``NO_COLOR`` must not change the match either."""
+    assert re.search(HARNESS_BREAKER_CLAUSE, _real_trip())
+    monkeypatch.setenv("NO_COLOR", "1")
+    assert re.search(HARNESS_BREAKER_CLAUSE, _real_trip())
+    assert _real_trip() == (
+        "Wake breaker TRIPPED timeline=019e7750-66ee-7f53-829f-13a8a710b6da count=11 "
+        "threshold=10 window=60s cooldown=60s hold=60.00s"
+    )
+
+
+def test_a_real_trip_carries_no_source_stamp_and_feeds_no_other_column():
+    """The alert's predicate is a block-list (``!= 'probe'``), so a real trip must carry no
+    ``source=`` — a stamp leaking onto the production path would filter every genuine runaway out of
+    *Circuit Breaker Tripped*. And its fields must be ones no column extracts: a ``duration=`` here
+    would land a breaker hold in the wake-duration series."""
+    for line in (_real_trip(), breaker_reset_line(timeline="T", held=60.0)):
+        assert not re.search(SOURCE_LABEL, line), line
+        for pattern in FORBIDDEN_ON_A_SYNTHETIC:
+            assert not re.search(pattern, line), f"{pattern!r} matched {line!r}"
+
+
+def test_the_reset_line_matches_no_alarm():
+    """The reset is good news, and it must never read as a trip: a clause that matched it would
+    page on every recovery."""
+    line = breaker_reset_line(timeline="T", held=12.5)
+
+    assert plain(line) == "Wake breaker RESET timeline=T held=12.50s"
+    assert not any(re.search(c, line) for clauses in NEEDLES.values() for c in clauses)
 
 
 def test_the_shipped_record_wears_the_production_log_envelope():
@@ -338,7 +427,8 @@ def _fake_journalctl(monkeypatch, *, stdout="", returncode=0, error=None):
     monkeypatch.setattr(_log_grammar.subprocess, "run", run)
 
 
-def test_main_exits_zero_when_the_lines_are_readable_back(journal, monkeypatch, capsys):
+@pytest.mark.parametrize("column", COLUMNS)
+def test_main_exits_zero_when_the_lines_are_readable_back(journal, monkeypatch, capsys, column):
     """The claim this upgrades is *"rendered"* → *"in the journal"*: the difference between a write
     call returning and a line actually existing for Vector to ship."""
     written: list[str] = []
@@ -354,8 +444,10 @@ def test_main_exits_zero_when_the_lines_are_readable_back(journal, monkeypatch, 
     monkeypatch.setattr(_log_grammar.subprocess, "run", run)
     monkeypatch.setattr(_log_grammar, "agent_slug", lambda *a, **k: "jt")
 
-    assert main([BILLING_BLOCKED]) == 0
-    assert "proven: billing_blocked" in capsys.readouterr().out
+    assert main([column]) == 0
+    clauses = len(lines(column, agent="jt"))
+    noun = "clause line" if clauses == 1 else "clause lines"
+    assert f"proven: {column} ({clauses} {noun})" in capsys.readouterr().out
 
 
 def test_main_fails_when_the_lines_never_appear(journal, monkeypatch, capsys):
@@ -378,11 +470,13 @@ def test_main_is_unprovable_when_journalctl_cannot_run(journal, monkeypatch, cap
     assert "UNPROVABLE" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("argv", [[], ["billing_blocked", "extra"], ["breaker_tripped"]])
-def test_a_question_this_build_cannot_answer_is_unprovable_not_failed(argv, capsys):
+@pytest.mark.parametrize("argv", [[], ["billing_blocked", "extra"], ["wake_failed"]])
+def test_a_question_this_build_cannot_answer_is_unprovable_not_failed(argv, capsys, monkeypatch):
     """A manifest naming a column this build does not exercise is a question we never got to ask.
-    ``breaker_tripped`` is the router's — a sibling claim in the same namespace, deliberately not
-    answerable here."""
+    ``wake_failed`` is a real fleet column this package feeds but has no probe for. `emit` is
+    stubbed, so the refusal is proven to come from the question and not from a box with no
+    journald (which would also answer 75, and did — for the wrong reason — before issue #592)."""
+    monkeypatch.setattr(_log_grammar, "emit", lambda messages: None)
     assert main(argv) == EX_TEMPFAIL
     assert "UNPROVABLE" in capsys.readouterr().err
 
@@ -390,7 +484,8 @@ def test_a_question_this_build_cannot_answer_is_unprovable_not_failed(argv, caps
 # --- the ledger row -------------------------------------------------------------------------
 
 
-def test_the_claim_row_is_rare_with_a_ttl_and_names_its_own_script(tmp_path):
+@pytest.mark.parametrize("column", COLUMNS)
+def test_the_claim_row_is_rare_with_a_ttl_and_names_its_own_script(tmp_path, column):
     """`class: rare` is the contract's teeth here. Every other row this package emits is
     `dependency` — *present after a converge*, re-proven by the converge floor. This one asks
     something the floor structurally cannot: *do the bytes a founder-named alarm matches still
@@ -399,12 +494,12 @@ def test_the_claim_row_is_rare_with_a_ttl_and_names_its_own_script(tmp_path):
     `ttl_hours` could never go stale, which would make one success green forever.
     """
     rows = {c["claim"]: c for c in claims(tmp_path)["claims"]}
-    row = rows[f"log-grammar:{BILLING_BLOCKED}"]
+    row = rows[f"log-grammar:{column}"]
 
     assert row["class"] == "rare"
     assert row["ttl_hours"] == TTL_HOURS and TTL_HOURS  # required, and not zero
     assert row["prove"]["kind"] == "probe"
-    assert row["prove"]["cmd"].endswith(f"{SCRIPT} {BILLING_BLOCKED}")
+    assert row["prove"]["cmd"].endswith(f"{SCRIPT} {column}")
     assert row["evidence"] == f"journal:{IDENTIFIER}"
 
 
@@ -414,7 +509,7 @@ def test_the_claim_row_is_emitted_even_by_a_box_with_no_config_home(tmp_path):
     to be red about."""
     rows = {c["claim"] for c in claims(tmp_path / "never-installed")["claims"]}
 
-    assert f"log-grammar:{BILLING_BLOCKED}" in rows
+    assert {f"log-grammar:{column}" for column in COLUMNS} <= rows
 
 
 def test_the_probe_command_resolves_beside_the_interpreter(tmp_path, monkeypatch):
