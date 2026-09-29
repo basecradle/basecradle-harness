@@ -9,6 +9,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.133.4] - 2026-09-29
 
+### Fixed: tool calls that share an id in one response are made unique where the reply enters (issue #578)
+
+The delivery guarantee pairs each tool call with its result by id, within its own turn's run
+(`_session._results`, `heal_interrupted_calls`, `_idempotency.creates`). So it assumes two calls in
+one response never share an id, and nothing made that true. An id is the vendor's string, and every
+adapter passed it through verbatim. If a response carried two calls with the same id, or two empty
+ones, every reader collapsed them into one. Once the first create's result landed, the second read
+as answered. It was then capped on disk while still in flight, and a wake killed at that moment left
+it unhealed and never re-issued. The recovery's promise to heal every interrupted create silently
+did not hold. No fleet vendor is known to do this; the founder approved closing it anyway, because
+the guarantee should hold under any vendor behavior.
+
+`Engine.run` now makes every id unique the moment a reply enters (`_engine._unique_call_ids`). This
+is one rule in one place, where every adapter's answer arrives, so a provider nobody has written yet
+is covered too. The first call to use an id keeps it byte for byte, so every vendor the fleet runs is
+untouched. A repeat or an empty id is renamed to `<id>-<n>` (`call-<n>` for an empty one), and the
+rename steps past every id the reply already holds. It is logged at WARNING on its own
+`tool_call_ids rewritten` head, deliberately not a `tool` line, since nothing ran. The #578
+reproduction is pinned through the engine. The test reads the disk while the second call runs, so
+without the fix it fails on the consequence itself: the in-flight create is capped and never healed.
+
 ### Fixed: a capped argument keeps its whole share, not half of it, when its text has line breaks or quotes
 
 The argument cap measures its budget in serialized characters (`_json_size`), where a newline or a
