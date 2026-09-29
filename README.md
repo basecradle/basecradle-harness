@@ -539,6 +539,16 @@ Three properties make it safe to point at a page-the-human alert:
   while a **real** failure (which carries no stamp) always does. The direction matters: if the
   stamp ever stopped being read, the probes would *flood* the alert rather than a genuine outage
   being silently dropped.
+- **And it leads with `PROBE`, for the human the stamp does not reach.** The stamp trails the line;
+  a person reading a Live Tail reads the red verb first, and once read a probe as a real
+  out-of-funds block ([issue #593](https://github.com/basecradle/basecradle-harness/issues/593)).
+  The token is rendered from the same switch as the stamp, so a line carries both or neither, and
+  it precedes the grammar without touching it:
+
+  ```text
+  [basecradle-log-grammar] INFO PROBE wake reported_failure kind=billing reason=log_grammar_probe source=probe agent=jt
+  [basecradle-log-grammar] INFO PROBE wake billing_blocked reason=log_grammar_probe source=probe agent=jt
+  ```
 - **One author for the bytes.** Production and probe call the same two renderers, so a refactor
   that changes the real line changes the synthetic in the same edit. Two spellings would let the
   probe keep proving a grammar production no longer writes.

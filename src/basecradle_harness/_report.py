@@ -231,6 +231,25 @@ def report_body(rc: ReportClass, *, item: str, provider: str | None, exc: Provid
 #: predicate the NOC's four wake charts already carry.
 PROBE_SOURCE = "probe"
 
+#: The token a probe line **leads** with, for the human reader the stamp does not reach (issue #593).
+#: ``source=probe`` is the machine contract — the alert predicates and the extraction guard read it —
+#: but it trails the line, and on 2026-09-29 the founder read a probe's red ``wake reported_failure``
+#: in a Live Tail as a real out-of-funds block: the eye lands on the verb, not on the identifier
+#: column or the last field. One bare uppercase token ahead of the grammar changes no fleet column
+#: (the NOC measured all 42 with the engine Better Stack runs, basecradle-noc#857).
+PROBE_TOKEN = "PROBE"
+
+
+def probe_prefix(source: str | None) -> str:
+    """The leading ``PROBE `` a line wears when — and only when — it carries the probe stamp.
+
+    Rendered from the **same switch** as the stamp (the capital's ruling, amended 2026-09-29), so the
+    two can never disagree: a line with ``source=probe`` always leads with the token, and a real line
+    (which passes no ``source``) never does. The token is plain text ahead of the painted head, so it
+    never splits or repaints the bytes under proof.
+    """
+    return f"{PROBE_TOKEN} " if source == PROBE_SOURCE else ""
+
 
 def billing_onset_line(
     *,
@@ -255,13 +274,20 @@ def billing_onset_line(
     refactor that changes the real line changes the probe's line in the same edit. Two spellings
     would let the probe keep proving a grammar production no longer writes.
 
-    ``source`` and ``agent`` are the **probe-only** trailing fields (the capital's ruling 3,
-    2026-08-18: the grammar-under-proof bytes are never altered or interleaved; probe-only fields
-    trail them). Production passes neither, and `kv` drops them — so the real line is byte-for-byte
-    what it was before this function existed, and *carrying no* ``source=`` is what keeps it inside
-    the alarm's block-list predicate. See `_log_grammar` for why the probe passes no ``provider``.
+    ``source`` and ``agent`` are the **probe-only** fields, under the capital's ruling as amended on
+    2026-09-29 (issue #593, superseding ruling 3 of 2026-08-18):
+
+        Probe-only fields trail the grammar under proof, with one exception: a single leading
+        PROBE token may precede it, rendered from the same switch as the source=probe stamp, so
+        the two can never disagree. The token never alters, splits, or repaints the bytes under
+        proof.
+
+    `probe_prefix` is that switch. Production passes neither field, and `kv` drops them — so the
+    real line is byte-for-byte what it was before this function existed, and *carrying no*
+    ``source=`` is what keeps it inside the alarm's block-list predicate. See `_log_grammar` for why
+    the probe passes no ``provider``.
     """
-    return f"{head('wake reported_failure', RED)} " + kv(
+    line = f"{head('wake reported_failure', RED)} " + kv(
         kind=BILLING,
         reason=reason,
         provider=provider,
@@ -270,6 +296,7 @@ def billing_onset_line(
         source=source,
         agent=agent,
     )
+    return probe_prefix(source) + line
 
 
 def billing_repeat_line(
@@ -292,9 +319,9 @@ def billing_repeat_line(
     the column extracted *anything*, so one working clause would green a column whose other clause
     has gone deaf (the two-clause finding on basecradle-noc#509, adopted by the capital).
 
-    Same single-author contract as `billing_onset_line`; same probe-only trailing fields.
+    Same single-author contract as `billing_onset_line`; same probe-only fields, leading token included.
     """
-    return f"{head('wake billing_blocked', YELLOW)} " + kv(
+    line = f"{head('wake billing_blocked', YELLOW)} " + kv(
         reason=reason,
         provider=provider,
         timeline=timeline,
@@ -302,6 +329,7 @@ def billing_repeat_line(
         source=source,
         agent=agent,
     )
+    return probe_prefix(source) + line
 
 
 class BillingState:

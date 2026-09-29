@@ -61,7 +61,9 @@ Three consequences that look like details and are not
 -----------------------------------------------------
 
 - **The stamp is not a parameter.** `lines` always passes ``source=PROBE_SOURCE``; there is no
-  "quiet" mode to get wrong. A probe line that lost its stamp is a page to a human's phone.
+  "quiet" mode to get wrong. A probe line that lost its stamp is a page to a human's phone — and,
+  because the leading ``PROBE`` token is keyed on the same value, one that lost its token is a
+  probe a human would read as a real failure.
 - **The synthetic carries no ``provider=``, and the reason is a *neighbouring* instrument.** The
   real billing lines carry it, but ``provider`` is the declared witness **parent** for two other
   columns (``llm_missing_tokens``, ``tool_cost``, both parented on ``' llm provider='``). A probe
@@ -90,8 +92,15 @@ failures makes that record actively misleading; and the fleet's ``error_lines`` 
 identifier-scoped to ``basecradle-router`` and ``basecradle-wake-*``, so a wake identifier would
 contaminate *Server Errors* — one of only two charts the fleet's alarm spec records as
 deliberately carrying no filter. Under its own identifier this contributes nothing to it at any
-severity, and a human reading a Live Tail sees ``[basecradle-log-grammar]`` and knows at a glance
-that the line is instrumentation.
+severity.
+
+What the identifier does **not** do is tell a human the line is synthetic. This docstring used to
+say a reader of a Live Tail "sees ``[basecradle-log-grammar]`` and knows at a glance", and on
+2026-09-29 that was false: the founder read the pair under ``host:ai`` as a real billing block on
+@briggs mid-task, because the eye lands on the red verb, not on the identifier column or the
+trailing stamp. So every probe line now **leads** with a bare ``PROBE`` token (issue #593,
+`_report.probe_prefix`), rendered from the same switch as ``source=probe`` so the two cannot
+disagree. The stamp stays where it is and stays the machine contract; the token is for the person.
 
 The line is written at **INFO** and wearing the same `LOG_FORMAT` envelope every harness line
 wears, so the fleet's ``level`` column reads it honestly rather than seeing a severity-less line.
