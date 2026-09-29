@@ -100,6 +100,12 @@ def test_report_body_billing_says_add_funds_in_plain_language():
     body = report_body(rc, item="your message", provider="openrouter", exc=exc)
     assert "out of credit" in body
     assert "Add funds" in body
+    # Funding raises no event, so nothing re-wakes the agent: the notice asks the funder to post
+    # (issue #596). The old promise that pending work "will be handled then" was true only by luck.
+    assert body.endswith(
+        "When the account is funded, post here and I will pick up where I stopped."
+    )
+    assert "will be handled then" not in body
     assert "OpenRouter" in body
     assert "Insufficient credits. Add more at openrouter.ai/credits" in body  # verbatim
 
