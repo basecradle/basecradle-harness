@@ -893,7 +893,8 @@ def _calls_payload(calls: list[ToolCall], results: dict[str, Message]) -> list[d
 def _results(messages: list[Message], assistant: int) -> dict[str, Message]:
     """The results answering `messages[assistant]`'s calls — **from its own run, never globally.**
 
-    A `tool_call_id` is the provider's own string and nothing normalizes it: a model that numbers its
+    A `tool_call_id` is the provider's own string, unique only *within* one response (the engine
+    makes it so, `_engine._unique_call_ids`, issue #578): a model that numbers its
     calls per response (`call_0`, `call_1` — what an OpenRouter-fronted model emits, and the fleet's
     primary agent is one) reuses the same ids on every turn. A global lookup would hand this turn's
     call the *previous* turn's result — declaring an interrupted create answered, capping the
@@ -1021,7 +1022,8 @@ def heal_interrupted_calls(history: list[Message]) -> int:
             index += 1
             continue
         # **Answered-ness is scoped to the assistant turn that issued the call, never to the whole
-        # transcript.** A tool-call id is the *provider's* string and nothing normalizes it: a model
+        # transcript.** A tool-call id is the *provider's* string, unique only within one response
+        # (`_engine._unique_call_ids`, issue #578): a model
         # that numbers its calls per response (`call_0`, `call_1` — the shape an OpenRouter-fronted
         # model emits) reuses the same id on every turn. A global set of answered ids would then see
         # the *previous* turn's result and call this turn's identical id answered — leaving a real

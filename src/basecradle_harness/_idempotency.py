@@ -128,7 +128,8 @@ def creates(work: list[Message]) -> list[Create]:
     them. Two functions that obviously agree is how they stop agreeing.
 
     **A call is paired with a result from its own assistant turn's run, never by a global id
-    lookup.** A tool-call id is the provider's own string and nothing normalizes it: a model that
+    lookup.** A tool-call id is the provider's own string, unique only *within* one response (the
+    engine makes it so, `_engine._unique_call_ids`, issue #578) and nothing more: a model that
     numbers its calls per response (`call_0`, `call_1` — what an OpenRouter-fronted model emits)
     reuses the same ids on every turn. Matching them across the whole transcript would pair a call
     with the *previous* turn's result — declaring an interrupted call answered (so it is never
