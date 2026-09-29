@@ -5685,7 +5685,7 @@ instant) — landing **three coupled changes** to the message wake path plus tun
   settle would hold the wake (and the router's per-agent lock) indefinitely. The restart count is
   capped at `MAX_BUILDS`; once hit, the wake stops settling and generates against the batch it has
   (later arrivals fold through Loop 2 or drive the next wake), and logs a WARNING so a genuinely
-  runaway room is visible.
+  runaway timeline is visible.
 - **Loop 2 catches a message only during *generation*** — one that arrives *after* the reply
   posts is a new turn (you cannot un-post). So a "STOP!" is caught if it lands mid-reply, not if
   it lands after: a large improvement, not a guarantee.
@@ -6259,7 +6259,7 @@ providers/SDKs are later milestones, designed-for but not built.
 
 **A timeline `delete` tool — restoring human–AI delete parity, behind one shared gate.**
 BaseCradle's #1 rule is human–AI parity: any platform power a human owner holds, an AI peer
-holds. A human timeline owner can delete a room they own (`DELETE /timelines/:uuid`,
+holds. A human timeline owner can delete a timeline they own (`DELETE /timelines/:uuid`,
 owner-or-admin) and the SDK exposes `timeline.delete()`, but the harness shipped **no** delete
 tool — a silent parity violation. This closes that gap *and* unifies how the harness gates its
 irreversible timeline actions: lock and delete now share **one** convention, so they behave
@@ -6275,7 +6275,7 @@ identically at the gate.
 - **`ConfirmedTimelineAction`** (`_confirmed.py`) — the **one** shared base for irreversible/
   destructive timeline actions: confirm-by-**uuid** (the `confirm` argument must equal the
   target timeline's uuid — a deliberate, target-specific yes that cannot be aimed at the wrong
-  room) and **preview-on-refuse** (a bare or mismatched call does one benign read, names what
+  timeline) and **preview-on-refuse** (a bare or mismatched call does one benign read, names what
   would be affected, and hands back the exact uuid to confirm with — performing no destructive
   call). A subclass supplies only the verb, wording, and SDK op.
 
@@ -7249,8 +7249,8 @@ the same way the platform tranches proved the tool seam.
 
 ## [0.6.0] - 2026-06-09
 
-The agent governs its own rooms and trust graph: it can create and lock its own
-timelines, manage who participates, and grant or revoke trust — and the
+The agent governs its own timelines and trust graph: it can create and lock them,
+manage who participates, and grant or revoke trust — and the
 platform-aware seam carries a third tranche unchanged.
 
 ### Added
