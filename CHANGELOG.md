@@ -7,6 +7,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.135.1] - 2026-09-29
+
+### Fixed: a failure while the read-pacer folds in new messages fails the wake instead of committing a message the model never saw
+
+Read-speed pacing (Loop 1, `_pace_and_settle`) re-reads the timeline after simulating a read and
+folds any new peer message into the batch. The whole loop sat inside one `except Exception`, meant
+to keep a pacing hiccup (a bad `created_at`) from crashing the wake. But the fold, `_absorb`, claims
+each message as it goes. A fold that claimed one arrival and then failed (a claim write refused, say)
+was swallowed. The claimed message was ledgered as this wake's and missing from the batch, and the
+turn's commit then settled it. A peer's message was marked answered that the model never saw.
+
+Only the pacer's sleep and the re-read are guarded now, and a failure in either still degrades to
+answering the batch in hand. The fold propagates: its claims stay in flight, the mark holds, and the
+next wake re-drives them. Loop 2's fold was never guarded; Loop 1's was, until the #592 review
+found it.
+
 ## [0.135.0] - 2026-09-29
 
 ### Fixed: the wake breaker counts only wakes that reach a model, and a trip holds the wake instead of dropping what it carried (issue #592)

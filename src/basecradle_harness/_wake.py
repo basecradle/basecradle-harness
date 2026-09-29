@@ -4325,36 +4325,45 @@ class WakeAgent:
         arrivals through Loop 2 instead (and the rest drive the next wake). A WARNING is logged so
         a genuinely runaway timeline is visible.
 
-        **Never crash the wake (B2).** A bad `created_at` or any hiccup in the pacer degrades to
-        *no further delay* and proceeds with the current batch, never propagating — the same
-        invariant the brief/dashboard/memory hooks are held to.
+        **Never crash the wake over pacing (B2) — and never swallow the fold.** A bad `created_at`
+        or any hiccup in the pacer, or a re-read the platform will not answer, degrades to *no
+        further delay* and proceeds with the batch in hand — the same invariant the
+        brief/dashboard/memory hooks are held to, and nothing is lost by it: a message this read
+        missed has a delivery of its own. `_absorb` is the one step that is **not** guarded,
+        because it claims as it goes. A fold that failed half-way has already claimed and ledgered
+        the messages before the failure, and swallowing the error would drop them from the batch
+        while leaving them `_OURS` — so `_settle` would commit messages the model never saw. It
+        propagates instead: the claims stay in flight, the mark holds, and the next wake re-drives
+        them. (Loop 2's fold was never guarded; this one was, until it was found reviewing #592.)
         """
         if probe_seen or not self.pacer.enabled:
             return
         newest = batch[-1]
         if getattr(newest.user, "kind", None) != "ai":
             return  # a human (or non-AI) newest → respond now, no read-pace
-        try:
-            restarts = 0
-            while True:
+        restarts = 0
+        while True:
+            try:
                 self.pacer.pace(newest)
                 self.claims.beat()  # the batch is claimed and a read can take minutes (issue #532)
-                new_peers, _ = self._absorb(session, self._fetch_fresh(), posted)
-                batch.extend(new_peers)
-                if not (new_peers and getattr(new_peers[-1].user, "kind", None) == "ai"):
-                    break  # settled: the newest is stable (or the latest arrival is a human)
-                restarts += 1
-                if restarts >= self.max_builds:
-                    _log.warning(
-                        "Read-pace settle hit the %d-restart cap for timeline %s (a runaway "
-                        "multi-peer timeline?); proceeding to generate against the current batch.",
-                        self.max_builds,
-                        self.timeline_uuid,
-                    )
-                    break
-                newest = new_peers[-1]  # a newer peer AI landed: restart the read on it
-        except Exception:  # noqa: BLE001 - pacing must never break the wake; degrade to no delay
-            _log.warning("Read-pacing failed; answering without further delay.", exc_info=True)
+                fresh = self._fetch_fresh()
+            except Exception:  # noqa: BLE001 - pacing must never break the wake; degrade to no delay
+                _log.warning("Read-pacing failed; answering without further delay.", exc_info=True)
+                return
+            new_peers, _ = self._absorb(session, fresh, posted)
+            batch.extend(new_peers)
+            if not (new_peers and getattr(new_peers[-1].user, "kind", None) == "ai"):
+                return  # settled: the newest is stable (or the latest arrival is a human)
+            restarts += 1
+            if restarts >= self.max_builds:
+                _log.warning(
+                    "Read-pace settle hit the %d-restart cap for timeline %s (a runaway "
+                    "multi-peer timeline?); proceeding to generate against the current batch.",
+                    self.max_builds,
+                    self.timeline_uuid,
+                )
+                return
+            newest = new_peers[-1]  # a newer peer AI landed: restart the read on it
 
     def _generate_settled(self, session: Session, batch: list[object], posted: list[object]) -> str:
         """Loop 2 — run the turn against the batch, rebuilding if a message lands mid-generation.

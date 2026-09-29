@@ -4549,6 +4549,75 @@ class HookedProvider:
 # --- Loop 1: the settle loop --------------------------------------------------
 
 
+def test_a_fold_that_fails_mid_read_pace_fails_the_wake_and_commits_nothing(platform, tmp_path):
+    """The settle loop's fold claims as it goes, so a failure inside it must fail the wake.
+
+    Swallowed — as it was until reviewing #592 found it — a fold that claimed one arrival and then
+    failed left that message ledgered as this wake's and missing from the batch, and the turn's
+    commit settled it: a peer's message marked answered that the model never saw. Failed, the
+    claims stay in flight and the next wake re-drives them.
+    """
+    scripted = ScriptedMessages(platform, peer_ai_message(uuid=M0, body="first from Brain"))
+    pacer = ReadPacer(
+        clock=lambda: PACE_CREATED,
+        sleep=lambda _s: scripted.arrive(peer_ai_message(uuid=M1, body="and a follow-up")),
+    )
+    agent, provider = build_wake(tmp_path, HookedProvider(), pacer=pacer)
+    absorb = agent._absorb
+    calls: list[int] = []
+
+    def half_fold(session, items, posted):
+        calls.append(len(items))
+        if len(calls) == 2:  # the settle's fold: claim the arrival, then fail
+            absorb(session, items, posted)
+            raise OSError(28, "No space left on device")
+        return absorb(session, items, posted)
+
+    agent._absorb = half_fold
+    with pytest.raises(OSError):
+        agent.wake()
+
+    assert provider.prompts == []  # nothing reached the model…
+    claims = ClaimStore(tmp_path)
+    for uuid in (M0, M1):  # …and nothing was committed: both are still this wake's to answer
+        assert claims.read(TIMELINE_UUID, uuid, kind="messages").phase == "in-flight"
+
+
+@pytest.mark.parametrize("fault", ["pace", "read"])
+def test_a_pacer_or_a_re_read_that_fails_degrades_to_answering_now(
+    platform, tmp_path, caplog, fault
+):
+    """The other half of the rule: pacing is an economy, so a pacer that raises (a bad
+    `created_at`) or a re-read the platform will not answer degrades to no further delay, and the
+    batch in hand is answered."""
+    serve_messages(platform, page(peer_ai_message(uuid=M0, body="hello from Brain")))
+
+    def broken_sleep(_seconds):
+        if fault == "pace":
+            raise ValueError("bad created_at")
+
+    pacer = ReadPacer(clock=lambda: PACE_CREATED, sleep=broken_sleep)
+    agent, provider = build_wake(tmp_path, HookedProvider(), pacer=pacer)
+    if fault == "read":
+        fetch = agent._fetch_fresh
+        failed = {"once": False}
+
+        def unreachable_once():
+            if not failed["once"]:
+                failed["once"] = True
+                raise ConnectionError("the platform did not answer")
+            return fetch()
+
+        agent._fetch_fresh = unreachable_once
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        agent.wake()
+
+    assert provider.prompts == ["[2026-06-04T00:00:00.000Z] briggs: hello from Brain"]
+    assert any("Read-pacing failed" in r.getMessage() for r in caplog.records)
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
+
+
 def test_a_newer_ai_message_during_the_read_restarts_the_settle(platform, tmp_path):
     """A newer peer-AI message landing during the read-pace folds in and restarts the wait.
 
