@@ -482,7 +482,7 @@ class Engine:
                 # provider's prompt cache hot — so the counter rides a *trailing* system turn,
                 # re-appended each step, never a mutation of the head of the context.
                 messages.append(Message.system(_step_note(step, self.max_steps, started)))
-                reply = self._chat(messages, specs)
+                reply = _unique_call_ids(self._chat(messages, specs))
                 # Read **here**, beside the call it describes, never at the return check below: the
                 # adapter's `last_finish_reason` is a *most recent call* field, and between this
                 # line and that check sits arbitrary work (tool dispatch, a turn hook) that a later
@@ -1062,6 +1062,48 @@ class Engine:
         _log.info("tool %s", kv(name=name, duration=f"{elapsed:.2f}s", outcome=_outcome(error)))
         if error is not None:
             _log.warning("tool %s", kv(name=name, error=error))
+
+
+def _unique_call_ids(reply: Message) -> Message:
+    """`reply`, with every tool call's id **unique within it** — the one place this is made true.
+
+    A call is paired with its result by id, within its own turn's run: `_session._results` (what the
+    cap may bound), `heal_interrupted_calls` (what a killed wake left unanswered) and
+    `_idempotency.creates` (the ordinal a key is minted from) all key on it. So all three *assume*
+    two calls in one response never share an id — and nothing made it so, because an id is the
+    vendor's string and every adapter passes it through verbatim. A response carrying two calls with
+    the same id, or two empty ones, collapsed that pairing (issue #578): once the first call's result
+    landed, the second create read as answered, so it was capped on disk **while still in flight**,
+    and a wake killed then left it unhealed and never re-issued. The recovery's promise to heal
+    every interrupted create silently did not hold.
+
+    Normalized **here**, where every adapter's answer enters the loop, rather than in each adapter:
+    one rule in one place, and a provider a developer writes in an afternoon is covered without
+    having to know it exists. The first call to use an id keeps it, byte for byte, so a vendor that
+    behaves (every one the fleet runs) is untouched and this costs nothing. A repeat or an empty id
+    is renamed to `<id>-<n>` (`call-<n>` for an empty one), the first such name that no call in the
+    reply already uses. The renamed id is what the transcript and the next request carry; the
+    vendor pairs its own history by the ids it is sent, so a consistent rename is all it needs. It is
+    logged at WARNING on its own head, because a vendor doing this is a fact worth knowing and not a
+    `tool` line: nothing ran.
+    """
+    taken = {call.id for call in reply.tool_calls if call.id}
+    kept: set[str] = set()
+    renamed: list[str] = []
+    for call in reply.tool_calls:
+        if call.id and call.id not in kept:
+            kept.add(call.id)
+            continue
+        base, n = call.id or "call", 1
+        while f"{base}-{n}" in taken:
+            n += 1
+        renamed.append(f"{call.id or '(empty)'}>{base}-{n}")
+        call.id = f"{base}-{n}"
+        taken.add(call.id)
+        kept.add(call.id)
+    if renamed:
+        _log.warning("tool_call_ids rewritten %s", kv(renamed=",".join(renamed)))
+    return reply
 
 
 def _progress(on_progress: Callable[[], None] | None) -> None:

@@ -34,6 +34,7 @@ from basecradle_harness._session import (
     _elide_argument,
     _json_size,
     _within,
+    heal_interrupted_calls,
     turn_work,
 )
 
@@ -1252,3 +1253,113 @@ def test_the_turn_is_located_by_identity_so_a_compaction_cannot_misplace_it(tmp_
     assert first == second  # equal...
     assert turn_work(history, second) == [history[-1]]  # ...but the right one is found anyway
     assert turn_work(history, first) == [history[1]]
+
+
+# --- Two calls in one response never share an id (issue #578) ----------------------------------
+
+
+@pytest.mark.parametrize("ids", [("", ""), ("call_0", "call_0")], ids=["empty", "repeated"])
+def test_calls_sharing_an_id_in_one_response_are_still_two_calls(tmp_path, caplog, ids):
+    """The #578 reproduction, driven through the engine: a response whose calls share an id.
+
+    Before the fix, the pairing every reader keys on (`_results`, `heal_interrupted_calls`,
+    `creates`) collapsed the two into one. Once the first create's result landed, the second read
+    as answered, so it was capped on disk **while still in flight**, and a wake killed there left
+    it unhealed and never re-issued. The tool here reads the transcript file while the second call
+    runs: exactly the state such a kill would leave behind.
+    """
+    body = "x" * 5_000
+    path = tmp_path / "t.json"
+    disk_mid_step: list[list[dict]] = []
+
+    class Messages(Tool):
+        name = "messages"
+        description = "post a message"
+
+        def run(self, **kwargs):
+            if kwargs["body"].startswith("second"):
+                disk_mid_step.append(json.loads(path.read_text()))
+            return "posted"
+
+    both = Message.assistant(
+        tool_calls=[
+            ToolCall(
+                id=ids[0], name="messages", arguments={"action": "create", "body": "first " + body}
+            ),
+            ToolCall(
+                id=ids[1], name="messages", arguments={"action": "create", "body": "second " + body}
+            ),
+        ]
+    )
+    provider = ScriptedProvider(both, text("Posted both."))
+    session = Session("timeline:x", Harness(provider, tools=[Messages()]).engine, path=path)
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        session.send("post it twice")
+
+    # The state a kill mid-step would leave: the in-flight create is whole on disk, and it heals.
+    (disk,) = disk_mid_step
+    stored = [c for m in disk for c in m.get("tool_calls", [])]
+    assert stored[1]["arguments"]["body"] == "second " + body
+    reloaded = [Message.from_dict(d) for d in disk]
+    assert heal_interrupted_calls(reloaded) == 1
+    work = turn_work(reloaded, next(m for m in reloaded if m.role == "user"))
+    assert [(c.ordinal, c.call.arguments["body"][:6]) for c in interrupted(work, INTERRUPTED)] == [
+        (2, "second")
+    ]
+
+    # Every id in the reply is now unique and non-empty; a repeat keeps the first one byte for byte.
+    first, second = both.tool_calls
+    assert first.id and second.id and first.id != second.id
+    if ids[0]:
+        assert first.id == ids[0]
+    assert any(r.getMessage().startswith("tool_call_ids rewritten") for r in caplog.records)
+
+    # And the next request pairs each result with its own call.
+    calls = [c.id for m in provider.calls[1][0] for c in m.tool_calls]
+    answers = [m.tool_call_id for m in provider.calls[1][0] if m.role == "tool"]
+    assert calls == answers == [first.id, second.id]
+
+
+def test_a_response_whose_ids_are_already_unique_is_left_exactly_as_it_came(caplog):
+    """Every vendor the fleet runs sends unique ids, and for them this must cost nothing at all."""
+    reply = Message.assistant(
+        tool_calls=[
+            ToolCall(id="call_0", name="messages", arguments={"action": "create", "body": "a"}),
+            ToolCall(id="call_1", name="messages", arguments={"action": "create", "body": "b"}),
+        ]
+    )
+    provider = ScriptedProvider(reply, text("Done."))
+    posted: list[str] = []
+
+    class Messages(Tool):
+        name = "messages"
+        description = "post a message"
+
+        def run(self, **kwargs):
+            posted.append(kwargs["body"])
+            return "posted"
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        Session("timeline:x", Harness(provider, tools=[Messages()]).engine).send("go")
+
+    assert [c.id for c in reply.tool_calls] == ["call_0", "call_1"]
+    assert posted == ["a", "b"]
+    assert not any("tool_call_ids" in r.getMessage() for r in caplog.records)
+
+
+def test_a_renamed_id_never_takes_a_name_another_call_already_has():
+    """`call-1` is a name a vendor could send too; the rename steps past every id the reply holds."""
+    from basecradle_harness._engine import _unique_call_ids
+
+    reply = Message.assistant(
+        tool_calls=[
+            ToolCall(id="", name="a"),
+            ToolCall(id="call-1", name="b"),
+            ToolCall(id="", name="c"),
+            ToolCall(id="call-1", name="d"),
+        ]
+    )
+    ids = [c.id for c in _unique_call_ids(reply).tool_calls]
+    assert len(set(ids)) == 4 and all(ids)
+    assert ids[1] == "call-1"  # the vendor's own id, first use, untouched
