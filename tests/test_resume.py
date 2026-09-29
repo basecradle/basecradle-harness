@@ -50,6 +50,7 @@ from basecradle_harness import (
     Tool,
     ToolCall,
 )
+from basecradle_harness._elision import archive_marker, argument_marker, refusal
 from basecradle_harness._exceptions import ProviderConnectionError
 from basecradle_harness._idempotency import MESSAGE, IdempotencyKeys, key
 from basecradle_harness._session import INTERRUPTED, TOOL_ARGS_CAP, _json_size, turn_work
@@ -525,6 +526,46 @@ def test_an_interrupted_creates_body_survives_the_cap_and_is_re_posted_whole(pla
     assert _json_size(call["arguments"]) <= TOOL_ARGS_CAP
     assert call["arguments"]["body"].startswith("Here is the full report")
     assert f"elided from {len(body)} chars" in call["arguments"]["body"]
+
+
+def test_an_interrupted_create_carrying_a_copied_marker_is_not_re_issued(platform, tmp_path):
+    """The recovery seam meets the #576 guard, and says what is true: the outcome is **unknown**.
+
+    A wake on 0.133.2 or earlier sent a `messages create` whose body held a copied elision marker,
+    and was killed before the result was saved. Whether that POST landed is the one thing nobody
+    knows. Re-issuing it would post the fragment if it had not; telling the model "nothing was sent"
+    would invite a rewrite under the *next* ordinal, and a second post if it had. So the re-issue is
+    refused, the model is told the original's outcome is unknown, and nothing is posted.
+    """
+    whole = "Here is the full report you asked for. " * 80
+    copied = whole[:900] + argument_marker(len(whole)) + whole[-128:]
+    serve_messages(platform, page(message(uuid=M0, body=MULTILINE)))
+
+    crashed_wake_owning(tmp_path, M0)
+    session = Harness(_Finishes(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
+    session.history.append(
+        Message(role="user", content=f"[2026-06-04T00:00:00.000Z] john: {MULTILINE}", items=[M0])
+    )
+    session.history.append(
+        Message.assistant(
+            tool_calls=[
+                ToolCall(id="c1", name="messages", arguments={"action": "create", "body": copied})
+            ]
+        )
+    )
+    session._save()
+
+    finishes = _Finishes()
+    agent, _ = build_wake(tmp_path, finishes, tools=[MessagesTool()])
+    agent.wake()
+
+    assert _posts(platform) == []
+    (result,) = [m for m in _transcript(tmp_path) if m.get("tool_call_id") == "c1"]
+    assert result["content"] == refusal(archive_marker(copied), reissue=True)
+    assert "unknown" in result["content"]
+    assert "nothing was sent" not in result["content"]
+    # And the model finishing the turn read that, not the "outcome unknown" placeholder.
+    assert any(m.role == "tool" and m.content == result["content"] for m in finishes.seen[0])
 
 
 def test_an_unsettled_create_keeps_its_arguments_across_every_save_until_it_is_re_issued(tmp_path):
