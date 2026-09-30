@@ -92,6 +92,7 @@ from uuid import uuid4
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._caching import anchor_cacheable_prefix, bind_conversation, cache_mode
 from basecradle_harness._context import TOOL_ARGS_CAP, TOOL_RESULT_CAP, Compactor
+from basecradle_harness._elision import argument_marker, gone, is_marker, result_marker
 from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._idempotency import create_kind
@@ -892,7 +893,8 @@ def _calls_payload(calls: list[ToolCall], results: dict[str, Message]) -> list[d
 def _results(messages: list[Message], assistant: int) -> dict[str, Message]:
     """The results answering `messages[assistant]`'s calls — **from its own run, never globally.**
 
-    A `tool_call_id` is the provider's own string and nothing normalizes it: a model that numbers its
+    A `tool_call_id` is the provider's own string, unique only *within* one response (the engine
+    makes it so, `_engine._unique_call_ids`, issue #578): a model that numbers its
     calls per response (`call_0`, `call_1` — what an OpenRouter-fronted model emits, and the fleet's
     primary agent is one) reuses the same ids on every turn. A global lookup would hand this turn's
     call the *previous* turn's result — declaring an interrupted create answered, capping the
@@ -1020,7 +1022,8 @@ def heal_interrupted_calls(history: list[Message]) -> int:
             index += 1
             continue
         # **Answered-ness is scoped to the assistant turn that issued the call, never to the whole
-        # transcript.** A tool-call id is the *provider's* string and nothing normalizes it: a model
+        # transcript.** A tool-call id is the *provider's* string, unique only within one response
+        # (`_engine._unique_call_ids`, issue #578): a model
         # that numbers its calls per response (`call_0`, `call_1` — the shape an OpenRouter-fronted
         # model emits) reuses the same id on every turn. A global set of answered ids would then see
         # the *previous* turn's result and call this turn's identical id answered — leaving a real
@@ -1175,7 +1178,7 @@ def _elide(text: str, budget: int) -> str:
     """
     if len(text) <= max(budget, _MIN_EXCERPT):
         # Under its share, or too small for cutting to be worth the marker that says so. The second
-        # is also what makes this a **fixed point**: `_gone` is well under `_MIN_EXCERPT`, so a value
+        # is also what makes this a **fixed point**: `gone` is well under `_MIN_EXCERPT`, so a value
         # already at the floor is never elided again — no marker of a marker, each naming a size that
         # is no longer true, on every save for the life of the timeline.
         return text
@@ -1183,44 +1186,14 @@ def _elide(text: str, budget: int) -> str:
     # smaller, so the real marker is never longer than this one, and the excerpt below therefore
     # cannot overrun the share. (The marker's length depends on the numbers printed in it, which
     # depend on the excerpt, which depends on the marker: measuring the worst case breaks the circle.)
-    room = budget - len(_result_marker(len(text), len(text)))
+    room = budget - len(result_marker(len(text), len(text)))
     if room < _MIN_EXCERPT:
-        return _gone(len(text))  # no room for an excerpt worth reading; the floor is all that fits
+        return gone(len(text))  # no room for an excerpt worth reading; the floor is all that fits
     room = min(room, _ELISION_HEAD + _ELISION_TAIL)  # a share may shrink the excerpt, never grow it
     tail = room * _ELISION_TAIL // (_ELISION_HEAD + _ELISION_TAIL)
     head = room - tail
     cut = len(text) - head - tail
-    return text[:head] + _result_marker(cut, len(text)) + (text[-tail:] if tail else "")
-
-
-def _gone(size: int) -> str:
-    """What an elision says when there is no room even for an excerpt: how much there was, and nothing.
-
-    **The floor of the whole cap, and the one place the bound stops being hard** — so it is worth
-    saying exactly what it is. A tool result cannot be *dropped* (its call would dangle, and a dangling
-    `tool_call_id` is malformed permanently) and neither can a call's arguments (`create_kind` reads
-    them, and a create the recovery cannot count is a message posted twice). A thing that cannot be
-    dropped must be allowed to say that it is gone — so a step that fans out wider than its budget has
-    characters for pays one of these per call, and the total creeps past `TOOL_RESULT_CAP` at a fan-out
-    of ~140 (or `TOOL_ARGS_CAP` at ~50).
-
-    That residue is bounded by **what the model emitted, never by what its tools returned** — one
-    short record per call it chose to make, of the same order as the `id`+`name` envelope the transcript
-    must keep for that call anyway, and bounded the same way (the provider's max-output-tokens). It is
-    the excerpt *markers* that are chatty, and deliberately: they accompany content worth reading. Here
-    there is none, and their prose ("re-run it if you need it in full") would cost five times the fact
-    it decorates — per call, on the one shape where every call is already down to its last few dozen
-    characters.
-    """
-    return f"[... {size} chars elided ...]"
-
-
-def _result_marker(cut: int, total: int) -> str:
-    """What stands in for the elided middle of a tool result."""
-    return (
-        f"\n\n[... {cut} chars elided of {total} — this is an archived excerpt; the full "
-        f"result was shown when the tool ran. Re-run it if you need it in full. ...]\n\n"
-    )
+    return text[:head] + result_marker(cut, len(text)) + (text[-tail:] if tail else "")
 
 
 def _cap_arguments(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
@@ -1240,14 +1213,16 @@ def _cap_arguments(arguments: dict[str, Any], budget: int) -> dict[str, Any]:
     dropped is one no `CREATE_CALLS` entry could match anyway, so `create_kind` answers ``None`` before
     the cap and ``None`` after it.
 
-    **The fit is measured, never computed**, and that is why this loop exists rather than one pass of
-    arithmetic: how many characters a string costs once serialized depends on the string (a quote or a
-    backslash escapes to two), so a budget that is exactly right on prose can be exceeded by the same
-    length of JSON or source code. Halving and re-measuring converges in one or two passes and cannot
-    lie about the result; the alternative — assuming a worst-case escape factor — would cut every
-    ordinary argument to a fraction of the budget it is actually entitled to.
+    **The fit is measured, never computed**: how many characters a string costs once serialized
+    depends on the string (a quote or a backslash escapes to two), so a budget that is exactly right on
+    prose can be exceeded by the same length of JSON or source code. Each excerpt is measured as it is
+    cut (`_within`), so the first attempt fits whenever the values are what is large. This loop is the
+    backstop for when they are not: so many keys, or keys so long, that the share left for the values
+    is itself the problem, or so many large values that their floors (`gone`) overrun a tiny share. Halving and re-measuring cannot lie about the result, and the alternative,
+    assuming a worst-case escape factor, would cut every ordinary argument to a fraction of the budget
+    it is actually entitled to.
     """
-    if _json_size(arguments) <= budget:
+    if _json_size(arguments) <= budget or _is_stub(arguments):
         return arguments
     attempt = budget
     for _ in range(_ARG_FIT_ATTEMPTS):
@@ -1291,30 +1266,81 @@ def _elide_argument(value: Any, budget: int) -> Any:
     the cap a **fixed point** when a value is already down at the marker's own size: without it, a
     transcript re-saved every turn would grind a marker into a marker of a marker, each one naming a
     size that is no longer true.
+
+    **The excerpt is cut by what it costs serialized, never by how many characters it has.** `budget`
+    is a serialized size (`_json_size`), and a newline or a quote costs two there. Cutting the head at
+    `room` *characters* overshot the share by one character per escape, and the only slack was two
+    characters per argument (`_fit` charges each value's quotes twice). So a call whose excerpt held
+    more than a handful of escapes (seven, for an ordinary three-argument create; one, for a
+    single-argument call) missed its fit, and `_cap_arguments` halved the whole budget to recover. A
+    2,413-character reply in paragraphs kept 811 characters of its text where it had room for 1,821.
+    Measuring the head and the tail (`_within`) makes the first fit the right one, for every script
+    and every escape.
     """
     size = _json_size(value)
     if size <= _MIN_EXCERPT:
         # Too small for cutting to be worth the marker that says so — and the fixed point that keeps a
-        # floor marker (`_gone`, well under this) from being ground into a shorter one on every save.
+        # floor marker (`gone`, well under this) from being ground into a shorter one on every save.
         return value
     if not isinstance(value, str):
         # A structure has no honest head-and-tail, so there is nothing to excerpt: it is the floor or
         # it is whole.
-        elided: Any = _gone(size)
+        elided: Any = gone(size)
         return elided if _json_size(elided) < size else value
 
-    marker = (
-        f"\n\n[... elided from {len(value)} chars — this argument is an archived excerpt; the full "
-        f"value was sent when the call ran. ...]\n\n"
-    )
+    marker = argument_marker(len(value))
     room = budget - _json_size(marker)
     if room < _MIN_EXCERPT:
-        elided = _gone(size)  # no room for an excerpt worth reading; the floor is all that fits
+        elided = gone(size)  # no room for an excerpt worth reading; the floor is all that fits
         return elided if _json_size(elided) < size else value
-    tail = min(room // 5, _ARG_ELISION_TAIL)
-    head = room - tail
-    elided = value[:head] + marker + (value[-tail:] if tail else "")
+    tail_room = min(room // 5, _ARG_ELISION_TAIL)
+    head = _within(value, room - tail_room)
+    tail = _within(value, tail_room, from_end=True)
+    elided = head + marker + tail
     return elided if _json_size(elided) < size else value
+
+
+def _within(text: str, room: int, *, from_end: bool = False) -> str:
+    """The longest head (or tail) of `text` whose **serialized** cost is at most `room`.
+
+    Measured, never computed, for `_cap_arguments`'s reason: what a character costs once serialized
+    depends on the character (one for a letter, whatever its script; two for a newline or a quote;
+    six for a control character), so the only honest answer is to serialize and look. A binary search
+    does it in a dozen measurements, which is what makes measuring affordable. A cost is never below a
+    character count, so no excerpt is longer than `room` characters, and a tail keeps its
+    `_ARG_ELISION_TAIL` ceiling in characters as well as in cost.
+    """
+    low, high = 0, min(len(text), max(room, 0))
+    while low < high:
+        middle = (low + high + 1) // 2
+        piece = text[len(text) - middle :] if from_end else text[:middle]
+        if _json_size(piece) - 2 <= room:  # the two quotes are the joined value's, paid once
+            low = middle
+        else:
+            high = middle - 1
+    return text[len(text) - low :] if from_end else text[:low]
+
+
+#: The key a stubbed call keeps its floor marker under (`_arguments_stub`).
+_STUB_KEY = "[elided]"
+
+
+def _is_stub(arguments: dict[str, Any]) -> bool:
+    """Is this call **already** its stub? Then it is the floor, and the floor is never cut again.
+
+    The stub is the one bound that is not hard (see `gone`): at a fan-out of about fifty calls, or a
+    share small enough, it is bigger than its share, so the next save found it over budget and stubbed
+    it *again*, this time naming the size of the stub. `[... 3984 chars elided ...]` became `[... 63
+    chars elided ...]` on the second save and stayed wrong forever: the marker of a marker, naming a
+    size that is no longer true, which the fixed point exists to rule out. A stub is recognized by its
+    shape (`action` at most, plus the floor marker, whole), so a stub from 0.70.0, whose wording
+    differs, is recognized too.
+    """
+    return (
+        _STUB_KEY in arguments
+        and set(arguments) <= {"action", _STUB_KEY}
+        and is_marker(arguments[_STUB_KEY])
+    )
 
 
 def _arguments_stub(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1329,7 +1355,7 @@ def _arguments_stub(arguments: dict[str, Any]) -> dict[str, Any]:
     action = arguments.get("action")
     if isinstance(action, str) and len(action) <= _ARG_ACTION_MAX:
         stub["action"] = action
-    stub["[elided]"] = _gone(_json_size(arguments))
+    stub[_STUB_KEY] = gone(_json_size(arguments))
     return stub
 
 

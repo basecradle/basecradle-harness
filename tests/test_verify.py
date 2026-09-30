@@ -402,9 +402,14 @@ def test_claims_are_emitted_even_when_the_box_is_failing(converged, monkeypatch)
 def test_a_box_with_no_config_home_still_has_rows_to_be_red_about(tmp_path):
     ids = [row["claim"] for row in claims(tmp_path / "nothing-here")["claims"]]
 
-    # The log-grammar row is unconditional for the same reason the other two are: an agent that
-    # cannot emit the grammar a founder-named alarm matches must have a row to be red about.
-    assert ids == ["harness-config-home", "harness-package-pin", "log-grammar:billing_blocked"]
+    # The log-grammar rows are unconditional for the same reason the other two are: an agent that
+    # cannot emit the grammar an alarm matches must have a row to be red about.
+    assert ids == [
+        "harness-config-home",
+        "harness-package-pin",
+        "log-grammar:billing_blocked",
+        "log-grammar:breaker_tripped",
+    ]
 
 
 def test_the_subject_slug_falls_back_to_the_env_then_the_os_user(converged, monkeypatch):
@@ -561,6 +566,7 @@ def test_the_emitter_still_states_the_unconditional_rows_with_no_config_home(
         "harness-config-home",
         "harness-package-pin",
         "log-grammar:billing_blocked",
+        "log-grammar:breaker_tripped",
     ]
 
 

@@ -24,12 +24,14 @@ from basecradle_harness import (
     MemoryExchange,
     MemoryProvider,
     MemoryScope,
+    Policy,
+    Tool,
     WakeAgent,
     _context,
     _mining,
 )
 from basecradle_harness import _wake as wake_module
-from basecradle_harness._brief import BRIEF_FENCE_LITERALS
+from basecradle_harness._brief import BRIEF_FENCE_LITERALS, your_home_text
 from basecradle_harness._engine import EngineError
 from basecradle_harness._install import install
 from basecradle_harness._mempalace import (
@@ -49,6 +51,7 @@ from basecradle_harness._mining import (
     classify,
     strip_injected,
 )
+from basecradle_harness._policy import SHELL
 from basecradle_harness._rerank import MemPalaceReranker
 
 BC_URL = "https://basecradle.com"
@@ -76,6 +79,11 @@ MCP_SENTINEL = "SENTINEL-MCP-do-not-mine-this-servers-own-instructions"
 # The brief's `brain` part (issue #564): the model id is read off the live adapter every wake, so the
 # canned model below carries it as its own `model` — the path a real adapter's id takes.
 BRAIN_SENTINEL = "SENTINEL-BRAIN-do-not-mine-this-model-id"
+# The brief's `your_home` part (issue #571). Its text is fixed — the NOC's canonical, shipped in the
+# package — so the sentinel is one of its own lines rather than a planted string: the proof is about
+# the bytes a shell agent really reads. Read off the file, never re-typed, so a re-sync from the NOC
+# cannot leave this checking a sentence the section no longer contains.
+YOUR_HOME_SENTINEL = next(line for line in your_home_text().splitlines() if "byte-exact" in line)
 # The reranker's *own* output. Not a brief surface — a whole extra model whose text the boundary
 # has never had to account for (issue #464). It must reach neither the agent's model nor the palace.
 RERANK_SENTINEL = "SENTINEL-RERANK-do-not-show-or-mine-this-reranker-narration"
@@ -87,6 +95,7 @@ SENTINELS = (
     RECALL_SENTINEL,
     MCP_SENTINEL,
     BRAIN_SENTINEL,
+    YOUR_HOME_SENTINEL,
 )
 
 
@@ -193,10 +202,31 @@ def platform():
         yield router
 
 
+class _ShellCapable(Tool):
+    """Holds the `SHELL` capability and does nothing else.
+
+    A stand-in rather than the shipped `ShellTool`, so the mining proof does not also depend on the
+    process not being root (`ShellTool` refuses to load as root, issue #253): the boundary under
+    test is the brief's, and `render_your_home` reads the capability, not the class.
+    """
+
+    name = "shell_capable"
+    description = "A stand-in that holds the shell capability."
+    parameters = {"type": "object", "properties": {}}
+    requires = frozenset({SHELL})
+
+    def run(self, **kwargs):
+        return "ok"
+
+
 def _agent(home, provider, model=None, monkeypatch=None):
     if monkeypatch is not None:
         monkeypatch.setenv("HARNESS_SYSTEM_PROMPT", f"You are Nova.\n\n{CHARTER_SENTINEL}")
-    harness = Harness(model or _CannedModel(), home=home)
+    # A shell agent (issue #571): the unlocked profile and a tool holding `SHELL`, so the brief
+    # carries "Your Home" — the one part composed from what the agent can do, not what it was told.
+    harness = Harness(
+        model or _CannedModel(), home=home, tools=[_ShellCapable()], policy=Policy.unlocked()
+    )
     return WakeAgent(
         harness,
         timeline=TIMELINE_UUID,
@@ -214,7 +244,8 @@ def _agent(home, provider, model=None, monkeypatch=None):
 
 def test_no_part_of_the_brief_reaches_the_mined_exchange(platform, tmp_path, monkeypatch):
     """The issue's acceptance test: sentinels in charter, manifest, dashboard, recall and — since
-    issue #553 — an MCP server's own instructions, and since issue #564 the brain part.
+    issue #553 — an MCP server's own instructions, since issue #564 the brain part, and since issue
+    #571 the "Your Home" section a shell agent reads.
 
     Both halves matter and both are asserted. If the sentinels never reached the *model*, this
     would pass for the wrong reason — a brief that composed empty proves nothing about a

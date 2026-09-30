@@ -33,6 +33,20 @@ Two report shapes, one per handled class:
   funds it. The report says so in plain language, the notice is **debounced** (one per outage per
   timeline — `BillingState`), and the pending work is left pending so it resumes on the first
   successful call after funding.
+
+And one note that is not a vendor verdict at all (issue #589, founder-approved 2026-09-29: *"a bad
+ask should cost one wasted wake and a visible stall, never a crash loop"*):
+
+- **Stall** (`stall_body`): a turn whose resumes have failed on the turn itself
+  `_wake.RESUME_CEILING` times — timed out, killed mid-resume, or cut off having written nothing;
+  never an outage, which only delays. No single failure was permanent, but the *item* has proven
+  itself unfinishable, and resuming it again would replay the same accumulated context into the same
+  failure forever. It is the provider-failure report's own case,
+  reached by repetition rather than by a vendor's word: the model cannot get this done, so there is
+  no agent to ask. It is written **in the harness's own words**, as the ruling asks, and says so —
+  what was being worked on, that it could not finish, and what would help — because a note in the
+  agent's voice about work its model never did would be the harness speaking *for* the agent,
+  which the Unspoken Channel forbids.
 """
 
 from __future__ import annotations
@@ -124,6 +138,76 @@ def provider_label(provider: str | None) -> str:
     return _PROVIDER_LABELS.get(provider, provider)
 
 
+#: The most of an error's text a stall note quotes. An adapter's message is short; the cap is for
+#: the one that is not (an HTML error page, a stack of nested causes), which on a timeline would bury
+#: the sentence that says what to do.
+STALL_DETAIL_CAP = 500
+
+#: What a stall note says when the last resume never reported back — the wake running it was killed
+#: (issue #589). Only the *last* one: an earlier one may well have reported, and saying "each attempt
+#: was interrupted" when one of them timed out would be a claim the harness cannot back.
+STALL_UNREPORTED = "the last of them never reported back, because the wake running it stopped"
+
+#: What a stall note says when the resumes were cut off at the output budget having written nothing
+#: — a model spending its whole cap before a word. Not the vendor's words, because the vendor said
+#: nothing wrong; it stopped where it was told to.
+STALL_NOTHING_WRITTEN = "each ran out of its output budget before writing anything"
+
+#: What a stall note says when the resumes kept writing and kept being cut off at the output budget
+#: inside one wake (issue #596): the answer is longer than the budget lets the model finish, and
+#: continuing it again would spend another budget on the same outcome.
+STALL_PAST_BUDGET = "each was cut off at its output budget before the answer was complete"
+
+
+def stall_detail(error: BaseException) -> str:
+    """What a stall note says about the failure that ended the last resume — safe to post publicly.
+
+    A **provider** failure is quoted as its adapter reported it — the vendor's own words where the
+    vendor spoke (`verbatim`, decision 3 of issue #336) — because that is the fact a human can act
+    on. Anything else is the harness's own fault, and its text is **not** posted: an internal
+    exception can carry a path on the box, a variable's contents, a stack of causes — nothing a peer
+    on the timeline is owed, and something a third party should not read. It is named by class, and
+    the text stays in the log where it belongs.
+    """
+    if isinstance(error, ProviderError):
+        detail = verbatim(error).strip() or type(error).__name__
+        if len(detail) > STALL_DETAIL_CAP:
+            detail = detail[: STALL_DETAIL_CAP - 1].rstrip() + "…"
+        return f"last error: {detail}"
+    return f"last error: an internal fault ({type(error).__name__}); the details are in its log"
+
+
+def stall_body(*, item: str, resumes: int, tool_calls: int, detail: str) -> str:
+    """The stall note (issue #589) — the harness speaking for itself, never as the agent.
+
+    Three things, in the order a reader needs them: **what was being worked on** (the item, and how
+    far the turn got — the tool calls it had made are the one measure of progress the transcript
+    holds), **that it could not finish** (how many resumes failed on the turn itself, and how), and
+    **what would help** (ask again, smaller). Every clause is one the harness can back: it counts
+    only the resumes that failed on the turn (`_wake.RESUME_CEILING`), so it says that many failed
+    and makes no claim about how many tries there were in all.
+    """
+    progress = (
+        f" It had made {tool_calls} tool call{'s' if tool_calls != 1 else ''} toward it."
+        if tool_calls
+        else ""
+    )
+    # The closing sentence names the likely cause, so it follows the failure: a turn that kept
+    # running out of its output budget is not the provider having trouble (issue #596).
+    if detail in (STALL_PAST_BUDGET, STALL_NOTHING_WRITTEN):
+        cause = "this agent's output budget may be too small for answers like this one."
+    else:
+        cause = "the model provider may be having trouble."
+    return (
+        "Automatic notice from this agent's harness — its model did not write this. "
+        f"The model could not finish working on {item}: the turn stopped partway, and {resumes} "
+        f"attempt{'s' if resumes != 1 else ''} to resume it failed ({detail}).{progress} The "
+        "harness has stopped retrying so it does not loop, and nothing more will happen on it by "
+        "itself. What would help: send it again, ideally split into smaller steps. If this keeps "
+        f"happening, {cause}"
+    )
+
+
 def report_body(rc: ReportClass, *, item: str, provider: str | None, exc: ProviderError) -> str:
     """The peer-facing notice for a reported failure — verbatim vendor error, plain-language framing.
 
@@ -131,13 +215,20 @@ def report_body(rc: ReportClass, *, item: str, provider: str | None, exc: Provid
     says plainly to add funds; the permanent notice names what could not be processed and, for a
     too-large payload, that the original is untouched and a smaller version may work (decision 1). The
     vendor's own words ride inside, unchanged.
+
+    **The billing notice asks for a post, and that is the whole re-wake** (issue #596, the capital's
+    ruling). Funding an account raises no platform event, so nothing wakes the agent when the money
+    lands; the notice used to promise "pending messages will be handled then", which was true only
+    if somebody happened to speak again. The person who funds the account is the person reading this
+    notice, so it tells them the one thing that makes the promise true: post here once it is funded.
     """
     name = provider_label(provider)
     detail = verbatim(exc)
     if rc.kind == BILLING:
         return (
             f"I can't respond right now — my {name} account is out of credit ({detail}). "
-            f"Add funds to the {name} account to resume; pending messages will be handled then."
+            f"Add funds to the {name} account to resume. When the account is funded, post here "
+            "and I will pick up where I stopped."
         )
     base = f"I couldn't process {item}: {name} rejected the request — {detail}."
     if rc.reason == _PAYLOAD_TOO_LARGE:
@@ -157,6 +248,25 @@ def report_body(rc: ReportClass, *, item: str, provider: str | None, exc: Provid
 #: billing line out of the founder-named *LLM Vendor Payment Failed* page, via the block-list
 #: predicate the NOC's four wake charts already carry.
 PROBE_SOURCE = "probe"
+
+#: The token a probe line **leads** with, for the human reader the stamp does not reach (issue #593).
+#: ``source=probe`` is the machine contract — the alert predicates and the extraction guard read it —
+#: but it trails the line, and on 2026-09-29 the founder read a probe's red ``wake reported_failure``
+#: in a Live Tail as a real out-of-funds block: the eye lands on the verb, not on the identifier
+#: column or the last field. One bare uppercase token ahead of the grammar changes no fleet column
+#: (the NOC measured all 42 with the engine Better Stack runs, basecradle-noc#857).
+PROBE_TOKEN = "PROBE"
+
+
+def probe_prefix(source: str | None) -> str:
+    """The leading ``PROBE `` a line wears when — and only when — it carries the probe stamp.
+
+    Rendered from the **same switch** as the stamp (the capital's ruling, amended 2026-09-29), so the
+    two can never disagree: a line with ``source=probe`` always leads with the token, and a real line
+    (which passes no ``source``) never does. The token is plain text ahead of the painted head, so it
+    never splits or repaints the bytes under proof.
+    """
+    return f"{PROBE_TOKEN} " if source == PROBE_SOURCE else ""
 
 
 def billing_onset_line(
@@ -182,13 +292,20 @@ def billing_onset_line(
     refactor that changes the real line changes the probe's line in the same edit. Two spellings
     would let the probe keep proving a grammar production no longer writes.
 
-    ``source`` and ``agent`` are the **probe-only** trailing fields (the capital's ruling 3,
-    2026-08-18: the grammar-under-proof bytes are never altered or interleaved; probe-only fields
-    trail them). Production passes neither, and `kv` drops them — so the real line is byte-for-byte
-    what it was before this function existed, and *carrying no* ``source=`` is what keeps it inside
-    the alarm's block-list predicate. See `_log_grammar` for why the probe passes no ``provider``.
+    ``source`` and ``agent`` are the **probe-only** fields, under the capital's ruling as amended on
+    2026-09-29 (issue #593, superseding ruling 3 of 2026-08-18):
+
+        Probe-only fields trail the grammar under proof, with one exception: a single leading
+        PROBE token may precede it, rendered from the same switch as the source=probe stamp, so
+        the two can never disagree. The token never alters, splits, or repaints the bytes under
+        proof.
+
+    `probe_prefix` is that switch. Production passes neither field, and `kv` drops them — so the
+    real line is byte-for-byte what it was before this function existed, and *carrying no*
+    ``source=`` is what keeps it inside the alarm's block-list predicate. See `_log_grammar` for why
+    the probe passes no ``provider``.
     """
-    return f"{head('wake reported_failure', RED)} " + kv(
+    line = f"{head('wake reported_failure', RED)} " + kv(
         kind=BILLING,
         reason=reason,
         provider=provider,
@@ -197,6 +314,7 @@ def billing_onset_line(
         source=source,
         agent=agent,
     )
+    return probe_prefix(source) + line
 
 
 def billing_repeat_line(
@@ -219,9 +337,9 @@ def billing_repeat_line(
     the column extracted *anything*, so one working clause would green a column whose other clause
     has gone deaf (the two-clause finding on basecradle-noc#509, adopted by the capital).
 
-    Same single-author contract as `billing_onset_line`; same probe-only trailing fields.
+    Same single-author contract as `billing_onset_line`; same probe-only fields, leading token included.
     """
-    return f"{head('wake billing_blocked', YELLOW)} " + kv(
+    line = f"{head('wake billing_blocked', YELLOW)} " + kv(
         reason=reason,
         provider=provider,
         timeline=timeline,
@@ -229,6 +347,7 @@ def billing_repeat_line(
         source=source,
         agent=agent,
     )
+    return probe_prefix(source) + line
 
 
 class BillingState:

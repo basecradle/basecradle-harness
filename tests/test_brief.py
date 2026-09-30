@@ -13,6 +13,8 @@ only ever re-derives the tags from the table under test would agree with any tab
 from __future__ import annotations
 
 import inspect
+from hashlib import sha256
+from importlib import resources
 from types import SimpleNamespace
 
 import httpx
@@ -28,16 +30,21 @@ from basecradle_harness import (
     render_defects,
     render_manifest,
     render_mcp,
+    render_your_home,
 )
 from basecradle_harness._brief import (
     BRAIN_HEADER,
     BRIEF_FENCE_LITERALS,
     BRIEF_TAGS,
+    YOUR_HOME_RESOURCE,
     brief_parts,
     brief_section_sizes,
     join_brief,
+    your_home_text,
 )
+from basecradle_harness._install import _packaged_defaults, install
 from basecradle_harness._mempalace import _fenced as mempalace_fenced
+from basecradle_harness._policy import BASECRADLE, SHELL
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -391,6 +398,7 @@ def test_every_part_is_fenced_with_the_name_of_its_source():
         defects="DEFECT",
         safety="SAFETY",
         mcp="MCP",
+        your_home="HOME",
         dashboard="DASH",
         memory="MEM",
         system_prompt="CHARTER",
@@ -405,6 +413,7 @@ def test_every_part_is_fenced_with_the_name_of_its_source():
         "<defects>\nDEFECT\n</defects>\n\n"
         "<safety>\nSAFETY\n</safety>\n\n"
         "<mcp>\nMCP\n</mcp>\n\n"
+        "<your-home.md>\nHOME\n</your-home.md>\n\n"
         "<dashboard.md>\nDASH\n</dashboard.md>\n\n"
         "<memory>\nMEM\n</memory>\n\n"
         "<system-prompt.md>\nCHARTER\n</system-prompt.md>"
@@ -609,12 +618,110 @@ def test_the_parts_still_partition_the_brief_with_their_tags_charged():
         manifest="Your active tools right now:\n- weather",
         defects="A tool is broken.",
         safety="An MCP server is active.",
+        your_home=render_your_home([_tool(SHELL)]),
         dashboard="# Dashboard",
         memory="You met John Doe on Tuesday.",
         system_prompt="You are Nova Digital.",
     )
 
     assert sum(brief_section_sizes(parts).values()) == len(join_brief(parts))
+
+
+# --- Your Home (issue #571) ---------------------------------------------------
+
+#: The sha256 of the canonical `your-home.md` as the capital's handoff and basecradle-noc both carry
+#: it (4,226 bytes, the viewer-fence sentence of basecradle-harness#583). The NOC owns the text and
+#: byte-diffs this package's copy against its own; pinning the checksum here makes a *local*
+#: rewording fail CI, so an edit can only ever arrive as a deliberate re-sync from the NOC — with
+#: this constant updated to match in the same change.
+CANONICAL_YOUR_HOME_SHA256 = "dad0e3011357535824dbc500e81666267671a7abf515623d5e4a0b67dc394991"
+
+
+def _tool(*requires: str) -> SimpleNamespace:
+    """A registered tool as `render_your_home` reads one: only its required capabilities."""
+    return SimpleNamespace(requires=frozenset(requires))
+
+
+def test_the_packaged_your_home_is_the_canonical_text_byte_for_byte():
+    raw = resources.files("basecradle_harness").joinpath(*YOUR_HOME_RESOURCE).read_bytes()
+
+    assert sha256(raw).hexdigest() == CANONICAL_YOUR_HOME_SHA256, (
+        "your-home.md is a verbatim copy of basecradle-noc's deploy/agent-home/your-home.md: "
+        "re-sync it from there, never reword it here"
+    )
+    assert your_home_text() == raw.decode("utf-8")  # read unmodified — no stripping, no templating
+
+
+def test_a_shell_agent_gets_the_whole_file():
+    """Every heading and the vault binding: never assembled from pieces, so nothing is left out."""
+    part = render_your_home([_tool(BASECRADLE), _tool(SHELL)])
+
+    assert part == your_home_text().rstrip("\n")
+    assert part.startswith("## Your Home\n")
+    assert "\n### The Vault (Binding)\n" in part
+    assert part.endswith("You place the bytes. You file the catalog. You keep the fence.")
+
+
+@pytest.mark.parametrize(
+    "tools",
+    [[], [_tool()], [_tool(BASECRADLE)], [_tool("some-future-capability")]],
+    ids=["no-tools", "plain-tool", "platform-tool", "unknown-capability"],
+)
+def test_an_agent_without_a_shell_gets_no_home_section(tools):
+    # It cannot reach the folders, so a rule about them is noise. The folders still exist on its
+    # box (the NOC provisions every agent's home); only the section is withheld.
+    assert render_your_home(tools) is None
+
+
+def test_whether_the_section_is_composed_is_decided_by_the_tools_alone():
+    """The founder's ruling: no detection — nothing reads the persona prompt to decide.
+
+    Pinned on the signature because that is where the rule is structural rather than a promise: a
+    renderer that is never handed the charter cannot scan it for a heading. The behavioral half
+    (the section survives any persona) is `test_wake`'s.
+    """
+    assert list(inspect.signature(render_your_home).parameters) == ["tools"]
+
+
+def test_the_fenced_section_is_the_shipped_file_byte_for_byte():
+    # The fence supplies the newline the renderer drops, so what sits between the tags *is* the
+    # file — the property the live verify on the box checks against the NOC's canonical.
+    brief = compose_brief(
+        initialize=None,
+        manifest=None,
+        your_home=render_your_home([_tool(SHELL)]),
+        dashboard=None,
+        system_prompt="CHARTER",
+    )
+
+    assert brief.startswith(f"<your-home.md>\n{your_home_text()}</your-home.md>\n\n")
+
+
+def test_your_home_sits_after_the_tool_parts_and_before_the_dashboard():
+    """The agent reads what it can call (and that `shell` points to "Your Home"), then its home."""
+    brief = compose_brief(
+        initialize=None,
+        manifest="MANIFEST",
+        mcp="MCP",
+        your_home="HOME",
+        dashboard="DASH",
+        system_prompt=None,
+    )
+    assert brief == fenced(
+        ("manifest", "MANIFEST"), ("mcp", "MCP"), ("your_home", "HOME"), ("dashboard", "DASH")
+    )
+
+
+def test_the_section_is_never_installed_where_an_operator_could_edit_it(tmp_path):
+    """It ships outside `_defaults/`, so the installer — which copies all of that — never sees it.
+
+    A config-home copy would be an operator's to edit, and the ruling is the same bytes for every
+    shell agent: the text is the harness's, read from the package on every wake.
+    """
+    assert not any("your-home" in path for path in _packaged_defaults())
+    home = tmp_path / "cfg"
+    install(home, opt_in=["shell"])
+    assert not [path for path in home.rglob("*") if "your-home" in path.name]
 
 
 # --- fetch_dashboard_md -------------------------------------------------------

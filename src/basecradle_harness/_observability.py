@@ -101,7 +101,7 @@ NO_COLOR_ENV = "NO_COLOR"
 #: out and pastes into a query — and coloring them would put escape bytes inside the very tokens the
 #: line exists to hand over.
 _VERDICT_VALUES: dict[str, dict[str, str]] = {
-    "outcome": {"ok": GREEN, "error": RED, "declined": YELLOW},
+    "outcome": {"ok": GREEN, "error": RED},
 }
 
 #: Credential shapes scrubbed out of any logged value — defense in depth at the *source*, so a

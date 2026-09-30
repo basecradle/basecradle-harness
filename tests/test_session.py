@@ -32,7 +32,10 @@ from basecradle_harness._session import (
     TOOL_RESULT_CAP,
     _cap_arguments,
     _elide_argument,
+    _fill,
     _json_size,
+    _within,
+    heal_interrupted_calls,
     turn_work,
 )
 
@@ -707,6 +710,100 @@ def test_a_call_is_capped_by_the_language_it_is_written_in_never_by_the_script()
     assert capped["body"].startswith("日本語の長い本文です。")
 
 
+#: Long bodies whose serialized size is bigger than their length, each the way real speech gets there:
+#: paragraphs, quotation, a script with its own line breaks, source code, and the worst case, control
+#: characters, which serialize at six apiece.
+_ESCAPE_HEAVY = [
+    pytest.param(("A paragraph of the plan, carried over. " * 6 + "\n\n") * 15, id="paragraphs"),
+    pytest.param('He said "yes", and she said "not yet". ' * 90, id="quotation"),
+    pytest.param("日本語の文章です。\n" * 400, id="japanese-lines"),
+    pytest.param('path = "C:\\\\agents\\\\nova"\nprint(path)\n' * 90, id="source"),
+    pytest.param("a\x01b" * 1_500, id="control-characters"),
+]
+
+
+@pytest.mark.parametrize("body", _ESCAPE_HEAVY)
+def test_an_argument_that_escapes_still_gets_its_whole_share(body):
+    """**The first fit is the right one**, however the text serializes.
+
+    The excerpt used to be cut at `room` *characters* against a budget measured *serialized*, so every
+    newline or quote in the head overshot it by one, and past the two characters of slack per argument
+    the fit failed and `_cap_arguments` halved the entire budget to recover. That is the cost of
+    escaping, paid at 50%.
+
+    Now the share is spent: the call serializes within the cap and nowhere near half of it, the tail
+    stays within its ceiling, and re-saving the result changes nothing.
+    """
+    arguments = {"action": "create", "timeline": TIMELINE, "body": body}
+    assert _json_size(arguments) > TOOL_ARGS_CAP  # genuinely over, or this proves nothing
+
+    capped = _cap_arguments(arguments, TOOL_ARGS_CAP)
+
+    # Within the cap, and nowhere near half of it (every shape here serialized to 1,001-1,188 before).
+    assert TOOL_ARGS_CAP * 3 // 4 < _json_size(capped) <= TOOL_ARGS_CAP
+    assert capped["action"] == "create" and capped["timeline"] == TIMELINE
+    kept = capped["body"]
+    assert kept.startswith(body[:40])
+    marker_end = kept.index("...]\n\n") + len("...]\n\n")
+    assert len(kept) - marker_end <= 128  # the tail keeps its ceiling, in characters too
+    assert _cap_arguments(capped, TOOL_ARGS_CAP) == capped  # a fixed point on every later save
+
+
+def test_a_multi_paragraph_reply_keeps_most_of_its_share_not_half():
+    """The live shape: a 2,413-character reply in paragraphs. It kept 811 characters of its text."""
+    reply = ("The plan holds; the next step is ours, and we take it together. " * 4 + "\n\n") * 10
+    reply = reply[:2413]
+
+    capped = _cap_arguments(
+        {"action": "create", "timeline": TIMELINE, "body": reply}, TOOL_ARGS_CAP
+    )
+
+    kept = capped["body"]
+    marker = kept[kept.index("\n\n[... elided") : kept.index("...]\n\n") + len("...]\n\n")]
+    assert len(kept) - len(marker) > 1_700  # of the message's own text, not the marker
+
+
+def test_an_excerpt_is_the_longest_that_fits_its_room():
+    """`_within` returns the longest head or tail within `room`, measured serialized."""
+    text = 'line one\nline "two"\n' * 50
+    for room in (0, 1, 7, 64, 333, 999):
+        for from_end in (False, True):
+            piece = _within(text, room, from_end=from_end)
+            assert _json_size(piece) - 2 <= room
+            assert text.endswith(piece) if from_end else text.startswith(piece)
+            longer = text[len(text) - len(piece) - 1 :] if from_end else text[: len(piece) + 1]
+            assert _json_size(longer) - 2 > room  # one more character would not have fit
+
+
+def test_a_stub_is_the_floor_and_every_later_save_leaves_it_alone():
+    """The stub is bigger than its share at a wide enough fan-out, and that must not re-stub it.
+
+    Found by the adversarial review of 0.133.4. At about fifty calls in a step, each call's share of
+    `TOOL_ARGS_CAP` is smaller than its own stub, so the next save found the stub over budget and
+    stubbed it again, naming the size *of the stub*: `[... 3984 chars elided ...]` became
+    `[... 63 chars elided ...]` and stayed that way, a marker of a marker naming a size that is no
+    longer true. A save is made every turn for the life of the timeline, so a bound that is not a
+    fixed point rewrites history on every one of them.
+    """
+    call = {"action": "create", "timeline": TIMELINE, "body": "para one.\n\n" * 300}
+    once = _fill([call] * 50, TOOL_ARGS_CAP, size=_json_size, elide=_cap_arguments)
+    assert once[0] == {"action": "create", "[elided]": f"[... {_json_size(call)} chars elided ...]"}
+    assert _fill(once, TOOL_ARGS_CAP, size=_json_size, elide=_cap_arguments) == once
+
+    # A share too small for any stub, and a stub from 0.70.0 (whose wording differs): both left alone.
+    assert _cap_arguments(once[0], 10) == once[0]
+    legacy = {
+        "action": "create",
+        "[elided]": "[... the 3 arguments of this call (9120 chars) were archived out of the "
+        "transcript; they were sent in full when the call ran. ...]",
+    }
+    assert _cap_arguments(legacy, 40) == legacy
+
+    # And a value that merely *contains* a marker is an excerpt, not a stub: still the cap's to cut.
+    not_a_stub = {"action": "create", "[elided]": "x" * 3_000 + "[... 5 chars elided ...]"}
+    assert _json_size(_cap_arguments(not_a_stub, 1_000)) <= 1_000
+
+
 def test_a_call_of_several_medium_arguments_keeps_all_of_them(tmp_path):
     """Water-filling, and why the cap does not simply elide the biggest argument until the call fits.
 
@@ -988,7 +1085,7 @@ def test_a_steps_growth_is_bounded_by_what_the_model_wrote_never_by_what_its_too
     """The bound underneath the bound — and the one that holds at **every** fan-out, without exception.
 
     Above ~50 parallel calls the total creeps past `persisted_step_cap()`, and that is not a leak: it
-    is the floor (`_gone`). A result cannot be dropped (its call would dangle, permanently) and neither
+    is the floor (`_elision.gone`). A result cannot be dropped (its call would dangle, permanently) and neither
     can a call's arguments (`create_kind` reads them), so each call keeps one short record saying how
     much is gone — of the same order as the `id`+`name` envelope the transcript must keep for that call
     anyway. **That residue scales with what the model emitted, never with what its tools returned**,
@@ -1186,3 +1283,113 @@ def test_the_turn_is_located_by_identity_so_a_compaction_cannot_misplace_it(tmp_
     assert first == second  # equal...
     assert turn_work(history, second) == [history[-1]]  # ...but the right one is found anyway
     assert turn_work(history, first) == [history[1]]
+
+
+# --- Two calls in one response never share an id (issue #578) ----------------------------------
+
+
+@pytest.mark.parametrize("ids", [("", ""), ("call_0", "call_0")], ids=["empty", "repeated"])
+def test_calls_sharing_an_id_in_one_response_are_still_two_calls(tmp_path, caplog, ids):
+    """The #578 reproduction, driven through the engine: a response whose calls share an id.
+
+    Before the fix, the pairing every reader keys on (`_results`, `heal_interrupted_calls`,
+    `creates`) collapsed the two into one. Once the first create's result landed, the second read
+    as answered, so it was capped on disk **while still in flight**, and a wake killed there left
+    it unhealed and never re-issued. The tool here reads the transcript file while the second call
+    runs: exactly the state such a kill would leave behind.
+    """
+    body = "x" * 5_000
+    path = tmp_path / "t.json"
+    disk_mid_step: list[list[dict]] = []
+
+    class Messages(Tool):
+        name = "messages"
+        description = "post a message"
+
+        def run(self, **kwargs):
+            if kwargs["body"].startswith("second"):
+                disk_mid_step.append(json.loads(path.read_text()))
+            return "posted"
+
+    both = Message.assistant(
+        tool_calls=[
+            ToolCall(
+                id=ids[0], name="messages", arguments={"action": "create", "body": "first " + body}
+            ),
+            ToolCall(
+                id=ids[1], name="messages", arguments={"action": "create", "body": "second " + body}
+            ),
+        ]
+    )
+    provider = ScriptedProvider(both, text("Posted both."))
+    session = Session("timeline:x", Harness(provider, tools=[Messages()]).engine, path=path)
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        session.send("post it twice")
+
+    # The state a kill mid-step would leave: the in-flight create is whole on disk, and it heals.
+    (disk,) = disk_mid_step
+    stored = [c for m in disk for c in m.get("tool_calls", [])]
+    assert stored[1]["arguments"]["body"] == "second " + body
+    reloaded = [Message.from_dict(d) for d in disk]
+    assert heal_interrupted_calls(reloaded) == 1
+    work = turn_work(reloaded, next(m for m in reloaded if m.role == "user"))
+    assert [(c.ordinal, c.call.arguments["body"][:6]) for c in interrupted(work, INTERRUPTED)] == [
+        (2, "second")
+    ]
+
+    # Every id in the reply is now unique and non-empty; a repeat keeps the first one byte for byte.
+    first, second = both.tool_calls
+    assert first.id and second.id and first.id != second.id
+    if ids[0]:
+        assert first.id == ids[0]
+    assert any(r.getMessage().startswith("tool_call_ids rewritten") for r in caplog.records)
+
+    # And the next request pairs each result with its own call.
+    calls = [c.id for m in provider.calls[1][0] for c in m.tool_calls]
+    answers = [m.tool_call_id for m in provider.calls[1][0] if m.role == "tool"]
+    assert calls == answers == [first.id, second.id]
+
+
+def test_a_response_whose_ids_are_already_unique_is_left_exactly_as_it_came(caplog):
+    """Every vendor the fleet runs sends unique ids, and for them this must cost nothing at all."""
+    reply = Message.assistant(
+        tool_calls=[
+            ToolCall(id="call_0", name="messages", arguments={"action": "create", "body": "a"}),
+            ToolCall(id="call_1", name="messages", arguments={"action": "create", "body": "b"}),
+        ]
+    )
+    provider = ScriptedProvider(reply, text("Done."))
+    posted: list[str] = []
+
+    class Messages(Tool):
+        name = "messages"
+        description = "post a message"
+
+        def run(self, **kwargs):
+            posted.append(kwargs["body"])
+            return "posted"
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        Session("timeline:x", Harness(provider, tools=[Messages()]).engine).send("go")
+
+    assert [c.id for c in reply.tool_calls] == ["call_0", "call_1"]
+    assert posted == ["a", "b"]
+    assert not any("tool_call_ids" in r.getMessage() for r in caplog.records)
+
+
+def test_a_renamed_id_never_takes_a_name_another_call_already_has():
+    """`call-1` is a name a vendor could send too; the rename steps past every id the reply holds."""
+    from basecradle_harness._engine import _unique_call_ids
+
+    reply = Message.assistant(
+        tool_calls=[
+            ToolCall(id="", name="a"),
+            ToolCall(id="call-1", name="b"),
+            ToolCall(id="", name="c"),
+            ToolCall(id="call-1", name="d"),
+        ]
+    )
+    ids = [c.id for c in _unique_call_ids(reply).tool_calls]
+    assert len(set(ids)) == 4 and all(ids)
+    assert ids[1] == "call-1"  # the vendor's own id, first use, untouched

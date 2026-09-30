@@ -9,6 +9,7 @@ https://basecradle.com · API docs: https://basecradle.com/docs/api
 from basecradle_harness._assets import AssetsTool, assets_options
 from basecradle_harness._audio import Transcriber
 from basecradle_harness._basecradle import TimelineAgent
+from basecradle_harness._breaker import BreakerDecision, WakeBreaker
 from basecradle_harness._brief import (
     compose_brief,
     fetch_dashboard_md,
@@ -18,6 +19,7 @@ from basecradle_harness._brief import (
     render_manifest,
     render_mcp,
     render_safety,
+    render_your_home,
 )
 from basecradle_harness._code import CodeAttachTool, CodeExecutionBridge
 from basecradle_harness._confirmed import ConfirmedTimelineAction
@@ -42,6 +44,7 @@ from basecradle_harness._exceptions import (
     ProviderRequestError,
     ProviderResponseError,
     ProviderServerError,
+    ProviderTimeoutError,
     ProviderToolSchemaError,
 )
 from basecradle_harness._governance import TimelinesTool, TrustTool
@@ -141,7 +144,6 @@ from basecradle_harness._video import (
     sample_frames,
 )
 from basecradle_harness._wake import (
-    BreakerDecision,
     Claim,
     ClaimStore,
     MarkStore,
@@ -149,7 +151,6 @@ from basecradle_harness._wake import (
     SeenStore,
     StaleTimelineError,
     WakeAgent,
-    WakeBreaker,
 )
 from basecradle_harness._webfetch import WebFetchTool
 from basecradle_harness._webhooks import WebhookEndpointsTool, WebhookEventsTool
@@ -199,6 +200,7 @@ __all__ = [
     "render_defects",
     "render_brain",
     "render_budget",
+    "render_your_home",
     "fetch_dashboard_md",
     # Provider contract + adapters
     "Provider",
@@ -304,6 +306,7 @@ __all__ = [
     "ProviderResponseError",
     "ProviderContextLengthError",
     "ProviderConnectionError",
+    "ProviderTimeoutError",
     "ProviderAPIError",
     "ProviderAuthError",
     "ProviderBillingError",

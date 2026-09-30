@@ -64,6 +64,24 @@ class ProviderConnectionError(ProviderError):
     """
 
 
+class ProviderTimeoutError(ProviderConnectionError):
+    """The call ran out of time — a connect timeout, a read timeout, or a gRPC deadline (issue #589).
+
+    Raised by an adapter that **knows** its SDK timed out, so the one fault whose retry differs
+    from every other transport failure is typed at the boundary that can see it, rather than
+    inferred from a cause chain three layers down. It subclasses `ProviderConnectionError` on
+    purpose: every ``except`` that catches a transport failure still catches it, and a third-party
+    adapter that only ever raises the parent keeps working — `_retry.connection_reason` still reads
+    the cause for it.
+
+    What sets it apart is what a retry can buy. A transport failure is re-issued as it was; a
+    timeout is not, because the identical request would wait the identical time and fail the same
+    way (issue #589's second defect: three minutes burned per step). A timeout is retried **once,
+    with a materially larger budget** (`basecradle_harness._timeouts.TIMEOUT_RETRY_SCALE`), or not
+    at all.
+    """
+
+
 class ProviderToolSchemaError(ProviderError):
     """The provider refused **one tool's** JSON Schema, naming it (issue #496).
 

@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from basecradle_harness._assets import model_sees_images, model_sees_video
+from basecradle_harness._elision import archive_marker, refusal
 from basecradle_harness._exceptions import (
     EngineError,
     ProviderConnectionError,
@@ -67,6 +68,7 @@ from basecradle_harness._messages import (
 from basecradle_harness._observability import MAIN, describe_provider, kv, truncated
 from basecradle_harness._provider import Provider
 from basecradle_harness._retry import Retry, _default_backoff, connection_reason
+from basecradle_harness._timeouts import bind_scale, last_timeout
 from basecradle_harness._tools import ToolRegistry
 
 _log = logging.getLogger("basecradle_harness")
@@ -99,11 +101,12 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: ``The read operation timed out`` with no ``llm retry`` line anywhere in it: ~12 minutes and a
 #: second full step budget to recover what a ≤3s wait would have survived.
 #:
-#: **It was also the pre-#284 shape, in the class #284's own note names.** The `openai` SDK retries
-#: `APITimeoutError` and `APIConnectionError` internally (the adapter leaves ``max_retries`` on)
+#: **It was also the pre-#284 shape, in the class #284's own note names.** The `openai` SDK retried
+#: `APITimeoutError` and `APIConnectionError` internally (the adapter left ``max_retries`` on)
 #: while the `openrouter` adapter sets ``retry_config=None`` — so a read timeout was survivable
 #: three times over on one provider and fatal on the first raise on another, decided by nobody. That
-#: is the sentence below condemning the state this constant was in.
+#: is the sentence below condemning the state this constant was in. (Since issue #589 no adapter
+#: retries inside its SDK: this retry is the only one, on every provider.)
 #:
 #: **What the retry cannot do is double-act, and that is what makes it safe** (the objection is
 #: answered in full in `basecradle_harness._retry`): a call that never returned dispatched no tools
@@ -111,13 +114,15 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: A read timeout *can* buy a duplicate generation at the vendor — bounded by the attempt count, and
 #: the exposure every `openai`-SDK agent has always taken.
 #:
-#: **The cost it does carry is wall clock, and it is the slow-5xx shape below becoming ordinary.**
-#: A *timeout* burns the whole client timeout before it raises, so a genuinely-unreachable provider
-#: now fails a wake in ~3 × ``DEFAULT_TIMEOUT`` rather than one — ~180s against ~60s at the shipped
-#: constants. That is worth it and the arithmetic is why: the alternative to waiting is the router
-#: re-waking, which replays the whole transcript and spends a fresh step budget (the live event cost
-#: 691s), so three minutes of patience is cheap against twelve of recovery. It is also the shape the
-#: NOC's Wake Duration Outlier alert watches, which is a reason to have written the number down.
+#: **A timeout is the one member retried differently, and issue #589 is why.** The first cut of
+#: #545 re-sent a timed-out call as it was — into the identical wall, twice more: on 2026-09-29
+#: @glm-5.2's ninth step needed more than the flat 60 s every call then got, and each step burned
+#: three minutes failing identically. Timeouts are now *fitted* to the call
+#: (`basecradle_harness._timeouts`), and a timeout earns **one** retry, at twice the budget
+#: (`_retry.TIMEOUT_RETRIES`; `_chat` binds the larger budget on the adapter). The wall-clock cost of
+#: a provider that accepts a request and never answers is therefore one fit plus twice the fit
+#: before the wake fails — stated in `_timeouts`, and the shape the NOC's Wake Duration Outlier
+#: alert watches.
 #:
 #: **The 429 joined in issue #506, reversing a deliberate exclusion, and the reversal is the
 #: interesting part.** It was excluded on the reasoning that hammering a rate-limited endpoint only
@@ -130,25 +135,22 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: rather than after. What keeps the old reasoning honest is the bound: the wait is capped and it is
 #: **the vendor's own ``Retry-After`` where one was given** (`basecradle_harness._retry`).
 #:
-#: **What is uniform here is the policy, not the attempt count — stated, because the last time this
-#: was left implicit it became issue #284.** Some vendor SDKs retry a 5xx themselves and some do not,
-#: so the retries *compose*: the `openai` SDK carries ``max_retries=2``, giving a 5xx up to 3 × 3 = 9
-#: HTTP attempts there, while the native `openrouter` adapter disables its SDK's retry (its default
-#: backs off for up to an hour and would hang a wake) and so takes exactly 3. The SDK's retry is
-#: deliberately left on where it exists, because it also covers connection errors — which the engine
-#: pointedly does **not** retry — and removing it to equalize a count would cost real resilience to
-#: buy a symmetry nobody benefits from. Since #506 the 429 composes the same way where an SDK
-#: retries it (the `openai` SDK does, honoring ``Retry-After`` itself); the compounding is bounded on
-#: both sides, and the engine's own half now has a total-sleep budget the SDK's does not.
+#: **What is uniform here is the policy *and* the attempt count, and the second half is new.** Until
+#: issue #589 the `openai` SDK carried ``max_retries=2`` and composed with this retry — a 5xx took up
+#: to 3 × 3 = 9 HTTP attempts there against exactly 3 on the native adapters. That was defended here
+#: as resilience the engine lacked, because the engine did not retry connection errors; #545 made it
+#: retry them, and #589 found the composition's worst member: the SDK re-sent a **timed-out** request
+#: with the identical budget, which is the wall this retry now refuses to walk into. So every adapter
+#: leaves retrying to this one policy, and a fault takes the same attempts on every provider. (The
+#: one SDK-level retry left is gRPC's own on the native xAI path, and it re-sends only `UNAVAILABLE`
+#: — a request that never reached a server — never a deadline.)
 #:
-#: **The bound worth knowing is wall-clock, not attempts.** A 5xx normally returns *fast*, so 9
-#: attempts is ~6s of backoff and irrelevant. The pathological shape is a **slow** 5xx — a gateway
-#: that burns the client timeout (``DEFAULT_TIMEOUT``, 60s) before answering — where the compounding
-#: is 9 × 60s rather than 9 × nothing. That is a genuinely-down provider, and the wake fails either
-#: way; but it fails *slowly*, which cuts against this repo's own "fail the wake fast and let the
-#: router re-wake" stance. It is bounded and it is known, not an accident. The *sleep* half of that
-#: compounding now has the total-time deadline this note called for (`_retry.RETRY_BUDGET_SECONDS`,
-#: issue #506); the per-attempt client timeout is the half that remains, and it is the SDK's.
+#: **The bound worth knowing is wall-clock, not attempts.** A 5xx normally returns *fast*, so its
+#: attempts cost ~1.5s of backoff and are irrelevant. The pathological shape is a **slow** 5xx — a
+#: gateway that burns the whole generation budget before answering — which is a genuinely-down
+#: provider, and the wake fails either way, slowly. The *sleep* half has the total-time deadline
+#: (`_retry.RETRY_BUDGET_SECONDS`, issue #506); the per-attempt budget is the fitted one
+#: (`basecradle_harness._timeouts`).
 _TRANSIENT = (
     ProviderResponseError,
     ProviderServerError,
@@ -224,10 +226,9 @@ def _backoff(attempt: int, reason: str) -> float:
 
     **A timeout stays on the short beat on purpose, and it is worth saying why the long one looks
     right**: a rate limit is a *capacity window* that a half-second does not outlast, so it earns
-    the patient schedule — but a call that timed out has already waited the whole client timeout
-    (`DEFAULT_TIMEOUT`, 60s), and the thing to buy after that is a re-route, not more waiting. The
-    sleep is the only part of this the engine controls; the per-attempt timeout is the SDK's, and it
-    is what actually bounds a timeout retry's wall clock.
+    the patient schedule — but a call that timed out has already waited its whole fitted budget, and
+    what it needs next is *more room for the answer*, which is what its one retry gets (twice the
+    budget, issue #589). Sleeping longer between the two would buy nothing.
     """
     return (
         _default_backoff(attempt, reason)
@@ -481,7 +482,7 @@ class Engine:
                 # provider's prompt cache hot — so the counter rides a *trailing* system turn,
                 # re-appended each step, never a mutation of the head of the context.
                 messages.append(Message.system(_step_note(step, self.max_steps, started)))
-                reply = self._chat(messages, specs)
+                reply = _unique_call_ids(self._chat(messages, specs))
                 # Read **here**, beside the call it describes, never at the return check below: the
                 # adapter's `last_finish_reason` is a *most recent call* field, and between this
                 # line and that check sits arbitrary work (tool dispatch, a turn hook) that a later
@@ -813,6 +814,12 @@ class Engine:
         (the session compacts and retries *that* its own way), or a permanent `ProviderError` such
         as a bad `model_params.json` key. Retrying a permanent fault only repeats it.
 
+        **A timeout is retried once, with twice the budget, and never again** (issue #589). The
+        adapter fits every call's budget to the call (`basecradle_harness._timeouts`); the retry's
+        larger one is bound on the adapter here before the attempt (`_timeouts.bind_scale`), and
+        lowered again whatever happens, so the next step — and any compaction call after this
+        turn — runs at the ordinary fit.
+
         On exhaustion the last error is re-raised (the wake aborts with a clean non-zero exit) — but
         every retried attempt logs a WARNING — the shared ``llm retry`` line, so a brain retry, a
         rerank retry and a describe retry read identically in one journal (issue #506) — and the
@@ -830,20 +837,31 @@ class Engine:
             sleep=self._sleep,
         )
         last_exc: ProviderError | None = None
-        for _ in range(attempts):
-            try:
-                return self.provider.chat(messages, tools=tools)
-            except _TRANSIENT as exc:
-                last_exc = exc
-                if not retry.again(exc, reason=_reason(exc)):
-                    break
+        try:
+            for _ in range(attempts):
+                bind_scale(self.provider, retry.timeout_scale)
+                try:
+                    return self.provider.chat(messages, tools=tools)
+                except _TRANSIENT as exc:
+                    last_exc = exc
+                    if not retry.again(
+                        exc, reason=_reason(exc), timed_out_after=last_timeout(self.provider)
+                    ):
+                        break
+        finally:
+            if retry.timeout_scale != 1.0:
+                bind_scale(self.provider, 1.0)
+        assert last_exc is not None  # the loop only exits here after catching at least once
+        # A timeout names the budget it ran out of, so "the answer needed more than N seconds" is
+        # read off the journal. Any other fault's budget says nothing about it and is left off.
+        budget = last_timeout(self.provider) if _reason(last_exc) == "timeout" else None
         _log.error(
-            "%s on all %d attempt(s); giving up: %s",
+            "%s on %d attempt(s)%s; giving up: %s",
             _fault(last_exc),
-            attempts,
+            retry.attempt,
+            "" if budget is None else f" (last budget {budget:.0f}s)",
             last_exc,
         )
-        assert last_exc is not None  # the loop only exits here after catching at least once
         raise last_exc
 
     def _log_step(self, step: int, reply: Message, extend: bool, started: datetime) -> None:
@@ -1001,10 +1019,10 @@ class Engine:
         never as an exception — because the model reading it cannot tell, and must not need to tell,
         a call that failed live from one that failed on re-issue.
         """
-        text, _, _ = _split_result(self._run_tool(name, arguments))
+        text, _, _ = _split_result(self._run_tool(name, arguments, reissue=True))
         return text
 
-    def _run_tool(self, name: str, arguments: dict) -> str | ToolResult:
+    def _run_tool(self, name: str, arguments: dict, *, reissue: bool = False) -> str | ToolResult:
         """Run one tool call, turning any failure into a result the model can read.
 
         Errors are fed back as the tool's output rather than raised: a model that
@@ -1033,6 +1051,14 @@ class Engine:
                 return f"Error: {self.withheld_tools[name]}"
             self._log_tool(name, started, error=f"no tool named {name!r}")
             return f"Error: no tool named {name!r}."
+        # The harness's own elision marker, copied out of the model's context into a call it is
+        # making (issue #576): run it, and a fragment goes out saying "the full value was sent".
+        # Refused on both seams, the live dispatch and the recovery's `run_tool`, because both
+        # arrive here — told apart only in what the model is told happened (`refusal`).
+        marker = archive_marker(arguments)
+        if marker is not None:
+            self._log_tool(name, started, error="arguments carry a harness elision marker")
+            return refusal(marker, reissue=reissue)
         try:
             result = tool.run(**arguments)
         except Exception as exc:  # noqa: BLE001 - any tool failure becomes model-readable
@@ -1053,6 +1079,48 @@ class Engine:
         _log.info("tool %s", kv(name=name, duration=f"{elapsed:.2f}s", outcome=_outcome(error)))
         if error is not None:
             _log.warning("tool %s", kv(name=name, error=error))
+
+
+def _unique_call_ids(reply: Message) -> Message:
+    """`reply`, with every tool call's id **unique within it** — the one place this is made true.
+
+    A call is paired with its result by id, within its own turn's run: `_session._results` (what the
+    cap may bound), `heal_interrupted_calls` (what a killed wake left unanswered) and
+    `_idempotency.creates` (the ordinal a key is minted from) all key on it. So all three *assume*
+    two calls in one response never share an id — and nothing made it so, because an id is the
+    vendor's string and every adapter passes it through verbatim. A response carrying two calls with
+    the same id, or two empty ones, collapsed that pairing (issue #578): once the first call's result
+    landed, the second create read as answered, so it was capped on disk **while still in flight**,
+    and a wake killed then left it unhealed and never re-issued. The recovery's promise to heal
+    every interrupted create silently did not hold.
+
+    Normalized **here**, where every adapter's answer enters the loop, rather than in each adapter:
+    one rule in one place, and a provider a developer writes in an afternoon is covered without
+    having to know it exists. The first call to use an id keeps it, byte for byte, so a vendor that
+    behaves (every one the fleet runs) is untouched and this costs nothing. A repeat or an empty id
+    is renamed to `<id>-<n>` (`call-<n>` for an empty one), the first such name that no call in the
+    reply already uses. The renamed id is what the transcript and the next request carry; the
+    vendor pairs its own history by the ids it is sent, so a consistent rename is all it needs. It is
+    logged at WARNING on its own head, because a vendor doing this is a fact worth knowing and not a
+    `tool` line: nothing ran.
+    """
+    taken = {call.id for call in reply.tool_calls if call.id}
+    kept: set[str] = set()
+    renamed: list[str] = []
+    for call in reply.tool_calls:
+        if call.id and call.id not in kept:
+            kept.add(call.id)
+            continue
+        base, n = call.id or "call", 1
+        while f"{base}-{n}" in taken:
+            n += 1
+        renamed.append(f"{call.id or '(empty)'}>{base}-{n}")
+        call.id = f"{base}-{n}"
+        taken.add(call.id)
+        kept.add(call.id)
+    if renamed:
+        _log.warning("tool_call_ids rewritten %s", kv(renamed=",".join(renamed)))
+    return reply
 
 
 def _progress(on_progress: Callable[[], None] | None) -> None:

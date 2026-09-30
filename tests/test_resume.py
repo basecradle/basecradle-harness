@@ -50,6 +50,7 @@ from basecradle_harness import (
     Tool,
     ToolCall,
 )
+from basecradle_harness._elision import archive_marker, argument_marker, refusal
 from basecradle_harness._exceptions import ProviderConnectionError
 from basecradle_harness._idempotency import MESSAGE, IdempotencyKeys, key
 from basecradle_harness._session import INTERRUPTED, TOOL_ARGS_CAP, _json_size, turn_work
@@ -527,6 +528,46 @@ def test_an_interrupted_creates_body_survives_the_cap_and_is_re_posted_whole(pla
     assert f"elided from {len(body)} chars" in call["arguments"]["body"]
 
 
+def test_an_interrupted_create_carrying_a_copied_marker_is_not_re_issued(platform, tmp_path):
+    """The recovery seam meets the #576 guard, and says what is true: the outcome is **unknown**.
+
+    A wake on 0.133.2 or earlier sent a `messages create` whose body held a copied elision marker,
+    and was killed before the result was saved. Whether that POST landed is the one thing nobody
+    knows. Re-issuing it would post the fragment if it had not; telling the model "nothing was sent"
+    would invite a rewrite under the *next* ordinal, and a second post if it had. So the re-issue is
+    refused, the model is told the original's outcome is unknown, and nothing is posted.
+    """
+    whole = "Here is the full report you asked for. " * 80
+    copied = whole[:900] + argument_marker(len(whole)) + whole[-128:]
+    serve_messages(platform, page(message(uuid=M0, body=MULTILINE)))
+
+    crashed_wake_owning(tmp_path, M0)
+    session = Harness(_Finishes(), home=tmp_path).session(f"timeline:{TIMELINE_UUID}")
+    session.history.append(
+        Message(role="user", content=f"[2026-06-04T00:00:00.000Z] john: {MULTILINE}", items=[M0])
+    )
+    session.history.append(
+        Message.assistant(
+            tool_calls=[
+                ToolCall(id="c1", name="messages", arguments={"action": "create", "body": copied})
+            ]
+        )
+    )
+    session._save()
+
+    finishes = _Finishes()
+    agent, _ = build_wake(tmp_path, finishes, tools=[MessagesTool()])
+    agent.wake()
+
+    assert _posts(platform) == []
+    (result,) = [m for m in _transcript(tmp_path) if m.get("tool_call_id") == "c1"]
+    assert result["content"] == refusal(archive_marker(copied), reissue=True)
+    assert "unknown" in result["content"]
+    assert "nothing was sent" not in result["content"]
+    # And the model finishing the turn read that, not the "outcome unknown" placeholder.
+    assert any(m.role == "tool" and m.content == result["content"] for m in finishes.seen[0])
+
+
 def test_an_unsettled_create_keeps_its_arguments_across_every_save_until_it_is_re_issued(tmp_path):
     """The "outcome unknown" marker is a **durable** flag, not a one-wake grace period.
 
@@ -891,10 +932,10 @@ def test_a_wake_lost_to_a_read_timeout_after_posting_is_resumed_and_posts_once(
     Two properties, and they are one test because the second is what makes the first non-obvious.
 
     **The turn is retried where the retry can help.** Since issue #545 a transport fault is
-    transient, so the second model call is re-issued up to `DEFAULT_RESPONSE_RETRIES` more times
-    before the wake gives up — three calls after the post, not one. A transport failure that
-    *clears* never reaches the wake-level path at all; this double never clears, which is the only
-    way to exercise what happens when the retry is genuinely exhausted.
+    transient, and since issue #589 a *timeout* is retried exactly once, with twice the budget —
+    two calls after the post, never the three identical ones that burned three minutes a step. A
+    timeout that *clears* never reaches the wake-level path at all; this double never clears, which
+    is the only way to exercise what happens when the retry is genuinely exhausted.
 
     **And exhausting it changes nothing about the recovery.** The dead turn issued a tool call, so
     the next wake **resumes** it rather than re-driving it — zero tools re-fire and the `messages`
@@ -911,7 +952,7 @@ def test_a_wake_lost_to_a_read_timeout_after_posting_is_resumed_and_posts_once(
         first.wake()
 
     assert _posts(platform) == ["Here is your owl."]  # the dying wake did speak, once
-    assert brain.calls == 4  # the post, then 1 + DEFAULT_RESPONSE_RETRIES exhausted attempts
+    assert brain.calls == 3  # the post, then the timed-out call and its one larger-budget retry
 
     serve_messages(platform, page(message(uuid=M0, body=MULTILINE)))
     second, live = build_wake(tmp_path, _Finishes(), tools=[MessagesTool()])

@@ -34,6 +34,7 @@ from basecradle_harness import (
     resolve_plugins,
 )
 from basecradle_harness._basecradle import _apply_safe_policy, _profile_from_env
+from basecradle_harness._brief import render_your_home, your_home_text
 from basecradle_harness._install import plugin_opts_in, plugin_source_providers
 from basecradle_harness._shell import _ROOT_REFUSAL, _running_as_root, _with_path
 from basecradle_harness._venv import path_preamble
@@ -65,26 +66,43 @@ def test_name_and_required_parameter():
 
 
 def _shipped_shell_plugin():
-    """The shipped `_defaults/tools/shell.py` PLUGIN object, loaded from the package data file."""
-    import importlib.util
+    """The shipped `_defaults/tools/shell.py` PLUGIN object, loaded the way the plugin loader does.
+
+    Through `_plugins._import_file`, which suppresses bytecode: a plain `exec_module` leaves a
+    `__pycache__/*.pyc` inside the package's `_defaults/` tree, which the installer walks as text.
+    """
     from importlib.resources import as_file, files
 
-    src = files("basecradle_harness").joinpath("_defaults", "tools", "shell.py")
-    with as_file(src) as path:
-        spec = importlib.util.spec_from_file_location("_shipped_shell_plugin", path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-    return mod.PLUGIN
+    from basecradle_harness._plugins import _import_file
+
+    with as_file(files("basecradle_harness").joinpath("_defaults", "tools", "shell.py")) as path:
+        return _import_file(path).PLUGIN
 
 
-def test_the_note_steers_to_scratch_and_workspace_over_assets():
+def test_the_note_is_the_text_the_handoff_specified():
+    # Issue #571, verbatim: the folders are taught in one place ("Your Home"), so the note shrinks
+    # to a pointer. Pinned whole, because a pointer that drifts from the section's heading points
+    # at nothing.
+    assert _shipped_shell_plugin().note == (
+        "Full shell as your OS user — unlocked-profile only. Runs arbitrary commands, code, and "
+        "network calls with no sandbox beyond your Unix permissions. Your home directory and its "
+        'six standing folders are described under "Your Home" in your instructions; each '
+        "folder's README is its law. The command-line tools installed alongside your harness are "
+        "on your PATH — run them by name (`mempalace status` reads your own memory palace, if "
+        "that is your backend)."
+    )
+
+
+def test_the_home_steer_the_note_used_to_carry_reaches_every_shell_agent():
     # Issue #263: a shell-equipped agent should keep working files in its own home, not on a
-    # shared timeline. The note the model reads points it at ~/scratch and ~/workspace and
-    # away from assets — pin it so a future edit can't silently drop the steer.
-    note = _shipped_shell_plugin().note
-    assert "~/scratch" in note
-    assert "~/workspace" in note
-    assert "Prefer them over timeline assets for anything not meant to be shared." in note
+    # shared timeline. Issue #571 moved that steer out of this note into "Your Home", so pin the
+    # two facts that keep it reaching the model: the section says it, and the section is composed
+    # for exactly the tool that carries this note.
+    assert "Prefer these folders over timeline assets for anything not meant to be shared." in (
+        your_home_text()
+    )
+    assert '"Your Home"' in _shipped_shell_plugin().note
+    assert render_your_home([ShellTool()]).startswith("## Your Home\n")
 
 
 def test_the_note_says_the_agents_own_command_line_tools_are_on_its_path():

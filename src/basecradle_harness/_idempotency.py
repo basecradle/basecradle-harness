@@ -79,6 +79,14 @@ ASSET = "asset"
 TASK = "task"
 WEBHOOK_ENDPOINT = "webhook_endpoint"
 
+#: The one keyed create the **harness** issues rather than a tool: the stall note (issue #589). It is
+#: posted once per stalled turn and the turn's items are then abandoned — several writes, and a wake
+#: that dies between them leaves the turn for the next wake to stall again, possibly through another
+#: of its messages. Keyed on the turn's anchor like every key the turn mints (ordinal 1, there is only
+#: ever one), so that second stall returns the first note instead of posting another. Deliberately
+#: absent from `CREATE_CALLS`: no tool call issues it, so no transcript ordinal counts it.
+STALL_NOTE = "stall_note"
+
 CREATE_CALLS: dict[tuple[str, str], str] = {
     ("messages", "create"): MESSAGE,
     ("assets", "create"): ASSET,
@@ -128,7 +136,8 @@ def creates(work: list[Message]) -> list[Create]:
     them. Two functions that obviously agree is how they stop agreeing.
 
     **A call is paired with a result from its own assistant turn's run, never by a global id
-    lookup.** A tool-call id is the provider's own string and nothing normalizes it: a model that
+    lookup.** A tool-call id is the provider's own string, unique only *within* one response (the
+    engine makes it so, `_engine._unique_call_ids`, issue #578) and nothing more: a model that
     numbers its calls per response (`call_0`, `call_1` — what an OpenRouter-fronted model emits)
     reuses the same ids on every turn. Matching them across the whole transcript would pair a call
     with the *previous* turn's result — declaring an interrupted call answered (so it is never

@@ -391,6 +391,20 @@ def test_the_two_nudges_are_identical_after_their_opening_clause():
 # === the standing guard: nothing the model reads may invent a supervisor =======
 
 
+def _shipped_note(filename):
+    """A shipped tool plugin's manifest ``note``, loaded the way the plugin loader loads it.
+
+    Through `_plugins._import_file`, never a plain import: that is what keeps a load from leaving
+    bytecode inside the package's `_defaults/` tree, which the installer walks as text.
+    """
+    from importlib.resources import as_file, files
+
+    from basecradle_harness._plugins import _import_file
+
+    with as_file(files("basecradle_harness").joinpath("_defaults", "tools", filename)) as path:
+        return _import_file(path).PLUGIN.note
+
+
 def _model_facing_strings():
     """Every shipped string the *model* reads — the surface the operator frame must stay out of.
 
@@ -405,7 +419,9 @@ def _model_facing_strings():
         render_defects,
         render_mcp,
         render_safety,
+        render_your_home,
     )
+    from basecradle_harness._elision import gone, refusal
     from basecradle_harness._engine import (
         _RESERVE_NUDGE,
         _TRUNCATED_NOTE,
@@ -414,6 +430,7 @@ def _model_facing_strings():
     )
     from basecradle_harness._install import prompt_text
     from basecradle_harness._mcp import McpServerConfig, _about, _withholding, withheld_refusal
+    from basecradle_harness._policy import SHELL
 
     now = __import__("datetime").datetime(2026, 7, 14, tzinfo=__import__("datetime").timezone.utc)
     noted = McpServerConfig(name="pw", command="x", note="Headless Chromium on this box.")
@@ -444,6 +461,9 @@ def _model_facing_strings():
         "safety opt-out": render_safety(["mcp: filesystem"]) or "",
         # Issue #553: what the model is told about its MCP servers and the tools it does not get.
         "mcp part": render_mcp([_about(noted, _Client())]) or "",
+        # Issue #571: the home section every shell agent reads, and the note that points it there.
+        "your home": render_your_home([SimpleNamespace(requires=frozenset({SHELL}))]),
+        "shell note": _shipped_note("shell.py"),
         "withheld refusal": withheld_refusal(
             "pw", "browser_run_code_unsafe", waivable=True, offered=["browser_evaluate"]
         ),
@@ -453,6 +473,9 @@ def _model_facing_strings():
         "step note (terse)": _step_note(1, 24, now),
         "step note (escalated)": _step_note(23, 24, now),
         "builtin guidance": _server_builtin_guidance("web_search"),
+        # Issue #576: what a call carrying a harness elision marker gets back, live and on recovery.
+        "elision refusal": refusal(gone(900)),
+        "elision refusal (re-issue)": refusal(gone(900), reissue=True),
         # A resume replays the transcript up to the interruption, so the model reads this one as
         # its own account of what happened to it (issue #490) — which puts it squarely on this
         # surface, whatever its `system` role suggests.
@@ -913,6 +936,48 @@ def test_a_one_on_one_message_with_no_mention_is_informed_once(platform, tmp_pat
     nudges = [m for m in brain.shown if m.role == "system" and m.content == ONE_ON_ONE_NUDGE]
     assert len(nudges) == 1  # the one-on-one wording, exactly once
     assert [m for m in brain.shown if m.content == MENTION_NUDGE] == []  # not the mention wording
+
+
+class _CutOffBrain(_Brain):
+    """A scripted brain that also reports the vendor's finish reason — ``length`` cuts a turn off."""
+
+    def __init__(self, *replies, reasons):
+        super().__init__(*replies)
+        self.reasons = list(reasons)
+        self.last_finish_reason = None
+        self.all_shown: list[list[Message]] = []
+
+    def chat(self, messages, tools=None):
+        self.last_finish_reason = self.reasons[min(self.calls, len(self.reasons) - 1)]
+        self.all_shown.append(list(messages))
+        return super().chat(messages, tools)
+
+
+def test_a_resumed_turn_that_already_spoke_is_never_told_it_said_nothing(platform, tmp_path):
+    """A turn that posted and was then cut off must not be nudged when its continuation ends.
+
+    Arming reads its baseline off the wake's speech ledger, and a resume re-arms — so the post the
+    turn made *before* it was cut off sat under the baseline, the continuation ended on plain text
+    (as the truncation note asks it to), and the one-on-one arm told the agent it had posted
+    nothing: an invitation to say it all again. The transcript is the record of what the turn did,
+    so a resume of a turn whose work holds a timeline action does not arm (issue #596).
+    """
+    _wire(platform, body="What version are you running?", room="one_on_one")
+    brain = _CutOffBrain(
+        _speak("0.135.1."),  # answers through the tool…
+        Message.assistant(content="Told them the versi"),  # …and its narration is cut off
+        Message.assistant(content="on. Nothing else outstanding."),  # the continuation finishes
+        reasons=("stop", "length", "stop"),
+    )
+    harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+
+    agent.wake()
+
+    assert brain.calls == 3  # no fourth, nudged pass
+    shown = [m for turn in brain.all_shown for m in turn]
+    assert [m for m in shown if m.content in (MENTION_NUDGE, ONE_ON_ONE_NUDGE)] == []
+    assert _posts(platform) == ["0.135.1."]  # said once
 
 
 def test_a_one_on_one_agent_that_speaks_is_not_nudged(platform, tmp_path):

@@ -56,6 +56,23 @@ its members that a second identical request can actually fix. Deliberately **out
   the SDK failing to parse a **truncated or malformed body** — the EOF-mid-JSON class of issue #259
   — where the bytes never arrived whole.)
 
+A timeout is its own class, and it is retried once, with more time
+-----------------------------------------------------------------
+``timeout`` is in `RETRYABLE_REASONS`, but it is not retried the way the others are (issue #589).
+Every other member is a fault a second **identical** request can fix: a 429 clears, a 5xx was the
+server's hiccup, a mangled body arrives whole next time, a dropped connection reconnects. A timeout
+is the one where the identical request is the one thing guaranteed **not** to help — it waits the
+identical time and runs out the identical way. On 2026-09-29 that cost @glm-5.2 three full minutes
+per step (a 60 s wall, then 0.5 s and 1 s later the same request into the same wall), four wakes in
+a row.
+
+So a timeout earns **at most one** retry (`TIMEOUT_RETRIES`), and that retry runs at
+`_timeouts.TIMEOUT_RETRY_SCALE` times the budget: `Retry.timeout_scale` is what the caller binds on
+the adapter before the next attempt (`_timeouts.bind_scale`). The line says so — a timeout retry
+carries ``timeout_scale=`` and, when the adapter reports what it applied, the budget it ran out of
+(``timeout=``) and the one the retry gets (``next_timeout=``). A second timeout is not retried: a
+fit that has been exceeded at twice its size is not describing a slow answer.
+
 The budget, and why a cap is not an expectation
 -----------------------------------------------
 At most `RETRY_ATTEMPTS` retries and at most `RETRY_BUDGET_SECONDS` of **total sleep per call**. The
@@ -93,7 +110,9 @@ import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from basecradle_harness._exceptions import ProviderTimeoutError
 from basecradle_harness._observability import _secs, log_llm_retry
+from basecradle_harness._timeouts import TIMEOUT_RETRY_SCALE
 
 #: How many **extra** attempts a transient fault earns: 2 retries, so 3 attempts in all. Small on
 #: purpose — the faults this covers clear in about a second or not at all, and a call that has been
@@ -122,6 +141,11 @@ RETRYABLE_REASONS = frozenset(
     {"rate_limited", "server_error", "transport", "timeout", "invalid_response"}
 )
 
+
+#: How many retries a **timeout** earns, whatever the call's attempt count (issue #589): one, at
+#: `_timeouts.TIMEOUT_RETRY_SCALE` times the budget. See the module docstring for why a timeout is
+#: never re-sent into the same wall.
+TIMEOUT_RETRIES = 1
 
 #: How far `connection_reason` walks an exception's cause chain. An adapter chains what its SDK
 #: raised, and an SDK chains what *its* transport raised, so the fact being looked for is one or two
@@ -184,14 +208,24 @@ def connection_reason(exc: object) -> str:
     of which is an optional extra, and a fourth family would fall out of it silently. A class that
     calls itself a timeout is the fact all of them share.
 
-    Anything else reads as ``transport``: the fallback is the broader, safer word, and both are in
-    `RETRYABLE_REASONS`, so a misread in **either** direction costs a less precise line and never a
-    lost retry — which is what makes a suffix match the right precision for this question. Two known
-    imprecisions, stated rather than left to be discovered: the native xAI gRPC path's
-    ``DEADLINE_EXCEEDED`` names no timeout class at all and reads ``transport``, and a class
-    deliberately named so as to end in ``Timeout`` without being one would read ``timeout`` (no
-    library names an exception that way; a test written to be adversarial does).
+    **A `ProviderTimeoutError` answers first, and the walk is now the fallback** (issue #589). Since
+    a timeout is retried differently from a transport failure — once, with more time, rather than
+    as it was — the word is no longer only a log word, and a misread now costs a retry of the wrong
+    shape. So every shipped adapter types its timeouts at the boundary that can see them, and the
+    walk remains for an adapter that only ever raises the parent class.
+
+    For such an adapter, anything else reads as ``transport``: the fallback is the broader word,
+    retried as it always was. One known imprecision, stated rather than left to be discovered: a
+    class deliberately named so as to end in ``Timeout`` without being one would read ``timeout``
+    (no library names an exception that way; a test written to be adversarial does). The native xAI
+    ``DEADLINE_EXCEEDED`` that used to read ``transport`` is typed by its adapter now.
     """
+    if isinstance(exc, ProviderTimeoutError):
+        # The adapter knew, and said so with the type (issue #589) — the answer that needs no
+        # inference. It is also the only answer the native xAI path can give: a gRPC
+        # ``DEADLINE_EXCEEDED`` names no timeout class, so the cause walk below reads it
+        # ``transport`` and a deadline would be retried as if the network had dropped.
+        return "timeout"
     seen = exc
     for _ in range(_CAUSE_DEPTH):
         cause = getattr(seen, "__cause__", None)
@@ -299,6 +333,14 @@ class Retry:
         #: Seconds actually slept so far. The budget is read off this, never off a wall clock: the
         #: thing being bounded is the wait this code chose, not how slow the vendor was.
         self.slept = 0.0
+        #: How much of its fitted budget the **next** attempt gets (issue #589). ``1.0`` until a
+        #: timeout is retried, then `_timeouts.TIMEOUT_RETRY_SCALE` for every attempt after it —
+        #: more time never hurts an attempt that failed for another reason. The caller binds it on
+        #: the adapter before each attempt (`_timeouts.bind_scale`); `Retry` never reaches the
+        #: adapter itself, because what a caller calls is the caller's to know.
+        self.timeout_scale = 1.0
+        #: Timeout retries made so far — capped at `TIMEOUT_RETRIES` whatever `attempts` allows.
+        self._timeout_retries = 0
 
     @property
     def retried(self) -> bool:
@@ -311,18 +353,46 @@ class Retry:
         """
         return self.attempt > 1
 
-    def again(self, exc: object, *, reason: str | None, is_config: bool = False) -> bool:
+    def again(
+        self,
+        exc: object,
+        *,
+        reason: str | None,
+        is_config: bool = False,
+        timed_out_after: float | None = None,
+    ) -> bool:
         """Record this attempt's failure; wait and answer ``True`` when it is worth another.
 
         ``False`` — do not retry — is the answer for a fault outside `RETRYABLE_REASONS`, for a
-        config-class fault, and for a retryable one that has run out of attempts. **Nothing is
-        logged in that case**: the caller is about to write the final line, and a retry line for a
-        retry that never happened would put a WARNING in the journal for an event that did not
-        occur.
+        config-class fault, for a retryable one that has run out of attempts, and for a **second**
+        timeout (`TIMEOUT_RETRIES`). **Nothing is logged in that case**: the caller is about to
+        write the final line, and a retry line for a retry that never happened would put a WARNING
+        in the journal for an event that did not occur.
+
+        A timeout that *is* retried raises `timeout_scale` for the attempts after it (issue #589).
+        ``timed_out_after`` is the generation budget the adapter applied to the attempt that timed
+        out (`_timeouts.last_timeout`), when it says; with it the line names both the budget that
+        ran out and the one the retry gets, so "retried with a larger budget" is read off the
+        journal rather than inferred from it.
         """
         self.attempt += 1
         if not retryable(reason, is_config=is_config) or self.attempt >= self.attempts:
             return False
+        timing: dict[str, Any] = {}
+        if reason == "timeout":
+            if self._timeout_retries >= TIMEOUT_RETRIES:
+                return False
+            self._timeout_retries += 1
+            self.timeout_scale = TIMEOUT_RETRY_SCALE
+            timing = {
+                "timeout": None if timed_out_after is None else _secs(timed_out_after),
+                "timeout_scale": _scale(TIMEOUT_RETRY_SCALE),
+                "next_timeout": (
+                    None
+                    if timed_out_after is None
+                    else _secs(timed_out_after * TIMEOUT_RETRY_SCALE)
+                ),
+            }
         wait = self._wait_for(exc, reason or "")
         log_llm_retry(
             provider=self.provider,
@@ -333,7 +403,7 @@ class Retry:
             reason=reason,
             next_in=wait,
             diagnostics=diagnostics(exc),
-            extra=self._extra,
+            extra={**timing, **self._extra},
         )
         self.slept += wait
         if wait > 0:
@@ -353,6 +423,11 @@ class Retry:
         hinted = _retry_after(exc)
         wait = self._backoff(self.attempt, reason) if hinted is None else hinted
         return min(max(0.0, float(wait)), remaining)
+
+
+def _scale(value: float) -> str:
+    """A budget multiplier as the line prints it: ``2``, not ``2.0`` — a factor, not a duration."""
+    return f"{value:g}"
 
 
 def _default_backoff(attempt: int, reason: str) -> float:

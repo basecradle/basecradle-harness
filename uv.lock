@@ -292,14 +292,14 @@ wheels = [
 
 [[package]]
 name = "basecradle"
-version = "0.9.0"
+version = "0.10.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2e/59/b16e5e43facd81296e7a428dd7ce29ee1ab8386370189b79d75ab6d14bf6/basecradle-0.9.0.tar.gz", hash = "sha256:99a9a5bbeb522c0a797bf074923170ab21bf867f109d4094b2a1a627f203965f", size = 118064, upload-time = "2026-09-23T02:54:58.832Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b4/84/e1730272e174f4354e7acd67f75a095eadfb79a9aba85cbf63d033ff64f1/basecradle-0.10.0.tar.gz", hash = "sha256:7e9b255d21aec35cf21cb41c1ea5b2ea759b21834dddc01e01bf23055810e5f3", size = 122210, upload-time = "2026-09-23T03:28:50.737Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/53/0e/9ae7294a6a6c1cd42050a9543041923c8be243a147728ec9cbe231ef5611/basecradle-0.9.0-py3-none-any.whl", hash = "sha256:3e85df116a2ec6dad2accacd9431dfb39e5f5ea9889e241747fb34533b0286e6", size = 36854, upload-time = "2026-09-23T02:54:57.562Z" },
+    { url = "https://files.pythonhosted.org/packages/8e/ea/3f4b4c16031cd8f79cb32ac965f3769ebfedae968d19c844a0c1ed752e2f/basecradle-0.10.0-py3-none-any.whl", hash = "sha256:8da7f1d5e2d95b5c0cef97714b7f687db1201debd9116d4308a9577c8e956005", size = 38835, upload-time = "2026-09-23T03:28:49.551Z" },
 ]
 
 [[package]]
@@ -922,15 +922,15 @@ wheels = [
 
 [[package]]
 name = "httpcore2"
-version = "2.10.0"
+version = "2.13.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "h11" },
     { name = "truststore" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a9/83/a896fc59940fc5a6e2aff3a4be1d92fa890112936803b331cae75a993c34/httpcore2-2.10.0.tar.gz", hash = "sha256:13c0cc3d1919d4f28457f60cd2c2abe04113a8af184ccf1142811beba936f9dc", size = 67427, upload-time = "2026-08-09T09:11:32.123Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cb/f3/1db7aa2bc2524062192bb0e0323969492d1883152a232fe36eea65f4e35c/httpcore2-2.13.1.tar.gz", hash = "sha256:e0aa977abe17e69a3b820a24542a6fa88702676d83880b8d194dcd18408e5103", size = 68071, upload-time = "2026-09-23T07:47:22.372Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/4f/d149104195a35e2853a2fc203a8e3477747e58c80e17dda686dace174383/httpcore2-2.10.0-py3-none-any.whl", hash = "sha256:7df06cfb34070cae4f7c89be69dc1095eca138e9704ceffb98d25c1912ab6f01", size = 83000, upload-time = "2026-08-09T09:11:29.555Z" },
+    { url = "https://files.pythonhosted.org/packages/09/ba/a4568248771ce81957bfb7cc600264a40fbcda092391ee1c415c50be4bea/httpcore2-2.13.1-py3-none-any.whl", hash = "sha256:e1e05d4f25f7d7d496bfb96748f6f4b67657b03da069b3a68c36069f3db73d0a", size = 83423, upload-time = "2026-09-23T07:47:19.365Z" },
 ]
 
 [[package]]
@@ -1000,7 +1000,7 @@ wheels = [
 
 [[package]]
 name = "httpx2"
-version = "2.10.0"
+version = "2.13.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio", marker = "sys_platform != 'emscripten'" },
@@ -1010,9 +1010,9 @@ dependencies = [
     { name = "truststore", marker = "sys_platform != 'emscripten'" },
     { name = "typing-extensions", marker = "python_full_version < '3.13'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bd/3d/f9a8c07a3884f3e5b26205e8436a18b3af61c5d53192c3bea235574dbbec/httpx2-2.10.0.tar.gz", hash = "sha256:8741d7329fe2c7885fc9ceb61c8217acfb87a85f75723714b89ebf7ad7196338", size = 98749, upload-time = "2026-08-09T09:11:33.24Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d5/44/474bef2a0e9d90f1715d32cb98b0738695ca17ba324095fb2497ed7fbd59/httpx2-2.13.1.tar.gz", hash = "sha256:e48744a19e3af5ee48313d0ce5fe941d5422fae5705ea922a4aabf94d7800dfa", size = 100405, upload-time = "2026-09-23T07:47:23.052Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b9/6d/a637d52449d98a6892d9a4dc0262587afdb6a66f201871842dce5a97b1c1/httpx2-2.10.0-py3-none-any.whl", hash = "sha256:5e3194a432701e1cc6f69a8b1b2fa199ef907013fede8d9a09a2c5b7b8141a18", size = 94355, upload-time = "2026-08-09T09:11:30.882Z" },
+    { url = "https://files.pythonhosted.org/packages/d8/9c/6fe8931fd9f381042a9e4c7d5a7b4cbf7016b252bec0c99a49fce42c3326/httpx2-2.13.1-py3-none-any.whl", hash = "sha256:6dff50fabc270ee5fd25d845d0b078ed20564579744d6d962850975996d2f9a4", size = 95597, upload-time = "2026-09-23T07:47:20.995Z" },
 ]
 
 [[package]]
@@ -1787,7 +1787,7 @@ wheels = [
 
 [[package]]
 name = "openai"
-version = "3.14.1"
+version = "3.19.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
@@ -1797,14 +1797,14 @@ dependencies = [
     { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a2/a5/bc3681f645a0d026332047cc19a703315979740a11a5763f46c163abd614/openai-3.14.1.tar.gz", hash = "sha256:2f3423a71af767d9071b059cf6df1e97a721c3a8d19417375ad7993d4df0d346", size = 1634770, upload-time = "2026-09-15T23:13:35.708Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7c/91/2d5722388a50cc86e162779df5fbfe0afa652a6e2d5c9ee616e081a82098/openai-3.19.2.tar.gz", hash = "sha256:de185f9834ad064d965ec42bd0766731cf66bceea16a7670294a835d207019e6", size = 1716953, upload-time = "2026-09-24T00:06:07.315Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f7/13/d1caa2b2385ed22a1e10e1fd7fc09a92e282cffadad49c569827315f468a/openai-3.14.1-py3-none-any.whl", hash = "sha256:a6758739282f3b1cafe8df1204f7a2f7b1e9edbbcfa41c0efba687448fbc51cf", size = 2003545, upload-time = "2026-09-15T23:13:33.164Z" },
+    { url = "https://files.pythonhosted.org/packages/bd/20/4fe123e60525375878c67d1d8d051c9c5dec81cc56a579ba9304ca743303/openai-3.19.2-py3-none-any.whl", hash = "sha256:66247fcd07266e72536e90656dc27f3b0bb1e9d8696d4013fc55402c0b96a5c2", size = 2071459, upload-time = "2026-09-24T00:06:05.416Z" },
 ]
 
 [[package]]
 name = "openrouter"
-version = "1.1.156"
+version = "1.2.22"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpcore" },
@@ -1812,9 +1812,9 @@ dependencies = [
     { name = "jsonpath-python" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/da/0d/a06176db9b08a20c42a912d51d853b81f1c5466ded421f971b2dc2b3bb90/openrouter-1.1.156.tar.gz", hash = "sha256:417768e1b638035355576d34c9ad047b67bbbe6293c99a66c96688f510864ee9", size = 479998, upload-time = "2026-09-17T06:14:12.385Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/16/bb/f95f1595c38263c0dc95b32fbdd4bf2fda7e5c9b3672ca7baca7693009cb/openrouter-1.2.22.tar.gz", hash = "sha256:abb9469e05195682bf54401c4bb3da46ad45c34a364419101d0220c05471476a", size = 507055, upload-time = "2026-09-23T21:57:21.812Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a8/30/4febdab971c6a517149d0a8b51edb5ad28e1b08d05c4a5d6542dc04a9706/openrouter-1.1.156-py3-none-any.whl", hash = "sha256:3b3f7e5e93ac671a5c30d098634f5aee1b2510435ae1dc8f89fba7545556ac43", size = 1029256, upload-time = "2026-09-17T06:14:10.653Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/1a/1b1facf104525e087fad9fc0d8e9dde3b2a2bca7f8a5b7bb192c1fcb303f/openrouter-1.2.22-py3-none-any.whl", hash = "sha256:6ec6ed1ae35808d319046294a98f955510276fbfe6a2c8d34573f5382f7f8082", size = 1087839, upload-time = "2026-09-23T21:57:20.198Z" },
 ]
 
 [[package]]

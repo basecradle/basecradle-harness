@@ -44,16 +44,19 @@ from basecradle_harness import (
     Engine,
     Message,
     MessagesTool,
+    ProviderBillingError,
     Session,
     Tool,
     ToolCall,
     ToolRegistry,
 )
+from basecradle_harness import _wake as _wake_module
 from basecradle_harness._engine import _TRUNCATED_NOTE, is_truncation_note
 from basecradle_harness._memory_provider import MemoryExchange, MemoryProvider
 from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openrouter import OpenRouterProvider
 from basecradle_harness._wake import (
+    RESUME_CEILING,
     ClaimStore,
     MarkStore,
     SeenStore,
@@ -62,20 +65,25 @@ from basecradle_harness._wake import (
 )
 from basecradle_harness._xai_sdk import XaiSdkProvider
 from tests.test_wake import (
+    A0,
+    A1,
     BC_URL,
     M0,
     M1,
     M2,
     PNG_BYTES,
+    PROBE_SECRET,
     REPLY,
     TIMELINE_UUID,
     _posts,
+    asset,
     asset_page,
     build_wake,
     dashboard,
     event_page,
     message,
     page,
+    probe_marker,
     serve_messages,
     task,
     task_page,
@@ -139,6 +147,24 @@ class _CutOff:
         self.calls += 1
         reply = self._replies[min(self.calls - 1, len(self._replies) - 1)]
         return reply
+
+
+class _CutOffThenDown(_CutOff):
+    """Cut off once, then unreachable — so the turn is still unfinished when the wake ends.
+
+    Since issue #596 a wake finishes its own truncated turn before it ends (`WakeAgent.wake` runs the
+    recovery again, in-wake). A continuation that cannot reach the model is the one way an
+    unfinished turn still outlives the wake that cut it off, and it is what the tests of the
+    *cross-wake* half of the guarantee — the resume issue #297 built — are driven through. A plain
+    `RuntimeError`, deliberately: it is not a fault of the turn, so it never counts toward #589's
+    ceiling, and the engine does not retry it, so no backoff sleeps in a test.
+    """
+
+    def chat(self, messages, tools=None):
+        if self.calls >= len(self._replies):
+            self.calls += 1
+            raise RuntimeError("the provider is unreachable")
+        return super().chat(messages, tools)
 
 
 class _Finishes:
@@ -395,22 +421,30 @@ def test_every_shipped_adapter_records_the_finish_reason():
 # === the wake: a truncated turn is not committed ==============================
 
 
-def test_a_truncated_turn_leaves_the_message_pending(platform, tmp_path):
-    """The whole point. The mark does not move and the claim stays in-flight.
+def test_a_truncated_turn_leaves_the_message_pending(platform, tmp_path, caplog):
+    """The whole point. A turn this wake could not finish is never committed as it stands.
 
     Committing here is the defect: the mark is a **cursor**, so moving it past this message hides
     it from every future wake, forever — and the peer, who can see the agent said nothing, has no
-    way to tell that from an agent that read them and chose silence.
+    way to tell that from an agent that read them and chose silence. (The wake tries to finish the
+    turn itself first, issue #596; here the continuation cannot reach the model.)
     """
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    agent, _ = build_wake(tmp_path, _CutOff())
+    agent, _ = build_wake(tmp_path, _CutOffThenDown())
 
-    agent.wake()
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        agent.wake()
 
+    # …and says, greppably, that it is waiting on a wake nothing is scheduled to start (#596).
+    assert any(
+        "wake deferred" in r.getMessage() and "reason=resume_failed" in r.getMessage()
+        for r in caplog.records
+    )
     assert MarkStore(tmp_path).get(TIMELINE_UUID) is None  # the cursor did not pass it
     assert _claim(tmp_path).phase == "in-flight"  # and the item is still owed an answer
+    assert _claim(tmp_path).resumes == 0  # an unreachable model is not a fault of the turn
     # The evidence the *next* wake will classify on is on disk, not just in this process.
-    assert _transcript(tmp_path)[-1]["content"] == _TRUNCATED_NOTE
+    assert any(t.get("content") == _TRUNCATED_NOTE for t in _transcript(tmp_path))
 
 
 def test_the_next_wake_finishes_the_turn_rather_than_starting_it_again(platform, tmp_path):
@@ -421,7 +455,7 @@ def test_the_next_wake_finishes_the_turn_rather_than_starting_it_again(platform,
     nobody, forever, one wake at a time. Continuing from the fragment converges.
     """
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    first, _ = build_wake(tmp_path, _CutOff())
+    first, _ = build_wake(tmp_path, _CutOffThenDown())
     first.wake()
 
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
@@ -447,7 +481,7 @@ def test_a_truncated_turn_that_already_spoke_never_speaks_twice(platform, tmp_pa
     nothing, because the tool's result is already on disk.
     """
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    speaks = _CutOff(
+    speaks = _CutOffThenDown(
         Message.assistant(
             tool_calls=[
                 ToolCall(id="c1", name="messages", arguments={"action": "create", "body": "Owls!"})
@@ -470,22 +504,369 @@ def test_a_truncated_turn_that_already_spoke_never_speaks_twice(platform, tmp_pa
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
 
 
-def test_a_resume_that_truncates_again_stays_pending(platform, tmp_path):
-    """Repeating means the output budget is too small for what this turn is trying to say.
+def test_a_stall_on_the_last_pass_is_not_reported_as_deferred(
+    platform, tmp_path, caplog, monkeypatch
+):
+    """`wake deferred` means *still pending, with nothing scheduled to finish it* — so a turn that
+    stalled on the wake's last allowed pass is settled, and must not be reported as deferred.
 
-    The harness says so — loudly, every time — and leaves the item pending rather than committing a
-    fragment. Raising the budget is the operator's call, and the harness never makes it for them.
+    The shape that reaches it: the message turn is cut off once and finished on the next pass, and
+    the task that pass then drives is cut off every time — its two continuations and its stall land
+    on the third and fourth passes, and the backstop is lowered to four so that is the last.
+    """
+    monkeypatch.setattr(_wake_module, "_MAX_WAKE_PASSES", 4)
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200, json=task_page(task(uuid=M1, instructions="check the owl feeder"))
+        )
+    )
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),
+        Message.assistant(content="…ecies of owl. That is the whole of it."),
+        Message.assistant(content="Checking the fee"),
+        Message.assistant(content="der now"),
+        Message.assistant(content=", and the"),
+        reasons=("length", "stop", "length", "length", "length"),
+    )
+    agent, _ = build_wake(tmp_path, brain, tools=[MessagesTool()])
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert brain.calls == 5
+    assert _claim(tmp_path).phase == "done"  # the message, finished on the second pass
+    assert (
+        _claim(tmp_path, M1, kind="tasks").phase == "abandoned"
+    )  # the task, stalled on the fourth
+    assert len(_posts(platform)) == 1  # its stall note
+    assert not any("wake deferred" in r.getMessage() for r in caplog.records)
+
+
+def test_a_stall_clears_the_latch_so_its_own_pass_answers_what_came_after(
+    platform, tmp_path, caplog
+):
+    """A stall settles the cut-off turn, so the latch has nothing left to protect — it is cleared
+    in the stall's own pass, which goes on to answer what came after. Left set, the work behind it
+    would wait for a pass the wake might not have left (the review of #596 found exactly that: a
+    second task, held back on the last pass, never claimed, never recorded, never reported).
     """
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    build_wake(tmp_path, _CutOff())[0].wake()
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200,
+            json=task_page(
+                task(uuid=M2, instructions="water the owl box"),
+                task(uuid=M1, instructions="check the owl feeder"),
+            ),
+        )
+    )
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),  # pass 1: the message, cut off
+        Message.assistant(content="…ecies. That is all."),  # pass 2: finished
+        Message.assistant(content="Checking the fee"),  # pass 2: task M1, cut off
+        Message.assistant(content="der now"),  # pass 3: M1 continued, cut off
+        Message.assistant(content=", and the"),  # pass 4: M1 cut off again → stalled
+        Message.assistant(content="Watered."),  # pass 4, same pass: task M2, answered
+        reasons=("length", "stop", "length", "length", "length", "stop"),
+    )
+    agent, _ = build_wake(tmp_path, brain, tools=[MessagesTool()])
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert brain.calls == 6
+    assert _claim(tmp_path, M1, kind="tasks").phase == "abandoned"
+    assert _claim(tmp_path, M2, kind="tasks").phase == "done"
+    assert SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks") == {M1, M2}
+    passes = [r.getMessage() for r in caplog.records if "wake continuing" in r.getMessage()]
+    assert len(passes) == 3  # passes 2, 3 and 4 — no fifth pass was needed for M2
+    assert not any("wake deferred" in r.getMessage() for r in caplog.records)
+
+
+def test_an_earlier_wakes_turn_first_continued_on_a_later_pass_still_makes_progress(
+    platform, tmp_path
+):
+    """Progress resets the count only on the *first* continuation a wake makes of a turn — and that
+    is a property of the turn, not of the pass it happens to run on. Here an earlier wake's task
+    turn is first continued on pass 2 (pass 1 was held by a message cut off ahead of it); its words
+    still count as progress, so it gets the same two further continuations any turn gets."""
+    serve_messages(platform, page())
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200, json=task_page(task(uuid=M1, instructions="check the owl feeder"))
+        )
+    )
+    build_wake(tmp_path, _CutOffThenDown())[0].wake()  # wake 1: the task, cut off, left pending
+    assert _claim(tmp_path, M1, kind="tasks").phase == "in-flight"
 
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    second, brain = build_wake(tmp_path, _CutOff(Message.assistant(content="ecies of ow")))
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),  # pass 1: the message, cut off
+        Message.assistant(content="…ecies. That is all."),  # pass 2: finished
+        Message.assistant(content="der, and"),  # pass 2: M1's first continuation — progress
+        Message.assistant(content=" the seed"),  # pass 3: counts (1)
+        Message.assistant(content=" tray"),  # pass 4: counts (2) → stalled
+        reasons=("length", "stop", "length", "length", "length"),
+    )
+    second, _ = build_wake(tmp_path, brain, tools=[MessagesTool()])
     second.wake()
 
-    assert brain.calls == 1  # it did resume
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) is None  # and it is still not finished
+    assert brain.calls == 5
+    assert _claim(tmp_path).phase == "done"
+    assert _claim(tmp_path, M1, kind="tasks").phase == "abandoned"
+
+
+def test_a_probe_a_later_pass_re_reads_is_acked_once(platform, tmp_path):
+    """A later pass re-reads the list from the mark, which is held behind the cut-off message — so
+    a NOC probe newer than it comes round again. It was acked on the first pass; it is not acked a
+    second time (the review of #596: without this a wake could post up to four acks)."""
+    MarkStore(tmp_path).set(TIMELINE_UUID, "019e7750-0000-7000-8000-000000000000")
+    serve_messages(
+        platform,
+        page(message(uuid=M1, body=probe_marker()), message(uuid=M0, body=BODY)),
+    )
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),
+        Message.assistant(content="…ecies. That is all."),
+        reasons=("length", "stop"),
+    )
+    agent, _ = build_wake(tmp_path, brain, probe_secret=PROBE_SECRET)
+
+    posted = agent.wake()
+
+    assert brain.calls == 2  # the cut-off turn, then its continuation on pass 2
+    assert len([p for p in _posts(platform) if "ACK" in p]) == 1
+    assert len(posted) == 1
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+
+
+def test_an_item_the_recovery_settled_is_recorded_even_behind_a_latch(platform, tmp_path):
+    """The latch holds back work that needs the model; it has no business holding back an item the
+    recovery just settled without one. Here a task's turn finished before its wake was killed (the
+    narration is on disk, the claim was never committed), and the next wake hits the out-of-funds
+    wall on the message ahead of it: the task is committed by `_recover` and must be recorded in
+    that same wake, not left for one nothing is scheduled to start."""
+
+    class _Killed(BaseException):
+        pass
+
+    class _DiesMining(_RecordingMemory):
+        def observe(self, exchange):
+            raise _Killed  # after the turn's narration is on disk, before its claim is committed
+
+    serve_messages(platform, page())
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200, json=task_page(task(uuid=M1, instructions="check the owl feeder"))
+        )
+    )
+    doomed, _ = build_wake(tmp_path, _Finishes(), memory_provider=_DiesMining())
+    with pytest.raises(_Killed):
+        doomed.wake()
+    assert _claim(tmp_path, M1, kind="tasks").phase == "in-flight"
+
+    class _Unfunded:
+        provider, model = "openai", "gpt-4o"
+
+        def chat(self, messages, tools=None):
+            raise ProviderBillingError("Insufficient credits", status_code=402)
+
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    build_wake(tmp_path, _Unfunded(), tools=[MessagesTool()])[0].wake()
+
+    assert _claim(tmp_path, M1, kind="tasks").phase == "done"
+    assert SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks") == {M1}
+    assert _claim(tmp_path).phase == "in-flight"  # the message waits for funding, as it should
+
+
+def test_the_backstop_names_what_it_leaves_waiting(platform, tmp_path, caplog, monkeypatch):
+    """Past the pass backstop, whatever is still waiting is named: the cut-off turn, and the work its
+    latch held back. Ordinary work never reaches the backstop; a defect that did would otherwise
+    leave both silently in flight."""
+    monkeypatch.setattr(_wake_module, "_MAX_WAKE_PASSES", 1)
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200, json=task_page(task(uuid=M1, instructions="check the owl feeder"))
+        )
+    )
+    agent, _ = build_wake(tmp_path, _CutOff())
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        agent.wake()
+
+    deferred = [r.getMessage() for r in caplog.records if "wake deferred" in r.getMessage()]
+    assert any(f"item={M0}" in d and "reason=truncated" in d for d in deferred)
+    assert any(f"item={M1}" in d and "reason=held_back" in d for d in deferred)
+
+
+def test_an_asset_probe_a_later_pass_re_reads_is_acked_once(platform, tmp_path):
+    """The per-item seams re-read from their own cursor too: an asset probe newer than an asset whose
+    turn was cut off comes round on the next pass, and is not acked a second time."""
+    serve_messages(platform, page())
+    MarkStore(tmp_path).set(TIMELINE_UUID, "019e7780-0000-7000-8000-000000000000", kind="assets")
+    platform.get("/assets").mock(
+        return_value=httpx.Response(
+            200,
+            json=asset_page(
+                asset(uuid=A1, description=probe_marker()),
+                asset(uuid=A0),
+            ),
+        )
+    )
+    brain = _CutOff(
+        Message.assistant(content="A barn owl, perched on a fe"),
+        Message.assistant(content="nce post. That is the picture."),
+        reasons=("length", "stop"),
+    )
+    agent, _ = build_wake(tmp_path, brain, probe_secret=PROBE_SECRET)
+
+    agent.wake()
+
+    assert brain.calls == 2
+    assert len([p for p in _posts(platform) if "ACK" in p]) == 1
+    assert _claim(tmp_path, A0, kind="assets").phase == "done"
+
+
+def test_a_note_refused_then_posted_in_the_same_wake_is_not_reported_as_waiting(
+    platform, tmp_path, caplog
+):
+    """`wake deferred` is decided at the end of the wake, for what is still unsettled then — so a
+    stall note the platform refuses on one pass and takes on the next leaves nothing to report."""
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    replies = iter(
+        [
+            httpx.Response(423, json={"error": "This timeline is locked."}),
+            httpx.Response(201, json={"message": message(uuid=REPLY, body="note", mine=True)}),
+        ]
+    )
+    platform.post(f"/timelines/{TIMELINE_UUID}/messages").mock(
+        side_effect=lambda request: next(replies)
+    )
+    agent, _ = build_wake(tmp_path, _CutOff(), tools=[MessagesTool()])
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        agent.wake()
+
+    assert _claim(tmp_path).phase == "abandoned"  # the note went out on the pass after the refusal
+    assert not any("wake deferred" in r.getMessage() for r in caplog.records)
+
+
+def test_a_stall_that_mixes_a_written_and_an_empty_continuation_says_what_is_true(
+    platform, tmp_path
+):
+    """The note says "each" of the attempts failed the same way, so its detail has to be true of
+    both: one continuation wrote something and one wrote nothing, and what they share is being cut
+    off at the budget — never "each ran out before writing anything"."""
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),
+        Message.assistant(content="ecies of ow"),
+        Message.assistant(content=""),
+    )
+    agent, _ = build_wake(tmp_path, brain, tools=[MessagesTool()])
+
+    agent.wake()
+
+    (note,) = _posts(platform)
+    assert "cut off at its output budget before the answer was complete" in note
+    assert "before writing anything" not in note
+
+
+def test_a_truncated_turn_is_finished_in_the_same_wake(platform, tmp_path, caplog):
+    """Issue #596: the wake that cut a turn off finishes it, rather than waiting for a next wake.
+
+    The router wakes an agent only on an event, and a truncated turn exits clean — so "the next wake
+    finishes it" meant a peer's half-answered question sat until somebody else spoke. The wake now
+    runs its reconciles again once the pass ends (the next wake, started early), and the recovery it
+    already has resumes the turn from the fragment: one question, one continuation, one answer.
+    """
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),
+        Message.assistant(content="…ecies of owl. That is the whole of it."),
+        reasons=("length", "stop"),
+    )
+    agent, _ = build_wake(tmp_path, brain)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert brain.calls == 2
+    continuation = brain.seen[1]
+    assert sum(1 for m in continuation if m.role == "user" and not m.injected) == 1  # resumed…
+    assert any(m.role == "assistant" and m.content == "The barn owl is a sp" for m in continuation)
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # …and settled, in this wake
+    assert _claim(tmp_path).phase == "done"
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("wake continuing" in line and "pass=2" in line for line in lines)
+    assert not any("wake deferred" in line for line in lines)
+    assert not _posts(platform)  # no stall note: it finished
+
+
+def test_a_turn_that_keeps_being_cut_off_stalls_within_the_wake(platform, tmp_path):
+    """The capital's ruling on #596: inside one wake every continuation counts toward #589's
+    ceiling. A turn gets its fresh attempt and two continuations, and then the stall note — visible,
+    once — rather than a peer left silently half-answered until an event nobody may send."""
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    agent, brain = build_wake(tmp_path, _CutOff(), tools=[MessagesTool()])
+
+    agent.wake()
+
+    assert brain.calls == 1 + RESUME_CEILING
+    (note,) = _posts(platform)
+    assert "cut off at its output budget before the answer was complete" in note
+    assert _claim(tmp_path).phase == "abandoned"
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0  # nothing waits behind it
+
+
+def test_a_resume_that_keeps_being_cut_off_stalls_within_its_wake(platform, tmp_path):
+    """The cross-wake resume follows the same rule once it is inside a wake: its own continuation
+    made progress (a long answer spread over wakes is never stalled for being long, #589), and the
+    continuations it then makes in that wake count, ending in the note."""
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    build_wake(tmp_path, _CutOffThenDown())[0].wake()
     assert _claim(tmp_path).phase == "in-flight"
+
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    second, brain = build_wake(
+        tmp_path, _CutOff(Message.assistant(content="ecies of ow")), tools=[MessagesTool()]
+    )
+    second.wake()
+
+    # The cross-wake resume (progress: the count resets), then two continuations in this wake.
+    assert brain.calls == 1 + RESUME_CEILING
+    assert len(_posts(platform)) == 1  # the stall note, once
+    assert _claim(tmp_path).phase == "abandoned"
+
+
+def test_the_work_a_latch_held_back_is_answered_after_the_stall(platform, tmp_path, caplog):
+    """A stall settles the cut-off turn, but the latch had already held back what came after it in
+    the pass — so the wake runs one more pass and answers that too, rather than leaving it for a
+    wake nothing is scheduled to start."""
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200, json=task_page(task(uuid=M1, instructions="check the owl feeder"))
+        )
+    )
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),
+        Message.assistant(content="ecies of ow"),
+        Message.assistant(content="l, and the"),
+        Message.assistant(content="The feeder is full."),
+        reasons=("length", "length", "length", "stop"),
+    )
+    agent, _ = build_wake(tmp_path, brain, tools=[MessagesTool()])
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    assert brain.calls == 4  # three on the message (then its stall note), one on the task
+    assert _claim(tmp_path).phase == "abandoned"
+    assert SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks") == {M1}
+    assert not any("wake deferred" in r.getMessage() for r in caplog.records)
 
 
 def test_a_truncated_batch_turn_holds_every_message_in_it(platform, tmp_path):
@@ -502,7 +883,7 @@ def test_a_truncated_batch_turn_holds_every_message_in_it(platform, tmp_path):
         message(uuid=M0, body="answered already"),
     )
     serve_messages(platform, inbox)
-    first, _ = build_wake(tmp_path, _CutOff())
+    first, _ = build_wake(tmp_path, _CutOffThenDown())
     first.wake()
 
     claims = ClaimStore(tmp_path)
@@ -534,7 +915,7 @@ def test_a_finished_resume_leaves_a_transcript_that_reads_as_finished(platform, 
     by a second rule.)
     """
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    build_wake(tmp_path, _CutOff())[0].wake()
+    build_wake(tmp_path, _CutOffThenDown())[0].wake()
 
     assert any(t.get("content") == _TRUNCATED_NOTE for t in _transcript(tmp_path))
 
@@ -591,7 +972,7 @@ def test_a_truncated_turn_is_mined_like_any_other(platform, tmp_path):
     """
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
     memory = _RecordingMemory()
-    agent, _ = build_wake(tmp_path, _CutOff(), memory_provider=memory)
+    agent, _ = build_wake(tmp_path, _CutOffThenDown(), memory_provider=memory)
 
     agent.wake()
 
@@ -613,27 +994,25 @@ def test_the_guarantee_covers_every_kind_not_just_messages(platform, tmp_path):
             200, json=task_page(task(uuid=M1, instructions="check the owl feeder"))
         )
     )
-    agent, brain = build_wake(tmp_path, _CutOff())
+    agent, brain = build_wake(tmp_path, _CutOffThenDown())
 
     agent.wake()
 
-    assert brain.calls == 1  # the task did drive a turn, and that turn was cut off
+    assert brain.calls == 2  # the task drove a turn that was cut off, and one continuation failed
     assert _claim(tmp_path, M1, kind="tasks").phase == "in-flight"
     assert SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks") == set()
 
 
 def test_a_wake_that_left_a_turn_unfinished_starts_no_more_model_work(platform, tmp_path):
-    """**The latch, and it is what keeps the resume's evidence alive.**
+    """**The latch, and it is what keeps the resume's evidence alive** — now within one wake (#596).
 
     A turn left cut off is waiting on a resume, and a resume reads the *transcript*. Every further
-    turn this wake runs can compact that transcript (`Session.send` ends in `_compact_if_needed`,
-    and an over-length rescue compacts hard), and a compaction that destroys the unfinished turn
-    turns the next wake's verdict from **resume** into **abandon** — the peer dropped, loudly, by
-    the machinery meant to answer them. So the wake stops starting new turns, exactly as the
-    out-of-funds wall does.
-
-    The deferred items are not dropped: unclaimed, unrecorded, re-read on the next wake. That is
-    the same outcome `_generate_settled` already gives a message that lands during its final build.
+    turn the pass runs can compact that transcript (`Session.send` ends in `_compact_if_needed`, and
+    an over-length rescue compacts hard), and a compaction that destroys the unfinished turn turns
+    the recovery's verdict from **resume** into **abandon** — the peer dropped, loudly, by the
+    machinery meant to answer them. So the pass stops starting new turns, exactly as the
+    out-of-funds wall does, and the next pass — this wake, started over — finishes the cut-off turn
+    *first* and only then drives the task the latch held back.
     """
     serve_messages(platform, page(message(uuid=M0, body=BODY)))
     platform.get("/tasks").mock(
@@ -641,21 +1020,23 @@ def test_a_wake_that_left_a_turn_unfinished_starts_no_more_model_work(platform, 
             200, json=task_page(task(uuid=M1, instructions="check the owl feeder"))
         )
     )
-    agent, brain = build_wake(tmp_path, _CutOff())
+    brain = _CutOff(
+        Message.assistant(content="The barn owl is a sp"),
+        Message.assistant(content="…ecies of owl. That is the whole of it."),
+        Message.assistant(content="The feeder is full."),
+        reasons=("length", "stop", "stop"),
+    )
+    agent, _ = build_wake(tmp_path, brain)
 
     agent.wake()
 
-    # ONE model call: the message batch. The task behind it was never engaged.
-    assert brain.calls == 1
-    assert _claim(tmp_path, M1, kind="tasks") is None  # not even claimed
-    assert SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks") == set()  # …and not recorded
-
-    # The next wake, with a brain that finishes, takes both: the message's turn is resumed and the
-    # task is driven fresh. Nothing was lost by stopping.
-    serve_messages(platform, page(message(uuid=M0, body=BODY)))
-    second, healthy = build_wake(tmp_path, _Finishes())
-    second.wake()
-
-    assert len(healthy.seen) == 2
+    assert brain.calls == 3  # the batch (cut off), its continuation, and only then the task
+    continuation, task_turn = brain.seen[1], brain.seen[2]
+    assert any(is_truncation_note(m) for m in continuation)  # the cut-off turn, finished…
+    assert sum(1 for m in continuation if m.role == "user" and not m.injected) == 1
+    assert "check the owl feeder" in (task_turn[-1].content or "") or any(
+        "check the owl feeder" in (m.content or "") for m in task_turn if m.role == "user"
+    )  # …before the task behind the latch was driven at all
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
+    assert _claim(tmp_path).settled
     assert SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks") == {M1}

@@ -1374,13 +1374,28 @@ def test_model_params_metadata_is_stripped_on_the_xai_sdk_build(monkeypatch, cap
 
 def test_model_params_timeout_is_stripped_on_the_openrouter_build(monkeypatch, caplog):
     # `timeout` is a harness-owned constructor arg — stripped like on the xai-sdk branch, so a
-    # non-numeric value can never reach `int(timeout * 1000)`. Regression guard for the owned-set.
+    # non-numeric value can never reach the adapter's fixed-budget override. Regression guard for
+    # the owned-set.
     _set_openrouter_model_key(monkeypatch)
     _write_model_params({"timeout": "30s", "temperature": 0.2})
     with caplog.at_level("WARNING"):
         provider = _provider_from_config("openrouter", "openrouter", "chat")
     assert provider._default_params == {"temperature": 0.2}
     assert "'timeout'" in caplog.text
+    provider.close()
+
+
+@pytest.mark.parametrize("owned", ["timeout_ms", "retries"])
+def test_model_params_cannot_put_back_a_flat_timeout_or_the_sdks_retry(owned, monkeypatch, caplog):
+    """Both are real `chat.send` keywords, and each quietly undoes issue #589: `timeout_ms` spreads
+    one number across every phase of the request — the flat wall the fitted budget replaced — and
+    `retries` re-arms the SDK's own retry under the engine's. Owned, they are warned and dropped."""
+    _set_openrouter_model_key(monkeypatch)
+    _write_model_params({owned: 60_000, "temperature": 0.2})
+    with caplog.at_level("WARNING"):
+        provider = _provider_from_config("openrouter", "openrouter", "chat")
+    assert provider._default_params == {"temperature": 0.2}
+    assert f"'{owned}'" in caplog.text
     provider.close()
 
 

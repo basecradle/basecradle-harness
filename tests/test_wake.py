@@ -27,6 +27,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from hashlib import sha256
 from importlib import metadata
+from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -43,11 +44,13 @@ from basecradle_harness import (
     MarkStore,
     Message,
     MessagesTool,
+    Policy,
     ProviderBillingError,
     ProviderContextLengthError,
     ProviderPayloadTooLargeError,
     ReadPacer,
     SeenStore,
+    ShellTool,
     StaleTimelineError,
     Tool,
     WakeAgent,
@@ -56,8 +59,10 @@ from basecradle_harness import (
     install,
     render_brain,
 )
+from basecradle_harness import _brief as brief_module
 from basecradle_harness import _wake as wake_module
 from basecradle_harness._basecradle import _incoming_text, _messages_since, _parse_created_at
+from basecradle_harness._brief import your_home_text
 from basecradle_harness._cleanup import prune_settled_claims
 from basecradle_harness._messages import ToolCall
 from basecradle_harness._observability import BLUE, GREEN, RED, RESET, YELLOW
@@ -493,13 +498,16 @@ def _brief_turns(agent):
     return [m for m in history if _is_brief(m)]
 
 
-def build_wake(home, provider=None, *, system_prompt=None, onboard=False, tools=None, **kwargs):
+def build_wake(
+    home, provider=None, *, system_prompt=None, onboard=False, tools=None, policy=None, **kwargs
+):
     """A fresh WakeAgent over `home` — a stand-in for one router-spawned process.
 
     The agent gets a `MessagesTool` by default, because since issue #293 that is the **only** way
     an agent can speak: a harness with no messages tool is a mute agent, and every test that
     asserts a post would be asserting the absence of a tool rather than the presence of a
-    decision. `tools=[]` builds the mute agent deliberately.
+    decision. `tools=[]` builds the mute agent deliberately. `policy` defaults to the harness's
+    own (locked); a shell agent passes `Policy.unlocked()`, the one profile that admits a shell.
     """
     provider = provider or CountingProvider()
     client = BaseCradle(token=FAKE_TOKEN)
@@ -508,6 +516,7 @@ def build_wake(home, provider=None, *, system_prompt=None, onboard=False, tools=
         system_prompt=system_prompt,
         home=home,
         tools=[MessagesTool()] if tools is None else tools,
+        policy=policy,
     )
     agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=client, onboard=onboard, **kwargs)
     return agent, provider
@@ -2344,6 +2353,37 @@ def test_from_env_hands_the_withheld_tools_and_server_notes_on(platform, wake_en
     assert agent.mcp_about == ["about pw"]
 
 
+@pytest.mark.parametrize(
+    ("profile", "opt_in"),
+    [("unlocked", ["shell"]), ("locked", ["shell"]), ("unlocked", [])],
+    ids=["unlocked-opted-in", "locked-opted-in", "unlocked-not-opted-in"],
+)
+def test_from_env_composes_your_home_exactly_for_the_shell_profile(
+    platform, wake_env, monkeypatch, profile, opt_in
+):
+    """Issue #571 on the production path: a real config home, under each half of the double gate.
+
+    Opted in and unlocked, the shipped shell plugin loads and the brief carries the section and the
+    note that points at it. Either gate alone — the opt-in under the locked profile, or the
+    unlocked profile with no opt-in — leaves the agent without a shell, and with it goes the
+    section: it cannot reach the folders, so it is told nothing about them.
+    """
+    install(os.environ["BASECRADLE_CONFIG_HOME"], opt_in=opt_in)
+    monkeypatch.setenv("HARNESS_PROFILE", profile)
+    monkeypatch.setenv("HARNESS_ONBOARD", "1")
+    serve_dashboard_md(platform)
+
+    agent = WakeAgent.from_env(timeline=TIMELINE_UUID)
+    brief = agent._compose_brief()
+
+    if profile == "unlocked" and opt_in:
+        assert _home_section(brief) == your_home_text()
+        assert 'described under "Your Home" in your instructions' in brief  # the shell note
+    else:
+        assert _home_section(brief) is None
+        assert '"Your Home"' not in brief
+
+
 def test_resolved_config_reports_the_resolved_mcp_request_timeout(wake_env, monkeypatch):
     """The MCP-timeout axis (issue #320): `--resolved-config` emits the **resolved** per-request
     MCP timeout — the exact value a wake would use, not a re-read of the raw env — so the NOC can
@@ -3078,6 +3118,131 @@ def test_an_adapter_that_cannot_describe_itself_costs_the_brain_and_not_the_brie
     assert "omitting the brain part" in caplog.text
 
 
+def _home_section(brief: str) -> str | None:
+    """The text between the ``your-home.md`` fence tags, or ``None`` when the part is absent."""
+    if "<your-home.md>\n" not in brief:
+        return None
+    return brief.split("<your-home.md>\n", 1)[1].split("</your-home.md>", 1)[0]
+
+
+def _build_shell_wake(home, **kwargs):
+    """A shell agent: the unlocked profile plus the real, shipped `ShellTool` (issue #571)."""
+    return build_wake(
+        home,
+        tools=[MessagesTool(), ShellTool()],
+        policy=Policy.unlocked(),
+        onboard=True,
+        tool_manifest=[("messages", None), ("shell", None)],
+        **kwargs,
+    )
+
+
+def test_a_shell_agent_is_shown_your_home_byte_for_byte(platform, tmp_path, caplog):
+    """Issue #571, end to end: the packaged file, exactly, after the tools and before the dashboard.
+
+    The bytes between the fence tags are compared with the file itself rather than a phrase from
+    it — "byte-identical to the canonical" is the definition of done, and the canonical's checksum
+    is pinned against that same file in `test_brief`.
+    """
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="Where should I keep my notes?")))
+    agent, model = _build_shell_wake(tmp_path)
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    brief = _brief_shown(model)[0].content
+    assert _home_section(brief) == your_home_text()
+    assert brief.count("## Your Home") == 1
+    assert (
+        brief.index("</manifest>") < brief.index("<your-home.md>") < brief.index("<dashboard.md>")
+    )
+    # Measured under its own name on the attribution line, never folded into `brief`.
+    attribution = next(
+        r.getMessage() for r in caplog.records if "context attribution" in r.getMessage()
+    )
+    fenced_part = f"<your-home.md>\n{your_home_text()}</your-home.md>"
+    assert re.search(r"\bbrief_your_home=(\d+)", plain(attribution)).group(1) == str(
+        len(fenced_part) + 2
+    )
+
+
+def test_an_agent_without_a_shell_is_shown_no_home_section(platform, tmp_path):
+    """The locked profile cannot hold a shell, so it cannot reach the folders: no section at all."""
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="Where should I keep my notes?")))
+    agent, model = build_wake(tmp_path, onboard=True, tool_manifest=[("messages", None)])
+
+    agent.wake()
+
+    brief = _brief_shown(model)[0].content
+    assert _home_section(brief) is None
+    assert "## Your Home" not in brief
+    assert "Your active tools right now:" in brief  # the brief itself was composed
+
+
+@pytest.mark.parametrize(
+    "persona",
+    [
+        "You are Nova Digital.",
+        "You are Nova Digital.\n\n### The Vault (Binding)\n\nMy vault holds what I was entrusted.",
+        "You are Nova Digital.\n\n" + your_home_text(),
+    ],
+    ids=["silent-on-home", "own-vault-binding", "carries-the-whole-section"],
+)
+def test_your_home_is_composed_whatever_the_persona_prompt_says(platform, tmp_path, persona):
+    """The founder's ruling: one plumbing, no detection, and the system prompt is never touched.
+
+    A system prompt that already carries a vault binding — or the whole section — still gets the
+    harness's section, in full, from the same code path; and the system prompt reaches the model
+    exactly as its owner wrote it, with the file on disk byte-identical after the wake.
+    """
+    cfg = Path(os.environ["BASECRADLE_CONFIG_HOME"])
+    install(cfg)
+    system_prompt = cfg / "prompts" / "system-prompt.md"
+    system_prompt.write_text(persona, encoding="utf-8")
+    before = system_prompt.read_bytes()
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, model = _build_shell_wake(tmp_path)
+
+    agent.wake()
+
+    brief = _brief_shown(model)[0].content
+    assert _home_section(brief) == your_home_text()
+    # Trimmed, as every prompt file always is on its way into the brief — and otherwise untouched.
+    assert f"<system-prompt.md>\n{persona.strip()}\n</system-prompt.md>" in brief
+    # The system prompt is the agent's: read, never written.
+    assert system_prompt.read_bytes() == before
+
+
+def test_a_missing_your_home_file_costs_that_part_loudly(platform, tmp_path, monkeypatch, caplog):
+    """A package without its own data file is a broken install: the part goes, and it pages.
+
+    ERROR rather than the brain part's WARNING, because this is not a caller's adapter having a bad
+    moment — it is a defect that recurs on every wake until someone reinstalls, and the shell agent
+    loses the law for its folders the whole time. Everything else in the brief stands.
+    """
+
+    def missing():
+        raise FileNotFoundError("_agent_home/your-home.md")
+
+    monkeypatch.setattr(brief_module, "your_home_text", missing)
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    agent, model = _build_shell_wake(tmp_path)
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        posted = agent.wake()
+
+    assert len(posted) == 1  # the peer was still answered
+    brief = _brief_shown(model)[0].content
+    assert _home_section(brief) is None
+    assert "Your active tools right now:" in brief and "<dashboard.md>" in brief
+    records = [r for r in caplog.records if "Your Home" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.ERROR]
+
+
 def test_a_dashboard_fetch_failure_does_not_break_the_wake(platform, tmp_path):
     """A failed dashboard fetch degrades gracefully — the brief is composed from the rest."""
     platform.get("/users/dashboard.md").mock(return_value=httpx.Response(503))
@@ -3281,13 +3446,29 @@ def test_the_brief_is_composed_once_per_wake_across_many_items(platform, tmp_pat
 
 
 # --- Group 6: the cross-wake circuit-breaker ---------------------------------
+#
+# Issue #592 rebuilt it around the incident that falsified its premise: on 2026-09-29 @briggs's
+# timeline drained a long wake's backlog as ten empty replays in 25 seconds, the eleventh process
+# start tripped the breaker, and the wake that tripped it was carrying @origin's direct question —
+# dropped, with nothing to re-wake it until a third party posted twelve minutes later. The breaker
+# now counts a wake at its first model work, and a trip *holds* the wake rather than dropping it.
+
+#: One message newer than every `Mn` above, for the arrival that lands while a wake holds.
+M4 = "019e7756-1a2b-7c3d-8e4f-5a6b7c8d9e0f"
 
 
 class FakeClock:
-    """A deterministic, advanceable clock — so a synthetic wake burst is reproducible."""
+    """A deterministic, advanceable clock — so a synthetic wake burst is reproducible.
+
+    It is the breaker's sleep too: a hold advances the clock instead of waiting, and is recorded,
+    so a test asserts how long a wake held without ever holding. `on_sleep` runs on every slice of
+    a hold — the seam for a message that lands while a wake is waiting.
+    """
 
     def __init__(self, t: float = 1_000_000.0) -> None:
         self.t = t
+        self.slept: list[float] = []
+        self.on_sleep = None
 
     def __call__(self) -> float:
         return self.t
@@ -3295,74 +3476,118 @@ class FakeClock:
     def advance(self, seconds: float) -> None:
         self.t += seconds
 
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.t += seconds
+        if self.on_sleep is not None:
+            self.on_sleep()
 
-def _alert_bodies(platform):
-    """Every message body posted to the timeline — replies and breaker alerts alike."""
-    calls = platform.post(f"/timelines/{TIMELINE_UUID}/messages").calls
-    return [json.loads(c.request.content)["message"]["body"] for c in calls]
+
+def _breaker(home, clock, *, max_wakes=10, window=60.0, cooldown=None):
+    return WakeBreaker(
+        home, max_wakes=max_wakes, window=window, cooldown=cooldown, now=clock, sleep=clock.sleep
+    )
 
 
-def test_wake_breaker_trips_over_the_cap_and_auto_resets(tmp_path):
-    """The breaker state machine, unit-level: under the cap is fine, over it trips once, a
-    continuing burst stays tripped, and once the window clears past the cooldown it auto-resets."""
+def _wake_with_breaker(tmp_path, provider, clock, *, max_wakes, window=60.0, cooldown=None, **kw):
+    """A fresh wake (a stand-in router process) sharing the on-disk breaker state + clock."""
+    breaker = _breaker(tmp_path, clock, max_wakes=max_wakes, window=window, cooldown=cooldown)
+    agent, _ = build_wake(tmp_path, provider, breaker=breaker, **kw)
+    return agent
+
+
+def _counted(home) -> int:
+    """How many engaged wakes the breaker's window file holds for the test timeline."""
+    path = home / "breaker" / f"{TIMELINE_UUID}.wakes"
+    return len(path.read_text().split()) if path.exists() else 0
+
+
+def test_the_breaker_admits_under_the_cap_and_trips_over_it(tmp_path):
+    """The state machine, unit-level: under the cap proceeds, over it trips once and holds for the
+    cooldown, and `release` ends the trip in a clean window that counts the wake it released."""
     clock = FakeClock()
-    breaker = WakeBreaker(tmp_path, max_wakes=3, window=60.0, now=clock)
+    breaker = _breaker(tmp_path, clock, max_wakes=3)
 
-    # Three wakes at the same instant: at the cap, not over it — no trip.
     for i in range(3):
-        decision = breaker.record_and_check(TIMELINE_UUID)
-        assert decision == BreakerDecision(
-            short_circuit=False, tripped=False, reset=False, count=i + 1
-        )
+        decision = breaker.admit(TIMELINE_UUID)
+        assert decision == BreakerDecision(tripped=False, hold=0.0, reset=False, count=i + 1)
 
-    # The fourth wake is over the cap → TRIP (the one-time transition).
-    decision = breaker.record_and_check(TIMELINE_UUID)
-    assert decision.short_circuit and decision.tripped and decision.count == 4
+    decision = breaker.admit(TIMELINE_UUID)
+    assert decision == BreakerDecision(tripped=True, hold=60.0, reset=True, count=4)
     assert breaker.tripped(TIMELINE_UUID)
 
-    # A fifth wake while the burst continues: still short-circuits, but it is *not* a fresh
-    # trip transition (so the caller won't re-alert).
-    decision = breaker.record_and_check(TIMELINE_UUID)
-    assert decision.short_circuit and not decision.tripped and not decision.reset
-
-    # The burst stops; advance past the window + cooldown so it clears → AUTO-RESET.
-    clock.advance(200)
-    decision = breaker.record_and_check(TIMELINE_UUID)
-    assert decision.reset and not decision.short_circuit
+    clock.advance(decision.hold)
+    breaker.release(TIMELINE_UUID)
     assert not breaker.tripped(TIMELINE_UUID)
+    # Not a re-trip on its own history: the window restarted at the release, with that wake in it.
+    assert breaker.admit(TIMELINE_UUID).count == 2
+
+
+def test_a_standing_trip_holds_only_what_is_left_of_its_cooldown(tmp_path):
+    """A trip whose holder was killed mid-hold is finished by the next wake to reach model work —
+    which serves the remainder, is not counted against the window it is about to clear, and holds
+    nothing at all once the cooldown is spent."""
+    clock = FakeClock()
+    first = _breaker(tmp_path, clock, max_wakes=1, cooldown=90.0)
+    first.admit(TIMELINE_UUID)
+    assert first.admit(TIMELINE_UUID).tripped  # …and then this process dies holding it
+
+    clock.advance(30)
+    second = _breaker(tmp_path, clock, max_wakes=1, cooldown=90.0)  # a fresh process, same home
+    assert second.tripped(TIMELINE_UUID)
+    assert second.admit(TIMELINE_UUID) == BreakerDecision(
+        tripped=False, hold=60.0, reset=True, count=2
+    )
+    assert _counted(tmp_path) == 2  # a standing trip records nothing
+
+    clock.advance(200)
+    assert second.admit(TIMELINE_UUID) == BreakerDecision(
+        tripped=False, hold=0.0, reset=True, count=0
+    )
+
+
+def test_a_clock_stepped_backwards_never_stretches_a_hold_past_the_cooldown(tmp_path):
+    """The trip stamp is wall-clock, because it must outlive the process. A clock stepped back an
+    hour (NTP, a VM restore) must not turn a one-minute trip into an hour's hold of the agent's
+    every timeline."""
+    clock = FakeClock()
+    breaker = _breaker(tmp_path, clock, max_wakes=1)
+    breaker.admit(TIMELINE_UUID)
+    assert breaker.admit(TIMELINE_UUID).tripped
+
+    clock.advance(-3600)
+    assert breaker.admit(TIMELINE_UUID).hold == 60.0
 
 
 def test_wake_breaker_normal_load_never_trips(tmp_path):
-    """A steady, human-paced cadence (one wake every 30 s, cap 10/60 s) never trips —
+    """A steady, human-paced cadence (one engaged wake every 30 s, cap 10/60 s) never trips —
     legitimate multi-peer activity must stay clear of the breaker."""
     clock = FakeClock()
-    breaker = WakeBreaker(tmp_path, max_wakes=10, window=60.0, now=clock)
+    breaker = _breaker(tmp_path, clock, max_wakes=10)
     for _ in range(50):
         clock.advance(30)  # at most ~2 wakes in any 60 s window
-        decision = breaker.record_and_check(TIMELINE_UUID)
-        assert not decision.short_circuit and not decision.tripped
+        decision = breaker.admit(TIMELINE_UUID)
+        assert not decision.tripped and decision.hold == 0.0
 
 
 def test_wake_breaker_disabled_when_cap_is_zero(tmp_path):
-    """Cap 0 is the operator escape hatch: the breaker is off and never short-circuits."""
+    """Cap 0 is the operator escape hatch: the breaker is off, never holds, never trips."""
     breaker = WakeBreaker(tmp_path, max_wakes=0, window=60.0)
     assert not breaker.enabled
     for _ in range(100):
-        assert not breaker.record_and_check(TIMELINE_UUID).short_circuit
+        assert breaker.admit(TIMELINE_UUID) == BreakerDecision(
+            tripped=False, hold=0.0, reset=False, count=0
+        )
     assert not breaker.tripped(TIMELINE_UUID)
 
 
-def test_wake_breaker_trip_marker_persists_across_processes(tmp_path):
-    """The trip marker is durable: a brand-new breaker (a fresh process) over the same home
-    sees the timeline is tripped and keeps short-circuiting — wake mode is process-per-event."""
-    clock = FakeClock()
-    first = WakeBreaker(tmp_path, max_wakes=1, window=60.0, now=clock)
-    first.record_and_check(TIMELINE_UUID)  # count 1 — at the cap
-    assert first.record_and_check(TIMELINE_UUID).tripped  # count 2 — over → trip
-
-    second = WakeBreaker(tmp_path, max_wakes=1, window=60.0, now=clock)
-    assert second.tripped(TIMELINE_UUID)
-    assert second.record_and_check(TIMELINE_UUID).short_circuit
+def test_the_breaker_waits_through_its_injected_sleep(tmp_path):
+    """The hold's one seam, mirroring `ReadPacer`: a test records it, and a zero hold never sleeps."""
+    slept: list[float] = []
+    breaker = WakeBreaker(tmp_path, sleep=slept.append)
+    breaker.wait(0.0)
+    breaker.wait(12.5)
+    assert slept == [12.5]
 
 
 def test_wake_breaker_from_env_reads_tunables(tmp_path, monkeypatch):
@@ -3382,117 +3607,433 @@ def test_wake_breaker_from_env_reads_tunables(tmp_path, monkeypatch):
     assert (default.max_wakes, default.window) == (10, 60.0)  # generous safe defaults
 
 
-def _wake_with_breaker(tmp_path, provider, clock, *, max_wakes, window=60.0):
-    """A fresh wake (a stand-in router process) sharing the on-disk breaker state + clock."""
-    breaker = WakeBreaker(tmp_path, max_wakes=max_wakes, window=window, now=clock)
-    agent, _ = build_wake(tmp_path, provider, breaker=breaker)
-    return agent
+def test_wakes_that_find_nothing_to_do_never_count_toward_the_breaker(platform, tmp_path, caplog):
+    """The incident, replayed: a backlog of empty wakes, then the one that matters (issue #592).
 
-
-def test_a_wake_burst_trips_self_declines_and_alerts_exactly_once(platform, tmp_path):
-    """End to end: a runaway burst trips the breaker; the tripping (and every later) wake makes
-    NO provider call, the loud alert posts exactly once, and the unseen message is left
-    recoverable (its mark never advanced)."""
-    clock = FakeClock()
-    provider = CountingProvider()
-    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
-
-    def wake_with(*page_messages):
-        serve_messages(platform, page(*page_messages))
-        return _wake_with_breaker(tmp_path, provider, clock, max_wakes=2).wake()
-
-    # Two healthy wakes, each answering a new message → two provider calls.
-    assert len(wake_with(message(uuid=M1, body="one"), message(uuid=M0, body="old"))) == 1
-    assert len(wake_with(message(uuid=M2, body="two"), message(uuid=M1, body="one"))) == 1
-    assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] john: one",
-        "[2026-06-04T00:00:00.000Z] john: two",
-    ]
-
-    # The third wake would answer M3 — but it is over the cap in the window: TRIP, self-decline.
-    assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
-    assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] john: one",
-        "[2026-06-04T00:00:00.000Z] john: two",
-    ]  # the model was NOT called
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2  # M3 unseen → recoverable next healthy wake
-
-    # A fourth, still-tripped wake also makes no provider call — and posts no second alert.
-    assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
-    assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] john: one",
-        "[2026-06-04T00:00:00.000Z] john: two",
-    ]
-
-    # **The alert is a log line, never a post** (issue #293). The harness does not speak for the
-    # agent, and the breaker alert was the one message it still wrote in the agent's own voice. The
-    # operator's breadcrumb is the WARNING (which is exactly what the NOC alerts on); the peers see
-    # what actually happened — an agent that went quiet. So the *only* bodies on this timeline are
-    # the two replies the agent itself chose to send, before the burst tripped it.
-    assert _alert_bodies(platform) == ["Hello, John.", "Hello, John."]
-
-
-def test_the_breaker_auto_resets_and_resumes_after_the_burst_clears(platform, tmp_path, caplog):
-    """Once the burst clears past the cooldown, the next wake auto-resets: it logs the recovery
-    alert and resumes normal operation (engages the message it had been declining)."""
-    clock = FakeClock()
-    provider = CountingProvider()
-    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
-
-    def wake_with(*page_messages):
-        serve_messages(platform, page(*page_messages))
-        return _wake_with_breaker(tmp_path, provider, clock, max_wakes=2).wake()
-
-    # Drive a trip (two healthy, then the third trips).
-    wake_with(message(uuid=M1, body="one"), message(uuid=M0, body="old"))
-    wake_with(message(uuid=M2, body="two"), message(uuid=M1, body="one"))
-    assert wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two")) == []
-    assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] john: one",
-        "[2026-06-04T00:00:00.000Z] john: two",
-    ]
-
-    # The burst stops; time passes past the window + cooldown. The next wake auto-resets and
-    # answers M3, the message it had been declining.
-    clock.advance(200)
-    with caplog.at_level("WARNING", logger="basecradle_harness"):
-        posted = wake_with(message(uuid=M3, body="three"), message(uuid=M2, body="two"))
-    assert len(posted) == 1  # the agent spoke — through its tool, as it now always does
-    assert provider.prompts == [
-        "[2026-06-04T00:00:00.000Z] john: one",
-        "[2026-06-04T00:00:00.000Z] john: two",
-        "[2026-06-04T00:00:00.000Z] john: three",
-    ]  # resumed
-    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M3
-    # The recovery alert is a WARNING, not a post (issue #293). The only bodies on this timeline are
-    # the three replies the agent itself chose to send — the two healthy wakes before the trip, and
-    # this one, resumed. No alert, no harness-authored word in the agent's voice.
-    resets = [r.getMessage() for r in caplog.records if "Wake breaker RESET" in r.getMessage()]
-    assert len(resets) == 1
-    assert _alert_bodies(platform) == ["Hello, John."] * 3
-
-
-def test_a_tripped_wake_never_touches_the_timeline(platform, tmp_path):
-    """A tripped wake is inert: no provider call, and **no post of any kind** (issue #293).
-
-    This once tested that the breaker's alert post degraded gracefully on a locked timeline. There
-    is no alert post any more — the breaker speaks to the operator, in the journal — so what is
-    worth pinning is the stronger property that replaced it: a tripped wake writes *nothing* to the
-    timeline, which is why a locked timeline can no longer refuse anything it does.
+    Replays of deliveries a long wake already answered, and the agent's own echo, arrive faster
+    than the cap allows — eleven process starts in 22 seconds against a cap of 10 a minute. None of
+    them called a model, so none of them is a runaway, and the founder's question behind them is
+    answered at once: no hold, no trip line, and exactly one wake in the breaker's window.
     """
     clock = FakeClock()
     provider = CountingProvider()
-    # Pre-fill the window so the very next wake trips (cap 1; two recorded wakes already in window).
-    pre = WakeBreaker(tmp_path, max_wakes=1, window=60.0, now=clock)
-    pre.record_and_check(TIMELINE_UUID)
-    pre.record_and_check(TIMELINE_UUID)  # now tripped on disk
-    serve_messages(platform, page(message(uuid=M0, body="hi")))
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
 
-    posted = _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()  # must not raise
+    def wake_with(*page_messages):
+        clock.advance(2)
+        serve_messages(platform, page(*page_messages))
+        return _wake_with_breaker(tmp_path, provider, clock, max_wakes=10).wake()
 
-    assert posted == []
-    assert provider.prompts == []  # tripped → no provider call
-    assert _alert_bodies(platform) == []  # …and nothing reached the timeline
+    for _ in range(6):  # replays: nothing past the mark
+        assert wake_with(message(uuid=M0, body="old")) == []
+    for _ in range(5):  # the agent's own echo, self-filtered
+        assert (
+            wake_with(message(uuid=M1, body="done", mine=True), message(uuid=M0, body="old")) == []
+        )
+    assert provider.prompts == [] and _counted(tmp_path) == 0
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        posted = wake_with(
+            message(uuid=M2, body="are you there?"),
+            message(uuid=M1, body="done", mine=True),
+            message(uuid=M0, body="old"),
+        )
+
+    assert len(posted) == 1
+    assert provider.prompts == ["[2026-06-04T00:00:00.000Z] john: are you there?"]
+    assert clock.slept == []
+    assert not any(line.startswith("Wake breaker") for line in _lines(caplog))
+    assert _counted(tmp_path) == 1
+
+
+def test_a_trip_holds_the_wake_then_answers_everything_that_landed(platform, tmp_path, caplog):
+    """Over the cap, the wake holds for the cooldown and then does its work — never drops it.
+
+    This is the re-wake the incident needed (issue #592): the burst's last event is the live one,
+    and it lands *while* the tripping wake waits, so the same wake answers it — folded into one
+    turn with the message it was already holding, from the marks, with nobody having to post again.
+    The trip line is logged before the hold (the fleet's alert reads it) and the reset after it;
+    and the harness speaks for nobody — the only posts are the agent's own replies.
+    """
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+
+    def wake(*page_messages):
+        serve_messages(platform, page(*page_messages))
+        return _wake_with_breaker(tmp_path, provider, clock, max_wakes=2).wake()
+
+    wake(message(uuid=M1, body="one"), message(uuid=M0, body="old"))
+    wake(message(uuid=M2, body="two"), message(uuid=M1, body="one"))
+    assert _counted(tmp_path) == 2 and clock.slept == []  # the cap, exactly
+
+    scripted = ScriptedMessages(
+        platform, message(uuid=M3, body="three"), message(uuid=M2, body="two")
+    )
+    clock.on_sleep = lambda: scripted.arrive(message(uuid=M4, body="are you there?"))
+    agent = _wake_with_breaker(tmp_path, provider, clock, max_wakes=2)
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        posted = agent.wake()
+
+    assert clock.slept == [60.0]
+    assert len(posted) == 1
+    assert provider.prompts[-1] == (
+        "[2026-06-04T00:00:00.000Z] john: three\n[2026-06-04T00:00:00.000Z] john: are you there?"
+    )
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M4
+    lines = _lines(caplog)
+    tripped = _line(caplog, "Wake breaker TRIPPED")
+    reset = _line(caplog, "Wake breaker RESET")
+    assert tripped == (
+        f"Wake breaker TRIPPED timeline={TIMELINE_UUID} count=3 threshold=2 window=60s "
+        "cooldown=60s hold=60.00s"
+    )
+    assert reset == f"Wake breaker RESET timeline={TIMELINE_UUID} held=60.00s"
+    assert lines.index(tripped) < lines.index(reset) < lines.index(_line(caplog, "wake end"))
+    assert "outcome=ok" in _line(caplog, "wake end")
+    assert not agent.breaker.tripped(TIMELINE_UUID)
+    assert _posts(platform) == ["Hello, John."] * 3
+
+
+def test_a_trip_whose_holder_died_is_finished_by_the_next_wake_with_work(
+    platform, tmp_path, caplog
+):
+    """A wake killed mid-hold leaves its trip on disk. A wake with nothing to do leaves it alone —
+    it has no model work to admit, so it neither holds nor resets. The next wake that does have
+    work serves what is left of the cooldown, resets, and answers; it does not trip again."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    standing = _breaker(tmp_path, clock, max_wakes=1)
+    standing.admit(TIMELINE_UUID)
+    assert standing.admit(TIMELINE_UUID).tripped  # its holder then died mid-hold
+    clock.advance(45)
+
+    serve_messages(platform, page(message(uuid=M0, body="old")))
+    assert _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake() == []
+    assert clock.slept == [] and standing.tripped(TIMELINE_UUID)
+
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        posted = _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()
+
+    assert clock.slept == [15.0]
+    assert len(posted) == 1
+    assert _line(caplog, "Wake breaker RESET") == (
+        f"Wake breaker RESET timeline={TIMELINE_UUID} held=15.00s"
+    )
+    assert not any(line.startswith("Wake breaker TRIPPED") for line in _lines(caplog))
+    assert not standing.tripped(TIMELINE_UUID)
+
+
+def test_a_long_hold_keeps_the_claims_it_is_holding_alive(platform, tmp_path):
+    """A holding wake has already claimed what it will answer, so a hold longer than the heartbeat
+    interval is served in slices with a beat after each (issue #532): a claim's age must mean time
+    since its owner last made progress, and a wake deliberately waiting is alive, not orphaned."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    _wake_with_breaker(tmp_path, provider, clock, max_wakes=1, cooldown=720).wake()
+
+    serve_messages(platform, page(message(uuid=M2, body="two"), message(uuid=M1, body="one")))
+    agent = _wake_with_breaker(tmp_path, provider, clock, max_wakes=1, cooldown=720)
+    beats: list[float] = []
+    agent.claims.beat = lambda: beats.append(clock())
+    tripped_at = clock()
+    agent.wake()
+
+    assert clock.slept == [_CLAIM_BEAT_EVERY, _CLAIM_BEAT_EVERY, 720 - 2 * _CLAIM_BEAT_EVERY]
+    assert beats[:3] == [tripped_at + 300, tripped_at + 600, tripped_at + 720]
+
+
+def test_a_probe_on_a_tripped_timeline_is_acked_without_holding(platform, tmp_path):
+    """A wake whose only item is the NOC's heartbeat never reaches the breaker: the probe is acked
+    model-free in `_absorb`, so there is no model work to admit, nothing to hold for and nothing to
+    count — where a tripped wake used to decline the ack along with everything else."""
+    clock = FakeClock()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    standing = _breaker(tmp_path, clock, max_wakes=1)
+    standing.admit(TIMELINE_UUID)
+    assert standing.admit(TIMELINE_UUID).tripped
+    serve_messages(
+        platform, page(message(uuid=M1, body=probe_marker()), message(uuid=M0, body="old"))
+    )
+    provider = CountingProvider()
+
+    posted = _wake_with_breaker(
+        tmp_path, provider, clock, max_wakes=1, probe_secret=PROBE_SECRET
+    ).wake()
+
+    assert len(posted) == 1 and provider.prompts == []  # the ack, and no model
+    assert clock.slept == [] and _counted(tmp_path) == 2  # no hold, nothing recorded
+
+
+def test_the_hold_comes_before_a_posted_image_is_rendered(platform, tmp_path):
+    """On the per-item path the wake is admitted *before* the item is rendered — because rendering
+    a picture is perception (a blob fetch, and for a blind brain a describer call), and the whole
+    point of the gate is that nothing model-shaped happens ahead of it."""
+    events: list[str] = []
+    clock = FakeClock()
+    clock.on_sleep = lambda: events.append("hold")
+    standing = _breaker(tmp_path, clock, max_wakes=1)
+    standing.admit(TIMELINE_UUID)
+    assert standing.admit(TIMELINE_UUID).tripped
+    serve_messages(platform, page())
+    serve_assets(platform, asset_page(asset(uuid=A0)))
+
+    def blob(request):
+        events.append("render")
+        return httpx.Response(200, content=PNG_BYTES)
+
+    platform.get(path__regex=r"^/blobs/").mock(side_effect=blob)
+    provider = CountingProvider()
+
+    _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()
+
+    assert events[:2] == ["hold", "render"]
+    assert len(provider.prompts) == 1  # held, then answered — never dropped
+
+
+def test_a_wake_of_several_turns_is_counted_once(platform, tmp_path):
+    """The breaker counts *wakes*. A wake that answers a message batch and then carries out an
+    activated task runs two turns and is one entry in the window."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    serve_tasks(platform, task_page(task(uuid=T0, instructions="Check the build.")))
+
+    _wake_with_breaker(tmp_path, provider, clock, max_wakes=10).wake()
+
+    assert len(provider.prompts) == 2
+    assert _counted(tmp_path) == 1
+
+
+class _KilledMidHold(BaseException):
+    """What a `SIGKILL` during a hold looks like from inside: nothing `except Exception` catches."""
+
+
+def test_a_hold_is_forgotten_with_the_wake_that_served_it(platform, tmp_path):
+    """Per-wake state, both halves: the next wake of the same process is counted afresh, and it
+    does not re-read after a hold it never took."""
+    clock = FakeClock()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    _breaker(tmp_path, clock, max_wakes=1).admit(TIMELINE_UUID)  # the cap, reached
+    agent = _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=1)
+    folds: list[int] = []
+    fold = agent._absorb_after_hold
+
+    def counting_fold(*args):
+        folds.append(1)
+        return fold(*args)
+
+    agent._absorb_after_hold = counting_fold
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    agent.wake()  # trips, holds, folds once
+    clock.advance(120)
+    serve_messages(platform, page(message(uuid=M2, body="two"), message(uuid=M1, body="one")))
+    agent.wake()  # under the cap again: no hold, so no fold
+
+    assert clock.slept == [60.0]
+    assert folds == [1]
+
+
+def test_every_wake_of_one_process_is_counted(platform, tmp_path):
+    """The admission is per *wake*, not per process: an agent that wakes twice with work is counted
+    twice, or a second wake in one process would slip past the breaker unmeasured."""
+    clock = FakeClock()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    agent = _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=10)
+
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    agent.wake()
+    serve_messages(platform, page(message(uuid=M2, body="two"), message(uuid=M1, body="one")))
+    agent.wake()
+
+    assert _counted(tmp_path) == 2
+
+
+def test_a_wake_killed_mid_hold_leaves_its_trip_for_the_next_wake_to_finish(platform, tmp_path):
+    """The reset is written *after* the hold, never before. A wake the box kills while it waits has
+    not served its cooldown, so its trip must still stand for the next wake with work to finish —
+    and the message it was carrying, claimed and never shown to the model, is answered then."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()
+
+    def killed(_seconds):
+        raise _KilledMidHold
+
+    serve_messages(platform, page(message(uuid=M2, body="two"), message(uuid=M1, body="one")))
+    breaker = WakeBreaker(tmp_path, max_wakes=1, now=clock, sleep=killed)
+    doomed, _ = build_wake(tmp_path, provider, breaker=breaker)
+    with pytest.raises(_KilledMidHold):
+        doomed.wake()
+
+    assert breaker.tripped(TIMELINE_UUID)
+    assert len(provider.prompts) == 1  # the second message never reached the model
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1
+
+    clock.advance(20)
+    posted = _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()
+
+    assert clock.slept == [40.0]
+    assert len(posted) == 1
+    assert provider.prompts[-1] == "[2026-06-04T00:00:00.000Z] john: two"
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M2
+    assert not breaker.tripped(TIMELINE_UUID)
+
+
+def test_an_error_folding_in_after_a_hold_fails_the_wake_and_commits_nothing(platform, tmp_path):
+    """Only the *read* after a hold may degrade. `_absorb` claims as it goes, so an error inside the
+    fold must fail the wake: swallowed, it could leave a message claimed and ledgered but outside the
+    turn, and the turn's commit would settle it unanswered. Failed, the claims stay in flight and
+    the next wake re-drives them."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()
+
+    scripted = ScriptedMessages(
+        platform, message(uuid=M2, body="two"), message(uuid=M1, body="one")
+    )
+    clock.on_sleep = lambda: scripted.arrive(message(uuid=M3, body="three"))
+    agent = _wake_with_breaker(tmp_path, provider, clock, max_wakes=1)
+    absorb = agent._absorb
+    calls: list[int] = []
+
+    def failing_fold(session, items, posted):
+        calls.append(len(items))
+        if len(calls) == 2:  # the fold after the hold: it claims the arrival, then fails
+            absorb(session, items, posted)
+            raise OSError(28, "No space left on device")
+        return absorb(session, items, posted)
+
+    agent._absorb = failing_fold
+    with pytest.raises(OSError):
+        agent.wake()
+
+    assert clock.slept == [60.0]
+    assert len(provider.prompts) == 1  # the batch never reached the model…
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M1  # …the mark never passed it…
+    claims = ClaimStore(tmp_path)
+    for uuid in (M2, M3):  # …and both, the arrival the fold claimed included, are still in flight
+        assert claims.read(TIMELINE_UUID, uuid, kind="messages").phase == "in-flight"
+
+
+def test_a_platform_that_will_not_answer_after_a_hold_leaves_the_batch_in_hand(
+    platform, tmp_path, caplog
+):
+    """The read after a hold is an economy, so it may fail without failing the wake: the batch the
+    wake already holds is answered, and a message it could not read has a delivery of its own."""
+    clock = FakeClock()
+    provider = CountingProvider()
+    MarkStore(tmp_path).set(TIMELINE_UUID, M0)
+    serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
+    _wake_with_breaker(tmp_path, provider, clock, max_wakes=1).wake()
+
+    serve_messages(platform, page(message(uuid=M2, body="two"), message(uuid=M1, body="one")))
+    agent = _wake_with_breaker(tmp_path, provider, clock, max_wakes=1)
+    fetch = agent._fetch_fresh
+    armed = {"next": False}
+    clock.on_sleep = lambda: armed.update(next=True)
+
+    def unreachable_once():
+        if armed["next"]:
+            armed["next"] = False
+            raise ConnectionError("the platform did not answer")
+        return fetch()
+
+    agent._fetch_fresh = unreachable_once
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        posted = agent.wake()
+
+    assert len(posted) == 1
+    assert provider.prompts[-1] == "[2026-06-04T00:00:00.000Z] john: two"
+    assert any("after the breaker hold" in line for line in _lines(caplog))
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        ("HARNESS_WAKE_BREAKER_WINDOW", "0"),
+        ("HARNESS_WAKE_BREAKER_WINDOW", "-60"),
+        ("HARNESS_WAKE_BREAKER_WINDOW", "nan"),
+        ("HARNESS_WAKE_BREAKER_COOLDOWN", "inf"),
+        ("HARNESS_WAKE_BREAKER_COOLDOWN", "-1"),
+    ],
+)
+def test_a_tunable_that_would_fail_silently_fails_loudly(tmp_path, monkeypatch, var, value):
+    """A zero or ``nan`` window is a breaker that reports itself on and never trips; an infinite
+    cooldown is a hold that never ends, wedging every timeline of the agent. Each fails the wake at
+    construction instead, where `main` reports it as a config failure — naming the variable. The
+    other tunable is set valid, so each case proves its own check rather than a neighbour's."""
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_WINDOW", "60")
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_COOLDOWN", "60")
+    monkeypatch.setenv(var, value)
+    with pytest.raises(ValueError, match=var):
+        WakeBreaker.from_env(tmp_path)
+
+
+def test_a_disabled_breaker_validates_nothing(tmp_path, monkeypatch):
+    """The escape hatch always works: a cap of 0 turns the breaker off whatever else is set."""
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_MAX", "0")
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_WINDOW", "0")
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_COOLDOWN", "inf")
+    assert not WakeBreaker.from_env(tmp_path).enabled
+
+
+def test_resolved_config_reports_the_breaker_and_fails_where_a_wake_would(
+    wake_env, monkeypatch, capsys
+):
+    """The deploy verifier reads the breaker through the resolution the wake runs, so it is red
+    exactly when every wake would fail — and a disabled breaker reports nothing else, because
+    nothing else then means anything."""
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_COOLDOWN", "90")
+    assert main(["--resolved-config"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert (
+        report["wake_breaker_max"],
+        report["wake_breaker_window"],
+        report["wake_breaker_cooldown"],
+    ) == (10, 60.0, 90.0)
+
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_COOLDOWN", "inf")
+    assert main(["--resolved-config"]) == 1
+    assert "HARNESS_WAKE_BREAKER_COOLDOWN" in capsys.readouterr().err
+
+    monkeypatch.setenv("HARNESS_WAKE_BREAKER_MAX", "0")
+    assert main(["--resolved-config"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert (report["wake_breaker_max"], report["wake_breaker_window"]) == (0, None)
+
+
+def test_a_zero_cooldown_is_allowed_and_holds_nothing(tmp_path):
+    """Zero is a legitimate choice — log the trip, hold nothing — and not a failure to refuse."""
+    clock = FakeClock()
+    breaker = _breaker(tmp_path, clock, max_wakes=1, cooldown=0.0)
+    breaker.admit(TIMELINE_UUID)
+    assert breaker.admit(TIMELINE_UUID) == BreakerDecision(
+        tripped=True, hold=0.0, reset=True, count=2
+    )
+
+
+def test_a_stamp_from_before_a_backwards_clock_step_is_not_recent(tmp_path):
+    """Three engaged wakes, then the clock steps back an hour: those stamps now read as the future,
+    and kept they would sit in the window for the whole hour and trip the next wake for nothing."""
+    clock = FakeClock()
+    breaker = _breaker(tmp_path, clock, max_wakes=3)
+    for _ in range(3):
+        breaker.admit(TIMELINE_UUID)
+
+    clock.advance(-3600)
+    decision = breaker.admit(TIMELINE_UUID)
+
+    assert not decision.tripped and decision.count == 1
 
 
 def test_a_directly_constructed_wake_gets_a_default_breaker(platform, tmp_path):
@@ -4006,6 +4547,75 @@ class HookedProvider:
 
 
 # --- Loop 1: the settle loop --------------------------------------------------
+
+
+def test_a_fold_that_fails_mid_read_pace_fails_the_wake_and_commits_nothing(platform, tmp_path):
+    """The settle loop's fold claims as it goes, so a failure inside it must fail the wake.
+
+    Swallowed — as it was until reviewing #592 found it — a fold that claimed one arrival and then
+    failed left that message ledgered as this wake's and missing from the batch, and the turn's
+    commit settled it: a peer's message marked answered that the model never saw. Failed, the
+    claims stay in flight and the next wake re-drives them.
+    """
+    scripted = ScriptedMessages(platform, peer_ai_message(uuid=M0, body="first from Brain"))
+    pacer = ReadPacer(
+        clock=lambda: PACE_CREATED,
+        sleep=lambda _s: scripted.arrive(peer_ai_message(uuid=M1, body="and a follow-up")),
+    )
+    agent, provider = build_wake(tmp_path, HookedProvider(), pacer=pacer)
+    absorb = agent._absorb
+    calls: list[int] = []
+
+    def half_fold(session, items, posted):
+        calls.append(len(items))
+        if len(calls) == 2:  # the settle's fold: claim the arrival, then fail
+            absorb(session, items, posted)
+            raise OSError(28, "No space left on device")
+        return absorb(session, items, posted)
+
+    agent._absorb = half_fold
+    with pytest.raises(OSError):
+        agent.wake()
+
+    assert provider.prompts == []  # nothing reached the model…
+    claims = ClaimStore(tmp_path)
+    for uuid in (M0, M1):  # …and nothing was committed: both are still this wake's to answer
+        assert claims.read(TIMELINE_UUID, uuid, kind="messages").phase == "in-flight"
+
+
+@pytest.mark.parametrize("fault", ["pace", "read"])
+def test_a_pacer_or_a_re_read_that_fails_degrades_to_answering_now(
+    platform, tmp_path, caplog, fault
+):
+    """The other half of the rule: pacing is an economy, so a pacer that raises (a bad
+    `created_at`) or a re-read the platform will not answer degrades to no further delay, and the
+    batch in hand is answered."""
+    serve_messages(platform, page(peer_ai_message(uuid=M0, body="hello from Brain")))
+
+    def broken_sleep(_seconds):
+        if fault == "pace":
+            raise ValueError("bad created_at")
+
+    pacer = ReadPacer(clock=lambda: PACE_CREATED, sleep=broken_sleep)
+    agent, provider = build_wake(tmp_path, HookedProvider(), pacer=pacer)
+    if fault == "read":
+        fetch = agent._fetch_fresh
+        failed = {"once": False}
+
+        def unreachable_once():
+            if not failed["once"]:
+                failed["once"] = True
+                raise ConnectionError("the platform did not answer")
+            return fetch()
+
+        agent._fetch_fresh = unreachable_once
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        agent.wake()
+
+    assert provider.prompts == ["[2026-06-04T00:00:00.000Z] briggs: hello from Brain"]
+    assert any("Read-pacing failed" in r.getMessage() for r in caplog.records)
+    assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
 
 
 def test_a_newer_ai_message_during_the_read_restarts_the_settle(platform, tmp_path):
@@ -4570,23 +5180,23 @@ def test_a_quiet_wake_reports_ok_with_nothing_posted(platform, tmp_path, caplog)
     assert "turns=0" in end and "steps=0/24" in end  # the model was never engaged
 
 
-def test_a_breaker_declined_wake_says_so_in_its_end_line(platform, tmp_path, caplog):
-    """A self-declining wake is not a healthy one — the end line must not read `ok`."""
+def test_a_held_wake_ends_ok_because_it_did_its_work(platform, tmp_path, caplog):
+    """A breaker hold is a delay, not a verdict (issue #592). The wake that held still answered what
+    it was carrying, so its end line reads ``ok``; there is no ``declined`` any more, because a
+    tripped wake no longer leaves its work for somebody else's post to recover."""
     clock = FakeClock()
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
     serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
-    for _ in range(2):  # burn the cap so the next wake trips
-        _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2).wake()
+    _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=1).wake()
 
-    agent = _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2)
+    serve_messages(platform, page(message(uuid=M2, body="two"), message(uuid=M1, body="one")))
+    agent = _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=1)
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         agent.wake()
 
+    assert clock.slept == [60.0]
     end = _line(caplog, "wake end")
-    assert "outcome=declined" in end
-    assert "steps=0/24" in end  # no provider call was made
-    # A decline is the third verdict word, and it reads YELLOW — neither a success nor a fault.
-    assert any(f"{YELLOW}outcome=declined{RESET}" in m for m in _raw(caplog))
+    assert "outcome=ok" in end and "posted=1" in end and "turns=1" in end
 
 
 def test_a_successful_post_logs_the_message_it_created(platform, tmp_path, caplog):
@@ -4747,28 +5357,29 @@ def test_a_crashing_wake_still_reports_what_it_had_done(platform, tmp_path, capl
 
 
 def test_the_breaker_alert_is_a_log_line_not_a_post(platform, tmp_path, caplog):
-    """The breaker speaks to the **operator**, in the journal — never to the peers (issue #293).
+    """The breaker speaks to the journal — never to the peers (issue #293).
 
     Its trip alert used to be a message on the timeline, written in the agent's own voice ("I
     appear to be in a wake loop here…") — words the agent never wrote and never chose to send. The
-    harness does not speak for the agent any more, so the alert is the WARNING it always also was.
-    Nothing is lost: the breadcrumb was always the operator's, and the NOC alerts on this exact
-    string (`Wake breaker TRIPPED`), never on the post.
+    harness does not speak for the agent, so the alert is the WARNING it always also was, and the
+    fleet alerts on exactly that string (`Wake breaker TRIPPED`). A trip that holds and then answers
+    (issue #592) leaves the agent's own reply on the timeline and nothing of the harness's.
     """
     clock = FakeClock()
     MarkStore(tmp_path).set(TIMELINE_UUID, M0)
     serve_messages(platform, page(message(uuid=M1, body="one"), message(uuid=M0, body="old")))
-    for _ in range(2):  # burn the cap so the next wake trips
-        _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2).wake()
-    said_before = _posts(platform)
+    _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=1).wake()
 
+    serve_messages(platform, page(message(uuid=M2, body="two"), message(uuid=M1, body="one")))
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=2).wake()
+        _wake_with_breaker(tmp_path, CountingProvider(), clock, max_wakes=1).wake()
 
-    assert "Wake breaker TRIPPED" in _line(caplog, "Wake breaker TRIPPED")  # the operator is told
-    assert _posts(platform) == said_before  # …and the tripped wake put nothing on the timeline
-    end = _line(caplog, "wake end")
-    assert "outcome=declined" in end and "posted=0" in end
+    assert _line(caplog, "Wake breaker TRIPPED").startswith("Wake breaker TRIPPED timeline=")
+    assert [r.levelname for r in caplog.records if "Wake breaker" in r.getMessage()] == [
+        "WARNING",
+        "WARNING",
+    ]
+    assert _posts(platform) == ["Hello, John.", "Hello, John."]  # the agent's two replies, only
 
 
 def test_a_probe_ack_is_logged_as_an_ack_not_as_the_agent_speaking(platform, tmp_path, caplog):
