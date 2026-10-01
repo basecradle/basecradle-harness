@@ -83,6 +83,7 @@ from basecradle_harness._media import (
 )
 from basecradle_harness._observability import media_timer
 from basecradle_harness._platform import PlatformTool, explain
+from basecradle_harness._secret import reveal, secret
 
 #: xAI's API root. These tools are xAI-native; this changes only for a proxy, never to reach
 #: another vendor (the key is the agent's xAI key).
@@ -170,14 +171,14 @@ class _GrokMediaTool(PlatformTool):
         model: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
-        self._api_key = api_key
+        self._api_key = secret(api_key)  # never a plain attribute (issue #599)
         self._base_url = base_url.rstrip("/")
         self._model = model or self.default_model
         self._timeout = timeout
 
     def _key(self) -> str | None:
         """The xAI key: the explicit one, or the agent's provider key from the environment."""
-        return self._api_key or os.environ.get("AI_API_KEY")
+        return reveal(self._api_key) or os.environ.get("AI_API_KEY")
 
     def _request(
         self, key: str, method: str, endpoint: str, *, json: dict[str, Any] | None = None

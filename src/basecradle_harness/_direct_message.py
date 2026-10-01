@@ -58,6 +58,7 @@ from collections.abc import Callable
 import httpx
 
 from basecradle_harness._platform import PlatformTool
+from basecradle_harness._secret import reveal, secret
 
 logger = logging.getLogger("basecradle_harness")
 
@@ -155,7 +156,7 @@ class DirectMessageTool(PlatformTool):
         retry_delay: float = RETRY_DELAY,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
-        self._token = token
+        self._token = secret(token)  # never a plain attribute (issue #599)
         self._base_url = base_url.rstrip("/")
         self._topic = topic
         self._timeout = timeout
@@ -183,7 +184,7 @@ class DirectMessageTool(PlatformTool):
                 "per character.)"
             )
 
-        token = self._token or os.environ.get(TOKEN_ENV)
+        token = reveal(self._token) or os.environ.get(TOKEN_ENV)
         if not token:
             return (
                 f"Error: {self.name!r} has no publish credential — {TOKEN_ENV} is unset or "

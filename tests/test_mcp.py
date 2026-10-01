@@ -48,6 +48,7 @@ from basecradle_harness._mcp import (
     _server_label,
     _sse_response,
     mcp_tool_name,
+    revealed,
     withheld_refusal,
 )
 from basecradle_harness._policy import SHELL
@@ -123,7 +124,7 @@ def test_parse_stdio_config(tmp_path):
     assert cfg.transport == "stdio"
     assert cfg.command == "uvx"
     assert cfg.args == ("some-mcp",)
-    assert cfg.env == {"K": "v"}
+    assert revealed(cfg.env) == {"K": "v"}
 
 
 def test_parse_http_config(tmp_path):
@@ -131,7 +132,7 @@ def test_parse_http_config(tmp_path):
     (cfg,) = load_mcp_configs(tmp_path)
     assert cfg.transport == "http"
     assert cfg.url == "https://h/mcp"
-    assert cfg.headers == {"Authorization": "t"}
+    assert revealed(cfg.headers) == {"Authorization": "t"}
 
 
 def test_parse_mcpservers_wrapper_unwraps_single_entry(tmp_path):

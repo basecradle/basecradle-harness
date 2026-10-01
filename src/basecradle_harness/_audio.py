@@ -34,6 +34,7 @@ import os
 from basecradle_harness._exceptions import ProviderError
 from basecradle_harness._observability import media_timer
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
+from basecradle_harness._secret import reveal, secret
 
 #: OpenAI's Audio API root. Transcription is an OpenAI service; this changes only for
 #: a proxy, not to reach another vendor (the key is the OpenAI key).
@@ -75,7 +76,7 @@ class Transcriber:
         model: str = DEFAULT_MODEL,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
-        self._api_key = api_key
+        self._api_key = secret(api_key)  # never a plain attribute (issue #599)
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
@@ -83,7 +84,7 @@ class Transcriber:
     @property
     def key(self) -> str | None:
         """The key this transcriber would use, read at call time — ``None`` when there is none."""
-        return self._api_key or os.environ.get("AI_API_KEY")
+        return reveal(self._api_key) or os.environ.get("AI_API_KEY")
 
     def transcribe(self, data: bytes, filename: str, content_type: str, key: str) -> str:
         """Send the audio to the transcription endpoint (via the openai SDK) and return its text.

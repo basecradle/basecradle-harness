@@ -90,6 +90,7 @@ from basecradle_harness._media import (
 from basecradle_harness._observability import media_timer
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._platform import PlatformTool, explain
+from basecradle_harness._secret import reveal, secret
 
 #: OpenAI's Images API root. Image generation/editing is an OpenAI service; this
 #: changes only for a proxy, not to reach another vendor (the key is the OpenAI key).
@@ -212,7 +213,7 @@ class _ImageTool(PlatformTool):
         size: str = DEFAULT_SIZE,
         timeout: float = DEFAULT_TIMEOUT,
     ) -> None:
-        self._api_key = api_key
+        self._api_key = secret(api_key)  # never a plain attribute (issue #599)
         self._base_url = base_url.rstrip("/")
         self._model = model or self.MODEL
         self._default_size = size
@@ -222,7 +223,7 @@ class _ImageTool(PlatformTool):
 
     def _key(self) -> str | None:
         """The OpenAI key: the explicit one, or the agent's provider key from env."""
-        return self._api_key or os.environ.get("AI_API_KEY")
+        return reveal(self._api_key) or os.environ.get("AI_API_KEY")
 
     def _client(self, key: str):
         """An ``openai`` SDK client for the Images API, plus the module (for error mapping).

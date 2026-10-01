@@ -292,14 +292,14 @@ wheels = [
 
 [[package]]
 name = "basecradle"
-version = "0.10.0"
+version = "0.13.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b4/84/e1730272e174f4354e7acd67f75a095eadfb79a9aba85cbf63d033ff64f1/basecradle-0.10.0.tar.gz", hash = "sha256:7e9b255d21aec35cf21cb41c1ea5b2ea759b21834dddc01e01bf23055810e5f3", size = 122210, upload-time = "2026-09-23T03:28:50.737Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/95/24/03d1de7448a9d39cb1d0329936e9e6346d638efeb505d134fffdc698f15a/basecradle-0.13.0.tar.gz", hash = "sha256:44d9d6d0dde6d4601531b330f9d2f7740ff8e50694efeef7a24ec8b57f144ad9", size = 190563, upload-time = "2026-09-30T11:07:13.262Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/ea/3f4b4c16031cd8f79cb32ac965f3769ebfedae968d19c844a0c1ed752e2f/basecradle-0.10.0-py3-none-any.whl", hash = "sha256:8da7f1d5e2d95b5c0cef97714b7f687db1201debd9116d4308a9577c8e956005", size = 38835, upload-time = "2026-09-23T03:28:49.551Z" },
+    { url = "https://files.pythonhosted.org/packages/30/59/b0e1f404e024a15fac5748a95373c24dff8a5a15cbcac226fe62ec2d31f2/basecradle-0.13.0-py3-none-any.whl", hash = "sha256:4a4d43da8e295e0d7f4e43c5224ac32083e0a02babb89035a3869b81673b6e36", size = 47092, upload-time = "2026-09-30T11:07:11.863Z" },
 ]
 
 [[package]]
@@ -340,7 +340,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "av", specifier = ">=17,<19" },
-    { name = "basecradle", specifier = ">=0.9.0" },
+    { name = "basecradle", specifier = ">=0.13.0" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.7.1" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=3.3.1,<4" },

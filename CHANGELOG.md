@@ -7,6 +7,50 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.137.0] - 2026-10-01
+
+### Security: no representation of a credential-holding object emits the credential (issue #599)
+
+The class sweep from basecradle#612 (*a generic serializer or representation of an object holding a
+credential emits the credential*), run across every object here that holds one. **Whether to
+rotate:** no harness code path printed, logged, pickled or serialized any of these objects, so a
+credential reached a log or a file only if something *outside* the harness did. The two shapes that
+qualify are an operator's own `%r` of an MCP config, and a crash reporter that expands locals
+(Sentry, `rich`, `cgitb`) attached to the process. If neither applies to your agent, nothing leaked.
+
+| object | what held the credential | what emitted it before |
+|---|---|---|
+| `McpServerConfig` | every `env` and `headers` value | **`repr`, `str`, `%r`/`%s` logging**, `pprint`, `vars`, `asdict`, `pickle`, `copy`, `json.dump(fp, default=vars)` |
+| `StdioMcpClient`, `HttpMcpClient` | the config they hold | `vars`, a crash reporter, `json.dump(fp, default=vars)`, `__reduce__`, `copy` |
+| the `basecradle` client (`BaseCradle` / `SelfHealingBaseCradle`) | the bearer token, plus the re-mint password | `vars`, a crash reporter, `json.dump(fp, default=vars)`, `__reduce__`, `copy` |
+| `WakeAgent` | the NOC probe HMAC secret | `vars`, a crash reporter, `__reduce__`, `copy` |
+| `XaiSdkProvider` | the API key, in the kwargs it rebuilds its client from | `vars`, a crash reporter, `json.dump(fp, default=vars)`, `__reduce__`, `copy` |
+| `MemPalaceReranker` | its dedicated OpenRouter key | the above, plus `pickle.dumps` and `deepcopy` |
+| the image, Grok media, transcription, account-balance and direct-message tools | a key passed explicitly to the constructor (production reads the environment at call time and holds `None`) | the above, plus `pickle.dumps` and `deepcopy` |
+
+`repr`, `str` and `%r` logging of every object other than an MCP config **never** emitted a
+credential, and neither did a caught provider exception.
+
+- **`Secret`** (new, exported): a credential held this way has no `__dict__`. It renders as
+  `Secret('[REDACTED]')`, refuses `pickle` with a `TypeError` naming the risk, survives
+  `copy`/`deepcopy` as the same object, and gives the value back only through `.reveal()`. Every
+  holder above now keeps its credential in one, revealed on the line that sends it.
+  `McpServerConfig` still accepts plain strings and wraps them, so `mcp/*.json` files and the
+  constructor are unchanged.
+- **Changed:** reading `McpServerConfig.env[...]` or `.headers[...]` now returns a `Secret`. Use
+  `.reveal()` for the value. This is the minor bump.
+- **The platform SDK floor is now `basecradle>=0.13.0`**, the release that fixed its client's half
+  (basecradle-python#242: token out of `__dict__`, `token=[REDACTED]` in `repr`, `pickle`/`copy`
+  refused). Before this, the floor was 0.9.0 and the lock pinned 0.10.0, so a deployed harness
+  carried every surface that release closed.
+- Stated residuals: the login **email** stays a plain attribute, because it is an identifier and not
+  a credential. A credential a **vendor SDK** keeps on its own client (`openai.OpenAI.api_key`, the
+  `openrouter` and `xai_sdk` clients) is that vendor's attribute, reached only through our private
+  `_client`. That is the same boundary the SDK sweep drew around `httpx`.
+- `tests/test_secret.py` drives 16 surfaces against all 14 holders with a distinct fake per
+  credential kind, and checks that each credential still reaches the call that needs it. Every
+  holder test fails on 0.136.0.
+
 ## [0.136.0] - 2026-09-29
 
 ### Fixed: a turn cut off at the output budget is finished in the same wake, and the out-of-funds notice asks for the post that resumes it (issue #596)

@@ -109,6 +109,7 @@ from basecradle_harness._observability import (
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._schema import UnrepresentableSchema, normalize_object_root
+from basecradle_harness._secret import Secret
 from basecradle_harness._timeouts import call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
@@ -267,6 +268,8 @@ class XaiSdkProvider:
         #: conversation changes — the SDK fixes a channel's gRPC metadata at construction, so that
         #: is the only seam the key can reach (issue #433). ``None`` for an injected client: there
         #: is nothing to rebuild it from, and rebuilding someone else's client is not ours to do.
+        #: The key rides as a `Secret` (issue #599): this dict lives for the adapter's whole life, in
+        #: its ``__dict__``, and is revealed only on the line that builds the client.
         self._client_kwargs: dict[str, Any] | None = None
         #: The bound conversation `self._client` has already been **reconciled against** — normally
         #: the key its metadata carries, and on a rebuild that failed, the key it gave up on. Either
@@ -316,7 +319,7 @@ class XaiSdkProvider:
             # No ``timeout`` here: the deadline is fitted per call and set by `_bound_client`, which
             # rebuilds the client when it changes. Until the first call this client runs on the
             # SDK's own default — which only the non-turn reads (`context_limit`) ever see.
-            self._client_kwargs = kwargs
+            self._client_kwargs = {**kwargs, "api_key": Secret(key)}
             self._client = self._xai.Client(**kwargs)
 
     def chat(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> Message:
@@ -593,7 +596,7 @@ class XaiSdkProvider:
         ):
             self.last_timeout = self._applied_deadline
             return self._client
-        kwargs = dict(self._client_kwargs)
+        kwargs = {**self._client_kwargs, "api_key": self._client_kwargs["api_key"].reveal()}
         if self._conversation:
             kwargs["metadata"] = ((CONVERSATION_METADATA_KEY, self._conversation),)
         if self._deadline is not None:

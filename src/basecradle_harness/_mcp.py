@@ -132,6 +132,7 @@ from basecradle_harness._assets import (
 from basecradle_harness._install import config_home
 from basecradle_harness._media import sniff_media_ext
 from basecradle_harness._messages import ImageContent, ToolResult
+from basecradle_harness._secret import Secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 from basecradle_harness._venv import with_interpreter_bin
 from basecradle_harness._version import __version__
@@ -319,22 +320,42 @@ class McpServerConfig:
     only `WITHHOLDABLE` names are accepted. ``withheld_waivable`` tells the agent the withholding is
     a default it may ask to have lifted. ``note`` is the operator's own words to the model about this
     server — what it is and what backs it — shown beside whatever the server says about itself.
+
+    Every value of ``env`` and ``headers`` is held as a `Secret` (issue #599): they are where an
+    operator puts a server's credentials, and this dataclass's generated ``repr`` printed them in
+    full. A plain string is accepted and wrapped, so building one is unchanged; the names stay
+    readable, and `revealed` is the one way the values come back out, on the line that hands them to
+    the subprocess or the HTTP client.
     """
 
     name: str
     command: str | None = None
     args: tuple[str, ...] = ()
-    env: Mapping[str, str] = field(default_factory=dict)
+    env: Mapping[str, Secret] = field(default_factory=dict)
     url: str | None = None
-    headers: Mapping[str, str] = field(default_factory=dict)
+    headers: Mapping[str, Secret] = field(default_factory=dict)
     withheld_tools: tuple[str, ...] = DEFAULT_WITHHELD
     withheld_waivable: bool = False
     note: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("env", "headers"):
+            values = getattr(self, name)
+            object.__setattr__(
+                self,
+                name,
+                {k: v if isinstance(v, Secret) else Secret(v) for k, v in values.items()},
+            )
 
     @property
     def transport(self) -> str:
         """``"stdio"`` when a command is set, else ``"http"`` (a url)."""
         return "stdio" if self.command else "http"
+
+
+def revealed(values: Mapping[str, Secret]) -> dict[str, str]:
+    """An `McpServerConfig` ``env`` or ``headers`` mapping with its values revealed, for sending."""
+    return {k: v.reveal() for k, v in values.items()}
 
 
 def load_mcp_configs(home: str | os.PathLike[str] | None = None) -> list[McpServerConfig]:
@@ -673,7 +694,7 @@ class StdioMcpClient(McpClient):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                env={**with_interpreter_bin(os.environ), **self.config.env},
+                env={**with_interpreter_bin(os.environ), **revealed(self.config.env)},
                 cwd=self.workdir,
                 text=True,
                 bufsize=1,
@@ -778,7 +799,7 @@ class HttpMcpClient(McpClient):
         self._session_id: str | None = None
         self._client = httpx.Client(
             base_url="",
-            headers={**config.headers},
+            headers=revealed(config.headers),
             timeout=timeout,
         )
         self._url = config.url

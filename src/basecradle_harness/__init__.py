@@ -124,6 +124,7 @@ from basecradle_harness._plugins import (
 from basecradle_harness._policy import BASECRADLE, SHELL, Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._reads import MessagesTool, UsersTool
+from basecradle_harness._secret import Secret
 from basecradle_harness._session import Session
 from basecradle_harness._shell import ShellTool
 from basecradle_harness._system_prompt import (
@@ -210,6 +211,7 @@ __all__ = [
     # Tools, registry, and the safety boundary
     "Tool",
     "ToolRegistry",
+    "Secret",
     "MemoryTool",
     "WebFetchTool",
     "ShellTool",

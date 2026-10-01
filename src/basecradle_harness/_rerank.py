@@ -97,6 +97,7 @@ from basecradle_harness._openrouter import (
     require_openrouter_sdk,
 )
 from basecradle_harness._retry import Retry, connection_reason, diagnostics
+from basecradle_harness._secret import Secret
 from basecradle_harness._timeouts import call_timeout
 
 _log = logging.getLogger("basecradle_harness")
@@ -282,7 +283,7 @@ class MemPalaceReranker:
     ) -> None:
         self.model = model
         self.providers = tuple(providers)
-        self._api_key = api_key
+        self._api_key = Secret(api_key)  # out of every representation (issue #599)
         self._fault = fault
         self._client = client
         self._timeout = timeout
@@ -450,7 +451,7 @@ class MemPalaceReranker:
         if self._client is None:
             self._openrouter = require_openrouter_sdk()
             self._client = self._openrouter.OpenRouter(
-                api_key=self._api_key,
+                api_key=self._api_key.reveal(),
                 # No `timeout_ms`, for the brain adapter's reason: the SDK spreads it across every
                 # phase, so each attempt's fitted budget is set on the client instead (`_pick`).
                 #
