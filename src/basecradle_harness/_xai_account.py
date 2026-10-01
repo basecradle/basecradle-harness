@@ -74,6 +74,7 @@ from typing import Any
 
 import httpx
 
+from basecradle_harness._secret import reveal, secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 
 #: The xAI Management API root — a billing/account surface, distinct from the inference endpoint
@@ -173,7 +174,7 @@ class XaiAccountBalanceTool(Tool):
         cache_ttl: float = DEFAULT_CACHE_TTL,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._management_key = management_key
+        self._management_key = secret(management_key)  # never a plain attribute (issue #599)
         self._team_id = team_id
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
@@ -184,7 +185,7 @@ class XaiAccountBalanceTool(Tool):
 
     def run(self) -> str:
         """Report the live credit remaining, or a clear reason it is unavailable."""
-        key = self._management_key or os.environ.get("XAI_MANAGEMENT_KEY")
+        key = reveal(self._management_key) or os.environ.get("XAI_MANAGEMENT_KEY")
         if not key:
             return (
                 "xAI account balance unavailable — XAI_MANAGEMENT_KEY is not configured. Set it "

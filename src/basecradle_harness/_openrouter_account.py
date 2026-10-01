@@ -55,6 +55,7 @@ from typing import Any
 
 import httpx
 
+from basecradle_harness._secret import reveal, secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 
 #: The OpenRouter API root. `/credits` is an account-administration surface reached with a
@@ -147,7 +148,7 @@ class OpenRouterAccountBalanceTool(Tool):
         cache_ttl: float = DEFAULT_CACHE_TTL,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._management_key = management_key
+        self._management_key = secret(management_key)  # never a plain attribute (issue #599)
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
         self._cache_ttl = cache_ttl
@@ -160,7 +161,7 @@ class OpenRouterAccountBalanceTool(Tool):
 
     def run(self) -> str:
         """Report the credit remaining, or a clear reason it is unavailable."""
-        key = self._management_key or os.environ.get("OPENROUTER_MANAGEMENT_KEY")
+        key = reveal(self._management_key) or os.environ.get("OPENROUTER_MANAGEMENT_KEY")
         if not key:
             return (
                 "OpenRouter account balance unavailable — OPENROUTER_MANAGEMENT_KEY is not "

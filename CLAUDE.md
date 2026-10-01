@@ -828,6 +828,13 @@ see the absence of.**
   default. Only `WITHHOLDABLE` names are accepted, so withholding a new tool needs a stated reason
   in code review, and a config naming anything else fails closed (the server does not load) and
   visibly (its stem stays in `mcp_servers`, its reason lands in `skipped`).
+- **A credential an object holds is a `Secret`, never a plain attribute** (issue #599, the class
+  from basecradle#612). A key in `__dict__` is emitted by `vars()`, by a crash reporter that expands
+  locals, by `json.dump(o, fp, default=vars)` (it writes before it raises), and by `pickle`; a
+  dataclass field is emitted by its generated `repr` too, which is how `McpServerConfig` printed an
+  operator's MCP tokens. `_secret.Secret` has no `__dict__`, renders `[REDACTED]`, refuses pickle,
+  and is revealed only on the line that sends it. **A new attribute holding a credential needs a
+  `Secret` and a row in `tests/test_secret.py`'s `HOLDERS`**, or it is the same leak again.
 - **MCP is safe-by-default.** `mcp/` ships **empty** and the locked `Policy` denies shell/exec, so
   a fresh install is safe by default. Loading an MCP server — **or** a drop-in `tools/` tool
   that needs a policy-denied capability — is the operator *knowingly leaving the safe zone*, so the

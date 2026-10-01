@@ -205,6 +205,7 @@ from basecradle_harness._rerank import (
     RERANK_PROVIDERS_VAR,
     providers_from_env,
 )
+from basecradle_harness._secret import secret
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
@@ -1546,7 +1547,9 @@ class WakeAgent:
         # message, webhook, and task reconciles each recognize a signed probe in their own
         # carrier field and ack it token-free, before the model. Unset → the short-circuit
         # is off and every item goes to the model.
-        self.probe_secret = probe_secret
+        # Held as a `Secret` (issue #599): an HMAC key in `__dict__` is one crash report away from
+        # anyone who can forge a probe ack.
+        self.probe_secret = secret(probe_secret)
         self.marks = marks or MarkStore(harness.home)  # type: ignore[arg-type]
         # Activated tasks are tracked by a seen-set, not a high-water mark (see
         # `SeenStore`); it lives beside the marks, under the same home root.
@@ -3249,7 +3252,7 @@ class WakeAgent:
         """
         if not self.probe_secret:
             return None
-        return verify_probe(carrier, self.probe_secret)
+        return verify_probe(carrier, self.probe_secret.reveal())
 
     # --- the first wake: infer a high-water mark from the timeline ------------
 

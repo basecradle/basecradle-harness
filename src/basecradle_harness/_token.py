@@ -41,6 +41,8 @@ from typing import Any
 
 from basecradle import AuthenticationError, BaseCradle, UnauthorizedError
 
+from basecradle_harness._secret import reveal, secret
+
 # The ``BASECRADLE_TOKEN`` assignment to rewrite, in either form an env file takes: a
 # shell ``export BASECRADLE_TOKEN=…`` or a bare dotenv ``BASECRADLE_TOKEN=…``, with any
 # leading indentation. The two capture groups are the indentation and the optional
@@ -219,7 +221,7 @@ class SelfHealingBaseCradle(BaseCradle):
     ) -> None:
         super().__init__(token, **kwargs)
         self._email = email
-        self._password = password
+        self._password = secret(password)  # out of `__dict__`'s plain values (issue #599)
         self._session_name = session_name
         self._env_file = env_file
 
@@ -244,7 +246,7 @@ class SelfHealingBaseCradle(BaseCradle):
         """
         token = mint_token(
             email=self._email,
-            password=self._password,
+            password=reveal(self._password),
             session_name=self._session_name,
             env_file=self._env_file,
             base_url=self.base_url,
