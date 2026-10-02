@@ -7,6 +7,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.137.2] - 2026-10-02
+
+### Fixed: `basecradle-harness-scrub-palace` follows a palace whose home was renamed (issue #606)
+
+MemPalace records each drawer's `source_file` as an absolute path. After a home-directory rename,
+the scrub keyed files by those stale strings. So a scaffolding file filed under the old home passed
+the whole-file rule on its own, its drawers were deleted, and the unlink found nothing at the old
+path. The file stayed on disk. If no wake had run since the rename, the next one re-mined it as new
+content and the scrubbed scaffolding came back (reproduced on `mempalace==3.9.0`). If a wake had
+run, MemPalace's registry row for the file's new path was counted as a sibling memory and could
+hold the file.
+
+A recorded path in a `conversations/` directory is now read as the file of that name in *this*
+palace's `conversations/` directory. The unanimity tally, the block list, the unlink and the drawer
+delete all key on that identity, so drawers filed under the old and the new home vote as one file.
+The unlink still runs only after the resolved-path containment test. Registry rows are neither
+counted nor deleted. No surviving drawer is rewritten.
+
 ## [0.137.1] - 2026-10-02
 
 ### Fixed: MemPalace recall no longer returns registry rows as memories (issue #606)
