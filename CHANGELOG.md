@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.139.0] - 2026-10-02
+
+### Added: `basecradle-harness-palace-check --sample N`, and a diagnosis of every miss (issue #606)
+
+Three probes say whether a moved palace serves; they cannot say whether the move made recall worse.
+`--sample N` probes N drawers chosen by the SHA-256 of their drawer id, so a palace and its relocated
+copy probe the same drawers wherever they sit, and `--filed-before` holds the population still while
+a live palace keeps growing. The report prints only the misses and ends with one comparable line:
+`sample summary: probes N, passed P, failed F, failing digest D`, after the population and its
+sample digest.
+
+Every probe that misses, in either mode, gets a text-free `why:` line. It gives the drawer's rank in
+a top-100 search and in the vector half of a top-10 search, whether the vector index returns it for
+its own embedding, how many drawers share its exact text or its query, and what the drawers that
+took the top 10 share with it (text, query, content hash, source file). The verdict is `twin` (an
+identical copy holds the slot), `cut` (full scoring would place it, but union search kept ten nearer
+vector candidates before ranking), `crowded` (outscored even on full scoring) or `unreached`. A file the dry-run
+forecast says will be mined as new gets its own line, with the drawers recorded under its name and
+whether its content hash today matches a recorded one. No drawer text is ever printed.
+
 ## [0.138.0] - 2026-10-02
 
 ### Added: `basecradle-harness-palace-check` (issue #606)
