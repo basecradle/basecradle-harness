@@ -117,6 +117,22 @@ MAX_N_RESULTS = 20
 # `context` already reads as "no hits").
 _CANDIDATE_STRATEGY = "union"
 
+# The `room` MemPalace stamps on a **registry sentinel** (mempalace 3.9.0 `convo_miner._register_file`):
+# a bookkeeping row whose whole document is ``[registry] <absolute path of a mined file>``, written so
+# a file that mined to nothing, or whose content is already filed under another path, is not
+# re-read on every mine. It is not a memory, and upstream's searcher returns it like one (issue
+# #606). A home rename writes one per conversation file, each carrying the new home's name, so a
+# message that names the agent recalled ten paths and no memories. `search` drops them.
+_REGISTRY_ROOM = "_registry"
+
+# How far `search` may widen the fetch to make up for sentinels it dropped, as a multiple of the pool
+# it wanted. Measured on a 2,000-file palace renamed into a home named after the agent (issue #606):
+# when real memories match a query they rank above every sentinel, so one doubling recovers the full
+# count; when none match, sentinels fill the ranking and real drawers surface only past all of them,
+# thousands deep, as matches too weak to recall. The cap stops the widening there rather than paying
+# for that tail on every wake. Each widened fetch measured under 0.1 s at this size.
+_MAX_FETCH_FACTOR = 8
+
 # The tag whose open/close pair fences the injected recall. The generator's name lives on the
 # fence itself, not only in the prose above it: the block is spliced into a ~54K-character system
 # turn between the dashboard and the charter, and a reader skimming that brief scans the tags —
@@ -267,6 +283,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
         **Without one** the call is byte-identical to what it was before rerank existed: the same
         ``n_results``, the same union strategy, the same slice. Rerank is off by *absence*.
 
+        **Registry sentinels are never returned** (issue #606): they are MemPalace's bookkeeping, not
+        memories (see `_REGISTRY_ROOM`). The first fetch is exactly the one above; only when it
+        dropped a sentinel, came back short, and filled its page does `search` fetch again at twice
+        the size, up to `_MAX_FETCH_FACTOR` times the pool. A palace with no sentinels in the ranking
+        is searched once, as before. Past the cap a query can return fewer than it asked for, which
+        is the honest answer: what lies behind thousands of sentinels is not worth recalling.
+
         `surface` names which half asked (`SURFACE_TURN0` / `SURFACE_TOOL`) and rides the log lines
         so a per-wake Turn-0 recall is separable from a deliberate mid-task search. It defaults to
         the tool surface — the deliberate one — because that is what a third-party caller of this
@@ -283,19 +306,31 @@ class MemPalaceMemoryProvider(MemoryProvider):
         pool = pool_size(wanted) if self.reranker is not None else wanted
         started = time.monotonic()
         searcher = _import("searcher")
-        # Never pass `max_distance`: upstream's union merge opens with
-        # `if max_distance > 0.0: return`, so *any* distance threshold silently disables
-        # the BM25 half of the pool (lexical-only candidates carry no vector distance) and
-        # `candidate_strategy` above becomes a no-op. A distance filter and union recall
-        # are mutually exclusive upstream; we keep the recall. Pinned by test.
-        result = searcher.search_memories(
-            query,
-            str(self.palace_path),
-            n_results=pool,
-            candidate_strategy=_CANDIDATE_STRATEGY,
-        )
-        raw = result.get("results") if isinstance(result, dict) else None
-        hits = [hit for hit in (raw or []) if isinstance(hit, dict) and hit.get("text")]
+        fetch = pool
+        while True:
+            # Never pass `max_distance`: upstream's union merge opens with
+            # `if max_distance > 0.0: return`, so *any* distance threshold silently disables
+            # the BM25 half of the pool (lexical-only candidates carry no vector distance) and
+            # `candidate_strategy` above becomes a no-op. A distance filter and union recall
+            # are mutually exclusive upstream; we keep the recall. Pinned by test.
+            result = searcher.search_memories(
+                query,
+                str(self.palace_path),
+                n_results=fetch,
+                candidate_strategy=_CANDIDATE_STRATEGY,
+            )
+            raw = result.get("results") if isinstance(result, dict) else None
+            raw = [hit for hit in (raw or []) if isinstance(hit, dict) and hit.get("text")]
+            hits = [hit for hit in raw if hit.get("room") != _REGISTRY_ROOM]
+            sentinels = len(raw) - len(hits)
+            # Widen only while it can help: something was dropped, the result is still short, and
+            # the backend filled the page (a short page means the palace has nothing further).
+            if not sentinels or len(hits) >= pool or len(raw) < fetch:
+                break
+            if fetch >= pool * _MAX_FETCH_FACTOR:
+                break
+            fetch = min(fetch * 2, pool * _MAX_FETCH_FACTOR)
+        hits = hits[:pool]
         if self.reranker is not None:
             hits = self.reranker.rerank(query, hits, wanted, surface=surface)
         else:
@@ -308,6 +343,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
             pool=pool,
             hits=hits,
             seconds=time.monotonic() - started,
+            fetched=fetch,
+            sentinels=sentinels,
         )
         return hits
 
@@ -537,7 +574,14 @@ def _write_cli_config(config_dir: Path, config_file: Path, data: dict) -> None:
 
 
 def _log_recall(
-    *, surface: str, reranked: bool, pool: int, hits: list[dict], seconds: float
+    *,
+    surface: str,
+    reranked: bool,
+    pool: int,
+    hits: list[dict],
+    seconds: float,
+    fetched: int,
+    sentinels: int,
 ) -> None:
     """The ``memory recall`` line — one per retrieval, on either surface.
 
@@ -558,7 +602,17 @@ def _log_recall(
     ``chars`` counts the recalled **chunk text**, not the rendered block: it is the quantity that
     is comparable between the two surfaces (Turn-0 fences and captions its hits; the tool does
     not), and it is what an operator asking "how much memory is this wake paying for?" means.
+
+    ``sentinels`` (registry rows the last fetch dropped) and ``fetched`` (how wide that fetch went)
+    are written only when there is something to say (issue #606): a palace with no sentinels in its
+    ranking logs the same line it always did, and one that has them says how many and what the
+    widening cost.
     """
+    extra: dict[str, object] = {}
+    if sentinels:
+        extra["sentinels"] = sentinels
+    if fetched != pool:
+        extra["fetched"] = fetched
     _log.info(
         "memory recall %s",
         kv(
@@ -569,6 +623,7 @@ def _log_recall(
             injected=len(hits),
             duration=_secs(seconds),
             chars=sum(len(str(hit.get("text") or "")) for hit in hits),
+            **extra,
         ),
     )
 

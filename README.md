@@ -1183,6 +1183,12 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   INFO llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
   ```
 
+  MemPalace keeps bookkeeping rows in the palace, one `[registry] <path>` row for each file it has already processed, and its search returns them like memories. Recall drops them. When some were dropped, the line says how many (`sentinels=`), and `fetched=` says how far the search widened to make up the count, to at most eight times the pool. A home-directory rename adds one such row per conversation file, so these two fields are where a relocated palace shows up:
+
+  ```
+  INFO memory recall provider=mempalace surface=turn0 rerank=off pool=10 injected=10 duration=0.31s chars=6461 sentinels=14 fetched=20
+  ```
+
   And a describe, on an agent with a [describer](#give-a-blind-model-eyes--the-describer) configured:
 
   ```
