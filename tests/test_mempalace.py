@@ -233,6 +233,161 @@ def test_context_never_sets_max_distance(fake_mempalace, tmp_path):
     assert "max_distance" not in searcher.queries[0][2]
 
 
+# --- registry sentinels are bookkeeping, never memories (issue #606) ----------
+
+_SENTINEL_PATH = "/home/nova/harness/mempalace/conversations/0f8e1c2d3b4a59687766554433221100.md"
+
+
+def _sentinel(n=0):
+    """A row shaped exactly as MemPalace 3.9.0 `_register_file` writes it, as the searcher returns it."""
+    return {
+        "text": f"[registry] {_SENTINEL_PATH}#{n}",
+        "room": "_registry",
+        "wing": "conversations",
+    }
+
+
+def _memory(n):
+    return {"text": f"Nova told John the codeword is AZURE-{n:04d}.", "room": "technical"}
+
+
+def _ranked(searcher, ranking):
+    """Make the fake searcher honor ``n_results`` over a fixed ranking, as the real one does."""
+
+    def search_memories(query, palace_path, **kwargs):
+        searcher.queries.append((query, palace_path, kwargs))
+        return {"results": ranking[: kwargs["n_results"]]}
+
+    searcher.search_memories = search_memories
+
+
+def test_registry_sentinels_never_reach_either_memory_surface(fake_mempalace, tmp_path):
+    """A home rename writes one ``[registry] <path>`` row per conversation file, and upstream's
+    searcher returns them like memories. A message naming the agent then recalled ten file paths
+    and no memories. They are dropped before Turn 0 or the tool ever sees them."""
+    _, searcher = fake_mempalace
+    _ranked(searcher, [_sentinel(0), _memory(1), _sentinel(1), _memory(2)])
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    provider = MemPalaceMemoryProvider(palace, n_results=3)
+
+    block = provider.context(_scope(query="hey nova"))
+    (tool,) = provider.tools()
+    result = tool.run("hey nova")
+
+    for rendered in (block, result):
+        assert "[registry]" not in rendered
+        assert "AZURE-0001" in rendered and "AZURE-0002" in rendered
+
+
+def test_a_short_page_is_searched_once(fake_mempalace, tmp_path):
+    """A page shorter than the fetch means the palace has nothing further; widening buys nothing."""
+    _, searcher = fake_mempalace
+    _ranked(searcher, [_sentinel(), _memory(1)])
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    hits = MemPalaceMemoryProvider(palace).search("hey nova", 5)
+
+    assert [hit["text"] for hit in hits] == [_memory(1)["text"]]
+    assert [q[2]["n_results"] for q in searcher.queries] == [5]
+
+
+def test_dropped_sentinels_are_made_up_by_widening_the_fetch(fake_mempalace, tmp_path):
+    """The requested count still comes back when real memories sit behind the sentinels."""
+    _, searcher = fake_mempalace
+    _ranked(searcher, [_sentinel(n) for n in range(30)] + [_memory(n) for n in range(20)])
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    hits = MemPalaceMemoryProvider(palace).search("hey nova", 10)
+
+    assert [hit["text"] for hit in hits] == [_memory(n)["text"] for n in range(10)]
+    assert [q[2]["n_results"] for q in searcher.queries] == [10, 20, 40]
+
+
+def test_the_widening_stops_at_its_cap(fake_mempalace, tmp_path):
+    """A query nothing real answers ranks sentinels all the way down; the search stops at
+    ``_MAX_FETCH_FACTOR`` times the pool and returns what it has, which is nothing."""
+    _, searcher = fake_mempalace
+    _ranked(searcher, [_sentinel(n) for n in range(1000)])
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    provider = MemPalaceMemoryProvider(palace)
+
+    assert provider.search("hey nova", 10) == []
+    assert [q[2]["n_results"] for q in searcher.queries] == [10, 20, 40, 80]
+    assert provider.context(_scope(query="hey nova")) is None
+
+
+def test_a_palace_without_sentinels_is_searched_exactly_once(fake_mempalace, tmp_path):
+    _, searcher = fake_mempalace
+    _ranked(searcher, [_memory(n) for n in range(50)])
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    MemPalaceMemoryProvider(palace).search("hey nova", 10)
+
+    assert [q[2] for q in searcher.queries] == [{"n_results": 10, "candidate_strategy": "union"}]
+
+
+def test_the_recall_line_names_dropped_sentinels_only_when_there_were_some(
+    fake_mempalace, tmp_path, caplog
+):
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    provider = MemPalaceMemoryProvider(palace)
+
+    def recall_line():
+        line = [
+            r.getMessage() for r in caplog.records if r.getMessage().startswith("memory recall")
+        ]
+        caplog.clear()
+        return line[-1]
+
+    caplog.set_level("INFO", logger="basecradle_harness")
+    _ranked(searcher, [_memory(n) for n in range(20)])
+    provider.search("hey nova", 5)
+    clean = recall_line()
+    assert "sentinels=" not in clean and "fetched=" not in clean
+
+    _ranked(searcher, [_sentinel(n) for n in range(7)] + [_memory(n) for n in range(20)])
+    provider.search("hey nova", 5)
+    polluted = recall_line()
+    # 5 (all sentinels) → 10 (three memories) → 20 (thirteen): the last fetch dropped all seven.
+    assert "sentinels=7" in polluted
+    assert "fetched=20" in polluted
+    assert "injected=5" in polluted
+
+
+def test_the_reranker_is_handed_a_pool_without_sentinels(fake_mempalace, tmp_path):
+    """Rerank reads the pool `search` hands it, so a sentinel left in would spend a pick slot."""
+
+    class Recorder:
+        def __init__(self):
+            self.pools = []
+
+        def rerank(self, query, hits, k, *, surface):
+            self.pools.append(list(hits))
+            return hits[:k]
+
+        def close(self):
+            pass
+
+    _, searcher = fake_mempalace
+    _ranked(searcher, [_sentinel(n) for n in range(25)] + [_memory(n) for n in range(40)])
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    recorder = Recorder()
+
+    MemPalaceMemoryProvider(palace, reranker=recorder).search("hey nova", 10)
+
+    (pool,) = recorder.pools
+    assert len(pool) == 20  # the reranker's pool, refilled with memories and cut to size
+    assert all(hit["room"] != "_registry" for hit in pool)
+
+
 def test_context_is_none_when_the_backend_cannot_do_lexical_search(fake_mempalace, tmp_path):
     """Graceful degradation: a backend without `lexical_search` errors, and we simply skip.
 

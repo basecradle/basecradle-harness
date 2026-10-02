@@ -7,6 +7,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.137.1] - 2026-10-02
+
+### Fixed: MemPalace recall no longer returns registry rows as memories (issue #606)
+
+MemPalace writes a bookkeeping row, `[registry] <absolute path>`, for each file it has already
+processed under a path it does not otherwise know: a file that mined to nothing, or one whose
+content is already filed under another path. Its searcher returns those rows like memories, and the
+harness passed them straight into Turn-0 recall and `memory_search`. A home-directory rename writes
+one per conversation file, each carrying the new home's name. Measured on a 2,000-file palace
+renamed into a home named after the agent: a query on that name came back as ten file paths and no
+memories.
+
+`MemPalaceMemoryProvider.search` now drops every hit whose `room` is `_registry`. If that leaves the
+result short and the page was full, it fetches again at twice the size, up to eight times the pool,
+so the requested count comes back whenever real memories exist behind the rows. A palace with no
+registry rows in its ranking is searched once, exactly as before. The `memory recall` line gains
+`sentinels=` and `fetched=`, both written only when rows were dropped. No stored drawer is changed.
+
 ## [0.137.0] - 2026-10-01
 
 ### Security: no representation of a credential-holding object emits the credential (issue #599)
