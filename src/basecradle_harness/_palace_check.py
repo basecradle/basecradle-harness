@@ -191,15 +191,32 @@ def forecast(palace: Path, agent: str) -> Forecast | None:
     return Forecast(duplicate, new) if duplicate or new else None
 
 
-def new_file_diagnosis(found: Census, convos: Path, name: str) -> str:
-    """Why the next observe will mine ``name`` as new drawers, in counts and flags only.
+def accepted_hashes(collection) -> dict | None:
+    """MemPalace's own map of the content it will recognise, keyed ``(wing, content_hash)``.
 
-    A moved file is recognised by the content hash its drawers carry, so a file forecast as new
-    either has no drawers anywhere (it was never mined) or has drawers whose recorded hash the
-    miner does not accept: no hash, an older ``normalize_version``, another extract mode, or a hash
-    that no longer matches the file. If its drawers exist elsewhere, mining it again adds a second
-    copy of each, and the two copies then compete for the same slots (see `diagnose`): a move that
-    re-mines a file can turn a drawer that passed into a ``twin`` miss.
+    The very map the miner reads to decide that a file at a new path is already filed
+    (``prefetch_content_hashes``, with the adapter's extract mode). ``None`` when it cannot be
+    read, so a reason is reported as unknown rather than guessed.
+    """
+    try:
+        return _import("palace").prefetch_content_hashes(collection, extract_mode="exchange")
+    except ImportError:
+        raise
+    except Exception:  # noqa: BLE001 - a diagnosis input, never a crash of the check
+        return None
+
+
+def new_file_diagnosis(found: Census, convos: Path, name: str, accepted: dict | None) -> str:
+    """Why the next observe will mine ``name`` as new drawers, in counts, flags and one reason.
+
+    The first line is the file's record: the drawers filed under its name, their wings, hashes,
+    ``normalize_version`` and extract mode, and whether today's content hash matches one of theirs.
+    The ``reason:`` line is the miner's decision, read off `accepted_hashes`: a moved file is
+    recognised only when MemPalace's map holds its content hash **in the observe's wing**, so a
+    record whose every field matches can still be refused (issue #606, phase 4: the first version
+    of this line listed every field but the wing, and said "matches" about a file the miner then
+    filed again). If its drawers exist elsewhere, mining it again adds a second copy of each, and
+    the two copies then compete for the same slots (see `diagnose`).
     """
     rows = [
         meta for _, meta, _ in found.real if Path(str(meta.get("source_file") or "")).name == name
@@ -207,25 +224,86 @@ def new_file_diagnosis(found: Census, convos: Path, name: str) -> str:
     here = str((convos / name).resolve())
     at_here = sum(str(meta.get("source_file")) == here for meta in rows)
     hashed = [meta for meta in rows if meta.get("content_hash")]
-    stored = {h for meta in hashed for h in str(meta["content_hash"]).split(",") if h}
+    stored = {h for meta in hashed for h in _hashes(meta)}
+    wings = sorted({str(meta.get("wing") or "-") for meta in rows}) or ["-"]
     versions = sorted({str(meta.get("normalize_version", 1)) for meta in rows}) or ["-"]
     modes = sorted({str(meta.get("extract_mode") or "-") for meta in rows}) or ["-"]
     try:
         conversations = [
             c for c in _import("normalize").normalize_conversations(str(convos / name)) if c
         ]
-        today = {hashlib.sha256(c.strip().encode("utf-8")).hexdigest() for c in conversations}
-        matches = "yes" if today & stored else "no"
+        today = [hashlib.sha256(c.strip().encode("utf-8")).hexdigest() for c in conversations]
+        matches = "yes" if set(today) & stored else "no"
+        reason = _new_reason(found, here, today, bool(hashed), bool(rows), accepted)
     except ImportError:
         raise
     except Exception as error:  # noqa: BLE001 - a diagnosis line, never a crash of the check
-        matches = f"unknown ({type(error).__name__})"
+        matches = reason = f"unknown ({type(error).__name__})"
     return (
         f"  mined as new: {name}: {len(rows)} drawers recorded under this file name "
-        f"({at_here} at this location); content_hash on {len(hashed)}; "
+        f"({at_here} at this location); wing {','.join(wings)}; content_hash on {len(hashed)}; "
         f"normalize_version {','.join(versions)}; extract_mode {','.join(modes)}; "
-        f"today's content hash matches a recorded one: {matches}"
+        f"today's content hash matches a recorded one: {matches}\n"
+        f"    reason: {reason}"
     )
+
+
+def _new_reason(
+    found: Census, here: str, today: list[str], hashed: bool, named: bool, accepted: dict | None
+) -> str:
+    """The first of the file's conversations MemPalace will not recognise, and why, in words.
+
+    Whether it is recognised is MemPalace's answer (``accepted``). *Why not* is read off the drawers
+    that carry its hash: the first of wing, extract mode and ``normalize_version`` that keeps every
+    one of them out of the map under the observe's wing.
+    """
+    if accepted is None:
+        return "unknown, MemPalace's content-hash map could not be read"
+    wing = _CONVERSATIONS_WING
+    unknown = [h for h in today if accepted.get((wing, h)) in (None, here)]
+    if not unknown:
+        return "none: MemPalace's content-hash map recognises every conversation in it"
+    content_hash = unknown[0]
+    count = f" ({len(unknown)} of its {len(today)} conversations)" if len(today) > 1 else ""
+    if accepted.get((wing, content_hash)) == here:
+        return f"it changed since it was mined at this path, and is re-mined in place{count}"
+    carriers = [meta for _, meta, _ in found.real if content_hash in _hashes(meta)]
+    if not carriers:
+        if not named:
+            return f"it was never filed{count}"
+        if not hashed:
+            return f"its drawers carry no content hash (filed before MemPalace 3.7){count}"
+        return f"no drawer carries today's content hash: it changed after it was filed{count}"
+    in_wing = [meta for meta in carriers if meta.get("wing") == wing]
+    if not in_wing:
+        others = ", ".join(
+            sorted({repr(meta["wing"]) if meta.get("wing") else "(none)" for meta in carriers})
+        )
+        return (
+            f"its content is filed only in wing {others}, not the observe's {wing!r}; MemPalace "
+            f"recognises a moved file's content within one wing but a known path in any, so a "
+            f"move files it again in {wing!r}: a second copy of each of its drawers{count}"
+        )
+    exchange = [meta for meta in in_wing if _exchange_mode(meta)]
+    if not exchange:
+        modes = ", ".join(sorted({str(meta.get("extract_mode") or "-") for meta in in_wing}))
+        return f"its content is filed only under extract_mode {modes}, not exchange{count}"
+    current = getattr(_import("palace"), "NORMALIZE_VERSION", None)
+    if current is not None and all(meta.get("normalize_version", 1) < current for meta in exchange):
+        versions = ", ".join(sorted({str(meta.get("normalize_version", 1)) for meta in exchange}))
+        return (
+            f"its content is filed only at normalize_version {versions}, older than "
+            f"MemPalace's {current}{count}"
+        )
+    return (
+        f"MemPalace does not accept its recorded hash, for a reason this check cannot name{count}"
+    )
+
+
+def _exchange_mode(meta: dict) -> bool:
+    """Whether MemPalace counts a drawer as filed in exchange mode (a legacy row with none, too)."""
+    mode = meta.get("extract_mode")
+    return mode == "exchange" or (mode is None and meta.get("ingest_mode") in (None, "convos"))
 
 
 def practice_observe(provider: MemPalaceMemoryProvider) -> float:
@@ -572,8 +650,9 @@ def main(argv: list[str] | None = None) -> int:
                     f"{len(predicted.new)} files -> mined as new drawers"
                 )
                 convos = palace / _CONVERSATIONS_WING
+                accepted = accepted_hashes(collection) if predicted.new else None
                 for new_name in predicted.new:
-                    print(new_file_diagnosis(found, convos, new_name))
+                    print(new_file_diagnosis(found, convos, new_name, accepted))
         if args.sample:
             drawn = sample(found, args.sample, args.filed_before)
             rows, elsewhere = drawn.rows, False

@@ -6,6 +6,7 @@ model what the check depends on: a paged collection, a searcher that honors ``n_
 dry-run mine that prints MemPalace's per-file lines.
 """
 
+import hashlib
 import sys
 import types
 from importlib import metadata
@@ -100,6 +101,7 @@ def fake(monkeypatch):
         missing=set(),
         cut=set(),
         dry_run_lines=None,
+        hash_map_fails=False,
     )
 
     palace = types.ModuleType("mempalace.palace")
@@ -109,6 +111,26 @@ def fake(monkeypatch):
         return state.collection
 
     palace.get_collection = get_collection
+    palace.NORMALIZE_VERSION = 2
+
+    def prefetch_content_hashes(collection, extract_mode=None):
+        # MemPalace's rule: hashed rows at the current normalize_version in the asked extract mode,
+        # keyed by (wing, hash), the first source seen for a pair kept.
+        if state.hash_map_fails:
+            raise RuntimeError("partial fetch")
+        hashes = {}
+        for _, meta in collection.drawers.values():
+            mode = meta.get("extract_mode")
+            if not (mode == extract_mode or (mode is None and extract_mode == "exchange")):
+                continue
+            if not meta.get("wing") or meta.get("normalize_version", 1) < 2:
+                continue
+            for content_hash in str(meta.get("content_hash") or "").split(","):
+                if content_hash:
+                    hashes.setdefault((meta["wing"], content_hash), meta["source_file"])
+        return hashes
+
+    palace.prefetch_content_hashes = prefetch_content_hashes
 
     searcher = types.ModuleType("mempalace.searcher")
 
@@ -508,9 +530,120 @@ def test_a_file_forecast_as_new_is_diagnosed_in_counts(home, fake, capsys):
 
     assert (
         f"  mined as new: {name}: 1 drawers recorded under this file name (0 at this location); "
-        "content_hash on 1; normalize_version 1; extract_mode -; "
+        "wing -; content_hash on 1; normalize_version 1; extract_mode -; "
         "today's content hash matches a recorded one: no"
     ) in lines
+    assert "    reason: no drawer carries today's content hash: it changed after it was filed" in (
+        lines
+    )
+
+
+# --- phase 4: the reason a file forecast as new is not recognised, decided by MemPalace's map ---
+
+HAND = "notes-on-the-garden-project.md"
+HAND_TEXT = "> What did John plan for the garden?\nNova said tomatoes, watered twice a week.\n"
+
+
+def _hand_file(home, **meta):
+    """A hand-placed file on disk and its five drawers filed under the old home, ``meta`` applied."""
+    (home / "mempalace" / "conversations" / HAND).write_text(HAND_TEXT, encoding="utf-8")
+    content_hash = hashlib.sha256(HAND_TEXT.strip().encode("utf-8")).hexdigest()
+    drawers = {}
+    for chunk in range(5):
+        row = _meta(
+            f"{OLD}/{HAND}",
+            "2026-08-30T00:00:00",
+            chunk_index=chunk,
+            wing="notes_on_the_garden_project.md",
+            extract_mode="exchange",
+            normalize_version=2,
+        )
+        if chunk == 0:
+            row["content_hash"] = content_hash
+        row.update(meta)
+        drawers[f"hand-{chunk}"] = (f"Garden chunk {chunk}.", row)
+    return drawers
+
+
+def _reason(capsys, home):
+    _, lines = _run(capsys, home)
+    return [line for line in lines if line.startswith("    reason: ")]
+
+
+def test_content_filed_only_in_another_wing_is_named_as_the_reason(home, fake, capsys):
+    """The phase 4 file: every field matches except the wing, which the miner's map is keyed on."""
+    fake.collection = FakeCollection(_hand_file(home))
+    fake.dry_run_lines = [f"    [DRY RUN] {HAND} -> room:planning (5 drawers)"]
+
+    _, lines = _run(capsys, home)
+
+    assert (
+        f"  mined as new: {HAND}: 5 drawers recorded under this file name (0 at this location); "
+        "wing notes_on_the_garden_project.md; content_hash on 1; normalize_version 2; "
+        "extract_mode exchange; today's content hash matches a recorded one: yes"
+    ) in lines
+    assert (
+        "    reason: its content is filed only in wing 'notes_on_the_garden_project.md', not the "
+        "observe's 'conversations'; MemPalace recognises a moved file's content within one wing "
+        "but a known path in any, so a move files it again in 'conversations': a second copy of "
+        "each of its drawers"
+    ) in lines
+
+
+def test_content_filed_in_the_observes_wing_is_recognised(home, fake, capsys):
+    """If MemPalace's map holds the hash in the observe's wing, the check says so, not a guess."""
+    fake.collection = FakeCollection(_hand_file(home, wing="conversations"))
+    fake.dry_run_lines = [f"    [DRY RUN] {HAND} -> room:planning (5 drawers)"]
+
+    assert _reason(capsys, home) == [
+        "    reason: none: MemPalace's content-hash map recognises every conversation in it"
+    ]
+
+
+@pytest.mark.parametrize(
+    ("meta", "reason"),
+    [
+        (
+            {"wing": "conversations", "extract_mode": "general"},
+            "its content is filed only under extract_mode general, not exchange",
+        ),
+        (
+            {"wing": "conversations", "normalize_version": 1},
+            "its content is filed only at normalize_version 1, older than MemPalace's 2",
+        ),
+        (
+            {"content_hash": None},
+            "its drawers carry no content hash (filed before MemPalace 3.7)",
+        ),
+    ],
+)
+def test_each_way_the_map_refuses_a_record_is_named(home, fake, capsys, meta, reason):
+    drawers = _hand_file(home)
+    drawers["hand-0"][1].update(meta)
+    if drawers["hand-0"][1]["content_hash"] is None:
+        del drawers["hand-0"][1]["content_hash"]
+    fake.collection = FakeCollection(drawers)
+    fake.dry_run_lines = [f"    [DRY RUN] {HAND} -> room:planning (5 drawers)"]
+
+    assert _reason(capsys, home) == [f"    reason: {reason}"]
+
+
+def test_a_file_never_filed_says_so(home, fake, capsys):
+    (home / "mempalace" / "conversations" / HAND).write_text(HAND_TEXT, encoding="utf-8")
+    fake.collection = FakeCollection(_drawers(home))
+    fake.dry_run_lines = [f"    [DRY RUN] {HAND} -> room:planning (1 drawers)"]
+
+    assert _reason(capsys, home) == ["    reason: it was never filed"]
+
+
+def test_an_unreadable_hash_map_is_an_unknown_reason_not_a_guess(home, fake, capsys):
+    fake.collection = FakeCollection(_hand_file(home))
+    fake.dry_run_lines = [f"    [DRY RUN] {HAND} -> room:planning (5 drawers)"]
+    fake.hash_map_fails = True
+
+    assert _reason(capsys, home) == [
+        "    reason: unknown, MemPalace's content-hash map could not be read"
+    ]
 
 
 def test_filed_before_needs_a_sample_and_a_local_time(home, fake, capsys):

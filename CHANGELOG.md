@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.139.1] - 2026-10-02
+
+### Fixed: `palace-check` names why a file forecast as "mined as new" is not recognised (issue #606)
+
+A moved conversation file is recognised by its content hash, but MemPalace looks that hash up per
+wing: `prefetch_content_hashes` keys its map on `(wing, content_hash)`, while the path skip
+(`prefetch_mined_set`) matches a known path in any wing. A file mined on its own, outside the
+observe, is filed in a wing named after the file (`mine_convos` on a single file with no `wing`), so
+at its own path the observe skips it, and at a new path it is filed again in `conversations`: a
+second copy of each of its drawers. The `mined as new:` line printed every field of the file's
+record except the wing, so it said the hash matched about a file the miner then filed again.
+
+The line now gives the wings its drawers are filed in, and a `reason:` line under it gives the
+miner's decision, read off MemPalace's own content-hash map: content filed only in another wing,
+under another extract mode or an older `normalize_version`, drawers with no content hash, content
+changed since it was filed, never filed, or recognised after all. No drawer text is printed.
+
 ## [0.139.0] - 2026-10-02
 
 ### Added: `basecradle-harness-palace-check --sample N`, and a diagnosis of every miss (issue #606)
