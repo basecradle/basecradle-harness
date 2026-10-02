@@ -214,7 +214,7 @@ The palace resolves the way a wake resolves it (`MEMPALACE_PALACE_PATH`, else `$
 
 ### Check a palace after a home move — `basecradle-harness-palace-check`
 
-MemPalace records every drawer's source as an absolute path, so renaming an agent's home directory leaves the palace holding paths under a home that no longer exists. This command proves the palace still works from where it is now. It makes **no platform call and no model call**, and it is **read-only** by default:
+MemPalace records every drawer's source as an absolute path, so renaming an agent's home directory leaves the palace holding paths under a home that no longer exists. This command proves the palace still works from where it is now. It makes **no platform call and no model call**, and it is **read-only** by default. It writes no drawer, row, metadata value or embedding. ChromaDB still rewrites bytes in its own storage files whenever the palace is opened, even read-only, so compare palaces by their contents, never by a checksum of the directory:
 
 ```bash
 basecradle-harness-palace-check /home/<user>/harness    # or set $HARNESS_HOME and pass nothing
