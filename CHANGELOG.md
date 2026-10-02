@@ -7,6 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.140.0] - 2026-10-02
+
+### Added: `basecradle-harness-palace-check --register-off-wing` (issue #613)
+
+MemPalace recognises a moved conversation file by its content only within the wing it mines into,
+so a file once mined on its own into another wing is filed again in `conversations` at the first
+wake after a home move: a second copy of each of its drawers (issue #606, phase 4). Run once after
+the rename and before that wake, `--register-off-wing` registers each such file in the wing its
+drawers already carry, with MemPalace's own single-file mine: one registry row per file, no drawer,
+and no existing drawer touched. It acts only on files whose reason is the other-wing case, takes
+the wing from the drawers, refuses and writes nothing if any file would file a drawer, reports the
+rows and drawers it wrote (drawers must be 0), and registers nothing on a second run.
+`--dry-run` prints what it would do. It writes to the palace and says so in its help and output.
+
 ## [0.139.1] - 2026-10-02
 
 ### Fixed: `palace-check` names why a file forecast as "mined as new" is not recognised (issue #606)

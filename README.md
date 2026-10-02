@@ -230,6 +230,20 @@ It opens the palace exactly as a wake resolves it from that `HARNESS_HOME` (an i
 
 `--practice-observe` is for a **practice copy only**, and it **writes to the palace**. A practice user has no platform account and never completes a wake, so the registry rows a first wake at a new home writes would never exist there. The mode runs the harness's own observe once, with a fixed exchange and no model call, before the report. Never run it against an agent's live palace.
 
+`--register-off-wing` is for a **real move**, and it **writes to the palace**. Run it once after the home rename and before the agent's first wake. MemPalace recognises a moved conversation file by its content only within the wing the observe mines into (`conversations`). So a file once mined on its own into another wing (for example `mempalace mine <file> --mode convos` with no `--wing`, which names the wing after the file) would be filed again at that first wake: a second copy of each of its drawers. This mode registers each such file in the wing its drawers already carry. That writes **one registry row per file and no drawer**, and touches no existing drawer:
+
+```bash
+basecradle-harness-palace-check --register-off-wing --dry-run /home/<user>/harness   # says what it would do
+basecradle-harness-palace-check --register-off-wing /home/<user>/harness             # does it, then reports
+```
+
+- **It acts only on the other-wing case.** That is a file the dry-run forecast says will be mined as new, whose unrecognised content is filed in exactly one other wing. The wing comes from those drawers, never from an argument. Every other file is left alone and named.
+- **It refuses, writing nothing,** if MemPalace's own dry run of any one of those files would file a drawer.
+- **It reports what it wrote**: files registered, registry rows written, and drawers written, which must be 0. It exits 1 if the palace changed any other way.
+- **It is safe to run twice.** A registered file is known by its path, so a second run registers nothing.
+
+After it, the report's forecast reads `0 files -> mined as new drawers`.
+
 **Does a move make recall worse?** Three probes can say a palace serves; they cannot say a move left recall as good as it was. `--sample N` probes N drawers instead, and prints only the ones that miss:
 
 ```bash

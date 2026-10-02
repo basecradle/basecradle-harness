@@ -102,6 +102,8 @@ def fake(monkeypatch):
         cut=set(),
         dry_run_lines=None,
         hash_map_fails=False,
+        simulate=False,
+        misbehave=False,
     )
 
     palace = types.ModuleType("mempalace.palace")
@@ -160,7 +162,9 @@ def fake(monkeypatch):
 
     def mine_convos(convo_dir, palace_path, **kwargs):
         state.mines.append((convo_dir, kwargs))
-        if kwargs.get("dry_run") and state.dry_run_lines is not None:
+        if state.simulate:
+            _simulate_mine(state, Path(convo_dir), kwargs, prefetch_content_hashes)
+        elif kwargs.get("dry_run") and state.dry_run_lines is not None:
             print("\n".join(state.dry_run_lines))
 
     convo_miner.mine_convos = mine_convos
@@ -180,6 +184,46 @@ def fake(monkeypatch):
         monkeypatch.setitem(sys.modules, f"mempalace.{name}", module)
     monkeypatch.setitem(sys.modules, "mempalace", parent)
     return state
+
+
+def _simulate_mine(state, path, kwargs, prefetch_content_hashes):
+    """MemPalace's two rules, for a directory or one file: a known path in any wing is skipped;
+    content already filed in the mining wing under another path gets a registry row; anything
+    else is filed as a drawer. Prints the per-file lines MemPalace prints."""
+    drawers = state.collection.drawers
+    wing, dry = kwargs["wing"], kwargs.get("dry_run")
+    known = {meta.get("source_file") for _, meta in drawers.values()}
+    accepted = prefetch_content_hashes(state.collection, extract_mode="exchange")
+    for file in sorted(path.glob("*.md")) if path.is_dir() else [path]:
+        source = str(file.resolve())
+        if source in known:
+            continue
+        text = file.read_text(encoding="utf-8")
+        content_hash = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+        dup = accepted.get((wing, content_hash))
+        if dup and dup != source:
+            print(f"  = [   1/1] {file.name}  duplicate of {Path(dup).name}")
+            if not dry:
+                drawers[f"registry-{wing}-{source}"] = (
+                    f"[registry] {source}",
+                    {"source_file": source, "room": "_registry", "wing": wing},
+                )
+            if not (state.misbehave and not dry):
+                continue
+        if dry:
+            print(f"    [DRY RUN] {file.name} -> room:general (1 drawers)")
+            continue
+        drawers[f"mined-{wing}-{source}"] = (
+            text,
+            _meta(
+                source,
+                "2026-10-02T00:00:00",
+                wing=wing,
+                content_hash=content_hash,
+                extract_mode="exchange",
+                normalize_version=2,
+            ),
+        )
 
 
 def _run(capsys, *argv):
@@ -662,3 +706,190 @@ def test_the_digest_is_order_free_and_says_none_for_nothing():
     assert _palace_check.digest(["b", "a"]) == _palace_check.digest(["a", "b", "a"])
     assert len(_palace_check.digest(["a"])) == 16
     assert _palace_check.digest([]) == "none"
+
+
+# --- issue #613: --register-off-wing files a moved off-wing file as a registry row, never a drawer ---
+
+
+def _moved_palace(home, fake, *, hand=None):
+    """A moved palace: four observe-mined files in ``conversations`` and the hand-placed file."""
+    convos = home / "mempalace" / "conversations"
+    drawers = {}
+    for index, name in enumerate(NAMES):
+        text = f"> Fact {index}?\nNova told John fact number {index}.\n"
+        (convos / name).write_text(text, encoding="utf-8")
+        drawers[f"drawer-{index}"] = (
+            text,
+            _meta(
+                f"{OLD}/{name}",
+                f"2026-09-0{index + 1}T00:00:00",
+                wing="conversations",
+                extract_mode="exchange",
+                normalize_version=2,
+                content_hash=hashlib.sha256(text.strip().encode("utf-8")).hexdigest(),
+            ),
+        )
+    drawers.update(_hand_file(home, **(hand or {})))
+    fake.collection = FakeCollection(drawers)
+    fake.simulate = True
+    return fake.collection.drawers
+
+
+def _writes(fake):
+    return [(path, kw) for path, kw in fake.mines if not kw.get("dry_run")]
+
+
+def test_register_off_wing_dry_run_says_what_it_would_do_and_writes_nothing(home, fake, capsys):
+    drawers = _moved_palace(home, fake)
+    before = dict(drawers)
+
+    code, lines = _run(capsys, "--register-off-wing", "--dry-run", home)
+
+    assert code == 0
+    assert "register off-wing (dry run, writes nothing):" in lines
+    assert f"  would register: {HAND} in wing 'notes_on_the_garden_project.md'" in lines
+    assert (
+        "register off-wing (dry run): files to register 1, registry rows to write 1, "
+        "drawers to write 0"
+    ) in lines
+    assert drawers == before
+    assert not _writes(fake)
+
+
+def test_register_off_wing_writes_one_registry_row_in_the_drawers_wing_and_no_drawer(
+    home, fake, capsys
+):
+    drawers = _moved_palace(home, fake)
+    real_before = sum(meta.get("room") != "_registry" for _, meta in drawers.values())
+
+    code, lines = _run(capsys, "--register-off-wing", home)
+
+    assert code == 0
+    assert "register off-wing (WRITES TO THE PALACE):" in lines
+    assert f"  registered: {HAND} in wing 'notes_on_the_garden_project.md'" in lines
+    assert (
+        "register off-wing: WROTE to this palace: files registered 1, registry rows written 1, "
+        "drawers written 0"
+    ) in lines
+    # MemPalace's own single-file mine, in the wing the drawers carry: never an argument's.
+    ((path, kwargs),) = _writes(fake)
+    assert Path(path).name == HAND
+    assert kwargs["wing"] == "notes_on_the_garden_project.md"
+    assert kwargs["extract_mode"] == "exchange"
+    assert sum(meta.get("room") != "_registry" for _, meta in drawers.values()) == real_before
+    # And the report that follows: the next observe files nothing new.
+    assert (
+        "next observe (dry run): 4 files -> registry sentinel, 0 files -> mined as new drawers"
+        in (lines)
+    )
+
+
+def test_register_off_wing_twice_registers_nothing_the_second_time(home, fake, capsys):
+    drawers = _moved_palace(home, fake)
+    _run(capsys, "--register-off-wing", home)
+    after_first = dict(drawers)
+    fake.mines.clear()
+
+    code, lines = _run(capsys, "--register-off-wing", home)
+
+    assert code == 0
+    assert (
+        "register off-wing: WROTE to this palace: files registered 0, registry rows written 0, "
+        "drawers written 0"
+    ) in lines
+    assert drawers == after_first
+    assert not _writes(fake)
+
+
+def test_register_off_wing_refuses_and_writes_nothing_if_a_file_would_file_drawers(
+    home, fake, capsys
+):
+    """Drawers MemPalace's map does not accept (an older normalize_version) cannot register it."""
+    drawers = _moved_palace(home, fake, hand={"normalize_version": 1})
+    before = dict(drawers)
+
+    code, lines = _run(capsys, "--register-off-wing", home)
+
+    assert code == 1
+    assert (
+        f"  refused: {HAND}: mining it in wing 'notes_on_the_garden_project.md' would file drawers"
+    ) in lines
+    assert "  refused, nothing written" in lines
+    assert drawers == before
+    assert not _writes(fake)
+
+
+@pytest.mark.parametrize(
+    "hand",
+    [
+        {"wing": "conversations", "content_hash": "0" * 64},  # changed since it was filed
+        {"content_hash": None},  # filed before content hashes
+    ],
+)
+def test_register_off_wing_leaves_every_other_reason_alone(home, fake, capsys, hand):
+    _moved_palace(home, fake, hand=hand)
+    if hand.get("content_hash") is None:
+        del fake.collection.drawers["hand-0"][1]["content_hash"]
+
+    code, lines = _run(capsys, "--register-off-wing", home)
+
+    assert code == 0
+    assert f"  left alone: {HAND}: not the other-wing case (see its reason: line)" in lines
+    assert not _writes(fake)
+
+
+def test_register_off_wing_leaves_a_file_filed_in_two_other_wings_alone(home, fake, capsys):
+    drawers = _moved_palace(home, fake)
+    copy = dict(drawers["hand-0"][1], wing="another_wing", source_file=f"{OLD}/elsewhere.md")
+    drawers["hand-copy"] = ("Garden chunk copy.", copy)
+
+    code, lines = _run(capsys, "--register-off-wing", home)
+
+    assert code == 0
+    assert f"  left alone: {HAND}: not the other-wing case (see its reason: line)" in lines
+    assert not _writes(fake)
+
+
+def test_register_off_wing_fails_loudly_if_mempalace_files_a_drawer_anyway(home, fake, capsys):
+    """Its dry run said one registry row; the write filed a drawer too. Never reported as done."""
+    _moved_palace(home, fake)
+    fake.misbehave = True
+
+    code, lines = _run(capsys, "--register-off-wing", home)
+
+    assert code == 1
+    assert (
+        "register off-wing: WROTE to this palace: files registered 1, registry rows written 1, "
+        "drawers written 1"
+    ) in lines
+    assert any(line.startswith("FAIL: expected 1 registry rows and 0 drawers") for line in lines)
+
+
+def test_dry_run_needs_register_off_wing(home, fake, capsys):
+    with pytest.raises(SystemExit):
+        _palace_check.main(["--dry-run", str(home)])
+    assert "--dry-run applies to --register-off-wing" in capsys.readouterr().err
+
+
+def test_the_register_flag_says_it_writes_in_its_help(capsys):
+    with pytest.raises(SystemExit):
+        _palace_check.main(["--help"])
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "--register-off-wing WRITES TO THE PALACE." in help_text
+
+
+def test_register_off_wing_leaves_an_unreadable_file_alone_and_names_it(
+    home, fake, capsys, monkeypatch
+):
+    _moved_palace(home, fake)
+
+    def unreadable(path):
+        raise OSError("refused")
+
+    monkeypatch.setattr(sys.modules["mempalace.normalize"], "normalize_conversations", unreadable)
+
+    code, lines = _run(capsys, "--register-off-wing", home)
+
+    assert code == 0
+    assert f"  left alone: {HAND}: could not be read (OSError)" in lines
+    assert not _writes(fake)
