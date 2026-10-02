@@ -230,6 +230,25 @@ It opens the palace exactly as a wake resolves it from that `HARNESS_HOME` (an i
 
 `--practice-observe` is for a **practice copy only**, and it **writes to the palace**. A practice user has no platform account and never completes a wake, so the registry rows a first wake at a new home writes would never exist there. The mode runs the harness's own observe once, with a fixed exchange and no model call, before the report. Never run it against an agent's live palace.
 
+**Does a move make recall worse?** Three probes can say a palace serves; they cannot say a move left recall as good as it was. `--sample N` probes N drawers instead, and prints only the ones that miss:
+
+```bash
+basecradle-harness-palace-check --sample 500 --filed-before 2026-10-02T07:00:00 /home/<user>/harness
+```
+
+- **The same drawers on any palace that holds them.** The sample is ordered by the SHA-256 of each drawer id, and MemPalace never changes a drawer's id when its palace moves. Every real drawer is eligible wherever it was filed, so a live palace and its relocated copy draw from the same population.
+- **`--filed-before`** (the box's local time, as MemPalace's `filed_at` records it) holds that population still while a live palace keeps growing after the copy is taken.
+- **One summary line to compare.** The report ends with `sample summary: probes N, passed P, failed F, failing digest D`, preceded by the population and its `sample digest` and by the failures counted by verdict. Two reports with the same sample digest and the same failing digest failed on the same drawers.
+
+**Every miss is diagnosed, and no drawer text is ever printed,** in either mode. A `why:` line under each failure gives ids, counts and ranks only. It reports where the drawer ranks in a top-100 search and in the vector half of a top-10 search, whether the vector index returns it for its own embedding, and how many drawers carry its exact text or its query. It also reports how many of the drawers that took the top 10 share its text, its query, its content hash or its source file. The probe's query is the first 400 characters of the drawer, while the drawer's embedding covers the whole chunk, so a drawer is not guaranteed to be nearest to its own query. The verdict names one of four causes:
+
+- **`twin`.** A drawer with identical text holds a top-10 slot, so the memory is recalled under another id. This happens when more copies of one exchange exist than there are slots.
+- **`cut`.** Full scoring would place the drawer in the top 10, since a top-100 search does. But MemPalace's union search keeps only the ten nearest vector candidates before it ranks, and this drawer was not among them, so its vector score was dropped and it never got to compete.
+- **`crowded`.** Even on full scoring the drawer ranks below 10, and no identical copy holds a slot. Near copies sharing its query typically take the slots.
+- **`unreached`.** The drawer is not in the top 100 at all. With `vector self-query no`, the index itself has lost it.
+
+When the dry-run forecast says files will be **mined as new**, each one gets a line too. It gives the drawers recorded under that file name, how many carry a content hash, their `normalize_version` and extract mode, and whether the file's content hash today matches a recorded one. A file that already has drawers elsewhere and is mined again gets a second copy of each, and those copies then compete with the originals for the same slots.
+
 Writing your own is one small class — implement only the surfaces you want:
 
 ```python
