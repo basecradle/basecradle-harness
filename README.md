@@ -247,7 +247,7 @@ basecradle-harness-palace-check --sample 500 --filed-before 2026-10-02T07:00:00 
 - **`crowded`.** Even on full scoring the drawer ranks below 10, and no identical copy holds a slot. Near copies sharing its query typically take the slots.
 - **`unreached`.** The drawer is not in the top 100 at all. With `vector self-query no`, the index itself has lost it.
 
-When the dry-run forecast says files will be **mined as new**, each one gets a line too. It gives the drawers recorded under that file name, how many carry a content hash, their `normalize_version` and extract mode, and whether the file's content hash today matches a recorded one. A file that already has drawers elsewhere and is mined again gets a second copy of each, and those copies then compete with the originals for the same slots.
+When the dry-run forecast says files will be **mined as new**, each one gets a line too. It gives the drawers recorded under that file name, the wings they are filed in, how many carry a content hash, their `normalize_version` and extract mode, and whether the file's content hash today matches a recorded one. A `reason:` line under it gives MemPalace's own decision, read off its content-hash map. MemPalace recognises a moved file's content only within the observe's wing (`conversations`), so a file mined on its own into another wing is skipped at its own path and filed again after a move. A file that already has drawers elsewhere and is mined again gets a second copy of each, and those copies then compete with the originals for the same slots.
 
 Writing your own is one small class — implement only the surfaces you want:
 
