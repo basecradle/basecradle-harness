@@ -7,6 +7,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.138.0] - 2026-10-02
+
+### Added: `basecradle-harness-palace-check` (issue #606)
+
+A console script that proves a MemPalace palace opens from a given `HARNESS_HOME` and still returns
+drawers filed before a home-directory move. It makes no platform call and no model call (the
+reranker is switched off for the run, and an inherited `MEMPALACE_PALACE_PATH` is ignored), and it
+is read-only by default. It searches for three real drawers through the harness's own recall,
+preferring drawers filed under another path, and exits 0 only if all three come back. The report
+gives the registry-row count, the chunk-0 drawers that predate MemPalace 3.7, the conversation files
+not yet registered at their current path, MemPalace's dry-run forecast of the next observe, and, on
+its last line, how many registry rows recall returns for the home directory's own name.
+
+`--practice-observe` is off by default and is for practice copies only. It writes to the palace:
+it runs the harness's own observe once, with a fixed exchange and no model call, so a practice user
+that can never complete a wake still gets the rows a first wake at the new home would write. The
+help text and the output both say it writes.
+
 ## [0.137.2] - 2026-10-02
 
 ### Fixed: `basecradle-harness-scrub-palace` follows a palace whose home was renamed (issue #606)

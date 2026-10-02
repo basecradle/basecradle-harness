@@ -212,6 +212,24 @@ The palace resolves the way a wake resolves it (`MEMPALACE_PALACE_PATH`, else `$
 - **`--apply` removes the conversation file with the drawers, and that is load-bearing.** The adapter mines *files*, and MemPalace re-mines any file whose drawers are gone or incomplete — so a scrub that left the file behind would be undone by the very next wake. Only paths inside the palace's own `conversations/` directory are ever unlinked. Unanimity is what makes that safe rather than dangerous, and the two rules are one rule read from both ends: a file is scrubbed **whole or not at all**, so an unlink can never drag a conversation other drawers still remember, and a surviving drawer is never orphaned of the file it was mined from. Both the unlink and the drawer delete re-check that condition at the point of action, not only where the report was sorted.
 - **It follows a palace whose home was renamed** ([issue #606](https://github.com/basecradle/basecradle-harness/issues/606)). MemPalace records each drawer's source as an absolute path, so after a home rename the recorded paths name a home that no longer exists. A recorded path in a `conversations/` directory is read as the file of that name in *this* palace's `conversations/` directory, so the right file is unlinked, and drawers filed under the old and the new home vote as one file. MemPalace's own `[registry] <path>` bookkeeping rows are not memories: they neither hold a file nor get deleted.
 
+### Check a palace after a home move — `basecradle-harness-palace-check`
+
+MemPalace records every drawer's source as an absolute path, so renaming an agent's home directory leaves the palace holding paths under a home that no longer exists. This command proves the palace still works from where it is now. It makes **no platform call and no model call**, and it is **read-only** by default:
+
+```bash
+basecradle-harness-palace-check /home/<user>/harness    # or set $HARNESS_HOME and pass nothing
+```
+
+It opens the palace exactly as a wake resolves it from that `HARNESS_HOME` (an inherited `MEMPALACE_PALACE_PATH` is ignored, and the reranker is off for the run). It then picks three real drawers, preferring ones filed under another path, and searches for each through the harness's own recall. It **exits 0 only if every one comes back**. The report also states:
+
+- how many registry rows the palace holds;
+- how many chunk-0 drawers predate MemPalace 3.7 (with no `content_hash`; after a move, their files would re-mine as new drawers, so this should be 0);
+- how many conversation files have no row at their current path;
+- MemPalace's own dry-run forecast of what the next observe will do;
+- on its last line, how many registry rows recall returns for the home directory's own name. This must be 0.
+
+`--practice-observe` is for a **practice copy only**, and it **writes to the palace**. A practice user has no platform account and never completes a wake, so the registry rows a first wake at a new home writes would never exist there. The mode runs the harness's own observe once, with a fixed exchange and no model call, before the report. Never run it against an agent's live palace.
+
 Writing your own is one small class — implement only the surfaces you want:
 
 ```python
