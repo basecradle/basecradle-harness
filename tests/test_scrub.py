@@ -271,6 +271,116 @@ def test_a_drawer_with_no_source_file_is_held_because_unanimity_cannot_be_proven
     assert set(collection.drawers) == {"junk"}
 
 
+# --- a palace whose home was renamed (issue #606) ------------------------------------------------
+
+_FILE = "8f14e45fceea167a5a36dedd4bea2543.md"
+
+
+def _relocated_palace(tmp_path):
+    """A palace now under ``tmp_path``, whose drawers were filed under a home that was renamed."""
+    root = tmp_path / "mempalace"
+    (root / "conversations").mkdir(parents=True)
+    source = root / "conversations" / _FILE
+    source.write_text("mined", encoding="utf-8")
+    return root, source, f"/home/olduser/harness/mempalace/conversations/{_FILE}"
+
+
+def _registry_row(path):
+    """A MemPalace registry row, as `_register_file` writes one for a relocated file."""
+    return (f"[registry] {path}", {"source_file": str(path), "room": "_registry"})
+
+
+def test_a_relocated_file_is_scrubbed_where_it_is_now(tmp_path):
+    """Before the fix the drawers went and the unlink found nothing at the old path, so the file
+    stayed behind and the next wake re-mined the pollution as new."""
+    root, source, old = _relocated_palace(tmp_path)
+    collection = FakeCollection(
+        {
+            "junk-a": (LEGACY_HEADING, {"source_file": old}),
+            "junk-b": (_STUCK_NOTE, {"source_file": old}),
+        }
+    )
+
+    deleted, removed = _scrub.apply(collection, _scrub.scan(collection, root))
+
+    assert (deleted, removed) == (2, 1)
+    assert not source.exists()
+
+
+def test_the_registry_row_a_wake_writes_after_a_rename_does_not_hold_the_file(tmp_path):
+    """After the first wake at the new home, MemPalace has filed one registry row for the file
+    under its new path. It is bookkeeping, not a sibling memory, and it is left in place."""
+    root, source, old = _relocated_palace(tmp_path)
+    collection = FakeCollection(
+        {
+            "junk": (LEGACY_HEADING, {"source_file": old}),
+            "registry": _registry_row(source),
+        }
+    )
+
+    report = _scrub.scan(collection, root)
+    deleted, removed = _scrub.apply(collection, report)
+
+    assert [f.drawer_id for f in report.scrub] == ["junk"]
+    assert report.held == []
+    assert (deleted, removed) == (1, 1)
+    assert set(collection.drawers) == {"registry"}
+
+
+def test_unanimity_spans_every_home_a_file_was_filed_under(tmp_path):
+    """One file, two recorded paths: its drawers vote as one file, so a memory filed under the new
+    home holds a scaffolding drawer filed under the old one, and nothing is deleted."""
+    root, source, old = _relocated_palace(tmp_path)
+    collection = FakeCollection(
+        {
+            "junk": (LEGACY_HEADING, {"source_file": old}),
+            "memory": ("> john: my dog is called Rex\nNoted.", {"source_file": str(source)}),
+        }
+    )
+
+    report = _scrub.scan(collection, root)
+    deleted, removed = _scrub.apply(collection, report)
+
+    assert [f.drawer_id for f in report.held] == ["junk"]
+    assert (deleted, removed) == (0, 0)
+    assert source.exists()
+
+
+def test_a_file_moved_twice_is_one_file(tmp_path):
+    root, source, old = _relocated_palace(tmp_path)
+    older = f"/home/oldest/harness/mempalace/conversations/{_FILE}"
+    collection = FakeCollection(
+        {
+            "junk-a": (LEGACY_HEADING, {"source_file": older}),
+            "junk-b": (_STUCK_NOTE, {"source_file": old}),
+        }
+    )
+
+    deleted, removed = _scrub.apply(collection, _scrub.scan(collection, root))
+
+    assert (deleted, removed) == (2, 1)
+    assert not source.exists()
+
+
+def test_a_relocated_path_cannot_climb_out_of_the_palace(tmp_path):
+    """The name is taken from metadata, so it gets the same containment test as any other path."""
+    root = tmp_path / "mempalace"
+    (root / "conversations").mkdir(parents=True)
+    collection = FakeCollection(
+        {
+            "junk": (
+                LEGACY_HEADING,
+                {"source_file": "/home/olduser/harness/mempalace/conversations/.."},
+            )
+        }
+    )
+
+    deleted, removed = _scrub.apply(collection, _scrub.scan(collection, root))
+
+    assert (deleted, removed) == (1, 0)
+    assert root.is_dir() and (root / "conversations").is_dir()
+
+
 def test_paging_covers_a_palace_larger_than_one_page(monkeypatch, tmp_path):
     """A file's drawers can straddle a page boundary, so unanimity is decided after the walk."""
     monkeypatch.setattr(_scrub, "_PAGE", 3)

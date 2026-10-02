@@ -66,7 +66,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from basecradle_harness._memory_provider import _palace_path
-from basecradle_harness._mempalace import _CONVERSATIONS_WING, _import
+from basecradle_harness._mempalace import _CONVERSATIONS_WING, _REGISTRY_ROOM, _import
 from basecradle_harness._mining import Verdict, catalog, classify
 from basecradle_harness._observability import GREEN, RED, YELLOW, head, kv
 from basecradle_harness._version import __version__
@@ -141,14 +141,24 @@ def scan(collection, palace: Path) -> Report:
     delete it. That is the conservative direction and it costs nothing: an unprovable file is
     reported, not scrubbed.
 
-    It keys on the ``source_file`` metadata string exactly as written, and that is sound rather
-    than lazy: every drawer of one file is written by the one `mine_convos` call that mined it,
-    over the one directory string the adapter passed, so a file's drawers cannot disagree about
-    how their path is spelled. A resolution per drawer would buy nothing and cost a syscall
-    apiece across tens of thousands of them. (`apply` still resolves before it unlinks — there
-    the question is containment, not identity.)
+    It keys on the file a drawer was mined from (`_file_of`), and that is a string operation,
+    never a syscall per drawer. Within one location the key is the ``source_file`` string exactly
+    as written. **Across a home rename it is not** (issue #606): MemPalace records an absolute
+    path, so a palace that moved holds drawers filed under the old home and, once a wake has run,
+    registry rows filed under the new one, all for the same file. Keyed by the raw string, those
+    are separate "files": the old one passes unanimity alone, its drawers are deleted, and the
+    unlink finds nothing at the old path, leaving the file for the next wake to re-mine. So a
+    conversation file is identified by its name in *this* palace's ``conversations`` directory,
+    whatever home it was filed under. (`apply` still resolves before it unlinks; there the
+    question is containment, not identity.)
+
+    **Registry rows take no part.** MemPalace's ``[registry] <path>`` rows (`_REGISTRY_ROOM`) are
+    its bookkeeping, not memories. Counted, the one a relocated file gets at its new path would
+    be a non-scaffolding "sibling" and would hold every relocated file forever. They are neither
+    classified nor counted, and nothing here deletes them.
     """
     report = Report(palace=palace)
+    root = palace / _CONVERSATIONS_WING
     findings: list[Finding] = []
     #: ``source_file -> drawers mined from it`` and ``-> those that classified SCRUB``.
     mined: dict[str, int] = {}
@@ -165,16 +175,19 @@ def scan(collection, palace: Path) -> Report:
             report.total += 1
             text = documents[index] if index < len(documents) else None
             meta = (metadatas[index] if index < len(metadatas) else None) or {}
+            if meta.get("room") == _REGISTRY_ROOM:
+                continue
             source = meta.get("source_file") or None
-            if source:
-                mined[source] = mined.get(source, 0) + 1
+            file = _file_of(source, root)
+            if file:
+                mined[file] = mined.get(file, 0) + 1
             if not text:
                 continue
             verdict, classes = classify(text)
             if verdict is Verdict.KEEP:
                 continue
-            if verdict is Verdict.SCRUB and source:
-                scaffolding[source] = scaffolding.get(source, 0) + 1
+            if verdict is Verdict.SCRUB and file:
+                scaffolding[file] = scaffolding.get(file, 0) + 1
             findings.append(
                 Finding(
                     drawer_id=drawer_id,
@@ -189,11 +202,11 @@ def scan(collection, palace: Path) -> Report:
         if finding.verdict is Verdict.REVIEW:
             report.review.append(finding)
             continue
-        source = finding.source_file
-        if source is None:
+        file = _file_of(finding.source_file, root)
+        if file is None:
             report.held.append(replace(finding, held=_HELD_NO_SOURCE))
             continue
-        others = mined.get(source, 0) - scaffolding.get(source, 0)
+        others = mined.get(file, 0) - scaffolding.get(file, 0)
         if others:
             report.held.append(replace(finding, held=_HELD_SIBLINGS.format(others=others)))
         else:
@@ -239,14 +252,22 @@ def apply(collection, report: Report) -> tuple[int, int]:
             # Loud, and not fatal: the drawers still go, and a file the next wake re-mines is a
             # re-pollution the next scrub catches. Silence here would leave it invisible.
             _log.warning("scrub %s", kv(op="unlink", path=str(path), error=str(error)))
-    ids = [finding.drawer_id for finding in report.scrub if finding.source_file not in blocked]
+    root = report.palace / _CONVERSATIONS_WING
+    ids = [
+        finding.drawer_id
+        for finding in report.scrub
+        if _file_of(finding.source_file, root) not in blocked
+    ]
     for start in range(0, len(ids), _DELETE_BATCH):
         collection.delete(ids=ids[start : start + _DELETE_BATCH])
     return len(ids), removed
 
 
 def _blocked(report: Report) -> frozenset[str]:
-    """Every source file the *report itself* shows mined something this scrub may not delete.
+    """Every file the *report itself* shows mined something this scrub may not delete.
+
+    Keyed by `_file_of`, the same identity `scan` counts by, so a drawer filed under a home the
+    palace has since moved from blocks the same file as one filed under the current home.
 
     `scan` already keeps such a file's matches out of `scrub`, so on a report it built this set
     never intersects what `apply` is about to touch. It is computed again anyway: this is the
@@ -259,19 +280,25 @@ def _blocked(report: Report) -> frozenset[str]:
     `scan`'s tally alone, which is why the tally is the primary enforcement and this is the
     second line.
     """
-    return frozenset(
-        finding.source_file for finding in (*report.held, *report.review) if finding.source_file
-    )
+    root = report.palace / _CONVERSATIONS_WING
+    files = (_file_of(finding.source_file, root) for finding in (*report.held, *report.review))
+    return frozenset(file for file in files if file)
 
 
 def _convo_files(report: Report, blocked: frozenset[str]) -> list[Path]:
-    """The mining input files behind the scrubbed drawers, restricted to this palace's own dir."""
+    """The mining input files behind the scrubbed drawers, restricted to this palace's own dir.
+
+    Each is located by `_file_of`, so a drawer filed under the home the palace lived in before a
+    rename unlinks the file where it is now (issue #606). The containment test below is applied
+    to that located path, and it is the whole of what keeps the unlink inside this palace.
+    """
     root = (report.palace / _CONVERSATIONS_WING).resolve()
     files: dict[Path, None] = {}
     for finding in report.scrub:
-        if not finding.source_file or finding.source_file in blocked:
+        file = _file_of(finding.source_file, report.palace / _CONVERSATIONS_WING)
+        if not file or file in blocked:
             continue
-        path = Path(finding.source_file)
+        path = Path(file)
         try:
             resolved = path.resolve()
         except OSError:  # pragma: no cover - a path that cannot even be resolved is not ours
@@ -280,6 +307,28 @@ def _convo_files(report: Report, blocked: frozenset[str]) -> list[Path]:
             continue
         files[resolved] = None
     return list(files)
+
+
+def _file_of(source: str | None, conversations: Path) -> str | None:
+    """The file a drawer was mined from, as it is named in *this* palace (issue #606).
+
+    MemPalace records ``source_file`` as the absolute path the file had when it was mined, so a
+    palace whose home was renamed holds paths under a home that no longer exists. The adapter
+    writes every exchange file directly into ``<palace>/conversations/`` under a unique name, so
+    a recorded path whose directory is a ``conversations`` directory names the file of that name
+    in this palace's ``conversations`` directory, wherever the palace lived when it was filed.
+    Any other path is returned unchanged, exactly as before, and `_convo_files` unlinks it only if
+    it already lies inside this palace's ``conversations`` directory.
+
+    String work only, with no filesystem call: `scan` runs it on every drawer. Where the answer
+    becomes an unlink, `_convo_files` resolves it and tests containment.
+    """
+    if not source:
+        return None
+    path = Path(source)
+    if path.parent.name == _CONVERSATIONS_WING:
+        return str(conversations / path.name)
+    return source
 
 
 # --- rendering ---------------------------------------------------------------
