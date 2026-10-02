@@ -13,12 +13,20 @@ search is the harness's own `MemPalaceMemoryProvider.search`, so what passes her
 recalls.
 
 **Read-only by default.** The palace is opened read-only, the forecast is MemPalace's own dry-run
-mine, and the searches write nothing. The one exception is the explicit, off-by-default
+mine, and the searches write nothing. One exception is the explicit, off-by-default
 ``--practice-observe`` mode: a practice user has no platform account and can never complete a wake,
 so the registry rows a first wake at the new home writes would never exist there. That mode runs
 the harness's own observe path once, with a fixed exchange and no model call, so the report that
 follows reads the palace as a first wake leaves it. It **writes to the palace** and is for a
 practice copy only; its help and its output both say so.
+
+**One write for a real move: ``--register-off-wing``** (issue #613). MemPalace recognises a moved
+file's content only within the mining wing, so a conversation file once mined on its own into
+another wing is filed again in ``conversations`` at the first wake after a move. Run once after
+the rename and before that wake, this mode registers each such file in the wing its drawers
+already carry: one registry row per file, no drawer, no drawer touched (`register_off_wing`). It
+**writes to the palace**, refuses and writes nothing if any file would file a drawer, and has a
+``--dry-run`` form; its help and its output say so.
 
 **Three probes, or a sample** (issue #606, phase 3). By default the check searches for three real
 drawers (the oldest, middle and newest), which says whether a moved palace serves at all. Three
@@ -229,10 +237,7 @@ def new_file_diagnosis(found: Census, convos: Path, name: str, accepted: dict | 
     versions = sorted({str(meta.get("normalize_version", 1)) for meta in rows}) or ["-"]
     modes = sorted({str(meta.get("extract_mode") or "-") for meta in rows}) or ["-"]
     try:
-        conversations = [
-            c for c in _import("normalize").normalize_conversations(str(convos / name)) if c
-        ]
-        today = [hashlib.sha256(c.strip().encode("utf-8")).hexdigest() for c in conversations]
+        today = _today(convos / name)
         matches = "yes" if set(today) & stored else "no"
         reason = _new_reason(found, here, today, bool(hashed), bool(rows), accepted)
     except ImportError:
@@ -248,6 +253,39 @@ def new_file_diagnosis(found: Census, convos: Path, name: str, accepted: dict | 
     )
 
 
+def _today(path: Path) -> list[str]:
+    """The content hash of each conversation in a file, exactly as the miner computes them."""
+    conversations = [c for c in _import("normalize").normalize_conversations(str(path)) if c]
+    return [hashlib.sha256(c.strip().encode("utf-8")).hexdigest() for c in conversations]
+
+
+def _unrecognised(here: str, today: list[str], accepted: dict) -> list[str]:
+    """Today's hashes MemPalace's map does not hold under the observe's wing for another path."""
+    return [h for h in today if accepted.get((_CONVERSATIONS_WING, h)) in (None, here)]
+
+
+def off_wing(found: Census, here: str, today: list[str], accepted: dict) -> str | None:
+    """The one wing a file's unrecognised content is filed in, when that is the whole reason.
+
+    Read off the drawers themselves: every conversation MemPalace will not recognise is carried
+    by drawers, none of them in the observe's wing, and all of them in the same other wing. Any
+    other shape (a hash nobody carries, two wings, a drawer with no wing, a file that changed
+    since it was mined here) is ``None``, and `register_off_wing` leaves the file alone.
+    """
+    unknown = _unrecognised(here, today, accepted)
+    if not unknown or any(accepted.get((_CONVERSATIONS_WING, h)) == here for h in unknown):
+        return None
+    wings: set[str] = set()
+    for content_hash in unknown:
+        carriers = [meta for _, meta, _ in found.real if content_hash in _hashes(meta)]
+        if not carriers:
+            return None
+        wings |= {str(meta.get("wing") or "") for meta in carriers}
+    if len(wings) != 1 or "" in wings or _CONVERSATIONS_WING in wings:
+        return None
+    return wings.pop()
+
+
 def _new_reason(
     found: Census, here: str, today: list[str], hashed: bool, named: bool, accepted: dict | None
 ) -> str:
@@ -260,7 +298,7 @@ def _new_reason(
     if accepted is None:
         return "unknown, MemPalace's content-hash map could not be read"
     wing = _CONVERSATIONS_WING
-    unknown = [h for h in today if accepted.get((wing, h)) in (None, here)]
+    unknown = _unrecognised(here, today, accepted)
     if not unknown:
         return "none: MemPalace's content-hash map recognises every conversation in it"
     content_hash = unknown[0]
@@ -318,6 +356,110 @@ def practice_observe(provider: MemPalaceMemoryProvider) -> float:
             )
         )
     return time.monotonic() - started
+
+
+def _mine_file(path: Path, palace: Path, wing: str, agent: str, *, dry_run: bool) -> list[str]:
+    """MemPalace's own single-file mine, in ``wing``; returns the per-file lines it prints."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        _import("convo_miner").mine_convos(
+            str(path), str(palace), wing=wing, agent=agent, extract_mode="exchange", dry_run=dry_run
+        )
+    return out.getvalue().splitlines()
+
+
+def _only_registers(lines: list[str]) -> bool:
+    """Whether a single-file dry run says it will write one registry row and no drawer."""
+    duplicate = sum("duplicate of" in line for line in lines)
+    new = sum("[DRY RUN]" in line and "->" in line for line in lines)
+    return duplicate == 1 and new == 0
+
+
+def _counts(palace: Path) -> tuple[int, int]:
+    """Real drawers and registry rows, read fresh off the palace."""
+    collection = _import("palace").get_collection(str(palace), create=False, read_only=True)
+    found = census(collection, palace)
+    return len(found.real), found.registry
+
+
+def register_off_wing(provider: MemPalaceMemoryProvider, palace: Path, *, dry_run: bool) -> int:
+    """Register each moved file whose content is filed only in another wing, in that wing.
+
+    The observe mines ``conversations/`` into wing ``conversations``, and MemPalace recognises a
+    moved file's content only within the mining wing, so a file once mined on its own into
+    another wing is filed again after a move: a second copy of each of its drawers (issue #606,
+    phase 4). Mining that one file in the wing its drawers already carry is recognised as a
+    duplicate, and writes **one registry row and no drawer**; the observe then skips the file by
+    its path. No drawer and no drawer metadata is touched (issue #613).
+
+    Acts only on files the dry-run forecast says will be mined as new **and** whose unrecognised
+    content is filed in exactly one other wing (`off_wing`), taking the wing from those drawers.
+    Before writing anything, each file's own single-file dry run must say it registers and files
+    no drawer; if any would file one, nothing is written and the run is refused. A file registered
+    once is known by its path, so a second run finds nothing to do. Returns the exit code.
+    """
+    word = "dry run, writes nothing" if dry_run else "WRITES TO THE PALACE"
+    print(f"register off-wing ({word}):")
+    collection = _import("palace").get_collection(str(palace), create=False, read_only=True)
+    found = census(collection, palace)
+    predicted = forecast(palace, provider.agent) if found.unregistered else Forecast(0, [])
+    if predicted is None:
+        print("  refused, nothing written: MemPalace's dry-run output was not readable")
+        return 1
+    accepted = accepted_hashes(collection) if predicted.new else {}
+    if accepted is None:
+        print("  refused, nothing written: MemPalace's content-hash map could not be read")
+        return 1
+    convos = palace / _CONVERSATIONS_WING
+    plan: list[tuple[Path, str]] = []
+    for name in predicted.new:
+        path = convos / name
+        try:
+            wing = off_wing(found, str(path.resolve()), _today(path), accepted)
+        except ImportError:
+            raise
+        except Exception as error:  # noqa: BLE001 - one unreadable file is left alone, and named
+            print(f"  left alone: {name}: could not be read ({type(error).__name__})")
+            continue
+        if wing is None:
+            print(f"  left alone: {name}: not the other-wing case (see its reason: line)")
+        else:
+            plan.append((path, wing))
+    refused = [
+        (path, wing)
+        for path, wing in plan
+        if not _only_registers(_mine_file(path, palace, wing, provider.agent, dry_run=True))
+    ]
+    for path, wing in refused:
+        print(f"  refused: {path.name}: mining it in wing {wing!r} would file drawers")
+    if refused:
+        print("  refused, nothing written")
+        return 1
+    if dry_run:
+        for path, wing in plan:
+            print(f"  would register: {path.name} in wing {wing!r}")
+        print(
+            f"register off-wing (dry run): files to register {len(plan)}, "
+            f"registry rows to write {len(plan)}, drawers to write 0"
+        )
+        return 0
+    real, registry = _counts(palace)
+    for path, wing in plan:
+        _mine_file(path, palace, wing, provider.agent, dry_run=False)
+        print(f"  registered: {path.name} in wing {wing!r}")
+    real_after, registry_after = _counts(palace)
+    rows, drawers = registry_after - registry, real_after - real
+    print(
+        f"register off-wing: WROTE to this palace: files registered {len(plan)}, "
+        f"registry rows written {rows}, drawers written {drawers}"
+    )
+    if drawers or rows != len(plan):
+        print(
+            f"FAIL: expected {len(plan)} registry rows and 0 drawers; the palace changed in "
+            "another way while this ran, or MemPalace did not do what its dry run said"
+        )
+        return 1
+    return 0
 
 
 def probes(found: Census) -> tuple[list[tuple[str, dict, str]], bool]:
@@ -573,6 +715,22 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--register-off-wing",
+        action="store_true",
+        help=(
+            "WRITES TO THE PALACE. Before the report, register each moved conversation file whose "
+            "content is filed only in another wing, in the wing its drawers carry: one registry "
+            "row per file and no drawer, so the next observe does not file it again. Refuses, "
+            "writing nothing, if any such file would file a drawer. Run after a home move and "
+            "before the first wake. Add --dry-run to print what it would do."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="with --register-off-wing: print what it would register, and write nothing.",
+    )
+    parser.add_argument(
         "--sample",
         type=_positive,
         metavar="N",
@@ -595,6 +753,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.filed_before is not None and args.sample is None:
         parser.error("--filed-before applies to --sample")
+    if args.dry_run and not args.register_off_wing:
+        parser.error("--dry-run applies to --register-off-wing")
 
     for name in _CLEARED_ENV:
         os.environ.pop(name, None)
@@ -614,6 +774,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr)
     try:
         provider = MemPalaceMemoryProvider(palace)
+        if args.register_off_wing:
+            code = register_off_wing(provider, palace, dry_run=args.dry_run)
+            if code:
+                return code
         if args.practice_observe:
             seconds = practice_observe(provider)
             print(
