@@ -13,7 +13,10 @@ search is the harness's own `MemPalaceMemoryProvider.search`, so what passes her
 recalls.
 
 **Read-only by default.** The palace is opened read-only, the forecast is MemPalace's own dry-run
-mine, and the searches write nothing. One exception is the explicit, off-by-default
+mine, and the searches write nothing: no drawer, row, metadata value or embedding changes. The
+palace's *files* are another matter: ChromaDB rewrites bytes in ``chroma.sqlite3`` and its index
+segment on every open, even MemPalace's ``read_only=True`` one, so a checksum of the palace
+directory moves while its contents do not (measured with MemPalace 3.9.0). One exception is the explicit, off-by-default
 ``--practice-observe`` mode: a practice user has no platform account and can never complete a wake,
 so the registry rows a first wake at the new home writes would never exist there. That mode runs
 the harness's own observe path once, with a fixed exchange and no model call, so the report that
