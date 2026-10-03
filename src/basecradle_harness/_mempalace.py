@@ -360,11 +360,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
         searcher = _import("searcher")
         fetch = ask
         while True:
-            # Never pass `max_distance`: upstream's union merge opens with
-            # `if max_distance > 0.0: return`, so *any* distance threshold silently disables
-            # the BM25 half of the pool (lexical-only candidates carry no vector distance) and
-            # `candidate_strategy` above becomes a no-op. A distance filter and union recall
-            # are mutually exclusive upstream; we keep the recall. Pinned by test.
+            # Never pass `max_distance`: through MemPalace 3.8.0 (and so at this package's
+            # 3.7.1 floor) upstream's union merge opens with `if max_distance > 0.0: return`, so
+            # *any* distance threshold silently disables the BM25 half of the pool and
+            # `candidate_strategy` above becomes a no-op. Since 3.9.0 (MemPalace#1964) a
+            # threshold instead scores each lexical hit on its real vector distance; whether to
+            # use that is issue #625. Until the floor moves, we keep the recall. Pinned by test.
             result = searcher.search_memories(
                 query,
                 str(self.palace_path),
