@@ -133,6 +133,21 @@ _REGISTRY_ROOM = "_registry"
 # for that tail on every wake. Each widened fetch measured under 0.1 s at this size.
 _MAX_FETCH_FACTOR = 8
 
+# How many results `search` asks MemPalace for when no reranker is bound, as a multiple of the count
+# it returns (issue #611). Upstream's union search keeps only the `n` nearest of the `3n` drawers its
+# vector half proposes (`_candidate_pool_limits`: union returns `n` as the pre-merge limit), and a
+# drawer outside those `n` competes on BM25 alone, which the hybrid rank caps at 0.4. It then loses
+# to any close vector match even when full scoring would rank it first: the palace check's `cut`
+# miss. Asking for more and keeping the first `k` lets those drawers compete. The first `--sample`
+# on a real palace (2,000 probes, about 5,700 drawers) found 29 `cut` misses, more than a quarter of
+# all its misses. Four, from a 1,000-probe sample of a 6,966-drawer synthetic palace with 20 `cut`
+# misses (issue #611): 2x recovered 8, 3x 9, 4x 13, 5x 14, 8x 17, and no multiple lost a drawer 1x
+# found. 4x added 9 ms to a median recall of 81 ms. Past it the gain is a few drawers per thousand,
+# and the sentinel widening above scales with the pool: its worst case (pool x 1, 2, 4, 8) measured
+# about 0.36 s at 1x, 0.53 s at 4x and 0.82 s at 8x. With a reranker bound the pool is already
+# wider (`pool_size`), so this does not apply there.
+_UNRANKED_HEADROOM = 4
+
 # The tag whose open/close pair fences the injected recall. The generator's name lives on the
 # fence itself, not only in the prose above it: the block is spliced into a ~54K-character system
 # turn between the dashboard and the charter, and a reader skimming that brief scans the tags —
@@ -280,15 +295,18 @@ class MemPalaceMemoryProvider(MemoryProvider):
         hits are the searcher's own dicts, selected by index — no model-authored text enters them,
         so nothing about the #438 mining boundary changes: rerank is read-side only.
 
-        **Without one** the call is byte-identical to what it was before rerank existed: the same
-        ``n_results``, the same union strategy, the same slice. Rerank is off by *absence*.
+        **Without one** (rerank is off by *absence*) the search asks for `_UNRANKED_HEADROOM` times
+        the requested count and keeps the first ``n_results`` of the hybrid ranking (issue #611), so
+        a drawer upstream's vector cut would have scored on BM25 alone gets to compete on full
+        scoring. No model is called and the ``openrouter`` SDK is never imported.
 
         **Registry sentinels are never returned** (issue #606): they are MemPalace's bookkeeping, not
         memories (see `_REGISTRY_ROOM`). The first fetch is exactly the one above; only when it
-        dropped a sentinel, came back short, and filled its page does `search` fetch again at twice
-        the size, up to `_MAX_FETCH_FACTOR` times the pool. A palace with no sentinels in the ranking
-        is searched once, as before. Past the cap a query can return fewer than it asked for, which
-        is the honest answer: what lies behind thousands of sentinels is not worth recalling.
+        dropped a sentinel, left fewer hits than the caller needs (the reranker's whole pool, or the
+        requested count without one), and filled its page does `search` fetch again at twice the
+        size, up to `_MAX_FETCH_FACTOR` times the pool. A palace with no sentinels in the ranking is
+        searched once. Past the cap a query can return fewer than it asked for, which is the honest
+        answer: what lies behind thousands of sentinels is not worth recalling.
 
         `surface` names which half asked (`SURFACE_TURN0` / `SURFACE_TOOL`) and rides the log lines
         so a per-wake Turn-0 recall is separable from a deliberate mid-task search. It defaults to
@@ -303,7 +321,11 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if not self.palace_path.exists():
             return []
         wanted = self.n_results if n_results is None else n_results
-        pool = pool_size(wanted) if self.reranker is not None else wanted
+        reranked = self.reranker is not None
+        pool = candidate_pool(wanted, reranked=reranked)
+        # The reranker reads the whole pool; without one only the first `wanted` are kept, so the
+        # headroom past them is ranking context, never something to widen the fetch to refill.
+        need = pool if reranked else wanted
         started = time.monotonic()
         searcher = _import("searcher")
         fetch = pool
@@ -325,7 +347,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             sentinels = len(raw) - len(hits)
             # Widen only while it can help: something was dropped, the result is still short, and
             # the backend filled the page (a short page means the palace has nothing further).
-            if not sentinels or len(hits) >= pool or len(raw) < fetch:
+            if not sentinels or len(hits) >= need or len(raw) < fetch:
                 break
             if fetch >= pool * _MAX_FETCH_FACTOR:
                 break
@@ -334,12 +356,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
         if self.reranker is not None:
             hits = self.reranker.rerank(query, hits, wanted, surface=surface)
         else:
-            # A no-op when the searcher honored `n_results`, and the guard against a backend that
-            # did not — the requested bound is this method's promise, not upstream's.
+            # The first `wanted` of a ranking made over the wider pool. Also the guard against a
+            # backend that did not honor `n_results`: the requested bound is this method's promise,
+            # not upstream's.
             hits = hits[:wanted]
         _log_recall(
             surface=surface,
-            reranked=self.reranker is not None,
+            reranked=reranked,
             pool=pool,
             hits=hits,
             seconds=time.monotonic() - started,
@@ -626,6 +649,16 @@ def _log_recall(
             **extra,
         ),
     )
+
+
+def candidate_pool(wanted: int, *, reranked: bool) -> int:
+    """How many results `MemPalaceMemoryProvider.search` asks MemPalace for, to return ``wanted``.
+
+    The reranker's pool when one is bound (`pool_size`), else ``_UNRANKED_HEADROOM`` times the
+    count (issue #611). One function, so the palace check reads the ask the search really makes
+    when it judges whether upstream's vector cut kept a drawer out (`_palace_check.diagnose`).
+    """
+    return pool_size(wanted) if reranked else _UNRANKED_HEADROOM * max(1, wanted)
 
 
 def _bounded(n_results: int | None, default: int) -> int:

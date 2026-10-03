@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from basecradle_harness import _palace_check
+from basecradle_harness._palace_check import _ASK, _VECTOR_ASK
 from basecradle_harness._rerank import RERANK_MODEL_VAR
 
 OLD = "/home/olduser/harness/mempalace/conversations"
@@ -138,6 +139,9 @@ def fake(monkeypatch):
 
     def search_memories(query, palace_path, **kwargs):
         state.searches.append((query, kwargs))
+        n = kwargs["n_results"]
+        # MemPalace's union search: the vector half proposes 3n and keeps the n nearest.
+        kept = set(state.collection.query(query_texts=[query], n_results=3 * n)["ids"][0][:n])
         rows = [
             {
                 "drawer_id": drawer_id,
@@ -148,13 +152,13 @@ def fake(monkeypatch):
             }
             for drawer_id, (text, meta) in state.collection.drawers.items()
             if drawer_id not in state.missing
-            # A cut drawer reaches the top only when the search keeps enough vector candidates.
-            and not (drawer_id in state.cut and kwargs["n_results"] <= 10)
+            # A cut drawer reaches the top only when the vector half kept it.
+            and not (drawer_id in state.cut and drawer_id not in kept)
         ]
         # Drawers whose text opens with the query rank first, in insertion order: the first ten of
         # a set of copies take the slots, which is how MemPalace keeps exact ties in index order.
         rows.sort(key=lambda hit: not hit["text"].strip().startswith(query))
-        return {"results": rows[: kwargs["n_results"]]}
+        return {"results": rows[:n]}
 
     searcher.search_memories = search_memories
 
@@ -300,7 +304,8 @@ def test_no_model_call_and_the_named_home_decides_the_palace(
     code, _ = _run(capsys, home)
 
     assert code == 0
-    assert {kwargs["n_results"] for _, kwargs in fake.searches} == {10}  # no rerank pool
+    # The unranked ask (issue #611), never the reranker's pool.
+    assert {kwargs["n_results"] for _, kwargs in fake.searches} == {_ASK}
     assert fake.opened[0][0] == str(home.resolve() / "mempalace")
 
 
@@ -496,7 +501,7 @@ def test_a_drawer_outranked_by_near_copies_is_crowded(home, fake, capsys):
 
     at = next(i for i, line in enumerate(lines) if line.startswith("FAIL: drawer probe "))
     assert lines[at + 1] == (
-        "  why: crowded; deep rank 11/100 (similarity 1.0, via drawer); vector rank 11/30; "
+        f"  why: crowded; deep rank 11/100 (similarity 1.0, via drawer); vector rank 11/{_VECTOR_ASK}; "
         "vector self-query yes; "
         "drawers with identical text 0 (0 filed later), with the same query 0; "
         "top 10: 0 identical text, 0 same query, 0 same content hash, 0 same source file"
@@ -504,19 +509,33 @@ def test_a_drawer_outranked_by_near_copies_is_crowded(home, fake, capsys):
 
 
 def test_a_drawer_full_scoring_would_place_but_the_vector_cut_drops_is_cut(home, fake, capsys):
-    """Its own query ranks it first over a wide pool, but ten drawers sit nearer to that query in
-    the vector index, so a top-10 search never lets it compete."""
-    drawers = _many(12)
+    """Its own query ranks it first over a wide pool, but more drawers than a top-10 search keeps
+    from its vector half sit nearer to that query, so that search never lets it compete."""
+    drawers = _many(_ASK + 2)
     fake.collection = FakeCollection(drawers, far={"drawer-004"})
     fake.cut = {"drawer-004"}
 
-    _, lines = _run(capsys, "--sample", 12, home)
+    _, lines = _run(capsys, "--sample", _ASK + 2, home)
 
     why = next(line for line in lines if line.startswith("  why:"))
     assert why.startswith(
-        "  why: cut; deep rank 1/100 (similarity 1.0, via drawer); vector rank 12/30; "
+        f"  why: cut; deep rank 1/100 (similarity 1.0, via drawer); vector rank {_ASK + 2}/{_VECTOR_ASK}; "
     )
     assert lines[-2] == "failed by verdict: twin 0, cut 1, crowded 0, unreached 0"
+
+
+def test_a_drawer_inside_the_headroom_is_not_cut(home, fake, capsys):
+    """Issue #611: eleven drawers sit nearer to its query than it does, which put it past the ten a
+    top-10 search used to keep from its vector half. The search now asks for more and keeps the
+    first ten of the ranking, so the drawer competes on full scoring and comes back."""
+    assert _ASK > 12
+    fake.collection = FakeCollection(_many(12), far={"drawer-004"})
+    fake.cut = {"drawer-004"}
+
+    code, lines = _run(capsys, "--sample", 12, home)
+
+    assert code == 0
+    assert lines[-2] == "failed by verdict: twin 0, cut 0, crowded 0, unreached 0"
 
 
 def test_a_drawer_the_vector_index_does_not_hold_is_unreached(home, fake, capsys):
@@ -527,7 +546,7 @@ def test_a_drawer_the_vector_index_does_not_hold_is_unreached(home, fake, capsys
 
     why = next(line for line in lines if line.startswith("  why:"))
     assert why.startswith(
-        "  why: unreached; not in top 100; vector rank: not in the 30 candidates; "
+        f"  why: unreached; not in top 100; vector rank: not in the {_VECTOR_ASK} candidates; "
         "vector self-query no (not in its own top 100)"
     )
 

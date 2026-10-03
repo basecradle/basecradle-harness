@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.141.0] - 2026-10-02
+
+### Changed: MemPalace recall asks for four times what it keeps when no reranker is bound (issue #611)
+
+MemPalace's union search keeps only the `n` nearest of the `3n` drawers its vector half proposes,
+then ranks. A drawer outside those `n` scores on BM25 alone, which the hybrid rank caps at 0.4, so
+it loses to any close vector match even when full scoring would rank it first. The palace check
+calls this miss `cut`, and on the first `--sample` of a real palace it was 29 of 106 misses. With
+no reranker bound, `MemPalaceMemoryProvider.search` now asks for `_UNRANKED_HEADROOM` (4) times the
+requested count and keeps the first ones. Both memory surfaces change together: Turn-0 injection
+and the `memory_search` tool. With a reranker bound nothing changes; its pool was already wider.
+
+Measured on a 1,000-probe sample of a 6,966-drawer synthetic palace built to produce `cut` misses,
+with the palace check before and after: `cut` 20 → 9, `unreached` 5 → 2, passed 975 → 989, the
+same sample digest, and no drawer missed that the old search found. Median recall went from 81 ms
+to 90 ms. The sweep over 2×, 3×, 5× and 8× is on the issue.
+
+The sentinel widening from 0.137.1 composes with it: it widens only until the requested count is
+filled (the headroom is never refilled), up to eight times the larger pool. On the recall line a
+rerank-off search now reports `pool=40` for a top-10 recall, where it reported `pool=10`.
+
+The palace check reads the same ask (`candidate_pool`) when it judges a miss, so `cut` now means
+the vector half of a top-10 search did not keep the drawer among the 40 it asks for, and the `why:`
+line gives its vector rank out of 120 candidates.
+
 ## [0.140.0] - 2026-10-02
 
 ### Added: `basecradle-harness-palace-check --register-off-wing` (issue #613)

@@ -543,7 +543,8 @@ library API. So it is built here (`_rerank.py`), with no MemPalace fork and no M
   founder ruling (issue #466) then set it to **10** — the one judgement call #464 left open; the
   pool rule is unchanged, so a Turn-0 rerank still reads twenty and returns the best ten.
 - **Off by absence.** `HARNESS_MEMPALACE_RERANK_MODEL` unset → `reranker_from_env()` is `None`,
-  `search` runs the identical query it ran before, and the `openrouter` SDK is never imported. There
+  `search` runs the identical query it ran before (until issue #611 gave the rerank-off query its
+  own headroom, `_UNRANKED_HEADROOM`), and the `openrouter` SDK is never imported. There
   is no shadow mode and no `…_ENABLED` companion: the model id *is* the switch, so there is no second
   place for the configuration to disagree with itself.
 - **Its own key, its own client, never the brain's.** `HARNESS_MEMPALACE_RERANK_API_KEY` is required

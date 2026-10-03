@@ -27,6 +27,7 @@ import respx
 from openrouter import OpenRouter
 
 from basecradle_harness._mempalace import (
+    _UNRANKED_HEADROOM,
     DEFAULT_N_RESULTS,
     MemPalaceMemoryProvider,
 )
@@ -417,17 +418,19 @@ def test_a_rerank_off_agent_says_so_and_emits_no_rerank_line(fake_mempalace, tmp
 # === Off by absence ===========================================================
 
 
-def test_rerank_off_is_byte_identical_to_the_pre_rerank_search(fake_mempalace, tmp_path):
-    """The regression bar: no model configured → the same query, the same pool, the same slice."""
+def test_rerank_off_keeps_the_head_of_the_unranked_ask(fake_mempalace, tmp_path):
+    """The regression bar: no model configured → one search at the unranked headroom (issue #611),
+    never the reranker's pool, and the first ``k`` of its ranking in its own order."""
     _, searcher = fake_mempalace
-    searcher.result = {"results": hits(3)}
+    searcher.result = {"results": hits(9)}
     palace = tmp_path / "palace"
     palace.mkdir()
 
     out = MemPalaceMemoryProvider(palace_path=palace).search("q", 3, surface=SURFACE_TURN0)
 
-    _query, _palace, kwargs = searcher.queries[0]
-    assert kwargs == {"n_results": 3, "candidate_strategy": "union"}  # no pool widening
+    (query,) = searcher.queries
+    assert query[2] == {"n_results": _UNRANKED_HEADROOM * 3, "candidate_strategy": "union"}
+    assert _UNRANKED_HEADROOM * 3 != pool_size(3)
     assert [hit["text"] for hit in out] == ["memory 1", "memory 2", "memory 3"]
 
 

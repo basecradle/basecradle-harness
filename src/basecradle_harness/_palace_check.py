@@ -70,6 +70,7 @@ from basecradle_harness._mempalace import (
     _REGISTRY_ROOM,
     MemPalaceMemoryProvider,
     _import,
+    candidate_pool,
 )
 from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL
 from basecradle_harness._version import __version__
@@ -97,9 +98,14 @@ _TOP = 10
 #: found, so "not in the top 100" means recall cannot reach it in practice.
 _DEEP = 100
 
-#: How many candidates a top-10 search asks the vector index for: MemPalace 3.9 asks for three
-#: times the requested count (``_candidate_pool_size``) and, in union mode, keeps the nearest ten.
-_VECTOR_ASK = 3 * _TOP
+#: How many results a top-10 search asks MemPalace for: the harness's own ask, with the unranked
+#: headroom (issue #611; this check runs with the reranker off), so the verdicts below are read
+#: against the search an agent actually makes.
+_ASK = candidate_pool(_TOP, reranked=False)
+
+#: How many candidates that search asks the vector index for: MemPalace 3.9 asks for three times
+#: the requested count (``_candidate_pool_size``) and, in union mode, keeps the nearest ``_ASK``.
+_VECTOR_ASK = 3 * _ASK
 
 #: Hex characters of a digest. Sixty-four bits: two reports compared by eye never collide by chance.
 _DIGEST_CHARS = 16
@@ -593,12 +599,13 @@ def diagnose(
     """Why a probe drawer is not in its top 10, as ``(line, verdict)``: ids, counts and ranks only.
 
     How MemPalace 3.9's union search (the harness's ``candidate_strategy``) fills the top k, which
-    is what every verdict below is read against: the vector index proposes ``3k`` drawers and only
-    the ``k`` nearest are kept; BM25 adds its own top ``3k``; the merged pool is ranked by
-    ``0.6 * similarity + 0.4 * BM25`` (BM25 scaled to the pool's best) and cut to ``k``. A drawer
-    the vector half did not keep scores on BM25 alone, at most 0.4, and loses to any close vector
-    match. Exact distance ties are kept in the index's own order, and equal final scores go to the
-    newer drawer (``authored_at``).
+    is what every verdict below is read against: the harness asks for ``n`` results (``_ASK``,
+    the unranked headroom times the 10 it keeps, issue #611); the vector index proposes ``3n``
+    drawers and only the ``n`` nearest are kept; BM25 adds its own top ``3n``; the merged pool is
+    ranked by ``0.6 * similarity + 0.4 * BM25`` (BM25 scaled to the pool's best) and the harness
+    keeps the first 10. A drawer the vector half did not keep scores on BM25 alone, at most 0.4,
+    and loses to any close vector match. Exact distance ties are kept in the index's own order, and
+    equal final scores go to the newer drawer (``authored_at``).
 
     The probe's query is the head of the drawer, while the drawer's embedding is of the whole
     chunk, so its own query need not find it nearest. A miss is one of four kinds:
@@ -607,8 +614,9 @@ def diagnose(
       under another id. Identical text embeds identically, so when more copies exist than slots the
       index's tie order decides which copies are kept, and the rest miss.
     - **cut**: a top-100 search ranks it in the top 10, but the vector half of a top-10 search
-      does not place it among its nearest ten, so that search dropped its vector score before
-      ranking. Full scoring would have placed it; the pre-rank cut did not let it compete.
+      does not place it among the ``_ASK`` nearest it keeps, so that search dropped its vector
+      score before ranking. Full scoring would have placed it; the pre-rank cut did not let it
+      compete.
     - **crowded**: a top-100 search ranks it below 10, and no identical copy is in the top 10:
       other drawers outscore it even on full scoring, typically near copies sharing its query.
     - **unreached**: not in the top 100 at all. With ``vector self-query no`` the index itself has
@@ -653,7 +661,7 @@ def diagnose(
         verdict = "twin"
     elif rank is None:
         verdict = "unreached"
-    elif rank <= _TOP and vector_known and (vector is None or vector > _TOP):
+    elif rank <= _TOP and vector_known and (vector is None or vector > _ASK):
         verdict = "cut"
     else:
         verdict = "crowded"
