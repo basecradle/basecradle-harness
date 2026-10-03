@@ -944,3 +944,38 @@ the defect, not a shorter spelling.
 **Boundary:** the harness never learns the NOC's regexes and the NOC never learns the emitter — the
 contract is the field shapes above, published in the completion comment. Live verification is the
 capital's, after the NOC re-points its columns.
+
+### The `<harness>` brief part — what the agent runs under (issue #623)
+
+The brief named the model (`<brain>`, issue #564) and never the software around it, so an agent
+asked what version it ran, or reasoning about a behavior that changed with a release, had nothing
+to answer from. `_brief.render_harness` composes a part right after `<brain>` with three facts
+and no more:
+
+```text
+<harness>
+Your harness this wake: the software that woke you, built this brief and runs your tools, read from the installed package — not a guess. None of this section is confidential: when asked what harness or version you run, answer from it.
+- Name: BaseCradle Harness
+- Version: `0.145.0`
+- Repository (public): https://github.com/basecradle/basecradle-harness
+</harness>
+```
+
+- **The version is the installed package's own `__version__`** — what `basecradle-harness-wake
+  --version` prints. `render_harness` takes no argument, so nothing can hand it a version from an
+  environment variable, a pin, or a config home's install stamp (which names the harness that last
+  *reconciled* that home, not the one running).
+- **The repository is one constant** (`HARNESS_REPOSITORY`), pinned by test to the `Source` URL
+  the package metadata publishes, so the brief and PyPI cannot name two places.
+- **Each non-confidential header speaks for its own section only.** `initialize.md` tells the agent
+  never to reveal its brief, so `<brain>` carried a carve-out — first worded "unlike the rest of
+  this brief, none of it is confidential", which a second such section made false. Both headers now
+  say "None of this section is confidential" (wording approved by @origin, 2026-10-03), and a third
+  such section later needs no edit to either.
+- **No changelog, no capability claims, no "what's new".** What the harness can do is disclosed by
+  the tool set and the other parts; a release note in every wake is cost with no reader. About 60
+  tokens a wake, in the per-wake brief, which is already outside the cached prefix.
+- It is harness-composed from constants: not peer-influenced (no fence strip), measured on the
+  attribution line as `brief_harness=`, carried as a sentinel in `test_mining.py`, and in the
+  model-facing strings `test_unspoken.py` audits.
+

@@ -417,6 +417,7 @@ def _model_facing_strings():
         render_brain,
         render_budget,
         render_defects,
+        render_harness,
         render_mcp,
         render_safety,
         render_your_home,
@@ -457,6 +458,8 @@ def _model_facing_strings():
             )
         )
         or "",
+        # Issue #623: what the model is told about the software it runs under.
+        "harness": render_harness(),
         "tool defect": render_defects(["memory — failed to load"]) or "",
         "safety opt-out": render_safety(["mcp: filesystem"]) or "",
         # Issue #553: what the model is told about its MCP servers and the tools it does not get.

@@ -55,9 +55,11 @@ from basecradle_harness import (
     Tool,
     WakeAgent,
     WakeBreaker,
+    __version__,
     _wake,
     install,
     render_brain,
+    render_harness,
 )
 from basecradle_harness import _brief as brief_module
 from basecradle_harness import _wake as wake_module
@@ -3084,6 +3086,35 @@ def test_the_brief_names_the_brain_the_wake_calls(platform, tmp_path, caplog):
     )
     fenced_part = f"<brain>\n{block}\n</brain>"
     assert re.search(r"\bbrief_brain=(\d+)", plain(attribution)).group(1) == str(
+        len(fenced_part) + 2
+    )
+
+
+def test_the_brief_names_the_harness_the_wake_runs_under(platform, tmp_path, caplog):
+    """Issue #623, end to end: the agent is shown the harness it runs under, by its running version.
+
+    The part sits right after the brain and before the budget, carries the installed package's own
+    version, and is measured on the attribution line under its own name.
+    """
+    serve_dashboard_md(platform)
+    serve_messages(platform, page(message(uuid=M0, body="What harness and version are you on?")))
+    agent, model = build_wake(
+        tmp_path, provider=_ConfiguredBrain(), onboard=True, tool_manifest=[("memory", None)]
+    )
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    brief = _brief_shown(model)[0].content
+    block = brief.split("<harness>\n", 1)[1].split("\n</harness>", 1)[0]
+    assert block == render_harness()
+    assert f"- Version: `{__version__}`" in block.splitlines()
+    assert brief.index("</brain>") < brief.index("<harness>") < brief.index("<budget>")
+    attribution = next(
+        r.getMessage() for r in caplog.records if "context attribution" in r.getMessage()
+    )
+    fenced_part = f"<harness>\n{block}\n</harness>"
+    assert re.search(r"\bbrief_harness=(\d+)", plain(attribution)).group(1) == str(
         len(fenced_part) + 2
     )
 

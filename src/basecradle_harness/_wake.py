@@ -129,6 +129,7 @@ from basecradle_harness._brief import (
     render_brain,
     render_budget,
     render_defects,
+    render_harness,
     render_manifest,
     render_mcp,
     render_safety,
@@ -2994,25 +2995,25 @@ class WakeAgent:
         return self._brief
 
     def _compose_brief(self, query: str | None = None) -> str | None:
-        """Compose the persistent brief: now + brain + budget + initialize + manifest + … + charter.
+        """Compose the persistent brief: now + brain + harness + budget + … + charter.
 
         The parts, in order (see `basecradle_harness._brief`): the **current-time anchor**
-        (`_now_line` — the absolute "now" the model reasons every item's age against, fresh
-        each wake since the brief is re-composed per wake), the **brain** (`render_brain` — the
-        model, provider, SDK, surface and tuning, read off the very adapter the engine calls, so
-        the agent can name what it runs on — issue #564), the **step-budget statement**
-        (`render_budget` — the engine's per-turn budget N, stated once so the live per-step
-        counter can stay terse), the provider-independent `initialize.md` operating guidance, the
-        generated manifest of the agent's *active* tools, any **tool defect** (a shipped default
-        that failed to load), the **safe-by-default opt-out notice** (active MCP servers /
-        policy-refused drop-ins — omitted when there are none), what each **MCP server** is
-        (`render_mcp` — omitted when none has anything to say), **Your Home** (`render_your_home` —
-        the six standing folders and their law, composed for every agent holding the ``SHELL``
-        capability and for no other, issue #571), the live `dashboard.md` primer
-        (fetched fresh each wake; a fetch failure degrades to omitting it, never breaking the wake),
-        the memory provider's recalled
-        **context** for this turn (its `context` hook — omitted when there is none or the
-        provider's hook is a no-op), and the operator's `system-prompt.md` personality
+        (`_now_line` — the absolute "now" the model reasons every item's age against, fresh each
+        wake since the brief is re-composed per wake), the **brain** (`render_brain` — the model,
+        provider, SDK, surface and tuning, read off the very adapter the engine calls, so the agent
+        can name what it runs on — issue #564), the **harness** (`render_harness` — its name, the
+        running package version and its public repository, issue #623), the **step-budget
+        statement** (`render_budget` — the engine's per-turn budget N, stated once so the live
+        per-step counter can stay terse), the provider-independent `initialize.md` operating
+        guidance, the generated manifest of the agent's *active* tools, any **tool defect** (a
+        shipped default that failed to load), the **safe-by-default opt-out notice** (active MCP
+        servers / policy-refused drop-ins — omitted when there are none), what each **MCP server**
+        is (`render_mcp` — omitted when none has anything to say), **Your Home** (`render_your_home`
+        — the six standing folders and their law, composed for every agent holding the ``SHELL``
+        capability and for no other, issue #571), the live `dashboard.md` primer (fetched fresh each
+        wake; a fetch failure degrades to omitting it, never breaking the wake), the memory
+        provider's recalled **context** for this turn (its `context` hook — omitted when there is
+        none or the provider's hook is a no-op), and the operator's `system-prompt.md` personality
         charter. Any part may be absent and the brief is composed from the rest.
 
         **Never break the wake.** `fetch_dashboard_md` already swallows its (network) failures
@@ -3037,6 +3038,7 @@ class WakeAgent:
             parts = brief_parts(
                 now=_now_line(),
                 brain=self._brain(),
+                harness=render_harness(),
                 budget=render_budget(self.harness.engine.max_steps),
                 initialize=prompt_text("initialize.md"),
                 manifest=render_manifest(self._manifest_entries()),
