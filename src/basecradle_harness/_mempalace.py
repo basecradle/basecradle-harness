@@ -69,6 +69,7 @@ import os
 import re
 import time
 import uuid
+from importlib import metadata
 from pathlib import Path
 
 from basecradle_harness._memory_provider import (
@@ -141,6 +142,28 @@ _MAX_FETCH_FACTOR = 8
 # reranker bound `search` asks for `pool_size` instead and this does not apply; the same cut on that
 # path is what `basecradle-harness-palace-check --reranked-pool` measures (issue #617).
 _UNRANKED_HEADROOM = 4
+
+# The `max_distance` every search passes, where it filters nothing (issue #625). Through MemPalace
+# 3.8.0 a lexical hit the vector half did not also return scores on BM25 alone, which the hybrid
+# rank caps at 0.4, so a drawer whose only route into the pool was its exact tokens lost to any
+# close vector match. Since 3.9.0 (MemPalace#1964) a threshold makes upstream score each lexical hit
+# on its real vector distance, read from its stored embedding, so it competes on full scoring at any
+# ask. 2.0 is the largest distance cosine can report, so on a cosine palace it cuts no candidate by
+# distance. The one residual is upstream's: a lexical hit whose stored embedding cannot be loaded is
+# dropped under a threshold rather than kept on BM25 alone (logged by MemPalace at DEBUG only). It
+# was #625's stated risk, and the measurement the capital ruled on (basecradle-noc#957) gained a
+# rare-token drawer, lost none, and dropped no lexical hit; the palace check's end-to-end mode
+# counts those drops on every arm that passes the threshold.
+SEARCH_MAX_DISTANCE = 2.0
+
+# The first MemPalace that scores a lexical hit on its distance under a threshold. Before it,
+# upstream's union merge opens with `if max_distance > 0.0: return`, so any threshold switches the
+# lexical half of the pool off: the opposite of what the threshold is passed for.
+THRESHOLD_MEMPALACE = (3, 9)
+
+# The one distance metric under which `SEARCH_MAX_DISTANCE` filters nothing. A legacy Chroma `l2`
+# palace reports distances up to 4, where 2.0 would cut vector candidates; `ip` is unbounded.
+_THRESHOLD_METRIC = "cosine"
 
 # The tag whose open/close pair fences the injected recall. The generator's name lives on the
 # fence itself, not only in the prose above it: the block is spliced into a ~54K-character system
@@ -221,6 +244,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
         self.n_results = n_results
         self.agent = agent
         self.reranker = reranker if reranker is not None else reranker_from_env()
+        # The `max_distance` decision, once it has been made on a definitive reading. See
+        # `distance_threshold`.
+        self._threshold: tuple[float | None, str] | None = None
         # No host-local SQLite store of our own — MemPalace is the engine. The base
         # `store` attribute stays None, which is correct for a middleware provider.
 
@@ -278,7 +304,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
 
         Shared by the automatic `context` hook (Turn-0 injection) and the model-facing
         `MemPalaceSearchTool` (deliberate mid-task recall), so the two can never drift apart
-        on *how* the palace is searched — the union pool, the no-`max_distance` rule, the
+        on *how* the palace is searched — the union pool, the `max_distance` decision, the
         bound, and (since issue #464) **the LLM rerank** all live here once. Returns the raw hit
         dicts (possibly empty); rendering is the caller's, because a Turn-0 block and a tool
         result read differently.
@@ -293,6 +319,11 @@ class MemPalaceMemoryProvider(MemoryProvider):
         the requested count and keeps the first ``n_results`` of the hybrid ranking (issue #611), so
         a drawer upstream's vector cut would have scored on BM25 alone gets to compete on full
         scoring. No model is called and the ``openrouter`` SDK is never imported.
+
+        **Either way it passes ``max_distance=2.0`` where that filters nothing** (issue #625): on
+        MemPalace 3.9 and later, on a cosine palace (`distance_threshold`). There it changes no pool
+        size and cuts no candidate; it makes upstream score a lexical-only hit on its real vector
+        distance instead of on BM25 alone. Anywhere else the search is the one it was before.
 
         **Registry sentinels are never returned** (issue #606): they are MemPalace's bookkeeping, not
         memories (see `_REGISTRY_ROOM`). The first fetch is exactly the one above; only when it
@@ -322,7 +353,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
         # headroom past them is ranking context, never something to widen the fetch to refill.
         need = pool if reranked else wanted
         started = time.monotonic()
-        hits, fetch, sentinels = self._ranking(query, ask=pool, need=need, surface=surface)
+        threshold, _ = self.distance_threshold()
+        hits, fetch, sentinels = self._ranking(
+            query, ask=pool, need=need, surface=surface, max_distance=threshold
+        )
         hits = hits[:pool]
         if self.reranker is not None:
             hits = self.reranker.rerank(query, hits, wanted, surface=surface)
@@ -339,8 +373,59 @@ class MemPalaceMemoryProvider(MemoryProvider):
             seconds=time.monotonic() - started,
             fetched=fetch,
             sentinels=sentinels,
+            max_distance=threshold,
         )
         return hits
+
+    def distance_threshold(self, collection=None) -> tuple[float | None, str]:
+        """The ``max_distance`` `search` passes on this palace, and why: ``(threshold, reason)``.
+
+        `SEARCH_MAX_DISTANCE` only where it filters nothing (issue #625, the capital's ruling: *it
+        must never cut a candidate*): MemPalace at least `THRESHOLD_MEMPALACE`, where a threshold
+        rescores the lexical half instead of switching it off, **and** a drawers collection that
+        declares the cosine metric. Otherwise ``None``, which sends nothing and searches exactly as
+        before. ``reason`` names what decided it (``cosine``, ``mempalace:<version>``,
+        ``metric:<metric>``, ``metric:unreadable``, ``collection:unopened``), for the palace check
+        and the one log line a declined threshold writes.
+
+        The metric is read off the collection's own declaration (`palace_metric`), never through
+        upstream's ``_metric_for_collection``, which answers ``cosine`` for anything it cannot read:
+        that default is right for ranking and wrong for a decision whose failure direction must be
+        "pass nothing".
+
+        Made once per provider on a definitive reading (a wake; the life of the process for the
+        long-lived `TimelineAgent` poll loop), because a palace's metric is fixed
+        when its collection is created. A collection that cannot be opened decides nothing and is
+        asked again next time; that search passes no threshold. ``collection`` is an already-open
+        drawers collection (the palace check has one); without it this opens one read-only.
+        """
+        if self._threshold is not None:
+            return self._threshold
+        version = mempalace_version()
+        if not at_least(version, THRESHOLD_MEMPALACE):
+            decision: tuple[float | None, str] = (None, f"mempalace:{version or 'unknown'}")
+        else:
+            if collection is None:
+                try:
+                    collection = _import("palace").get_collection(
+                        str(self.palace_path), create=False, read_only=True
+                    )
+                except Exception:  # noqa: BLE001 - undecided: this search passes no threshold
+                    return None, "collection:unopened"
+            metric = palace_metric(collection)
+            if metric is None:
+                decision = (None, "metric:unreadable")
+            elif metric == _THRESHOLD_METRIC:
+                decision = (SEARCH_MAX_DISTANCE, _THRESHOLD_METRIC)
+            else:
+                decision = (None, f"metric:{metric}")
+        self._threshold = decision
+        if decision[0] is None:
+            _log.info(
+                "memory threshold %s",
+                kv(provider=_MEMPALACE, max_distance="off", reason=decision[1]),
+            )
+        return decision
 
     def _ranking(
         self,
@@ -360,23 +445,24 @@ class MemPalaceMemoryProvider(MemoryProvider):
         here; bounding them is the caller's. The palace check calls this with the reranked asks
         (issue #617), so what it measures is fetched exactly the way `search` fetches.
 
-        ``max_distance`` exists for the palace check's end-to-end measurement alone (issue #627),
-        which compares a search with one against today's. `search` never passes it, and ``None``
-        sends nothing, so the request is byte-for-byte the one below the comment.
+        ``max_distance`` is what `search` decided (`distance_threshold`), or what a palace-check arm
+        names (issue #627); ``None`` sends nothing at all, so that request is byte-for-byte the one
+        made before issue #625.
 
-        An answer from upstream that is an error envelope, or no list of results at all, reads as
-        no hits, and logs one WARNING (`_log_search_failure`).
+        An answer from upstream that is an error envelope, or no list of results at all, logs one
+        WARNING (`_log_search_failure`) and reads as no hits. **Except on a widened fetch** (issue
+        #624): the fetch before it succeeded, so its hits are what comes back and the widening stops
+        there. A failed retry never throws away an answer already in hand. ``fetch`` and
+        ``sentinels`` are then that fetch's, the one whose hits are returned; the WARNING is what
+        says a wider one was tried and failed.
         """
         searcher = _import("searcher")
         fetch = ask
+        found: tuple[list[dict], int, int] | None = None
         while True:
-            # `search` never passes `max_distance` (only the palace check's measurement does, issue
-            # #627): through MemPalace 3.8.0 (and so at this package's
-            # 3.7.1 floor) upstream's union merge opens with `if max_distance > 0.0: return`, so
-            # *any* distance threshold silently disables the BM25 half of the pool and
-            # `candidate_strategy` above becomes a no-op. Since 3.9.0 (MemPalace#1964) a
-            # threshold instead scores each lexical hit on its real vector distance; whether to
-            # use that is issue #625. Until the floor moves, we keep the recall. Pinned by test.
+            # Never passed except by `distance_threshold`'s decision or a palace-check arm: before
+            # MemPalace 3.9.0 any threshold switches the union pool's lexical half off, and on a
+            # palace that is not cosine 2.0 cuts vector candidates. Pinned by test.
             threshold = {} if max_distance is None else {"max_distance": max_distance}
             result = searcher.search_memories(
                 query,
@@ -388,9 +474,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
             raw = result.get("results") if isinstance(result, dict) else None
             if not isinstance(raw, list) or (isinstance(result, dict) and "error" in result):
                 _log_search_failure(result, surface=surface)
+                if found is not None:
+                    return found
             raw = [hit for hit in (raw or []) if isinstance(hit, dict) and hit.get("text")]
             hits = [hit for hit in raw if hit.get("room") != _REGISTRY_ROOM]
             sentinels = len(raw) - len(hits)
+            found = (hits, fetch, sentinels)
             # Widen only while it can help: something was dropped, the result is still short, and
             # the backend filled the page (a short page means the palace has nothing further).
             if not sentinels or len(hits) >= need or len(raw) < fetch:
@@ -398,7 +487,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             if fetch >= ask * _MAX_FETCH_FACTOR:
                 break
             fetch = min(fetch * 2, ask * _MAX_FETCH_FACTOR)
-        return hits, fetch, sentinels
+        return found
 
     def close(self) -> None:
         """Release the reranker's HTTP client, if one was ever built.
@@ -437,7 +526,7 @@ class MemPalaceSearchTool(Tool):
 
     The model-facing half of MemPalace memory (issue #267), beside the automatic half. It is a
     thin dispatcher onto `MemPalaceMemoryProvider.search` — the *same* in-process call the
-    `context` hook makes (same union pool, same no-`max_distance` rule) — so what the agent can
+    `context` hook makes (same union pool, same `max_distance` decision) — so what the agent can
     reach by asking is exactly what the palace would have injected, only with a query it wrote
     itself and at the moment it needs it.
 
@@ -634,6 +723,7 @@ def _log_recall(
     seconds: float,
     fetched: int,
     sentinels: int,
+    max_distance: float | None = None,
 ) -> None:
     """The ``memory recall`` line — one per retrieval, on either surface.
 
@@ -659,8 +749,14 @@ def _log_recall(
     are written only when there is something to say (issue #606): a palace with no sentinels in its
     ranking logs the same line it always did, and one that has them says how many and what the
     widening cost.
+
+    ``max_distance`` is written only when the search passed one (issue #625), so a palace searched
+    exactly as before logs the line it always did, and the reason is on the one ``memory
+    threshold`` line `MemPalaceMemoryProvider.distance_threshold` writes.
     """
     extra: dict[str, object] = {}
+    if max_distance is not None:
+        extra["max_distance"] = max_distance
     if sentinels:
         extra["sentinels"] = sentinels
     if fetched != pool:
@@ -722,6 +818,42 @@ def candidate_pool(wanted: int, *, reranked: bool) -> int:
     when it judges whether upstream's vector cut kept a drawer out (`_palace_check.diagnose`).
     """
     return pool_size(wanted) if reranked else _UNRANKED_HEADROOM * max(1, wanted)
+
+
+def mempalace_version() -> str | None:
+    """The installed MemPalace distribution's version, or ``None`` when it cannot be read."""
+    try:
+        return metadata.version("mempalace")
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def at_least(version: str | None, floor: tuple[int, ...]) -> bool:
+    """Whether a ``major.minor…`` version string is at or past ``floor``; ``False`` when unknown."""
+    if version is None:
+        return False
+    parts: list[int] = []
+    for piece in version.split("."):
+        digits = re.match(r"\d+", piece)
+        if digits is None:
+            break
+        parts.append(int(digits.group(0)))
+    return tuple(parts[: len(floor)]) >= floor
+
+
+def palace_metric(collection) -> str | None:
+    """The distance metric a drawers collection declares, lowercased; ``None`` if unreadable.
+
+    MemPalace's backends declare it as ``distance_metric`` (a legacy Chroma palace reports its real
+    ``hnsw:space``). Deliberately not upstream's ``_metric_for_collection``, which answers
+    ``cosine`` when the declaration cannot be read: a decision that must never cut a candidate
+    (`MemPalaceMemoryProvider.distance_threshold`) needs to know that it could not tell.
+    """
+    try:
+        metric = collection.distance_metric
+    except Exception:  # noqa: BLE001 - any failure to read it means "cannot tell"
+        return None
+    return str(metric).lower() if isinstance(metric, str) and metric else None
 
 
 def _bounded(n_results: int | None, default: int) -> int:

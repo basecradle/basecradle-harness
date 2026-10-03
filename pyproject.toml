@@ -92,7 +92,10 @@ openrouter = ["openrouter>=1.1.70,<2"]
 # absence (no `HARNESS_MEMPALACE_RERANK_MODEL`, no rerank), so every MemPalace agent would
 # otherwise install a vendor SDK it never imports — and a second extra name for one dependency
 # is a second pin the fleet has to keep in step with the first. One dependency, one extra.
-mempalace = ["mempalace>=3.7.1"]
+#
+# 3.9.0 is the floor because `search` passes `max_distance` (issue #625), and before 3.9.0
+# (MemPalace#1964) a threshold switches the union pool's lexical half off instead of scoring it.
+mempalace = ["mempalace>=3.9.0"]
 
 [project.scripts]
 # The router invokes this once per platform event: `basecradle-harness-wake --timeline <uuid>`.

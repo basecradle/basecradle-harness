@@ -17,7 +17,7 @@ import respx
 import respx.mocks
 from respx.mocks import HTTPCoreMocker
 
-from basecradle_harness import OpenAIProvider, _mining
+from basecradle_harness import OpenAIProvider, _mempalace, _mining
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -102,12 +102,18 @@ def mail_tool(name: str) -> dict:
 
 @pytest.fixture
 def fake_mempalace(monkeypatch):
-    """Install fake ``mempalace.convo_miner`` / ``mempalace.searcher`` modules.
+    """Install fake ``mempalace.convo_miner`` / ``mempalace.searcher`` / ``mempalace.palace``.
 
-    Returns the two fakes so a test can assert how the adapter called them. ``mine_convos``
+    Returns the first two fakes so a test can assert how the adapter called them. ``mine_convos``
     records its args; ``search_memories`` records the kwargs it was *passed* (not their
-    defaults — the `max_distance` guard below turns on that distinction) and returns
-    whatever the test stashes on it.
+    defaults — the `max_distance` tests turn on that distinction) and returns whatever the test
+    stashes on it.
+
+    The palace is the fleet's (issue #625): MemPalace 3.10.0, a drawers collection that declares
+    the cosine metric, so `search` passes ``max_distance=2.0`` by default. A test that needs
+    another palace sets ``searcher.metric`` (the collection's ``distance_metric``; an exception
+    instance is raised on read) or patches ``_mempalace.mempalace_version``. ``searcher.opened``
+    counts how often the collection was opened.
     """
     convo_miner = types.ModuleType("mempalace.convo_miner")
     convo_miner.calls = []
@@ -128,14 +134,35 @@ def fake_mempalace(monkeypatch):
         return searcher.result
 
     searcher.search_memories = search_memories
+    searcher.metric = "cosine"
+    searcher.opened = 0
+
+    class Collection:
+        @property
+        def distance_metric(self):
+            if isinstance(searcher.metric, BaseException):
+                raise searcher.metric
+            return searcher.metric
+
+    palace = types.ModuleType("mempalace.palace")
+
+    def get_collection(palace_path, **kwargs):
+        assert kwargs == {"create": False, "read_only": True}, kwargs
+        searcher.opened += 1
+        return Collection()
+
+    palace.get_collection = get_collection
 
     parent = types.ModuleType("mempalace")
     parent.convo_miner = convo_miner
     parent.searcher = searcher
+    parent.palace = palace
 
     monkeypatch.setitem(sys.modules, "mempalace", parent)
     monkeypatch.setitem(sys.modules, "mempalace.convo_miner", convo_miner)
     monkeypatch.setitem(sys.modules, "mempalace.searcher", searcher)
+    monkeypatch.setitem(sys.modules, "mempalace.palace", palace)
+    monkeypatch.setattr(_mempalace, "mempalace_version", lambda: "3.10.0")
     return convo_miner, searcher
 
 

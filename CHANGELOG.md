@@ -7,6 +7,66 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.144.0] - 2026-10-03
+
+### Changed: every MemPalace search passes `max_distance=2.0` where it filters nothing (issue #625)
+
+MemPalace's union search keeps only the `n` nearest of its `3n` vector candidates before it ranks,
+and a drawer that comes back through BM25 alone is scored on BM25 alone, capped at 0.4, so it loses
+to any close vector match even when full scoring would rank it first (MemPalace#2660, the palace
+check's `cut`). Since MemPalace 3.9 (MemPalace#1964) a distance threshold makes upstream score each
+lexical hit on its real vector distance, read from its stored embedding. `search` now passes
+`max_distance=2.0` on every search, with a reranker bound or not, and **only where it filters
+nothing**: MemPalace 3.9 or later, on a palace whose drawers collection declares the cosine metric
+(2.0 is the largest cosine distance). Anywhere else it searches exactly as before and logs one
+`memory threshold provider=mempalace max_distance=off reason=…` INFO line per provider (a wake).
+"Filters nothing" means by distance: under any threshold MemPalace drops a lexical hit whose stored
+embedding cannot be loaded rather than keeping it on BM25 alone, #625's stated risk, measured at zero
+on the real palace and counted by the palace check's end-to-end mode. Pool sizes do
+not change: the reranker still reads `pool_size`, and `_UNRANKED_HEADROOM` stays.
+
+The decision is `MemPalaceMemoryProvider.distance_threshold`, made once per provider. It reads the
+metric off the collection's own `distance_metric` (`palace_metric`), never upstream's
+`_metric_for_collection`, which answers `cosine` for anything it cannot read. The `memory recall`
+line carries `max_distance=2.0` when the search passed it.
+
+Decided on measurement (basecradle-noc#957, a real palace through the real reranker): the threshold
+gained one rare-token drawer in the final 10 and lost none, and dropped no lexical hit for a missing
+embedding; a 40-drawer pool on top of it gained only duplicates and is not built. Verified for this
+release:
+
+- MemPalace#2660's reproduction, widened to 80 decoys so the cut happens at the harness's own asks,
+  through `search` itself on MemPalace 3.10.0 and on 3.9.0 (the fleet's): the cut drawer is absent
+  without the threshold and first with it, with the reranker off (ask 4) and on (pool 20).
+- A legacy Chroma `l2` palace on the real backend, on both versions, reads `metric:l2` and gets no
+  threshold.
+- Recall time on a 6,000-drawer synthetic palace, 200 interleaved queries, no model: median 75 → 114
+  ms with the reranker off (ask 40), 70 → 102 ms with it on (pool 20); the metric is read once per
+  wake (under 90 ms cold, 2 ms warm).
+
+**The `mempalace` extra now needs `mempalace>=3.9.0`** (was 3.7.1). Before 3.9.0 a threshold
+switches the lexical half of the pool off; `search` checks the installed version as well and passes
+nothing below it.
+
+### Changed: `basecradle-harness-palace-check --end-to-end` measures the new search as today's
+
+Arm **1** (and 1R) is today's search, taking its threshold from the same `distance_threshold`
+decision `search` makes; arm **2** is now the search before this release (ask 20, no
+`max_distance`), kept so the comparison can be run again; arm **3** is unchanged (ask 40 with
+`max_distance=2.0`). Lexical drops are counted on the arms that pass the threshold (1, 1R, 3). The
+mode runs only where `search` passes the threshold, and refuses elsewhere as before.
+`--reranked-pool` fetches both its arms with the threshold `search` passes. A live run of the mode
+against a synthetic palace with the real reranker (`z-ai/glm-5.3-flash`, 25 probes, four arms)
+completed for $0.035.
+
+### Fixed: a widened MemPalace fetch that errors keeps the hits already found (issue #624)
+
+When the first fetch returned real memories, dropped a registry sentinel and filled its page, and
+the widened fetch then answered with an error envelope, the error's empty list replaced the hits
+already in hand, so the agent recalled nothing. The hits of the last fetch that succeeded now come
+back, the widening stops there, and the search-failure WARNING still fires. A first fetch that fails
+is unchanged: no hits, one WARNING.
+
 ## [0.143.0] - 2026-10-03
 
 ### Added: `basecradle-harness-palace-check --end-to-end` — is the right drawer in the final 10 (issue #627)

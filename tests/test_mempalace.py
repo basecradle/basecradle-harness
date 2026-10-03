@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from basecradle_harness import _mempalace
 from basecradle_harness._basecradle import _publish_palace_binding, _resolve_tools
 from basecradle_harness._memory_provider import (
     MemoryExchange,
@@ -27,10 +28,13 @@ from basecradle_harness._memory_provider import (
 from basecradle_harness._mempalace import (
     DEFAULT_N_RESULTS,
     MAX_N_RESULTS,
+    SEARCH_MAX_DISTANCE,
     MemPalaceMemoryProvider,
     MemPalaceSearchTool,
     candidate_pool,
+    palace_metric,
 )
+from basecradle_harness._rerank import MemPalaceReranker
 
 
 def _unranked(wanted):
@@ -223,28 +227,160 @@ def test_context_widens_the_rerank_pool_with_the_union_candidate_strategy(fake_m
     assert searcher.queries[0][2]["candidate_strategy"] == "union"
 
 
-def test_context_never_sets_max_distance(fake_mempalace, tmp_path):
-    """A distance filter would silently kill the union merge — so the adapter must never set one.
+# --- max_distance: passed where it filters nothing, never anywhere else (issue #625) --------
 
-    Through MemPalace 3.8.0, at this package's 3.7.1 floor, upstream's
-    `_merge_bm25_union_candidates` opens with `if max_distance > 0.0: return`, so *any* nonzero
-    threshold drops the lexical half of the pool and quietly reduces
-    `candidate_strategy="union"` to a no-op. (3.9.0 computes lexical hits' distances instead;
-    issue #625.) This is the tripwire for a distance filter added without knowing that.
-    """
+
+class _PickFirst(MemPalaceReranker):
+    """A reranker double that calls no model: it keeps the head of the pool it is handed."""
+
+    def __init__(self):
+        self.pools = []
+
+    def rerank(self, query, hits, k, *, surface):
+        self.pools.append(len(hits))
+        return hits[:k]
+
+    def close(self):
+        pass
+
+
+@pytest.mark.parametrize("reranked", [False, True], ids=["rerank-off", "rerank-on"])
+def test_every_search_passes_max_distance_on_a_cosine_palace(fake_mempalace, tmp_path, reranked):
+    """On MemPalace 3.9+ a threshold makes upstream score a lexical-only hit on its real vector
+    distance, where before it was capped at BM25's 0.4 and lost to any close vector match. 2.0 is
+    the largest distance cosine can report, so it cuts nothing. It goes on every search, a reranker
+    bound or not, and changes no pool size: the ask is what it was before."""
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    reranker = _PickFirst() if reranked else None
+    provider = MemPalaceMemoryProvider(palace, reranker=reranker)
+
+    provider.context(_scope(query="anything"))
+    (tool,) = provider.tools()
+    tool.run("anything else")
+
+    ask = candidate_pool(DEFAULT_N_RESULTS, reranked=reranked)
+    assert [q[2] for q in searcher.queries] == [
+        {"n_results": ask, "candidate_strategy": "union", "max_distance": SEARCH_MAX_DISTANCE}
+    ] * 2
+    assert SEARCH_MAX_DISTANCE == 2.0
+
+
+@pytest.mark.parametrize(
+    ("metric", "version", "reason"),
+    [
+        ("l2", "3.10.0", "metric:l2"),  # a legacy Chroma palace: distances up to 4, 2.0 cuts
+        ("ip", "3.10.0", "metric:ip"),  # unbounded
+        ("", "3.10.0", "metric:unreadable"),
+        (RuntimeError("no hnsw:space"), "3.10.0", "metric:unreadable"),
+        ("cosine", "3.8.0", "mempalace:3.8.0"),  # a threshold switches the lexical half off
+        ("cosine", None, "mempalace:unknown"),
+    ],
+)
+def test_no_max_distance_where_it_could_cut_a_candidate(
+    fake_mempalace, tmp_path, caplog, monkeypatch, metric, version, reason
+):
+    """The capital's ruling: it must never cut a candidate. Anywhere 2.0 is not a no-op filter, the
+    search is the one made before issue #625, byte for byte, and one line says why."""
+    _, searcher = fake_mempalace
+    searcher.metric = metric
+    monkeypatch.setattr(_mempalace, "mempalace_version", lambda: version)
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    provider = MemPalaceMemoryProvider(palace)
+
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        provider.search("anything")
+        provider.search("anything else")
+
+    assert [q[2] for q in searcher.queries] == [
+        {"n_results": _unranked(DEFAULT_N_RESULTS), "candidate_strategy": "union"}
+    ] * 2
+    lines = [r.getMessage() for r in caplog.records]
+    assert lines.count(f"memory threshold provider=mempalace max_distance=off reason={reason}") == 1
+    assert not [line for line in lines if "max_distance=" in line and "recall" in line]
+
+
+def test_a_collection_that_will_not_open_decides_nothing_and_is_asked_again(
+    fake_mempalace, tmp_path, monkeypatch
+):
+    """Undecided is not declined: that search passes no threshold, and the next one asks again
+    rather than keeping a palace that was merely not there yet from ever getting one."""
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    provider = MemPalaceMemoryProvider(palace)
+    opened = sys.modules["mempalace.palace"].get_collection
+
+    def refuse(path, **kwargs):
+        raise RuntimeError("Collection [mempalace_drawers] does not exist")
+
+    monkeypatch.setattr(sys.modules["mempalace.palace"], "get_collection", refuse)
+    provider.search("anything")
+    monkeypatch.setattr(sys.modules["mempalace.palace"], "get_collection", opened)
+    provider.search("anything")
+
+    assert "max_distance" not in searcher.queries[0][2]
+    assert searcher.queries[1][2]["max_distance"] == SEARCH_MAX_DISTANCE
+
+
+def test_the_decision_is_made_once_per_provider(fake_mempalace, tmp_path):
+    """A palace's metric is fixed when its collection is created, so it is read once, not per search."""
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    provider = MemPalaceMemoryProvider(palace)
+
+    for query in ("one", "two", "three"):
+        provider.search(query)
+
+    assert searcher.opened == 1
+
+
+def test_the_metric_is_read_off_the_declaration_never_defaulted_to_cosine():
+    """Upstream's ``_metric_for_collection`` answers cosine for anything it cannot read, which is
+    the wrong direction for this decision: unreadable has to mean no threshold."""
+
+    class Declares:
+        def __init__(self, metric):
+            self.metric = metric
+
+        @property
+        def distance_metric(self):
+            if isinstance(self.metric, BaseException):
+                raise self.metric
+            return self.metric
+
+    assert palace_metric(Declares("COSINE")) == "cosine"
+    assert palace_metric(Declares("l2")) == "l2"
+    assert palace_metric(Declares(None)) is None
+    assert palace_metric(Declares("")) is None
+    assert palace_metric(Declares(KeyError("hnsw:space"))) is None
+    assert palace_metric(object()) is None
+
+
+def test_the_recall_line_names_the_threshold_it_passed(fake_mempalace, tmp_path, caplog):
+    """Read on a live wake: the line says the search passed it, and says nothing when it did not."""
     _, searcher = fake_mempalace
     palace = tmp_path / "palace"
     palace.mkdir()
 
-    MemPalaceMemoryProvider(palace).context(_scope(query="anything"))
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        MemPalaceMemoryProvider(palace).search("anything", surface="turn0")
+        searcher.metric = "l2"
+        MemPalaceMemoryProvider(palace).search("anything", surface="turn0")
 
-    assert "max_distance" not in searcher.queries[0][2]
+    recalls = [r.getMessage() for r in caplog.records if r.getMessage().startswith("memory recall")]
+    assert len(recalls) == 2
+    assert recalls[0].endswith(" max_distance=2.0")
+    assert "max_distance" not in recalls[1]
 
 
 def test_the_fetch_passes_a_threshold_only_when_one_is_given(fake_mempalace, tmp_path):
-    """The palace check's end-to-end measurement (issue #627) compares a search with
-    ``max_distance`` against today's, through the very fetch `search` makes. ``None`` must send
-    nothing at all, so today's arm is byte-for-byte today's request."""
+    """The palace check's end-to-end measurement (issue #627) keeps an arm without the threshold,
+    through the very fetch `search` makes. ``None`` must send nothing at all, so that arm is
+    byte-for-byte the request made before issue #625."""
     _, searcher = fake_mempalace
     palace = tmp_path / "palace"
     palace.mkdir()
@@ -361,6 +497,61 @@ def test_the_widening_stops_at_its_cap(fake_mempalace, tmp_path):
     assert provider.context(_scope(query="hey nova")) is None
 
 
+@pytest.mark.parametrize("reranked", [False, True], ids=["rerank-off", "rerank-on"])
+def test_a_widened_fetch_that_errors_keeps_the_hits_already_found(
+    fake_mempalace, tmp_path, caplog, reranked
+):
+    """Issue #624: the first fetch found real memories, dropped a sentinel and filled its page, so
+    the search widened; the wider fetch answered with an error envelope. The memories in hand come
+    back, the failure is still one WARNING, and the widening stops there."""
+    _, searcher = fake_mempalace
+    reranker = _PickFirst() if reranked else None
+    pool = candidate_pool(5, reranked=reranked)
+    # Two memories, then sentinels to the end of a full page: short of what either path needs.
+    first = [_memory(0), _memory(1)] + [_sentinel(n) for n in range(pool - 2)]
+
+    def search_memories(query, palace_path, **kwargs):
+        searcher.queries.append((query, palace_path, kwargs))
+        if len(searcher.queries) == 1:
+            return {"results": first[: kwargs["n_results"]]}
+        return {"error": "Search error: the collection went away", "results": []}
+
+    searcher.search_memories = search_memories
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        hits = MemPalaceMemoryProvider(palace, reranker=reranker).search("hey nova", 5)
+
+    assert [hit["text"] for hit in hits] == [_memory(0)["text"], _memory(1)["text"]]
+    assert [q[2]["n_results"] for q in searcher.queries] == [pool, 2 * pool]
+    (warning,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warning.getMessage().startswith("memory op=search result=failed ")
+    (recall,) = [
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("memory recall")
+    ]
+    assert "injected=2" in recall
+    # The fetch whose hits came back, not the one that failed.
+    assert f"sentinels={pool - 2}" in recall and "fetched=" not in recall
+    if reranked:
+        assert reranker.pools == [2]
+
+
+def test_a_first_fetch_that_errors_still_reads_as_no_hits(fake_mempalace, tmp_path, caplog):
+    """Only a *widened* fetch has an answer behind it to keep. A first fetch that fails is what it
+    always was: memory degrades to nothing, the WARNING says why, the wake goes on."""
+    _, searcher = fake_mempalace
+    searcher.result = {"error": "Search error", "results": []}
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        assert MemPalaceMemoryProvider(palace).search("hey nova", 5) == []
+
+    assert len(searcher.queries) == 1
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+
+
 def test_a_palace_without_sentinels_is_searched_exactly_once(fake_mempalace, tmp_path):
     _, searcher = fake_mempalace
     _ranked(searcher, [_memory(n) for n in range(50)])
@@ -370,7 +561,7 @@ def test_a_palace_without_sentinels_is_searched_exactly_once(fake_mempalace, tmp
     MemPalaceMemoryProvider(palace).search("hey nova", 10)
 
     assert [q[2] for q in searcher.queries] == [
-        {"n_results": _unranked(10), "candidate_strategy": "union"}
+        {"n_results": _unranked(10), "candidate_strategy": "union", "max_distance": 2.0}
     ]
 
 
@@ -612,7 +803,7 @@ def test_search_tool_recalls_through_the_same_union_search_as_context(fake_mempa
     query, palace_path, kwargs = searcher.queries[0]
     assert (query, palace_path) == ("that endpoint we discussed in March", str(palace))
     assert kwargs["candidate_strategy"] == "union"  # inherited from #266 — never vector-only
-    assert "max_distance" not in kwargs  # which would silently kill the union pool
+    assert kwargs["max_distance"] == SEARCH_MAX_DISTANCE  # the same decision as `context`'s
     # The provider's default when the model names no count — read from the constant, so a
     # deliberate change to it (5 → 8 in issue #464, → 10 in issue #466) stays one edit rather than
     # a hunt for literals.

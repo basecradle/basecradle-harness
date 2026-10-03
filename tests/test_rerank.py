@@ -492,7 +492,11 @@ def test_rerank_off_keeps_the_head_of_the_unranked_ask(fake_mempalace, tmp_path)
     out = MemPalaceMemoryProvider(palace_path=palace).search("q", 3, surface=SURFACE_TURN0)
 
     (query,) = searcher.queries
-    assert query[2] == {"n_results": _UNRANKED_HEADROOM * 3, "candidate_strategy": "union"}
+    assert query[2] == {
+        "n_results": _UNRANKED_HEADROOM * 3,
+        "candidate_strategy": "union",
+        "max_distance": 2.0,  # issue #625: the same on either path
+    }
     assert _UNRANKED_HEADROOM * 3 != pool_size(3)
     assert [hit["text"] for hit in out] == ["memory 1", "memory 2", "memory 3"]
 
