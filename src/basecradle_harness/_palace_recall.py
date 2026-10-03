@@ -723,6 +723,31 @@ def report(run: Run, ceiling: int, estimated: int, header: str) -> None:
 # --- the mode ------------------------------------------------------------------
 
 
+def refusal(provider: MemPalaceMemoryProvider, collection) -> str | None:
+    """Why the arms cannot be measured on this palace, or ``None`` when they can.
+
+    The arms are described by the threshold `search` passes, so they are measured only where
+    `search` passes it: one decision, the provider's, read here rather than restated. Shared with
+    ``--pool-diagnosis`` (issue #633), which fetches the same arms.
+    """
+    version = _mempalace.mempalace_version()
+    metric = palace_metric(collection)
+    threshold, reason = provider.distance_threshold(collection)
+    if threshold != THRESHOLD and reason.startswith("mempalace:"):
+        return (
+            f"arms 1 and 3 measure how MemPalace {'.'.join(map(str, THRESHOLD_MEMPALACE))} and "
+            f"later score a lexical hit under a max_distance (MemPalace#1964); this box has "
+            f"MemPalace {version or 'unknown'}"
+        )
+    if threshold != THRESHOLD:
+        return (
+            f"max_distance {THRESHOLD} filters nothing only on a cosine palace; this palace's "
+            f"distance metric is {metric or 'unreadable'}, where search passes no max_distance "
+            f"and arm 3 would also cut vector candidates"
+        )
+    return None
+
+
 def main(
     provider: MemPalaceMemoryProvider,
     reranker: MemPalaceReranker,
@@ -738,26 +763,12 @@ def main(
     query_of,
 ) -> int:
     """The ``--end-to-end`` mode, after the palace check has opened the palace. Returns the exit code."""
-    # The arms are described by the threshold `search` passes, so the mode runs only where `search`
-    # passes it: one decision, the provider's, read here rather than restated.
+    refused = refusal(provider, collection)
+    if refused is not None:
+        print(f"REFUSED: {refused}. Nothing spent.")
+        return 1
     version = _mempalace.mempalace_version()
     metric = palace_metric(collection)
-    threshold, reason = provider.distance_threshold(collection)
-    if threshold != THRESHOLD and reason.startswith("mempalace:"):
-        print(
-            f"REFUSED: arms 1 and 3 measure how MemPalace "
-            f"{'.'.join(map(str, THRESHOLD_MEMPALACE))} and later score a lexical hit under a "
-            f"max_distance (MemPalace#1964); this box has MemPalace {version or 'unknown'}. "
-            f"Nothing spent."
-        )
-        return 1
-    if threshold != THRESHOLD:
-        print(
-            f"REFUSED: max_distance {THRESHOLD} filters nothing only on a cosine palace; this "
-            f"palace's distance metric is {metric or 'unreadable'}, where search passes no "
-            f"max_distance and arm 3 would also cut vector candidates. Nothing spent."
-        )
-        return 1
     chosen = select(found, heads, rares, before, sample=sample, query_of=query_of)
     probes = schedule(chosen.head, chosen.rare)
     texts = [text.strip() for _, _, text in found.real]

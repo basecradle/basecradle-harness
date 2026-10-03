@@ -312,6 +312,32 @@ The summary carries the fallback counts because a reranker that fell back hands 
 
 **A run that cannot finish says so.** On the ceiling, a config-class reranker fault such as a rejected key, a search that returns an empty pool (a failed MemPalace search returns nothing and logs a WARNING), an interrupt, or any error, it stops, reports what it has, marked `PARTIAL`, and exits 1. A probe counts only once all four of its arms have run, so a stopped run holds the same probes in every arm, and an error is named by its class alone. Only a complete run exits 0. Progress goes to stderr every ten probes.
 
+#### Why a probe is not in the pool — `--pool-diagnosis`
+
+`--end-to-end` can say a probe's drawer was **not in the pool**; `--pool-diagnosis` says why. It is **token-free and read-only**: no reranker runs and nothing is written. It takes the same probe flags, so it draws the same probes and fetches them through the same arms 1, 2 and 3 (arm 1R is arm 1 again), and run with the flags of an end-to-end run it diagnoses that run's misses:
+
+```bash
+basecradle-harness-palace-check --sample 150 --rare-token-probes 100 --filed-before 2026-10-02T07:00:00 --pool-diagnosis /home/<user>/harness
+```
+
+For every probe whose drawer is not in arm 1's pool it prints which arms' pools hold it, then a `why:` line of ids, counts and ranks:
+
+- **The vector half**: the drawer's rank among the candidates it proposes (three times the fetch) and how far that is past the ones it keeps; whether the drawer's own embedding finds it.
+- **The lexical half**: its rank among the candidates it asks for; whether it lies inside the backend's **scan window**; and its rank with no window. On the Chroma backend the lexical half reads only the first `max(500, 3 × fetch)` full-text matches in index order, not the best ones, and scores those. A query of common words matches far more than 500 drawers, so a newer drawer can be the best lexical match in the palace and still never be read.
+- **The merge**: whether it became a candidate, and its hybrid rank among the real candidates (registry sentinels left out) against the pool's 20; why the merge refused a lexical hit (no loadable embedding under `max_distance`; a drawer already admitted, kept by the vector half or ranked above it lexically, with the same file and chunk; or no source file at all).
+- **Sentinels and the widening**: how many sentinels the fetch dropped, how wide it went, and whether it hit its cap.
+- **A wider ask**: the first of 40, 80, 160, 320 and 640 whose pool holds it.
+- **Copies in the pool**: how many have byte-identical text, and the pool drawer that shares most of its tokens, with that share as a number.
+- **The self-check**: MemPalace returns only its first results, so the candidate set and hybrid rank are rebuilt with MemPalace's own merge and ranking functions, and every line says whether that rebuild matches the real search.
+
+Its verdict is the first of these that applies: **`twin`** (an identical copy is in the pool), **`near-twin`** (a pool drawer shares at least 80% of its distinct tokens), **`sentinels`** (a candidate inside the pool but for sentinels, with the widening at its cap), **`crowded`** (a candidate, outranked), **`dropped`** (refused under `max_distance` for want of an embedding), **`shadowed`** (refused because a drawer already admitted holds its file and chunk, or because it has no source file), **`missing`** (an index has lost it: no stored embedding, or no full-text match for its own text), **`fts-window`** (the lexical half would have proposed it but for the scan window), **`cut`** (the vector half proposed it and did not keep it, and the lexical half would not have proposed it either), **`unreached`** (neither half proposes it), or **`unknown`** (the rebuild does not match the search, or a measurement failed, named by its exception class). It ends with, per probe kind, the count and digest of probes missing from each arm's pool and from every arm's pool, the verdict counts, and one summary line:
+
+```
+pool diagnosis summary: head probes N (digest …), rare-token probes M (digest …); not in arm 1's pool X (digest …); in no arm's pool Y (digest …)
+```
+
+It prints no path at all, not even the palace's (the report's first line says so), and names an error by its class alone. It exits 0 only when arm 1's pool holds every probe drawer. What it cannot tell: why a drawer's opening is a poor match for its own embedding, whether a closet boost moved a vector rank (a palace with closets says so, and the self-check catches the effect), and what the reranker would have picked had the drawer been in the pool (that is `--end-to-end`). It refuses where `--end-to-end` refuses.
+
 **Every miss is diagnosed, and no drawer text is ever printed,** in either mode. A `why:` line under each failure gives ids, counts and ranks only. It reports where the drawer ranks in a top-100 search and in the vector half of a top-10 search, whether the vector index returns it for its own embedding, and how many drawers carry its exact text or its query. It also reports how many of the drawers that took the top 10 share its text, its query, its content hash or its source file. The probe's query is the first 400 characters of the drawer, while the drawer's embedding covers the whole chunk, so a drawer is not guaranteed to be nearest to its own query. The verdict names one of four causes:
 
 - **`twin`.** A drawer with identical text holds a top-10 slot, so the memory is recalled under another id. This happens when more copies of one exchange exist than there are slots.
