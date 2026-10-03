@@ -58,9 +58,13 @@ from basecradle_harness._faults import is_out_of_funds
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
     finish_reason,
+    generation_id,
+    generation_id_header,
+    generation_of,
     log_llm_call,
     reported_cost,
     serving_endpoint,
+    stamp_generation_id,
     token_counts,
 )
 from basecradle_harness._openai_wire import (
@@ -435,7 +439,8 @@ class OpenAIProvider:
             response = self._client.responses.create(**payload)
         data = response.model_dump()
         self._log_call(started, data)
-        return message_from_responses(data)
+        with generation_of(data):
+            return message_from_responses(data)
 
     def _with_code_container(self, spec: dict[str, Any]) -> dict[str, Any]:
         """Inject the live ``container`` into the ``code_interpreter`` built-in, per turn.
@@ -466,7 +471,8 @@ class OpenAIProvider:
             response = self._client.chat.completions.create(**payload)
         data = response.model_dump()
         self._log_call(started, data)
-        return message_from_chat(data)
+        with generation_of(data):
+            return message_from_chat(data)
 
     def _log_call(self, started: float, data: Mapping[str, Any]) -> None:
         """The one INFO line this call earns: provider, endpoint, model, duration, tokens, cost.
@@ -504,6 +510,9 @@ class OpenAIProvider:
             # it got back is whole (issue #488). One reader covers both surfaces: Chat states it on
             # the choice, Responses only once its `status` goes `incomplete`.
             finish_reason=reason,
+            # The body's own ``id`` on both surfaces (issue #634): a ``chatcmpl-`` or ``resp_`` id
+            # from OpenAI, a uuid from xAI, the ``gen-`` generation id from OpenRouter.
+            generation_id=generation_id(data),
         )
 
     def context_limit(self) -> int | None:
@@ -592,15 +601,19 @@ class _ErrorMapper:
             # DNS/TCP/TLS, or the connection dropping mid-response. ``from exc`` keeps the SDK's
             # own cause on the record.
             raise ProviderConnectionError(f"Could not reach the provider: {exc}") from exc
+        # A response that arrived — refused or unparseable — may name the call in a header, and the
+        # vendor's refund path asks for exactly that id (issue #634). Only OpenRouter sets one; at
+        # OpenAI or xAI the read yields nothing, so the line simply carries less.
+        generation = generation_id_header(getattr(getattr(exc, "response", None), "headers", None))
         if isinstance(exc, openai.APIStatusError):
-            raise _from_status_error(exc) from exc
+            raise stamp_generation_id(_from_status_error(exc), generation) from exc
         if isinstance(exc, openai.APIError):
             # A non-status SDK error: the response arrived but could not be parsed — a truncated
             # body, malformed JSON, or a schema mismatch (`openai.APIResponseValidationError` lands
             # here — it is an APIError, not an APIStatusError). This is the transient
             # unparseable-response class (issue #259), so it maps to the retryable
             # `ProviderResponseError`; the engine re-requests it before giving up.
-            raise ProviderResponseError(str(exc)) from exc
+            raise stamp_generation_id(ProviderResponseError(str(exc)), generation) from exc
         if isinstance(exc, json.JSONDecodeError):
             # The HTTP client's ``response.json()`` raises this on a truncated / non-JSON 200 body
             # (HTTPX2 since ``openai`` 3.0, HTTPX before it — the fault is the same), and the

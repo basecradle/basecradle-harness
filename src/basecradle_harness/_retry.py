@@ -262,9 +262,13 @@ def diagnostics(exc: object) -> dict[str, Any]:
     place the offending endpoint can ever be seen. Without it nobody can say which of
     ``baseten, coreweave, parasail, modal`` refused.
 
-    Returned as a dict so the same four fields, under the same names and in the same order, ride
+    Returned as a dict so the same fields, under the same names and in the same order, ride
     **both** the retry line and the final ``outcome=fallback`` line — one function, so the two can
     never disagree about what a failure looked like.
+
+    The fifth, ``generation_id``, is the vendor's own id for the failed attempt (issue #634), which
+    the adapter that saw the response stamped on the error (`ProviderError.generation_id`). Both
+    emitters render it last on the line, wherever it sits in this dict.
     """
     hinted = _retry_after(exc)
     return {
@@ -276,6 +280,7 @@ def diagnostics(exc: object) -> dict[str, Any]:
         # counters under one key is a dashboard nobody can read.
         "routing_attempt": getattr(exc, "routing_attempt", None),
         "attempts": getattr(exc, "routing_attempts", None),
+        "generation_id": getattr(exc, "generation_id", None),
     }
 
 

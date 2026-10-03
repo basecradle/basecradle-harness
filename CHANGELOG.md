@@ -7,6 +7,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.147.0] - 2026-10-03
+
+### Added: the `llm` line names the call by the vendor's own id (issue #634)
+
+Every `llm` line now ends with `generation_id=`, the id the vendor gave the call: OpenRouter's
+`gen-…` generation id, OpenAI's `chatcmpl-…` or `resp_…` id, xAI's response id. It is what
+OpenRouter's feedback and refund path asks for. On 2026-10-03 three calls ran 10 to 14 minutes each
+and came back at the 131,072-token output cap (basecradle-noc#963), and the journal had their time,
+model, endpoint, tokens and cost and no id, so the complaint went by email with timestamps.
+
+A refused or unparseable attempt names its generation too. OpenRouter sets `X-Generation-Id` on
+every response, a 4xx or 5xx included (measured live), and an adapter's error mapper stamps it on
+the error it raises (`ProviderError.generation_id`). A body that arrived and could not be turned into
+a turn carries its own id. So the `llm retry` line and a rerank's or a describe's `outcome=fallback`
+line carry `generation_id=` whenever the attempt had one, and in the #963 shape (a body logged, then
+rejected as `invalid_response`) the `llm` line and the retry line after it name the same generation.
+
+The field renders last on both lines, so no column before it moves; the NOC's own extraction
+expressions read identical values off a line with it and without it (`tests/test_generation_id.py`).
+It is omitted, never a placeholder, when the vendor gave none, and omitted when what it gave is not
+shaped like an id, because the value is vendor-written text on a line whose columns are partial
+regex matches. OpenAI's `x-request-id` is a different id with a different use and is not logged
+under this name. No id is a credential: each vendor looks one up only for the account that made the
+call. Live checks in `tests/test_openrouter_live.py` (the id against OpenRouter's generation API,
+and a live refusal's header), `tests/test_openai_live.py` and `tests/test_xai_sdk_live.py`.
+
 ## [0.146.0] - 2026-10-03
 
 ### Added: `basecradle-harness-palace-check --pool-diagnosis`, why a probe is not in the pool (issue #633)

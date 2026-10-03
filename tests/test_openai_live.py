@@ -49,6 +49,7 @@ and its own ``armed`` flag, since four keys do not arrive as one event.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import pytest
@@ -103,3 +104,28 @@ def test_openai_accepts_the_cache_affinity_key_on_both_surfaces(surface):
 
     assert "pong" in (reply.content or "").lower()
     assert provider.last_tokens_in and provider.last_tokens_in > 0
+
+
+@pytest.mark.parametrize(("surface", "prefix"), [("responses", "resp_"), ("chat", "chatcmpl-")])
+@pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
+def test_the_live_line_names_the_call_by_openais_own_id(surface, prefix, caplog):
+    """The line's ``generation_id=`` is the body's id for the call, on both surfaces (issue #634).
+
+    By value: each surface's own prefix, which also tells it apart from the ``req_`` id OpenAI sends
+    in ``x-request-id`` — a different id with a different use, never to be passed off as this one.
+    On the Responses surface the id is looked up as well, through the API that stores responses by
+    default, so the line is proved to name a call OpenAI can find.
+    """
+    provider = OpenAIProvider(model=MODEL, api_key=KEY, surface=surface, max_retries=0)
+    try:
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            provider.chat([Message.user("Reply with exactly: pong")])
+        line = next(
+            r.getMessage() for r in caplog.records if r.getMessage().startswith("llm provider=")
+        )
+        generation = line.split()[-1].removeprefix("generation_id=")
+        assert generation.startswith(prefix), line
+        if surface == "responses":
+            assert provider._client.responses.retrieve(generation).id == generation
+    finally:
+        provider.close()

@@ -1289,13 +1289,21 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   | `cached_tokens` | How much of the prompt was a **cache hit** rather than full freight — the difference between paying the input rate and the ~5× cheaper cache-read rate | Wherever the provider reports it |
   | `endpoint` | Which **upstream actually served** the call, per the endpoint the router says it *selected* | Only where the provider *is* a router. OpenRouter fans one model id out to dozens of endpoints differing up to 10× in context ceiling and 5.4× in price, so `provider=openrouter` alone cannot say what a call ran against; a direct-to-vendor SDK has no such distinction and logs none |
   | `cost` | The call's charge **in dollars, as the provider reported it** | Only where a provider states one natively (OpenRouter's `usage.cost`; xAI's ticks, converted by its own SDK). The **same field, same plain-decimal shape, rides the media line** — xAI reports the exact charge for image and video generation on the wire too |
+  | `generation_id` | The **vendor's own id for the call** — what its feedback and refund path asks for, so a complaint names the generation instead of a timestamp the vendor has to search by. Always the **last** field, so no column before it moves | Every provider that returns one: OpenRouter's `gen-…` generation id, OpenAI's `chatcmpl-…` / `resp_…` id, xAI's response id. It also rides the **`llm retry`** line and a fallback line when the refused attempt had one — OpenRouter names *every* response, a 4xx or 5xx included, in its `X-Generation-Id` header, and a body that arrived but could not be parsed still carries its id. Omitted, never a placeholder, when the vendor gave none, and omitted when what it gave is not shaped like an id |
 
   **`endpoint` is read from the router's own routing metadata — the endpoint it flags as *selected* — and the OpenRouter cells request that metadata on every call** (`X-OpenRouter-Metadata`), because unasked, a router says nothing trustworthy about its routing. It is deliberately **not** read from the response's top-level `provider` field: that field is undocumented, and it names *the last upstream OpenRouter spoke to*, which is **not** the serving endpoint whenever a server-side tool ran — with the [web-search built-in](#search-the-web--the-responses-surface) active, a live `z-ai/glm-5.2` call reports `"provider": "OpenAI"`, a vendor that serves no endpoint in that model's pool. Reading it didn't lose data, it **fabricated a distribution**. Where no selected endpoint is named, the field is **omitted** — a wrong endpoint is worse than an absent one, exactly as a fabricated cost would be.
 
   So a routed call earns the full line, and an operator can answer "what did that cost, who served it, and was the cache doing anything?" from the journal alone:
 
   ```
-  INFO llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445
+  INFO llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445 generation_id=gen-1791030923-8abbrsSEsIk06gI224Fi
+  ```
+
+  A body that comes back and cannot be turned into a turn (say, a tool call's arguments cut off at the output cap) is logged first and retried after, and both lines name the **same** generation, so the call to complain about is the one on the page:
+
+  ```
+  INFO llm provider=openrouter purpose=main endpoint=Morph model=z-ai/glm-5.3 duration=824.75s tokens_in=96210 tokens_out=131072 tokens_total=227282 cost=0.40598019 generation_id=gen-1791025202-Qm4xT7pL2vNc9RkA8sDe
+  WARNING llm retry provider=openrouter purpose=main model=z-ai/glm-5.3 attempt=1/3 reason=invalid_response next_in=0.50s generation_id=gen-1791025202-Qm4xT7pL2vNc9RkA8sDe
   ```
 - **One line per tool run** (name, duration, `ok`/`error`) — because a failing tool's error is fed back *to the model* as its result, which made it invisible to the operator; a failure now also logs a `WARNING` carrying the error text.
 - **One line per [context compaction](#the-context-budget--the-transcript-compacts-itself)**, plus one naming the context limit the agent resolved and where it came from — so "which ceiling is this agent actually on, and is it compacting?" is answerable from the journal, never inferred:

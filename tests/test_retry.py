@@ -382,6 +382,7 @@ def test_an_adapter_with_nothing_to_say_carries_nothing(caplog):
         "provider_code": None,
         "routing_attempt": None,
         "attempts": None,
+        "generation_id": None,
     }
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
         retry(purpose=MAIN, kind=None, extra={}, sleep=lambda _s: None).again(

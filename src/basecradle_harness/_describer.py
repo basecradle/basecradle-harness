@@ -674,6 +674,9 @@ class Describer:
             # The vendor's own account of the fault (issue #506) reads next to the `reason` it
             # explains, and is absent on every line with nothing to explain.
             extra={**(diagnostics or {}), "subject": subject},
+            # The vendor's id for the call the adapter recorded (issue #634); a refused attempt's
+            # rides in `diagnostics` instead, and either way it is rendered last.
+            generation_id=call.generation_id,
             level=level,
         )
 

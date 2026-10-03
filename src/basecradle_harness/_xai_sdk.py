@@ -103,6 +103,8 @@ from basecradle_harness._faults import is_out_of_funds, is_too_large, refused_to
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
 from basecradle_harness._observability import (
     finish_reason,
+    generation_id,
+    generation_of,
     log_llm_call,
     serving_endpoint,
     token_counts,
@@ -392,8 +394,12 @@ class XaiSdkProvider:
             # it got back is whole (issue #488). This SDK names its proto enum (`REASON_MAX_LEN`),
             # which the shared reader knows alongside the two chat-wire spellings.
             finish_reason=reason,
+            # xAI's response id (issue #634) — on its HTTP surface the same value it sends as
+            # ``x-request-id``, so a support request names the call either way.
+            generation_id=generation_id(response),
         )
-        return self._from_wire(response)
+        with generation_of(response):
+            return self._from_wire(response)
 
     def _sample(
         self,
