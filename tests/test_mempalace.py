@@ -226,10 +226,11 @@ def test_context_widens_the_rerank_pool_with_the_union_candidate_strategy(fake_m
 def test_context_never_sets_max_distance(fake_mempalace, tmp_path):
     """A distance filter would silently kill the union merge — so the adapter must never set one.
 
-    Upstream's `_merge_bm25_union_candidates` opens with `if max_distance > 0.0: return`:
-    BM25-only candidates carry no vector distance, so *any* nonzero threshold drops the
-    lexical half of the pool and quietly reduces `candidate_strategy="union"` to a no-op.
-    This is the tripwire for a future distance filter added without knowing that.
+    Through MemPalace 3.8.0, at this package's 3.7.1 floor, upstream's
+    `_merge_bm25_union_candidates` opens with `if max_distance > 0.0: return`, so *any* nonzero
+    threshold drops the lexical half of the pool and quietly reduces
+    `candidate_strategy="union"` to a no-op. (3.9.0 computes lexical hits' distances instead;
+    issue #625.) This is the tripwire for a distance filter added without knowing that.
     """
     _, searcher = fake_mempalace
     palace = tmp_path / "palace"
