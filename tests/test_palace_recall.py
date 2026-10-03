@@ -31,7 +31,7 @@ import httpx
 import pytest
 import respx
 
-from basecradle_harness import _palace_check, _palace_recall
+from basecradle_harness import _mempalace, _palace_check, _palace_recall
 from basecradle_harness._mempalace import MemPalaceMemoryProvider
 from basecradle_harness._palace_recall import (
     ARM_1,
@@ -111,6 +111,9 @@ FILLER = [
 
 
 class FakeCollection:
+    #: What the palace declares. MemPalace's own ``_metric_for_collection`` is faked to agree.
+    distance_metric = "cosine"
+
     def __init__(self, drawers, lookup):
         self.rows = [(drawer, text) for drawer, (text, _) in drawers.items()]
         self.lookup = lookup
@@ -159,7 +162,7 @@ def palace(tmp_path, monkeypatch):
         return {"results": ranking[: kwargs["n_results"]]}
 
     searcher.search_memories = search_memories
-    searcher._metric_for_collection = lambda col: "cosine"
+    searcher._metric_for_collection = lambda col: col.distance_metric
     searcher._lexical_hit_vector_distances = lambda col, query, hits, metric: {
         hit.id: 0.5 for hit in hits if not drawers[hit.id][1].dropped
     }
@@ -168,7 +171,7 @@ def palace(tmp_path, monkeypatch):
         setattr(parent, name, module)
         monkeypatch.setitem(sys.modules, f"mempalace.{name}", module)
     monkeypatch.setitem(sys.modules, "mempalace", parent)
-    monkeypatch.setattr(_palace_recall, "mempalace_version", lambda: "3.9.0")
+    monkeypatch.setattr(_mempalace, "mempalace_version", lambda: "3.9.0")
     monkeypatch.setenv(RERANK_MODEL_VAR, MODEL)
     monkeypatch.setenv(RERANK_API_KEY_VAR, FAKE_KEY)
     monkeypatch.setenv(RERANK_PROVIDERS_VAR, "deepinfra,together")
@@ -267,11 +270,12 @@ def test_every_arm_and_both_probe_kinds_report_the_known_answer(palace, router, 
     probes = ALL + RARE_ALL
     assert route.call_count == 4 * probes
 
-    # head: a3 + d2 + f2 + s2 reach arm 1's pool; f is never picked.
+    # head: a3 + c2 + f2 + s2 reach arm 1's pool (today's search passes the threshold, so c is in
+    # and d dropped); f is never picked.
     expected = {
         ("head", "1"): (14, 9, 7),
         ("head", "1R"): (14, 9, 7),
-        ("head", "2"): (14, 9, 7),  # c in, d dropped
+        ("head", "2"): (14, 9, 7),  # no threshold: d in, c out
         ("head", "3"): (14, 11, 9),  # b reached by the ask of 40
         ("rare-token", "1"): (12, 7, 5),  # the two common drawers have no rare token
         ("rare-token", "1R"): (12, 7, 5),
@@ -283,14 +287,16 @@ def test_every_arm_and_both_probe_kinds_report_the_known_answer(palace, router, 
         assert f"probes {count}, in pool {pool}, in final 10 {final}, " in line, line
         assert f"rerank ok {count}, fallback 0" in line
         assert f"tokens in {count * 1000} out {count * 100}" in line
-        if arm in ("2", "3"):
+        if arm == "2":
+            assert "lexical hits dropped" not in line
+        else:
             assert (
                 "lexical hits dropped for a missing embedding 2 (probe drawers it kept out of the pool 2)"
                 in line
             )
 
-    # Every miss tagged by its stage: b, c (arm 1 only), d (arms 2, 3) and e were never fetched;
-    # f was fetched every time and never picked.
+    # Every miss tagged by its stage: b (arms 1, 1R, 2), d (arms 1, 1R, 3), c (arm 2) and e were
+    # never fetched; f was fetched every time and never picked.
     stages = {"1": (5, 2), "1R": (5, 2), "2": (5, 2), "3": (3, 2)}
     for kind in ("head", "rare-token"):
         for arm, (unfetched, unpicked) in stages.items():
@@ -312,24 +318,16 @@ def test_every_arm_and_both_probe_kinds_report_the_known_answer(palace, router, 
             two = _line(lines, f"end-to-end {kind} arm 2 vs 1: in {stage} ")
             assert "gained 2" in two and "lost 2" in two
             three = _line(lines, f"end-to-end {kind} arm 3 vs 1: in {stage} ")
-            assert "gained 4" in three and "lost 2" in three
+            assert "gained 2" in three and "lost 0" in three
 
     def ids(prefix):
         return {line.rsplit(" ", 1)[1] for line in lines if line.startswith(prefix)}
 
-    assert ids("end-to-end head arm 3 vs 1 in final 10 gained:") == {
-        "drawer-b-00",
-        "drawer-b-01",
-        "drawer-c-00",
-        "drawer-c-01",
-    }
-    assert ids("end-to-end head arm 3 vs 1 in pool gained:") == {
-        "drawer-b-00",
-        "drawer-b-01",
-        "drawer-c-00",
-        "drawer-c-01",
-    }
-    assert ids("end-to-end head arm 2 vs 1 in final 10 lost:") == {"drawer-d-00", "drawer-d-01"}
+    assert ids("end-to-end head arm 3 vs 1 in final 10 gained:") == {"drawer-b-00", "drawer-b-01"}
+    assert ids("end-to-end head arm 3 vs 1 in pool gained:") == {"drawer-b-00", "drawer-b-01"}
+    # The search before #625 loses what the threshold lifts, and finds what it drops.
+    assert ids("end-to-end head arm 2 vs 1 in final 10 lost:") == {"drawer-c-00", "drawer-c-01"}
+    assert ids("end-to-end head arm 2 vs 1 in final 10 gained:") == {"drawer-d-00", "drawer-d-01"}
 
     summary = lines[-1]
     assert summary.startswith("end-to-end summary: complete; mempalace 3.9.0, metric cosine,")
@@ -449,10 +447,10 @@ def test_the_mode_calls_the_production_fetch_and_the_production_rerank(
     code, _, _ = _run(capsys, palace, "--sample", 1, "--end-to-end", "--token-ceiling", 5_000_000)
     assert code == 0
     assert fetched == [
-        (20, 20, None, "palace-check"),
         (20, 20, 2.0, "palace-check"),
-        (40, 40, 2.0, "palace-check"),
         (20, 20, None, "palace-check"),
+        (40, 40, 2.0, "palace-check"),
+        (20, 20, 2.0, "palace-check"),
     ]
     assert reranked == [
         (20, 10, "palace-check"),
@@ -460,15 +458,15 @@ def test_the_mode_calls_the_production_fetch_and_the_production_rerank(
         (40, 10, "palace-check"),
         (20, 10, "palace-check"),
     ]
-    # max_distance reaches MemPalace on arms 2 and 3 only, and today's arms send exactly what
-    # `search` sends.
-    assert [search.get("max_distance") for search in palace.searches] == [None, 2.0, 2.0, None]
-    assert palace.searches[0] == {"n_results": 20, "candidate_strategy": "union"}
+    # Today's arms send exactly what `search` sends (issue #625), and arm 2 the search before it.
+    assert [search.get("max_distance") for search in palace.searches] == [2.0, None, 2.0, 2.0]
+    assert palace.searches[1] == {"n_results": 20, "candidate_strategy": "union"}
 
 
 def test_arm_1_recalls_exactly_what_a_reranked_wake_recalls(palace, router):
     """Arm 1 is not a model of today's search, it is today's search: `search` with the same
-    reranker bound returns the same drawers in the same order."""
+    reranker bound returns the same drawers in the same order. Class c ranks differently with a
+    threshold and without, so this also pins that arm 1 passes the one `search` passes."""
     router.post(CHAT_URL).mock(side_effect=oracle())
     reranker = reranker_from_env()
     palace_path = palace.home / "mempalace"
@@ -573,15 +571,16 @@ def test_an_incomplete_rerank_configuration_refuses(palace, router, capsys, monk
 
 
 def test_a_mempalace_before_3_9_refuses(palace, router, capsys, monkeypatch):
-    """Before 3.9 a threshold disables the lexical half, so arms 2 and 3 would measure that."""
-    monkeypatch.setattr(_palace_recall, "mempalace_version", lambda: "3.8.0")
+    """Before 3.9 a threshold disables the lexical half, so `search` passes none and arm 1 would not
+    be today's search; arm 3 would measure the disabled half."""
+    monkeypatch.setattr(_mempalace, "mempalace_version", lambda: "3.8.0")
     route = router.post(CHAT_URL).mock(side_effect=oracle())
     code, lines, _ = _run(
         capsys, palace, "--sample", 1, "--end-to-end", "--token-ceiling", 5_000_000
     )
     assert code == 1
     assert route.call_count == 0
-    assert lines[-1].startswith("REFUSED: arms 2 and 3 measure how MemPalace 3.9 and later")
+    assert lines[-1].startswith("REFUSED: arms 1 and 3 measure how MemPalace 3.9 and later")
 
 
 @pytest.mark.parametrize(
@@ -662,7 +661,7 @@ def test_a_drawer_whose_every_token_is_widely_held_has_no_rare_token():
 
 def test_a_palace_that_is_not_cosine_refuses(palace, router, capsys, monkeypatch):
     """On a legacy l2 palace a threshold of 2.0 also cuts vector candidates a wake keeps."""
-    monkeypatch.setattr(sys.modules["mempalace.searcher"], "_metric_for_collection", lambda c: "l2")
+    monkeypatch.setattr(FakeCollection, "distance_metric", "l2")
     route = router.post(CHAT_URL).mock(side_effect=oracle())
     code, lines, _ = _run(capsys, palace, "--sample", 1, "--end-to-end", "--token-ceiling", 10**7)
     assert code == 1
@@ -809,7 +808,7 @@ def test_the_estimate_learns_a_denser_tokenizer_from_what_the_vendor_reports(
 def test_a_lexical_drop_is_charged_to_a_probe_only_when_it_cost_the_pool():
     tally = _palace_recall.Tally()
     probe = Probe("head", "drawer-a-00", "text", "text")
-    arm = _palace_recall.ARM_2
+    arm = _palace_recall.ARM_3
 
     def result(in_pool):
         return _palace_recall.Result(

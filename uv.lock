@@ -342,7 +342,7 @@ requires-dist = [
     { name = "av", specifier = ">=17,<19" },
     { name = "basecradle", specifier = ">=0.13.0" },
     { name = "httpx", specifier = ">=0.28" },
-    { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.7.1" },
+    { name = "mempalace", marker = "extra == 'mempalace'", specifier = ">=3.9.0" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=3.3.1,<4" },
     { name = "openrouter", marker = "extra == 'openrouter'", specifier = ">=1.1.70,<2" },
     { name = "pillow", specifier = ">=12,<13" },

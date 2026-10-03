@@ -129,6 +129,14 @@ It also gives the model **one read-only tool, `memory_search`** — deliberate r
 
 **Recall asks MemPalace for four times what it keeps** ([issue #611](https://github.com/basecradle/basecradle-harness/issues/611)). MemPalace's union search keeps only as many vector candidates as it was asked for before it ranks, so a drawer outside them scores on BM25 alone (at most 0.4 of a full score) and loses to any close vector match, even when full scoring would rank it first. Asking for four times the count and keeping the first ones lets those drawers compete. On a real palace, misses of this kind were more than a quarter of all misses; on a synthetic palace built to produce them, four times recovered 13 of 20 for about 9 ms per recall, and lost no drawer the old search found. This applies with the [reranker](#let-a-model-pick-what-gets-recalled--the-llm-reranker) off; with it on, the pool is already wider.
 
+**And every recall passes `max_distance=2.0` where that filters nothing** ([issue #625](https://github.com/basecradle/basecradle-harness/issues/625)). Since MemPalace 3.9 a distance threshold makes the union search score a lexical-only candidate on its real vector distance, read from its stored embedding, instead of on BM25 alone, so a drawer that reached the pool only through its exact tokens competes on full scoring at any ask. 2.0 is the largest distance a cosine palace can report, so it cuts no candidate by distance there. The one thing it does drop is MemPalace's own rule under any threshold: a lexical hit whose stored embedding cannot be loaded is left out rather than kept on BM25 alone. On the real palace that decided this change, that happened to no drawer, and the palace check's `--end-to-end` mode counts it. The harness passes it only on MemPalace 3.9 or later and only on a palace that declares the cosine metric; on anything else (a legacy palace built with Chroma's default `l2` metric, say) it searches exactly as before and logs one line saying why, once per wake (once per process for a long-lived poll loop):
+
+```
+INFO memory threshold provider=mempalace max_distance=off reason=metric:l2
+```
+
+On a 6,000-drawer palace it adds about 35 ms to a recall. It changes no pool size, with the reranker on or off. This is why the `mempalace` extra needs MemPalace 3.9.0 or later.
+
 **The `mempalace` CLI reaches the same palace, with no flags.** MemPalace ships its own command line, and it defaults to `~/.mempalace/palace` — right for the one-human-one-AI install it was written for, wrong for a harness agent whose palace lives under *its* home. So when a MemPalace-provider agent binds, the harness writes the path it just bound into `~/.mempalace/config.json`, the file every `mempalace` command reads when you give it no `--palace`. A bare `mempalace status` or `mempalace search "…"` then operates on the agent's live palace instead of an empty directory it has never used:
 
 ```console
@@ -283,16 +291,16 @@ Every probe runs four arms, in the order 1, 2, 3, 1R:
 
 | Arm | Ask MemPalace for | `max_distance` | Reranker reads | Keeps |
 |---|---|---|---|---|
-| 1 | 20 | not passed (today's search) | 20 | 10 |
+| 1 | 20 | 2.0 (today's search) | 20 | 10 |
 | 1R | arm 1 again | | | |
-| 2 | 20 | 2.0 | 20 | 10 |
+| 2 | 20 | not passed (the search before 0.144.0) | 20 | 10 |
 | 3 | 40 | 2.0 | 40 | 10 |
 
-Arm 1R is arm 1 run a second time, fetch and rerank both; how much it disagrees with arm 1 is the noise floor, and a difference between arms smaller than that is not a result. On MemPalace 3.9 and later, on a cosine palace, `max_distance=2.0` filters nothing by distance but scores a lexical-only candidate on its real vector distance instead of on BM25 alone; a lexical hit whose stored embedding cannot be loaded is dropped, and arms 2 and 3 count those drops (and how many probe drawers a drop kept out of the pool). The mode refuses to run where the arms would measure something else: before MemPalace 3.9, where a threshold switches the lexical half off entirely, and on a palace whose distance metric is not cosine, where 2.0 would also cut vector candidates.
+Arm 1R is arm 1 run a second time, fetch and rerank both; how much it disagrees with arm 1 is the noise floor, and a difference between arms smaller than that is not a result. Arm 1 takes its threshold from the same decision `search` makes, so it is today's search and not a copy of it. On MemPalace 3.9 and later, on a cosine palace, `max_distance=2.0` filters nothing by distance but scores a lexical-only candidate on its real vector distance instead of on BM25 alone; a lexical hit whose stored embedding cannot be loaded is dropped, and arms 1, 1R and 3 count those drops (and how many probe drawers a drop kept out of the pool). Arm 2 is the search before the threshold, kept so that comparison can be run again. The mode runs only where `search` passes the threshold and refuses everywhere else: before MemPalace 3.9, where a threshold switches the lexical half off entirely, and on a palace whose distance metric is not cosine, where 2.0 would also cut vector candidates.
 
 There are two kinds of probe, reported separately. **Head probes** (`--sample N`) query the opening text of the drawer, drawn exactly as `--sample` draws them. **Rare-token probes** (`--rare-token-probes M`) query nothing but the drawer's rarest exact token, by how many drawers in the palace carry it, read the way MemPalace's BM25 reads tokens (at least three characters). A drawer whose rarest token is carried by more than three drawers is skipped and counted.
 
-For each kind and arm the report gives the probe count, how many probe drawers were in the pool handed to the reranker, how many were in the final 10, the reranker outcomes (ok, or fallback by reason), the median search time, the tokens in and out and the cost the vendor reported, and, for arms 2 and 3, the lexical drops. Two more lines per arm follow. **Misses by stage** tags every miss by where it happened: the drawer was not in the pool at all, or it was in the pool and the reranker did not pick it. **Twins** counts the palace check's `twin` outcome on its own: the drawer is not in the final 10 but a drawer with byte-identical text is, split by whether the drawer itself was in the pool (the reranker read both and took the copy) or not (only the copy was fetched). Each arm is then compared with arm 1, cut both ways: the drawers it gained and lost **in the pool** and **in the final 10**, each set with a digest, and how many probes had a fallback in either arm. It prints counts, drawer ids and digests only, never memory text or a query. It ends with one line to compare between runs:
+For each kind and arm the report gives the probe count, how many probe drawers were in the pool handed to the reranker, how many were in the final 10, the reranker outcomes (ok, or fallback by reason), the median search time, the tokens in and out and the cost the vendor reported, and, for arms 1, 1R and 3, the lexical drops. Two more lines per arm follow. **Misses by stage** tags every miss by where it happened: the drawer was not in the pool at all, or it was in the pool and the reranker did not pick it. **Twins** counts the palace check's `twin` outcome on its own: the drawer is not in the final 10 but a drawer with byte-identical text is, split by whether the drawer itself was in the pool (the reranker read both and took the copy) or not (only the copy was fetched). Each arm is then compared with arm 1, cut both ways: the drawers it gained and lost **in the pool** and **in the final 10**, each set with a digest, and how many probes had a fallback in either arm. It prints counts, drawer ids and digests only, never memory text or a query. It ends with one line to compare between runs:
 
 ```
 end-to-end summary: complete; mempalace 3.9.0, metric cosine, rerank model …; head probes N (digest …), rare-token probes M (digest …); in final 10: head 1=… 1R=… 2=… 3=…; rare-token 1=… 1R=… 2=… 3=…; probes with a fallback: head 1=… 1R=… 2=… 3=…; rare-token …; tokens charged T of ceiling C (estimated E; calls charged at their estimate U)
@@ -307,7 +315,7 @@ The summary carries the fallback counts because a reranker that fell back hands 
 **Every miss is diagnosed, and no drawer text is ever printed,** in either mode. A `why:` line under each failure gives ids, counts and ranks only. It reports where the drawer ranks in a top-100 search and in the vector half of a top-10 search, whether the vector index returns it for its own embedding, and how many drawers carry its exact text or its query. It also reports how many of the drawers that took the top 10 share its text, its query, its content hash or its source file. The probe's query is the first 400 characters of the drawer, while the drawer's embedding covers the whole chunk, so a drawer is not guaranteed to be nearest to its own query. The verdict names one of four causes:
 
 - **`twin`.** A drawer with identical text holds a top-10 slot, so the memory is recalled under another id. This happens when more copies of one exchange exist than there are slots.
-- **`cut`.** Full scoring would place the drawer in the top 10, since a top-100 search does. But MemPalace's union search keeps only as many of the nearest vector candidates as the harness asks it for (four times the ten it keeps) before it ranks, and this drawer was not among them, so its vector score was dropped and it never got to compete.
+- **`cut`.** Full scoring would place the drawer in the top 10, since a top-100 search does. But MemPalace's union search keeps only as many of the nearest vector candidates as the harness asks it for (four times the ten it keeps) before it ranks, and this drawer was not among them, so its vector score was dropped and it never got to compete. Since 0.144.0 the search passes `max_distance=2.0`, which rescores a lexical-only candidate on its real distance, so a `cut` there also means BM25 did not bring the drawer into the pool either.
 - **`crowded`.** Even on full scoring the drawer ranks below 10, and no identical copy holds a slot. Near copies sharing its query typically take the slots.
 - **`unreached`.** The drawer is not in the top 100 at all. With `vector self-query no`, the index itself has lost it.
 
@@ -1281,17 +1289,19 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   A **recall is not a model call** — it spends nothing and has no tokens — so it keeps its own head, `memory recall`, naming the *category* with the software as a field value. The rerank *is* a model call, so it is an `llm` line like any other:
 
   ```
-  INFO memory recall provider=mempalace surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
+  INFO memory recall provider=mempalace surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871 max_distance=2.0
   INFO llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
   ```
 
   MemPalace keeps bookkeeping rows in the palace, one `[registry] <path>` row for each file it has already processed, and its search returns them like memories. Recall drops them. When some were dropped, the line says how many (`sentinels=`), and `fetched=` says how far the search widened to make up the count, to at most eight times the pool. A home-directory rename adds one such row per conversation file, so these two fields are where a relocated palace shows up:
 
   ```
-  INFO memory recall provider=mempalace surface=turn0 rerank=off pool=40 injected=10 duration=0.31s chars=6461 sentinels=44 fetched=80
+  INFO memory recall provider=mempalace surface=turn0 rerank=off pool=40 injected=10 duration=0.31s chars=6461 max_distance=2.0 sentinels=44 fetched=80
   ```
 
-  A search MemPalace could not serve (a backend without lexical search, a palace that will not open, a query that raised) answers with an error rather than a ranking. Recall reads that as no hits, so the wake goes on without memories, and one `WARNING` says why before the recall line. It names the answer's shape (`reason=error`, `no_results` or `not_a_dict`) and the error's field names, never MemPalace's error text, which can quote the query:
+  `max_distance=2.0` is there when the search passed the threshold, and absent when it did not ([above](#swap-the-memory-backend--the-memory-provider)).
+
+  A search MemPalace could not serve (a backend without lexical search, a palace that will not open, a query that raised) answers with an error rather than a ranking. Recall reads that as no hits, so the wake goes on without memories, and one `WARNING` says why before the recall line. If it was a *widened* fetch that failed (the one that makes up for dropped bookkeeping rows), the hits the first fetch already found are kept and recalled. It names the answer's shape (`reason=error`, `no_results` or `not_a_dict`) and the error's field names, never MemPalace's error text, which can quote the query:
 
   ```
   WARNING memory op=search result=failed provider=mempalace surface=turn0 reason=error keys=error,results

@@ -6,34 +6,37 @@ is shown, after its reranker has picked?** This mode answers it, for a sample of
 running each probe through the agent's **own** reranker: `MemPalaceReranker.rerank` itself, built
 from the agent's own ``HARNESS_MEMPALACE_RERANK_*`` configuration, with the production prompt and
 the production validation. The pool it reads is fetched by `MemPalaceMemoryProvider._ranking`, the
-call `MemPalaceMemoryProvider.search` makes, so arm 1 is exactly what a wake recalls today
-(``tests/test_palace_recall.py`` pins that equivalence). It changes no search behaviour, and it is
-read-only on the palace.
+call `MemPalaceMemoryProvider.search` makes, with the threshold `search` itself decides on, so arm 1
+is exactly what a wake recalls today (``tests/test_palace_recall.py`` pins that equivalence). It
+changes no search behaviour, and it is read-only on the palace.
 
 **Four arms, the same probes in each:**
 
 ====  ==============  ================  ===============  =====
 Arm   Ask upstream    ``max_distance``  Reranker reads   Keeps
 ====  ==============  ================  ===============  =====
-1     20              not passed        20               10
+1     20              2.0               20               10
 1R    arm 1 again
-2     20              2.0               20               10
+2     20              not passed        20               10
 3     40              2.0               40               10
 ====  ==============  ================  ===============  =====
 
 Arm 1R is arm 1 run a second time, fetch and rerank both. Its disagreement with arm 1 is the noise
 floor: a difference between two arms smaller than that is not a result. Each probe runs its arms in
 the order 1, 2, 3, 1R, so the repeat is as far from arm 1 as one probe allows, and a run the budget
-stops early still holds the same probes in every arm.
+stops early still holds the same probes in every arm. Arm 1 is today's search, which passes
+``max_distance=2.0`` since issue #625; arm 2 is the search before it, kept so the comparison that
+decided #625 can be run again; arm 3 is a wider pool the measurement found no gain in.
 
 On a cosine palace ``max_distance=2.0`` filters nothing by distance: no cosine distance exceeds it.
 What it changes, on MemPalace 3.9 and later (MemPalace#1964), is how a lexical-only candidate is
 scored: on its real vector distance instead of on BM25 alone (#625). Its stated risk is that a
-lexical hit whose stored embedding cannot be loaded is **dropped**, so arms 2 and 3 also count those
-drops. The mode refuses to run where the arms would measure something else: before MemPalace 3.9,
+lexical hit whose stored embedding cannot be loaded is **dropped**, so the arms that pass it (1, 1R
+and 3) also count those drops. The mode runs only where `search` passes the threshold
+(`MemPalaceMemoryProvider.distance_threshold`) and refuses everywhere else: before MemPalace 3.9,
 where a threshold disables the lexical half of the search altogether, and on a palace whose distance
 metric is not cosine (a legacy Chroma ``l2`` palace measures squared distances up to 4, so 2.0 would
-also cut vector candidates a wake keeps).
+also cut vector candidates). On either, arm 1 would not be today's search.
 
 **Two probe kinds, reported separately:**
 
@@ -84,14 +87,17 @@ import time
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from importlib import metadata
 
+from basecradle_harness import _mempalace
 from basecradle_harness._context import WORST_CASE_CHARS_PER_TOKEN
 from basecradle_harness._mempalace import (
     DEFAULT_N_RESULTS,
+    SEARCH_MAX_DISTANCE,
+    THRESHOLD_MEMPALACE,
     MemPalaceMemoryProvider,
     _import,
     candidate_pool,
+    palace_metric,
 )
 from basecradle_harness._rerank import (
     RERANK_OUTPUT_TOKENS,
@@ -111,13 +117,9 @@ KEEP = DEFAULT_N_RESULTS
 TODAY_ASK = candidate_pool(KEEP, reranked=True)
 WIDE_ASK = 2 * TODAY_ASK
 
-#: The threshold arms 2 and 3 pass. Above every distance a normalized embedding can have, so it
-#: filters nothing by distance; see the module docstring for what it does change.
-THRESHOLD = 2.0
-
-#: The first MemPalace that scores a lexical hit on its distance under a threshold (MemPalace#1964).
-#: Before it, any threshold disables the lexical half, and arms 2 and 3 would measure that instead.
-MIN_MEMPALACE = (3, 9)
+#: The threshold `search` passes (issue #625), and arms 1 and 3 with it. Above every distance a
+#: cosine palace can report, so it filters nothing by distance; see the module docstring.
+THRESHOLD = SEARCH_MAX_DISTANCE
 
 
 @dataclass(frozen=True)
@@ -126,6 +128,10 @@ class Arm:
     #: The ``n_results`` asked of MemPalace. The reranker reads all of it.
     ask: int
     max_distance: float | None
+    #: Fetched with the threshold `search` itself decides on (`distance_threshold`), never a copy
+    #: of it: the arm *is* today's search. ``max_distance`` is what that decision is on every palace
+    #: the mode runs on, which `main` checks before anything is spent.
+    as_search: bool = False
 
     def describe(self) -> str:
         distance = (
@@ -134,9 +140,10 @@ class Arm:
         return f"ask {self.ask}, {distance}, reranker reads {self.ask}, keeps {KEEP}"
 
 
-ARM_1 = Arm("1", TODAY_ASK, None)
-ARM_1R = Arm("1R", TODAY_ASK, None)
-ARM_2 = Arm("2", TODAY_ASK, THRESHOLD)
+ARM_1 = Arm("1", TODAY_ASK, THRESHOLD, as_search=True)
+ARM_1R = Arm("1R", TODAY_ASK, THRESHOLD, as_search=True)
+#: The search before issue #625, kept so the comparison can be run again.
+ARM_2 = Arm("2", TODAY_ASK, None)
 ARM_3 = Arm("3", WIDE_ASK, THRESHOLD)
 #: The order a probe runs its arms in: the repeat last, as far from arm 1 as a probe allows.
 RUN_ORDER = (ARM_1, ARM_2, ARM_3, ARM_1R)
@@ -355,11 +362,13 @@ def fetch(
     """The pool `arm` hands the reranker for `probe`: ``(pool, fetch, seconds)``.
 
     Through the provider's own `_ranking`, the fetch half of `search`: with ``need`` the whole ask,
-    because the reranker reads all of it, exactly as `search` asks with one bound.
+    because the reranker reads all of it, exactly as `search` asks with one bound. Today's arms take
+    their threshold from the provider's own decision, as `search` does.
     """
     started = time.monotonic()
+    threshold = provider.distance_threshold()[0] if arm.as_search else arm.max_distance
     hits, width, _ = provider._ranking(
-        probe.query, ask=arm.ask, need=arm.ask, surface=SURFACE, max_distance=arm.max_distance
+        probe.query, ask=arm.ask, need=arm.ask, surface=SURFACE, max_distance=threshold
     )
     return hits[: arm.ask], width, time.monotonic() - started
 
@@ -714,26 +723,6 @@ def report(run: Run, ceiling: int, estimated: int, header: str) -> None:
 # --- the mode ------------------------------------------------------------------
 
 
-def mempalace_version() -> str | None:
-    """The installed MemPalace distribution's version, or ``None`` when it cannot be read."""
-    try:
-        return metadata.version("mempalace")
-    except metadata.PackageNotFoundError:
-        return None
-
-
-def _at_least(version: str | None, floor: tuple[int, ...]) -> bool:
-    if version is None:
-        return False
-    parts: list[int] = []
-    for piece in version.split("."):
-        digits = re.match(r"\d+", piece)
-        if digits is None:
-            break
-        parts.append(int(digits.group(0)))
-    return tuple(parts[: len(floor)]) >= floor
-
-
 def main(
     provider: MemPalaceMemoryProvider,
     reranker: MemPalaceReranker,
@@ -749,22 +738,24 @@ def main(
     query_of,
 ) -> int:
     """The ``--end-to-end`` mode, after the palace check has opened the palace. Returns the exit code."""
-    version = mempalace_version()
-    if not _at_least(version, MIN_MEMPALACE):
+    # The arms are described by the threshold `search` passes, so the mode runs only where `search`
+    # passes it: one decision, the provider's, read here rather than restated.
+    version = _mempalace.mempalace_version()
+    metric = palace_metric(collection)
+    threshold, reason = provider.distance_threshold(collection)
+    if threshold != THRESHOLD and reason.startswith("mempalace:"):
         print(
-            f"REFUSED: arms 2 and 3 measure how MemPalace "
-            f"{'.'.join(map(str, MIN_MEMPALACE))} and later score a lexical hit under a "
+            f"REFUSED: arms 1 and 3 measure how MemPalace "
+            f"{'.'.join(map(str, THRESHOLD_MEMPALACE))} and later score a lexical hit under a "
             f"max_distance (MemPalace#1964); this box has MemPalace {version or 'unknown'}. "
             f"Nothing spent."
         )
         return 1
-    metric_of = getattr(_import("searcher"), "_metric_for_collection", None)
-    metric = metric_of(collection) if metric_of is not None else None
-    if metric != "cosine":
+    if threshold != THRESHOLD:
         print(
             f"REFUSED: max_distance {THRESHOLD} filters nothing only on a cosine palace; this "
-            f"palace's distance metric is {metric or 'unreadable'}, where arms 2 and 3 would also "
-            f"cut vector candidates a wake keeps. Nothing spent."
+            f"palace's distance metric is {metric or 'unreadable'}, where search passes no "
+            f"max_distance and arm 3 would also cut vector candidates. Nothing spent."
         )
         return 1
     chosen = select(found, heads, rares, before, sample=sample, query_of=query_of)

@@ -52,8 +52,9 @@ A holds every probe drawer.
 
 **The final 10, through the real reranker: ``--sample N --end-to-end``** (issue #627). Whether a
 probe's drawer reaches the pool says nothing about whether the model then picks it. This mode runs
-each probe through the agent's own reranker, in four arms (today's search, the same again for the
-noise floor, today's ask with ``max_distance=2.0``, and twice the ask with it), for head probes and
+each probe through the agent's own reranker, in four arms (today's search, which passes
+``max_distance=2.0``; the same again for the noise floor; today's ask without it, the search before
+issue #625; and twice the ask with it), for head probes and
 for rare-token probes, and reports where each probe's own drawer lands. It spends rerank-model
 tokens, so it takes a ``--token-ceiling``, refuses to start when its estimate exceeds it, and stops
 (reporting what it has, marked partial) when the next probe would. ``--dry-run`` prints the estimate
@@ -645,7 +646,8 @@ def diagnose(
     - **cut**: a top-100 search ranks it in the top 10, but the vector half of a top-10 search
       does not place it among the ``_ASK`` nearest it keeps, so that search dropped its vector
       score before ranking. Full scoring would have placed it; the pre-rank cut did not let it
-      compete.
+      compete. Where `search` passes ``max_distance`` (issue #625) a lexical hit is rescored on its
+      real distance, so a cut there also means BM25 did not bring it into the pool either.
     - **crowded**: a top-100 search ranks it below 10, and no identical copy is in the top 10:
       other drawers outscore it even on full scoring, typically near copies sharing its query.
     - **unreached**: not in the top 100 at all. With ``vector self-query no`` the index itself has
@@ -729,6 +731,9 @@ def compare_pools(provider: MemPalaceMemoryProvider, rows) -> PoolComparison:
     outside it can never be recalled, whatever the model would have chosen.
     """
     found = PoolComparison()
+    # The threshold `search` passes on this palace (issue #625), in both arms: they differ in the
+    # ask and nothing else.
+    threshold, _ = provider.distance_threshold()
     for drawer_id, _, text in rows:
         query = query_of(text)
         for ask, ids, seconds in (
@@ -736,7 +741,9 @@ def compare_pools(provider: MemPalaceMemoryProvider, rows) -> PoolComparison:
             (_CANDIDATE_ASK, found.candidate, found.candidate_seconds),
         ):
             started = time.monotonic()
-            hits, _, _ = provider._ranking(query, ask=ask, need=_RERANK_POOL, surface=SURFACE_TOOL)
+            hits, _, _ = provider._ranking(
+                query, ask=ask, need=_RERANK_POOL, surface=SURFACE_TOOL, max_distance=threshold
+            )
             seconds.append(time.monotonic() - started)
             if drawer_id in [hit.get("drawer_id") for hit in hits[:_RERANK_POOL]]:
                 ids.add(drawer_id)
@@ -887,8 +894,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "SPENDS RERANK-MODEL TOKENS. With --sample and --token-ceiling: run each probe through "
             "the agent's own reranker (its HARNESS_MEMPALACE_RERANK_* configuration) in four arms "
-            f"(ask {_RERANK_POOL} as today; the same again, for the noise floor; ask "
-            f"{_RERANK_POOL} with max_distance 2.0; ask {_CANDIDATE_ASK} with max_distance 2.0) "
+            f"(ask {_RERANK_POOL} with max_distance 2.0, as today; the same again, for the noise "
+            f"floor; ask {_RERANK_POOL} with no max_distance, the search before 0.144.0; ask "
+            f"{_CANDIDATE_ASK} with max_distance 2.0) "
             f"and report whether the probe's own drawer is in the final {_TOP}. Read-only on the "
             "palace. Exit 0 only for a complete run."
         ),
