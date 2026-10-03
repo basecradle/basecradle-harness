@@ -240,6 +240,8 @@ It opens the palace exactly as a wake resolves it from that `HARNESS_HOME` (an i
 
 `--practice-observe` is for a **practice copy only**, and it **writes to the palace**. A practice user has no platform account and never completes a wake, so the registry rows a first wake at a new home writes would never exist there. The mode runs the harness's own observe once, with a fixed exchange and no model call, before the report. Never run it against an agent's live palace.
 
+Run a practice copy with `HOME` pointed at a scratch directory, not under your own account. Every write to a palace leaves a lock file in `$HOME/.mempalace/locks` that MemPalace never removes, and a wake also writes the palace's path into `$HOME/.mempalace/config.json`. On the agent's own account that is the right place; under yours, each practice palace leaves another file behind. From a checkout of this repository, `uv run scripts/isolated_home.py <command>` runs one command that way and removes the scratch home afterwards.
+
 `--register-off-wing` is for a **real move**, and it **writes to the palace**. Run it once after the home rename and before the agent's first wake. MemPalace recognises a moved conversation file by its content only within the wing the observe mines into (`conversations`). So a file once mined on its own into another wing (for example `mempalace mine <file> --mode convos` with no `--wing`, which names the wing after the file) would be filed again at that first wake: a second copy of each of its drawers. This mode registers each such file in the wing its drawers already carry. That writes **one registry row per file and no drawer**, and touches no existing drawer:
 
 ```bash

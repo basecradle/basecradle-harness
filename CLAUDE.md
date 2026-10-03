@@ -920,4 +920,8 @@ uv run ruff check .      # lint
 uv run ruff format .     # format
 uv build                 # build the wheel + sdist
 basecradle-harness-install --config-home <dir>   # scaffold/upgrade a config home
+uv run --extra mempalace pytest -m mempalace       # real-palace tests (Python 3.11+; they run under a throwaway HOME)
+uv run scripts/isolated_home.py <command>        # any off-fleet run that writes a palace: a palace check, a local wake
 ```
+
+**An off-fleet run that writes a palace runs under a throwaway `HOME`** (issue #630). MemPalace keeps one lock file per palace in `$HOME/.mempalace/locks` and never removes it, and a wake publishes its palace into `$HOME/.mempalace/config.json`; on a fleet box that is the agent's own home, on the laptop it is @origin's. `scripts/isolated_home.py` runs one command with `HOME` pointed at a temporary directory (sharing only the embedding-model download cache) and removes it afterwards, and `conftest` does the same for every test marked `mempalace`.

@@ -6,6 +6,7 @@ any network — the SDK adapter is tested against real, SDK-valid response bodie
 responses follow the OpenAI chat-completions / Responses schemas.
 """
 
+import importlib.util
 import json
 import pathlib
 import re
@@ -180,6 +181,36 @@ def _isolated_config_home(tmp_path_factory, monkeypatch):
     # The scaffolding catalog reads that home's charter and memoizes the result (`_mining.catalog`),
     # so a catalog built under one test's config home would answer for the next one's.
     _mining._reset()
+
+
+# `scripts/isolated_home.py` is repo tooling, not shipped code, so it is loaded by path.
+_ISOLATED_HOME_SPEC = importlib.util.spec_from_file_location(
+    "isolated_home", pathlib.Path(__file__).resolve().parent.parent / "scripts" / "isolated_home.py"
+)
+isolated_home = importlib.util.module_from_spec(_ISOLATED_HOME_SPEC)
+_ISOLATED_HOME_SPEC.loader.exec_module(isolated_home)
+
+
+@pytest.fixture(scope="session")
+def _mempalace_home():
+    """One throwaway ``$HOME`` for every real-MemPalace test in the session, removed at its end."""
+    with isolated_home.isolated_home() as home:
+        yield home
+
+
+@pytest.fixture(autouse=True)
+def _isolated_mempalace_home(request, monkeypatch):
+    """Run every test marked ``mempalace`` with ``HOME`` pointed at a throwaway home (issue #630).
+
+    Every write to a real palace leaves a lock file in ``$HOME/.mempalace/locks`` that MemPalace
+    never removes, and each test palace has a fresh path, so before this the real-palace suite left
+    one per palace in the developer's home on every run. Keyed on the marker rather than requested
+    by name, so a new real-palace test is isolated without anyone remembering to ask. It covers
+    writes made inside a test; a wider-scoped fixture that writes a palace must point ``HOME`` at
+    ``_mempalace_home`` itself. ``test_isolated_home_real.py`` proves the lock lands here.
+    """
+    if request.node.get_closest_marker("mempalace") is not None:
+        monkeypatch.setenv("HOME", str(request.getfixturevalue("_mempalace_home")))
 
 
 @pytest.fixture
