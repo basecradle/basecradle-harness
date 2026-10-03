@@ -85,6 +85,7 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._observability import (
     MEMORY,
+    generation_id,
     log_llm_call,
     reasoning_tokens,
     reported_cost,
@@ -477,6 +478,7 @@ class MemPalaceReranker:
             picked=len(picks),
             usage=data.get("usage"),
             endpoint=serving_endpoint(data),
+            generation=generation_id(data),
             uncertain_attempts=uncertain,
         )
         return picks
@@ -527,6 +529,7 @@ class MemPalaceReranker:
         endpoint: str | None = None,
         detail: str | None = None,
         diagnostics: Mapping[str, Any] | None = None,
+        generation: str | None = None,
         uncertain_attempts: int = 0,
     ) -> None:
         """The reranker's ``llm`` line — one per rerank attempt, whatever the outcome.
@@ -590,6 +593,9 @@ class MemPalaceReranker:
                 "pool": pool,
                 "picked": picked,
             },
+            # The generation the rerank was answered by (issue #634); a fallback's id, when the
+            # refusal named one, arrives inside `diagnostics` and lands in the same last place.
+            generation_id=generation,
             level=level,
         )
 

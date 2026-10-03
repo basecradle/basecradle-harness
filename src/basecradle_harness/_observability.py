@@ -58,6 +58,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
+from basecradle_harness._exceptions import ProviderError
+
 _log = logging.getLogger("basecradle_harness")
 
 #: The cap on one field's rendered length. The values that need it are the error texts — a tool's
@@ -406,8 +408,8 @@ class LlmCall:
     """What an adapter recorded about a call whose line its **caller** will write.
 
     Everything the caller needs that only the adapter knows — the endpoint a router picked, the
-    usage the vendor reported, the cost it stated, how long the call took, and **why the vendor
-    stopped generating**. Every field stays ``None`` when the call raised before the adapter got
+    usage the vendor reported, the cost it stated, how long the call took, the id the vendor gave
+    the call (issue #634), and **why the vendor stopped generating**. Every field stays ``None`` when the call raised before the adapter got
     that far, so the caller's line simply carries less rather than carrying a guess.
 
     `finish_reason` is the one field here that is **not** rendered on the line, and that is
@@ -425,6 +427,7 @@ class LlmCall:
     endpoint: str | None = None
     cost: float | None = None
     finish_reason: str | None = None
+    generation_id: str | None = None
 
 
 #: The capture handle for the model call currently in flight, or ``None`` — which is the ordinary
@@ -486,6 +489,7 @@ def log_llm_call(
     reason: str | None = None,
     detail: str | None = None,
     extra: Mapping[str, Any] | None = None,
+    generation_id: str | None = None,
     level: int = logging.INFO,
 ) -> None:
     """**One `llm` line per model-call attempt, whatever the outcome** — the whole grammar.
@@ -509,8 +513,12 @@ def log_llm_call(
     **Field order is the contract** and matches what the NOC's column regexes were written against:
     ``provider purpose kind endpoint model duration tokens_* cached_tokens tokens_reasoning cost
     outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
-    ``picked``). `kv` drops whatever is ``None``, so a call with nothing to report is byte-identical
-    to what it always was apart from ``purpose=main``.
+    ``picked``), and last of all ``generation_id`` — the vendor's own id for the call (issue #634),
+    rendered last so that no column written before it moves. `kv` drops whatever is ``None``, so a
+    call with nothing to report is byte-identical to what it always was apart from ``purpose=main``.
+    An ``extra`` that carries a ``generation_id`` of its own (a fallback line's `diagnostics`) is
+    rendered in that same last place, and the argument wins when both are given: one key, one value,
+    one position.
 
     Four of the fields are **capabilities, answered by whoever can**: token counts
     (`token_counts`), the cached-prompt count that says whether caching is doing anything, the
@@ -544,7 +552,7 @@ def log_llm_call(
         # explicit `purpose` is a caller writing its own line and is never captured.
         captured.provider, captured.model, captured.seconds = provider, model, seconds
         captured.usage, captured.endpoint, captured.cost = usage, endpoint, cost
-        captured.finish_reason = finish_reason
+        captured.finish_reason, captured.generation_id = finish_reason, generation_id
         return
     if purpose is None:
         purpose = MAIN
@@ -578,9 +586,22 @@ def log_llm_call(
             outcome=outcome,
             reason=reason,
             detail=detail,
-            **(extra or {}),
+            **_generation_last(extra, generation_id),
         ),
     )
+
+
+def _generation_last(extra: Mapping[str, Any] | None, generation: str | None) -> dict[str, Any]:
+    """`extra` with ``generation_id`` moved to the end — `generation` winning over one it carried.
+
+    Merged as a dict rather than splatted beside a keyword, for `log_llm_retry`'s reason: a
+    `diagnostics` dict in `extra` carries a ``generation_id`` too, and a second value under one
+    keyword is a ``TypeError`` raised from inside an ``except`` block in a wake.
+    """
+    fields = dict(extra or {})
+    carried = fields.pop("generation_id", None)
+    fields["generation_id"] = generation if generation is not None else carried
+    return fields
 
 
 #: The head a **retry** line wears — and the one property of it that is load-bearing is what it is
@@ -625,8 +646,10 @@ def log_llm_retry(
 
     ``diagnostics`` is `basecradle_harness._retry.diagnostics` — the vendor's own account of the
     fault, built by one function so that these fields and the ones on the final ``outcome=fallback``
-    line can never disagree. ``extra`` is the call site's own trailing context (``surface=`` for a
-    rerank, ``subject=`` for a describe), so a retry is greppable beside the line it belongs to.
+    line can never disagree. Its ``generation_id`` (issue #634) is rendered last, as on the `llm`
+    line: the id a vendor's refund path asks for, and a refused attempt is exactly the one needing
+    it. ``extra`` is the call site's own trailing context (``surface=`` for a rerank, ``subject=``
+    for a describe), so a retry is greppable beside the line it belongs to.
 
     **WARNING, always.** A retry is a degradation that recovered; it is not an error (nothing was
     lost) and it is not routine (something went wrong). Logging it at INFO would hide a rising 429
@@ -648,7 +671,8 @@ def log_llm_retry(
         "next_in": _secs(next_in),
         **(extra or {}),
     }
-    _log.warning("%s %s", RETRY_HEAD, kv(**fields))
+    # The vendor's id for the refused attempt (issue #634) rides last, as on the `llm` line.
+    _log.warning("%s %s", RETRY_HEAD, kv(**_generation_last(fields, None)))
 
 
 def log_media_call(
@@ -869,6 +893,98 @@ def serving_endpoint(response: Any) -> str | None:
         if isinstance(name, str) and name.strip():
             return name.strip()
     return None
+
+
+#: What a vendor's call id looks like — the one shape every id the fleet's vendors issue fits, and
+#: nothing else (issue #634). Measured live 2026-10-03: OpenRouter ``gen-1791030923-8abbrs…``,
+#: OpenAI ``chatcmpl-EUtF…`` and ``resp_0080…``, xAI a bare uuid. The value is vendor-written text
+#: on a line whose columns are partial regex matches, so anything outside this shape is not an id
+#: and is omitted rather than quoted: a quoted ``"x kind=y"`` would still feed ``kind=`` to a
+#: column that never asked a vendor for it.
+_GENERATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+#: The header OpenRouter sets on **every** response, a refusal included (measured live 2026-10-03
+#: on a 400 and a 404 as well as a 200, where it equals the body's ``id``). Matched without regard
+#: to case, since an SDK's error may hand its headers back as a plain dict.
+GENERATION_ID_HEADER = "x-generation-id"
+
+
+def generation_id(response: Any) -> str | None:
+    """The vendor's own id for this call, read off its response — or ``None`` (issue #634).
+
+    The ``id`` every chat-completions and Responses body carries, and the native xAI response's
+    ``id`` attribute: OpenRouter's generation id, OpenAI's completion or response id, xAI's
+    response id. It is what a vendor's feedback and refund path asks for, so the line carries it
+    and a complaint names the generation instead of a timestamp the vendor has to search by.
+
+    Omitted, never a placeholder, when the response names none or names something that is not an
+    id (`_GENERATION_ID`). Not a secret on any vendor: each one looks the id up only for the account
+    that made the call, so it identifies a call and grants nothing.
+    """
+    if response is None:
+        return None
+    return _as_generation_id(_read(response, "id"))
+
+
+def generation_id_header(headers: Any) -> str | None:
+    """The `GENERATION_ID_HEADER` off a response's headers, or ``None`` (issue #634).
+
+    The only id a **refused** attempt carries — a 429 or a 5xx has no body id — and the one a body
+    that failed to parse still carries, so an adapter's error mapper stamps it on the error it
+    raises (`ProviderError.generation_id`). Asked of any vendor: one that sets no such header
+    yields ``None`` here, which is a capability read and not a vendor branch.
+    """
+    if headers is None:
+        return None
+    get = getattr(headers, "get", None)
+    if not callable(get):
+        return None
+    try:
+        value = get(GENERATION_ID_HEADER)
+        if value is None and isinstance(headers, Mapping):
+            value = next(
+                (v for k, v in headers.items() if str(k).lower() == GENERATION_ID_HEADER), None
+            )
+    except Exception:  # noqa: BLE001 - this is the failure path; a header read must never raise
+        return None
+    return _as_generation_id(value)
+
+
+def stamp_generation_id(error: BaseException, generation: str | None) -> BaseException:
+    """`error` carrying `generation` as its `generation_id`, unless it already names one.
+
+    Returned rather than raised so a mapper reads ``raise stamp_generation_id(mapped, …) from exc``.
+    An id an inner layer already stamped is kept: it was read closer to the response.
+    """
+    if generation is not None and getattr(error, "generation_id", None) is None:
+        try:
+            error.generation_id = generation  # type: ignore[attr-defined]
+        except AttributeError:  # a slotted third-party exception: observability never breaks a turn
+            pass
+    return error
+
+
+@contextmanager
+def generation_of(response: Any) -> Iterator[None]:
+    """Stamp the response's `generation_id` on a provider error raised while reading it.
+
+    The shape of basecradle-noc#963: a body arrives, the `llm` line is written with its id, and
+    reading the turn out of it then fails (tool-call arguments cut off at the output cap) — so the
+    ``llm retry reason=invalid_response`` line that follows names the same generation.
+    """
+    try:
+        yield
+    except ProviderError as exc:
+        stamp_generation_id(exc, generation_id(response))
+        raise
+
+
+def _as_generation_id(value: Any) -> str | None:
+    """`value` when it has the shape of a vendor's call id (`_GENERATION_ID`), else ``None``."""
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if _GENERATION_ID.fullmatch(value) else None
 
 
 def describe_provider(provider: object) -> tuple[str, str]:

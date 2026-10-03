@@ -42,6 +42,7 @@ cadence, and adding a case here needs no coordination at all.
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
@@ -180,6 +181,79 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
         f"endpoint={endpoint!r} with a server-side search active — issue #280 exactly: the search "
         f"tool's upstream logged as the model's. Real pool: {sorted(pool)}"
     )
+
+
+def _generation(provider: OpenRouterProvider, generation: str):
+    """OpenRouter's own record of `generation`, waiting for it to be written.
+
+    The generation API answers 404 until the record lands, which is a timing fact about OpenRouter
+    and not a verdict on the id: measured live on 2026-10-03, a record took about two and a half
+    minutes to appear. So it is polled for up to five, and anything but a 404, or the 404 still
+    standing at the deadline, is raised as it came.
+    """
+    import time
+
+    from openrouter import errors
+
+    deadline = time.monotonic() + 300
+    while True:
+        try:
+            return provider._client.generations.get_generation(id=generation).data
+        except errors.OpenRouterError as exc:
+            if getattr(exc, "status_code", None) != 404 or time.monotonic() > deadline:
+                raise
+            time.sleep(10)
+
+
+@pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
+def test_the_live_generation_id_is_the_one_openrouter_looks_the_call_up_by(caplog):
+    """The line's ``generation_id=`` is OpenRouter's own id for the call (issue #634).
+
+    Checked against the **generation API**, the lookup OpenRouter's feedback and refund path runs
+    on, rather than by its shape: an id the vendor cannot find is worse than none, because it sends
+    a complaint after a call that does not exist. The record must name the model, and the upstream
+    it names must be the one the line's ``endpoint=`` named, so the id and the routing datum are
+    proved to describe the same call.
+    """
+    import logging
+
+    provider = OpenRouterProvider(model=MODEL, api_key=KEY, max_tokens=16)
+    try:
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            provider.chat([Message.user("Say hi.")])
+        line = _llm_line(caplog)
+        generation = _field(line, "generation_id")
+        assert generation and generation.startswith("gen-"), line
+        record = _generation(provider, generation)
+    finally:
+        provider.close()
+
+    assert record.id == generation
+    assert record.model.startswith(MODEL), record.model
+    assert record.provider_name == _field(line, "endpoint"), (record.provider_name, line)
+
+
+@pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
+def test_a_live_refusal_carries_the_generation_id_openrouter_set_on_it():
+    """OpenRouter names a **refused** call too, in ``X-Generation-Id`` (issue #634).
+
+    A routing pin no endpoint satisfies is refused before any upstream is reached, so this costs
+    nothing — and it is the one class of fault whose id lives only in a header. The offline suite
+    proves the adapter reads the header; only a live refusal proves OpenRouter still sends it.
+    """
+    from basecradle_harness import ProviderAPIError
+
+    provider = OpenRouterProvider(
+        model=MODEL, api_key=KEY, max_tokens=16, provider={"only": ["no-such-endpoint"]}
+    )
+    try:
+        with pytest.raises(ProviderAPIError) as raised:
+            provider.chat([Message.user("Say hi.")])
+    finally:
+        provider.close()
+
+    generation = raised.value.generation_id
+    assert generation and re.fullmatch(r"gen-[0-9]+-[A-Za-z0-9]+", generation), generation
 
 
 # === the MemPalace reranker (issue #464) ======================================

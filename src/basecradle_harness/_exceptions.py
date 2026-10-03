@@ -30,7 +30,17 @@ class EngineError(HarnessError):
 
 
 class ProviderError(HarnessError):
-    """A model provider call failed."""
+    """A model provider call failed.
+
+    `generation_id` is the vendor's own identifier for the failed attempt, when the vendor gave
+    one (issue #634) — stamped by the adapter that saw it, never constructed by a caller: the
+    ``X-Generation-Id`` header OpenRouter sets on every response, error responses included, or the
+    ``id`` of a body that arrived and could not be turned into a turn. It is what a vendor's
+    feedback and refund path asks for, and a failed or rejected call is exactly the one whose id is
+    needed. ``None`` when the vendor named none, which the retry line then omits.
+    """
+
+    generation_id: str | None = None
 
 
 class ProviderResponseError(ProviderError):

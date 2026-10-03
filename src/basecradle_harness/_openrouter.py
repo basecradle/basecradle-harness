@@ -78,9 +78,13 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
     finish_reason,
+    generation_id,
+    generation_id_header,
+    generation_of,
     log_llm_call,
     reported_cost,
     serving_endpoint,
+    stamp_generation_id,
     token_counts,
 )
 from basecradle_harness._openai_wire import (
@@ -460,9 +464,13 @@ class OpenRouterProvider:
             # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
             # it got back is whole (issue #488).
             finish_reason=reason,
+            # OpenRouter's generation id (``gen-…``), the id its feedback and refund path asks for
+            # (issue #634). The body's ``id`` equals the ``X-Generation-Id`` header on a success.
+            generation_id=generation_id(data),
         )
         self._restore_annotations(data)
-        return message_from_chat(data)
+        with generation_of(data):
+            return message_from_chat(data)
 
     def context_limit(self) -> int | None:
         """The **honest** context ceiling behind a router — not the model object's best case (#276).
@@ -676,15 +684,18 @@ class _ErrorMapper:
         if exc is None:
             return False
         errors = self._openrouter.errors
+        # OpenRouter names every response in a header, a refusal included (issue #634): the one id
+        # a 429 or a 5xx carries, and the one a body that would not parse still carries.
+        generation = generation_id_header(getattr(exc, "headers", None))
         if isinstance(exc, errors.ResponseValidationError):
             # A 200 whose body the SDK's typed ChatResult could not parse — the truncated /
             # EOF-mid-JSON class (issue #259). It is a `ResponseValidationError` (an
             # OpenRouterError subclass) but *transient*, so it maps to the retryable
             # `ProviderResponseError`, not a permanent one; the engine re-requests it. Checked
             # before the generic OpenRouterError branch below, which it subclasses.
-            raise ProviderResponseError(str(exc)) from exc
+            raise stamp_generation_id(ProviderResponseError(str(exc)), generation) from exc
         if isinstance(exc, errors.OpenRouterError):
-            raise _from_status_error(exc) from exc
+            raise stamp_generation_id(_from_status_error(exc), generation) from exc
         if isinstance(exc, errors.NoResponseError):
             raise ProviderConnectionError(f"Could not reach OpenRouter: {exc}") from exc
         if isinstance(exc, httpx.TimeoutException):

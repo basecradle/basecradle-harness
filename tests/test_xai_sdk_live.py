@@ -234,3 +234,25 @@ def test_the_normalized_schema_is_accepted_and_the_agent_answers():
 
     assert reply.role == "assistant"
     assert "ok" in (reply.content or "").lower()
+
+
+@pytest.mark.skipif(not KEY, reason="set XAI_API_KEY to run the live xAI response-id probe")
+def test_the_live_line_names_the_call_by_xais_own_response_id(caplog):
+    """The native line's ``generation_id=`` is xAI's response id for the call (issue #634).
+
+    By value: xAI's ids are uuids (measured live 2026-10-03, where the HTTP surface sends the same
+    value as ``x-request-id``). The offline suite proves the adapter reads the real ``Response.id``
+    property over a real proto; only a live call proves the server still fills it.
+    """
+    provider = XaiSdkProvider(model="grok-4.3", api_key=KEY)
+    try:
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            provider.chat([Message.user("Reply with the single word: ok")])
+    finally:
+        provider.close()
+
+    line = next(
+        r.getMessage() for r in caplog.records if r.getMessage().startswith("llm provider=")
+    )
+    generation = line.split()[-1].removeprefix("generation_id=")
+    assert str(uuid.UUID(generation)) == generation, line
