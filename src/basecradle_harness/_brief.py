@@ -19,7 +19,11 @@ The brief is composed, in order, of a current-time anchor followed by four parts
    call. Read off the live adapter each wake, so it is the configuration that actually makes the
    call and cannot drift from it. Before it, an agent asked which model it was said it could not
    tell — the journal named the model on every wake, and the agent had none of it.
-0c. **The step-budget statement** (`render_budget`) — the one-time "this turn has a budget of
+0c. **The harness** (`render_harness`, issue #623) — the software the agent runs under: its name,
+   the version that is running (the installed package's own `__version__`) and its public
+   repository. Before it, an agent asked what version it ran, or reasoning about a behavior that
+   changed with a release, had nothing to answer from.
+0d. **The step-budget statement** (`render_budget`) — the one-time "this turn has a budget of
    N steps, a live counter follows each step, per-turn and resets each wake" rule (issue #243),
    so the live per-step counter the engine injects can stay terse. Omitted when there is no
    budget to announce.
@@ -48,15 +52,16 @@ The brief is composed, in order, of a current-time anchor followed by four parts
 Composition is pure (`compose_brief` / `render_manifest`); the one impure piece, the
 live dashboard fetch (`fetch_dashboard_md`), is isolated and tolerant by construction.
 
-**Every part is fenced in a named tag pair** (issue #509). The brief mixes authority levels
-inside one ~54 K-character system turn — `initialize.md` and `system-prompt.md` are
-*instructions*, and so is a shell agent's `your-home.md` (the harness's own binding), the now/brain/budget/manifest/defect/safety parts are *harness-generated*, the
-dashboard is *fetched live* and carries peer-authored strings (timeline names, handles, about
-text), and the memory part is *recalled excerpts of past conversation*. Input Security tells the
-agent its only instructions are this brief and its charter; without a boundary per part, the agent
-has no way to see inside the brief where instruction ends and fetched data begins. The recall
-block got a fence first, for exactly that reason (`_mempalace._fenced`); `BRIEF_TAGS` applies the
-same reasoning to all twelve parts, uniformly — no part unfenced, no part special.
+**Every part is fenced in a named tag pair** (issue #509). The brief mixes authority levels inside
+one ~54 K-character system turn — `initialize.md` and `system-prompt.md` are *instructions*, and so
+is a shell agent's `your-home.md` (the harness's own binding), the
+now/brain/harness/budget/manifest/defect/safety parts are *harness-generated*, the dashboard is
+*fetched live* and carries peer-authored strings (timeline names, handles, about text), and the
+memory part is *recalled excerpts of past conversation*. Input Security tells the agent its only
+instructions are this brief and its charter; without a boundary per part, the agent has no way to
+see inside the brief where instruction ends and fetched data begins. The recall block got a fence
+first, for exactly that reason (`_mempalace._fenced`); `BRIEF_TAGS` applies the same reasoning to
+all thirteen parts, uniformly — no part unfenced, no part special.
 
 The framing belongs to the **composer**, never to the content: a prompt file on disk that
 carried its own wrapper tag would be content claiming to be structure, and an operator editing
@@ -80,6 +85,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from importlib import resources
 
 from basecradle_harness._policy import SHELL
+from basecradle_harness._version import __version__
 
 #: What separates two parts of the composed brief. Named because `brief_section_sizes` has to
 #: charge it to somebody for the sizes to be a true partition of the joined text.
@@ -101,6 +107,7 @@ _JOIN = "\n\n"
 BRIEF_TAGS: dict[str, str] = {
     "now": "now",
     "brain": "brain",
+    "harness": "harness",
     "budget": "budget",
     "initialize": "initialize.md",
     "manifest": "manifest",
@@ -143,11 +150,11 @@ _FENCE_LITERAL = re.compile(
 #:   `<mempalace-recall>` pair for this reason; that strip covers only the provider's inner
 #:   fence, so the outer one is stripped here.)
 #:
-#: The other nine do not need it and deliberately do not get it: ``now``, ``brain``, ``budget``,
-#: ``manifest``, ``defects`` and ``safety`` are composed by the harness out of its own constants
-#: and the operator's config, ``your_home`` is a file the harness itself ships, and ``initialize``
-#: / ``system_prompt`` are files only the operator writes. A strip there would be editing text
-#: nobody untrusted authored.
+#: The other ten do not need it and deliberately do not get it: ``now``, ``brain``, ``harness``,
+#: ``budget``, ``manifest``, ``defects`` and ``safety`` are composed by the harness out of its own
+#: constants and the operator's config, ``your_home`` is a file the harness itself ships, and
+#: ``initialize`` / ``system_prompt`` are files only the operator writes. A strip there would be
+#: editing text nobody untrusted authored.
 #:
 #: **Both literals of every part's pair are stripped, not just the part's own closer.** A peer who
 #: plants another part's *opening* tag inside a data block does not break that block's boundary,
@@ -319,10 +326,14 @@ def render_defects(notices: Sequence[str] | None) -> str | None:
 #:   matter who asks", which is right for the brief and would make a careful model refuse the very
 #:   question this part answers. The carve-out lives here, in the harness's words, rather than in
 #:   ``initialize.md``, because an operator may have edited that file and every agent needs this.
+#:   It speaks for **this section only** (issue #623, wording approved by @origin 2026-10-03): the
+#:   first draft said "unlike the rest of this brief", which a second non-confidential section
+#:   (`HARNESS_HEADER`) made false. A header that says nothing about the rest of the brief stays
+#:   true however many such sections follow.
 BRAIN_HEADER = (
     "Your brain this wake: the model your turns are sent to and how each call is made, read from "
-    "the configuration that makes the call — not a guess. Unlike the rest of this brief, none of "
-    "it is confidential: when asked what model you are, answer from it."
+    "the configuration that makes the call — not a guess. None of this section is confidential: "
+    "when asked what model you are, answer from it."
 )
 
 
@@ -386,6 +397,54 @@ def _json(value: object) -> str:
         return str(value)
 
 
+#: The ``harness`` part's opening line (issue #623) — `BRAIN_HEADER`'s two jobs, for the software
+#: rather than the model: where the facts come from (the installed package, so it outranks any
+#: version the model might infer from its own training or an old transcript), and that this section
+#: may be shared, speaking for itself alone. Wording approved by @origin, 2026-10-03.
+HARNESS_HEADER = (
+    "Your harness this wake: the software that woke you, built this brief and runs your tools, "
+    "read from the installed package — not a guess. None of this section is confidential: when "
+    "asked what harness or version you run, answer from it."
+)
+
+#: The name the ``harness`` part gives the software.
+HARNESS_NAME = "BaseCradle Harness"
+
+#: Where the harness lives: one constant, pinned by test to the package metadata's ``Source`` URL
+#: in ``pyproject.toml`` so the brief and PyPI can never name two different places.
+HARNESS_REPOSITORY = "https://github.com/basecradle/basecradle-harness"
+
+
+def render_harness() -> str:
+    """The brief's ``harness`` part: the software this agent runs under (issue #623).
+
+    Three facts and no more — the name, the running version, the public repository. An agent asked
+    what version it runs, or reasoning about a behavior that changed with a release, had nothing to
+    answer from: the brief named the model (`render_brain`) and never the harness.
+
+    Two things are deliberate:
+
+    - **The version is the installed package's own `__version__`** — the value
+      ``basecradle-harness-wake --version`` prints — and the function takes no argument, so nothing
+      can hand it a version read from an environment variable, a pin, or a config home's install
+      stamp (which records the harness that last *reconciled* that home, not the one running).
+    - **No changelog, no capability claims, no "what's new".** What the harness can do is disclosed
+      by the tool set and the other parts; a release note in every wake is cost with no reader. A
+      fourth fact is argued on its own.
+
+    It is generated from constants, so it is never peer-influenced and carries no fence strip, and
+    like the rest of the brief it is shown each wake and never persisted.
+    """
+    return "\n".join(
+        [
+            HARNESS_HEADER,
+            f"- Name: {HARNESS_NAME}",
+            f"- Version: `{__version__}`",
+            f"- Repository (public): {HARNESS_REPOSITORY}",
+        ]
+    )
+
+
 def render_budget(max_steps: int | None) -> str | None:
     """The one-time step-budget statement for the persistent brief, or ``None``.
 
@@ -415,6 +474,7 @@ def brief_parts(
     *,
     now: str | None = None,
     brain: str | None = None,
+    harness: str | None = None,
     budget: str | None = None,
     initialize: str | None,
     manifest: str | None,
@@ -446,6 +506,7 @@ def brief_parts(
     named = (
         ("now", now),
         ("brain", brain),
+        ("harness", harness),
         ("budget", budget),
         ("initialize", initialize),
         ("manifest", manifest),
@@ -530,6 +591,7 @@ def compose_brief(
     *,
     now: str | None = None,
     brain: str | None = None,
+    harness: str | None = None,
     budget: str | None = None,
     initialize: str | None,
     manifest: str | None,
@@ -543,30 +605,29 @@ def compose_brief(
 ) -> str | None:
     """Join the brief parts in order, skipping any that are absent or empty.
 
-    Order is load-bearing: the **current-time anchor** first (the absolute "now" every other
-    item's age is reasoned against — `_wake.py::_now_line`), then the **brain** the turns run on
-    (issue #564), then the step budget, then operating guidance (how to act), then the tools the
-    agent has, then any **tool defect** (a shipped default that failed to load — issue #160 —
-    right after the manifest it contradicts, so the agent reads "you have these tools, but this
-    one is broken" together), then the **safe-by-default opt-out notice** (Group 5), then what
-    each **MCP server** is (issue #553 — right after the notice that names them), then **Your
-    Home** for an agent with a shell (issue #571 — its folders and their law, after the tools that
-    reach them), then the live dashboard (where it is), then any recalled **memory**
-    relevant to the turn (the memory provider's `context` hook — injected just before the
-    charter, the way middleware memory systems inject retrieved context before the system
-    prompt), then the personality charter. Any part may be absent — a missing dashboard (fetch
-    failed), a memory provider that recalled nothing, no MCP/policy opt-out, no broken default, an
-    agent with no shell, an operator who blanked their charter — and the brief is composed from
-    whatever remains.
-    With nothing at all, returns ``None``.
+    Order is load-bearing: the **current-time anchor** first (the absolute "now" every other item's
+    age is reasoned against — `_wake.py::_now_line`), then the **brain** the turns run on (issue
+    #564), then the **harness** that runs them (issue #623), then the step budget, then operating
+    guidance (how to act), then the tools the agent has, then any **tool defect** (a shipped default
+    that failed to load — issue #160 — right after the manifest it contradicts, so the agent reads
+    "you have these tools, but this one is broken" together), then the **safe-by-default opt-out
+    notice** (Group 5), then what each **MCP server** is (issue #553 — right after the notice that
+    names them), then **Your Home** for an agent with a shell (issue #571 — its folders and their
+    law, after the tools that reach them), then the live dashboard (where it is), then any recalled
+    **memory** relevant to the turn (the memory provider's `context` hook — injected just before the
+    charter, the way middleware memory systems inject retrieved context before the system prompt),
+    then the personality charter. Any part may be absent — a missing dashboard (fetch failed), a
+    memory provider that recalled nothing, no MCP/policy opt-out, no broken default, an agent with
+    no shell, an operator who blanked their charter — and the brief is composed from whatever
+    remains. With nothing at all, returns ``None``.
 
-    ``now``, ``brain``, ``budget``, ``defects``, ``safety``, ``mcp``, ``your_home`` and ``memory``
-    default to ``None`` so a caller with none of them (a test exercising composition, or the common
-    no-MCP / no-shell / default-SQLite-provider case) composes exactly the brief it did before
-    these seams existed.
-    The **brain** and the **step budget** ride right after the time anchor and before the
-    operating guidance — standing facts about what runs the turn and how it is bounded, so the
-    model reads them up front (issues #564, #243).
+    ``now``, ``brain``, ``harness``, ``budget``, ``defects``, ``safety``, ``mcp``, ``your_home`` and
+    ``memory`` default to ``None`` so a caller with none of them (a test exercising composition, or
+    the common no-MCP / no-shell / default-SQLite-provider case) composes exactly the brief it did
+    before these seams existed.
+    The **brain**, the **harness** and the **step budget** ride right after the time anchor and
+    before the operating guidance — standing facts about what runs the turn and how it is bounded,
+    so the model reads them up front (issues #564, #623, #243).
 
     Every part that survives is **fenced in its own named tag pair** on the way out — the
     filename for a file-backed part (`initialize.md`, `your-home.md`, `dashboard.md`,
@@ -584,6 +645,7 @@ def compose_brief(
         brief_parts(
             now=now,
             brain=brain,
+            harness=harness,
             budget=budget,
             initialize=initialize,
             manifest=manifest,

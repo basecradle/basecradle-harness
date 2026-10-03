@@ -31,7 +31,7 @@ from basecradle_harness import (
     _mining,
 )
 from basecradle_harness import _wake as wake_module
-from basecradle_harness._brief import BRIEF_FENCE_LITERALS, your_home_text
+from basecradle_harness._brief import BRIEF_FENCE_LITERALS, HARNESS_HEADER, your_home_text
 from basecradle_harness._engine import EngineError
 from basecradle_harness._install import install
 from basecradle_harness._mempalace import (
@@ -84,6 +84,9 @@ BRAIN_SENTINEL = "SENTINEL-BRAIN-do-not-mine-this-model-id"
 # the bytes a shell agent really reads. Read off the file, never re-typed, so a re-sync from the NOC
 # cannot leave this checking a sentence the section no longer contains.
 YOUR_HOME_SENTINEL = next(line for line in your_home_text().splitlines() if "byte-exact" in line)
+# The brief's `harness` part (issue #623). Composed from the harness's own constants, so — as for
+# Your Home — the sentinel is its own header line, the one sentence no conversation would carry.
+HARNESS_SENTINEL = HARNESS_HEADER
 # The reranker's *own* output. Not a brief surface — a whole extra model whose text the boundary
 # has never had to account for (issue #464). It must reach neither the agent's model nor the palace.
 RERANK_SENTINEL = "SENTINEL-RERANK-do-not-show-or-mine-this-reranker-narration"
@@ -96,6 +99,7 @@ SENTINELS = (
     MCP_SENTINEL,
     BRAIN_SENTINEL,
     YOUR_HOME_SENTINEL,
+    HARNESS_SENTINEL,
 )
 
 
@@ -244,8 +248,8 @@ def _agent(home, provider, model=None, monkeypatch=None):
 
 def test_no_part_of_the_brief_reaches_the_mined_exchange(platform, tmp_path, monkeypatch):
     """The issue's acceptance test: sentinels in charter, manifest, dashboard, recall and — since
-    issue #553 — an MCP server's own instructions, since issue #564 the brain part, and since issue
-    #571 the "Your Home" section a shell agent reads.
+    issue #553 — an MCP server's own instructions, since issue #564 the brain part, since issue #571
+    the "Your Home" section a shell agent reads, and since issue #623 the harness part.
 
     Both halves matter and both are asserted. If the sentinels never reached the *model*, this
     would pass for the wrong reason — a brief that composed empty proves nothing about a

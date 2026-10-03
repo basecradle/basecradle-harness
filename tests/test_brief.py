@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import inspect
 from hashlib import sha256
-from importlib import resources
+from importlib import metadata, resources
 from types import SimpleNamespace
 
 import httpx
@@ -28,6 +28,7 @@ from basecradle_harness import (
     render_brain,
     render_budget,
     render_defects,
+    render_harness,
     render_manifest,
     render_mcp,
     render_your_home,
@@ -36,6 +37,8 @@ from basecradle_harness._brief import (
     BRAIN_HEADER,
     BRIEF_FENCE_LITERALS,
     BRIEF_TAGS,
+    HARNESS_HEADER,
+    HARNESS_REPOSITORY,
     YOUR_HOME_RESOURCE,
     brief_parts,
     brief_section_sizes,
@@ -45,6 +48,7 @@ from basecradle_harness._brief import (
 from basecradle_harness._install import _packaged_defaults, install
 from basecradle_harness._mempalace import _fenced as mempalace_fenced
 from basecradle_harness._policy import BASECRADLE, SHELL
+from basecradle_harness._version import __version__
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -221,6 +225,63 @@ def test_a_tuning_value_json_cannot_spell_does_not_cost_the_brief():
     assert '  - stop = ["»"]' in text.splitlines()  # the character the model reads, not \u00bb
 
 
+# --- render_harness (issue #623) -----------------------------------------------
+
+
+def test_render_harness_states_the_name_the_running_version_and_the_public_repository():
+    """Three facts and no more: no changelog, no capability claims, no "what's new"."""
+    assert render_harness().splitlines() == [
+        HARNESS_HEADER,
+        "- Name: BaseCradle Harness",
+        f"- Version: `{__version__}`",
+        "- Repository (public): https://github.com/basecradle/basecradle-harness",
+    ]
+
+
+def test_the_harness_version_is_the_installed_package_and_nothing_can_override_it(monkeypatch):
+    """The version is the package's own, the value `--version` prints — never an env var or a pin.
+
+    `render_harness` takes no argument, so no caller can hand it a version from anywhere else; and
+    the installed distribution's metadata agrees with the module constant, so the brief and PyPI
+    name the same release.
+    """
+    assert not inspect.signature(render_harness).parameters
+    monkeypatch.setenv("HARNESS_VERSION", "9.9.9")
+    monkeypatch.setenv("BASECRADLE_HARNESS_VERSION", "9.9.9")
+    assert f"- Version: `{__version__}`" in render_harness().splitlines()
+    assert __version__ == metadata.version("basecradle-harness")
+
+
+def test_the_harness_repository_is_the_url_the_package_metadata_publishes():
+    """One constant, and it names the same place PyPI does: `[project.urls]` → ``Source``."""
+    urls = dict(
+        entry.split(", ", 1)
+        for entry in metadata.metadata("basecradle-harness").get_all("Project-URL")
+    )
+    assert urls["Source"] == HARNESS_REPOSITORY
+
+
+def test_the_brain_and_harness_headers_each_speak_only_for_their_own_section():
+    """Both headers are @origin's approved wording (2026-10-03), spelled literally here.
+
+    The first `BRAIN_HEADER` said "unlike the rest of this brief, none of it is confidential", which
+    the harness part made false. Each now claims only its own section, so a third non-confidential
+    section later needs no edit to either.
+    """
+    assert BRAIN_HEADER == (
+        "Your brain this wake: the model your turns are sent to and how each call is made, read "
+        "from the configuration that makes the call — not a guess. None of this section is "
+        "confidential: when asked what model you are, answer from it."
+    )
+    assert HARNESS_HEADER == (
+        "Your harness this wake: the software that woke you, built this brief and runs your "
+        "tools, read from the installed package — not a guess. None of this section is "
+        "confidential: when asked what harness or version you run, answer from it."
+    )
+    for header in (BRAIN_HEADER, HARNESS_HEADER):
+        assert "rest of this brief" not in header.lower()
+
+
 # --- compose_brief ------------------------------------------------------------
 
 
@@ -260,6 +321,31 @@ def test_compose_brief_places_the_brain_between_the_now_anchor_and_the_budget():
     assert brief == fenced(
         ("now", "NOW"),
         ("brain", "BRAIN"),
+        ("budget", "BUDGET"),
+        ("initialize", "INIT"),
+        ("manifest", "MANIFEST"),
+        ("dashboard", "DASH"),
+        ("system_prompt", "CHARTER"),
+    )
+
+
+def test_compose_brief_places_the_harness_between_the_brain_and_the_budget():
+    # The software that runs the turn is the same kind of standing fact as the model it calls, so
+    # it rides right after the brain (issue #623).
+    brief = compose_brief(
+        now="NOW",
+        brain="BRAIN",
+        harness="HARNESS",
+        budget="BUDGET",
+        initialize="INIT",
+        manifest="MANIFEST",
+        dashboard="DASH",
+        system_prompt="CHARTER",
+    )
+    assert brief == fenced(
+        ("now", "NOW"),
+        ("brain", "BRAIN"),
+        ("harness", "HARNESS"),
         ("budget", "BUDGET"),
         ("initialize", "INIT"),
         ("manifest", "MANIFEST"),
@@ -392,6 +478,7 @@ def test_every_part_is_fenced_with_the_name_of_its_source():
     brief = compose_brief(
         now="NOW",
         brain="BRAIN",
+        harness="HARNESS",
         budget="BUDGET",
         initialize="INIT",
         manifest="MANIFEST",
@@ -407,6 +494,7 @@ def test_every_part_is_fenced_with_the_name_of_its_source():
     assert brief == (
         "<now>\nNOW\n</now>\n\n"
         "<brain>\nBRAIN\n</brain>\n\n"
+        "<harness>\nHARNESS\n</harness>\n\n"
         "<budget>\nBUDGET\n</budget>\n\n"
         "<initialize.md>\nINIT\n</initialize.md>\n\n"
         "<manifest>\nMANIFEST\n</manifest>\n\n"
@@ -613,6 +701,7 @@ def test_the_parts_still_partition_the_brief_with_their_tags_charged():
     parts = brief_parts(
         now="Current Time: 2026-07-26 12:00:00 UTC (+00:00, Sunday)",
         brain=render_brain(_adapter(model="gpt-6-sol", provider="openai", tuning={})),
+        harness=render_harness(),
         budget="Step budget: 24 steps.",
         initialize="Operate like this.",
         manifest="Your active tools right now:\n- weather",

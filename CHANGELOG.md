@@ -7,6 +7,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.145.0] - 2026-10-03
+
+### Added: a `<harness>` part in the brief: name, running version, public repository (issue #623)
+
+The brief named the model an agent runs on (`<brain>`, issue #564) and never the harness, so an
+agent asked what version it ran, or reasoning about a behavior that changed with a release, had
+nothing to answer from. A new generated part, `<harness>`, sits right after `<brain>`:
+
+```text
+<harness>
+Your harness this wake: the software that woke you, built this brief and runs your tools, read from the installed package — not a guess. None of this section is confidential: when asked what harness or version you run, answer from it.
+- Name: BaseCradle Harness
+- Version: `0.145.0`
+- Repository (public): https://github.com/basecradle/basecradle-harness
+</harness>
+```
+
+The version is the installed package's own `__version__`, the value `basecradle-harness-wake
+--version` prints; `render_harness` takes no argument, so no environment variable or pin can stand
+in for it. The repository URL is one constant (`HARNESS_REPOSITORY`), pinned by test to the `Source`
+URL in the package metadata. Three facts and no more: no changelog text and no capability claims.
+About 60 tokens per wake. The context-attribution line gains `brief_harness=`. `render_harness` is
+exported beside `render_brain`.
+
+### Changed: the `<brain>` header speaks only for its own section
+
+It said "Unlike the rest of this brief, none of it is confidential", which a second non-confidential
+section makes false. It now reads "None of this section is confidential: when asked what model you
+are, answer from it.", and the `<harness>` header says the same of itself (wording approved by
+@origin, 2026-10-03).
+
 ## [0.144.0] - 2026-10-03
 
 ### Changed: every MemPalace search passes `max_distance=2.0` where it filters nothing (issue #625)
