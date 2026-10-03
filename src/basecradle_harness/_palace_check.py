@@ -6,11 +6,12 @@ so ``$HARNESS_HOME`` moves and the palace moves with it, while every drawer keep
 home and a search returns drawers filed before the move. This command checks exactly that, and
 reports what the next observe will do to the palace.
 
-**Token-free.** No platform call and no model call: the palace is resolved from the
-``HARNESS_HOME`` given (never from an inherited ``MEMPALACE_PALACE_PATH``), and the only model call
-on this path, the reranker, is switched off for the process before the provider is built. The
-search is the harness's own `MemPalaceMemoryProvider.search`, so what passes here is what an agent
-recalls.
+**Token-free, except in one mode.** No platform call and no model call: the palace is resolved
+from the ``HARNESS_HOME`` given (never from an inherited ``MEMPALACE_PALACE_PATH``), and the only
+model call on this path, the reranker, is switched off for the process before the provider is
+built. The search is the harness's own `MemPalaceMemoryProvider.search`, so what passes here is
+what an agent recalls. The one exception is the explicit ``--end-to-end`` mode below, which calls
+the agent's own rerank model and is bounded by a ``--token-ceiling`` it cannot run without.
 
 **Read-only by default.** The palace is opened read-only, the forecast is MemPalace's own dry-run
 mine, and the searches write nothing: no drawer, row, metadata value or embedding changes. The
@@ -49,6 +50,15 @@ finds that the other misses. Both arms fetch through the provider's own ranking 
 sentinels are dropped as `search` drops them; the reranker itself never runs. Exit 0 only when arm
 A holds every probe drawer.
 
+**The final 10, through the real reranker: ``--sample N --end-to-end``** (issue #627). Whether a
+probe's drawer reaches the pool says nothing about whether the model then picks it. This mode runs
+each probe through the agent's own reranker, in four arms (today's search, the same again for the
+noise floor, today's ask with ``max_distance=2.0``, and twice the ask with it), for head probes and
+for rare-token probes, and reports where each probe's own drawer lands. It spends rerank-model
+tokens, so it takes a ``--token-ceiling``, refuses to start when its estimate exceeds it, and stops
+(reporting what it has, marked partial) when the next probe would. ``--dry-run`` prints the estimate
+and calls no model. See `basecradle_harness._palace_recall`.
+
 **A miss is diagnosed, never printed.** A probe that does not come back gets a ``why:`` line made of
 ids, counts and ranks: how many drawers carry its exact text or its query, what took the top slots,
 where it ranks in a deeper fetch and in the vector index alone, and whether the index finds it by
@@ -83,7 +93,7 @@ from basecradle_harness._mempalace import (
     _import,
     candidate_pool,
 )
-from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL
+from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL, reranker_from_env
 from basecradle_harness._version import __version__
 
 PROG = "basecradle-harness-palace-check"
@@ -773,6 +783,16 @@ def _cutoff(value: str) -> datetime:
     return when
 
 
+def _count(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        number = -1
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"not a count: {value!r}")
+    return number
+
+
 def _positive(value: str) -> int:
     try:
         number = int(value)
@@ -789,9 +809,9 @@ def main(argv: list[str] | None = None) -> int:
         prog=PROG,
         description=(
             "Prove an agent's MemPalace palace opens from the given HARNESS_HOME and returns drawers "
-            "filed before a home-directory move. No platform call, no model call, and no drawer "
-            "text is ever printed. Read-only unless --practice-observe is given. Exit 0 only if "
-            "every probe drawer comes back."
+            "filed before a home-directory move. No platform call, no model call (except with "
+            "--end-to-end), and no drawer text is ever printed. Read-only unless --practice-observe "
+            "or --register-off-wing is given. Exit 0 only if every probe drawer comes back."
         ),
     )
     parser.add_argument(
@@ -825,7 +845,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="with --register-off-wing: print what it would register, and write nothing.",
+        help=(
+            "with --register-off-wing: print what it would register, and write nothing. With "
+            "--end-to-end: print the probes and the token estimate, and call no model."
+        ),
     )
     parser.add_argument(
         "--sample",
@@ -858,14 +881,74 @@ def main(argv: list[str] | None = None) -> int:
             f"only if arm A holds every probe drawer."
         ),
     )
+    parser.add_argument(
+        "--end-to-end",
+        action="store_true",
+        help=(
+            "SPENDS RERANK-MODEL TOKENS. With --sample and --token-ceiling: run each probe through "
+            "the agent's own reranker (its HARNESS_MEMPALACE_RERANK_* configuration) in four arms "
+            f"(ask {_RERANK_POOL} as today; the same again, for the noise floor; ask "
+            f"{_RERANK_POOL} with max_distance 2.0; ask {_CANDIDATE_ASK} with max_distance 2.0) "
+            f"and report whether the probe's own drawer is in the final {_TOP}. Read-only on the "
+            "palace. Exit 0 only for a complete run."
+        ),
+    )
+    parser.add_argument(
+        "--rare-token-probes",
+        type=_count,
+        default=0,
+        metavar="M",
+        help=(
+            "with --end-to-end: also probe M drawers by their rarest exact token alone, reported "
+            "separately from the --sample head probes."
+        ),
+    )
+    parser.add_argument(
+        "--token-ceiling",
+        type=_positive,
+        metavar="T",
+        help=(
+            "with --end-to-end, and required by it: the most rerank-model tokens (in plus out, "
+            "every arm) the run may spend. It refuses to start when its estimate exceeds T, and "
+            "stops, marked partial, before a probe that would."
+        ),
+    )
     args = parser.parse_args(argv)
+    if args.end_to_end:
+        if args.sample is None or args.token_ceiling is None:
+            parser.error("--end-to-end needs --sample and --token-ceiling")
+        if args.reranked_pool or args.practice_observe or args.register_off_wing:
+            parser.error(
+                "--end-to-end runs alone: not with --reranked-pool, --practice-observe or "
+                "--register-off-wing"
+            )
+    elif args.rare_token_probes or args.token_ceiling is not None:
+        parser.error("--rare-token-probes and --token-ceiling apply to --end-to-end")
     if args.filed_before is not None and args.sample is None:
         parser.error("--filed-before applies to --sample")
     if args.reranked_pool and args.sample is None:
         parser.error("--reranked-pool applies to --sample")
-    if args.dry_run and not args.register_off_wing:
-        parser.error("--dry-run applies to --register-off-wing")
+    if args.dry_run and not (args.register_off_wing or args.end_to_end):
+        parser.error("--dry-run applies to --register-off-wing or --end-to-end")
 
+    reranker = None
+    if args.end_to_end:
+        # Read before the clear below switches reranking off for everything else this check does.
+        reranker = reranker_from_env()
+        if reranker is None:
+            print(
+                f"{PROG}: --end-to-end runs the agent's own reranker, and {RERANK_MODEL_VAR} is "
+                "not set",
+                file=sys.stderr,
+            )
+            return 1
+        if reranker.fault:
+            print(
+                f"{PROG}: --end-to-end: the agent's rerank configuration is incomplete "
+                f"({reranker.fault})",
+                file=sys.stderr,
+            )
+            return 1
     for name in _CLEARED_ENV:
         os.environ.pop(name, None)
     raw_home = args.harness_home or os.environ.get("HARNESS_HOME")
@@ -927,6 +1010,25 @@ def main(argv: list[str] | None = None) -> int:
                 accepted = accepted_hashes(collection) if predicted.new else None
                 for new_name in predicted.new:
                     print(new_file_diagnosis(found, convos, new_name, accepted))
+        if reranker is not None:
+            from basecradle_harness import _palace_recall
+
+            try:
+                return _palace_recall.main(
+                    provider,
+                    reranker,
+                    collection,
+                    found,
+                    heads=args.sample,
+                    rares=args.rare_token_probes,
+                    before=args.filed_before,
+                    ceiling=args.token_ceiling,
+                    dry_run=args.dry_run,
+                    sample=sample,
+                    query_of=query_of,
+                )
+            finally:
+                reranker.close()
         if args.sample:
             drawn = sample(found, args.sample, args.filed_before)
             rows, elsewhere = drawn.rows, False

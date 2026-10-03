@@ -241,6 +241,23 @@ def test_context_never_sets_max_distance(fake_mempalace, tmp_path):
     assert "max_distance" not in searcher.queries[0][2]
 
 
+def test_the_fetch_passes_a_threshold_only_when_one_is_given(fake_mempalace, tmp_path):
+    """The palace check's end-to-end measurement (issue #627) compares a search with
+    ``max_distance`` against today's, through the very fetch `search` makes. ``None`` must send
+    nothing at all, so today's arm is byte-for-byte today's request."""
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    provider = MemPalaceMemoryProvider(palace)
+
+    provider._ranking("q", ask=20, need=20, surface="palace-check")
+    provider._ranking("q", ask=40, need=40, surface="palace-check", max_distance=2.0)
+
+    assert "max_distance" not in searcher.queries[0][2]
+    assert searcher.queries[1][2]["max_distance"] == 2.0
+    assert searcher.queries[1][2]["n_results"] == 40
+
+
 # --- registry sentinels are bookkeeping, never memories (issue #606) ----------
 
 _SENTINEL_PATH = "/home/nova/harness/mempalace/conversations/0f8e1c2d3b4a59687766554433221100.md"

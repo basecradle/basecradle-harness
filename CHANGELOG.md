@@ -7,6 +7,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.143.0] - 2026-10-03
+
+### Added: `basecradle-harness-palace-check --end-to-end` — is the right drawer in the final 10 (issue #627)
+
+Every recall number so far said whether the right drawer reached the pool. This mode says whether
+it is **in the 10 the agent is shown**, after the agent's own reranker has picked. Each probe runs
+through the production `MemPalaceReranker.rerank`, built from the agent's
+`HARNESS_MEMPALACE_RERANK_*` variables, over a pool fetched by the production fetch
+(`MemPalaceMemoryProvider._ranking`), in four arms: **1** asks MemPalace for 20 with no
+`max_distance` (today's search; a test pins it to what `search` returns with the same reranker),
+**1R** is arm 1 run again (the noise floor), **2** asks for 20 with `max_distance=2.0`, and **3**
+asks for 40 with it and hands the reranker all 40. There are two probe kinds, reported separately:
+head probes (`--sample N`, the drawer's opening text, drawn as `--sample` draws) and rare-token
+probes (`--rare-token-probes M`, the drawer's rarest exact token alone, by document frequency, read
+as MemPalace's BM25 reads tokens; a drawer whose rarest token more than three drawers carry is
+skipped and counted).
+
+Per kind and arm it reports probes, drawers in the pool, drawers in the final 10, reranker outcomes
+by reason, median search time, and the tokens and cost the vendor reported; arms 2 and 3 also count
+the lexical hits a threshold drops because their stored embedding could not be loaded (#625's
+stated risk), computed with MemPalace's own helpers. Each arm adds a **misses by stage** line (not
+in the pool, or in the pool and not picked) and a **twins** line (the palace check's `twin`: not in
+the final 10 while a byte-identical drawer is, split by whether the drawer itself was in the pool),
+both asked for by the agent whose palace is measured. Each arm is compared with arm 1 cut both
+ways, in the pool and in the final 10 (gained and lost, each with a digest, and how many probes had
+a fallback in either arm), and the report ends with an `end-to-end summary:` line to compare
+between runs, which also carries each arm's fallback count (a fallback hands back the hybrid
+order). Counts, drawer ids and digests only: no memory text, no query, no path. It refuses to run on
+MemPalace before 3.9, where a threshold switches the lexical half off, and on a palace whose
+distance metric is not cosine, where 2.0 would also cut vector candidates.
+
+**It spends rerank-model tokens, and the ceiling is enforced in code.** `--token-ceiling` is
+required. The mode estimates the whole run first (mean drawer length, three characters a token, a
+full 1,024 output tokens a call) and refuses to start over the ceiling; `--dry-run` prints the
+estimate and calls no model. During the run each probe's four pools are fetched first, the four
+calls are estimated from the exact requests the reranker will send (never at fewer tokens a
+character than the vendor has reported so far), and the probe runs only if it fits. A call is
+charged what the vendor reported, or its estimate when it reported nothing or only half; a retry
+after a timeout or a dropped connection, and a call an interrupt cut short, each cost one estimate
+more. A run stopped by the ceiling, a config-class reranker fault, an empty pool (a failed search),
+an interrupt or any error reports what it has, marked `PARTIAL`, and exits 1; a probe counts only
+once all four arms have run, and an error is named by its class alone, since its text can quote
+the query.
+
+Two small seams carry it, and neither changes a wake: `_ranking` takes an optional `max_distance`
+that `search` never passes (``None`` sends nothing, pinned by test), and `MemPalaceReranker` keeps
+`last_report`, the outcome, tokens and cost its one `llm` line states, read the same way, and how
+many attempts it retried after a timeout or a dropped connection, plus a `fault` property. The measurement's rerank lines carry `surface=palace-check`, so they never count
+as an agent's `turn0` or `tool` recall.
+
 ## [0.142.0] - 2026-10-03
 
 ### Added: `basecradle-harness-palace-check --sample N --reranked-pool` (issue #617)
