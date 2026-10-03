@@ -1,6 +1,6 @@
 ---
 name: harness-release-deploy
-description: Step-by-step procedure for releasing and deploying basecradle-harness — the OIDC Trusted-Publishing pipeline (v* tag → TestPyPI rehearsal → capital-approved pypi env-gate → PyPI), the contractual workflow/environment names, the four-owner build→publish→deploy→verify flow, and the @jt verify (the token-free plumbing check, then the real model wake on a temporary timeline that proves the release). Use when cutting a release, bumping the version for a release, waiting on or reasoning about the pypi env-gate, or confirming a release reached and converged the fleet. The standing invariants (released ≠ deployed; no closing keyword on release PRs; the capital not @origin actuates publish) live in CLAUDE.md → Releasing.
+description: Step-by-step procedure for releasing and deploying basecradle-harness — the OIDC Trusted-Publishing pipeline (v* tag → TestPyPI rehearsal → capital-approved pypi env-gate → PyPI), the contractual workflow/environment names, the four-owner build→publish→deploy→verify flow, the @jt verify (the token-free plumbing check, then the real model wake on a temporary timeline that proves the release), and a builder's local proof wake as @jt (which wakes the fleet's @jt too, so its timeline is deleted only after the capital confirms that wake ended). Use when cutting a release, proving a change with a local wake before it ships, bumping the version for a release, waiting on or reasoning about the pypi env-gate, or confirming a release reached and converged the fleet. The standing invariants (released ≠ deployed; no closing keyword on release PRs; the capital not @origin actuates publish) live in CLAUDE.md → Releasing.
 ---
 
 # Harness Release + Deploy Procedure
@@ -61,10 +61,53 @@ Constitution baselines: **basecradle#362** (one deployer for the fleet's machine
    answers whether `main` is releasable; preflight will refuse the tag if it is not.
    **Your release responsibility ends at the version bump** — you do not publish, deploy, or
    verify on a box. The *change* is still yours to prove before it ships: where its behavior lives
-   in a model turn, drive a real wake of the local build on a temporary timeline (and delete it
-   after), the same shape as step 4b. Where the laptop cannot reach the platform or the provider,
-   say so in the completion comment so step 4b knows it carries the whole proof — never let green
-   offline tests stand in for it silently.
+   in a model turn, drive a real wake of the local build on a temporary timeline, the same shape
+   as step 4b (the local proof wake, below). Where the laptop cannot reach the platform or the
+   provider, say so in the completion comment so step 4b knows it carries the whole proof — never
+   let green offline tests stand in for it silently.
+
+   **The local proof wake runs as @jt, and the fleet runs @jt too.** It is one platform account
+   with a live integration, so every event you cause on the temporary timeline (the task you
+   activate, the message you post) is delivered to the **deployed @jt on the fleet box** as well,
+   and the router wakes it. Every local proof wake is therefore **two wakes**, and that is a known
+   cost of testing as @jt, not a fault to work around:
+   - **A second model bill**, on the fleet's key, for a wake nobody asked for.
+   - **A second agent acting on the timeline.** The deployed @jt (on the *previous* release)
+     answers too, and its reply is authored by the same account as yours. Its create can even win
+     the idempotency key your local wake mints (same account, same anchor, same ordinal), so your
+     wake reports `posted=1` and the record it got back is the fleet's message. **Judge your
+     build from its own log lines** (the `context attribution`, `llm` and `wake end` lines, and
+     whatever the change added), never from a post on the timeline.
+   - **The fleet @jt's memory keeps the exchange**, by design, as it keeps every conversation.
+
+   Run it like this:
+   1. Run the wake under a throwaway home, against a config home `basecradle-harness-install`
+      laid down (a wake with none narrates instead of posting, so it tests nothing production
+      runs):
+
+      ```bash
+      uv run scripts/isolated_home.py basecradle-harness-wake --timeline <uuid>
+      ```
+
+      `BASECRADLE_CONFIG_HOME` and `HARNESS_HOME` name scratch directories explicitly; they pass
+      through the wrapper (issue #630).
+   2. **Never delete the temporary timeline yourself while the fleet's wake on it may be running.**
+      A delete under a live wake makes its next post fail (`No record exists for the given
+      UUID.`), it logs `ERROR post failed`, and that ERROR pages @origin. This happened on
+      2026-10-03 (issue #632): a timeline deleted about a minute after the local wake posted, with
+      the fleet's wake still mid-turn.
+   3. **You cannot tell from the laptop that the fleet's wake has ended**, and the platform does not
+      say. A reply from @jt is not the end of a wake: a wake goes on after it posts, and the
+      reply may be your own (see above). No reply is not the end either: silence is a legitimate
+      outcome (`posted=0`), and a wake can be mid-turn when you look. Its lifetime has no bound
+      you can wait out. The only evidence is the fleet box's journal: every `wake start
+      timeline=<uuid>` for that timeline has its `wake end` with the same `delivery=`. You
+      cannot read it (the laptop cannot reach @jt's box), so **the capital confirms it**.
+   4. So, when your proof is done: comment on your issue naming the timeline uuid, ask the
+      capital to confirm the fleet's wake on it has ended, and apply `needs-capital`. Delete the
+      timeline (`bc.timelines.get(uuid).delete()`) when the capital says it has, and say so on
+      the issue. The timeline is yours until then: you created it, so you delete it. An issue
+      whose `CLOSER:` is you is not closed while it is still standing.
 2. **Publish to PyPI — the capital.** Owns the `pypi` env-gate.
 3. **Deploy / converge the fleet (incl. @jt) — the NOC, the fleet's sole deployer.** The NOC reads
    each box's running version, compares it to the git-tracked desired state, and converges any
@@ -96,8 +139,11 @@ Constitution baselines: **basecradle#362** (one deployer for the fleet's machine
    3. Read that wake's own log lines on the box: the `wake` bookend, the `llm` line(s), and every
       line the release added or changed. The outcome is judged from what the log and the timeline
       show, never from the absence of an error.
-   4. **Delete the timeline.** The orphan sweep (`basecradle-harness-cleanup --sweep`) then GCs its
-      on-box session artifacts on its next run; @jt's memory keeps the exchange by design.
+   4. **Delete the timeline, once no wake on it is running**: every `wake start` naming it has
+      its `wake end` with the same `delivery=`. Read that at the moment you delete, not from the
+      step-3 wake alone, because a later event on the timeline can start another. A delete under a live wake fails its next post and pages (issue #632). The orphan
+      sweep (`basecradle-harness-cleanup --sweep`) then GCs its on-box session artifacts on its
+      next run; @jt's memory keeps the exchange by design.
 
    **Nobody waits for traffic to arrive.** A system being built, rolled or verified is not at
    rest, so "no token burn at rest" does not apply to it (`constitution.md` → How We Build,
