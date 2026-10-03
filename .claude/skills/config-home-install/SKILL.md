@@ -93,6 +93,11 @@ Exit nonzero is the product: it is what turns a stripped overlay into a red conv
 invariants — proves the declared set not pristine-ness, unproven is red, claims emitted whatever
 the verdict — live in CLAUDE.md → Green-While-Absent.
 
+**Exit 0 proves the config home, not the agent.** `verify` is a token-free check: it proves the
+declared capability set is on disk, which is plumbing. Whether the agent can actually *do* what a
+release or a rollout changed is proven by a real model wake on a temporary timeline (the
+`harness-release-deploy` skill, step 4b) — a green verify never stands in for it.
+
 ## Grandfather, loudly (on upgrade)
 
 On upgrade, a powerful tool a *prior* version had already scaffolded into an existing config
