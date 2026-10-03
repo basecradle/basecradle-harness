@@ -60,6 +60,13 @@ tokens, so it takes a ``--token-ceiling``, refuses to start when its estimate ex
 (reporting what it has, marked partial) when the next probe would. ``--dry-run`` prints the estimate
 and calls no model. See `basecradle_harness._palace_recall`.
 
+**Why a probe is not in the pool: ``--sample N --pool-diagnosis``** (issue #633). Token-free and
+read-only. The same probes as ``--end-to-end`` and the same three fetches, and for every probe whose
+drawer is not in arm 1's pool, where it ranks in the vector half and the lexical half and how far
+from the cut, whether a wider ask reaches it and at which, whether a copy or near copy took its
+place, whether sentinels or the widening cap kept it out, and whether an index has lost it. See
+`basecradle_harness._palace_pool`.
+
 **A miss is diagnosed, never printed.** A probe that does not come back gets a ``why:`` line made of
 ids, counts and ranks: how many drawers carry its exact text or its query, what took the top slots,
 where it ranks in a deeper fetch and in the vector index alone, and whether the index finds it by
@@ -889,6 +896,20 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--pool-diagnosis",
+        action="store_true",
+        help=(
+            "with --sample: token-free and read-only. Fetch the probes --end-to-end draws through "
+            f"its three arms (ask {_RERANK_POOL} with max_distance 2.0, as today; ask "
+            f"{_RERANK_POOL} with none; ask {_CANDIDATE_ASK} with max_distance 2.0), and for each "
+            f"probe whose drawer is not in today's pool say why: its rank in the vector half and "
+            "the lexical half, how far from the cut, the first wider ask that reaches it, any "
+            "identical or near copy in the pool, sentinels and the widening cap, and a lost "
+            "embedding or lexical row. Ids, counts and ranks only. Exit 0 only if today's pool "
+            "holds every probe drawer."
+        ),
+    )
+    parser.add_argument(
         "--end-to-end",
         action="store_true",
         help=(
@@ -907,8 +928,8 @@ def main(argv: list[str] | None = None) -> int:
         default=0,
         metavar="M",
         help=(
-            "with --end-to-end: also probe M drawers by their rarest exact token alone, reported "
-            "separately from the --sample head probes."
+            "with --end-to-end or --pool-diagnosis: also probe M drawers by their rarest exact "
+            "token alone, reported separately from the --sample head probes."
         ),
     )
     parser.add_argument(
@@ -930,8 +951,18 @@ def main(argv: list[str] | None = None) -> int:
                 "--end-to-end runs alone: not with --reranked-pool, --practice-observe or "
                 "--register-off-wing"
             )
-    elif args.rare_token_probes or args.token_ceiling is not None:
-        parser.error("--rare-token-probes and --token-ceiling apply to --end-to-end")
+    elif args.token_ceiling is not None:
+        parser.error("--token-ceiling applies to --end-to-end")
+    if args.pool_diagnosis:
+        if args.sample is None:
+            parser.error("--pool-diagnosis applies to --sample")
+        if args.end_to_end or args.reranked_pool or args.practice_observe or args.register_off_wing:
+            parser.error(
+                "--pool-diagnosis runs alone: not with --end-to-end, --reranked-pool, "
+                "--practice-observe or --register-off-wing"
+            )
+    elif args.rare_token_probes and not args.end_to_end:
+        parser.error("--rare-token-probes applies to --end-to-end or --pool-diagnosis")
     if args.filed_before is not None and args.sample is None:
         parser.error("--filed-before applies to --sample")
     if args.reranked_pool and args.sample is None:
@@ -965,9 +996,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     home = Path(raw_home).expanduser().resolve()
     palace = _palace_path(home)
-    print(f"palace: {palace}")
+    # `--pool-diagnosis` prints ids, counts and ranks only (issue #633): no path, no upstream text.
+    paths = not args.pool_diagnosis
+    print(
+        f"palace: {palace}" if paths else "palace: under the HARNESS_HOME given (path not printed)"
+    )
     if not palace.is_dir():
-        print(f"FAIL: no palace at {palace}")
+        print(
+            f"FAIL: no palace at {palace}" if paths else "FAIL: no palace under that HARNESS_HOME"
+        )
         return 1
 
     # A sample runs hundreds of searches; one `memory recall` line each would bury the report.
@@ -990,7 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
         except ImportError:
             raise
         except Exception as error:  # noqa: BLE001 - a vendor refusal of any class, relayed in one line
-            print(f"FAIL: could not open the palace: {type(error).__name__}: {error}")
+            detail = f": {error}" if paths else ""
+            print(f"FAIL: could not open the palace: {type(error).__name__}{detail}")
             return 1
         found = census(collection, palace)
         print(
@@ -1003,7 +1041,8 @@ def main(argv: list[str] | None = None) -> int:
             f"conversation files: {found.files}, "
             f"not yet registered at this location: {found.unregistered}"
         )
-        if found.unregistered:
+        # The next-observe forecast names conversation files, and is the move check's business.
+        if found.unregistered and paths:
             predicted = forecast(palace, provider.agent)
             if predicted is None:
                 print(
@@ -1037,6 +1076,20 @@ def main(argv: list[str] | None = None) -> int:
                 )
             finally:
                 reranker.close()
+        if args.pool_diagnosis:
+            from basecradle_harness import _palace_pool
+
+            return _palace_pool.main(
+                provider,
+                collection,
+                found,
+                heads=args.sample,
+                rares=args.rare_token_probes,
+                before=args.filed_before,
+                sample=sample,
+                query_of=query_of,
+                self_query=_self_query,
+            )
         if args.sample:
             drawn = sample(found, args.sample, args.filed_before)
             rows, elsewhere = drawn.rows, False

@@ -225,7 +225,10 @@ testpaths = ["tests"]
 # Live tests hit a real provider endpoint (a paid model call) and need a real key, so they are
 # their own explicitly-marked job, deselected from the default offline run (`-m "not live"`).
 # Opt in with `uv run pytest -m live` once the right key is in the environment.
-addopts = "-m 'not live'"
+# MemPalace tests build real palaces with the optional `mempalace` extra and the embedding model it
+# downloads on first use, so they are deselected too: `uv run --extra mempalace pytest -m mempalace`.
+addopts = "-m 'not live and not mempalace'"
 markers = [
     "live: hits a real provider endpoint (real key, real network, costs a model call); excluded from the default run",
+    "mempalace: builds real MemPalace palaces (the mempalace extra, its embedding model); excluded from the default run",
 ]

@@ -7,6 +7,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.146.0] - 2026-10-03
+
+### Added: `basecradle-harness-palace-check --pool-diagnosis`, why a probe is not in the pool (issue #633)
+
+The end-to-end run on a real palace (basecradle-noc#957) found head probes whose drawer was in no
+arm's pool, even at an ask of 40, and could only say "not in the pool". The new mode says why. It
+is token-free and read-only (no reranker, no model call, nothing written), takes the same probe
+flags as `--end-to-end` (`--sample`, `--rare-token-probes`, `--filed-before`), so it draws the same
+probes, and fetches them through the same arms 1, 2 and 3. For each probe not in arm 1's pool it
+prints a `why:` line of ids, counts and ranks: the drawer's rank in the vector half and the lexical
+half and how far past each cut, whether it lies inside the lexical half's scan window and its rank
+with none, whether and where it ranks among the merged candidates, the sentinels the fetch dropped
+and whether the widening hit its cap, the first wider ask (40 to 640) whose pool holds it, the
+identical and nearest copies in the pool (nearness printed as a token-overlap share), and whether
+an index has lost it. Verdicts extend the rerank-off report's `twin`, `cut`, `crowded` and
+`unreached` with `near-twin`, `sentinels`, `dropped`, `shadowed`, `missing`, `fts-window` and
+`unknown`. It prints no path, not even the palace's, and names an error by its class alone. The
+report ends with per-arm digests of the probes each pool misses, the digest of those no pool holds,
+and one summary line. Module: `_palace_pool.py`.
+
+MemPalace returns only its first results, so the candidate set and the hybrid rank are rebuilt with
+MemPalace's own merge, ranking and dedupe functions, and every line says whether the rebuild
+matches the real `search_memories`; a probe whose rebuild does not match is `unknown`, never a
+guess. Proven on real palaces, one per kind of miss, on MemPalace 3.9.0 and 3.10.0
+(`tests/test_palace_pool_real.py`, under a new `mempalace` pytest marker that the default run
+deselects: it needs the extra and its embedding model).
+
+**What building it found:** MemPalace's Chroma backend reads only the first `max(500, 3 × fetch)`
+full-text matches for the lexical half, in index order rather than by relevance, and scores only
+those. A query of common words (a head probe) matches far more than 500 drawers, so a newer drawer
+can be the best lexical match in the palace and never be read. The `fts-window` verdict names that
+case.
+
+### Changed: `--end-to-end`'s refusal is one function both modes call
+
+`_palace_recall.refusal` decides whether the arms describe today's search on this palace (MemPalace
+3.9 or later, a cosine palace), and `--pool-diagnosis` refuses exactly where `--end-to-end` does.
+The refusal text is unchanged.
+
 ## [0.145.0] - 2026-10-03
 
 ### Added: a `<harness>` part in the brief: name, running version, public repository (issue #623)
