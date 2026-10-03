@@ -7,6 +7,42 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.142.0] - 2026-10-03
+
+### Added: `basecradle-harness-palace-check --sample N --reranked-pool` (issue #617)
+
+The 0.141.0 measurement ran with the reranker off, the path no fleet MemPalace agent takes: with a
+rerank model bound, `search` asks MemPalace for `pool_size(10)` = 20 candidates and the model picks
+10, so a drawer upstream's vector cut keeps out of those 20 can never be recalled. This mode
+measures that path on the same sample, with no model call. **Arm A** (today's rule) asks for 20 and
+keeps 20; **arm B** (the candidate rule) asks for 40 and keeps the first 20. For each probe it asks
+whether the probe's own drawer is in the pool each arm would hand the reranker, then reports each
+arm's count and median search time, one line per drawer only one arm finds, and a closing
+`reranked summary:` line with the sample digest and a digest per difference. Exit 0 only when arm A
+holds every probe drawer. Still read-only, ids and counts only.
+
+Both arms fetch through `MemPalaceMemoryProvider._ranking`, the fetch half of `search` (registry
+sentinels dropped and the fetch widened exactly as there), split out so the check cannot measure a
+fetch the agent does not make. A test pins that `_ranking` at the reranked ask is the pool `search`
+hands a bound reranker. What any search asks for or returns does not change.
+
+### Added: a MemPalace search that fails logs a WARNING (issue #617)
+
+When `search_memories` answered with an error instead of a ranking, recall returned no hits and the
+only line was `memory recall … injected=0`, which is also what a palace with nothing relevant says.
+`search` now logs one WARNING first:
+`memory op=search result=failed provider=mempalace surface=… reason=error keys=error,results`.
+MemPalace 3.9 and 3.10 answer every failure with an envelope carrying `error` beside an empty
+`results` list, so the `error` key is the signal; an answer with no results list at all
+(`reason=no_results`) or not a dict (`reason=not_a_dict`) logs too. Upstream's error text is not
+logged, because messages such as `Search error: {e}` interpolate an exception that can quote the
+query; the line carries the envelope's field names instead. What `search` returns does not change.
+
+### Changed
+
+- The comment above `_UNRANKED_HEADROOM` is cut to why the constant exists; the measurements are
+  on issue #611.
+
 ## [0.141.0] - 2026-10-02
 
 ### Changed: MemPalace recall asks for four times what it keeps when no reranker is bound (issue #611)

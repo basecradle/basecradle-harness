@@ -256,6 +256,20 @@ basecradle-harness-palace-check --sample 500 --filed-before 2026-10-02T07:00:00 
 - **`--filed-before`** (the box's local time, as MemPalace's `filed_at` records it) holds that population still while a live palace keeps growing after the copy is taken.
 - **One summary line to compare.** The report ends with `sample summary: probes N, passed P, failed F, failing digest D`, preceded by the population and its `sample digest` and by the failures counted by verdict. Two reports with the same sample digest and the same failing digest failed on the same drawers.
 
+**The reranked path, with no model call.** The sample above searches with the reranker off. An agent with a [rerank model](#let-a-model-pick-what-gets-recalled--the-llm-reranker) searches differently: it asks MemPalace for 20 candidates and the model picks 10 of them, so a drawer outside those 20 can never be recalled. `--reranked-pool` measures that path instead, on the same sample:
+
+```bash
+basecradle-harness-palace-check --sample 2000 --reranked-pool /home/<user>/harness
+```
+
+For each probe it asks whether the probe's own drawer is among the 20 a reranked search hands the reranker today (**arm A**: ask for 20, keep 20), and among the first 20 of an ask for 40 (**arm B**: the candidate rule). Both arms fetch exactly as the agent's search does, registry rows dropped and the fetch widened the same way; the reranker itself never runs. It prints one `arm B only:` or `arm A only:` line per drawer that only one arm finds, a line per arm with its count and median search time, and ends with:
+
+```
+reranked summary: probes N, sample digest S, arm A found A, arm B found B, B finds A misses X (digest D), A finds B misses Y (digest E)
+```
+
+It exits 0 only when arm A holds every probe drawer. A drawer in the pool is not a drawer recalled (the model still picks 10 of the 20); a drawer outside it is a drawer the model never sees.
+
 **Every miss is diagnosed, and no drawer text is ever printed,** in either mode. A `why:` line under each failure gives ids, counts and ranks only. It reports where the drawer ranks in a top-100 search and in the vector half of a top-10 search, whether the vector index returns it for its own embedding, and how many drawers carry its exact text or its query. It also reports how many of the drawers that took the top 10 share its text, its query, its content hash or its source file. The probe's query is the first 400 characters of the drawer, while the drawer's embedding covers the whole chunk, so a drawer is not guaranteed to be nearest to its own query. The verdict names one of four causes:
 
 - **`twin`.** A drawer with identical text holds a top-10 slot, so the memory is recalled under another id. This happens when more copies of one exchange exist than there are slots.
@@ -1241,6 +1255,12 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
 
   ```
   INFO memory recall provider=mempalace surface=turn0 rerank=off pool=40 injected=10 duration=0.31s chars=6461 sentinels=44 fetched=80
+  ```
+
+  A search MemPalace could not serve (a backend without lexical search, a palace that will not open, a query that raised) answers with an error rather than a ranking. Recall reads that as no hits, so the wake goes on without memories, and one `WARNING` says why before the recall line. It names the answer's shape (`reason=error`, `no_results` or `not_a_dict`) and the error's field names, never MemPalace's error text, which can quote the query:
+
+  ```
+  WARNING memory op=search result=failed provider=mempalace surface=turn0 reason=error keys=error,results
   ```
 
   And a describe, on an agent with a [describer](#give-a-blind-model-eyes--the-describer) configured:

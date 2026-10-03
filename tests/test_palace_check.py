@@ -912,3 +912,116 @@ def test_register_off_wing_leaves_an_unreadable_file_alone_and_names_it(
     assert code == 0
     assert f"  left alone: {HAND}: could not be read (OSError)" in lines
     assert not _writes(fake)
+
+
+# --- --reranked-pool: the reranked path, with no model call (issue #617) -------
+
+POOL = _palace_check._RERANK_POOL
+ASK = _palace_check._CANDIDATE_ASK
+FILLERS = [f"filler-{n:02d}" for n in range(ASK + 10)]
+
+
+def _arm_palace(fake, monkeypatch):
+    """A palace with a known answer in each arm, and a searcher scripted per query and per ask.
+
+    ``only-b`` is past the vector cut at an ask of 20 and ranks fifth at 40; ``only-a`` ranks
+    twentieth at 20 and is pushed to twenty-sixth at 40 by drawers the wider cut admits; ``both``
+    sits behind registry sentinels in either ask; ``neither`` is never in a ranking; every filler is
+    its own query's first hit.
+    """
+    drawers = {
+        name: (f"Nova told John {name} about the release.", _meta(f"{OLD}/{name}.md", "2026-09-01"))
+        for name in ("only-a", "only-b", "both", "neither", *FILLERS)
+    }
+    fake.collection = FakeCollection(drawers)
+    text = {drawer_id: payload[0] for drawer_id, payload in drawers.items()}
+    by_text = {body: drawer_id for drawer_id, body in text.items()}
+
+    def row(drawer_id):
+        return {"drawer_id": drawer_id, "text": text[drawer_id], "room": "general"}
+
+    def sentinel(n):
+        return {
+            "drawer_id": f"registry-{n}",
+            "text": f"[registry] {OLD}/{n}.md",
+            "room": "_registry",
+        }
+
+    def search_memories(query, palace_path, **kwargs):
+        n = kwargs["n_results"]
+        fake.searches.append((query, kwargs))
+        probe = by_text.get(query)  # the home-name query is no probe, and matches nothing
+        if probe is None:
+            return {"results": []}
+        fillers = [row(f) for f in FILLERS]
+        if probe == "only-b":
+            ranking = fillers if n < ASK else [*fillers[:4], row("only-b"), *fillers[4:]]
+        elif probe == "only-a":
+            ranking = [*fillers[: POOL - 1], row("only-a"), *fillers[POOL - 1 :]]
+            if n >= ASK:
+                ranking = [*fillers[-6:], *ranking]  # admitted only by the wider cut
+        elif probe == "both":
+            ranking = [*(sentinel(k) for k in range(POOL - 2)), row("both"), *fillers]
+        elif probe == "neither":
+            ranking = fillers
+        else:
+            ranking = [row(probe), *(f for f in fillers if f["drawer_id"] != probe)]
+        return {"results": ranking[:n]}
+
+    monkeypatch.setattr(sys.modules["mempalace.searcher"], "search_memories", search_memories)
+    return drawers
+
+
+def test_reranked_pool_reports_what_each_arm_hands_the_reranker(home, fake, capsys, monkeypatch):
+    drawers = _arm_palace(fake, monkeypatch)
+    monkeypatch.setenv(RERANK_MODEL_VAR, "some/model")
+
+    code, lines = _run(capsys, "--sample", len(drawers), "--reranked-pool", home)
+
+    probes = len(drawers)
+    assert (POOL, ASK) == (20, 40)
+    assert code == 1  # arm A, today's rule, misses `only-b` and `neither`
+    assert "arm B only: drawer only-b" in lines
+    assert "arm A only: drawer only-a" in lines
+    assert not [line for line in lines if line.startswith(("PASS", "FAIL", "failed by verdict"))]
+    assert any(
+        line.startswith(f"reranked pool arm A (ask 20, keep 20): found {probes - 2} of {probes}")
+        for line in lines
+    )
+    assert any(
+        line.startswith(
+            f"reranked pool arm B (ask 40, keep first 20): found {probes - 2} of {probes}"
+        )
+        for line in lines
+    )
+    sample_digest = _palace_check.digest(drawers)
+    assert lines[-1] == (
+        f"reranked summary: probes {probes}, sample digest {sample_digest}, "
+        f"arm A found {probes - 2}, arm B found {probes - 2}, "
+        f"B finds A misses 1 (digest {_palace_check.digest(['only-b'])}), "
+        f"A finds B misses 1 (digest {_palace_check.digest(['only-a'])})"
+    )
+    # Every probe asked exactly the two arms' asks (the sentinel probe widens each, as `search`
+    # does), and no model was called: the reranker never runs on this path.
+    asks = {kwargs["n_results"] for query, kwargs in fake.searches if "only" in query}
+    assert asks == {POOL, ASK}
+    both = [kwargs["n_results"] for query, kwargs in fake.searches if " both " in query]
+    assert both == [POOL, 2 * POOL, ASK]
+
+
+def test_reranked_pool_passes_when_today_holds_every_probe(home, fake, capsys):
+    fake.collection = FakeCollection(_many(12))
+
+    code, lines = _run(capsys, "--sample", 5, "--reranked-pool", home)
+
+    assert code == 0
+    assert lines[-1].endswith(
+        "arm A found 5, arm B found 5, B finds A misses 0 (digest none), "
+        "A finds B misses 0 (digest none)"
+    )
+
+
+def test_reranked_pool_needs_sample(home, fake, capsys):
+    with pytest.raises(SystemExit):
+        _palace_check.main(["--reranked-pool", str(home)])
+    assert "--reranked-pool applies to --sample" in capsys.readouterr().err

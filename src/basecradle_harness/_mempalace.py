@@ -113,8 +113,8 @@ MAX_N_RESULTS = 20
 # pulls the top lexical (FTS BM25) candidates into the pool and merges them, for the cost
 # of one extra local FTS query per retrieval. The ChromaDB backend every palace uses
 # implements the `lexical_search` capability union needs; a backend that doesn't degrades
-# gracefully (`search_memories` returns an error dict with no "results" key, which
-# `context` already reads as "no hits").
+# gracefully (`search_memories` returns an error envelope, which `search` reads as "no hits" and
+# logs as a WARNING).
 _CANDIDATE_STRATEGY = "union"
 
 # The `room` MemPalace stamps on a **registry sentinel** (mempalace 3.9.0 `convo_miner._register_file`):
@@ -134,18 +134,12 @@ _REGISTRY_ROOM = "_registry"
 _MAX_FETCH_FACTOR = 8
 
 # How many results `search` asks MemPalace for when no reranker is bound, as a multiple of the count
-# it returns (issue #611). Upstream's union search keeps only the `n` nearest of the `3n` drawers its
-# vector half proposes (`_candidate_pool_limits`: union returns `n` as the pre-merge limit), and a
-# drawer outside those `n` competes on BM25 alone, which the hybrid rank caps at 0.4. It then loses
-# to any close vector match even when full scoring would rank it first: the palace check's `cut`
-# miss. Asking for more and keeping the first `k` lets those drawers compete. The first `--sample`
-# on a real palace (2,000 probes, about 5,700 drawers) found 29 `cut` misses, more than a quarter of
-# all its misses. Four, from a 1,000-probe sample of a 6,966-drawer synthetic palace with 20 `cut`
-# misses (issue #611): 2x recovered 8, 3x 9, 4x 13, 5x 14, 8x 17, and no multiple lost a drawer 1x
-# found. 4x added 9 ms to a median recall of 81 ms. Past it the gain is a few drawers per thousand,
-# and the sentinel widening above scales with the pool: its worst case (pool x 1, 2, 4, 8) measured
-# about 0.36 s at 1x, 0.53 s at 4x and 0.82 s at 8x. With a reranker bound the pool is already
-# wider (`pool_size`), so this does not apply there.
+# it returns (issue #611, where the measurements are). Upstream's union search keeps only the `n`
+# nearest of the `3n` drawers its vector half proposes, and a drawer outside them competes on BM25
+# alone, which the hybrid rank caps at 0.4, so it loses to any close vector match even when full
+# scoring would rank it first. Asking for more and keeping the first `k` lets it compete. With a
+# reranker bound `search` asks for `pool_size` instead and this does not apply; the same cut on that
+# path is what `basecradle-harness-palace-check --reranked-pool` measures (issue #617).
 _UNRANKED_HEADROOM = 4
 
 # The tag whose open/close pair fences the injected recall. The generator's name lives on the
@@ -314,9 +308,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
         method is doing.
 
         Empty before the palace exists (nothing observed yet) — short-circuited without
-        touching MemPalace. A backend that cannot serve the union request answers with an error
-        dict carrying no ``results`` key, which reads here as no hits: memory degrades, the wake
-        does not break.
+        touching MemPalace. A search upstream cannot serve (a backend without the union request's
+        lexical half, a palace that will not open, a query that raised) answers with an error
+        envelope, which reads here as no hits: memory degrades, the wake does not break, and one
+        WARNING says so (issue #617).
         """
         if not self.palace_path.exists():
             return []
@@ -327,31 +322,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         # headroom past them is ranking context, never something to widen the fetch to refill.
         need = pool if reranked else wanted
         started = time.monotonic()
-        searcher = _import("searcher")
-        fetch = pool
-        while True:
-            # Never pass `max_distance`: upstream's union merge opens with
-            # `if max_distance > 0.0: return`, so *any* distance threshold silently disables
-            # the BM25 half of the pool (lexical-only candidates carry no vector distance) and
-            # `candidate_strategy` above becomes a no-op. A distance filter and union recall
-            # are mutually exclusive upstream; we keep the recall. Pinned by test.
-            result = searcher.search_memories(
-                query,
-                str(self.palace_path),
-                n_results=fetch,
-                candidate_strategy=_CANDIDATE_STRATEGY,
-            )
-            raw = result.get("results") if isinstance(result, dict) else None
-            raw = [hit for hit in (raw or []) if isinstance(hit, dict) and hit.get("text")]
-            hits = [hit for hit in raw if hit.get("room") != _REGISTRY_ROOM]
-            sentinels = len(raw) - len(hits)
-            # Widen only while it can help: something was dropped, the result is still short, and
-            # the backend filled the page (a short page means the palace has nothing further).
-            if not sentinels or len(hits) >= need or len(raw) < fetch:
-                break
-            if fetch >= pool * _MAX_FETCH_FACTOR:
-                break
-            fetch = min(fetch * 2, pool * _MAX_FETCH_FACTOR)
+        hits, fetch, sentinels = self._ranking(query, ask=pool, need=need, surface=surface)
         hits = hits[:pool]
         if self.reranker is not None:
             hits = self.reranker.rerank(query, hits, wanted, surface=surface)
@@ -370,6 +341,50 @@ class MemPalaceMemoryProvider(MemoryProvider):
             sentinels=sentinels,
         )
         return hits
+
+    def _ranking(
+        self, query: str, *, ask: int, need: int, surface: str
+    ) -> tuple[list[dict], int, int]:
+        """MemPalace's hybrid ranking for `query`, sentinels dropped: ``(hits, fetch, sentinels)``.
+
+        The fetch half of `search`, and the one place the palace is asked: ``ask`` is the
+        ``n_results`` sent upstream, ``need`` how many hits the caller must have before a dropped
+        sentinel stops being worth a wider fetch. ``fetch`` is how wide the last fetch went and
+        ``sentinels`` how many it dropped, for the ``memory recall`` line. The hits are unbounded
+        here; bounding them is the caller's. The palace check calls this with the reranked asks
+        (issue #617), so what it measures is fetched exactly the way `search` fetches.
+
+        An answer from upstream that is an error envelope, or no list of results at all, reads as
+        no hits, and logs one WARNING (`_log_search_failure`).
+        """
+        searcher = _import("searcher")
+        fetch = ask
+        while True:
+            # Never pass `max_distance`: upstream's union merge opens with
+            # `if max_distance > 0.0: return`, so *any* distance threshold silently disables
+            # the BM25 half of the pool (lexical-only candidates carry no vector distance) and
+            # `candidate_strategy` above becomes a no-op. A distance filter and union recall
+            # are mutually exclusive upstream; we keep the recall. Pinned by test.
+            result = searcher.search_memories(
+                query,
+                str(self.palace_path),
+                n_results=fetch,
+                candidate_strategy=_CANDIDATE_STRATEGY,
+            )
+            raw = result.get("results") if isinstance(result, dict) else None
+            if not isinstance(raw, list) or (isinstance(result, dict) and "error" in result):
+                _log_search_failure(result, surface=surface)
+            raw = [hit for hit in (raw or []) if isinstance(hit, dict) and hit.get("text")]
+            hits = [hit for hit in raw if hit.get("room") != _REGISTRY_ROOM]
+            sentinels = len(raw) - len(hits)
+            # Widen only while it can help: something was dropped, the result is still short, and
+            # the backend filled the page (a short page means the palace has nothing further).
+            if not sentinels or len(hits) >= need or len(raw) < fetch:
+                break
+            if fetch >= ask * _MAX_FETCH_FACTOR:
+                break
+            fetch = min(fetch * 2, ask * _MAX_FETCH_FACTOR)
+        return hits, fetch, sentinels
 
     def close(self) -> None:
         """Release the reranker's HTTP client, if one was ever built.
@@ -646,6 +661,40 @@ def _log_recall(
             injected=len(hits),
             duration=_secs(seconds),
             chars=sum(len(str(hit.get("text") or "")) for hit in hits),
+            **extra,
+        ),
+    )
+
+
+def _log_search_failure(result: object, *, surface: str) -> None:
+    """One WARNING for a MemPalace search that answered with an error, not a ranking (issue #617).
+
+    Before it, such a search returned no hits and the ``memory recall`` line said ``injected=0``,
+    exactly what a palace with nothing relevant says, so an agent woke with no memories and nothing
+    said why. MemPalace 3.9 and 3.10 answer every failure with an envelope carrying ``error``
+    beside an empty ``results`` list (``_search_error_result``), so the envelope's ``error`` key is
+    the signal, not a missing list; an answer with no list at all is the other shape, and logs too.
+
+    **The upstream error text is not logged.** Several of its messages interpolate an exception
+    (``f"Search error: {e}"``), and an exception raised mid-query can carry the query, which is a
+    peer's words. So the line says only what can be shown to carry neither memory text nor the
+    query: the answer's shape (``reason``) and the envelope's field names (``keys``, upstream's own
+    identifiers, which tell a backend without lexical search from a palace that will not open).
+    MemPalace's own logger records the detail on the paths where it has it.
+    """
+    if isinstance(result, dict):
+        reason = "error" if "error" in result else "no_results"
+        extra: dict[str, object] = {"keys": ",".join(sorted(str(key) for key in result))}
+    else:
+        reason, extra = "not_a_dict", {"type": type(result).__name__}
+    _log.warning(
+        "memory %s",
+        kv(
+            op="search",
+            result="failed",
+            provider=_MEMPALACE,
+            surface=surface,
+            reason=reason,
             **extra,
         ),
     )
