@@ -388,6 +388,37 @@ def test_the_recall_line_names_dropped_sentinels_only_when_there_were_some(
     assert "injected=5" in polluted
 
 
+def test_the_ranking_call_is_the_pool_a_reranker_is_handed(fake_mempalace, tmp_path):
+    """The palace check's arm A (issue #617) fetches through `_ranking` with the reranked ask; it
+    measures the reranked path only while that is exactly what `search` hands a bound reranker,
+    sentinels dropped and the fetch widened the same way."""
+
+    class Recorder:
+        def __init__(self):
+            self.pools = []
+
+        def rerank(self, query, hits, k, *, surface):
+            self.pools.append(list(hits))
+            return hits[:k]
+
+        def close(self):
+            pass
+
+    _, searcher = fake_mempalace
+    _ranked(searcher, [_sentinel(n) for n in range(7)] + [_memory(n) for n in range(60)])
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    recorder = Recorder()
+    provider = MemPalaceMemoryProvider(palace, reranker=recorder)
+    pool = candidate_pool(10, reranked=True)
+
+    provider.search("hey nova", 10)
+    hits, fetch, sentinels = provider._ranking("hey nova", ask=pool, need=pool, surface="tool")
+
+    assert recorder.pools == [hits[:pool]]
+    assert (fetch, sentinels) == (2 * pool, 7)
+
+
 def test_the_reranker_is_handed_a_pool_without_sentinels(fake_mempalace, tmp_path):
     """Rerank reads the pool `search` hands it, so a sentinel left in would spend a pick slot."""
 
@@ -415,14 +446,79 @@ def test_the_reranker_is_handed_a_pool_without_sentinels(fake_mempalace, tmp_pat
     assert all(hit["room"] != "_registry" for hit in pool)
 
 
+# MemPalace 3.9.0's `_search_error_result` envelope for a union request a backend cannot serve.
+_ENVELOPE = {
+    "error": "candidate_strategy='union' requires a backend with lexical_search support",
+    "results": [],
+    "unsupported_capability": "supports_lexical_search",
+    "hint": "Use candidate_strategy='vector' or select a backend that supports lexical search.",
+}
+
+# A query that names a peer's words, and an upstream error that carries it back, the way
+# `f"Search error: {e}"` can when the exception quotes what it was asked.
+_QUERY = "John's codeword is AZURE-7731"
+_ERROR = f"Search error: no such column near {_QUERY!r}"
+
+
+@pytest.mark.parametrize(
+    ("answer", "fields"),
+    [
+        (_ENVELOPE, "reason=error keys=error,hint,results,unsupported_capability"),
+        ({"error": _ERROR, "results": []}, "reason=error keys=error,results"),
+        ({"error": _ERROR}, "reason=error keys=error"),
+        ({"total": 0}, "reason=no_results keys=total"),
+        (None, "reason=not_a_dict type=NoneType"),
+    ],
+)
+def test_a_search_upstream_could_not_serve_logs_one_warning(
+    fake_mempalace, tmp_path, caplog, answer, fields
+):
+    """An agent woke with no memories and nothing said why (issue #617): the recall line of a failed
+    search reads ``injected=0``, exactly like a palace with nothing relevant. One WARNING now says
+    so, naming only the answer's shape and its field names: never the query and never upstream's
+    error text, which can carry it. What `search` returns does not change."""
+    _, searcher = fake_mempalace
+    searcher.result = answer
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        hits = MemPalaceMemoryProvider(palace).search(_QUERY, 5, surface="turn0")
+
+    assert hits == []
+    (warning,) = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert warning.getMessage() == (
+        f"memory op=search result=failed provider=mempalace surface=turn0 {fields}"
+    )
+    for record in caplog.records:
+        assert "AZURE" not in record.getMessage()
+        assert "Search error" not in record.getMessage()
+    assert any(r.getMessage().startswith("memory recall ") for r in caplog.records)
+
+
+def test_a_search_that_answers_logs_no_warning(fake_mempalace, tmp_path, caplog):
+    """An empty ranking is an answer, not a failure: a palace with nothing relevant stays quiet."""
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    for result in ({"results": []}, {"results": [{"text": "John lives in Dallas."}]}):
+        searcher.result = result
+        with caplog.at_level("INFO", logger="basecradle_harness"):
+            MemPalaceMemoryProvider(palace).search("where does John live", 5)
+
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
 def test_context_is_none_when_the_backend_cannot_do_lexical_search(fake_mempalace, tmp_path):
     """Graceful degradation: a backend without `lexical_search` errors, and we simply skip.
 
-    `search_memories` answers a union request it cannot serve with an error dict carrying no
-    ``results`` key. Turn-0 composition just omits the memory section — never a crash.
+    `search_memories` answers a union request it cannot serve with its error envelope, ``error``
+    beside an empty ``results`` (MemPalace 3.9 and 3.10). Turn-0 composition just omits the memory
+    section — never a crash.
     """
     _, searcher = fake_mempalace
-    searcher.result = {"error": "backend does not support lexical_search"}
+    searcher.result = _ENVELOPE
     palace = tmp_path / "palace"
     palace.mkdir()
 
@@ -561,11 +657,11 @@ def test_search_tool_before_the_palace_exists_reports_a_miss(fake_mempalace, tmp
 
 
 def test_search_tool_degrades_when_the_backend_cannot_do_lexical_search(fake_mempalace, tmp_path):
-    """A backend that can't serve the union request answers with an error dict and no `results`
-    key — which reads as a miss, exactly as it does for `context`. Memory degrades; nothing raises.
+    """A backend that can't serve the union request answers with its error envelope, which reads
+    as a miss, exactly as it does for `context`. Memory degrades; nothing raises.
     """
     _, searcher = fake_mempalace
-    searcher.result = {"error": "backend does not support lexical_search"}
+    searcher.result = _ENVELOPE
     palace = tmp_path / "palace"
     palace.mkdir()
 

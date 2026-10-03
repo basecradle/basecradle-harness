@@ -39,6 +39,16 @@ palaces holding the same drawers probe the same ones, and ``--filed-before`` hol
 still while a live palace keeps growing. The sample ends with one comparable summary line, and two
 reports with the same sample digest and the same failing digest failed on the same drawers.
 
+**The reranked path, with no model call: ``--sample N --reranked-pool``** (issue #617). The sample
+above runs the search with the reranker off, which is not the path a fleet agent with a reranker
+takes: there `search` asks MemPalace for ``pool_size(10)`` = 20 and a model picks 10 of them, so a
+drawer outside those 20 can never be recalled. This mode answers, for the same sample, whether each
+probe's own drawer is among the 20 handed to the reranker today (arm A), and among the first 20 of
+an ask for 40 (arm B, the candidate rule), and reports how many each arm finds and how many one
+finds that the other misses. Both arms fetch through the provider's own ranking call, so registry
+sentinels are dropped as `search` drops them; the reranker itself never runs. Exit 0 only when arm
+A holds every probe drawer.
+
 **A miss is diagnosed, never printed.** A probe that does not come back gets a ``why:`` line made of
 ids, counts and ranks: how many drawers carry its exact text or its query, what took the top slots,
 where it ranks in a deeper fetch and in the vector index alone, and whether the index finds it by
@@ -57,6 +67,7 @@ import hashlib
 import io
 import logging
 import os
+import statistics
 import sys
 import time
 from collections import Counter
@@ -106,6 +117,14 @@ _ASK = candidate_pool(_TOP, reranked=False)
 #: How many candidates that search asks the vector index for: MemPalace 3.9 asks for three times
 #: the requested count (``_candidate_pool_size``) and, in union mode, keeps the nearest ``_ASK``.
 _VECTOR_ASK = 3 * _ASK
+
+#: The pool a reranked top-10 search hands its reranker: the harness's own ask with a reranker
+#: bound (`pool_size`), all of it kept. Arm A of ``--reranked-pool`` (issue #617).
+_RERANK_POOL = candidate_pool(_TOP, reranked=True)
+
+#: Arm B of ``--reranked-pool``, the candidate rule: ask MemPalace for twice that pool and hand the
+#: reranker the first `_RERANK_POOL` of the ranking.
+_CANDIDATE_ASK = 2 * _RERANK_POOL
 
 #: Hex characters of a digest. Sixty-four bits: two reports compared by eye never collide by chance.
 _DIGEST_CHARS = 16
@@ -674,6 +693,73 @@ def diagnose(
     ), verdict
 
 
+@dataclass
+class PoolComparison:
+    """What ``--reranked-pool`` found: drawer ids per arm, and each arm's search times."""
+
+    #: Probes whose own drawer is in the pool today's rule hands the reranker.
+    today: set[str] = field(default_factory=set)
+    #: Probes whose own drawer is in the pool the candidate rule would hand it.
+    candidate: set[str] = field(default_factory=set)
+    today_seconds: list[float] = field(default_factory=list)
+    candidate_seconds: list[float] = field(default_factory=list)
+
+
+def compare_pools(provider: MemPalaceMemoryProvider, rows) -> PoolComparison:
+    """For each probe, whether its own drawer reaches the reranker under each rule (issue #617).
+
+    **Arm A, today's rule:** ask MemPalace for `_RERANK_POOL` (``pool_size(10)``) and keep all of
+    it, which is what `MemPalaceMemoryProvider.search` hands a bound reranker. **Arm B, the
+    candidate rule:** ask for `_CANDIDATE_ASK` and keep the first `_RERANK_POOL`. Both are fetched
+    by the provider's own `MemPalaceMemoryProvider._ranking`, the call `search` makes, so registry
+    sentinels are dropped and the fetch widened exactly as there. No reranker runs: the question is
+    what the model would be shown, not what it would pick, so the answer costs no model call.
+
+    A drawer in the pool is not a drawer recalled (the reranker still picks 10 of it); a drawer
+    outside it can never be recalled, whatever the model would have chosen.
+    """
+    found = PoolComparison()
+    for drawer_id, _, text in rows:
+        query = query_of(text)
+        for ask, ids, seconds in (
+            (_RERANK_POOL, found.today, found.today_seconds),
+            (_CANDIDATE_ASK, found.candidate, found.candidate_seconds),
+        ):
+            started = time.monotonic()
+            hits, _, _ = provider._ranking(query, ask=ask, need=_RERANK_POOL, surface=SURFACE_TOOL)
+            seconds.append(time.monotonic() - started)
+            if drawer_id in [hit.get("drawer_id") for hit in hits[:_RERANK_POOL]]:
+                ids.add(drawer_id)
+    return found
+
+
+def _median(seconds: list[float]) -> str:
+    return f"{statistics.median(seconds):.3f}s" if seconds else "n/a"
+
+
+def _report_pools(pools: PoolComparison, rows) -> None:
+    """The ``--reranked-pool`` report: one line per arm, then the summary two reports compare on."""
+    probes_n = len(rows)
+    print(
+        f"reranked pool arm A (ask {_RERANK_POOL}, keep {_RERANK_POOL}): found {len(pools.today)} "
+        f"of {probes_n}, median search {_median(pools.today_seconds)}"
+    )
+    print(
+        f"reranked pool arm B (ask {_CANDIDATE_ASK}, keep first {_RERANK_POOL}): found "
+        f"{len(pools.candidate)} of {probes_n}, median search {_median(pools.candidate_seconds)}"
+    )
+    gained = pools.candidate - pools.today
+    lost = pools.today - pools.candidate
+    # Last, because it is the line two reports are compared on: the same sample digest and the same
+    # per-arm digests mean the same drawers moved.
+    print(
+        f"reranked summary: probes {probes_n}, sample digest {digest(row[0] for row in rows)}, "
+        f"arm A found {len(pools.today)}, arm B found {len(pools.candidate)}, "
+        f"B finds A misses {len(gained)} (digest {digest(gained)}), "
+        f"A finds B misses {len(lost)} (digest {digest(lost)})"
+    )
+
+
 def _cutoff(value: str) -> datetime:
     """``--filed-before``: an ISO timestamp, naive, because MemPalace's ``filed_at`` is naive."""
     try:
@@ -761,9 +847,22 @@ def main(argv: list[str] | None = None) -> int:
             "as a copy taken at TIME."
         ),
     )
+    parser.add_argument(
+        "--reranked-pool",
+        action="store_true",
+        help=(
+            f"with --sample: measure the reranked path instead, with no model call. For each "
+            f"probe, is its own drawer in the {_RERANK_POOL} candidates a reranked search hands "
+            f"its reranker today (ask {_RERANK_POOL}, arm A), and in the first {_RERANK_POOL} of "
+            f"an ask for {_CANDIDATE_ASK} (arm B)? Ends with one summary line of both arms. Exit 0 "
+            f"only if arm A holds every probe drawer."
+        ),
+    )
     args = parser.parse_args(argv)
     if args.filed_before is not None and args.sample is None:
         parser.error("--filed-before applies to --sample")
+    if args.reranked_pool and args.sample is None:
+        parser.error("--reranked-pool applies to --sample")
     if args.dry_run and not args.register_off_wing:
         parser.error("--dry-run applies to --register-off-wing")
 
@@ -839,21 +938,31 @@ def main(argv: list[str] | None = None) -> int:
         index = Index(found)
         failing: list[str] = []
         verdicts: Counter[str] = Counter()
-        for row in rows:
-            drawer_id, meta, text = row
-            hits = provider.search(query_of(text), _TOP, surface=SURFACE_TOOL)
-            ok = drawer_id in [hit.get("drawer_id") for hit in hits]
-            if ok and args.sample:
-                continue
-            print(
-                f"{'PASS' if ok else 'FAIL'}: drawer {drawer_id} (filed {meta.get('filed_at')}, "
-                f"source {meta.get('source_file')})"
-            )
-            if not ok:
-                failing.append(drawer_id)
-                line, verdict = diagnose(provider, collection, index, row, hits)
-                verdicts[verdict] += 1
-                print(line)
+        pools = compare_pools(provider, rows) if args.reranked_pool else None
+        if pools is not None:
+            failing = [row[0] for row in rows if row[0] not in pools.today]
+            for label, ids in (
+                ("arm B only", pools.candidate - pools.today),
+                ("arm A only", pools.today - pools.candidate),
+            ):
+                for drawer_id in sorted(ids):
+                    print(f"{label}: drawer {drawer_id}")
+        else:
+            for row in rows:
+                drawer_id, meta, text = row
+                hits = provider.search(query_of(text), _TOP, surface=SURFACE_TOOL)
+                ok = drawer_id in [hit.get("drawer_id") for hit in hits]
+                if ok and args.sample:
+                    continue
+                print(
+                    f"{'PASS' if ok else 'FAIL'}: drawer {drawer_id} (filed {meta.get('filed_at')}, "
+                    f"source {meta.get('source_file')})"
+                )
+                if not ok:
+                    failing.append(drawer_id)
+                    line, verdict = diagnose(provider, collection, index, row, hits)
+                    verdicts[verdict] += 1
+                    print(line)
         if not args.sample:
             where = (
                 "filed at another location" if elsewhere else "any location (none filed elsewhere)"
@@ -876,16 +985,21 @@ def main(argv: list[str] | None = None) -> int:
                 f"sample population: {drawn.population} drawers ({cutoff}); "
                 f"sample digest {digest(row[0] for row in rows)}"
             )
-            print(
-                "failed by verdict: "
-                + ", ".join(f"{v} {verdicts[v]}" for v in ("twin", "cut", "crowded", "unreached"))
-            )
-            # Last, because it is the line two reports are compared on: the same probes and the
-            # same failing digest mean the same drawers failed.
-            print(
-                f"sample summary: probes {len(rows)}, passed {len(rows) - len(failing)}, "
-                f"failed {len(failing)}, failing digest {digest(failing)}"
-            )
+            if pools is not None:
+                _report_pools(pools, rows)
+            else:
+                print(
+                    "failed by verdict: "
+                    + ", ".join(
+                        f"{v} {verdicts[v]}" for v in ("twin", "cut", "crowded", "unreached")
+                    )
+                )
+                # Last, because it is the line two reports are compared on: the same probes and
+                # the same failing digest mean the same drawers failed.
+                print(
+                    f"sample summary: probes {len(rows)}, passed {len(rows) - len(failing)}, "
+                    f"failed {len(failing)}, failing digest {digest(failing)}"
+                )
     except ImportError as error:
         print(f"{PROG}: {error}", file=sys.stderr)
         return 1
