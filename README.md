@@ -127,6 +127,8 @@ Both tag literals are stripped from a hit's text before it is fenced, case-insen
 
 It also gives the model **one read-only tool, `memory_search`** — deliberate recall beside the automatic kind. Turn-0 injection happens *once* per wake, against the incoming message's text; a memory the agent turns out to need mid-task, and that the top-K didn't surface, would otherwise be unreachable for the rest of that wake ("what was that endpoint we discussed in March?"). The tool is the way back to the palace with a query the model writes itself — the same in-process search `context` runs, and **no write surface**: `observe` stays the palace's only writer, so there is no concurrent-writer problem to solve.
 
+**Recall asks MemPalace for four times what it keeps** ([issue #611](https://github.com/basecradle/basecradle-harness/issues/611)). MemPalace's union search keeps only as many vector candidates as it was asked for before it ranks, so a drawer outside them scores on BM25 alone (at most 0.4 of a full score) and loses to any close vector match, even when full scoring would rank it first. Asking for four times the count and keeping the first ones lets those drawers compete. On a real palace, misses of this kind were more than a quarter of all misses; on a synthetic palace built to produce them, four times recovered 13 of 20 for about 9 ms per recall, and lost no drawer the old search found. This applies with the [reranker](#let-a-model-pick-what-gets-recalled--the-llm-reranker) off; with it on, the pool is already wider.
+
 **The `mempalace` CLI reaches the same palace, with no flags.** MemPalace ships its own command line, and it defaults to `~/.mempalace/palace` — right for the one-human-one-AI install it was written for, wrong for a harness agent whose palace lives under *its* home. So when a MemPalace-provider agent binds, the harness writes the path it just bound into `~/.mempalace/config.json`, the file every `mempalace` command reads when you give it no `--palace`. A bare `mempalace status` or `mempalace search "…"` then operates on the agent's live palace instead of an empty directory it has never used:
 
 ```console
@@ -162,7 +164,7 @@ pip install 'basecradle-harness[openai,mempalace,openrouter]'
 
 | Var | Meaning |
 |---|---|
-| `HARNESS_MEMPALACE_RERANK_MODEL` | The OpenRouter model id that reranks (e.g. `z-ai/glm-5.3-flash`). **Unset = off**: the same query, no pool widening, no rerank call, the SDK never imported |
+| `HARNESS_MEMPALACE_RERANK_MODEL` | The OpenRouter model id that reranks (e.g. `z-ai/glm-5.3-flash`). **Unset = off**: the plain hybrid search (asking for four times the count and keeping the first ones, see above), no rerank call, the SDK never imported |
 | `HARNESS_MEMPALACE_RERANK_API_KEY` | An OpenRouter key **dedicated to reranking**. Required when the model is set, and it never falls back to `AI_API_KEY` — so an agent whose brain is OpenAI or xAI reranks without the two credentials ever meeting |
 | `HARNESS_MEMPALACE_RERANK_PROVIDERS` | Comma-separated OpenRouter provider slugs, sent as `provider: {only: […], allow_fallbacks: true, data_collection: "deny"}`. Required when the model is set. There is deliberately **no default list in the code**: which endpoints are acceptable is a jurisdiction and data-policy decision with a date on it, and a vendor list baked into a package goes stale where nobody can see it. The **list** is the guarantee, not the fallback flag — `only` restricts the pool outright, so a fallback retries *inside* your slugs and never outside them |
 
@@ -257,7 +259,7 @@ basecradle-harness-palace-check --sample 500 --filed-before 2026-10-02T07:00:00 
 **Every miss is diagnosed, and no drawer text is ever printed,** in either mode. A `why:` line under each failure gives ids, counts and ranks only. It reports where the drawer ranks in a top-100 search and in the vector half of a top-10 search, whether the vector index returns it for its own embedding, and how many drawers carry its exact text or its query. It also reports how many of the drawers that took the top 10 share its text, its query, its content hash or its source file. The probe's query is the first 400 characters of the drawer, while the drawer's embedding covers the whole chunk, so a drawer is not guaranteed to be nearest to its own query. The verdict names one of four causes:
 
 - **`twin`.** A drawer with identical text holds a top-10 slot, so the memory is recalled under another id. This happens when more copies of one exchange exist than there are slots.
-- **`cut`.** Full scoring would place the drawer in the top 10, since a top-100 search does. But MemPalace's union search keeps only the ten nearest vector candidates before it ranks, and this drawer was not among them, so its vector score was dropped and it never got to compete.
+- **`cut`.** Full scoring would place the drawer in the top 10, since a top-100 search does. But MemPalace's union search keeps only as many of the nearest vector candidates as the harness asks it for (four times the ten it keeps) before it ranks, and this drawer was not among them, so its vector score was dropped and it never got to compete.
 - **`crowded`.** Even on full scoring the drawer ranks below 10, and no identical copy holds a slot. Near copies sharing its query typically take the slots.
 - **`unreached`.** The drawer is not in the top 100 at all. With `vector self-query no`, the index itself has lost it.
 
@@ -1238,7 +1240,7 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   MemPalace keeps bookkeeping rows in the palace, one `[registry] <path>` row for each file it has already processed, and its search returns them like memories. Recall drops them. When some were dropped, the line says how many (`sentinels=`), and `fetched=` says how far the search widened to make up the count, to at most eight times the pool. A home-directory rename adds one such row per conversation file, so these two fields are where a relocated palace shows up:
 
   ```
-  INFO memory recall provider=mempalace surface=turn0 rerank=off pool=10 injected=10 duration=0.31s chars=6461 sentinels=14 fetched=20
+  INFO memory recall provider=mempalace surface=turn0 rerank=off pool=40 injected=10 duration=0.31s chars=6461 sentinels=44 fetched=80
   ```
 
   And a describe, on an agent with a [describer](#give-a-blind-model-eyes--the-describer) configured:

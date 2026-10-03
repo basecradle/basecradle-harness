@@ -107,7 +107,7 @@ _log = logging.getLogger("basecradle_harness")
 RERANK_KIND = "rerank"
 
 #: The OpenRouter model id that reranks — **and the feature's only switch**. Absent or empty means
-#: rerank is off: plain hybrid retrieval, byte-identical to the behaviour before this module, and
+#: rerank is off: plain hybrid retrieval (at the unranked headroom, issue #611), no model call, and
 #: no rerank log line at all. There is deliberately no ``…_ENABLED`` companion; two ways to say the
 #: same thing is one way to disagree with yourself.
 RERANK_MODEL_VAR = "HARNESS_MEMPALACE_RERANK_MODEL"

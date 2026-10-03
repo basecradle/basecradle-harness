@@ -29,7 +29,13 @@ from basecradle_harness._mempalace import (
     MAX_N_RESULTS,
     MemPalaceMemoryProvider,
     MemPalaceSearchTool,
+    candidate_pool,
 )
+
+
+def _unranked(wanted):
+    """What a rerank-off search asks MemPalace for, to return ``wanted`` (issue #611)."""
+    return candidate_pool(wanted, reranked=False)
 
 
 def _scope(query=None):
@@ -104,7 +110,8 @@ def test_context_renders_top_k_hits_into_a_block(fake_mempalace, tmp_path):
     # (retrieval is on the wake path; a second search would double the vector + FTS work).
     assert len(searcher.queries) == 1
     query, palace_path, kwargs = searcher.queries[0]
-    assert (query, palace_path, kwargs["n_results"]) == ("where does john live", str(palace), 3)
+    assert (query, palace_path) == ("where does john live", str(palace))
+    assert kwargs["n_results"] == _unranked(3)
 
 
 def test_the_framing_sentence_names_mempalace_and_disclaims_instruction(fake_mempalace, tmp_path):
@@ -290,20 +297,35 @@ def test_a_short_page_is_searched_once(fake_mempalace, tmp_path):
     hits = MemPalaceMemoryProvider(palace).search("hey nova", 5)
 
     assert [hit["text"] for hit in hits] == [_memory(1)["text"]]
-    assert [q[2]["n_results"] for q in searcher.queries] == [5]
+    assert [q[2]["n_results"] for q in searcher.queries] == [_unranked(5)]
 
 
 def test_dropped_sentinels_are_made_up_by_widening_the_fetch(fake_mempalace, tmp_path):
     """The requested count still comes back when real memories sit behind the sentinels."""
     _, searcher = fake_mempalace
-    _ranked(searcher, [_sentinel(n) for n in range(30)] + [_memory(n) for n in range(20)])
+    pool = _unranked(10)
+    _ranked(searcher, [_sentinel(n) for n in range(3 * pool)] + [_memory(n) for n in range(20)])
     palace = tmp_path / "palace"
     palace.mkdir()
 
     hits = MemPalaceMemoryProvider(palace).search("hey nova", 10)
 
     assert [hit["text"] for hit in hits] == [_memory(n)["text"] for n in range(10)]
-    assert [q[2]["n_results"] for q in searcher.queries] == [10, 20, 40]
+    assert [q[2]["n_results"] for q in searcher.queries] == [pool, 2 * pool, 4 * pool]
+
+
+def test_the_headroom_is_never_widened_to_refill(fake_mempalace, tmp_path):
+    """Without a reranker only the requested count is kept, so a fetch that dropped a sentinel and
+    still holds that many memories is enough: the headroom past them is ranking context (#611)."""
+    _, searcher = fake_mempalace
+    _ranked(searcher, [_sentinel(0)] + [_memory(n) for n in range(100)])
+    palace = tmp_path / "palace"
+    palace.mkdir()
+
+    hits = MemPalaceMemoryProvider(palace).search("hey nova", 10)
+
+    assert [hit["text"] for hit in hits] == [_memory(n)["text"] for n in range(10)]
+    assert [q[2]["n_results"] for q in searcher.queries] == [_unranked(10)]
 
 
 def test_the_widening_stops_at_its_cap(fake_mempalace, tmp_path):
@@ -315,8 +337,9 @@ def test_the_widening_stops_at_its_cap(fake_mempalace, tmp_path):
     palace.mkdir()
     provider = MemPalaceMemoryProvider(palace)
 
+    pool = _unranked(10)
     assert provider.search("hey nova", 10) == []
-    assert [q[2]["n_results"] for q in searcher.queries] == [10, 20, 40, 80]
+    assert [q[2]["n_results"] for q in searcher.queries] == [pool, 2 * pool, 4 * pool, 8 * pool]
     assert provider.context(_scope(query="hey nova")) is None
 
 
@@ -328,7 +351,9 @@ def test_a_palace_without_sentinels_is_searched_exactly_once(fake_mempalace, tmp
 
     MemPalaceMemoryProvider(palace).search("hey nova", 10)
 
-    assert [q[2] for q in searcher.queries] == [{"n_results": 10, "candidate_strategy": "union"}]
+    assert [q[2] for q in searcher.queries] == [
+        {"n_results": _unranked(10), "candidate_strategy": "union"}
+    ]
 
 
 def test_the_recall_line_names_dropped_sentinels_only_when_there_were_some(
@@ -352,12 +377,14 @@ def test_the_recall_line_names_dropped_sentinels_only_when_there_were_some(
     clean = recall_line()
     assert "sentinels=" not in clean and "fetched=" not in clean
 
-    _ranked(searcher, [_sentinel(n) for n in range(7)] + [_memory(n) for n in range(20)])
+    pool = _unranked(5)
+    _ranked(searcher, [_sentinel(n) for n in range(pool)] + [_memory(n) for n in range(20)])
     provider.search("hey nova", 5)
     polluted = recall_line()
-    # 5 (all sentinels) → 10 (three memories) → 20 (thirteen): the last fetch dropped all seven.
-    assert "sentinels=7" in polluted
-    assert "fetched=20" in polluted
+    # The pool (all sentinels) → twice it (as many memories): the last fetch dropped them all.
+    assert f"sentinels={pool}" in polluted
+    assert f"fetched={2 * pool}" in polluted
+    assert f"pool={pool}" in polluted
     assert "injected=5" in polluted
 
 
@@ -475,7 +502,7 @@ def test_search_tool_recalls_through_the_same_union_search_as_context(fake_mempa
     # The provider's default when the model names no count — read from the constant, so a
     # deliberate change to it (5 → 8 in issue #464, → 10 in issue #466) stays one edit rather than
     # a hunt for literals.
-    assert kwargs["n_results"] == DEFAULT_N_RESULTS
+    assert kwargs["n_results"] == _unranked(DEFAULT_N_RESULTS)
 
 
 def test_search_tool_clamps_a_model_chosen_bound(fake_mempalace, tmp_path):
@@ -496,10 +523,10 @@ def test_search_tool_clamps_a_model_chosen_bound(fake_mempalace, tmp_path):
     tool.run(query="anything", n_results=8)
 
     assert [kwargs["n_results"] for _q, _p, kwargs in searcher.queries] == [
-        MAX_N_RESULTS,
-        1,
-        DEFAULT_N_RESULTS,  # a string is not an integer bound — fall back to the default
-        8,
+        _unranked(MAX_N_RESULTS),
+        _unranked(1),
+        _unranked(DEFAULT_N_RESULTS),  # a string is not an integer bound — fall back to the default
+        _unranked(8),
     ]
 
 
