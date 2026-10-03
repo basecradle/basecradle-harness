@@ -40,6 +40,7 @@ from basecradle_harness._rerank import (
     SURFACE_TOOL,
     SURFACE_TURN0,
     MemPalaceReranker,
+    RerankReport,
     pool_size,
     providers_from_env,
     reranker_from_env,
@@ -317,6 +318,68 @@ def test_an_empty_pool_never_calls_the_model(router):
     route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
     assert reranker().rerank("q", [], 5, surface=SURFACE_TURN0) == []
     assert not route.called
+
+
+# === What a rerank reports, for a caller that measures (issue #627) ==============
+
+
+def test_the_last_report_carries_what_the_line_says(router):
+    """The palace check's end-to-end mode charges its token ceiling from this, so it must say what
+    the one ``llm`` line says, read the same way."""
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1, 2))))
+    measured = reranker()
+    measured.rerank("q", hits(20), 2, surface=SURFACE_TOOL)
+    assert measured.last_report == RerankReport(
+        outcome="ok", reason=None, tokens_in=4812, tokens_out=611, cost=0.000846
+    )
+
+
+def test_an_unusable_answer_reports_its_reason_and_its_bill(router):
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion("no idea")))
+    measured = reranker()
+    measured.rerank("q", hits(20), 2, surface=SURFACE_TOOL)
+    assert measured.last_report.outcome == "fallback"
+    assert measured.last_report.reason == "parse"
+    assert measured.last_report.tokens_in == 4812  # a parse failure was still billed
+
+
+def test_a_usage_block_of_zeros_reports_no_tokens_and_no_cost(router):
+    """Honest absence, as the line keeps it (issue #488): zeros stated nothing."""
+    zeros = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "cost": 0}
+    body = completion(picks(1), usage=zeros)
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+    measured = reranker()
+    measured.rerank("q", hits(20), 1, surface=SURFACE_TOOL)
+    assert measured.last_report == RerankReport(outcome="ok", reason=None)
+
+
+def test_a_fault_with_no_call_reports_no_tokens(router):
+    measured = MemPalaceReranker(model=MODEL, fault="config:missing_api_key")
+    measured.rerank("q", hits(20), 2, surface=SURFACE_TOOL)
+    assert measured.fault == "config:missing_api_key"
+    assert measured.last_report == RerankReport(outcome="fallback", reason="config:missing_api_key")
+
+
+def test_a_retried_timeout_is_reported_as_an_uncertain_attempt_and_a_429_is_not(router):
+    """A timed-out request may have been generated and billed; a refused one was not."""
+    ok = httpx.Response(200, json=completion(picks(1)))
+    route = router.post(CHAT_URL)
+    route.side_effect = [httpx.ReadTimeout("timed out"), ok]
+    measured = reranker()
+    measured.rerank("q", hits(20), 1, surface=SURFACE_TOOL)
+    assert measured.last_report.uncertain_attempts == 1
+
+    route.side_effect = [rate_limited(), httpx.Response(200, json=completion(picks(1)))]
+    measured.rerank("q", hits(20), 1, surface=SURFACE_TOOL)
+    assert measured.last_report.uncertain_attempts == 0
+
+
+def test_an_empty_pool_clears_the_last_report(router):
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+    measured = reranker()
+    measured.rerank("q", hits(20), 1, surface=SURFACE_TOOL)
+    measured.rerank("q", [], 1, surface=SURFACE_TOOL)
+    assert measured.last_report is None
 
 
 # === The log lines ============================================================

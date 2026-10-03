@@ -343,7 +343,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
         return hits
 
     def _ranking(
-        self, query: str, *, ask: int, need: int, surface: str
+        self,
+        query: str,
+        *,
+        ask: int,
+        need: int,
+        surface: str,
+        max_distance: float | None = None,
     ) -> tuple[list[dict], int, int]:
         """MemPalace's hybrid ranking for `query`, sentinels dropped: ``(hits, fetch, sentinels)``.
 
@@ -354,23 +360,30 @@ class MemPalaceMemoryProvider(MemoryProvider):
         here; bounding them is the caller's. The palace check calls this with the reranked asks
         (issue #617), so what it measures is fetched exactly the way `search` fetches.
 
+        ``max_distance`` exists for the palace check's end-to-end measurement alone (issue #627),
+        which compares a search with one against today's. `search` never passes it, and ``None``
+        sends nothing, so the request is byte-for-byte the one below the comment.
+
         An answer from upstream that is an error envelope, or no list of results at all, reads as
         no hits, and logs one WARNING (`_log_search_failure`).
         """
         searcher = _import("searcher")
         fetch = ask
         while True:
-            # Never pass `max_distance`: through MemPalace 3.8.0 (and so at this package's
+            # `search` never passes `max_distance` (only the palace check's measurement does, issue
+            # #627): through MemPalace 3.8.0 (and so at this package's
             # 3.7.1 floor) upstream's union merge opens with `if max_distance > 0.0: return`, so
             # *any* distance threshold silently disables the BM25 half of the pool and
             # `candidate_strategy` above becomes a no-op. Since 3.9.0 (MemPalace#1964) a
             # threshold instead scores each lexical hit on its real vector distance; whether to
             # use that is issue #625. Until the floor moves, we keep the recall. Pinned by test.
+            threshold = {} if max_distance is None else {"max_distance": max_distance}
             result = searcher.search_memories(
                 query,
                 str(self.palace_path),
                 n_results=fetch,
                 candidate_strategy=_CANDIDATE_STRATEGY,
+                **threshold,
             )
             raw = result.get("results") if isinstance(result, dict) else None
             if not isinstance(raw, list) or (isinstance(result, dict) and "error" in result):

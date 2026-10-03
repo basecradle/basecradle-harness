@@ -216,7 +216,7 @@ The palace resolves the way a wake resolves it (`MEMPALACE_PALACE_PATH`, else `$
 
 ### Check a palace after a home move — `basecradle-harness-palace-check`
 
-MemPalace records every drawer's source as an absolute path, so renaming an agent's home directory leaves the palace holding paths under a home that no longer exists. This command proves the palace still works from where it is now. It makes **no platform call and no model call**, and it is **read-only** by default. It writes no drawer, row, metadata value or embedding. ChromaDB still rewrites bytes in its own storage files whenever the palace is opened, even read-only, so compare palaces by their contents, never by a checksum of the directory:
+MemPalace records every drawer's source as an absolute path, so renaming an agent's home directory leaves the palace holding paths under a home that no longer exists. This command proves the palace still works from where it is now. It makes **no platform call and no model call** (the one exception is [`--end-to-end`](#the-final-10-through-the-agents-own-reranker----end-to-end), which says so and takes a token ceiling), and it is **read-only** by default. It writes no drawer, row, metadata value or embedding. ChromaDB still rewrites bytes in its own storage files whenever the palace is opened, even read-only, so compare palaces by their contents, never by a checksum of the directory:
 
 ```bash
 basecradle-harness-palace-check /home/<user>/harness    # or set $HARNESS_HOME and pass nothing
@@ -269,6 +269,40 @@ reranked summary: probes N, sample digest S, arm A found A, arm B found B, B fin
 ```
 
 It exits 0 only when arm A holds every probe drawer. A drawer in the pool is not a drawer recalled (the model still picks 10 of the 20); a drawer outside it is a drawer the model never sees.
+
+#### The final 10, through the agent's own reranker — `--end-to-end`
+
+`--reranked-pool` says whether a drawer reaches the reranker; `--end-to-end` says whether it is **in the 10 the agent is shown** after the reranker picks. It runs each probe through the agent's own reranker (the production `MemPalaceReranker.rerank`, built from the agent's `HARNESS_MEMPALACE_RERANK_*` variables, which must be set in the environment it runs in) over a pool fetched exactly as the agent's search fetches it. It changes no search behaviour and is read-only on the palace. **It spends rerank-model tokens**, so it needs a ceiling:
+
+```bash
+basecradle-harness-palace-check --sample 150 --rare-token-probes 100 --end-to-end --token-ceiling 1600000 --dry-run /home/<user>/harness   # the estimate, no model call
+basecradle-harness-palace-check --sample 150 --rare-token-probes 100 --end-to-end --token-ceiling 1600000 /home/<user>/harness
+```
+
+Every probe runs four arms, in the order 1, 2, 3, 1R:
+
+| Arm | Ask MemPalace for | `max_distance` | Reranker reads | Keeps |
+|---|---|---|---|---|
+| 1 | 20 | not passed (today's search) | 20 | 10 |
+| 1R | arm 1 again | | | |
+| 2 | 20 | 2.0 | 20 | 10 |
+| 3 | 40 | 2.0 | 40 | 10 |
+
+Arm 1R is arm 1 run a second time, fetch and rerank both; how much it disagrees with arm 1 is the noise floor, and a difference between arms smaller than that is not a result. On MemPalace 3.9 and later, on a cosine palace, `max_distance=2.0` filters nothing by distance but scores a lexical-only candidate on its real vector distance instead of on BM25 alone; a lexical hit whose stored embedding cannot be loaded is dropped, and arms 2 and 3 count those drops (and how many probe drawers a drop kept out of the pool). The mode refuses to run where the arms would measure something else: before MemPalace 3.9, where a threshold switches the lexical half off entirely, and on a palace whose distance metric is not cosine, where 2.0 would also cut vector candidates.
+
+There are two kinds of probe, reported separately. **Head probes** (`--sample N`) query the opening text of the drawer, drawn exactly as `--sample` draws them. **Rare-token probes** (`--rare-token-probes M`) query nothing but the drawer's rarest exact token, by how many drawers in the palace carry it, read the way MemPalace's BM25 reads tokens (at least three characters). A drawer whose rarest token is carried by more than three drawers is skipped and counted.
+
+For each kind and arm the report gives the probe count, how many probe drawers were in the pool handed to the reranker, how many were in the final 10, the reranker outcomes (ok, or fallback by reason), the median search time, the tokens in and out and the cost the vendor reported, and, for arms 2 and 3, the lexical drops. Two more lines per arm follow. **Misses by stage** tags every miss by where it happened: the drawer was not in the pool at all, or it was in the pool and the reranker did not pick it. **Twins** counts the palace check's `twin` outcome on its own: the drawer is not in the final 10 but a drawer with byte-identical text is, split by whether the drawer itself was in the pool (the reranker read both and took the copy) or not (only the copy was fetched). Each arm is then compared with arm 1, cut both ways: the drawers it gained and lost **in the pool** and **in the final 10**, each set with a digest, and how many probes had a fallback in either arm. It prints counts, drawer ids and digests only, never memory text or a query. It ends with one line to compare between runs:
+
+```
+end-to-end summary: complete; mempalace 3.9.0, metric cosine, rerank model …; head probes N (digest …), rare-token probes M (digest …); in final 10: head 1=… 1R=… 2=… 3=…; rare-token 1=… 1R=… 2=… 3=…; probes with a fallback: head 1=… 1R=… 2=… 3=…; rare-token …; tokens charged T of ceiling C (estimated E; calls charged at their estimate U)
+```
+
+The summary carries the fallback counts because a reranker that fell back hands back the hybrid order: that arm measured the search, not the reranker.
+
+**The ceiling is enforced in code.** Before any model call the mode estimates the whole run from the palace's mean drawer length, at three characters a token plus a full 1,024 output tokens a call, and refuses to start when the estimate is over the ceiling. During the run it fetches each probe's four pools first (no tokens), estimates those four calls from the exact requests the reranker will send (never at fewer tokens a character than the vendor has reported so far), and runs the probe only if that fits in what is left. A call is charged the tokens the vendor reported for it, in plus out; a call that reported nothing, or only half, is charged its estimate (or what it reported, if more); an attempt retried after a timeout or a dropped connection, and a call an interrupt cut short, each cost one estimate more, because the vendor may have billed them. One probe in flight can still run over its estimate (a model writing more than 1,024 output tokens, or text that tokenizes denser than anything seen so far); the next probe then does not start.
+
+**A run that cannot finish says so.** On the ceiling, a config-class reranker fault such as a rejected key, a search that returns an empty pool (a failed MemPalace search returns nothing and logs a WARNING), an interrupt, or any error, it stops, reports what it has, marked `PARTIAL`, and exits 1. A probe counts only once all four of its arms have run, so a stopped run holds the same probes in every arm, and an error is named by its class alone. Only a complete run exits 0. Progress goes to stderr every ten probes.
 
 **Every miss is diagnosed, and no drawer text is ever printed,** in either mode. A `why:` line under each failure gives ids, counts and ranks only. It reports where the drawer ranks in a top-100 search and in the vector half of a top-10 search, whether the vector index returns it for its own embedding, and how many drawers carry its exact text or its query. It also reports how many of the drawers that took the top 10 share its text, its query, its content hash or its source file. The probe's query is the first 400 characters of the drawer, while the drawer's embedding covers the whole chunk, so a drawer is not guaranteed to be nearest to its own query. The verdict names one of four causes:
 
