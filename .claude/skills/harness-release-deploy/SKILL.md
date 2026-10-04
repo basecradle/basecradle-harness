@@ -1,6 +1,6 @@
 ---
 name: harness-release-deploy
-description: Step-by-step procedure for releasing and deploying basecradle-harness — the OIDC Trusted-Publishing pipeline (v* tag → TestPyPI rehearsal → capital-approved pypi env-gate → PyPI), the contractual workflow/environment names, the four-owner build→publish→deploy→verify flow, the @jt verify (the token-free plumbing check, then the real model wake on a temporary timeline that proves the release), and a builder's local proof wake as @jt (which wakes the fleet's @jt too, so its timeline is deleted only after the capital confirms that wake ended). Use when cutting a release, proving a change with a local wake before it ships, bumping the version for a release, waiting on or reasoning about the pypi env-gate, or confirming a release reached and converged the fleet. The standing invariants (released ≠ deployed; no closing keyword on release PRs; the capital not @origin actuates publish) live in CLAUDE.md → Releasing.
+description: Step-by-step procedure for releasing and deploying basecradle-harness — the OIDC Trusted-Publishing pipeline (v* tag → TestPyPI rehearsal → capital-approved pypi env-gate → PyPI), the contractual workflow/environment names, the four-owner build→publish→deploy→verify flow, the @jt verify (the token-free plumbing check, then the real model wake on a temporary timeline that proves the release), and a builder's local proof wake as its own account `@basecradle-harness-ai` (no integration, so one wake, and the builder deletes its timeline once that wake has ended). Use when cutting a release, proving a change with a local wake before it ships, bumping the version for a release, waiting on or reasoning about the pypi env-gate, or confirming a release reached and converged the fleet. The standing invariants (released ≠ deployed; no closing keyword on release PRs; the capital not @origin actuates publish) live in CLAUDE.md → Releasing.
 ---
 
 # Harness Release + Deploy Procedure
@@ -66,22 +66,27 @@ Constitution baselines: **basecradle#362** (one deployer for the fleet's machine
    provider, say so in the completion comment so step 4b knows it carries the whole proof — never
    let green offline tests stand in for it silently.
 
-   **The local proof wake runs as @jt, and the fleet runs @jt too.** It is one platform account
-   with a live integration, so every event you cause on the temporary timeline (the task you
-   activate, the message you post) is delivered to the **deployed @jt on the fleet box** as well,
-   and the router wakes it. Every local proof wake is therefore **two wakes**, and that is a known
-   cost of testing as @jt, not a fault to work around:
-   - **A second model bill**, on the fleet's key, for a wake nobody asked for.
-   - **A second agent acting on the timeline.** The deployed @jt (on the *previous* release)
-     answers too, and its reply is authored by the same account as yours. Its create can even win
-     the idempotency key your local wake mints (same account, same anchor, same ordinal), so your
-     wake reports `posted=1` and the record it got back is the fleet's message. **Judge your
-     build from its own log lines** (the `context attribution`, `llm` and `wake end` lines, and
-     whatever the change added), never from a post on the timeline.
-   - **The fleet @jt's memory keeps the exchange**, by design, as it keeps every conversation.
+   **The local proof wake runs as `@basecradle-harness-ai`, this builder's own platform account,
+   never as @jt** (issue #640; @origin, 2026-10-03). @jt is a live agent on the fleet box with a
+   live integration, so a laptop wake under his login woke the deployed @jt as well: a second
+   model bill, a second agent answering under the same name (its create could even win the local
+   wake's idempotency key), test traffic in his memory, and a timeline nobody could safely delete
+   until the capital had read his journal (issue #632). `@basecradle-harness-ai` has **no
+   integration URL**, so nothing but the local build wakes on its timelines: one wake, a post that
+   is its own, and an ending the builder can see. It is @origin's 2026-08-30 ruling applied to a
+   login: a test suite is its own consumer and never shares a live agent's credential.
+
+   The credentials are `BASECRADLE_EMAIL` / `BASECRADLE_PASSWORD` in
+   `~/.config/basecradle/harness-test.env`, beside the suite's own provider keys. Source the file;
+   never print it. The wake mints its own token from those two. Sign-in is rate-limited, so a
+   script that also needs the SDK mints one token and reuses it.
 
    Run it like this:
-   1. Run the wake under a throwaway home, against a config home `basecradle-harness-install`
+   1. Create a temporary timeline as `@basecradle-harness-ai` and give the wake something to
+      engage. A task the account schedules for itself, activating now, is the usual trigger: the
+      wake skips the agent's own messages, but a task it set itself is meant to run. A test of the
+      message path needs a peer's message, which this one account cannot supply.
+   2. Run the wake under a throwaway home, against a config home `basecradle-harness-install`
       laid down (a wake with none narrates instead of posting, so it tests nothing production
       runs):
 
@@ -91,23 +96,21 @@ Constitution baselines: **basecradle#362** (one deployer for the fleet's machine
 
       `BASECRADLE_CONFIG_HOME` and `HARNESS_HOME` name scratch directories explicitly; they pass
       through the wrapper (issue #630).
-   2. **Never delete the temporary timeline yourself while the fleet's wake on it may be running.**
-      A delete under a live wake makes its next post fail (`No record exists for the given
-      UUID.`), it logs `ERROR post failed`, and that ERROR pages @origin. This happened on
-      2026-10-03 (issue #632): a timeline deleted about a minute after the local wake posted, with
-      the fleet's wake still mid-turn.
-   3. **You cannot tell from the laptop that the fleet's wake has ended**, and the platform does not
-      say. A reply from @jt is not the end of a wake: a wake goes on after it posts, and the
-      reply may be your own (see above). No reply is not the end either: silence is a legitimate
-      outcome (`posted=0`), and a wake can be mid-turn when you look. Its lifetime has no bound
-      you can wait out. The only evidence is the fleet box's journal: every `wake start
-      timeline=<uuid>` for that timeline has its `wake end` with the same `delivery=`. You
-      cannot read it (the laptop cannot reach @jt's box), so **the capital confirms it**.
-   4. So, when your proof is done: comment on your issue naming the timeline uuid, ask the
-      capital to confirm the fleet's wake on it has ended, and apply `needs-capital`. Delete the
-      timeline (`bc.timelines.get(uuid).delete()`) when the capital says it has, and say so on
-      the issue. The timeline is yours until then: you created it, so you delete it. An issue
-      whose `CLOSER:` is you is not closed while it is still standing.
+   3. Judge the build from its own log lines (the `context attribution`, `llm` and `wake end`
+      lines, and whatever the change added) **and** from what it posted. No other agent runs this
+      account, so a post on the timeline is the local build's own.
+   4. Delete the timeline yourself (`bc.timelines.get(uuid).delete()`) once the wake has ended:
+      its `wake end` line is written and the command has returned. Never while it runs. A delete
+      under a live wake fails its next post (`No record exists for the given UUID.`) and logs
+      `ERROR post failed`, which on the fleet pages @origin (issue #632). Say on the issue that
+      it is deleted. You created it, so you delete it, and an issue whose `CLOSER:` is you is not
+      closed while it is still standing.
+
+   **This holds only while `@basecradle-harness-ai` has no integration.** If this builder ever
+   moves to the fleet server and the account gets wake notifications turned on (an integration
+   pointed at the router), every event a laptop test causes wakes the fleet's copy too, and the
+   #632 collision is back under a new name. A separate, laptop-only test account is needed
+   **before** that integration is armed. The same note is on basecradle-noc#91.
 2. **Publish to PyPI — the capital.** Owns the `pypi` env-gate.
 3. **Deploy / converge the fleet (incl. @jt) — the NOC, the fleet's sole deployer.** The NOC reads
    each box's running version, compares it to the git-tracked desired state, and converges any
