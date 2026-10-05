@@ -882,6 +882,10 @@ def _endpoint(*, name, context_length, status=0, max_prompt_tokens=None):
         # every endpoint the live pool serves. Nothing here reads it — but a fixture the unmarshaller
         # rejects makes `context_limit()` degrade to `None` for every test below.
         "supports_tool_choice": {"none": True, "auto": True, "required": True, "function": True},
+        # Required since openrouter 1.3.15 (issue #646), and `{}` on every endpoint the live
+        # `z-ai/glm-5.2` pool serves (2026-10-04). Same story as `supports_tool_choice`: unread here,
+        # but without it the unmarshaller rejects the whole response.
+        "native_tools": {},
         "quantization": "fp8",
         "tag": f"{name.lower()}/fp8",
         "status": status,
