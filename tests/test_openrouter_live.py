@@ -17,6 +17,15 @@ run by ``addopts = -m 'not live'`` and skipped when no key is present. Run it de
 The capital re-runs it (with a valid OpenRouter key) at the release gate; this file makes that a
 repeatable command rather than a one-off manual probe.
 
+**Every client here can be pointed at a regional host** (issue #651): ``OPENROUTER_BASE_URL``, when
+set, is the API root the brain and the reranker are built against, so the same gate runs against
+``us.openrouter.ai``, where OpenRouter routes only to endpoints inside the region::
+
+    OPENROUTER_BASE_URL=https://us.openrouter.ai/api/v1 OPENROUTER_API_KEY=sk-or-... \
+        uv run pytest -m live tests/test_openrouter_live.py -v
+
+Unset, every call goes to the SDK's own default host, exactly as before the variable existed.
+
 **Something runs this on a schedule now, and a SKIP is RED** (issue #450). Nothing did before: ``-m
 'not live'`` hides this file from every default run and from CI, and it skips itself green with no
 key — three states, *passed* / *skipped* / *never invoked*, and from outside the box the last two
@@ -43,6 +52,7 @@ from __future__ import annotations
 
 import os
 import re
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -54,12 +64,14 @@ pytestmark = pytest.mark.live
 
 KEY = os.environ.get("OPENROUTER_API_KEY")
 MODEL = "z-ai/glm-5.2"
+#: The API root every client in this file is built against — ``None`` is the SDK's own default host.
+BASE_URL = (os.environ.get("OPENROUTER_BASE_URL") or "").strip() or None
 
 
 @pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
 def test_native_openrouter_returns_a_reply():
     """A real turn against ``openrouter.ai`` returns non-empty assistant text (@glm-5.2's brain)."""
-    provider = OpenRouterProvider(model="z-ai/glm-5.2", api_key=KEY)
+    provider = OpenRouterProvider(base_url=BASE_URL, model="z-ai/glm-5.2", api_key=KEY)
     try:
         reply = provider.chat([Message.user("Reply with a single short greeting.")])
     finally:
@@ -82,7 +94,9 @@ def test_live_model_params_reach_the_endpoint():
     release gate for a reason that had nothing to do with model params. A false-failing gate is
     worse than no gate: it trains you to ignore it.
     """
-    provider = OpenRouterProvider(model=MODEL, api_key=KEY, temperature=0.2, max_tokens=512)
+    provider = OpenRouterProvider(
+        base_url=BASE_URL, model=MODEL, api_key=KEY, temperature=0.2, max_tokens=512
+    )
     try:
         reply = provider.chat([Message.user("Say hi.")])
     finally:
@@ -132,7 +146,7 @@ def test_the_live_endpoint_is_a_real_member_of_the_models_pool(caplog):
     """
     import logging
 
-    provider = OpenRouterProvider(model=MODEL, api_key=KEY, max_tokens=16)
+    provider = OpenRouterProvider(base_url=BASE_URL, model=MODEL, api_key=KEY, max_tokens=16)
     try:
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
             provider.chat([Message.user("Say hi.")])
@@ -168,7 +182,9 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
     """
     import logging
 
-    provider = OpenRouterProvider(model=MODEL, api_key=KEY, builtin_tools=("web_search",))
+    provider = OpenRouterProvider(
+        base_url=BASE_URL, model=MODEL, api_key=KEY, builtin_tools=("web_search",)
+    )
     try:
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
             provider.chat([Message.user("What is the capital of France? One word.")])
@@ -217,7 +233,7 @@ def test_the_live_generation_id_is_the_one_openrouter_looks_the_call_up_by(caplo
     """
     import logging
 
-    provider = OpenRouterProvider(model=MODEL, api_key=KEY, max_tokens=16)
+    provider = OpenRouterProvider(base_url=BASE_URL, model=MODEL, api_key=KEY, max_tokens=16)
     try:
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
             provider.chat([Message.user("Say hi.")])
@@ -244,7 +260,11 @@ def test_a_live_refusal_carries_the_generation_id_openrouter_set_on_it():
     from basecradle_harness import ProviderAPIError
 
     provider = OpenRouterProvider(
-        model=MODEL, api_key=KEY, max_tokens=16, provider={"only": ["no-such-endpoint"]}
+        model=MODEL,
+        api_key=KEY,
+        base_url=BASE_URL,
+        max_tokens=16,
+        provider={"only": ["no-such-endpoint"]},
     )
     try:
         with pytest.raises(ProviderAPIError) as raised:
@@ -324,7 +344,11 @@ def test_the_live_reranker_picks_and_reports_what_it_cost(caplog):
         {"text": "> nova: lunch is at noon"},
     ]
     reranker = MemPalaceReranker(
-        model=RERANK_MODEL, api_key=KEY, providers=RERANK_PROVIDERS, timeout=120.0
+        model=RERANK_MODEL,
+        api_key=KEY,
+        providers=RERANK_PROVIDERS,
+        base_url=BASE_URL,
+        timeout=120.0,
     )
     try:
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
@@ -363,7 +387,10 @@ def test_a_live_rerank_against_a_nonexistent_model_is_config_class(caplog):
     from basecradle_harness._rerank import SURFACE_TOOL, MemPalaceReranker
 
     reranker = MemPalaceReranker(
-        model="z-ai/glm-does-not-exist-5.3", api_key=KEY, providers=RERANK_PROVIDERS
+        model="z-ai/glm-does-not-exist-5.3",
+        api_key=KEY,
+        providers=RERANK_PROVIDERS,
+        base_url=BASE_URL,
     )
     try:
         with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
@@ -379,3 +406,77 @@ def test_a_live_rerank_against_a_nonexistent_model_is_config_class(caplog):
         record.getMessage(),
         "reason",
     ).startswith("config:"), record.getMessage()
+
+
+#: A regional host for the one refusal only a regional host can give. The configured one when it is
+#: regional, else the US host — so this check runs on the default gate too and never skips (a skip
+#: is red at the prober, issue #450).
+REGIONAL_BASE_URL = (
+    BASE_URL
+    if BASE_URL and urlsplit(BASE_URL).hostname != "openrouter.ai"
+    else "https://us.openrouter.ai/api/v1"
+)
+
+#: A model with **no endpoint in the US or EU region** — measured 2026-10-05: one endpoint, served
+#: outside both. A dated fact about the pool, not about this code: the day it gains an endpoint in
+#: the region, the call below is answered rather than refused, and the assertion says so.
+OUT_OF_REGION_MODEL = "qwen/qwen3-max"
+
+
+def _live_refusal(caplog, *, model, providers, base_url):
+    import logging
+
+    from basecradle_harness._rerank import SURFACE_TOOL, MemPalaceReranker
+
+    reranker = MemPalaceReranker(model=model, api_key=KEY, providers=providers, base_url=base_url)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+            chosen = reranker.rerank("q", [{"text": "a"}, {"text": "b"}], 2, surface=SURFACE_TOOL)
+    finally:
+        reranker.close()
+    # It falls back rather than raising — a broken reranker never costs the agent its memories.
+    assert [hit["text"] for hit in chosen] == ["a", "b"]
+    return _rerank_record(caplog)
+
+
+@pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
+def test_a_live_provider_list_the_pool_cannot_serve_names_its_cause(caplog):
+    """OpenRouter's *no allowed providers* 404 (issue #651), from the vendor and not from a fixture.
+
+    On a regional host this is what a provider list valid on the global host turns into — the region
+    narrows which providers exist — so the line must say the list is the problem, at ERROR, and
+    never ``config:model_not_found`` for a model that exists. A slug no endpoint carries gets the
+    same refusal on every host, so this runs on whichever one the gate is pointed at.
+    """
+    import logging
+
+    record = _live_refusal(
+        caplog, model=RERANK_MODEL, providers=("no-such-endpoint",), base_url=BASE_URL
+    )
+    assert record.levelno == logging.ERROR, record.getMessage()
+    assert _field(plain(record.getMessage()), "reason") == "config:no_allowed_providers", (
+        record.getMessage()
+    )
+
+
+@pytest.mark.skipif(not KEY, reason="set OPENROUTER_API_KEY to run the live OpenRouter probe")
+def test_a_live_model_with_no_endpoint_in_the_region_names_its_cause(caplog):
+    """OpenRouter's *no endpoints in your data region* 404 (issue #651), from a regional host.
+
+    In-region routing fails closed: a regional host refuses rather than send the call out of the
+    region. The line must name that, at ERROR — it is configuration, never weather, so it is asked
+    once and never waited out.
+    """
+    import logging
+
+    record = _live_refusal(
+        caplog, model=OUT_OF_REGION_MODEL, providers=("alibaba",), base_url=REGIONAL_BASE_URL
+    )
+    message = plain(record.getMessage())
+    assert _field(message, "outcome") == "fallback", (
+        f"{OUT_OF_REGION_MODEL} was served at {REGIONAL_BASE_URL}: it has gained an endpoint in "
+        f"the region, so pick a model that has none. {message}"
+    )
+    assert record.levelno == logging.ERROR, message
+    assert _field(message, "reason") == "config:no_region_endpoint", message
+    assert not [r for r in caplog.records if r.getMessage().startswith("llm retry ")]

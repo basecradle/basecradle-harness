@@ -4,7 +4,7 @@ The three-way provider-failure taxonomy (issue #336) classifies every fault by i
 the vendor: transient (retried), permanent-for-the-request (reported once, never retried), and
 account-blocked / out-of-funds (reported, debounced, self-healing). Most of the wire signals an
 adapter maps are **structured** — an HTTP status, an ``error.type`` code — and those are read
-directly where they live. Two signals are not, and this module holds their heuristics:
+directly where they live. Some signals are not, and this module holds their heuristics:
 
 - `is_out_of_funds` — the billing / insufficient-credit class, for the one adapter whose out-of-funds
   shape is *not* a clean status code: the native xAI gRPC path overloads ``RESOURCE_EXHAUSTED`` for
@@ -18,9 +18,13 @@ directly where they live. Two signals are not, and this module holds their heuri
   content of the error is not merely its nature but **which tool**: xAI states an
   ``INVALID_ARGUMENT`` naming the offending tool, and that name is what lets the adapter drop one
   tool instead of losing the wake.
+- `routing_refusal` — OpenRouter's two *I could not route this* refusals (issue #651), both HTTP
+  404 and both configuration: no endpoint for the model in a regional host's region, or endpoints
+  in it that the configured provider list permits none of. The status alone cannot tell them from
+  each other or from a missing model, and the reason a fallback line carries must name which.
 
-Both are the sibling of `basecradle_harness._context.is_context_overflow` — a phrase match on a
-provider error string — and both **fail safe** exactly as it does: a phrasing they do not recognize
+Each is a sibling of `basecradle_harness._context.is_context_overflow` — a phrase match on a
+provider error string — and each **fails safe** exactly as it does: a phrasing they do not recognize
 is simply not recognized, and the adapter falls through to its existing classification (a bare
 ``RESOURCE_EXHAUSTED`` stays a rate limit). A false negative costs one misclassified fault; the
 patterns are kept narrow so a false positive — reporting a rate limit as an out-of-funds outage — is
@@ -124,6 +128,38 @@ def refused_tool_schema(text: str) -> tuple[str, str] | None:
     if found is None:
         return None
     return found.group("name"), found.group("reason").strip()
+
+
+#: OpenRouter's two routing refusals (issue #651), keyed by the ``reason`` suffix each one files
+#: under, in the vendor's own words as the live endpoint sent them on 2026-10-05 — from
+#: ``us.openrouter.ai`` and ``eu.openrouter.ai`` alike, and the second from the global host too:
+#:
+#: - ``No endpoints found supporting your data region.`` — a regional host found no endpoint for the
+#:   model in its region. It **fails closed**: in-region routing never leaves the region to answer.
+#: - ``No allowed providers are available for the selected model. Providers serving <model>: …, but
+#:   your request's provider.only preference permits only: …`` — endpoints exist, and the
+#:   configured ``only`` list names none of them. On a regional host this is the shape a provider
+#:   list valid on the global host takes, because the region narrows which providers exist.
+#:
+#: Matched on the text because a 404 is the only status either carries, and the same status means
+#: "no such model" elsewhere. Matched on the leading sentence, never the list after it, which names
+#: providers and changes whenever the pool does.
+_ROUTING_REFUSALS = (
+    ("no_region_endpoint", "no endpoints found supporting your data region"),
+    ("no_allowed_providers", "no allowed providers are available for the selected model"),
+)
+
+
+def routing_refusal(text: str) -> str | None:
+    """Which of OpenRouter's routing refusals this error text is, or ``None`` (issue #651).
+
+    ``no_region_endpoint`` or ``no_allowed_providers``: both are configuration — the same request
+    fails the same way until someone changes the model, the provider list, or the host — so a
+    caller files them config-class and never retries them. Fails safe like its siblings: a phrasing
+    it does not recognize returns ``None`` and the caller keeps its existing classification.
+    """
+    folded = (text or "").casefold()
+    return next((reason for reason, phrase in _ROUTING_REFUSALS if phrase in folded), None)
 
 
 def is_out_of_funds(text: str) -> bool:
