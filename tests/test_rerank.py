@@ -35,6 +35,7 @@ from basecradle_harness._observability import RETRY_HEAD
 from basecradle_harness._rerank import (
     POOL_FLOOR,
     RERANK_API_KEY_VAR,
+    RERANK_BASE_URL_VAR,
     RERANK_MODEL_VAR,
     RERANK_PROVIDERS_VAR,
     SURFACE_TOOL,
@@ -524,6 +525,90 @@ def test_provider_slugs_keep_their_order_and_drop_the_blanks():
     assert providers_from_env("") == ()
 
 
+# === The base URL: a regional host, or exactly today's request (issue #651) ====
+
+#: OpenRouter's own default host — what the SDK calls when it is given no ``server_url``.
+GLOBAL_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+#: A regional host, where OpenRouter routes only to endpoints inside the region.
+REGIONAL_BASE_URL = "https://us.openrouter.ai/api/v1"
+REGIONAL_CHAT_URL = f"{REGIONAL_BASE_URL}/chat/completions"
+
+
+def _rerank_env(**overrides):
+    env = {RERANK_MODEL_VAR: MODEL, RERANK_API_KEY_VAR: FAKE_KEY, RERANK_PROVIDERS_VAR: "deepinfra"}
+    env.update(overrides)
+    return {key: value for key, value in env.items() if value is not None}
+
+
+@pytest.mark.parametrize("value", [None, "", "   "], ids=["absent", "empty", "blank"])
+def test_no_base_url_leaves_the_reranker_on_the_sdks_own_host(value):
+    bound = reranker_from_env(_rerank_env(**{RERANK_BASE_URL_VAR: value}))
+    assert bound is not None
+    assert bound.base_url is None
+    assert bound.fault is None
+
+
+def test_a_base_url_binds_trimmed():
+    bound = reranker_from_env(_rerank_env(**{RERANK_BASE_URL_VAR: f"  {REGIONAL_BASE_URL}  "}))
+    assert bound is not None
+    assert bound.base_url == REGIONAL_BASE_URL
+    assert bound.fault is None
+
+
+@pytest.mark.parametrize(
+    "value", ["us.openrouter.ai/api/v1", "ftp://us.openrouter.ai/api/v1", "https://"]
+)
+def test_a_base_url_that_is_not_one_is_config_class_and_calls_nothing(router, caplog, value):
+    """Left to the transport, a host with no scheme fails as a *transport* error on every call —
+    WARNING, the class that heals itself, which this one never would. So it pages instead."""
+    route = router.route().mock(return_value=httpx.Response(200, json=completion(picks(1))))
+    bound = reranker_from_env(_rerank_env(**{RERANK_BASE_URL_VAR: value}))
+
+    assert bound is not None
+    assert bound.fault == "config:invalid_base_url"
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        chosen = bound.rerank("q", hits(3), 2, surface=SURFACE_TOOL)
+
+    assert not route.called
+    assert [hit["text"] for hit in chosen] == ["memory 1", "memory 2"]
+    assert _reason_of(caplog.records) == (logging.ERROR, "config:invalid_base_url")
+
+
+def _sent(base_url):
+    """The one request a production-built reranker sends, with ``base_url`` set or not."""
+    with respx.mock(assert_all_called=False, assert_all_mocked=True) as mock:
+        routes = {
+            url: mock.post(url).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+            for url in (GLOBAL_CHAT_URL, REGIONAL_CHAT_URL)
+        }
+        bound = reranker_from_env(_rerank_env(**{RERANK_BASE_URL_VAR: base_url}))
+        try:
+            bound.rerank("what was that endpoint", hits(20), 1, surface=SURFACE_TURN0)
+        finally:
+            bound.close()
+        called = [url for url, route in routes.items() if route.called]
+        assert len(called) == 1, called
+        return called[0], mock.calls.last.request
+
+
+def test_a_base_url_moves_the_host_and_nothing_else():
+    """Unset is today's request, byte for byte; set, the same bytes go to the regional host.
+
+    Built through `reranker_from_env` with no injected client, because the client the SDK builds
+    from ``server_url`` is the thing under test — an injected one would carry its own host and
+    prove nothing about the setting.
+    """
+    default_url, default = _sent(None)
+    regional_url, regional = _sent(REGIONAL_BASE_URL)
+
+    assert default_url == GLOBAL_CHAT_URL
+    assert regional_url == REGIONAL_CHAT_URL
+    assert regional.content == default.content
+    assert {k: v for k, v in regional.headers.items() if k != "host"} == {
+        k: v for k, v in default.headers.items() if k != "host"
+    }
+
+
 # === Failure classes ==========================================================
 
 
@@ -540,6 +625,24 @@ def _reason_of(records):
         (403, "forbidden", logging.ERROR, "config:auth"),
         (402, "insufficient credits", logging.ERROR, "config:billing"),
         (404, "no such model", logging.ERROR, "config:model_not_found"),
+        # The two routing refusals (issue #651), in the words the live endpoint sent on 2026-10-05:
+        # both 404, both configuration, each named for its cause rather than a missing model.
+        (
+            404,
+            "No endpoints found supporting your data region.",
+            logging.ERROR,
+            "config:no_region_endpoint",
+        ),
+        (
+            404,
+            (
+                "No allowed providers are available for the selected model. Providers serving "
+                "z-ai/glm-5.3-flash: sail-research, deepinfra, but your request's provider.only "
+                "preference permits only: streamlake."
+            ),
+            logging.ERROR,
+            "config:no_allowed_providers",
+        ),
         (429, "slow down", logging.WARNING, "rate_limited"),
         (500, "oops", logging.WARNING, "server_error"),
         (418, "teapot", logging.WARNING, "api_error"),
@@ -855,6 +958,36 @@ def test_a_config_class_fault_is_never_waited_out(router, caplog):
     assert delays == []
     assert retry_lines(caplog.records) == []
     assert _reason_of(caplog.records) == (logging.ERROR, "config:auth")
+
+
+@pytest.mark.parametrize(
+    ("message", "reason"),
+    [
+        ("No endpoints found supporting your data region.", "config:no_region_endpoint"),
+        (
+            (
+                "No allowed providers are available for the selected model. Providers serving "
+                "z-ai/glm-5.3-flash: inceptron, but your request's provider.only preference permits "
+                "only: deepinfra."
+            ),
+            "config:no_allowed_providers",
+        ),
+    ],
+)
+def test_a_routing_refusal_is_never_waited_out(router, caplog, message, reason):
+    """A region with no endpoint, or a provider list that permits none there, refuses the same
+    request the same way until someone changes the setting (issue #651) — so it is asked once."""
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(404, json=error(404, message)))
+    delays, spy = _no_sleep()
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        chosen = reranker(sleep=spy).rerank("q", hits(20), 2, surface=SURFACE_TOOL)
+
+    assert [hit["text"] for hit in chosen] == ["memory 1", "memory 2"]
+    assert route.call_count == 1
+    assert delays == []
+    assert retry_lines(caplog.records) == []
+    assert _reason_of(caplog.records) == (logging.ERROR, reason)
 
 
 def test_an_unusable_answer_is_not_retried(router, caplog):

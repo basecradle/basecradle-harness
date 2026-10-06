@@ -113,6 +113,7 @@ from basecradle_harness._basecradle import (
     _resolve_tools,
     _resolve_tools_and_provider,
     _response_retries_from_env,
+    base_url_override,
     resolved_model_params,
 )
 from basecradle_harness._breaker import (
@@ -205,6 +206,9 @@ from basecradle_harness._rerank import (
     RERANK_MODEL_VAR,
     RERANK_PROVIDERS_VAR,
     providers_from_env,
+)
+from basecradle_harness._rerank import (
+    base_url_from_env as rerank_base_url_from_env,
 )
 from basecradle_harness._secret import secret
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
@@ -5365,6 +5369,10 @@ def resolved_config() -> dict[str, object]:
       the only honest signal available off-box. ``None`` (never ``""``) if the distribution is
       not installed at all: a defect, not a shrug — an agent with no platform SDK has no body.
     - ``ai_model`` — the ``AI_MODEL`` env value, or ``None`` if unset.
+    - ``ai_base_url`` — the ``AI_BASE_URL`` override exactly as the brain reads it (stripped), or
+      ``None`` when unset or blank (issue #651). The *override*, never the resolved default: one
+      comparison rule then serves every agent on every provider — an endpoint a deployer did not
+      declare reads ``null`` — and a regional host a deployer did declare can be read back.
     - ``active_profile`` — the deploy-selected policy profile, ``"locked"`` or ``"unlocked"``
       (`HARNESS_PROFILE`, fail-closed to ``"locked"``; issue #256). It governs the tool set below:
       under ``"unlocked"`` a policy-forbidden opted-in tool (e.g. ``shell``) appears in ``tools``;
@@ -5531,6 +5539,10 @@ def resolved_config() -> dict[str, object]:
       signal reads green. And the NOC may only pin an extra whose version the harness reports
       (`fleet-ops.md` §4), so an agent brained by ``openai`` or ``xai-sdk`` that carries the
       ``openrouter`` extra **solely** to rerank is unpinnable without this field.
+    - ``mempalace_rerank_base_url`` — the OpenRouter API root the reranker calls (issue #651), as
+      configured (``null`` = the SDK's own default host). A regional host is a data-residency
+      decision, and one that silently fell off a box would send recalled memories through the
+      global host while every other field read the same, so it is reported beside the trio.
     - ``max_context_tokens`` — the operator's context-budget override (`HARNESS_MAX_CONTEXT_TOKENS`;
       issue #276), or ``null`` when unset. ``0`` means compaction is **disabled** on this agent, and
       that is the state worth being able to see from outside. The *resolved* ceiling is deliberately
@@ -5568,6 +5580,7 @@ def resolved_config() -> dict[str, object]:
         "ai_sdk_version": _sdk_version(sdk),
         "platform_sdk_version": _platform_sdk_version(),
         "ai_model": os.environ.get("AI_MODEL") or None,
+        "ai_base_url": base_url_override(),
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
         "wake_breaker_max": breaker_max,
@@ -5580,6 +5593,7 @@ def resolved_config() -> dict[str, object]:
             providers_from_env(os.environ.get(RERANK_PROVIDERS_VAR))
         ),
         "mempalace_rerank_sdk_version": _dist_version(_RERANK_SDK_DISTRIBUTION),
+        "mempalace_rerank_base_url": rerank_base_url_from_env(),
         "describer_model": describer_model_from_env(),
         "describer_providers": list(describer_providers_from_env()),
         "describer_api_key_set": bool((os.environ.get(DESCRIBER_API_KEY_VAR) or "").strip()),

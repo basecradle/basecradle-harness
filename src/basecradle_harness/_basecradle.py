@@ -674,6 +674,17 @@ def _config_from_env() -> tuple[str, str, str]:
     return provider, sdk, surface
 
 
+def base_url_override() -> str | None:
+    """The operator's ``AI_BASE_URL``, stripped — or ``None`` when it is unset or blank.
+
+    The one read of the variable, shared by every client built from it and by ``--resolved-config``
+    (``ai_base_url``, issue #651), so what the report says is the endpoint the agent calls, by
+    construction. Blank is absence: a value of spaces used to reach the SDK as a base URL and fail
+    every call, while a report reading it as unset would have described an agent that did not exist.
+    """
+    return (os.environ.get("AI_BASE_URL") or "").strip() or None
+
+
 #: A provider's canonical endpoint, supplied as the **default** ``base_url`` so an agent's
 #: ``.env`` needn't hardcode it (``AI_BASE_URL`` always overrides for a proxy/gateway/self-host).
 #: ``openai`` is absent → the SDK targets OpenAI's own default. xAI's compat endpoint speaks the
@@ -1115,7 +1126,7 @@ def _provider_from_config(
                 "pass only keys chat.send names; use the openai-SDK path for the extra_body escape "
                 "hatch."
             )
-        base_url = os.environ.get("AI_BASE_URL") or _PROVIDER_BASE_URLS.get(provider)
+        base_url = base_url_override() or _PROVIDER_BASE_URLS.get(provider)
         # The opted-in web_search built-in rides the chat `tools` array as OpenRouter's
         # `openrouter:web_search` server tool (the adapter maps the name → wire type); its optional
         # `parameters` come from the operator's search_params.json. Read that file **only when web
@@ -1162,7 +1173,7 @@ def _provider_from_config(
             f"upstream), but AI_SDK_SURFACE resolved to {surface!r}. Set AI_SDK_SURFACE=chat (or "
             "use AI_SDK=openrouter for the native adapter, which is chat-only by design)."
         )
-    base_url = os.environ.get("AI_BASE_URL") or _PROVIDER_BASE_URLS.get(provider)
+    base_url = base_url_override() or _PROVIDER_BASE_URLS.get(provider)
     params, params_extra_body = _split_model_params(
         loaded_params(), owned=_OWNED_OPENAI, sdk_label="the openai SDK"
     )
@@ -1270,7 +1281,7 @@ def _maybe_code_bridge(
         or CODE_EXECUTION_BUILTIN not in builtins
     ):
         return None
-    base_url = os.environ.get("AI_BASE_URL") or None
+    base_url = base_url_override()
     return CodeExecutionBridge(base_url=base_url)
 
 

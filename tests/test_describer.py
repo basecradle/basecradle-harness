@@ -10,9 +10,12 @@ is byte-identical to what it was before this feature existed.
 """
 
 import base64
+import json
 import logging
 
+import httpx
 import pytest
+import respx
 
 from basecradle_harness import (
     Describer,
@@ -1220,3 +1223,105 @@ def test_a_re_budget_is_not_a_retry_and_keeps_its_own_llm_line(caplog):
 
     assert len(_helper_lines(caplog)) == 2  # both attempts answered; both were billed
     assert _retry_lines(caplog) == []  # and neither was a *retry*
+
+
+# --- a regional OpenRouter host: the describer follows the brain's AI_BASE_URL (issue #651) ----
+
+#: A regional host, where OpenRouter routes only to endpoints inside the region.
+REGIONAL_BASE_URL = "https://us.openrouter.ai/api/v1"
+REGIONAL_CHAT_URL = f"{REGIONAL_BASE_URL}/chat/completions"
+FAKE_OPENROUTER_KEY = "sk-or-v1-0123456789abcdef0123456789abcdef"
+#: The smallest picture worth sending: a 1×1 PNG, inline, so no download is involved.
+PIXEL = ImageContent(
+    url="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQ"
+    "DwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+    alt="pixel.png",
+)
+
+
+def _openrouter_completion(content):
+    """A chat body both SDKs accept — ``system_fingerprint`` is required by the openrouter SDK."""
+    return {
+        "id": "gen-describe0001",
+        "object": "chat.completion",
+        "created": 0,
+        "model": "google/gemini-3-flash",
+        "system_fingerprint": "fp_test",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 812, "completion_tokens": 64, "total_tokens": 876},
+    }
+
+
+@pytest.fixture(params=["openrouter", "openai"], ids=["openrouter-sdk", "openai-sdk"])
+def regional_brain(request, monkeypatch):
+    """A brain on OpenRouter through either SDK, its ``AI_BASE_URL`` on a regional host."""
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")
+    monkeypatch.setenv("AI_SDK", request.param)
+    # OpenRouter over the openai SDK is chat-only; the native SDK has one surface and takes none.
+    if request.param == "openai":
+        monkeypatch.setenv("AI_SDK_SURFACE", "chat")
+    else:
+        monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("AI_API_KEY", FAKE_OPENROUTER_KEY)
+    monkeypatch.setenv("AI_BASE_URL", REGIONAL_BASE_URL)
+    return request.param
+
+
+def test_the_describer_follows_the_brains_base_url_onto_the_wire(regional_brain):
+    """The describer is built on the brain's stack, so its call goes where ``AI_BASE_URL`` says.
+
+    Proved on the wire rather than on an attribute: the adapter recording a ``base_url`` is not the
+    SDK client sending to it, and only the request respx receives says which host was asked. Every
+    request is mocked or refused, so a call to the global host fails this test outright.
+    """
+    with respx.mock(assert_all_mocked=True) as mock:
+        route = mock.post(REGIONAL_CHAT_URL).mock(
+            return_value=httpx.Response(200, json=_openrouter_completion(DESCRIPTION))
+        )
+        assert describer_from_env(_env()).describe_images([PIXEL]) == DESCRIPTION
+
+    assert route.call_count == 1
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["model"] == "google/gemini-3-flash"
+    assert sent["provider"]["only"] == ["google-vertex", "deepinfra"]
+    assert route.calls.last.request.headers["Authorization"] == "Bearer sk-or-v1-describer"
+
+
+@pytest.mark.parametrize(
+    ("message", "reason"),
+    [
+        ("No endpoints found supporting your data region.", "config:no_region_endpoint"),
+        (
+            (
+                "No allowed providers are available for the selected model. Providers serving "
+                "google/gemini-3-flash: google-ai-studio, but your request's provider.only preference "
+                "permits only: google-vertex, deepinfra."
+            ),
+            "config:no_allowed_providers",
+        ),
+    ],
+)
+def test_a_regional_routing_refusal_is_config_class_and_asked_once(
+    regional_brain, caplog, message, reason
+):
+    """Both 404s are configuration (issue #651): the honest caption, an ERROR naming the cause
+    rather than a missing model, and no second request into a refusal that cannot change."""
+    with respx.mock(assert_all_mocked=True) as mock:
+        route = mock.post(REGIONAL_CHAT_URL).mock(
+            return_value=httpx.Response(404, json={"error": {"message": message, "code": 404}})
+        )
+        with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+            assert describer_from_env(_env()).describe_images([PIXEL]) is None
+
+    assert route.call_count == 1
+    assert not [r for r in caplog.records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
+    line = _helper_lines(caplog)[0]
+    assert line.levelno == logging.ERROR, line.getMessage()
+    assert f"reason={reason}" in line.getMessage()

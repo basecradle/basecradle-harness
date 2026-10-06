@@ -650,6 +650,39 @@ def test_a_generic_400_stays_a_plain_api_error_and_propagates(router):
     provider.close()
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        "No endpoints found supporting your data region.",
+        (
+            "No allowed providers are available for the selected model. Providers serving "
+            "z-ai/glm-5.2: inceptron, mistral, but your request's provider.only preference permits "
+            "only: deepinfra."
+        ),
+    ],
+    ids=["no-region-endpoint", "no-allowed-providers"],
+)
+def test_a_routing_refusal_propagates_as_a_config_fault_and_is_never_retried(router, message):
+    """OpenRouter's two routing refusals (issue #651) on the brain: both 404, both configuration.
+
+    The brain's config class is the generic one above — a plain `ProviderAPIError` that propagates
+    on the first raise, leaving the peer's message to be answered once the setting is fixed — and
+    never a transient class the engine would re-request into a refusal that cannot change. The
+    vendor's sentence rides the error, so the wake's failure names the cause.
+    """
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(404, json={"error": {"message": message, "code": 404}})
+    )
+    provider = _provider(retries_disabled=True)
+    with pytest.raises(ProviderAPIError) as exc:
+        provider.chat([Message.user("Hi")])
+    assert type(exc.value) is ProviderAPIError
+    assert not isinstance(exc.value, _TRANSIENT)
+    assert exc.value.status_code == 404
+    assert message in str(exc.value)
+    provider.close()
+
+
 def test_transport_failure_maps_to_connection_error(router):
     router.post(CHAT_URL).mock(side_effect=httpx.ConnectError("no route to host"))
     provider = _provider(retries_disabled=True)

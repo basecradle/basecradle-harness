@@ -2085,6 +2085,59 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     assert report["describer_model"] is None
     assert report["describer_providers"] == []
     assert report["describer_api_key_set"] is False
+    # The endpoint overrides (issue #651): `null` is "not declared", the shipped default.
+    assert report["ai_base_url"] is None
+    assert report["mempalace_rerank_base_url"] is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("  https://us.openrouter.ai/api/v1  ", "https://us.openrouter.ai/api/v1"),
+    ],
+    ids=["unset", "empty", "blank", "set"],
+)
+@pytest.mark.parametrize(
+    ("var", "field"),
+    [
+        ("AI_BASE_URL", "ai_base_url"),
+        ("HARNESS_MEMPALACE_RERANK_BASE_URL", "mempalace_rerank_base_url"),
+    ],
+)
+def test_resolved_config_reports_each_endpoint_override(
+    wake_env, monkeypatch, capsys, var, field, value, expected
+):
+    """An endpoint a deployer declares can be read back, and one it did not declare reads ``null``
+    (issue #651). The *override*, never the resolved default, so one comparison rule serves every
+    agent on every provider — and a regional host that fell off a box reads differently from one
+    that is there."""
+    if value is None:
+        monkeypatch.delenv(var, raising=False)
+    else:
+        monkeypatch.setenv(var, value)
+
+    assert main(["--resolved-config"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report[field] == expected
+
+
+def test_a_blank_ai_base_url_is_absence_to_the_brain_too(monkeypatch):
+    """The report reads blank as unset, so the client must — or ``null`` would describe an agent
+    that does not exist. Before issue #651 a value of spaces reached the SDK as the base URL."""
+    from basecradle_harness._basecradle import _provider_from_config
+
+    monkeypatch.setenv("AI_MODEL", "z-ai/glm-5.2")
+    monkeypatch.setenv("AI_API_KEY", "sk-or-v1-0123456789abcdef0123456789abcdef")
+    monkeypatch.setenv("AI_BASE_URL", "   ")
+    provider = _provider_from_config("openrouter", "openrouter", "chat")
+    try:
+        assert provider.base_url == "https://openrouter.ai/api/v1"
+    finally:
+        provider.close()
 
 
 def test_resolved_config_reports_the_configured_describer(wake_env, monkeypatch, capsys):

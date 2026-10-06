@@ -7,6 +7,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.148.0] - 2026-10-05
+
+### Added: a regional OpenRouter host for the reranker, and the endpoint overrides read back (issue #651)
+
+OpenRouter serves in-region routing on regional hostnames: a call sent to
+`https://us.openrouter.ai/api/v1` is decrypted in that region, routed only to endpoints there, and
+refused rather than sent out of it. An operator could point the brain there with `AI_BASE_URL`, and
+the describer and the web search server tool followed, but the MemPalace reranker built its client
+with no host at all and always called the global one.
+
+- **`HARNESS_MEMPALACE_RERANK_BASE_URL`** sets the reranker's API root. Unset, the request is byte
+  for byte the one 0.147.0 sent (pinned by a wire test comparing the two). A value that is not an
+  `http(s)` URL with a host is a config-class fault, `reason=config:invalid_base_url` at ERROR,
+  rather than a transport error retried at WARNING on every wake.
+- **OpenRouter's two routing refusals are named for their cause.** Both are HTTP 404, and both used
+  to log `config:model_not_found` on the reranker and the describer, for a model that exists. They
+  are now `config:no_region_endpoint` (*No endpoints found supporting your data region.*) and
+  `config:no_allowed_providers` (*No allowed providers are available for the selected model.*),
+  read off OpenRouter's own text, which was measured live on the US and EU hosts. Both remain
+  config-class, at ERROR, and neither is retried. The brain needed no change: a 404 there is a plain
+  `ProviderAPIError` that propagates on the first raise with OpenRouter's sentence, which is the
+  brain's config class, and that is now pinned by test.
+- **The describer follows `AI_BASE_URL`**, proved on the wire for both SDKs that reach OpenRouter
+  and live through the `openrouter` SDK against the US host.
+- **`--resolved-config` reports `ai_base_url` and `mempalace_rerank_base_url`**: each override
+  exactly as read (stripped), `null` when unset or blank. Neither is the resolved default, so an
+  endpoint nobody declared reads `null` on every provider.
+- **A blank `AI_BASE_URL` is now absence.** A value of spaces used to reach the SDK as the base URL
+  and fail every call; all three readers and the report now share one read
+  (`_basecradle.base_url_override`).
+- **The live gate runs against a regional host.** `tests/test_openrouter_live.py` builds every
+  client against `OPENROUTER_BASE_URL` when it is set, and gains two refusal checks. The region one
+  always runs against a regional host (the configured one, or the US host), so it never skips on the
+  default gate.
+
 ## [0.147.0] - 2026-10-03
 
 ### Added: the `llm` line names the call by the vendor's own id (issue #634)

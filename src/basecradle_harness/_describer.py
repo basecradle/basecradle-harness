@@ -115,6 +115,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
     ProviderServerError,
 )
+from basecradle_harness._faults import routing_refusal
 from basecradle_harness._messages import ImageContent, Message, VideoContent
 from basecradle_harness._observability import (
     HELPER,
@@ -951,6 +952,11 @@ def _fault_of(exc: ProviderError) -> str:
     bad key rather than beside the 429 above it precisely because a rate limit heals with time and
     an empty account heals only when somebody puts money in it.
 
+    OpenRouter's two routing refusals (issue #651) are config-class as well, and are named for their
+    cause rather than filed with a missing model: both arrive as a 404, and an ``AI_BASE_URL`` on a
+    regional host is where they come from — no endpoint for the describer model in the region, or
+    none the ``HARNESS_DESCRIBER_PROVIDERS`` list permits there.
+
     A generic 4xx is runtime-class deliberately: it is far more likely a fixable harness/config
     defect than a permanent property of the pool, and reporting it as config-class would page a
     human for something the next release fixes.
@@ -977,6 +983,9 @@ def _fault_of(exc: ProviderError) -> str:
         # a rerank that timed out named the same fault differently on the same box.
         return connection_reason(exc)
     if isinstance(exc, ProviderAPIError):
+        refusal = routing_refusal(f"{exc} {getattr(exc, 'body', '') or ''}")
+        if refusal:
+            return f"config:{refusal}"
         return "config:model_not_found" if getattr(exc, "status_code", None) == 404 else "api_error"
     return "provider_error"
 

@@ -41,7 +41,9 @@ the searcher produced, so no model-authored text can enter them.
 
 - **Config-class** — a model configured with no key or no provider list, the ``openrouter`` SDK
   not installed, a rejected key (401/403), an unfunded account (402), a model id that does not
-  exist (404). Every one of these is *dead until a human acts*, so it falls back to plain hybrid
+  exist, a base URL that is not one, and OpenRouter's two routing refusals: no endpoint for the
+  model in a regional host's region, or none the provider list permits (both 404, issue #651).
+  Every one of these is *dead until a human acts*, so it falls back to plain hybrid
   and logs at **ERROR**, once per wake. A silently-dead reranker is the exact failure this repo
   calls Green-While-Absent, and ERROR is what makes the fleet's "Error on AI Server" alert fire.
 - **Runtime-class** — a timeout, a 429, a 5xx, a transport blip, an unparseable or unusable
@@ -70,6 +72,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from basecradle_harness._exceptions import (
     ProviderAPIError,
@@ -83,6 +86,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
     ProviderServerError,
 )
+from basecradle_harness._faults import routing_refusal
 from basecradle_harness._observability import (
     MEMORY,
     generation_id,
@@ -131,6 +135,18 @@ RERANK_API_KEY_VAR = "HARNESS_MEMPALACE_RERANK_API_KEY"
 #: flag is not** (issue #468) — ``only`` restricts the pool outright whatever ``allow_fallbacks``
 #: says, so fallbacks route *within* the pinned list and never outside it.
 RERANK_PROVIDERS_VAR = "HARNESS_MEMPALACE_RERANK_PROVIDERS"
+
+#: The OpenRouter API root the rerank call goes to — optional, and **absent means the SDK's own
+#: default host**, byte for byte the request this module sent before the variable existed (issue
+#: #651). Its purpose is a regional host (``https://us.openrouter.ai/api/v1``), where OpenRouter
+#: decrypts and routes the call only inside that region and refuses rather than leave it. The
+#: reranker needs its own setting because it is its own client: on an agent whose brain is OpenAI
+#: or xAI, ``AI_BASE_URL`` names another vendor entirely.
+#:
+#: A regional host changes **which providers exist** for a model, so a provider list valid on the
+#: global host can permit nothing on a regional one — OpenRouter says so in a 404 this module files
+#: as ``config:no_allowed_providers`` (`basecradle_harness._faults.routing_refusal`).
+RERANK_BASE_URL_VAR = "HARNESS_MEMPALACE_RERANK_BASE_URL"
 
 #: The reasoning budget the rerank call asks for. Ranking twenty short excerpts against one query
 #: is a *selection* task, not a reasoning task — the founder's decision, and it is a constant here
@@ -240,6 +256,16 @@ def providers_from_env(raw: str | None) -> tuple[str, ...]:
     return tuple(slug.strip() for slug in (raw or "").split(",") if slug.strip())
 
 
+def base_url_from_env(env: Mapping[str, str] | None = None) -> str | None:
+    """The configured `RERANK_BASE_URL_VAR`, stripped — or ``None`` when it is unset or blank.
+
+    The one read, shared by `reranker_from_env` and ``--resolved-config``
+    (``mempalace_rerank_base_url``), so the report says what the reranker calls by construction.
+    """
+    source = os.environ if env is None else env
+    return (source.get(RERANK_BASE_URL_VAR) or "").strip() or None
+
+
 def reranker_from_env(env: Mapping[str, str] | None = None) -> MemPalaceReranker | None:
     """The agent's reranker, or ``None`` when no model is configured (rerank off).
 
@@ -250,7 +276,12 @@ def reranker_from_env(env: Mapping[str, str] | None = None) -> MemPalaceReranker
     configured a reranker by accident, so a configured-and-dead one is a defect to page on, while
     an unconfigured one is a choice.
 
-    Side-effect-free: it reads three environment variables and constructs nothing. The
+    A base URL that is not an ``http(s)`` URL with a host is a config fault too, and for the same
+    reason: left to the transport, a value like ``us.openrouter.ai/api/v1`` fails as a *transport*
+    error on every call — WARNING, the runtime class, which self-heals in principle and never does
+    here — so the reranker would be dead while paging nobody.
+
+    Side-effect-free: it reads four environment variables and constructs nothing. The
     ``openrouter`` SDK is imported, and its client built, on the first call that actually reranks —
     so this is safe on the pure-resolution path (`basecradle_harness._resolve`) and costs an agent
     that never reranks nothing at all.
@@ -261,12 +292,23 @@ def reranker_from_env(env: Mapping[str, str] | None = None) -> MemPalaceReranker
         return None
     api_key = (source.get(RERANK_API_KEY_VAR) or "").strip()
     providers = providers_from_env(source.get(RERANK_PROVIDERS_VAR))
+    base_url = base_url_from_env(source)
     fault: str | None = None
     if not api_key:
         fault = "config:missing_api_key"
     elif not providers:
         fault = "config:missing_providers"
-    return MemPalaceReranker(model=model, api_key=api_key, providers=providers, fault=fault)
+    elif base_url is not None and not _is_http_url(base_url):
+        fault = "config:invalid_base_url"
+    return MemPalaceReranker(
+        model=model, api_key=api_key, providers=providers, base_url=base_url, fault=fault
+    )
+
+
+def _is_http_url(value: str) -> bool:
+    """Is ``value`` an absolute ``http``/``https`` URL with a host — something a client can reach?"""
+    parts = urlsplit(value)
+    return parts.scheme in ("http", "https") and bool(parts.netloc)
 
 
 class MemPalaceReranker:
@@ -283,6 +325,9 @@ class MemPalaceReranker:
             pinned list*. Off, it was not (issue #468): OpenRouter picked one pinned upstream,
             that upstream's shared pool answered 429, and the call failed with three acceptable
             endpoints untried — a momentary limit at one vendor defeating the whole reranker.
+        base_url: The OpenRouter API root to call (a regional host, issue #651), passed to the SDK
+            as ``server_url``. ``None`` — the default — leaves the SDK on its own default host.
+            Ignored when ``client`` is injected, which carries its own.
         fault: A pre-known config fault (a missing key or provider list) this reranker was born
             with. It never reranks; every call falls back to hybrid and reports (see
             `reranker_from_env`).
@@ -304,6 +349,7 @@ class MemPalaceReranker:
         model: str,
         api_key: str = "",
         providers: Sequence[str] = (),
+        base_url: str | None = None,
         fault: str | None = None,
         client: Any | None = None,
         timeout: float | None = None,
@@ -311,6 +357,7 @@ class MemPalaceReranker:
     ) -> None:
         self.model = model
         self.providers = tuple(providers)
+        self.base_url = base_url
         self._api_key = Secret(api_key)  # out of every representation (issue #599)
         self._fault = fault
         self._client = client
@@ -495,6 +542,9 @@ class MemPalaceReranker:
             self._openrouter = require_openrouter_sdk()
             self._client = self._openrouter.OpenRouter(
                 api_key=self._api_key.reveal(),
+                # `None` is the SDK's own default host — exactly the client built before a regional
+                # host could be configured (issue #651).
+                server_url=self.base_url,
                 # No `timeout_ms`, for the brain adapter's reason: the SDK spreads it across every
                 # phase, so each attempt's fitted budget is set on the client instead (`_pick`).
                 #
@@ -689,7 +739,11 @@ def _fault_of(exc: ProviderError) -> tuple[str, bool]:
     """``(reason, is_config)`` for a provider fault — the taxonomy in one place.
 
     **Config-class** is "dead until a human acts": a rejected key, an unfunded account, a model id
-    that does not exist. A 402 is config-class rather than a sibling of the 429 above it for
+    that does not exist, and the two routing refusals (issue #651) — no endpoint for the model in
+    a regional host's region, or none the configured provider list permits. Those two are 404s like
+    a missing model, so they are read off the vendor's text first and each named for its cause: a
+    line that said ``config:model_not_found`` for a model that exists would send the operator to
+    fix the wrong setting. A 402 is config-class rather than a sibling of the 429 above it for
     exactly that reason — a rate limit heals with time, an empty account heals only when somebody
     puts money in it, which is the same shape as a bad key (`CLAUDE.md` → Provider Capabilities
     draws the identical line for the wake's own provider failures).
@@ -721,6 +775,9 @@ def _fault_of(exc: ProviderError) -> tuple[str, bool]:
         # describer answered `transport` flat, so one fault had two words in one journal.
         return connection_reason(exc), False
     if isinstance(exc, ProviderAPIError):
+        refusal = routing_refusal(f"{exc} {getattr(exc, 'body', '') or ''}")
+        if refusal:
+            return f"config:{refusal}", True
         if getattr(exc, "status_code", None) == 404 or _is_unknown_model(exc):
             return "config:model_not_found", True
         return "api_error", False
