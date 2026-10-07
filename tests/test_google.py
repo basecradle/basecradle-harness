@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 
 import httpx
@@ -55,8 +56,10 @@ from basecradle_harness._google import (
     LOCAL_CALL_ID_PREFIX,
     SKIP_SIGNATURE,
     SYSTEM_LABEL,
+    UNCHECKED,
     GoogleConfigError,
     GoogleProvider,
+    credentials_file_state,
 )
 from basecradle_harness._google_rates import Usage, call_cost
 from basecradle_harness._observability import truncated
@@ -264,7 +267,9 @@ def test_a_broken_key_never_puts_the_key_in_the_error(tmp_path, private_key_pem)
     with pytest.raises(GoogleConfigError) as raised:
         build(broken)
     assert raised.value.reason == "invalid_credentials_file"
-    message = str(raised.value) + repr(raised.value.__cause__)
+    # google-auth's `InvalidValue` quotes the key in its repr, so neither link may hold it.
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    message = str(raised.value)
     assert "PRIVATE KEY" not in message and info["private_key"][40:80] not in message
 
 
@@ -275,6 +280,162 @@ def test_a_key_pasted_where_its_path_belongs_is_refused_and_never_echoed(private
         GoogleProvider(MODEL, credentials_file=inline, location=LOCATION)
     assert raised.value.reason == "inline_credentials"
     assert "PRIVATE KEY" not in str(raised.value) and PROJECT not in str(raised.value)
+
+
+def test_a_key_file_that_is_not_text_is_invalid_and_never_quoted(tmp_path):
+    """A binary file is read and is not UTF-8: a config fault like any other, never a raw decode error."""
+    binary = tmp_path / "key.json"
+    binary.write_bytes(b"\xff\xfe nova-secret-bytes \x80")
+    with pytest.raises(GoogleConfigError) as raised:
+        build(binary)
+    assert raised.value.reason == "invalid_credentials_file"
+    assert "nova-secret-bytes" not in str(raised.value)
+    # Neither link of the chain: a decode error's `.object` is the file's bytes.
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+def test_a_key_file_that_is_not_json_keeps_no_copy_of_itself_on_the_error(tmp_path):
+    """A JSON error's ``.doc`` is the whole document, so it must not ride the chain either."""
+    bad = tmp_path / "key.json"
+    bad.write_text('{"private_key": "nova-secret-doc", ')
+    with pytest.raises(GoogleConfigError) as raised:
+        build(bad)
+    assert raised.value.reason == "invalid_credentials_file"
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+def test_a_deeply_nested_key_file_is_invalid_not_a_crash(tmp_path):
+    """`json.loads` raises `RecursionError`, a ``RuntimeError``, on a deep enough document."""
+    deep = tmp_path / "key.json"
+    deep.write_text("[" * 100_000)
+    with pytest.raises(GoogleConfigError) as raised:
+        build(deep)
+    assert raised.value.reason == "invalid_credentials_file"
+    assert credentials_file_state(str(deep)) == "invalid"
+
+
+def test_a_key_the_crypto_library_cannot_handle_is_invalid_not_a_crash(
+    monkeypatch, key_file, private_key_pem
+):
+    """`cryptography` raises `UnsupportedAlgorithm`, outside the `ValueError` family, for a key on a
+    curve it does not support; whatever the parse raises is the one config fault."""
+    from cryptography.exceptions import UnsupportedAlgorithm
+
+    def unsupported(info, **kwargs):
+        raise UnsupportedAlgorithm(f"unsupported curve in {info['private_key']}")
+
+    monkeypatch.setattr(service_account.Credentials, "from_service_account_info", unsupported)
+    with pytest.raises(GoogleConfigError) as raised:
+        build(key_file)
+    assert raised.value.reason == "invalid_credentials_file"
+    assert "UnsupportedAlgorithm" in str(raised.value)
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+    assert credentials_file_state(str(key_file)) == "invalid"
+
+
+def test_a_home_directory_that_does_not_exist_is_invalid_not_a_crash():
+    raw = "~nova-no-such-user-7f3a9c/key.json"
+    with pytest.raises(GoogleConfigError) as raised:
+        GoogleProvider(MODEL, credentials_file=raw, location=LOCATION)
+    assert raised.value.reason == "invalid_credentials_file"
+    assert credentials_file_state(raw) == "invalid"
+
+
+# --- the key file's state, as --resolved-config reports it (issue #661) -------------------------
+
+
+def test_the_state_of_a_key_that_loads_is_ok(key_file):
+    assert credentials_file_state(str(key_file)) == "ok"
+
+
+@pytest.mark.parametrize("raw", [None, "", "   "])
+def test_an_unset_key_file_has_no_state(raw):
+    assert credentials_file_state(raw) is None
+
+
+def test_the_state_of_an_absent_key_file_is_missing(tmp_path):
+    assert credentials_file_state(str(tmp_path / "absent.json")) == "missing"
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_the_state_of_a_key_file_that_cannot_be_read_is_unreadable(key_file):
+    key_file.chmod(0)
+    try:
+        assert credentials_file_state(str(key_file)) == "unreadable"
+    finally:
+        key_file.chmod(0o600)
+
+
+def test_a_directory_where_the_key_file_belongs_is_unreadable(tmp_path):
+    assert credentials_file_state(str(tmp_path)) == "unreadable"
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        b"not json {",
+        b"\xff\xfe not text \x80",
+        json.dumps({"type": "authorized_user", "refresh_token": "1//fake"}).encode(),
+        json.dumps(["a", "list"]).encode(),
+    ],
+    ids=["not-json", "not-utf8", "not-a-service-account", "not-an-object"],
+)
+def test_the_state_of_a_key_file_that_will_not_load_is_invalid(tmp_path, contents):
+    bad = tmp_path / "key.json"
+    bad.write_bytes(contents)
+    assert credentials_file_state(str(bad)) == "invalid"
+
+
+def test_the_state_of_a_key_whose_private_key_will_not_parse_is_invalid(tmp_path, private_key_pem):
+    broken = tmp_path / "key.json"
+    broken.write_text(json.dumps(key_info(private_key_pem.replace("MII", "XXX"))))
+    assert credentials_file_state(str(broken)) == "invalid"
+
+
+def test_the_state_of_a_key_pasted_where_its_path_belongs_is_invalid(private_key_pem):
+    assert credentials_file_state(json.dumps(key_info(private_key_pem))) == "invalid"
+
+
+def test_the_state_is_the_wakes_own_verdict(tmp_path, private_key_pem):
+    """One loader, one verdict: every file the adapter refuses has a state that is not ``ok``."""
+    cases = {
+        "missing": tmp_path / "absent.json",
+        "invalid": tmp_path / "bad.json",
+    }
+    cases["invalid"].write_text("not json {")
+    for state, path in cases.items():
+        with pytest.raises(GoogleConfigError):
+            build(path)
+        assert credentials_file_state(str(path)) == state
+
+
+def test_a_relative_key_file_is_judged_where_the_wake_reads_it(
+    monkeypatch, tmp_path, private_key_pem
+):
+    """A relative path resolves against the config home, exactly as `credentials_path` resolves it."""
+    home = tmp_path / "config-home"
+    (home / "secrets").mkdir(parents=True)
+    (home / "secrets" / "vertex.json").write_text(json.dumps(key_info(private_key_pem)))
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    assert credentials_file_state("secrets/vertex.json") == "ok"
+
+
+def test_without_google_auth_the_file_is_still_judged_and_the_key_is_unchecked(
+    monkeypatch, tmp_path, key_file
+):
+    """The SDK missing (the 2026-10-07 incident) leaves every file check but the key parse runnable.
+
+    A file that fails those checks reports its real fault; one that passes them is ``unchecked``,
+    never ``ok``, because nobody parsed the key.
+    """
+    monkeypatch.setitem(sys.modules, "google.oauth2", None)
+    monkeypatch.setitem(sys.modules, "google.oauth2.service_account", None)
+    assert credentials_file_state(str(key_file)) == UNCHECKED
+    assert credentials_file_state(str(tmp_path / "absent.json")) == "missing"
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json {")
+    assert credentials_file_state(str(bad)) == "invalid"
 
 
 def test_the_project_defaults_to_the_one_the_key_names(provider):

@@ -7,6 +7,45 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.152.0] - 2026-10-07
+
+### Added: the describer's SDK version and each key file's state in `--resolved-config` (issue #661)
+
+On 2026-10-07 a describer was switched to Gemini on Vertex while `google-genai` was not installed,
+and every wake withheld its images for about ten minutes while the fleet's drift check read green:
+nothing in `--resolved-config` said whether the describer's own SDK was there, or whether its key
+file would load.
+
+- **`describer_sdk_version`** — the installed version of the distribution `HARNESS_DESCRIBER_SDK`
+  names, read from installed metadata like every other version field; `null` when it is not
+  installed or no own stack is set. The fleet can now pin `google-genai` and read the pin back.
+- **`ai_credentials_file_state` / `describer_credentials_file_state`** — `ok`, `missing`,
+  `unreadable`, `invalid`, `unchecked`, or `null` when unset, judged by `credentials_path` +
+  `load_credentials`, the code a wake runs (`_google.credentials_file_state`). Only the verdict is
+  reported: nothing read from the file, and not the loader's message. **`unchecked`** is a fifth
+  value the issue did not list: with `google-auth` absent, every check of the file still runs
+  except parsing the private key, so a file that passes them is reported as unchecked rather than
+  `ok` for a key nobody parsed.
+- **`tool_env`** — a credential-file variable is `true` only when its state is `ok`. It used to
+  read `true` whenever the variable was set, file or no file, which broke the map's contract that
+  every `false` is a capability that cannot do its job.
+
+### Fixed: every key file the loader refuses is a config fault, and none of it rides the error
+
+`load_credentials` documents that every failure is a `GoogleConfigError`, and four were not: a
+binary file (`UnicodeDecodeError`), a deeply nested document (`RecursionError` from `json.loads`), a
+key `cryptography` cannot handle (`UnsupportedAlgorithm`, outside the `ValueError` family), and a
+`~user` path naming no such user (`RuntimeError` from `expanduser`). The describer filed each as
+`config:no_provider`, and `--resolved-config` would have crashed on them. Each is now
+`invalid_credentials_file`.
+
+The errors also kept the file on their chain. A decode error holds its bytes, a JSON error the whole
+document, and google-auth's `InvalidValue` the key's repr. `from None` hides a cause from a printed
+traceback but still keeps it as `__context__`. Each check now raises outside the handler that caught
+the error, so neither link of the chain holds anything read from the file. The loader also reads and
+checks the file before importing `google-auth`, so a missing or malformed file is judged the same
+whether or not the SDK is installed.
+
 ## [0.151.1] - 2026-10-07
 
 ### Fixed: the Google docs no longer say Vertex refuses Search beside function declarations (issue #660)

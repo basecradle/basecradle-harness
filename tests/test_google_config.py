@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
+from importlib import metadata
 
 import pytest
 
@@ -389,10 +392,191 @@ def test_resolved_config_reports_a_describer_on_its_own_stack(
     assert report["describer_credentials_file"] == "secrets/vertex-eyes.json"
     assert report["describer_location"] is None and report["describer_project"] is None
     assert report["describer_sdk_surface"] is None
-    # Every `false` is a capability that cannot do its job: this describer has no location.
-    assert report["tool_env"]["HARNESS_DESCRIBER_CREDENTIALS_FILE"] is True
+    # Every `false` is a capability that cannot do its job: this describer has no location, and its
+    # key file is set but does not exist (issue #661), so neither variable reads `true`.
+    assert report["describer_credentials_file_state"] == "missing"
+    assert report["tool_env"]["HARNESS_DESCRIBER_CREDENTIALS_FILE"] is False
     assert report["tool_env"]["HARNESS_DESCRIBER_LOCATION"] is False
     assert "HARNESS_DESCRIBER_API_KEY" not in report["tool_env"]
+
+
+# --- the describer's SDK version and the key files' state (issue #661) ------------------------
+
+
+@pytest.fixture
+def vertex_describer(monkeypatch, clean_describer, key_file):  # noqa: F811 - fixture
+    monkeypatch.setenv("HARNESS_DESCRIBER_MODEL", GEMINI)
+    monkeypatch.setenv("HARNESS_DESCRIBER_PROVIDER", "google")
+    monkeypatch.setenv("HARNESS_DESCRIBER_SDK", "google-genai")
+    monkeypatch.setenv("HARNESS_DESCRIBER_CREDENTIALS_FILE", str(key_file))
+    monkeypatch.setenv("HARNESS_DESCRIBER_LOCATION", "us")
+    return key_file
+
+
+def _report(capsys) -> tuple[dict, str]:
+    assert main(["--resolved-config"]) == 0
+    out = capsys.readouterr().out
+    return json.loads(out), out
+
+
+def test_the_describer_sdk_version_is_the_installed_one(wake_env, vertex_describer, capsys):  # noqa: F811
+    report, _ = _report(capsys)
+    assert report["describer_sdk_version"] == metadata.version("google-genai")
+    assert report["describer_credentials_file_state"] == "ok"
+    assert report["tool_env"]["HARNESS_DESCRIBER_CREDENTIALS_FILE"] is True
+    assert report["tool_env"]["HARNESS_DESCRIBER_LOCATION"] is True
+
+
+def test_a_describer_sdk_that_is_not_installed_reads_null(
+    wake_env,  # noqa: F811
+    vertex_describer,
+    monkeypatch,
+    capsys,
+):
+    """The 2026-10-07 incident: the describer switched to an SDK the box did not have."""
+    real = metadata.version
+
+    def version(dist):
+        if dist == "google-genai":
+            raise metadata.PackageNotFoundError(dist)
+        return real(dist)
+
+    monkeypatch.setattr("basecradle_harness._wake.metadata.version", version)
+    report, _ = _report(capsys)
+    assert report["describer_sdk"] == "google-genai"
+    assert "describer_sdk_version" in report and report["describer_sdk_version"] is None
+
+
+def test_no_describer_sdk_set_reads_null(wake_env, clean_describer, capsys):  # noqa: F811
+    report, _ = _report(capsys)
+    assert report["describer_sdk"] is None
+    assert "describer_sdk_version" in report and report["describer_sdk_version"] is None
+    assert report["describer_credentials_file_state"] is None
+    assert report["ai_credentials_file_state"] is None
+
+
+def _write(path, contents: bytes):
+    path.write_bytes(contents)
+    return path
+
+
+@pytest.mark.parametrize(
+    ("state", "make"),
+    [
+        ("ok", lambda tmp, key: key),
+        ("missing", lambda tmp, key: tmp / "absent.json"),
+        ("invalid", lambda tmp, key: _write(tmp / "bad.json", b"not json {")),
+    ],
+)
+def test_each_key_file_is_reported_by_its_state(
+    wake_env,  # noqa: F811
+    vertex_describer,
+    monkeypatch,
+    capsys,
+    tmp_path,
+    state,
+    make,
+):
+    """Both key files, each judged on its own, and `tool_env` true only for a file that loads."""
+    path = make(tmp_path, vertex_describer)
+    monkeypatch.setenv("HARNESS_DESCRIBER_CREDENTIALS_FILE", str(path))
+    monkeypatch.setenv("AI_CREDENTIALS_FILE", str(path))
+    report, _ = _report(capsys)
+    assert report["describer_credentials_file_state"] == state
+    assert report["ai_credentials_file_state"] == state
+    assert report["tool_env"]["HARNESS_DESCRIBER_CREDENTIALS_FILE"] is (state == "ok")
+
+
+def test_a_blank_key_file_variable_reads_false_in_tool_env(
+    wake_env,  # noqa: F811
+    vertex_describer,
+    monkeypatch,
+    capsys,
+):
+    """Set but blank is no key file at all: the describer reads it as missing, and so does the map."""
+    monkeypatch.setenv("HARNESS_DESCRIBER_CREDENTIALS_FILE", "   ")
+    report, _ = _report(capsys)
+    assert report["describer_credentials_file_state"] is None
+    assert report["tool_env"]["HARNESS_DESCRIBER_CREDENTIALS_FILE"] is False
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads any file")
+def test_an_unreadable_key_file_is_reported_unreadable(
+    wake_env,  # noqa: F811
+    vertex_describer,
+    capsys,
+):
+    vertex_describer.chmod(0)
+    try:
+        report, _ = _report(capsys)
+    finally:
+        vertex_describer.chmod(0o600)
+    assert report["describer_credentials_file_state"] == "unreadable"
+    assert report["tool_env"]["HARNESS_DESCRIBER_CREDENTIALS_FILE"] is False
+
+
+def test_without_google_auth_a_good_key_file_is_unchecked_never_ok(
+    wake_env,  # noqa: F811
+    vertex_describer,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setitem(sys.modules, "google.oauth2", None)
+    monkeypatch.setitem(sys.modules, "google.oauth2.service_account", None)
+    report, _ = _report(capsys)
+    assert report["describer_credentials_file_state"] == "unchecked"
+    assert report["tool_env"]["HARNESS_DESCRIBER_CREDENTIALS_FILE"] is False
+
+
+SENTINEL = "nova-sentinel-7f3a9c"
+
+
+def _sentinel_files(tmp_path, pem) -> dict[str, bytes]:
+    """A key file in every state, each carrying `SENTINEL` in every field it has."""
+    loaded = key_info(
+        pem,
+        project_id=f"{SENTINEL}-project",
+        private_key_id=f"{SENTINEL}0123456789abcdef",
+        client_email=f"{SENTINEL}@nova-project.iam.gserviceaccount.com",
+        client_id=f"{SENTINEL}-client",
+    )
+    broken = {**loaded, "private_key": pem.replace("MII", "XXX")}
+    return {
+        "ok": json.dumps(loaded).encode(),
+        "invalid-key": json.dumps(broken).encode(),
+        "invalid-type": json.dumps({**loaded, "type": f"{SENTINEL}-type"}).encode(),
+        "invalid-json": f'{{"private_key": "{SENTINEL}", '.encode(),
+        "invalid-utf8": b"\xff\xfe" + SENTINEL.encode() + b"\x80",
+        "invalid-deep": f"[{json.dumps(SENTINEL)}, ".encode() + b"[" * 100_000,
+    }
+
+
+@pytest.mark.parametrize("unchecked", [False, True], ids=["sdk", "no-sdk"])
+def test_nothing_read_from_a_key_file_reaches_the_report(
+    wake_env,  # noqa: F811
+    vertex_describer,
+    monkeypatch,
+    capsys,
+    tmp_path,
+    private_key_pem,  # noqa: F811
+    unchecked,
+):
+    if unchecked:
+        monkeypatch.setitem(sys.modules, "google.oauth2", None)
+        monkeypatch.setitem(sys.modules, "google.oauth2.service_account", None)
+    states = set()
+    for name, contents in _sentinel_files(tmp_path, private_key_pem).items():
+        path = _write(tmp_path / f"{name}.json", contents)
+        monkeypatch.setenv("HARNESS_DESCRIBER_CREDENTIALS_FILE", str(path))
+        monkeypatch.setenv("AI_CREDENTIALS_FILE", str(path))
+        assert main(["--resolved-config"]) == 0
+        captured = capsys.readouterr()
+        out = captured.out + captured.err
+        states.add(json.loads(captured.out)["describer_credentials_file_state"])
+        assert SENTINEL not in out
+        assert "PRIVATE KEY" not in out and private_key_pem[40:80] not in out
+    # The sentinels were read, not skipped: each file reached the loader and got a real verdict.
+    assert states == ({"unchecked", "invalid"} if unchecked else {"ok", "invalid"})
 
 
 def test_resolved_config_withholds_a_key_pasted_where_its_path_belongs(
