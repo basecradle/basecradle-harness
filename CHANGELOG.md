@@ -7,6 +7,23 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.151.1] - 2026-10-07
+
+### Fixed: the Google docs no longer say Vertex refuses Search beside function declarations (issue #660)
+
+The 0.151.0 live gate asserted that Vertex refuses `google_search` sent beside function
+declarations, as Vertex's documentation says. On 2026-10-07 Vertex `us` accepted that request with
+`gemini-3.8-flash`, so the gate failed on a vendor limit the harness does not depend on:
+`GoogleProvider.search` sends Google Search as its only tool. The case is gone from
+`tests/test_google_live.py`, with the reason written in the module.
+
+The shipped text that said Vertex *refuses* the combination now says what is still true: Vertex's
+documentation does not support it (the "Grounding with Google Search" page, updated 2026-10-06).
+That is the README, the `_google` and `_google_search` docstrings, and the comment in the shipped
+`tools/google_search.py` default. Nothing the harness sends changes. Because the default's bytes
+changed, an untouched copy in a config home is refreshed on the next install, and an edited one gets
+a `google_search.py.new` beside it.
+
 ## [0.151.0] - 2026-10-07
 
 ### Added: OpenAI's cost on every line, computed from its published rates (issue #657)

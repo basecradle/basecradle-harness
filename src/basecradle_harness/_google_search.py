@@ -1,13 +1,14 @@
 """Google Search for a Gemini brain on Vertex AI — a harness-run tool, not a built-in (issue #656).
 
 Every other provider's web search is a *built-in*: the vendor runs it inside the model's own turn and
-the harness never sees it happen. Vertex cannot do that for Google Search on a harness agent, because
-it refuses a search tool beside function declarations in one request ("Multiple tools are supported
-only when they are all search tools") and every harness turn carries function declarations. So the
-agent gets a ``web_search`` **function tool** with the same name and the same job, and when it calls
-one the harness makes a separate grounded call to the same model (`GoogleProvider.search`), with
-``google_search`` as its only tool and the query as its only content. The answer comes back with its
-sources as the tool result.
+the harness never sees it happen. Vertex does not support that for Google Search on a harness agent:
+its documentation rules out a search tool beside function declarations in one request ("Multiple
+tools are supported only when they are all search tools"), and every harness turn carries function
+declarations. (Vertex stopped enforcing the rule on gemini-3.8-flash by 2026-10-07, issue #660; the
+documented shape is the one the harness sends.) So the agent gets a ``web_search`` **function
+tool** with the same name and the same job, and when it calls one the harness makes a separate
+grounded call to the same model (`GoogleProvider.search`), with ``google_search`` as its only tool
+and the query as its only content. The answer comes back with its sources as the tool result.
 
 It is opted in like every provider's search (issue #168: powerful tools fail closed everywhere) and
 offered only to an agent brained by Google. The grounded call is made on the **brain's own** Vertex
