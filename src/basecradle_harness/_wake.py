@@ -92,6 +92,7 @@ except ImportError:  # pragma: no cover - Windows; the package must still import
     fcntl = None  # type: ignore[assignment]
 from basecradle import BaseCradle, BaseCradleError, NotFoundError
 
+from basecradle_harness import _google_rates, _openai_rates
 from basecradle_harness._assets import _describe, _is_image, image_input, model_sees_images
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
@@ -188,6 +189,7 @@ from basecradle_harness._messages import ImageContent, Message
 from basecradle_harness._mining import strip_injected
 from basecradle_harness._observability import (
     BLUE,
+    COST_BASIS_COMPUTED,
     GREEN,
     RED,
     YELLOW,
@@ -5392,6 +5394,14 @@ def resolved_config() -> dict[str, object]:
       ``None`` when unset or blank (issue #651). The *override*, never the resolved default: one
       comparison rule then serves every agent on every provider — an endpoint a deployer did not
       declare reads ``null`` — and a regional host a deployer did declare can be read back.
+    - ``cost_basis`` / ``cost_rates_source`` / ``cost_model_priced`` — where the brain's ``cost=``
+      comes from (issues #655, #657): ``"computed"`` from the harness's transcription of the
+      vendor's published rates (OpenAI aimed at its own host, Google), with the page and the date it
+      was read (``cost_rates_source``) and whether the configured ``AI_MODEL`` has a row there
+      (``cost_model_priced`` — ``false`` is a brain whose calls log no ``cost=``); ``"stated"``
+      where the vendor states its own price (OpenRouter, the native xAI SDK); ``null`` where neither
+      holds (OpenAI aimed at another host, xAI through the ``openai`` SDK), which is a brain the
+      spend dashboard cannot see. The last two fields are ``null`` unless the basis is computed.
     - ``active_profile`` — the deploy-selected policy profile, ``"locked"`` or ``"unlocked"``
       (`HARNESS_PROFILE`, fail-closed to ``"locked"``; issue #256). It governs the tool set below:
       under ``"unlocked"`` a policy-forbidden opted-in tool (e.g. ``shell``) appears in ``tools``;
@@ -5611,6 +5621,7 @@ def resolved_config() -> dict[str, object]:
         "ai_location": _configured(LOCATION_VAR),
         "ai_project": _configured(PROJECT_VAR),
         "ai_credentials_file": reported_credentials_file(os.environ.get(CREDENTIALS_FILE_VAR)),
+        **_cost_report(provider_name, sdk, os.environ.get("AI_MODEL") or ""),
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
         "wake_breaker_max": breaker_max,
@@ -5664,6 +5675,26 @@ def resolved_config() -> dict[str, object]:
         "mcp_request_timeout": _timeout_from_env(),
         "model_params": model_params,
         "model_params_stripped": stripped,
+    }
+
+
+def _cost_report(provider: str, sdk: str, model: str) -> dict[str, object]:
+    """The ``cost_*`` fields of `resolved_config` — read off the same tables the adapters price from."""
+    tables = {"openai": _openai_rates, "google": _google_rates}
+    table = tables.get(provider)
+    if table is _openai_rates and not _openai_rates.priced_host(base_url_override()):
+        table = None
+    if table is not None:
+        return {
+            "cost_basis": COST_BASIS_COMPUTED,
+            "cost_rates_source": table.SOURCE,
+            "cost_model_priced": bool(model) and table.known(model),
+        }
+    stated = provider == "openrouter" or (provider == "xai" and sdk == "xai-sdk")
+    return {
+        "cost_basis": "stated" if stated else None,
+        "cost_rates_source": None,
+        "cost_model_priced": None,
     }
 
 

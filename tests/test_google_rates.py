@@ -1,4 +1,4 @@
-"""The Vertex rate table (`_google_rates`) — the one place the harness computes a dollar figure.
+"""The Vertex rate table (`_google_rates`) — where the harness computes a Gemini call's dollars.
 
 Every expected figure below is worked by hand from Google's published Standard rows, so a test reads
 as the arithmetic it pins. The rule under all of them: a call the table cannot price gets ``None``,
@@ -14,14 +14,17 @@ from types import SimpleNamespace
 import pytest
 
 from basecradle_harness._google_rates import (
+    GROUNDING,
     LONG_CONTEXT_THRESHOLD,
     RATES,
     Usage,
     billing_day,
     call_cost,
     from_usage_metadata,
+    grounding_cost,
     known,
 )
+from basecradle_harness._observability import ComputedCost
 
 INTRO = datetime.date(2026, 10, 6)
 STANDARD = datetime.date(2027, 1, 1)
@@ -178,3 +181,49 @@ def test_every_row_is_well_formed():
             for tier in tiers:
                 for rate in (tier.input, tier.cached, tier.output, tier.audio_input):
                     assert rate is None or rate >= 0
+
+
+# --- Google Search grounding (issue #656) ------------------------------------------------------
+
+
+def test_every_priced_model_has_a_grounding_scheme():
+    assert set(GROUNDING) == set(RATES)
+
+
+def test_a_gemini_3_search_is_billed_per_grounding_query():
+    """$14 per 1,000 grounding queries — the queries Google lists, whatever they found."""
+    fee = grounding_cost("gemini-3.8-flash", queries=3, sourced=True)
+    assert isinstance(fee, ComputedCost)
+    assert fee == pytest.approx(3 * 0.014)
+
+
+def test_a_gemini_2_5_search_is_billed_once_per_prompt_however_many_queries():
+    """$35 per 1,000 grounding prompts — "only one charge for a Grounding Prompt"."""
+    assert grounding_cost("gemini-2.5-flash", queries=5, sourced=True) == pytest.approx(0.035)
+    assert grounding_cost("gemini-2.5-pro", queries=None, sourced=True) == pytest.approx(0.035)
+
+
+def test_a_search_that_returned_no_sources_is_not_billed():
+    assert grounding_cost("gemini-3.8-flash", queries=2, sourced=False) is None
+    assert grounding_cost("gemini-2.5-flash", queries=2, sourced=False) is None
+
+
+def test_a_fee_the_table_cannot_state_is_none_never_a_guess():
+    assert grounding_cost("gemini-9-ultra", queries=2, sourced=True) is None
+    assert (
+        grounding_cost("gemini-3.8-flash", queries=None, sourced=True) is None
+    )  # nothing to count
+
+
+def test_grounding_tokens_are_free_on_gemini_3_and_charged_on_2_5():
+    usage = Usage(prompt=100, cached=0, output=10, tool_prompt=1_000)
+    on_3 = call_cost("gemini-3.8-flash", "global", usage, on=INTRO)
+    assert on_3 - call_cost("gemini-3.8-flash", "global", usage, on=INTRO, grounded=True) == (
+        pytest.approx(1_000 * 0.75 / 1e6)
+    )
+    on_25 = call_cost("gemini-2.5-flash", "global", usage, on=INTRO)
+    assert call_cost("gemini-2.5-flash", "global", usage, on=INTRO, grounded=True) == on_25
+
+
+def test_every_token_price_is_a_computed_cost():
+    assert isinstance(cost(prompt=1_000, cached=0, output=10), ComputedCost)

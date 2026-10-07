@@ -761,7 +761,10 @@ see the absence of.**
   default on every provider** and activates **only** when explicitly dropped into an agent's
   `tools/` overlay (the same "ships empty" stance as `mcp/`). The powerful defaults (by plugin
   stem): `generate_image`, `edit_image`, `web_search` (OpenAI), `xai_search`
-  (xAI `web_search`/`x_search`), `openrouter_search`, `code_execution`, `grok_generate_image`,
+  (xAI `web_search`/`x_search`), `openrouter_search`, `google_search` (issue #656 — Gemini
+  grounding as a harness-run `web_search` tool, because Vertex refuses a search tool beside function
+  declarations), `url_context` (Gemini reading pages itself, #656), `code_execution` (OpenAI, xAI
+  and Gemini variants), `grok_generate_image`,
   `grok_edit_image`, `grok_generate_video`, `xai_account_balance` (issue #179 — xAI Management
   API credit read, `Vendor("xai")`-gated because it reads an *xAI* account),
   `openrouter_account_balance` (issue #425 — the OpenRouter mirror, and the one account tool with

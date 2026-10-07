@@ -43,6 +43,7 @@ from basecradle_harness import (
 from basecradle_harness._describer import VIDEO_PART_LABELS, describer_from_env
 from basecradle_harness._google import GoogleProvider
 from basecradle_harness._google_rates import Usage, call_cost
+from basecradle_harness._observability import _money
 
 pytestmark = pytest.mark.live
 
@@ -111,7 +112,11 @@ def test_the_cost_is_the_tables_arithmetic_over_what_vertex_reported(caplog):
     tokens_in, tokens_out = int(_field(line, "tokens_in")), int(_field(line, "tokens_out"))
     cached = int(_field(line, "cached_tokens") or 0)
     expected = call_cost(MODEL, LOCATION, Usage(prompt=tokens_in, cached=cached, output=tokens_out))
-    assert expected is not None and float(cost) == pytest.approx(expected, rel=1e-6)
+    # Compared as the line renders it (`_money`: eight decimals, trailing zeros trimmed), never as
+    # an unrounded float — a sub-cent call's figure is rounded on the line, so `approx` against the
+    # raw arithmetic failed on exactly the cheap calls this model makes (found running #655's gate).
+    assert expected is not None and cost == _money(expected), line
+    assert _field(line, "cost_basis") == "computed", line
 
 
 @needs_key
@@ -263,3 +268,83 @@ def test_a_model_that_does_not_exist_is_a_404():
     ):
         provider.chat([Message.user("hi")])
     assert raised.value.status_code == 404
+
+
+# --- built-ins and Google Search grounding (issue #656) ----------------------------------------
+#
+# Two facts only Vertex can state: which built-ins it accepts **beside** function declarations (the
+# harness sends declarations on every turn), and the shape grounding metadata comes back in, which
+# both the sources footer and the grounding fee are read from.
+
+
+@needs_key
+def test_search_beside_function_declarations_is_refused_as_google_documents():
+    """The reason Search is a grounded call of its own (`GoogleProvider.search`) and not a built-in.
+
+    If this starts passing the request, Vertex has lifted the limit and Search can become a
+    built-in on the brain's own turn — a design change to take to the capital, not a fix.
+    """
+    from google.genai import errors, types
+
+    with _provider() as provider:
+        config = types.GenerateContentConfig(
+            tools=[
+                types.Tool(google_search=types.GoogleSearch()),
+                types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=NUMBER_TOOL.name,
+                            description=NUMBER_TOOL.description,
+                            parameters_json_schema=NUMBER_TOOL.parameters,
+                        )
+                    ]
+                ),
+            ],
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+        )
+        with pytest.raises(errors.ClientError) as refused:
+            provider._client.models.generate_content(
+                model=MODEL, contents="What is the weather in Chicago?", config=config
+            )
+    assert refused.value.code == 400
+
+
+@needs_key
+def test_code_execution_runs_beside_the_function_declarations():
+    with _provider(builtin_tools=["code_execution"]) as provider:
+        reply = provider.chat(
+            [
+                Message.user(
+                    "Use code execution to compute 2**31 - 1 and reply with only the number."
+                )
+            ],
+            tools=[NUMBER_TOOL],
+        )
+    assert "2147483647" in (reply.content or "").replace(",", "")
+
+
+@needs_key
+def test_url_context_reads_a_page_beside_the_function_declarations():
+    with _provider(builtin_tools=["url_context"]) as provider:
+        reply = provider.chat(
+            [Message.user("What is the <h1> heading of https://example.com ? Reply with it only.")],
+            tools=[NUMBER_TOOL],
+        )
+    assert "example domain" in (reply.content or "").lower()
+
+
+@needs_key
+def test_a_search_is_grounded_cited_and_priced(caplog):
+    with _provider() as provider, caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        answer = provider.search("Who won the most recent FIFA World Cup final?")
+    assert "\n\nSources:\n- " in answer, answer
+    llm = _llm_line(caplog)
+    assert _field(llm, "purpose") == "helper" and _field(llm, "kind") == "search.grounding", llm
+    assert _field(llm, "cost") is not None and _field(llm, "cost_basis") == "computed", llm
+    fee = next(
+        m for m in (r.getMessage() for r in caplog.records) if m.startswith("media provider=google")
+    )
+    queries = int(_field(fee, "count"))
+    assert queries >= 1, fee
+    assert _field(fee, "cost") == _money(queries * 0.014), fee
+    assert _field(fee, "cost_basis") == "computed", fee

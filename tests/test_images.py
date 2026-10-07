@@ -741,3 +741,53 @@ def test_a_generation_logs_one_media_line(tool, caplog):
     assert "provider=openai" in line
     assert "kind=image.generate" in line
     assert "model=gpt-image-2.5-flare" in line
+
+
+# --- the computed cost on the media line (issue #657) ------------------------
+
+OPENAI_IMAGES = "https://api.openai.com/v1"
+
+
+def _generate_on_openai(client, caplog, body):
+    import logging
+
+    tool = GenerateImageTool(api_key=FAKE_KEY, base_url=OPENAI_IMAGES)
+    tool.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(f"{OPENAI_IMAGES}/images/generations").mock(
+            return_value=httpx.Response(200, json=body)
+        )
+        mock.get(f"{BC_URL}/timelines/{TIMELINE_UUID}").mock(
+            return_value=httpx.Response(200, json=_timeline_envelope())
+        )
+        mock.post(f"{BC_URL}/timelines/{TIMELINE_UUID}/assets").mock(
+            return_value=httpx.Response(201, json=asset_response())
+        )
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            tool.run(prompt="a red cube on a white table")
+    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+
+
+def test_a_generation_on_openai_is_priced_from_its_token_usage(client, caplog):
+    """50 text tokens in at $5/M, 4,160 image tokens out at $30/M = $0.12505."""
+    body = {
+        **images_response(),
+        "usage": {
+            "input_tokens": 50,
+            "input_tokens_details": {"image_tokens": 0, "text_tokens": 50},
+            "output_tokens": 4160,
+            "total_tokens": 4210,
+        },
+    }
+    line = _generate_on_openai(client, caplog, body)
+    assert line.endswith(" cost=0.12505 cost_basis=computed"), line
+
+
+def test_a_generation_whose_usage_cannot_be_priced_says_so(client, caplog):
+    import logging
+
+    line = _generate_on_openai(client, caplog, images_response())  # no usage block at all
+    assert " cost=" not in line
+    assert any(
+        r.levelno == logging.WARNING and "not priced" in r.getMessage() for r in caplog.records
+    )

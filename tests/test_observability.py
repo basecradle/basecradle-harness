@@ -10,6 +10,8 @@ import logging
 import re
 from datetime import datetime, timezone
 
+import pytest
+
 from basecradle_harness import ToolRegistry
 from basecradle_harness._engine import Engine
 from basecradle_harness._observability import (
@@ -19,6 +21,7 @@ from basecradle_harness._observability import (
     RED,
     RESET,
     YELLOW,
+    ComputedCost,
     byok,
     capture_llm_call,
     color_enabled,
@@ -522,7 +525,7 @@ def test_the_media_line_carries_the_cost_when_the_provider_states_it(caplog):
 
 
 def test_the_media_line_omits_cost_when_the_provider_states_none(caplog):
-    """OpenAI reports no media cost on any endpoint — the field is absent, not a fabricated `cost=0`."""
+    """A call with no stated and no computable cost has no `cost=` — absent, not a fabricated `cost=0`."""
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_media_call(
             provider="openai", kind="image.generate", model="gpt-image-2.5-flare", seconds=3.4
@@ -583,7 +586,7 @@ def test_the_media_timer_logs_the_cost_recorded_on_its_handle(caplog):
 
 
 def test_the_media_timer_omits_cost_when_its_handle_is_left_unset(caplog):
-    """Every OpenAI media path leaves the handle untouched — the line carries no `cost=`."""
+    """A block that never prices its call leaves the handle untouched — the line carries no `cost=`."""
     with (
         caplog.at_level(logging.INFO, logger="basecradle_harness"),
         media_timer(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"),
@@ -591,6 +594,91 @@ def test_the_media_timer_omits_cost_when_its_handle_is_left_unset(caplog):
         pass
 
     assert "cost=" not in caplog.records[0].getMessage()
+
+
+# --- a computed cost names its basis (issues #655, #656, #657) --------------
+#
+# OpenAI and Google state no price, so their cost is the harness's arithmetic over the vendor's
+# published rates. The line says so with the fleet's existing literal, `cost_basis=computed` (the
+# NOC's Steel launcher already writes it), immediately after `cost=` — and only there.
+
+
+def test_a_computed_cost_is_followed_by_its_basis_on_the_llm_line(caplog):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(provider="openai", model="gpt-6-sol", seconds=1, cost=ComputedCost(0.0147))
+
+    assert caplog.records[0].getMessage() == (
+        "llm provider=openai purpose=main model=gpt-6-sol duration=1.00s cost=0.0147 "
+        "cost_basis=computed"
+    )
+
+
+def test_a_stated_cost_carries_no_basis_so_its_line_is_unchanged(caplog):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(provider="xai", model="grok-4.7", seconds=1, cost=0.0147)
+
+    assert "cost_basis" not in caplog.records[0].getMessage()
+
+
+def test_a_basis_never_appears_without_the_figure_it_describes(caplog):
+    """A computed cost the line drops (an unreported usage block's zero) takes its basis with it."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(
+            provider="google",
+            model="gemini-3.8-flash",
+            seconds=1,
+            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            cost=ComputedCost(0.0),
+        )
+
+    line = caplog.records[0].getMessage()
+    assert "cost=" not in line and "cost_basis" not in line
+
+
+def test_a_captured_computed_cost_keeps_its_basis_on_the_callers_line(caplog):
+    """The describer and the reranker write their own line from what the adapter recorded; the
+    basis travels with the figure, so neither can forget it."""
+    with capture_llm_call() as call:
+        log_llm_call(
+            provider="google", model="gemini-3.8-flash", seconds=1, cost=ComputedCost(0.002)
+        )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(
+            provider=call.provider,
+            purpose="helper",
+            kind="image.describe",
+            model=call.model,
+            seconds=call.seconds,
+            cost=call.cost,
+            outcome="ok",
+        )
+
+    assert " cost=0.002 cost_basis=computed " in caplog.records[0].getMessage()
+
+
+def test_a_per_use_tool_fee_is_a_media_line_with_a_count_and_no_duration(caplog):
+    """A web search's or a grounding query's fee: billed units, no duration of its own."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_media_call(
+            provider="google",
+            kind="search.grounding",
+            model="gemini-3.8-flash",
+            seconds=None,
+            count=2,
+            cost=ComputedCost(0.028),
+        )
+
+    assert caplog.records[0].getMessage() == (
+        "media provider=google kind=search.grounding model=gemini-3.8-flash count=2 cost=0.028 "
+        "cost_basis=computed"
+    )
+    assert _COST_RE.search(caplog.records[0].getMessage()).group(1) == "0.028"
+
+
+def test_computed_cost_arithmetic_is_a_plain_float():
+    """Only a rate table makes one: a sum of two is a figure nobody has stood behind."""
+    total = ComputedCost(0.01) + ComputedCost(0.02)
+    assert type(total) is float and total == pytest.approx(0.03)
 
 
 # --- the delivery id and the provider descriptor -----------------------------

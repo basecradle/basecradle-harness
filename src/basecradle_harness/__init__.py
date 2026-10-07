@@ -49,6 +49,7 @@ from basecradle_harness._exceptions import (
     ProviderToolSchemaError,
 )
 from basecradle_harness._google import GoogleConfigError, GoogleProvider
+from basecradle_harness._google_search import GoogleSearchTool
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._grok import (
     GrokEditImageTool,
@@ -112,6 +113,7 @@ from basecradle_harness._plugins import (
     ActivationContext,
     EnvSet,
     LoadedPlugins,
+    ModelFamily,
     OpenAIKey,
     OpenAISurface,
     Requirement,
@@ -212,6 +214,7 @@ __all__ = [
     "XaiSdkProvider",
     "OpenRouterProvider",
     "GoogleProvider",
+    "GoogleSearchTool",
     "GoogleConfigError",
     # Tools, registry, and the safety boundary
     "Tool",
@@ -235,6 +238,7 @@ __all__ = [
     "Requirement",
     "Vendor",
     "Sdk",
+    "ModelFamily",
     "OpenAISurface",
     "EnvSet",
     "OpenAIKey",

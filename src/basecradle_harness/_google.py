@@ -67,9 +67,28 @@ The wire translation, and the three places Gemini differs
 Cost — computed, never vendor-stated
 ------------------------------------
 Vertex reports tokens and no dollars, so ``cost=`` on this adapter's ``llm`` line is **computed**
-from Google's published rates (`basecradle_harness._google_rates`) — the one adapter whose cost is
-harness arithmetic, by the capital's ruling on #655. A model, a location class, or a traffic tier the
+from Google's published rates (`basecradle_harness._google_rates`), by the capital's ruling on #655 —
+one of the two vendors (OpenAI is the other, #657) whose cost is harness arithmetic, tagged
+``cost_basis=computed`` on the line. A model, a location class, or a traffic tier the
 table does not carry gets **no** ``cost=``, and one WARNING per model per adapter, never a guess.
+
+Server-side built-ins, and the one Vertex will not combine (issue #656)
+----------------------------------------------------------------------
+Two of Gemini's built-ins ride **beside** the harness's function declarations on every turn, opted in
+like every provider's powerful built-ins: **code execution** (Python in Google's sandbox) and **URL
+context** (the model reads up to 20 URLs itself). Both bill as tokens only — the code, its result
+and the fetched pages arrive as ``tool_use_prompt_token_count``, priced at the input rate — so they
+need nothing beyond the call's own ``cost=``.
+
+**Google Search grounding cannot ride beside them.** Vertex: *"The Gemini API doesn't support
+combining search tools (such as googleSearch) with non-search tools (such as function calling …) in
+the same generateContent request"*, and every harness turn carries function declarations. So Search
+is a harness-run tool instead (`basecradle_harness._google_search`): the agent calls ``web_search``,
+and the harness makes **one grounded call** (`GoogleProvider.search`) with ``google_search`` as its
+only tool — the combination Vertex does accept — and hands back the answer with a ``Sources:``
+footer built from the grounding metadata. That call writes its own ``llm`` line
+(``purpose=helper kind=search.grounding``), and its grounding fee, which is not tokens, its own
+priced ``media`` line (`_google_rates.grounding_cost`).
 
 Stateless per turn: the full conversation is sent every call and the harness owns history. This
 adapter never streams.
@@ -107,15 +126,24 @@ from basecradle_harness._exceptions import (
     ProviderTimeoutError,
 )
 from basecradle_harness._faults import is_out_of_funds, is_too_large
-from basecradle_harness._google_rates import call_cost, from_usage_metadata, known
+from basecradle_harness._google_rates import (
+    call_cost,
+    from_usage_metadata,
+    grounding_cost,
+    grounding_units,
+    known,
+)
 from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec, VideoContent
 from basecradle_harness._observability import (
+    HELPER,
     finish_reason,
     generation_id,
     generation_of,
     log_llm_call,
+    log_media_call,
     token_counts,
 )
+from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._timeouts import (
     METADATA_TIMEOUT,
     CallTimeout,
@@ -133,6 +161,15 @@ DEFAULT_SURFACE = "native"
 PROVIDER = "google"
 #: The ``AI_SDK`` value — the PyPI distribution the harness imports, as for every adapter (#158).
 SDK = "google-genai"
+
+#: The server-side built-ins this adapter sends beside the function declarations, by the builtin name
+#: a tool plugin resolves to → the ``types.Tool`` field that enables it. Google Search is not here:
+#: Vertex refuses it beside function calling (see the module docstring), so it is `search` instead.
+BUILTINS = {"code_execution": "code_execution", "url_context": "url_context"}
+
+#: The ``kind`` the grounded search call and its fee are logged under — one name for the ``llm``
+#: line and the ``media`` line, so the two halves of one search are one grep apart.
+SEARCH_KIND = "search.grounding"
 
 #: The variables the brain's Vertex configuration is read from, when the caller passes none.
 CREDENTIALS_FILE_VAR = "AI_CREDENTIALS_FILE"
@@ -413,8 +450,9 @@ class GoogleProvider:
             name yet, from the operator's ``model_params.json``.
         client: An already-built ``google.genai.Client`` (or compatible). The seam tests inject one;
             when given, no credential is loaded and nothing is built.
-        builtin_tools: Accepted for the factory's uniform signature. This adapter ships no
-            server-side built-in yet, so every name is ignored (and none resolves for this provider).
+        builtin_tools: The server-side built-ins to send beside the function declarations on every
+            turn, by builtin name (`BUILTINS`: ``code_execution``, ``url_context``). A name this
+            adapter does not send is ignored — no plugin resolves one for this provider.
         default_params: ``GenerateContentConfig`` fields applied to every call, from the operator's
             ``model_params.json`` — ``temperature``, ``top_p``, ``top_k``, ``max_output_tokens``,
             ``thinking_config``, ``safety_settings``, ``seed``, ``stop_sequences``, ``labels``,
@@ -473,6 +511,12 @@ class GoogleProvider:
         #: The models already warned about for having no rate in the table, so the warning is once
         #: per model per wake rather than once per call.
         self._unpriced: set[str] = set()
+        #: The built-ins' wire entries, built once; sent ahead of the function declarations.
+        self._builtins = [
+            self._types.Tool(**{BUILTINS[name]: _builtin_config(self._types, name)})
+            for name in dict.fromkeys(builtin_tools)
+            if name in BUILTINS
+        ]
         self._phased = _PhasedTimeout()
         self._http: httpx.Client | None = None
         #: The service-account credentials, sealed, so the adapter can refresh the token on its own
@@ -605,8 +649,11 @@ class GoogleProvider:
         if system:
             update["system_instruction"] = system
         declared = [self._declaration(spec) for spec in tools or ()]
+        wire_tools = list(self._builtins)
         if declared:
-            update["tools"] = [types.Tool(function_declarations=declared)]
+            wire_tools.append(types.Tool(function_declarations=declared))
+        if wire_tools:
+            update["tools"] = wire_tools
         # The operator's tuning as the SDK's own typed config, so every nested field (a
         # `thinking_config`, a `safety_settings` list) is serialized the way the SDK serializes it.
         config = self._config.model_copy(update=update)
@@ -638,6 +685,84 @@ class GoogleProvider:
         with generation_of({"id": response_id}):
             return self._from_wire(response, candidate, reason)
 
+    def search(self, query: str) -> str:
+        """Answer `query` with Google Search grounding, in one call of its own (issue #656).
+
+        The call's only tool is ``google_search`` — no function declarations, which Vertex will not
+        combine with a search tool — and its only content is the query, so nothing of the agent's
+        conversation leaves for it. Returns the grounded answer with a ``Sources:`` footer.
+
+        Two lines, both ``kind=search.grounding``: the call's ``llm`` line as ``purpose=helper`` —
+        it is a model call the brain made on the agent's behalf, never the brain's own turn — with
+        its tokens priced from the table (grounding's own input tokens exempt where Google says so),
+        and a ``media`` line for the grounding fee, which is not tokens and is the fleet's tool
+        spend. A fee the table cannot state is logged without ``cost=`` and one WARNING. Raises the
+        same typed `ProviderError`s as `chat`; the tool hands the model their text.
+        """
+        types = self._types
+        budget = call_timeout(
+            len(query), output_tokens=output_cap(self._default_params), fixed=self._fixed_timeout
+        )
+        self._phased.budget = budget
+        config = self._config.model_copy(
+            update={
+                "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
+                "http_options": types.HttpOptions(
+                    timeout=int(budget.generation * 1000),
+                    extra_body=copy.deepcopy(self._extra_body) if self._extra_body else None,
+                ),
+                "tools": [types.Tool(google_search=types.GoogleSearch())],
+            }
+        )
+        contents = [types.Content(role="user", parts=[types.Part(text=query)])]
+        started = time.monotonic()
+        with _mapped_errors(self._genai):
+            self._refresh_token(budget)
+            response = self._client.models.generate_content(
+                model=self.model, contents=contents, config=config
+            )
+        seconds = time.monotonic() - started
+        meta = getattr(response, "usage_metadata", None)
+        candidate = _first_candidate(response)
+        log_llm_call(
+            provider=self.provider,
+            purpose=HELPER,
+            kind=SEARCH_KIND,
+            endpoint=self.location,
+            model=self.model,
+            seconds=seconds,
+            usage=_wire_usage(meta),
+            cost=self._cost(meta, grounded=True),
+            outcome="ok",
+            generation_id=generation_id({"id": getattr(response, "response_id", None)}),
+        )
+        grounding = getattr(candidate, "grounding_metadata", None)
+        sources = _grounding_sources(grounding)
+        queries = _grounding_queries(grounding)
+        if sources:
+            fee = grounding_cost(self.model, queries=queries, sourced=True)
+            if fee is None:
+                _log.warning(
+                    "Google Search grounding on %r is not priced (no published scheme for the "
+                    "model, or no grounding queries listed to count); its fee carries no cost=.",
+                    self.model,
+                )
+            log_media_call(
+                provider=self.provider,
+                kind=SEARCH_KIND,
+                model=self.model,
+                seconds=None,
+                count=grounding_units(self.model, queries),
+                cost=fee,
+            )
+        parts = getattr(getattr(candidate, "content", None), "parts", None) or []
+        text = "".join(
+            part.text
+            for part in parts
+            if getattr(part, "text", None) and not getattr(part, "thought", None)
+        )
+        return (text or "(Google Search returned no answer.)") + format_citations(sources)
+
     def _refresh_token(self, budget: CallTimeout) -> None:
         """Refresh the access token now, bounded and single-shot, if it is not valid (`_token_request`).
 
@@ -649,7 +774,7 @@ class GoogleProvider:
             return
         self._credentials.value.refresh(_token_request((budget.connect, METADATA_TIMEOUT)))
 
-    def _cost(self, meta: Any) -> float | None:
+    def _cost(self, meta: Any, *, grounded: bool = False) -> float | None:
         """This call's dollars at Google's published rates — computed, never vendor-stated (#655)."""
         if not known(self.model) and self.model not in self._unpriced:
             self._unpriced.add(self.model)
@@ -664,6 +789,7 @@ class GoogleProvider:
             self.location or "",
             from_usage_metadata(meta),
             service_tier=self._default_params.get("service_tier"),
+            grounded=grounded,
         )
 
     # --- harness -> Gemini ----------------------------------------------------
@@ -876,6 +1002,28 @@ def _validated_params(types: Any, params: Mapping[str, Any]) -> tuple[dict[str, 
             f"{exc}",
         ) from exc
     return dict(params), typed
+
+
+def _builtin_config(types: Any, name: str) -> Any:
+    """The (empty) configuration object a built-in's ``types.Tool`` field takes."""
+    return {"code_execution": types.ToolCodeExecution, "url_context": types.UrlContext}[name]()
+
+
+def _grounding_sources(grounding: Any) -> list[dict[str, str]]:
+    """The web sources a grounded answer cites, as ``{"url", "title"}`` for `format_citations`."""
+    sources = []
+    for chunk in getattr(grounding, "grounding_chunks", None) or ():
+        web = getattr(chunk, "web", None)
+        uri = getattr(web, "uri", None)
+        if uri:
+            sources.append({"url": uri, "title": getattr(web, "title", None) or ""})
+    return sources
+
+
+def _grounding_queries(grounding: Any) -> int | None:
+    """How many grounding queries Google lists for the call — ``None`` when it lists none."""
+    queries = [q for q in getattr(grounding, "web_search_queries", None) or () if q]
+    return len(queries) or None
 
 
 def _call_key(call: ToolCall) -> tuple[str, str, str]:

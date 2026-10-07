@@ -129,3 +129,152 @@ def test_the_live_line_names_the_call_by_openais_own_id(surface, prefix, caplog)
             assert provider._client.responses.retrieve(generation).id == generation
     finally:
         provider.close()
+
+
+# --- the computed cost (issue #657) ------------------------------------------------------------
+#
+# OpenAI states no price, so the line's `cost=` is the harness's arithmetic over `_openai_rates`.
+# Only the live endpoint can say whether the usage shapes that arithmetic reads are the ones OpenAI
+# actually sends — the cache-write count, the Images split, the transcription duration — so each is
+# checked here against a real response, by value: the line's figure must equal the table's own
+# arithmetic over what OpenAI reported, rendered the way the line renders it — and the cache-write
+# count is proven non-zero on a prompt long enough to be written, so a misspelt field cannot price
+# every write as ordinary input and still pass.
+
+FLEET_MODEL = "gpt-6-sol"
+
+
+def _line(caplog, head):
+    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith(head))
+
+
+def _field(line, name):
+    for token in line.split():
+        if token.startswith(f"{name}="):
+            return token.split("=", 1)[1]
+    return None
+
+
+@pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
+def test_a_fleet_model_turn_logs_the_tables_arithmetic_as_its_cost(caplog):
+    from basecradle_harness._observability import _money, capture_llm_call
+    from basecradle_harness._openai_rates import call_cost, usage_of
+
+    provider = OpenAIProvider(model=FLEET_MODEL, api_key=KEY, surface="responses", max_retries=0)
+    try:
+        with capture_llm_call() as call:
+            provider.chat([Message.user("Reply with exactly: pong")])
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            provider.chat([Message.user("Reply with exactly: pong")])
+    finally:
+        provider.close()
+
+    usage = usage_of(call.usage)
+    assert usage is not None and usage.input > 0 and usage.output > 0
+    expected = call_cost(FLEET_MODEL, usage)
+    assert expected is not None and _money(call.cost) == _money(expected)
+    line = _line(caplog, "llm provider=")
+    assert _field(line, "cost") is not None and _field(line, "cost_basis") == "computed", line
+
+
+@pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
+def test_a_web_search_logs_one_priced_line_per_search_call(caplog):
+    provider = OpenAIProvider(
+        model=FLEET_MODEL,
+        api_key=KEY,
+        surface="responses",
+        max_retries=0,
+        builtin_tools=["web_search"],
+    )
+    try:
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            provider.chat(
+                [Message.user("Search the web: what is today's top headline on bbc.com? One line.")]
+            )
+    finally:
+        provider.close()
+
+    line = _line(caplog, "media provider=openai kind=search.web")
+    count = int(_field(line, "count"))
+    assert count >= 1
+    assert _field(line, "cost") == f"{count * 0.01:.8f}".rstrip("0").rstrip(".")
+    assert _field(line, "cost_basis") == "computed"
+
+
+@pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
+def test_an_images_response_carries_the_usage_split_its_price_reads():
+    """The Images API reports image and text input apart; without that split there is no price."""
+    from openai import OpenAI
+
+    from basecradle_harness._openai_rates import image_cost
+
+    client = OpenAI(api_key=KEY, max_retries=0)
+    response = client.images.generate(
+        model="gpt-image-2.5-flare", prompt="a small red dot", size="1024x1024", quality="low"
+    )
+    usage = response.usage
+    assert usage is not None and usage.input_tokens_details.text_tokens > 0
+    assert usage.output_tokens > 0
+    assert image_cost("gpt-image-2.5-flare", usage.model_dump()) is not None
+
+
+@pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
+def test_a_transcription_reports_the_duration_its_price_reads():
+    """gpt-transcribe is priced per minute, from the duration the response states."""
+    import io
+    import struct
+    import wave
+
+    from openai import OpenAI
+
+    from basecradle_harness._openai_rates import transcription_cost
+
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as audio:  # two seconds of a quiet tone, 16 kHz mono
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(16_000)
+        audio.writeframes(b"".join(struct.pack("<h", (i % 40) * 50) for i in range(32_000)))
+    client = OpenAI(api_key=KEY, max_retries=0)
+    response = client.audio.transcriptions.create(
+        model="gpt-transcribe", file=("tone.wav", buffer.getvalue(), "audio/wav")
+    )
+    usage = response.usage
+    assert usage is not None and usage.type == "duration"
+    assert usage.seconds == pytest.approx(2.0, abs=0.5)
+    assert transcription_cost("gpt-transcribe", usage.model_dump()) == pytest.approx(
+        usage.seconds / 60 * 0.0045
+    )
+
+
+@pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
+def test_a_cache_write_is_reported_and_priced_at_the_write_rate():
+    """A long, never-seen prefix is written to the cache, and OpenAI says so in the field we read.
+
+    Unique per run (a fresh uuid leads the prompt), so no earlier run's cache can turn the write
+    into a read. If OpenAI renamed ``cache_write_tokens``, `usage_of` would read 0 and this fails.
+    """
+    import uuid
+
+    from basecradle_harness._observability import _money, capture_llm_call
+    from basecradle_harness._openai_rates import RATES, Usage, call_cost, usage_of
+
+    filler = " ".join(f"Clause {i}: the harness prices every call it can." for i in range(400))
+    prompt = f"Run {uuid.uuid4()}. {filler}\n\nReply with exactly: pong"
+    provider = OpenAIProvider(model=FLEET_MODEL, api_key=KEY, surface="responses", max_retries=0)
+    try:
+        with capture_llm_call() as call:
+            provider.chat([Message.user(prompt)])
+    finally:
+        provider.close()
+
+    usage = usage_of(call.usage)
+    assert usage is not None and usage.cache_write > 0, call.usage
+    assert _money(call.cost) == _money(call_cost(FLEET_MODEL, usage))
+    as_plain_input = call_cost(
+        FLEET_MODEL, Usage(input=usage.input, cached=usage.cached, output=usage.output)
+    )
+    tier = RATES[FLEET_MODEL].short
+    assert call.cost - as_plain_input == pytest.approx(
+        usage.cache_write * (tier.cache_write - tier.input) / 1e6
+    )

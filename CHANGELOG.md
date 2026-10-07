@@ -7,6 +7,91 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.151.0] - 2026-10-07
+
+### Added: OpenAI's cost on every line, computed from its published rates (issue #657)
+
+OpenAI's API returns token usage and no price, so every `llm provider=openai` line the fleet wrote
+carried no `cost=` — 206 brain calls in 30 days, none with a cost (basecradle#645) — and the agents
+brained on GPT-6 Sol were invisible on *Total Spend by Provider* and *Spend by Agent*. By the
+capital's ruling, OpenAI is now priced exactly as Google is: from a maintained table, one mechanism
+for both vendors.
+
+- **`_openai_rates`** transcribes OpenAI's Standard rates from
+  `https://developers.openai.com/api/docs/pricing` (read 2026-10-07): the GPT-6 family (`gpt-6-sol`,
+  `gpt-6.1-sol`, `gpt-6-luna`, `gpt-6-astra`), GPT-5.6 (`sol`, `terra`, `luna`), `gpt-5.5`, `gpt-5.4`,
+  `gpt-5.4-mini` and `gpt-5.4-nano` — every OpenAI model the fleet runs or has run, with their
+  families. A call is priced by its input tokens split three ways (uncached, cached, and on GPT-5.6
+  and later a **cache write**, `input_tokens_details.cache_write_tokens`, at its own rate), its
+  output tokens, and its context tier (above 272K input tokens every token of the call is priced on
+  the long-context row). A dated snapshot id is priced as its alias.
+- **What is not priced, and says so:** a model the table does not carry, a call served on Flex,
+  Fast (formerly Priority), Ultrafast or Scale, a prompt past 272K tokens on a model with no
+  long-context row (`gpt-5.4-mini`, `gpt-5.4-nano`), and any client aimed at a host other than
+  `api.openai.com` (OpenAI bills data-residency and FedRAMP endpoints with a 10% uplift) log no
+  `cost=` and one WARNING per kind of gap per wake. Nothing is computed for an xAI or OpenRouter endpoint behind the
+  `openai` SDK: those state their own prices where they state any.
+- **Media.** `image.generate` / `image.edit` are priced from the Images API's usage (image and text
+  input apart, image output), and `audio.transcribe` from the duration OpenAI reports
+  (`gpt-transcribe`, $0.0045 a minute) or its tokens (`gpt-4o-transcribe`).
+- **Web search** is billed per call on top of the tokens ($10 per 1,000 search calls), so each
+  Responses call that searched writes its own priced line:
+  `media provider=openai kind=search.web model=gpt-6-sol count=3 cost=0.03 cost_basis=computed`.
+- **One stated gap: code-interpreter containers.** OpenAI bills a container per session, and no
+  response says which billing applies or how long the session lived, so a wake that ran one logs
+  one WARNING saying the charge is not priced. Read it off OpenAI's usage dashboard.
+
+### Added: `cost_basis=computed` beside every computed dollar (issues #655, #657)
+
+A computed `cost=` is now followed by `cost_basis=computed`, the literal the NOC's Steel launcher
+already writes for its computed browser cost, so a computed figure reads the same wherever it comes
+from. It rides the OpenAI and Google `llm` lines, their media lines and the tool-fee lines below, and
+it appears only when `cost=` does. A vendor-stated cost carries no basis, so those lines are
+byte-identical to 0.150.0. The basis travels with the figure (`ComputedCost`), so a caller writing
+its own line from a captured call — the describer, the reranker — carries it without being told.
+
+```
+llm provider=openai purpose=main model=gpt-6-sol duration=11.49s tokens_in=18633 tokens_out=415 tokens_total=19048 cached_tokens=4391 cost=0.0335122 cost_basis=computed generation_id=resp_…
+```
+
+### Added: Gemini's built-ins, and Google Search grounding with its fee on the journal (issue #656)
+
+- **`code_execution`** (a Google variant on the existing stem) and **`url_context`** (a new stem) ride
+  beside the agent's function tools on every turn of a Gemini brain. Both bill as tokens only, so
+  the call's own `cost=` covers them. Both require a **Gemini 3** model (a new `ModelFamily`
+  requirement, `ModelFamily("gemini-3")`): that is the family the live gate proves the combination
+  on, and a refusal beside function declarations would be a 400 on every turn, so on another model
+  they resolve as `skipped` rather than risk an agent that never speaks.
+- **`google_search`** (a new stem) gives a Gemini agent a **`web_search` tool the harness runs**.
+  Vertex refuses a search tool beside function declarations in one request ("Multiple tools are
+  supported only when they are all search tools"), and every harness turn carries function
+  declarations, so Search cannot be a built-in there. Instead `GoogleProvider.search` makes one
+  grounded call with Google Search as its only tool and the query as its only content, on the
+  brain's own model and Vertex account, and returns the answer with a `Sources:` footer.
+- **What a search costs is logged on two lines**, by `@origin`'s condition that every pay-per-use
+  tool reach spend reporting: the grounded call's `llm` line (`purpose=helper kind=search.grounding`,
+  its tokens priced from the table, with grounding's own input tokens free on Gemini 3 as Google
+  states), and a priced fee line,
+  `media provider=google kind=search.grounding model=gemini-3.8-flash count=2 cost=0.028 cost_basis=computed`.
+  Gemini 3 bills $14 per 1,000 grounding queries and Gemini 2.5 $35 per 1,000 grounded prompts, both
+  only when sources come back; `count=` is the billed units (the queries, or `1` for a 2.5 prompt). **The free allowance is not netted out**: the harness cannot see
+  where an account stands against Google's 5,000 free queries a month, so every query is priced at
+  list. A fee that cannot be counted is logged without `cost=` and one WARNING.
+- All three are powerful and **opt-in on every provider**:
+  `basecradle-harness-install --opt-in code_execution,url_context,google_search`.
+
+### Added: `--resolved-config` says where the brain's cost comes from
+
+Three fields: `cost_basis` (`computed`, `stated`, or `null` for a brain the spend dashboard cannot
+see), `cost_rates_source` (the pricing page and the date it was read, for a computed basis), and
+`cost_model_priced` (whether `AI_MODEL` has a row in that table).
+
+### Fixed
+
+- **The Google live gate's cost test** compared an unrounded figure against the line's
+  eight-decimal rendering, so it failed on exactly the sub-cent calls a Flash model makes. It now
+  compares the line's string with the table's arithmetic rendered the same way.
+
 ## [0.150.0] - 2026-10-06
 
 ### Added: Gemini on Vertex AI, called direct — a brain, and a describer on its own stack (issue #655)
