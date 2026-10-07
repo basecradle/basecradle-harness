@@ -839,6 +839,45 @@ def test_the_line_names_the_upstream_that_actually_served_the_call(router, caplo
     assert "cost=0.0445" in line  # OpenRouter's own figure, not harness arithmetic
 
 
+def test_a_byok_call_logs_the_upstream_cost_through_the_typed_sdk(router, caplog):
+    """The SDK's typed `ChatUsage` must carry `is_byok` and `cost_details` through `model_dump`,
+    or a BYOK call logs `cost=0` (issue #653) — so this goes through the real SDK, not a dict."""
+    import logging
+
+    body = completion(content="Hi.")
+    body["usage"] |= {
+        "cost": 0,
+        "is_byok": True,
+        "cost_details": {
+            "upstream_inference_cost": 0.000288,
+            "upstream_inference_prompt_cost": 0.0000105,
+            "upstream_inference_completions_cost": 0.0002775,
+        },
+    }
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider().chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert " cost=0.000288 " in line
+    assert line.endswith(" billing=byok")
+
+
+def test_a_call_billed_by_openrouter_names_no_biller(router, caplog):
+    import logging
+
+    body = completion(content="Hi.")
+    body["usage"] |= {"cost": 0.0445}
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider().chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert " cost=0.0445" in line and "billing=" not in line
+
+
 def test_the_call_asks_openrouter_which_endpoint_it_routed_to(router, caplog):
     """The metadata is **opt-in**: unasked, OpenRouter says nothing trustworthy about routing. So
     every call sends the header — without it the `endpoint=` field silently disappears."""

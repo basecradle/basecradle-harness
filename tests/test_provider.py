@@ -923,6 +923,29 @@ def test_the_same_adapter_reports_the_endpoint_and_cost_when_the_response_carrie
     assert "OpenAI" not in line
 
 
+def test_the_openai_sdk_at_openrouter_reports_a_byok_calls_upstream_cost(router, provider, caplog):
+    """The ``openai`` SDK keeps fields it does not model, so a BYOK body read through it costs what
+    the provider bills (``cost_details.upstream_inference_cost``), not OpenRouter's 0 (issue #653).
+    """
+    body = completion(content="Hi.")
+    body["usage"] = {
+        "prompt_tokens": 42,
+        "completion_tokens": 111,
+        "total_tokens": 153,
+        "cost": 0,
+        "is_byok": True,
+        "cost_details": {"upstream_inference_cost": 0.000288},
+    }
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("hello")])
+
+    line = _llm_line(caplog)
+    assert " cost=0.000288 " in line
+    assert line.endswith(" billing=byok")
+
+
 def test_an_openai_response_names_no_endpoint_or_cost_and_the_fields_are_omitted(
     router, responses_provider, caplog
 ):
