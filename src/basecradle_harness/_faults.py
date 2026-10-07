@@ -41,7 +41,11 @@ import re
 #: is included because OpenAI's own out-of-funds body says ``insufficient_quota`` — but the adapter
 #: reads that structured code first and only falls back to this text match for a vendor (xAI) that
 #: gives no code. Matches OpenAI's human message ("exceeded your current quota, please check your
-#: plan and billing details") and the plain shapes an xAI/OpenRouter body is likely to use.
+#: plan and billing details") and the plain shapes an xAI/OpenRouter body is likely to use. Vertex AI
+#: (issue #655) refuses a project whose billing is off with a 403 that the Google adapter reads by its
+#: structured ``BILLING_DISABLED`` reason first; the text alternatives below are its two wordings —
+#: *"The billing account for the owning project is disabled …"* and *"This API method requires
+#: billing to be enabled"*.
 _OUT_OF_FUNDS_PHRASES = re.compile(
     r"insufficient[ _-]?(?:quota|funds|credit|balance)"
     r"|out of (?:credit|credits|funds|quota)"
@@ -51,7 +55,9 @@ _OUT_OF_FUNDS_PHRASES = re.compile(
     r"|payment required"
     r"|billing (?:details|hard limit|issue)"
     r"|check your plan and billing"
-    r"|exceeded your current quota",
+    r"|exceeded your current quota"
+    r"|billing[ _](?:account (?:for the owning project )?is )?disabled"
+    r"|requires billing to be enabled",
     re.IGNORECASE,
 )
 

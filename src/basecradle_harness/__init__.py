@@ -48,6 +48,7 @@ from basecradle_harness._exceptions import (
     ProviderTimeoutError,
     ProviderToolSchemaError,
 )
+from basecradle_harness._google import GoogleConfigError, GoogleProvider
 from basecradle_harness._governance import TimelinesTool, TrustTool
 from basecradle_harness._grok import (
     GrokEditImageTool,
@@ -210,6 +211,8 @@ __all__ = [
     "OpenAIProvider",
     "XaiSdkProvider",
     "OpenRouterProvider",
+    "GoogleProvider",
+    "GoogleConfigError",
     # Tools, registry, and the safety boundary
     "Tool",
     "ToolRegistry",

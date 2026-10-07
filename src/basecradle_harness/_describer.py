@@ -160,6 +160,30 @@ DESCRIBER_API_KEY_VAR = "HARNESS_DESCRIBER_API_KEY"
 #: serve a Gemini-class describer — an inherited pin fails every call with no eligible provider.
 DESCRIBER_PROVIDERS_VAR = "HARNESS_DESCRIBER_PROVIDERS"
 
+#: The describer's **own stack** (issue #655): the vendor and SDK it calls, when they are not the
+#: brain's. Both or neither — absent, the describer rides the brain's ``(provider, sdk, surface)``
+#: exactly as it always has; set, it is built on that vendor's SDK at its default surface, never
+#: pointed at the brain's ``AI_BASE_URL``. The case it exists for: an agent whose brain runs on one
+#: vendor and whose eyes are Gemini on Vertex, called direct.
+DESCRIBER_PROVIDER_VAR = "HARNESS_DESCRIBER_PROVIDER"
+DESCRIBER_SDK_VAR = "HARNESS_DESCRIBER_SDK"
+#: The surface of the describer's own stack, for an SDK with more than one — read exactly as
+#: ``AI_SDK_SURFACE`` is (`_basecradle._surface_for`): unset, the SDK's default. Part of the stack, so
+#: it is meaningless (and a fault) without the two above.
+DESCRIBER_SURFACE_VAR = "HARNESS_DESCRIBER_SDK_SURFACE"
+
+#: A describer on Google's Vertex AI takes a service-account key file and a place instead of an API
+#: key and a routing list — its **own**, never a fallback to the brain's ``AI_CREDENTIALS_FILE`` /
+#: ``AI_LOCATION`` / ``AI_PROJECT``, for the same one-credential-per-purpose reason as the key. The
+#: file and the location are required; the project defaults to the one the file names.
+DESCRIBER_CREDENTIALS_FILE_VAR = "HARNESS_DESCRIBER_CREDENTIALS_FILE"
+DESCRIBER_LOCATION_VAR = "HARNESS_DESCRIBER_LOCATION"
+DESCRIBER_PROJECT_VAR = "HARNESS_DESCRIBER_PROJECT"
+
+#: The provider whose describer is configured by credential file and location rather than by key
+#: and routing list.
+_VERTEX_PROVIDER = "google"
+
 #: The ``kind=`` a describe carries on its `llm` line — the *job* within the ``helper`` category
 #: (issue #485). **Thing then verb**, matching the media lines' own vocabulary (``video.generate``,
 #: ``audio.transcribe``) rather than inventing a second word order for the same idea. Constants
@@ -813,71 +837,183 @@ def describer_providers_from_env(env: Any = None) -> tuple[str, ...]:
     )
 
 
+def describer_stack_from_env(env: Any = None) -> tuple[str | None, str | None]:
+    """The describer's own ``(provider, sdk)`` override as configured, either half ``None`` if unset.
+
+    Read raw and unvalidated: `describer_from_env` decides what an incomplete or unknown stack means
+    (a config fault), and ``--resolved-config`` reports what the operator wrote.
+    """
+    source = env if env is not None else os.environ
+    provider = (source.get(DESCRIBER_PROVIDER_VAR) or "").strip().lower() or None
+    sdk = (source.get(DESCRIBER_SDK_VAR) or "").strip().lower() or None
+    return provider, sdk
+
+
+def describer_surface_from_env(env: Any = None) -> str | None:
+    """The describer's own surface as configured (``HARNESS_DESCRIBER_SDK_SURFACE``), or ``None``."""
+    source = env if env is not None else os.environ
+    return (source.get(DESCRIBER_SURFACE_VAR) or "").strip().lower() or None
+
+
+def describer_required_env(env: Any = None) -> frozenset[str]:
+    """The variables a configured describer reads its credential from — empty when it is off.
+
+    The ``tool_env`` map's describer half (issue #427's shape): with a describer configured, a
+    ``false`` there is exactly a describer that cannot do its job, so the set names what *this*
+    describer's provider takes — the key on a key-based vendor, the credential file and location on
+    Vertex — and nothing it does not.
+    """
+    source = env if env is not None else os.environ
+    if not describer_model_from_env(source):
+        return frozenset()
+    provider, _sdk = describer_stack_from_env(source)
+    if provider is None:
+        provider = (source.get("AI_PROVIDER") or "openai").strip().lower()
+    if provider == _VERTEX_PROVIDER:
+        return frozenset({DESCRIBER_CREDENTIALS_FILE_VAR, DESCRIBER_LOCATION_VAR})
+    return frozenset({DESCRIBER_API_KEY_VAR})
+
+
 def describer_from_env(env: Any = None) -> Describer | None:
     """The agent's describer, or ``None`` when no model is configured (describer off).
 
-    ``None`` is the ordinary state and the shipped default: every perception path then behaves
-    exactly as it did before this module existed. A model *with* a missing key or provider list is
-    **not** ``None`` — it is a describer carrying a config fault, which falls back to the withheld
-    caption on every call and says so at ERROR once per wake. The difference is the whole point:
-    nobody configures a describer by accident, so a configured-and-dead one is a defect to page on,
-    while an unconfigured one is a choice.
+    (``HARNESS_DESCRIBER_SDK_SURFACE`` selects the own stack's surface, as ``AI_SDK_SURFACE`` does the
+    brain's; set without the stack it is ``config:incomplete_stack``.)
 
-    What it takes from the brain is the **SDK, surface and endpoint** — one adapter family, one
-    error taxonomy — via the brain's own factory, so those cannot drift. What it does **not** take
-    is the brain's key, its routing pin, or its ``model_params.json``: see `DESCRIBER_API_KEY_VAR`
-    and `DESCRIBER_PROVIDERS_VAR` for why each of those is a separate configuration and not an
-    oversight. It is built with **no server built-ins and no code bridge**: a describer that could
-    search the web or run code is not a sense organ.
+    ``None`` is the ordinary state and the shipped default: every perception path then behaves
+    exactly as it did before this module existed. A model *with* a missing credential is **not**
+    ``None`` — it is a describer carrying a config fault, which falls back to the withheld caption on
+    every call and says so at ERROR once per wake. The difference is the whole point: nobody
+    configures a describer by accident, so a configured-and-dead one is a defect to page on, while an
+    unconfigured one is a choice.
+
+    **Which stack it runs on.** By default the brain's **SDK, surface and endpoint** — one adapter
+    family, one error taxonomy — via the brain's own factory, so those cannot drift. With
+    ``HARNESS_DESCRIBER_PROVIDER`` + ``HARNESS_DESCRIBER_SDK`` set (issue #655) it runs on that
+    vendor instead, at the SDK's default surface and its own default endpoint, built by the same
+    factory. Either way it never takes the brain's credential, routing pin, or ``model_params.json``:
+    see `DESCRIBER_API_KEY_VAR`, `DESCRIBER_PROVIDERS_VAR` and `DESCRIBER_CREDENTIALS_FILE_VAR` for
+    why each is a separate configuration and not an oversight. It is built with **no server
+    built-ins and no code bridge**: a describer that could search the web or run code is not a sense
+    organ.
+
+    **What its credential is depends on its provider.** A key-based vendor needs the dedicated key
+    and the OpenRouter routing list, as it always has (``config:missing_api_key`` /
+    ``config:missing_providers``). Vertex needs a service-account key file and a location instead
+    (``config:missing_credentials_file`` / ``config:missing_location``), and a file that will not
+    load is ``config:`` + the adapter's own reason.
 
     A build failure (no adapter for the SDK, no ``AI_MODEL``) becomes a config fault rather than a
     raise: a misconfigured describer must cost the *description*, never the wake. The import is
     local because the factory lives in `_basecradle`, which imports the engine that calls this.
 
-    `env` overrides only the **describer's own three** variables. The brain's ``(provider, sdk,
-    surface)`` triple always comes from the process environment, and deliberately: the describer is
-    defined as *the brain's stack with a different model, key and pin*, so resolving that stack
+    `env` overrides only the **describer's own** variables. The brain's ``(provider, sdk, surface)``
+    triple always comes from the process environment, and deliberately: a describer riding the
+    brain's stack is defined as *that* stack with a different model and credential, so resolving it
     from a caller-supplied mapping would let it be built against a stack the agent is not running.
     """
     source = env if env is not None else os.environ
     model = describer_model_from_env(source)
     if not model:
         return None
-    # Read once, checked once, passed once — a second read here is a second thing to keep in step.
-    api_key = (source.get(DESCRIBER_API_KEY_VAR) or "").strip()
-    if not api_key:
-        return Describer(None, model, fault="config:missing_api_key")
-    providers = describer_providers_from_env(source)
-    if not providers:
-        return Describer(None, model, fault="config:missing_providers")
+    own_provider, own_sdk = describer_stack_from_env(source)
+    own_surface = describer_surface_from_env(source)
+    if (own_provider is None) != (own_sdk is None) or (own_surface and own_provider is None):
+        # Half a stack is neither the brain's nor a stack: building either would be a guess about
+        # which half the operator meant.
+        return Describer(None, model, fault="config:incomplete_stack")
     try:
-        from basecradle_harness._basecradle import _config_from_env, _provider_from_config
+        from basecradle_harness._basecradle import (
+            _PROVIDERS,
+            _config_from_env,
+            _provider_from_config,
+            _surface_for,
+        )
 
-        provider_name, sdk, surface = _config_from_env()
-
-        def build(budget: int) -> Provider:
-            """This describer's adapter, capped at `budget` output tokens (issue #488).
-
-            A builder rather than one instance because the cap is a **construction** argument on
-            every shipped adapter, and a still, a clip and a retry are three caps. The closure is
-            what keeps the whole vendor question — which of ``max_tokens`` /
-            ``max_completion_tokens`` / ``max_output_tokens`` this cell takes — inside
-            `_provider_from_config`, where every other vendor spelling already lives.
-            """
-            return _provider_from_config(
-                provider_name,
-                sdk,
-                surface,
-                model=model,
-                api_key=api_key,
-                routing=providers,
-                inherit_params=False,
-                max_output_tokens=budget,
-            )
-
-        provider = build(IMAGE_OUTPUT_BUDGET)
+        brain = None if own_provider is None else _config_from_env()[0]
+        if own_provider is None:
+            provider_name, sdk, surface = _config_from_env()
+        else:
+            if own_provider not in _PROVIDERS:
+                return Describer(
+                    None,
+                    model,
+                    fault="config:unknown_provider",
+                    detail=f"{DESCRIBER_PROVIDER_VAR}={own_provider!r}",
+                )
+            provider_name, sdk = own_provider, own_sdk
+            surface = _surface_for(own_sdk, own_surface)
     except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
         return Describer(None, model, fault="config:no_provider", detail=str(exc))
+    credential: dict[str, Any]
+    if provider_name == _VERTEX_PROVIDER:
+        # Read once, checked once, passed once — a second read here is a second thing to keep in
+        # step. Passed explicitly even when empty-checked, so the adapter's fallback to the brain's
+        # `AI_*` variables can never be reached from here.
+        credentials_file = (source.get(DESCRIBER_CREDENTIALS_FILE_VAR) or "").strip()
+        if not credentials_file:
+            return Describer(None, model, fault="config:missing_credentials_file")
+        location = (source.get(DESCRIBER_LOCATION_VAR) or "").strip()
+        if not location:
+            return Describer(None, model, fault="config:missing_location")
+        credential = {
+            "credentials_file": credentials_file,
+            "location": location,
+            "project": (source.get(DESCRIBER_PROJECT_VAR) or "").strip() or None,
+        }
+    else:
+        api_key = (source.get(DESCRIBER_API_KEY_VAR) or "").strip()
+        if not api_key:
+            return Describer(None, model, fault="config:missing_api_key")
+        providers = describer_providers_from_env(source)
+        if not providers:
+            return Describer(None, model, fault="config:missing_providers")
+        credential = {"api_key": api_key, "routing": providers}
+
+    # `AI_BASE_URL` is the brain's vendor's host, so it carries over only when the describer reaches
+    # that same vendor — riding the brain's stack, or naming the brain's provider as its own (an
+    # OpenRouter regional host stays regional either way). On Vertex a host *is* a location, so it
+    # carries over only to a describer at the brain's own location: sent to another, it would run
+    # the describer somewhere other than where it was configured to run.
+    inherit_endpoint = own_provider is None or own_provider == brain
+    if provider_name == _VERTEX_PROVIDER:
+        brain_location = (os.environ.get("AI_LOCATION") or "").strip().lower()
+        inherit_endpoint = inherit_endpoint and credential["location"].lower() == brain_location
+
+    def build(budget: int) -> Provider:
+        """This describer's adapter, capped at `budget` output tokens (issue #488).
+
+        A builder rather than one instance because the cap is a **construction** argument on every
+        shipped adapter, and a still, a clip and a retry are three caps. The closure is what keeps
+        the whole vendor question — which of ``max_tokens`` / ``max_completion_tokens`` /
+        ``max_output_tokens`` this cell takes — inside `_provider_from_config`, where every other
+        vendor spelling already lives.
+        """
+        return _provider_from_config(
+            provider_name,
+            sdk,
+            surface,
+            model=model,
+            inherit_params=False,
+            # `AI_BASE_URL` is the brain's vendor's host, so it carries over exactly when the
+            # describer reaches that same vendor — riding the brain's stack, or naming the brain's
+            # provider as its own (an OpenRouter regional host stays regional either way).
+            inherit_endpoint=inherit_endpoint,
+            max_output_tokens=budget,
+            **credential,
+        )
+
+    try:
+        provider = build(IMAGE_OUTPUT_BUDGET)
+    except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
+        from basecradle_harness._google import GoogleConfigError
+
+        # A Vertex configuration names its own fault (a missing or unreadable key file, no
+        # location); anything else that stops the build is the generic one.
+        fault = (
+            f"config:{exc.reason}" if isinstance(exc, GoogleConfigError) else "config:no_provider"
+        )
+        return Describer(None, model, fault=fault, detail=str(exc))
     # Built eagerly at the still budget so a config fault is caught here, where it is reported once
     # per wake; every other budget is built on the call that needs it, and most wakes need none.
     return Describer(provider, model, build=build, budget=IMAGE_OUTPUT_BUDGET)

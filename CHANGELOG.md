@@ -7,6 +7,81 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.150.0] - 2026-10-06
+
+### Added: Gemini on Vertex AI, called direct — a brain, and a describer on its own stack (issue #655)
+
+The fleet calls first-party models it holds an account with direct. Google was the exception: the only
+road to Gemini was OpenRouter, which added a party and a fee to the data path and could not reach
+Google's newest Flash models inside the United States at all. This release adds a fourth adapter.
+
+- **`AI_PROVIDER=google` + `AI_SDK=google-genai`** — `GoogleProvider`, over Google's official
+  `google-genai` SDK in Vertex AI mode. Install with `pip install 'basecradle-harness[google-genai]'`
+  (pinned `google-genai>=2.28.0,<3`). `AI_SDK` names the PyPI distribution, as it does for every
+  adapter.
+- **Configuration:** `AI_CREDENTIALS_FILE` (the *path* to a service-account JSON key; relative paths
+  are read from the config home), `AI_LOCATION` (**required, no default** — the SDK's own default,
+  `global`, lets Google process the call anywhere), `AI_PROJECT` (optional; defaults to the key's
+  `project_id`). Only a `service_account` key loads, and Application Default Credentials are never
+  consulted. A missing, unreadable or malformed key, a key pasted where its path belongs (refused
+  without being echoed), a missing location or project, and an unknown or Vertex-unsupported
+  `model_params.json` key each stop the agent at startup with a named reason (`GoogleConfigError`).
+  The location is read case-blind.
+  At `AI_LOCATION=us` the call goes to `aiplatform.us.rep.googleapis.com`.
+- **Every call control:** `model_params.json` keys are the SDK's own `GenerateContentConfig` fields
+  (`temperature`, `thinking_config`, `safety_settings`, `labels`, `service_tier`, …), validated at
+  startup; `extra_body` merges into the request body. The harness owns `system_instruction`, `tools`,
+  `http_options`, `automatic_function_calling` and `candidate_count`.
+- **Wire translation:** only the leading system turns become the `system_instruction` (a later one,
+  such as the per-wake brief, stays in place as a labelled user turn, so the cacheable prefix is
+  unchanged); a step's tool results travel as one content, answering each call by name; Gemini 3's
+  thought signatures are sent back for the life of the wake, and a turn resumed after a crash carries
+  Google's documented `skip_thought_signature_validator` for the call whose signature died with the
+  old wake.
+- **Capabilities:** `cache_mode` automatic (Gemini's implicit cache; the hit rides `cached_tokens=`),
+  `supports_vision` / `supports_video` true for `gemini-*` models, finish reason, input-token count,
+  and the fitted per-call timeout (fixed connect, fitted generation) on the wire through the adapter's
+  own `httpx` client, with the SDK's own retry left off. The service-account token is refreshed by
+  the adapter through one bounded request, never `google-auth`'s 120-second, three-attempt default. `context_limit` answers unknown: Vertex's
+  model record, as the SDK reads it, carries no token limit — set `HARNESS_MAX_CONTEXT_TOKENS`
+  (1,048,576 for the Gemini 3 Flash family) or the budget takes its 128K floor.
+- **Faults by their nature:** Vertex's two context-overflow wordings compact and retry; an oversized
+  payload is reported once; a project with billing off (`BILLING_DISABLED`, or its two wordings) is
+  the billing class; 401/403 and a refused key are auth; 429 is a rate limit carrying `Retry-After`;
+  Vertex's own deadline (`504` / `DEADLINE_EXCEEDED`) is a timeout, retried once with twice the
+  budget; other 5xx, a dropped connection and a token-endpoint blip are transient; a generic 400
+  propagates.
+- **Cost is computed** (`_google_rates`): Vertex states tokens and no dollars, so `cost=` on
+  `llm provider=google` is priced from Google's published Standard rates — by model, location class
+  (`global` vs non-global, where `us` is non-global), the >200K context tier, the modality split where
+  audio is priced apart, and the billing date (the Gemini 3.6/3.7/3.8 Flash introductory rates through
+  2026-12-31 and the standard rates from 2027-01-01 are both in the table). It is the one adapter whose
+  cost is harness arithmetic, by the capital's ruling. An unknown model, an unstated cell, or a
+  Priority/Flex/Provisioned call logs **no** `cost=` and one WARNING per model per wake.
+- **The `llm` line grammar is unchanged:** `llm provider=google purpose=main endpoint=<location>
+  model=<gemini id> duration=… tokens_in=… tokens_out=… tokens_total=… cached_tokens=… cost=…
+  generation_id=<response id>`. `tokens_out` counts the reply **and** the thinking (both billed as
+  output); `tokens_reasoning` (on helper lines) is the thinking alone.
+- **The describer can take its own stack.** `HARNESS_DESCRIBER_PROVIDER` + `HARNESS_DESCRIBER_SDK`
+  (both or neither; absent = the brain's stack, as before) build the describer on another vendor, at
+  that SDK's default surface or `HARNESS_DESCRIBER_SDK_SURFACE`, and at its vendor's default
+  endpoint — the brain's `AI_BASE_URL` carries over only when the own stack names the brain's own
+  provider. On
+  Vertex it takes `HARNESS_DESCRIBER_CREDENTIALS_FILE`, `HARNESS_DESCRIBER_LOCATION` (both required)
+  and `HARNESS_DESCRIBER_PROJECT`, never the brain's; `HARNESS_DESCRIBER_API_KEY` / `_PROVIDERS` are
+  required only on key-based providers, as before. New faults: `config:incomplete_stack`,
+  `config:unknown_provider`, `config:missing_credentials_file`, `config:missing_location`, and the key
+  file's own reasons (`config:invalid_credentials_file`, …).
+- **`--resolved-config`** adds `ai_location`, `ai_project`, `ai_credentials_file` (the path, never
+  the key), `describer_provider`, `describer_sdk`, `describer_location`, `describer_project`,
+  `describer_credentials_file`, `describer_sdk_surface` (a credential-file value that is not a path
+  reads `[withheld: not a path]`); `tool_env` names a Vertex describer's key-file and location variables
+  in place of the API key.
+- **Live gate:** `tests/test_google_live.py`, run with `VERTEX_CREDENTIALS_FILE` (and optionally
+  `VERTEX_LOCATION`, `VERTEX_PROJECT`, `VERTEX_MODEL`).
+- Not yet wired: Gemini's server-side built-ins (Google Search grounding, code execution) — issue
+  #656.
+
 ## [0.149.0] - 2026-10-06
 
 ### Added: a bring-your-own-key call reports what the provider bills, and says who bills it (issue #653)

@@ -52,6 +52,7 @@ from basecradle_harness import (
 )
 from basecradle_harness import _wake as _wake_module
 from basecradle_harness._engine import _TRUNCATED_NOTE, is_truncation_note
+from basecradle_harness._google import GoogleProvider
 from basecradle_harness._memory_provider import MemoryExchange, MemoryProvider
 from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openrouter import OpenRouterProvider
@@ -413,7 +414,7 @@ def test_every_shipped_adapter_records_the_finish_reason():
     else in this suite would go red. Mirrors `test_caching.test_every_shipped_adapter_declares_a_
     cache_mode`, deliberately, so the two read as one habit.
     """
-    for adapter in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider):
+    for adapter in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider, GoogleProvider):
         source = inspect.getsource(adapter)
         assert "self.last_finish_reason" in source, adapter.__name__
 

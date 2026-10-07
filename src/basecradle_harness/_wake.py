@@ -139,9 +139,15 @@ from basecradle_harness._brief import (
 from basecradle_harness._code import CodeExecutionBridge
 from basecradle_harness._describer import (
     DESCRIBER_API_KEY_VAR,
+    DESCRIBER_CREDENTIALS_FILE_VAR,
+    DESCRIBER_LOCATION_VAR,
+    DESCRIBER_PROJECT_VAR,
     described_caption,
     describer_model_from_env,
     describer_providers_from_env,
+    describer_required_env,
+    describer_stack_from_env,
+    describer_surface_from_env,
 )
 from basecradle_harness._engine import compose_hooks, is_truncation_note
 from basecradle_harness._exceptions import (
@@ -152,6 +158,12 @@ from basecradle_harness._exceptions import (
     ProviderError,
     ProviderPayloadTooLargeError,
     ProviderTimeoutError,
+)
+from basecradle_harness._google import (
+    CREDENTIALS_FILE_VAR,
+    LOCATION_VAR,
+    PROJECT_VAR,
+    reported_credentials_file,
 )
 from basecradle_harness._harness import Harness
 from basecradle_harness._idempotency import (
@@ -5369,6 +5381,13 @@ def resolved_config() -> dict[str, object]:
       the only honest signal available off-box. ``None`` (never ``""``) if the distribution is
       not installed at all: a defect, not a shrug — an agent with no platform SDK has no body.
     - ``ai_model`` — the ``AI_MODEL`` env value, or ``None`` if unset.
+    - ``ai_location`` / ``ai_project`` / ``ai_credentials_file`` — the Vertex configuration of an
+      ``AI_PROVIDER=google`` brain (issue #655): the location as configured (``null`` = unset, which
+      such a brain refuses to start on rather than default to ``global``), the project as configured
+      (``null`` = the one the key file names), and the **path** to the service-account key, never its
+      contents. Reported whatever the provider, so a stray value on a non-Google agent is visible.
+      A credential-file setting that is not a plausible path (the key pasted in its place) reads
+      ``"[withheld: not a path]"`` — present and wrong, never echoed.
     - ``ai_base_url`` — the ``AI_BASE_URL`` override exactly as the brain reads it (stripped), or
       ``None`` when unset or blank (issue #651). The *override*, never the resolved default: one
       comparison rule then serves every agent on every provider — an endpoint a deployer did not
@@ -5523,6 +5542,14 @@ def resolved_config() -> dict[str, object]:
       pass must be able to tell apart from a deliberately blind agent. The key also rides
       ``tool_env`` (below) when a model is configured, which is issue #427's ungated-call-time-read
       surface; the two are different consumers of the same fact, not the fact twice.
+    - ``describer_provider`` / ``describer_sdk`` — the describer's **own stack** when it is not the
+      brain's (issue #655: ``HARNESS_DESCRIBER_PROVIDER`` / ``HARNESS_DESCRIBER_SDK``), ``null``
+      when it rides the brain's. ``describer_location`` / ``describer_project`` /
+      ``describer_credentials_file`` (withheld like ``ai_credentials_file`` when it is not a path),
+      ``describer_sdk_surface`` (``HARNESS_DESCRIBER_SDK_SURFACE``) — a describer on Vertex's place
+      and key **path**, as configured
+      (``null`` when unset). On Vertex, ``tool_env`` carries the key-file and location variables in
+      place of the API key.
     - ``mempalace_rerank_model`` / ``mempalace_rerank_providers`` /
       ``mempalace_rerank_sdk_version`` — the MemPalace **LLM reranker**'s configuration (issue
       #464): the OpenRouter model id that reranks (``null`` = rerank off, the shipped default), the
@@ -5581,6 +5608,9 @@ def resolved_config() -> dict[str, object]:
         "platform_sdk_version": _platform_sdk_version(),
         "ai_model": os.environ.get("AI_MODEL") or None,
         "ai_base_url": base_url_override(),
+        "ai_location": _configured(LOCATION_VAR),
+        "ai_project": _configured(PROJECT_VAR),
+        "ai_credentials_file": reported_credentials_file(os.environ.get(CREDENTIALS_FILE_VAR)),
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
         "wake_breaker_max": breaker_max,
@@ -5597,6 +5627,14 @@ def resolved_config() -> dict[str, object]:
         "describer_model": describer_model_from_env(),
         "describer_providers": list(describer_providers_from_env()),
         "describer_api_key_set": bool((os.environ.get(DESCRIBER_API_KEY_VAR) or "").strip()),
+        "describer_provider": describer_stack_from_env()[0],
+        "describer_sdk": describer_stack_from_env()[1],
+        "describer_location": _configured(DESCRIBER_LOCATION_VAR),
+        "describer_project": _configured(DESCRIBER_PROJECT_VAR),
+        "describer_credentials_file": reported_credentials_file(
+            os.environ.get(DESCRIBER_CREDENTIALS_FILE_VAR)
+        ),
+        "describer_sdk_surface": describer_surface_from_env(),
         "tools": sorted(tool.name for tool in resolved.tools),
         "builtins": sorted(resolved.builtins),
         "skipped": sorted(name for name, _reason in resolved.skipped),
@@ -5608,13 +5646,15 @@ def resolved_config() -> dict[str, object]:
             var: bool(os.environ.get(var))
             for var in sorted(
                 {v for deps in resolved.env_dependencies.values() for v in deps}
-                # The describer's key is an **ungated call-time read** with no plugin to declare it
-                # (issue #427's shape, without a `ToolPlugin` to hang `needs_env` on), so it is
-                # unioned in here — but *only when a describer is configured*, because a `false`
-                # for a variable nobody wants is the `XAI_TEAM_ID` noise this map deliberately
-                # avoids. With one configured the map's contract holds exactly: **every `false` is
-                # an active capability that cannot do its job.**
-                | ({DESCRIBER_API_KEY_VAR} if describer_model_from_env() else set())
+                # The describer's credential is an **ungated call-time read** with no plugin to
+                # declare it (issue #427's shape, without a `ToolPlugin` to hang `needs_env` on), so
+                # it is unioned in here — but *only when a describer is configured*, because a
+                # `false` for a variable nobody wants is the `XAI_TEAM_ID` noise this map
+                # deliberately avoids. Which variables depends on the describer's provider: the key,
+                # or on Vertex the key file and location (issue #655). With one configured the map's
+                # contract holds exactly: **every `false` is an active capability that cannot do its
+                # job.**
+                | describer_required_env()
             )
         },
         "mcp_servers": sorted(
@@ -5625,6 +5665,11 @@ def resolved_config() -> dict[str, object]:
         "model_params": model_params,
         "model_params_stripped": stripped,
     }
+
+
+def _configured(var: str) -> str | None:
+    """`var` as the process environment sets it, stripped — ``None`` when unset or blank."""
+    return (os.environ.get(var) or "").strip() or None
 
 
 def main(argv: list[str] | None = None) -> int:

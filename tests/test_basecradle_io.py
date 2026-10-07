@@ -48,6 +48,7 @@ from basecradle_harness._basecradle import (
     resolved_model_params,
 )
 from basecradle_harness._brief import BRAIN_HEADER
+from basecradle_harness._google import GoogleProvider
 from basecradle_harness._model_params import MODEL_PARAMS_NAME
 from basecradle_harness._search_params import SEARCH_PARAMS_NAME
 from basecradle_harness._version import __version__
@@ -1658,7 +1659,9 @@ def test_every_shipped_sdk_has_an_adapter_that_declares_it():
     `_SDK_SURFACES` is the one list of SDKs the config accepts, so it is what the declarations are
     checked against — and a single-surface adapter's `surface` is that SDK's one surface.
     """
-    adapters = {cls.sdk: cls for cls in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider)}
+    adapters = {
+        cls.sdk: cls for cls in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider, GoogleProvider)
+    }
     assert set(adapters) == set(_SDK_SURFACES)
     for sdk, (surfaces, default) in _SDK_SURFACES.items():
         declared = getattr(adapters[sdk], "surface", None)  # the openai one is per instance
