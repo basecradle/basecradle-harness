@@ -164,6 +164,7 @@ from basecradle_harness._google import (
     CREDENTIALS_FILE_VAR,
     LOCATION_VAR,
     PROJECT_VAR,
+    credentials_file_state,
     reported_credentials_file,
 )
 from basecradle_harness._harness import Harness
@@ -5464,8 +5465,9 @@ def resolved_config() -> dict[str, object]:
       ``tools``/``builtins``: one stem can fan out to several resolved names and a name can
       differ from its stem.
     - ``tool_env`` — ``env var → is it set (non-empty) in this process's environment?``, over
-      every variable the **active tool plugins declare** a dependency on (issue #427). Presence
-      only, **never a value**: this file is read by the drift audit and pasted into issues, and a
+      every variable the **active tool plugins declare** a dependency on (issue #427) — except that
+      a credential-*file* variable reads ``true`` only when its file would load (issue #661; see
+      ``describer_credentials_file_state``). Presence (or that verdict) only, **never a value**: this file is read by the drift audit and pasted into issues, and a
       boolean answers the operator's question without carrying a secret anywhere. Read from the
       process environment at report time, like every env-sourced field here — so a probe invoked
       with a stripped environment reports the same falses this one would, for the same reason
@@ -5560,6 +5562,22 @@ def resolved_config() -> dict[str, object]:
       and key **path**, as configured
       (``null`` when unset). On Vertex, ``tool_env`` carries the key-file and location variables in
       place of the API key.
+    - ``describer_sdk_version`` — the installed version of the distribution ``describer_sdk`` names,
+      ``null`` when it is not installed or no own stack is set (a describer riding the brain's stack
+      is covered by ``ai_sdk_version``). Read from installed metadata like every version here (issue
+      #661). It exists because a describer switched to an SDK the box does not have is dead on every
+      wake while ``describer_sdk`` reads exactly what the operator meant, and because the NOC pins
+      only an extra whose version the harness reports back.
+    - ``ai_credentials_file_state`` / ``describer_credentials_file_state`` — whether each Vertex key
+      file would load, judged by the **adapter's own loader** (`_google.credentials_file_state`:
+      `credentials_path` + `load_credentials`, the code a wake runs), so the report can never judge
+      a file differently from the wake. ``ok``, ``missing``, ``unreadable``, ``invalid`` (not
+      UTF-8, not JSON, not a service-account key, a key that will not parse, or the key pasted where
+      its path belongs), ``unchecked`` (every check passed that can run without ``google-auth``, and
+      the key itself could not be parsed because the SDK is not installed — never ``ok`` for a key
+      nobody parsed), or ``null`` when the variable is unset. Only the verdict is reported: nothing
+      read from the file, and not the loader's message, reaches this output. A credential-file
+      variable in ``tool_env`` is ``true`` only when its state is ``ok``.
     - ``mempalace_rerank_model`` / ``mempalace_rerank_providers`` /
       ``mempalace_rerank_sdk_version`` — the MemPalace **LLM reranker**'s configuration (issue
       #464): the OpenRouter model id that reranks (``null`` = rerank off, the shipped default), the
@@ -5609,6 +5627,12 @@ def resolved_config() -> dict[str, object]:
     # The configured servers, rejected files included (issue #553): a file the harness refused is
     # a server its operator declared, and dropping its name here would read as "never configured".
     mcp_configs, mcp_rejected = load_mcp_configs_report()
+    describer_provider, describer_sdk = describer_stack_from_env()
+    # Judged once each, by the wake's own loader, and read by both the state fields and `tool_env`.
+    file_states = {
+        var: credentials_file_state(os.environ.get(var))
+        for var in (CREDENTIALS_FILE_VAR, DESCRIBER_CREDENTIALS_FILE_VAR)
+    }
     return {
         "harness_version": __version__,
         "ai_provider": provider_name,
@@ -5621,6 +5645,7 @@ def resolved_config() -> dict[str, object]:
         "ai_location": _configured(LOCATION_VAR),
         "ai_project": _configured(PROJECT_VAR),
         "ai_credentials_file": reported_credentials_file(os.environ.get(CREDENTIALS_FILE_VAR)),
+        "ai_credentials_file_state": file_states[CREDENTIALS_FILE_VAR],
         **_cost_report(provider_name, sdk, os.environ.get("AI_MODEL") or ""),
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
@@ -5638,13 +5663,15 @@ def resolved_config() -> dict[str, object]:
         "describer_model": describer_model_from_env(),
         "describer_providers": list(describer_providers_from_env()),
         "describer_api_key_set": bool((os.environ.get(DESCRIBER_API_KEY_VAR) or "").strip()),
-        "describer_provider": describer_stack_from_env()[0],
-        "describer_sdk": describer_stack_from_env()[1],
+        "describer_provider": describer_provider,
+        "describer_sdk": describer_sdk,
+        "describer_sdk_version": None if describer_sdk is None else _sdk_version(describer_sdk),
         "describer_location": _configured(DESCRIBER_LOCATION_VAR),
         "describer_project": _configured(DESCRIBER_PROJECT_VAR),
         "describer_credentials_file": reported_credentials_file(
             os.environ.get(DESCRIBER_CREDENTIALS_FILE_VAR)
         ),
+        "describer_credentials_file_state": file_states[DESCRIBER_CREDENTIALS_FILE_VAR],
         "describer_sdk_surface": describer_surface_from_env(),
         "tools": sorted(tool.name for tool in resolved.tools),
         "builtins": sorted(resolved.builtins),
@@ -5654,7 +5681,9 @@ def resolved_config() -> dict[str, object]:
             None if resolved.overlay_stems is None else list(resolved.overlay_stems)
         ),
         "tool_env": {
-            var: bool(os.environ.get(var))
+            # A credential-file variable is `true` only when its file would load (issue #661): set
+            # but unloadable, the capability behind it cannot do its job, which is what `false` says.
+            var: bool(os.environ.get(var)) and file_states.get(var, "ok") == "ok"
             for var in sorted(
                 {v for deps in resolved.env_dependencies.values() for v in deps}
                 # The describer's credential is an **ungated call-time read** with no plugin to

@@ -265,11 +265,19 @@ def credentials_path(raw: str | os.PathLike[str] | None) -> Path | None:
             "The Vertex credential setting holds something that is not a file path (it looks like "
             "the key itself). Put the key in a file and set the variable to that file's path.",
         )
-    path = Path(text).expanduser()
-    if not path.is_absolute():
-        from basecradle_harness._install import config_home
+    try:
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            from basecradle_harness._install import config_home
 
-        path = config_home() / path
+            path = config_home() / path
+    except RuntimeError:
+        # `expanduser` on a `~user` with no such user (here or in the config home). The value is a
+        # path, so naming it is safe.
+        raise GoogleConfigError(
+            "invalid_credentials_file",
+            f"The Vertex credential path {text} names a home directory that does not exist.",
+        ) from None
     return path
 
 
@@ -296,11 +304,13 @@ def load_credentials(path: Path) -> tuple[Any, str | None]:
 
     Every failure is a `GoogleConfigError` naming the path and never the contents: the file holds a
     private key, and an error message is the most-copied text on the box.
-    """
-    from google.oauth2 import service_account
 
+    The file is read and checked **before** ``google-auth`` is imported, so a missing, unreadable or
+    malformed file is judged the same whether or not the SDK is installed (`credentials_file_state`
+    reports exactly that); only parsing the key itself needs the SDK.
+    """
     try:
-        raw = path.read_text(encoding="utf-8")
+        data = path.read_bytes()
     except FileNotFoundError as exc:
         raise GoogleConfigError(
             "missing_credentials_file", f"The Vertex credential file {path} does not exist."
@@ -310,31 +320,94 @@ def load_credentials(path: Path) -> tuple[Any, str | None]:
             "unreadable_credentials_file",
             f"The Vertex credential file {path} cannot be read ({type(exc).__name__}).",
         ) from exc
-    try:
-        info = json.loads(raw)
-    except ValueError as exc:
+    # Every check of the contents records its fault and raises **outside** the handler that caught
+    # it. The caught error carries the file — a decode error its bytes, a JSON error the whole
+    # document, a google-auth error the key's repr — and an exception raised inside a handler keeps
+    # it as `__context__` even under `from None`, where anything that walks the chain would find it.
+    info, problem = _key_info(data)
+    if problem is not None:
         raise GoogleConfigError(
-            "invalid_credentials_file",
-            f"The Vertex credential file {path} is not valid JSON.",
-        ) from exc
+            "invalid_credentials_file", f"The Vertex credential file {path} {problem}."
+        )
     if not isinstance(info, Mapping) or info.get("type") != "service_account":
         raise GoogleConfigError(
             "invalid_credentials_file",
             f"The Vertex credential file {path} is not a service-account key "
             '(its "type" must be "service_account").',
         )
+    from google.oauth2 import service_account
+
+    failure = None
     try:
         credentials = service_account.Credentials.from_service_account_info(
             info, scopes=[CLOUD_PLATFORM_SCOPE]
         )
-    except (ValueError, KeyError, TypeError) as exc:
+    except ImportError:
+        raise  # a piece of the SDK is missing: that says nothing about the file
+    except Exception as exc:  # noqa: BLE001 - every way a key fails to parse is this one fault
+        # Broad on purpose: google-auth and `cryptography` raise outside the `ValueError` family
+        # too (`UnsupportedAlgorithm` for a key on a curve they do not support), and anything that
+        # escaped here would be a crash where the adapter documents a config fault.
+        failure = type(exc).__name__
+    if failure is not None:
         raise GoogleConfigError(
             "invalid_credentials_file",
-            f"The Vertex credential file {path} is not a usable service-account key "
-            f"({type(exc).__name__}).",
-        ) from None
+            f"The Vertex credential file {path} is not a usable service-account key ({failure}).",
+        )
     project = info.get("project_id")
     return credentials, project if isinstance(project, str) and project.strip() else None
+
+
+def _key_info(data: bytes) -> tuple[Any, str | None]:
+    """A key file's bytes as JSON, or ``(None, what is wrong)`` — never an exception carrying them.
+
+    `RecursionError` is caught beside `ValueError` because a deeply nested document raises it from
+    `json.loads`, and it is a ``RuntimeError``.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None, "is not UTF-8 text"
+    try:
+        return json.loads(text), None
+    except (ValueError, RecursionError):
+        return None, "is not valid JSON"
+
+
+#: `credentials_file_state`'s verdict for each `GoogleConfigError` the loader can raise. An inline
+#: key is ``invalid``: the setting is present and is not a usable credential file.
+_FILE_STATES = {
+    "missing_credentials_file": "missing",
+    "unreadable_credentials_file": "unreadable",
+    "invalid_credentials_file": "invalid",
+    "inline_credentials": "invalid",
+}
+
+#: The verdict when the file passes every check the harness can make without ``google-auth`` and
+#: the key itself cannot be parsed because the SDK is not installed. Never ``ok``: that would claim
+#: a key nobody parsed is usable.
+UNCHECKED = "unchecked"
+
+
+def credentials_file_state(raw: str | None) -> str | None:
+    """Whether a credential-file setting would load, judged by the loader a wake uses (issue #661).
+
+    One of ``ok``, ``missing``, ``unreadable``, ``invalid``, ``unchecked`` (`UNCHECKED`), or ``None``
+    when the setting is unset or blank. The verdict is `credentials_path` + `load_credentials`
+    themselves, so ``--resolved-config`` can never judge a file differently from the wake that
+    loads it. Only the verdict leaves this function: the loaded credential and the error's message
+    are dropped here, so nothing read from the file can reach the report.
+    """
+    try:
+        path = credentials_path(raw)
+        if path is None:
+            return None
+        load_credentials(path)
+    except GoogleConfigError as exc:
+        return _FILE_STATES.get(exc.reason, "invalid")
+    except ImportError:
+        return UNCHECKED
+    return "ok"
 
 
 class _Sealed:
