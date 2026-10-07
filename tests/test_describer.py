@@ -38,6 +38,7 @@ from basecradle_harness._describer import (
     DESCRIBER_API_KEY_VAR,
     DESCRIBER_MODEL_VAR,
     DESCRIBER_PROVIDERS_VAR,
+    DESCRIPTION_MEMO_CAP,
     IMAGE_KIND,
     IMAGE_OUTPUT_BUDGET,
     RETRY_BUDGET_FACTOR,
@@ -47,6 +48,7 @@ from basecradle_harness._describer import (
     described_caption,
     describer_providers_from_env,
 )
+from basecradle_harness._exceptions import ProviderAuthError, ProviderServerError
 from basecradle_harness._observability import RETRY_HEAD
 from basecradle_harness._retry import RETRY_BUDGET_SECONDS
 
@@ -966,8 +968,9 @@ def test_the_unreported_bill_is_noted_once_per_wake_for_that_model_and_kind(capl
     describer = Describer(vision, "d/model")
 
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
-        for _ in range(3):
-            describer.describe_images([ImageContent(url="x", alt="poster.png")])
+        # Three *different* pictures: the same one three times is one call since #664.
+        for n in range(3):
+            describer.describe_images([ImageContent(url=f"x{n}", alt="poster.png")])
 
     notes = _notes(caplog)
     assert len(notes) == 1
@@ -1325,3 +1328,167 @@ def test_a_regional_routing_refusal_is_config_class_and_asked_once(
     line = _helper_lines(caplog)[0]
     assert line.levelno == logging.ERROR, line.getMessage()
     assert f"reason={reason}" in line.getMessage()
+
+
+# === Once per wake, not once per perception (issue #664) ======================
+# The describer is the one object every perception path shares, and its life is the wake, so it is
+# where the description is remembered. Every test below counts the describer's *calls* and its
+# `llm` lines, because the defect was a second billed call, not a second caption.
+
+
+def _describes(caplog, kind=IMAGE_KIND):
+    return [r for r in _helper_lines(caplog) if f"kind={kind}" in r.getMessage()]
+
+
+def _repeats(caplog):
+    return [r for r in caplog.records if r.getMessage().startswith("describe repeated ")]
+
+
+def test_two_perceptions_of_one_image_in_one_wake_are_one_describer_call(caplog):
+    """@rowan's wake: the same logo perceived twice, two `kind=image.describe` lines, two bills."""
+    vision = LoggingDescriberProvider(answer=DESCRIPTION)
+    describer = Describer(vision, "d/model")
+    # Two *separate* fetches of the same file — arrival and `view` each build their own object.
+    first = ImageContent(url="data:image/png;base64,AAAA", alt="logo.png")
+    again = ImageContent(url="data:image/png;base64,AAAA", alt="logo.png")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([first]) == DESCRIPTION
+        assert describer.describe_images([again]) == DESCRIPTION  # the same words, both times
+
+    assert len(vision.seen) == 1
+    assert len(_describes(caplog)) == 1  # one call, one line: a repeat bills nothing
+    (repeat,) = _repeats(caplog)
+    assert repeat.levelno == logging.DEBUG
+    message = repeat.getMessage()
+    assert "kind=image.describe" in message and "subject=logo.png" in message
+    assert "outcome=ok" in message
+    assert "cost=" not in message and "tokens_" not in message  # never a call record
+
+
+def test_two_different_images_are_two_describer_calls(caplog):
+    vision = LoggingDescriberProvider(answer=DESCRIPTION)
+    describer = Describer(vision, "d/model")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        describer.describe_images([ImageContent(url="data:image/png;base64,AAAA", alt="a.png")])
+        describer.describe_images([ImageContent(url="data:image/png;base64,BBBB", alt="a.png")])
+
+    assert len(vision.seen) == 2  # the same name over different pixels is a different picture
+    assert len(_describes(caplog)) == 2
+    assert _repeats(caplog) == []
+
+
+def test_a_transient_failure_is_asked_again_on_the_next_perception(caplog):
+    """A 5xx was already waited out inside its call; minutes later the vendor may be back."""
+    vision = _OutageDescriberProvider(answer=DESCRIPTION)
+    _, spy = _no_sleep()
+    describer = Describer(vision, "d/model", sleep=spy)
+    picture = [ImageContent(url="data:image/png;base64,AAAA", alt="logo.png")]
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images(picture) is None  # the honest withheld caption
+        refused = vision.calls  # every attempt the shared bounded policy allowed
+        vision.down = False  # the outage clears
+        assert describer.describe_images(picture) == DESCRIPTION
+        assert describer.describe_images(picture) == DESCRIPTION  # a success is then remembered
+
+    assert refused >= 1 and vision.calls == refused + 1
+
+
+class _OutageDescriberProvider(FakeDescriberProvider):
+    """Answers a 502 while `down`, the way an upstream outage does, and describes once it clears."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.down = True
+        self.calls = 0
+
+    def chat(self, messages, tools=None):
+        self.calls += 1
+        if self.down:
+            raise ProviderServerError("upstream 502", status_code=502)
+        return super().chat(messages, tools)
+
+
+def test_an_unusable_answer_is_remembered_and_not_bought_twice(caplog):
+    """An empty answer was generated and billed; asking the same question again buys it again."""
+    vision = LoggingDescriberProvider(answer="   ")
+    describer = Describer(vision, "d/model")
+    picture = [ImageContent(url="data:image/png;base64,AAAA", alt="logo.png")]
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images(picture) is None
+        assert describer.describe_images(picture) is None  # still the withheld caption
+
+    assert len(vision.seen) == 1
+    assert len(_describes(caplog)) == 1
+    assert "outcome=fallback" in _repeats(caplog)[0].getMessage()
+
+
+def test_a_config_fault_is_remembered_for_the_wake(caplog):
+    """Dead until a human acts: a second request receives the identical refusal."""
+    vision = LoggingDescriberProvider(raises=ProviderAuthError("bad key", status_code=401))
+    describer = Describer(vision, "d/model")
+    picture = [ImageContent(url="data:image/png;base64,AAAA", alt="logo.png")]
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images(picture) is None
+        assert describer.describe_images(picture) is None
+
+    assert len(vision.seen) == 1
+    (line,) = _describes(caplog)
+    assert line.levelno == logging.ERROR  # the one page this fault earns
+
+
+def test_the_same_clip_and_window_is_described_once_and_another_window_again():
+    """A description of seconds 1-2 is not a description of the clip."""
+    vision = FakeDescriberProvider(video=True)
+    describer = Describer(vision, "d/model")
+    whole = _clip()
+
+    first = describer.describe_video(whole)
+    assert describer.describe_video(_clip()) == first
+    assert len(vision.seen) == 1
+
+    window = _clip()
+    window.sampling = FrameSampling(start=1.0, end=2.0)
+    describer.describe_video(window)
+    assert len(vision.seen) == 2
+
+
+def test_the_memo_is_bounded_and_forgets_the_oldest_first():
+    """A library caller may hold one describer across many runs; the memo must not grow forever."""
+    vision = FakeDescriberProvider(answer=DESCRIPTION)
+    describer = Describer(vision, "d/model")
+
+    def look(n):
+        describer.describe_images([ImageContent(url=f"data:image/png;base64,{n}", alt="p.png")])
+
+    for n in range(DESCRIPTION_MEMO_CAP + 1):
+        look(n)
+    assert len(vision.seen) == DESCRIPTION_MEMO_CAP + 1
+
+    look(DESCRIPTION_MEMO_CAP)  # the newest is still remembered
+    assert len(vision.seen) == DESCRIPTION_MEMO_CAP + 1
+    look(0)  # the oldest was forgotten, so it is described again
+    assert len(vision.seen) == DESCRIPTION_MEMO_CAP + 2
+
+
+def test_view_twice_in_one_wake_describes_once_and_shows_the_same_words():
+    """The engine path: two `view`s of one picture → one describer call, one description."""
+    brain = BlindProvider(
+        Message.assistant(tool_calls=[ToolCall(id="c1", name="view", arguments={})]),
+        Message.assistant(tool_calls=[ToolCall(id="c2", name="view", arguments={})]),
+        Message.assistant(content="Then I know what it is."),
+    )
+    vision = FakeDescriberProvider(answer=DESCRIPTION)
+    engine = _engine(brain, ViewTool(), describer=Describer(vision, "d/model"))
+    history = [Message.user("look at cat.png, then look again")]
+
+    engine.run(history)
+
+    assert len(vision.seen) == 1
+    described = [m.content for m in history if m.injected]
+    assert len(described) == 2 and described[0] == described[1]
+    assert DESCRIPTION in described[0]
