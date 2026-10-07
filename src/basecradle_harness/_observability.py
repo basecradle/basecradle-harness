@@ -170,6 +170,23 @@ _TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
 #: the dashboard layer, where staleness is visible.
 _COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost",),)
 
+#: Where OpenRouter says a call ran on **the operator's own provider credential** (bring-your-own-
+#: key, issue #653) — and where it then puts the dollars. On such a call the provider bills the
+#: inference directly, so ``usage.cost`` reads ``0`` (OpenRouter's credits were not spent on it)
+#: and the provider's charge moves to ``usage.cost_details.upstream_inference_cost``. A non-BYOK
+#: call carries no ``is_byok`` at all (measured 2026-10-06), so absence reads exactly as before.
+#: The two figures are never summed: on a BYOK call ``usage.cost`` is not a second charge for the
+#: same tokens, and OpenRouter's BYOK fee is taken from credits without being reported per call.
+_BYOK_FIELDS: tuple[tuple[str, ...], ...] = (("is_byok",),)
+_UPSTREAM_COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost_details", "upstream_inference_cost"),)
+
+#: The ``billing=`` value a BYOK call carries on its `llm` line: the dollar figure in ``cost=`` is
+#: on the provider's own invoice, not on OpenRouter's credits (issue #653). **A stable literal** —
+#: the NOC's extraction keys on it — and the only value the field takes: a call billed the ordinary
+#: way carries no ``billing=``, so its line is byte-identical to what it was before the field
+#: existed.
+BYOK_BILLING = "byok"
+
 #: Where a provider states how many of the completion's tokens went to **reasoning**. Deliberately
 #: kept out of `_TOKEN_FIELDS` — that dict is the shared ``llm`` line's field set, and adding a
 #: field there would change the bytes of a line the fleet dashboard already extracts on. This is
@@ -514,11 +531,12 @@ def log_llm_call(
     ``provider purpose kind endpoint model duration tokens_* cached_tokens tokens_reasoning cost
     outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
     ``picked``), and last of all ``generation_id`` — the vendor's own id for the call (issue #634),
-    rendered last so that no column written before it moves. `kv` drops whatever is ``None``, so a
-    call with nothing to report is byte-identical to what it always was apart from ``purpose=main``.
-    An ``extra`` that carries a ``generation_id`` of its own (a fallback line's `diagnostics`) is
-    rendered in that same last place, and the argument wins when both are given: one key, one value,
-    one position.
+    rendered last so that no column written before it moves — and then, after even that,
+    ``billing=byok`` on a call the provider billed directly (issue #653, `BYOK_BILLING`), for the
+    same reason. `kv` drops whatever is ``None``, so a call with nothing to report is byte-identical
+    to what it always was apart from ``purpose=main``. An ``extra`` that carries a ``generation_id``
+    of its own (a fallback line's `diagnostics`) is rendered in that same place, and the argument
+    wins when both are given: one key, one value, one position.
 
     Four of the fields are **capabilities, answered by whoever can**: token counts
     (`token_counts`), the cached-prompt count that says whether caching is doing anything, the
@@ -586,9 +604,26 @@ def log_llm_call(
             outcome=outcome,
             reason=reason,
             detail=detail,
-            **_generation_last(extra, generation_id),
+            **_trailing(extra, generation_id, usage),
         ),
     )
+
+
+def _trailing(
+    extra: Mapping[str, Any] | None, generation: str | None, usage: Any
+) -> dict[str, Any]:
+    """The `llm` line's tail: `extra`, then ``generation_id``, then ``billing`` (issue #653).
+
+    ``billing`` names who bills the ``cost=`` on the line, and is stated only where the vendor said
+    the call ran on the operator's own key (`byok`). It is rendered after everything, so on a BYOK
+    line no field the NOC already extracts moves, and every other line is byte-identical to what it
+    was before the field existed. Read off `usage`, never passed: one carried in `extra` is
+    replaced rather than splatted beside it, for `_generation_last`'s reason.
+    """
+    fields = _generation_last(extra, generation)
+    fields.pop("billing", None)
+    fields["billing"] = BYOK_BILLING if byok(usage) else None
+    return fields
 
 
 def _generation_last(extra: Mapping[str, Any] | None, generation: str | None) -> dict[str, Any]:
@@ -845,11 +880,29 @@ def reported_cost(usage: Any) -> float | None:
     native SDK *and* through the ``openai`` SDK pointed at ``openrouter.ai``, which keeps the
     field. Every other endpoint reports tokens and no dollars, and gets no ``cost=``: see
     `_COST_FIELDS` for why the harness will not fill that gap with a price table of its own.
+
+    **It is what the operator pays for the call, whichever party bills it** (issue #653). On a
+    bring-your-own-key call (`byok`) OpenRouter's ``usage.cost`` is ``0`` and the provider's own
+    charge is ``cost_details.upstream_inference_cost``, so that is the figure read — never the sum
+    of the two. A BYOK block that states no upstream figure gets ``None``: the ``0`` beside it is
+    OpenRouter's share, and printing it would turn a call the provider billed into a free one.
     """
-    value = _first(usage, _COST_FIELDS) if usage is not None else None
+    if usage is not None and byok(usage):
+        value = _first(usage, _UPSTREAM_COST_FIELDS)
+    else:
+        value = _first(usage, _COST_FIELDS) if usage is not None else None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     return float(value)
+
+
+def byok(usage: Any) -> bool:
+    """Whether the vendor says this call ran on the operator's own provider key (issue #653).
+
+    ``True`` only for a literal ``True`` (`_BYOK_FIELDS`): a truthy string or a ``1`` is a vendor's
+    surprise, and reading one as BYOK would move the dollar figure to a field that is not there.
+    """
+    return usage is not None and _first(usage, _BYOK_FIELDS) is True
 
 
 def reasoning_tokens(usage: Any) -> int | None:

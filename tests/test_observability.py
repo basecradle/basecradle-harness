@@ -19,6 +19,7 @@ from basecradle_harness._observability import (
     RED,
     RESET,
     YELLOW,
+    byok,
     capture_llm_call,
     color_enabled,
     delivery_id,
@@ -146,6 +147,69 @@ def test_a_non_numeric_cost_is_left_out_rather_than_guessed_at():
     assert reported_cost({"cost": True}) is None  # a bool is not a dollar figure
 
 
+# --- bring-your-own-key: the provider bills it, and the dollars move (issue #653) ---------------
+#
+# On a BYOK call OpenRouter's own `usage.cost` is 0 — its credits were not spent — and the
+# provider's charge is `cost_details.upstream_inference_cost`. Measured 2026-10-06 on
+# `google/gemini-3.6-flash` through a Vertex BYOK credential; these figures are that response's.
+
+#: The usage block of a BYOK call, as OpenRouter returned it.
+BYOK_USAGE = {
+    "prompt_tokens": 42,
+    "completion_tokens": 111,
+    "total_tokens": 153,
+    "cost": 0,
+    "is_byok": True,
+    "cost_details": {
+        "upstream_inference_cost": 0.000288,
+        "upstream_inference_prompt_cost": 0.0000105,
+        "upstream_inference_completions_cost": 0.0002775,
+    },
+}
+
+
+def test_a_byok_call_costs_what_the_provider_bills_for_it():
+    """`cost=` is what the operator pays, whichever party bills it — so on a BYOK call it is the
+    upstream figure, and never the sum with OpenRouter's 0 beside it."""
+    assert byok(BYOK_USAGE) is True
+    assert reported_cost(BYOK_USAGE) == 0.000288
+
+
+def test_a_byok_block_that_states_no_upstream_figure_reports_no_cost():
+    """The `cost: 0` beside it is OpenRouter's share. Printing it would turn a call the provider
+    billed into a free one, so the field is absent — as for any provider that states no dollars."""
+    usage = {k: v for k, v in BYOK_USAGE.items() if k != "cost_details"}
+    assert reported_cost(usage) is None
+    assert reported_cost(usage | {"cost_details": None}) is None
+    assert reported_cost(usage | {"cost_details": {"upstream_inference_cost": None}}) is None
+
+
+def test_a_call_billed_the_ordinary_way_reads_usage_cost_as_before():
+    """No `is_byok` is what a non-BYOK call carries; an explicit `false` reads the same — and an
+    `upstream_inference_cost` beside it is not the operator's bill, so it is never preferred."""
+    ordinary = {"prompt_tokens": 1, "cost": 0.0445}
+    assert byok(ordinary) is False
+    assert reported_cost(ordinary) == 0.0445
+    explicit = ordinary | {"is_byok": False, "cost_details": {"upstream_inference_cost": 0.04}}
+    assert byok(explicit) is False
+    assert reported_cost(explicit) == 0.0445
+
+
+def test_only_a_literal_true_reads_as_byok():
+    """A vendor's surprise must not move the dollar figure to a field that is not there."""
+    for surprise in ("true", 1, "yes"):
+        assert byok({"is_byok": surprise}) is False
+    assert byok(None) is False
+
+    class Usage:  # an SDK object rather than a mapping reads the same way
+        is_byok = True
+        cost = 0
+        cost_details = type("CostDetails", (), {"upstream_inference_cost": 0.000288})()
+
+    assert byok(Usage()) is True
+    assert reported_cost(Usage()) == 0.000288
+
+
 # --- the serving endpoint: a capability, not a vendor branch ------------------
 
 
@@ -260,6 +324,86 @@ def test_the_llm_line_names_the_serving_endpoint_the_cache_hit_and_the_cost(capl
         "llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s "
         "tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445"
     )
+
+
+def test_a_byok_line_carries_the_upstream_cost_and_names_the_biller_last(caplog):
+    """`billing=byok` rides after everything, `generation_id` included, so no field the NOC
+    already extracts moves on a BYOK line (issue #653)."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(
+            provider="openrouter",
+            purpose="helper",
+            kind="image.describe",
+            endpoint="Google",
+            model="google/gemini-3.6-flash",
+            seconds=1.5,
+            usage=BYOK_USAGE,
+            cost=reported_cost(BYOK_USAGE),
+            extra={"subject": "cat.png"},
+            generation_id="gen-1791300000-AbCdEfGhIjKlMnOpQrSt",
+        )
+
+    assert caplog.records[0].getMessage() == (
+        "llm provider=openrouter purpose=helper kind=image.describe endpoint=Google "
+        "model=google/gemini-3.6-flash duration=1.50s tokens_in=42 tokens_out=111 tokens_total=153 "
+        "cost=0.000288 subject=cat.png "
+        "generation_id=gen-1791300000-AbCdEfGhIjKlMnOpQrSt billing=byok"
+    )
+
+
+def test_a_byok_line_with_no_upstream_figure_still_names_the_biller(caplog):
+    """Who bills it is stated; how much is not — so `billing=byok` and no `cost=`."""
+    usage = {k: v for k, v in BYOK_USAGE.items() if k != "cost_details"}
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(
+            provider="openrouter",
+            model="google/gemini-3.6-flash",
+            seconds=1,
+            usage=usage,
+            cost=reported_cost(usage),
+        )
+
+    line = caplog.records[0].getMessage()
+    assert "cost=" not in line
+    assert line.endswith(" billing=byok")
+
+
+def test_a_non_byok_line_is_byte_identical_and_carries_no_billing(caplog):
+    """The line a call billed the ordinary way writes is exactly what it wrote before #653."""
+    usage = {"prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100, "cost": 0.0445}
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(
+            provider="openrouter",
+            model="z-ai/glm-5.2",
+            seconds=2.5,
+            usage=usage,
+            cost=reported_cost(usage),
+            generation_id="gen-1",
+        )
+
+    assert caplog.records[0].getMessage() == (
+        "llm provider=openrouter purpose=main model=z-ai/glm-5.2 duration=2.50s "
+        "tokens_in=90 tokens_out=10 tokens_total=100 cost=0.0445 generation_id=gen-1"
+    )
+
+
+def test_billing_is_read_off_usage_and_one_carried_in_extra_is_replaced(caplog):
+    """An `extra` naming `billing` must neither raise (two values for one keyword, inside a wake)
+    nor speak for the vendor: the field is what usage says, and it stays last."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(
+            provider="openrouter",
+            model="m",
+            seconds=1,
+            usage={"prompt_tokens": 1},
+            extra={"billing": "byok", "surface": "tool"},
+        )
+        log_llm_call(
+            provider="openrouter", model="m", seconds=1, usage=BYOK_USAGE, extra={"billing": "x"}
+        )
+
+    assert caplog.records[0].getMessage().endswith(" surface=tool")
+    assert caplog.records[1].getMessage().endswith(" billing=byok")
 
 
 def test_a_free_call_reports_a_zero_cost_rather_than_dropping_the_field(caplog):

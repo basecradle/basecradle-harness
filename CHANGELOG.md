@@ -7,6 +7,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.149.0] - 2026-10-06
+
+### Added: a bring-your-own-key call reports what the provider bills, and says who bills it (issue #653)
+
+OpenRouter supports bring-your-own-key: a provider credential registered on the OpenRouter account,
+so the provider bills the inference and OpenRouter takes a fee from credits. On such a call the
+response's `usage.cost` is `0` and the provider's charge moves to
+`usage.cost_details.upstream_inference_cost`. The harness read `usage.cost` only, so every BYOK call
+logged `cost=0`, and every dollar chart built on `cost=` undercounted from the moment a BYOK
+credential existed on the account (live already: the fleet's Google Vertex describe calls).
+
+- **`cost=` is what the operator pays for the call, whichever party bills it.** When `usage.is_byok`
+  is `true`, `reported_cost` reads `cost_details.upstream_inference_cost`; otherwise `usage.cost`,
+  exactly as before. The two are never summed. A BYOK block that states no upstream figure logs no
+  `cost=`, as a provider that states no dollars does today, rather than OpenRouter's `0`. One reader
+  serves every caller, so the brain (both SDKs that reach OpenRouter), the reranker and the
+  describer all follow, and so does the reranker's own `RerankReport.cost`.
+- **New field on the `llm provider=` line: `billing=byok`**, on a call the vendor says ran on the
+  operator's own key, and on no other line. It is rendered **last**, after `generation_id`, so no
+  field the NOC already extracts moves; a call billed the ordinary way carries no `billing=` and its
+  line is byte-identical to 0.148.0's. `byok` is a stable literal and the field's only value.
+- OpenRouter's BYOK fee is not on the line: it is taken from credits and not reported per call.
+
 ## [0.148.0] - 2026-10-05
 
 ### Added: a regional OpenRouter host for the reranker, and the endpoint overrides read back (issue #651)
