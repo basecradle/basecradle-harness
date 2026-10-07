@@ -272,41 +272,17 @@ def test_a_model_that_does_not_exist_is_a_404():
 
 # --- built-ins and Google Search grounding (issue #656) ----------------------------------------
 #
-# Two facts only Vertex can state: which built-ins it accepts **beside** function declarations (the
-# harness sends declarations on every turn), and the shape grounding metadata comes back in, which
-# both the sources footer and the grounding fee are read from.
-
-
-@needs_key
-def test_search_beside_function_declarations_is_refused_as_google_documents():
-    """The reason Search is a grounded call of its own (`GoogleProvider.search`) and not a built-in.
-
-    If this starts passing the request, Vertex has lifted the limit and Search can become a
-    built-in on the brain's own turn — a design change to take to the capital, not a fix.
-    """
-    from google.genai import errors, types
-
-    with _provider() as provider:
-        config = types.GenerateContentConfig(
-            tools=[
-                types.Tool(google_search=types.GoogleSearch()),
-                types.Tool(
-                    function_declarations=[
-                        types.FunctionDeclaration(
-                            name=NUMBER_TOOL.name,
-                            description=NUMBER_TOOL.description,
-                            parameters_json_schema=NUMBER_TOOL.parameters,
-                        )
-                    ]
-                ),
-            ],
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-        )
-        with pytest.raises(errors.ClientError) as refused:
-            provider._client.models.generate_content(
-                model=MODEL, contents="What is the weather in Chicago?", config=config
-            )
-    assert refused.value.code == 400
+# Two facts only Vertex can state: that it accepts the built-ins the harness sends **beside**
+# function declarations (the harness sends declarations on every turn), and the shape grounding
+# metadata comes back in, which both the sources footer and the grounding fee are read from.
+#
+# What is deliberately **not** pinned here is whether Vertex refuses Google Search beside function
+# declarations (issue #660). This gate asserted that refusal until Vertex `us` accepted the request
+# with gemini-3.8-flash on 2026-10-07, while Vertex's own pages still said it is unsupported
+# ("Grounding with Google Search", updated 2026-10-06). The harness never sends that combination
+# (`GoogleProvider.search` makes Google Search its only tool), so a gate on it was a gate on a
+# vendor limit, red or green for reasons that say nothing about a release. What the harness relies
+# on is the grounded call itself, pinned below.
 
 
 @needs_key

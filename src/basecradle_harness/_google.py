@@ -72,21 +72,23 @@ one of the two vendors (OpenAI is the other, #657) whose cost is harness arithme
 ``cost_basis=computed`` on the line. A model, a location class, or a traffic tier the
 table does not carry gets **no** ``cost=``, and one WARNING per model per adapter, never a guess.
 
-Server-side built-ins, and the one Vertex will not combine (issue #656)
-----------------------------------------------------------------------
+Server-side built-ins, and the one Vertex does not support combining (issues #656, #660)
+--------------------------------------------------------------------------------------
 Two of Gemini's built-ins ride **beside** the harness's function declarations on every turn, opted in
 like every provider's powerful built-ins: **code execution** (Python in Google's sandbox) and **URL
 context** (the model reads up to 20 URLs itself). Both bill as tokens only — the code, its result
 and the fetched pages arrive as ``tool_use_prompt_token_count``, priced at the input rate — so they
 need nothing beyond the call's own ``cost=``.
 
-**Google Search grounding cannot ride beside them.** Vertex: *"The Gemini API doesn't support
-combining search tools (such as googleSearch) with non-search tools (such as function calling …) in
-the same generateContent request"*, and every harness turn carries function declarations. So Search
-is a harness-run tool instead (`basecradle_harness._google_search`): the agent calls ``web_search``,
-and the harness makes **one grounded call** (`GoogleProvider.search`) with ``google_search`` as its
-only tool — the combination Vertex does accept — and hands back the answer with a ``Sources:``
-footer built from the grounding metadata. That call writes its own ``llm`` line
+**Google Search grounding is not sent beside them.** Vertex's documentation: *"The Gemini API
+doesn't support combining search tools (such as googleSearch) with non-search tools (such as
+function calling …) in the same generateContent request"*, and every harness turn carries function
+declarations. Vertex has stopped *enforcing* that (it accepted the combination on gemini-3.8-flash
+in ``us`` on 2026-10-07, issue #660), but an undocumented acceptance is not something to put on
+every turn. So Search is a harness-run tool instead (`basecradle_harness._google_search`): the agent
+calls ``web_search``, and the harness makes **one grounded call** (`GoogleProvider.search`) with
+``google_search`` as its only tool — the shape Vertex documents — and hands back the answer with a
+``Sources:`` footer built from the grounding metadata. That call writes its own ``llm`` line
 (``purpose=helper kind=search.grounding``), and its grounding fee, which is not tokens, its own
 priced ``media`` line (`_google_rates.grounding_cost`).
 
@@ -164,7 +166,7 @@ SDK = "google-genai"
 
 #: The server-side built-ins this adapter sends beside the function declarations, by the builtin name
 #: a tool plugin resolves to → the ``types.Tool`` field that enables it. Google Search is not here:
-#: Vertex refuses it beside function calling (see the module docstring), so it is `search` instead.
+#: Vertex does not support it beside function calling (see the module docstring), so it is `search`.
 BUILTINS = {"code_execution": "code_execution", "url_context": "url_context"}
 
 #: The ``kind`` the grounded search call and its fee are logged under — one name for the ``llm``
@@ -688,8 +690,8 @@ class GoogleProvider:
     def search(self, query: str) -> str:
         """Answer `query` with Google Search grounding, in one call of its own (issue #656).
 
-        The call's only tool is ``google_search`` — no function declarations, which Vertex will not
-        combine with a search tool — and its only content is the query, so nothing of the agent's
+        The call's only tool is ``google_search`` — no function declarations, which Vertex does not
+        support beside a search tool — and its only content is the query, so nothing of the agent's
         conversation leaves for it. Returns the grounded answer with a ``Sources:`` footer.
 
         Two lines, both ``kind=search.grounding``: the call's ``llm`` line as ``purpose=helper`` —

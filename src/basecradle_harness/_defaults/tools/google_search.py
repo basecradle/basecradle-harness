@@ -1,10 +1,10 @@
 # Default tool plugin: Google Search for a Gemini brain on Vertex AI. Delete to disable.
 #
-# Not a built-in, unlike every other provider's search: Vertex refuses a search tool beside function
-# declarations in one request, and every harness turn carries function declarations. So this is a
-# `web_search` function tool the harness runs: one grounded Gemini call of its own, `google_search`
-# its only tool, on the brain's own Vertex account and model (issue #656, `_google_search.py`). The
-# agent gets the grounded answer and its sources as the tool result.
+# Not a built-in, unlike every other provider's search: Vertex documents no support for a search
+# tool beside function declarations in one request, and every harness turn carries function
+# declarations. So this is a `web_search` function tool the harness runs: one grounded Gemini call
+# of its own, `google_search` its only tool, on the brain's own Vertex account and model (issue
+# #656, `_google_search.py`). The agent gets the grounded answer and its sources as the tool result.
 #
 # It shares the model-facing name `web_search` with the OpenAI, xAI and OpenRouter search plugins
 # and carries a different requirement, so exactly one activates per config.
