@@ -407,7 +407,9 @@ class Engine:
         #: life of this engine — one adapter instance per wake, never one per picture. ``False`` is
         #: *not yet asked*; ``None`` is *asked and there is none*, which is the ordinary case (no
         #: `HARNESS_DESCRIBER_MODEL`). The two are distinguished so a describer-less agent pays the
-        #: env read once rather than on every withheld image.
+        #: env read once rather than on every withheld image. The describer also remembers what it
+        #: said about each piece of media (issue #664), so one instance per wake is also one paid
+        #: describe per picture, however many paths perceive it.
         self._describer: Any = False
         #: Steps spent across every `run` this engine has driven, and how many runs that was. A
         #: wake process runs one engine, so together these *are* the wake's model usage — what its

@@ -274,6 +274,15 @@ Four invariants, each with an "obviously fine" broken form:
   `cost_usd` off the *response* — swallowing that would lose real spend from the rollup to fix a
   line that was only ever wrong about zeros. This is the honest-absence rule `endpoint` and `cost`
   already keep, applied to the one shape that *looks* like an answer.
+- **One describe per piece of media per wake, and only a transient failure is asked again**
+  (issue #664). Every perception path (arrival, `view`, `watch`) reaches the one `Describer`, whose
+  life is the wake, so the memo lives there (`Describer._once`), keyed by a digest of the payload it
+  is shown plus a clip's window, and never by a uuid the media types do not carry. A repeat writes
+  **no `llm` line**, because that line is one billed call; it writes a DEBUG `describe repeated`
+  line with no cost. A `RETRYABLE_REASONS` failure is not remembered, since the vendor's bad minute
+  may be over by the next perception. Every other failure is remembered as `None`, because asking
+  again buys the same verdict: a config fault, an unusable answer that was already billed, or a clip
+  that will not decode. Treating "failed" as one class in either direction is the regression.
 - **The caption always names the describer.** Without it the brain reads a paragraph about a picture
   it never received as its own perception — and so does anyone reading its memory a month later. The
   describer is also put through the **brain's own** fail-closed `model_sees_video` gate, so a

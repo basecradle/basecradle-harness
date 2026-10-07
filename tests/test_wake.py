@@ -1636,6 +1636,57 @@ def test_a_describer_that_cannot_answer_leaves_the_plain_degrade_untouched(
     assert "model has no vision input" in _line(caplog, "image degraded to text")
 
 
+class _BlindViewer(_TextOnlyProvider):
+    """A blind brain that answers a posted image by `view`ing it — the @rowan shape (issue #664)."""
+
+    def chat(self, messages, tools=None):
+        self._calls += 1
+        last = _convo(messages)[-1]
+        if last.role == "user" and not last.injected:
+            self.prompts.append(last.content)
+            return Message.assistant(
+                tool_calls=[
+                    ToolCall(id="c1", name="assets", arguments={"action": "view", "uuid": A1})
+                ]
+            )
+        self.last_messages = list(messages)
+        return Message.assistant(content=self.narration)
+
+
+def test_an_image_described_on_arrival_is_not_described_again_by_view(platform, tmp_path, caplog):
+    """One image, two perceptions in one wake (arrival, then `view`), one paid describe.
+
+    Before #664 nothing remembered the description, so @rowan's wakes logged one
+    `kind=image.describe` line per perception. The two paths share the engine's describer, and the
+    describer now remembers what it said, so the brain reads the same words twice for one bill.
+    """
+    from basecradle_harness import AssetsTool, Describer
+
+    MarkStore(tmp_path).set(TIMELINE_UUID, A0, kind="assets")
+    serve_messages(platform, page())
+    posted = asset(uuid=A1, filename="logo.png")
+    serve_assets(platform, asset_page(posted))
+    platform.get(f"/assets/{A1}").mock(return_value=httpx.Response(200, json={"asset": posted}))
+    agent, provider = build_wake(tmp_path, provider=_BlindViewer(), tools=[AssetsTool()])
+    vision = _DescribingProvider()
+    agent.harness.engine._describer = Describer(vision, "google/gemini-3-flash")
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        agent.wake()
+
+    assert len(vision.seen) == 1
+    describes = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("llm provider=") and "kind=image.describe" in r.getMessage()
+    ]
+    assert len(describes) == 1, describes
+    description = "A hand-drawn architecture diagram labelled 'wake path'."
+    assert description in provider.prompts[0]  # on arrival
+    viewed = [m.content for m in provider.last_messages if m.injected]
+    assert any(description in text for text in viewed)  # and again, for free, on `view`
+
+
 def test_a_vision_capable_model_is_still_shown_the_image(platform, tmp_path, caplog):
     """The gate fails toward perception: a model that answers vision=True keeps seeing the picture,
     and no degrade line is logged — the change is confined to the definite no-vision case."""

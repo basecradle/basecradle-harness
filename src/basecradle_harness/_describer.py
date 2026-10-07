@@ -96,10 +96,12 @@ the transcript never pretends the brain saw pixels.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
-from collections.abc import Callable, Mapping
+from collections import OrderedDict
+from collections.abc import Callable, Hashable, Mapping
 from typing import TYPE_CHECKING, Any
 
 from basecradle_harness._assets import model_sees_video
@@ -128,7 +130,7 @@ from basecradle_harness._observability import (
     truncated,
     usage_reported,
 )
-from basecradle_harness._retry import Retry, connection_reason, diagnostics
+from basecradle_harness._retry import RETRYABLE_REASONS, Retry, connection_reason, diagnostics
 from basecradle_harness._timeouts import bind_scale, last_timeout
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -279,6 +281,28 @@ VIDEO_OUTPUT_BUDGET = 3 * IMAGE_OUTPUT_BUDGET
 RETRY_BUDGET_FACTOR = 2
 
 
+#: How many descriptions one describer remembers (issue #664). A wake perceives a handful of
+#: pieces of media, so this never binds there; it exists because a library caller may hold one
+#: engine — and so one describer — across many runs, and a memo with no bound is a leak with a
+#: purpose. The oldest description is forgotten first, which costs a second describe and nothing
+#: else.
+DESCRIPTION_MEMO_CAP = 64
+
+
+def _media_key(url: str) -> str:
+    """A piece of media's identity for the description memo: a digest of what the describer sees.
+
+    The digest is taken over the **payload handed to the describer** — the data URL carrying the
+    bytes — rather than over an asset uuid, for three reasons. It is the identity of the thing
+    actually described, so two perceptions can share a description only when they showed the
+    describer the same pixels. It needs no plumbing: `ImageContent` and `VideoContent` carry no
+    uuid, and an MCP server's picture has none to carry. And it is the same value on every path,
+    because the asset wake and the `view`/`watch` tool fetch through the one `image_input` /
+    `video_input` seam.
+    """
+    return hashlib.sha256(url.encode()).hexdigest()
+
+
 class Describer:
     """A vision-capable model that turns pixels into words for a brain that has none.
 
@@ -340,6 +364,13 @@ class Describer:
         self._providers: dict[int, Provider] = (
             {} if budget is None or provider is None else {budget: provider}
         )
+        #: What this describer has already said about each piece of media (issue #664), keyed by
+        #: `_media_key`. The object's life **is** the wake, so this is the per-wake memo the issue
+        #: asks for and needs no clock: every path that perceives the same media again (the asset
+        #: arriving, `view`, `watch`) reads the words already bought instead of paying for them a
+        #: second time, and the agent reads the same description each time. ``None`` is a failure
+        #: remembered on purpose (`_once` says which failures are), never a missing entry.
+        self._described: OrderedDict[Hashable, str | None] = OrderedDict()
 
     def describe_images(self, images: list[ImageContent]) -> str | None:
         """The pictures in words, or ``None`` if the describer could not answer.
@@ -349,12 +380,18 @@ class Describer:
         """
         if not images:
             return None
-        return self._ask(
-            DESCRIBE_PROMPT,
-            images=images,
+        subject = _names(images)
+        return self._once(
+            (IMAGE_KIND, *(_media_key(image.url) for image in images)),
             kind=IMAGE_KIND,
-            subject=_names(images),
-            budget=IMAGE_OUTPUT_BUDGET,
+            subject=subject,
+            describe=lambda: self._answer(
+                DESCRIBE_PROMPT,
+                images=images,
+                kind=IMAGE_KIND,
+                subject=subject,
+                budget=IMAGE_OUTPUT_BUDGET,
+            ),
         )
 
     def describe_video(self, clip: VideoContent) -> str | None:
@@ -372,7 +409,73 @@ class Describer:
         and had to say it could not. The frames path already carried its facts (`sample_frames`
         returns the summary naming duration, rate, resolution and every timestamp it decoded); the
         native path decoded nothing, so it probes for them.
+
+        The key carries the **window** as well as the bytes: a description of seconds 10-12 is not
+        a description of the clip, so a second `watch` of a different window asks again.
         """
+        sampling = clip.sampling
+        return self._once(
+            (VIDEO_KIND, _media_key(clip.url), sampling.every, sampling.start, sampling.end),
+            kind=VIDEO_KIND,
+            subject=clip.alt or "video",
+            describe=lambda: self._watch(clip),
+        )
+
+    # --- internals -----------------------------------------------------------
+
+    def _once(
+        self,
+        key: Hashable,
+        *,
+        kind: str,
+        subject: str,
+        describe: Callable[[], tuple[str | None, str | None]],
+    ) -> str | None:
+        """Describe the media under `key` at most once per wake (issue #664) — or say it again.
+
+        Before this, nothing memoized the *description*: a wake that saw a peer's image arrive and
+        had its brain `view` it paid the describer twice for the same pixels, one `llm` line per
+        perception. The memo lives on the describer because the describer is the one object every
+        perception path shares (`Engine.describer`) and its life is exactly the wake.
+
+        **A repeat makes no call, so it writes no `llm` line** — that line is one billed call, and
+        a repeat is not one. It writes a DEBUG line instead, with no cost on it, so a journal read
+        at DEBUG can still see that the second perception happened and what it was handed.
+
+        **A failure is remembered unless a later attempt can do better.** The transient faults
+        (`RETRYABLE_REASONS` — a 429, a 5xx, a transport blip, a timeout, an unparseable answer) are
+        *not* remembered: each was already waited out inside its call, and a later perception in
+        the same wake is seconds or minutes on, so the vendor's bad minute may be over. Everything
+        else is remembered as ``None``, because asking again buys the same verdict: a config-class
+        fault is dead until a human acts, an unusable answer (truncated after its larger-budget
+        retry, empty, missing a part) was billed and is a fact about this media at this budget, an
+        undecodable clip will not decode on the second try, and an unrecognized fault
+        (``provider_error``) is one the retry policy already declines to call transient. The caller
+        gets the honest withheld caption either way, as it always did.
+        """
+        if key in self._described:
+            self._described.move_to_end(key)
+            text = self._described[key]
+            _log.debug(
+                "describe repeated %s",
+                kv(
+                    purpose=HELPER,
+                    kind=kind,
+                    model=self.model,
+                    subject=subject,
+                    outcome="ok" if text is not None else "fallback",
+                ),
+            )
+            return text
+        text, reason = describe()
+        if reason is None or reason not in RETRYABLE_REASONS:
+            self._described[key] = text if reason is None else None
+            if len(self._described) > DESCRIPTION_MEMO_CAP:
+                self._described.popitem(last=False)
+        return text if reason is None else None
+
+    def _watch(self, clip: VideoContent) -> tuple[str | None, str | None]:
+        """`describe_video`'s one describe: ``(description, None)`` or ``(None, reason)``."""
         name = clip.alt or "video"
         if model_sees_video(self.provider):
             from basecradle_harness._video import native_watch
@@ -381,7 +484,7 @@ class Describer:
             # native tier (issue #482) — one function, two callers, so a describer and a
             # video-capable brain can never watch different halves of the same clip.
             watched = native_watch(clip)
-            described = self._ask(
+            described, reason = self._answer(
                 DESCRIBE_PROMPT + DESCRIBE_VIDEO_SUFFIX,
                 videos=[watched.clip],
                 kind=VIDEO_KIND,
@@ -390,9 +493,9 @@ class Describer:
                 parts=True,
             )
             if described is None:
-                return None
+                return None, reason
             facts = _watched_facts(name, watched)
-            return described if facts is None else f"{facts}\n{described}"
+            return (described if facts is None else f"{facts}\n{described}"), None
         try:
             from basecradle_harness._video import decode_data_url, sample_frames
 
@@ -408,8 +511,8 @@ class Describer:
             # which is what `outcome=fallback` on this purpose means. It carries no duration and
             # no cost, exactly as a config-class fault does.
             self._report(name, kind=VIDEO_KIND, reason="undecodable_video", detail=str(exc))
-            return None
-        described = self._ask(
+            return None, "undecodable_video"
+        described, reason = self._answer(
             DESCRIBE_PROMPT + DESCRIBE_FRAMES_SUFFIX,
             images=frames,
             kind=VIDEO_KIND,
@@ -417,11 +520,9 @@ class Describer:
             budget=VIDEO_OUTPUT_BUDGET,
             parts=True,
         )
-        return None if described is None else f"{summary}\n{described}"
+        return (None, reason) if described is None else (f"{summary}\n{described}", None)
 
-    # --- internals -----------------------------------------------------------
-
-    def _ask(
+    def _answer(
         self,
         prompt: str,
         *,
@@ -431,15 +532,16 @@ class Describer:
         parts: bool = False,
         images: list[ImageContent] | None = None,
         videos: list[VideoContent] | None = None,
-    ) -> str | None:
-        """One describe: the media plus the fixed prompt, in, plain text out — or ``None``.
+    ) -> tuple[str | None, str | None]:
+        """One describe: the media plus the fixed prompt, in, ``(text, None)`` out — or ``(None, reason)``.
 
         The media rides a single ``user`` turn carrying the prompt as its text — the one shape
         every surface serializes (`_openai_wire`, `_xai_sdk`), so this needs no vendor branch. No
         tools are offered: a describer with tools is an agent, and this is a sense organ.
 
         **Every failure is caught here**, because the alternative is a wake that dies over a
-        picture. The result is ``None`` and the caller says so honestly.
+        picture. The text is ``None`` and the caller says so honestly; the ``reason`` is what
+        `_once` reads to decide whether the failure is worth remembering.
 
         One describe is **at most two answered attempts** (issue #488). A vendor that stopped at ``length``
         did not answer the question — it ran out of room — and that is the one failure a *larger
@@ -457,10 +559,9 @@ class Describer:
         if self.fault is not None or self.provider is None:
             # Born broken — a missing key or provider list, or a provider that would not build. No
             # call is attempted; the report is the whole behaviour.
-            self._report(
-                subject, kind=kind, reason=self.fault or "config:no_provider", detail=self.detail
-            )
-            return None
+            reason = self.fault or "config:no_provider"
+            self._report(subject, kind=kind, reason=reason, detail=self.detail)
+            return None, reason
         text, reason = self._attempt(
             prompt,
             kind=kind,
@@ -480,7 +581,7 @@ class Describer:
                 images=images,
                 videos=videos,
             )
-        return None if reason is not None else text
+        return (None, reason) if reason is not None else (text, None)
 
     def _attempt(
         self,
@@ -513,14 +614,14 @@ class Describer:
             # tries again.
             self._report(subject, kind=kind, reason="provider_error", detail=str(exc))
             return None, "provider_error"
-        if provider is None:  # pragma: no cover - `_ask` refuses a faulted describer first
+        if provider is None:  # pragma: no cover - `_answer` refuses a faulted describer first
             self._report(subject, kind=kind, reason="config:no_provider", detail=self.detail)
             return None, "config:no_provider"
         turn = Message(
             role="user", content=prompt, images=list(images or []), videos=list(videos or [])
         )
         # One bounded retry for the transient faults (issue #506) — a 429, a 5xx, a transport blip.
-        # It is *inside* `_attempt` rather than beside the `length` re-budget in `_ask`, and the two
+        # It is *inside* `_attempt` rather than beside the `length` re-budget in `_answer`, and the two
         # are different things: a re-budget asks the model a **different** question (more room),
         # which is a second call that answered and was billed and therefore earns its own `llm`
         # line; a retry re-issues the **identical** question after a refusal that generated nothing,
@@ -746,7 +847,7 @@ class Describer:
 
 
 #: The ``reason=`` a truncated answer carries, named rather than spelled at three sites — it is
-#: both what the line says and the one value `_ask` retries on.
+#: both what the line says and the one value `_answer` retries on.
 _TRUNCATED = "truncated"
 
 
@@ -764,7 +865,7 @@ def _unusable(text: str, call: LlmCall, *, parts: bool) -> str | None:
     true is the one that *explains* the rest:
 
     - **truncated** — the vendor itself says it stopped at ``length``. It is the only one a bigger
-      budget can fix, so it is the only one `_ask` retries on, and it is asked first because a
+      budget can fix, so it is the only one `_answer` retries on, and it is asked first because a
       truncated answer is usually also missing its parts and would otherwise be reported as the
       symptom rather than the cause.
     - **empty_response** — nothing came back. The pre-#488 check, unchanged.

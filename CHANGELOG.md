@@ -7,6 +7,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.152.1] - 2026-10-07
+
+### Fixed: a picture is described once per wake, not once per perception (issue #664)
+
+Every wake that described an image paid for it more than once. On 2026-10-07 `@rowan` was sent
+one image and one message, and the wake logged two `kind=image.describe` lines for the same logo,
+one per turn. The cause is in the two paths that perceive an image for a blind brain. The message
+turn runs first and has only one way to perceive a picture: the brain called `assets view` on it,
+and the engine described it. The asset turn runs next and describes every image on arrival. The
+transcript never describes anything again on replay. The engine memoized the describer *instance*,
+and nothing memoized the *description*.
+
+- **The describer remembers what it said for the wake** (`Describer._once`). Arrival, `view` and
+  `watch` all reach the engine's one describer, so a second perception of the same media gets the
+  same words and makes no call. The key is a digest of the payload the describer is shown, plus the
+  window for a clip, so a different window of the same clip is described again. The media types
+  carry no asset uuid and an MCP server's picture has none, and the asset wake and `view` fetch
+  through the same `image_input`, so the bytes are the identity every path can agree on. The memo
+  holds at most `DESCRIPTION_MEMO_CAP` (64) entries, for a library caller that keeps one engine
+  across many runs.
+- **The cost line stays one line per billed call.** A repeat writes no `llm` line. It writes a
+  DEBUG `describe repeated` line with the kind, model, subject and outcome, and no cost or tokens.
+- **Only a transient failure is asked again.** A failure in `RETRYABLE_REASONS` (a timeout, a 429, a
+  5xx, a dropped connection, an unparseable answer) is not remembered: it was already waited out
+  inside its call, and a later perception in the same wake may find the vendor back. Every other
+  failure is remembered for the wake and the caller gets the withheld caption with no call: a
+  config fault is dead until a human acts, an empty, cut-off or incomplete answer was already billed
+  and asking again buys the same answer, and a clip that would not decode will not decode next
+  time.
+
 ## [0.152.0] - 2026-10-07
 
 ### Added: the describer's SDK version and each key file's state in `--resolved-config` (issue #661)

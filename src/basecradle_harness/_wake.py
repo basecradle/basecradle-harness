@@ -2327,7 +2327,10 @@ class WakeAgent:
 
         The describer is the **engine's** (`Engine.describer`), memoized there — so an agent whose
         wake perceives an asset *and* calls `view` builds one adapter instance, not two, and the
-        two paths can never end up describing with different models.
+        two paths can never end up describing with different models. It is also one *describe*,
+        not two (issue #664): the describer remembers its answer for the wake, keyed by the bytes
+        it was shown, and `view` fetches through the same `image_input` and so hands it the same
+        bytes.
 
         The fetch is `image_input`, the same viewability gate the engine's `view` path uses: an
         oversized or unviewable file gets the plain description, exactly as before, rather than a
