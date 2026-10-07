@@ -1,11 +1,14 @@
 """What a Gemini call on Vertex AI cost, priced from Google's published rates (issue #655).
 
-Every other adapter's ``cost=`` is the vendor's own figure: OpenRouter states ``usage.cost`` and xAI
-states ticks. **Vertex states tokens and no dollars**, so the ``llm provider=google`` line would
+OpenRouter states ``usage.cost`` and xAI states ticks, and those adapters log the vendor's own
+figure. **Vertex states tokens and no dollars**, so the ``llm provider=google`` line would
 otherwise carry no cost at all, and an agent brained on Gemini would be invisible on the fleet's
 spend dashboard. The capital's ruling on #655 is to price the call from a maintained table rather
-than leave the hole, and this module is that table. It is the one place in the harness that
-*computes* a dollar figure instead of reading one, so three rules hold it honest:
+than leave the hole, and this module is that table. It and its OpenAI twin
+(`basecradle_harness._openai_rates`, issue #657 — one mechanism, two vendors) are the only places
+in the harness that *compute* a dollar figure instead of reading one, so three rules hold them
+honest, and every figure they produce is a `ComputedCost`, which the line tags
+``cost_basis=computed``:
 
 - **A figure the table cannot state is omitted, never estimated.** An unknown model, a rate the
   page lists as ``N/A``, a tier or an endpoint class the page prices separately and the table does
@@ -27,14 +30,31 @@ than leave the hole, and this module is that table. It is the one place in the h
 Pricing is the **Standard pay-as-you-go** tier only. Priority, Flex, batch and Provisioned
 Throughput are priced elsewhere on the page (or not per call at all), and a call the response says
 ran on one of them gets no cost.
+
+Grounding with Google Search (issue #656)
+-----------------------------------------
+A grounded call carries a charge that is not tokens, so it is priced apart (`grounding_cost`) and
+logged on its own ``media`` line. Two schemes, by model family, both from `SOURCE`: the Gemini 3
+models bill **each grounding query** ($14 per 1,000, the queries Google lists in
+``webSearchQueries``) and do not charge the input tokens grounding feeds back; the Gemini 2.5 models
+bill **each grounding prompt** once however many queries it made ($35 per 1,000), with no such
+exemption stated. Either way a prompt is billed "only when [it] successfully returns sources".
+
+**The free allowance is not netted out.** Google includes 5,000 grounding queries a month (Gemini 3)
+or a daily prompt allowance (Gemini 2.5) at no charge, and the harness cannot see where the account
+stands against it — other agents and other callers draw from the same pool. So every query is priced
+at list, the founder's ruling on #656: the dashboard can overstate grounding spend inside the
+allowance, and never understate it beyond.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from typing import Any
+
+from basecradle_harness._observability import ComputedCost
 
 #: Where every number in `RATES` was read, and when. Edit the table from this page, and move the
 #: date with it.
@@ -276,6 +296,42 @@ RATES: Mapping[str, tuple[Rates, ...]] = {
 
 
 @dataclass(frozen=True)
+class Grounding:
+    """How a model's Google Search grounding is billed, in USD per unit (see the module docstring).
+
+    Exactly one of ``per_query`` / ``per_prompt`` is set. ``free_tokens`` is whether the input
+    tokens grounding feeds back to the model are exempt from the token charge.
+    """
+
+    per_query: float | None = None
+    per_prompt: float | None = None
+    free_tokens: bool = False
+
+
+#: "$14 per 1,000 Grounding Queries … Input tokens provided by Grounding with Google Search … are
+#: not charged" — the Gemini 3 section of `SOURCE`.
+_GROUNDING_3X = Grounding(per_query=14.00 / 1_000, free_tokens=True)
+#: "$35 per 1,000 Grounding Prompts … Even if multiple Grounding Queries are sent, there is only one
+#: charge for a Grounding Prompt" — the Gemini 2.5 section of `SOURCE`.
+_GROUNDING_25 = Grounding(per_prompt=35.00 / 1_000)
+
+#: Model id → its grounding scheme. Every model in `RATES`, so a model the token table prices is a
+#: model whose grounding can be priced too.
+GROUNDING: Mapping[str, Grounding] = {
+    "gemini-3.8-flash": _GROUNDING_3X,
+    "gemini-3.7-flash": _GROUNDING_3X,
+    "gemini-3.6-flash": _GROUNDING_3X,
+    "gemini-3.5-flash": _GROUNDING_3X,
+    "gemini-3.5-flash-lite": _GROUNDING_3X,
+    "gemini-3.1-flash-lite": _GROUNDING_3X,
+    "gemini-3.1-pro-preview": _GROUNDING_3X,
+    "gemini-2.5-pro": _GROUNDING_25,
+    "gemini-2.5-flash": _GROUNDING_25,
+    "gemini-2.5-flash-lite": _GROUNDING_25,
+}
+
+
+@dataclass(frozen=True)
 class Usage:
     """The token counts a Vertex response reported, in the shape pricing needs.
 
@@ -327,13 +383,16 @@ def call_cost(
     *,
     service_tier: Any = None,
     on: date | None = None,
-) -> float | None:
-    """What this call cost in USD at Google's published Standard rates, or ``None``.
+    grounded: bool = False,
+) -> ComputedCost | None:
+    """What this call's tokens cost in USD at Google's published Standard rates, or ``None``.
 
     `location` is the Vertex location the call ran at; `service_tier` is whatever the request asked
     for (``None`` when it asked for none), so a response that names no traffic tier is priced as
     standard only when the request did not ask for another one. `on` is the billing day, Pacific
-    time, defaulting to today.
+    time, defaulting to today. `grounded` says the call's only tool was Google Search, so its
+    tool-use input tokens are grounding results — exempt from the token charge on the models
+    `GROUNDING` says so for. The grounding fee itself is `grounding_cost`, never folded in here.
 
     ``None`` whenever any rate the call needs is not in the table — see the module docstring.
     """
@@ -349,7 +408,41 @@ def call_cost(
     if tiers is None:
         return None
     tier = tiers[1] if usage.prompt > LONG_CONTEXT_THRESHOLD else tiers[0]
-    return _price(tier, usage)
+    if grounded and _grounding(model).free_tokens:
+        usage = replace(usage, tool_prompt=0)
+    total = _price(tier, usage)
+    return None if total is None else ComputedCost(total)
+
+
+def grounding_cost(model: str, *, queries: int | None, sourced: bool) -> ComputedCost | None:
+    """The Google Search grounding fee for one grounded call, at list, or ``None``.
+
+    `queries` is how many grounding queries the response lists (``None`` when it lists none it
+    could count); `sourced` is whether it returned any source. A call that returned no sources is
+    not billed and gets ``None``, and so does one whose fee cannot be stated: an unknown model, or a
+    per-query model whose queries were not listed. The free allowance is not netted out — see the
+    module docstring.
+    """
+    scheme = GROUNDING.get(_model_key(model))
+    if scheme is None or not sourced:
+        return None
+    if scheme.per_prompt is not None:
+        return ComputedCost(scheme.per_prompt)
+    if scheme.per_query is None or not queries:
+        return None
+    return ComputedCost(queries * scheme.per_query)
+
+
+def grounding_units(model: str, queries: int | None) -> int | None:
+    """How many units a grounded call is billed for: its queries, or one prompt on a per-prompt model."""
+    scheme = GROUNDING.get(_model_key(model))
+    if scheme is not None and scheme.per_prompt is not None:
+        return 1
+    return queries
+
+
+def _grounding(model: str) -> Grounding:
+    return GROUNDING.get(_model_key(model)) or Grounding()
 
 
 def known(model: str) -> bool:

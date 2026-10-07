@@ -26,6 +26,16 @@ bare ``ModuleNotFoundError`` deep in a wake.
 
 Stateless per turn, like the wire it speaks: the full conversation is sent every call and the
 harness owns history, so Responses' server-side state (``previous_response_id``) is unused.
+
+Cost — stated where the endpoint states it, computed where OpenAI states none
+-----------------------------------------------------------------------------
+Pointed at OpenRouter, the response carries its own dollar figure and the line reports it. Pointed
+at **OpenAI**, which returns tokens and no price, the line's ``cost=`` is computed from OpenAI's
+published Standard rates (`basecradle_harness._openai_rates`, issue #657) and tagged
+``cost_basis=computed``; a web search's per-call fee gets its own priced ``media`` line
+(``kind=search.web``), and a code-interpreter container — whose charge no response describes — is a
+stated gap, one WARNING per wake. Pointed at xAI, nothing is computed: the xAI surfaces state their
+own prices where they state any, and a table of OpenAI's rates says nothing about xAI's.
 """
 
 from __future__ import annotations
@@ -62,10 +72,22 @@ from basecradle_harness._observability import (
     generation_id_header,
     generation_of,
     log_llm_call,
+    log_media_call,
     reported_cost,
     serving_endpoint,
     stamp_generation_id,
     token_counts,
+)
+from basecradle_harness._openai_rates import (
+    CONTAINER_GAP,
+    LONG_CONTEXT_THRESHOLD,
+    call_cost,
+    known,
+    priced_host,
+    ran_container,
+    search_calls,
+    usage_of,
+    web_search_cost,
 )
 from basecradle_harness._openai_wire import (
     builtin_to_responses,
@@ -312,6 +334,13 @@ class OpenAIProvider:
         #: The conversation this adapter's next calls belong to, or ``None`` (issue #435). Bound by
         #: `bind_conversation`; sticky until the next bind, exactly as on the native xAI adapter.
         self._conversation: str | None = None
+        #: Whether this client's calls are priced from OpenAI's rates (`_openai_rates`): only when
+        #: it is aimed at OpenAI itself. The label decides whose rates could apply and the host
+        #: decides whether they are the list price — a residency endpoint is billed with an uplift.
+        self._computes_cost = provider == "openai"
+        #: The cost gaps already stated this wake (an unknown model, an unpriced host, a container),
+        #: so each WARNING is written once per adapter — one wake — rather than once per call.
+        self._gaps_stated: set[str] = set()
         self._openai = openai
         self._client = openai.OpenAI(
             api_key=key,
@@ -439,6 +468,7 @@ class OpenAIProvider:
             response = self._client.responses.create(**payload)
         data = response.model_dump()
         self._log_call(started, data)
+        self._log_tool_fees(data)
         with generation_of(data):
             return message_from_responses(data)
 
@@ -487,7 +517,8 @@ class OpenAIProvider:
         one adapter is aimed at three endpoints, and the *response* is what says whether either
         fact exists. Pointed at OpenRouter it comes back naming the upstream that served the call
         and what it charged (the ``openai`` SDK's models keep unmodeled fields, so both survive
-        `model_dump`); pointed at OpenAI or xAI it says neither, and the fields are simply absent.
+        `model_dump`); pointed at OpenAI or xAI it says neither. For OpenAI the cost is then
+        computed from its published rates (`_cost`); for xAI the field is absent.
         """
         usage = data.get("usage")
         # Remember what we just logged: the context budget triggers on the *provider's* count, so
@@ -499,13 +530,16 @@ class OpenAIProvider:
         # (issue #490): the same `finish_reason` this line already hands `log_llm_call`, kept where
         # the engine can reach it without a `capture_llm_call` around every brain call.
         self.last_finish_reason = reason
+        cost = reported_cost(usage)
+        if cost is None:
+            cost = self._cost(data, usage)
         log_llm_call(
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
             usage=usage,
             endpoint=serving_endpoint(data),
-            cost=reported_cost(usage),
+            cost=cost,
             # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
             # it got back is whole (issue #488). One reader covers both surfaces: Chat states it on
             # the choice, Responses only once its `status` goes `incomplete`.
@@ -514,6 +548,89 @@ class OpenAIProvider:
             # from OpenAI, a uuid from xAI, the ``gen-`` generation id from OpenRouter.
             generation_id=generation_id(data),
         )
+
+    def _cost(self, data: Mapping[str, Any], usage: Any) -> float | None:
+        """This call's dollars at OpenAI's published rates — computed, never stated (issue #657).
+
+        ``None`` for any endpoint but OpenAI's own, and for anything the table cannot price; each
+        gap that will recur all wake is stated once, so a missing figure is never a silent one.
+        """
+        if not self._computes_cost or not self._priced_endpoint():
+            return None
+        if not known(self.model):
+            self._state_gap(
+                f"model:{self.model}",
+                "No published rate for OpenAI model %r in the harness's table, so its calls carry "
+                "no cost= on the llm line. Add the model's row to _openai_rates.RATES from OpenAI's "
+                "pricing page.",
+                self.model,
+            )
+        tokens = usage_of(usage)
+        served = data.get("service_tier")
+        cost = call_cost(
+            self.model,
+            tokens,
+            served_tier=served,
+            asked_tier=self._default_params.get("service_tier"),
+        )
+        if cost is None and tokens is not None and known(self.model):
+            # A model the table carries, on a call it still cannot price: a non-Standard tier, or a
+            # prompt past the long-context threshold on a model with no long-context row.
+            self._state_gap(
+                f"call:{served}:{tokens.input > LONG_CONTEXT_THRESHOLD}",
+                "OpenAI call on %r not priced (service_tier=%s, input_tokens=%d): the harness's "
+                "table carries Standard rates only, and this model's long-context row where OpenAI "
+                "states one. This kind of call carries no cost= for the rest of the wake.",
+                self.model,
+                served,
+                tokens.input,
+            )
+        return cost
+
+    def _log_tool_fees(self, data: Mapping[str, Any]) -> None:
+        """The per-use charges a Responses call's server-side tools ran up, beside its token cost.
+
+        A web search is billed per search call on top of the tokens, so it gets its own priced
+        ``media`` line (``kind=search.web``) — the head the fleet's tool spend is read from. A
+        code-interpreter container is billed per session and no response says how long one lived,
+        so it is a stated gap (`CONTAINER_GAP`), never a figure. Only for OpenAI: an xAI or
+        OpenRouter endpoint states its own tool charges where it states any.
+        """
+        if not self._computes_cost:
+            return
+        output = data.get("output")
+        calls = search_calls(output)
+        if calls:
+            log_media_call(
+                provider=self.provider,
+                kind="search.web",
+                model=self.model,
+                seconds=None,
+                count=calls,
+                cost=web_search_cost(calls) if self._priced_endpoint() else None,
+            )
+        if ran_container(output):
+            self._state_gap("container", "%s", CONTAINER_GAP)
+
+    def _priced_endpoint(self) -> bool:
+        """Whether this client is aimed at OpenAI's own host — stating the gap once when not."""
+        if priced_host(self.base_url):
+            return True
+        self._state_gap(
+            "host",
+            "This OpenAI client is aimed at %s, not %s: OpenAI bills its data-residency and FedRAMP "
+            "endpoints with an uplift and a proxy's price is its own, so no call here is priced.",
+            self.base_url,
+            "api.openai.com",
+        )
+        return False
+
+    def _state_gap(self, key: str, message: str, *args: Any) -> None:
+        """One WARNING per cost gap per wake — the same rule `GoogleProvider` keeps for its table."""
+        if key in self._gaps_stated:
+            return
+        self._gaps_stated.add(key)
+        _log.warning(message, *args)
 
     def context_limit(self) -> int | None:
         """This model's context ceiling, if the endpoint this adapter is aimed at states one (#276).

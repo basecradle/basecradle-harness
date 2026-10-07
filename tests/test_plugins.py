@@ -957,3 +957,19 @@ def test_the_shipped_assets_plugin_declares_the_hook_and_no_provider_affinity():
     assert "configure=assets_options" in source
     assert "OpenAIKey" not in source
     assert plugin_source_providers(source) is None  # universal: relevant to every agent
+
+
+def test_model_family_gates_on_the_model_ids_last_segment_case_blind():
+    from basecradle_harness import ActivationContext, ModelFamily
+
+    def ctx(model):
+        return ActivationContext(
+            provider="google", sdk="google-genai", surface="", model=model, env={}
+        )
+
+    gate = ModelFamily("gemini-3")
+    assert gate.met(ctx("gemini-3.8-flash"))
+    assert gate.met(ctx("publishers/google/models/Gemini-3.1-Pro-Preview"))
+    assert not gate.met(ctx("gemini-2.5-pro"))
+    assert not gate.met(ctx(""))
+    assert gate.reason == "needs a gemini-3* model (AI_MODEL)"

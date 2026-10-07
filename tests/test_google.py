@@ -33,6 +33,7 @@ from google.auth import exceptions as auth_errors
 from google.oauth2 import service_account
 
 from basecradle_harness import (
+    GoogleSearchTool,
     ImageContent,
     Message,
     ProviderAPIError,
@@ -57,6 +58,7 @@ from basecradle_harness._google import (
     GoogleConfigError,
     GoogleProvider,
 )
+from basecradle_harness._google_rates import Usage, call_cost
 from basecradle_harness._observability import truncated
 from basecradle_harness._timeouts import CONNECT_TIMEOUT, TIMEOUT_RETRY_SCALE
 
@@ -761,7 +763,10 @@ def _llm_line(caplog) -> str:
 
 
 def test_the_llm_line_shape(router, provider, caplog):
-    """The exact field order the NOC's columns key on (issue #655's completion comment quotes it)."""
+    """The exact field order the NOC's columns key on (issue #655's completion comment quotes it).
+
+    ``cost_basis=computed`` follows the computed ``cost=`` (issue #657), as the Steel line's does.
+    """
     router.post(GENERATE).mock(return_value=ok(text("hi")))
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         provider.chat([Message.user("go")])
@@ -769,7 +774,7 @@ def test_the_llm_line_shape(router, provider, caplog):
     assert re.fullmatch(
         r"llm provider=google purpose=main endpoint=us model=gemini-3\.8-flash "
         r"duration=\d+\.\d\ds tokens_in=1200 tokens_out=100 tokens_total=1300 cached_tokens=1000 "
-        r"cost=\S+ generation_id=resp-0123456789abcdef",
+        r"cost=\S+ cost_basis=computed generation_id=resp-0123456789abcdef",
         line,
     ), line
 
@@ -1087,3 +1092,266 @@ def test_no_representation_of_the_adapter_emits_its_key_or_token(router, provide
         except Exception:  # noqa: BLE001 - refusing is an acceptable answer; emitting is not
             shown = ""
         assert key_line not in shown and FAKE_TOKEN not in shown, name
+
+
+# === Gemini's built-ins, and Google Search as a grounded call of its own (issue #656) =========
+#
+# Code execution and URL context ride beside the function declarations on every turn. Google Search
+# cannot — Vertex refuses a search tool beside function calling — so `GoogleProvider.search` makes a
+# separate call whose only tool is ``google_search``, and `GoogleSearchTool` hands its answer to the
+# agent as ``web_search``. These pin what goes on the wire, the two lines a search writes (its
+# ``llm`` line as a helper call, its grounding fee as a priced ``media`` line), and the honest gaps.
+
+GROUNDED_USAGE = {
+    "promptTokenCount": 20,
+    "candidatesTokenCount": 120,
+    "toolUsePromptTokenCount": 4000,
+    "totalTokenCount": 4140,
+    "trafficType": "ON_DEMAND",
+}
+
+
+def grounded(*parts, queries=("weather in chicago", "chicago forecast"), chunks=None, usage=None):
+    """A grounded ``generateContent`` body: the answer, the queries Google ran, the sources."""
+    payload = body(*parts, usage=usage or GROUNDED_USAGE)
+    if chunks is None:
+        chunks = [
+            {"web": {"uri": "https://vertexaisearch.cloud.google.com/r/1", "title": "weather.gov"}},
+            {
+                "web": {
+                    "uri": "https://vertexaisearch.cloud.google.com/r/2",
+                    "title": "nws.noaa.gov",
+                }
+            },
+        ]
+    payload["candidates"][0]["groundingMetadata"] = {
+        "webSearchQueries": list(queries),
+        "groundingChunks": chunks,
+    }
+    return httpx.Response(200, json=payload)
+
+
+def _lines_starting(caplog, head):
+    return [m for m in (r.getMessage() for r in caplog.records) if m.startswith(head)]
+
+
+@pytest.fixture
+def _pinned_billing_day(monkeypatch):
+    monkeypatch.setattr(
+        "basecradle_harness._google_rates.billing_day", lambda: datetime.date(2026, 10, 7)
+    )
+
+
+# === built-ins beside the function declarations ================================================
+
+
+def test_code_execution_and_url_context_ride_beside_the_function_declarations(router, key_file):
+    provider = build(key_file, builtin_tools=["code_execution", "url_context"])
+    route = router.post(GENERATE).mock(return_value=ok(text("hi")))
+    provider.chat([Message.user("go")], tools=[MEMORY_TOOL])
+    tools = sent(route)["tools"]
+    assert tools[:2] == [{"codeExecution": {}}, {"urlContext": {}}]
+    assert [d["name"] for d in tools[2]["functionDeclarations"]] == ["memory_search"]
+
+
+def test_built_ins_are_sent_on_a_turn_with_no_function_tools(router, key_file):
+    provider = build(key_file, builtin_tools=["code_execution"])
+    route = router.post(GENERATE).mock(return_value=ok(text("hi")))
+    provider.chat([Message.user("go")])
+    assert sent(route)["tools"] == [{"codeExecution": {}}]
+
+
+def test_google_search_is_never_sent_beside_the_function_declarations(router, key_file):
+    """Vertex refuses that combination, so no builtin name ever puts it on a turn."""
+    provider = build(key_file, builtin_tools=["google_search", "web_search", "url_context"])
+    route = router.post(GENERATE).mock(return_value=ok(text("hi")))
+    provider.chat([Message.user("go")], tools=[MEMORY_TOOL])
+    wire = json.dumps(sent(route)["tools"])
+    assert "googleSearch" not in wire and "google_search" not in wire
+    assert sent(route)["tools"][0] == {"urlContext": {}}
+
+
+def test_a_turn_with_neither_sends_no_tools_field(router, provider):
+    route = router.post(GENERATE).mock(return_value=ok(text("hi")))
+    provider.chat([Message.user("go")])
+    assert "tools" not in sent(route)
+
+
+def test_code_execution_parts_leave_the_models_own_words_as_the_reply(router, key_file):
+    provider = build(key_file, builtin_tools=["code_execution"])
+    parts = (
+        text("Let me compute. "),
+        {"executableCode": {"language": "PYTHON", "code": "print(2**10)"}},
+        {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1024\n"}},
+        text("It is 1024."),
+    )
+    router.post(GENERATE).mock(return_value=ok(*parts))
+    reply = provider.chat([Message.user("2^10?")])
+    assert reply.content == "Let me compute. It is 1024."
+
+
+# === the grounded search call ==================================================================
+
+
+def test_a_search_sends_google_search_alone_and_only_the_query(router, provider):
+    route = router.post(GENERATE).mock(return_value=grounded(text("Sunny.")))
+    provider.search("weather in chicago this weekend")
+    request = sent(route)
+    assert request["tools"] == [{"googleSearch": {}}]
+    assert request["contents"] == [
+        {"role": "user", "parts": [{"text": "weather in chicago this weekend"}]}
+    ]
+    assert "systemInstruction" not in request
+
+
+def test_a_search_returns_the_grounded_answer_with_its_sources(router, provider):
+    router.post(GENERATE).mock(return_value=grounded(text("Sunny, 55°F.")))
+    answer = provider.search("weather in chicago")
+    assert answer == (
+        "Sunny, 55°F.\n\nSources:\n"
+        "- weather.gov — https://vertexaisearch.cloud.google.com/r/1\n"
+        "- nws.noaa.gov — https://vertexaisearch.cloud.google.com/r/2"
+    )
+
+
+def test_a_search_writes_a_helper_llm_line_and_a_priced_grounding_line(router, provider, caplog):
+    router.post(GENERATE).mock(return_value=grounded(text("Sunny.")))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.search("weather in chicago")
+    (llm,) = _lines_starting(caplog, "llm ")
+    assert re.fullmatch(
+        r"llm provider=google purpose=helper kind=search\.grounding endpoint=us "
+        r"model=gemini-3\.8-flash duration=\d+\.\d\ds tokens_in=20 tokens_out=120 "
+        r"tokens_total=4140 cost=\S+ cost_basis=computed \S*outcome=ok\S* "
+        r"generation_id=resp-0123456789abcdef",
+        llm,
+    ), llm
+    assert _lines_starting(caplog, "media ") == [
+        (
+            "media provider=google kind=search.grounding model=gemini-3.8-flash count=2 "
+            "cost=0.028 cost_basis=computed"
+        )
+    ]
+
+
+def test_grounding_tokens_are_not_charged_on_a_gemini_3_search(
+    router, provider, caplog, _pinned_billing_day
+):
+    """ "Input tokens provided by Grounding with Google Search … are not charged" (Gemini 3)."""
+    router.post(GENERATE).mock(return_value=grounded(text("Sunny.")))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.search("weather")
+    cost = float(re.search(r" cost=([0-9.]+) ", _lines_starting(caplog, "llm ")[0]).group(1))
+    # 20 in × $0.825/M + 120 out × $4.125/M, non-global, introductory rate; the 4,000 grounding
+    # tokens nowhere.
+    assert cost == pytest.approx((20 * 0.825 + 120 * 4.125) / 1e6, abs=1e-8)
+
+
+def test_the_brains_own_turns_still_pay_for_tool_use_tokens(_pinned_billing_day):
+    """Code execution's and URL context's tokens are billed as input: only grounding is exempt."""
+    usage = Usage(prompt=20, cached=0, output=120, tool_prompt=4000)
+    charged = call_cost(MODEL, "us", usage)
+    exempt = call_cost(MODEL, "us", usage, grounded=True)
+    assert charged - exempt == pytest.approx(4000 * 0.825 / 1e6)
+
+
+def test_a_search_that_returned_no_sources_is_not_billed_a_grounding_fee(router, provider, caplog):
+    router.post(GENERATE).mock(return_value=grounded(text("I could not find that."), chunks=[]))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        answer = provider.search("something unfindable")
+    assert answer == "I could not find that."
+    assert not _lines_starting(caplog, "media ")
+
+
+def test_a_fee_that_cannot_be_counted_is_logged_without_a_cost_and_warned(router, provider, caplog):
+    router.post(GENERATE).mock(return_value=grounded(text("Sunny."), queries=()))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.search("weather")
+    assert _lines_starting(caplog, "media ") == [
+        "media provider=google kind=search.grounding model=gemini-3.8-flash"
+    ]
+    assert any(
+        r.levelno == logging.WARNING and "grounding" in r.getMessage() for r in caplog.records
+    )
+
+
+def test_a_search_failure_is_the_same_typed_error_a_turn_raises(router, provider):
+    router.post(GENERATE).mock(
+        return_value=httpx.Response(
+            429, json={"error": {"code": 429, "message": "quota", "status": "RESOURCE_EXHAUSTED"}}
+        )
+    )
+    with pytest.raises(ProviderError):
+        provider.search("weather")
+
+
+# === the web_search tool =======================================================================
+
+
+class _Searcher:
+    def __init__(self, answer="Sunny.", error=None):
+        self.answer, self.error, self.queries = answer, error, []
+
+    def search(self, query):
+        self.queries.append(query)
+        if self.error:
+            raise self.error
+        return self.answer
+
+
+def test_the_tool_is_web_search_and_hands_the_model_the_grounded_answer():
+    searcher = _Searcher()
+    tool = GoogleSearchTool(searcher)
+    assert tool.name == "web_search"
+    assert tool.run(query="  weather in chicago  ") == "Sunny."
+    assert searcher.queries == ["weather in chicago"]
+
+
+def test_an_empty_query_is_refused_without_a_call():
+    searcher = _Searcher()
+    assert GoogleSearchTool(searcher).run(query="  ").startswith("Error:")
+    assert searcher.queries == []
+
+
+def test_a_provider_failure_reaches_the_model_as_text():
+    tool = GoogleSearchTool(_Searcher(error=ProviderError("Vertex rate-limited the request")))
+    assert tool.run(query="weather") == "Error searching the web: Vertex rate-limited the request"
+
+
+def test_the_tool_searches_on_the_brains_own_vertex_configuration(router, key_file, monkeypatch):
+    monkeypatch.setenv("AI_MODEL", MODEL)
+    monkeypatch.setenv("AI_CREDENTIALS_FILE", str(key_file))
+    monkeypatch.setenv("AI_LOCATION", "us")
+    route = router.post(GENERATE).mock(return_value=grounded(text("Sunny.")))
+    tool = GoogleSearchTool()
+    assert tool.run(query="weather").startswith("Sunny.")
+    assert tool.run(query="again").startswith("Sunny.")
+    assert route.call_count == 2
+
+
+def test_a_brain_with_no_vertex_configuration_gets_a_readable_error(monkeypatch):
+    monkeypatch.setenv("AI_MODEL", MODEL)
+    answer = GoogleSearchTool().run(query="weather")
+    assert answer.startswith("Error searching the web: No Vertex location")
+
+
+def test_a_brain_with_no_model_gets_a_readable_error(monkeypatch):
+    monkeypatch.delenv("AI_MODEL", raising=False)
+    assert "AI_MODEL" in GoogleSearchTool().run(query="weather")
+
+
+def test_a_per_prompt_model_bills_one_grounding_unit_however_many_queries(router, key_file, caplog):
+    """Gemini 2.5 bills the grounded prompt once ($35 per 1,000), so `count=` is 1, not the queries."""
+    provider = build(key_file)
+    provider.model = "gemini-2.5-flash"
+    router.post(GENERATE.replace(MODEL, "gemini-2.5-flash")).mock(
+        return_value=grounded(text("Sunny."), queries=("a", "b", "c"))
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.search("weather")
+    assert _lines_starting(caplog, "media ") == [
+        (
+            "media provider=google kind=search.grounding model=gemini-2.5-flash count=1 "
+            "cost=0.035 cost_basis=computed"
+        )
+    ]

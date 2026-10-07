@@ -70,6 +70,8 @@ def test_only_computes_a_pruned_agents_exact_tools_pin():
         # are provider-affine and matched to their own row, so none of them would notice a
         # regression that made a no-requires plugin resolve by provider.
         ("xai", "xai-sdk", ["openrouter_account_balance"]),
+        # Gemini on Vertex (issue #656): two built-ins and a harness-run `web_search` tool.
+        ("google", "google-genai", ["code_execution", "url_context", "google_search"]),
     ],
 )
 def test_matches_resolved_config_on_the_box(monkeypatch, tmp_path, provider, sdk, opt_in):
@@ -549,3 +551,32 @@ def test_every_shipped_stem_appears_in_the_map():
     assert report["memory"]["tools"] == ["memory"]  # …and is reported on its own axis
     for entry in report["stems"].values():
         assert entry["status"] in {"active", "inactive", "excluded"}
+
+
+@pytest.mark.parametrize(
+    ("model", "builtins"),
+    [("gemini-3.8-flash", ["code_execution", "url_context"]), ("gemini-2.5-pro", [])],
+)
+def test_gemini_built_ins_resolve_only_for_the_family_they_are_proven_on(
+    monkeypatch, tmp_path, model, builtins
+):
+    """Code execution and URL context ride beside function declarations, which the live gate proves
+    on Gemini 3 (issue #656). On another model they are skipped — on the box and off it alike — while
+    the harness-run `web_search` (a grounded call of its own) is offered to both."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setenv("AI_PROVIDER", "google")
+    monkeypatch.setenv("AI_SDK", "google-genai")
+    monkeypatch.setenv("AI_MODEL", model)
+    monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
+    monkeypatch.delenv("HARNESS_MEMORY_PROVIDER", raising=False)
+    monkeypatch.delenv("HARNESS_PROFILE", raising=False)
+    opt_in = ["code_execution", "url_context", "google_search"]
+    install(cfg, provider="google", opt_in=opt_in)
+
+    live = resolved_config()
+    computed = resolve_stems(provider="google", sdk="google-genai", model=model, opt_in=opt_in)
+
+    assert live["builtins"] == computed["builtins"] == builtins
+    assert "web_search" in live["tools"] and "web_search" in computed["tools"]

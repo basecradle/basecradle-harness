@@ -155,6 +155,31 @@ class Sdk(Requirement):
 
 
 @dataclass(frozen=True)
+class ModelFamily(Requirement):
+    """Met iff the model id (``AI_MODEL``) starts with `prefix`, compared case-blind.
+
+    The rare model-specific gate `ActivationContext.model` was reserved for. Gemini's
+    ``code_execution`` and ``url_context`` built-ins declare ``ModelFamily("gemini-3")`` (issue #656):
+    they ride beside the agent's function declarations on every turn, and Vertex has accepted that
+    combination on the Gemini 3 family — proven by the live gate — while it historically refused a
+    built-in beside function calling on 2.x. A refusal there would be a 400 on every turn, which is
+    an agent that never speaks; gating on the family the combination is proven for keeps the tool off
+    rather than the agent dead, and keeps `--resolved-config` naming exactly what is sent. A resource
+    path (``publishers/google/models/<id>``) is read by its last segment.
+    """
+
+    prefix: str
+
+    def met(self, ctx: ActivationContext) -> bool:
+        model = (ctx.model or "").strip().rsplit("/", 1)[-1].lower()
+        return model.startswith(self.prefix.lower())
+
+    @property
+    def reason(self) -> str:
+        return f"needs a {self.prefix}* model (AI_MODEL)"
+
+
+@dataclass(frozen=True)
 class OpenAISurface(Requirement):
     """Met iff the OpenAI adapter's wire surface equals `surface` (``"responses"`` | ``"chat"``).
 

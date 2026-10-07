@@ -70,6 +70,7 @@ live-verified footguns below as the standing exception.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
 
@@ -89,8 +90,11 @@ from basecradle_harness._media import (
 )
 from basecradle_harness._observability import media_timer
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
+from basecradle_harness._openai_rates import image_cost, priced_host
 from basecradle_harness._platform import PlatformTool, explain
 from basecradle_harness._secret import reveal, secret
+
+_log = logging.getLogger("basecradle_harness")
 
 #: OpenAI's Images API root. Image generation/editing is an OpenAI service; this
 #: changes only for a proxy, not to reach another vendor (the key is the OpenAI key).
@@ -234,6 +238,28 @@ class _ImageTool(PlatformTool):
         openai = require_openai_sdk()
         client = openai.OpenAI(api_key=key, base_url=self._base_url, timeout=self._timeout)
         return openai, client
+
+    def _cost(self, response: object) -> float | None:
+        """What this call cost at OpenAI's published image rates (issue #657), or ``None``.
+
+        OpenAI states no price on an Images response, only its token usage, so the figure is
+        computed (`_openai_rates.image_cost`) and the media line tags it ``cost_basis=computed``.
+        A call that cannot be priced — another host, a model or a usage shape the table does not
+        carry — says so in a WARNING, so the missing figure is a stated gap and never a silent one.
+        """
+        if not priced_host(self._base_url):
+            _log.warning(
+                "Image call to %s is not priced: the harness prices OpenAI's own host only.",
+                self._base_url,
+            )
+            return None
+        cost = image_cost(self._model, getattr(response, "usage", None))
+        if cost is None:
+            _log.warning(
+                "Image call on %r is not priced: its model or usage is not in _openai_rates.",
+                self._model,
+            )
+        return cost
 
     def _coverage_params(
         self,
@@ -386,10 +412,11 @@ class GenerateImageTool(_ImageTool):
         try:
             openai, client = self._client(key)
             with (
-                media_timer(provider="openai", kind="image.generate", model=self._model),
+                media_timer(provider="openai", kind="image.generate", model=self._model) as call,
                 sdk_error_context(openai),
             ):
                 response = client.images.generate(model=self._model, prompt=prompt, n=1, **coverage)
+                call.cost = self._cost(response)
             image_bytes = self._decode(response)
         except ProviderConnectionError as exc:
             return f"Error generating image: could not reach the image API: {exc}"
@@ -537,12 +564,13 @@ class EditImageTool(_ImageTool):
         try:
             openai, client = self._client(key)
             with (
-                media_timer(provider="openai", kind="image.edit", model=self._model),
+                media_timer(provider="openai", kind="image.edit", model=self._model) as call,
                 sdk_error_context(openai),
             ):
                 response = client.images.edit(
                     model=self._model, image=sources, prompt=prompt, n=1, **extra, **coverage
                 )
+                call.cost = self._cost(response)
             image_bytes = self._decode(response)
         except ProviderConnectionError as exc:
             return f"Error editing image: could not reach the image API: {exc}"

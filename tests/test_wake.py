@@ -2140,6 +2140,50 @@ def test_a_blank_ai_base_url_is_absence_to_the_brain_too(monkeypatch):
         provider.close()
 
 
+@pytest.mark.parametrize(
+    ("provider", "sdk", "model", "base_url", "expected"),
+    [
+        ("openai", "openai", "gpt-6-sol", None, ("computed", "developers.openai.com", True)),
+        ("openai", "openai", "gpt-7-nova", None, ("computed", "developers.openai.com", False)),
+        ("openai", "openai", "gpt-6-sol", "https://eu.api.openai.com/v1", (None, None, None)),
+        (
+            "google",
+            "google-genai",
+            "gemini-3.8-flash",
+            None,
+            ("computed", "cloud.google.com", True),
+        ),
+        ("openrouter", "openrouter", "z-ai/glm-5.3", None, ("stated", None, None)),
+        ("xai", "xai-sdk", "grok-4.7", None, ("stated", None, None)),
+        ("xai", "openai", "grok-4.7", None, (None, None, None)),
+    ],
+)
+def test_resolved_config_reports_where_the_brains_cost_comes_from(
+    wake_env, monkeypatch, capsys, provider, sdk, model, base_url, expected
+):
+    """Computed from a rate table (and which page, and whether the model is on it), stated by the
+    vendor, or neither — the last being a brain the spend dashboard cannot see (issue #657)."""
+    monkeypatch.setenv("AI_PROVIDER", provider)
+    monkeypatch.setenv("AI_SDK", sdk)
+    monkeypatch.setenv("AI_MODEL", model)
+    monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
+    if base_url is None:
+        monkeypatch.delenv("AI_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("AI_BASE_URL", base_url)
+
+    assert main(["--resolved-config"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    basis, source_host, priced = expected
+    assert report["cost_basis"] == basis
+    assert report["cost_model_priced"] is priced
+    if source_host is None:
+        assert report["cost_rates_source"] is None
+    else:
+        assert f"https://{source_host}/" in report["cost_rates_source"]
+
+
 def test_resolved_config_reports_the_configured_describer(wake_env, monkeypatch, capsys):
     """A describer costs money on every withheld picture and is otherwise invisible from off the
     box, so its trio is reported exactly as the rerank trio is — and the key never is."""

@@ -165,12 +165,47 @@ _TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
 #: returns it on every response (``usage.cost``, already in USD); the xAI SDK reports it in
 #: ``ticks`` and converts it with its own helper, so that adapter passes the figure to
 #: `log_llm_call` directly rather than through this reader. A provider that reports tokens but no
-#: dollars logs no ``cost=`` — with **one** stated exception: Google's Vertex AI, whose adapter prices
-#: the call from Google's published rates (`basecradle_harness._google_rates`, the capital's ruling on
-#: issue #655), because a Gemini brain with no cost at all would be invisible on the fleet's spend
-#: dashboard. That table omits rather than guesses — an unknown model or tier gets no ``cost=`` — and
-#: no other adapter derives a figure: a stale table is worse than an absent field.
+#: dollars logs no ``cost=`` — with **two** stated exceptions, the vendors whose APIs state no price
+#: at all: Google's Vertex AI and OpenAI, whose adapters price the call from the vendor's published
+#: rates (`basecradle_harness._google_rates`, `basecradle_harness._openai_rates`; the capital's
+#: rulings on issues #655 and #657), because a brain with no cost at all would be invisible on the
+#: fleet's spend dashboard. Those tables omit rather than guess — an unknown model or tier gets no
+#: ``cost=`` — and they hand the figure over as a `ComputedCost`, so the line says which kind of
+#: figure it is (`COST_BASIS_COMPUTED`). No other adapter derives one: a stale table is worse than an
+#: absent field.
 _COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost",),)
+
+#: The ``cost_basis=`` value a line carries when its ``cost=`` is the harness's arithmetic over a
+#: vendor's published rates rather than a figure the vendor stated (issues #655, #656, #657). **The
+#: fleet's existing literal, never a second one**: the NOC's Steel launcher already tags its computed
+#: browser cost ``cost_basis=computed`` (basecradle-noc#797), so a computed dollar reads the same
+#: wherever it comes from. Rendered immediately after ``cost=``, as the Steel line renders it, and
+#: only when ``cost=`` itself is rendered — a basis with no figure is a claim about nothing. A
+#: vendor-stated cost carries no ``cost_basis``, so every such line is byte-identical to what it was.
+COST_BASIS_COMPUTED = "computed"
+
+
+class ComputedCost(float):
+    """A dollar figure the harness **computed** from a vendor's published rates.
+
+    A plain ``float`` everywhere it is used — summed, formatted, compared — and the one bit of
+    provenance it carries is its type: `log_llm_call` and `log_media_call` render
+    ``cost_basis=computed`` beside any cost that is one. The provenance travels *with the figure*
+    rather than as a second argument because a figure passes through hands that never knew it was
+    computed: a non-brain caller writes its own line from what `capture_llm_call` recorded (the
+    describer, the reranker), and a basis threaded as a parameter is exactly the field such a
+    caller forgets — at which point a computed dollar reads, on the dashboard, as one the vendor
+    stated. Arithmetic on it returns a plain ``float`` by design: only the rate tables construct one,
+    at the end, from a figure they are prepared to stand behind.
+    """
+
+    __slots__ = ()
+
+
+def cost_basis(cost: Any) -> str | None:
+    """``COST_BASIS_COMPUTED`` for a `ComputedCost` that will render, ``None`` otherwise."""
+    return COST_BASIS_COMPUTED if isinstance(cost, ComputedCost) and _money(cost) else None
+
 
 #: Where OpenRouter says a call ran on **the operator's own provider credential** (bring-your-own-
 #: key, issue #653) — and where it then puts the dollars. On such a call the provider bills the
@@ -531,7 +566,7 @@ def log_llm_call(
 
     **Field order is the contract** and matches what the NOC's column regexes were written against:
     ``provider purpose kind endpoint model duration tokens_* cached_tokens tokens_reasoning cost
-    outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
+    cost_basis outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
     ``picked``), and last of all ``generation_id`` — the vendor's own id for the call (issue #634),
     rendered last so that no column written before it moves — and then, after even that,
     ``billing=byok`` on a call the provider billed directly (issue #653, `BYOK_BILLING`), for the
@@ -551,7 +586,9 @@ def log_llm_call(
     capital's ruling on issue #655: Google's Vertex AI is addressed by *location*, so its line names
     the location the call was sent to (``endpoint=us``, ``endpoint=global``) — the residency fact the
     operator chose — and its ``cost`` is computed from Google's published rates (`_COST_FIELDS`).
-    ``global`` is Google's choice of where to run, not a place, so it says no more than that.
+    ``global`` is Google's choice of where to run, not a place, so it says no more than that. A cost
+    that is computed (a `ComputedCost`, Google's or OpenAI's) is followed by ``cost_basis=computed``;
+    a vendor-stated one carries no basis, so its line is unchanged (`COST_BASIS_COMPUTED`).
 
     **A usage block of nothing but zeros is not usage** (issue #488), so the token fields and the
     ``cost`` read out of it are omitted rather than printed as zeros. That is the same honest-absence
@@ -607,6 +644,7 @@ def log_llm_call(
             **counts,
             tokens_reasoning=tokens_reasoning,
             cost=_money(cost),
+            cost_basis=cost_basis(cost),
             outcome=outcome,
             reason=reason,
             detail=detail,
@@ -717,9 +755,15 @@ def log_llm_retry(
 
 
 def log_media_call(
-    *, provider: str, kind: str, model: str, seconds: float, cost: float | None = None
+    *,
+    provider: str,
+    kind: str,
+    model: str,
+    seconds: float | None,
+    cost: float | None = None,
+    count: int | None = None,
 ) -> None:
-    """One INFO line per media generation: provider, what was made, how long it took, its cost.
+    """One INFO line per media generation or per-use tool charge: provider, what, how long, cost.
 
     ``kind`` is the shape of the work (``image.generate``, ``image.edit``, ``video.generate``,
     ``audio.transcribe``) — the media endpoints are slow and expensive, so their duration is the
@@ -727,29 +771,43 @@ def log_media_call(
     per-tool line already carries its duration and error text, and a second line would only say
     the same thing twice.
 
-    ``cost`` is the dollar charge **as the provider stated it**, when it stated one — the same
-    honest-absence contract `log_llm_call` keeps, rendered through the same `_money` formatter, so a
-    media line's ``cost=`` is byte-identical to an LLM line's (see `_money` for the one cost
-    convention that spans both). It is the field that makes media generation visible to the tool-cost
-    dashboard: xAI reports the exact charge for image and video generation on the wire
-    (``usage.cost_in_usd_ticks``) and the grok media cells pass it here; OpenAI reports no media cost
-    on any endpoint, so ``cost`` stays ``None`` there and the field is simply omitted. Never derived
-    from a price table of the harness's own — the rule the LLM line's cost obeys, extended to media.
+    **The same line carries a server-side tool's per-use fee** (issues #656, #657): ``search.web``
+    for OpenAI's web search (billed per search call) and ``search.grounding`` for Gemini's Google
+    Search grounding (billed per grounding query). Those charges are not model tokens, so they do
+    not belong in the `llm` line's ``cost=``; and the fleet's tool-spend category is a positive gate
+    on this ``media provider=`` head (basecradle-noc#626), so a fee written on any *new* head would be
+    a dollar nobody counts. ``count`` is the billed units — calls, queries — and ``seconds`` is
+    ``None`` for such a line, because the work ran inside a model call the `llm` line already timed.
+
+    ``cost`` is the dollar charge as the provider stated it (xAI's ``usage.cost_in_usd_ticks`` on the
+    grok media cells), or — where the vendor states no price, which is OpenAI and Google — as the
+    harness computed it from the vendor's published rates (a `ComputedCost`, which renders
+    ``cost_basis=computed`` after it, `COST_BASIS_COMPUTED`). The same honest-absence contract
+    `log_llm_call` keeps, through the same `_money` formatter (see `_money` for the one cost
+    convention that spans both): a charge the harness cannot price is omitted, never guessed.
     """
     _log.info(
         "media %s",
-        kv(provider=provider, kind=kind, model=model, duration=_secs(seconds), cost=_money(cost)),
+        kv(
+            provider=provider,
+            kind=kind,
+            model=model,
+            count=count,
+            duration=None if seconds is None else _secs(seconds),
+            cost=_money(cost),
+            cost_basis=cost_basis(cost),
+        ),
     )
 
 
 class MediaCall:
-    """The mutable handle `media_timer` yields, so a caller can record the provider-stated cost.
+    """The mutable handle `media_timer` yields, so a caller can record the call's cost.
 
     A media call's charge is knowable only *after* the vendor responds and its body is read — which
     happens inside the timed block. So the timer hands back this handle; the tool sets ``cost`` from
-    the response body (a plain USD float, or ``None`` when the provider states none) and the timer
-    logs it on a clean exit. A block that never sets it — every OpenAI media path, which has no cost
-    to report — leaves it ``None``, and the line omits ``cost=`` exactly as before.
+    the response body (a provider-stated USD float, a `ComputedCost` priced from the response's
+    usage, or ``None`` when neither is possible) and the timer logs it on a clean exit. A block that
+    never sets it leaves it ``None``, and the line omits ``cost=``.
     """
 
     __slots__ = ("cost",)
@@ -885,8 +943,8 @@ def reported_cost(usage: Any) -> float | None:
     Only OpenRouter states a figure on the wire today (``usage.cost``) — reachable through the
     native SDK *and* through the ``openai`` SDK pointed at ``openrouter.ai``, which keeps the
     field. Every other endpoint reports tokens and no dollars, and gets no ``cost=`` from here: see
-    `_COST_FIELDS` for the one adapter (Google's) that computes its figure instead, and why no other
-    does.
+    `_COST_FIELDS` for the two vendors (Google, OpenAI) whose figure the harness computes instead,
+    and why no other is.
 
     **It is what the operator pays for the call, whichever party bills it** (issue #653). On a
     bring-your-own-key call (`byok`) OpenRouter's ``usage.cost`` is ``0`` and the provider's own
@@ -1111,10 +1169,11 @@ def _money(cost: Any) -> str | None:
     (`` llm provider=`` vs everything else), not on the cost field. So the invariant is exactly that
     ``cost=`` keeps this shape on every kind, and the `` llm provider=`` head never appears on a
     non-LLM line (a media line begins ``media ``). A call carries ``cost=`` **when the provider
-    states the figure** (OpenRouter's ``usage.cost``, xAI's ticks; OpenAI states none, and the field
-    is absent) — and on Google's Vertex AI, which states none, when the call's model and tier are in
-    the harness's transcription of Google's published rates (issue #655, `_google_rates`). Nowhere
-    else is a figure derived, because a stale table is worse than an honest gap.
+    states the figure** (OpenRouter's ``usage.cost``, xAI's ticks) — and on the two vendors that
+    state none, Google's Vertex AI and OpenAI, when the call's model and tier are in the harness's
+    transcription of the vendor's published rates (issues #655 and #657, `_google_rates`,
+    `_openai_rates`), tagged ``cost_basis=computed``. Nowhere else is a figure derived, because a
+    stale table is worse than an honest gap.
 
     Typed loosely on purpose: the figure comes straight off a vendor object (`Response.cost_usd`),
     so anything that is not a real number — ``None``, a string, a bool — is dropped rather than
