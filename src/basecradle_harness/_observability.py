@@ -164,10 +164,12 @@ _TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
 #: Where a provider states the call's **dollar cost**, when it states one at all. OpenRouter
 #: returns it on every response (``usage.cost``, already in USD); the xAI SDK reports it in
 #: ``ticks`` and converts it with its own helper, so that adapter passes the figure to
-#: `log_llm_call` directly rather than through this reader. What the harness will **never** do is
-#: derive a cost from a price table of its own: a stale table is worse than an absent field, so a
-#: provider that reports tokens but no dollars simply logs no ``cost=`` and the money math stays at
-#: the dashboard layer, where staleness is visible.
+#: `log_llm_call` directly rather than through this reader. A provider that reports tokens but no
+#: dollars logs no ``cost=`` — with **one** stated exception: Google's Vertex AI, whose adapter prices
+#: the call from Google's published rates (`basecradle_harness._google_rates`, the capital's ruling on
+#: issue #655), because a Gemini brain with no cost at all would be invisible on the fleet's spend
+#: dashboard. That table omits rather than guesses — an unknown model or tier gets no ``cost=`` — and
+#: no other adapter derives a figure: a stale table is worse than an absent field.
 _COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost",),)
 
 #: Where OpenRouter says a call ran on **the operator's own provider credential** (bring-your-own-
@@ -545,7 +547,11 @@ def log_llm_call(
     converter). Each is omitted, cleanly, by a provider with no answer — a direct-to-vendor SDK has
     no serving endpoint distinct from itself, and most vendors report tokens but never dollars. A
     provider that reports none of them still gets its provider/model/duration line, which is the
-    part that is always true.
+    part that is always true. **One direct-to-vendor adapter fills ``endpoint`` differently**, by the
+    capital's ruling on issue #655: Google's Vertex AI is addressed by *location*, so its line names
+    the location the call was sent to (``endpoint=us``, ``endpoint=global``) — the residency fact the
+    operator chose — and its ``cost`` is computed from Google's published rates (`_COST_FIELDS`).
+    ``global`` is Google's choice of where to run, not a place, so it says no more than that.
 
     **A usage block of nothing but zeros is not usage** (issue #488), so the token fields and the
     ``cost`` read out of it are omitted rather than printed as zeros. That is the same honest-absence
@@ -878,8 +884,9 @@ def reported_cost(usage: Any) -> float | None:
 
     Only OpenRouter states a figure on the wire today (``usage.cost``) — reachable through the
     native SDK *and* through the ``openai`` SDK pointed at ``openrouter.ai``, which keeps the
-    field. Every other endpoint reports tokens and no dollars, and gets no ``cost=``: see
-    `_COST_FIELDS` for why the harness will not fill that gap with a price table of its own.
+    field. Every other endpoint reports tokens and no dollars, and gets no ``cost=`` from here: see
+    `_COST_FIELDS` for the one adapter (Google's) that computes its figure instead, and why no other
+    does.
 
     **It is what the operator pays for the call, whichever party bills it** (issue #653). On a
     bring-your-own-key call (`byok`) OpenRouter's ``usage.cost`` is ``0`` and the provider's own
@@ -1103,10 +1110,11 @@ def _money(cost: Any) -> str | None:
     is load-bearing: the dashboard splits **LLM cost** from **tool cost** on the line *head*
     (`` llm provider=`` vs everything else), not on the cost field. So the invariant is exactly that
     ``cost=`` keeps this shape on every kind, and the `` llm provider=`` head never appears on a
-    non-LLM line (a media line begins ``media ``). A call carries ``cost=`` **when, and only when,
-    the provider states the figure** — never derived from a price table of the harness's own, because
-    a stale table is worse than an honest gap (OpenRouter's ``usage.cost``, xAI's ticks; OpenAI
-    states none, and the field is absent).
+    non-LLM line (a media line begins ``media ``). A call carries ``cost=`` **when the provider
+    states the figure** (OpenRouter's ``usage.cost``, xAI's ticks; OpenAI states none, and the field
+    is absent) — and on Google's Vertex AI, which states none, when the call's model and tier are in
+    the harness's transcription of Google's published rates (issue #655, `_google_rates`). Nowhere
+    else is a figure derived, because a stale table is worse than an honest gap.
 
     Typed loosely on purpose: the figure comes straight off a vendor object (`Response.cost_usd`),
     so anything that is not a real number — ``None``, a string, a bool — is dropped rather than

@@ -82,7 +82,12 @@ _OUT_OF_FUNDS = "out_of_funds"
 
 #: How a raw provider label (``AI_PROVIDER`` / the adapter's ``provider``) reads in a peer-facing
 #: notice. An unknown label passes through unchanged rather than being mangled.
-_PROVIDER_LABELS = {"xai": "xAI", "openai": "OpenAI", "openrouter": "OpenRouter"}
+_PROVIDER_LABELS = {
+    "xai": "xAI",
+    "openai": "OpenAI",
+    "openrouter": "OpenRouter",
+    "google": "Google",
+}
 
 
 @dataclass(frozen=True)

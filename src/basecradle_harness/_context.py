@@ -240,13 +240,18 @@ _SUMMARY_MARKER = "[Earlier conversation compacted"
 #: tools (`sdk_error_context`), where "exceeds the maximum size" is an ordinary file-too-big 400 —
 #: and a rescue that fires on the wrong 400 would compact a transcript that was never too long. A
 #: false negative costs one un-rescued wake; a false positive silently eats conversation.
+#:
+#: Vertex AI's Gemini (issue #655) says it two ways, both naming the *input token count*: *"The input
+#: token count (1236488) exceeds the maximum number of tokens allowed (1048576)."* and *"Unable to
+#: submit request because the input token count is 131335 but model only supports up to 131072."*
 _OVERFLOW_PHRASES = re.compile(
     r"context[ _-]?(?:length|window|limit)"
     r"|maximum context"
     r"|too many (?:input |prompt )?tokens"
     r"|(?:prompt|input|message[s]?) (?:is |are )?too long"
     r"|exceeds? the (?:model'?s? )?(?:maximum |max )?context"
-    r"|reduce the length of the (?:messages|prompt|input)",
+    r"|reduce the length of the (?:messages|prompt|input)"
+    r"|input token count\b.{0,40}?(?:exceeds the maximum number of tokens|but model only supports)",
     re.IGNORECASE,
 )
 

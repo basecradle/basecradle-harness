@@ -26,9 +26,10 @@ The model config is **three independent axes** (issue #158) — one name per con
 identical in the env, the code, and the docs:
 
 - ``AI_PROVIDER``             — the vendor whose endpoint + key the agent uses:
-  ``openai`` (default) | ``xai`` | ``openrouter``. Both ``openai`` and ``xai`` are wired through
-  the one ``openai`` SDK adapter (xAI's endpoint speaks the same wire — ``AI_PROVIDER=xai`` points
-  the SDK at ``api.x.ai``, issue #163); ``openrouter`` is a later milestone.
+  ``openai`` (default) | ``xai`` | ``openrouter`` | ``google``. Both ``openai`` and ``xai`` are wired
+  through the one ``openai`` SDK adapter (xAI's endpoint speaks the same wire — ``AI_PROVIDER=xai``
+  points the SDK at ``api.x.ai``, issue #163); ``openrouter`` has its native SDK as well, and
+  ``google`` is Gemini on Vertex AI over ``google-genai`` (issue #655).
 - ``AI_SDK``                  — the **library/package name** of the SDK the harness imports to
   reach the model: ``openai`` (default), and ``xai-sdk`` (the committed next phase, #165). The value is the importable
   package, which also disambiguates it from the provider token (``AI_PROVIDER=xai`` selects
@@ -37,7 +38,10 @@ identical in the env, the code, and the docs:
   reach a model and says so. Two adapters ship: ``openai`` (the OpenAI-wire SDK — also xAI over
   ``api.x.ai``) and ``xai-sdk`` (xAI's native gRPC SDK, #165).
 - ``AI_MODEL``                — the model id (e.g. ``gpt-5.4-mini``).
-- ``AI_API_KEY``             — the provider's API key.
+- ``AI_API_KEY``             — the provider's API key (every provider but ``google``).
+- ``AI_CREDENTIALS_FILE`` / ``AI_LOCATION`` / ``AI_PROJECT`` — ``google`` only: a service-account
+  JSON key *path*, the Vertex location (required, no default), and the project (defaults to the one
+  the key names). See `basecradle_harness._google`.
 - ``AI_BASE_URL``            — optional; override the provider's endpoint.
 - ``AI_SDK_SURFACE``          — optional; **SDK-scoped**, not a top-level config axis. The
   active SDK adapter declares its own ``SURFACES`` + ``DEFAULT_SURFACE``; this var selects among
@@ -76,6 +80,15 @@ from basecradle_harness._engine import (
     DEFAULT_MAX_STEPS,
     DEFAULT_RESPONSE_RETRIES,
     compose_hooks,
+)
+from basecradle_harness._google import (
+    DEFAULT_SURFACE as GOOGLE_DEFAULT_SURFACE,
+)
+from basecradle_harness._google import (
+    SURFACES as GOOGLE_SURFACES,
+)
+from basecradle_harness._google import (
+    GoogleProvider,
 )
 from basecradle_harness._harness import Harness
 from basecradle_harness._install import charter_from_env, reconcile_on_upgrade
@@ -595,7 +608,7 @@ def _compose_prompt(orientation: str | None, system_prompt: str | None) -> str |
 #: The config defaults: the @jt stack (OpenAI vendor, openai SDK, Responses surface).
 DEFAULT_PROVIDER = "openai"
 DEFAULT_SDK = "openai"
-_PROVIDERS = ("openai", "xai", "openrouter")
+_PROVIDERS = ("openai", "xai", "openrouter", "google")
 
 #: ``surface`` is an **SDK-scoped** concept: each SDK adapter declares its own allowed
 #: ``SURFACES`` and ``DEFAULT_SURFACE`` (so the *next* multi-surface SDK follows the same
@@ -610,6 +623,8 @@ _SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
     # The native openrouter SDK ships the OpenAI-compatible chat wire only (its Responses API is
     # beta upstream), so it too declares a single surface and leaves `AI_SDK_SURFACE` unset.
     "openrouter": (OPENROUTER_SURFACES, OPENROUTER_DEFAULT_SURFACE),
+    # Gemini on Vertex speaks one surface, `generateContent` (issue #655).
+    "google-genai": (GOOGLE_SURFACES, GOOGLE_DEFAULT_SURFACE),
 }
 
 
@@ -821,6 +836,36 @@ _OWNED_OPENROUTER = frozenset(
         "retries",
     }
 )
+#: The google-genai build's own wiring (issue #655). The rest of ``model_params.json`` is checked
+#: against the SDK's ``GenerateContentConfig`` when the adapter is built, so a key that is neither
+#: owned here nor named there fails at startup with the SDK's own words.
+_OWNED_GOOGLE = frozenset(
+    {
+        "model",
+        "contents",
+        "config",
+        "stream",
+        # The Vertex connection: its credential, place and endpoint are configuration, never tuning.
+        "credentials",
+        "credentials_file",
+        "project",
+        "location",
+        "base_url",
+        "client",
+        "timeout",
+        "builtin_tools",
+        # The harness composes these on every call: the leading system turns, the offered tools,
+        # the per-call timeout, and the SDK's own function-calling loop switched off (the harness
+        # runs every tool through its registry, never the SDK).
+        "system_instruction",
+        "tools",
+        "http_options",
+        "automatic_function_calling",
+        # The adapter reads the first candidate; asking for more bills for answers nobody reads.
+        "candidate_count",
+        "should_return_http_response",
+    }
+)
 
 
 def _split_model_params(
@@ -948,10 +993,12 @@ def resolved_model_params(sdk: str) -> tuple[dict[str, Any], list[str]]:
     - ``model_params`` — the ``model_params.json`` object **verbatim** (``{}`` when the file is
       absent), so a verifier sees exactly what the operator wrote.
     - ``stripped`` — the sorted keys that would **not** reach the SDK call: the harness-owned
-      collisions for this SDK's build path (`_OWNED_OPENAI`/`_OWNED_XAI_SDK`/`_OWNED_OPENROUTER`,
+      collisions for this SDK's build path (`_OWNED_OPENAI`/`_OWNED_XAI_SDK`/`_OWNED_OPENROUTER`/
+      `_OWNED_GOOGLE`,
       keyed on the SDK, since the openai adapter serves openai/xai/openrouter alike), **plus**
       ``extra_body`` on the SDKs whose build warns-and-drops it (``xai-sdk``, ``openrouter``; the
-      openai SDK passes ``extra_body`` through, so it is not counted there). The effective tuning
+      openai and google-genai SDKs pass ``extra_body`` through, so it is not counted there). The
+      effective tuning
       the SDK receives is thus ``model_params`` minus ``stripped``.
 
     A malformed ``model_params.json`` raises `ValueError` here (from `load_model_params`) — the
@@ -959,7 +1006,11 @@ def resolved_model_params(sdk: str) -> tuple[dict[str, Any], list[str]]:
     turns it into a clean non-zero exit, so the NOC catches the misconfiguration before it goes live.
     """
     loaded = load_model_params()
-    owned = {"xai-sdk": _OWNED_XAI_SDK, "openrouter": _OWNED_OPENROUTER}.get(sdk, _OWNED_OPENAI)
+    owned = {
+        "xai-sdk": _OWNED_XAI_SDK,
+        "openrouter": _OWNED_OPENROUTER,
+        "google-genai": _OWNED_GOOGLE,
+    }.get(sdk, _OWNED_OPENAI)
     stripped = set(loaded) & owned
     if sdk in ("xai-sdk", "openrouter") and "extra_body" in loaded:
         stripped.add("extra_body")
@@ -1013,6 +1064,10 @@ def _provider_from_config(
     routing: Sequence[str] | None = None,
     inherit_params: bool = True,
     max_output_tokens: int | None = None,
+    credentials_file: str | None = None,
+    location: str | None = None,
+    project: str | None = None,
+    inherit_endpoint: bool = True,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -1076,6 +1131,13 @@ def _provider_from_config(
     #   would be a caller with a vendor branch in it. The describer sets it so a description has
     #   room for the structure it was asked for and a bound on what the transcript keeps (issue
     #   #488); ``None`` sends nothing at all, which is every other caller and the status quo.
+    # - ``credentials_file`` / ``location`` / ``project`` — the Vertex counterpart of ``api_key``
+    #   (issue #655): a describer on Google carries its **own** service-account key and place, never
+    #   the brain's. ``None`` falls back to the brain's ``AI_*`` variables, exactly as ``api_key``
+    #   falls back to ``AI_API_KEY`` — which is why the describer always passes all three.
+    # - ``inherit_endpoint`` — ``False`` drops ``AI_BASE_URL``. A describer on the brain's stack
+    #   shares its endpoint by design; one on a *different* vendor must never be pointed at the
+    #   brain's (issue #655), so it reaches its own vendor's default host.
     #
     # ``AI_MODEL`` is still required either way, so a config missing it fails on the brain, where
     # the error is actionable.
@@ -1083,6 +1145,7 @@ def _provider_from_config(
     if not model:
         raise ValueError("AI_MODEL is required — the model id to run (e.g. gpt-5.4-mini).")
     loaded_params = load_model_params if inherit_params else dict
+    endpoint = base_url_override() if inherit_endpoint else None
 
     # ``model_params.json`` is read *after* each branch's config-shape guards (below), never here:
     # a config mismatch (e.g. AI_SDK=xai-sdk + AI_PROVIDER=openrouter) must surface its own
@@ -1109,6 +1172,30 @@ def _provider_from_config(
             params["max_tokens"] = max_output_tokens
         return XaiSdkProvider(model, api_key=api_key, builtin_tools=list(builtins), **params)
 
+    if sdk == "google-genai":
+        if provider != "google":
+            raise ValueError(
+                f"AI_SDK=google-genai reaches Gemini on Vertex AI, so it requires "
+                f"AI_PROVIDER=google (got {provider!r})."
+            )
+        params, extra_body = _split_model_params(
+            loaded_params(), owned=_OWNED_GOOGLE, sdk_label="the google-genai SDK"
+        )
+        # `routing` is an OpenRouter concept; Vertex is Google's own endpoint, reached directly,
+        # and its residency is the *location*. Dropped, not sent.
+        if max_output_tokens is not None:
+            params["max_output_tokens"] = max_output_tokens
+        return GoogleProvider(
+            model,
+            credentials_file=credentials_file,
+            location=location,
+            project=project,
+            base_url=endpoint,
+            extra_body=extra_body,
+            builtin_tools=list(builtins),
+            **params,
+        )
+
     if sdk == "openrouter":
         if provider != "openrouter":
             raise ValueError(
@@ -1126,7 +1213,7 @@ def _provider_from_config(
                 "pass only keys chat.send names; use the openai-SDK path for the extra_body escape "
                 "hatch."
             )
-        base_url = base_url_override() or _PROVIDER_BASE_URLS.get(provider)
+        base_url = endpoint or _PROVIDER_BASE_URLS.get(provider)
         # The opted-in web_search built-in rides the chat `tools` array as OpenRouter's
         # `openrouter:web_search` server tool (the adapter maps the name → wire type); its optional
         # `parameters` come from the operator's search_params.json. Read that file **only when web
@@ -1157,12 +1244,14 @@ def _provider_from_config(
         raise ValueError(
             f"AI_SDK={sdk!r} has no adapter — the harness ships 'openai' (the OpenAI-wire SDK, "
             "also xAI over api.x.ai and OpenRouter over openrouter.ai), 'xai-sdk' (native xAI), "
-            "and 'openrouter' (native OpenRouter). Set one of those."
+            "'openrouter' (native OpenRouter), and 'google-genai' (Gemini on Vertex AI). Set one "
+            "of those."
         )
     if provider not in OPENAI_SDK_PROVIDERS:
         raise ValueError(
             f"AI_PROVIDER={provider!r} has no adapter via the openai SDK — 'openai', 'xai', and "
-            "'openrouter' are wired (xAI over api.x.ai, OpenRouter over openrouter.ai)."
+            "'openrouter' are wired (xAI over api.x.ai, OpenRouter over openrouter.ai). For "
+            "AI_PROVIDER=google, set AI_SDK=google-genai."
         )
     if provider == "openrouter" and surface != "chat":
         # OpenRouter's Responses API is beta upstream, so the openai-SDK-at-OpenRouter cell is
@@ -1173,7 +1262,7 @@ def _provider_from_config(
             f"upstream), but AI_SDK_SURFACE resolved to {surface!r}. Set AI_SDK_SURFACE=chat (or "
             "use AI_SDK=openrouter for the native adapter, which is chat-only by design)."
         )
-    base_url = base_url_override() or _PROVIDER_BASE_URLS.get(provider)
+    base_url = endpoint or _PROVIDER_BASE_URLS.get(provider)
     params, params_extra_body = _split_model_params(
         loaded_params(), owned=_OWNED_OPENAI, sdk_label="the openai SDK"
     )

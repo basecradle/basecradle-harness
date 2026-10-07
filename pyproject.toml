@@ -82,6 +82,12 @@ xai-sdk = ["xai-sdk>=1.19.0,<2"]
 # names can drift on a minor bump), so it is minor-capped (`<0.12`) — bump the cap deliberately,
 # never blindly. Kept out of the base install so the core stays light; an openrouter agent installs it.
 openrouter = ["openrouter>=1.1.70,<2"]
+# Google's `google-genai` SDK (AI_SDK=google-genai): Gemini on Vertex AI, called direct (issue #655) —
+# a brain, or a describer on its own stack. Floor is the version this adapter was built and wire-tested
+# against (2.28.0); major-capped so a breaking 3.0 never auto-upgrades. It brings `google-auth`, which
+# loads the service-account key the adapter is configured with. Kept out of the base install so the
+# core stays light; a Google agent installs it.
+google-genai = ["google-genai>=2.28.0,<3"]
 # The MemPalace memory provider (a reference `MemoryProvider`): a local-first OSS memory
 # system (ChromaDB + SQLite). Kept out of the base install so the core stays light — the
 # adapter imports it lazily and is only used when HARNESS_MEMORY_PROVIDER=mempalace.
@@ -150,6 +156,8 @@ Issues = "https://github.com/basecradle/basecradle-harness/issues"
 # production each ships only via its optional extra.
 # `openrouter` is likewise a dev dep so the suite exercises the real OpenRouter SDK adapter
 # offline — the SDK's httpx transport is respx-mocked, so it never touches the network.
+# `google-genai` too: the Google adapter hands the SDK its own `httpx` client, which respx mocks, and
+# the tests stub the service-account token refresh (the one call `google-auth` makes over `requests`).
 # `ruff`'s floor is a correctness constraint, not a preference: the *default rule set is
 # version-dependent* (0.16 took it from 59 rules to 413, and it now formats Python blocks inside
 # Markdown too — issue #367). `[tool.ruff.lint].ignore` and this repo's per-site `noqa`s are
@@ -163,6 +171,7 @@ dev = [
     "openai>=3.3.1,<4",
     "xai-sdk>=1.19.0,<2",
     "openrouter>=1.1.70,<2",
+    "google-genai>=2.28.0,<3",
 ]
 
 [build-system]

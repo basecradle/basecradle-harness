@@ -33,6 +33,7 @@ from basecradle_harness._caching import (
     bind_conversation,
     cache_mode,
 )
+from basecradle_harness._google import GoogleProvider
 from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openai_wire import chat_message_to_wire
 from basecradle_harness._openrouter import OpenRouterProvider
@@ -84,13 +85,13 @@ def test_every_shipped_adapter_declares_a_cache_mode():
     This is the test that fails when someone adds an adapter and forgets — which is the whole point
     of the rule, because forgetting on an explicit-cache vendor costs money and says nothing.
     """
-    for adapter in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider):
+    for adapter in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider, GoogleProvider):
         assert adapter.cache_mode in CACHE_MODES, adapter.__name__
 
 
 def test_the_shipped_adapters_declare_automatic():
     """Today's endpoints all cache by themselves — so the engine must put nothing on their wire."""
-    for adapter in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider):
+    for adapter in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider, GoogleProvider):
         assert adapter.cache_mode == AUTOMATIC, adapter.__name__
 
 
