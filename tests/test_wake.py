@@ -6378,6 +6378,52 @@ def test_resolved_config_distinguishes_an_empty_overlay_from_no_overlay(
     assert [name for name in report["tools"] if name != "memory"] == []
 
 
+def test_resolved_config_reports_the_provider_the_overlay_was_reconciled_for(
+    wake_env, monkeypatch, tmp_path
+):
+    """Issue #672, the @pong shape: converge moved `AI_PROVIDER` after the installer had already
+    filtered the overlay for `openai`. `ai_provider` reads the new vendor, so only the recorded
+    reconcile input can show the overlay is filtered for the old one."""
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    install(cfg, provider="openai")
+    monkeypatch.setenv("AI_PROVIDER", "wiro")
+    monkeypatch.setenv("AI_SDK", "openai")
+    monkeypatch.setenv("AI_BASE_URL", "https://api.example.com/v1")
+
+    report = resolved_config()
+
+    assert report["ai_provider"] == "wiro"
+    assert report["overlay_provider"] == "openai"  # the drift, readable off the box
+
+    install(cfg, provider="wiro")  # the repair: reconcile under the agent's own provider
+    assert resolved_config()["overlay_provider"] == "wiro"
+
+
+def test_resolved_config_overlay_provider_tells_unfiltered_from_never_reconciled(
+    wake_env, monkeypatch, tmp_path
+):
+    """`*` (an `--all-providers` install, filtered for no vendor) and `null` (nothing reconciled)
+    are different facts. Both are recorded as an absence of a slug, and a reader that could not
+    tell them apart would call an unfiltered overlay unreconciled."""
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(tmp_path / "never-installed"))
+    assert resolved_config()["overlay_provider"] is None
+
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    install(cfg, provider=None)
+    assert resolved_config()["overlay_provider"] == "*"
+
+    # A declaration this version cannot read reports nothing rather than a guess.
+    path = cfg / ".declared.json"
+    path.write_text(json.dumps({"contract": 99, "provider": "openai"}), encoding="utf-8")
+    assert resolved_config()["overlay_provider"] is None
+    path.write_text("{not json", encoding="utf-8")
+    assert resolved_config()["overlay_provider"] is None
+    path.write_text(json.dumps({"contract": 1, "provider": 7}), encoding="utf-8")
+    assert resolved_config()["overlay_provider"] is None
+
+
 # --- the claim heartbeat (issue #532) -------------------------------------------------------
 #
 # `_orphaned`'s age rule used to rest on "a wake is bounded by `max_steps` model calls", and it is

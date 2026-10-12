@@ -7,6 +7,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.154.0] - 2026-10-12
+
+### Added: `--resolved-config` reports the provider the overlay was reconciled for (issue #672)
+
+`basecradle-harness-install` records the provider it filtered the `tools/` overlay for in
+`.declared.json`, and `basecradle-harness-verify` already turns red when it differs from
+`AI_PROVIDER` (`provider-mismatch`). `--resolved-config` did not report it, so a fleet drift audit
+could not see that drift: after converge changed `@pong`'s `AI_PROVIDER` to `wiro`, the installer
+had already filtered its overlay for `openai`, `ai_provider` read `wiro`, and the box looked
+in sync until the claims check failed.
+
+- **New field `overlay_provider`**, read from the same record the verifier reads: the slug the
+  overlay was reconciled for; `"*"` for an `--all-providers` install, which is filtered for no
+  vendor and so matches every `ai_provider`; or `null` when no reconcile can be read (never
+  installed, installed before 0.95.0, an unreadable file, or a declaration contract this version
+  does not know).
+- A drift check compares it with `ai_provider`: they differ (and the value is not `"*"`) means
+  the overlay needs `basecradle-harness-install` re-run under the agent's own provider.
+
+Additive: no existing field changed.
+
 ## [0.153.0] - 2026-10-12
 
 ### Changed: `AI_PROVIDER` names the vendor that bills the account, and any vendor slug is legal (issue #670)
