@@ -25,11 +25,16 @@ Configuration is environment-first (see `TimelineAgent.from_env`):
 The model config is **three independent axes** (issue #158) — one name per concept,
 identical in the env, the code, and the docs:
 
-- ``AI_PROVIDER``             — the vendor whose endpoint + key the agent uses:
-  ``openai`` (default) | ``xai`` | ``openrouter`` | ``google``. Both ``openai`` and ``xai`` are wired
-  through the one ``openai`` SDK adapter (xAI's endpoint speaks the same wire — ``AI_PROVIDER=xai``
-  points the SDK at ``api.x.ai``, issue #163); ``openrouter`` has its native SDK as well, and
-  ``google`` is Gemini on Vertex AI over ``google-genai`` (issue #655).
+- ``AI_PROVIDER``             — **the vendor that bills the account** (whose key it is), and the
+  label every ``llm provider=`` line carries — the fleet's spend chart groups on it (issue #670).
+  Four vendors are *known* and get conventions: ``openai`` (default) | ``xai`` | ``openrouter`` |
+  ``google``. Both ``openai`` and ``xai`` are wired through the one ``openai`` SDK adapter (xAI's
+  endpoint speaks the same wire — ``AI_PROVIDER=xai`` points the SDK at ``api.x.ai``, issue #163);
+  ``openrouter`` has its native SDK as well, and ``google`` is Gemini on Vertex AI over
+  ``google-genai`` (issue #655). **Any other slug** (``^[a-z0-9._-]+$``, e.g. ``wiro``) is a legal
+  vendor with the *generic* OpenAI-compatible profile: ``AI_SDK=openai`` and ``AI_BASE_URL`` are
+  required, the surface defaults to ``chat``, and nothing vendor-specific goes on the wire
+  (`_provider_from_config`). The dialect is derived from the vendor, never configured.
 - ``AI_SDK``                  — the **library/package name** of the SDK the harness imports to
   reach the model: ``openai`` (default), and ``xai-sdk`` (the committed next phase, #165). The value is the importable
   package, which also disambiguates it from the provider token (``AI_PROVIDER=xai`` selects
@@ -42,12 +47,14 @@ identical in the env, the code, and the docs:
 - ``AI_CREDENTIALS_FILE`` / ``AI_LOCATION`` / ``AI_PROJECT`` — ``google`` only: a service-account
   JSON key *path*, the Vertex location (required, no default), and the project (defaults to the one
   the key names). See `basecradle_harness._google`.
-- ``AI_BASE_URL``            — optional; override the provider's endpoint.
+- ``AI_BASE_URL``            — optional for a known vendor (overrides its endpoint); **required**
+  for any other, which has no default host.
 - ``AI_SDK_SURFACE``          — optional; **SDK-scoped**, not a top-level config axis. The
   active SDK adapter declares its own ``SURFACES`` + ``DEFAULT_SURFACE``; this var selects among
   them (omitted → the adapter's default; provided-but-unlisted → a hard fail). The ``openai``
   adapter has two — ``responses`` (default, @jt's surface — the one that runs ``web_search`` and
-  sees images) and ``chat``; a single-surface SDK never sets it. See `_resolve_surface`,
+  sees images) and ``chat``, which is the default instead for a generic vendor (Chat Completions is
+  what an OpenAI-compatible gateway implements); a single-surface SDK never sets it. See `_resolve_surface`,
   `_provider_from_config`, and `basecradle_harness._plugins`.
 - ``HARNESS_SYSTEM_PROMPT``   — **legacy fallback** for the agent's standing charter. The
   charter is now sourced from real files under the config home —
@@ -65,11 +72,13 @@ from __future__ import annotations
 import itertools
 import logging
 import os
+import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from basecradle import BaseCradle
@@ -608,7 +617,89 @@ def _compose_prompt(orientation: str | None, system_prompt: str | None) -> str |
 #: The config defaults: the @jt stack (OpenAI vendor, openai SDK, Responses surface).
 DEFAULT_PROVIDER = "openai"
 DEFAULT_SDK = "openai"
-_PROVIDERS = ("openai", "xai", "openrouter", "google")
+
+#: The vendors the harness **knows** — each carries conventions the harness supplies for it: a
+#: default host, a cache-affinity answer, its search built-in wiring, its rate table, its plugin
+#: gates, its SDK pairing rules. ``AI_PROVIDER`` is not limited to them (issue #670): it names *the
+#: vendor that bills the account*, so any other slug is a legal provider with the generic
+#: OpenAI-compatible profile (`is_generic_provider`). The set is closed only in the sense that
+#: matters — a vendor not named here gets **no** convention, never a guessed one.
+KNOWN_PROVIDERS = ("openai", "xai", "openrouter", "google")
+
+#: The shape every provider token must have, known or not. It is the NOC dashboard's own extraction
+#: (``provider=([A-Za-z0-9._-]+)``) narrowed to the lowercase this layer normalizes to, so a token
+#: that passes here is one the spend chart reads whole — a typo'd ``Wiro.AI/`` would otherwise land
+#: as a truncated label and split the chart.
+_PROVIDER_SLUG = re.compile(r"[a-z0-9._-]+")
+
+#: The surface a generic vendor gets when ``AI_SDK_SURFACE`` is unset: Chat Completions is what
+#: OpenAI-compatible gateways implement. ``responses`` stays an explicit opt-in there, and the
+#: ``openai``/``xai`` defaults (``responses``) are untouched — this is per vendor *class*, not per SDK.
+GENERIC_DEFAULT_SURFACE = "chat"
+
+
+def normalize_provider(raw: str | None) -> str:
+    """``raw`` as a provider token — stripped, lowercased, and validated as a slug.
+
+    The one reader of the provider *shape*, shared by the wake, the off-box resolver and the
+    describer's own stack, so the three cannot disagree on which tokens are legal. Empty or unset
+    is the default vendor; anything that is not a slug is a hard error naming the rule.
+    """
+    provider = (raw or DEFAULT_PROVIDER).strip().lower()
+    if not _PROVIDER_SLUG.fullmatch(provider):
+        raise ValueError(
+            f"AI_PROVIDER={provider!r} is not a provider slug: it names the vendor that bills the "
+            "account, as lowercase letters, digits, '.', '_' or '-' (e.g. 'openai', 'wiro'). Known "
+            f"vendors: {', '.join(KNOWN_PROVIDERS)}; any other slug takes AI_SDK=openai and "
+            "AI_BASE_URL."
+        )
+    return provider
+
+
+def is_generic_provider(provider: str) -> bool:
+    """Whether `provider` is a vendor the harness knows nothing about — the generic profile."""
+    return provider not in KNOWN_PROVIDERS
+
+
+def _require_generic_profile(provider: str, sdk: str, endpoint: str | None) -> None:
+    """Refuse a generic vendor the harness could not reach honestly (issue #670) — else nothing.
+
+    The one place the generic profile's two preconditions are spelled, read by both the config
+    triple (`_config_from_env`, so a wake refuses at startup and ``--resolved-config`` exits
+    nonzero rather than reading green on a box whose every wake would fail) and the provider build
+    (`_provider_from_config`, which a describer reaches with an endpoint of its own):
+
+    - **``AI_SDK=openai``** — the only generic-wire SDK. Every native SDK reaches exactly one vendor.
+    - **a host** — a vendor the harness has never heard of has no default, and a guessed one sends
+      the agent's key to somebody else.
+    """
+    _require_generic_sdk(provider, sdk)
+    if is_generic_provider(provider) and not endpoint:
+        raise ValueError(
+            f"AI_PROVIDER={provider!r} is not a vendor the harness knows, so it has no default "
+            "host: set AI_BASE_URL to the vendor's OpenAI-compatible API root (e.g. "
+            "https://api.example.com/v1). The harness never guesses where to send the key."
+        )
+
+
+def _require_generic_sdk(provider: str, sdk: str) -> None:
+    """The SDK half of `_require_generic_profile` — the half that needs no deployment fact.
+
+    Split out so the off-box resolver (`_resolve.resolve_stems`), which is handed a hypothetical
+    configuration and never an endpoint, refuses the same pairing a wake refuses.
+    """
+    if is_generic_provider(provider) and sdk != "openai":
+        why = (
+            "that SDK reaches only its own vendor"
+            if sdk in _SDK_SURFACES
+            else "the harness ships no adapter by that name"
+        )
+        raise ValueError(
+            f"AI_PROVIDER={provider!r} is not a vendor the harness knows, so it is reached as a "
+            f"generic OpenAI-compatible endpoint, which needs AI_SDK=openai (got {sdk!r}: {why}). "
+            f"Known vendors: {', '.join(KNOWN_PROVIDERS)}."
+        )
+
 
 #: ``surface`` is an **SDK-scoped** concept: each SDK adapter declares its own allowed
 #: ``SURFACES`` and ``DEFAULT_SURFACE`` (so the *next* multi-surface SDK follows the same
@@ -628,12 +719,12 @@ _SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
 }
 
 
-def _resolve_surface(sdk: str) -> str:
+def _resolve_surface(sdk: str, provider: str = DEFAULT_PROVIDER) -> str:
     """`_surface_for` against the process environment's ``AI_SDK_SURFACE`` — the wake's reader."""
-    return _surface_for(sdk, os.environ.get("AI_SDK_SURFACE"))
+    return _surface_for(sdk, os.environ.get("AI_SDK_SURFACE"), provider)
 
 
-def _surface_for(sdk: str, raw: str | None) -> str:
+def _surface_for(sdk: str, raw: str | None, provider: str = DEFAULT_PROVIDER) -> str:
     """Resolve a raw ``AI_SDK_SURFACE`` value against the active SDK adapter's declared surfaces.
 
     The uniform, SDK-scoped contract (issue #163): the active adapter owns its surface set, so
@@ -651,6 +742,11 @@ def _surface_for(sdk: str, raw: str | None) -> str:
     `raw` is passed in rather than read here so the one rule serves both the wake (which reads the
     env) and the deterministic off-box resolver (`_resolve.resolve_stems`, which takes a
     ``--surface`` argument and must never depend on the environment it happens to run in).
+
+    `provider` changes exactly one thing: the **default** for a generic vendor over the ``openai``
+    SDK is `GENERIC_DEFAULT_SURFACE` (issue #670). The set a provided value is validated against is
+    the SDK's, whoever the vendor — the per-vendor *refusals* (OpenRouter is chat-only over this
+    SDK) stay where every other vendor rule lives, in `_provider_from_config`.
     """
     raw = (raw or "").strip().lower()
     spec = _SDK_SURFACES.get(sdk)
@@ -662,6 +758,8 @@ def _surface_for(sdk: str, raw: str | None) -> str:
             )
         return ""
     surfaces, default = spec
+    if sdk == "openai" and is_generic_provider(provider):
+        default = GENERIC_DEFAULT_SURFACE
     if not raw:
         return default
     if raw not in surfaces:
@@ -675,17 +773,18 @@ def _config_from_env() -> tuple[str, str, str]:
     """The ``(provider, sdk, surface)`` config triple from the environment, validated.
 
     Read in one place so the provider build and the plugin activation context agree on every
-    axis. ``AI_PROVIDER`` is validated here against the known providers; ``AI_SDK_SURFACE`` is
-    resolved **SDK-scoped** (`_resolve_surface`) — an unrecognized value is a clear error, never
-    a silent fall-through. The SDK name is not constrained here — whether an adapter exists for
-    it is decided when the provider is built (`_provider_from_config`), so the error names the
-    missing adapter.
+    axis. ``AI_PROVIDER`` is validated here as a **slug** (`normalize_provider`) — it names the
+    vendor that bills the account, so any well-formed token is legal and only a malformed one is
+    refused (issue #670); whether that vendor can be *reached* with the configured SDK and host is
+    the provider build's question. ``AI_SDK_SURFACE`` is resolved **SDK-scoped**
+    (`_resolve_surface`) — an unrecognized value is a clear error, never a silent fall-through. The
+    SDK name is not constrained here — whether an adapter exists for it is decided when the provider
+    is built (`_provider_from_config`), so the error names the missing adapter.
     """
-    provider = (os.environ.get("AI_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
-    if provider not in _PROVIDERS:
-        raise ValueError(f"Unknown AI_PROVIDER {provider!r}; expected one of {_PROVIDERS}.")
+    provider = normalize_provider(os.environ.get("AI_PROVIDER"))
     sdk = (os.environ.get("AI_SDK") or DEFAULT_SDK).strip().lower()
-    surface = _resolve_surface(sdk)
+    _require_generic_profile(provider, sdk, base_url_override())
+    surface = _resolve_surface(sdk, provider)
     return provider, sdk, surface
 
 
@@ -748,10 +847,13 @@ def _xai_search_parameters(builtins: Sequence[str]) -> dict[str, Any] | None:
 # ``stream: true`` would not just override wiring but crash the turn — strip it everywhere.
 # ``extra_body`` is *not* listed here: it is lifted out separately (D4) — merged on the openai
 # SDK, warned-and-dropped on the SDKs where it is not a legal concept.
-#: The endpoint vendors the one ``openai``-SDK adapter is wired to reach. Named rather than inlined
-#: in the guard below because it is the *matrix* — every cell of ``provider × surface`` needs a
-#: decided cache-affinity answer (`_openai._AFFINITY`), and a test enumerates the cells from here.
-#: A second, drifting copy of this list would let a newly-wired vendor read as already-decided.
+#: The **known** vendors the one ``openai``-SDK adapter is wired to reach with their conventions.
+#: Named rather than inlined in the guard below because it is the *matrix* — every cell of
+#: ``provider × surface`` needs a decided cache-affinity answer (`_openai._AFFINITY`), and a test
+#: enumerates the cells from here. A second, drifting copy of this list would let a newly-wired
+#: vendor read as already-decided. A *generic* vendor (`is_generic_provider`) is reachable through
+#: the same adapter but is not a cell of this matrix: it has no conventions to decide, so it gets
+#: none — by construction, never by a lookup that happens to miss (issue #670).
 OPENAI_SDK_PROVIDERS = ("openai", "xai", "openrouter")
 
 _OWNED_OPENAI = frozenset(
@@ -1045,7 +1147,9 @@ def _openai_budget_key(provider: str, surface: str) -> str:
     - **OpenAI's** chat endpoint takes ``max_completion_tokens``. ``max_tokens`` is deprecated
       there and is a hard *"Unsupported parameter"* on its reasoning models — which a describer or
       any other helper may well be — so the modern spelling is the only safe one;
-    - **xAI** and **OpenRouter** over the chat wire take ``max_tokens``, the field each documents.
+    - **xAI** and **OpenRouter** over the chat wire take ``max_tokens``, the field each documents —
+      and so does a **generic** vendor (issue #670): ``max_tokens`` is the field the OpenAI-compatible
+      chat wire has always had, and the one a gateway that mirrors it is surest to read.
     """
     if surface == "responses":
         return "max_output_tokens"
@@ -1152,11 +1256,16 @@ def _provider_from_config(
     # actionable error, not be masked by a malformed model_params file the wake would never even
     # use. So the read sits at the point of use in each branch, past its guard.
 
+    # A generic vendor's preconditions are checked before any SDK branch, so a native SDK named with
+    # one is refused in the generic profile's words rather than in that SDK's.
+    _require_generic_profile(provider, sdk, endpoint)
+
     if sdk == "xai-sdk":
         if provider != "xai":
             raise ValueError(
                 f"AI_SDK=xai-sdk reaches xAI's native endpoint, so it requires AI_PROVIDER=xai "
-                f"(got {provider!r}). Use AI_SDK=openai for a non-xAI provider."
+                f"(got {provider!r}). Use AI_SDK=openai for any other vendor (a vendor the harness "
+                "does not know also needs AI_BASE_URL)."
             )
         params, extra_body = _split_model_params(
             loaded_params(), owned=_OWNED_XAI_SDK, sdk_label="the native xai-sdk"
@@ -1176,7 +1285,8 @@ def _provider_from_config(
         if provider != "google":
             raise ValueError(
                 f"AI_SDK=google-genai reaches Gemini on Vertex AI, so it requires "
-                f"AI_PROVIDER=google (got {provider!r})."
+                f"AI_PROVIDER=google (got {provider!r}). Use AI_SDK=openai for any other vendor "
+                "(a vendor the harness does not know also needs AI_BASE_URL)."
             )
         params, extra_body = _split_model_params(
             loaded_params(), owned=_OWNED_GOOGLE, sdk_label="the google-genai SDK"
@@ -1200,8 +1310,9 @@ def _provider_from_config(
         if provider != "openrouter":
             raise ValueError(
                 f"AI_SDK=openrouter reaches OpenRouter's native endpoint, so it requires "
-                f"AI_PROVIDER=openrouter (got {provider!r}). Use AI_SDK=openai for a non-OpenRouter "
-                "provider, or set AI_PROVIDER=openrouter."
+                f"AI_PROVIDER=openrouter (got {provider!r}). Use AI_SDK=openai for any other vendor "
+                "(a vendor the harness does not know also needs AI_BASE_URL), or set "
+                "AI_PROVIDER=openrouter."
             )
         params, extra_body = _split_model_params(
             loaded_params(), owned=_OWNED_OPENROUTER, sdk_label="the openrouter SDK"
@@ -1242,16 +1353,28 @@ def _provider_from_config(
 
     if sdk != "openai":
         raise ValueError(
-            f"AI_SDK={sdk!r} has no adapter — the harness ships 'openai' (the OpenAI-wire SDK, "
-            "also xAI over api.x.ai and OpenRouter over openrouter.ai), 'xai-sdk' (native xAI), "
-            "'openrouter' (native OpenRouter), and 'google-genai' (Gemini on Vertex AI). Set one "
-            "of those."
+            f"AI_SDK={sdk!r} has no adapter — the harness ships 'openai' (the OpenAI-wire SDK: "
+            "OpenAI, xAI over api.x.ai, OpenRouter over openrouter.ai, and any other "
+            "OpenAI-compatible vendor at its AI_BASE_URL), 'xai-sdk' (native xAI), 'openrouter' "
+            "(native OpenRouter), and 'google-genai' (Gemini on Vertex AI). Set one of those."
+        )
+    if is_generic_provider(provider):
+        return _generic_openai_provider(
+            provider,
+            surface,
+            model=model,
+            api_key=api_key,
+            endpoint=endpoint,
+            builtins=builtins,
+            load_params=loaded_params,
+            max_output_tokens=max_output_tokens,
         )
     if provider not in OPENAI_SDK_PROVIDERS:
         raise ValueError(
-            f"AI_PROVIDER={provider!r} has no adapter via the openai SDK — 'openai', 'xai', and "
-            "'openrouter' are wired (xAI over api.x.ai, OpenRouter over openrouter.ai). For "
-            "AI_PROVIDER=google, set AI_SDK=google-genai."
+            f"AI_PROVIDER={provider!r} is not reached through the openai SDK — over it the harness "
+            "knows 'openai', 'xai' (api.x.ai) and 'openrouter' (openrouter.ai), and reaches any "
+            "vendor it does not know at its AI_BASE_URL. For AI_PROVIDER=google, set "
+            "AI_SDK=google-genai."
         )
     if provider == "openrouter" and surface != "chat":
         # OpenRouter's Responses API is beta upstream, so the openai-SDK-at-OpenRouter cell is
@@ -1349,6 +1472,94 @@ def _provider_from_config(
             params, extra_body=params_extra_body, extra_headers=params_extra_headers
         ),
         **params,
+    )
+
+
+def _require_no_generic_builtins(provider: str, builtins: Sequence[str]) -> None:
+    """Refuse a server-side built-in on a generic vendor — the one place that rule is spelled.
+
+    Every shipped built-in is gated on a known vendor, so this fires only for an operator's own
+    ``tools/`` plugin that offers one ungated. Read by the build and by ``--resolved-config``, so the
+    probe exits nonzero exactly when every wake would refuse, rather than reading green over it.
+    """
+    if builtins and is_generic_provider(provider):
+        raise ValueError(
+            f"AI_PROVIDER={provider!r} is a generic OpenAI-compatible vendor, which runs no "
+            f"server-side built-in, but {sorted(builtins)} are active. Remove those tools from "
+            "this agent's tools/ overlay."
+        )
+
+
+def _generic_openai_provider(
+    provider: str,
+    surface: str,
+    *,
+    model: str,
+    api_key: str | None,
+    endpoint: str | None,
+    builtins: Sequence[str],
+    load_params: Any,
+    max_output_tokens: int | None,
+) -> Provider:
+    """The **generic** OpenAI-compatible profile: a vendor the harness knows only by name (#670).
+
+    ``AI_PROVIDER`` names the vendor that bills the account, so a vendor the harness has never
+    heard of is a legal provider — and gets exactly what the harness can honestly give it, which is
+    the ``openai`` SDK's own wire and nothing a known vendor's conventions would add:
+
+    - **its host comes from the operator.** There is no default to fall back on, and a guessed one
+      sends the agent's key to somebody else, so a missing ``AI_BASE_URL`` refuses at startup
+      (`_require_generic_profile`, which the caller has already run).
+    - **nothing vendor-specific goes on the wire.** No cache-affinity key (the adapter's
+      `_openai._AFFINITY` has no cell for it, by construction — a vendor field at an endpoint that
+      never asked for one is a 400 on every wake), no ``search_parameters``, no routing header, no
+      routing pin (a describer's ``routing`` is dropped, exactly as it is on ``openai`` and
+      ``xai`` — it is an OpenRouter concept). The operator's own
+      ``model_params.json`` ``extra_body``/``extra_headers`` still pass, because those are the
+      operator's words for this vendor.
+    - **no server-side built-in.** Every shipped built-in is gated on a known vendor, so one
+      arriving here is a configuration the harness cannot honour; it is refused by name rather
+      than silently dropped, which would leave the agent believing it can search.
+    - **nothing priced from a table.** The adapter computes a cost only for ``openai``
+      (`OpenAIProvider._computes_cost`), so a generic vendor states no cost-gap WARNING and its
+      ``llm`` line carries the vendor's own ``usage.cost`` when the endpoint states one.
+
+    The output budget takes the chat wire's ``max_tokens`` (or ``max_output_tokens`` on Responses),
+    the field every OpenAI-compatible gateway documents (`_openai_budget_key`).
+    """
+    _require_no_generic_builtins(provider, builtins)
+    # The one trace that this vendor got the generic profile. A misspelled known vendor
+    # (``openroutr``) is a well-formed slug and so runs generic; without this line nothing would
+    # say the agent lost that vendor's conventions. INFO, not WARNING: for a real generic vendor it
+    # is the expected state on every wake, and a warning nobody acts on is one nobody reads.
+    _log.info(
+        "provider profile=generic provider=%s surface=%s host=%s",
+        provider,
+        surface,
+        urlsplit(endpoint).netloc or endpoint,
+    )
+    # Read past the guards, as on every other branch: a config mismatch names its own fix rather
+    # than being masked by a malformed tuning file the wake would never use.
+    tuning, params_extra_body = _split_model_params(
+        load_params(), owned=_OWNED_OPENAI, sdk_label="the openai SDK"
+    )
+    # Lifted out, as on every other openai-SDK cell, so an operator's headers merge rather than
+    # arriving as a second value for the same keyword.
+    params_extra_headers = tuning.pop("extra_headers", None)
+    if max_output_tokens is not None:
+        tuning[_openai_budget_key(provider, surface)] = max_output_tokens
+    return OpenAIProvider(
+        model,
+        api_key=api_key,
+        base_url=endpoint,
+        provider=provider,
+        surface=surface,
+        extra_body=params_extra_body,
+        extra_headers=params_extra_headers,
+        reported_tuning=_reported_tuning(
+            tuning, extra_body=params_extra_body, extra_headers=params_extra_headers
+        ),
+        **tuning,
     )
 
 

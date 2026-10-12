@@ -47,7 +47,7 @@ compatible = OpenAIProvider(
 )
 ```
 
-> The vendor axes are independent: **`AI_PROVIDER`** (whose endpoint + key), **`AI_SDK`** (the package the harness imports), and **`AI_MODEL`**. Four SDK adapters ship: **`openai`** (the OpenAI-wire SDK — which, because both xAI's and OpenRouter's endpoints speak the same chat wire, also runs the all-xAI [`xai` profile](#go-all-xai--the-xai-profile) at `api.x.ai` and the [`openrouter` profile](#go-openrouter--the-openrouter-profile) at `openrouter.ai`), the native **`xai-sdk`** (xAI's first-party gRPC SDK, [#165](https://github.com/basecradle/basecradle-harness/issues/165)), the native **`openrouter`** (OpenRouter's first-party SDK, [#234](https://github.com/basecradle/basecradle-harness/issues/234)), and **`google-genai`** (Gemini on Google's Vertex AI, called direct — [the `google` profile](#go-direct-to-gemini--the-google-profile), [#655](https://github.com/basecradle/basecradle-harness/issues/655)). BaseCradle is a research lab — the harness builds out the **full** provider × SDK × surface matrix, additively.
+> The vendor axes are independent: **`AI_PROVIDER`** (the vendor that bills the account — whose key; any OpenAI-compatible vendor works through [the generic profile](#any-other-openai-compatible-vendor--the-generic-profile)), **`AI_SDK`** (the package the harness imports), and **`AI_MODEL`**. Four SDK adapters ship: **`openai`** (the OpenAI-wire SDK — which, because both xAI's and OpenRouter's endpoints speak the same chat wire, also runs the all-xAI [`xai` profile](#go-all-xai--the-xai-profile) at `api.x.ai` and the [`openrouter` profile](#go-openrouter--the-openrouter-profile) at `openrouter.ai`), the native **`xai-sdk`** (xAI's first-party gRPC SDK, [#165](https://github.com/basecradle/basecradle-harness/issues/165)), the native **`openrouter`** (OpenRouter's first-party SDK, [#234](https://github.com/basecradle/basecradle-harness/issues/234)), and **`google-genai`** (Gemini on Google's Vertex AI, called direct — [the `google` profile](#go-direct-to-gemini--the-google-profile), [#655](https://github.com/basecradle/basecradle-harness/issues/655)). BaseCradle is a research lab — the harness builds out the **full** provider × SDK × surface matrix, additively.
 
 ## One agent, many channels — shared memory, separate conversations
 
@@ -438,14 +438,14 @@ wake end timeline=019e77… outcome=ok turns=1 steps=2/24 posted=0 duration=3.31
 | `BASECRADLE_EMAIL` + `BASECRADLE_PASSWORD` | *(fallback)* with no token set, the agent mints one on startup — a credential-only AI comes up under its own power, no human in the loop. The password is used once to mint a token and never logged, stored, or placed on the agent's reasoning surface |
 | `BASECRADLE_SESSION_NAME` | *(optional)* labels the credential minted from a password, so you can tell it apart later |
 | `BASECRADLE_TIMELINE` | The uuid of the timeline to watch |
-| `AI_PROVIDER` | *(optional)* the vendor whose endpoint + key the agent uses: `openai` (default), `xai` (the [all-xAI profile](#go-all-xai--the-xai-profile)), `openrouter` (the [OpenRouter profile](#go-openrouter--the-openrouter-profile)), or `google` (the [Google profile](#go-direct-to-gemini--the-google-profile)) |
+| `AI_PROVIDER` | *(optional)* **the vendor that bills the account** — whose key it is, and the label every `llm provider=` line carries. Four are known and get conventions: `openai` (default), `xai` (the [all-xAI profile](#go-all-xai--the-xai-profile)), `openrouter` (the [OpenRouter profile](#go-openrouter--the-openrouter-profile)), and `google` (the [Google profile](#go-direct-to-gemini--the-google-profile)). Any other lowercase slug (`[a-z0-9._-]+`, e.g. `wiro`) is a legal vendor under [the generic profile](#any-other-openai-compatible-vendor--the-generic-profile), which needs `AI_SDK=openai` and `AI_BASE_URL` |
 | `AI_SDK` | *(optional)* the PyPI package the harness imports to reach the model: `openai` (default), the native `xai-sdk`, the native `openrouter`, or `google-genai`. Install the matching extra (`pip install 'basecradle-harness[openai]'`, `[xai-sdk]`, `[openrouter]`, or `[google-genai]`) |
 | `AI_MODEL` | The model id, e.g. `gpt-5.4-mini` |
 | `AI_API_KEY` | The provider's API key — every provider but `google`, which takes the three below |
 | `AI_CREDENTIALS_FILE` | *(`google` only)* the **path** to a Google Cloud service-account JSON key — never the JSON itself in the environment. A relative path is read from the config home. Only a `service_account` key loads; a personal `gcloud` login is refused, and Application Default Credentials are never consulted |
 | `AI_LOCATION` | *(`google` only, required)* the Vertex location — `us` for Google's US multi-region. **No default**: Google's SDK would default to `global`, which lets Google process the call anywhere, so an unset location stops the agent at startup instead |
 | `AI_PROJECT` | *(`google` only, optional)* the Google Cloud project. Defaults to the `project_id` the key file names |
-| `AI_BASE_URL` | *(optional)* override the provider's endpoint — a proxy, a gateway, or OpenRouter's [regional host](#let-a-model-pick-what-gets-recalled--the-llm-reranker) (`https://us.openrouter.ai/api/v1`), which the [describer](#give-a-blind-model-eyes--the-describer) follows too. Blank is the same as unset. `--resolved-config` reports it as `ai_base_url` |
+| `AI_BASE_URL` | *(optional for a known vendor, **required** for any other)* override the provider's endpoint — a proxy, a gateway, or OpenRouter's [regional host](#let-a-model-pick-what-gets-recalled--the-llm-reranker) (`https://us.openrouter.ai/api/v1`), which the [describer](#give-a-blind-model-eyes--the-describer) follows too. Blank is the same as unset. `--resolved-config` reports it as `ai_base_url` |
 | `XAI_MANAGEMENT_KEY` | *(optional, tool-scoped)* a read-only xAI **Management Key** (scope `BillingRead`) for the opt-in [`xai_account_balance`](#go-all-xai--the-xai-profile) tool — a billing/account credential distinct from `AI_API_KEY`. Unset → the tool reports `unavailable` rather than failing, and [`--resolved-config`](#run-under-a-router-wake-mode)'s `tool_env` reports it `false` so the gap is visible off-box |
 | `XAI_TEAM_ID` | *(optional, tool-scoped)* the team UUID for `xai_account_balance`. **Omit it** — the tool discovers the team from the Management Key itself; set it only to override discovery |
 | `OPENROUTER_MANAGEMENT_KEY` | *(optional, tool-scoped)* an OpenRouter **Management key** for the opt-in [`openrouter_account_balance`](#check-your-openrouter-credit--the-account-balance-tool) tool — an account-administration credential distinct from `AI_API_KEY` (an inference key is rejected on that endpoint). Unset → the tool reports `unavailable` rather than failing, and [`--resolved-config`](#run-under-a-router-wake-mode)'s `tool_env` reports it `false` so the gap is visible off-box |
@@ -1169,7 +1169,7 @@ The `openai` SDK adapter is aimed at **three** vendors on **two** surfaces, and 
 
 **OpenAI is sent a key on its own documented advice, not by symmetry with xAI.** OpenAI describes `prompt_cache_key` as helping "requests with the same prefix reach the same cache" and recommends exactly the value the harness already has — "a stable user, workspace, session, or thread ID that matches how your application reuses context" — with the one caution being **cardinality** ("do not generate a new key for every request"), which one stable key per session satisfies by construction. What makes it safe where the OpenRouter pin was not is a property, not a brand: OpenAI's key "[does] not pin requests to a machine", and its machines are its own, so there is no non-caching endpoint for it to stick to. **No live measurement was made** — the fleet runs no OpenAI-brained agent — and that is stated rather than assumed away: whenever one exists, `cached_tokens=` on its log line is the authority, exactly as everywhere else here.
 
-**A "send nothing" is recorded as a decision, not as an absent row.** In a plain lookup table a deliberate *no* and a cell nobody considered look identical, so every buildable cell is present — OpenRouter's with an explicit null — and a test enumerates the cells from the config layer's own wired-provider list and fails the build when one has no answer. Wiring a fourth vendor forces the question instead of inheriting one.
+**A "send nothing" is recorded as a decision, not as an absent row.** In a plain lookup table a deliberate *no* and a cell nobody considered look identical, so every buildable cell is present — OpenRouter's with an explicit null — and a test enumerates the cells from the config layer's own wired-provider list and fails the build when one has no answer. Wiring a fourth vendor forces the question instead of inheriting one. A vendor reached under [the generic profile](#any-other-openai-compatible-vendor--the-generic-profile) is never a row: it has no conventions, so it sends nothing on either surface, by construction.
 
 Everything above is verified the way the gRPC key is: the tests read the **recorded HTTP request** — its real body, its real headers — never a mock's arguments.
 
@@ -1901,6 +1901,29 @@ AI_LOCATION=us                                # required — no default
   - **What a search costs is on the journal**, on two lines: the grounded call's own `llm` line (`purpose=helper kind=search.grounding`, its tokens priced from the table — grounding's own input tokens are free on Gemini 3), and a priced `media` line for the **grounding fee**: $14 per 1,000 grounding queries on Gemini 3, $35 per 1,000 grounded prompts on 2.5, billed only when sources come back; `count=` is the billed units (queries, or `1` for a 2.5 prompt). **The free allowance is not netted out.** Google includes 5,000 grounding queries a month (Gemini 3) at no charge, and the harness cannot see where your account stands against it, so every query is priced at list: inside the allowance the dashboard overstates grounding spend, and it never understates it.
 
 Prove it live with the [live gate](tests/test_google_live.py): `VERTEX_CREDENTIALS_FILE=… VERTEX_LOCATION=us uv run pytest -m live tests/test_google_live.py -v`.
+
+## Any other OpenAI-compatible vendor — the generic profile
+
+`AI_PROVIDER` names **the vendor that bills the account**, because that is what it is read as everywhere it lands: the `llm provider=` line, the fleet's *Spend by Provider* chart, the brief's `brain` part, `--resolved-config`'s `ai_provider`. So a vendor the harness has never heard of is still a legal provider — name it, and the harness reaches it through the `openai` SDK with nothing added ([#670](https://github.com/basecradle/basecradle-harness/issues/670)):
+
+```bash
+AI_PROVIDER=wiro                          # the biller — any lowercase slug: [a-z0-9._-]+
+AI_SDK=openai                             # required: the only SDK that speaks a generic wire
+AI_BASE_URL=https://llm.wiro.ai/v1        # required: an unknown vendor has no default host
+AI_MODEL=qwen/qwen3-8-27b-obliterated
+AI_API_KEY=...                            # the vendor's key
+# AI_SDK_SURFACE=responses                # optional; the default here is chat
+```
+
+What the generic profile does, and why:
+
+- **No default host, ever.** `AI_BASE_URL` missing stops the agent at startup (and makes `--resolved-config` exit nonzero), naming the fix. A guessed host would send the key to somebody else.
+- **Chat Completions by default.** That is what OpenAI-compatible gateways implement; `AI_SDK_SURFACE=responses` is an explicit opt-in. The `openai` and `xai` defaults (`responses`) are unchanged.
+- **Nothing vendor-specific on the wire.** No `prompt_cache_key`, no `x-grok-conv-id`, no `search_parameters`, no routing header or pin. Each of those is one known vendor's convention, and an endpoint that never asked for one may refuse the request. Your own `model_params.json` `extra_body` / `extra_headers` still pass.
+- **No vendor-coupled tools.** Every server-side built-in and every vendor media tool is gated on a known vendor, so none activates, and the installer lays down only the vendor-neutral defaults. A built-in that is somehow active anyway is a startup error, never a silent drop.
+- **The vendor's own price.** Nothing is priced from a rate table, so there is no "not aimed at api.openai.com" cost-gap warning; when the endpoint states `usage.cost` (Wiro does), the `llm` line carries it as `cost=`.
+
+A native SDK (`xai-sdk`, `openrouter`, `google-genai`) reaches only its own vendor and refuses a generic one. The four known vendors behave exactly as they always have.
 
 ## Receive inbound activity — the webhook tools
 

@@ -162,7 +162,8 @@ _TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
 }
 
 #: Where a provider states the call's **dollar cost**, when it states one at all. OpenRouter
-#: returns it on every response (``usage.cost``, already in USD); the xAI SDK reports it in
+#: returns it on every response (``usage.cost``, already in USD), as do some OpenAI-compatible
+#: vendors reached under the generic profile (Wiro, issue #670); the xAI SDK reports it in
 #: ``ticks`` and converts it with its own helper, so that adapter passes the figure to
 #: `log_llm_call` directly rather than through this reader. A provider that reports tokens but no
 #: dollars logs no ``cost=`` — with **two** stated exceptions, the vendors whose APIs state no price
@@ -940,11 +941,13 @@ def _finish_reason(response: Any) -> str | None:
 def reported_cost(usage: Any) -> float | None:
     """The call's cost in dollars **as the provider reported it**, or ``None`` when it didn't.
 
-    Only OpenRouter states a figure on the wire today (``usage.cost``) — reachable through the
-    native SDK *and* through the ``openai`` SDK pointed at ``openrouter.ai``, which keeps the
-    field. Every other endpoint reports tokens and no dollars, and gets no ``cost=`` from here: see
-    `_COST_FIELDS` for the two vendors (Google, OpenAI) whose figure the harness computes instead,
-    and why no other is.
+    Read off ``usage.cost`` wherever an endpoint states one: OpenRouter does — reachable through
+    the native SDK *and* through the ``openai`` SDK pointed at ``openrouter.ai``, which keeps the
+    field — and so do OpenAI-compatible vendors reached under the generic profile (Wiro states it,
+    issue #670); the ``openai`` SDK keeps an unmodeled field, so it survives ``model_dump``. An
+    endpoint that reports tokens and no dollars gets no ``cost=`` from here: see `_COST_FIELDS`
+    for the two vendors (Google, OpenAI) whose figure the harness computes instead, and why no
+    other is.
 
     **It is what the operator pays for the call, whichever party bills it** (issue #653). On a
     bring-your-own-key call (`byok`) OpenRouter's ``usage.cost`` is ``0`` and the provider's own

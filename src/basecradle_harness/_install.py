@@ -241,7 +241,15 @@ def plugin_opts_in(source: str) -> bool:
 
 
 def active_provider_from_env() -> str:
-    """The active ``AI_PROVIDER`` for provider-aware install/reconcile, normalized (default openai)."""
+    """The active ``AI_PROVIDER`` for provider-aware install/reconcile, normalized (default openai).
+
+    Any token passes (issue #670): ``AI_PROVIDER`` names the vendor that bills the account, and a
+    vendor the harness does not know simply has no plugin naming it — so `plugin_relevant_to` keeps
+    every vendor-neutral default and prunes every vendor-affine one, with no list of known vendors
+    consulted here. The slug's *shape* is not checked here: a wake refuses a malformed one
+    (`_basecradle.normalize_provider`) before its reconcile runs, while the installer CLI takes its
+    ``--provider`` as given, as it always has.
+    """
     return (os.environ.get("AI_PROVIDER") or _DEFAULT_PROVIDER).strip().lower()
 
 
@@ -1256,8 +1264,9 @@ def main(argv: list[str] | None = None) -> int:
         "--provider",
         default=None,
         help=(
-            "lay down only the tool defaults relevant to this provider "
-            "(default: $AI_PROVIDER, else 'openai'). Use --all-providers to disable filtering."
+            "lay down only the tool defaults relevant to this provider — a known vendor or any "
+            "other slug, which keeps only the vendor-neutral defaults (default: $AI_PROVIDER, "
+            "else 'openai'). Use --all-providers to disable filtering."
         ),
     )
     parser.add_argument(

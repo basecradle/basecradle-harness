@@ -216,8 +216,19 @@ def test_a_google_brain_describer_still_needs_its_own_key_file(
         ({"HARNESS_DESCRIBER_PROVIDER": "google"}, "config:incomplete_stack"),
         ({"HARNESS_DESCRIBER_SDK": "google-genai"}, "config:incomplete_stack"),
         (
-            {"HARNESS_DESCRIBER_PROVIDER": "gemini", "HARNESS_DESCRIBER_SDK": "google-genai"},
-            "config:unknown_provider",
+            # A well-formed slug is a vendor now (issue #670), so `gemini` is refused by the build
+            # (google-genai reaches only `google`), and only a malformed token is refused by shape.
+            {
+                "HARNESS_DESCRIBER_PROVIDER": "gemini",
+                "HARNESS_DESCRIBER_SDK": "google-genai",
+                "HARNESS_DESCRIBER_API_KEY": "sk-or-v1-describer0123456789abcdef",
+                "HARNESS_DESCRIBER_PROVIDERS": "google-vertex",
+            },
+            "config:no_provider",
+        ),
+        (
+            {"HARNESS_DESCRIBER_PROVIDER": "Gemini/AI", "HARNESS_DESCRIBER_SDK": "google-genai"},
+            "config:invalid_provider",
         ),
         (
             {"HARNESS_DESCRIBER_PROVIDER": "google", "HARNESS_DESCRIBER_SDK": "google-genai"},
@@ -251,7 +262,8 @@ def test_a_google_brain_describer_still_needs_its_own_key_file(
     ids=[
         "provider-without-sdk",
         "sdk-without-provider",
-        "unknown-provider",
+        "unknown-vendor-on-a-native-sdk",
+        "malformed-provider",
         "no-key-file",
         "no-location",
         "key-file-absent",

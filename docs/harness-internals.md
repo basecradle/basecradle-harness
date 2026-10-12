@@ -979,3 +979,50 @@ Your harness this wake: the software that woke you, built this brief and runs yo
   attribution line as `brief_harness=`, carried as a sentinel in `test_mining.py`, and in the
   model-facing strings `test_unspoken.py` audits.
 
+
+### `AI_PROVIDER` is the biller — the generic OpenAI-compatible profile (issue #670)
+
+`AI_PROVIDER` had two meanings that coincided for every cell ever shipped: the **vendor that bills
+the account** (what the `llm provider=` line, *Spend by Provider* and the NOC's dashboard contract
+read it as) and the **key into every vendor convention** (default host, cache-affinity cell, search
+wiring, rate table, plugin gates). It was validated as a closed enum of four, so `@pong` — the
+`openai` SDK aimed at Wiro — could only be configured as `openai`, and was charted as OpenAI, sent
+OpenAI's `prompt_cache_key`, warned every wake that its host was not `api.openai.com`, and told in
+its brief that it ran on OpenAI.
+
+The founder's ruling (@origin, 2026-10-12): the token is the biller, the set opens, the dialect is
+derived from the vendor. The shape of the change:
+
+- **One reader of the token's shape** (`_basecradle.normalize_provider`): strip, lowercase, and a
+  slug `[a-z0-9._-]+` — the NOC's own extraction, so a legal token is one the chart reads whole.
+  The wake, the off-box resolver and the describer's own stack all call it.
+- **One place for the generic profile's preconditions** (`_require_generic_profile`): `AI_SDK=openai`
+  and a host. Run by `_config_from_env` (so startup refuses and `--resolved-config` exits nonzero
+  instead of reading green on a box whose every wake would fail) and by `_provider_from_config` (a
+  describer reaches it with an endpoint of its own, and a describer on a generic vendor other than
+  the brain's has none to inherit, so it reports `config:no_provider`).
+- **The build** (`_generic_openai_provider`) passes only the operator's own `model_params.json`
+  through. Everything vendor-specific falls out by construction: `_AFFINITY` has no generic key,
+  `_computes_cost` is an equality on `openai`, every `Vendor`/`OpenAIKey` gate is an equality on a
+  known name, and the installer's affinity prune keeps exactly the vendor-neutral defaults. A
+  server-side built-in arriving anyway is refused by name rather than dropped.
+- **The surface default is per vendor class**: `_surface_for` takes the provider, and only a
+  generic vendor over the `openai` SDK defaults to `chat`.
+- **A generic build writes one INFO line**, `provider profile=generic provider=… surface=… host=…`.
+  A misspelled known vendor is a well-formed slug and now runs generic rather than refusing, and
+  this line is the only trace that it lost that vendor's conventions. INFO and not WARNING, because
+  for a real generic vendor it is the expected state on every wake. Its head is deliberately not
+  `llm provider=`, which the fleet counts as model calls.
+- **The probes refuse what the wake refuses**: `--resolved-config` applies the built-in refusal
+  (`_require_no_generic_builtins`; only an operator's ungated plugin can trigger it), and
+  `basecradle-harness-resolve` applies the SDK half (`_require_generic_sdk`). The host half is a
+  deployment fact the pure resolver is never handed.
+- A describer naming a generic vendor of its own is refused **in its own variables' names**
+  (`HARNESS_DESCRIBER_PROVIDER` / `HARNESS_DESCRIBER_SDK`): the build's message names the brain's,
+  and following it (set `AI_BASE_URL`) would point the brain at the describer's vendor.
+- The describer's malformed-provider fault is `config:invalid_provider` (it was
+  `config:unknown_provider`, which no longer describes anything a well-formed slug can be).
+
+The wire claim is proven against a real loopback HTTP server (`tests/test_generic_provider.py`),
+with a known vendor on the same server as the control, and mutation-checked: re-introducing an
+OpenAI fallback in the affinity lookup, or letting a generic label reach the rate table, fails it.

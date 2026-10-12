@@ -519,13 +519,13 @@ def test_main_exits_nonzero_with_no_json_on_a_bad_question(capsys):
     """A bad question fails loud and prints **nothing** to stdout — no half-answer to parse.
 
     An automation that reads stdout and ignores the exit code must not be handed a plausible
-    object built from a question the command refused. Both failure classes are covered: an unknown
-    provider and an unknown stem.
+    object built from a question the command refused. Both failure classes are covered: a
+    malformed provider (any well-formed slug is a vendor since issue #670) and an unknown stem.
     """
-    assert main(["--provider", "nope"]) == 1
+    assert main(["--provider", "No/pe"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "nope" in captured.err
+    assert "no/pe" in captured.err
 
     assert main(["--opt-in", "xai_serch"]) == 1
     captured = capsys.readouterr()

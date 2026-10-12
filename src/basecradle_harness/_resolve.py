@@ -53,12 +53,14 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from basecradle_harness._basecradle import (
-    _PROVIDERS,
     _SDK_SURFACES,
     DEFAULT_PROVIDER,
     DEFAULT_SDK,
+    KNOWN_PROVIDERS,
     _merge_memory_tools,
+    _require_generic_sdk,
     _surface_for,
+    normalize_provider,
 )
 from basecradle_harness._install import (
     packaged_tool_sources,
@@ -231,8 +233,12 @@ def resolve_stems(
     """Resolve a hypothetical configuration to its active tool names and built-ins.
 
     Args:
-        provider: ``AI_PROVIDER`` — ``openai`` | ``xai`` | ``openrouter``. Validated; an unknown
-            provider raises, exactly as a wake's `_config_from_env` would.
+        provider: ``AI_PROVIDER`` — the vendor that bills the account: a known one (``openai`` |
+            ``xai`` | ``openrouter`` | ``google``) or any other slug, which takes the generic
+            OpenAI-compatible profile (issue #670). A malformed slug raises, and so does a generic
+            vendor on any SDK but ``openai``, exactly as a wake's `_config_from_env` would. The
+            generic profile's other precondition, ``AI_BASE_URL``, is a deployment fact this pure
+            resolver is never handed, so it is not checked here.
         sdk: ``AI_SDK`` — the vendor SDK package the harness would import.
         surface: ``AI_SDK_SURFACE``. ``None`` resolves to the SDK adapter's own ``DEFAULT_SURFACE``
             (`_surface_for`), so the common case needs no argument; a value not in that adapter's
@@ -270,13 +276,13 @@ def resolve_stems(
         "A stem is not a tool name".
 
     Raises:
-        ValueError: an unknown provider, SDK, profile, or an SDK-mismatched surface.
+        ValueError: a malformed provider slug, an unknown SDK or profile, or an SDK-mismatched
+            surface.
         UnknownStemError: a requested stem names no shipped tool-plugin default.
     """
-    provider = (provider or DEFAULT_PROVIDER).strip().lower()
-    if provider not in _PROVIDERS:
-        raise ValueError(f"Unknown provider {provider!r}; expected one of {_PROVIDERS}.")
+    provider = normalize_provider(provider)
     sdk = (sdk or DEFAULT_SDK).strip().lower()
+    _require_generic_sdk(provider, sdk)
     if sdk not in _SDK_SURFACES:
         # The wake leaves this to the provider build, which fails with "no adapter for that SDK"
         # the moment it tries to reach a model. This path never builds a provider, so nothing
@@ -284,7 +290,7 @@ def resolve_stems(
         # *different* question (an `openroute` typo drops `openrouter_search`, and the pin computed
         # from it is short a name). Same failure class as an unknown stem, so: same hard stop.
         raise ValueError(f"Unknown sdk {sdk!r}; expected one of {tuple(_SDK_SURFACES)}.")
-    resolved_surface = _surface_for(sdk, surface)
+    resolved_surface = _surface_for(sdk, surface, provider)
     profile = (profile or "locked").strip().lower()
     if profile not in _PROFILES:
         raise ValueError(f"Unknown profile {profile!r}; expected one of {tuple(_PROFILES)}.")
@@ -553,7 +559,7 @@ def _attribute(
 def main(argv: list[str] | None = None) -> int:
     """The ``basecradle-harness-resolve`` entrypoint: print the resolution as JSON, then exit.
 
-    Exit 0 on success; 1 on a bad question (an unknown provider/profile, an SDK-mismatched surface,
+    Exit 0 on success; 1 on a bad question (a malformed provider, an unknown profile, an SDK-mismatched surface,
     an unknown stem, an unloadable memory provider) with the reason on stderr and **no JSON on
     stdout** — a half-answer an automation might parse is worse than none, and a stem typo
     producing a short pin is the exact failure this command exists to prevent.
@@ -571,7 +577,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--provider",
         default=DEFAULT_PROVIDER,
-        help=f"AI_PROVIDER — one of {', '.join(_PROVIDERS)} (default: {DEFAULT_PROVIDER}).",
+        help=(
+            f"AI_PROVIDER — the vendor that bills the account: a known one "
+            f"({', '.join(KNOWN_PROVIDERS)}) or any other slug, which takes the generic "
+            f"OpenAI-compatible profile (default: {DEFAULT_PROVIDER})."
+        ),
     )
     parser.add_argument(
         "--sdk",
@@ -653,7 +663,7 @@ def main(argv: list[str] | None = None) -> int:
             assume_credentials=args.assume_credentials,
         )
     except (ValueError, TypeError, ImportError) as error:
-        # The classes a *bad question* raises — an unknown provider/profile/surface/stem
+        # The classes a *bad question* raises — a malformed provider, an unknown profile/surface/stem
         # (`ValueError`, which `UnknownStemError` extends), and a `--memory-provider` path that
         # does not import or is not a `MemoryProvider` (`ImportError`/`TypeError`). Anything else
         # is a defect in the package, and it propagates as a traceback rather than being dressed

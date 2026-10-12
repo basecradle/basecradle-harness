@@ -111,6 +111,7 @@ from basecradle_harness._basecradle import (
     _parse_created_at,
     _profile_from_env,
     _recent,
+    _require_no_generic_builtins,
     _resolve_tools,
     _resolve_tools_and_provider,
     _response_retries_from_env,
@@ -5353,7 +5354,8 @@ def resolved_config() -> dict[str, object]:
     **ground truth, never self-report** (the basecradle#307 failure class, where a capability is a
     corpse while every version/health signal still reads green). It resolves through the **same
     code paths the running agent uses**: the validated ``(provider, sdk, surface)`` triple
-    (`_config_from_env`, which hard-fails an unknown provider or an SDK-mismatched surface) and the
+    (`_config_from_env`, which hard-fails a malformed provider slug, a generic vendor with no
+    ``AI_SDK=openai`` or no ``AI_BASE_URL``, or an SDK-mismatched surface) and the
     active tool set after the full plugin/memory/MCP/locked-policy resolution (`_resolve_tools`) —
     so the output is what the agent would actually do, not a declared list.
 
@@ -5405,7 +5407,11 @@ def resolved_config() -> dict[str, object]:
       (``cost_model_priced`` — ``false`` is a brain whose calls log no ``cost=``); ``"stated"``
       where the vendor states its own price (OpenRouter, the native xAI SDK); ``null`` where neither
       holds (OpenAI aimed at another host, xAI through the ``openai`` SDK), which is a brain the
-      spend dashboard cannot see. The last two fields are ``null`` unless the basis is computed.
+      spend dashboard cannot see. A **generic** vendor (issue #670) is ``null`` too, for a different
+      reason: whether it states a price is a fact about its responses that no configuration can
+      know, so the basis is not claimed — its ``llm`` line carries the vendor's ``usage.cost`` when
+      the endpoint states one (Wiro does). The last two fields are ``null`` unless the basis is
+      computed.
     - ``active_profile`` — the deploy-selected policy profile, ``"locked"`` or ``"unlocked"``
       (`HARNESS_PROFILE`, fail-closed to ``"locked"``; issue #256). It governs the tool set below:
       under ``"unlocked"`` a policy-forbidden opted-in tool (e.g. ``shell``) appears in ``tools``;
@@ -5624,6 +5630,9 @@ def resolved_config() -> dict[str, object]:
     provider_name, sdk, surface = _config_from_env()
     profile_name, _policy = _profile_from_env()
     resolved, memory = _resolve_tools(provider_name, sdk, surface)
+    # The build's built-in refusal, applied here too: this path never builds a provider, and a probe
+    # that read green over a configuration every wake refuses would be reading a corpse (#670).
+    _require_no_generic_builtins(provider_name, resolved.builtins)
     memory_name, memory_version = describe_memory_provider(memory)
     model_params, stripped = resolved_model_params(sdk)
     breaker_max, breaker_window, breaker_cooldown = breaker_settings_from_env()

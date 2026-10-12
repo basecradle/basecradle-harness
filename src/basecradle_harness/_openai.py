@@ -152,11 +152,12 @@ class _Affinity:
 #: **A decided "send nothing" is written as an explicit ``None``, not as an absent key**, and the
 #: distinction is the whole discipline: in a plain dict a deliberate no and a cell nobody thought
 #: about are the same silence, which is precisely the green-while-absent shape this repo keeps
-#: getting bitten by. Every buildable cell is a key here, and `test_openai_affinity` fails the build
-#: when one is not — so wiring a fourth vendor forces the question rather than inheriting an answer.
-#: A `provider` label that is not a key at all (an operator's own) also sends nothing: the only
-#: thing this feature can do is put a vendor field on a wire, and doing that at an endpoint that
-#: never asked for it is a 400 on every wake.
+#: getting bitten by. Every **known** vendor's buildable cell is a key here, and
+#: `test_openai_affinity` fails the build when one is not — so wiring a fourth vendor forces the
+#: question rather than inheriting an answer. A **generic** vendor (`_basecradle.is_generic_provider`,
+#: issue #670) is deliberately *never* a key, and so sends nothing: the only thing this feature can do
+#: is put a vendor field on a wire, and doing that at an endpoint that never asked for it is a 400 on
+#: every wake. That test pins this direction too.
 _AFFINITY: dict[tuple[str, str], _Affinity | None] = {
     # OpenAI documents the field for exactly this purpose, and recommends exactly this value:
     # *"Group a prompt version with a stable user, workspace, session, or thread ID that matches
@@ -210,9 +211,10 @@ class OpenAIProvider:
         model: The model id (e.g. ``"gpt-5.4-mini"``).
         api_key: The OpenAI bearer token. Falls back to ``AI_API_KEY`` when omitted.
         base_url: The API root. Defaults to OpenAI; set it for an OpenAI-compatible endpoint.
-        provider: The endpoint's vendor (``AI_PROVIDER``) — a **label**, not wiring: this one
-            adapter serves OpenAI, xAI, and OpenRouter alike, and only `_provider_from_config`
-            knows which endpoint it aimed the client at. It rides the per-call log line so a
+        provider: The vendor that bills the account (``AI_PROVIDER``) — a **label**, not wiring:
+            this one adapter serves OpenAI, xAI, OpenRouter and any OpenAI-compatible vendor the
+            harness does not know (issue #670) alike, and only `_provider_from_config` knows which
+            endpoint it aimed the client at. It rides the per-call log line so a
             grok-through-the-openai-SDK wake reads ``provider=xai``, not ``provider=openai``.
             It is also the one thing that decides which **cache-affinity** carrier this client
             uses (`_AFFINITY`, issue #435), so aim it honestly: a label the table does not know
@@ -337,6 +339,9 @@ class OpenAIProvider:
         #: Whether this client's calls are priced from OpenAI's rates (`_openai_rates`): only when
         #: it is aimed at OpenAI itself. The label decides whose rates could apply and the host
         #: decides whether they are the list price — a residency endpoint is billed with an uplift.
+        #: An equality, never a membership test, so a vendor the harness does not know (issue #670)
+        #: is unpriced *by construction*: no table, and no cost-gap WARNING about a table that was
+        #: never its own.
         self._computes_cost = provider == "openai"
         #: The cost gaps already stated this wake (an unknown model, an unpriced host, a container),
         #: so each WARNING is written once per adapter — one wake — rather than once per call.
