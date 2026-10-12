@@ -72,8 +72,9 @@ class ActivationContext:
     provider-coupled tool loads only under the pairing it actually works with.
 
     Args:
-        provider: ``AI_PROVIDER`` — the vendor whose endpoint/key the agent uses
-            (``"openai"`` | ``"xai"`` | ``"openrouter"``). What a `Vendor` requirement matches.
+        provider: ``AI_PROVIDER`` — the vendor that bills the account (``"openai"`` | ``"xai"`` |
+            ``"openrouter"`` | ``"google"``, or any other slug under the generic profile, issue
+            #670). What a `Vendor` requirement matches.
         sdk: ``AI_SDK`` — the PyPI package the harness imports to reach the model
             (``"openai"`` | ``"xai-sdk"`` | …). Reserved for SDK-specific gating.
         surface: The OpenAI adapter's internal wire surface — ``"responses"`` (default) or
@@ -112,11 +113,13 @@ class Requirement(ABC):
 
 @dataclass(frozen=True)
 class Vendor(Requirement):
-    """Met iff the active provider equals `name` (``"openai"`` | ``"xai"`` | ``"openrouter"``).
+    """Met iff the active provider equals `name` (``"openai"`` | ``"xai"`` | ``"openrouter"`` | …).
 
     The requirement a provider-coupled tool declares: the grok media tools and xAI Live Search
     require ``Vendor("xai")`` and self-exclude everywhere else, so an xAI agent's stack touches
-    no OpenAI surface and an OpenAI agent never sees a grok-only tool.
+    no OpenAI surface and an OpenAI agent never sees a grok-only tool. An equality on the label, so
+    a vendor the harness does not know (issue #670) meets no shipped `Vendor` gate and gets no
+    vendor-coupled tool — by construction, never by a list of exclusions.
     """
 
     name: str

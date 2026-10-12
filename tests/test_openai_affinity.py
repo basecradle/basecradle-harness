@@ -23,7 +23,7 @@ import httpx
 import pytest
 
 from basecradle_harness import Harness, Message, OpenAIProvider, Session
-from basecradle_harness._basecradle import OPENAI_SDK_PROVIDERS
+from basecradle_harness._basecradle import OPENAI_SDK_PROVIDERS, _provider_from_config
 from basecradle_harness._caching import bind_conversation
 from basecradle_harness._openai import (
     _AFFINITY,
@@ -233,14 +233,16 @@ def test_the_bound_key_wins_over_a_construction_time_default(router):
 # === every buildable cell has a decided answer ==================================================
 
 
-def test_every_buildable_cell_has_a_decided_affinity_answer():
+def test_every_known_vendor_cell_has_a_decided_affinity_answer():
     """The mechanical form of the DoD: a documented "no" is fine; silence is not.
 
-    Enumerated from the config layer's own wired-provider list and the adapter's own `SURFACES`,
-    never a second copy of either — so wiring a fourth vendor, or adding a third surface, fails
-    here until somebody reads that endpoint's guidance and writes the answer down. Absence and a
-    deliberate `None` are indistinguishable to a reader of a plain dict, which is exactly the
-    green-while-absent shape this repo keeps paying for.
+    "Buildable" means a **known** vendor's cell (issue #670): the token set is open, and a vendor
+    the harness does not know has no conventions to decide. Enumerated from the config layer's own
+    known-vendor list for this SDK and the adapter's own `SURFACES`, never a second copy of either
+    — so wiring a fourth *known* vendor, or adding a third surface, fails here until somebody reads
+    that endpoint's guidance and writes the answer down. Absence and a deliberate `None` are
+    indistinguishable to a reader of a plain dict, which is exactly the green-while-absent shape
+    this repo keeps paying for.
     """
     buildable = {
         (vendor, surface)
@@ -252,6 +254,20 @@ def test_every_buildable_cell_has_a_decided_affinity_answer():
     }
 
     assert buildable <= set(_AFFINITY), f"undecided cells: {sorted(buildable - set(_AFFINITY))}"
+
+
+@pytest.mark.parametrize("surface", SURFACES)
+def test_a_generic_vendor_cell_resolves_to_no_affinity_by_construction(monkeypatch, surface):
+    """The other half (issue #670): a vendor the harness does not know is never a key, so the
+    factory builds it a client that sends no routing key on any surface — a vendor field at an
+    endpoint that never asked is a 400. (The bytes themselves are read off a real server in
+    `test_generic_provider`.)"""
+    assert {vendor for vendor, _surface in _AFFINITY} <= set(OPENAI_SDK_PROVIDERS)
+    monkeypatch.setenv("AI_BASE_URL", BASE_URL)
+    provider = _provider_from_config("wiro", "openai", surface, model="m", api_key=FAKE_KEY)
+    assert provider.provider == "wiro"
+    assert provider._affinity is None
+    provider.close()
 
 
 def test_a_decided_no_is_a_present_key_not_a_missing_one():

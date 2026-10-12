@@ -2733,12 +2733,16 @@ def test_main_wake_admits_an_opted_in_shell_under_the_unlocked_profile(
 def test_main_resolved_config_exits_nonzero_on_a_misconfigured_provider(
     wake_env, monkeypatch, capsys
 ):
-    """A resolution error (an unknown AI_PROVIDER) is the verifier's honest "misconfigured" signal:
-    a clean non-zero exit with the reason on stderr, never a raw traceback."""
-    monkeypatch.setenv("AI_PROVIDER", "bogus")
+    """A resolution error is the verifier's honest "misconfigured" signal: a clean non-zero exit
+    with the reason on stderr, never a raw traceback.
+
+    The case is a vendor the harness does not know with no host (issue #670): every wake of it
+    would refuse at startup, so a verifier that read it green would be reading a corpse."""
+    monkeypatch.setenv("AI_PROVIDER", "wiro")
+    monkeypatch.delenv("AI_BASE_URL", raising=False)
 
     assert main(["--resolved-config"]) == 1
-    assert "Unknown AI_PROVIDER 'bogus'" in capsys.readouterr().err
+    assert "set AI_BASE_URL" in capsys.readouterr().err
 
 
 def test_main_returns_nonzero_when_home_is_missing(platform, wake_env, monkeypatch):

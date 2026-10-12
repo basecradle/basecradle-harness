@@ -1025,25 +1025,31 @@ def describer_from_env(env: Any = None) -> Describer | None:
         return Describer(None, model, fault="config:incomplete_stack")
     try:
         from basecradle_harness._basecradle import (
-            _PROVIDERS,
             _config_from_env,
             _provider_from_config,
             _surface_for,
+            is_generic_provider,
+            normalize_provider,
         )
 
         brain = None if own_provider is None else _config_from_env()[0]
         if own_provider is None:
             provider_name, sdk, surface = _config_from_env()
         else:
-            if own_provider not in _PROVIDERS:
+            # Any well-formed vendor slug is a provider (issue #670), so the only refusal here is
+            # the shape. A generic vendor other than the brain's has no host it could inherit; that
+            # is refused below, in this describer's own variables' names.
+            try:
+                normalize_provider(own_provider)
+            except ValueError:
                 return Describer(
                     None,
                     model,
-                    fault="config:unknown_provider",
+                    fault="config:invalid_provider",
                     detail=f"{DESCRIBER_PROVIDER_VAR}={own_provider!r}",
                 )
             provider_name, sdk = own_provider, own_sdk
-            surface = _surface_for(own_sdk, own_surface)
+            surface = _surface_for(own_sdk, own_surface, own_provider)
     except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
         return Describer(None, model, fault="config:no_provider", detail=str(exc))
     credential: dict[str, Any]
@@ -1077,6 +1083,32 @@ def describer_from_env(env: Any = None) -> Describer | None:
     # carries over only to a describer at the brain's own location: sent to another, it would run
     # the describer somewhere other than where it was configured to run.
     inherit_endpoint = own_provider is None or own_provider == brain
+    if own_provider is not None and is_generic_provider(own_provider):
+        # Said here rather than left to the build, whose message names the *brain's* variables:
+        # following it (set AI_BASE_URL) would point the brain at the describer's vendor.
+        if own_sdk != "openai":
+            return Describer(
+                None,
+                model,
+                fault="config:no_provider",
+                detail=(
+                    f"{DESCRIBER_PROVIDER_VAR}={own_provider!r} is a vendor the harness does not "
+                    f"know, which is reached only with {DESCRIBER_SDK_VAR}=openai "
+                    f"(got {own_sdk!r})."
+                ),
+            )
+        if not inherit_endpoint:
+            return Describer(
+                None,
+                model,
+                fault="config:no_provider",
+                detail=(
+                    f"{DESCRIBER_PROVIDER_VAR}={own_provider!r} is a vendor the harness does not "
+                    "know, so it has no default host, and a describer on a vendor other than the "
+                    "brain's inherits no AI_BASE_URL. Ride the brain's stack (unset "
+                    f"{DESCRIBER_PROVIDER_VAR} and {DESCRIBER_SDK_VAR}), or name a known vendor."
+                ),
+            )
     if provider_name == _VERTEX_PROVIDER:
         brain_location = (os.environ.get("AI_LOCATION") or "").strip().lower()
         inherit_endpoint = inherit_endpoint and credential["location"].lower() == brain_location

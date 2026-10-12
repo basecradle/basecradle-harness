@@ -809,8 +809,9 @@ def test_config_from_env_is_case_insensitive(monkeypatch):
     assert surface == "chat"
 
 
-def test_config_from_env_rejects_an_unknown_provider(monkeypatch):
-    monkeypatch.setenv("AI_PROVIDER", "telepathy")
+def test_config_from_env_rejects_a_malformed_provider(monkeypatch):
+    # The set is open (issue #670) — only the token's *shape* is refused here.
+    monkeypatch.setenv("AI_PROVIDER", "tele/pathy")
     with pytest.raises(ValueError, match="AI_PROVIDER"):
         _config_from_env()
 

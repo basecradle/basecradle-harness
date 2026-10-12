@@ -7,6 +7,44 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.153.0] - 2026-10-12
+
+### Changed: `AI_PROVIDER` names the vendor that bills the account, and any vendor slug is legal (issue #670)
+
+`AI_PROVIDER` is read as the biller everywhere it lands — the `llm provider=` line, the fleet's
+*Spend by Provider* chart, the brief's `brain` part, `--resolved-config`'s `ai_provider` — but the
+harness validated it as a closed enum of four vendors. The first agent on a fifth (`@pong`, the
+`openai` SDK aimed at Wiro) could only be configured as `openai`, so Wiro's dollars were charted as
+OpenAI's, OpenAI's `prompt_cache_key` was sent to Wiro on every call, every wake warned that the
+client was "not aimed at api.openai.com", and the brief told the agent it ran on OpenAI.
+
+- **Known vendors keep everything.** `openai`, `xai`, `openrouter` and `google` behave byte for byte
+  as before: default host, cache affinity, search wiring, rate table, plugin gates, SDK pairing.
+- **Any other slug is a legal provider with the generic OpenAI-compatible profile.** The token is
+  normalized as before (`strip().lower()`) and must match `^[a-z0-9._-]+$`, the shape the NOC's
+  dashboard extracts. The generic profile requires `AI_SDK=openai` and `AI_BASE_URL` (missing either
+  refuses at startup, and `--resolved-config` exits nonzero), defaults the surface to `chat`
+  (`responses` stays an explicit opt-in; the `openai`/`xai` defaults are unchanged), and puts nothing
+  vendor-specific on the wire: no affinity key, no `search_parameters`, no routing header or pin, no
+  server-side built-in (one active is a startup error, not a silent drop). Nothing is priced from a
+  table, so no cost-gap WARNING; the vendor's own `usage.cost` is reported as `cost=` when stated.
+- **Tools and installer.** No vendor-coupled tool activates for a generic vendor, and
+  `basecradle-harness-install` lays down only the vendor-neutral defaults for one.
+- **The describer's malformed-provider fault is renamed** `config:invalid_provider` (was
+  `config:unknown_provider`): a well-formed slug is now a vendor, so only the shape can be wrong.
+  A describer naming a generic vendor other than the brain's has no host to inherit and reports
+  `config:no_provider`.
+- **Every error message that listed the four vendors** now states the new rule.
+- **A generic build logs one INFO line**, `provider profile=generic provider=<slug> surface=<s>
+  host=<host>`. A misspelled known vendor (`openroutr`) is a well-formed slug and now runs generic
+  instead of refusing; this line is what makes that visible.
+- `--resolved-config` also refuses a server-side built-in on a generic vendor, as the wake does,
+  and `basecradle-harness-resolve` refuses a generic vendor on a native SDK.
+
+Every existing configuration of a known vendor behaves as before. Two things that used to refuse
+no longer do: a previously unknown `AI_PROVIDER` is accepted, and so is a misspelled known one (see
+the INFO line above). The describer fault rename is the one changed literal.
+
 ## [0.152.1] - 2026-10-07
 
 ### Fixed: a picture is described once per wake, not once per perception (issue #664)
