@@ -1035,6 +1035,38 @@ def declared_opt_in(declaration: Mapping[str, object]) -> set[str]:
     return {item for item in value if isinstance(item, str)} if isinstance(value, list) else set()
 
 
+#: What `overlay_provider` reports for an overlay reconciled with ``--all-providers``. Outside the
+#: provider-slug grammar (``^[a-z0-9._-]+$``) by construction, so it can never name a vendor.
+OVERLAY_ALL_PROVIDERS = "*"
+
+
+def overlay_provider(root: str | os.PathLike[str] | None = None) -> str | None:
+    """The provider the installed overlay was reconciled for, as the last install recorded it.
+
+    The provider is one of the overlay's inputs (the installer lays down and prunes a vendor's
+    tranche by it), so an agent whose ``AI_PROVIDER`` moved after its last install runs an overlay
+    filtered for another vendor (issue #672). This read lets ``--resolved-config`` report that
+    input beside ``ai_provider`` so the two can be compared off the box. Three values:
+
+    - the normalized slug the reconcile filtered for;
+    - `OVERLAY_ALL_PROVIDERS` for an unfiltered (``--all-providers``) install, which matches every
+      agent, as `_verify._check_provider` reads it. The file records that as JSON ``null``; it is
+      reported as its own value so it cannot be mistaken for the next case;
+    - ``None`` when no reconcile can be read: no declaration, an unreadable one, a ``contract``
+      this version does not know (read with this version's assumptions, it could report something
+      that is not true, which is `_verify`'s reason for refusing it), or a damaged ``provider``.
+    """
+    declaration = read_declaration(root)
+    if declaration.get("contract") != DECLARATION_CONTRACT or "provider" not in declaration:
+        return None
+    value = declaration["provider"]
+    if value is None:
+        return OVERLAY_ALL_PROVIDERS
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return None
+
+
 def declared_files(declaration: Mapping[str, object]) -> set[str]:
     """The managed paths a declaration records as present, tolerant of a damaged shape."""
     value = declaration.get("files")

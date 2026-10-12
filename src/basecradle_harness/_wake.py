@@ -179,7 +179,12 @@ from basecradle_harness._idempotency import (
     interrupted,
 )
 from basecradle_harness._idempotency import key as mint_key
-from basecradle_harness._install import charter_from_env, prompt_text, system_prompt_text
+from basecradle_harness._install import (
+    charter_from_env,
+    overlay_provider,
+    prompt_text,
+    system_prompt_text,
+)
 from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs_report
 from basecradle_harness._memory_provider import (
     MemoryExchange,
@@ -5473,6 +5478,16 @@ def resolved_config() -> dict[str, object]:
       fourth thing again — unknown, not empty. It is *stems*, like ``opt_in_tools`` and unlike
       ``tools``/``builtins``: one stem can fan out to several resolved names and a name can
       differ from its stem.
+    - ``overlay_provider`` — the provider the installed overlay was **reconciled for**, as the last
+      ``basecradle-harness-install`` recorded it in ``.declared.json`` (issue #672; the same record
+      ``basecradle-harness-verify`` reads for its ``provider-mismatch`` check). The installer lays
+      down and prunes each vendor's tool tranche by provider, so an ``AI_PROVIDER`` changed after
+      the last install leaves an overlay filtered for the old vendor while ``ai_provider`` reads the
+      new one. Compared against ``ai_provider``, this makes that drift visible off the box. The
+      normalized slug, or ``"*"`` for an ``--all-providers`` install (filtered for no vendor, so it
+      matches every ``ai_provider``), or ``null`` when no reconcile can be read: never installed, an
+      install older than the declaration (0.95.0), an unreadable file, or a declaration contract this
+      version does not know. Read off disk like ``overlay_tool_stems``, never re-derived.
     - ``tool_env`` — ``env var → is it set (non-empty) in this process's environment?``, over
       every variable the **active tool plugins declare** a dependency on (issue #427) — except that
       a credential-*file* variable reads ``true`` only when its file would load (issue #661; see
@@ -5692,6 +5707,7 @@ def resolved_config() -> dict[str, object]:
         "overlay_tool_stems": (
             None if resolved.overlay_stems is None else list(resolved.overlay_stems)
         ),
+        "overlay_provider": overlay_provider(),
         "tool_env": {
             # A credential-file variable is `true` only when its file would load (issue #661): set
             # but unloadable, the capability behind it cannot do its job, which is what `false` says.
