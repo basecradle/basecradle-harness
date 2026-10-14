@@ -4366,6 +4366,7 @@ def test_activated_task_is_timestamped():
     # scheduled — so the stamp reads consistent with every other inbound item.
     task = SimpleNamespace(
         created_at=TS,
+        user=SimpleNamespace(handle="john"),
         content=SimpleNamespace(
             uuid="019e7770-5555-7eee-8fff-506172839405",
             activate_at="2026-06-11T06:00:00+00:00",
@@ -4373,8 +4374,35 @@ def test_activated_task_is_timestamped():
         ),
     )
     text = _activated_task_text(task)
-    assert text.startswith(f"[{TS}] A task you scheduled has activated")
+    assert text.startswith(f"[{TS}] A task scheduled by @john has activated")
     assert "scheduled for 2026-06-11T06:00:00+00:00" in text  # complementary, retained
+
+
+def test_an_activated_task_reads_as_a_message_to_the_room():
+    """A task is a message with a send time (issue #674) — the activation turn, verbatim.
+
+    One rendering for every viewer, its author included: it names the author by `@handle`, says
+    the task is in front of every viewer, and asks the model to act on what it addresses *to it*.
+    The second-person "A task you scheduled … Carry out its instructions" told every viewer of a
+    shared timeline that a peer's task was its own.
+    """
+    task = SimpleNamespace(
+        created_at=TS,
+        user=SimpleNamespace(handle="john"),
+        content=SimpleNamespace(
+            uuid="019e7770-5555-7eee-8fff-506172839405",
+            activate_at="2026-06-11T06:00:00+00:00",
+            instructions="@nova — check the queue.",
+        ),
+    )
+
+    assert _activated_task_text(task) == (
+        f"[{TS}] A task scheduled by @john has activated and is now in front of every viewer of "
+        "this timeline (task 019e7770-5555-7eee-8fff-506172839405, scheduled for "
+        "2026-06-11T06:00:00+00:00). Act on whatever it addresses to you:\n"
+        "@nova — check the queue."
+    )
+    assert "you scheduled" not in _activated_task_text(task)
 
 
 # --- read-speed pacing for AI↔AI conversations (issue #224) ------------------

@@ -2785,7 +2785,9 @@ class WakeAgent:
             rendered = render(item)
             shown, images = rendered if isinstance(rendered, tuple) else (rendered, [])
             try:
-                narration = self._engage(session, shown, images, item)
+                narration = self._engage(
+                    session, shown, images, item, addressing=_addressing(item, kind, shown)
+                )
             except _REPORTED_FAILURES as exc:
                 # A permanent or out-of-funds provider failure: report it to the timeline once, model-
                 # free, rather than propagating to a router-retry loop (issue #336). Permanent →
@@ -2842,6 +2844,8 @@ class WakeAgent:
         text: str,
         images: list[ImageContent],
         item: object | None = None,
+        *,
+        addressing: str | None = None,
     ) -> str:
         """Run the model on one item, degrading the engine's step-cap to a graceful note.
 
@@ -2860,9 +2864,16 @@ class WakeAgent:
         one place that knows *what* the agent is being shown, and it is re-armed per model call
         because "was this addressed to me, and did I act?" is a question about a turn, not a wake.
         This path serves the non-message kinds (an asset, a webhook delivery, an activated task),
-        so it never passes `counterpart_message`: a task activation or an asset on a 1-on-1 must
-        **not** arm the one-on-one nudge (the heartbeat pattern — issue #332). The mention arm still
-        fires if the item's text happens to address the agent.
+        so it never passes `counterpart_message`, and for a task that is a rule rather than a
+        convenience. The one-on-one arm infers "a bare message on a 1-on-1 is for the other viewer",
+        and the inference holds only because a message is never for its own author (the agent's own
+        posts are self-filtered). **A task can be addressed to its own author** (issue #674: a task
+        is a message with a send time, and a follow-up you schedule for yourself names you), so on a
+        1-on-1 a bare task is as likely for its author as for the other viewer, the inference does
+        not hold, and the arm must not fire. (The heartbeat of issue #332 was the symptom that
+        exposed it, not the reason.) The mention arm still fires when the item addresses the agent
+        by `@handle`, read from `addressing` (`_addressing`: a task's instructions, never the header
+        that names its author) or, absent that, from `text`.
 
         The persistent brief rides *with* this call — spliced in just ahead of the user turn,
         so it is present and recent for the item it governs, and never persisted (see
@@ -2877,7 +2888,7 @@ class WakeAgent:
         The keys were minted for these kinds before their recovery existed, on the bet that the day
         it landed they would already be right. It landed in issue #289, and they were.
         """
-        self.informer.arm(text)
+        self.informer.arm(text if addressing is None else addressing)
         self._degraded = False
         uuid = _uuid_of(item) if item is not None else None
         if uuid is not None:
@@ -3925,7 +3936,7 @@ class WakeAgent:
             # transcript is the record of what the turn did; a create in its work is an action.
             acted = _turn_acted(_turn_work(session.history, turn))
             self.informer.arm(
-                None if acted else rendered,
+                None if acted else _addressing(item, kind, rendered),
                 counterpart_message=not acted and kind == _MESSAGES and not self._is_own(item),
             )
             self._degraded = False
@@ -5261,10 +5272,17 @@ def _event_payload(content: object) -> str:
 
 
 def _activated_task_text(task: object) -> str:
-    """A newly-activated task as the agent hears it: its instructions, to carry out now.
+    """A newly-activated task as the agent hears it: a message with a send time, to the room.
 
-    A task is work the agent (or a peer) scheduled for this moment, so it is phrased as
-    a directive to act, not a notification to consider — the activation *is* the cue.
+    **A task is a message with a send time** (issue #674, @origin's ruling 2026-10-14). It has an
+    author, every viewer of its timeline can read it from the moment it is created, and when it
+    activates every viewer is woken by it — exactly like a message. So it is rendered the same way
+    for every viewer, its author included, naming that author by `@handle`, and the model is told
+    to act on whatever it addresses *to it* — never that it scheduled the task and must carry it
+    out. That second-person form told every viewer of a shared timeline that a peer's task was its
+    own: `@rowan` went looking for `@briggs`'s credential folder because `@briggs`'s scheduled PAT
+    rotation told him he had scheduled it. There is no self case: the author reads its own handle
+    and knows it from the Dashboard.
 
     The leading ``[created_at]`` stamp is the task **item**'s own timeline timestamp. A task's
     Item is created when it *activates* (the platform's `Task::ActivationJob` inserts the Item
@@ -5273,21 +5291,41 @@ def _activated_task_text(task: object) -> str:
     complementary ``scheduled for {activate_at}`` text stays.
     """
     content = task.content
-    return _task_dialogue(task) + _TASK_CARRY_OUT_HINT + f"\n{content.instructions}"
+    return _task_dialogue(task) + _TASK_ACT_HINT + f"\n{content.instructions}"
 
 
 #: The directive the harness wraps around an activation. Framing, not dialogue (issue #438) —
 #: the task's own `instructions` are authored by the agent or a peer and are mined; this is not.
-_TASK_CARRY_OUT_HINT = " Carry out its instructions:"
+_TASK_ACT_HINT = " Act on whatever it addresses to you:"
 
 
 def _task_dialogue(task: object) -> str:
-    """The activation's own header — which task, when it was scheduled for, when it fired."""
+    """The activation's own header — who scheduled it, which task, when it was due, when it fired.
+
+    The author is written as an **`@handle`** (issue #674, verbatim from the ruling), unlike the
+    bare handle `_event_dialogue` and `_asset_dialogue` write. The no-reply informer arms on an
+    exact `@handle`, so read whole, this header would mention its own author on every activation.
+    The informer therefore reads a task's **instructions** alone (`_addressing`): the header is the
+    harness's framing, and whom a task addresses is said only in its author's own words.
+    """
     content = task.content
     return (
-        f"[{task.created_at}] A task you scheduled has activated and is due now "
+        f"[{task.created_at}] A task scheduled by @{task.user.handle} has activated and is now "
+        f"in front of every viewer of this timeline "
         f"(task {content.uuid}, scheduled for {content.activate_at})."
     )
+
+
+def _addressing(item: object, kind: str, rendered: str) -> str:
+    """The part of an item's rendering an `@handle` mention is read from — its author's words.
+
+    For every kind but a task this is the rendering itself: no other header writes an `@handle`
+    (`_event_dialogue` says why). A task's header names its author as `@handle` (`_task_dialogue`),
+    so a task is read for mentions in its **instructions** only: who a task is for is said there,
+    by its author, and the harness's own framing must never make it look addressed to the agent
+    that wrote it.
+    """
+    return item.content.instructions if kind == _TASKS else rendered
 
 
 # The PyPI distribution name for each AI_SDK value, so `--version` can report the *installed*

@@ -1216,7 +1216,8 @@ def _step_note(step: int, max_steps: int, now: datetime) -> str:
     escalation = (
         " Steps are running low. Prioritize the most important remaining actions — including "
         "anything you still mean to say on a timeline, which means calling the `messages` tool — "
-        "summarize progress cleanly, and if work remains, schedule a follow-up task before you "
+        "summarize progress cleanly, and if work remains, schedule a follow-up task addressed to "
+        "yourself before you "
         f"run out. Step {max_steps} is your final action step — end it with plain text to finish "
         "cleanly. Never ignore the step counter; treat it as a hard constraint."
     )

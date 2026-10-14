@@ -236,8 +236,11 @@ class NoReplyInformer:
        the same guaranteed second chance a mention does. The wake supplies both facts: the
        two-viewer-ness once at construction (`one_on_one`), and "this turn is reading a
        counterpart's message" per arm (`counterpart_message`) — the latter is what keeps a task
-       activation or an agent's own alarm on that same 1-on-1 (the heartbeat pattern) from arming,
-       where a nudge would burn a model turn per beat forever.
+       activation on that same 1-on-1 from arming. The arm's inference ("a bare message here is
+       for the other viewer") holds only because a message is never for its own author; **a task
+       can be addressed to its own author** (issue #674), so on a 1-on-1 a bare task is as likely
+       for either viewer and the inference does not hold. (The heartbeat of issue #332, a nudge
+       burning a model turn per beat, was the symptom that exposed it.)
 
     Then it appends the nudge and returns True, so the model gets one more pass with its tools still
     in hand: act, or say why not. Either is a valid ending, and it may end in silence again — the

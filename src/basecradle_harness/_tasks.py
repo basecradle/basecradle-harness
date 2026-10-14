@@ -1,4 +1,4 @@
-"""Give the agent scheduled work: create, list, and read tasks on a timeline.
+"""Give the agent posts with a send time: create, list, and read tasks on a timeline.
 
 The second tool that acts *on* the platform, and the proof that the seam from
 `_assets.py` generalizes: this is a plain `PlatformTool` subclass with **no new
@@ -6,14 +6,18 @@ foundation** — it reaches the SDK client and current timeline through the boun
 `PlatformContext`, exactly as `AssetsTool` does. A contributor adds the next
 platform tranche by copying this same shape.
 
-A task is the platform's unit of scheduled work: an instruction, an activation
-time, and a status. Three actions, the task equivalent of what a human peer does:
+A task is **a message with a send time** (issue #674): an instruction, an
+activation time, a status, and an author. Every viewer of its timeline can read it
+from the moment it is created and is woken by it when it activates, so its
+instructions are written to the room, each addressed by @handle to whoever should
+act on it, the author included when the work is its own. Every rendering below
+names the author. Three actions, the task equivalent of what a human peer does:
 
 - **list** — what tasks are here, with the uuids needed to read them, each with
   its status and activation time.
 - **read** — one task in full by uuid: its complete instructions, when it
   activates, and its current status.
-- **create** — schedule a task from instructions the agent produced, with the
+- **create** — post a task from instructions the agent produced, with the
   time it should activate.
 
 Ops default to the **current** timeline (the one the agent is engaged on); an
@@ -70,10 +74,12 @@ class TasksTool(PlatformTool):
 
     name = "tasks"
     description = (
-        "Schedule and review work on the timeline. action='create' schedules a task "
-        "from the instructions you give and an activation time (activate_at); "
-        "action='list' shows the tasks here with their uuids, status, and activation "
-        "time; action='read' returns one task in full by uuid. "
+        "Post an instruction to the timeline at a chosen time. Every viewer can read it now "
+        "and is woken by it at activate_at; write it as a message to the room, each "
+        "instruction addressed by @handle (name yourself for your own follow-up). "
+        "action='create' posts a task from the instructions you give and an activation time "
+        "(activate_at); action='list' shows the tasks here with their uuids, status, "
+        "activation time, and author; action='read' returns one task in full by uuid. "
         "activate_at takes a relative offset like '+90m', '+2h', or '+1d' (seconds, "
         "minutes, hours, days, weeks — resolved from now), or an absolute ISO-8601 "
         "timestamp like '2026-06-10T15:00:00Z'. "
@@ -95,7 +101,11 @@ class TasksTool(PlatformTool):
             },
             "instructions": {
                 "type": "string",
-                "description": "What the task should do, in your own words (create only).",
+                "description": (
+                    "What should happen when it activates, each instruction addressed to the "
+                    "@handle(s) who should act — yourself included when the work is yours "
+                    "(create only)."
+                ),
             },
             "activate_at": {
                 "type": "string",
@@ -192,7 +202,7 @@ class TasksTool(PlatformTool):
         content = task.content
         return (
             f"uuid={content.uuid} · status={content.status} · "
-            f"activate_at={content.activate_at}\n\n{content.instructions}"
+            f"activate_at={content.activate_at} · by @{task.user.handle}\n\n{content.instructions}"
         )
 
 
@@ -200,7 +210,7 @@ class TasksTool(PlatformTool):
 
 
 def _describe(task, *, preview: bool = False) -> str:
-    """One task as a compact line: uuid, status, activation time, and instructions.
+    """One task as a compact line: uuid, status, activation time, author, and instructions.
 
     With `preview`, instructions are elided to keep a `list` scannable; a `read`
     renders them in full elsewhere.
@@ -211,7 +221,7 @@ def _describe(task, *, preview: bool = False) -> str:
         instructions = instructions[:_LIST_INSTRUCTIONS_PREVIEW].rstrip() + "…"
     return (
         f"uuid={content.uuid} · status={content.status} · "
-        f"activate_at={content.activate_at} — {instructions}"
+        f"activate_at={content.activate_at} · by @{task.user.handle} — {instructions}"
     )
 
 

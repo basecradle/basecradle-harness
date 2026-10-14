@@ -673,7 +673,9 @@ JOHN_ACTOR = {"uuid": JOHN_UUID, "handle": "john", "name": "John Doe", "kind": "
 BRIGGS_ACTOR = {"uuid": BRIGGS_UUID, "handle": "briggs", "name": "Briggs", "kind": "ai"}
 
 
-def _wire(router, *, body="What's the status?", mine=False, room="solo", task=None):
+def _wire(
+    router, *, body="What's the status?", mine=False, room="solo", task=None, task_author=None
+):
     """The four platform routes a wake touches, with one unseen item on the timeline.
 
     `room` sets the timeline's live viewer set — the thing the one-on-one arm (issue #332) reads:
@@ -686,7 +688,8 @@ def _wire(router, *, body="What's the status?", mine=False, room="solo", task=No
 
     `task` (instructions string) swaps the message wake for a **task-activation** wake: the messages
     route serves empty and one activated task is served, so a wake reconciles the task, not a peer's
-    message — the heartbeat pattern the one-on-one arm must ignore.
+    message — the heartbeat pattern the one-on-one arm must ignore. `task_author` is the task's
+    author (default: the agent itself, its own alarm).
     """
     actor = NOVA_ACTOR if mine else JOHN_ACTOR
     owner, participants = {
@@ -760,7 +763,8 @@ def _wire(router, *, body="What's the status?", mine=False, room="solo", task=No
                 "type": "task",
                 "created_at": "2026-06-10T00:00:00.000Z",
                 "updated_at": "2026-06-10T00:00:00.000Z",
-                "user": NOVA_ACTOR,  # a task the agent scheduled for itself — its own alarm
+                # Default: a task the agent scheduled for itself — its own alarm.
+                "user": task_author or NOVA_ACTOR,
                 "timeline": {"uuid": TIMELINE_UUID},
                 "content": {
                     "uuid": T0,
@@ -1018,9 +1022,13 @@ def test_a_task_activation_on_a_one_on_one_is_not_nudged(platform, tmp_path):
     """**The heartbeat pattern** (issue #332, point 3): a self-scheduled alarm on a 1-on-1 timeline.
 
     A one-on-one timeline also wakes the agent for its *own* activated tasks, where `posted=0` is
-    the desired outcome. That wake reads a task, not the counterpart's message, so the one-on-one arm
-    stays quiet — otherwise every beat would burn an extra model turn forever. The task path never
-    passes `counterpart_message`, so no nudge appears even though the timeline is two-viewer.
+    the desired outcome. The task path never passes `counterpart_message`, and the reason is the
+    rule of issue #674 rather than the heartbeat: the one-on-one arm infers that a bare message is
+    for the other viewer because a message is never for its own author, and a task can be — so on
+    a 1-on-1 a bare task is as likely for either viewer, and the arm must not fire.
+
+    It also pins the other half of #674: the activation header names the author as `@nova`, and
+    that must not read as a mention of the agent that wrote it.
     """
     _wire(platform, room="one_on_one", task="post the daily heartbeat if all is well")
     brain = _Brain(Message.assistant(content="All nominal; nothing to report this beat."))
@@ -1032,6 +1040,46 @@ def test_a_task_activation_on_a_one_on_one_is_not_nudged(platform, tmp_path):
     assert brain.calls == 1  # one pass, no nudge — the heartbeat is undisturbed
     assert [m for m in brain.shown if m.content in (MENTION_NUDGE, ONE_ON_ONE_NUDGE)] == []
     assert posted == []
+
+
+def test_a_task_naming_its_author_in_the_header_does_not_mention_it(platform, tmp_path):
+    """The activation header's `@author` is framing, never a mention (issue #674).
+
+    `@nova` scheduled a task addressed to `@john` on a group timeline. Nova is woken by it too,
+    and its header reads "scheduled by @nova" — but whom the task is for is said in its
+    instructions, so Nova, silent, is not nudged.
+    """
+    _wire(platform, room="group", task="@john — any sales in the last 2 days?")
+    brain = _Brain(Message.assistant(content="John's question; nothing for me."))
+    harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+
+    posted = agent.wake()
+
+    shown = "\n".join(str(m.content) for m in brain.shown)
+    assert "A task scheduled by @nova has activated" in shown  # the header does name it…
+    assert brain.calls == 1  # …and is not read as a mention: no nudge
+    assert [m for m in brain.shown if m.content in (MENTION_NUDGE, ONE_ON_ONE_NUDGE)] == []
+    assert posted == []
+
+
+def test_a_peers_task_addressed_to_the_agent_arms_the_mention(platform, tmp_path):
+    """A task is a message with a send time, so an `@handle` in its instructions is a mention.
+
+    `@john` scheduled a task addressed to `@nova`; Nova ends the turn silent and gets the one
+    mention nudge, exactly as a message naming it would.
+    """
+    _wire(platform, room="group", task="@nova — check the queue.", task_author=JOHN_ACTOR)
+    brain = _Brain(Message.assistant(content="Later."), Message.assistant(content="Still later."))
+    harness = Harness(brain, home=tmp_path, tools=[MessagesTool()])
+    agent = WakeAgent(harness, timeline=TIMELINE_UUID, client=BaseCradle(token=FAKE_TOKEN))
+
+    agent.wake()
+
+    shown = "\n".join(str(m.content) for m in brain.shown)
+    assert "A task scheduled by @john has activated" in shown
+    assert brain.calls == 2
+    assert [m for m in brain.shown if m.content == MENTION_NUDGE] != []
 
 
 def test_two_agents_over_one_harness_do_not_accrete_informers(platform, tmp_path):
