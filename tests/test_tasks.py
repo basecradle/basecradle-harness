@@ -238,6 +238,91 @@ def test_read_without_a_uuid_is_a_friendly_error(tool):
     assert "needs the task's uuid" in tool.run(action="read")
 
 
+# --- cancel ------------------------------------------------------------------
+
+
+def problem(status, code, detail):
+    """An RFC 9457 problem document, the platform's error shape."""
+    return httpx.Response(
+        status,
+        json={"type": "about:blank", "status": status, "code": code, "detail": detail},
+        headers={"Content-Type": "application/problem+json"},
+    )
+
+
+def test_cancel_withdraws_the_task_and_reports_it_cancelled(tool):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/tasks/{T_ONE}").mock(
+            return_value=httpx.Response(200, json={"task": a_task()})
+        )
+        cancel = mock.post(f"{BC_URL}/tasks/{T_ONE}/cancellation").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "task": {**a_task(), "content": {**a_task()["content"], "status": "cancelled"}}
+                },
+            )
+        )
+        result = tool.run(action="cancel", uuid=T_ONE)
+
+    assert cancel.call_count == 1
+    assert result == (
+        f"Cancelled the task. uuid={T_ONE} · status=cancelled · "
+        "activate_at=2026-06-10T15:00:00Z · by @nova — Summarize the incident thread"
+    )
+
+
+def test_cancel_by_a_non_author_relays_the_403_plainly(tool):
+    detail = "Only the task's author can cancel it."
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/tasks/{T_ONE}").mock(
+            return_value=httpx.Response(200, json={"task": a_task()})
+        )
+        mock.post(f"{BC_URL}/tasks/{T_ONE}/cancellation").mock(
+            return_value=problem(403, "not_task_author", detail)
+        )
+        result = tool.run(action="cancel", uuid=T_ONE)
+
+    assert result == f"Error: couldn't cancel task {T_ONE}: {detail}"
+
+
+def test_cancel_of_a_task_no_longer_pending_relays_the_409_plainly(tool):
+    detail = "This task is no longer pending (it is activated), so it can't be cancelled."
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/tasks/{T_TWO}").mock(
+            return_value=httpx.Response(200, json={"task": another_task()})
+        )
+        mock.post(f"{BC_URL}/tasks/{T_TWO}/cancellation").mock(
+            return_value=problem(409, "task_not_pending", detail)
+        )
+        result = tool.run(action="cancel", uuid=T_TWO)
+
+    assert result == f"Error: couldn't cancel task {T_TWO}: {detail}"
+
+
+def test_cancel_of_a_task_it_cannot_see_relays_the_404_without_posting(tool):
+    detail = "Task not found."
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/tasks/{T_ONE}").mock(return_value=problem(404, "not_found", detail))
+        result = tool.run(action="cancel", uuid=T_ONE)
+
+    assert result == f"Error: couldn't cancel task {T_ONE}: {detail}"
+
+
+def test_cancel_without_a_uuid_is_a_friendly_error_and_calls_nothing(tool):
+    with respx.mock(assert_all_mocked=True):  # any request would fail as unmocked
+        assert tool.run(action="cancel") == (
+            "Error: 'cancel' needs the task's uuid. Use 'list' to find it."
+        )
+
+
+def test_the_schema_offers_cancel_and_says_uuid_serves_it(tool):
+    props = TasksTool.parameters["properties"]
+    assert props["action"]["enum"] == ["create", "list", "read", "cancel"]
+    assert "read and cancel" in props["uuid"]["description"]
+    assert "action='cancel'" in TasksTool.description
+
+
 # --- cross-timeline + validation + binding -----------------------------------
 
 
