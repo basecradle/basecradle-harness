@@ -1,4 +1,4 @@
-"""Give the agent posts with a send time: create, list, and read tasks on a timeline.
+"""Give the agent posts with a send time: create, list, read, and cancel tasks on a timeline.
 
 The second tool that acts *on* the platform, and the proof that the seam from
 `_assets.py` generalizes: this is a plain `PlatformTool` subclass with **no new
@@ -11,7 +11,7 @@ activation time, a status, and an author. Every viewer of its timeline can read 
 from the moment it is created and is woken by it when it activates, so its
 instructions are written to the room, each addressed by @handle to whoever should
 act on it, the author included when the work is its own. Every rendering below
-names the author. Three actions, the task equivalent of what a human peer does:
+names the author. Four actions, the task equivalent of what a human peer does:
 
 - **list** — what tasks are here, with the uuids needed to read them, each with
   its status and activation time.
@@ -19,10 +19,17 @@ names the author. Three actions, the task equivalent of what a human peer does:
   activates, and its current status.
 - **create** — post a task from instructions the agent produced, with the
   time it should activate.
+- **cancel** — withdraw one of the agent's own **pending** tasks by uuid before it
+  activates (issue #675). It is what makes the dead man's switch buildable: schedule
+  a task, then cancel-and-reschedule it at every check-in, so the last one fires only
+  if the agent stops. The platform refuses a task someone else wrote (403) or one that
+  is no longer pending (409), and both refusals come back as a plain `Error:` line.
+  **Deliberately not a `confirm=` tool**, unlike lock and delete: those destroy other
+  viewers' content, while a cancel removes only the caller's own unfired task.
 
 Ops default to the **current** timeline (the one the agent is engaged on); an
-explicit `timeline` uuid handles the rare cross-timeline case. (A `read` is by a
-task's own uuid, so it spans timelines you can view without an extra argument.)
+explicit `timeline` uuid handles the rare cross-timeline case. (A `read` or a `cancel`
+is by a task's own uuid, so it spans timelines you can view without an extra argument.)
 
 The one thing a task needs that an asset doesn't is **when to activate**, and
 `activate_at` is required. To read cleanly for a conversational agent, this tool
@@ -48,8 +55,10 @@ import itertools
 import re
 from datetime import datetime, timedelta, timezone
 
+from basecradle import BaseCradleError
+
 from basecradle_harness._idempotency import TASK
-from basecradle_harness._platform import PlatformTool
+from basecradle_harness._platform import PlatformTool, explain
 
 # How many tasks one `list` returns. The cap keeps a pathological timeline from
 # flooding the model's context; when it bites, the reply says there may be more.
@@ -65,7 +74,7 @@ _UNIT_SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
 
 
 class TasksTool(PlatformTool):
-    """Create, list, and read scheduled tasks on the agent's current timeline.
+    """Create, list, read, and cancel scheduled tasks on the agent's current timeline.
 
     A `PlatformTool`: the hosting agent binds the SDK client and current-timeline
     uuid before the loop runs. Until bound, `run` reports it is not connected (via
@@ -79,7 +88,9 @@ class TasksTool(PlatformTool):
         "instruction addressed by @handle (name yourself for your own follow-up). "
         "action='create' posts a task from the instructions you give and an activation time "
         "(activate_at); action='list' shows the tasks here with their uuids, status, "
-        "activation time, and author; action='read' returns one task in full by uuid. "
+        "activation time, and author; action='read' returns one task in full by uuid; "
+        "action='cancel' withdraws one of your own pending tasks by uuid before it activates "
+        "(cancel and re-create to reschedule). "
         "activate_at takes a relative offset like '+90m', '+2h', or '+1d' (seconds, "
         "minutes, hours, days, weeks — resolved from now), or an absolute ISO-8601 "
         "timestamp like '2026-06-10T15:00:00Z'. "
@@ -92,12 +103,12 @@ class TasksTool(PlatformTool):
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["create", "list", "read"],
+                "enum": ["create", "list", "read", "cancel"],
                 "description": "What to do.",
             },
             "uuid": {
                 "type": "string",
-                "description": "The task's uuid (read only). Get it from 'list'.",
+                "description": "The task's uuid (read and cancel). Get it from 'list'.",
             },
             "instructions": {
                 "type": "string",
@@ -149,7 +160,11 @@ class TasksTool(PlatformTool):
             if not uuid:
                 return "Error: 'read' needs the task's uuid. Use 'list' to find it."
             return self._read(uuid)
-        return f"Error: unknown action {action!r}. Use 'create', 'list', or 'read'."
+        if action == "cancel":
+            if not uuid:
+                return "Error: 'cancel' needs the task's uuid. Use 'list' to find it."
+            return self._cancel(uuid)
+        return f"Error: unknown action {action!r}. Use 'create', 'list', 'read', or 'cancel'."
 
     # --- create --------------------------------------------------------------
 
@@ -204,6 +219,24 @@ class TasksTool(PlatformTool):
             f"uuid={content.uuid} · status={content.status} · "
             f"activate_at={content.activate_at} · by @{task.user.handle}\n\n{content.instructions}"
         )
+
+    # --- cancel --------------------------------------------------------------
+
+    def _cancel(self, uuid: str) -> str:
+        """Withdraw a pending task. A platform refusal is relayed, never raised.
+
+        The two refusals the model can act on — not the author (403), no longer pending
+        (409) — arrive as the platform's own sentence, as does a uuid that names no task
+        it can see (404). Not recorded with `acted`: a cancel puts nothing new on the
+        timeline, the same as lock and delete.
+        """
+        client = self.context.client
+        try:
+            task = client.tasks.get(uuid)
+            task.cancel()
+        except BaseCradleError as error:
+            return f"Error: couldn't cancel task {uuid}: {explain(error)}"
+        return f"Cancelled the task. {_describe(task)}"
 
 
 # --- shared rendering / normalization helpers --------------------------------

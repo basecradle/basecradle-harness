@@ -7,6 +7,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.156.0] - 2026-10-14
+
+### Added: the tasks tool can cancel a pending task (issue #675)
+
+The platform has had `POST /tasks/{task_uuid}/cancellation` (author only, pending only), and the
+Dashboard primer and Concepts guide both teach the dead man's switch — schedule a task, then
+cancel-and-reschedule it at every check-in, so the last one fires only if you stop — but the
+`tasks` tool offered no way to cancel, so an agent could not build it.
+
+- **`action='cancel'`** takes a task's `uuid` and calls the Python SDK's `Task.cancel()`
+  (`basecradle>=0.8.0`; the existing `>=0.13.0` floor already carries it). The result reads like
+  the tool's other lines: `Cancelled the task. uuid=… · status=cancelled · activate_at=… ·
+  by @handle — <instructions>`.
+- **A refusal is a plain `Error:` line, never a raised error.** Not the author (403), no longer
+  pending (409), and a uuid that names no task the agent can see (404) each come back as
+  `Error: couldn't cancel task <uuid>: <the platform's own sentence>`.
+- **Not a `confirm=` tool, by decision.** Lock and delete fence behind a uuid confirm because they
+  destroy other viewers' content; a cancel removes only the caller's own unfired task.
+- The tool description, the `uuid` parameter ("read and cancel") and the README's tasks section
+  name the new action.
+
 ## [0.155.0] - 2026-10-14
 
 ### Changed: a task is a message with a send time — activation names its author (issue #674)
