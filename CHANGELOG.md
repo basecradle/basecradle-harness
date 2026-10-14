@@ -7,6 +7,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.155.0] - 2026-10-14
+
+### Changed: a task is a message with a send time — activation names its author (issue #674)
+
+A task reaches every viewer of its timeline when it activates, and the harness told every one of
+them *"A task you scheduled has activated … Carry out its instructions"*. On 2026-10-07 `@briggs`
+scheduled a rotation of his own GitHub PAT on a shared timeline; `@rowan` was told he had scheduled
+it, went looking for `@briggs`'s credential folder, and asked `@origin` for `@briggs`'s
+credentials. Per `@origin`'s ruling (2026-10-14), a task is a message with a send time: it has an
+author, every viewer can read it from creation and is woken by it at activation, and its
+instructions address each `@handle` who should act, the author included when the work is its own.
+
+- **The activation turn** is one rendering for every viewer, author included:
+  `[<created_at>] A task scheduled by @<author> has activated and is now in front of every viewer
+  of this timeline (task <uuid>, scheduled for <activate_at>). Act on whatever it addresses to
+  you:` followed by the instructions. The header/instructions split of issue #438 is unchanged:
+  the header is mined as provenance, the hint is not.
+- **The no-reply informer reads a task's mentions from its instructions only.** The header's
+  `@author` would otherwise arm the mention nudge for the author on every activation of its own
+  task, including a task it addressed to someone else.
+- **`initialize.md`** gains *"A task is a post you make to the timeline later, never a private
+  alarm."* ahead of the existing task bullet; the shared-workspace bullet now names messages,
+  assets, and tasks; *"To schedule work, `tasks`."* is now *"To post something later, `tasks`."*
+  An installed config home picks this up through the usual conffile upgrade (an operator-edited
+  copy gets `initialize.md.new` beside it).
+- **The `tasks` tool** restates its description and the `instructions` parameter on the same
+  concept, and `create`, `list` and `read` name each task's author (`· by @<handle>`).
+- **The step-budget brief and the low-steps step note** now say "schedule a follow-up task
+  addressed to yourself".
+- **The reason a task never arms the one-on-one nudge is now written down correctly** (code and
+  `CLAUDE.md`): the arm infers a bare message on a 1-on-1 is for the other viewer because a
+  message is never for its own author, and a task can be. The behavior is unchanged.
+
 ## [0.154.0] - 2026-10-12
 
 ### Added: `--resolved-config` reports the provider the overlay was reconciled for (issue #672)

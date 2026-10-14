@@ -109,6 +109,7 @@ def test_create_with_a_relative_offset_normalizes_against_now(tool, monkeypatch)
         )
 
     assert "Scheduled a task" in result
+    assert "· by @nova — Summarize the incident thread" in result  # names its author (#674)
     # +2h from a fixed noon resolves to 14:00 UTC, sent as an absolute timestamp.
     assert captured["body"]["task"]["activate_at"] == "2026-06-09T14:00:00+00:00"
     assert captured["body"]["task"]["instructions"] == "Summarize the incident thread"
@@ -165,6 +166,7 @@ def test_list_renders_each_task_with_its_uuid_status_and_time(tool):
     assert "pending" in result
     assert "activated" in result
     assert "2026-06-10T15:00:00Z" in result
+    assert result.count("· by @nova — ") == 2  # every line names its author (issue #674)
 
 
 def test_list_on_an_empty_timeline_says_so(tool):
@@ -229,6 +231,7 @@ def test_read_returns_the_full_task(tool):
     assert full in result  # the whole body, not a preview
     assert T_ONE in result
     assert "pending" in result
+    assert result.split("\n\n")[0].endswith(" · by @nova")  # the header names the author (#674)
 
 
 def test_read_without_a_uuid_is_a_friendly_error(tool):

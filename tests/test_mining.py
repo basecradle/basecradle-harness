@@ -365,6 +365,7 @@ def _asset():
 def _task():
     return _Content(
         created_at="2026-08-29T12:00:00Z",
+        user=_Content(handle="nova"),
         content=_Content(
             uuid=TASK_UUID,
             activate_at="2026-08-29T12:00:00Z",
@@ -392,7 +393,7 @@ def _event():
     ("item", "kind", "framing", "content"),
     [
         (_asset(), wake_module._ASSETS, "Use the assets tool", "skyline.png"),
-        (_task(), wake_module._TASKS, "Carry out its instructions", "Post the weekly report."),
+        (_task(), wake_module._TASKS, "Act on whatever it addresses", "Post the weekly report."),
         (_event(), wake_module._EVENTS, "Decide whether and how", '{"ok":true}'),
     ],
 )

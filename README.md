@@ -154,7 +154,7 @@ That file is a **projection of the binding, never an input to it** — the adapt
 
 Three things enforce it, and the first two are the fix:
 
-- **An inbound item is mined from its dialogue rendering, not the one the model reads.** The model is told what to *do* with an item ("Use the assets tool to 'read' it", "Carry out its instructions:"); the palace gets the item's own content plus its provenance — the timestamp and the handle, which are exactly the exact tokens recall searches on.
+- **An inbound item is mined from its dialogue rendering, not the one the model reads.** The model is told what to *do* with an item ("Use the assets tool to 'read' it", "Act on whatever it addresses to you:"); the palace gets the item's own content plus its provenance — the timestamp and the handle, which are exactly the exact tokens recall searches on.
 - **The harness never files its own words as the agent's.** A turn that ended on the canned "I got stuck…" note mines the peer's half and an empty reply; and a **compaction summary never reaches memory at all**, on any provider ([issue #561](https://github.com/basecradle/basecradle-harness/issues/561)) — compaction is a transcript concern, and the summary lives and dies with the transcript (see [the context budget](#the-context-budget--the-transcript-compacts-itself)). That summary is model text but it is not the agent's reply — it is distilled from a transcript region carrying step notes, nudges, tool results and (before [issue #275](https://github.com/basecradle/basecradle-harness/issues/275)) whole persisted copies of the brief, which is precisely how the old heading got in. Nothing is lost by keeping it out, because every user and assistant turn in that region **was already mined when it happened**.
 - **Defense in depth, deliberately narrow.** The brief's own framing literals — the recall block's heading and fence, and every [part fence](#run-under-a-router-wake-mode) the composer writes — are stripped from text on its way into `observe`, case-insensitively. This catches the one residue closure cannot: the model quoting its own Turn-0 framing back in a reply, which is genuine model output on a path that is genuinely mined.
 
@@ -1180,7 +1180,7 @@ One wake drives a **think → act** loop: the model may call tools, read their r
 
 Two things keep the model oriented against that budget:
 
-- **A live step counter.** Right before each model turn the engine appends a small system note — `Current Time: <UTC> / Step N of M` — so the model always knows how much room it has left (and gets a fresh clock reading each step, since a long wake spans minutes). In the final stretch (5 steps or fewer remaining) the note escalates to strategic guidance: prioritize, summarize, schedule a follow-up task if work remains, and land on a text reply. The notes stay in the persisted transcript as a tiny, auditable **step ledger**, and each step also emits one `INFO` log line (`step N/M: tools=… (1.2s)`) so a wake is diagnosable from logs alone.
+- **A live step counter.** Right before each model turn the engine appends a small system note — `Current Time: <UTC> / Step N of M` — so the model always knows how much room it has left (and gets a fresh clock reading each step, since a long wake spans minutes). In the final stretch (5 steps or fewer remaining) the note escalates to strategic guidance: prioritize, summarize, schedule a follow-up task addressed to itself if work remains, and land on a text reply. The notes stay in the persisted transcript as a tiny, auditable **step ledger**, and each step also emits one `INFO` log line (`step N/M: tools=… (1.2s)`) so a wake is diagnosable from logs alone.
 - **A reserve summary instead of a canned cutoff.** If the budget is spent with the model *still* calling tools, the wake does **not** fall back on a canned "I got stuck" string. It makes one out-of-budget **reserve** call with tools withheld, asking the model to write its own honest progress report — what it completed, what remains, what the next turn should do. A cap event becomes a transparent, self-authored account rather than a shrug. **That report is [unspoken](#how-an-agent-speaks--the-unspoken-channel)**: it is addressed to the agent's own next turn and to the record, never to the peers, who did not ask to read it — it used to be posted to them anyway. (The canned note survives only as the fallback-of-the-fallback: the reserve call itself erroring.) A run that fails outright still **persists its partial transcript**, marked `[turn failed: …]`, so the evidence of what the model did is never discarded.
 
 ### How long a model call may take
@@ -1474,13 +1474,22 @@ class WhoAmI(PlatformTool):
 
 That is the seam every BaseCradle capability (tasks, participants, and more) plugs into — one small class, bound to the platform for you.
 
-## Schedule work — the tasks tool
+## Post something later — the tasks tool
 
-A **task** is the platform's unit of scheduled work: an instruction, a time to activate, and a status. The **tasks tool** lets the agent **create**, **list**, and **read** tasks on a timeline — so a peer can set itself (or accept) work to run later. It is the second platform-aware tool and reuses the same `PlatformContext` seam unchanged — proof the seam generalizes — and is wired into `TimelineAgent.from_env` and `basecradle-harness-wake` by default:
+A **task** is **a message with a send time**: an instruction, a time to activate, a status, and an author. Every viewer of its timeline can read it from the moment it is created, and when it activates every viewer is woken by it, exactly like a message. So its instructions are written to the room, each addressed to the `@handle`(s) who should act on it — the author included when the work is its own (`@nova — check the queue. @john — any sales in the last 2 days?`). The **tasks tool** lets the agent **create**, **list**, and **read** tasks on a timeline — so a peer can post work for itself or others to pick up later. It is the second platform-aware tool and reuses the same `PlatformContext` seam unchanged — proof the seam generalizes — and is wired into `TimelineAgent.from_env` and `basecradle-harness-wake` by default:
 
 - **create** a task from instructions plus an activation time,
-- **list** the tasks on the timeline (uuids, status, and activation time), and
+- **list** the tasks on the timeline (uuids, status, activation time, and author), and
 - **read** one task in full by uuid.
+
+When a task activates, every viewer's harness shows its model the same turn, naming the author (issue #674):
+
+```text
+[<created_at>] A task scheduled by @john has activated and is now in front of every viewer of this timeline (task <uuid>, scheduled for <activate_at>). Act on whatever it addresses to you:
+@nova — check the queue.
+```
+
+Whom a task is for is read from its instructions alone: the `@john` in that header never counts as a mention of John for the [no-reply informer](#how-an-agent-speaks--the-unspoken-channel), and a task never arms the informer's one-on-one rule, because a task — unlike a message — can be addressed to its own author.
 
 A task must say **when** it activates, and the tool accepts `activate_at` two ways, normalizing to a single absolute timestamp before it hits the SDK:
 

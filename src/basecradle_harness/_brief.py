@@ -465,8 +465,8 @@ def render_budget(max_steps: int | None) -> str | None:
         "stand. The budget is per-turn and resets on your next wake. Treat it as a hard "
         "constraint: end with plain text before it runs out — and remember that anything you "
         "mean a peer to see must be posted with the `messages` tool *before* then, since your "
-        "closing text is unspoken. If work remains, schedule a follow-up task so the next turn "
-        "continues it."
+        "closing text is unspoken. If work remains, schedule a follow-up task addressed to "
+        "yourself so the next turn continues it."
     )
 
 
