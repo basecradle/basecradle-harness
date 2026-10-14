@@ -5284,11 +5284,13 @@ def _activated_task_text(task: object) -> str:
     rotation told him he had scheduled it. There is no self case: the author reads its own handle
     and knows it from the Dashboard.
 
-    The leading ``[created_at]`` stamp is the task **item**'s own timeline timestamp. A task's
-    Item is created when it *activates* (the platform's `Task::ActivationJob` inserts the Item
-    in the same transaction it flips the task to activated), not when it was scheduled — so
-    this reads ≈ now, consistent with every other inbound item, never "days ago." The
-    complementary ``scheduled for {activate_at}`` text stays.
+    The leading ``[created_at]`` stamp is when the task was **created** — when its author wrote
+    it — and ``scheduled for {activate_at}`` is its send time. Read against the brief's `Current
+    Time:` anchor, the two say how long ago it was written and when it was due. (This docstring
+    used to say the platform inserts a task's Item only at activation, so the stamp read ≈ now.
+    The live proof wake for issue #674 measured otherwise on 2026-10-14: a task created at
+    21:28:22 and due at 21:28:42 carried ``created_at`` 21:28:22.878Z, the moment of the create.
+    That fits the ruling: a task is a message with a send time, written when it is created.)
     """
     content = task.content
     return _task_dialogue(task) + _TASK_ACT_HINT + f"\n{content.instructions}"

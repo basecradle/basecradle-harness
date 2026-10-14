@@ -4362,8 +4362,8 @@ def test_a_delivery_on_the_agents_own_endpoint_is_not_a_mention_of_it():
 
 
 def test_activated_task_is_timestamped():
-    # The task ITEM's created_at is its activation moment (≈ now), not when it was
-    # scheduled — so the stamp reads consistent with every other inbound item.
+    # The stamp is the task's own created_at (when its author wrote it); the activation time
+    # rides beside it as `scheduled for`.
     task = SimpleNamespace(
         created_at=TS,
         user=SimpleNamespace(handle="john"),
