@@ -89,6 +89,8 @@ The guard, applied when adding or auditing any tool tranche:
 - **Withholding is allowed only as an explicit, documented, sanctioned exception** — never by oversight. If a power is deliberately *not* exposed (too dangerous for the safe default, gated to the unlocked profile, founder decision), say so in the code/docs with the reason. Silence is the defect; a stated exception is fine.
 - **An irreversible owner power still ships** — it ships *guarded* (see the `ConfirmedTimelineAction` uuid-confirm + preview gate that lock and delete share), not omitted. Parity is the default even for the dangerous powers; the safety lives in the gate, not in withholding the capability.
 
+**One documented exception: Contact Messages.** The platform's admin-only Contact Messages surface, which the SDKs expose, is deliberately not a harness tool (@origin, 2026-10-16); the reasoning, and the care any future tool for it must take to stay unmistakable from the `messages` tool, are recorded in [issue #679](https://github.com/basecradle/basecradle-harness/issues/679).
+
 (This same principle is settled fleet law — `constitution.md` → How We Build (the capability-parity bullet) and the core `CLAUDE.md` → Architecture Decisions; this is its harness-local procedural form.)
 
 ## Context Discipline (Recurrence Guard)
