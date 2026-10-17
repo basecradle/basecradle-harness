@@ -417,10 +417,14 @@ REGIONAL_BASE_URL = (
     else "https://us.openrouter.ai/api/v1"
 )
 
-#: A model with **no endpoint in the US or EU region** — measured 2026-10-05: one endpoint, served
-#: outside both. A dated fact about the pool, not about this code: the day it gains an endpoint in
-#: the region, the call below is answered rather than refused, and the assertion says so.
-OUT_OF_REGION_MODEL = "qwen/qwen3-max"
+#: A model with **no endpoint in the US or EU region** — measured 2026-10-17: one endpoint, Alibaba's,
+#: tagged bare ``alibaba`` with no region, served outside both. A dated fact about the pool, not about
+#: this code: the day it gains an endpoint in the region, the call below is answered rather than
+#: refused, and the assertion says so; the day it loses its last endpoint, the refusal reads
+#: ``config:model_not_found`` instead. Both have happened: ``qwen/qwen3-max`` (measured 2026-10-05)
+#: was deprecated on 2026-10-09 with no endpoint left (issue #682), and its successor
+#: ``qwen/qwen3.8-max-0902`` carries an ``alibaba/us-east-1`` endpoint the US host serves.
+OUT_OF_REGION_MODEL = "qwen/qwen-plus"
 
 
 def _live_refusal(caplog, *, model, providers, base_url):
