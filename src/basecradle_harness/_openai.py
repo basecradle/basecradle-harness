@@ -14,7 +14,7 @@ Two surfaces, one adapter
 - ``"responses"`` (the default, @jt's surface) → ``client.responses.create``. The only path
   that runs server-side built-ins (``web_search``) and the path that sees images.
 - ``"chat"`` → ``client.chat.completions.create``. The portable Chat Completions surface, for
-  an OpenAI-compatible endpoint (a later milestone's OpenRouter) that lacks Responses.
+  an OpenAI-compatible endpoint (a generic vendor) that lacks Responses.
 
 The wire translation for both is the shared, transport-free `basecradle_harness._openai_wire`
 — so this class is just *SDK plumbing*: build the request dict, call the SDK, parse
