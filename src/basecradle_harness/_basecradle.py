@@ -704,8 +704,8 @@ def _require_generic_sdk(provider: str, sdk: str) -> None:
 #: ``surface`` is an **SDK-scoped** concept: each SDK adapter declares its own allowed
 #: ``SURFACES`` and ``DEFAULT_SURFACE`` (so the *next* multi-surface SDK follows the same
 #: contract without re-litigation), keyed by the ``AI_SDK`` package name. ``AI_SDK_SURFACE``
-#: selects among the active adapter's surfaces; a single-surface SDK simply isn't listed here
-#: (no surfaces to pick from) and never sets the var. v0 ships only the ``openai`` adapter.
+#: selects among the active adapter's surfaces. Every shipped SDK is listed; a single-surface
+#: SDK declares a one-element set, so the var is left unset for it and any other value fails.
 _SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
     "openai": (OPENAI_SURFACES, OPENAI_DEFAULT_SURFACE),
     # The native xai-sdk speaks a single (gRPC) surface; `AI_SDK_SURFACE` is left unset for it,

@@ -1,4 +1,4 @@
-"""The ``openai`` vendor-SDK adapter — the one provider adapter v0 ships.
+"""The ``openai`` vendor-SDK adapter — the default ``AI_SDK``, and the generic profile's.
 
 The harness reaches an LLM **only through a vendor's official SDK**, never hand-rolled HTTP.
 This is that adapter for ``AI_SDK=openai``: a thin wrapper over the real ``openai`` package

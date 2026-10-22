@@ -57,7 +57,7 @@ dependencies = [
 # upgrade. `pip install basecradle-harness[openai]` is the @jt / OpenAI stack; with no SDK
 # extra installed the harness comes up with no way to reach a model and says so plainly.
 [project.optional-dependencies]
-# The `openai` vendor SDK (AI_SDK=openai): the one adapter v0 ships. Drives the model loop
+# The `openai` vendor SDK (AI_SDK=openai): the default adapter. Drives the model loop
 # (Responses + Chat Completions), the server-side web_search built-in, vision, and the
 # gpt-image-2 / audio endpoints — all through this package, no harness-owned HTTP.
 # Pin: floor is the major this adapter is built and tested against (3.x); major-capped so a
