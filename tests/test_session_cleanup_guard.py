@@ -1124,3 +1124,17 @@ def test_the_guard_never_pipes_into_a_short_circuiting_consumer():
         code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
         offenders = [m.group(0) for m in pattern.finditer(code)]
         assert not offenders, f"{path.name}: {offenders}"
+
+
+def test_the_guard_scripts_are_shellcheck_clean():
+    """``"$guard" done`` read to shellcheck as a stray loop keyword (SC1010). Every shellcheck
+    finding fails here, not only that one. CI's runner image carries shellcheck, so there it is
+    required; a laptop without it skips."""
+    shellcheck = shutil.which("shellcheck")
+    if shellcheck is None:
+        assert not os.environ.get("CI"), "shellcheck is missing on the CI runner"
+        pytest.skip("shellcheck is not installed")
+    got = subprocess.run(
+        [shellcheck, str(GUARD), str(SELF_EXIT)], check=False, capture_output=True, text=True
+    )
+    assert got.returncode == 0, got.stdout
