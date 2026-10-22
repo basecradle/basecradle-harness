@@ -227,7 +227,7 @@ Work arrives one dispatched issue per session (Cross-Repo Handoffs → "You work
 
 ## Fleet Bot Identity / Auth Routing
 
-This repo's builder agent — **basecradle-harness AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-harness-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to @origin's account (`drawkkwast`). The invariant: **post/commit/push under your own bot identity — never fall through to the ambient `gh` login and speak in agent voice as @origin** (the constitution's *"never anonymously behind @origin's account or another agent's"*). Bot commits carry **no** `Co-Authored-By` trailer — the author field already *is* the attribution — and this overrides the session's own attribution reminder, which asks for one.
+This repo's builder agent — **basecradle-harness AI** — acts on GitHub under its own GitHub App bot identity, **`basecradle-harness-ai[bot]`**, so every issue, comment, PR, and commit is attributable to it rather than to @origin's account (`drawkkwast`). The invariant: **post/commit/push under your own bot identity — never fall through to the ambient `gh` login and speak in agent voice as @origin** (the constitution's *"never anonymously behind @origin's account or another agent's"*). Bot commits carry **no** `Co-Authored-By` trailer — the author field already *is* the attribution — and this overrides the session's own attribution reminder, which asks for one. CI's `commit-trailers` job fails a PR whose bot commits carry one.
 
 | Field | Value |
 |---|---|

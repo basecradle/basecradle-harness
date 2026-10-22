@@ -60,12 +60,83 @@ jobs:
       - name: Check release coherence
         run: python3 scripts/check_release.py repo
 
+  # Fleet Bot Identity: a commit authored by this repo's bot carries no Co-Authored-By
+  # trailer — the commit author already *is* the agent. Every session is handed an
+  # attribution reminder asking for one, so the rule is enforced here rather than trusted
+  # to the text (issue #700; the job is basecradle-python's, where the text alone was
+  # violated five times across three sessions).
+  trailers:
+    name: commit-trailers
+    runs-on: ubuntu-latest
+    steps:
+      # Both steps are gated on the event rather than the job: a job that *skips* would
+      # fail the CI gate below, which counts a skip as a failure. All-steps-skipped still
+      # reports success.
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+        with:
+          # Walking base..head needs both ends present in the clone.
+          fetch-depth: 0
+      - name: No Co-Authored-By on bot commits
+        if: github.event_name == 'pull_request'
+        env:
+          BOT: basecradle-harness-ai[bot]
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # Single source of truth: the identity is CLAUDE.md's to state. If it changes
+          # there and not here, the author filter below would quietly match nothing and
+          # the guard would pass everything — fail instead.
+          grep -qF "$BOT" CLAUDE.md || {
+            echo "::error::$BOT is no longer the commit-author in CLAUDE.md -> Fleet Bot Identity. Update this check to match."
+            exit 1
+          }
+
+          # Only the commits this PR contributes: reachable from the head and not from
+          # the base branch. The live base ref is excluded alongside the event's
+          # point-in-time base.sha, so a branch that merged main in never re-litigates
+          # main's own commits — GitHub's squash-merge adds a self-co-author trailer to
+          # every one of them, and they can never be rewritten. For the same reason this
+          # must never be widened to push events.
+          excludes=("$BASE_SHA")
+          if git rev-parse --verify --quiet "refs/remotes/origin/$BASE_REF" >/dev/null; then
+            excludes+=("refs/remotes/origin/$BASE_REF")
+          fi
+
+          bad=()
+          shas=$(git log --format=%H "$HEAD_SHA" --not "${excludes[@]}")
+          for sha in $shas; do
+            # Each git call is its own assignment so that a failure trips set -e; inside
+            # a `case` word or before `||` it would not, and the commit would be skipped
+            # unexamined.
+            author=$(git show -s --format='%an <%ae>' "$sha")
+            # Quoted, so the [bot] brackets stay literal and are not a glob class.
+            case "$author" in *"$BOT"*) ;; *) continue ;; esac
+            # The whole message, not git's %(trailers:...) — that parses only the final
+            # paragraph, so a trailer with any paragraph after it slips through. A
+            # line-anchored scan fails closed instead. A here-string, never a pipe: under
+            # pipefail, `grep -q` exits on its first match, the writer can die of SIGPIPE,
+            # and the pipeline's failure would read as "no trailer" (basecradle#707).
+            message=$(git show -s --format=%B "$sha")
+            if grep -qi '^Co-Authored-By:' <<< "$message"; then
+              bad+=("$(git show -s --format='%h %s' "$sha")")
+            fi
+          done
+
+          for commit in "${bad[@]}"; do
+            echo "::error::Fleet Bot Identity: $commit carries a Co-Authored-By trailer. A commit authored by $BOT carries none — rewrite the message without it."
+          done
+          [ ${#bad[@]} -eq 0 ]
+
   # The gate: the single required status check in branch protection.
   # Adding or dropping Python versions never requires a ruleset change.
   ci:
     name: CI
     runs-on: ubuntu-latest
-    needs: [lint, test, changelog]
+    needs: [lint, test, changelog, trailers]
     if: always()
     steps:
       - name: Fail unless every required job succeeded
