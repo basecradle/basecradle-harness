@@ -208,7 +208,7 @@ Runtime dependencies start at `basecradle` (the SDK) plus `httpx` — declared b
   The one place we delete *inside* an agent's own memory is **`basecradle-harness-scrub-palace`**, and it is an application of this rule rather than an exception to it: everything it removes is **harness-composed scaffolding the harness itself wrongly mined** (#438) — our towels, left in the guest's suitcase. Four properties earn it that standing, and they are the bar for anything that ever wants to follow it: it reports by default and deletes only on an explicit `--apply`; it matches exact literals assembled from the constants *we* write, never a heuristic; it holds a whole source file unless **every** drawer that file mined is ours (#444); and it unlinks only inside that palace's own `conversations` wing, proven by a resolved-path containment test rather than a string prefix. A cleanup that cannot make all four claims is not this tool and does not get to borrow its licence.
 - **Bot-authored fleet commits carry no `Co-Authored-By` trailer.** When the commit author already *is* the fleet agent (`basecradle-harness-ai[bot]`), a co-author trailer is redundant and wrong — the author field is the attribution. (Commits authored by a human keep whatever trailer their tooling adds.)
 - **A user-facing change updates `README.md` in the same PR.** For this package the **README is the user-facing doc** (the principle is `constitution.md` → Truth in Documentation; where the capital's own Documentation Maintenance convention names `docs/api.md` / `docs/user_guide.md`, this repo's equivalent is `README.md`). A new tool, provider, provider profile, env var, or any change to onboarding/usage **must** update `README.md` in the *same* PR that ships it — same-PR currency, no "docs later." This is a standing PR definition-of-done item: a feature that lands with stale onboarding docs is not done. (Root cause this guards against: PRs #140/#143 updated `CLAUDE.md` + `CHANGELOG` but not the README, drifting it ~2 releases behind — issue #147.)
-- **Lint: this repo tracks ruff's *default* rule set — it never freezes a `select` list.** Ruff 0.16 took the defaults from 59 rules to 413 (issue #367), and a later release can move them again. Tracking them is deliberate: with no `select`, a rule ruff newly adopts arrives as a **red Dependabot PR to be worked**, not as signal quietly never enabled — and pinning `ruff<X` to make the red go away trades a visible, fixable debt for an invisible one. `[tool.ruff.lint].ignore` in `pyproject.toml` is the deliberate other half: the rules this repo does *not* adopt, **each carrying its reason** — nothing is suppressed silently, there or at a call site. The split is by *scope*: a rule that is wrong for this repo as an architectural stance (the `Tool` contract's `parameters`, the ledger's always-quoted `Decimal`, `__all__` grouped by concept, the parse boundaries' uniform `ValueError`) is ignored globally with that stance written down; a one-off exception to a rule that *is* adopted gets a per-site `noqa` **with a reason**, so a future accident still trips the rule. `extend-select` is the third piece: the few rules held *independently* of the default set — `I`, and `E402`, which was in the pre-0.16 default (`E4`) until ruff's curation dropped it. Tracking the defaults must never silently **cost** coverage the repo already had; a rule ruff removes is re-adopted deliberately or let go deliberately, never by omission. The `ruff` dev-dep floor is a correctness constraint, not a preference: it must be ≥ the version the `ignore` list and the `noqa`s were written against, or a contributor lints a different repo than CI does. Note that ruff also formats Python inside Markdown as of 0.16, so `README.md`'s example blocks are held to the same formatter as the package.
+- **Lint: this repo tracks ruff's *default* rule set — it never freezes a `select` list.** A rule ruff newly adopts arrives as a **red Dependabot PR to be worked**, never silenced by pinning `ruff<X`. `[tool.ruff.lint].ignore` in `pyproject.toml` lists the rules this repo does *not* adopt, **each carrying its reason** — a rule wrong for the repo as an architectural stance is ignored globally with that stance written down; a one-off exception to an adopted rule is a per-site `noqa` **with a reason**. `extend-select` holds the rules kept *independently* of the default set (`I`, and `E402`, which ruff's curation dropped): tracking the defaults must never silently **cost** coverage the repo already had. The `ruff` dev-dep floor must be ≥ the version the `ignore` list and the `noqa`s were written against, or a contributor lints a different repo than CI does. Ruff also formats Python inside Markdown, so `README.md`'s example blocks are held to the same formatter.
 - **Tests pin invariants** and read like documentation.
 - **Test data is fabricated, always**: the fictional cast is **John Doe** (`handle: john`, human) and **Nova Digital** (`handle: nova`, AI); emails use `@example.com`; UUIDs are real, well-formed UUIDv7 values (never `1111…` junk); tokens are correctly-shaped fakes. No real platform data ever appears here.
 - **Tests never hit the live API or a live model.** Both the SDK and the provider are mocked at the transport level. Any live check is its own explicitly-marked job, excluded from the default run.
@@ -222,7 +222,7 @@ Publishing is via PyPI **Trusted Publishing** (GitHub Actions OIDC, zero stored 
 
 Two standing invariants:
 
-- **A release is not done at PyPI — it is not done until the fleet is deployed AND verified live.** PyPI publish is the *middle* of a release: the reference agent **@jt** runs a *deployed* venv that PyPI publication does not touch, and a release that stops at PyPI silently leaves @jt behind — the recurring **released ≠ deployed** failure class. The captain *builds* (and bumps the version) but never *deploys*; the **NOC** is the fleet's sole deployer; the **capital** verifies live and closes. **"Verified live" means a real model wake, never only a token-free check** (`constitution.md` → How We Build, "building is not rest"; @origin, 2026-10-03): `--version` and the probe ack prove the plumbing, and the release is proven by a wake of @jt the capital drives itself on a temporary timeline, exercising what the release changed, its log lines read and the timeline deleted after. Nobody waits for traffic to arrive on its own. **A temporary timeline is deleted only once no wake on it is running** (issue #632): a delete under a live wake fails that wake's next post, and the `ERROR post failed` it logs pages @origin. **A builder's local proof wake runs as the builder's own account, `@basecradle-harness-ai`, never as @jt** (issue #640; @origin, 2026-10-03). Run as @jt, it woke the deployed @jt too, because his account has a live integration: two wakes, two bills, a second agent answering under the same name, and a timeline only the capital could clear for deletion (#632). The builder's account has no integration, so the local build is the only thing that wakes: the builder judges it from its own log lines and its own post, and deletes the timeline itself once that wake has ended. **That holds only while the account has no integration** — if a builder moves to the fleet server and `@basecradle-harness-ai` gets wake notifications, the collision is back, and a separate laptop-only test account is needed before that integration is armed (also on basecradle-noc#91). The procedure is the `harness-release-deploy` skill, step 1. A few dollars of test tokens needs no permission; a test expected to use more than about one million agent-side tokens is put to @origin first, through the capital (a builder raises it with `needs-capital`, never to a founder directly).
+- **A release is not done at PyPI — it is not done until the fleet is deployed AND verified live.** PyPI publish is the *middle* of a release: the reference agent **@jt** runs a *deployed* venv that PyPI publication does not touch, and a release that stops at PyPI silently leaves @jt behind — the recurring **released ≠ deployed** failure class. The captain *builds* (and bumps the version) but never *deploys*; the **NOC** is the fleet's sole deployer; the **capital** verifies live and closes. **"Verified live" means a real model wake, never only a token-free check** (`constitution.md` → How We Build, "building is not rest"; @origin, 2026-10-03): `--version` and the probe ack prove the plumbing, and the release is proven by a wake of @jt the capital drives itself on a temporary timeline, exercising what the release changed, its log lines read and the timeline deleted after. Nobody waits for traffic to arrive on its own. **A temporary timeline is deleted only once no wake on it is running**: a delete under a live wake fails that wake's next post, and the `ERROR post failed` it logs pages @origin. **A builder's local proof wake runs as the builder's own account, `@basecradle-harness-ai`, never as @jt** (@origin, 2026-10-03): @jt's account has a live integration, so a wake under it wakes the deployed @jt too. The builder's account has none, so the builder judges the local build from its own log lines and its own post, and deletes the timeline itself once that wake has ended. **That holds only while the account has no integration** — before `@basecradle-harness-ai` ever gets wake notifications, a separate laptop-only test account is needed (basecradle-noc#91). The procedure is the `harness-release-deploy` skill, step 1. A few dollars of test tokens needs no permission; a test expected to use more than about one million agent-side tokens is put to @origin first, through the capital (a builder raises it with `needs-capital`, never to a founder directly).
 - **No closing keyword on a release PR.** Auto-close fires on merge, before the publish is approved and confirmed live; an issue closed before its work is proven on PyPI is a lie. Close the release issue **by hand, only after it is verified live on PyPI**, recording version + URL in the closing comment.
 
 The full four-owner pipeline (build → capital publishes → NOC converges → capital verifies on @jt), the contractual workflow/env names, and the on-box verify commands live in the **`harness-release-deploy` skill**.
@@ -428,62 +428,9 @@ sweep) is spent provenance and lives in **`docs/harness-internals.md`** — not 
 
 ### Green-While-Absent: the declared set is proven, never assumed (Recurrence Guard)
 
-The whole install/upgrade layer above is written in **observations** — a file is present, a hash
-matches — and an observation cannot tell an operator's deliberate deletion from a capability
-something **stripped**. That is not a gap in a check; it is the absence of one, and it is the
-harness's instance of a fleet-wide failure shape (basecradle#460, five independent instances the
-night of 2026-07-26→27): *fleet observability catches failures that happen; none of these
-happened.* An overlay tool gone, a config home never reconciled after `pip install -U`, a vendor
-tranche pruned by a converge that ran the installer without the agent's `AI_PROVIDER` — none
-raise, none log, none stop the agent. It simply cannot do a thing it believes it can. **Absence
-emits no signal**, so nothing but a prover will ever produce one.
+The install/upgrade layer is written in **observations** — a file is present, a hash matches — and an observation cannot tell an operator's deliberate deletion from a capability something **stripped**. An overlay tool gone, a config home never reconciled after `pip install -U`, a vendor tranche pruned by a converge that ran the installer without the agent's `AI_PROVIDER` (it then filters for `openai`) — none raise, none log, none stop the agent. **Absence emits no signal**, so nothing but a prover will ever produce one.
 
-The floor, and it is not negotiable: **no capability may be claimed without something that turns
-red when it is absent.** `install` writes the claim (`.declared.json`: the grants, the provider
-filtered for, the managed files present when the reconcile finished);
-**`basecradle-harness-verify`** (`_verify.py`) proves it and exits nonzero with a specific
-diagnosis; **`basecradle-harness-claims`** prints the rows for the fleet's claims-vs-evidence
-ledger (Claims Manifest Contract v1 — the **NOC owns that contract**; amendments go up through the
-capital, never peer-to-peer). Four things about it are load-bearing, and each has an "obviously
-fine" broken form:
-
-- **It proves the *declared* set, never pristine-ness.** An operator edit and a reconcile-ratified
-  deletion are both legitimate and neither is a finding. A prover that reddens on legitimate work
-  is switched off inside a week, and a switched-off prover proves nothing.
-- **Unproven is red.** No config home, an unparseable declaration, a declaration from a `contract`
-  this version does not know — every one exits nonzero. "Nothing to check, looks fine" is the
-  original defect wearing a prover's clothes.
-- **A granted power tool's absence is a strip, not a decision — and that inverts an older rule on
-  purpose.** For a benign default an absence is still honored as the operator's deletion; for a
-  *granted* one it is healed (`RESTORED`, reported loudly) and `--revoke-opt-in` is the symmetric
-  way to withdraw. Without that asymmetry a prune erases its own evidence and every later
-  reconcile ratifies it — which is exactly what happened. (The migration is safe in the one
-  direction that matters: the initial grant set is bootstrapped from what is *present* in the
-  overlay, never from what the manifest remembers laying down, so a pre-#374 deletion reads as the
-  retirement it was and is not resurrected.)
-- **The claims are emitted whatever the verdict.** A claim that disappears when it stops being
-  true makes the ledger agree with the box precisely when the box is wrong. **That is why the
-  emitter is its own console script and not a verify flag** (issue #376): the NOC's enumerated-op
-  wrapper runs a component's emitter from its own baked map, as a **bare bin with no arguments**,
-  as the agent's own user under `env -i`, and a bare `basecradle-harness-verify` prints a human
-  report and exits 1 on a finding — right logic, wrong shape for that seam. So
-  `basecradle-harness-claims` (`emit_main`) is a command whose *whole* behavior is "state the
-  claims": no arguments, because the config home comes from `$HOME` and the subject from the OS
-  user, which is what makes the manifest describe the agent it runs as (the wrapper refuses any
-  other subject, so an emitter offering `--subject` would be offering to speak for someone else);
-  and **exit 0 whatever the verdict**, including on a box with no config home at all — refusing
-  there is the tempting inversion and installs *no manifest*, which deletes every row for that
-  agent and turns a specific, probeable `harness-config-home` red into a generic "the emitter
-  failed": green-while-absent reappearing one level up, inside the instrument built to catch it.
-  Nonzero means only *the claims cannot be stated*. Both emitters serialize through one
-  `claims_document`, so "they agree" is construction, not discipline.
-
-What it deliberately does **not** prove is *activation* — a present tool can still be inactive for
-want of a key — because folding that in would make a missing `AI_API_KEY` read as a stripped
-overlay. `--resolved-config` is the authority there, and the split is stated in the report's
-`notes` rather than left in prose. The corollary for anything added to the config home later: **a
-new kind of managed state needs a declaration entry and a check, or it is a capability nobody can
-see the absence of.**
+The floor, and it is not negotiable: **no capability may be claimed without something that turns red when it is absent.** `install` writes the claim (`.declared.json`); **`basecradle-harness-verify`** (`_verify.py`) proves it and exits nonzero with a specific diagnosis; **`basecradle-harness-claims`** prints the rows for the fleet's claims-vs-evidence ledger (Claims Manifest Contract v1 — the **NOC owns that contract**; amendments go up through the capital). Four properties are load-bearing: it proves the **declared** set, never pristine-ness; **unproven is red** (`verify` exits nonzero with no config home, an unparseable declaration, or a `contract` it does not know); **a granted power tool's absence is a strip, not a decision** — the one deliberate exception to the conffile rule's never-resurrect (a benign default's absence is still honored as the operator's deletion) — it is healed (`RESTORED`, loudly) and `--revoke-opt-in` is the only withdrawal; and **the claims are emitted whatever the verdict** (`basecradle-harness-claims` takes no arguments and exits 0 even with no config home — nonzero means only *the claims cannot be stated*). It deliberately does not prove *activation*; `--resolved-config` is the authority there. **A new kind of managed state needs a declaration entry and a check, or it is a capability nobody can see the absence of.** The reasoning behind each property, and the broken form each one forecloses, is in the **`config-home-install` skill**.
 
 ### Security invariants (never relaxed, never moved to a skill)
 
@@ -539,8 +486,7 @@ see the absence of.**
   tool-less **by construction**, never "on unless someone remembered to prune"; any provider/SDK-based
   default would silently arm whoever moves onto that provider next. On upgrade, a powerful tool a prior
   version already scaffolded is **kept, never silently stripped, and reported loudly**. *(Decided
-  by the capital + founder; see [[classify-safety-by-capability-not-provider]]. Granting/pruning
-  mechanics: the `config-home-install` skill.)*
+  by the capital + founder. Granting/pruning mechanics: the `config-home-install` skill.)*
 
   **One capability left this set by founder decision, and it is recorded here rather than left to
   be inferred from an absence** (issue #484, 2026-09-09). `hear_audio` was an opt-in powerful tool
