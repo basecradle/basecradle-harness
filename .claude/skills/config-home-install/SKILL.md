@@ -1,15 +1,14 @@
 ---
 name: config-home-install
-description: Step-by-step procedure for scaffolding and upgrading a Harness config home with basecradle-harness-install — the installer's per-file conffile-upgrade logic, granting powerful tools with --opt-in, retiring one with --revoke-opt-in, proving the result with basecradle-harness-verify, the loud grandfather report, and the per-agent fleet rollout. Use when installing or upgrading a config home, running or debugging basecradle-harness-install or basecradle-harness-verify, deciding how a shipped default reconciles against an operator's edits, granting/retiring an agent's powerful tools, or changing what the installer declares (.declared.json) or what basecradle-harness-verify / basecradle-harness-claims prove and emit. The config-home layout, resolution order, and the two security invariants (capability opt-in fails-closed, MCP safe-by-default) live in CLAUDE.md → Config Home; this skill carries the procedure.
+description: Step-by-step procedure for scaffolding and upgrading a Harness config home with basecradle-harness-install — the installer's per-file conffile-upgrade logic, granting powerful tools with --opt-in, retiring one with --revoke-opt-in, proving the result with basecradle-harness-verify, the loud grandfather report, and the per-agent fleet rollout. Use when installing or upgrading a config home, running or debugging basecradle-harness-install or basecradle-harness-verify, deciding how a shipped default reconciles against an operator's edits, granting/retiring an agent's powerful tools, or changing what the installer declares (.declared.json) or what basecradle-harness-verify / basecradle-harness-claims prove and emit. The config-home layout, resolution order, and the security invariants live in CLAUDE.md → Config Home; this skill carries the procedure.
 ---
 
 # Config Home — Install / Upgrade Procedure
 
 The invariants — the config-home path (`<agent-home>/.config/basecradle/`) and resolution
 order (`--config-home` → `$BASECRADLE_CONFIG_HOME` → `$HOME/.config/basecradle`), the layout
-tree, installer idempotence, the conffile discipline, and the two standing security invariants
-(powerful tools fail closed / opt-in on every provider — #168; MCP safe-by-default) — live in
-`CLAUDE.md` → "Config Home (Install / Upgrade)" and govern at all times. This skill is the
+tree, installer idempotence, the conffile discipline, and the security invariants (CLAUDE.md → Config Home → Security
+invariants) — live in `CLAUDE.md` → "Config Home (Install / Upgrade)" and govern at all times. This skill is the
 step-by-step procedure behind them. Deep mechanics and build history: `docs/harness-internals.md`.
 
 ## The installer — `basecradle-harness-install`
@@ -26,6 +25,11 @@ basecradle-harness-install --config-home <dir>   # scaffold or upgrade
 ```
 
 `agent.env` (the operator's token/keys) is **never created or touched** by the installer.
+
+**Provider filtering.** The installer lays down and prunes each vendor's tool tranche by provider:
+`--provider <slug>`, defaulting to `$AI_PROVIDER` and then to `openai`. Run it without the agent's
+`AI_PROVIDER` and it filters for `openai`, pruning every other vendor's tools — always run it with
+the agent's environment. `--all-providers` lays down every default regardless of provider.
 
 ## Conffile upgrade logic (per shipped default)
 
@@ -47,12 +51,12 @@ removal is listed in the summary as `removed <rel>.new` (issue #526).
 
 ## Granting a powerful tool (`--opt-in`)
 
-Powerful tools (every shipped default whose source declares `opt_in` — the list and the reason
-for each are in `CLAUDE.md` → Security invariants) fail closed and are **not scaffolded** by a
+Powerful tools (every shipped default whose source declares `opt_in` — the list, and why each class
+is powerful, are in `CLAUDE.md` → Security invariants) fail closed and are **not scaffolded** by a
 plain install. To grant one:
 
 ```bash
-basecradle-harness-install --config-home <dir> --opt-in <stems>   # e.g. --opt-in generate_image edit_image
+basecradle-harness-install --config-home <dir> --opt-in <stem,stem>   # e.g. --opt-in generate_image,edit_image
 ```
 
 This scaffolds the named powerful defaults into the agent's `tools/` overlay (equivalently,
@@ -67,7 +71,7 @@ ratified as a deletion.
 ## Retiring a powerful tool (`--revoke-opt-in`)
 
 ```bash
-basecradle-harness-install --config-home <dir> --revoke-opt-in <stems>
+basecradle-harness-install --config-home <dir> --revoke-opt-in <stem,stem>
 ```
 
 **Deleting the file is not a retirement** — under #374 a plain reconcile puts a granted tool
@@ -90,8 +94,9 @@ basecradle-harness-verify --config-home <dir> --emit-claims       # ledger rows 
 Run it **as the agent, with its environment** (it needs `AI_PROVIDER`; failing that it reads the
 config home's own `agent.env`, and failing *that* it says in the finding that it had to assume).
 Exit nonzero is the product: it is what turns a stripped overlay into a red converge. The
-invariants — proves the declared set not pristine-ness, unproven is red, claims emitted whatever
-the verdict — live in CLAUDE.md → Green-While-Absent.
+invariants — proves the declared set not pristine-ness, unproven is red, a granted tool's absence is
+a strip, claims emitted whatever the verdict — live in CLAUDE.md → Green-While-Absent; the reasoning
+is in § Why the Prover Is Shaped This Way, below.
 
 **Exit 0 proves the config home, not the agent.** `verify` is a token-free check: it proves the
 declared capability set is on disk, which is plumbing. Whether the agent can actually *do* what a
