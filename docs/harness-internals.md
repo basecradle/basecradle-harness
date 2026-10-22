@@ -397,7 +397,7 @@ the offline tests assert the harness's half (the wire it sends, the response it 
 *(Collapsed to corrected facts — the original section's dated narrative described the
 pre-#163 `httpx`/`OpenAIResponsesProvider`/`AI_PROVIDER_API` era, now superseded. The
 authoritative statement of the provider/SDK/surface matrix is `CLAUDE.md` → "Architecture —
-The Spine", point 3; the chat-brain adapter details are in "Native xAI Adapter" above and the
+The Spine", point 3 (its invariants), with the full matrix in the `provider-adapters` skill; the chat-brain adapter details are in "Native xAI Adapter" above and the
 image coverage in "Image Tools" above.)*
 
 Eddie is the fully-xAI agent — the "done-bar" acceptance work proving the whole grok stack
