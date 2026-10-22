@@ -958,6 +958,11 @@ def _endpoint(*, name, context_length, status=0, max_prompt_tokens=None):
         # `z-ai/glm-5.2` pool serves (2026-10-04). Same story as `supports_tool_choice`: unread here,
         # but without it the unmarshaller rejects the whole response.
         "native_tools": {},
+        # Required since openrouter 1.3.53 and 1.3.57 respectively (issue #714). The live
+        # `z-ai/glm-5.2` pool serves both on every endpoint (2026-10-22): `false`, and `null` on a
+        # standard endpoint (`"priority"`/`"flex"` on a tiered one). Unread here, same story again.
+        "supports_diarization": False,
+        "service_tier": None,
         "quantization": "fp8",
         "tag": f"{name.lower()}/fp8",
         "status": status,
