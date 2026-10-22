@@ -78,7 +78,7 @@ on the call itself**, every comment, `pr create`, `pr merge`, label, close, *and
 never a session-level setup step:
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
 gh issue comment <n> --repo basecradle/basecradle-harness --body "…"
 ```
 
@@ -98,7 +98,7 @@ it cannot prove a write landed as the bot — read that back from what GitHub re
 (`gh issue comment` prints the URL, whose `#issuecomment-<id>` fragment is the id):
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
 gh api repos/basecradle/basecradle-harness/issues/comments/<comment-id> --jq '.user.login'
 # → basecradle-harness-ai[bot]
 ```
@@ -119,7 +119,7 @@ prints it, so never call it.
 github.com, so the push is bare — only the mint prefix is needed, in the same Bash call:
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/2026-06-05-fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
 git push origin <branch>
 ```
 
