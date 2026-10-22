@@ -117,9 +117,11 @@ jobs:
             case "$author" in *"$BOT"*) ;; *) continue ;; esac
             # The whole message, not git's %(trailers:...) — that parses only the final
             # paragraph, so a trailer with any paragraph after it slips through. A
-            # line-anchored scan fails closed instead.
+            # line-anchored scan fails closed instead. A here-string, never a pipe: under
+            # pipefail, `grep -q` exits on its first match, the writer can die of SIGPIPE,
+            # and the pipeline's failure would read as "no trailer" (basecradle#707).
             message=$(git show -s --format=%B "$sha")
-            if printf '%s\n' "$message" | grep -qi '^Co-Authored-By:'; then
+            if grep -qi '^Co-Authored-By:' <<< "$message"; then
               bad+=("$(git show -s --format='%h %s' "$sha")")
             fi
           done
