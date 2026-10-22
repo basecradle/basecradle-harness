@@ -14,8 +14,10 @@ model-facing ``memory_search`` tool both get it for nothing, and can never drift
 the palace is reranked, for the same reason they cannot drift on how it is searched.
 
 **Off by absence.** No ``HARNESS_MEMPALACE_RERANK_MODEL`` → `reranker_from_env` returns ``None``,
-`search` runs exactly the query it ran before, and nothing here is imported at call time. There is
-no shadow mode and no "enabled" flag: the model id *is* the switch.
+`search` makes one unranked query and calls no model, and nothing here is imported at call time.
+That query is deliberately not the pre-rerank one (issue #611): it asks for ``_UNRANKED_HEADROOM``
+times the count and keeps the first ``k`` (`basecradle_harness._mempalace`). There is no shadow
+mode and no "enabled" flag: the model id *is* the switch.
 
 **Why the gain is real, and why the prompt differs from upstream's.** The benchmark asks the model
 to pick **one** hit and promote it to rank 1 — right for a QA harness that reads the top hit.
