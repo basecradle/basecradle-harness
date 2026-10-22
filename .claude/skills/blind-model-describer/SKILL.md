@@ -1,15 +1,15 @@
 ---
 name: blind-model-describer
-description: The full design of the blind-model describer — a second model that describes pictures and clips for a text-only brain across view, watch and asset arrival — the HARNESS_DESCRIBER_* settings, why it shares the brain's SDK and endpoint but never its key or model_params.json pins, dead-versus-off, the graded failure classes, judging an answer (truncated, empty_response, missing_parts) and the single retry, why an unreported bill judges nothing, the explicit output budgets, the per-wake memo, the caption that names the describer, and its mining sentinel. Use before editing _describer.py, the perception paths (assets view/watch, the asset wake's arrival), the describer's prompt or labels, the output-budget spellings in _provider_from_config, or any HARNESS_DESCRIBER_* setting. The invariants live in CLAUDE.md → MemPalace Rerank and the Blind-Model Describer; this skill carries the mechanisms and the reasoning.
+description: The full design of the blind-model describer — a second model that describes pictures and clips for a text-only brain across view, watch and asset arrival — the HARNESS_DESCRIBER_* settings, why it rides the brain's stack by default (or a stack of its own) but never takes the brain's credential, routing pin or model_params.json, dead-versus-off, the graded failure classes, judging an answer (truncated, empty_response, missing_parts) and the single retry, why an unreported bill judges nothing, the explicit output budgets, the per-wake memo, the caption that names the describer, and its mining sentinel. Use before editing _describer.py, the perception paths (assets view/watch, the asset wake's arrival), the describer's prompt or labels, the output-budget spellings in _provider_from_config, or any HARNESS_DESCRIBER_* setting. The invariants live in CLAUDE.md → MemPalace Rerank and the Blind-Model Describer — Second Models; this skill carries the mechanisms and the reasoning.
 ---
 
 # The Blind-Model Describer — The Full Design
 
-The invariants live in `CLAUDE.md` → "MemPalace Rerank and the Blind-Model Describer" and govern at all times. This skill carries the full design behind them. Read it in full before changing any of them.
+The invariants live in `CLAUDE.md` → "MemPalace Rerank and the Blind-Model Describer — Second Models" and govern at all times. This skill carries the full design behind them. Read it in full before changing any of them.
 
 A text-only brain (@glm-5.2, `input_modalities: ["text"]`) reaches the honest "described above, not
 shown" tier on every picture and every clip. Honest is not working. **`HARNESS_DESCRIBER_MODEL`** —
-a model id on the agent's *own* provider — makes the harness send the pixels to that model and hand
+a model id on the agent's own provider, or on the describer's own stack — makes the harness send the pixels to that model and hand
 the brain its words, across all three perception paths (`view`, `watch`, and a peer's image on
 arrival at the asset wake) through **one** seam (`Engine.describer`, memoized per wake), so they can
 never diverge on which model describes or how.
@@ -18,10 +18,13 @@ never diverge on which model describes or how.
 |---|---|
 | `HARNESS_DESCRIBER_MODEL` | The describer's model id. **Absent or empty = describer off** — byte-identical to the pre-#472 behavior, down to the log lines, with nothing imported and no adapter built. |
 | `HARNESS_DESCRIBER_API_KEY` | A key **dedicated to describing on this agent** (fleet rule: one key per agent per purpose). Required when MODEL is set; **never** a fallback to `AI_API_KEY`. |
-| `HARNESS_DESCRIBER_PROVIDERS` | Comma-separated OpenRouter slugs → `provider: {only: [...], allow_fallbacks: true, data_collection: "deny"}` — the same object, built by the same helper, as the reranker's. Required when MODEL is set. **No default list in code**, for the reason `HARNESS_MEMPALACE_RERANK_PROVIDERS` has none. |
+| `HARNESS_DESCRIBER_PROVIDERS` | Comma-separated OpenRouter slugs → `provider: {only: [...], allow_fallbacks: true, data_collection: "deny"}` — the same object, built by the same helper, as the reranker's. Required when MODEL is set on a key-based provider. **No default list in code**, for the reason `HARNESS_MEMPALACE_RERANK_PROVIDERS` has none (the `memory-palace` skill). |
+| `HARNESS_DESCRIBER_PROVIDER` + `HARNESS_DESCRIBER_SDK` | *Optional, both or neither* (issue #655): the describer's **own stack** when it should not ride the brain's — e.g. `google` + `google-genai` for Gemini eyes on Vertex beside a brain on OpenRouter. Built by the same factory at that SDK's default surface (or `HARNESS_DESCRIBER_SDK_SURFACE`, read as `AI_SDK_SURFACE` is). It keeps the brain's `AI_BASE_URL` only when it names the brain's own provider (`inherit_endpoint`); another vendor gets its default endpoint. One without the other, or a surface without the stack, is `config:incomplete_stack`. |
+| `HARNESS_DESCRIBER_CREDENTIALS_FILE` / `HARNESS_DESCRIBER_LOCATION` / `HARNESS_DESCRIBER_PROJECT` | A describer on **Vertex** (`google`) takes these instead of a key and a provider list: its own service-account key file and location (both required — `config:missing_credentials_file` / `config:missing_location`) and optionally its project (default: the one the key names). **Never** a fallback to the brain's `AI_CREDENTIALS_FILE` / `AI_LOCATION` / `AI_PROJECT`. |
 
-**The describer shares the brain's stack and nothing else, and each half of that is load-bearing.**
-It is built by `_provider_from_config(..., model=, api_key=, routing=, inherit_params=False)` — the
+**The describer shares the brain's stack and nothing else, and each half of that is load-bearing**
+(by default — with `HARNESS_DESCRIBER_PROVIDER`/`_SDK` set it runs on a stack of its own and shares
+only the factory; the credential, pin and `model_params.json` rule below holds either way). It is built by `_provider_from_config(..., model=, api_key=, routing=, inherit_params=False)` — the
 brain's own factory — so the **SDK, surface and endpoint** cannot drift: one adapter family, one
 error taxonomy. What it must **not** inherit is the brain's key (one key per agent per purpose, so a
 rotated or compromised describer key never touches the brain's account) or its routing pin:
@@ -34,12 +37,13 @@ key, same pins"; the amendment is the law.)
 Four invariants, each with an "obviously fine" broken form:
 
 - **Off by absence, and the model id is the only switch** — no shadow mode, no `…_ENABLED`
-  companion, for the same reason `_rerank.py` has none. The regression bar is a test.
+  companion, for the same reason `_rerank.py` has none (the `memory-palace` skill). The regression bar is a test.
 - **A model set without its key or its provider list is DEAD, not OFF** — `describer_from_env`
   returns a describer carrying a *config fault*, never `None`. `None` would make a half-configured
   describer indistinguishable from a deliberately blind agent, which is Green-While-Absent exactly.
 - **Never a fabricated description, and the failure classes are graded** — `_rerank.py`'s two, in
-  its words. **Config-class** (no key, no providers, a provider that would not build, 401/403, 402,
+  its words (the `memory-palace` skill). **Config-class** (no key, no providers, an incomplete own
+  stack, a missing Vertex key file or location, a provider that would not build, 401/403, 402,
   a model id that does not exist) → withheld caption + **ERROR**, *once per wake* (the object's life
   **is** the wake, so this needs no clock; repeats drop to DEBUG so one defect cannot become a
   storm). **Runtime-class** (timeout, 429, 5xx, transport, unparseable or empty answer, an
@@ -127,9 +131,13 @@ Four invariants, each with an "obviously fine" broken form:
   asset's own dialogue and nothing else — which is precisely the kind of claim #438 proved a
   docstring cannot be trusted to keep, so `test_mining.py` proves it on a real wake.
 
-`--resolved-config` reports `describer_model`, `describer_providers` and `describer_api_key_set` —
-**never the key itself**, here or anywhere; that file is pasted into issues. The key *also* rides
-`tool_env`, but **only when a model is configured**: it is an ungated call-time read with no plugin
+`--resolved-config` reports `describer_model`, `describer_providers`, `describer_api_key_set`, the own
+stack (`describer_provider`, `describer_sdk`, `describer_sdk_surface`, `describer_sdk_version`) and the
+Vertex settings (`describer_location`, `describer_project`, `describer_credentials_file`,
+`describer_credentials_file_state` — a verdict, never the file's contents) — **never the key
+itself**, here or anywhere; that file is pasted into issues. The credential variables *also* ride
+`tool_env` (`describer_credential_vars`: the key on a key-based vendor, the file and location on
+Vertex), but **only when a model is configured**: it is an ungated call-time read with no plugin
 to hang `needs_env` on (issue #427's shape without a `ToolPlugin`), and a `false` for a variable
 nobody wants is the `XAI_TEAM_ID` noise that map deliberately avoids. With a describer configured
 the map's contract holds exactly — *every `false` is an active capability that cannot do its job*.

@@ -1,11 +1,11 @@
 ---
 name: memory-palace
-description: The full design of the agent's memory surfaces beyond the SQLite default — the Mining Boundary (what a mining provider may store, dialogue-only renderings, the sentinel-wake proof, and the scrub-palace tool's catalog, unanimity and file-unit rules), and the MemPalace rerank (HARNESS_MEMPALACE_RERANK_* settings, the unranked-query headroom, structural injection tolerance, the two failure classes, the max_distance threshold decision, the memory recall and llm purpose=memory log lines, and the reasoning.exclude gap). Use before editing _mining.py, _wake._observe or _dialogue_of, what the compaction summarizer is shown, _rerank.py, _scrub.py, _mempalace.py or the palace-check modules, the recall block's wording, or any HARNESS_MEMPALACE_* setting, and before adding a harness-composed surface to the brief or to an item's rendering. The invariants live in CLAUDE.md → The Mining Boundary and → MemPalace Rerank and the Blind-Model Describer; this skill carries the mechanisms and the reasoning.
+description: The full design of the memory surfaces beyond the SQLite default — the Mining Boundary (what a mining provider may store, dialogue-only renderings, the sentinel-wake proof, and the scrub-palace tool's catalog, unanimity and file-unit rules), and the MemPalace rerank (HARNESS_MEMPALACE_RERANK_* settings, the unranked-query headroom, structural injection tolerance, the two failure classes, the max_distance threshold, the recall and rerank log lines, the reasoning.exclude gap). Use before editing _mining.py, _wake._observe or _dialogue_of, the compaction summarizer's inputs, _rerank.py, _scrub.py, _mempalace.py or the palace-check modules, the recall block's wording, any harness constant the scrub catalog reads (_mining.catalog), or any HARNESS_MEMPALACE_* setting, and before adding a harness-composed surface to the brief or to an item's rendering. The invariants live in CLAUDE.md → The Mining Boundary and → MemPalace Rerank and the Blind-Model Describer — Second Models; this skill carries the reasoning.
 ---
 
 # Memory Palace — The Mining Boundary and the Rerank
 
-The invariants live in `CLAUDE.md` → "The Mining Boundary" and "MemPalace Rerank and the Blind-Model Describer" and govern at all times. This skill carries the full design behind them. Read it in full before changing any of them.
+The invariants live in `CLAUDE.md` → "The Mining Boundary" and "MemPalace Rerank and the Blind-Model Describer — Second Models" and govern at all times. This skill carries the full design behind them. Read it in full before changing any of them.
 
 ## The Mining Boundary
 
