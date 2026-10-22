@@ -2,9 +2,9 @@
 
 A `TimelineAgent` watches one timeline, hands each new message from someone else
 to a `Harness`, and posts the reply back — all through the `basecradle` SDK, never
-raw HTTP. This is the v0 way an agent lives on the platform: a poll loop for a
-single local agent. No webhooks, no router, no multi-tenancy — those are later,
-and their own repos.
+raw HTTP. This is the poll loop for a single local agent; a fleet agent is instead
+woken per event by basecradle-router (`_wake.py`), and multi-tenancy is never this
+package's (CLAUDE.md → Scope Boundary).
 
 Configuration is environment-first (see `TimelineAgent.from_env`):
 
@@ -36,12 +36,13 @@ identical in the env, the code, and the docs:
   required, the surface defaults to ``chat``, and nothing vendor-specific goes on the wire
   (`_provider_from_config`). The dialect is derived from the vendor, never configured.
 - ``AI_SDK``                  — the **library/package name** of the SDK the harness imports to
-  reach the model: ``openai`` (default), and ``xai-sdk`` (the committed next phase, #165). The value is the importable
+  reach the model: ``openai`` (default), ``xai-sdk``, ``openrouter`` or ``google-genai``. The value is the importable
   package, which also disambiguates it from the provider token (``AI_PROVIDER=xai`` selects
   xAI's *endpoint*; ``AI_SDK=xai-sdk`` selects xAI's *native SDK*, #165). The harness reaches an
   LLM **only** through a vendor SDK; with the named SDK not installed it comes up with no way to
-  reach a model and says so. Two adapters ship: ``openai`` (the OpenAI-wire SDK — also xAI over
-  ``api.x.ai``) and ``xai-sdk`` (xAI's native gRPC SDK, #165).
+  reach a model and says so. Four adapters ship: ``openai`` (the OpenAI-wire SDK — also xAI over
+  ``api.x.ai``, and every generic vendor), ``xai-sdk`` (xAI's native gRPC SDK, #165),
+  ``openrouter`` (OpenRouter's own SDK) and ``google-genai`` (Gemini on Vertex, #655).
 - ``AI_MODEL``                — the model id (e.g. ``gpt-5.4-mini``).
 - ``AI_API_KEY``             — the provider's API key (every provider but ``google``).
 - ``AI_CREDENTIALS_FILE`` / ``AI_LOCATION`` / ``AI_PROJECT`` — ``google`` only: a service-account
@@ -704,8 +705,9 @@ def _require_generic_sdk(provider: str, sdk: str) -> None:
 #: ``surface`` is an **SDK-scoped** concept: each SDK adapter declares its own allowed
 #: ``SURFACES`` and ``DEFAULT_SURFACE`` (so the *next* multi-surface SDK follows the same
 #: contract without re-litigation), keyed by the ``AI_SDK`` package name. ``AI_SDK_SURFACE``
-#: selects among the active adapter's surfaces; a single-surface SDK simply isn't listed here
-#: (no surfaces to pick from) and never sets the var. v0 ships only the ``openai`` adapter.
+#: selects among the active adapter's surfaces. Every shipped SDK is listed; a single-surface
+#: SDK declares a one-element set, so the var is left unset for it and any value outside the
+#: set fails.
 _SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
     "openai": (OPENAI_SURFACES, OPENAI_DEFAULT_SURFACE),
     # The native xai-sdk speaks a single (gRPC) surface; `AI_SDK_SURFACE` is left unset for it,
@@ -734,8 +736,8 @@ def _surface_for(sdk: str, raw: str | None, provider: str = DEFAULT_PROVIDER) ->
     - **provided** → validated against the adapter's ``SURFACES``; anything not in the set is a
       **hard fail** with a clear message.
 
-    catches both a typo (``responsess``) and a surface set on a single-surface SDK (one whose
-    adapter declares no surface set here — e.g. a future native ``xai-sdk`` or ``anthropic``).
+    catches both a typo (``responsess``) and a surface a single-surface SDK does not speak (a
+    value outside its one-element set, e.g. ``chat`` on ``xai-sdk``).
     For an SDK with no surface declaration, an *unset* var resolves to ``""`` and the precise
     "no adapter yet" error is left to the provider build; a *set* var is the clear error above.
 

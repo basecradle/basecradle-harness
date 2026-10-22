@@ -57,7 +57,7 @@ dependencies = [
 # upgrade. `pip install basecradle-harness[openai]` is the @jt / OpenAI stack; with no SDK
 # extra installed the harness comes up with no way to reach a model and says so plainly.
 [project.optional-dependencies]
-# The `openai` vendor SDK (AI_SDK=openai): the one adapter v0 ships. Drives the model loop
+# The `openai` vendor SDK (AI_SDK=openai): the default adapter. Drives the model loop
 # (Responses + Chat Completions), the server-side web_search built-in, vision, and the
 # gpt-image-2 / audio endpoints — all through this package, no harness-owned HTTP.
 # Pin: floor is the major this adapter is built and tested against (3.x); major-capped so a
@@ -72,14 +72,14 @@ dependencies = [
 openai = ["openai>=3.3.1,<4"]
 # The native xAI SDK (AI_SDK=xai-sdk): the Grok agents' end-state brain (issue #165). A
 # gRPC client — grok chat + tool calling + Live Search, natively, no OpenAI-wire shim. Floor is
-# the version this adapter was built against (1.17); major-capped so a breaking 2.0 never
+# the release the suite last ran against (Dependabot raises it); major-capped so a breaking 2.0 never
 # auto-upgrades. Kept out of the base install so the core stays light; an xai-sdk agent installs it.
 xai-sdk = ["xai-sdk>=1.19.0,<2"]
 # The OpenRouter SDK (AI_SDK=openrouter): a first-class native adapter over OpenRouter's own
 # first-party Python SDK — the brain for the @glm-5.2 peer (z-ai/glm-5.2) and any OpenRouter
-# model. Floor is the version this adapter was built against (0.11.3). This is a 0.x
-# Speakeasy-generated SDK: its *minor* is the breaking axis (typed signatures and `components`
-# names can drift on a minor bump), so it is minor-capped (`<0.12`) — bump the cap deliberately,
+# model. Floor is the release the suite last ran against (Dependabot raises it). A
+# Speakeasy-generated SDK whose typed signatures and `components` names can drift between
+# releases; it left 0.x in #363, so it is major-capped (`<2`) — bump the cap deliberately,
 # never blindly. Kept out of the base install so the core stays light; an openrouter agent installs it.
 openrouter = ["openrouter>=1.1.70,<2"]
 # Google's `google-genai` SDK (AI_SDK=google-genai): Gemini on Vertex AI, called direct (issue #655) —

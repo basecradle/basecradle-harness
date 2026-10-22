@@ -16,7 +16,7 @@ This skill is the step-by-step pipeline behind them.
 
 ## The pipeline (OIDC Trusted Publishing, zero stored credentials)
 
-Mirror the Python SDK's pipeline — `../sdks/python/.github/workflows/release.yml` is the template:
+Mirror the Python SDK's pipeline — `basecradle/basecradle-python` → `.github/workflows/release.yml` is the template:
 
 1. Push a `v*` git tag →
 2. **preflight** (the coherence gate — see below) →
