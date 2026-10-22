@@ -1,4 +1,4 @@
-"""A laptop builder session leaves the laptop as it found it (basecradle-noc#790; #700).
+"""A laptop builder session leaves the laptop as it found it (noc#790).
 
 On 2026-09-20 @origin found **Docker Desktop still running** and a **Chrome tab still open**,
 both left by builder sessions that had already self-exited. The engine had degraded to answering
@@ -14,21 +14,20 @@ Four properties are pinned here, each of which fails silently if it is dropped:
 
 * **The fail-closed hinge.** ``check`` refuses when there is **no baseline** — the state a session
   is in when its ``SessionStart`` hook never fired. A guard that no-ops when it cannot run is the
-  silent death itself (``basecradle-noc#190``), and without this the *whole* instrument reads
-  clean on the one session that never armed it.
+  silent death itself (``noc#190``), and without this the *whole* instrument reads clean on the
+  one session that never armed it.
 * **Prove-it-is-ours, or report.** The sweep removes only what carries this session's own label
   or builder prefix. Everything else that appeared during the session is **reported with the exact
   command and never touched** — an image somebody else pulled mid-session is theirs. The capital's
   ruling on this issue: *an empty Docker today is not a licence for ``docker system prune``.*
 * **A stop is read back off the process list.** ``osascript quit app "Docker"`` exited 0 while
-  every Docker process kept running (``basecradle-noc#716``). An exit code is not a stopped
-  process, so a quit that "succeeds" while the processes live must NOT be reported as stopped.
+  every Docker process kept running (``noc#716``). An exit code is not a stopped process, so a
+  quit that "succeeds" while the processes live must NOT be reported as stopped.
 * **The predicates are EXECUTED, never grepped.** A test asserting a label filter *appears* in the
-  source cannot tell a filter that fires from one that never does (``basecradle-noc#773``). So
-  the guard runs against a stub ``docker`` that records every argv, and the assertions are about
-  what it was — and was not — asked to remove. The stub also carries a **positive control**: an
-  unlabelled container and image sitting right beside the labelled ones, which the sweep must
-  leave alone.
+  source cannot tell a filter that fires from one that never does (``noc#773``). So the guard runs
+  against a stub ``docker`` that records every argv, and the assertions are about what it was — and
+  was not — asked to remove. The stub also carries a **positive control**: an unlabelled container
+  and image sitting right beside the labelled ones, which the sweep must leave alone.
 """
 
 from __future__ import annotations
@@ -83,10 +82,12 @@ elif a[:2] == ["desktop", "status"]:
 elif a[:2] == ["desktop", "start"]:
     st["desktop_status"] = "running"
     st["engine_up"] = True
+    if "ps_lines_after_start" in st:
+        st["ps_lines"] = st["ps_lines_after_start"]
     save()
 elif a[:2] == ["desktop", "stop"]:
     # The stub always REPORTS success. Whether the processes actually go away is the
-    # scenario's `desktop_stop_really_stops` — that gap is basecradle-noc#716 itself.
+    # scenario's `desktop_stop_really_stops` — that gap is noc#716 itself.
     st["desktop_status"] = "stopped" if st.get("desktop_stop_really_stops", True) else "running"
     if st.get("desktop_stop_really_stops", True):
         st["engine_up"] = False
@@ -136,6 +137,11 @@ elif a[:2] == ["buildx", "ls"]:
 elif a[:2] == ["system", "df"]:
     if not st["engine_up"]:
         sys.exit(1)
+    if st.get("df_failures", 0) > 0:
+        # An engine still settling: `docker version` answers, `system df` does not, yet.
+        st["df_failures"] -= 1
+        save()
+        sys.exit(1)
     print('{"Active":"0","Reclaimable":"0B","Size":"0B","TotalCount":"0","Type":"Images"}')
     print('{"Active":"0","Reclaimable":"0B","Size":"%s","TotalCount":"0","Type":"Build Cache"}'
           % st["build_cache"])
@@ -177,6 +183,10 @@ elif "lstart=" in a and "-p" in a:
     start = st.get("lstart", {}).get(a[a.index("-p") + 1])
     if start is None:
         sys.exit(1)
+    if isinstance(start, int):
+        # An epoch, rendered as the real ps renders it: in the caller's time zone.
+        time.tzset()
+        start = time.strftime("%a %b %e %H:%M:%S %Y", time.localtime(start))
     print(start)
 elif "etime=" in a and "-p" in a:
     start = st.get("proc_start", {}).get(a[a.index("-p") + 1])
@@ -224,6 +234,14 @@ if st.get("lsof_error"):
     # The real lsof's failure: exit 1, the same status as "nothing matched", with its reason on
     # stderr (measured on macOS's lsof 4.91).
     sys.stderr.write("lsof: can't get UID for nosuchuser\n")
+    sys.stderr.flush()
+    if st.get("lsof_err_raced"):
+        # A sibling run under the same key removing a shared stderr file mid-census.
+        root = os.environ["SESSION_GUARD_STATE_ROOT"]
+        for name in os.listdir(root):
+            path = os.path.join(root, name, "lsof.err")
+            if os.path.exists(path):
+                os.remove(path)
     sys.exit(1)
 if not st.get("listeners"):
     sys.exit(1)  # nothing matched: exit 1, silent
@@ -268,12 +286,12 @@ class Lab:
                 "DOCKER_STUB_STATE": str(self.state_file),
                 "DOCKER_STUB_CALLS": str(self.calls),
                 "DOCKER_STUB_LABEL": LABEL,
-                "BASECRADLE_HARNESS_SESSION_STATE_ROOT": str(self.state_root),
-                "BASECRADLE_HARNESS_DOCKER_APP_PREFIX": FAKE_APP_PREFIX,
+                "SESSION_GUARD_STATE_ROOT": str(self.state_root),
+                "SESSION_GUARD_DOCKER_APP_PREFIX": FAKE_APP_PREFIX,
                 "CLAUDE_CODE_SESSION_ID": "test-session",
-                "BASECRADLE_HARNESS_GUARD_STOP_WAIT": "2",
-                "BASECRADLE_HARNESS_GUARD_START_WAIT": "2",
-                "BASECRADLE_HARNESS_GUARD_POLL": "1",
+                "SESSION_GUARD_STOP_WAIT": "2",
+                "SESSION_GUARD_START_WAIT": "2",
+                "SESSION_GUARD_POLL": "1",
             }
         )
         return env
@@ -282,10 +300,10 @@ class Lab:
         return subprocess.run(
             [str(script), *args],
             env=self.env,
-            check=False,
             capture_output=True,
             text=True,
             cwd=self.tmp,
+            check=False,
         )
 
     def docker_state(self) -> dict:
@@ -314,7 +332,7 @@ def lab(tmp_path):
 
 CONTAINER = {"id": "c" * 64, "image": "ubuntu:24.04", "status": "Up 3 seconds", "labelled": True}
 FOREIGN_CONTAINER = {"id": "f" * 64, "image": "someone/else", "status": "Up", "labelled": False}
-IMAGE = {"id": "sha256:" + "a" * 64, "tag": "harness/replica:latest", "labelled": True}
+IMAGE = {"id": "sha256:" + "a" * 64, "tag": "noc/replica:latest", "labelled": True}
 FOREIGN_IMAGE = {"id": "sha256:" + "b" * 64, "tag": "postgres:17", "labelled": False}
 
 
@@ -325,7 +343,7 @@ def test_check_refuses_when_the_session_never_took_a_baseline(lab):
     """The state a session is in when its SessionStart hook never fired.
 
     Without this the whole instrument reads clean on the one session that never armed it —
-    ``basecradle-noc#190``'s rule (*an ERROR is not clean*) turned on the guard itself.
+    ``noc#190``'s rule (*an ERROR is not clean*) turned on the guard itself.
     """
     got = lab().run("check")
     assert got.returncode != 0
@@ -352,7 +370,7 @@ def test_self_exit_refuses_when_the_guard_itself_is_missing(tmp_path):
     exit_copy = shadow / "self-exit.sh"
     shutil.copy(SELF_EXIT, exit_copy)
     exit_copy.chmod(0o755)
-    got = subprocess.run([str(exit_copy)], check=False, capture_output=True, text=True)
+    got = subprocess.run([str(exit_copy)], capture_output=True, text=True, check=False)
     assert got.returncode != 0
     assert "refusing to exit without a cleanup check" in got.stderr
     assert "terminating" not in got.stdout
@@ -487,8 +505,7 @@ def test_docker_desktop_started_by_this_session_is_quit_and_the_stop_is_read_bac
 
 
 def test_a_quit_that_exits_zero_while_the_processes_live_is_not_reported_as_stopped(lab):
-    """``basecradle-noc#716``: an ``osascript quit`` exited 0 while every Docker process kept
-    running.
+    """``noc#716``: an ``osascript quit`` exited 0 while every Docker process kept running.
 
     An exit code is not a stopped process; the process list is. So the stub's ``desktop stop``
     succeeds and the processes stay — and the sweep must FAIL and say so, never claim a stop.
@@ -537,32 +554,6 @@ def test_docker_desktop_that_was_running_at_session_start_is_left_running(lab):
     assert lb.run("sweep").returncode == 0
     assert ["desktop", "stop"] not in lb.calls_log()
     assert lb.docker_state()["desktop_status"] == "running"
-
-
-def test_a_running_desktop_whose_engine_is_not_answering_is_never_claimed(lab):
-    """Running but not answering is the incident's own state (basecradle-noc#790). Claiming that
-    start would let ``sweep`` quit an app that was there before the session."""
-    lb = lab(engine_up=False)
-    assert lb.run("begin").returncode == 0
-    got = lb.run("docker-up")
-    assert got.returncode != 0
-    assert "already running" in got.stderr
-    assert not (lb.state_root / "test-session" / "docker_started_by_session").exists()
-    assert ["desktop", "start"] not in lb.calls_log()
-
-
-def test_docker_desktop_status_is_read_when_no_process_sits_under_the_bundle(lab):
-    """The second probe, ``docker desktop status``, is the one this port rewrote: captured, then
-    matched, instead of piped into ``grep -q``, which under pipefail can fail exactly when it
-    matched (#172). With no process under the bundle path, it alone decides whether Docker Desktop
-    was running, and a stop is still seen."""
-    lb = lab(ps_lines=[])
-    assert lb.run("begin").returncode == 0
-    lb.mutate(desktop_status="stopped")
-    lb.clean_tabs()
-    got = lb.run("check")
-    assert got.returncode != 0
-    assert "was running at session start and is not now" in got.stdout
 
 
 def test_docker_desktop_stopped_during_the_session_is_a_finding_too(lab):
@@ -680,10 +671,10 @@ def test_the_session_start_hook_is_wired_and_its_command_takes_the_baseline(tmp_
         ["bash", "-c", command],
         input=json.dumps({"session_id": "from-stdin", "hook_event_name": "SessionStart"}),
         env=env,
-        check=False,
         capture_output=True,
         text=True,
         cwd=tmp_path,
+        check=False,
     )
     assert got.returncode == 0, got.stderr
     assert (lb.state_root / "from-stdin" / "began_at").is_file()
@@ -702,9 +693,9 @@ def test_the_guard_reaches_for_no_blanket_prune_and_no_override_flag(lab):
     """Two absences, each of which would quietly undo the design.
 
     A blanket prune would sweep whatever else shares this Docker; an override flag would put
-    *"I mean to leave this behind"* and *"I forgot"* one byte apart (``basecradle-noc#481``'s
-    ruling on ``retract-model-params``, in basecradle-noc). Comment lines are stripped, because
-    this file *describes* both in prose and the commentary is not what runs.
+    *"I mean to leave this behind"* and *"I forgot"* one byte apart (``noc#481``'s ruling on
+    ``retract-model-params``, one file over). Comment lines are stripped, because this file
+    *describes* both in prose and the commentary is not what runs.
     """
     for path in (GUARD, SELF_EXIT):
         code = "\n".join(
@@ -714,7 +705,7 @@ def test_the_guard_reaches_for_no_blanket_prune_and_no_override_flag(lab):
         assert "--force" not in code, path
 
 
-# ------------------------------------------------------- listening ports (basecradle-noc#899)
+# ------------------------------------------------------------------ listening ports (#899)
 
 
 def _with_lsof(lab_obj, listeners):
@@ -728,9 +719,9 @@ def _began_epoch(lab_obj) -> int:
 
 
 def test_a_dev_server_started_during_the_session_blocks_the_exit_and_is_never_killed(lab):
-    """The capital, on @origin's word (basecradle-noc#899): what a session launched on the laptop
-    is the session's to close — a dev server or a listening port included. Read off the kernel,
-    reported with the exact command, never killed by the guard."""
+    """The capital, on @origin's word (#899): what a session launched on the laptop is the
+    session's to close — a dev server or a listening port included. Read off the kernel, reported
+    with the exact command, never killed by the guard."""
     lab_obj = _with_lsof(lab(), [["616", "ControlCe", "*:7000"]])
     assert lab_obj.run("begin").returncode == 0
     lab_obj.clean_tabs()
@@ -762,7 +753,7 @@ def test_a_listener_that_restarted_under_a_new_pid_is_not_a_new_one(lab):
 # unless the parser forces base 10.
 @pytest.mark.parametrize("elapsed", [9 * 60 + 8, 8 * 3600 + 9 * 60 + 8, 3 * 86400 + 8 * 3600 + 9])
 def test_a_process_older_than_the_session_that_moved_to_a_new_port_is_not_reported(lab, elapsed):
-    """``basecradle-noc#1073``: macOS's ``rapportd`` runs for hours and rotates its ephemeral port.
+    """``noc#1073``: macOS's ``rapportd`` runs for hours and rotates its ephemeral port.
 
     By address alone it read as session-started, and the only repair the guard offered was to kill
     a system daemon the session does not own — so ``self-exit.sh`` refused with nothing it could
@@ -834,7 +825,8 @@ def test_a_session_with_no_listener_baseline_is_not_clean_until_it_attests_one(l
     assert "no listening-port baseline" in lab_obj.run("check").stdout
     late = lab_obj.run("baseline-listeners")
     assert late.returncode == 0 and "LATE" in late.stdout
-    assert "listening" not in lab_obj.run("check").stdout
+    after = lab_obj.run("check")
+    assert after.returncode == 0 and "not-clean" not in after.stdout, after.stdout
 
 
 def test_no_lsof_means_we_could_not_look_which_is_never_clean(lab):
@@ -868,14 +860,17 @@ def test_no_lsof_means_we_could_not_look_which_is_never_clean(lab):
         if path:
             (lab_obj.bin / tool).symlink_to(path)
     run = lambda *a: subprocess.run(
-        [str(GUARD), *a], env=env, check=False, capture_output=True, text=True, cwd=lab_obj.tmp
+        [str(GUARD), *a], env=env, capture_output=True, text=True, cwd=lab_obj.tmp, check=False
     )
     assert run("begin").returncode == 0
     assert run("tabs-checked").returncode == 0
     assert "could not be censused" in run("check").stdout
 
 
-# ---------------------------------------------- review hardening (basecradle-router#354)
+# ------------------------------------------- the router port's findings (basecradle#707, #1106)
+#
+# basecradle-router#358 ported this guard and found six defects in the shape; each fix is mirrored
+# here with a test that goes red when the fix is reverted.
 
 
 def test_a_second_session_start_keeps_the_baseline_and_what_the_session_recorded(lab):
@@ -898,16 +893,28 @@ def test_a_census_cut_off_part_way_leaves_no_baseline(lab):
     got = subprocess.run(
         [str(GUARD), "begin"],
         env=lb.env,
-        check=False,
         capture_output=True,
         text=True,
         start_new_session=True,
+        check=False,
     )
     assert got.returncode < 0, "the stub was meant to kill the census"
     lb.mutate(ps_kills_group=False)
     check = lb.run("check")
     assert check.returncode != 0
     assert "no session baseline" in check.stdout
+
+
+def test_a_running_desktop_whose_engine_is_not_answering_is_never_claimed(lab):
+    """Running but not answering is the incident's own state (``noc#790``). Claiming that start
+    would let ``sweep`` quit an app that was there before the session."""
+    lb = lab(engine_up=False)
+    assert lb.run("begin").returncode == 0
+    got = lb.run("docker-up")
+    assert got.returncode != 0
+    assert "already running" in got.stderr
+    assert not (lb.state_root / "test-session" / "docker_started_by_session").exists()
+    assert ["desktop", "start"] not in lb.calls_log()
 
 
 def test_a_live_session_is_not_swept_as_stale_by_another_sessions_start(lab):
@@ -922,7 +929,7 @@ def test_a_live_session_is_not_swept_as_stale_by_another_sessions_start(lab):
     lb.clean_tabs()  # an overwrite of tabs_checked, not a new entry
     env = lb.env | {"CLAUDE_CODE_SESSION_ID": "another-session"}
     other = subprocess.run(
-        [str(GUARD), "begin"], env=env, check=False, capture_output=True, text=True
+        [str(GUARD), "begin"], env=env, capture_output=True, text=True, check=False
     )
     assert other.returncode == 0, other.stderr
     assert live.is_dir()
@@ -949,9 +956,9 @@ def test_self_exit_keeps_the_state_when_it_cannot_find_its_kill_target(lab):
     walk = subprocess.run(
         ["ps", "-o", "command=", "-p", str(os.getpid())],
         env=lb.env,
-        check=False,
         capture_output=True,
         text=True,
+        check=False,
     )
     assert walk.stdout.strip() == ""
     assert lb.run("begin").returncode == 0
@@ -962,19 +969,69 @@ def test_self_exit_keeps_the_state_when_it_cannot_find_its_kill_target(lab):
     assert (lb.state_root / "test-session" / "began_at").is_file()
 
 
-# ------------------------- the owner's answers (basecradle#707 a-d, basecradle-noc#1108; #707)
-#
-# basecradle-noc, as owner of the reference shape, answered the four open design questions in
-# basecradle-noc#1108; each answer is mirrored here with a test that goes red when it is reverted.
+def test_docker_desktop_status_is_read_when_no_process_sits_under_the_bundle(lab):
+    """With no process under the bundle path, ``docker desktop status`` alone decides whether
+    Docker Desktop was running, and a stop is still seen."""
+    lb = lab(ps_lines=[])
+    assert lb.run("begin").returncode == 0
+    lb.mutate(desktop_status="stopped")
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "was running at session start and is not now" in got.stdout
+
+
+def test_the_guard_never_pipes_into_a_short_circuiting_consumer():
+    """Both scripts run under ``pipefail``, where ``… | grep -q`` or ``… | head`` returns 141
+    whenever the producer is still writing when the consumer quits, and a MATCH reads as no match
+    (``noc#205``; the same ban ``test_fleet_deploy_runner`` holds on the wrapper). Capture, then
+    match. Comment lines are stripped, because the comments name the trap to warn about it.
+
+    The pattern carries its own positive control: a ``\\b`` after the ``q`` once let
+    ``| grep -qE`` through, the very shape this guard used to carry."""
+    pattern = re.compile(
+        r"(?<!\|)\|(?!\|)[^|\n]*\b(?:grep\s+(?:-[a-zA-Z]*[qm]|--quiet|--max-count)|head\b)"
+    )
+    for shape in (
+        "x | grep -q y",
+        "x | grep -qE y",
+        "x | grep -Eq y",
+        "x | grep -m1 y",
+        "x | head -1",
+    ):
+        assert pattern.search(shape), shape
+    assert not pattern.search('[[ -r f ]] || ! grep -qE "^k=" f')  # `||` is not a pipe
+    for path in (GUARD, SELF_EXIT):
+        text = path.read_text()
+        assert "set -uo pipefail" in text, path
+        code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+        offenders = [m.group(0) for m in pattern.finditer(code)]
+        assert not offenders, f"{path.name}: {offenders}"
+
+
+def test_the_guard_scripts_are_shellcheck_clean():
+    """``"$guard" done`` read to shellcheck as a stray loop keyword (SC1010). Every shellcheck
+    finding fails here, not only that one. CI's runner image carries shellcheck, so there it is
+    required; a laptop without it skips."""
+    shellcheck = shutil.which("shellcheck")
+    if shellcheck is None:
+        assert not os.environ.get("CI"), "shellcheck is missing on the CI runner"
+        pytest.skip("shellcheck is not installed")
+    got = subprocess.run(
+        [shellcheck, str(GUARD), str(SELF_EXIT)], capture_output=True, text=True, check=False
+    )
+    assert got.returncode == 0, got.stdout
+
+
+# ------------------------------------------- the open design questions (basecradle#707 a-d, #1106)
 
 
 def test_a_clear_keeps_the_baseline_because_the_key_is_the_claude_process(lab):
     """(d): ``/clear`` gives the same ``claude`` process a new session id, in the hook payload and
     in ``CLAUDE_CODE_SESSION_ID`` alike. Keyed on the session id, the hook then took a fresh
     baseline and orphaned the record that this session started Docker Desktop, which then sat in
-    the new baseline as pre-existing and was never quit — the basecradle-noc#790 leftover. Keyed
-    on the process (``CLAUDE_PID`` plus its start time), the hook's re-fire finds the baseline and
-    keeps it."""
+    the new baseline as pre-existing and was never quit — the #790 leftover. Keyed on the process
+    (``CLAUDE_PID`` plus its start time), the hook's re-fire finds the baseline and keeps it."""
     lb = lab(
         engine_up=False,
         desktop_status="stopped",
@@ -983,7 +1040,7 @@ def test_a_clear_keeps_the_baseline_because_the_key_is_the_claude_process(lab):
     )
     env = lb.env | {"CLAUDE_PID": "4711", "CLAUDE_CODE_SESSION_ID": "before-clear"}
     run = lambda *a: subprocess.run(
-        [str(GUARD), *a], env=env, check=False, capture_output=True, text=True, cwd=lb.tmp
+        [str(GUARD), *a], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
     )
     assert run("begin", "--session-id", "before-clear").returncode == 0
     assert run("docker-up").returncode == 0
@@ -1003,7 +1060,7 @@ def test_a_recycled_pid_is_a_different_process_and_takes_its_own_baseline(lab):
     lb = lab(lstart={"4711": "Thu Oct 22 00:12:56 2026"})
     env = lb.env | {"CLAUDE_PID": "4711"}
     run = lambda *a: subprocess.run(
-        [str(GUARD), *a], env=env, check=False, capture_output=True, text=True, cwd=lb.tmp
+        [str(GUARD), *a], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
     )
     assert run("begin").returncode == 0
     lb.mutate(lstart={"4711": "Fri Oct 23 09:00:00 2026"})
@@ -1061,18 +1118,28 @@ def test_an_engine_down_at_session_start_is_censused_by_docker_up(lab):
     assert IMAGE["id"] in lb.run("check").stdout  # what came after the census still shows
 
 
-def test_an_engine_that_came_up_from_outside_is_named_not_checked_never_blamed(lab):
-    """(b): an engine that came up after ``begin`` without a ``docker-up`` has no baseline to
-    compare against. The labelled checks still run; the unlabelled gap is named, never filed as
-    findings against what was already there."""
+def test_an_engine_that_came_up_from_outside_is_a_finding_never_blamed_on_what_was_there(lab):
+    """(b), as decided on basecradle#709 item 3: an engine that came up after ``begin`` without a
+    ``docker-up`` has no baseline to compare against. The labelled checks still run and nothing
+    that was already there is blamed — but the gap is a FINDING, because "we could not look" is
+    never clean and a session that used the engine out of protocol would otherwise exit clean. Its
+    lever is a late census, which every later ``check`` names."""
     lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[])
     assert lb.run("begin").returncode == 0
     lb.mutate(engine_up=True, images=[FOREIGN_IMAGE, IMAGE])
     lb.clean_tabs()
     got = lb.run("check")
-    assert "NOT CHECKED: unlabelled Docker artefacts" in got.stdout
     assert FOREIGN_IMAGE["id"] not in got.stdout
     assert f"labelled image still present: {IMAGE['id']}" in got.stdout
+
+    lb.mutate(images=[FOREIGN_IMAGE])  # the labelled finding is not what makes this one fail
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "not-clean: no Docker baseline" in got.stdout
+    assert lb.run("docker-up").returncode == 0
+    got = lb.run("check")
+    assert got.returncode == 0, got.stdout
+    assert "LATE: the Docker baseline was taken at" in got.stdout
 
 
 def test_a_build_cache_that_shrank_is_not_a_build(lab):
@@ -1097,44 +1164,288 @@ def test_a_build_cache_whose_size_cannot_be_read_is_not_clean(lab):
     assert "could not be read" in got.stdout
 
 
-def test_the_guard_never_pipes_into_a_short_circuiting_consumer():
-    """Both scripts run under ``pipefail``, where ``… | grep -q`` or ``… | head`` returns 141
-    whenever the producer is still writing when the consumer quits, and a MATCH reads as no match
-    (basecradle-noc#205; basecradle-router#172). Capture, then match. Comment lines are stripped,
-    because the comments name the trap to warn about it.
+def test_a_build_cache_unreadable_at_the_baseline_is_cleared_by_a_late_reading(lab):
+    """basecradle#709 item 6: a cache size that could not be read at the census never becomes
+    readable by re-running ``check``, so the finding it raised could never clear, and self-exit has
+    no override. ``docker-up`` re-reads it, and ``check`` names the reading as late."""
+    lb = lab(build_cache="garbled")
+    assert lb.run("begin").returncode == 0
+    lb.mutate(build_cache="1.2GB")
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "could not be read when the Docker baseline was taken" in got.stdout
 
-    The pattern carries its own positive and negative controls (basecradle-noc#1109): a ``\\b``
-    after the ``q`` once let ``| grep -qE`` through, the very shape this guard used to carry, and
-    ``||`` is not a pipe."""
-    pattern = re.compile(
-        r"(?<!\|)\|(?!\|)[^|\n]*\b(?:grep\s+(?:-[a-zA-Z]*[qm]|--quiet|--max-count)|head\b)"
-    )
-    for shape in (
-        "x | grep -q y",
-        "x | grep -qE y",
-        "x | grep -Eq y",
-        "x | grep -m1 y",
-        "x | head -1",
-    ):
-        assert pattern.search(shape), shape
-    assert not pattern.search('[[ -r f ]] || ! grep -qE "^k=" f')  # `||` is not a pipe
-    for path in (GUARD, SELF_EXIT):
-        text = path.read_text()
-        assert "set -uo pipefail" in text, path
-        code = "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
-        offenders = [m.group(0) for m in pattern.finditer(code)]
-        assert not offenders, f"{path.name}: {offenders}"
-
-
-def test_the_guard_scripts_are_shellcheck_clean():
-    """``"$guard" done`` read to shellcheck as a stray loop keyword (SC1010). Every shellcheck
-    finding fails here, not only that one. CI's runner image carries shellcheck, so there it is
-    required; a laptop without it skips."""
-    shellcheck = shutil.which("shellcheck")
-    if shellcheck is None:
-        assert not os.environ.get("CI"), "shellcheck is missing on the CI runner"
-        pytest.skip("shellcheck is not installed")
-    got = subprocess.run(
-        [shellcheck, str(GUARD), str(SELF_EXIT)], check=False, capture_output=True, text=True
-    )
+    assert lb.run("docker-up").returncode == 0
+    got = lb.run("check")
     assert got.returncode == 0, got.stdout
+    assert "LATE: the build cache's baseline was read at" in got.stdout
+
+
+def test_a_late_listener_baseline_is_named_on_every_check(lab):
+    """basecradle#709 item 5: a late baseline is an attestation, so no clean verdict hides it."""
+    lb = lab(lsof_error=True)
+    assert lb.run("begin").returncode == 0
+    lb.mutate(lsof_error=False)
+    assert lb.run("baseline-listeners").returncode == 0
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode == 0, got.stdout
+    assert "LATE: the listening-port baseline was taken at" in got.stdout
+
+
+def test_a_census_whose_stderr_file_a_sibling_removed_is_still_a_failure(lab):
+    """basecradle#709 item 1 (basecradle-router#360): a forked subagent shares ``CLAUDE_PID``, so
+    it shares the key and the state dir. A fixed ``lsof.err`` there could be removed by a sibling
+    run between the write and the read, and a failed census then read as an empty one."""
+    lb = lab()
+    assert lb.run("begin").returncode == 0
+    lb.mutate(lsof_error=True, lsof_err_raced=True, listeners=[["9001", "node", "127.0.0.1:3000"]])
+    lb.clean_tabs()
+    got = lb.run("check")
+    assert got.returncode != 0
+    assert "census failed" in got.stdout
+
+
+def test_the_process_key_does_not_depend_on_the_callers_time_zone(lab):
+    """basecradle#709 item 2 (basecradle-router#360): ``lstart`` is rendered in the caller's time
+    zone, and a Bash call sources the user's profile where the hook may not. Unpinned, the hook and
+    a later call computed two keys for one process, and ``check`` found no baseline."""
+    lb = lab(lstart={"4711": 1792656776})
+    run = lambda tz, *a: subprocess.run(
+        [str(GUARD), *a],
+        env=lb.env | {"CLAUDE_PID": "4711", "TZ": tz},
+        capture_output=True,
+        text=True,
+        cwd=lb.tmp,
+        check=False,
+    )
+    assert run("America/Chicago", "begin").returncode == 0
+    assert "kept" in run("Asia/Tokyo", "begin").stdout
+
+
+# ------------------------------------------ a resume orphans no Docker Desktop (#709 item 4)
+
+DESKTOP_PID = "4242"
+DESKTOP_LINE = f"  {DESKTOP_PID} {FAKE_APP_PREFIX}Contents/MacOS/com.docker.backend"
+
+
+def _resume_lab(lab):
+    """Session A (``claude`` 4711) starts Docker Desktop and is killed; B (4712) is the resume."""
+    lb = lab(
+        engine_up=False,
+        desktop_status="stopped",
+        ps_lines=[],
+        ps_lines_after_start=[DESKTOP_LINE],
+        lstart={"4711": 1792656776, "4712": 1792660000, DESKTOP_PID: 1792656800},
+    )
+
+    def as_session(pid):
+        env = lb.env | {"CLAUDE_PID": pid}
+        return lambda *a: subprocess.run(
+            [str(GUARD), *a], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
+        )
+
+    a = as_session("4711")
+    assert a("begin").returncode == 0
+    assert a("docker-up").returncode == 0
+    return lb, as_session
+
+
+def _state_of(lb, pid):
+    (only,) = lb.state_root.glob(f"claude-{pid}-*")
+    return only
+
+
+def _kill(lb, pid):
+    starts = lb.docker_state()["lstart"]
+    del starts[pid]
+    lb.mutate(lstart=starts)
+
+
+def test_a_resume_adopts_the_docker_desktop_its_dead_predecessor_started(lab):
+    """A resume is a new ``claude`` process, so it takes a new key and a new baseline, which saw
+    Docker Desktop running and called it pre-existing: the record that A started it was orphaned
+    under A's dead key and nothing ever quit it — the #790 leftover on the resume path. A recorded
+    the identity of every Desktop process, so B can prove the running one is that same one."""
+    lb, as_session = _resume_lab(lab)
+    _kill(lb, "4711")
+    b = as_session("4712")
+    began = b("begin")
+    assert began.returncode == 0
+    assert "ADOPTED" in began.stdout
+    assert [d.name.split("-")[1] for d in lb.state_root.iterdir()] == ["4712"]
+
+    assert b("tabs-checked").returncode == 0
+    got = b("check")
+    assert got.returncode != 0
+    assert "adopted the Docker Desktop" in got.stdout
+    assert b("sweep").returncode == 0
+    assert ["desktop", "stop"] in lb.calls_log()
+    final = b("check")
+    assert final.returncode == 0, final.stdout
+
+
+def test_a_docker_desktop_restarted_since_is_not_the_dead_sessions_and_is_never_quit(lab):
+    """Prove it is ours, or report: a Docker Desktop whose processes are not the ones the dead
+    session recorded was started by somebody since. Its record is stale and is cleared."""
+    lb, as_session = _resume_lab(lab)
+    _kill(lb, "4711")
+    starts = lb.docker_state()["lstart"]
+    starts[DESKTOP_PID] = 1792659000
+    lb.mutate(lstart=starts)
+    b = as_session("4712")
+    began = b("begin")
+    assert "ADOPTED" not in began.stdout
+    assert "is no longer running" in began.stdout
+    assert b("tabs-checked").returncode == 0
+    assert b("sweep").returncode == 0
+    assert ["desktop", "stop"] not in lb.calls_log()
+    assert b("check").returncode == 0
+
+
+def test_a_live_sessions_docker_desktop_is_never_adopted(lab):
+    """Two live sessions of one repo: the one whose ``claude`` is still running keeps its record."""
+    lb, as_session = _resume_lab(lab)
+    b = as_session("4712")
+    assert "ADOPTED" not in b("begin").stdout
+    assert _state_of(lb, "4711").is_dir()
+
+
+def test_a_record_with_no_process_to_prove_it_is_reported_and_never_adopted(lab):
+    """A record written before the processes were recorded proves nothing about the Docker Desktop
+    running now, so it is reported and left, never adopted."""
+    lb, as_session = _resume_lab(lab)
+    procs = _state_of(lb, "4711") / "docker_desktop_procs"
+    assert procs.read_text().startswith(f"{DESKTOP_PID}-")  # what docker-up recorded
+    procs.write_text("")
+    _kill(lb, "4711")
+    began = as_session("4712")("begin")
+    assert "ADOPTED" not in began.stdout
+    assert "not adopted" in began.stdout
+    assert _state_of(lb, "4711").is_dir()
+
+
+# ------------------------------------- one script, every laptop builder (basecradle-noc#1110)
+
+
+def _carrier(tmp_path, config):
+    """A copy of the shared scripts in another carrier's ``.claude``, with its own config."""
+    claude = tmp_path / "carrier" / ".claude"
+    claude.mkdir(parents=True)
+    for src in (GUARD, SELF_EXIT):
+        shutil.copy2(src, claude / src.name)
+    if config is not None:
+        (claude / "session-guard.env").write_text(config)
+    return claude / "session-guard.sh"
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        None,
+        "",
+        "SESSION_GUARD_REPO=\n",
+        "SESSION_GUARD_REPO=Basecradle-Router\n",
+        "SESSION_GUARD_REPO=basecradle-router\nSESSION_GUARD_REPO=basecradle-harness\n",
+        "SESSION_GUARD_REPO=basecradle-router\nrm -rf /\n",
+        "SESSION_GUARD_REPO=$(whoami)\n",
+    ],
+)
+def test_a_carrier_without_a_valid_config_takes_no_baseline_and_cannot_exit(lab, tmp_path, config):
+    """The config is read, never sourced, and a missing or malformed one refuses every command: a
+    carrier that forgot it must never run under some other repo's label, and with no baseline its
+    ``check`` refuses, so the gap is loud."""
+    guard = _carrier(tmp_path, config)
+    lb = lab()
+    begun = lb.run("begin", script=guard)
+    assert begun.returncode == 78
+    assert "session-guard.env" in begun.stderr
+    assert not lb.state_root.exists()
+    assert lb.run("check", script=guard).returncode != 0
+
+
+def test_a_carriers_label_prefix_and_state_root_come_from_its_config(lab, tmp_path):
+    """The one per-repo value: the label the sweep filters on, the builder prefix and the default
+    state root are all derived from it, so the same bytes serve every carrier."""
+    guard = _carrier(tmp_path, "# a comment\n\nSESSION_GUARD_REPO=basecradle-router\n")
+    lb = lab(
+        containers=[CONTAINER],
+        builders=["desktop-linux", "basecradle-router-builder-x", "basecradle-noc-builder-y"],
+    )
+    env = lb.env | {"DOCKER_STUB_LABEL": "basecradle-router-builder=1", "HOME": str(tmp_path)}
+    del env["SESSION_GUARD_STATE_ROOT"]
+    run = lambda *a: subprocess.run(
+        [str(guard), *a], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
+    )
+    assert run("begin").returncode == 0
+    assert (tmp_path / ".cache/basecradle-router/builder-sessions/test-session/began_at").is_file()
+    assert run("sweep").returncode == 0
+    calls = lb.calls_log()
+    assert ["rm", "-f", CONTAINER["id"]] in calls
+    assert ["buildx", "rm", "basecradle-router-builder-x"] in calls
+    assert ["buildx", "rm", "basecradle-noc-builder-y"] not in calls
+
+
+def test_the_shared_scripts_name_no_carrier_in_their_code():
+    """Byte-identical across carriers means nothing repo-specific outside a comment: a literal
+    label, prefix or env name here would be one carrier's value baked into every other's guard."""
+    for path in (GUARD, SELF_EXIT):
+        code = "\n".join(
+            ln for ln in path.read_text().splitlines() if not ln.lstrip().startswith("#")
+        )
+        assert "basecradle-" not in code, path
+        assert "BASECRADLE_" not in code, path
+    assert (REPO / ".claude" / "session-guard.env").read_text().splitlines()[-1] == (
+        "SESSION_GUARD_REPO=basecradle-harness"
+    )
+
+
+# ------------------------------- two census paths that read a failed look (basecradle#710)
+
+
+def test_a_claude_pid_whose_start_time_cannot_be_read_refuses_the_run_never_moves_it(lab):
+    """basecradle#710 item 1: one failed ``ps`` used to drop a run onto the session-id key. Its
+    writes then landed in a directory no later call reads (here: the record that it started Docker
+    Desktop, so nothing would ever quit it), and its lsof stderr redirect into that missing
+    directory read as "no listeners". A CLAUDE_PID that cannot be read now refuses the run."""
+    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[], lstart={"4711": 1792656776})
+    env = lb.env | {"CLAUDE_PID": "4711"}
+    run = lambda *a: subprocess.run(
+        [str(GUARD), *a], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
+    )
+    assert run("begin").returncode == 0
+    lb.mutate(lstart={})  # one `ps -o lstart=` that fails
+    up = run("docker-up")
+    assert up.returncode == 75
+    assert "cannot be read" in up.stderr
+    assert [d.name.split("-")[0] for d in lb.state_root.iterdir()] == ["claude"]
+    assert ["desktop", "start"] not in lb.calls_log()
+
+
+def test_an_lsof_stderr_redirect_that_fails_is_a_failed_census(lab, tmp_path):
+    """basecradle#710 item 1: a redirect that fails never runs lsof and returns 1 with nothing
+    printed, which is the "no listeners" shape exactly. Here the redirect's directory is gone."""
+    lb = lab()
+    assert lb.run("begin").returncode == 0
+    lb.mutate(listeners=[["9001", "node", "127.0.0.1:3000"]])
+    lb.clean_tabs()
+    env = lb.env | {"TMPDIR": str(tmp_path / "gone")}
+    shim = tmp_path / "bin" / "mktemp"
+    shim.write_text('#!/bin/sh\necho "$TMPDIR/session-guard-lsof.x"\n')  # a path, never created
+    shim.chmod(0o755)
+    got = subprocess.run(
+        [str(GUARD), "check"], env=env, capture_output=True, text=True, cwd=lb.tmp, check=False
+    )
+    assert got.returncode != 0
+    assert "census failed" in got.stdout
+
+
+def test_one_failed_cache_read_at_the_census_is_read_again_before_it_is_stored(lab):
+    """basecradle#710 item 2: the ``started`` census runs the moment ``docker version`` first
+    answers, and one failed ``docker system df`` stored an unreadable baseline for the session."""
+    lb = lab(engine_up=False, desktop_status="stopped", ps_lines=[], build_cache="1.2GB")
+    assert lb.run("begin").returncode == 0
+    lb.mutate(df_failures=1)
+    assert lb.run("docker-up").returncode == 0
+    assert (lb.state_root / "test-session" / "build_cache.base").read_text() == "1.2GB\n"
