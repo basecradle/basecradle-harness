@@ -2596,7 +2596,7 @@ def test_resolved_config_reports_a_bound_mempalace_provider(wake_env, monkeypatc
 
 def test_resolved_config_reports_the_installed_platform_sdk_not_the_declared_pin(wake_env):
     """The platform-SDK axis (issue #303). The version is read from the *installed* distribution —
-    what this venv can actually import — never from `pyproject`'s `basecradle>=0.6` pin, which is
+    what this venv can actually import — never from `pyproject`'s `basecradle` floor, which is
     what the harness declares about itself and would read green on a venv that never got the
     upgrade. That gap is the whole defect: a `--resolved-config` builds no platform client, so an
     agent sitting on `basecradle` 0.5.x passed every drift axis and `TypeError`d on
