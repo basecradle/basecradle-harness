@@ -20,7 +20,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import respx
-from basecradle import BaseCradle
+from basecradle import BaseCradle, NotFoundError
 
 from basecradle_harness import (
     compose_brief,
@@ -858,6 +858,24 @@ def test_fetch_dashboard_md_degrades_on_an_empty_body():
         assert fetch_dashboard_md(client) is None  # blank primer → omit, not an empty section
 
 
-def test_fetch_dashboard_md_tolerates_a_transportless_client():
-    # An object that is not an SDK client (no `_client`) degrades to None rather than raising.
+def test_fetch_dashboard_md_reads_the_sdks_public_accessor():
+    # A client with `dashboard_md` and no private transport at all: the primer is read off the
+    # public accessor alone, so a rename of the SDK's internals cannot strip the section (#716).
+    client = SimpleNamespace(dashboard_md=lambda: "\n# Welcome\n")
+    assert fetch_dashboard_md(client) == "# Welcome"
+
+
+def test_fetch_dashboard_md_degrades_when_the_accessor_raises():
+    def refuse() -> str:
+        raise NotFoundError("Not Found", status=404)
+
+    assert fetch_dashboard_md(SimpleNamespace(dashboard_md=refuse)) is None
+
+
+def test_fetch_dashboard_md_degrades_when_the_accessor_returns_empty():
+    assert fetch_dashboard_md(SimpleNamespace(dashboard_md=lambda: "")) is None
+
+
+def test_fetch_dashboard_md_tolerates_a_non_sdk_object():
+    # An object that is not an SDK client degrades to None rather than raising.
     assert fetch_dashboard_md(object()) is None
