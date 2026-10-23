@@ -5425,7 +5425,7 @@ def resolved_config() -> dict[str, object]:
       if that SDK is not installed.
     - ``platform_sdk_version`` — the installed version of the ``basecradle`` **platform** SDK
       (issue #303), read from installed metadata like the two version fields above — never from
-      the ``basecradle>=0.6`` pin in `pyproject`, which is what the harness *declares*, not what
+      the ``basecradle`` floor in `pyproject`, which is what the harness *declares*, not what
       the venv *has*. It is the third version-bearing dependency and was the odd one out: the
       harness hard-depends on it (every timeline read, and every ``idempotency_key=`` create the
       delivery guarantee rests on, needs ``basecradle>=0.6``), yet nothing named it, so an agent
