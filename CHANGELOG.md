@@ -16,8 +16,10 @@ public surface, `getattr(client, "_client", None).get(...)`, because the SDK had
 The guard that kept the wake alive was also the hazard: a rename of that private attribute would
 have stripped the `<dashboard.md>` part from every agent's brief with no error anywhere.
 
-- **The primer is now `client.dashboard_md()`** (basecradle-python#294): the same request over the
-  client's own transport and token, the body verbatim. The private-transport reach is gone.
+- **The primer is now `client.dashboard_md()`** (basecradle-python#294): the client's own
+  transport, token, base URL and timeout, the body verbatim. The private-transport reach is gone.
+  One wire difference: the request now sends the SDK's `Accept: */*` rather than the client's
+  default `Accept: application/json`.
 - **The contract is unchanged.** A typed SDK error, a connection error, or an empty body still
   degrades to `None`, and the brief is composed without the section; the text is still stripped.
 - **The platform SDK floor is now `basecradle>=0.15.0`**, the first release carrying the accessor.

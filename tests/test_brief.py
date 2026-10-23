@@ -866,14 +866,25 @@ def test_fetch_dashboard_md_reads_the_sdks_public_accessor():
 
 
 def test_fetch_dashboard_md_degrades_when_the_accessor_raises():
+    calls = []
+
     def refuse() -> str:
+        calls.append("dashboard_md")
         raise NotFoundError("Not Found", status=404)
 
     assert fetch_dashboard_md(SimpleNamespace(dashboard_md=refuse)) is None
+    assert calls == ["dashboard_md"]  # the accessor was reached, and its raise degraded
 
 
 def test_fetch_dashboard_md_degrades_when_the_accessor_returns_empty():
-    assert fetch_dashboard_md(SimpleNamespace(dashboard_md=lambda: "")) is None
+    calls = []
+
+    def blank() -> str:
+        calls.append("dashboard_md")
+        return "  \n"
+
+    assert fetch_dashboard_md(SimpleNamespace(dashboard_md=blank)) is None
+    assert calls == ["dashboard_md"]
 
 
 def test_fetch_dashboard_md_tolerates_a_non_sdk_object():
