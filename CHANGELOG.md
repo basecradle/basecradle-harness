@@ -7,6 +7,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.157.0] - 2026-10-22
+
+### Changed: the Dashboard primer is read through the SDK's public accessor (issue #716)
+
+`fetch_dashboard_md` fetched `/users/dashboard.md` for the brief by reaching below the Python SDK's
+public surface, `getattr(client, "_client", None).get(...)`, because the SDK had no accessor for it.
+The guard that kept the wake alive was also the hazard: a rename of that private attribute would
+have stripped the `<dashboard.md>` part from every agent's brief with no error anywhere.
+
+- **The primer is now `client.dashboard_md()`** (basecradle-python#294): the client's own
+  transport, token, base URL and timeout, the body verbatim. The private-transport reach is gone.
+  One wire difference: the request now sends the SDK's `Accept: */*` rather than the client's
+  default `Accept: application/json`.
+- **The contract is unchanged.** A typed SDK error, a connection error, or an empty body still
+  degrades to `None`, and the brief is composed without the section; the text is still stripped.
+- **The platform SDK floor is now `basecradle>=0.15.0`**, the first release carrying the accessor.
+  An environment pinned below it is refused at install, which is the minor bump.
+- `fetch_dashboard_md` is annotated as taking a `BaseCradle` rather than `object`.
+
 ## [0.156.0] - 2026-10-14
 
 ### Added: the tasks tool can cancel a pending task (issue #675)

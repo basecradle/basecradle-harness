@@ -83,9 +83,13 @@ import json
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from importlib import resources
+from typing import TYPE_CHECKING
 
 from basecradle_harness._policy import SHELL
 from basecradle_harness._version import __version__
+
+if TYPE_CHECKING:
+    from basecradle import BaseCradle
 
 #: What separates two parts of the composed brief. Named because `brief_section_sizes` has to
 #: charge it to somebody for the sizes to be a true partition of the joined text.
@@ -660,31 +664,21 @@ def compose_brief(
     )
 
 
-def fetch_dashboard_md(client: object) -> str | None:
+def fetch_dashboard_md(client: BaseCradle) -> str | None:
     """The platform's live ``dashboard.md`` primer, or ``None`` on any failure (graceful).
 
     The structured ``GET /users/dashboard`` the SDK exposes as ``client.me`` is JSON; the
     *primer* the platform maintains for a freshly-woken peer is the Markdown at
-    ``/users/dashboard.md``, which the SDK does not (yet) wrap with a typed accessor. So we
-    fetch it over the SDK client's already-authenticated transport — reusing its base URL,
-    token, and headers — rather than standing up a second HTTP stack with separate auth.
+    ``/users/dashboard.md``, which the SDK exposes as ``client.dashboard_md()`` — over the
+    client's own transport, so the same token, base URL and timeout as every other call, and
+    the body verbatim (``basecradle>=0.15.0``, issue #716).
 
-    **Never break the wake (the issue's hard requirement).** Every failure mode — the
-    transport being absent, a non-2xx, a connection error, an empty body — degrades to
-    ``None``, and the brief is composed without the dashboard section. A primer that briefly
-    fails to load must never take an agent down with it.
-
-    The ``.md`` path itself selects the Markdown representation, so no restrictive ``Accept``
-    header is sent — a strict ``Accept: text/markdown`` would risk a ``406`` if the server
-    negotiates differently, which would silently drop the dashboard section on every wake.
+    **Never break the wake (the issue's hard requirement).** Every failure mode — a typed SDK
+    error for a non-2xx, a connection error, an empty body — degrades to ``None``, and the
+    brief is composed without the dashboard section. A primer that briefly fails to load must
+    never take an agent down with it.
     """
-    transport = getattr(client, "_client", None)
-    if transport is None:
-        return None
     try:
-        response = transport.get("/users/dashboard.md")
-        if not response.is_success:
-            return None
-        return response.text.strip() or None
+        return client.dashboard_md().strip() or None
     except Exception:  # noqa: BLE001 - a primer fetch must never break the wake; degrade to None
         return None

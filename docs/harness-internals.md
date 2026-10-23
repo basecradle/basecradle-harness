@@ -129,8 +129,8 @@ fetches the live dashboard. Composed, in order, of four parts (`_brief.py`):
    (`ResolvedTools.manifest`), each tool with its optional one-line `note`. Always matches
    the active provider + drop-ins, so it can never drift from what the model can call.
 3. **Live `dashboard.md`** — the platform's *maintained* primer, fetched fresh from
-   `/users/dashboard.md` over the SDK client's authenticated transport (the SDK has no typed
-   markdown accessor yet). **A fetch failure degrades gracefully** — the brief is composed
+   `/users/dashboard.md` through the SDK's `client.dashboard_md()` accessor
+   (`basecradle>=0.15.0`, issue #716). **A fetch failure degrades gracefully** — the brief is composed
    from the rest and the wake never breaks. Replaces Group 1's structured field-scrape.
 4. **`system-prompt.md`** (`prompts/`, personality) — `HARNESS_SYSTEM_PROMPT` remains the
    legacy fallback for an un-migrated agent.
