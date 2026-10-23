@@ -1,6 +1,6 @@
 ---
 name: harness-release-deploy
-description: Step-by-step procedure for releasing and deploying basecradle-harness — the OIDC Trusted-Publishing pipeline (v* tag → TestPyPI rehearsal → capital-approved pypi env-gate → PyPI), the contractual workflow/environment names, the four-owner build→publish→deploy→verify flow, the @jt verify (the token-free plumbing check, then the real model wake on a temporary timeline that proves the release), and a builder's local proof wake as its own account `@basecradle-harness-ai` (no integration, so one wake, and the builder deletes its timeline once that wake has ended). Use when cutting a release, proving a change with a local wake before it ships, bumping the version for a release, waiting on or reasoning about the pypi env-gate, or confirming a release reached and converged the fleet. The standing invariants (released ≠ deployed; no closing keyword on release PRs; the capital not @origin actuates publish) live in CLAUDE.md → Releasing.
+description: Step-by-step procedure for releasing and deploying basecradle-harness — the OIDC Trusted-Publishing pipeline (v* tag → TestPyPI rehearsal → capital-approved pypi env-gate → PyPI), the contractual workflow/environment names, the four-owner build→tag+publish→deploy→verify flow, the capital's derived-tag command, the @jt verify (the token-free plumbing check, then the real model wake on a temporary timeline that proves the release), and a builder's local proof wake as its own account `@basecradle-harness-ai` (no integration, so one wake, and the builder deletes its timeline once that wake has ended). Use when bumping the version for a release, handing a release to the capital, cutting a tag (the capital's), proving a change with a local wake before it ships, waiting on or reasoning about the pypi env-gate, or confirming a release reached and converged the fleet. The standing invariants (released ≠ deployed; no closing keyword on release PRs; the captain's part ends at the bump + changelog and the capital cuts the tag; the capital not @origin actuates publish) live in CLAUDE.md → Releasing.
 ---
 
 # Harness Release + Deploy Procedure
@@ -10,6 +10,8 @@ The invariants live in `CLAUDE.md` → "Releasing" and govern at all times:
   recurring *released ≠ deployed* failure class).
 - **No closing keyword on a release PR** — close the release issue by hand, only after the package
   is verified live on PyPI, recording version + URL in the closing comment.
+- **The captain's part ends at the version bump + changelog; the capital cuts the tag** (@origin,
+  2026-10-22, recorded on basecradle-ruby#240). The captain never pushes a tag.
 - **The capital, not @origin, actuates publish** (`constitution.md` → Earned Autonomy).
 
 This skill is the step-by-step pipeline behind them.
@@ -18,7 +20,7 @@ This skill is the step-by-step pipeline behind them.
 
 Mirror the Python SDK's pipeline — `basecradle/basecradle-python` → `.github/workflows/release.yml` is the template:
 
-1. Push a `v*` git tag →
+1. the **capital** pushes a `v*` git tag, derived from the tree (step 2 of the four-owner flow) →
 2. **preflight** (the coherence gate — see below) →
 3. build →
 4. **TestPyPI** rehearsal →
@@ -27,7 +29,8 @@ Mirror the Python SDK's pipeline — `basecradle/basecradle-python` → `.github
 
 ### Preflight — the tag cannot lie (issue #308)
 
-Nothing is built or published until `scripts/check_release.py preflight <tag>` passes. It asserts
+Nothing is built or published until `scripts/check_release.py preflight <tag>` passes — run by
+the capital before it pushes the tag, and again by the workflow as its first job. It asserts
 three things, each of which has actually gone wrong here:
 
 - **The tag matches `_version.py`.** Hatchling reads the version from the *code*, never from the
@@ -39,9 +42,13 @@ three things, each of which has actually gone wrong here:
   Tagging over staged changes publishes a version whose own changelog calls its headline fix
   unreleased. That was issue #308's exact state, and it now cannot ship.
 
-**If preflight fails, do not force the tag.** Fix `main` (promote `[Unreleased]` into the release's
-section, bump `_version.py`), delete and re-push the tag. The same script runs on every PR as the
-`changelog` CI job, in `repo` mode, so `main` should already be coherent when you tag.
+**If preflight fails, nobody forces the tag.** The capital's own run refuses before any tag
+exists; the workflow's run fails on a pushed one, which the capital deletes, local and remote. Either
+way the capital puts the failure on the issue, the captain fixes `main` in a PR (a missing version
+section, content left under `[Unreleased]`) and hands back with `needs-capital`, and the capital
+re-cuts the tag. A tag derived from the tree cannot disagree with `_version.py`; that check is the
+backstop for one typed by hand. The same script runs on every PR as the `changelog` CI job, in
+`repo` mode, so `main` should already be coherent by the time the capital tags.
 
 **Contractual names — never rename:** the workflow filename and the environment names
 `testpypi` / `pypi` match the Trusted Publisher registrations on PyPI/TestPyPI. Renaming any of
@@ -59,12 +66,19 @@ Constitution baselines: **basecradle#362** (one deployer for the fleet's machine
    section (`## [x.y.z] - <date>`). Never fold a change into an already-dated section: that is the
    move that erased v0.43.0 and v0.47.0 from the changelog. `python3 scripts/check_release.py repo`
    answers whether `main` is releasable; preflight will refuse the tag if it is not.
-   **Your release responsibility ends at the version bump** — you do not publish, deploy, or
-   verify on a box. The *change* is still yours to prove before it ships: where its behavior lives
-   in a model turn, drive a real wake of the local build on a temporary timeline, the same shape
-   as step 4b (the local proof wake, below). Where the laptop cannot reach the platform or the
-   provider, say so in the completion comment so step 4b knows it carries the whole proof — never
+   **Your release responsibility ends at the version bump + changelog** — you do not tag, publish,
+   deploy, or verify on a box, and you never push a `v*` tag, even when the release looks ready.
+   The *change* is still yours to prove before it ships: where its behavior lives in a model turn,
+   drive a real wake of the local build on a temporary timeline (the local proof wake, below — the
+   same shape as the capital's step 4b). Where the laptop cannot reach the platform or the
+   provider, say so in the hand-off comment so step 4b knows it carries the whole proof — never
    let green offline tests stand in for it silently.
+
+   **Once the PR merges, hand off.** Your completion comment *is* the hand-off: it names the
+   version and the merge commit, says what you proved and what you could not, and goes out with
+   the **`needs-capital`** label applied in the same action. Leave the issue open — the capital closes it once the release is
+   verified live, and that holds on an issue you filed yourself too. That comment is the last
+   thing you owe the release.
 
    **The local proof wake runs as `@basecradle-harness-ai`, this builder's own platform account,
    never as @jt** (issue #640; @origin, 2026-10-03). @jt is a live agent on the fleet box with a
@@ -111,7 +125,58 @@ Constitution baselines: **basecradle#362** (one deployer for the fleet's machine
    pointed at the router), every event a laptop test causes wakes the fleet's copy too, and the
    #632 collision is back under a new name. A separate, laptop-only test account is needed
    **before** that integration is armed. The same note is on basecradle-noc#91.
-2. **Publish to PyPI — the capital.** Owns the `pypi` env-gate.
+2. **Tag and publish to PyPI — the capital.** The capital cuts the tag and owns the `pypi`
+   env-gate.
+
+   **Which commit, which version.** The tag goes on `main`'s tip once the release commit has
+   merged. Several versions merged since the last tag are tagged **once, at the latest**, and that
+   one release carries every changelog section beneath it (0.134.1, 0.135.0 and 0.135.1 shipped as
+   one `v0.135.1`). So before cutting the tag, list the versions it will carry
+   (`git describe --tags --abbrev=0` names the last tag; every CHANGELOG section above it rides
+   along) and verify and close each one's issue under this release. A version nobody accounts for
+   is published silently and never verified (v0.53.0 and v0.54.0 were passed over that way,
+   2026-07-06, and have no tag of their own).
+
+   **Never type the tag — derive it from the version the tree builds**, from the root of a clean
+   clone, as one block. Preflight gates the tag:
+
+   ```bash
+   (
+     set -euo pipefail
+
+     git switch main
+     git pull --ff-only
+     [ -z "$(git status --porcelain)" ] || { echo "tree is not clean — refusing to tag" >&2; exit 1; }
+
+     out="$(mktemp -d)"
+     trap 'rm -rf "$out"' EXIT
+     uv build --wheel --out-dir "$out"
+     version="$(basename "$out"/*.whl | cut -d- -f2)"
+     [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+       echo "this tree builds '$version', not a plain X.Y.Z release — refusing to tag" >&2
+       exit 1
+     }
+
+     python3 scripts/check_release.py preflight "v$version"
+     git tag -a "v$version" -m "v$version"
+     git push origin "v$version"
+   )
+   ```
+
+   The version is read off the wheel's filename, the artifact the pipeline publishes, rather than
+   off `_version.py` by hand: hatchling's version regex is looser than a `sed` (case-insensitive,
+   either quote, a leading `v` stripped), and the filename has already applied PEP 440
+   normalization. The same shape is the Python SDK's (`basecradle-python` → `release-to-pypi`
+   skill, step 2), which carries why each line is load-bearing: one command per line under
+   `set -e`, a subshell instead of a heredoc, `--porcelain` because hatchling packages untracked
+   files, a fresh build directory so exactly one wheel matches.
+
+   **A wrong tag is deleted in both places, local and remote** — two commands, never a `&&`
+   chain, so a failed local delete cannot skip the remote: `git tag -d vX.Y.Z`, then
+   `git push origin :refs/tags/vX.Y.Z`. A push that failed leaves only the local tag, which
+   `git tag -d` alone clears before the block is run again. Re-cutting the **same** version is
+   safe only while the run stopped before `publish-testpypi`: TestPyPI and PyPI never accept a file
+   name twice, so once the rehearsal has uploaded, the fix is a new version from the captain.
 3. **Deploy / converge the fleet (incl. @jt) — the NOC, the fleet's sole deployer.** The NOC reads
    each box's running version, compares it to the git-tracked desired state, and converges any
    off-target box via its `fleet-upgrade-campaign` (triggered by its release-drift detection).
