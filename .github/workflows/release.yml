@@ -1,4 +1,4 @@
-# The release pipeline: tag → build → TestPyPI rehearsal → human approval → PyPI.
+# The release pipeline: tag → preflight → build → TestPyPI rehearsal → the capital's approval → PyPI.
 #
 # Zero stored credentials: PyPI trusts this workflow via OIDC (Trusted Publishing).
 # The workflow filename and the environment names (testpypi, pypi) are contractual —
