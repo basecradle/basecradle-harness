@@ -54,8 +54,9 @@ jobs:
   # skipped, which reports success, as `commit-trailers` does. The palace modules are the ones
   # that read or write a palace, and the memory seam they implement. The suite imports far more
   # (through `_palace_check`, most of the package), so a change elsewhere that breaks a real
-  # palace is not caught here: that is the scope the capital approved, stated rather than implied. It is not yet in the gate's
-  # `needs`: it becomes required once it has run green on main (the capital's decision, #742).
+  # palace is not caught here: that is the scope the capital approved, stated rather than
+  # implied. It is in the gate's `needs`, so it is required: the capital's decision (#742) was
+  # to require it once it had run green on main, which it did on both installs (run 41213154763).
   mempalace:
     name: mempalace (${{ matrix.mempalace }})
     runs-on: ubuntu-latest
@@ -245,7 +246,7 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-latest
-    needs: [lint, test, changelog, trailers]
+    needs: [lint, test, mempalace, changelog, trailers]
     if: always()
     steps:
       - name: Fail unless every required job succeeded

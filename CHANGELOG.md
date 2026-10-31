@@ -36,8 +36,8 @@ fleet's MemPalace pin does not move with this release.
   `_memory_provider.py`, `_mining.py`, `_rerank.py`, `_scrub.py`), the real-palace tests, their
   conftest or home helper, or the workflow, twice: on the locked MemPalace
   and on the floor `pyproject.toml` declares, read from it. The embedding model is cached. On any
-  other change its steps are skipped and it reports success. It is not yet part of the required
-  gate; it joins it once it has run green on `main`.
+  other change its steps are skipped and it reports success. It is part of the required gate,
+  joined after it had run green on `main`.
 - **The real-palace scenarios build their crowds as the chunks of one conversation file**, which
   no MemPalace folds, so each scenario tests the same mechanism on every supported version; two new
   scenarios test the fold itself.
