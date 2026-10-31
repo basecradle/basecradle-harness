@@ -23,6 +23,10 @@ The three rules that hold `_google_rates` honest hold this table too:
   the usage block reports (a cache *write* is its own rate on GPT-5.6 and later), and the service tier
   the response names.
 
+**Its watcher is the NOC's fleet price check** (basecradle-noc#1025 / #1147), which checks each
+row against OpenRouter's listed price or the vendor's billed cost; a table it does not check is
+not shipped (issue #755).
+
 What is priced, and what is not
 -------------------------------
 - **Model calls** (`call_cost`): Standard tier only. Flex, Fast (formerly Priority), Ultrafast, Batch

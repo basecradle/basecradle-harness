@@ -7,6 +7,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Documentation: a computed-cost rate table ships on the NOC's price check (issue #755)
+
+- **`CLAUDE.md` → Provider Capabilities carries the rule** that a rate table is not shipped until
+  the NOC checks it: an adapter whose `cost=` is `cost_basis=computed` ships its
+  `_<vendor>_rates.py` together with a handoff, filed through the capital, that adds the table to
+  the fleet price check (basecradle-noc#1025 / #1147), and the arc is done only when that check
+  reads the table green. Rate modules keep the `_<vendor>_rates.py` name so the NOC's discovery
+  finds them. Neither `_openai_rates` (#657) nor `_anthropic_rates` (#725) joined the check when it
+  shipped.
+- **`_anthropic_rates`, `_google_rates` and `_openai_rates` name the check as their watcher** in
+  their module docstrings. No code changes.
+
 ## [0.166.0] - 2026-10-31
 
 ### Fixed: drawers filed under MemPalace 3.10 read as filed under 3.11, and the palace check names the rest (issue #751)
