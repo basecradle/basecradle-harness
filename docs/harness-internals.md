@@ -180,7 +180,8 @@ reference adapter to prove it end-to-end, **without changing the default's behav
 - **The MemPalace reference adapter** (`_mempalace.py`) — an **optional extra**
   (`pip install basecradle-harness[mempalace]`). A real `MemoryProvider` over MemPalace's
   local **library** API (not its MCP tools — that is the separate MCP path, Group 5 below):
-  `observe` mines each exchange (`convo_miner.mine_convos`), `context` retrieves top-K
+  `observe` files each exchange (`convo_miner.mine_convos` then; since 0.164.0
+  `convo_miner.file_conversation_exchange`, issue #741), `context` retrieves top-K
   relevant chunks across all timelines (`searcher.search_memories`). Supplies **no
   model-facing tool** (memory is automatic), so a MemPalace agent runs with BaseCradle-only
   tools.

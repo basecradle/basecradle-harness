@@ -3,11 +3,12 @@
 MemPalace is an optional extra and not installed in the test env, so its library is
 faked at the ``sys.modules`` boundary (the adapter imports ``mempalace.convo_miner`` /
 ``mempalace.searcher`` lazily). These pin the contract the adapter relies on: `observe`
-mines a quote-formatted exchange file, `context` retrieves and renders top-K hits, the
+writes a quote-formatted exchange file and files it whole, `context` retrieves and renders top-K hits, the
 provider exposes one **read-only** `memory_search` tool over that same retrieval call, and a
 genuinely missing package degrades to an actionable "install the extra" error.
 """
 
+import hashlib
 import json
 import os
 import stat
@@ -47,35 +48,150 @@ def _scope(query=None):
     return MemoryScope(agent="agent-uuid", timeline="tl-uuid", query=query)
 
 
-# --- observe: mine a quote-formatted exchange file ---------------------------
+# --- observe: file one exchange, one drawer, verbatim (issue #741) ----------
 
 
-def test_observe_writes_an_exchange_file_and_mines_it(fake_mempalace, tmp_path):
+def test_observe_writes_the_record_and_files_it_as_one_drawer(fake_mempalace, tmp_path):
+    convo_miner, _ = fake_mempalace
+    provider = MemPalaceMemoryProvider(tmp_path / "palace", agent="nova")
+
+    provider.observe(MemoryExchange(user="Where do I live?", assistant="Dallas.", scope=_scope()))
+
+    convo_dir = (tmp_path / "palace" / "conversations").resolve()
+    (path,) = convo_dir.glob("*.md")
+    assert path.read_text() == "> Where do I live?\nDallas.\n"  # `>` user turn, then the reply
+
+    # Filed through MemPalace's live-agent write path, never by mining the directory.
+    assert convo_miner.calls == []
+    (drawer,) = convo_miner.filed
+    assert drawer["text"] == path.read_text()
+    assert drawer["source_file"] == str(path)  # resolved: the spelling MemPalace's miner records
+    assert drawer["wing"] == "conversations"
+    assert drawer["agent"] == "nova"
+    assert drawer["palace"] == str(tmp_path / "palace")
+    assert convo_miner.locked == [str(path)]  # under MemPalace's own per-file lock
+
+
+def test_a_multiline_message_is_one_drawer_with_every_line(fake_mempalace, tmp_path):
+    """The defect: a four-line brief was four drawers, its short line dropped, provenance on one.
+
+    MemPalace's convo chunker reads every `>` line as a new turn and drops a drawer of 30
+    characters or fewer, so `2. Lyra.` was never filed. Filed whole, nothing is cut or lost.
+    """
+    convo_miner, _ = fake_mempalace
+    provider = MemPalaceMemoryProvider(tmp_path / "palace")
+    brief = (
+        "[2026-10-31T10:36:46.734Z] john: Opening brief for a memory test.\n"
+        "1. Your codename is AMBER-FOX-17.\n"
+        "2. Lyra.\n"
+        "3. You will be asked about them in a different timeline."
+    )
+
+    provider.observe(MemoryExchange(user=brief, assistant="Got it.\n\nLyra.", scope=_scope()))
+
+    (drawer,) = convo_miner.filed
+    assert drawer["text"] == (
+        "> [2026-10-31T10:36:46.734Z] john: Opening brief for a memory test.\n"
+        "> 1. Your codename is AMBER-FOX-17.\n"
+        "> 2. Lyra.\n"
+        "> 3. You will be asked about them in a different timeline.\n"
+        "Got it.\n\nLyra.\n"
+    )
+
+
+def test_each_drawer_carries_what_mempalaces_miner_decides_by(fake_mempalace, tmp_path):
+    """Without these a `mempalace mine` of the directory files the exchange again, shredded.
+
+    ``source_mtime`` lets the miner skip the file by path, ``chunk_total`` says the set is whole,
+    and ``content_hash`` (the miner's own, on every drawer) lets it recognise the file by content
+    after a home move.
+    """
     convo_miner, _ = fake_mempalace
     provider = MemPalaceMemoryProvider(tmp_path / "palace")
 
     provider.observe(MemoryExchange(user="Where do I live?", assistant="Dallas.", scope=_scope()))
 
-    convo_dir = tmp_path / "palace" / "conversations"
-    files = list(convo_dir.glob("*.md"))
-    assert len(files) == 1
-    body = files[0].read_text()
-    assert body == "> Where do I live?\nDallas.\n"  # MemPalace exchange format: `>` turn + reply
-
-    # And the directory was mined into the palace, agent-scoped, exchange mode.
-    assert len(convo_miner.calls) == 1
-    cdir, palace, kwargs = convo_miner.calls[0]
-    assert cdir == str(convo_dir)
-    assert palace == str(tmp_path / "palace")
-    assert kwargs["extract_mode"] == "exchange"
+    (path,) = (tmp_path / "palace" / "conversations").glob("*.md")
+    (drawer,) = convo_miner.filed
+    content = path.read_text()
+    assert drawer["extra_metadata"] == {
+        "source_mtime": os.path.getmtime(path),
+        "chunk_total": 1,
+        "content_hash": hashlib.sha256(content.strip().encode("utf-8")).hexdigest(),
+    }
+    assert drawer["room"] == "general"  # MemPalace's own room detection, as the miner does it
 
 
-def test_observe_quotes_every_line_of_a_multiline_message(fake_mempalace, tmp_path):
+def test_a_long_exchange_is_split_at_lines_into_the_fewest_drawers(fake_mempalace, tmp_path):
+    convo_miner, _ = fake_mempalace
     provider = MemPalaceMemoryProvider(tmp_path / "palace")
-    provider.observe(MemoryExchange(user="line one\nline two", assistant="ok", scope=_scope()))
+    paragraphs = [f"Paragraph {n}: " + "word " * 60 for n in range(12)]
+    reply = "\n\n".join(paragraphs) + "\nThe passphrase is cobalt-heron-42."
 
-    body = next((tmp_path / "palace" / "conversations").glob("*.md")).read_text()
-    assert body == "> line one\n> line two\nok\n"
+    provider.observe(MemoryExchange(user="Hand it over.", assistant=reply, scope=_scope()))
+
+    texts = [drawer["text"] for drawer in convo_miner.filed]
+    assert len(texts) > 1
+    assert all(len(text) <= _mempalace.EXCHANGE_PIECE_CHARS for text in texts)
+    assert "".join(texts) == f"> Hand it over.\n{reply}\n"  # nothing dropped, nothing reordered
+    assert {drawer["extra_metadata"]["chunk_total"] for drawer in convo_miner.filed} == {len(texts)}
+    assert len({drawer["source_file"] for drawer in convo_miner.filed}) == 1
+
+
+@pytest.mark.parametrize("size", [12, 40, 800])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "short\n",
+        "> " + "x" * 2000 + "\n",  # one quoted line, no spaces: cut mid-word
+        "> " + "quoted words " * 200 + "\nreply " * 300,
+        "\n\n\n> \n> a\n\n" + ("y" * 900) + "\n",
+        "> " + "a" * 30 + " " + "b" * 3000 + "\n",
+    ],
+)
+def test_pieces_lose_nothing_and_never_pass_the_size(text, size):
+    """Every piece fits; joined, with each re-quote taken off again, they are the text."""
+    pieces = _mempalace._pieces(text, size)
+
+    assert all(len(piece) <= size for piece in pieces)
+    assert all(piece.strip() for piece in pieces)
+    rebuilt = pieces[0] if pieces else ""
+    for piece in pieces[1:]:
+        # A continuation of a cut quoted line carries the quote again; that is the one addition.
+        cut_quoted = not rebuilt.endswith("\n") and piece.startswith("> ")
+        rebuilt += piece[2:] if cut_quoted else piece
+    assert rebuilt.strip() == text.strip()
+
+
+def test_a_cut_quoted_line_stays_a_peers_words_on_its_continuation():
+    """The reading guide says a `>` line is what was said to you; a cut must not make it the agent's."""
+    line = "> " + "peer words " * 200 + "\n"
+
+    pieces = _mempalace._pieces(line, 800)
+
+    assert len(pieces) > 1
+    assert all(piece.startswith("> ") for piece in pieces)
+
+
+def test_a_failed_filing_leaves_neither_drawers_nor_a_file(fake_mempalace, tmp_path):
+    """All or nothing: a file with no drawers is one a later mine would shred."""
+    convo_miner, _ = fake_mempalace
+    provider = MemPalaceMemoryProvider(tmp_path / "palace")
+    filed = convo_miner.file_conversation_exchange
+
+    def fail_on_the_second(collection, **kwargs):
+        if len(convo_miner.filed) == 1:
+            raise RuntimeError("chroma refused the write")
+        return filed(collection, **kwargs)
+
+    convo_miner.file_conversation_exchange = fail_on_the_second
+    reply = "\n".join("line " * 50 for _ in range(8))
+
+    with pytest.raises(RuntimeError, match="chroma refused"):
+        provider.observe(MemoryExchange(user="Go on.", assistant=reply, scope=_scope()))
+
+    assert convo_miner.deleted == ["drawer_1"]
+    assert list((tmp_path / "palace" / "conversations").glob("*.md")) == []
 
 
 def test_observe_skips_a_wholly_empty_exchange(fake_mempalace, tmp_path):
@@ -84,7 +200,7 @@ def test_observe_skips_a_wholly_empty_exchange(fake_mempalace, tmp_path):
 
     provider.observe(MemoryExchange(user="   ", assistant="", scope=_scope()))
 
-    assert convo_miner.calls == []
+    assert convo_miner.filed == []
     assert not (tmp_path / "palace" / "conversations").exists()
 
 
@@ -1306,7 +1422,7 @@ def test_the_cli_and_the_adapter_are_one_mind_not_two(fake_mempalace, home, monk
 
     provider.observe(MemoryExchange(user="Where do I live?", assistant="Dallas.", scope=_scope()))
 
-    (_convo_dir, mined_palace, _kwargs) = convo_miner.calls[0]
+    mined_palace = convo_miner.filed[0]["palace"]
     assert mined_palace == _cli_default_palace(home)
     assert (Path(mined_palace) / "conversations").is_dir()  # the palace the exchange landed in
 

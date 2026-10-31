@@ -7,6 +7,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.164.0] - 2026-10-31
+
+### Fixed: a multi-line message is filed whole, not one drawer per line (issue #741)
+
+The MemPalace observe wrote each exchange as a file and mined the directory with MemPalace's convo
+chunker, which reads every line beginning `>` as a new user turn. Since every line of the user half
+is quoted, a four-line peer brief was filed as four drawers, a line of 30 characters or fewer
+(`2. Lyra.`) was dropped, the reply attached to the last line only, and only the first drawer said
+who wrote it. No encoding of a one-exchange file avoids every drop inside that chunker.
+
+- **The observe files through MemPalace's canonical write path for live agents**,
+  `convo_miner.file_conversation_exchange`: one exchange, one drawer, verbatim. The conversation
+  file is still written, named as before, and stays the record `basecradle-harness-scrub-palace`
+  removes with its drawers. The directory is never mined.
+- **An exchange over 800 characters (`EXCHANGE_PIECE_CHARS`) is split at line boundaries** into
+  the fewest drawers that fit, nothing dropped, a cut quoted line re-quoted on its continuation.
+  Measured on a real palace with near-topic competitors: filed whole, a fact in the last paragraph
+  of a 6.3k-character message was not in the top ten; split at 800 it was at rank 5 to 6. 800 is
+  also MemPalace's own chunk size, so a Turn-0 recall and a rerank request stay bounded as before.
+- **Each drawer carries `source_mtime`, `chunk_total` and `content_hash`**, the fields MemPalace's
+  own miner decides by, so a `mempalace mine` of the directory files nothing a second time, a set
+  cut short reads as unfiled, and after a home move every file is recognised by its content.
+- **All or nothing**: written and filed under MemPalace's per-file lock, and on any error the
+  drawers filed so far are deleted and the file removed.
+- **`basecradle-harness-palace-check`**: its forecast is now of what a `mempalace mine` of the
+  conversation files would do. Its `next observe (dry run):` and `conversation files:` lines keep
+  their wording byte for byte, because the NOC's rename flow parses them. `--practice-observe`
+  says it filed the exchange rather than mined it.
+- Existing drawers are untouched; only new exchanges take the new path. The `mempalace` floor stays
+  `>=3.9.0`: the API is identical from 3.9.0 through 3.11.0, and the real-palace tests pass on
+  3.9.0, 3.10.0 and 3.11.0.
+
 ## [0.163.0] - 2026-10-31
 
 ### Changed: Turn-0 recall skips what this wake just filed from its seeded backlog (issue #746)
