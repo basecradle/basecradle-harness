@@ -27,6 +27,10 @@ honest, and every figure they produce is a `ComputedCost`, which the line tags
   2026-12-31, and the standard rates that follow are already in the table, so the switch needs no
   release).
 
+**Its watcher is the NOC's fleet price check** (basecradle-noc#1025 / #1147), which checks each
+row against OpenRouter's listed price or the vendor's billed cost; a table it does not check is
+not shipped (issue #755).
+
 Pricing is the **Standard pay-as-you-go** tier only. Priority, Flex, batch and Provisioned
 Throughput are priced elsewhere on the page (or not per call at all), and a call the response says
 ran on one of them gets no cost.

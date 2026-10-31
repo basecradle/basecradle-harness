@@ -19,6 +19,10 @@ The three rules that hold `_google_rates` and `_openai_rates` honest hold this t
   reads and cache writes"), the cache split the usage block reports (a 5-minute write, a 1-hour
   write and a read are three different rates), and the inference geography the request asked for.
 
+**Its watcher is the NOC's fleet price check** (basecradle-noc#1025 / #1147), which checks each
+row against OpenRouter's listed price or the vendor's billed cost; a table it does not check is
+not shipped (issue #755).
+
 What is priced, and what is not
 -------------------------------
 - **Model calls** (`call_cost`): standard tier, standard speed. ``inference_geo="us"`` applies the
