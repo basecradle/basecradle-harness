@@ -405,3 +405,18 @@ def test_an_anthropic_fetch_is_on_the_next_wakes_request(router, tmp_path):
     note = second[assistant + 1]["content"][0]["text"]
     assert note.startswith(SYSTEM_LABEL + HEADER)
     assert f'web_fetch: "{FETCHED}"' in note
+
+
+def test_marking_a_later_failure_is_bounded_and_skips_an_unlisted_use():
+    from basecradle_harness._server_tools import FAILURE_CAP, mark_failed
+
+    turn = fetched()
+    assert mark_failed(turn, 0, "x" * 500)
+    assert len(turn.server_tools.uses[0].failed) == FAILURE_CAP
+    assert bound(turn.server_tools) == turn.server_tools  # still a fixed point
+    many = Message(role="assistant")
+    many.server_tools = record(ServerToolUse("web_search", f"q{n}") for n in range(MAX_LISTED + 1))
+    assert many.server_tools.unlisted == 1
+    assert not mark_failed(many, MAX_LISTED, "unlisted")  # counted, never listed, nothing to mark
+    assert all(not use.failed for use in many.server_tools.uses)
+    assert not mark_failed(Message.assistant(content="hi"), 0, "none")

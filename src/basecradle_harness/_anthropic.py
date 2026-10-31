@@ -117,9 +117,12 @@ The wire translation
   Anthropic runs it then — but only if the message answering the group holds ``tool_result`` blocks
   and nothing else (measured live, issue #735). The engine's step note, and any other system note
   or injected image after a step's results, is therefore folded into the last result's ``content``
-  there (`_fold_into_results`); left as a trailing block it was a 400 on every mixed group. A
-  server tool's own failure arrives inside an HTTP 200 (its result's
-  ``content`` is an error object where success is a list) and is logged, never raised.
+  there (`_fold_into_results`); left as a trailing block it was a 400 on every mixed group. Its
+  result therefore arrives in the *next* reply, so a failure there is marked on the record of the
+  reply that made the call (`_mark_late_failures`, issue #737); the engine keeps showing that turn's
+  note as first sent for the rest of the wake, so the mark is persisted at once and shown from the
+  next wake. A server tool's own failure arrives inside an HTTP 200 (its result's ``content`` is an
+  error object where success is a list) and is logged, never raised.
 
 Every vendor control, and the three the 5.x models refuse
 ---------------------------------------------------------
@@ -209,7 +212,7 @@ from basecradle_harness._observability import (
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._secret import Sealed
-from basecradle_harness._server_tools import record, summarize
+from basecradle_harness._server_tools import mark_failed, record, summarize
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
@@ -517,10 +520,33 @@ class AnthropicProvider:
                 getattr(details, "explanation", None) or "no explanation given.",
             )
         reply = _reply(blocks)
+        self._mark_late_failures(blocks)
         self._replies[id(reply)] = (reply, blocks, digest)
         self._state_code_gap(blocks)
         with generation_of({"id": getattr(response, "id", None)}):
             return reply
+
+    def _mark_late_failures(self, blocks: Sequence[Mapping[str, Any]]) -> None:
+        """Mark on its own record a server tool whose failure arrived in this later reply (#737).
+
+        A mixed group's server tool runs only once the client results go back, so its result lands
+        in the reply after the one holding its ``server_tool_use``. `_reply` reads a reply alone, so
+        the earlier reply — still kept, and the same `Message` the transcript holds — is found here
+        by the use's id, at its position among that reply's uses (the order the record keeps).
+        """
+        for block in blocks:
+            content = block.get("content")
+            if block.get("type") not in _RESULTS or not isinstance(content, Mapping):
+                continue
+            if "error_code" not in content:
+                continue
+            target = block.get("tool_use_id")
+            for message, kept, _ in self._replies.values():
+                ids = [b.get("id") for b in kept if b.get("type") == "server_tool_use"]
+                if target in ids:
+                    reason = str(content.get("error_code") or "failed")
+                    mark_failed(message, ids.index(target), reason)
+                    break
 
     def _call(self, request: dict[str, Any]) -> Any:
         """One billed ``messages.create``, its ``llm`` line, and its search fee's ``media`` line."""
@@ -1113,7 +1139,7 @@ def _reply(blocks: Sequence[Mapping[str, Any]]) -> Message:
         if kind == "server_tool_use":
             use = ServerToolUse(name=block.get("name") or "", input=summarize(block.get("input")))
             used.append(use)
-            by_id[block.get("id") or ""] = use
+            by_id.setdefault(block.get("id") or "", use)  # the first, as the late path reads
         elif kind == "text":
             texts.append(block.get("text") or "")
             for cited in block.get("citations") or ():

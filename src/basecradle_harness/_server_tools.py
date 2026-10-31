@@ -227,6 +227,23 @@ def _cut(text: str, cap: int) -> str:
     return text if len(text) <= cap else text[: cap - len(_ELLIPSIS)] + _ELLIPSIS
 
 
+def mark_failed(message: Message, index: int, reason: str) -> bool:
+    """Mark the `index`-th use on `message`'s record as failed, bounded — ``True`` if it was listed.
+
+    For a failure the vendor reports *after* the reply that recorded the use: on Anthropic a mixed
+    server-and-client group runs its server tool only on the next call, so the error result arrives
+    in a later reply than the ``server_tool_use`` (issue #737). A use past `MAX_LISTED` is counted,
+    not listed, and has no line to mark.
+    """
+    found = message.server_tools
+    if found is None or not 0 <= index < len(found.uses):
+        return False
+    use = found.uses[index]
+    failed = _cut(_one_line(reason), FAILURE_CAP) or "failed"
+    found.uses[index] = ServerToolUse(name=use.name, input=use.input, failed=failed)
+    return True
+
+
 def render(found: ServerToolRecord) -> str:
     """The system note that shows a turn's record to the model — never longer than `NOTE_CAP`."""
     found = bound(found) or ServerToolRecord()
@@ -244,25 +261,51 @@ def chars(message: Message) -> int:
     return len(render(found)) if found is not None else 0
 
 
-def with_records(messages: list[Message]) -> list[Message]:
+def with_records(
+    messages: list[Message], shown: dict[int, tuple[Message, str]] | None = None
+) -> list[Message]:
     """`messages` with each assistant turn's record shown as a system note after the turn.
 
     The note goes after the turn's own tool results — never between a call and its result, which
     some vendors refuse — and before whatever follows them. The turns themselves are the same
     objects, never copies: an adapter that keeps per-reply state finds its replies by identity. A
     list with no record in it is returned as it is.
+
+    `shown` remembers, by turn identity, the note each turn was first shown with, and that note is
+    sent again for as long as the memo lives (the engine keeps it for its wake). A record can
+    change after it was first shown — a failure Anthropic reports in a later reply is marked on it
+    (issue #737) — and re-rendering would change bytes already sent mid-wake: every later reply's
+    preserved thinking would be stripped (its prefix changed) and the cache tail rewritten, to tell
+    the model what the raw result in front of it already says. The changed record is persisted at
+    once and shown from the next wake. Entries for turns no longer in `messages` are dropped.
     """
     if not any(chars(message) for message in messages):
         return messages
-    shown: list[Message] = []
+    result: list[Message] = []
     pending: str | None = None
+    present: set[int] = set()
     for message in messages:
         if pending is not None and message.role != "tool":
-            shown.append(Message.system(pending))
+            result.append(Message.system(pending))
             pending = None
-        shown.append(message)
+        result.append(message)
         if message.role == "assistant" and chars(message):
-            pending = render(message.server_tools)  # type: ignore[arg-type]
+            pending = _note_for(message, shown)
+            present.add(id(message))
     if pending is not None:
-        shown.append(Message.system(pending))
-    return shown
+        result.append(Message.system(pending))
+    if shown is not None:
+        for key in [key for key in shown if key not in present]:
+            del shown[key]
+    return result
+
+
+def _note_for(message: Message, shown: dict[int, tuple[Message, str]] | None) -> str:
+    """The note `message` was first shown with, if `shown` holds it, else rendered (and held)."""
+    held = shown.get(id(message)) if shown is not None else None
+    if held is not None and held[0] is message:
+        return held[1]
+    note = render(message.server_tools)  # type: ignore[arg-type]
+    if shown is not None:
+        shown[id(message)] = (message, note)
+    return note

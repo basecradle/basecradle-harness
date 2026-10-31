@@ -1434,3 +1434,109 @@ def test_a_server_tool_already_answered_in_its_reply_leaves_the_next_message_alo
     provider.chat(convo, tools=[TOOL])
     answering = body(route, 1)["messages"][2]
     assert [b["type"] for b in answering["content"]] == ["tool_result", "text"]
+
+
+# === a server tool's failure that arrives in the next reply is marked on its record (#737) ======
+
+
+def test_a_late_failure_is_marked_on_the_reply_that_recorded_the_use(router, provider):
+    fetch = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01L",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com/gone"},
+    }
+    refused = {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": "srvtoolu_01L",
+        "content": {"type": "web_fetch_tool_result_error", "error_code": "url_not_accessible"},
+    }
+    router.post(MESSAGES).mock(
+        side_effect=[
+            reply(fetch, tool_use("toolu_01E", TOOL.name, {"label": "x"}), stop_reason="tool_use"),
+            reply(refused, text("I could not read it.")),
+        ]
+    )
+    convo = [Message.user("fetch it and get the number")]
+    first = provider.chat(convo, tools=[TOOL])
+    assert first.server_tools.uses[0].failed == ""  # not run yet
+    convo += [first, Message.tool("toolu_01E", "7"), Message.system("Step 2 of 24.")]
+    second = provider.chat(convo, tools=[TOOL])
+    assert first.server_tools.uses[0].failed == "url_not_accessible"  # marked where it was recorded
+    assert second.server_tools is None  # and not listed a second time
+    assert first.to_dict()["server_tools"]["uses"][0]["failed"] == "url_not_accessible"
+
+
+def test_a_late_failure_through_the_engine_marks_the_right_use_and_keeps_the_wake_stable(
+    router, provider
+):
+    """Two server uses after a thinking block, the second failing a reply later (issue #737).
+
+    The mark lands on the second use — its position among the server uses, not among all blocks —
+    on the very turn the transcript holds. And the note already sent for that turn is sent again
+    unchanged for the rest of the wake, so the next reply keeps its thinking.
+    """
+    from basecradle_harness import Engine, Tool, ToolRegistry
+
+    class Number(Tool):
+        name = TOOL.name
+        description = TOOL.description
+        parameters = TOOL.parameters
+
+        def run(self, **kwargs):
+            return "7"
+
+    search = {**SEARCH_USE, "id": "srvtoolu_01A"}
+    fetch = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01B",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com/gone"},
+    }
+    searched = {**SEARCH_RESULT, "tool_use_id": "srvtoolu_01A"}
+    refused = {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": "srvtoolu_01B",
+        "content": {"type": "web_fetch_tool_result_error", "error_code": "url_not_accessible"},
+    }
+    route = router.post(MESSAGES).mock(
+        side_effect=[
+            reply(
+                thinking("t1"),
+                search,
+                searched,
+                fetch,
+                tool_use("toolu_01G", TOOL.name, {"label": "a"}),
+                stop_reason="tool_use",
+            ),
+            reply(
+                refused,
+                thinking("t2"),
+                tool_use("toolu_01H", TOOL.name, {"label": "b"}),
+                stop_reason="tool_use",
+            ),
+            reply(text("done")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(Number())
+    messages = [Message.user("search, fetch, and get two numbers")]
+
+    Engine(provider, registry).run(messages)
+
+    first = messages[2]
+    assert first.role == "assistant"
+    assert [(u.name, u.failed) for u in first.server_tools.uses] == [
+        ("web_search", ""),
+        ("web_fetch", "url_not_accessible"),
+    ]
+    assert first.to_dict()["server_tools"]["uses"][1]["failed"] == "url_not_accessible"
+
+    def note_in(index):
+        flat = json.dumps(body(route, index)["messages"])
+        return "url_not_accessible" in flat and "(failed: " in flat
+
+    assert not note_in(1) and not note_in(2)  # the note already sent is sent unchanged
+    step3 = body(route, 2)["messages"]
+    second = next(m for m in step3[3:] if m["role"] == "assistant")
+    assert thinking("t2") in second["content"]  # the round in flight keeps its thinking

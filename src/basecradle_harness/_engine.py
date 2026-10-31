@@ -413,6 +413,9 @@ class Engine:
         #: said about each piece of media (issue #664), so one instance per wake is also one paid
         #: describe per picture, however many paths perceive it.
         self._describer: Any = False
+        #: Each recorded turn's server-tool note as first shown, by turn identity, for this engine's
+        #: life — one wake (`_server_tools.with_records`, issue #737).
+        self._record_notes: dict[int, tuple[Message, str]] = {}
         #: Steps spent across every `run` this engine has driven, and how many runs that was. A
         #: wake process runs one engine, so together these *are* the wake's model usage — what its
         #: end-of-wake log line reports. `max_steps` is a **per-run** budget, so `steps_used` may
@@ -843,8 +846,10 @@ class Engine:
         last_exc: ProviderError | None = None
         # Server-side tool activity is shown beside the turn it happened in (issue #727): a system
         # note per recorded turn, spliced into the request only — never into `messages`, which is
-        # the transcript. Composed once per call; every retry sends the same request.
-        shown = with_records(messages)
+        # the transcript. Composed once per call; every retry sends the same request. Each turn's
+        # note is the one it was first shown with for the life of this engine (`_record_notes`), so
+        # a record marked mid-wake never changes bytes already sent (issue #737).
+        shown = with_records(messages, self._record_notes)
         try:
             for _ in range(attempts):
                 bind_scale(self.provider, retry.timeout_scale)

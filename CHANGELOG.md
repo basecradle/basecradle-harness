@@ -7,6 +7,28 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.161.2] - 2026-10-31
+
+### Fixed: an Anthropic server tool's failure that arrives in the next reply is marked on its record (issue #737)
+
+The server-tool record (0.161.0) marks a use the vendor reported as failed, so a fetch that never
+read the page is never listed as one that did. In a mixed server-and-client group, which works since
+0.161.1, the server tool runs only once the client results go back, so its result arrives in the
+reply *after* the one holding its `server_tool_use`. The adapter matched a result to its use only
+within one reply, so such a failure left the earlier record unmarked, and the transcript kept a
+failed fetch as one that had gone through.
+
+- The adapter now finds the earlier, still-kept reply by the use's id and marks the use at its
+  position on that reply's record, bounded by `FAILURE_CAP` (`_server_tools.mark_failed`). The
+  transcript holds that same turn, so the next save persists the mark. Measured live on 2026-10-31:
+  the later reply answers the earlier reply's use by its id, and any `server_tool_use` it carries
+  itself is a new, nested call.
+- A use past `MAX_LISTED` is counted, not listed, and has no line to mark.
+- **The mark is shown from the next wake, never mid-wake.** The engine sends each turn's note as it
+  was first shown for the rest of its wake (`Engine._record_notes`). Re-rendering it would change
+  bytes already sent, so Anthropic's preserved thinking for every later reply would be stripped and
+  the cache tail rewritten, to tell the model what the raw error result in front of it already said.
+
 ## [0.161.1] - 2026-10-31
 
 ### Fixed: an Anthropic turn calling a server tool and a client tool together failed on its next step (issue #735)
