@@ -229,14 +229,35 @@ SDK = "anthropic"
 #: reads ``ANTHROPIC_BASE_URL`` for itself.
 DEFAULT_BASE_URL = "https://api.anthropic.com"
 
+#: Who may call a web tool (issue #740): the model directly, and code in the sandbox. That is
+#: Anthropic's own default for these versions — the sandbox caller alone, ``code_execution_20260120``,
+#: the caller a sandbox call reports even beside ``code_execution_20260521`` — with ``direct`` added,
+#: so dynamic filtering is kept. Left at the default, the model holds no direct schema for the tool
+#: (asked, it says *"I can't call `web_fetch` directly … it's only available inside the
+#: code_execution environment"*) while the brief names it as a tool it holds; when it calls one
+#: directly anyway it wraps its arguments (``{"params": {"url": …}}``) or sends ``{}``, and the tool
+#: answers ``invalid_tool_input``. Measured 2026-10-31 on ``claude-haiku-5-5`` under a
+#: harness-shaped brief, eight requests an arm: 3 of 4 direct fetches and 8 of 14 direct searches
+#: failed at the default, 0 of 8 and 0 of 9 with these callers, and a fetch from the sandbox still
+#: succeeded.
+WEB_CALLERS = ("direct", "code_execution_20260120")
+
 #: The server tools this adapter sends, by the builtin name a tool plugin resolves to → the tool
 #: definition on the wire. The latest versions on 2026-10-31: web search and web fetch with dynamic
-#: filtering and ``response_inclusion``, and the code-execution tool whose results arrive as
-#: ``bash_code_execution_tool_result``. None needs a beta header. Sent in this order, ahead of the
-#: function tools, so the cached prefix is the same bytes on every call.
-BUILTINS: Mapping[str, Mapping[str, str]] = {
-    "web_search": {"type": "web_search_20260318", "name": "web_search"},
-    "web_fetch": {"type": "web_fetch_20260318", "name": "web_fetch"},
+#: filtering and ``response_inclusion``, both carrying `WEB_CALLERS`, and the code-execution tool
+#: whose results arrive as ``bash_code_execution_tool_result``. None needs a beta header. Sent in
+#: this order, ahead of the function tools, so the cached prefix is the same bytes on every call.
+BUILTINS: Mapping[str, Mapping[str, Any]] = {
+    "web_search": {
+        "type": "web_search_20260318",
+        "name": "web_search",
+        "allowed_callers": list(WEB_CALLERS),
+    },
+    "web_fetch": {
+        "type": "web_fetch_20260318",
+        "name": "web_fetch",
+        "allowed_callers": list(WEB_CALLERS),
+    },
     "code_execution": {"type": "code_execution_20260521", "name": "code_execution"},
 }
 
@@ -410,7 +431,9 @@ class AnthropicProvider:
         self._fixed_timeout = timeout
         self._anthropic = require_anthropic()
         self._params, self._cache_control = validated_params(default_params, self._anthropic)
-        self._builtins = [dict(BUILTINS[name]) for name in BUILTINS if name in set(builtin_tools)]
+        self._builtins = [
+            copy.deepcopy(dict(BUILTINS[name])) for name in BUILTINS if name in set(builtin_tools)
+        ]
         #: Each reply this adapter returned, by identity, with its raw blocks and the digest of the
         #: prefix it was produced on — what the next step sends back (see the module docstring).
         self._replies: dict[int, tuple[Message, list[dict[str, Any]], str]] = {}
@@ -1005,7 +1028,7 @@ def _wire_tools(builtins: list[dict[str, Any]], tools: Sequence[ToolSpec] | None
         }
         for spec in sorted(tools or (), key=lambda spec: spec.name)
     ]
-    return [dict(tool) for tool in builtins] + declared
+    return [copy.deepcopy(tool) for tool in builtins] + declared
 
 
 def _rendered(message: Message) -> list[dict[str, Any]]:

@@ -282,6 +282,39 @@ def test_a_web_fetch_reads_a_url_given_in_the_user_turn(caplog):
 
 
 @needs_key
+@pytest.mark.parametrize(
+    ("builtin", "prompt", "result_type"),
+    [
+        (
+            "web_fetch",
+            "Fetch https://example.com and tell me its exact title.",
+            "web_fetch_tool_result",
+        ),
+        ("web_search", "What is the current stable version of Python?", "web_search_tool_result"),
+    ],
+)
+def test_a_web_tool_called_directly_runs(caplog, builtin, prompt, result_type):
+    """Issue #740: the model's own call, not one from the sandbox, is accepted and succeeds.
+
+    ``tool_choice`` forces the direct call the model sometimes makes on its own, which a passing
+    test cannot otherwise count on (the natural fetch above may run from the sandbox). At
+    Anthropic's default ``allowed_callers`` the forced request is refused with a 400, and an
+    unforced direct call arrives with wrapped arguments and fails ``invalid_tool_input``.
+    """
+    adapter = _provider(builtin_tools=[builtin], tool_choice={"type": "tool", "name": builtin})
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        adapter.chat([Message.user(prompt)])
+    assert "server tool failed" not in caplog.text
+    kept = next(iter(adapter._replies.values()))[1]
+    results = [block for block in kept if block.get("type") == result_type]
+    assert results
+    for result in results:
+        assert result.get("caller") == {"type": "direct"}
+        content = result["content"]
+        assert not (isinstance(content, dict) and content.get("error_code")), content
+
+
+@needs_key
 def test_code_execution_computes_the_right_answer():
     adapter = _provider(builtin_tools=["code_execution"])
     answer = adapter.chat(
