@@ -43,6 +43,104 @@ jobs:
       - name: Test
         run: uv run pytest
 
+  # The real-palace suite (`-m mempalace`, which the default run deselects): real MemPalace
+  # palaces and the embedding model they download. A MemPalace bump merged on green that this
+  # suite would have failed is the failure it catches (issue #742: 3.11.0 broke
+  # `--pool-diagnosis`, and nothing ran it). Two installs, because the harness supports a range:
+  # the locked MemPalace, which a Dependabot bump moves, and the floor `pyproject.toml` declares.
+  #
+  # It runs only when the change touches what the suite tests (the lock, `pyproject.toml`, a
+  # palace module, the suite itself or this workflow); otherwise every step after the check is
+  # skipped, which reports success, as `commit-trailers` does. It is not yet in the gate's
+  # `needs`: it becomes required once it has run green on main (the capital's decision, #742).
+  mempalace:
+    name: mempalace (${{ matrix.mempalace }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mempalace: [locked, floor]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The path check diffs the change's two ends, so both must be in the clone.
+          fetch-depth: 0
+      - name: Does the change touch the real-palace suite?
+        id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            base=$PR_BASE head=$PR_HEAD
+          else
+            base=$PUSH_BEFORE head=$PUSH_AFTER
+          fi
+          # A diff that cannot be computed (a push whose before is all zeros or not in the
+          # clone) runs the suite: the doubt goes to running it, never to skipping it.
+          if ! changed=$(git diff --name-only "$base" "$head" 2>/dev/null); then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          run=false
+          while IFS= read -r file; do
+            case "$file" in
+              uv.lock | pyproject.toml | .github/workflows/ci.yml \
+                | src/basecradle_harness/_mempalace.py | src/basecradle_harness/_palace_*.py \
+                | tests/conftest.py | tests/test_*_real.py | scripts/isolated_home.py)
+                run=true
+                ;;
+            esac
+          done <<< "$changed"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@v10.3.2
+        if: steps.paths.outputs.run == 'true'
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        if: steps.paths.outputs.run == 'true'
+        run: uv sync --locked --extra mempalace
+      - name: Install the declared floor
+        if: steps.paths.outputs.run == 'true' && matrix.mempalace == 'floor'
+        run: |
+          set -euo pipefail
+          # The floor is read from the one place it is declared, never restated here.
+          floor=$(uv run --no-sync python - <<'EOF'
+          import re
+          import tomllib
+
+          with open("pyproject.toml", "rb") as handle:
+              extra = tomllib.load(handle)["project"]["optional-dependencies"]["mempalace"]
+          (spec,) = [item for item in extra if item.startswith("mempalace")]
+          print(re.fullmatch(r"mempalace>=([0-9][0-9.]*)", spec).group(1))
+          EOF
+          )
+          uv pip install "mempalace==$floor"
+      - name: Which MemPalace
+        if: steps.paths.outputs.run == 'true'
+        run: uv run --no-sync python -c "import mempalace; print('mempalace', mempalace.__version__)"
+      # The default embedding model (about 80 MB) lands in ~/.cache/chroma on first use, and the
+      # suite's throwaway HOME links that directory only when the real home already holds it
+      # (scripts/isolated_home.py), so a miss downloads it here, under the real home, first.
+      - uses: actions/cache@v6
+        id: model
+        if: steps.paths.outputs.run == 'true'
+        with:
+          path: ~/.cache/chroma
+          key: chroma-onnx-all-MiniLM-L6-v2
+      - name: Download the embedding model
+        if: steps.paths.outputs.run == 'true' && steps.model.outputs.cache-hit != 'true'
+        run: >-
+          uv run --no-sync python -c "from chromadb.utils.embedding_functions import
+          ONNXMiniLM_L6_V2; ONNXMiniLM_L6_V2()(['warm'])"
+      - name: Test
+        if: steps.paths.outputs.run == 'true'
+        run: uv run --no-sync pytest -m mempalace
+
   # The CHANGELOG, _version.py, and the git tags must tell one story. This runs on every PR
   # because the failure it catches is introduced by an ordinary-looking PR and only becomes
   # visible later: a bump that renames the *previous* release's header instead of adding its

@@ -8,7 +8,7 @@ three fetches (arms 1, 2 and 3; arm 1R is arm 1 again). It is **token-free and r
 reranker runs, no model is called, nothing is written. It prints counts, drawer ids, ranks and
 digests: never memory text, never a query, never a path.
 
-**How MemPalace fills the pool**, which every fact below is read against (MemPalace 3.9 and 3.10,
+**How MemPalace fills the pool**, which every fact below is read against (MemPalace 3.9 to 3.11,
 ``search_memories`` with ``candidate_strategy="union"``, as `MemPalaceMemoryProvider._ranking`
 calls it with ``n_results=F``, the fetch width):
 
@@ -16,25 +16,39 @@ calls it with ``n_results=F``, the fetch width):
    the ``F`` nearest of them.
 2. **The lexical half** asks the backend's ``lexical_search`` for ``3F`` drawers by BM25. On the
    Chroma backend that is an FTS ``MATCH`` of the query's tokens, **capped at a scan window** of
-   ``max(500, 3F)`` rows taken in index order, with no ordering by relevance, and BM25 then scores
-   only the rows inside the window. A query made of common words matches far more than 500 drawers,
-   so the lexical half of a head probe sees only the window's drawers (the oldest in a palace that
-   only grows), however well a newer drawer matches. ``scan window`` below is that cap, read off the
-   backend's own default (``_lexical_search_via_sqlite``), never restated here.
+   ``max(500, 3F)`` rows, and BM25 then scores only the rows inside the window. Before MemPalace
+   3.11 the window is the first rows in index order, with no ordering by relevance: a query made of
+   common words matches far more than 500 drawers, so the lexical half of a head probe sees only
+   the window's drawers (the oldest in a palace that only grows), however well a newer drawer
+   matches. From 3.11 the window is ordered by SQLite FTS5's own ``rank`` (issue #742), so it holds
+   the best full-text matches by FTS5's scoring, which is not MemPalace's BM25: a drawer can still
+   fall outside it, far more rarely. ``scan window`` below is that cap, read off the backend's own
+   default (``_lexical_search_via_sqlite``), never restated here, and which rows it holds is always
+   measured with the backend's own function.
 3. **The merge** adds each lexical hit the vector half did not keep, in lexical order, dropping
    one that shares a ``(source_file, chunk_index)`` with a drawer already admitted (**shadowed**: a
    second copy filed under the same path, issue #606) and, under ``max_distance``, one whose stored embedding cannot be loaded
    (**dropped**, the #625 risk).
 4. **The hybrid rank** scores every candidate ``0.6 × similarity + 0.4 × BM25`` (BM25 over the
-   candidates, scaled to the best) and MemPalace returns the first ``F``. The harness drops registry
-   sentinels from those and, while that leaves it short, fetches again at twice the width, up to
-   ``8×`` the ask (`_MAX_FETCH_FACTOR`); the first 20 real drawers are the pool.
+   candidates, scaled to the best).
+5. **The fold** (MemPalace 3.11, ``_fold_copies_across_sources``; issue #742): hits whose text is
+   identical, at least ``_FOLD_MIN_CHARS`` long and from **different source files** become one hit,
+   the best-ranked, which lists the others under ``also_in``; copies within one file stay separate.
+   When folding leaves fewer than ``F`` hits while the vector half's query came back full, MemPalace
+   repeats the whole search with the vector half four times wider (``_scaled_pool_limits``), up to
+   ``_MAX_POOL_SCALE`` times and never past ``_MAX_FOLD_POOL`` candidates. A MemPalace without the
+   fold skips this step.
+
+MemPalace then returns the first ``F``. The harness drops registry sentinels from those and, while
+that leaves it short, fetches again at twice the width, up to ``8×`` the ask (`_MAX_FETCH_FACTOR`);
+the first 20 real drawers are the pool.
 
 **The candidate set and the hybrid rank are reconstructed, and the reconstruction checks itself.**
 MemPalace returns only the first ``F``, so where a drawer ranked below them is not something any
-call says. This mode rebuilds steps 1 to 4 for the probe's query with MemPalace's own functions
-(the merge, the hybrid rank, the dedupe, the stop words and weights it resolves), replicating only
-the loop that turns the vector half's rows into hits, and then asks the real ``search_memories`` the
+call says. This mode rebuilds steps 1 to 5 for the probe's query with MemPalace's own functions
+(the merge, the hybrid rank, the dedupe, the fold and its retry test, the stop words and weights it
+resolves), replicating only the loop that turns the vector half's rows into hits and the retry's
+loop around them, and then asks the real ``search_memories`` the
 same question: every line says whether the reconstruction's first ``F`` match the search's. A probe
 whose reconstruction does not match gets the verdict ``unknown``: its vector and lexical ranks are
 still direct measurements, and its merge facts are not trusted. A palace with **closets** (none of
@@ -52,6 +66,9 @@ carried to the pool, the rest name the stage that kept the drawer out:
 - **sentinels**: a candidate that would be in the pool but for registry sentinels ranked above it,
   with the widening at its cap.
 - **crowded**: a candidate, outranked: its hybrid rank among the real candidates is past 20.
+- **folded**: the fold made it part of a drawer with identical text from another file, and that
+  drawer is not in the pool (were it in the pool, the verdict would be ``twin``). The line prints
+  that drawer's hybrid rank, which is this memory's.
 - **dropped**: the lexical half proposed it and the threshold refused it, its embedding unloadable.
 - **shadowed**: the lexical half proposed it and the merge refused it: a drawer already admitted
   (kept by the vector half, or a lexical hit ranked above it) holds its ``(source_file,
@@ -120,12 +137,18 @@ LADDER = tuple(TODAY_ASK * 2**step for step in range(1, 6))
 #: reads). The vector half's factor is read off ``_candidate_pool_limits`` instead.
 _LEXICAL_FACTOR = 3
 
+#: How much wider each of MemPalace's fold retries makes the vector half: the literal
+#: ``_pool_scale * 4`` in ``search_memories`` (3.11). Its bounds are read off MemPalace's own
+#: ``_MAX_POOL_SCALE`` and ``_MAX_FOLD_POOL``.
+_FOLD_RETRY_FACTOR = 4
+
 #: The verdicts, in the order the report counts them.
 VERDICTS = (
     "twin",
     "near-twin",
     "sentinels",
     "crowded",
+    "folded",
     "dropped",
     "shadowed",
     "missing",
@@ -184,6 +207,12 @@ class Facts:
     raw_rank: int | None = None
     real_rank: int | None = None
     sentinels_above: int = 0
+    #: How many times wider than its first the fold's retry made the vector half (1: no retry).
+    pool_scale: int = 1
+    #: The candidate the fold made this drawer part of (identical text, another file), and that
+    #: candidate's hybrid rank among the real candidates.
+    folded_into: str | None = None
+    folded_rank: int | None = None
     #: ``(shared, of)``: how many of the search's first ``fetch`` the reconstruction also ranks
     #: first, and ``matches`` when the two lists are identical.
     shared: int = 0
@@ -211,6 +240,11 @@ def overlap(a: str, b: str) -> float:
 
 def _rank(ids: list, drawer_id: str) -> int | None:
     return ids.index(drawer_id) + 1 if drawer_id in ids else None
+
+
+def _sentinels_above(ranked: list[dict], rank: int) -> int:
+    """How many registry sentinels MemPalace ranks above the 1-based ``rank``."""
+    return sum(hit.get("room") == _REGISTRY_ROOM for hit in ranked[: rank - 1])
 
 
 def _lexical_backend(collection):
@@ -275,18 +309,51 @@ def _dedup_key(hit: dict):
     return hit.get("source_file")
 
 
-def reconstruct(collection, query: str, n: int, threshold: float | None):
-    """MemPalace's union search for ``n`` results, unranked tail kept: ``(proposed, ranked)``.
+@dataclass
+class Reconstruction:
+    """MemPalace's union search for ``n`` results, rebuilt with its unranked tail kept."""
 
-    ``proposed`` is the vector half's rows as hits, nearest first; ``ranked`` every candidate after
-    the merge, in hybrid order (sentinels included, as MemPalace ranks them). Every step but the
-    first is MemPalace's own function; the first replicates ``search_memories``'s loop over the
-    vector rows, without the closet boost (see the module docstring).
+    #: The vector half's rows as hits, nearest first, and how many of them it keeps.
+    proposed: list[dict]
+    kept: int
+    #: Every candidate after the merge, in hybrid order with copies folded (sentinels included, as
+    #: MemPalace ranks them).
+    ranked: list[dict]
+    #: The pool scale the search ended at: 1, or what the fold's retries widened it to.
+    scale: int
+
+
+def reconstruct(collection, query: str, n: int, threshold: float | None) -> Reconstruction:
+    """MemPalace's union search for ``n`` results, retried as the search retries it.
+
+    A MemPalace with the fold repeats a search whose folded copies left it short (module docstring,
+    step 5), so the rebuild does too, with MemPalace's own test and bounds; one without the fold
+    never repeats.
     """
     searcher = _import("searcher")
+    short = getattr(searcher, "_copies_left_results_short", None)
+    scale = 1
+    while True:
+        built, asked, fetched = _reconstruct_at(searcher, collection, query, n, threshold, scale)
+        if short is None or not short(built.ranked[:n], n, fetched, asked):
+            return built
+        if scale >= searcher._MAX_POOL_SCALE or asked >= searcher._MAX_FOLD_POOL:
+            return built
+        scale *= _FOLD_RETRY_FACTOR
+
+
+def _reconstruct_at(searcher, collection, query, n, threshold, scale):
+    """One pass of the search at pool ``scale``: ``(Reconstruction, rows asked, rows fetched)``.
+
+    Every step but the first is MemPalace's own function; the first replicates
+    ``search_memories``'s loop over the vector rows, without the closet boost (see the module
+    docstring).
+    """
     metric = searcher._metric_for_collection(collection)
     stop_words = searcher._resolve_stop_words(None)
-    proposed_n, kept_n = searcher._candidate_pool_limits("union", n)
+    limits = searcher._candidate_pool_limits("union", n)
+    scaled = getattr(searcher, "_scaled_pool_limits", None)
+    proposed_n, kept_n = limits if scaled is None else scaled(limits, scale)
     rows = collection.query(
         query_texts=[query],
         n_results=proposed_n,
@@ -336,7 +403,11 @@ def reconstruct(collection, query: str, n: int, threshold: float | None):
     searcher._hybrid_rank(
         hits, query, *(weights() if weights else ()), metric=metric, stop_words=stop_words
     )
-    return proposed, searcher._dedupe_rendered_hits(hits)
+    ranked = searcher._dedupe_rendered_hits(hits)
+    fold = getattr(searcher, "_fold_copies_across_sources", None)
+    if fold is not None:
+        ranked = fold(ranked, searcher._search_hit_source, searcher._search_hit_ref)
+    return Reconstruction(proposed, kept_n, ranked, scale), proposed_n, len(docs)
 
 
 def _searched(palace: Path, query: str, n: int, threshold: float | None) -> list:
@@ -390,9 +461,9 @@ def _measure(provider, collection, texts, total, facts, pool, self_query) -> Non
     facts.capped = width >= TODAY_ASK * _MAX_FETCH_FACTOR
 
     # The vector half, the merge and the hybrid rank, for the fetch the pool came from.
-    proposed, ranked = reconstruct(collection, query, width, threshold)
-    kept_n = _import("searcher")._candidate_pool_limits("union", width)[1]
-    facts.vector_proposed, facts.vector_kept = len(proposed), kept_n
+    built = reconstruct(collection, query, width, threshold)
+    proposed, ranked, kept_n = built.proposed, built.ranked, built.kept
+    facts.vector_proposed, facts.vector_kept, facts.pool_scale = len(proposed), kept_n, built.scale
     facts.vector_rank = _rank([hit["drawer_id"] for hit in proposed], drawer)
     facts.vector_self = self_query(collection, drawer)
     facts.closets = _closets(provider.palace_path)
@@ -400,9 +471,13 @@ def _measure(provider, collection, texts, total, facts, pool, self_query) -> Non
     facts.candidates = len(order)
     facts.raw_rank = _rank(order, drawer)
     if facts.raw_rank is not None:
-        above = ranked[: facts.raw_rank - 1]
-        facts.sentinels_above = sum(hit.get("room") == _REGISTRY_ROOM for hit in above)
+        facts.sentinels_above = _sentinels_above(ranked, facts.raw_rank)
         facts.real_rank = facts.raw_rank - facts.sentinels_above
+    for index, hit in enumerate(ranked, 1):
+        if any(ref.get("drawer_id") == drawer for ref in hit.get("also_in") or ()):
+            facts.folded_into = hit.get("drawer_id")
+            facts.folded_rank = index - _sentinels_above(ranked, index)
+            break
     searched = _searched(provider.palace_path, query, width, threshold)
     facts.shared = len(set(searched) & set(order[:width]))
     facts.matches = searched == order[: len(searched)] and len(searched) == min(width, len(order))
@@ -487,6 +562,10 @@ def verdict(facts: Facts) -> str:
         if facts.raw_rank > facts.fetch and facts.real_rank <= TODAY_ASK:
             return "sentinels"
         return "crowded"
+    if facts.folded_into is not None:
+        # Its memory is a candidate under the copy it was folded into, which a twin would have
+        # found in the pool: the copy's rank is the memory's.
+        return "folded"
     if facts.dropped:
         return "dropped"
     if facts.shadowed_by is not None or facts.sourceless:
@@ -565,6 +644,14 @@ def render(facts: Facts) -> str:
         )
         if facts.sentinels_above:
             merge += f", {facts.sentinels_above} sentinels above it"
+    if facts.folded_into is not None:
+        merge += (
+            f"; folded into drawer {facts.folded_into} (identical text, another file), hybrid "
+            f"rank {facts.folded_rank} of the real candidates "
+            f"({_past(facts.folded_rank, TODAY_ASK)})"
+        )
+    if facts.pool_scale > 1:
+        merge += f"; the fold's retry widened the vector half {facts.pool_scale}×"
     parts.append(f"merge: {merge}")
     cap = TODAY_ASK * _MAX_FETCH_FACTOR
     parts.append(

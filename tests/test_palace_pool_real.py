@@ -16,7 +16,11 @@ How the scenarios steer MemPalace, with nothing but text:
 
 - **Copies of a head** (``H``, 60 words, longer than the 400-character query a head probe makes) are the nearest drawers to a query of ``H`` in both halves,
   so ``n`` of them put the probe drawer ``P = H + T`` (``T`` 25 other words) at rank ``n + 1`` in
-  the vector half and in the lexical half alike.
+  the vector half and in the lexical half alike. They are filed as the chunks of **one**
+  conversation file: since MemPalace 3.11 the search folds identical text from different files
+  into one hit (issue #742), and copies within one file are never folded, so a crowd built this way
+  is the same crowd on every MemPalace the harness supports. The fold itself has scenarios of its
+  own.
 - **A decoy** is ``H`` behind 300 one-character tokens. BM25 reads only ``\\w{2,}``, so lexically it
   is a copy of ``H``; the embedding model reads its first 256 word pieces, which are all filler, so
   it is far from ``H``. Decoys push ``P`` down the lexical half and leave the vector half alone.
@@ -37,8 +41,20 @@ pytestmark = pytest.mark.mempalace
 mempalace = pytest.importorskip("mempalace")
 
 from basecradle_harness import _palace_check, _palace_pool  # noqa: E402
-from basecradle_harness._mempalace import _REGISTRY_ROOM, MemPalaceMemoryProvider  # noqa: E402
+from basecradle_harness._mempalace import (  # noqa: E402
+    _REGISTRY_ROOM,
+    MemPalaceMemoryProvider,
+    at_least,
+    mempalace_version,
+)
 from basecradle_harness._palace_recall import ARM_1, ARM_2, ARM_3, HEAD, Probe, fetch  # noqa: E402
+
+#: Whether this MemPalace folds identical text from different files into one hit (3.11, issue #742).
+FOLDS = hasattr(pytest.importorskip("mempalace.searcher"), "_fold_copies_across_sources")
+
+#: Whether the Chroma backend's FTS scan window holds the best matches by FTS5's ``rank`` rather
+#: than the first ones filed: MemPalace 3.11.0's ``_lexical_search_via_sqlite`` (issue #742).
+RANKED_WINDOW = at_least(mempalace_version(), (3, 11))
 
 SYLLABLES = [a + b for a in "bdfgklmnprstvz" for b in ("a", "e", "i", "o", "u", "ai", "or")]
 
@@ -152,10 +168,12 @@ def _build(root: Path, name: str, drawers: list[tuple[str, str, dict]]) -> Path:
     collection = get_collection(str(palace), create=True)
     rows = []
     for index, (drawer_id, text, extra) in enumerate(drawers):
+        extra = dict(extra)
         meta = {
             "wing": "conversations",
             "room": "general",
-            "source_file": f"{palace}/conversations/{drawer_id}.md",
+            # ``file`` names a conversation file several drawers share, one chunk each.
+            "source_file": f"{palace}/conversations/{extra.pop('file', drawer_id)}.md",
             "chunk_index": 0,
             "filed_at": f"2026-09-{1 + index // 1440:02d}T{index // 60 % 24:02d}:{index % 60:02d}:00",
         }
@@ -171,8 +189,15 @@ def _build(root: Path, name: str, drawers: list[tuple[str, str, dict]]) -> Path:
     return palace
 
 
+def _one_file(prefix: str, text: str, n: int, **extra) -> list[tuple[str, str, dict]]:
+    """``n`` drawers of ``text``, the chunks of one conversation file: never folded."""
+    return [
+        (f"{prefix}-{i:03d}", text, {"file": prefix, "chunk_index": i, **extra}) for i in range(n)
+    ]
+
+
 def _copies(n: int, prefix: str = "copy") -> list[tuple[str, str, dict]]:
-    return [(f"{prefix}-{i:03d}", H, {}) for i in range(n)]
+    return _one_file(prefix, H, n)
 
 
 def _fillers(n: int) -> list[tuple[str, str, dict]]:
@@ -224,9 +249,57 @@ def test_twin(root):
     for i in range(25):
         facts, word = _diagnose(palace, f"twin-{i:03d}")
         if not facts.arms["1"]:
-            verdicts[f"twin-{i:03d}"] = (word, facts.identical)
+            verdicts[f"twin-{i:03d}"] = (word, facts.identical, facts.folded_into)
     assert len(verdicts) == 5
-    assert all(word == "twin" and identical == 20 for word, identical in verdicts.values())
+    assert all(verdict == ("twin", 20, None) for verdict in verdicts.values())
+
+
+def test_twins_in_separate_files(root):
+    """The same 25 copies, one file each. MemPalace 3.11 folds them into one hit, and retries the
+    search wider because folding left it short; before 3.11 they are the five-miss twins above."""
+    drawers = [(f"apart-{i:03d}", H, {}) for i in range(25)] + _fillers(40)
+    palace = _build(root, "apart", drawers)
+    verdicts = {}
+    for i in range(25):
+        facts, word = _diagnose(palace, f"apart-{i:03d}")
+        assert facts.matches
+        if not facts.arms["1"]:
+            verdicts[f"apart-{i:03d}"] = (
+                word,
+                facts.identical,
+                facts.folded_into,
+                facts.pool_scale,
+            )
+    if not FOLDS:
+        assert len(verdicts) == 5
+        assert all(verdict == ("twin", 20, None, 1) for verdict in verdicts.values())
+        return
+    assert len(verdicts) == 24
+    (kept,) = {f"apart-{i:03d}" for i in range(25)} - set(verdicts)
+    assert all(verdict == ("twin", 1, kept, 4) for verdict in verdicts.values())
+
+
+def test_folded(root):
+    """``P`` in two files behind 25 copies of its head: on MemPalace 3.11 one is folded into the
+    other, which ranks 26th, out of the pool; before 3.11 both are crowded, 26th and 27th."""
+    drawers = _copies(25) + [("first", P, {}), ("second", P, {})] + _fillers(40)
+    palace = _build(root, "folded", drawers)
+    diagnosed = {name: _diagnose(palace, name) for name in ("first", "second")}
+    for facts, _ in diagnosed.values():
+        assert facts.matches
+        assert facts.identical == 0
+    words = {name: word for name, (_, word) in diagnosed.items()}
+    if not FOLDS:
+        assert words == {"first": "crowded", "second": "crowded"}
+        assert sorted(facts.real_rank for facts, _ in diagnosed.values()) == [26, 27]
+        return
+    assert sorted(words.values()) == ["crowded", "folded"]
+    (folded,) = [name for name, word in words.items() if word == "folded"]
+    (kept,) = {"first", "second"} - {folded}
+    facts = diagnosed[folded][0]
+    assert (facts.folded_into, facts.folded_rank, facts.real_rank) == (kept, 26, None)
+    assert diagnosed[kept][0].real_rank == 26
+    assert _palace_pool.render(facts).startswith("  why: folded;")
 
 
 def test_near_twin(root):
@@ -259,12 +332,7 @@ def test_crowded(root):
 
 def test_cut(root):
     """The vector half proposes ``P`` (31st) and keeps 20; 65 lexical equals rank it out of the 60."""
-    drawers = (
-        _copies(30)
-        + [(f"decoy-{i:03d}", DECOY, {}) for i in range(35)]
-        + [("probe", P, {})]
-        + _fillers(40)
-    )
+    drawers = _copies(30) + _one_file("decoy", DECOY, 35) + [("probe", P, {})] + _fillers(40)
     palace = _build(root, "cut", drawers)
     facts, word = _diagnose(palace, "probe")
     assert word == "cut"
@@ -287,7 +355,9 @@ def test_unreached(root):
 
 
 def test_fts_window(root):
-    """``P`` is the best lexical match outside the copies, and is filed after 520 rows the scan reads."""
+    """``P`` is the best lexical match outside the copies, and is filed after 520 rows that match.
+    Before MemPalace 3.11 the scan reads the first 500 filed, so ``P`` is outside it; from 3.11 it
+    reads the best 500 by FTS5's rank, so ``P`` is inside it and is a candidate, crowded."""
     drawers = (
         [(f"window-{i:03d}", _window_filler(i), {}) for i in range(520)]
         + _copies(45)
@@ -295,22 +365,21 @@ def test_fts_window(root):
     )
     palace = _build(root, "window", drawers)
     facts, word = _diagnose(palace, "probe")
-    assert word == "fts-window"
     assert facts.matches
     assert facts.window == 500
-    assert facts.window_rank is None
     assert facts.full_rank == 46
     assert facts.scored == 566
     assert facts.vector_rank == 46
     assert facts.first_ask == 80
+    if RANKED_WINDOW:
+        assert (word, facts.window_rank, facts.real_rank) == ("crowded", 46, 46)
+    else:
+        assert (word, facts.window_rank) == ("fts-window", None)
 
 
 def test_shadowed(root):
     """``P`` shares its file and chunk with a kept copy, so the merge refuses its lexical hit."""
-    copies = _copies(20)
-    shared = copies[0][2] | {"source_file": "/old/home/conversations/shared.md"}
-    copies[0] = (copies[0][0], copies[0][1], shared)
-    drawers = copies + [("probe", P, {"source_file": shared["source_file"]})] + _fillers(40)
+    drawers = _copies(20) + [("probe", P, {"file": "copy", "chunk_index": 0})] + _fillers(40)
     palace = _build(root, "shadowed", drawers)
     facts, word = _diagnose(palace, "probe")
     assert word == "shadowed"
@@ -337,7 +406,7 @@ def test_shadowed_by_an_earlier_lexical_hit(root):
 
 def test_sentinels(root):
     """200 sentinels nearer than ``P`` fill the fetch up to the widening cap of 160."""
-    sentinels = [(f"sentinel-{i:03d}", H, {"room": _REGISTRY_ROOM}) for i in range(200)]
+    sentinels = _one_file("sentinel", H, 200, room=_REGISTRY_ROOM)
     palace = _build(root, "sentinels", sentinels + [("probe", P, {})] + _fillers(20))
     facts, word = _diagnose(palace, "probe")
     assert word == "sentinels"
