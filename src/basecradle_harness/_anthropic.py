@@ -29,18 +29,29 @@ Explicit caching — the fleet's first ``cache_mode = "explicit"``
 Anthropic caches only a prefix the client **marks**, so this is the adapter #277 built the engine's
 breakpoint for. The engine stamps `Message.cache_anchor` on the last turn of the frozen transcript
 (`_caching.anchor_cacheable_prefix`); here that becomes ``cache_control: {"type": "ephemeral"}`` on
-the anchored turn's last block — a system block when the anchor is the charter. Two placements are
-the adapter's own, because only the adapter knows the wire's positions (issue #726):
+the anchored turn's last block — a system block when the anchor is the charter. Three placements are
+the adapter's own, because only the adapter knows the wire's positions (issues #726, #729). The four
+breakpoints Anthropic allows are spent as **anchor + tail + two chained**:
 
+- **The tail, on every step.** The anchor caches what *later wakes* read; everything after it — the
+  per-wake brief, the new turn, the wake's own growing tool chain — is volatile across wakes and
+  byte-stable across the steps of one wake, which re-sends it on every call. So the request's last
+  block that can carry one gets a breakpoint too: step *k* writes its tail and step *k + 1* reads
+  it, paying the write rate only on its own growth (Anthropic's documented pattern for an agentic
+  loop). No later wake can read a tail entry, since the next wake's prefix lacks this wake's brief;
+  the next step of this wake can, and that read is the point. It goes on step 1 too: the step 1 →
+  step 2 read is the largest (the whole brief), and a wake cannot know at step 1 whether a step 2 is
+  coming. A single-step wake pays a 0.25× write premium on its brief and turn for that, and the
+  decision to pay it is recorded on issue #729.
 - **No anchor, the tool list.** On a first wake the frozen transcript is empty (the charter rides
   the per-wake brief), so the engine anchors nothing. The stable/volatile boundary is then the end
-  of ``tools``, which renders first, and the last tool definition carries the one breakpoint — so
-  every step after the first reads the tool list instead of paying for it again.
+  of ``tools``, which renders first, and the last tool definition carries the breakpoint — the one
+  entry a first wake writes that the *next* wake can read.
 - **The lookback chain.** A breakpoint finds an earlier entry only within `LOOKBACK` (20) positions
   of itself, and the entry a wake can find is the one the previous wake wrote at *its* anchor. A
   wake that added 20 positions or more (about seven sequential tool steps) would leave the next
-  wake's anchor blind, rewriting the whole prefix at the write rate. So up to three more
-  breakpoints are chained back from the anchor, `LOOKBACK` apart, reaching 80 positions; a hit is a
+  wake's anchor blind, rewriting the whole prefix at the write rate. So `CHAINED` (two) more
+  breakpoints are chained back from the anchor, `LOOKBACK` apart, reaching 60 positions; a hit is a
   read and the write is charged once, so they cost nothing (`AnthropicProvider._place_breakpoints`).
 
 Every placement is on the request only: copy-on-write, never persisted, and never counted by the
@@ -52,8 +63,10 @@ make the marks pay out, and each one fails silently when broken:
   function tools **sorted by name** (`_wire_tools`), whatever order the registry handed over.
 - **The TTL** is five minutes unless ``model_params.json`` sets
   ``"cache_control": {"type": "ephemeral", "ttl": "1h"}``. That key is the template of every
-  breakpoint the harness places, never Anthropic's top-level automatic-caching field: an automatic
-  breakpoint at the volatile tail would write a cache entry no later wake can read.
+  breakpoint the harness places, never Anthropic's top-level automatic-caching field. That field
+  is a tail breakpoint placed by the API (*"the last cacheable block"*, taking one of the four
+  slots, and a 400 when four explicit ones already exist); the adapter places the same tail
+  itself, so all four breakpoints are on the request, where they are counted and a test reads them.
 - **The proof is the response**, never a declaration: ``usage.cache_read_input_tokens`` rides the
   ``llm`` line as ``cached_tokens=``, and the write beside it as ``cache_write_tokens=`` (writes
   bill at 1.25x for five minutes and 2x for an hour, so the cost needs them). A prefix under the
@@ -245,6 +258,11 @@ LOOKBACK = 20
 
 #: The most ``cache_control`` breakpoints one request may carry; a fifth is a 400.
 MAX_BREAKPOINTS = 4
+
+#: How many breakpoints are chained back from the anchor. The four slots are spent as anchor + tail
+#: + `CHAINED` (issue #729: the tail goes on every step and the chain gives up the slot), a reach of
+#: `LOOKBACK` × (1 + `CHAINED`) = 60 positions behind the anchor.
+CHAINED = MAX_BREAKPOINTS - 2
 
 #: The block types whose consecutive runs Anthropic counts as a single lookback position.
 _RUNS = frozenset({"tool_use", "tool_result"})
@@ -670,14 +688,14 @@ class AnthropicProvider:
                 self._mark(blocks)
         self._replies = {key: kept for key, kept in self._replies.items() if key in present}
         sent = [*system, *(block for turn in wire for block in turn["content"])]
-        # The tool list renders before the first system or message block, so its end is the
-        # position just before them: an entry a first wake wrote there is still worth reaching.
-        self._place_breakpoints(sent, first=-1 if tools else 0)
         if tools and not any("cache_control" in block for block in sent):
             # No frozen turn to anchor (a first wake: the charter rides the brief, so the frozen
             # transcript is empty). The stable/volatile boundary is then the end of the tool list,
             # which renders first and is the same bytes on every call of this agent.
             tools[-1]["cache_control"] = self._template()
+        # The tool list renders before the first system or message block, so its end is the
+        # position just before them: an entry a first wake wrote there is still worth reaching.
+        self._place_breakpoints(sent, first=-1 if tools else 0, tail=self._mark_tail(sent))
         return system, wire, stream
 
     def _template(self) -> dict[str, Any]:
@@ -691,48 +709,80 @@ class AnthropicProvider:
                 blocks[position]["cache_control"] = self._template()
                 return
 
-    def _place_breakpoints(self, blocks: list[dict[str, Any]], *, first: int = 0) -> None:
+    def _mark_tail(self, blocks: list[dict[str, Any]]) -> int | None:
+        """Put the tail breakpoint on the request's last block that can carry one (issue #729).
+
+        Within one wake every step re-sends the step before it and adds its own growth, so step *k*'s
+        tail entry is the prefix step *k + 1* reads: the per-wake brief, the new turn and the wake's
+        own tool chain are written once and read on every later step, rather than billed in full on
+        each. Returns the block's index, or ``None`` when no block after the anchor can carry one
+        (the walk stops at an existing breakpoint rather than marking behind it).
+        """
+        for position in range(len(blocks) - 1, -1, -1):
+            if "cache_control" in blocks[position]:
+                return None
+            if _markable(blocks[position]):
+                blocks[position]["cache_control"] = self._template()
+                return position
+        return None
+
+    def _place_breakpoints(
+        self, blocks: list[dict[str, Any]], *, first: int = 0, tail: int | None = None
+    ) -> None:
         """Walk back from the anchor's breakpoint, adding one every `LOOKBACK` positions (#726).
 
         `blocks` is the request's system blocks and then every message block, in send order; `first`
-        is the earliest position an entry can sit at (-1 when a tool list precedes them). The
-        anchor's breakpoint finds an entry only within `LOOKBACK` positions of itself, and the entry
-        a wake can find is the one the *previous* wake wrote at its own anchor — the end of the
+        is the earliest position an entry can sit at (-1 when a tool list precedes them); `tail` is
+        the index of the tail breakpoint `_mark_tail` placed, if any. The four slots are spent as
+        **anchor + tail + two chained** (`CHAINED`), and the tail's slot is reserved on every
+        request, whether or not a tail could be placed: one fixed split, verifiable by eye.
+
+        The anchor's breakpoint finds an entry only within `LOOKBACK` positions of itself, and the
+        entry a wake can find is the one the *previous* wake wrote at its own anchor — the end of the
         transcript as it stood then. So a previous wake that added `LOOKBACK` or more positions of
-        work (about seven sequential tool steps: a call, its result and a step note each) leaves this wake's anchor blind to it, and the whole
-        prefix is written again at the write rate: more than sending no breakpoint at all.
+        work (about seven sequential tool steps: a call, its result and a step note each) leaves this
+        wake's anchor blind to it, and the whole prefix is written again at the write rate: more than
+        sending no breakpoint at all.
 
         Each added breakpoint starts a lookback window of its own, so they are chained back from the
         anchor, each on the earliest position the window before it still reaches. Spaced exactly
-        `LOOKBACK` apart the windows tile with no gap, and the reach is `LOOKBACK` × `MAX_BREAKPOINTS`
-        positions behind the anchor (80). A breakpoint that hits is a read; the write is charged once,
-        for the span after the hit, so the extra breakpoints cost nothing.
+        `LOOKBACK` apart the windows tile with no gap, and the reach is `LOOKBACK` × (1 + `CHAINED`)
+        positions behind the anchor (60). A breakpoint that hits is a read; the write is charged once,
+        for the span after the hit, so the extra breakpoints cost nothing. The chain is walked from
+        the anchor only, never from the tail: what lies behind the tail and after the anchor is this
+        wake's own work, which the previous step's tail entry already covers.
 
         Nothing is added when the earliest breakpoint's own window already reaches `first`, and the
-        request never carries more than the vendor's four: a caller that anchored more keeps its latest
-        four, with a WARNING, rather than a 400. Each lands on the **last** block of its position (a
-        run of parallel calls or results is one position), and only on a block that can carry one;
-        where the earliest reachable position cannot, the next later one is taken, which narrows the
-        reach and never opens a gap. Every block is counted as a position except the runs Anthropic
-        names, so an uncertain count can only overstate a distance, which also never opens a gap.
+        request never carries more than the vendor's four: a caller that anchored more than the three
+        the tail leaves keeps its latest three, with a WARNING, rather than a 400. Each lands on the
+        **last** block of its position (a run of parallel calls or results is one position), and only
+        on a block that can carry one; where the earliest reachable position cannot, the next later
+        one is taken, which narrows the reach and never opens a gap. Every block is counted as a
+        position except the runs Anthropic names, so an uncertain count can only overstate a
+        distance, which also never opens a gap.
         """
-        marked = [index for index, block in enumerate(blocks) if "cache_control" in block]
+        anchors = MAX_BREAKPOINTS - 1  # the tail's slot is reserved on every request
+        marked = [
+            index
+            for index, block in enumerate(blocks)
+            if "cache_control" in block and index != tail
+        ]
         if not marked:
             return
-        if len(marked) > MAX_BREAKPOINTS:
+        if len(marked) > anchors:
             _log.warning(
-                "%d turns were anchored for caching and Anthropic takes at most %d breakpoints; "
-                "keeping the latest %d.",
+                "%d turns were anchored for caching; Anthropic takes at most %d breakpoints and the "
+                "request's tail takes one, so the latest %d are kept.",
                 len(marked),
                 MAX_BREAKPOINTS,
-                MAX_BREAKPOINTS,
+                anchors,
             )
-            for index in marked[:-MAX_BREAKPOINTS]:
+            for index in marked[:-anchors]:
                 del blocks[index]["cache_control"]
-            marked = marked[-MAX_BREAKPOINTS:]
+            marked = marked[-anchors:]
         positions = _positions(blocks)
         earliest = marked[0]
-        for _ in range(MAX_BREAKPOINTS - len(marked)):
+        for _ in range(anchors - len(marked)):
             reach = positions[earliest] - LOOKBACK
             if reach < first:
                 return

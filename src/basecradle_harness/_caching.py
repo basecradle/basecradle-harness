@@ -235,8 +235,9 @@ def anchor_cacheable_prefix(messages: list[Message], *, stable: int, mode: str) 
     per-wake brief rather than the transcript, so the frozen prefix is empty. The anchor is the
     engine's one statement of where the boundary is; translating it is the adapter's, because only
     the adapter knows the wire's render order and positions. The Anthropic adapter puts the
-    breakpoint on the end of the tool list when no turn is anchored, and chains up to three more
-    back from an anchor so a long previous wake's entry is still in reach (issue #726).
+    breakpoint on the end of the tool list when no turn is anchored, chains two more back from an
+    anchor so a long previous wake's entry is still in reach (issue #726), and marks the request's
+    last block so the next step of the same wake reads this one (issue #729).
 
     A no-op for every mode but `EXPLICIT`.
     """

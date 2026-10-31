@@ -7,6 +7,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.160.0] - 2026-10-31
+
+### Added: Anthropic's explicit cache covers the steps of one wake (issue #729)
+
+The `anthropic` adapter now puts a **tail breakpoint** on the last block of every request, so each
+step of a wake reads the step before it. Before, breakpoints sat only on the stable prefix (the
+anchor and its chain, or the tool list), and everything after it went out uncached on every step of
+every wake: the per-wake brief (~17K characters), the new turn and the wake's own growing tool
+chain. Within one wake all of that is byte-stable from step to step; now step *k* writes its tail and
+step *k + 1* reads it, paying the write rate only on its own growth (Anthropic's documented pattern
+for an agentic loop).
+
+- **The four breakpoints are spent as anchor + tail + two chained.** The tail goes on every step,
+  step 1 included: the step 1 → step 2 read is the largest (the whole brief), and a wake cannot know
+  at step 1 whether a step 2 is coming. The chain gives up the slot, so its reach behind the anchor
+  is now **60 positions** (about 18 sequential tool steps of the previous wake), down from 80. The
+  split is fixed: the tail's slot is reserved on every request, and a library caller that anchors
+  more than three turns keeps its latest three, with a WARNING.
+- **The cost of a single-step wake.** It writes its brief and turn at 1.25× instead of 1× and never
+  reads them back: about $0.006 a wake at Opus 5.5 rates.
+- **Live, `claude-haiku-5-5`, a 14-step wake of the same shape as #726's wake B.** Before: every
+  step read `cached_tokens=12094` while `tokens_in` grew from 18,499 to 21,279, 100,961 uncached
+  input tokens across steps 2–14. After: step 2 read 17,923 of 18,297, step 14 read 20,779 of
+  21,100, **52** uncached input tokens across steps 2–14 (the few tokens that close each request,
+  which no breakpoint covers). The wake's input side at Opus 5.5 rates: $0.49 before, $0.13 after.
+  The next wake still found this one's anchor entry through the two-slot chain (11,855 read).
+- New live gate: `test_the_next_step_of_a_wake_reads_the_brief_through_the_tail` (step 2 reads
+  exactly what step 1 wrote; with the tail disabled, step 1 writes nothing).
+  `test_a_long_previous_wake_is_found_through_the_lookback_chain` now ends its first request on
+  its anchor, so the read it pins is still the chain's alone.
+
 ## [0.159.0] - 2026-10-31
 
 ### Fixed: Anthropic's explicit cache on a first wake and after a long wake (issue #726)
