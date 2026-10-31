@@ -7,6 +7,41 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.165.0] - 2026-10-31
+
+### Fixed: `--pool-diagnosis` reads MemPalace 3.11's search, and CI runs the real-palace suite (issue #742)
+
+On the locked MemPalace 3.11.0, ten of the eleven real-palace `--pool-diagnosis` tests failed, and
+no CI job ran them, so the Dependabot bump that moved the lock merged on green. MemPalace 3.11.0
+changed its search in two ways the diagnosis rebuilds:
+
+- **It folds identical text from different files into one hit** (`_fold_copies_across_sources`,
+  at least 100 characters), listing the others under `also_in`, and when folding leaves the page
+  short it repeats the whole search with the vector half four times wider, within its own bounds.
+  The diagnosis's rebuild did neither, so it stopped matching the real search and said `unknown`
+  for nearly everything. It now runs MemPalace's own fold and retry test, found by capability, so
+  a MemPalace without them (3.9, 3.10) is rebuilt as before. A probe folded into a copy that is not
+  in the pool gets the new verdict **`folded`**, with that copy's id and rank; one whose copy is
+  in the pool stays a `twin`. The `why:` line says when the retry widened the search.
+- **The full-text scan window is ranked**: the Chroma backend now keeps the best 500 matches by
+  SQLite FTS5's own rank instead of the first 500 filed. The diagnosis already measured the window
+  with the backend's own function, so only its documentation said otherwise; it is corrected here
+  and in the README. `fts-window` is now rare rather than routine on 3.11.
+
+The harness supports MemPalace 3.9.0 through 3.11.0: the real-palace suite passes on each. The
+fleet's MemPalace pin does not move with this release.
+
+- **A new CI job, `mempalace`, runs `pytest -m mempalace`** on a pull request or a push to `main`
+  that touches the lock, `pyproject.toml`, a palace module (`_mempalace.py`, `_palace_*.py`,
+  `_memory_provider.py`, `_mining.py`, `_rerank.py`, `_scrub.py`), the real-palace tests, their
+  conftest or home helper, or the workflow, twice: on the locked MemPalace
+  and on the floor `pyproject.toml` declares, read from it. The embedding model is cached. On any
+  other change its steps are skipped and it reports success. It is not yet part of the required
+  gate; it joins it once it has run green on `main`.
+- **The real-palace scenarios build their crowds as the chunks of one conversation file**, which
+  no MemPalace folds, so each scenario tests the same mechanism on every supported version; two new
+  scenarios test the fold itself.
+
 ## [0.164.0] - 2026-10-31
 
 ### Fixed: a multi-line message is filed whole, not one drawer per line (issue #741)

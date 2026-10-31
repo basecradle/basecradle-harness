@@ -695,7 +695,10 @@ def diagnose(
       does not place it among the ``_ASK`` nearest it keeps, so that search dropped its vector
       score before ranking. Full scoring would have placed it; the pre-rank cut did not let it
       compete. Where `search` passes ``max_distance`` (issue #625) a lexical hit is rescored on its
-      real distance, so a cut there also means BM25 did not bring it into the pool either.
+      real distance, so a cut there also means BM25 did not bring it into the pool either. From
+      MemPalace 3.11 a search whose folded copies (identical text from different files) leave it
+      short is repeated with a wider vector half, which this judgment does not model;
+      ``--pool-diagnosis`` does (issue #742).
     - **crowded**: a top-100 search ranks it below 10, and no identical copy is in the top 10:
       other drawers outscore it even on full scoring, typically near copies sharing its query.
     - **unreached**: not in the top 100 at all. With ``vector self-query no`` the index itself has

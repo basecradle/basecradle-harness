@@ -67,6 +67,12 @@ def _facts(**changes) -> Facts:
         # The lexical half proposed it today: its row is there, whatever a wider read says.
         ({"full_rank": None, "lexical_rank": 30, "vector_rank": 31}, "cut"),
         ({"raw_rank": 26, "real_rank": 26}, "crowded"),
+        # Folded into a copy past the pool: the copy's rank is the memory's, whatever else is true.
+        ({"folded_into": "drawer-copy", "folded_rank": 26, "vector_rank": 31}, "folded"),
+        (
+            {"folded_into": "drawer-copy", "folded_rank": 26, "lexical_rank": 21, "dropped": True},
+            "folded",
+        ),
         ({"fetch": 160, "capped": True, "raw_rank": 201, "real_rank": 1}, "sentinels"),
         # Behind sentinels, and past the pool even without them: outranked on merit.
         ({"fetch": 160, "capped": True, "raw_rank": 230, "real_rank": 30}, "crowded"),
@@ -85,6 +91,25 @@ def test_a_copy_outranks_every_mechanism_and_an_unverified_merge_trusts_none():
     assert verdict(_facts(identical=1, matches=False, error=None)) == "twin"
     # ...but below the copies, no mechanism is named off a reconstruction the search disagrees with.
     assert verdict(_facts(matches=False, lexical_rank=21, shadowed_by="drawer-copy")) == "unknown"
+
+
+def test_a_fold_into_a_copy_in_the_pool_is_a_twin():
+    """The fold keeps the best-ranked copy, so a copy in the pool means a twin, never ``folded``."""
+    facts = _facts(
+        identical=1, nearest=("drawer-copy", 1.0), folded_into="drawer-copy", folded_rank=3
+    )
+    assert verdict(facts) == "twin"
+
+
+def test_a_fold_and_its_retry_have_their_place_on_the_line():
+    line = render(_facts(folded_into="drawer-copy", folded_rank=26, pool_scale=4))
+    assert (
+        "merge: not among the 70 candidates; folded into drawer drawer-copy (identical text, another "
+        "file), hybrid rank 26 of the real candidates (6 past the cut); the fold's retry widened the "
+        "vector half 4×;"
+    ) in line
+    assert "folded into" not in render(_facts())
+    assert "retry" not in render(_facts())
 
 
 def test_a_lost_lexical_row_is_missing_only_where_the_window_was_measured():
@@ -109,6 +134,7 @@ def test_a_why_line_holds_ids_counts_and_ranks_and_never_the_memory(word):
         "near-twin": _facts(nearest=("drawer-near", 0.9)),
         "sentinels": _facts(fetch=160, capped=True, raw_rank=201, real_rank=1, sentinels_above=200),
         "crowded": _facts(raw_rank=26, real_rank=26),
+        "folded": _facts(folded_into="drawer-copy", folded_rank=26, pool_scale=4),
         "dropped": _facts(lexical_rank=12, dropped=True),
         "shadowed": _facts(lexical_rank=21, shadowed_by="drawer-copy"),
         "missing": _facts(vector_self="no stored embedding"),
