@@ -1008,6 +1008,12 @@ class GoogleProvider:
                     ServerToolUse(name="code_execution", input=getattr(executed, "code", "") or "")
                 )
                 continue
+            outcome = getattr(getattr(part, "code_execution_result", None), "outcome", None)
+            if outcome is not None and used and used[-1].name == "code_execution":
+                verdict = getattr(outcome, "name", None) or str(outcome)
+                if verdict != "OUTCOME_OK":
+                    used[-1].failed = verdict
+                continue
             call = getattr(part, "function_call", None)
             if call is not None:
                 call_id = getattr(call, "id", None) or f"{LOCAL_CALL_ID_PREFIX}{uuid.uuid4().hex}"
@@ -1037,7 +1043,10 @@ class GoogleProvider:
         for page in read or ():
             url = getattr(page, "retrieved_url", None)
             if url:
-                used.append(ServerToolUse(name="url_context", input=url))
+                status = getattr(page, "url_retrieval_status", None)
+                status = getattr(status, "name", None) or (str(status) if status else "")
+                failed = "" if status in ("", "URL_RETRIEVAL_STATUS_SUCCESS") else status
+                used.append(ServerToolUse(name="url_context", input=url, failed=failed))
         reply = Message.assistant(content="".join(texts) or None, tool_calls=calls)
         reply.server_tools = record(used)
         return reply

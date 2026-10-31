@@ -13,6 +13,8 @@ see a posted image even though the model could. These tests pin the vision conte
 its edges.
 """
 
+import json
+
 import pytest
 
 from basecradle_harness import ImageContent, Message, ProviderError, ToolSpec, VideoContent
@@ -234,3 +236,35 @@ def test_a_responses_turn_with_no_server_item_carries_no_record():
         {"output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}]}
     )
     assert reply.server_tools is None
+
+
+def test_a_failed_server_item_is_marked_and_an_mcp_call_leads_with_its_tool():
+    from basecradle_harness._openai_wire import message_from_responses
+
+    reply = message_from_responses(
+        {
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "failed",
+                    "action": {"type": "search", "query": "q"},
+                },
+                {
+                    "type": "mcp_call",
+                    "id": "mcp_1",
+                    "server_label": "deepwiki",
+                    "name": "ask_question",
+                    "arguments": json.dumps(
+                        {"repo": "basecradle/basecradle-harness", "q": "x" * 400}
+                    ),
+                    "approval_request_id": None,
+                    "error": None,
+                },
+            ]
+        }
+    )
+    search, mcp = reply.server_tools.uses
+    assert (search.name, search.failed) == ("web_search", "failed")
+    assert mcp.name == "mcp" and mcp.input.startswith("deepwiki/ask_question {")
+    assert mcp.failed == ""

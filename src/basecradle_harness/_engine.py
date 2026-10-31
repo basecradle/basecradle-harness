@@ -1011,8 +1011,11 @@ class Engine:
                 f"Step budget of {self.max_steps} spent and the reserve summary produced no text."
             )
         # Persist a clean text-only turn — drop any tool calls the model emitted alongside the
-        # text (they were never run, and a dangling tool-call turn would break the next wake).
+        # text (they were never run, and a dangling tool-call turn would break the next wake). The
+        # server-tool record stays (issue #727): a built-in that resolved in-call *did* run, and a
+        # report that cites it with no record behind it is the claim a later wake retracts.
         summary = Message.assistant(content=reply.content)
+        summary.server_tools = reply.server_tools
         messages.append(summary)
         _progress(on_progress)  # the reserve report IS this turn's terminal narration — persist it
         return summary

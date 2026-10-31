@@ -30,9 +30,9 @@ answers however it honestly can (`context_limit`), ``None`` when it cannot, and 
 summarization call itself, and for estimate error. That threshold is only safe because *no single
 turn can leap over it*: the persisted growth of one turn is bounded by what a tool call may leave
 behind — its result (`TOOL_RESULT_CAP`, 4 KB) **and its arguments** (`TOOL_ARGS_CAP`, 2 KB), plus
-the record of the server-side tools its model call ran (`_server_tools.NOTE_CAP`, ~1 KB, issue
-#727) — times `DEFAULT_MAX_STEPS` (24), ≈ 58 K tokens, which cannot cross from under-half to over-full on any
-budget at or above the floor. **Those two caps are prerequisites of this file**, not neighbors of
+the record of the server-side tools its model call ran (`_server_tools.NOTE_CAP`, ~1.4 KB, issue
+#727) — times `DEFAULT_MAX_STEPS` (24), plus one more record for the reserve summary, ≈ 61 K
+tokens, which cannot cross from under-half to over-full on any budget at or above the floor. **Those two caps are prerequisites of this file**, not neighbors of
 it: relax either and the 50% threshold stops being a safe distance. That is why they are *defined*
 here and merely *enforced* in `_session` — the proof and its inputs live together, where they cannot
 drift apart. (The arguments were the half nobody bounded: uncapped until issue #301, they made the
@@ -385,19 +385,27 @@ def worst_case_turn_tokens(max_steps: int) -> int:
     output in that step (its text, and one id+name envelope per call it emitted) is bounded by the
     provider's max-output-tokens, not by anything here; see the module docstring for why that term is
     the provider's to bound and not ours.
+
+    **Plus one server-tool record for the reserve summary** (issue #727). A step-capped turn ends in
+    one more model call (`Engine._reserve_summary`) with the function tools withheld, which does not
+    stop a server-side built-in from running inside it; the report it writes keeps that record, so
+    the turn's last call can persist one more `NOTE_CAP` than its steps. Its text is the model's own
+    output and is the provider's to bound, like every step's.
     """
-    return math.ceil(persisted_step_cap() * max_steps / WORST_CASE_CHARS_PER_TOKEN)
+    return math.ceil(
+        (persisted_step_cap() * max_steps + SERVER_TOOLS_NOTE_CAP) / WORST_CASE_CHARS_PER_TOKEN
+    )
 
 
 def min_safe_limit(max_steps: int) -> int:
     """The smallest context budget that still guarantees no single turn can leap the threshold.
 
     Solve `limit × (1 - COMPACT_AT) >= worst_case_turn_tokens(max_steps)` for `limit`. At the shipped
-    constants (4 KB result + 2 KB arguments + the ~1 KB server-tool note per step, 24 steps,
-    half-ceiling trigger) this is ~115 K — under the 128 K floor, which is why an agent that never
+    constants (4 KB result + 2 KB arguments + the ~1.4 KB server-tool note per step, 24 steps,
+    the reserve's record, half-ceiling trigger) this is ~123 K — under the 128 K floor, which is why an agent that never
     touches the knobs is safe by construction and never hears a word about any of this. **That margin
     is what sizes `TOOL_ARGS_CAP`** (and `_server_tools`' caps): at a 4 KB argument cap this lands at
-    148,016, *above* the floor, and every stock agent would start warning.
+    155,390, *above* the floor, and every stock agent would start warning.
 
     **This budget is itself safe** — it is the smallest value that *clears* the bar, not the largest
     that fails it. So the warning quotes it as "to at least N", never "above N": `threshold()` floors
@@ -423,7 +431,10 @@ def max_safe_steps(limit: int) -> int:
     the largest one that clears the warning.
     """
     headroom = limit - int(limit * COMPACT_AT)
-    return int(headroom * WORST_CASE_CHARS_PER_TOKEN / persisted_step_cap())
+    affordable = (
+        headroom * WORST_CASE_CHARS_PER_TOKEN - SERVER_TOOLS_NOTE_CAP
+    )  # the reserve's record
+    return max(0, int(affordable / persisted_step_cap()))
 
 
 def is_context_overflow(text: str) -> bool:
@@ -598,7 +609,8 @@ class ContextBudget:
         _log.warning(
             "context budget %d (source=%s) leaves %d tokens of headroom above the compaction "
             "threshold, below the %d a single tool-heavy turn can add (%d chars of result + "
-            "arguments + server-tool record per step x %d steps at %.1f chars/token): a turn may "
+            "arguments + server-tool record per step x %d steps, plus the reserve summary's "
+            "record, at %.1f chars/token): a turn may "
             "overshoot the ceiling "
             "before compaction, which runs only *between* turns, can fire. The over-length rescue "
             "(emergency compaction + retry) still applies. %s",

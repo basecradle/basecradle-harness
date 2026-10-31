@@ -161,13 +161,16 @@ class ServerToolUse:
 
     `name` is the tool as the model knows it (``web_fetch``, ``web_search``, ``code_execution``);
     `input` is one line saying what it was run on (the URL, the query, the code), composed by the
-    adapter that read the vendor's response (`_server_tools.summarize`). It is **not** a `ToolCall`:
-    the harness never ran it, never will, and the Delivery Guarantee's recovery reads every
-    `ToolCall` in a transcript as a call the harness dispatched (issue #727).
+    adapter that read the vendor's response (`_server_tools.summarize`). `failed` is the vendor's own
+    reason when it reported the use as failed (``url_not_accessible``), ``""`` when it reported no
+    failure — so a fetch that never read the page is never listed as one that did. It is **not** a
+    `ToolCall`: the harness never ran it, never will, and the Delivery Guarantee's recovery reads
+    every `ToolCall` in a transcript as a call the harness dispatched (issue #727).
     """
 
     name: str
     input: str = ""
+    failed: str = ""
 
 
 @dataclass
@@ -321,7 +324,10 @@ class Message:
             data["items"] = list(self.items)
         if self.server_tools is not None and (self.server_tools.uses or self.server_tools.unlisted):
             record: dict[str, Any] = {
-                "uses": [{"name": u.name, "input": u.input} for u in self.server_tools.uses]
+                "uses": [
+                    {"name": u.name, "input": u.input, **({"failed": u.failed} if u.failed else {})}
+                    for u in self.server_tools.uses
+                ]
             }
             if self.server_tools.unlisted:
                 record["unlisted"] = self.server_tools.unlisted
@@ -352,7 +358,11 @@ def _record_from_dict(data: Any) -> ServerToolRecord | None:
     if not isinstance(data, dict):
         return None
     uses = [
-        ServerToolUse(name=str(use.get("name") or ""), input=str(use.get("input") or ""))
+        ServerToolUse(
+            name=str(use.get("name") or ""),
+            input=str(use.get("input") or ""),
+            failed=str(use.get("failed") or ""),
+        )
         for use in data.get("uses") or ()
         if isinstance(use, dict)
     ]

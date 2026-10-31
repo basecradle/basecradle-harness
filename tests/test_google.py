@@ -1549,3 +1549,24 @@ def test_code_execution_and_url_context_are_recorded_on_the_reply(router, key_fi
 def test_a_gemini_turn_with_no_built_in_carries_no_record(router, provider):
     router.post(GENERATE).mock(return_value=ok(text("hi")))
     assert provider.chat([Message.user("go")]).server_tools is None
+
+
+def test_a_url_gemini_could_not_read_and_a_failed_run_are_marked_failed(router, key_file):
+    provider = build(key_file, builtin_tools=["code_execution", "url_context"])
+    response = body(
+        {"executableCode": {"language": "PYTHON", "code": "1/0"}},
+        {"codeExecutionResult": {"outcome": "OUTCOME_FAILED", "output": "ZeroDivisionError"}},
+        text("It failed."),
+    )
+    response["candidates"][0]["urlContextMetadata"] = {
+        "urlMetadata": [
+            {
+                "retrievedUrl": "https://example.com/gone",
+                "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_ERROR",
+            }
+        ]
+    }
+    router.post(GENERATE).mock(return_value=httpx.Response(200, json=response))
+    run, page = provider.chat([Message.user("go")]).server_tools.uses
+    assert (run.name, run.failed) == ("code_execution", "OUTCOME_FAILED")
+    assert (page.name, page.failed) == ("url_context", "URL_RETRIEVAL_STATUS_ERROR")

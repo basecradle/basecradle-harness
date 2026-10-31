@@ -1327,3 +1327,25 @@ def test_each_server_tool_use_is_recorded_on_the_reply(router, provider):
 def test_a_turn_with_no_server_tool_carries_no_record(router, provider):
     router.post(MESSAGES).mock(return_value=reply(text("hi")))
     assert provider.chat([Message.user("hi")]).server_tools is None
+
+
+def test_a_server_tool_the_vendor_reports_as_failed_is_marked_failed(router, provider):
+    fetch = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01X",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com/gone"},
+    }
+    refused = {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": "srvtoolu_01X",
+        "content": {"type": "web_fetch_tool_result_error", "error_code": "url_not_accessible"},
+    }
+    router.post(MESSAGES).mock(return_value=reply(fetch, refused, text("I could not read it.")))
+    answer = provider.chat([Message.user("fetch it")])
+    (use,) = answer.server_tools.uses
+    assert (use.name, use.input, use.failed) == (
+        "web_fetch",
+        "https://example.com/gone",
+        "url_not_accessible",
+    )

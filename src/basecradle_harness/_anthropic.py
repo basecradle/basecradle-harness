@@ -56,6 +56,8 @@ breakpoints Anthropic allows are spent as **anchor + tail + two chained**:
   wake's anchor blind, rewriting the whole prefix at the write rate. So `CHAINED` (two) more
   breakpoints are chained back from the anchor, `LOOKBACK` apart, reaching 60 positions; a hit is a
   read and the write is charged once, so they cost nothing (`AnthropicProvider._place_breakpoints`).
+  A step whose model call ran a server tool replays a fourth position, its record's note
+  (`_server_tools`, issue #727), so on a wake heavy with server tools the reach is about 15 steps.
 
 Every placement is on the request only: copy-on-write, never persisted, and never counted by the
 thinking-replay digest (`_Stream` reads every block without its ``cache_control``). Three properties
@@ -1051,12 +1053,13 @@ def _reply(blocks: Sequence[Mapping[str, Any]]) -> Message:
     calls: list[ToolCall] = []
     citations: list[dict[str, str]] = []
     used: list[ServerToolUse] = []
+    by_id: dict[str, ServerToolUse] = {}
     for block in blocks:
         kind = block.get("type")
         if kind == "server_tool_use":
-            used.append(
-                ServerToolUse(name=block.get("name") or "", input=summarize(block.get("input")))
-            )
+            use = ServerToolUse(name=block.get("name") or "", input=summarize(block.get("input")))
+            used.append(use)
+            by_id[block.get("id") or ""] = use
         elif kind == "text":
             texts.append(block.get("text") or "")
             for cited in block.get("citations") or ():
@@ -1074,6 +1077,10 @@ def _reply(blocks: Sequence[Mapping[str, Any]]) -> Message:
         elif kind in _RESULTS:
             content = block.get("content")
             if isinstance(content, Mapping) and "error_code" in content:
+                failed = by_id.get(block.get("tool_use_id") or "")
+                if failed is not None:
+                    # The record says so: a fetch that never read the page is not evidence it did.
+                    failed.failed = str(content.get("error_code") or "failed")
                 _log.warning(
                     "Anthropic's %s server tool failed inside the turn (error_code=%s); the model "
                     "was told and carried on.",

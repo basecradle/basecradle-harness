@@ -409,13 +409,26 @@ def _is_server_tool_item(kind: Any) -> bool:
     return isinstance(kind, str) and (kind in _SERVER_TOOL_ITEMS or kind.endswith("_search_call"))
 
 
+#: The item states a vendor reports for a server-side call that did not complete.
+_FAILED_STATUSES = frozenset({"failed", "incomplete"})
+
+
 def _server_tool_use(kind: str, item: Mapping[str, Any]) -> ServerToolUse:
-    """One server-side tool item as a `ServerToolUse`: its tool's name, and what it ran on."""
+    """One server-side tool item as a `ServerToolUse`: its tool's name, what it ran on, and whether
+    the vendor reported it failed."""
+    status = item.get("status")
+    failed = status if status in _FAILED_STATUSES else ("failed" if item.get("error") else "")
+    if kind == "mcp_call":
+        # The remote tool's own name leads, so a long argument list can never cut it off.
+        label = "/".join(str(part) for part in (item.get("server_label"), item.get("name")) if part)
+        given = f"{label} {item.get('arguments') or ''}".strip()
+        return ServerToolUse(name="mcp", input=given, failed=failed)
     action = item.get("action")
     given = action if isinstance(action, Mapping) and action else item
     return ServerToolUse(
         name=kind.removesuffix("_call"),
         input=summarize({k: v for k, v in given.items() if k not in _NOT_INPUT}),
+        failed=failed,
     )
 
 

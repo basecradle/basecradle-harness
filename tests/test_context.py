@@ -1033,14 +1033,15 @@ def test_an_unrelated_exceeds_the_maximum_is_not_the_wall(text):
 def test_the_worst_case_is_derived_from_the_constants_not_hardcoded():
     # The whole point of deriving it: tune a cap or the step budget and the guarantee's arithmetic
     # follows automatically. A literal 30_000 here would rot the day either constant moved.
+    # The last term is the reserve summary's server-tool record (issue #727): one more model call.
     assert worst_case_turn_tokens(DEFAULT_MAX_STEPS) == math.ceil(
-        (TOOL_RESULT_CAP + TOOL_ARGS_CAP + SERVER_TOOLS_NOTE_CAP)
-        * DEFAULT_MAX_STEPS
+        (
+            (TOOL_RESULT_CAP + TOOL_ARGS_CAP + SERVER_TOOLS_NOTE_CAP) * DEFAULT_MAX_STEPS
+            + SERVER_TOOLS_NOTE_CAP
+        )
         / WORST_CASE_CHARS_PER_TOKEN
     )
-    assert worst_case_turn_tokens(2 * DEFAULT_MAX_STEPS) == 2 * worst_case_turn_tokens(
-        DEFAULT_MAX_STEPS
-    )
+    assert worst_case_turn_tokens(2 * DEFAULT_MAX_STEPS) > worst_case_turn_tokens(DEFAULT_MAX_STEPS)
     # `min_safe_limit` is that same inequality solved for the ceiling.
     assert min_safe_limit(DEFAULT_MAX_STEPS) * (1 - COMPACT_AT) >= worst_case_turn_tokens(
         DEFAULT_MAX_STEPS
@@ -1075,9 +1076,9 @@ def test_the_shipped_caps_keep_the_default_install_inside_the_guarantee():
     """The floor must clear the bar *with the arguments counted* — or every stock agent warns.
 
     This is the constraint that sizes `TOOL_ARGS_CAP`. The 128 K floor leaves 64 K of headroom above
-    the threshold, and one turn can now add ~58 K of it (~7 KB per step x 24 steps at 3 chars/token:
+    the threshold, and one turn can now add ~61 K of it (~7.5 KB per step x 24 steps at 3 chars/token:
     the result, the arguments and, since issue #727, the server-tool note).
-    Raise the argument cap to the result cap's 4 KB and the minimum safe ceiling lands at 148_016 —
+    Raise the argument cap to the result cap's 4 KB and the minimum safe ceiling lands at 155_390 —
     *above* the floor — and the default install starts warning about a guarantee it has not actually
     lost. A warning that fires on every stock agent is a warning nobody reads.
     """

@@ -18,7 +18,9 @@ no fetch before it, publicly retracted the true post. The harness had hidden the
 agent's own action from it.
 
 - **Each assistant turn now persists a `ServerToolRecord`**: one `ServerToolUse` per use, the tool's
-  name and what it ran on (`web_fetch: https://example.com`). Four adapters report it: Anthropic
+  name, what it ran on, and the vendor's own reason when it reported the use as failed
+  (`web_fetch: "https://example.com" (failed: url_not_accessible)`), so a fetch that never read the
+  page is never listed as one that did. Four adapters report it: Anthropic
   (`server_tool_use` blocks), OpenAI Responses (named server items: `web_search_call`,
   `code_interpreter_call`, `file_search_call`, `image_generation_call`, `mcp_call` and any
   `*_search_call`; never `function_call` or `computer_call`, which are the client's), the native
@@ -27,15 +29,21 @@ agent's own action from it.
   xAI's `search_parameters` over the `openai` SDK name no call, so their turns carry none; their
   `Sources:` footer is what persists.
 - **Every later call shows it to the model** as one system note immediately after the turn and its
-  tool results: *"Server-side tools ran during your turn above…"*. It is spliced into the request
+  tool results: *"Server-side tools were called during your turn above…"*. It also says what the
+  record alone cannot: whatever the model wrote after a server tool was written with its result in
+  view. Without that sentence, a live wake asked to check its own claims conceded the fetch ran and
+  then disowned the title it had read from it. Each input is JSON-quoted, so text a peer influenced
+  reads as data and cannot open a line. It is spliced into the request
   only (`_server_tools.with_records`, in `Engine._chat`), never into the transcript, so compaction's
   cut rules, the recovery's walks and the persisted shape are untouched, and it is composed from
   persisted data alone, so it is byte-stable and costs the prefix cache nothing.
 - **It is bounded, and the bound is a term of the compaction proof.** At most 4 uses listed per turn,
-  each name at most 40 and each input at most 160 characters on one line, the rest counted: never
-  more than `NOTE_CAP` = 1,059 characters a turn. `persisted_step_cap()` is now 7,203 (was 6,144), so
-  the single-turn guarantee needs a ceiling of 115,248 (was 98,304); the 128 K floor still clears it.
-  The budget warning names the new term.
+  each name at most 40, each failure at most 40 and each quoted input at most 160 characters on one
+  line, the rest counted: never more than `NOTE_CAP` = 1,459 characters a turn.
+  `persisted_step_cap()` is now 7,603 (was 6,144), and the worst-case turn counts one more record for
+  the step-capped reserve summary (which keeps its record: a built-in can still run in that call), so
+  the single-turn guarantee needs a ceiling of 122,622 (was 98,304); the 128 K floor still clears it.
+  The budget warning names both terms.
 - **It is its own section on the `context attribution` line**, `history_server_tools`, and the
   sections still sum to `total`. The compaction summarizer is shown it too, so a summary can keep that
   the fetch happened and the identifier harvest can keep its URL.
@@ -48,8 +56,8 @@ agent's own action from it.
 
 `max_safe_steps` solved the inequality with `limit × (1 − COMPACT_AT)` while the warning measures
 the headroom above the *integer* threshold. The two differ by under a token, invisible while the
-step cap was 6,144; at 7,203 it quoted a step budget one below the largest that clears the warning.
-It now inverts the trigger exactly.
+step cap was 6,144; at any cap that is not, it could quote a step budget one below the largest that
+clears the warning. It now inverts the trigger exactly.
 
 ## [0.160.0] - 2026-10-31
 
