@@ -38,7 +38,7 @@ the adapter's own, because only the adapter knows the wire's positions (issue #7
   every step after the first reads the tool list instead of paying for it again.
 - **The lookback chain.** A breakpoint finds an earlier entry only within `LOOKBACK` (20) positions
   of itself, and the entry a wake can find is the one the previous wake wrote at *its* anchor. A
-  wake that added 20 positions or more (about five sequential tool steps) would leave the next
+  wake that added 20 positions or more (about seven sequential tool steps) would leave the next
   wake's anchor blind, rewriting the whole prefix at the write rate. So up to three more
   breakpoints are chained back from the anchor, `LOOKBACK` apart, reaching 80 positions; a hit is a
   read and the write is charged once, so they cost nothing (`AnthropicProvider._place_breakpoints`).
@@ -670,7 +670,9 @@ class AnthropicProvider:
                 self._mark(blocks)
         self._replies = {key: kept for key, kept in self._replies.items() if key in present}
         sent = [*system, *(block for turn in wire for block in turn["content"])]
-        self._place_breakpoints(sent)
+        # The tool list renders before the first system or message block, so its end is the
+        # position just before them: an entry a first wake wrote there is still worth reaching.
+        self._place_breakpoints(sent, first=-1 if tools else 0)
         if tools and not any("cache_control" in block for block in sent):
             # No frozen turn to anchor (a first wake: the charter rides the brief, so the frozen
             # transcript is empty). The stable/volatile boundary is then the end of the tool list,
@@ -689,14 +691,15 @@ class AnthropicProvider:
                 blocks[position]["cache_control"] = self._template()
                 return
 
-    def _place_breakpoints(self, blocks: list[dict[str, Any]]) -> None:
+    def _place_breakpoints(self, blocks: list[dict[str, Any]], *, first: int = 0) -> None:
         """Walk back from the anchor's breakpoint, adding one every `LOOKBACK` positions (#726).
 
-        `blocks` is the request's system blocks and then every message block, in send order. The
+        `blocks` is the request's system blocks and then every message block, in send order; `first`
+        is the earliest position an entry can sit at (-1 when a tool list precedes them). The
         anchor's breakpoint finds an entry only within `LOOKBACK` positions of itself, and the entry
         a wake can find is the one the *previous* wake wrote at its own anchor — the end of the
         transcript as it stood then. So a previous wake that added `LOOKBACK` or more positions of
-        work (about five sequential tool steps) leaves this wake's anchor blind to it, and the whole
+        work (about seven sequential tool steps: a call, its result and a step note each) leaves this wake's anchor blind to it, and the whole
         prefix is written again at the write rate: more than sending no breakpoint at all.
 
         Each added breakpoint starts a lookback window of its own, so they are chained back from the
@@ -705,8 +708,9 @@ class AnthropicProvider:
         positions behind the anchor (80). A breakpoint that hits is a read; the write is charged once,
         for the span after the hit, so the extra breakpoints cost nothing.
 
-        Nothing is added when the earliest breakpoint's own window already reaches the first
-        position, and none past the vendor's four. Each lands on the **last** block of its position (a
+        Nothing is added when the earliest breakpoint's own window already reaches `first`, and the
+        request never carries more than the vendor's four: a caller that anchored more keeps its latest
+        four, with a WARNING, rather than a 400. Each lands on the **last** block of its position (a
         run of parallel calls or results is one position), and only on a block that can carry one;
         where the earliest reachable position cannot, the next later one is taken, which narrows the
         reach and never opens a gap. Every block is counted as a position except the runs Anthropic
@@ -715,11 +719,22 @@ class AnthropicProvider:
         marked = [index for index, block in enumerate(blocks) if "cache_control" in block]
         if not marked:
             return
+        if len(marked) > MAX_BREAKPOINTS:
+            _log.warning(
+                "%d turns were anchored for caching and Anthropic takes at most %d breakpoints; "
+                "keeping the latest %d.",
+                len(marked),
+                MAX_BREAKPOINTS,
+                MAX_BREAKPOINTS,
+            )
+            for index in marked[:-MAX_BREAKPOINTS]:
+                del blocks[index]["cache_control"]
+            marked = marked[-MAX_BREAKPOINTS:]
         positions = _positions(blocks)
         earliest = marked[0]
         for _ in range(MAX_BREAKPOINTS - len(marked)):
             reach = positions[earliest] - LOOKBACK
-            if reach < 0:
+            if reach < first:
                 return
             candidate = next(
                 (

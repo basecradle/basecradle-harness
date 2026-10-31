@@ -41,6 +41,7 @@ from basecradle_harness._anthropic import (
     DEFAULT_BASE_URL,
     PAUSE_CONTINUATIONS,
     SYSTEM_LABEL,
+    _Stream,
 )
 from basecradle_harness._basecradle import _provider_from_config, resolved_model_params
 from basecradle_harness._caching import EXPLICIT, anchor_cacheable_prefix
@@ -499,6 +500,38 @@ def test_a_callers_own_anchors_count_against_the_four(router, provider):
         "messages[51][0]",
         "messages[31][0]",
     ]
+
+
+def test_with_a_tool_list_the_chain_reaches_back_past_the_first_block(router, provider):
+    """A first wake's entry sits at the end of the tool list, one position before block 0, so an
+    anchor at 19 (whose own window ends at 0) gets one more breakpoint to reach it."""
+    route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
+    provider.chat(anchored(chatter(20)), tools=[TOOL])
+    assert marks(body(route)) == ["messages[19][0]", "messages[0][0]"]
+
+
+def test_more_than_four_anchors_keep_the_latest_four(router, provider, caplog):
+    route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
+    frozen = chatter(12)
+    for index in (1, 3, 5, 7, 9):
+        frozen[index] = Message(role="assistant", content=f"answer {index}", cache_anchor=True)
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        provider.chat([*frozen, Message.user("now")])
+    assert marks(body(route)) == [
+        "messages[9][0]",
+        "messages[7][0]",
+        "messages[5][0]",
+        "messages[3][0]",
+    ]
+    assert any("at most 4 breakpoints" in r.getMessage() for r in caplog.records)
+
+
+def test_the_replay_digest_ignores_a_marked_tool():
+    """Whether or not the tool list carries the breakpoint, the prefix it digests is the same."""
+    tool = {"name": "add", "description": "Adds.", "input_schema": {"type": "object"}}
+    plain = _Stream([text("charter")], [dict(tool)]).digest()
+    marked = _Stream([text("charter")], [{**tool, "cache_control": {"type": "ephemeral"}}])
+    assert marked.digest() == plain
 
 
 def test_moving_a_breakpoint_never_strips_the_thinking(router, provider):

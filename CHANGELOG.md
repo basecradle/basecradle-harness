@@ -28,8 +28,10 @@ knows the wire's positions, now turns it into the breakpoints Anthropic needs.
   wake's first call read the previous entry in full (12,094 tokens); with the chain disabled, the live
   gate's 45-position sequence read 0 of 5,293.
 - Every breakpoint is placed on the request only, never persisted, never on a block that cannot carry
-  one, and never counted by the thinking-replay digest. A caller's own anchors count against
-  Anthropic's four.
+  one, and never counted by the thinking-replay digest. With a tool list present, the chain reaches
+  one position further, to the end of the tools, where a first wake's entry sits.
+- **A request never carries more than Anthropic's four breakpoints.** A library caller that anchored
+  more turns was sent a 400 (since 0.158.0); it now keeps the latest four, with a WARNING.
 - New live gates: `test_with_nothing_anchored_the_tool_list_is_read_back`,
   `test_a_long_previous_wake_is_found_through_the_lookback_chain`.
 
