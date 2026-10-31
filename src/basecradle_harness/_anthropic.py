@@ -114,7 +114,11 @@ The wire translation
   fault, never a fragment committed as an answer.
 - **A server tool and a client tool in one parallel group** come back with ``stop_reason:
   "tool_use"`` and the server tool not yet run; the raw blocks go back with the client results, and
-  Anthropic runs it then. A server tool's own failure arrives inside an HTTP 200 (its result's
+  Anthropic runs it then — but only if the message answering the group holds ``tool_result`` blocks
+  and nothing else (measured live, issue #735). The engine's step note, and any other system note
+  or injected image after a step's results, is therefore folded into the last result's ``content``
+  there (`_fold_into_results`); left as a trailing block it was a 400 on every mixed group. A
+  server tool's own failure arrives inside an HTTP 200 (its result's
   ``content`` is an error object where success is a list) and is logged, never raised.
 
 Every vendor control, and the three the 5.x models refuse
@@ -162,6 +166,7 @@ import logging
 import os
 import time
 from collections.abc import Mapping, Sequence
+from itertools import pairwise
 from typing import Any
 
 from basecradle_harness._anthropic_rates import (
@@ -702,6 +707,9 @@ class AnthropicProvider:
             if message.cache_anchor:
                 self._mark(blocks)
         self._replies = {key: kept for key, kept in self._replies.items() if key in present}
+        for before, after in pairwise(wire):
+            if before["role"] == "assistant" and _pending_server_tool(before["content"]):
+                _fold_into_results(after["content"])
         sent = [*system, *(block for turn in wire for block in turn["content"])]
         if tools and not any("cache_control" in block for block in sent):
             # No frozen turn to anchor (a first wake: the charter rides the brief, so the frozen
@@ -1012,6 +1020,52 @@ def _replayed(
     if next(calls, None) is not None:
         return _rendered(message)
     return blocks
+
+
+def _pending_server_tool(blocks: Sequence[Mapping[str, Any]]) -> bool:
+    """Does this assistant content carry a ``server_tool_use`` with no result yet (issue #735)?
+
+    That is the mixed parallel group: the model called a server tool and a client tool in one
+    response, and Anthropic stopped for the client's results before running the server tool.
+    """
+    answered = {block.get("tool_use_id") for block in blocks if block.get("type") in _RESULTS}
+    return any(
+        block.get("type") == "server_tool_use" and block.get("id") not in answered
+        for block in blocks
+    )
+
+
+def _fold_into_results(blocks: list[dict[str, Any]]) -> None:
+    """Make the user message after a pending server tool hold ``tool_result`` blocks only (#735).
+
+    Anthropic runs a pending server tool only when the message answering its group is nothing but
+    tool results: measured live on 2026-10-31, ``[tool_result]`` and ``[tool_result]`` with the text
+    folded into its ``content`` are accepted, while ``[tool_result, text]`` is a 400 naming the server
+    tool's missing result. The engine's step note (and any other system note, or an injected image)
+    follows a step's results as such a trailing block, so every mixed group failed on its next step.
+    The trailing blocks are moved, in order, into the last result's ``content``; a breakpoint one of
+    them carried moves to that result, which is where the position it marked now ends.
+    """
+    results = [block for block in blocks if block.get("type") == "tool_result"]
+    rest = [block for block in blocks if block.get("type") != "tool_result"]
+    if not results or not rest:
+        return
+    last = results[-1]
+    content = last.get("content")
+    folded: list[dict[str, Any]] = (
+        [{"type": "text", "text": content}] if isinstance(content, str) and content else []
+    )
+    if isinstance(content, list):
+        folded = list(content)
+    marked = None
+    for block in rest:
+        moved = dict(block)
+        marked = moved.pop("cache_control", None) or marked
+        folded.append(moved)
+    last["content"] = folded
+    if marked is not None:
+        last["cache_control"] = marked
+    blocks[:] = results
 
 
 def _assistant(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
