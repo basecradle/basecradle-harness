@@ -1,9 +1,9 @@
-# Default tool plugins: code execution (OpenAI Code Interpreter, xAI Agent-Tools, Gemini), and the
+# Default tool plugins: code execution (OpenAI Code Interpreter, xAI Agent-Tools, Gemini, Claude), and the
 # code_attach bridge tool. Delete to disable; see memory.py for the contract.
 #
 # Code runs **server-side, in the vendor's own sandbox** — the harness never executes
 # model-authored code on its boxes (issue #172). So the executor is a *built-in* (a wire-name
-# toggle, like web_search), not a Tool class. Three built-ins share the model-facing name
+# toggle, like web_search), not a Tool class. Four built-ins share the model-facing name
 # "code_execution" but carry different requirements, so exactly one activates per config:
 #
 #   - OpenAI: the Responses-API Code Interpreter (`code_interpreter`), needs openai + responses.
@@ -11,6 +11,11 @@
 #   - Google: Gemini's code execution on Vertex (`code_execution`), needs the google provider and a
 #     gemini-3 model — the family the live gate proves it beside function declarations on
 #     (issue #656). Billed as tokens only — the code and its result are input, the summary output.
+#
+#   - Anthropic: Claude's code execution (`code_execution_20260521`, bash and file edits in Anthropic's
+#     sandbox), needs the anthropic provider (issue #725). Free on a call that also carries web search
+#     or web fetch; otherwise Anthropic bills container time, which no response states, so the
+#     adapter says so once per wake instead of logging a number.
 #
 # `code_attach` (a Tool class) is the IN half of the **Asset bridge**: feed a BaseCradle Asset
 # into the executor as an input file. It is OpenAI-only — xAI's code execution has no input-file
@@ -53,6 +58,16 @@ PLUGINS = [
         note=(
             "Runs Python server-side in Google's sandbox, up to 30 seconds a run — compute only (no "
             "file exchange with the Asset system; a documented vendor limit)."
+        ),
+        opt_in=True,
+    ),
+    ToolPlugin(
+        builtin="code_execution",
+        name="code_execution",
+        requires=(Vendor("anthropic"),),
+        note=(
+            "Runs code server-side in Anthropic's sandbox (bash, Python, file edits) — compute only: "
+            "files it writes stay in the sandbox and do not become BaseCradle Assets."
         ),
         opt_in=True,
     ),

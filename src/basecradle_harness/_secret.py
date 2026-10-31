@@ -20,7 +20,9 @@ hands the key to a vendor.
 
 What it does not do, stated: a credential a **vendor SDK** keeps on its own client object (the
 ``openai`` client's ``api_key``, say) is that vendor's attribute, reached only through our private
-``_client``; reimplementing vendor clients is not this module's job.
+``_client``; reimplementing vendor clients is not this module's job. An adapter that wants that
+object out of every representation of itself holds it in a `Sealed` — the Google adapter's
+service-account credential and the Anthropic adapter's SDK client do.
 """
 
 from __future__ import annotations
@@ -79,6 +81,36 @@ class Secret:
         return self
 
     def __deepcopy__(self, memo: dict[int, Any]) -> Secret:
+        return self
+
+
+class Sealed:
+    """An object holding a credential — a vendor SDK client, a credentials object — kept out of
+    every representation of whatever holds *it*.
+
+    `Secret` holds a string; this holds an object that keeps its own credential in its own
+    ``__dict__`` (a Google credentials object's signer and bearer token, an SDK client's
+    ``api_key``), and keeps the same promise for it: no ``__dict__`` to walk, a redacted ``repr``,
+    and no pickling. A copy returns the same object, for `Secret`'s reason.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"Sealed({_REDACTED!r})"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> Any:
+        raise TypeError("A sealed credential cannot be serialized.")
+
+    def __copy__(self) -> Sealed:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> Sealed:
         return self
 
 

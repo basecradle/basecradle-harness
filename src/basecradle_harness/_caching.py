@@ -227,10 +227,11 @@ def anchor_cacheable_prefix(messages: list[Message], *, stable: int, mode: str) 
     objects are never mutated, so nothing leaks into the persisted transcript (see the docstring —
     a persisted anchor accumulates across wakes and eventually trips the four-breakpoint ceiling).
 
-    On an agent's *first* wake the frozen prefix is just the charter — and anchoring it is the
-    point, not an edge case: the charter (system prompt + operating guidance) is the single largest
-    byte-stable block an agent has, and caching it on wake one is what makes wake two a cache read.
-    Only a session with no charter at all has nothing to anchor (`stable <= 0`).
+    On an agent's *first* wake there is nothing to anchor (`stable <= 0`): the charter rides the
+    per-wake brief rather than the transcript, so the frozen prefix is empty, and caching starts on
+    wake two — which writes the entry wake three reads (measured live on Claude, issue #725). What
+    that costs on an explicit-cache vendor, and a second gap of the one-breakpoint shape, is filed
+    as issue #726.
 
     A no-op for every mode but `EXPLICIT`.
     """

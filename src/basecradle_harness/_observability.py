@@ -166,10 +166,11 @@ _TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
 #: vendors reached under the generic profile (Wiro, issue #670); the xAI SDK reports it in
 #: ``ticks`` and converts it with its own helper, so that adapter passes the figure to
 #: `log_llm_call` directly rather than through this reader. A provider that reports tokens but no
-#: dollars logs no ``cost=`` — with **two** stated exceptions, the vendors whose APIs state no price
-#: at all: Google's Vertex AI and OpenAI, whose adapters price the call from the vendor's published
-#: rates (`basecradle_harness._google_rates`, `basecradle_harness._openai_rates`; the capital's
-#: rulings on issues #655 and #657), because a brain with no cost at all would be invisible on the
+#: dollars logs no ``cost=`` — with **three** stated exceptions, the vendors whose APIs state no price
+#: at all: Google's Vertex AI, OpenAI and Anthropic, whose adapters price the call from the vendor's
+#: published rates (`basecradle_harness._google_rates`, `basecradle_harness._openai_rates`,
+#: `basecradle_harness._anthropic_rates`; the capital's rulings on issues #655, #657 and #725),
+#: because a brain with no cost at all would be invisible on the
 #: fleet's spend dashboard. Those tables omit rather than guess — an unknown model or tier gets no
 #: ``cost=`` — and they hand the figure over as a `ComputedCost`, so the line says which kind of
 #: figure it is (`COST_BASIS_COMPUTED`). No other adapter derives one: a stale table is worse than an
@@ -781,7 +782,7 @@ def log_media_call(
     ``None`` for such a line, because the work ran inside a model call the `llm` line already timed.
 
     ``cost`` is the dollar charge as the provider stated it (xAI's ``usage.cost_in_usd_ticks`` on the
-    grok media cells), or — where the vendor states no price, which is OpenAI and Google — as the
+    grok media cells), or — where the vendor states no price, which is OpenAI, Google and Anthropic — as the
     harness computed it from the vendor's published rates (a `ComputedCost`, which renders
     ``cost_basis=computed`` after it, `COST_BASIS_COMPUTED`). The same honest-absence contract
     `log_llm_call` keeps, through the same `_money` formatter (see `_money` for the one cost
@@ -885,11 +886,13 @@ def usage_reported(usage: Any) -> bool:
 #: Every spelling of *"generation stopped because the output budget ran out"* — the one finish
 #: reason that means the answer in hand is a **fragment**, not an answer. OpenAI and OpenRouter's
 #: chat wire say ``length``; OpenAI's Responses surface says ``max_output_tokens`` (as
-#: ``incomplete_details.reason``); the native xAI SDK names its enum ``REASON_MAX_LEN``. Compared
+#: ``incomplete_details.reason``); the native xAI SDK names its enum ``REASON_MAX_LEN``; Anthropic says
+#: ``max_tokens``, and ``model_context_window_exceeded`` when the output ran into the end of the
+#: context window rather than into its own cap — a fragment just the same. Compared
 #: case-insensitively, because the harness is matching a vendor's vocabulary rather than defining
 #: one.
 TRUNCATED_FINISH_REASONS = frozenset(
-    {"length", "max_tokens", "max_output_tokens", "reason_max_len"}
+    {"length", "max_tokens", "max_output_tokens", "reason_max_len", "model_context_window_exceeded"}
 )
 
 
@@ -946,7 +949,7 @@ def reported_cost(usage: Any) -> float | None:
     field — and so do OpenAI-compatible vendors reached under the generic profile (Wiro states it,
     issue #670); the ``openai`` SDK keeps an unmodeled field, so it survives ``model_dump``. An
     endpoint that reports tokens and no dollars gets no ``cost=`` from here: see `_COST_FIELDS`
-    for the two vendors (Google, OpenAI) whose figure the harness computes instead, and why no
+    for the three vendors (Google, OpenAI, Anthropic) whose figure the harness computes instead, and why no
     other is.
 
     **It is what the operator pays for the call, whichever party bills it** (issue #653). On a
@@ -1173,9 +1176,9 @@ def _money(cost: Any) -> str | None:
     ``cost=`` keeps this shape on every kind, and the `` llm provider=`` head never appears on a
     non-LLM line (a media line begins ``media ``). A call carries ``cost=`` **when the provider
     states the figure** (OpenRouter's ``usage.cost``, xAI's ticks) — and on the two vendors that
-    state none, Google's Vertex AI and OpenAI, when the call's model and tier are in the harness's
-    transcription of the vendor's published rates (issues #655 and #657, `_google_rates`,
-    `_openai_rates`), tagged ``cost_basis=computed``. Nowhere else is a figure derived, because a
+    state none, Google's Vertex AI, OpenAI and Anthropic, when the call's model and tier are in the
+    harness's transcription of the vendor's published rates (issues #655, #657 and #725,
+    `_google_rates`, `_openai_rates`, `_anthropic_rates`), tagged ``cost_basis=computed``. Nowhere else is a figure derived, because a
     stale table is worse than an honest gap.
 
     Typed loosely on purpose: the figure comes straight off a vendor object (`Response.cost_usd`),

@@ -87,6 +87,7 @@ _PROVIDER_LABELS = {
     "openai": "OpenAI",
     "openrouter": "OpenRouter",
     "google": "Google",
+    "anthropic": "Anthropic",
 }
 
 
