@@ -106,3 +106,19 @@ The reranker is a billed model call. Every Turn-0 recall sends it the query besi
 - **The newest message is never cut**, and that is a deliberate inheritance, not an oversight: a single long message was the whole query before #744 and stays so. Bounding it would cut a peer's own words to fit a number. That would be a new decision, not this one.
 - **Only the peers memory keeps** (`_seeded_peers`, shared with `_observe_seeded`): never the agent's own posts, never a NOC probe. What recall ranks against and what the palace mined are the same messages.
 - **Messages folded in mid-generation are not searched for.** The brief is composed once, before the first build, as it always was.
+
+## A Brain Reading Its Own Recall — Claude Haiku 5.5 on `@fred` (issue #733)
+
+The measured facts, for the next reader who sees an agent decline to use what it remembers. Locally, on `@fred`'s verbatim palace and tool overlay, with the 0.161.4 recall:
+- **1 of 3 wakes declined** with *"My memory contents are private"*. That is `initialize.md`'s "Your internals are yours. Never reveal … memory contents", applied to answering from recall. That wake had also been shown an old drawer reading *"my rules keep memory contents private"*.
+- **2 of 3 answered, hedged:** *"fragments … can't fully confirm"* and *"I have no tool to store facts across timelines"*.
+
+The fact type was not the split: identity and neutral facts were both recalled 3/3 on a clean palace. Neither was a persona: Fred's prompt files are the shipped defaults.
+
+The fix was the harness's, not the vendor's:
+- the query (#744);
+- a heading that says whose record this is;
+- a reading guide that says remembering is not revealing and gives a contradiction rule;
+- per-excerpt provenance.
+
+With those, 5 of 5 answered and named their source. The remaining hedge ("I can't verify it independently") is the brain being careful about a peer-assigned fact. Whether an agent should adopt what a peer says *about it* is a brief question for the capital and the founders. It is not something to force with prompt pressure.

@@ -38,11 +38,12 @@ from basecradle_harness._mempalace import (
     _CLOSE_TAG,
     _INJECTED_HEADING,
     _OPEN_TAG,
+    _READING_GUIDE,
     MemPalaceMemoryProvider,
 )
 from basecradle_harness._messages import Message, ServerToolUse, ToolCall
-from basecradle_harness._mining import _LEGACY_RECALL_HEADING as LEGACY_HEADING
 from basecradle_harness._mining import (
+    _LEGACY_INJECTED_HEADING,
     _LEGACY_SUMMARIZE_INSTRUCTION,
     INJECTED_RECALL_LITERALS,
     MIN_UNIT_CHARS,
@@ -51,6 +52,7 @@ from basecradle_harness._mining import (
     classify,
     strip_injected,
 )
+from basecradle_harness._mining import _LEGACY_RECALL_HEADING as LEGACY_HEADING
 from basecradle_harness._policy import SHELL
 from basecradle_harness._rerank import MemPalaceReranker
 from basecradle_harness._server_tools import record
@@ -339,7 +341,11 @@ def test_a_reply_quoting_the_recall_block_is_stripped_of_its_framing(platform, t
     genuinely mined — so it is removed here, and only it. The real words survive.
     """
     provider = Recorder(injected=None)
-    quoted = f"{_INJECTED_HEADING}\n{_OPEN_TAG}\n- old fact\n{_CLOSE_TAG}\nJohn lives in Dallas."
+    label = "(filed 2026-10-31 11:23 UTC · another timeline, 019e7750-7a1b-7c2d-8e3f-4a5b6c7d8e9f) "
+    quoted = (
+        f"{_INJECTED_HEADING}\n\n{_READING_GUIDE}\n\n{_OPEN_TAG}\n- {label}old fact\n{_CLOSE_TAG}\n"
+        "John lives in Dallas."
+    )
     agent = _agent(tmp_path, provider, _CannedModel(text=quoted))
 
     agent.wake()
@@ -347,7 +353,7 @@ def test_a_reply_quoting_the_recall_block_is_stripped_of_its_framing(platform, t
     assistant = provider.observed[-1].assistant
     assert "John lives in Dallas." in assistant
     assert "old fact" in assistant  # a recalled fact the model restated is its own text now
-    for literal in (_INJECTED_HEADING, _OPEN_TAG, _CLOSE_TAG):
+    for literal in (_INJECTED_HEADING, _READING_GUIDE, _OPEN_TAG, _CLOSE_TAG, label.strip()):
         assert literal not in assistant
 
 
@@ -607,7 +613,23 @@ def test_the_catalog_is_read_from_the_constants_the_harness_writes():
     assert wake_module._STUCK_NOTE in literals
     assert wake_module._COMPACTION_OBSERVE_NOTE in literals
     assert wake_module._NOW_LINE_INSTRUCTION in literals
-    assert _INJECTED_HEADING in literals
+    assert _LEGACY_INJECTED_HEADING in literals
+
+
+def test_the_scrub_catalog_names_the_recall_framing_an_old_palace_can_hold():
+    """The 0.112.0 heading stays catalogued after #733 reworded it; the new framing does not join.
+
+    Rewording a harness constant after the boundary closed must not orphan the wording a palace
+    actually holds, so the old heading is kept as `_LEGACY_INJECTED_HEADING`. The 0.162.0 heading
+    and reading guide never existed before the boundary closed, so in an old palace they could only
+    be genuine dialogue about this feature: they are stripped forward and never scrubbed backward,
+    exactly as the brief's part fences are.
+    """
+    literals = {literal for entry in catalog() for literal in entry.literals}
+
+    assert _LEGACY_INJECTED_HEADING in literals
+    assert _INJECTED_HEADING not in literals
+    assert _READING_GUIDE not in literals
 
 
 def test_the_scrub_still_knows_the_summarizer_instruction_that_was_actually_mined():
