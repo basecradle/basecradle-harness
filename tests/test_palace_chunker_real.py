@@ -8,10 +8,13 @@ drawer a fleet palace holds today reads that way under 3.11. Measured on palaces
 through its chunker (an exchange the observe filed as 3 drawers came back as 13); after a home
 move it files a second copy beside the old drawers, which it keeps.
 
-These tests build a palace with the installed MemPalace and then **age** it: every drawer is
-rewritten without ``convo_chunker_version``, which is exactly the metadata 3.10's
-``file_conversation_exchange`` and miner wrote. That is how a palace filed under 3.10 looks to
-3.11, and it is reproducible in CI, where only one MemPalace is installed per job.
+These tests build a palace with the installed MemPalace and then **age** it: every drawer and
+registry row is rewritten without ``convo_chunker_version``, which is the field 3.10 never wrote
+and the only one every mined-set decision here reads differently. Two differences remain and are
+deliberate: 3.11's ``source_dir_ino`` is kept (only MemPalace's ``sync`` reads it), and the
+miner's drawers were cut by 3.11's chunker, not 3.10's (no assertion here depends on how a miner
+drawer was cut). The real 3.10.0-to-3.11.0 upgrade was measured separately, on issue #751; this
+is the form CI can repeat, with one MemPalace installed per job.
 
 Marked ``mempalace`` and excluded from the default run. On the floor job (a MemPalace with no
 chunker version) only the first test runs; the rest are skipped there, by the version they need.
@@ -108,7 +111,7 @@ def _build(palace: Path) -> MemPalaceMemoryProvider:
 
 
 def _age(palace: Path) -> None:
-    """Rewrite every drawer without ``convo_chunker_version``: the palace as 3.10 left it.
+    """Rewrite every row without ``convo_chunker_version``, the field 3.10 never wrote.
 
     Delete and add again rather than update, because an update merges metadata and cannot drop a
     key. Embeddings, documents and every other field go back as they were.
@@ -182,7 +185,12 @@ def test_without_a_chunker_version_nothing_is_stale_and_nothing_is_stamped(palac
 
 @needs_version
 def test_a_fresh_observe_files_current_drawers(palace):
-    """On 3.11 and later the write path stamps the installed constant, read from the library."""
+    """On 3.11 and later every drawer the observe files carries the installed constant.
+
+    Both writers stamp it: 3.11's ``file_conversation_exchange`` itself, and the harness through
+    ``extra_metadata``, where upstream's value wins. So this passes on either alone; that the
+    harness stamps it, from the library's constant, is pinned offline in ``test_mempalace.py``.
+    """
     _build(palace)
 
     stamped = [meta for i, (_, meta) in _drawers(palace).items() if i in _ours(palace)]
@@ -220,6 +228,26 @@ def test_the_observes_drawers_are_told_from_the_miners_by_their_id(palace, tmp_p
     assert not filed_by_observe(f"drawer_conversations_{meta['room']}_{'0' * 24}", meta, text)
     # Nor is a drawer missing a field only the observe stamps.
     assert not filed_by_observe(drawer_id, {**meta, "chunk_total": None}, text)
+
+
+@needs_version
+def test_a_stale_registry_row_does_not_make_the_observes_file_the_miners(palace, tmp_path):
+    """A home moved and mined under 3.10 holds a registry row per file at the new path.
+
+    3.10's registry rows lack the field too, so under 3.11 they are version-stale like the drawers.
+    They are MemPalace's bookkeeping, not a drawer anybody filed, so they never decide whose a
+    file is: the observe's files still count as the observe's, and the stamp still applies.
+    """
+    _build(palace)
+    moved = tmp_path / "moved" / "mempalace"
+    shutil.copytree(palace, moved)
+    _mine(moved)  # a registry row at the new path for every file
+    _age(moved)
+
+    found = _census(moved)
+
+    assert found.registry == len(OBSERVED) + len(MINED)
+    assert (found.stale_files_ours, found.stale_files_theirs) == (len(OBSERVED), len(MINED))
 
 
 @needs_version
@@ -318,3 +346,28 @@ def test_after_a_move_the_stamped_observe_files_are_recognised_and_the_miners_ar
     assert len(reasons) == len(MINED)
     assert all("beside its old drawers, which it keeps" in r for r in reasons)
     assert all("left to MemPalace" in r for r in reasons)
+
+
+@needs_version
+def test_a_file_stale_for_both_reasons_is_named_version_stale(palace, capsys):
+    """One drawer of a set also at an old ``normalize_version``: the class is still named.
+
+    Before the fix the reason fell through to "a reason this check cannot name" while the summary
+    line counted the file as version-stale, so the two lines disagreed.
+    """
+    _build(palace)
+    _age(palace)
+    collection = mp.get_collection(str(palace))
+    runbook = [
+        (drawer_id, meta)
+        for drawer_id, (_, meta) in _drawers(palace).items()
+        if (meta.get("chunk_total") or 0) > 1
+    ]
+    drawer_id, meta = runbook[0]
+    collection.update(ids=[drawer_id], metadatas=[{**meta, "normalize_version": 1}])
+
+    out = _report(capsys, palace)
+
+    reasons = [line for line in out.splitlines() if line.strip().startswith("reason:")]
+    assert not any("cannot name" in r for r in reasons)
+    assert sum("the observe filed it" in r for r in reasons) == len(OBSERVED)

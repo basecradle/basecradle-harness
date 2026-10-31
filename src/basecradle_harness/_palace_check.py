@@ -196,12 +196,14 @@ class Census:
     #: Real drawers the harness's observe filed whose ``convo_chunker_version`` is older than
     #: `chunker`, and stale for no other reason (issue #751): what ``--stamp-chunker-version`` stamps.
     stale_ours: list[tuple[str, dict, str]] = field(default_factory=list)
-    #: Every other real drawer that is version-stale the same way: MemPalace's miner filed it (the
-    #: observe's path before 0.164.0). Left to MemPalace, and reported.
+    #: Every other real exchange-mode drawer that is version-stale the same way: any drawer not
+    #: provably the observe's, in any wing, which on a fleet palace is MemPalace's miner's (the
+    #: observe's path before 0.164.0). Left to MemPalace, and reported as ``miner-filed``.
     stale_theirs: list[tuple[str, dict, str]] = field(default_factory=list)
-    #: Conversation files on disk that a mine files again only because their records are
-    #: version-stale (no current record carries their name), split by whether every stale record
-    #: is the observe's. Measured on 3.11.0: a mine deletes the drawers filed at this location and
+    #: Conversation files on disk with a version-stale record and no record MemPalace accepts
+    #: (`_accepted`), split by whether every version-stale real drawer under their name is the
+    #: observe's (registry rows decide nothing). A file that also changed on disk is counted here
+    #: too; its forecast `reason:` line says which. Measured on 3.11.0: a mine deletes the drawers filed at this location and
     #: files the file again through its chunker, and files one whose drawers are only at another
     #: location (a moved home) a second time, beside the old drawers, which it keeps.
     stale_files_ours: int = 0
@@ -216,10 +218,13 @@ def census(collection, palace: Path) -> Census:
     out = Census(chunker=chunker_version())
     normalize = getattr(_import("palace"), "NORMALIZE_VERSION", None) if out.chunker else None
     recorded: set[str] = set()
-    # Per conversation file name: whether any record is current, whether any is version-stale, and
-    # whether every version-stale one is the observe's own (issue #751).
+    # Per conversation file name (issue #751): names with a record MemPalace accepts, names with a
+    # version-stale record, and, among the version-stale real drawers, names with one the observe
+    # filed and names with one it did not.
     current_names: set[str] = set()
-    stale_names: dict[str, bool] = {}
+    stale: set[str] = set()
+    observed: set[str] = set()
+    theirs: set[str] = set()
     # Per recorded path at this location, per stored ``source_mtime``: drawers seen and the
     # ``chunk_total`` they claim. MemPalace's own completeness rule (``prefetch_mined_set``).
     groups: dict[str, dict[object, list]] = {}
@@ -242,13 +247,17 @@ def census(collection, palace: Path) -> Census:
             if out.chunker is not None and _exchange_mode(meta):
                 name = Path(source).name
                 if _version_stale(meta, out.chunker, normalize):
-                    ours = not registry and filed_by_observe(drawer_id, meta, text)
-                    stale_names[name] = stale_names.get(name, True) and ours
+                    stale.add(name)
+                    # A registry row is MemPalace's bookkeeping, never a drawer: it says nothing
+                    # about who filed the file, so only real drawers decide that.
                     if not registry:
+                        ours = filed_by_observe(drawer_id, meta, text)
+                        theirs.update(() if ours else (name,))
+                        observed.update((name,) if ours else ())
                         (out.stale_ours if ours else out.stale_theirs).append(
                             (drawer_id, meta, text)
                         )
-                elif normalize is None or meta.get("normalize_version", 1) >= normalize:
+                elif _accepted(meta, source, prefix, normalize):
                     current_names.add(name)
             if registry:
                 out.registry += 1
@@ -272,12 +281,28 @@ def census(collection, palace: Path) -> Census:
     out.unregistered = sum(str(here / path.name) not in recorded for path in on_disk)
     out.short = sum(_short(groups.get(str(here / path.name))) for path in on_disk)
     for path in on_disk:
-        if path.name in stale_names and path.name not in current_names:
-            if stale_names[path.name]:
+        if path.name in stale and path.name not in current_names:
+            if path.name in observed and path.name not in theirs:
                 out.stale_files_ours += 1
             else:
                 out.stale_files_theirs += 1
     return out
+
+
+def _accepted(meta: dict, source: str, prefix: str, normalize: int | None) -> bool:
+    """Whether a current record is one MemPalace's miner would take as filing its file.
+
+    By path when it was filed at this location (``prefetch_mined_set``), or by content when it
+    carries a hash in the observe's wing (``prefetch_content_hashes``, which reads one wing). A
+    current record anywhere else (another wing, another home, no hash) files nothing for a mine
+    here. Its mtime is not compared: the forecast, which is MemPalace's own, is the authority on
+    that.
+    """
+    if normalize is not None and meta.get("normalize_version", 1) < normalize:
+        return False
+    if source.startswith(prefix):
+        return True
+    return meta.get("wing") == _CONVERSATIONS_WING and bool(meta.get("content_hash"))
 
 
 def _version_stale(meta: dict, chunker: int, normalize: int | None) -> bool:
@@ -484,15 +509,23 @@ def _new_reason(
             f"MemPalace's {current}{count}"
         )
     chunker = found.chunker
-    if chunker is not None and all(_version_stale(meta, chunker, current) for meta in exchange):
+    # Every carrier here is stale for one reason or the other (MemPalace accepts none of them), so
+    # if any is stale only by the chunker, that is the class: stamping or re-chunking it is what
+    # would make this content recognised.
+    chunked = [
+        row
+        for row in rows
+        if row[1].get("wing") == wing
+        and _exchange_mode(row[1])
+        and chunker is not None
+        and _version_stale(row[1], chunker, current)
+    ]
+    if chunked:
+        exchange = [meta for _, meta, _ in chunked]
         versions = ", ".join(
             sorted({str(meta.get("convo_chunker_version", 1)) for meta in exchange})
         )
-        ours = all(
-            filed_by_observe(*row)
-            for row in rows
-            if row[1].get("wing") == wing and _exchange_mode(row[1])
-        )
+        ours = all(filed_by_observe(*row) for row in chunked)
         remedy = (
             "; the observe filed it, so --stamp-chunker-version makes it current"
             if ours
