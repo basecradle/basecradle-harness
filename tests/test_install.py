@@ -697,6 +697,7 @@ def test_every_shipped_power_tool_default_is_classified_opt_in():
         "send_direct_message_to_origin",  # push notification to @origin's phone (issue #341)
         "google_search",  # Gemini grounding as a harness-run web_search tool (issue #656)
         "url_context",  # Gemini URL context server tool (issue #656)
+        "anthropic_search",  # Anthropic web_search server tool (issue #725)
     }
 
 

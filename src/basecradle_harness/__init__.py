@@ -6,6 +6,7 @@ core with clean extension points for human AI developers to fork and extend.
 https://basecradle.com · API docs: https://basecradle.com/docs/api
 """
 
+from basecradle_harness._anthropic import AnthropicConfigError, AnthropicProvider
 from basecradle_harness._assets import AssetsTool, assets_options
 from basecradle_harness._audio import Transcriber
 from basecradle_harness._basecradle import TimelineAgent
@@ -114,6 +115,7 @@ from basecradle_harness._plugins import (
     EnvSet,
     LoadedPlugins,
     ModelFamily,
+    NotVendor,
     OpenAIKey,
     OpenAISurface,
     Requirement,
@@ -216,6 +218,8 @@ __all__ = [
     "GoogleProvider",
     "GoogleSearchTool",
     "GoogleConfigError",
+    "AnthropicProvider",
+    "AnthropicConfigError",
     # Tools, registry, and the safety boundary
     "Tool",
     "ToolRegistry",
@@ -237,6 +241,7 @@ __all__ = [
     "ToolPlugin",
     "Requirement",
     "Vendor",
+    "NotVendor",
     "Sdk",
     "ModelFamily",
     "OpenAISurface",

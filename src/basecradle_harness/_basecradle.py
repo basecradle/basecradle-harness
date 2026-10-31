@@ -27,22 +27,25 @@ identical in the env, the code, and the docs:
 
 - ``AI_PROVIDER``             — **the vendor that bills the account** (whose key it is), and the
   label every ``llm provider=`` line carries — the fleet's spend chart groups on it (issue #670).
-  Four vendors are *known* and get conventions: ``openai`` (default) | ``xai`` | ``openrouter`` |
-  ``google``. Both ``openai`` and ``xai`` are wired through the one ``openai`` SDK adapter (xAI's
+  Five vendors are *known* and get conventions: ``openai`` (default) | ``xai`` | ``openrouter`` |
+  ``google`` | ``anthropic``. Both ``openai`` and ``xai`` are wired through the one ``openai`` SDK adapter (xAI's
   endpoint speaks the same wire — ``AI_PROVIDER=xai`` points the SDK at ``api.x.ai``, issue #163);
   ``openrouter`` has its native SDK as well, and ``google`` is Gemini on Vertex AI over
-  ``google-genai`` (issue #655). **Any other slug** (``^[a-z0-9._-]+$``, e.g. ``wiro``) is a legal
+  ``google-genai`` (issue #655), and ``anthropic`` is Claude over Anthropic's own ``anthropic`` SDK
+  (issue #725). **Any other slug** (``^[a-z0-9._-]+$``, e.g. ``wiro``) is a legal
   vendor with the *generic* OpenAI-compatible profile: ``AI_SDK=openai`` and ``AI_BASE_URL`` are
   required, the surface defaults to ``chat``, and nothing vendor-specific goes on the wire
   (`_provider_from_config`). The dialect is derived from the vendor, never configured.
 - ``AI_SDK``                  — the **library/package name** of the SDK the harness imports to
-  reach the model: ``openai`` (default), ``xai-sdk``, ``openrouter`` or ``google-genai``. The value is the importable
+  reach the model: ``openai`` (default), ``xai-sdk``, ``openrouter``, ``google-genai`` or
+  ``anthropic``. The value is the importable
   package, which also disambiguates it from the provider token (``AI_PROVIDER=xai`` selects
   xAI's *endpoint*; ``AI_SDK=xai-sdk`` selects xAI's *native SDK*, #165). The harness reaches an
   LLM **only** through a vendor SDK; with the named SDK not installed it comes up with no way to
-  reach a model and says so. Four adapters ship: ``openai`` (the OpenAI-wire SDK — also xAI over
+  reach a model and says so. Five adapters ship: ``openai`` (the OpenAI-wire SDK — also xAI over
   ``api.x.ai``, and every generic vendor), ``xai-sdk`` (xAI's native gRPC SDK, #165),
-  ``openrouter`` (OpenRouter's own SDK) and ``google-genai`` (Gemini on Vertex, #655).
+  ``openrouter`` (OpenRouter's own SDK), ``google-genai`` (Gemini on Vertex, #655) and
+  ``anthropic`` (Claude, direct, #725).
 - ``AI_MODEL``                — the model id (e.g. ``gpt-5.4-mini``).
 - ``AI_API_KEY``             — the provider's API key (every provider but ``google``).
 - ``AI_CREDENTIALS_FILE`` / ``AI_LOCATION`` / ``AI_PROJECT`` — ``google`` only: a service-account
@@ -84,6 +87,16 @@ from uuid import UUID
 
 from basecradle import BaseCradle
 
+from basecradle_harness._anthropic import (
+    DEFAULT_SURFACE as ANTHROPIC_DEFAULT_SURFACE,
+)
+from basecradle_harness._anthropic import (
+    SURFACES as ANTHROPIC_SURFACES,
+)
+from basecradle_harness._anthropic import (
+    AnthropicProvider,
+    validated_params,
+)
 from basecradle_harness._code import CODE_EXECUTION_BUILTIN, CodeExecutionBridge
 from basecradle_harness._context import Compactor, ContextBudget
 from basecradle_harness._engine import (
@@ -625,7 +638,7 @@ DEFAULT_SDK = "openai"
 #: vendor that bills the account*, so any other slug is a legal provider with the generic
 #: OpenAI-compatible profile (`is_generic_provider`). The set is closed only in the sense that
 #: matters — a vendor not named here gets **no** convention, never a guessed one.
-KNOWN_PROVIDERS = ("openai", "xai", "openrouter", "google")
+KNOWN_PROVIDERS = ("openai", "xai", "openrouter", "google", "anthropic")
 
 #: The shape every provider token must have, known or not. It is the NOC dashboard's own extraction
 #: (``provider=([A-Za-z0-9._-]+)``) narrowed to the lowercase this layer normalizes to, so a token
@@ -718,6 +731,8 @@ _SDK_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
     "openrouter": (OPENROUTER_SURFACES, OPENROUTER_DEFAULT_SURFACE),
     # Gemini on Vertex speaks one surface, `generateContent` (issue #655).
     "google-genai": (GOOGLE_SURFACES, GOOGLE_DEFAULT_SURFACE),
+    # Claude speaks one surface, the Messages API (issue #725).
+    "anthropic": (ANTHROPIC_SURFACES, ANTHROPIC_DEFAULT_SURFACE),
 }
 
 
@@ -971,6 +986,27 @@ _OWNED_GOOGLE = frozenset(
     }
 )
 
+#: The anthropic build's own wiring (issue #725). The rest of ``model_params.json`` is checked against
+#: the SDK's ``messages.create`` signature when the adapter is built, so a key that is neither owned
+#: here nor named there fails at startup. ``cache_control`` is deliberately **not** owned: it is the
+#: template of the harness's one breakpoint (its TTL), which the adapter reads (`_anthropic`).
+_OWNED_ANTHROPIC = frozenset(
+    {
+        "model",
+        "api_key",
+        "base_url",
+        "client",
+        "timeout",
+        "builtin_tools",
+        # The harness composes these on every call: the leading system turns, the conversation, the
+        # offered tools, and a non-streaming call.
+        "system",
+        "messages",
+        "tools",
+        "stream",
+    }
+)
+
 
 def _split_model_params(
     raw: Mapping[str, Any], *, owned: frozenset[str], sdk_label: str
@@ -1114,7 +1150,14 @@ def resolved_model_params(sdk: str) -> tuple[dict[str, Any], list[str]]:
         "xai-sdk": _OWNED_XAI_SDK,
         "openrouter": _OWNED_OPENROUTER,
         "google-genai": _OWNED_GOOGLE,
+        "anthropic": _OWNED_ANTHROPIC,
     }.get(sdk, _OWNED_OPENAI)
+    if sdk == "anthropic":
+        # The adapter's own startup checks — a sampling parameter (a 400 on every wake of a Claude
+        # 5.x brain), a key the SDK does not take, an owned key inside extra_body, an unusable
+        # cache_control — run here too, so `--resolved-config` exits nonzero on exactly what a
+        # wake would refuse. `AnthropicConfigError` is a `ValueError`.
+        validated_params({key: value for key, value in loaded.items() if key not in owned})
     stripped = set(loaded) & owned
     if sdk in ("xai-sdk", "openrouter") and "extra_body" in loaded:
         stripped.add("extra_body")
@@ -1178,7 +1221,7 @@ def _provider_from_config(
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
     The harness reaches an LLM **only** through a vendor SDK, so the **SDK picks the adapter**
-    and the **provider picks the endpoint** (its default ``base_url`` + key). Two adapters ship:
+    and the **provider picks the endpoint** (its default ``base_url`` + key). Five adapters ship:
 
     - ``AI_SDK=openai`` → `OpenAIProvider`, the official ``openai`` SDK. It serves **both**
       wired providers, differing only by endpoint and how the search built-in is wired:
@@ -1202,6 +1245,11 @@ def _provider_from_config(
       through the ``openai`` SDK pointed at ``openrouter.ai`` — a permanent matrix cell — but
       **chat-only and server-built-in-free** (that cell ships no server tools), gated below with a
       clear error naming the fix.
+    - ``AI_SDK=google-genai`` → `GoogleProvider`, Gemini on Vertex AI (issue #655). It talks **only**
+      to ``AI_PROVIDER=google`` and is configured by a service-account key file and a location.
+    - ``AI_SDK=anthropic`` → `AnthropicProvider`, Claude over Anthropic's own SDK (issue #725). It
+      talks **only** to ``AI_PROVIDER=anthropic``; the opted-in server tools (``web_search``,
+      ``web_fetch``, ``code_execution``) ride its ``tools`` array as Anthropic server tools.
     - Any other ``AI_SDK`` is a clear "no adapter yet" error.
 
     All read ``AI_MODEL`` and fall back to ``AI_API_KEY`` for the key. For the openai/openrouter
@@ -1308,6 +1356,30 @@ def _provider_from_config(
             **params,
         )
 
+    if sdk == "anthropic":
+        if provider != "anthropic":
+            raise ValueError(
+                f"AI_SDK=anthropic reaches Claude on Anthropic's own API, so it requires "
+                f"AI_PROVIDER=anthropic (got {provider!r}). Use AI_SDK=openai for any other vendor "
+                "(a vendor the harness does not know also needs AI_BASE_URL)."
+            )
+        params, extra_body = _split_model_params(
+            loaded_params(), owned=_OWNED_ANTHROPIC, sdk_label="the anthropic SDK"
+        )
+        # `extra_body` is a real `messages.create` passthrough on this SDK, so it goes back in
+        # beside the rest. `routing` is an OpenRouter concept; Anthropic is reached directly.
+        if extra_body is not None:
+            params["extra_body"] = extra_body
+        if max_output_tokens is not None:
+            params["max_tokens"] = max_output_tokens
+        return AnthropicProvider(
+            model,
+            api_key=api_key,
+            base_url=endpoint,
+            builtin_tools=list(builtins),
+            **params,
+        )
+
     if sdk == "openrouter":
         if provider != "openrouter":
             raise ValueError(
@@ -1358,7 +1430,8 @@ def _provider_from_config(
             f"AI_SDK={sdk!r} has no adapter — the harness ships 'openai' (the OpenAI-wire SDK: "
             "OpenAI, xAI over api.x.ai, OpenRouter over openrouter.ai, and any other "
             "OpenAI-compatible vendor at its AI_BASE_URL), 'xai-sdk' (native xAI), 'openrouter' "
-            "(native OpenRouter), and 'google-genai' (Gemini on Vertex AI). Set one of those."
+            "(native OpenRouter), 'google-genai' (Gemini on Vertex AI), and 'anthropic' (Claude, "
+            "direct). Set one of those."
         )
     if is_generic_provider(provider):
         return _generic_openai_provider(
@@ -1376,7 +1449,7 @@ def _provider_from_config(
             f"AI_PROVIDER={provider!r} is not reached through the openai SDK — over it the harness "
             "knows 'openai', 'xai' (api.x.ai) and 'openrouter' (openrouter.ai), and reaches any "
             "vendor it does not know at its AI_BASE_URL. For AI_PROVIDER=google, set "
-            "AI_SDK=google-genai."
+            "AI_SDK=google-genai; for AI_PROVIDER=anthropic, set AI_SDK=anthropic."
         )
     if provider == "openrouter" and surface != "chat":
         # OpenRouter's Responses API is beta upstream, so the openai-SDK-at-OpenRouter cell is

@@ -7,6 +7,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.158.0] - 2026-10-31
+
+### Added: Claude, direct — the `anthropic` provider adapter (issue #725)
+
+A fifth adapter, `AnthropicProvider`, reaches Claude through Anthropic's own `anthropic` SDK and its
+Messages API, peer to `openai`, `xai-sdk`, `openrouter` and `google-genai`. It is the fleet's first
+**explicit-cache** adapter.
+
+- **Config.** `AI_PROVIDER=anthropic`, `AI_SDK=anthropic`, `AI_MODEL` the Claude model id,
+  `AI_API_KEY` the key; one surface (`messages`). New extra: `pip install
+  'basecradle-harness[anthropic]'` (`anthropic>=2.3.0,<3`). The SDK never reads a key or host of its
+  own (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, a profile, `ANTHROPIC_BASE_URL`): the adapter
+  always passes both, and a build with no key stops at startup. `ANTHROPIC_CUSTOM_HEADERS` is named
+  in a WARNING. The SDK client is held sealed (issue #599).
+- **Explicit caching** (`cache_mode = "explicit"`). The engine's one breakpoint becomes
+  `cache_control: {"type": "ephemeral"}` on the anchored turn's last block; `model_params.json`'s
+  `cache_control` sets its TTL (`"1h"`) and is never sent as the top-level field. The tool list is
+  byte-stable: server tools first, function tools sorted by name. `cached_tokens=` is
+  `usage.cache_read_input_tokens`; the write rides as `cache_write_tokens=`. Live: a wake's first
+  call read the 13,794 tokens the previous wake wrote.
+- **Server tools as built-ins.** `web_search` (`web_search_20260318`, new opt-in stem
+  `anthropic_search`), `web_fetch` (`web_fetch_20260318`, new **benign** default stem
+  `anthropic_web_fetch`; the harness's own `web_fetch` steps aside under this provider through the
+  new `NotVendor` requirement), and `code_execution` (`code_execution_20260521`, a fourth variant in
+  the `code_execution` stem, opt-in). `pause_turn` is resumed in the adapter; a server tool beside a
+  client tool goes back with the client results; a server tool's error inside a 200 is logged.
+- **The reply's blocks go back verbatim within a wake** (thinking, server-tool blocks with their
+  `encrypted_content`, citations), never persisted. A kept reply whose wire prefix changed since it
+  was produced (a batched wake's second turn, a compaction between turns) goes back without its
+  thinking, so preserved thinking's history-editing check never 400s a wake.
+- **Every vendor control through `model_params.json`**, validated against `messages.create` at
+  startup. `temperature` / `top_p` / `top_k` are refused at startup and by `--resolved-config`.
+  `max_tokens`, required by the API, defaults to the model's own maximum from the Models API, which
+  also answers `context_limit()` (`max_input_tokens`) and `supports_vision()`
+  (`capabilities.image_input`).
+- **Faults by nature.** 429/529/5xx transient, 504 a timeout, 401/403 the credential,
+  `billing_error`, a low credit balance or a reached spend limit the billing class, an over-length prompt the context
+  class, `refusal` final (logged with its category). `model_context_window_exceeded` joins the
+  truncation vocabulary. The SDK's own retries are off.
+- **Cost, computed** (`_anthropic_rates`, `cost_basis=computed`): the uncached, 5-minute-write,
+  1-hour-write and read tokens at their own rates, Claude Haiku 5.5's higher row above a 100,000-token
+  prompt, 1.1× for US-only inference as `usage.inference_geo` reports it. Web search is a priced `media` line (`kind=search.web`, $10
+  per 1,000). New `llm` fields on this provider, each present only when reported:
+  `cache_write_tokens=`, `web_search_requests=`, `web_fetch_requests=`, `code_execution_requests=`.
+  Container time on a call with neither web tool is a stated gap, warned once per wake.
+- **Live gate**: `tests/test_anthropic_live.py`, reading `ANTHROPIC_LIVE_API_KEY`.
+- `Sealed` (the Google adapter's credential wrapper) moved to `_secret` and is shared.
+- Filed from the live proof: #726 (a first wake caches nothing; a long wake misses the next wake's
+  cache) and #727 (server-tool activity leaves no trace a later wake can read).
+
 ## [0.157.0] - 2026-10-22
 
 ### Changed: the Dashboard primer is read through the SDK's public accessor (issue #716)

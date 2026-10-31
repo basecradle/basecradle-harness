@@ -133,6 +133,32 @@ class Vendor(Requirement):
 
 
 @dataclass(frozen=True)
+class NotVendor(Requirement):
+    """Met iff the active provider is anything **but** `name` — a tool that yields to that vendor's own.
+
+    The one shipped case is ``web_fetch`` (issue #725): Claude has a server-side web fetch of its own
+    that claims the same model-facing name, and only one tool may hold a name per config. Since the
+    resolver gives a name to the *last* active plugin and the vendor's file sorts before
+    ``web_fetch.py``, the harness's own fetch steps aside under that one vendor rather than winning
+    by load order. Still an equality against a known vendor, so a vendor the harness does not know
+    keeps the harness's tool by construction.
+
+    Deliberately **not** a provider-affinity marker: the installer reads `Vendor` calls out of a
+    plugin's source to decide which agents get the file (`_install.plugin_source_providers`), and a
+    ``Vendor("anthropic")`` in ``web_fetch.py`` would prune it from every other agent in the fleet.
+    """
+
+    name: str
+
+    def met(self, ctx: ActivationContext) -> bool:
+        return ctx.provider != self.name
+
+    @property
+    def reason(self) -> str:
+        return f"yields to the {self.name!r} provider's own tool of the same name"
+
+
+@dataclass(frozen=True)
 class Sdk(Requirement):
     """Met iff the active vendor SDK equals `name` (``AI_SDK`` — the package the harness imports).
 

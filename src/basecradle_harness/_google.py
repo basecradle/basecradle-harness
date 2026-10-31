@@ -146,6 +146,7 @@ from basecradle_harness._observability import (
     token_counts,
 )
 from basecradle_harness._openai_wire import format_citations
+from basecradle_harness._secret import Sealed as _Sealed
 from basecradle_harness._timeouts import (
     METADATA_TIMEOUT,
     CallTimeout,
@@ -408,34 +409,6 @@ def credentials_file_state(raw: str | None) -> str | None:
     except ImportError:
         return UNCHECKED
     return "ok"
-
-
-class _Sealed:
-    """A credential object held by this adapter, out of every representation of the adapter.
-
-    `Secret` holds a string; a Google credentials object holds a private-key signer and, once
-    refreshed, a bearer token in its ``__dict__``. This keeps the same promise for it (issue #599):
-    no ``__dict__`` to walk, a redacted ``repr``, and no pickling.
-    """
-
-    __slots__ = ("value",)
-
-    def __init__(self, value: Any) -> None:
-        self.value = value
-
-    def __repr__(self) -> str:
-        return "_Sealed('[REDACTED]')"
-
-    __str__ = __repr__
-
-    def __reduce__(self) -> Any:
-        raise TypeError("A sealed credential cannot be serialized.")
-
-    def __copy__(self) -> _Sealed:
-        return self
-
-    def __deepcopy__(self, memo: dict[int, Any]) -> _Sealed:
-        return self
 
 
 #: The statuses Google's token endpoint answers when the fault is on its side or a capacity limit

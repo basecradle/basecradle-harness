@@ -24,6 +24,7 @@ from basecradle_harness import (
     ToolCall,
     ToolRegistry,
 )
+from basecradle_harness._anthropic import AnthropicProvider
 from basecradle_harness._caching import (
     AUTOMATIC,
     CACHE_MODES,
@@ -38,6 +39,9 @@ from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openai_wire import chat_message_to_wire
 from basecradle_harness._openrouter import OpenRouterProvider
 from basecradle_harness._xai_sdk import XaiSdkProvider
+
+#: The adapters whose endpoints cache a repeated prefix by themselves.
+AUTOMATIC_ADAPTERS = (OpenAIProvider, XaiSdkProvider, OpenRouterProvider, GoogleProvider)
 
 
 class ScriptedProvider:
@@ -85,14 +89,19 @@ def test_every_shipped_adapter_declares_a_cache_mode():
     This is the test that fails when someone adds an adapter and forgets — which is the whole point
     of the rule, because forgetting on an explicit-cache vendor costs money and says nothing.
     """
-    for adapter in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider, GoogleProvider):
+    for adapter in (*AUTOMATIC_ADAPTERS, AnthropicProvider):
         assert adapter.cache_mode in CACHE_MODES, adapter.__name__
 
 
-def test_the_shipped_adapters_declare_automatic():
-    """Today's endpoints all cache by themselves — so the engine must put nothing on their wire."""
-    for adapter in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider, GoogleProvider):
+def test_the_automatic_adapters_declare_automatic():
+    """These endpoints cache by themselves — so the engine must put nothing on their wire."""
+    for adapter in AUTOMATIC_ADAPTERS:
         assert adapter.cache_mode == AUTOMATIC, adapter.__name__
+
+
+def test_the_anthropic_adapter_declares_explicit():
+    """Claude caches only a marked prefix (issue #725): the one adapter the engine anchors for."""
+    assert AnthropicProvider.cache_mode == EXPLICIT
 
 
 @pytest.mark.parametrize(

@@ -30,6 +30,7 @@ from basecradle_harness import (
     install,
     render_brain,
 )
+from basecradle_harness._anthropic import AnthropicProvider
 from basecradle_harness._basecradle import (
     _SDK_SURFACES,
     DEFAULT_CONTEXT_MESSAGES,
@@ -1661,7 +1662,14 @@ def test_every_shipped_sdk_has_an_adapter_that_declares_it():
     checked against — and a single-surface adapter's `surface` is that SDK's one surface.
     """
     adapters = {
-        cls.sdk: cls for cls in (OpenAIProvider, XaiSdkProvider, OpenRouterProvider, GoogleProvider)
+        cls.sdk: cls
+        for cls in (
+            OpenAIProvider,
+            XaiSdkProvider,
+            OpenRouterProvider,
+            GoogleProvider,
+            AnthropicProvider,
+        )
     }
     assert set(adapters) == set(_SDK_SURFACES)
     for sdk, (surfaces, default) in _SDK_SURFACES.items():

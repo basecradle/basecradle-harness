@@ -25,6 +25,7 @@ import httpx
 import pytest
 import respx
 
+from basecradle_harness._anthropic import AnthropicProvider
 from basecradle_harness._audio import Transcriber
 from basecradle_harness._direct_message import DirectMessageTool
 from basecradle_harness._grok import GrokGenerateImageTool
@@ -46,13 +47,26 @@ PLATFORM = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
 PASSWORD = "pw-Zx9-correct-horse-battery-staple"
 OPENAI = "sk-proj-FAKEfakeFAKEfake0123456789abcdef"
 XAI = "xai-FAKEfakeFAKEfake0123456789abcdefFAKE"
+ANTHROPIC = "sk-ant-api03-FAKEfakeFAKEfake0123456789abcdef-AA"
 OPENROUTER = "sk-or-v1-fakefakefakefake0123456789abcdef0123"
 MANAGEMENT = "mgmt-FAKEfakeFAKEfake0123456789"
 NTFY = "tk_fakefakefakefake0123456789"
 PROBE = "probe-secret-FAKE0123456789abcdef"
 MCP_ENV = "ghp_FAKEfakeFAKEfake0123456789abcdef"
 MCP_HEADER = "Bearer mcp-FAKEfakeFAKE0123456789"
-FAKES = (PLATFORM, PASSWORD, OPENAI, XAI, OPENROUTER, MANAGEMENT, NTFY, PROBE, MCP_ENV, MCP_HEADER)
+FAKES = (
+    PLATFORM,
+    PASSWORD,
+    OPENAI,
+    XAI,
+    ANTHROPIC,
+    OPENROUTER,
+    MANAGEMENT,
+    NTFY,
+    PROBE,
+    MCP_ENV,
+    MCP_HEADER,
+)
 
 
 def _leaked(text: str) -> list[str]:
@@ -169,6 +183,7 @@ HOLDERS = {
     "SelfHealingBaseCradle": _self_healing,
     "PlatformContext": lambda: PlatformContext(client=_self_healing(), timeline=TIMELINE_UUID),
     "XaiSdkProvider": lambda: XaiSdkProvider("grok-4.3", api_key=XAI),
+    "AnthropicProvider": lambda: AnthropicProvider("claude-haiku-5-5", api_key=ANTHROPIC),
     "MemPalaceReranker": lambda: MemPalaceReranker(model="m", api_key=OPENROUTER, providers=["x"]),
     "GenerateImageTool": lambda: GenerateImageTool(api_key=OPENAI),
     "GrokGenerateImageTool": lambda: GrokGenerateImageTool(api_key=XAI),

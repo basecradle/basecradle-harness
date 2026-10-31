@@ -174,8 +174,8 @@ def test_unset_is_still_the_default_vendor():
     assert normalize_provider(None) == normalize_provider("") == "openai"
 
 
-def test_the_known_vendors_are_exactly_the_four_with_conventions():
-    assert KNOWN_PROVIDERS == ("openai", "xai", "openrouter", "google")
+def test_the_known_vendors_are_exactly_the_five_with_conventions():
+    assert KNOWN_PROVIDERS == ("openai", "xai", "openrouter", "google", "anthropic")
 
 
 # --- the generic profile's preconditions ----------------------------------------------------------
@@ -193,7 +193,7 @@ def test_the_build_refuses_a_generic_vendor_with_no_host_too():
         _provider_from_config(VENDOR, "openai", "chat", model=MODEL, api_key=FAKE_KEY)
 
 
-@pytest.mark.parametrize("sdk", ["openrouter", "xai-sdk", "google-genai"])
+@pytest.mark.parametrize("sdk", ["openrouter", "xai-sdk", "google-genai", "anthropic"])
 def test_a_native_sdk_cannot_reach_a_generic_vendor(generic_env, sdk):
     generic_env.setenv("AI_SDK", sdk)
     generic_env.setenv("AI_BASE_URL", "https://llm.example.com/v1")

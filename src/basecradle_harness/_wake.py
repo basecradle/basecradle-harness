@@ -92,7 +92,7 @@ except ImportError:  # pragma: no cover - Windows; the package must still import
     fcntl = None  # type: ignore[assignment]
 from basecradle import BaseCradle, BaseCradleError, NotFoundError
 
-from basecradle_harness import _google_rates, _openai_rates
+from basecradle_harness import _anthropic_rates, _google_rates, _openai_rates
 from basecradle_harness._assets import _describe, _is_image, image_input, model_sees_images
 from basecradle_harness._basecradle import (
     DEFAULT_CONTEXT_MESSAGES,
@@ -5331,8 +5331,8 @@ def _addressing(item: object, kind: str, rendered: str) -> str:
 
 
 # The PyPI distribution name for each AI_SDK value, so `--version` can report the *installed*
-# vendor-SDK version. Only `openai` ships an adapter in Milestone 1; the others are listed so a
-# later milestone's drift report names them without code change.
+# vendor-SDK version. Every shipped AI_SDK value is already its own distribution's name, so the
+# lookup falls back to the value itself; the entries here only make that explicit.
 _SDK_DISTRIBUTIONS = {"openai": "openai", "xai-sdk": "xai-sdk", "anthropic": "anthropic"}
 
 
@@ -5447,7 +5447,7 @@ def resolved_config() -> dict[str, object]:
       declare reads ``null`` — and a regional host a deployer did declare can be read back.
     - ``cost_basis`` / ``cost_rates_source`` / ``cost_model_priced`` — where the brain's ``cost=``
       comes from (issues #655, #657): ``"computed"`` from the harness's transcription of the
-      vendor's published rates (OpenAI aimed at its own host, Google), with the page and the date it
+      vendor's published rates (OpenAI aimed at its own host, Google, Anthropic), with the page and the date it
       was read (``cost_rates_source``) and whether the configured ``AI_MODEL`` has a row there
       (``cost_model_priced`` — ``false`` is a brain whose calls log no ``cost=``); ``"stated"``
       where the vendor states its own price (OpenRouter, the native xAI SDK); ``null`` where neither
@@ -5777,7 +5777,7 @@ def resolved_config() -> dict[str, object]:
 
 def _cost_report(provider: str, sdk: str, model: str) -> dict[str, object]:
     """The ``cost_*`` fields of `resolved_config` — read off the same tables the adapters price from."""
-    tables = {"openai": _openai_rates, "google": _google_rates}
+    tables = {"openai": _openai_rates, "google": _google_rates, "anthropic": _anthropic_rates}
     table = tables.get(provider)
     if table is _openai_rates and not _openai_rates.priced_host(base_url_override()):
         table = None
