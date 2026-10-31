@@ -681,6 +681,161 @@ def test_a_transcript_that_already_holds_the_conversation_seeds_and_observes_not
     assert [FACT in exchange.user for exchange in provider.observed] == [False]
 
 
+STAMP = "[2026-06-04T00:00:00.000Z]"
+
+
+def test_a_first_wake_recalls_against_the_question_above_the_pointer(platform, tmp_path):
+    """The recall query carries the seeded backlog, not only the pointer that woke the agent.
+
+    **The second half of the live miss on `@fred`** (issue #744): a peer posted two questions, then
+    "the two questions are in the message above". A first wake answers the newest message, and the
+    recall query was that message alone, so the palace was searched for a pointer's words. With an
+    identical candidate pool the reranker kept the fact drawers in one wake and dropped them in the
+    next, and the agent declined. The question is the backlog the model is handed to read, so it
+    joins the query, after the batch.
+    """
+    _serve_messages(
+        platform,
+        {
+            "messages": [_message(uuid=M1, body=POINTER), _message(uuid=BRIEF, body=FACT)],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+    agent = _wake(tmp_path, provider)
+
+    agent.wake()
+
+    (scope,) = provider.context_scopes
+    assert scope.query == f"{STAMP} john: {POINTER}\n{STAMP} john: {FACT}"
+
+
+def test_the_recall_query_is_the_whole_batch_not_its_newest_message(platform, tmp_path):
+    """Every message the turn answers is searched for, the newest first.
+
+    `MemoryScope.query`'s contract is the incoming turn's text, and a batched turn is every unseen
+    message (#226). Searching with ``batch[-1]`` alone meant the earlier messages of a burst were
+    never searched for at all (issue #744). The newest leads because the embedding reads the start
+    of the query, and the newest is the one the reply answers.
+    """
+    _serve_messages(
+        platform,
+        {
+            "messages": [
+                _message(uuid=M1, body="And what was my codename?"),
+                _message(uuid=M0, body="Where do I live?"),
+            ],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+    agent = _wake(tmp_path, provider)
+
+    agent.wake(trigger=M0)  # reply to M0 and everything newer: one batch of two, nothing seeded
+
+    (scope,) = provider.context_scopes
+    assert scope.query == f"{STAMP} john: And what was my codename?\n{STAMP} john: Where do I live?"
+
+
+def test_the_seeded_part_of_the_query_is_newest_first_and_capped(platform, tmp_path):
+    """``HARNESS_CONTEXT_MESSAGES=all`` can seed a whole timeline; the query carries a bounded part.
+
+    The message nearest the reply comes first, so it is the one the cut never reaches, and
+    nothing past `RECALL_CONTEXT_CAP` characters of backlog reaches the search (issue #744).
+    """
+    from basecradle_harness._wake import RECALL_CONTEXT_CAP
+
+    older = [
+        _message(uuid=f"019e7750-{i:04x}-7000-8000-{i:012x}", body=f"backlog message {i} " * 20)
+        for i in range(200)
+    ]
+    _serve_messages(
+        platform,
+        {"messages": [_message(uuid=M1, body=POINTER), *reversed(older)], "next_cursor": None},
+    )
+    provider = RecordingProvider()
+    agent = WakeAgent(
+        Harness(_CannedModel(), home=tmp_path),
+        timeline=TIMELINE_UUID,
+        client=BaseCradle(token=FAKE_TOKEN),
+        onboard=True,
+        memory_provider=provider,
+        context_messages=None,
+    )
+
+    agent.wake()
+
+    (scope,) = provider.context_scopes
+    batch, seeded = scope.query.split("\n", 1)
+    assert batch == f"{STAMP} john: {POINTER}"
+    assert seeded.startswith(f"{STAMP} john: backlog message 199 ")
+    assert len(seeded) <= RECALL_CONTEXT_CAP
+    assert "backlog message 190 " not in seeded
+
+
+def test_a_burst_keeps_its_newest_message_whole_and_first_and_caps_the_rest(platform, tmp_path):
+    """However much arrived unseen, the query is the newest message plus a bounded remainder.
+
+    The newest message, whole, is exactly the query 0.161.4 sent, so nothing a wake searched for
+    before is lost; the earlier messages of a long burst share `RECALL_CONTEXT_CAP` with the
+    backlog, so neither the embedding's window nor the reranker's prompt grows with the burst.
+    """
+    from basecradle_harness._wake import RECALL_CONTEXT_CAP
+
+    newest = "What did I tell you about the deploy? " * 40  # longer than the cap, never cut
+    burst = [
+        _message(uuid=f"019e7750-{i:04x}-7000-8000-{i:012x}", body=f"burst message {i} " * 20)
+        for i in range(30)
+    ]
+    _serve_messages(
+        platform,
+        {
+            "messages": [_message(uuid=M1, body=newest), *reversed(burst)],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+    agent = _wake(tmp_path, provider)
+
+    agent.wake(trigger=burst[0]["content"]["uuid"])  # reply to the whole burst: nothing seeded
+
+    (scope,) = provider.context_scopes
+    head = f"{STAMP} john: {newest}"
+    assert scope.query.startswith(head + "\n" + f"{STAMP} john: burst message 29 ")
+    assert len(scope.query) <= len(head) + 1 + RECALL_CONTEXT_CAP
+    assert "burst message 0 " not in scope.query
+
+
+def test_the_recall_query_keeps_out_own_posts_and_probes(platform, tmp_path):
+    """The query ranks against the seeded messages memory keeps, and no others (`_seeded_peers`)."""
+    _serve_messages(
+        platform,
+        {
+            "messages": [
+                _message(uuid=M1, body=POINTER),
+                _message(uuid=MSELF, body="my own earlier post", mine=True),
+                _message(uuid=PROBE_MSG, body=_probe()),
+                _message(uuid=BRIEF, body=FACT),
+            ],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+    agent = WakeAgent(
+        Harness(_CannedModel(), home=tmp_path),
+        timeline=TIMELINE_UUID,
+        client=BaseCradle(token=FAKE_TOKEN),
+        onboard=True,
+        memory_provider=provider,
+        probe_secret=PROBE_SECRET,
+    )
+
+    agent.wake()
+
+    (scope,) = provider.context_scopes
+    assert scope.query == f"{STAMP} john: {POINTER}\n{STAMP} john: {FACT}"
+
+
 def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):
     """observe/context that raise degrade gracefully — the wake still completes."""
 

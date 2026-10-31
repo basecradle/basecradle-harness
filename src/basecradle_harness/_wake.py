@@ -3254,13 +3254,21 @@ class WakeAgent:
         """
         if self.memory_provider is None:
             return
-        peers = [
+        for message in self._seeded_peers(seeded)[-DEFAULT_CONTEXT_MESSAGES:]:
+            self._observe(_dialogue_of(message, _MESSAGES), "")
+
+    def _seeded_peers(self, seeded: list[object]) -> list[object]:
+        """The peer messages in a first wake's seeded backlog, oldest first.
+
+        The one filter both readers of the seed apply — memory (`_observe_seeded`) and the Turn-0
+        recall query (`_recall_query`, issue #744) — so what is remembered and what recall ranks
+        against are the same messages: never the agent's **own** posts, never a **NOC probe**.
+        """
+        return [
             message
             for message in seeded
             if not self._is_own(message) and self._probe_nonce(message.content.body or "") is None
         ]
-        for message in peers[-DEFAULT_CONTEXT_MESSAGES:]:
-            self._observe(_dialogue_of(message, _MESSAGES), "")
 
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
         """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.
@@ -3371,7 +3379,7 @@ class WakeAgent:
             for message in seeded:
                 session.history.append(_as_turn(message, self.me_uuid))
         self._observe_seeded(seeded)  # before the turn: `send` persists the seed (see there)
-        posted = self._respond(session, to_reply)
+        posted = self._respond(session, to_reply, backlog=self._seeded_peers(seeded))
         # Close out the first wake by baselining the mark to `recent[0]` — but only when `_respond`
         # did *not* already advance it past `recent[0]` via a mid-wake arrival (issue #226). The
         # signal is exact and order-free: after `_respond`, the mark is either
@@ -3461,8 +3469,13 @@ class WakeAgent:
 
     # --- replying ------------------------------------------------------------
 
-    def _respond(self, session: Session, messages: list[object]) -> list[object]:
+    def _respond(
+        self, session: Session, messages: list[object], backlog: Sequence[object] = ()
+    ) -> list[object]:
         """Engage the model on a wake's unseen messages as **one batched turn** — the #226 path.
+
+        ``backlog`` is the peer backlog a first wake seeded as context (`_seeded_peers`), empty on
+        every other path. It is read by nothing but the Turn-0 recall query (`_recall_query`).
 
         This is the single choke point for the message path — both the incremental
         (`_messages_since`) and bootstrap (`_bootstrap`) branches funnel their unseen set
@@ -3545,7 +3558,7 @@ class WakeAgent:
             probe_seen = self._absorb_after_hold(session, batch, posted) or probe_seen
         self._pace_and_settle(session, batch, posted, probe_seen)
         try:
-            narration = self._generate_settled(session, batch, posted)
+            narration = self._generate_settled(session, batch, posted, backlog)
         except _REPORTED_FAILURES as exc:
             # A permanent or out-of-funds provider failure on the batch: report it once, model-free
             # (issue #336). Permanent → `_settle` commits the batch and advances the mark (the report
@@ -4640,7 +4653,13 @@ class WakeAgent:
                 return
             newest = new_peers[-1]  # a newer peer AI landed: restart the read on it
 
-    def _generate_settled(self, session: Session, batch: list[object], posted: list[object]) -> str:
+    def _generate_settled(
+        self,
+        session: Session,
+        batch: list[object],
+        posted: list[object],
+        backlog: Sequence[object] = (),
+    ) -> str:
         """Loop 2 — run the turn against the batch, rebuilding if a message lands mid-generation.
 
         Optimistic concurrency (compare-and-swap) around the model call: generate against the
@@ -4663,13 +4682,15 @@ class WakeAgent:
         (it was written for images) and inherits its most important job from it.
 
         The brief rides ephemerally with every build (composed once — see `_wake_brief`), so it
-        never lands in the transcript and never needs rolling back. Intermediate (stale) pure-text
+        never lands in the transcript and never needs rolling back. Its recall ranks against the
+        whole batch as it stands before the first build and, on a first wake, the seeded
+        ``backlog`` (`_recall_query`, issue #744). Intermediate (stale) pure-text
         builds *are* rolled back out of the transcript so only the surviving turn persists. Loop 2
         does **not** re-pace — Loop 1 already simulated the read, and re-pacing could stall a reply
         indefinitely in a chatty timeline. With pacing disabled it collapses to a single build (the
         pre-#226 single-shot behavior).
         """
-        brief = self._wake_brief(query=_incoming_text(batch[-1]))
+        brief = self._wake_brief(query=_recall_query(batch, backlog))
         base_len = len(session.history)  # rollback point: before any build
         # The anchor every key this turn mints is derived from: the batch's **oldest** message, and
         # oldest because it is the one thing a rebuild cannot change (a rebuild only ever appends
@@ -5146,6 +5167,41 @@ def _render_batch(messages: list[object]) -> str:
     A single-message batch renders identically to the pre-#226 per-message text.
     """
     return "\n".join(_incoming_text(message) for message in messages)
+
+
+#: The most characters the Turn-0 recall query carries **past the turn's newest message** (issue
+#: #744): the rest of the batch, then a first wake's seeded backlog. They join the query because a
+#: peer's normal opening is a question and then a pointer to it ("the two questions are in the
+#: message above"), and a query made of the pointer alone left recall a reranker coin toss. The
+#: newest message itself is never cut — it is exactly the query 0.161.4 sent, so nothing a wake
+#: searched for before is lost — and everything after it is capped because the query is not free:
+#: MemPalace's embedding reads only its start and is measurably diluted by a long one (upstream's
+#: `query_sanitizer`: R@10 89.8% → 1.0% for a short question behind 2,000+ prepended characters),
+#: and the reranker is sent the whole query on every recall. So the query is never more than the
+#: newest message plus 1,001 characters, however large the burst and however much
+#: `HARNESS_CONTEXT_MESSAGES=all` seeds.
+RECALL_CONTEXT_CAP = 1_000
+
+
+def _recall_query(batch: list[object], backlog: Sequence[object] = ()) -> str:
+    """What the Turn-0 recall ranks the palace against: the turn, newest first, then the backlog.
+
+    `MemoryScope.query`'s contract is the incoming turn's text, and the turn is the **whole
+    batch** — #226 narrowed it to the newest message with no stated reason, so a batch's earlier
+    messages were never searched for (issue #744). On a first wake the peer ``backlog`` the model
+    is handed to read follows (oldest-first in, as `_seeded_peers` returns it).
+
+    **Newest first throughout**, because the embedding reads the start of a query: the newest
+    message leads, whole, exactly as before; then the batch's earlier messages and the backlog,
+    each newer before older, cut at `RECALL_CONTEXT_CAP` characters. A one-message batch with no
+    backlog — most wakes — is the old query byte for byte.
+    """
+    newest, *earlier = reversed(batch)
+    context = [*earlier, *reversed(backlog)]
+    rest = "\n".join(_incoming_text(message) for message in context)
+    rest = rest[:RECALL_CONTEXT_CAP].strip()
+    head = _incoming_text(newest)
+    return f"{head}\n{rest}" if rest else head
 
 
 def _has_conversation(session: Session) -> bool:
