@@ -176,6 +176,10 @@ class Census:
     #: Conversation files on disk with no row recorded under their current path. A mine of the
     #: directory reads every one of them; the observe, since 0.164.0, none.
     unregistered: int = 0
+    #: Conversation files on disk whose drawers at this location fall short of the ``chunk_total``
+    #: they record (issue #741): a filing cut off partway. MemPalace's miner reads such a file as
+    #: unfiled, and a mine of the directory deletes what is there and files it again.
+    short: int = 0
 
 
 def census(collection, palace: Path) -> Census:
@@ -185,6 +189,9 @@ def census(collection, palace: Path) -> Census:
     prefix = str(here) + os.sep
     out = Census()
     recorded: set[str] = set()
+    # Per recorded path at this location, per stored ``source_mtime``: drawers seen and the
+    # ``chunk_total`` they claim. MemPalace's own completeness rule (``prefetch_mined_set``).
+    groups: dict[str, dict[object, list]] = {}
     offset = 0
     while True:
         page = collection.get(limit=_PAGE, offset=offset, include=["metadatas", "documents"])
@@ -203,6 +210,13 @@ def census(collection, palace: Path) -> Census:
             if meta.get("room") == _REGISTRY_ROOM:
                 out.registry += 1
                 continue
+            if source.startswith(prefix):
+                group = groups.setdefault(source, {}).setdefault(
+                    meta.get("source_mtime"), [0, None]
+                )
+                group[0] += 1
+                if meta.get("chunk_total") is not None:
+                    group[1] = meta.get("chunk_total")
             row = (drawer_id, meta, text)
             out.real.append(row)
             if not source.startswith(prefix):
@@ -213,7 +227,20 @@ def census(collection, palace: Path) -> Census:
     on_disk = sorted(convos.glob("*.md")) if convos.is_dir() else []
     out.files = len(on_disk)
     out.unregistered = sum(str(here / path.name) not in recorded for path in on_disk)
+    out.short = sum(_short(groups.get(str(here / path.name))) for path in on_disk)
     return out
+
+
+def _short(groups: dict[object, list] | None) -> bool:
+    """Whether a file's drawers fall short of the count they record, in every ``source_mtime``.
+
+    MemPalace's rule: a group with no ``chunk_total`` is trusted, and one is complete once it holds
+    that many drawers. A file with no real drawers here is not short; it is unregistered, or
+    registered with a row only.
+    """
+    if not groups:
+        return False
+    return not any(total is None or seen >= int(total) for seen, total in groups.values())
 
 
 @dataclass
@@ -867,7 +894,7 @@ def main(argv: list[str] | None = None) -> int:
             "content is filed only in another wing, in the wing its drawers carry: one registry "
             "row per file and no drawer, so a mine does not file it again. Refuses, "
             "writing nothing, if any such file would file a drawer. Run after a home move and "
-            "before the first wake. Add --dry-run to print what it would do."
+            "before the first wake or any mempalace mine. Add --dry-run to print what it would do."
         ),
     )
     parser.add_argument(
@@ -1055,11 +1082,12 @@ def main(argv: list[str] | None = None) -> int:
             f"conversation files: {found.files}, "
             f"not yet registered at this location: {found.unregistered}"
         )
+        print(f"conversation files filed short of their drawers: {found.short}")
         # The forecast names conversation files, and is the move check's business. Its line keeps
         # the words "next observe" because the NOC's rename flow matches it whole (`FORECAST_RE` in
         # basecradle-noc), as it does the "conversation files:" line above; it forecasts a mine of
         # the directory, which since 0.164.0 the observe never runs (issue #741).
-        if found.unregistered and paths:
+        if (found.unregistered or found.short) and paths:
             predicted = forecast(palace, provider.agent)
             if predicted is None:
                 print(

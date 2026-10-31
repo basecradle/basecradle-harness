@@ -387,21 +387,29 @@ class MemPalaceMemoryProvider(MemoryProvider):
           and a chunk 0 with no hash is what the palace check counts as unrecognisable.
 
         Under MemPalace's own per-file lock (``mine_lock``), the one a concurrent ``mempalace
-        mine`` takes for this file before it re-checks whether it is filed. If anything raises,
-        the drawers filed so far are deleted and the file is removed, then the error propagates:
-        a file with no drawers is one a later mine would shred, and a partial set one it would
-        re-file. A process killed between the write and the last drawer can still leave either;
-        the palace check names such a file (``mined as new``), and that exchange is lost exactly
-        as one is when observe fails.
+        mine`` takes for this file before it re-checks whether it is filed. If anything raises
+        (the write itself included: a full disk, text that will not encode), every drawer recorded
+        under the file is deleted and then the file is removed, and the error propagates: a file
+        with no drawers is one a later mine would shred, and a partial set one it would re-file.
+        **The file goes only once its drawers are gone** (`_unfile`). Where they cannot be deleted
+        (MemPalace 3.10 refuses a write while another process holds the palace's lock), the file
+        stays, so the set it heads remains visible rather than orphaned. A process killed partway
+        can leave either shape too; the palace check names both (a file not registered at this
+        location, or one filed short of its drawers), and that exchange is lost exactly as one is
+        when observe fails.
+
+        **What a mine did after each exchange and this path does not**: MemPalace's FTS5 integrity
+        check and auto-heal (``_validate_palace_fts5_after_mine``) and its hallway recompute. Its
+        own live-agent integration skips both too. A damaged lexical index is not silent: every
+        search it breaks answers with an error envelope, which `search` logs at WARNING.
         """
         convo_miner = _import("convo_miner")
         palace = _import("palace")
         collection = palace.get_collection(str(self.palace_path))
         pieces = _pieces(text)
-        filed: list[str] = []
         with palace.mine_lock(str(path)):
-            path.write_text(text, encoding="utf-8")
             try:
+                path.write_text(text, encoding="utf-8")
                 stamp = {
                     "source_mtime": os.path.getmtime(path),
                     "chunk_total": len(pieces),
@@ -420,10 +428,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
                     )
                     if drawer is None:  # a piece is never blank (`_pieces`); upstream changed
                         raise RuntimeError("MemPalace filed no drawer for a non-empty piece")
-                    filed.append(drawer)
             except BaseException:
-                _unfile(collection, filed)
-                path.unlink(missing_ok=True)
+                if _unfile(collection, str(path)):
+                    path.unlink(missing_ok=True)
                 raise
 
     def begin_wake(self) -> None:
@@ -1096,6 +1103,8 @@ def _pieces(text: str, size: int = EXCHANGE_PIECE_CHARS) -> list[str]:
     there is none), its continuation re-quoted when the line was a quoted one (`_QUOTE`). Nothing
     is dropped and nothing is reordered; a piece that is only whitespace is not a drawer.
     """
+    if size <= len(_QUOTE):
+        raise ValueError(f"a piece must hold more than the quote mark, not {size} characters")
     pieces: list[str] = []
     current = ""
     for line in text.splitlines(keepends=True):
@@ -1115,34 +1124,45 @@ def _pieces(text: str, size: int = EXCHANGE_PIECE_CHARS) -> list[str]:
 
 
 def _cut(line: str, size: int) -> list[str]:
-    """One over-long line as parts of at most ``size`` characters, re-quoted if it was quoted."""
+    """One over-long line as parts of at most ``size`` characters, re-quoted if it was quoted.
+
+    A remainder that is only the line's ending is not re-quoted, so a cut never invents an empty
+    quoted line.
+    """
     lead = _QUOTE if line.startswith(_QUOTE) else ""
     parts: list[str] = []
     while len(line) > size:
         space = line.rfind(" ", len(lead), size)
         cut = space + 1 if space > len(lead) else size
         parts.append(line[:cut])
-        line = lead + line[cut:]
+        rest = line[cut:]
+        line = lead + rest if rest.strip() else rest
     parts.append(line)
     return parts
 
 
-def _unfile(collection, drawers: list[str]) -> None:
-    """Delete the drawers a failed `MemPalaceMemoryProvider._file` wrote, never raising over it.
+def _unfile(collection, source_file: str) -> bool:
+    """Delete every drawer recorded under ``source_file``; ``True`` once none is left.
 
-    The filing's own error is the one that propagates; a delete that fails too is logged, and the
-    drawers it left name a file that is gone, which nothing re-files.
+    By the recorded path, not by the ids a failed `MemPalaceMemoryProvider._file` collected: an
+    upsert that landed before it raised returned no id. The same lookup MemPalace's miner purges a
+    file's drawers with (``_source_file_delete_ids``). Never raises: the filing's own error is the
+    one the caller must see, so a lookup or delete that fails too is logged, and ``False`` tells
+    the caller to keep the file.
     """
-    if not drawers:
-        return
     try:
-        collection.delete(ids=drawers)
+        found = collection.get(where={"source_file": source_file}, include=["metadatas"])
+        drawers = list(found.get("ids") or [])
+        if drawers:
+            collection.delete(ids=drawers)
+        return True
     except Exception:  # noqa: BLE001 - the filing's error is the one the caller must see
         _log.warning(
             "memory %s",
-            kv(op="observe", result="unfile_failed", provider=_MEMPALACE, drawers=len(drawers)),
+            kv(op="observe", result="unfile_failed", provider=_MEMPALACE),
             exc_info=True,
         )
+        return False
 
 
 def content_hashes(path: Path) -> list[str]:

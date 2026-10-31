@@ -120,11 +120,13 @@ def fake_mempalace(monkeypatch):
 
     Returns the first two fakes so a test can assert how the adapter called them.
     ``file_conversation_exchange`` records each drawer it is asked to file in ``filed`` (its
-    keyword arguments, plus the palace the collection was opened on, under ``palace``) and answers
-    MemPalace's way: a drawer id, or ``None`` for text that is blank once stripped. ``mine_convos``
+    keyword arguments, plus the palace the collection was opened on, under ``palace``, its id under
+    ``id`` and the text MemPalace stores, stripped, under ``stored``) and answers MemPalace's way: a
+    drawer id, or ``None`` for text that is blank once stripped. ``mine_convos``
     records its args in ``calls`` (the observe never calls it; the palace check's forecast does).
     ``palace.mine_lock`` records each path it locks in ``convo_miner.locked``, and a writable
-    collection records its deletes in ``convo_miner.deleted``. ``search_memories`` records the
+    collection answers ``get(where={"source_file": …})`` from ``filed`` and records its deletes in
+    ``convo_miner.deleted`` (a test makes either raise by setting ``convo_miner.refuse``). ``search_memories`` records the
     kwargs it was *passed* (not their defaults — the `max_distance` tests turn on that
     distinction) and returns whatever the test stashes on it.
 
@@ -139,6 +141,7 @@ def fake_mempalace(monkeypatch):
     convo_miner.filed = []
     convo_miner.locked = []
     convo_miner.deleted = []
+    convo_miner.refuse = None
 
     def mine_convos(convo_dir, palace_path, **kwargs):
         convo_miner.calls.append((convo_dir, palace_path, kwargs))
@@ -148,8 +151,12 @@ def fake_mempalace(monkeypatch):
         assert not unknown, f"MemPalace's file_conversation_exchange takes no {sorted(unknown)}"
         if not (kwargs["text"] or "").strip():
             return None
-        convo_miner.filed.append({**kwargs, "palace": collection.palace})
-        return f"drawer_{len(convo_miner.filed)}"
+        drawer = f"drawer_{len(convo_miner.filed) + 1}"
+        stored = kwargs["text"].strip()  # MemPalace strips the text it files
+        convo_miner.filed.append(
+            {**kwargs, "palace": collection.palace, "id": drawer, "stored": stored}
+        )
+        return drawer
 
     convo_miner.mine_convos = mine_convos
     convo_miner.file_conversation_exchange = file_conversation_exchange
@@ -180,7 +187,15 @@ def fake_mempalace(monkeypatch):
         def __init__(self, palace_path):
             self.palace = palace_path
 
+        def get(self, *, where, include):
+            if convo_miner.refuse is not None:
+                raise convo_miner.refuse
+            wanted = where["source_file"]
+            return {"ids": [d["id"] for d in convo_miner.filed if d["source_file"] == wanted]}
+
         def delete(self, *, ids):
+            if convo_miner.refuse is not None:
+                raise convo_miner.refuse
             convo_miner.deleted.extend(ids)
 
     palace = types.ModuleType("mempalace.palace")

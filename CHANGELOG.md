@@ -29,12 +29,18 @@ who wrote it. No encoding of a one-exchange file avoids every drop inside that c
 - **Each drawer carries `source_mtime`, `chunk_total` and `content_hash`**, the fields MemPalace's
   own miner decides by, so a `mempalace mine` of the directory files nothing a second time, a set
   cut short reads as unfiled, and after a home move every file is recognised by its content.
-- **All or nothing**: written and filed under MemPalace's per-file lock, and on any error the
-  drawers filed so far are deleted and the file removed.
+- **All or nothing**: written and filed under MemPalace's per-file lock. On any error every drawer
+  recorded under the file is deleted, and only then is the file removed; where the drawers cannot
+  be deleted the file stays, so the palace check names the short set rather than orphaning it.
+- **Not carried over from the mine**: MemPalace's FTS5 integrity check and auto-heal, and its
+  hallway recompute, ran after every mine. MemPalace's own live-agent integration skips both too;
+  a damaged lexical index still shows, as the `memory op=search result=failed` WARNING.
 - **`basecradle-harness-palace-check`**: its forecast is now of what a `mempalace mine` of the
   conversation files would do. Its `next observe (dry run):` and `conversation files:` lines keep
   their wording byte for byte, because the NOC's rename flow parses them. `--practice-observe`
-  says it filed the exchange rather than mined it.
+  says it filed the exchange rather than mined it. A new line, `conversation files filed short of
+  their drawers: N`, counts files whose drawers fall short of the `chunk_total` they record, and
+  the forecast now runs when it is above 0 as well.
 - Existing drawers are untouched; only new exchanges take the new path. The `mempalace` floor stays
   `>=3.9.0`: the API is identical from 3.9.0 through 3.11.0, and the real-palace tests pass on
   3.9.0, 3.10.0 and 3.11.0.

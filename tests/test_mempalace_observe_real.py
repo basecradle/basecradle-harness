@@ -126,8 +126,14 @@ def test_a_filing_short_of_its_drawers_is_never_read_as_filed(tmp_path):
     assert len(ids) > 1
     collection.delete(ids=ids[:1])
 
+    # The file is still registered at this location, so the census must name it as short, or the
+    # report never runs the forecast at all.
+    found = _palace_check.census(
+        mp.get_collection(str(palace), create=False, read_only=True), palace
+    )
     predicted = _palace_check.forecast(palace, provider.agent)
 
+    assert (found.unregistered, found.short) == (0, 1)
     assert predicted is not None and len(predicted.new) == 1
 
 

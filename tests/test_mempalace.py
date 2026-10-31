@@ -134,6 +134,9 @@ def test_a_long_exchange_is_split_at_lines_into_the_fewest_drawers(fake_mempalac
     assert len(texts) > 1
     assert all(len(text) <= _mempalace.EXCHANGE_PIECE_CHARS for text in texts)
     assert "".join(texts) == f"> Hand it over.\n{reply}\n"  # nothing dropped, nothing reordered
+    # What MemPalace keeps is each piece stripped: only the whitespace at a cut is lost.
+    stored = [drawer["stored"] for drawer in convo_miner.filed]
+    assert "\n".join(stored).split() == f"> Hand it over.\n{reply}".split()
     assert {drawer["extra_metadata"]["chunk_total"] for drawer in convo_miner.filed} == {len(texts)}
     assert len({drawer["source_file"] for drawer in convo_miner.filed}) == 1
 
@@ -190,8 +193,60 @@ def test_a_failed_filing_leaves_neither_drawers_nor_a_file(fake_mempalace, tmp_p
     with pytest.raises(RuntimeError, match="chroma refused"):
         provider.observe(MemoryExchange(user="Go on.", assistant=reply, scope=_scope()))
 
+    # Deleted by the path they were filed under, not by the ids collected along the way.
     assert convo_miner.deleted == ["drawer_1"]
     assert list((tmp_path / "palace" / "conversations").glob("*.md")) == []
+
+
+def test_a_write_that_fails_leaves_no_file_behind(fake_mempalace, tmp_path, monkeypatch):
+    convo_miner, _ = fake_mempalace
+    provider = MemPalaceMemoryProvider(tmp_path / "palace")
+    monkeypatch.setattr(_mempalace, "content_hashes", lambda path: 1 / 0)
+
+    with pytest.raises(ZeroDivisionError):
+        provider.observe(
+            MemoryExchange(user="Where do I live?", assistant="Dallas.", scope=_scope())
+        )
+
+    assert convo_miner.filed == []
+    assert list((tmp_path / "palace" / "conversations").glob("*.md")) == []
+
+
+def test_drawers_that_cannot_be_deleted_keep_their_file(fake_mempalace, tmp_path, caplog):
+    """An orphaned partial set is invisible; one that still has its file is named and re-filed."""
+    convo_miner, _ = fake_mempalace
+    provider = MemPalaceMemoryProvider(tmp_path / "palace")
+    filed = convo_miner.file_conversation_exchange
+
+    def fail_on_the_second(collection, **kwargs):
+        if len(convo_miner.filed) == 1:
+            convo_miner.refuse = RuntimeError("palace is locked by another mine")
+            raise RuntimeError("chroma refused the write")
+        return filed(collection, **kwargs)
+
+    convo_miner.file_conversation_exchange = fail_on_the_second
+    reply = "\n".join("line " * 50 for _ in range(8))
+
+    with pytest.raises(RuntimeError, match="chroma refused"):
+        provider.observe(MemoryExchange(user="Go on.", assistant=reply, scope=_scope()))
+
+    (path,) = (tmp_path / "palace" / "conversations").glob("*.md")
+    assert convo_miner.filed[0]["source_file"] == str(path)
+    assert "result=unfile_failed" in caplog.text
+
+
+def test_a_piece_must_hold_more_than_the_quote_mark():
+    with pytest.raises(ValueError, match="more than the quote mark"):
+        _mempalace._pieces("> a long quoted line\n", 2)
+
+
+def test_a_cut_never_invents_an_empty_quoted_line():
+    """A quoted line that fills a piece to the character leaves only its newline behind."""
+    line = "> " + "x" * 798 + "\n"  # 801 characters: the cut takes 800, the newline remains
+
+    pieces = _mempalace._pieces(line + "> next\n", 800)
+
+    assert pieces == ["> " + "x" * 798, "\n> next\n"]
 
 
 def test_observe_skips_a_wholly_empty_exchange(fake_mempalace, tmp_path):

@@ -296,6 +296,41 @@ def test_the_report_counts_what_a_moved_palace_holds(home, fake, capsys):
     )
 
 
+def test_a_filing_cut_short_is_counted_and_forecast(home, fake, capsys):
+    """Registered, yet unfiled to MemPalace: a set short of its ``chunk_total`` (issue #741).
+
+    Every file has a drawer at this location, so nothing is unregistered and the forecast used to
+    be skipped. One file holds 1 of the 3 drawers it records, which a mine deletes and files again.
+    """
+    here = str((home / "mempalace" / "conversations").resolve())
+    drawers = {}
+    for index, name in enumerate(NAMES):
+        total = 3 if index == 0 else 1
+        drawers[f"drawer-{index}"] = (
+            f"Nova told John fact number {index}.",
+            {
+                "source_file": f"{here}/{name}",
+                "source_mtime": 1.0,
+                "chunk_total": total,
+                "content_hash": f"{index:064x}",
+                "chunk_index": 0,
+                "filed_at": f"2026-10-0{index + 1}T00:00:00",
+                "room": "general",
+            },
+        )
+    fake.collection = FakeCollection(drawers)
+    fake.dry_run_lines = [f"    [DRY RUN] {NAMES[0]} -> room:general (3 drawers)"]
+
+    _, lines = _run(capsys, home)
+
+    assert "conversation files: 4, not yet registered at this location: 0" in lines
+    assert "conversation files filed short of their drawers: 1" in lines
+    assert (
+        "next observe (dry run): 0 files -> registry sentinel, 1 files -> mined as new drawers"
+        in lines
+    )
+
+
 def test_an_unreadable_dry_run_is_reported_as_unknown_not_as_nothing(home, fake, capsys):
     fake.collection = FakeCollection(_drawers(home))
     fake.dry_run_lines = ["a format this version does not know"]
