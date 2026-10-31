@@ -227,6 +227,23 @@ def _cut(text: str, cap: int) -> str:
     return text if len(text) <= cap else text[: cap - len(_ELLIPSIS)] + _ELLIPSIS
 
 
+def mark_failed(message: Message, index: int, reason: str) -> bool:
+    """Mark the `index`-th use on `message`'s record as failed, bounded — ``True`` if it was listed.
+
+    For a failure the vendor reports *after* the reply that recorded the use: on Anthropic a mixed
+    server-and-client group runs its server tool only on the next call, so the error result arrives
+    in a later reply than the ``server_tool_use`` (issue #737). A use past `MAX_LISTED` is counted,
+    not listed, and has no line to mark.
+    """
+    found = message.server_tools
+    if found is None or not 0 <= index < len(found.uses):
+        return False
+    use = found.uses[index]
+    failed = _cut(_one_line(reason), FAILURE_CAP) or "failed"
+    found.uses[index] = ServerToolUse(name=use.name, input=use.input, failed=failed)
+    return True
+
+
 def render(found: ServerToolRecord) -> str:
     """The system note that shows a turn's record to the model — never longer than `NOTE_CAP`."""
     found = bound(found) or ServerToolRecord()

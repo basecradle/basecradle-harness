@@ -1434,3 +1434,34 @@ def test_a_server_tool_already_answered_in_its_reply_leaves_the_next_message_alo
     provider.chat(convo, tools=[TOOL])
     answering = body(route, 1)["messages"][2]
     assert [b["type"] for b in answering["content"]] == ["tool_result", "text"]
+
+
+# === a server tool's failure that arrives in the next reply is marked on its record (#737) ======
+
+
+def test_a_late_failure_is_marked_on_the_reply_that_recorded_the_use(router, provider):
+    fetch = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01L",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com/gone"},
+    }
+    refused = {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": "srvtoolu_01L",
+        "content": {"type": "web_fetch_tool_result_error", "error_code": "url_not_accessible"},
+    }
+    router.post(MESSAGES).mock(
+        side_effect=[
+            reply(fetch, tool_use("toolu_01E", TOOL.name, {"label": "x"}), stop_reason="tool_use"),
+            reply(refused, text("I could not read it.")),
+        ]
+    )
+    convo = [Message.user("fetch it and get the number")]
+    first = provider.chat(convo, tools=[TOOL])
+    assert first.server_tools.uses[0].failed == ""  # not run yet
+    convo += [first, Message.tool("toolu_01E", "7"), Message.system("Step 2 of 24.")]
+    second = provider.chat(convo, tools=[TOOL])
+    assert first.server_tools.uses[0].failed == "url_not_accessible"  # marked where it was recorded
+    assert second.server_tools is None  # and not listed a second time
+    assert first.to_dict()["server_tools"]["uses"][0]["failed"] == "url_not_accessible"
