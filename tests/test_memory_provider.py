@@ -486,6 +486,201 @@ def test_memory_observes_a_silent_turn(platform, tmp_path):
     assert exchange.assistant == "Noted — no reply needed."  # the narration, not a posted reply
 
 
+BRIEF = (
+    "019e7750-7a1b-7c2d-8e3f-4a5b6c7d8e9f"  # a peer's fact, posted before the agent's first wake
+)
+PROBE_MSG = "019e7750-8b2c-7d3e-9f40-5b6c7d8e9fa0"
+FACT = "John here.\n\nTwo facts for later:\n1. Your codename is AMBER-FOX-17.\n2. Lyra."
+POINTER = "The two questions are in the message above."
+PROBE_SECRET = "noc-probe-secret-for-tests"
+
+
+def _probe(nonce="n0nce"):
+    from basecradle_harness._probe import _signature
+
+    return f"BCNOC1 {nonce} {_signature(nonce, PROBE_SECRET)}"
+
+
+def test_a_first_wake_observes_the_backlog_it_seeded_as_context(platform, tmp_path):
+    """A fact stated *above* the message that woke the agent is remembered, not only read.
+
+    **The live miss on `@fred`** (issue #733): a peer stated two facts, then posted a pointer to
+    them. A first wake replies to the newest message and seeds the older backlog into the
+    transcript as context, so the model read the facts and acknowledged them — and only the
+    pointer was mined. In the next timeline the palace held the pointer and the agent's paraphrase,
+    never the peer's own words.
+
+    So the seeded peer message is observed too, **as its own user-only exchange** in the shape it
+    would have had arriving on its own, and the turn's exchange is unchanged: the pointer and the
+    reply that answered it.
+    """
+    _serve_messages(
+        platform,
+        {
+            "messages": [_message(uuid=M1, body=POINTER), _message(uuid=BRIEF, body=FACT)],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+    agent = _wake(tmp_path, provider)
+
+    agent.wake()
+
+    seeded, turn = provider.observed  # the backlog first: it is observed before the turn
+    assert POINTER in turn.user and FACT not in turn.user
+    assert turn.assistant == "Hello, John."
+    assert seeded.user == f"[2026-06-04T00:00:00.000Z] john: {FACT}"  # the live dialogue shape
+    assert seeded.assistant == ""
+    assert seeded.scope.agent == NOVA_UUID and seeded.scope.timeline == TIMELINE_UUID
+
+
+def test_the_seeded_backlog_keeps_out_what_the_live_path_never_mines(platform, tmp_path):
+    """The agent's own posts and a NOC probe are seeded as context and still never mined.
+
+    Each is excluded on the live path for its own reason — the self-filter drops an own post before
+    any turn, and a probe is a machine contract acked without the model — so seeding one as context
+    must not become a back door into the palace.
+    """
+    _serve_messages(
+        platform,
+        {
+            "messages": [
+                _message(uuid=M1, body=POINTER),
+                _message(uuid=MSELF, body="my own earlier post", mine=True),
+                _message(uuid=PROBE_MSG, body=_probe()),
+                _message(uuid=BRIEF, body=FACT),
+            ],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+    client = BaseCradle(token=FAKE_TOKEN)
+    agent = WakeAgent(
+        Harness(_CannedModel(), home=tmp_path),
+        timeline=TIMELINE_UUID,
+        client=client,
+        onboard=True,
+        memory_provider=provider,
+        probe_secret=PROBE_SECRET,
+    )
+
+    agent.wake()
+
+    mined = [exchange.user for exchange in provider.observed]
+    assert any(FACT in user for user in mined)
+    assert not any("my own earlier post" in user or "BCNOC1" in user for user in mined)
+    assert len(mined) == 2  # the turn's exchange, and the one peer message seeded above it
+
+
+def test_the_seeded_backlog_is_in_memory_before_the_model_is_called(platform, tmp_path):
+    """A wake killed in the model call has already left the backlog in memory.
+
+    `Session.send` persists the seeded history before the model runs, and a later bootstrap never
+    seeds a transcript that already holds a conversation, so a backlog observed only after the turn
+    would be lost for good by any wake that died inside it — a signal skips a ``finally``. The model
+    here records what memory held at the moment it was called, and then fails.
+    """
+    provider = RecordingProvider()
+
+    class _DyingModel:
+        held: list[str] = []
+
+        def chat(self, messages, tools=None):
+            _DyingModel.held = [exchange.user for exchange in provider.observed]
+            raise RuntimeError("killed in the model call")
+
+    _serve_messages(
+        platform,
+        {
+            "messages": [_message(uuid=M1, body=POINTER), _message(uuid=BRIEF, body=FACT)],
+            "next_cursor": None,
+        },
+    )
+    agent = WakeAgent(
+        Harness(_DyingModel(), home=tmp_path),
+        timeline=TIMELINE_UUID,
+        client=BaseCradle(token=FAKE_TOKEN),
+        onboard=True,
+        memory_provider=provider,
+    )
+
+    with pytest.raises(RuntimeError, match="killed in the model call"):
+        agent.wake()
+
+    assert _DyingModel.held == [f"[2026-06-04T00:00:00.000Z] john: {FACT}"]
+
+
+def test_a_seeded_message_with_no_body_is_observed_and_never_breaks_the_wake(platform, tmp_path):
+    """The SDK hands a JSON ``null`` body through as ``None``; the probe check must not raise on it,
+    because it now runs before the turn, where a raise would cost the peer their reply."""
+    empty = _message(uuid=BRIEF, body=None)
+    _serve_messages(
+        platform, {"messages": [_message(uuid=M1, body=POINTER), empty], "next_cursor": None}
+    )
+    provider = RecordingProvider()
+    agent = WakeAgent(
+        Harness(_CannedModel(), home=tmp_path),
+        timeline=TIMELINE_UUID,
+        client=BaseCradle(token=FAKE_TOKEN),
+        onboard=True,
+        memory_provider=provider,
+        probe_secret=PROBE_SECRET,
+    )
+
+    agent.wake()
+
+    assert POINTER in provider.observed[-1].user  # the turn ran and was observed
+
+
+def test_at_most_the_newest_default_window_of_a_seeded_backlog_is_observed(platform, tmp_path):
+    """``HARNESS_CONTEXT_MESSAGES=all`` seeds a whole timeline, and each observe is a mining pass of
+    its own, so what is observed is bounded: the newest `DEFAULT_CONTEXT_MESSAGES`, oldest first."""
+    from basecradle_harness._basecradle import DEFAULT_CONTEXT_MESSAGES
+
+    older = [
+        _message(uuid=f"019e7750-{i:04x}-7000-8000-{i:012x}", body=f"backlog message {i}")
+        for i in range(DEFAULT_CONTEXT_MESSAGES + 10)
+    ]
+    _serve_messages(
+        platform,
+        {"messages": [_message(uuid=M1, body=POINTER), *reversed(older)], "next_cursor": None},
+    )
+    provider = RecordingProvider()
+    agent = WakeAgent(
+        Harness(_CannedModel(), home=tmp_path),
+        timeline=TIMELINE_UUID,
+        client=BaseCradle(token=FAKE_TOKEN),
+        onboard=True,
+        memory_provider=provider,
+        context_messages=None,
+    )
+
+    agent.wake()
+
+    seeded = [exchange.user.rsplit(" ", 1)[-1] for exchange in provider.observed[:-1]]
+    assert seeded == [str(i) for i in range(10, DEFAULT_CONTEXT_MESSAGES + 10)]
+
+
+def test_a_transcript_that_already_holds_the_conversation_seeds_and_observes_nothing(
+    platform, tmp_path
+):
+    """No re-seed, no re-mine: a mark lost under a kept transcript observes only its own turn."""
+    _serve_messages(
+        platform,
+        {
+            "messages": [_message(uuid=M1, body=POINTER), _message(uuid=BRIEF, body=FACT)],
+            "next_cursor": None,
+        },
+    )
+    provider = RecordingProvider()
+    agent = _wake(tmp_path, provider)
+    agent.harness.session(agent.source).history.append(Message.user(content="an earlier turn"))
+
+    agent.wake()
+
+    assert [FACT in exchange.user for exchange in provider.observed] == [False]
+
+
 def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):
     """observe/context that raise degrade gracefully — the wake still completes."""
 
