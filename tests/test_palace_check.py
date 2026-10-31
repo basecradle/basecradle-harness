@@ -940,6 +940,41 @@ def test_dry_run_needs_register_off_wing(home, fake, capsys):
     assert "--dry-run applies to --register-off-wing" in capsys.readouterr().err
 
 
+def test_the_version_stale_line_is_printed_on_every_mempalace(home, fake, capsys):
+    """Its first half has one grammar everywhere; before 3.11 the tail says there is no constant."""
+    fake.collection = FakeCollection(_drawers(home))
+
+    _, lines = _run(capsys, home)
+
+    assert (
+        "conversation files version-stale: 0 (observe-filed 0, miner-filed 0), "
+        "this MemPalace defines no convo_chunker_version"
+    ) in lines
+    assert _palace_check.STALE_CONSEQUENCE not in "\n".join(lines)
+
+
+def test_the_stamp_is_a_no_op_that_says_so_without_a_chunker_version(
+    home, fake, capsys, monkeypatch
+):
+    fake.collection = FakeCollection(_drawers(home))
+    version = types.ModuleType("mempalace.version")
+    version.__version__ = "3.10.0"
+    monkeypatch.setitem(sys.modules, "mempalace.version", version)
+
+    _, lines = _run(capsys, home, "--stamp-chunker-version")
+
+    assert "stamp chunker version (WRITES TO THE PALACE):" in lines
+    assert "  nothing to stamp: MemPalace 3.10.0 defines no convo_chunker_version" in lines
+    assert all(kwargs == {"create": False, "read_only": True} for _, kwargs in fake.opened)
+
+
+def test_the_stamp_flag_says_it_writes_in_its_help(capsys):
+    with pytest.raises(SystemExit):
+        _palace_check.main(["--help"])
+    text = " ".join(capsys.readouterr().out.split())
+    assert "--stamp-chunker-version WRITES TO THE PALACE." in text
+
+
 def test_the_register_flag_says_it_writes_in_its_help(capsys):
     with pytest.raises(SystemExit):
         _palace_check.main(["--help"])

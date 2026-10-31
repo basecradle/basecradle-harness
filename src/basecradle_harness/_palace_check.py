@@ -40,6 +40,15 @@ already carry: one registry row per file, no drawer, no drawer touched (`registe
 **writes to the palace**, refuses and writes nothing if any file would file a drawer, and has a
 ``--dry-run`` form; its help and its output say so.
 
+**One write for a MemPalace upgrade: ``--stamp-chunker-version``** (issue #751). MemPalace 3.11
+reads an exchange drawer with no ``convo_chunker_version`` as filed by an older chunker, and 3.10
+and earlier never wrote one, so every drawer filed before the upgrade drops out of its record of
+what is filed. This mode stamps the installed version on the drawers the observe filed
+(`stamp_chunker_version`), identified by their id recipe (`filed_by_observe`), and on nothing
+else: MemPalace's miner's drawers really were cut by the older chunker, so they are left to
+MemPalace and reported. Every report counts both kinds on one line (`stale_line`). It **writes to
+the palace** and has a ``--dry-run`` form.
+
 **Three probes, or a sample** (issue #606, phase 3). By default the check searches for three real
 drawers (the oldest, middle and newest), which says whether a moved palace serves at all. Three
 cannot say whether a move made recall *worse*, so ``--sample N`` probes N drawers instead, chosen
@@ -108,7 +117,9 @@ from basecradle_harness._mempalace import (
     MemPalaceMemoryProvider,
     _import,
     candidate_pool,
+    chunker_version,
     content_hashes,
+    filed_by_observe,
 )
 from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL, reranker_from_env
 from basecradle_harness._version import __version__
@@ -180,6 +191,21 @@ class Census:
     #: they record (issue #741): a filing cut off partway. MemPalace's miner reads such a file as
     #: unfiled, and a mine of the directory deletes what is there and files it again.
     short: int = 0
+    #: The installed MemPalace's ``CONVO_CHUNKER_VERSION``; ``None`` before 3.11 defined one.
+    chunker: int | None = None
+    #: Real drawers the harness's observe filed whose ``convo_chunker_version`` is older than
+    #: `chunker`, and stale for no other reason (issue #751): what ``--stamp-chunker-version`` stamps.
+    stale_ours: list[tuple[str, dict, str]] = field(default_factory=list)
+    #: Every other real drawer that is version-stale the same way: MemPalace's miner filed it (the
+    #: observe's path before 0.164.0). Left to MemPalace, and reported.
+    stale_theirs: list[tuple[str, dict, str]] = field(default_factory=list)
+    #: Conversation files on disk that a mine files again only because their records are
+    #: version-stale (no current record carries their name), split by whether every stale record
+    #: is the observe's. Measured on 3.11.0: a mine deletes the drawers filed at this location and
+    #: files the file again through its chunker, and files one whose drawers are only at another
+    #: location (a moved home) a second time, beside the old drawers, which it keeps.
+    stale_files_ours: int = 0
+    stale_files_theirs: int = 0
 
 
 def census(collection, palace: Path) -> Census:
@@ -187,8 +213,13 @@ def census(collection, palace: Path) -> Census:
     convos = palace / _CONVERSATIONS_WING
     here = convos.resolve()
     prefix = str(here) + os.sep
-    out = Census()
+    out = Census(chunker=chunker_version())
+    normalize = getattr(_import("palace"), "NORMALIZE_VERSION", None) if out.chunker else None
     recorded: set[str] = set()
+    # Per conversation file name: whether any record is current, whether any is version-stale, and
+    # whether every version-stale one is the observe's own (issue #751).
+    current_names: set[str] = set()
+    stale_names: dict[str, bool] = {}
     # Per recorded path at this location, per stored ``source_mtime``: drawers seen and the
     # ``chunk_total`` they claim. MemPalace's own completeness rule (``prefetch_mined_set``).
     groups: dict[str, dict[object, list]] = {}
@@ -207,7 +238,19 @@ def census(collection, palace: Path) -> Census:
             source = str(meta.get("source_file") or "")
             if source.startswith(prefix):
                 recorded.add(source)
-            if meta.get("room") == _REGISTRY_ROOM:
+            registry = meta.get("room") == _REGISTRY_ROOM
+            if out.chunker is not None and _exchange_mode(meta):
+                name = Path(source).name
+                if _version_stale(meta, out.chunker, normalize):
+                    ours = not registry and filed_by_observe(drawer_id, meta, text)
+                    stale_names[name] = stale_names.get(name, True) and ours
+                    if not registry:
+                        (out.stale_ours if ours else out.stale_theirs).append(
+                            (drawer_id, meta, text)
+                        )
+                elif normalize is None or meta.get("normalize_version", 1) >= normalize:
+                    current_names.add(name)
+            if registry:
                 out.registry += 1
                 continue
             if source.startswith(prefix):
@@ -228,7 +271,26 @@ def census(collection, palace: Path) -> Census:
     out.files = len(on_disk)
     out.unregistered = sum(str(here / path.name) not in recorded for path in on_disk)
     out.short = sum(_short(groups.get(str(here / path.name))) for path in on_disk)
+    for path in on_disk:
+        if path.name in stale_names and path.name not in current_names:
+            if stale_names[path.name]:
+                out.stale_files_ours += 1
+            else:
+                out.stale_files_theirs += 1
     return out
+
+
+def _version_stale(meta: dict, chunker: int, normalize: int | None) -> bool:
+    """Whether MemPalace reads a record as unfiled only because of its ``convo_chunker_version``.
+
+    MemPalace's own rule (``palace._meta_is_current``, 3.11): an exchange-mode record with no
+    ``convo_chunker_version`` counts as version 1, and one older than the installed constant is not
+    filed. A record whose ``normalize_version`` is stale too is not this class: its reason is that
+    one, and stamping the chunker version would not make it current.
+    """
+    if normalize is not None and meta.get("normalize_version", 1) < normalize:
+        return False
+    return meta.get("convo_chunker_version", 1) < chunker
 
 
 def _short(groups: dict[object, list] | None) -> bool:
@@ -392,7 +454,8 @@ def _new_reason(
     count = f" ({len(unknown)} of its {len(today)} conversations)" if len(today) > 1 else ""
     if accepted.get((wing, content_hash)) == here:
         return f"it changed since it was mined at this path, and is re-mined in place{count}"
-    carriers = [meta for _, meta, _ in found.real if content_hash in _hashes(meta)]
+    rows = [row for row in found.real if content_hash in _hashes(row[1])]
+    carriers = [meta for _, meta, _ in rows]
     if not carriers:
         if not named:
             return f"it was never filed{count}"
@@ -419,6 +482,31 @@ def _new_reason(
         return (
             f"its content is filed only at normalize_version {versions}, older than "
             f"MemPalace's {current}{count}"
+        )
+    chunker = found.chunker
+    if chunker is not None and all(_version_stale(meta, chunker, current) for meta in exchange):
+        versions = ", ".join(
+            sorted({str(meta.get("convo_chunker_version", 1)) for meta in exchange})
+        )
+        ours = all(
+            filed_by_observe(*row)
+            for row in rows
+            if row[1].get("wing") == wing and _exchange_mode(row[1])
+        )
+        remedy = (
+            "; the observe filed it, so --stamp-chunker-version makes it current"
+            if ours
+            else "; MemPalace's miner filed it, and it is left to MemPalace"
+        )
+        located = any(str(meta.get("source_file")) == here for meta in exchange)
+        effect = (
+            "a mine deletes its drawers here and files it again through MemPalace's chunker"
+            if located
+            else "a mine files it again here, beside its old drawers, which it keeps"
+        )
+        return (
+            f"version-stale: its content is filed only at convo_chunker_version {versions}, older "
+            f"than MemPalace's {chunker}, by an earlier MemPalace; {effect}{remedy}{count}"
         )
     return (
         f"MemPalace does not accept its recorded hash, for a reason this check cannot name{count}"
@@ -544,6 +632,97 @@ def register_off_wing(provider: MemPalaceMemoryProvider, palace: Path, *, dry_ru
         print(
             f"FAIL: expected {len(plan)} registry rows and 0 drawers; the palace changed in "
             "another way while this ran, or MemPalace did not do what its dry run said"
+        )
+        return 1
+    return 0
+
+
+#: What the version-stale line's second half says, printed whenever a file is version-stale.
+STALE_CONSEQUENCE = (
+    "a mine re-chunks each version-stale file filed at this location, and files each one filed "
+    "only at another location a second time, beside its old drawers; --stamp-chunker-version "
+    "makes the observe's own current, and MemPalace's miner's are left to MemPalace"
+)
+
+
+def stale_line(found: Census) -> str:
+    """The version-stale count, apart from unfiled files: always printed, in one grammar (#751).
+
+    ``conversation files version-stale: <n> (observe-filed <a>, miner-filed <b>), <why>``. The
+    first half is the same on every MemPalace, so a reader of the report can match it whole; the
+    tail names the installed constant, or says there is none.
+    """
+    ours, theirs = found.stale_files_ours, found.stale_files_theirs
+    why = (
+        f"convo_chunker_version older than MemPalace's {found.chunker}"
+        if found.chunker is not None
+        else "this MemPalace defines no convo_chunker_version"
+    )
+    return (
+        f"conversation files version-stale: {ours + theirs} "
+        f"(observe-filed {ours}, miner-filed {theirs}), {why}"
+    )
+
+
+def stamp_chunker_version(palace: Path, *, dry_run: bool) -> int:
+    """Stamp the observe's own version-stale drawers with the installed chunker version (#751).
+
+    MemPalace 3.11 reads an exchange drawer with no ``convo_chunker_version`` as filed by an older
+    chunker, so a drawer the observe filed under 3.10 or earlier drops out of the miner's mined
+    set and content-hash map. A mine then deletes it and files its exchange again through the
+    very chunker the observe exists to avoid (in place), or files a second copy beside it (after
+    a move). Those drawers were
+    never cut by a chunker at all (the observe files each exchange whole, issue #741), so the
+    installed version is true of them, and this writes it on each one and changes nothing else.
+
+    Only drawers `filed_by_observe` proves are the observe's own, by their id recipe, and only
+    those stale for this reason alone (`_version_stale`). A drawer MemPalace's miner filed is
+    never touched: its chunks really were cut by the older chunker. Idempotent: a stamped drawer
+    is current, so a second run finds nothing. Every stamped drawer is read back by id and must
+    hold exactly its old metadata plus the stamp. Returns the exit code.
+    """
+    word = "dry run, writes nothing" if dry_run else "WRITES TO THE PALACE"
+    print(f"stamp chunker version ({word}):")
+    current = chunker_version()
+    if current is None:
+        version = getattr(_import("version"), "__version__", "?")
+        print(f"  nothing to stamp: MemPalace {version} defines no convo_chunker_version")
+        return 0
+    collection = _import("palace").get_collection(str(palace), create=False, read_only=dry_run)
+    found = census(collection, palace)
+    targets = found.stale_ours
+    files = len({Path(str(meta.get("source_file") or "")).name for _, meta, _ in targets})
+    tail = (
+        f"convo_chunker_version {current}; miner-filed version-stale drawers left to MemPalace "
+        f"{len(found.stale_theirs)}"
+    )
+    if dry_run:
+        print(
+            f"stamp chunker version (dry run): drawers to stamp {len(targets)} in {files} files, "
+            f"{tail}"
+        )
+        return 0
+    expected = {
+        drawer_id: {**meta, "convo_chunker_version": current} for drawer_id, meta, _ in targets
+    }
+    ids = list(expected)
+    for start in range(0, len(ids), _PAGE):
+        batch = ids[start : start + _PAGE]
+        collection.update(ids=batch, metadatas=[expected[drawer_id] for drawer_id in batch])
+    wrong = 0
+    for start in range(0, len(ids), _PAGE):
+        batch = ids[start : start + _PAGE]
+        got = collection.get(ids=batch, include=["metadatas"])
+        back = dict(zip(got.get("ids") or [], got.get("metadatas") or []))
+        wrong += sum(back.get(drawer_id) != expected[drawer_id] for drawer_id in batch)
+    print(
+        f"stamp chunker version: WROTE to this palace: drawers stamped {len(ids) - wrong} in "
+        f"{files} files, {tail}"
+    )
+    if wrong:
+        print(
+            f"FAIL: {wrong} stamped drawers did not read back as their old metadata plus the "
+            "stamp; the palace changed in another way while this ran"
         )
         return 1
     return 0
@@ -868,8 +1047,9 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Prove an agent's MemPalace palace opens from the given HARNESS_HOME and returns drawers "
             "filed before a home-directory move. No platform call, no model call (except with "
-            "--end-to-end), and no drawer text is ever printed. Read-only unless --practice-observe "
-            "or --register-off-wing is given. Exit 0 only if every probe drawer comes back."
+            "--end-to-end), and no drawer text is ever printed. Read-only unless --practice-observe, "
+            "--register-off-wing or --stamp-chunker-version is given. Exit 0 only if every probe "
+            "drawer comes back."
         ),
     )
     parser.add_argument(
@@ -901,11 +1081,24 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--stamp-chunker-version",
+        action="store_true",
+        help=(
+            "WRITES TO THE PALACE. Before the report, stamp each drawer the harness's observe "
+            "filed under an older MemPalace with the installed MemPalace's "
+            "convo_chunker_version, so MemPalace 3.11 and later read it as filed. Only drawers "
+            "whose id proves the observe filed them; MemPalace's miner's drawers are never "
+            "touched. Changes no other field, and a second run stamps nothing. Run once after "
+            "upgrading MemPalace. Add --dry-run to print what it would do."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
-            "with --register-off-wing: print what it would register, and write nothing. With "
-            "--end-to-end: print the probes and the token estimate, and call no model."
+            "with --register-off-wing or --stamp-chunker-version: print what it would write, and "
+            "write nothing. With --end-to-end: print the probes and the token estimate, and call "
+            "no model."
         ),
     )
     parser.add_argument(
@@ -990,20 +1183,31 @@ def main(argv: list[str] | None = None) -> int:
     if args.end_to_end:
         if args.sample is None or args.token_ceiling is None:
             parser.error("--end-to-end needs --sample and --token-ceiling")
-        if args.reranked_pool or args.practice_observe or args.register_off_wing:
+        if (
+            args.reranked_pool
+            or args.practice_observe
+            or args.register_off_wing
+            or args.stamp_chunker_version
+        ):
             parser.error(
-                "--end-to-end runs alone: not with --reranked-pool, --practice-observe or "
-                "--register-off-wing"
+                "--end-to-end runs alone: not with --reranked-pool, --practice-observe, "
+                "--register-off-wing or --stamp-chunker-version"
             )
     elif args.token_ceiling is not None:
         parser.error("--token-ceiling applies to --end-to-end")
     if args.pool_diagnosis:
         if args.sample is None:
             parser.error("--pool-diagnosis applies to --sample")
-        if args.end_to_end or args.reranked_pool or args.practice_observe or args.register_off_wing:
+        if (
+            args.end_to_end
+            or args.reranked_pool
+            or args.practice_observe
+            or args.register_off_wing
+            or args.stamp_chunker_version
+        ):
             parser.error(
                 "--pool-diagnosis runs alone: not with --end-to-end, --reranked-pool, "
-                "--practice-observe or --register-off-wing"
+                "--practice-observe, --register-off-wing or --stamp-chunker-version"
             )
     elif args.rare_token_probes and not args.end_to_end:
         parser.error("--rare-token-probes applies to --end-to-end or --pool-diagnosis")
@@ -1011,8 +1215,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--filed-before applies to --sample")
     if args.reranked_pool and args.sample is None:
         parser.error("--reranked-pool applies to --sample")
-    if args.dry_run and not (args.register_off_wing or args.end_to_end):
-        parser.error("--dry-run applies to --register-off-wing or --end-to-end")
+    if args.dry_run and not (
+        args.register_off_wing or args.stamp_chunker_version or args.end_to_end
+    ):
+        parser.error(
+            "--dry-run applies to --register-off-wing, --stamp-chunker-version or --end-to-end"
+        )
 
     reranker = None
     if args.end_to_end:
@@ -1056,6 +1264,12 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr)
     try:
         provider = MemPalaceMemoryProvider(palace)
+        # Before registering: a stamped file is recognised by its content, so the register pass
+        # then sees only what is still unfiled (issue #751).
+        if args.stamp_chunker_version:
+            code = stamp_chunker_version(palace, dry_run=args.dry_run)
+            if code:
+                return code
         if args.register_off_wing:
             code = register_off_wing(provider, palace, dry_run=args.dry_run)
             if code:
@@ -1086,11 +1300,15 @@ def main(argv: list[str] | None = None) -> int:
             f"not yet registered at this location: {found.unregistered}"
         )
         print(f"conversation files filed short of their drawers: {found.short}")
+        print(stale_line(found))
+        if found.stale_files_ours or found.stale_files_theirs:
+            print(f"  {STALE_CONSEQUENCE}")
         # The forecast names conversation files, and is the move check's business. Its line keeps
         # the words "next observe" because the NOC's rename flow matches it whole (`FORECAST_RE` in
         # basecradle-noc), as it does the "conversation files:" line above; it forecasts a mine of
         # the directory, which since 0.164.0 the observe never runs (issue #741).
-        if (found.unregistered or found.short) and paths:
+        stale = found.stale_files_ours + found.stale_files_theirs
+        if (found.unregistered or found.short or stale) and paths:
             predicted = forecast(palace, provider.agent)
             if predicted is None:
                 print(
