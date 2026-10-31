@@ -141,6 +141,10 @@ Two constraints from the wire, both load-bearing:
   breakpoints at all, so an adapter reaching an explicit-cache model over the Responses surface
   cannot place one and must not claim it can.
 
+The engine states the boundary once; the adapter translates it into the vendor's breakpoints, which
+may be more than one (issue #726: Anthropic's lookback window reaches 20 positions per breakpoint, so
+its adapter chains more back from the anchor, and marks the tool list when nothing is anchored).
+
 The anchor is **copy-on-write**: it is stamped onto a *copy* of the turn, never onto the object the
 session persists. A `cache_anchor` written into the stored history would still be there on the next
 wake, when that turn is no longer the boundary — and the wake after that would add another, walking
@@ -228,10 +232,11 @@ def anchor_cacheable_prefix(messages: list[Message], *, stable: int, mode: str) 
     a persisted anchor accumulates across wakes and eventually trips the four-breakpoint ceiling).
 
     On an agent's *first* wake there is nothing to anchor (`stable <= 0`): the charter rides the
-    per-wake brief rather than the transcript, so the frozen prefix is empty, and caching starts on
-    wake two — which writes the entry wake three reads (measured live on Claude, issue #725). What
-    that costs on an explicit-cache vendor, and a second gap of the one-breakpoint shape, is filed
-    as issue #726.
+    per-wake brief rather than the transcript, so the frozen prefix is empty. The anchor is the
+    engine's one statement of where the boundary is; translating it is the adapter's, because only
+    the adapter knows the wire's render order and positions. The Anthropic adapter puts the
+    breakpoint on the end of the tool list when no turn is anchored, and chains up to three more
+    back from an anchor so a long previous wake's entry is still in reach (issue #726).
 
     A no-op for every mode but `EXPLICIT`.
     """

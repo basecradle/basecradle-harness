@@ -26,6 +26,7 @@ import hashlib
 import io
 import logging
 import os
+import uuid
 
 import pytest
 
@@ -117,6 +118,60 @@ def test_the_second_call_on_the_same_prefix_reads_the_cache(caplog):
     cached = int(_field(second, "cached_tokens"))
     assert cached > 0, second
     assert cached >= int(_field(first, "cache_write_tokens") or cached)
+
+
+def _cache(line: str) -> tuple[int, int]:
+    """A line's ``(cached_tokens, cache_write_tokens)``, an absent field read as zero."""
+    return int(_field(line, "cached_tokens") or 0), int(_field(line, "cache_write_tokens") or 0)
+
+
+@needs_key
+def test_with_nothing_anchored_the_tool_list_is_read_back(caplog):
+    """A first wake (issue #726): no frozen turn, so the breakpoint is the tool list's, and step 2
+    reads exactly what step 1 wrote."""
+    nonce = uuid.uuid4().hex
+    tools = [
+        ToolSpec(
+            name=f"lookup_topic_{n}",
+            description=f"[{nonce}] " + CHARTER.splitlines()[n + 1] * 3,
+            parameters={"type": "object", "properties": {"topic": {"type": "string"}}},
+        )
+        for n in range(1, 13)
+    ]
+    convo = [Message.system("brief"), Message.user("Reply with exactly the word: ok")]
+    adapter = _provider()
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=tools)
+        adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=tools)
+    first, second = _lines(caplog, "llm provider=")
+    read, written = _cache(first)
+    assert written > 0, first
+    assert _cache(second)[0] == read + written, second
+
+
+@needs_key
+def test_a_long_previous_wake_is_found_through_the_lookback_chain(caplog):
+    """A wake 45 positions past the last entry: only the chained breakpoints can reach it (#726).
+
+    The first request anchors position 9 and writes there. The second anchors position 54, whose own
+    window (54..35) cannot see 9; its chain adds 34 and 14, and 14's window (14..0) holds the entry.
+    So a read equal to the first request's whole write is the chain, and nothing else, finding it.
+    """
+    nonce = uuid.uuid4().hex
+    head = Message.user(f"[{nonce}]\n{CHARTER}\nQuestion 0.")
+    turns = [head] + [
+        Message.assistant(f"Answer {i}.") if i % 2 else Message.user(f"Question {i}.")
+        for i in range(1, 55)
+    ]
+    adapter = _provider()
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        for frozen in (turns[:10], turns[:55]):
+            convo = [*frozen, Message.system("brief"), Message.user("Reply with the word: ok")]
+            adapter.chat(anchor_cacheable_prefix(convo, stable=len(frozen), mode=EXPLICIT))
+    first, second = _lines(caplog, "llm provider=")
+    read, written = _cache(first)
+    assert written > 0, first
+    assert _cache(second)[0] == read + written, second
 
 
 @needs_key
