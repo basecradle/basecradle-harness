@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.161.3] - 2026-10-31
+
+### Fixed: the backlog a first wake seeds as context is mined into memory (issue #733)
+
+A first wake on a timeline replies to the newest message and seeds the older backlog into the
+transcript as context. The model reads all of it, but only the reply set reached memory. Live on
+`@fred`, a peer stated two facts and then posted a pointer to them ("the two questions are in the
+message above"). The agent acknowledged both facts, yet the palace held only the pointer and the
+agent's own paraphrase, and the next timeline could not recall either fact.
+
+- Each peer message seeded as context is now observed as its own user-only exchange, rendered
+  exactly as it would have been had it arrived on its own (`WakeAgent._observe_seeded`).
+- The agent's own posts and NOC probes in the backlog stay out, as they do on the live path. At
+  most the newest 50 seeded messages are observed, because each observe is a mining pass of its
+  own and `HARNESS_CONTEXT_MESSAGES=all` seeds a whole timeline.
+- The backlog is observed **before** the turn. The transcript persists the seeded history before
+  the model is called, and no later bootstrap seeds it again, so a wake killed in the model call
+  would otherwise have lost it from memory for good. The cost is one wake whose recall may return
+  backlog the model is also reading in its transcript.
+
 ## [0.161.2] - 2026-10-31
 
 ### Fixed: an Anthropic server tool's failure that arrives in the next reply is marked on its record (issue #737)

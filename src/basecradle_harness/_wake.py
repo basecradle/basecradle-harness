@@ -3224,6 +3224,44 @@ class WakeAgent:
             return
         _log.debug("memory %s", kv(op="observe", chars=len(user) + len(assistant)))
 
+    def _observe_seeded(self, seeded: list[object]) -> None:
+        """Hand memory the backlog a first wake seeded as context — each peer message on its own.
+
+        **Peer dialogue seeded into the agent's conversation is peer dialogue memory keeps**
+        (issue #733). A first wake replies to the newest message and seeds the older backlog into
+        the transcript as context, the way a human scrolls up before speaking, and before this only
+        the reply set reached `_observe`. So a peer who stated a fact and then pointed at it ("the
+        two questions are in the message above") had the pointer remembered and the fact
+        forgotten — live on `@fred`, where the agent acknowledged a codename in one timeline and
+        could not recall it in the next.
+
+        Each message is observed as **its own user-only exchange**, rendered by `_dialogue_of`
+        exactly as it would have been had it arrived as an item of its own, so a seeded message
+        and a live one land in the palace in one shape, and a long backlog does not become one
+        exchange cut into slices across message boundaries. Two kinds stay out, because the live
+        path never mines them either: the agent's **own** posts (the self-filter drops them before
+        any turn) and a **NOC probe** (a machine contract, acked without the model, never
+        dialogue). At most the newest `DEFAULT_CONTEXT_MESSAGES` are observed: each observe is a
+        mining pass of its own, and `HARNESS_CONTEXT_MESSAGES=all` seeds a whole timeline.
+
+        **Called before the turn, and that order is the point.** `Session.send` persists the seeded
+        history before the model is called, and once it has, no later bootstrap seeds it again; a
+        wake killed in the model call — a signal skips any ``finally`` — would otherwise have lost
+        the backlog from memory for good. The price is one wake whose recall may hand back backlog
+        the model is also reading in its transcript. A bootstrap whose transcript never persisted
+        (the turn ended before `send`) seeds and observes the same messages again on a later wake;
+        MemPalace drops a conversation whose content it already holds as a duplicate.
+        """
+        if self.memory_provider is None:
+            return
+        peers = [
+            message
+            for message in seeded
+            if not self._is_own(message) and self._probe_nonce(message.content.body or "") is None
+        ]
+        for message in peers[-DEFAULT_CONTEXT_MESSAGES:]:
+            self._observe(_dialogue_of(message, _MESSAGES), "")
+
     def _manifest_entries(self) -> list[tuple[str, str | None]]:
         """The ``(name, note)`` pairs for the tool manifest — the resolved set, else the registry.
 
@@ -3305,8 +3343,9 @@ class WakeAgent:
         *context* — so the agent answers the right thing while knowing what came
         before, the way a human scrolls up before speaking. The context is seeded
         only into a fresh transcript, so a restart that kept the transcript but lost
-        the mark does not re-seed. Finally, record the true newest message as the
-        mark, so the next wake is a normal incremental one.
+        the mark does not re-seed — and the peer messages it seeds are handed to memory
+        too (`_observe_seeded`). Finally, record the true newest
+        message as the mark, so the next wake is a normal incremental one.
         """
         recent = _recent(
             self.client.messages.filter(timeline=self.timeline_uuid), self.context_messages
@@ -3326,9 +3365,12 @@ class WakeAgent:
         # order — which is what `_settle`'s cursor requires.
         to_reply = stranded + list(reversed(recent[: split + 1]))  # chronological
         context = recent[split + 1 :]  # older than the reply set, still newest-first
+        seeded: list[object] = []
         if not _has_conversation(session):
-            for message in reversed(context):  # oldest-first into history
+            seeded = list(reversed(context))  # oldest-first into history
+            for message in seeded:
                 session.history.append(_as_turn(message, self.me_uuid))
+        self._observe_seeded(seeded)  # before the turn: `send` persists the seed (see there)
         posted = self._respond(session, to_reply)
         # Close out the first wake by baselining the mark to `recent[0]` — but only when `_respond`
         # did *not* already advance it past `recent[0]` via a mid-wake arrival (issue #226). The
