@@ -34,12 +34,13 @@ siblings that cannot be counted. The compaction-summary-of-a-brief artifact that
 is exactly the unanimous case, so true pollution still dies whole.
 
 **The source file goes with the drawers, and that is not tidiness — it is the whole reason a
-scrub holds.** The adapter mines *files*: `observe` writes each exchange under
-``<palace>/conversations/`` and re-mines the directory, and MemPalace decides what to skip by
-asking whether the file's drawers are still in the palace and *complete*
-(``palace.file_already_mined`` / ``prefetch_mined_set``, which omit a source whose surviving
-drawers are short of their recorded ``chunk_total``). Delete a drawer and leave its file, and
-the very next wake re-mines that file and puts the scaffolding straight back. So a file that
+scrub holds.** `observe` writes each exchange as a file under ``<palace>/conversations/`` beside
+the drawers it files, and a mine of that directory — which until 0.164.0 the observe itself ran
+on every wake, and which ``mempalace mine`` still is — decides what to skip by asking whether the
+file's drawers are still in the palace and *complete* (``palace.file_already_mined`` /
+``prefetch_mined_set``, which omit a source whose surviving drawers are short of their recorded
+``chunk_total``). Delete a drawer and leave its file, and the next mine re-files that file and
+puts the scaffolding straight back. So a file that
 lost a drawer is removed with it — only ever inside the palace's own ``conversations``
 directory, never a path outside it. Unanimity makes that safe rather than dangerous, and the two
 rules are the same rule read from both ends: a file is either scrubbed **whole** or not at all,
@@ -147,7 +148,7 @@ def scan(collection, palace: Path) -> Report:
     path, so a palace that moved holds drawers filed under the old home and, once a wake has run,
     registry rows filed under the new one, all for the same file. Keyed by the raw string, those
     are separate "files": the old one passes unanimity alone, its drawers are deleted, and the
-    unlink finds nothing at the old path, leaving the file for the next wake to re-mine. So a
+    unlink finds nothing at the old path, leaving the file for the next mine to re-file. So a
     conversation file is identified by its name in *this* palace's ``conversations`` directory,
     whatever home it was filed under. (`apply` still resolves before it unlinks; there the
     question is containment, not identity.)
@@ -236,7 +237,7 @@ def apply(collection, report: Report) -> tuple[int, int]:
     part-way through leaves the palace in one of two states, and only one of them is safe: unlink
     first, and the worst case is scaffolding drawers still in the palace with no file left to
     re-mine them from — exactly the status quo, which the next run finishes. Delete first, and the
-    worst case is drawers gone with their files still on disk, which the very next wake re-mines,
+    worst case is drawers gone with their files still on disk, which the next mine re-files,
     putting the scaffolding back. A file left orphaned of its drawers costs nothing (nothing reads
     it but the miner, which now skips it); a drawer left orphaned of its file costs a re-mine.
     """
@@ -249,7 +250,7 @@ def apply(collection, report: Report) -> tuple[int, int]:
         except FileNotFoundError:
             pass  # already gone: another pass, or an operator's own cleanup. Not a failure.
         except OSError as error:
-            # Loud, and not fatal: the drawers still go, and a file the next wake re-mines is a
+            # Loud, and not fatal: the drawers still go, and a file the next mine re-files is a
             # re-pollution the next scrub catches. Silence here would leave it invisible.
             _log.warning("scrub %s", kv(op="unlink", path=str(path), error=str(error)))
     root = report.palace / _CONVERSATIONS_WING
@@ -479,7 +480,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help=(
             "delete exactly the chunks the dry run reports under SCRUB, and the conversation "
-            "files they were mined from (so the next wake cannot re-mine them). HELD and REVIEW "
+            "files they were mined from (so a later mine cannot re-file them). HELD and REVIEW "
             "findings are never deleted. Run this with the agent's wakes held."
         ),
     )

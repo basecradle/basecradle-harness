@@ -31,8 +31,8 @@ is *not* filtered by timeline — so a fact learned on one timeline is recalled 
 That is the whole point of the proof (the capital's "Memory Prince" demonstration).
 
 **Library API, not MCP.** This uses MemPalace's in-process Python functions
-(`mempalace.convo_miner.mine_convos` to store, `mempalace.searcher.search_memories` to
-retrieve) — *not* its MCP tools, which are a later group (Group 5). MemPalace is an
+(`mempalace.convo_miner.file_conversation_exchange` to store, `mempalace.searcher.search_memories`
+to retrieve) — *not* its MCP tools, which are a later group (Group 5). MemPalace is an
 **optional extra** (``pip install basecradle-harness[mempalace]``) so the base package
 stays light; the import is lazy and a clear error names the extra when it is missing.
 
@@ -43,11 +43,17 @@ on exact tokens (handles, UUIDs, error strings, project names) that embeddings r
 is precisely the recall gap union closes. One call, so the automatic hook and the model-facing
 tool can never drift apart on *how* the palace is searched. See `_CANDIDATE_STRATEGY`.
 
-**Storage model.** MemPalace mines *files*: `observe` writes each exchange as a tiny
-quote-formatted markdown file under ``<palace>/conversations/`` and mines that directory
-(MemPalace skips already-mined files, so re-mining the dir only processes the new one).
-Known bound: one small file accrues per exchange — acceptable for a reference adapter; a
-production deployment would compact or rotate them.
+**Storage model.** `observe` writes each exchange as a tiny quote-formatted markdown file under
+``<palace>/conversations/`` — the record, which `basecradle-harness-scrub-palace` removes with its
+drawers — and files that same text through MemPalace's canonical write path for live agents,
+`file_conversation_exchange`: **one exchange, one drawer, verbatim**, past
+`EXCHANGE_PIECE_CHARS` split at line boundaries into as few drawers as fit (issue #741). It no
+longer mines the directory: MemPalace's convo chunker reads every ``>`` line as a new turn, so a
+multi-line message was filed one drawer per line, its short lines dropped. Each drawer carries the
+metadata MemPalace's own miner reads to decide a file is already filed (`_file`), so a
+``mempalace mine`` of the directory never files one again, and a moved home is recognised by
+content as before. Known bound: one small file accrues per exchange — acceptable for a reference
+adapter; a production deployment would compact or rotate them.
 
 **One palace, one mind — including from the CLI** (issue #409). The adapter's palace lives under
 the *agent's* home (``$HARNESS_HOME/mempalace``), which is what keeps two agents on one box from
@@ -63,6 +69,7 @@ agent's mind, and it is rewritten from the live value on every bind so it cannot
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -254,6 +261,26 @@ _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 # (cross-timeline recall); the agent identity already partitions palaces by home.
 _CONVERSATIONS_WING = "conversations"
 
+# The most characters one drawer holds (issue #741). An exchange this long or shorter is filed as
+# one drawer; a longer one is split at line boundaries into as few drawers as fit, nothing dropped.
+#
+# **Measured, not assumed** (MemPalace 3.10.0 and 3.11.0, a real palace of 262 exchanges with 60
+# near-topic competitors, rerank off): a 6.3k-character peer message filed whole, with a fact in its
+# last paragraph, never recalled that fact in the top ten, by its exact token or by meaning. The
+# embedding model reads only the first 256 word pieces, and BM25 normalizes a long document's score
+# down. Split at 800 the same fact came back at ranks 5 and 6; at 1,000, 6 and 4; at 1,200, 10 and
+# not at all. A four-line brief and its reply fit in one drawer at every size.
+#
+# 800 is also MemPalace's own convo chunk size, so the bounds that rested on it stay where they
+# were: a Turn-0 recall is at most `DEFAULT_N_RESULTS` drawers of this, and the reranker, which reads
+# its candidates whole (`_rerank._messages`), at most `pool_size` of them.
+EXCHANGE_PIECE_CHARS = 800
+
+# The mark `_exchange_markdown` puts before every line of the user half: MemPalace's exchange
+# format, and what `_READING_GUIDE` tells the model a quoted line means. A quoted line cut to fit a
+# drawer keeps it on its continuation, so a peer's words never read as the agent's.
+_QUOTE = "> "
+
 _MISSING = (
     "MemPalace is not installed. Install the optional extra to use the MemPalace memory "
     "provider:  pip install basecradle-harness[mempalace]"
@@ -311,41 +338,100 @@ class MemPalaceMemoryProvider(MemoryProvider):
     # --- the two middleware hooks --------------------------------------------
 
     def observe(self, exchange: MemoryExchange) -> None:
-        """Feed one completed exchange into MemPalace by mining a tiny convo file.
+        """File one completed exchange into MemPalace: one exchange, one drawer, verbatim.
 
-        Writes the exchange as a quote-formatted markdown file (MemPalace's
-        ``extract_mode="exchange"`` chunks a ``>`` user turn plus the response that
-        follows it into one unit) under ``<palace>/conversations/``, then mines that
-        directory. MemPalace tracks already-mined files, so re-mining only ingests the
-        file just written. An empty exchange (no user text *and* no reply) is skipped.
+        Writes the exchange as a quote-formatted markdown file under ``<palace>/conversations/``
+        (the record) and files that text through MemPalace's ``file_conversation_exchange``
+        (`_file`, issue #741). An exchange longer than `EXCHANGE_PIECE_CHARS` is filed as the
+        fewest drawers that fit. An empty exchange (no user text *and* no reply) is skipped.
 
-        A **seeded** exchange's file name is recorded before it is mined (issue #746), so a mine
-        that raises partway still keeps whatever it filed out of this wake's `context`. Recording
-        a name whose content MemPalace then drops as a duplicate costs nothing: no drawer carries
-        it, so nothing is excluded, and the older drawers holding that content are not this
-        wake's.
+        **The directory is never mined.** It was, until 0.164.0, and MemPalace's convo chunker
+        treats every line beginning ``>`` as a new user turn: a four-line peer brief was filed as
+        four drawers, a line of 30 characters or fewer was dropped, and only the first drawer
+        carried the ``[time] handle:`` provenance. No encoding of a one-exchange file avoids every
+        such drop inside that chunker, which is why the write path changed rather than the format.
+
+        A **seeded** exchange's file name is recorded before it is filed (issue #746), so a filing
+        that raises partway still keeps whatever it filed out of this wake's `context`. A name
+        whose filing then fails costs nothing: no drawer carries it, so nothing is excluded.
         """
         if not (exchange.user.strip() or exchange.assistant.strip()):
             return
         convo_dir = self.palace_path / "conversations"
         convo_dir.mkdir(parents=True, exist_ok=True)
-        # A uuid filename so concurrent wakes never collide and a re-mine sees each
-        # exchange exactly once, led by the timeline the exchange happened on so recall can say
-        # which one (`_TIMELINE_FILE`). The body is MemPalace's exchange format: `>` user turn,
-        # then the assistant response verbatim.
-        path = convo_dir / _conversation_name(exchange.scope.timeline)
-        path.write_text(_exchange_markdown(exchange), encoding="utf-8")
+        # A uuid filename so concurrent wakes never collide, led by the timeline the exchange
+        # happened on so recall can say which one (`_TIMELINE_FILE`). Resolved, because that is the
+        # spelling MemPalace's own miner records a file under (`scan_convos`), and a `mempalace
+        # mine` recognises a file it has seen by that exact string.
+        path = convo_dir.expanduser().resolve() / _conversation_name(exchange.scope.timeline)
         if exchange.seeded:
             self._seeded_files.add(path.name)
+        self._file(path, _exchange_markdown(exchange))
 
+    def _file(self, path: Path, text: str) -> None:
+        """Write ``text`` to ``path`` and file it as drawers, all of it or none of it.
+
+        Each drawer goes through ``file_conversation_exchange``, MemPalace's canonical write path
+        for live agents, which writes the metadata the convo miner writes. Three more fields are
+        stamped through its ``extra_metadata``, because they are what MemPalace's miner reads to
+        decide a file is already filed, and a file it thinks unfiled it files again, through the
+        very chunker this path exists to avoid:
+
+        - ``source_mtime`` — the file's own, so a ``mempalace mine`` of the directory (and the
+          palace check's dry run of one) skips it by path (``prefetch_mined_set``);
+        - ``chunk_total`` — how many drawers the exchange took, so a filing cut short is never
+          read as complete;
+        - ``content_hash`` — computed exactly as the miner computes it (`content_hashes`), so a
+          moved home's files are recognised by content and registered, never filed again
+          (issue #606). On every drawer: ``file_conversation_exchange`` stamps each one chunk 0,
+          and a chunk 0 with no hash is what the palace check counts as unrecognisable.
+
+        Under MemPalace's own per-file lock (``mine_lock``), the one a concurrent ``mempalace
+        mine`` takes for this file before it re-checks whether it is filed. If anything raises
+        (the write itself included: a full disk, text that will not encode), every drawer recorded
+        under the file is deleted and then the file is removed, and the error propagates: a file
+        with no drawers is one a later mine would shred, and a partial set one it would re-file.
+        **The file goes only once its drawers are gone** (`_unfile`). Where they cannot be deleted
+        (MemPalace 3.10 refuses a write while another process holds the palace's lock), the file
+        stays, so the set it heads remains visible rather than orphaned. A process killed partway
+        can leave either shape too; the palace check names both (a file not registered at this
+        location, or one filed short of its drawers), and that exchange is lost exactly as one is
+        when observe fails.
+
+        **What a mine did after each exchange and this path does not**: MemPalace's FTS5 integrity
+        check and auto-heal (``_validate_palace_fts5_after_mine``) and its hallway recompute. Its
+        own live-agent integration skips both too. A damaged lexical index is not silent: every
+        search it breaks answers with an error envelope, which `search` logs at WARNING.
+        """
         convo_miner = _import("convo_miner")
-        convo_miner.mine_convos(
-            str(convo_dir),
-            str(self.palace_path),
-            wing=_CONVERSATIONS_WING,
-            agent=self.agent,
-            extract_mode="exchange",
-        )
+        palace = _import("palace")
+        collection = palace.get_collection(str(self.palace_path))
+        pieces = _pieces(text)
+        with palace.mine_lock(str(path)):
+            try:
+                path.write_text(text, encoding="utf-8")
+                stamp = {
+                    "source_mtime": os.path.getmtime(path),
+                    "chunk_total": len(pieces),
+                    "content_hash": ",".join(content_hashes(path)),
+                }
+                room = convo_miner.detect_convo_room(text)
+                for piece in pieces:
+                    drawer = convo_miner.file_conversation_exchange(
+                        collection,
+                        wing=_CONVERSATIONS_WING,
+                        room=room,
+                        text=piece,
+                        source_file=str(path),
+                        agent=self.agent,
+                        extra_metadata=stamp,
+                    )
+                    if drawer is None:  # a piece is never blank (`_pieces`); upstream changed
+                        raise RuntimeError("MemPalace filed no drawer for a non-empty piece")
+            except BaseException:
+                if _unfile(collection, str(path)):
+                    path.unlink(missing_ok=True)
+                raise
 
     def begin_wake(self) -> None:
         """Forget the previous wake's seeded files: they are this wake's memories now (issue #746)."""
@@ -999,15 +1085,95 @@ def _import(submodule: str):
 
 
 def _exchange_markdown(exchange: MemoryExchange) -> str:
-    """One exchange as a MemPalace ``extract_mode="exchange"`` file: ``>`` turn + reply.
+    """One exchange in MemPalace's exchange format: every user line quoted ``>``, then the reply.
 
-    MemPalace chunks by exchange pair — a line beginning ``>`` is the user turn and the
-    lines after it (until the next ``>`` or ``---``) are the response. We quote every
-    line of the user text so a multi-line message stays one turn, then write the reply
-    verbatim below it.
+    The quote marks say whose words are whose, and they are what `_READING_GUIDE` tells the model
+    a quoted line means. Nothing chunks this text by them any more (`MemPalaceMemoryProvider._file`,
+    issue #741): it is filed as written, so the reply is verbatim whatever its lines begin with.
     """
-    quoted = "\n".join(f"> {line}" for line in exchange.user.splitlines() or [""])
+    quoted = "\n".join(f"{_QUOTE}{line}" for line in exchange.user.splitlines() or [""])
     return f"{quoted}\n{exchange.assistant}\n"
+
+
+def _pieces(text: str, size: int = EXCHANGE_PIECE_CHARS) -> list[str]:
+    """``text`` as the fewest drawers of at most ``size`` characters, cut only between lines.
+
+    Whole when it fits, which is every short exchange. Otherwise lines are packed in order, and a
+    single line longer than ``size`` is cut at its last space before the limit (mid-word only when
+    there is none), its continuation re-quoted when the line was a quoted one (`_QUOTE`). Nothing
+    is dropped and nothing is reordered; a piece that is only whitespace is not a drawer.
+    """
+    if size <= len(_QUOTE):
+        raise ValueError(f"a piece must hold more than the quote mark, not {size} characters")
+    pieces: list[str] = []
+    current = ""
+    for line in text.splitlines(keepends=True):
+        if len(line) > size:
+            if current:
+                pieces.append(current)
+            *whole, current = _cut(line, size)
+            pieces.extend(whole)
+            continue
+        if current and len(current) + len(line) > size:
+            pieces.append(current)
+            current = ""
+        current += line
+    if current:
+        pieces.append(current)
+    return [piece for piece in pieces if piece.strip()]
+
+
+def _cut(line: str, size: int) -> list[str]:
+    """One over-long line as parts of at most ``size`` characters, re-quoted if it was quoted.
+
+    A remainder that is only the line's ending is not re-quoted, so a cut never invents an empty
+    quoted line.
+    """
+    lead = _QUOTE if line.startswith(_QUOTE) else ""
+    parts: list[str] = []
+    while len(line) > size:
+        space = line.rfind(" ", len(lead), size)
+        cut = space + 1 if space > len(lead) else size
+        parts.append(line[:cut])
+        rest = line[cut:]
+        line = lead + rest if rest.strip() else rest
+    parts.append(line)
+    return parts
+
+
+def _unfile(collection, source_file: str) -> bool:
+    """Delete every drawer recorded under ``source_file``; ``True`` once none is left.
+
+    By the recorded path, not by the ids a failed `MemPalaceMemoryProvider._file` collected: an
+    upsert that landed before it raised returned no id. The same lookup MemPalace's miner purges a
+    file's drawers with (``_source_file_delete_ids``). Never raises: the filing's own error is the
+    one the caller must see, so a lookup or delete that fails too is logged, and ``False`` tells
+    the caller to keep the file.
+    """
+    try:
+        found = collection.get(where={"source_file": source_file}, include=["metadatas"])
+        drawers = list(found.get("ids") or [])
+        if drawers:
+            collection.delete(ids=drawers)
+        return True
+    except Exception:  # noqa: BLE001 - the filing's error is the one the caller must see
+        _log.warning(
+            "memory %s",
+            kv(op="observe", result="unfile_failed", provider=_MEMPALACE),
+            exc_info=True,
+        )
+        return False
+
+
+def content_hashes(path: Path) -> list[str]:
+    """The content hash of each conversation in a file, exactly as MemPalace's miner computes them.
+
+    SHA-256 of each stripped conversation ``normalize_conversations`` reads out of the file. What
+    the miner looks a moved file's content up by (``prefetch_content_hashes``), so `_file` stamps
+    it on every drawer and the palace check compares against it (issue #606).
+    """
+    conversations = [c for c in _import("normalize").normalize_conversations(str(path)) if c]
+    return [hashlib.sha256(c.strip().encode("utf-8")).hexdigest() for c in conversations]
 
 
 def _fenced(body: str) -> str:

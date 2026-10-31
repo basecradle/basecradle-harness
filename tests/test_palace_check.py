@@ -6,6 +6,7 @@ model what the check depends on: a paged collection, a searcher that honors ``n_
 dry-run mine that prints MemPalace's per-file lines.
 """
 
+import contextlib
 import hashlib
 import sys
 import types
@@ -99,6 +100,7 @@ def fake(monkeypatch):
         opened=[],
         searches=[],
         mines=[],
+        filed=[],
         missing=set(),
         cut=set(),
         dry_run_lines=None,
@@ -113,7 +115,12 @@ def fake(monkeypatch):
         state.opened.append((path, kwargs))
         return state.collection
 
+    @contextlib.contextmanager
+    def mine_lock(source_file):
+        yield
+
     palace.get_collection = get_collection
+    palace.mine_lock = mine_lock
     palace.NORMALIZE_VERSION = 2
 
     def prefetch_content_hashes(collection, extract_mode=None):
@@ -171,7 +178,13 @@ def fake(monkeypatch):
         elif kwargs.get("dry_run") and state.dry_run_lines is not None:
             print("\n".join(state.dry_run_lines))
 
+    def file_conversation_exchange(collection, **kwargs):
+        state.filed.append(kwargs)
+        return f"filed-{len(state.filed)}"
+
     convo_miner.mine_convos = mine_convos
+    convo_miner.file_conversation_exchange = file_conversation_exchange
+    convo_miner.detect_convo_room = lambda content: "general"
 
     normalize = types.ModuleType("mempalace.normalize")
     normalize.normalize_conversations = lambda path: [Path(path).read_text(encoding="utf-8")]
@@ -283,6 +296,41 @@ def test_the_report_counts_what_a_moved_palace_holds(home, fake, capsys):
     )
 
 
+def test_a_filing_cut_short_is_counted_and_forecast(home, fake, capsys):
+    """Registered, yet unfiled to MemPalace: a set short of its ``chunk_total`` (issue #741).
+
+    Every file has a drawer at this location, so nothing is unregistered and the forecast used to
+    be skipped. One file holds 1 of the 3 drawers it records, which a mine deletes and files again.
+    """
+    here = str((home / "mempalace" / "conversations").resolve())
+    drawers = {}
+    for index, name in enumerate(NAMES):
+        total = 3 if index == 0 else 1
+        drawers[f"drawer-{index}"] = (
+            f"Nova told John fact number {index}.",
+            {
+                "source_file": f"{here}/{name}",
+                "source_mtime": 1.0,
+                "chunk_total": total,
+                "content_hash": f"{index:064x}",
+                "chunk_index": 0,
+                "filed_at": f"2026-10-0{index + 1}T00:00:00",
+                "room": "general",
+            },
+        )
+    fake.collection = FakeCollection(drawers)
+    fake.dry_run_lines = [f"    [DRY RUN] {NAMES[0]} -> room:general (3 drawers)"]
+
+    _, lines = _run(capsys, home)
+
+    assert "conversation files: 4, not yet registered at this location: 0" in lines
+    assert "conversation files filed short of their drawers: 1" in lines
+    assert (
+        "next observe (dry run): 0 files -> registry sentinel, 1 files -> mined as new drawers"
+        in lines
+    )
+
+
 def test_an_unreadable_dry_run_is_reported_as_unknown_not_as_nothing(home, fake, capsys):
     fake.collection = FakeCollection(_drawers(home))
     fake.dry_run_lines = ["a format this version does not know"]
@@ -329,7 +377,9 @@ def test_practice_observe_runs_observe_once_and_says_it_wrote(home, fake, capsys
     written = [p for p in convos.iterdir() if p.name not in before]
     assert len(written) == 1
     assert _palace_check.PRACTICE_USER in written[0].read_text(encoding="utf-8")
-    assert fake.mines[0][1].get("dry_run", False) is False  # the observe mined for real
+    # The observe filed the exchange it was handed, and mined nothing (issue #741).
+    assert [kwargs["source_file"] for kwargs in fake.filed] == [str(written[0].resolve())]
+    assert not any(not kwargs.get("dry_run") for _, kwargs in fake.mines)
     assert lines[1].startswith("practice observe: WROTE one exchange to this palace")
     assert lines[1].endswith("Practice copies only.")
     assert code == 0

@@ -4,7 +4,15 @@ Written for a home-directory rename (issue #606). The fleet renames an agent's O
 so ``$HARNESS_HOME`` moves and the palace moves with it, while every drawer keeps the absolute
 ``source_file`` it was filed under. The relocation is right when the palace opens from the new
 home and a search returns drawers filed before the move. This command checks exactly that, and
-reports what the next observe will do to the palace.
+reports what a ``mempalace mine`` of the conversation files would do to the palace.
+
+**The forecast is of a mine, not of the observe** (issue #741). Until 0.164.0 the observe mined the
+whole ``conversations`` directory on every exchange, so a dry-run mine was a forecast of the next
+wake. The observe now files only the exchange it was handed, through MemPalace's live-agent write
+path, and never reads another file; what is left to forecast is what MemPalace's own miner would do
+if anything ran it there, which is the one way a file could still be filed twice. Two of the lines
+this prints are parsed by the NOC's rename flow and keep their wording byte for byte, the first of
+them still beginning ``next observe (dry run):`` (`forecast`).
 
 **Token-free, except in one mode.** No platform call and no model call: the palace is resolved
 from the ``HARNESS_HOME`` given (never from an inherited ``MEMPALACE_PALACE_PATH``), and the only
@@ -19,15 +27,15 @@ palace's *files* are another matter: ChromaDB rewrites bytes in ``chroma.sqlite3
 segment on every open, even MemPalace's ``read_only=True`` one, so a checksum of the palace
 directory moves while its contents do not (measured with MemPalace 3.9.0). One exception is the explicit, off-by-default
 ``--practice-observe`` mode: a practice user has no platform account and can never complete a wake,
-so the registry rows a first wake at the new home writes would never exist there. That mode runs
-the harness's own observe path once, with a fixed exchange and no model call, so the report that
-follows reads the palace as a first wake leaves it. It **writes to the palace** and is for a
-practice copy only; its help and its output both say so.
+so nothing would ever file an exchange at the new home. That mode runs the harness's own observe
+path once, with a fixed exchange and no model call, so the report that follows reads the palace as
+a first wake leaves it: one new file, filed and recognised by the forecast as filed. It **writes to
+the palace** and is for a practice copy only; its help and its output both say so.
 
 **One write for a real move: ``--register-off-wing``** (issue #613). MemPalace recognises a moved
 file's content only within the mining wing, so a conversation file once mined on its own into
-another wing is filed again in ``conversations`` at the first wake after a move. Run once after
-the rename and before that wake, this mode registers each such file in the wing its drawers
+another wing is filed again in ``conversations`` by a mine after a move (the first wake's observe,
+before 0.164.0). Run once after the rename and before that wake, this mode registers each such file in the wing its drawers
 already carry: one registry row per file, no drawer, no drawer touched (`register_off_wing`). It
 **writes to the palace**, refuses and writes nothing if any file would file a drawer, and has a
 ``--dry-run`` form; its help and its output say so.
@@ -100,6 +108,7 @@ from basecradle_harness._mempalace import (
     MemPalaceMemoryProvider,
     _import,
     candidate_pool,
+    content_hashes,
 )
 from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL, reranker_from_env
 from basecradle_harness._version import __version__
@@ -160,13 +169,17 @@ class Census:
     real: list[tuple[str, dict, str]] = field(default_factory=list)
     #: Real drawers whose ``source_file`` is not in this palace's ``conversations`` directory.
     elsewhere: list[tuple[str, dict, str]] = field(default_factory=list)
-    #: Real chunk-0 drawers with no ``content_hash`` (MemPalace before 3.7). After a move, the next
-    #: observe re-mines their files as new drawers instead of recognising them.
+    #: Real chunk-0 drawers with no ``content_hash`` (MemPalace before 3.7). After a move, a mine
+    #: re-files their files as new drawers instead of recognising them.
     unhashed: int = 0
     files: int = 0
-    #: Conversation files on disk with no row recorded under their current path. The next observe
-    #: reads every one of them.
+    #: Conversation files on disk with no row recorded under their current path. A mine of the
+    #: directory reads every one of them; the observe, since 0.164.0, none.
     unregistered: int = 0
+    #: Conversation files on disk whose drawers at this location fall short of the ``chunk_total``
+    #: they record (issue #741): a filing cut off partway. MemPalace's miner reads such a file as
+    #: unfiled, and a mine of the directory deletes what is there and files it again.
+    short: int = 0
 
 
 def census(collection, palace: Path) -> Census:
@@ -176,6 +189,9 @@ def census(collection, palace: Path) -> Census:
     prefix = str(here) + os.sep
     out = Census()
     recorded: set[str] = set()
+    # Per recorded path at this location, per stored ``source_mtime``: drawers seen and the
+    # ``chunk_total`` they claim. MemPalace's own completeness rule (``prefetch_mined_set``).
+    groups: dict[str, dict[object, list]] = {}
     offset = 0
     while True:
         page = collection.get(limit=_PAGE, offset=offset, include=["metadatas", "documents"])
@@ -194,6 +210,13 @@ def census(collection, palace: Path) -> Census:
             if meta.get("room") == _REGISTRY_ROOM:
                 out.registry += 1
                 continue
+            if source.startswith(prefix):
+                group = groups.setdefault(source, {}).setdefault(
+                    meta.get("source_mtime"), [0, None]
+                )
+                group[0] += 1
+                if meta.get("chunk_total") is not None:
+                    group[1] = meta.get("chunk_total")
             row = (drawer_id, meta, text)
             out.real.append(row)
             if not source.startswith(prefix):
@@ -204,12 +227,25 @@ def census(collection, palace: Path) -> Census:
     on_disk = sorted(convos.glob("*.md")) if convos.is_dir() else []
     out.files = len(on_disk)
     out.unregistered = sum(str(here / path.name) not in recorded for path in on_disk)
+    out.short = sum(_short(groups.get(str(here / path.name))) for path in on_disk)
     return out
+
+
+def _short(groups: dict[object, list] | None) -> bool:
+    """Whether a file's drawers fall short of the count they record, in every ``source_mtime``.
+
+    MemPalace's rule: a group with no ``chunk_total`` is trusted, and one is complete once it holds
+    that many drawers. A file with no real drawers here is not short; it is unregistered, or
+    registered with a row only.
+    """
+    if not groups:
+        return False
+    return not any(total is None or seen >= int(total) for seen, total in groups.values())
 
 
 @dataclass
 class Forecast:
-    """What the next observe will do to the conversation files, per MemPalace's own dry run."""
+    """What a mine of the conversation files would do, per MemPalace's own dry run."""
 
     #: Files whose content is already filed elsewhere: each gets one registry row, no drawers.
     duplicate: int
@@ -218,10 +254,12 @@ class Forecast:
 
 
 def forecast(palace: Path, agent: str) -> Forecast | None:
-    """What the next observe will do: which files get a registry row and which are mined as new.
+    """What a mine of the directory would do: which files get a registry row, which are mined as new.
 
-    MemPalace's own dry-run mine of the directory, with the adapter's arguments, read off the
-    per-file lines it prints. ``None`` when those lines cannot be read, so a changed upstream format
+    MemPalace's own dry-run mine of the directory, with the arguments the adapter mined with until
+    0.164.0, read off the per-file lines it prints. A file the observe filed is skipped by it: its
+    drawers carry the ``source_mtime``, ``chunk_total`` and ``content_hash`` the miner decides by
+    (`MemPalaceMemoryProvider._file`), so it is neither new here nor, after a move, unrecognised. ``None`` when those lines cannot be read, so a changed upstream format
     is reported as unknown rather than as a forecast of nothing.
     """
     out = io.StringIO()
@@ -261,7 +299,7 @@ def accepted_hashes(collection) -> dict | None:
 
 
 def new_file_diagnosis(found: Census, convos: Path, name: str, accepted: dict | None) -> str:
-    """Why the next observe will mine ``name`` as new drawers, in counts, flags and one reason.
+    """Why a mine of the directory would file ``name`` as new drawers, in counts, flags and a reason.
 
     The first line is the file's record: the drawers filed under its name, their wings, hashes,
     ``normalize_version`` and extract mode, and whether today's content hash matches one of theirs.
@@ -300,9 +338,12 @@ def new_file_diagnosis(found: Census, convos: Path, name: str, accepted: dict | 
 
 
 def _today(path: Path) -> list[str]:
-    """The content hash of each conversation in a file, exactly as the miner computes them."""
-    conversations = [c for c in _import("normalize").normalize_conversations(str(path)) if c]
-    return [hashlib.sha256(c.strip().encode("utf-8")).hexdigest() for c in conversations]
+    """The content hash of each conversation in a file, exactly as the miner computes them.
+
+    The adapter's own function (`content_hashes`), the one the observe stamps on every drawer it
+    files, so what this check compares against is never spelled a second time.
+    """
+    return content_hashes(path)
 
 
 def _unrecognised(here: str, today: list[str], accepted: dict) -> list[str]:
@@ -431,12 +472,12 @@ def _counts(palace: Path) -> tuple[int, int]:
 def register_off_wing(provider: MemPalaceMemoryProvider, palace: Path, *, dry_run: bool) -> int:
     """Register each moved file whose content is filed only in another wing, in that wing.
 
-    The observe mines ``conversations/`` into wing ``conversations``, and MemPalace recognises a
-    moved file's content only within the mining wing, so a file once mined on its own into
-    another wing is filed again after a move: a second copy of each of its drawers (issue #606,
-    phase 4). Mining that one file in the wing its drawers already carry is recognised as a
-    duplicate, and writes **one registry row and no drawer**; the observe then skips the file by
-    its path. No drawer and no drawer metadata is touched (issue #613).
+    A mine of ``conversations/`` files into wing ``conversations`` (the observe's own, before
+    0.164.0), and MemPalace recognises a moved file's content only within the mining wing, so a
+    file once mined on its own into another wing is filed again after a move: a second copy of
+    each of its drawers (issue #606, phase 4). Mining that one file in the wing its drawers already carry is recognised as a
+    duplicate, and writes **one registry row and no drawer**; a mine then skips the file by its
+    path. No drawer and no drawer metadata is touched (issue #613).
 
     Acts only on files the dry-run forecast says will be mined as new **and** whose unrecognised
     content is filed in exactly one other wing (`off_wing`), taking the wing from those drawers.
@@ -851,9 +892,9 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "WRITES TO THE PALACE. Before the report, register each moved conversation file whose "
             "content is filed only in another wing, in the wing its drawers carry: one registry "
-            "row per file and no drawer, so the next observe does not file it again. Refuses, "
+            "row per file and no drawer, so a mine does not file it again. Refuses, "
             "writing nothing, if any such file would file a drawer. Run after a home move and "
-            "before the first wake. Add --dry-run to print what it would do."
+            "before the first wake or any mempalace mine. Add --dry-run to print what it would do."
         ),
     )
     parser.add_argument(
@@ -1019,7 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.practice_observe:
             seconds = practice_observe(provider)
             print(
-                f"practice observe: WROTE one exchange to this palace and mined it "
+                f"practice observe: WROTE one exchange to this palace and filed it "
                 f"({seconds:.1f}s). Practice copies only."
             )
         try:
@@ -1041,8 +1082,12 @@ def main(argv: list[str] | None = None) -> int:
             f"conversation files: {found.files}, "
             f"not yet registered at this location: {found.unregistered}"
         )
-        # The next-observe forecast names conversation files, and is the move check's business.
-        if found.unregistered and paths:
+        print(f"conversation files filed short of their drawers: {found.short}")
+        # The forecast names conversation files, and is the move check's business. Its line keeps
+        # the words "next observe" because the NOC's rename flow matches it whole (`FORECAST_RE` in
+        # basecradle-noc), as it does the "conversation files:" line above; it forecasts a mine of
+        # the directory, which since 0.164.0 the observe never runs (issue #741).
+        if (found.unregistered or found.short) and paths:
             predicted = forecast(palace, provider.agent)
             if predicted is None:
                 print(

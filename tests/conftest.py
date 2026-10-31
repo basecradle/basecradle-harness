@@ -6,6 +6,7 @@ any network — the SDK adapter is tested against real, SDK-valid response bodie
 responses follow the OpenAI chat-completions / Responses schemas.
 """
 
+import contextlib
 import importlib.util
 import json
 import pathlib
@@ -86,6 +87,18 @@ respx.mocks.DEFAULT_MOCKER = _HTTPCoreBothMocker.name
 # the suite here rather than raising a TypeError against the real library in production.
 _SEARCH_KWARGS = {"n_results", "candidate_strategy", "max_distance"}
 
+# The same for `convo_miner.file_conversation_exchange` (MemPalace 3.9.0 through 3.11.0, every
+# argument after the collection keyword-only), so the observe's call is held to its real signature.
+_FILE_KWARGS = {
+    "wing",
+    "room",
+    "text",
+    "source_file",
+    "agent",
+    "authored_at",
+    "extra_metadata",
+}
+
 
 #: The published ``mcp-mail-server@2.0.2`` ``tools/list`` response, captured verbatim by running
 #: the tarball's own server over stdio (issue #496). Its `send_email` schema is the one that killed
@@ -103,12 +116,19 @@ def mail_tool(name: str) -> dict:
 
 @pytest.fixture
 def fake_mempalace(monkeypatch):
-    """Install fake ``mempalace.convo_miner`` / ``mempalace.searcher`` / ``mempalace.palace``.
+    """Install fake ``mempalace.convo_miner`` / ``.searcher`` / ``.palace`` / ``.normalize``.
 
-    Returns the first two fakes so a test can assert how the adapter called them. ``mine_convos``
-    records its args; ``search_memories`` records the kwargs it was *passed* (not their
-    defaults — the `max_distance` tests turn on that distinction) and returns whatever the test
-    stashes on it.
+    Returns the first two fakes so a test can assert how the adapter called them.
+    ``file_conversation_exchange`` records each drawer it is asked to file in ``filed`` (its
+    keyword arguments, plus the palace the collection was opened on, under ``palace``, its id under
+    ``id`` and the text MemPalace stores, stripped, under ``stored``) and answers MemPalace's way: a
+    drawer id, or ``None`` for text that is blank once stripped. ``mine_convos``
+    records its args in ``calls`` (the observe never calls it; the palace check's forecast does).
+    ``palace.mine_lock`` records each path it locks in ``convo_miner.locked``, and a writable
+    collection answers ``get(where={"source_file": …})`` from ``filed`` and records its deletes in
+    ``convo_miner.deleted`` (a test makes either raise by setting ``convo_miner.refuse``). ``search_memories`` records the
+    kwargs it was *passed* (not their defaults — the `max_distance` tests turn on that
+    distinction) and returns whatever the test stashes on it.
 
     The palace is the fleet's (issue #625): MemPalace 3.10.0, a drawers collection that declares
     the cosine metric, so `search` passes ``max_distance=2.0`` by default. A test that needs
@@ -118,11 +138,29 @@ def fake_mempalace(monkeypatch):
     """
     convo_miner = types.ModuleType("mempalace.convo_miner")
     convo_miner.calls = []
+    convo_miner.filed = []
+    convo_miner.locked = []
+    convo_miner.deleted = []
+    convo_miner.refuse = None
 
     def mine_convos(convo_dir, palace_path, **kwargs):
         convo_miner.calls.append((convo_dir, palace_path, kwargs))
 
+    def file_conversation_exchange(collection, **kwargs):
+        unknown = set(kwargs) - _FILE_KWARGS
+        assert not unknown, f"MemPalace's file_conversation_exchange takes no {sorted(unknown)}"
+        if not (kwargs["text"] or "").strip():
+            return None
+        drawer = f"drawer_{len(convo_miner.filed) + 1}"
+        stored = kwargs["text"].strip()  # MemPalace strips the text it files
+        convo_miner.filed.append(
+            {**kwargs, "palace": collection.palace, "id": drawer, "stored": stored}
+        )
+        return drawer
+
     convo_miner.mine_convos = mine_convos
+    convo_miner.file_conversation_exchange = file_conversation_exchange
+    convo_miner.detect_convo_room = lambda content: "general"
 
     searcher = types.ModuleType("mempalace.searcher")
     searcher.result = {"results": []}
@@ -145,24 +183,52 @@ def fake_mempalace(monkeypatch):
                 raise searcher.metric
             return searcher.metric
 
+    class WritableCollection:
+        def __init__(self, palace_path):
+            self.palace = palace_path
+
+        def get(self, *, where, include):
+            if convo_miner.refuse is not None:
+                raise convo_miner.refuse
+            wanted = where["source_file"]
+            return {"ids": [d["id"] for d in convo_miner.filed if d["source_file"] == wanted]}
+
+        def delete(self, *, ids):
+            if convo_miner.refuse is not None:
+                raise convo_miner.refuse
+            convo_miner.deleted.extend(ids)
+
     palace = types.ModuleType("mempalace.palace")
 
     def get_collection(palace_path, **kwargs):
+        if not kwargs:  # the observe's own open: MemPalace's default, which creates the palace
+            return WritableCollection(palace_path)
         assert kwargs == {"create": False, "read_only": True}, kwargs
         searcher.opened += 1
         return Collection()
 
+    @contextlib.contextmanager
+    def mine_lock(source_file):
+        convo_miner.locked.append(source_file)
+        yield
+
     palace.get_collection = get_collection
+    palace.mine_lock = mine_lock
+
+    normalize = types.ModuleType("mempalace.normalize")
+    normalize.normalize_conversations = lambda path: [pathlib.Path(path).read_text("utf-8")]
 
     parent = types.ModuleType("mempalace")
     parent.convo_miner = convo_miner
     parent.searcher = searcher
     parent.palace = palace
+    parent.normalize = normalize
 
     monkeypatch.setitem(sys.modules, "mempalace", parent)
     monkeypatch.setitem(sys.modules, "mempalace.convo_miner", convo_miner)
     monkeypatch.setitem(sys.modules, "mempalace.searcher", searcher)
     monkeypatch.setitem(sys.modules, "mempalace.palace", palace)
+    monkeypatch.setitem(sys.modules, "mempalace.normalize", normalize)
     monkeypatch.setattr(_mempalace, "mempalace_version", lambda: "3.10.0")
     return convo_miner, searcher
 
