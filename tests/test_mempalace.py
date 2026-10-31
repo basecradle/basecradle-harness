@@ -1343,9 +1343,12 @@ def test_missing_mempalace_degrades_to_an_actionable_error(tmp_path, monkeypatch
     (`_run_tool`), so a missing extra costs the call, never the wake — and what the model then
     reads names the extra to install rather than a raw "No module named" trace.
     """
-    # Ensure no fake is present and the real package is absent.
+    # Block the import outright rather than rely on the extra being absent: with it installed, a
+    # removed module would import for real, and the observe below would write a real palace and
+    # leave MemPalace's lock file in the developer's own ``~/.mempalace`` (issue #630's class).
+    # A ``None`` entry in ``sys.modules`` makes ``import`` raise ``ImportError``.
     for name in ("mempalace", "mempalace.convo_miner", "mempalace.searcher"):
-        monkeypatch.delitem(sys.modules, name, raising=False)
+        monkeypatch.setitem(sys.modules, name, None)
     palace = tmp_path / "palace"
     palace.mkdir()  # exists, so search reaches the lazy import rather than short-circuiting
     provider = MemPalaceMemoryProvider(palace)
