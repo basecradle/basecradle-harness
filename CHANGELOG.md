@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.162.0] - 2026-10-31
+
+### Fixed: Turn-0 recall searched only the batch's newest message (issue #744)
+
+Recall ranked the palace against `batch[-1]`. #226's batching narrowed it from the whole message, with
+no stated reason. `MemoryScope.query`'s contract is the incoming turn's text. On a first wake the turn
+is often a pointer ("the two questions are in the message above"), so the palace was searched for the
+pointer's words. Live on `@fred`, and reproduced locally on his verbatim palace with an identical
+candidate pool, the reranker kept the fact drawers in one wake and dropped them in the next. In the
+wake that dropped them, the agent declined to answer.
+
+- The query now leads with the newest message, whole: exactly the old query, so nothing a wake
+  searched for before is lost. After it come the batch's earlier messages, then, on a first wake,
+  the seeded peer backlog. Both run newest first and share one cap, `RECALL_CONTEXT_CAP` (1,000
+  characters). The backlog is the same set memory mines: never the agent's own posts, never a NOC
+  probe.
+- Measured bound: the query is at most the newest message plus 1,001 characters, at any burst or
+  backlog size. Against 0.161.4 it grows by at most ~1,000 characters, and so does the reranker's
+  prompt (9.5K → 10.5K at 20 candidates).
+
 ## [0.161.4] - 2026-10-31
 
 ### Fixed: Anthropic's web tools fail when the model calls them directly (issue #740)
