@@ -302,6 +302,23 @@ def test_a_steps_results_travel_as_one_user_message_with_the_results_first(route
     }
 
 
+def test_both_web_tools_may_be_called_directly_and_from_the_sandbox(router):
+    """Issue #740: at the default (the sandbox alone) a direct call arrives malformed and fails."""
+    adapter = AnthropicProvider(
+        MODEL, api_key=FAKE_KEY, max_tokens=64, builtin_tools=["web_fetch", "web_search"]
+    )
+    route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
+    adapter.chat([Message.user("hi")])
+    adapter.chat([Message.user("hi")])
+    for call in (0, 1):
+        sent = {tool["name"]: tool for tool in body(route, call)["tools"]}
+        for name in ("web_fetch", "web_search"):
+            assert sent[name]["allowed_callers"] == ["direct", "code_execution_20260120"]
+    # The definition the adapter holds is its own copy, so nothing done to it reaches the module's.
+    adapter._builtins[0]["allowed_callers"].append("tampered")
+    assert BUILTINS["web_search"]["allowed_callers"] == ["direct", "code_execution_20260120"]
+
+
 def test_the_tool_list_is_byte_stable_server_tools_first_then_sorted(router):
     adapter = AnthropicProvider(
         MODEL, api_key=FAKE_KEY, max_tokens=64, builtin_tools=["code_execution", "web_search"]
@@ -312,7 +329,11 @@ def test_the_tool_list_is_byte_stable_server_tools_first_then_sorted(router):
     first, second = body(route, 0)["tools"], body(route, 1)["tools"]
     assert first == second
     assert first == [
-        {"type": "web_search_20260318", "name": "web_search"},
+        {
+            "type": "web_search_20260318",
+            "name": "web_search",
+            "allowed_callers": ["direct", "code_execution_20260120"],
+        },
         {"type": "code_execution_20260521", "name": "code_execution"},
         {
             "name": "add",

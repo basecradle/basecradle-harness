@@ -257,10 +257,10 @@ def test_a_web_search_runs_server_side_and_its_fee_is_logged(caplog):
     media = _lines(caplog, "media provider=anthropic kind=search.web")
     assert sum(int(_field(line, "count")) for line in media) == searches  # one per billed call
     assert sum(float(_field(line, "cost")) for line in media) == pytest.approx(searches * 0.01)
-    # With dynamic filtering (web_search_20260318) the search runs inside Anthropic's code
-    # execution and the model cites its sources in its own words, when it does: no citation blocks
-    # arrive, so no Sources: footer is built (measured 2026-10-31). What is pinned is the vendor's
-    # own result — a successful search result list carrying real URLs, kept for the next step.
+    # With dynamic filtering (web_search_20260318) a search the model runs from Anthropic's code
+    # execution comes back with no citation blocks, so no Sources: footer is built (measured
+    # 2026-10-31); since issue #740 it may also call the search directly. Neither is pinned: what
+    # is pinned is the vendor's own result — a successful result list carrying real URLs.
     assert answer.content
     kept = next(iter(adapter._replies.values()))[1]
     results = [b["content"] for b in kept if b.get("type") == "web_search_tool_result"]
@@ -279,6 +279,39 @@ def test_a_web_fetch_reads_a_url_given_in_the_user_turn(caplog):
     assert "server tool failed" not in caplog.text
     kept = next(iter(adapter._replies.values()))[1]
     assert any(block.get("type") == "web_fetch_tool_result" for block in kept)
+
+
+@needs_key
+@pytest.mark.parametrize(
+    ("builtin", "prompt", "result_type"),
+    [
+        (
+            "web_fetch",
+            "Fetch https://example.com and tell me its exact title.",
+            "web_fetch_tool_result",
+        ),
+        ("web_search", "What is the current stable version of Python?", "web_search_tool_result"),
+    ],
+)
+def test_a_web_tool_called_directly_runs(caplog, builtin, prompt, result_type):
+    """Issue #740: the model's own call, not one from the sandbox, is accepted and succeeds.
+
+    ``tool_choice`` forces the direct call the model sometimes makes on its own, which a passing
+    test cannot otherwise count on (the natural fetch above may run from the sandbox). At
+    Anthropic's default ``allowed_callers`` the forced request is refused with a 400, and an
+    unforced direct call arrives with wrapped arguments and fails ``invalid_tool_input``.
+    """
+    adapter = _provider(builtin_tools=[builtin], tool_choice={"type": "tool", "name": builtin})
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        adapter.chat([Message.user(prompt)])
+    assert "server tool failed" not in caplog.text
+    kept = next(iter(adapter._replies.values()))[1]
+    results = [block for block in kept if block.get("type") == result_type]
+    # The forced call is direct; the model may follow it with one from the sandbox, which is fine.
+    assert any(result.get("caller") == {"type": "direct"} for result in results), results
+    for result in results:
+        content = result["content"]
+        assert not (isinstance(content, dict) and content.get("error_code")), content
 
 
 @needs_key

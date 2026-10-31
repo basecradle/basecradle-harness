@@ -7,6 +7,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.161.4] - 2026-10-31
+
+### Fixed: Anthropic's web tools fail when the model calls them directly (issue #740)
+
+`web_fetch_20260318` and `web_search_20260318` default `allowed_callers` to Anthropic's
+code-execution sandbox alone, and the adapter sent them without it. The model is then given no
+direct schema for either tool, while the brief names both as tools it holds. When it called one
+directly it wrapped its arguments (`{"params": {"url": …}}`) or sent `{}`, and the tool answered
+`invalid_tool_input`. Live on `@fred`, two fetches failed this way before the model ran the same
+fetch from inside code execution. Forcing a direct call at the default is a 400 that says the tool
+"only allows calls from ['code_execution_20260120']".
+
+- Both web tools are now sent with `allowed_callers: ["direct", "code_execution_20260120"]`
+  (`_anthropic.WEB_CALLERS`): Anthropic's own default with `direct` added, so dynamic filtering from
+  the sandbox is kept.
+- Measured on `claude-haiku-5-5` under a harness-shaped brief, eight requests an arm: at the default,
+  3 of 4 direct fetches and 8 of 14 direct searches failed. With the fix, 0 of 8 and 0 of 9 failed,
+  and a fetch from the sandbox still succeeded.
+- The live gate now forces a direct call to each tool with `tool_choice` and requires a direct call
+  that succeeded, with no failed result. It is red at the old default.
+- The tool list's bytes change, so each Anthropic agent's cached prefix is written once more on its
+  first wake after the upgrade.
+
 ## [0.161.3] - 2026-10-31
 
 ### Fixed: the backlog a first wake seeds as context is mined into memory (issue #733)
