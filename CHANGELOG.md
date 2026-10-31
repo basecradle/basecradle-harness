@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.163.0] - 2026-10-31
+
+### Changed: Turn-0 recall skips what this wake just filed from its seeded backlog (issue #746)
+
+0.161.3 (#733) mines a first wake's seeded backlog before the turn, so a wake killed in the model
+call cannot lose it, and 0.162.0 (#744) puts that backlog in the recall query. Together they made
+the drawers just filed the closest matches by construction. On `@fred`'s verbatim palace (rerank
+on, 10 injected) 4 of the 10 Turn-0 slots went to the question the model was answering in its own
+transcript.
+
+- **`MemoryExchange.seeded`** (new, defaults to `False`) marks an exchange observed from a first
+  wake's seeded backlog. A provider that ignores it behaves as before.
+- **The MemPalace provider records the files it wrote for a seeded exchange** and drops their
+  drawers from **this wake's Turn-0 recall** before the pool is cut. The search widens past them
+  the way it widens past registry sentinels, so the slots go to other memories, and a reranker
+  never sees them. Matching is by file name, so a home that moved does not defeat it.
+- **Nothing else is excluded.** The `memory_search` tool still returns them (a deliberate search
+  sees everything), and so does every later wake's recall. A turn's own exchange is never
+  excluded, and neither is every drawer from the current timeline, because a compacted transcript
+  no longer holds its early turns.
+- **`MemoryProvider.begin_wake()`** (new, a no-op by default) is called at the start of every
+  `WakeAgent.wake()`. The MemPalace provider clears its record there, so a second wake in one
+  process recalls the first one's seed like any memory.
+- **The `memory recall` line carries `excluded=`** when the Turn-0 recall dropped any.
+
 ## [0.162.0] - 2026-10-31
 
 ### Fixed: recalled memory says whose record it is, when it was filed and which timeline it came from (issue #733)

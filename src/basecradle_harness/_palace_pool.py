@@ -383,7 +383,7 @@ def _measure(provider, collection, texts, total, facts, pool, self_query) -> Non
         facts.nearest = max(near, key=lambda pair: (pair[1], pair[0]))
 
     # Today's fetch, exactly as `search` makes it: its width and the sentinels it dropped.
-    _, width, sentinels = provider._ranking(
+    _, width, sentinels, _ = provider._ranking(
         query, ask=TODAY_ASK, need=TODAY_ASK, surface=SURFACE, max_distance=threshold
     )
     facts.fetch, facts.sentinels = width, sentinels
@@ -460,7 +460,7 @@ def _measure(provider, collection, texts, total, facts, pool, self_query) -> Non
 
     # The first wider ask whose pool holds it, fetched exactly as `search` fetches.
     for ask in LADDER:
-        hits, _, _ = provider._ranking(
+        hits, _, _, _ = provider._ranking(
             query, ask=ask, need=ask, surface=SURFACE, max_distance=threshold
         )
         if drawer in [hit.get("drawer_id") for hit in hits[:ask]]:

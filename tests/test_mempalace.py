@@ -789,6 +789,99 @@ def test_the_recall_line_names_dropped_sentinels_only_when_there_were_some(
     assert "injected=5" in polluted
 
 
+# --- this wake's seeded backlog stays out of its own Turn-0 recall (issue #746) ----------------
+
+TIMELINE = "019e7750-66ee-7f53-829f-13a8a710b6da"
+
+
+def _filed(path, text):
+    """A drawer as the searcher returns it, mined from the conversation file at ``path``."""
+    return {"text": text, "source_file": str(path), "room": "technical"}
+
+
+def _seed(provider, user, *, seeded=True):
+    """Observe one exchange and return the conversation file it wrote."""
+    convos = provider.palace_path / "conversations"
+    before = set(convos.glob("*.md")) if convos.exists() else set()
+    provider.observe(
+        MemoryExchange(
+            user=user,
+            assistant="",
+            scope=MemoryScope(agent="a", timeline=TIMELINE),
+            seeded=seeded,
+        )
+    )
+    (path,) = set(convos.glob("*.md")) - before
+    return path
+
+
+def test_turn0_recall_refills_the_slots_this_wakes_seed_would_have_taken(
+    fake_mempalace, tmp_path, caplog
+):
+    """The seed's drawers are dropped before the cut, so the slots go to other memories.
+
+    Filtering *after* the cut would have injected 6 of 10 on `@fred`'s palace instead of 10; the
+    drop widens the fetch exactly as a registry sentinel does, and the line says how many it took.
+    """
+    _, searcher = fake_mempalace
+    provider = MemPalaceMemoryProvider(tmp_path / "palace", n_results=5, reranker=None)
+    seeds = [_seed(provider, f"> question part {n}") for n in range(4)]
+    pool = _unranked(5)
+    filed = [_filed(path, f"question part {n}") for n, path in enumerate(seeds)]
+    # The seed's drawers fill the whole first page, as a long backlog's can.
+    _ranked(searcher, (filed * pool)[:pool] + [_memory(n) for n in range(60)])
+    caplog.set_level("INFO", logger="basecradle_harness")
+
+    block = provider.context(_scope(query="question"))
+
+    assert "question part" not in block
+    assert [f"AZURE-{n:04d}" in block for n in range(5)] == [True] * 5
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("memory recall")]
+    # The first page was all seed, so the fetch widened past it; the wider one dropped the same.
+    assert "injected=5" in line and "sentinels=" not in line
+    assert f"excluded={pool}" in line and f"fetched={2 * pool}" in line
+
+
+def test_the_tool_and_a_later_wake_still_find_what_this_wake_seeded(fake_mempalace, tmp_path):
+    """Kept out of one place only: this wake's Turn 0. A deliberate search sees everything, and
+    the next wake recalls it like any memory — on a new provider or on this one after
+    `begin_wake` — because by then a compacted transcript may no longer hold it."""
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    provider = MemPalaceMemoryProvider(palace, reranker=None)
+    path = _seed(provider, "> Your codename is AMBER-FOX-17.")
+    searcher.result = {"results": [_filed(path, "Your codename is AMBER-FOX-17.")]}
+
+    assert provider.context(_scope(query="codename")) is None  # nothing else to recall
+    (tool,) = provider.tools()
+    assert "AMBER-FOX-17" in tool.run("codename")
+    later = MemPalaceMemoryProvider(palace, reranker=None)
+    assert "AMBER-FOX-17" in later.context(_scope(query="codename"))
+    # The same provider serving a second wake in one process (`WakeAgent.wake()` again).
+    provider.begin_wake()
+    assert "AMBER-FOX-17" in provider.context(_scope(query="codename"))
+
+
+def test_only_a_seeded_exchange_is_kept_out_and_it_is_matched_by_file_name(
+    fake_mempalace, tmp_path
+):
+    """The rule is the narrow one: a turn's own exchange is recalled even in the wake that filed
+    it, and a seeded file is recognised by its name wherever its recorded path says it lives
+    (a home that moved, issue #606)."""
+    _, searcher = fake_mempalace
+    provider = MemPalaceMemoryProvider(tmp_path / "palace", reranker=None)
+    seeded = _seed(provider, "> seeded fact")
+    turn = _seed(provider, "> the turn's own words", seeded=False)
+    moved = Path("/home/old-name/.harness/palace/conversations") / seeded.name
+    searcher.result = {
+        "results": [_filed(moved, "seeded fact"), _filed(turn, "the turn's own words")]
+    }
+
+    block = provider.context(_scope(query="fact"))
+
+    assert "the turn's own words" in block and "seeded fact" not in block
+
+
 def test_the_ranking_call_is_the_pool_a_reranker_is_handed(fake_mempalace, tmp_path):
     """The palace check's arm A (issue #617) fetches through `_ranking` with the reranked ask; it
     measures the reranked path only while that is exactly what `search` hands a bound reranker,
@@ -814,7 +907,7 @@ def test_the_ranking_call_is_the_pool_a_reranker_is_handed(fake_mempalace, tmp_p
     pool = candidate_pool(10, reranked=True)
 
     provider.search("hey nova", 10)
-    hits, fetch, sentinels = provider._ranking("hey nova", ask=pool, need=pool, surface="tool")
+    hits, fetch, sentinels, _ = provider._ranking("hey nova", ask=pool, need=pool, surface="tool")
 
     assert recorder.pools == [hits[:pool]]
     assert (fetch, sentinels) == (2 * pool, 7)

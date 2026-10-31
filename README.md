@@ -179,6 +179,8 @@ Three things enforce it, and the first two are the fix:
 
 However large the burst and however much is seeded, the query is the newest message plus at most 1,001 characters. With 20 candidates, that adds at most about 1,000 characters to the reranker's prompt (9.5K → 10.5K).
 
+**Turn-0 recall skips what this wake just filed from its seeded backlog** ([issue #746](https://github.com/basecradle/basecradle-harness/issues/746)). That backlog is mined before the turn, and the query carries it, so its drawers are the closest matches by construction. On one agent's palace they took 4 of the 10 injected slots with the very question the model was reading in its transcript. They are now dropped from the Turn-0 ranking before the pool is cut, so those slots go to other memories. The rule is narrow on purpose: only the conversation files this wake wrote from its seed, never every drawer from the current timeline (a compacted transcript no longer holds its early turns). The `memory_search` tool still returns them, and so does every later wake's recall.
+
 ### Let a model pick what gets recalled — the LLM reranker
 
 Hybrid search (vectors + BM25) decides what your agent remembers by *similarity*. MemPalace's own LongMemEval numbers say the single biggest step left is not a better index but **an LLM reading the candidate pool and choosing** — and upstream ships that only inside a benchmark script. The harness uses MemPalace's library API, so the reranker lives here, on the one `search` call both memory surfaces already share: the hybrid search fetches a **pool** of `max(20, 2 × requested)` candidates, a model picks the best of them, and those come back in its order. Turn-0 injection and the `memory_search` tool both get it, and neither can drift from the other.
@@ -1390,6 +1392,8 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   ```
   INFO memory recall provider=mempalace surface=turn0 rerank=off pool=40 injected=10 duration=0.31s chars=6461 max_distance=2.0 sentinels=44 fetched=80
   ```
+
+  `excluded=` appears only on a first wake's Turn-0 line, and counts the drawers that wake filed from its seeded backlog and kept out of its own recall ([above](#swap-the-memory-backend--the-memory-provider)). They widen the fetch the same way sentinels do.
 
   `max_distance=2.0` is there when the search passed the threshold, and absent when it did not ([above](#swap-the-memory-backend--the-memory-provider)).
 

@@ -367,7 +367,7 @@ def fetch(
     """
     started = time.monotonic()
     threshold = provider.distance_threshold()[0] if arm.as_search else arm.max_distance
-    hits, width, _ = provider._ranking(
+    hits, width, _, _ = provider._ranking(
         probe.query, ask=arm.ask, need=arm.ask, surface=SURFACE, max_distance=threshold
     )
     return hits[: arm.ask], width, time.monotonic() - started

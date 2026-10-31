@@ -80,11 +80,18 @@ class MemoryExchange:
         assistant: The agent's reply.
         scope: Whose memory this exchange belongs to (see `MemoryScope`); ``query`` is
             unset here — observation captures what *happened*, it does not retrieve.
+        seeded: ``True`` when this is a message a first wake seeded into the transcript as
+            context (a user-only exchange, observed before the turn), not a turn the agent
+            answered. The model is reading it in its transcript for the rest of this wake, so a
+            provider may keep what it files from it out of **this wake's** Turn-0 `context`
+            (issue #746) — and must still return it from a deliberate search. A provider that
+            ignores the flag behaves exactly as before it existed.
     """
 
     user: str
     assistant: str
     scope: MemoryScope
+    seeded: bool = False
 
 
 class MemoryProvider(ABC):
@@ -115,6 +122,15 @@ class MemoryProvider(ABC):
     def context(self, scope: MemoryScope) -> str | None:
         """Prompt-ready memory to inject at Turn 0, or ``None``. Default: no-op."""
         return None
+
+    def begin_wake(self) -> None:
+        """A new wake begins on this provider. Default: no-op.
+
+        One provider can serve more than one wake in a process (a library caller that calls
+        ``WakeAgent.wake()`` again), so state a provider keeps *for one wake* is reset here, never
+        in the constructor alone. The MemPalace adapter forgets which files the previous wake filed
+        from its seeded backlog (issue #746), so a later wake recalls them like any memory.
+        """
 
     def close(self) -> None:
         """Release any resources (e.g. close the store). Default: no-op."""
