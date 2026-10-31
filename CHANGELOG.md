@@ -7,6 +7,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.161.1] - 2026-10-31
+
+### Fixed: an Anthropic turn calling a server tool and a client tool together failed on its next step (issue #735)
+
+When one response called a server tool (`web_fetch`, `web_search`, `code_execution`) and a client
+tool (`messages`) in parallel, Anthropic stopped for the client's results before running the server
+tool. The adapter sends the raw blocks back with those results, and Anthropic resumes the group
+only if the message answering it holds `tool_result` blocks and nothing else. The engine's
+step-counter note follows every step's results, and the adapter merged it into that message as a
+trailing text block, so every such group was a 400 (*"`web_fetch` tool use … was found without a
+corresponding `web_fetch_tool_result` block"*) and the wake failed. Probed live against the API on
+2026-10-31: `[tool_result]` alone is accepted, and so is the text folded into the result's
+`content`; `[tool_result, text]` is refused. It had failed this way since 0.158.0.
+
+- After an assistant turn carrying a `server_tool_use` with no result, the adapter folds the
+  answering message's trailing blocks (the step note, any system note, an injected image) into the
+  last `tool_result`'s `content`, in order; a breakpoint one of them carried moves to that result.
+  The step note still reaches the model.
+- A new live gate draws a real mixed reply and continues it through the adapter with a step note
+  aboard. It was proven red with the fold disabled (the vendor's 400) and green with it.
+
 ## [0.161.0] - 2026-10-31
 
 ### Added: server-side tool activity leaves a record a later wake can read (issue #727)

@@ -364,3 +364,45 @@ def test_a_wrong_key_is_the_credential_class():
     adapter = AnthropicProvider(MODEL, api_key="sk-ant-api03-not-a-real-key-000000", max_tokens=16)
     with pytest.raises(ProviderAuthError):
         adapter.chat([Message.user("hi")])
+
+
+POST_TOOL = ToolSpec(
+    name="post_message",
+    description="Post a short message to the user's timeline.",
+    parameters={
+        "type": "object",
+        "properties": {"body": {"type": "string"}},
+        "required": ["body"],
+    },
+)
+
+
+@needs_key
+def test_a_mixed_server_and_client_group_is_continued_with_the_step_note_aboard():
+    """Issue #735: a server tool and a client tool in one group, then a step with a trailing note.
+
+    The engine always follows a step's tool results with its step-counter note, a trailing text
+    block in the same user message, which Anthropic answers with a 400 naming the server tool's
+    missing result. The adapter folds it into the last result. A model that does not split the
+    group this time cannot test it, so the attempt is retried a few times and skipped, not passed,
+    if no mixed reply is ever drawn.
+    """
+    ask = Message.user(
+        "In ONE response, call BOTH tools in parallel right away: web_fetch https://example.com "
+        "AND post_message with body 'Fetching now.'. Do not wait for one before the other."
+    )
+    for _ in range(4):
+        adapter = _provider(builtin_tools=["web_fetch"])
+        step = adapter.chat([ask], tools=[POST_TOOL])
+        kept = adapter._replies[id(step)][1]
+        uses = {b.get("id") for b in kept if b.get("type") == "server_tool_use"}
+        answered = {b.get("tool_use_id") for b in kept if b.get("type", "").endswith("_result")}
+        if step.tool_calls and uses - answered:
+            break
+    else:
+        pytest.skip("the model never drew a mixed server+client group; nothing was tested")
+    convo = [ask, step]
+    convo += [Message.tool(call.id, "posted") for call in step.tool_calls]
+    convo.append(Message.system("Current Time: 2026-10-31 12:00:00 UTC\nStep 2 of 24."))
+    answer = adapter.chat(convo, tools=[POST_TOOL])  # a 400 here is the defect
+    assert "example domain" in (answer.content or "").lower() or answer.tool_calls

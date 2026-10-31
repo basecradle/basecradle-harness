@@ -1349,3 +1349,56 @@ def test_a_server_tool_the_vendor_reports_as_failed_is_marked_failed(router, pro
         "https://example.com/gone",
         "url_not_accessible",
     )
+
+
+# === a mixed server+client group is continued with tool results only (issue #735) ==============
+
+
+def test_a_trailing_note_after_a_pending_server_tool_is_folded_into_the_result(router, provider):
+    fetch = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01P",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com"},
+    }
+    route = router.post(MESSAGES).mock(
+        side_effect=[
+            reply(fetch, tool_use("toolu_01C", TOOL.name, {"label": "x"}), stop_reason="tool_use"),
+            reply(text("done")),
+        ]
+    )
+    convo = [Message.user("fetch it and get the number")]
+    step = provider.chat(convo, tools=[TOOL])
+    convo += [step, Message.tool("toolu_01C", "7"), Message.system("Step 2 of 24.")]
+    provider.chat(convo, tools=[TOOL])
+    answering = body(route, 1)["messages"][2]
+    assert answering["role"] == "user"
+    assert [b["type"] for b in answering["content"]] == ["tool_result"]  # results only
+    (result,) = answering["content"]
+    assert result["content"] == [
+        {"type": "text", "text": "7"},
+        {"type": "text", "text": SYSTEM_LABEL + "Step 2 of 24."},
+    ]
+    assert result["cache_control"] == TAIL  # the tail moved with the note it was on
+
+
+def test_a_server_tool_already_answered_in_its_reply_leaves_the_next_message_alone(
+    router, provider
+):
+    route = router.post(MESSAGES).mock(
+        side_effect=[
+            reply(
+                SEARCH_USE,
+                SEARCH_RESULT,
+                tool_use("toolu_01C", TOOL.name, {"label": "x"}),
+                stop_reason="tool_use",
+            ),
+            reply(text("done")),
+        ]
+    )
+    convo = [Message.user("search, then get the number")]
+    step = provider.chat(convo, tools=[TOOL])
+    convo += [step, Message.tool("toolu_01C", "7"), Message.system("Step 2 of 24.")]
+    provider.chat(convo, tools=[TOOL])
+    answering = body(route, 1)["messages"][2]
+    assert [b["type"] for b in answering["content"]] == ["tool_result", "text"]
