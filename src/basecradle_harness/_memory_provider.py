@@ -80,11 +80,18 @@ class MemoryExchange:
         assistant: The agent's reply.
         scope: Whose memory this exchange belongs to (see `MemoryScope`); ``query`` is
             unset here — observation captures what *happened*, it does not retrieve.
+        seeded: ``True`` when this is a message a first wake seeded into the transcript as
+            context (a user-only exchange, observed before the turn), not a turn the agent
+            answered. The model is reading it in its transcript for the rest of this wake, so a
+            provider may keep what it files from it out of **this wake's** Turn-0 `context`
+            (issue #746) — and must still return it from a deliberate search. A provider that
+            ignores the flag behaves exactly as before it existed.
     """
 
     user: str
     assistant: str
     scope: MemoryScope
+    seeded: bool = False
 
 
 class MemoryProvider(ABC):

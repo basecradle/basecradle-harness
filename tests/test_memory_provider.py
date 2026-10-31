@@ -254,6 +254,7 @@ FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
 NOVA_UUID = "019e7750-66ee-79c8-ad8a-bbb6ea7c2bcc"  # the agent (me)
 JOHN_UUID = "019e7750-66ee-7e50-9e54-3bf8c3d6a8f1"  # the human
 TIMELINE_UUID = "019e7750-66ee-7f53-829f-13a8a710b6da"
+OTHER_TIMELINE = "019e7740-1d2e-7a3b-8c4d-5e6f7a8b9c0d"  # another of the agent's timelines
 MSELF = "019e7750-9a9a-7b7b-8c8c-0a0b0c0d0e0f"  # the agent's own prior post (oldest)
 M0 = "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"
 M1 = "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70"
@@ -532,6 +533,8 @@ def test_a_first_wake_observes_the_backlog_it_seeded_as_context(platform, tmp_pa
     assert seeded.user == f"[2026-06-04T00:00:00.000Z] john: {FACT}"  # the live dialogue shape
     assert seeded.assistant == ""
     assert seeded.scope.agent == NOVA_UUID and seeded.scope.timeline == TIMELINE_UUID
+    # Each says which it is, so a provider can keep the seed out of this wake's recall (#746).
+    assert (seeded.seeded, turn.seeded) == (True, False)
 
 
 def test_the_seeded_backlog_keeps_out_what_the_live_path_never_mines(platform, tmp_path):
@@ -834,6 +837,63 @@ def test_the_recall_query_keeps_out_own_posts_and_probes(platform, tmp_path):
 
     (scope,) = provider.context_scopes
     assert scope.query == f"{STAMP} john: {POINTER}\n{STAMP} john: {FACT}"
+
+
+def test_turn0_recall_skips_what_this_wake_filed_from_its_seed_and_the_tool_does_not(
+    platform, tmp_path, fake_mempalace, monkeypatch
+):
+    """This wake's seeded backlog never spends a Turn-0 slot; a deliberate search still finds it.
+
+    **The measured cost on `@fred`** (issue #746): a first wake files its seeded backlog before the
+    turn (#733), and the recall query carries that backlog (#744), so the drawers just filed were
+    the closest matches by construction — 4 of 10 injected slots went to the question the model was
+    reading in its transcript. Here the searcher ranks every drawer it holds, this wake's first, as
+    the real palace did, and one slot is all there is: the old memory must win it.
+    """
+    monkeypatch.delenv("HARNESS_MEMPALACE_RERANK_MODEL", raising=False)
+    _, searcher = fake_mempalace
+    palace = tmp_path / "palace"
+    old = {
+        "text": "> [2026-06-01T00:00:00.000Z] john: I live in Dallas.",
+        "source_file": f"/elsewhere/conversations/{OTHER_TIMELINE}.{'a' * 32}.md",
+        "room": "technical",
+    }
+
+    def search_memories(query, palace_path, **kwargs):
+        # Everything mined so far, this wake's files first: the shape that cost Fred his slots.
+        filed = [
+            {"text": path.read_text(), "source_file": str(path), "room": "technical"}
+            for path in sorted((palace / "conversations").glob("*.md"))
+        ]
+        return {"results": (filed + [old])[: kwargs["n_results"]]}
+
+    searcher.search_memories = search_memories
+    provider = MemPalaceMemoryProvider(palace, n_results=1, reranker=None)
+    recalled: list[str | None] = []
+    context = provider.context
+
+    def spy(scope):
+        recalled.append(context(scope))
+        return recalled[-1]
+
+    provider.context = spy
+    _serve_messages(
+        platform,
+        {
+            "messages": [_message(uuid=M1, body=POINTER), _message(uuid=BRIEF, body=FACT)],
+            "next_cursor": None,
+        },
+    )
+
+    _wake(tmp_path / "home", provider).wake()
+
+    (block,) = recalled
+    assert "I live in Dallas." in block
+    assert "AMBER-FOX-17" not in block
+    # The deliberate surface sees everything, this wake's seed included. (By now the turn's own
+    # exchange is filed too, so it asks for room for all three.)
+    (tool,) = provider.tools()
+    assert "AMBER-FOX-17" in tool.run("codename", n_results=3)
 
 
 def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):

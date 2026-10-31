@@ -3173,7 +3173,7 @@ class WakeAgent:
         _log.debug("memory %s", kv(op="recall", chars=len(recalled or "")))
         return recalled
 
-    def _observe(self, user: str, assistant: str) -> None:
+    def _observe(self, user: str, assistant: str, *, seeded: bool = False) -> None:
         """Hand a completed exchange to the memory provider's `observe` hook, guarded.
 
         **The one place the harness mines, and therefore the one place the boundary is kept**
@@ -3198,7 +3198,8 @@ class WakeAgent:
           that is genuinely mined.
 
         Fires after each real exchange (never on a probe ack or a self-skip — those never
-        reach here). A no provider, or one whose hook is a no-op (the default SQLite
+        reach here), and before the turn for a first wake's seeded backlog, which says so
+        (``seeded``, issue #746). A no provider, or one whose hook is a no-op (the default SQLite
         provider), does nothing. A hook that *raises* is swallowed: auto-capture is a
         best-effort side channel and must never break the wake or drop the reply that already
         posted.
@@ -3217,6 +3218,7 @@ class WakeAgent:
                     user=user,
                     assistant=assistant,
                     scope=MemoryScope(agent=self.me_uuid, timeline=self.timeline_uuid),
+                    seeded=seeded,
                 )
             )
         except Exception:  # noqa: BLE001 - a memory hook must never break the wake; swallow it
@@ -3247,15 +3249,22 @@ class WakeAgent:
         **Called before the turn, and that order is the point.** `Session.send` persists the seeded
         history before the model is called, and once it has, no later bootstrap seeds it again; a
         wake killed in the model call — a signal skips any ``finally`` — would otherwise have lost
-        the backlog from memory for good. The price is one wake whose recall may hand back backlog
-        the model is also reading in its transcript. A bootstrap whose transcript never persisted
-        (the turn ended before `send`) seeds and observes the same messages again on a later wake;
-        MemPalace drops a conversation whose content it already holds as a duplicate.
+        the backlog from memory for good. A bootstrap whose transcript never persisted (the turn
+        ended before `send`) seeds and observes the same messages again on a later wake; MemPalace
+        drops a conversation whose content it already holds as a duplicate.
+
+        **Each exchange says it was seeded** (`MemoryExchange.seeded`, issue #746), because that
+        order had a price: this wake's Turn-0 recall, which ranks against this same backlog
+        (`_recall_query`), handed it straight back. On `@fred`'s palace 4 of the 10 injected slots
+        went to the question the model was answering in its transcript. The flag lets the provider
+        keep what *this wake* filed from the seed out of this wake's Turn-0 recall, and nothing
+        else: a deliberate `memory_search` still finds it, and so does every later wake — by then a
+        compacted transcript may no longer hold it.
         """
         if self.memory_provider is None:
             return
         for message in self._seeded_peers(seeded)[-DEFAULT_CONTEXT_MESSAGES:]:
-            self._observe(_dialogue_of(message, _MESSAGES), "")
+            self._observe(_dialogue_of(message, _MESSAGES), "", seeded=True)
 
     def _seeded_peers(self, seeded: list[object]) -> list[object]:
         """The peer messages in a first wake's seeded backlog, oldest first.

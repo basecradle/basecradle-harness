@@ -302,6 +302,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
         # The `max_distance` decision, once it has been made on a definitive reading. See
         # `distance_threshold`.
         self._threshold: tuple[float | None, str] | None = None
+        # The names of the conversation files `observe` wrote this wake from a first wake's seeded
+        # backlog (`MemoryExchange.seeded`, issue #746): what `context` keeps out of Turn-0 recall.
+        self._seeded_files: set[str] = set()
         # No host-local SQLite store of our own — MemPalace is the engine. The base
         # `store` attribute stays None, which is correct for a middleware provider.
 
@@ -315,6 +318,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
         follows it into one unit) under ``<palace>/conversations/``, then mines that
         directory. MemPalace tracks already-mined files, so re-mining only ingests the
         file just written. An empty exchange (no user text *and* no reply) is skipped.
+
+        A **seeded** exchange's file name is recorded before it is mined (issue #746), so a mine
+        that raises partway still keeps whatever it filed out of this wake's `context`. Recording
+        a name whose content MemPalace then drops as a duplicate costs nothing: no drawer carries
+        it, so nothing is excluded, and the older drawers holding that content are not this
+        wake's.
         """
         if not (exchange.user.strip() or exchange.assistant.strip()):
             return
@@ -326,6 +335,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
         # then the assistant response verbatim.
         path = convo_dir / _conversation_name(exchange.scope.timeline)
         path.write_text(_exchange_markdown(exchange), encoding="utf-8")
+        if exchange.seeded:
+            self._seeded_files.add(path.name)
 
         convo_miner = _import("convo_miner")
         convo_miner.mine_convos(
@@ -344,17 +355,32 @@ class MemPalaceMemoryProvider(MemoryProvider):
         them as an injectable block, **fenced** in `_OPEN_TAG`/`_CLOSE_TAG` under the framing
         sentence (see `_fenced`). Returns ``None`` when there is no query, no palace yet, or no
         hit, so Turn-0 composition simply omits the section — no empty fence, no orphan sentence.
+
+        **What this wake filed from its seeded backlog is not recalled here** (issue #746). Those
+        drawers are the messages the model is reading in its transcript this very wake, and the
+        query ranks against that same backlog (`_wake._recall_query`), so they are close matches by
+        construction: on `@fred`'s palace they took 4 of the 10 slots. They are dropped from the
+        ranking before the pool is cut, so the slots go to other memories. The rule is the
+        narrowest one that is structural: the file names `observe` wrote for a seeded exchange on
+        this provider, which lives for one wake. Not every drawer from this timeline — a compacted
+        transcript no longer holds its early turns — and never on the `memory_search` tool, where a
+        deliberate search sees everything.
         """
         query = (scope.query or "").strip()
         if not query:
             return None
-        hits = self.search(query, surface=SURFACE_TURN0)
+        hits = self.search(query, surface=SURFACE_TURN0, exclude=frozenset(self._seeded_files))
         if not hits:
             return None
         return _fenced(_render_hits(hits, here=scope.timeline))
 
     def search(
-        self, query: str, n_results: int | None = None, *, surface: str = SURFACE_TOOL
+        self,
+        query: str,
+        n_results: int | None = None,
+        *,
+        surface: str = SURFACE_TOOL,
+        exclude: frozenset[str] = frozenset(),
     ) -> list[dict]:
         """The one retrieval call both memory surfaces make: relevant chunks for `query`.
 
@@ -389,6 +415,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
         searched once. Past the cap a query can return fewer than it asked for, which is the honest
         answer: what lies behind thousands of sentinels is not worth recalling.
 
+        ``exclude`` names conversation files whose drawers are dropped the same way, before the
+        pool is cut (`context` passes the ones this wake filed from its seeded backlog, issue
+        #746); empty by default, so the tool and every other caller search exactly as before.
+
         `surface` names which half asked (`SURFACE_TURN0` / `SURFACE_TOOL`) and rides the log lines
         so a per-wake Turn-0 recall is separable from a deliberate mid-task search. It defaults to
         the tool surface — the deliberate one — because that is what a third-party caller of this
@@ -410,8 +440,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
         need = pool if reranked else wanted
         started = time.monotonic()
         threshold, _ = self.distance_threshold()
-        hits, fetch, sentinels = self._ranking(
-            query, ask=pool, need=need, surface=surface, max_distance=threshold
+        hits, fetch, sentinels, excluded = self._ranking(
+            query, ask=pool, need=need, surface=surface, max_distance=threshold, exclude=exclude
         )
         hits = hits[:pool]
         if self.reranker is not None:
@@ -429,6 +459,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
             seconds=time.monotonic() - started,
             fetched=fetch,
             sentinels=sentinels,
+            excluded=excluded,
             max_distance=threshold,
         )
         return hits
@@ -491,13 +522,17 @@ class MemPalaceMemoryProvider(MemoryProvider):
         need: int,
         surface: str,
         max_distance: float | None = None,
-    ) -> tuple[list[dict], int, int]:
-        """MemPalace's hybrid ranking for `query`, sentinels dropped: ``(hits, fetch, sentinels)``.
+        exclude: frozenset[str] = frozenset(),
+    ) -> tuple[list[dict], int, int, int]:
+        """MemPalace's hybrid ranking for `query`, sentinels dropped: ``(hits, fetch, sentinels,
+        excluded)``.
 
         The fetch half of `search`, and the one place the palace is asked: ``ask`` is the
         ``n_results`` sent upstream, ``need`` how many hits the caller must have before a dropped
         sentinel stops being worth a wider fetch. ``fetch`` is how wide the last fetch went and
-        ``sentinels`` how many it dropped, for the ``memory recall`` line. The hits are unbounded
+        ``sentinels`` how many it dropped, for the ``memory recall`` line. A drawer filed from a
+        conversation file named in ``exclude`` is dropped too and counted in ``excluded``, and it
+        widens the fetch exactly as a sentinel does (issue #746). The hits are unbounded
         here; bounding them is the caller's. The palace check calls this with the reranked asks
         (issue #617), so what it measures is fetched exactly the way `search` fetches.
 
@@ -509,12 +544,12 @@ class MemPalaceMemoryProvider(MemoryProvider):
         WARNING (`_log_search_failure`) and reads as no hits. **Except on a widened fetch** (issue
         #624): the fetch before it succeeded, so its hits are what comes back and the widening stops
         there. A failed retry never throws away an answer already in hand. ``fetch`` and
-        ``sentinels`` are then that fetch's, the one whose hits are returned; the WARNING is what
+        ``sentinels`` (and ``excluded``) are then that fetch's, the one whose hits are returned; the WARNING is what
         says a wider one was tried and failed.
         """
         searcher = _import("searcher")
         fetch = ask
-        found: tuple[list[dict], int, int] | None = None
+        found: tuple[list[dict], int, int, int] | None = None
         while True:
             # Never passed except by `distance_threshold`'s decision or a palace-check arm: before
             # MemPalace 3.9.0 any threshold switches the union pool's lexical half off, and on a
@@ -535,10 +570,16 @@ class MemPalaceMemoryProvider(MemoryProvider):
             raw = [hit for hit in (raw or []) if isinstance(hit, dict) and hit.get("text")]
             hits = [hit for hit in raw if hit.get("room") != _REGISTRY_ROOM]
             sentinels = len(raw) - len(hits)
-            found = (hits, fetch, sentinels)
+            if exclude:
+                kept = [hit for hit in hits if _source_name(hit) not in exclude]
+                excluded = len(hits) - len(kept)
+                hits = kept
+            else:
+                excluded = 0
+            found = (hits, fetch, sentinels, excluded)
             # Widen only while it can help: something was dropped, the result is still short, and
             # the backend filled the page (a short page means the palace has nothing further).
-            if not sentinels or len(hits) >= need or len(raw) < fetch:
+            if not (sentinels or excluded) or len(hits) >= need or len(raw) < fetch:
                 break
             if fetch >= ask * _MAX_FETCH_FACTOR:
                 break
@@ -789,6 +830,7 @@ def _log_recall(
     seconds: float,
     fetched: int,
     sentinels: int,
+    excluded: int = 0,
     max_distance: float | None = None,
 ) -> None:
     """The ``memory recall`` line — one per retrieval, on either surface.
@@ -816,6 +858,9 @@ def _log_recall(
     ranking logs the same line it always did, and one that has them says how many and what the
     widening cost.
 
+    ``excluded`` (drawers this wake filed from its seeded backlog, kept out of a Turn-0 recall —
+    issue #746) is written only when non-zero, so every other recall logs the line it always did.
+
     ``max_distance`` is written only when the search passed one (issue #625), so a palace searched
     exactly as before logs the line it always did, and the reason is on the one ``memory
     threshold`` line `MemPalaceMemoryProvider.distance_threshold` writes.
@@ -825,6 +870,8 @@ def _log_recall(
         extra["max_distance"] = max_distance
     if sentinels:
         extra["sentinels"] = sentinels
+    if excluded:
+        extra["excluded"] = excluded
     if fetched != pool:
         extra["fetched"] = fetched
     _log.info(
@@ -1075,11 +1122,20 @@ def _filed(raw: object) -> str | None:
 
 def _timeline_of(hit: dict) -> str | None:
     """The timeline a drawer's conversation file was named for (`_TIMELINE_FILE`), or ``None``."""
-    source = hit.get("source_file") or hit.get("source_path")
-    if not isinstance(source, str):
-        return None
-    match = _TIMELINE_FILE.match(Path(source).name)
+    name = _source_name(hit)
+    match = _TIMELINE_FILE.match(name) if name else None
     return match["timeline"] if match else None
+
+
+def _source_name(hit: dict) -> str | None:
+    """The file name of the conversation a drawer was mined from, or ``None`` when unrecorded.
+
+    By name, never by the recorded path: MemPalace records an absolute path, and a home that moved
+    leaves drawers filed under one that no longer exists (issue #606). A name is a fresh uuid
+    (`_conversation_name`), so it identifies its file wherever the palace lives.
+    """
+    source = hit.get("source_file") or hit.get("source_path")
+    return Path(source).name if isinstance(source, str) and source else None
 
 
 def _conversation_name(timeline: str | None) -> str:

@@ -748,7 +748,7 @@ def compare_pools(provider: MemPalaceMemoryProvider, rows) -> PoolComparison:
             (_CANDIDATE_ASK, found.candidate, found.candidate_seconds),
         ):
             started = time.monotonic()
-            hits, _, _ = provider._ranking(
+            hits, _, _, _ = provider._ranking(
                 query, ask=ask, need=_RERANK_POOL, surface=SURFACE_TOOL, max_distance=threshold
             )
             seconds.append(time.monotonic() - started)
