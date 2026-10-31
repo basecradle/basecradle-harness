@@ -414,5 +414,9 @@ def test_marking_a_later_failure_is_bounded_and_skips_an_unlisted_use():
     assert mark_failed(turn, 0, "x" * 500)
     assert len(turn.server_tools.uses[0].failed) == FAILURE_CAP
     assert bound(turn.server_tools) == turn.server_tools  # still a fixed point
-    assert not mark_failed(turn, MAX_LISTED, "unlisted")  # counted, never listed, nothing to mark
+    many = Message(role="assistant")
+    many.server_tools = record(ServerToolUse("web_search", f"q{n}") for n in range(MAX_LISTED + 1))
+    assert many.server_tools.unlisted == 1
+    assert not mark_failed(many, MAX_LISTED, "unlisted")  # counted, never listed, nothing to mark
+    assert all(not use.failed for use in many.server_tools.uses)
     assert not mark_failed(Message.assistant(content="hi"), 0, "none")

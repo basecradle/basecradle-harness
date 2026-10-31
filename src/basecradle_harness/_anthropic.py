@@ -119,8 +119,10 @@ The wire translation
   or injected image after a step's results, is therefore folded into the last result's ``content``
   there (`_fold_into_results`); left as a trailing block it was a 400 on every mixed group. Its
   result therefore arrives in the *next* reply, so a failure there is marked on the record of the
-  reply that made the call (`_mark_late_failures`, issue #737). A server tool's own failure arrives inside an HTTP 200 (its result's
-  ``content`` is an error object where success is a list) and is logged, never raised.
+  reply that made the call (`_mark_late_failures`, issue #737); the engine keeps showing that turn's
+  note as first sent for the rest of the wake, so the mark is persisted at once and shown from the
+  next wake. A server tool's own failure arrives inside an HTTP 200 (its result's ``content`` is an
+  error object where success is a list) and is logged, never raised.
 
 Every vendor control, and the three the 5.x models refuse
 ---------------------------------------------------------
@@ -542,7 +544,8 @@ class AnthropicProvider:
             for message, kept, _ in self._replies.values():
                 ids = [b.get("id") for b in kept if b.get("type") == "server_tool_use"]
                 if target in ids:
-                    mark_failed(message, ids.index(target), str(content.get("error_code")))
+                    reason = str(content.get("error_code") or "failed")
+                    mark_failed(message, ids.index(target), reason)
                     break
 
     def _call(self, request: dict[str, Any]) -> Any:
@@ -1136,7 +1139,7 @@ def _reply(blocks: Sequence[Mapping[str, Any]]) -> Message:
         if kind == "server_tool_use":
             use = ServerToolUse(name=block.get("name") or "", input=summarize(block.get("input")))
             used.append(use)
-            by_id[block.get("id") or ""] = use
+            by_id.setdefault(block.get("id") or "", use)  # the first, as the late path reads
         elif kind == "text":
             texts.append(block.get("text") or "")
             for cited in block.get("citations") or ():

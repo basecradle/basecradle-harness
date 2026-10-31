@@ -24,6 +24,10 @@ failed fetch as one that had gone through.
   the later reply answers the earlier reply's use by its id, and any `server_tool_use` it carries
   itself is a new, nested call.
 - A use past `MAX_LISTED` is counted, not listed, and has no line to mark.
+- **The mark is shown from the next wake, never mid-wake.** The engine sends each turn's note as it
+  was first shown for the rest of its wake (`Engine._record_notes`). Re-rendering it would change
+  bytes already sent, so Anthropic's preserved thinking for every later reply would be stripped and
+  the cache tail rewritten, to tell the model what the raw error result in front of it already said.
 
 ## [0.161.1] - 2026-10-31
 
