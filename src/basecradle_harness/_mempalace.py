@@ -347,6 +347,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
             extract_mode="exchange",
         )
 
+    def begin_wake(self) -> None:
+        """Forget the previous wake's seeded files: they are this wake's memories now (issue #746)."""
+        self._seeded_files.clear()
+
     def context(self, scope: MemoryScope) -> str | None:
         """Retrieve the top-K relevant memories for this turn as a prompt-ready block.
 
@@ -361,8 +365,8 @@ class MemPalaceMemoryProvider(MemoryProvider):
         query ranks against that same backlog (`_wake._recall_query`), so they are close matches by
         construction: on `@fred`'s palace they took 4 of the 10 slots. They are dropped from the
         ranking before the pool is cut, so the slots go to other memories. The rule is the
-        narrowest one that is structural: the file names `observe` wrote for a seeded exchange on
-        this provider, which lives for one wake. Not every drawer from this timeline — a compacted
+        narrowest one that is structural: the file names `observe` wrote for a seeded exchange since
+        this wake began (`begin_wake`). Not every drawer from this timeline — a compacted
         transcript no longer holds its early turns — and never on the `memory_search` tool, where a
         deliberate search sees everything.
         """

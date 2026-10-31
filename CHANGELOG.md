@@ -27,6 +27,9 @@ transcript.
   sees everything), and so does every later wake's recall. A turn's own exchange is never
   excluded, and neither is every drawer from the current timeline, because a compacted transcript
   no longer holds its early turns.
+- **`MemoryProvider.begin_wake()`** (new, a no-op by default) is called at the start of every
+  `WakeAgent.wake()`. The MemPalace provider clears its record there, so a second wake in one
+  process recalls the first one's seed like any memory.
 - **The `memory recall` line carries `excluded=`** when the Turn-0 recall dropped any.
 
 ## [0.162.0] - 2026-10-31

@@ -1917,6 +1917,7 @@ class WakeAgent:
         # a second wake, and the breaker must count it.
         self._admitted = False
         self._breaker_held = False
+        self._begin_memory_wake()
         outcome = "error"  # only a clean return past the reconciles earns another verdict
         session: Session | None = None
         try:
@@ -3172,6 +3173,20 @@ class WakeAgent:
         # back (issue #464). That is the line the fleet reads; this one stays the seam's fallback.
         _log.debug("memory %s", kv(op="recall", chars=len(recalled or "")))
         return recalled
+
+    def _begin_memory_wake(self) -> None:
+        """Tell the memory provider a new wake begins, guarded — never breaks the wake.
+
+        A provider can keep state for one wake (MemPalace's record of what this wake filed from its
+        seeded backlog, kept out of this wake's Turn-0 recall, issue #746), and a second wake in one
+        process must not inherit it. A hook that raises costs only that state, with a WARNING.
+        """
+        if self.memory_provider is None:
+            return
+        try:
+            self.memory_provider.begin_wake()
+        except Exception:  # noqa: BLE001 - a memory hook must never break the wake
+            _log.warning("Memory provider begin_wake() failed; continuing.", exc_info=True)
 
     def _observe(self, user: str, assistant: str, *, seeded: bool = False) -> None:
         """Hand a completed exchange to the memory provider's `observe` hook, guarded.

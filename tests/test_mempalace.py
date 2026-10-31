@@ -844,8 +844,8 @@ def test_turn0_recall_refills_the_slots_this_wakes_seed_would_have_taken(
 
 def test_the_tool_and_a_later_wake_still_find_what_this_wake_seeded(fake_mempalace, tmp_path):
     """Kept out of one place only: this wake's Turn 0. A deliberate search sees everything, and
-    the next wake (a new provider) recalls it like any memory, because by then a compacted
-    transcript may no longer hold it."""
+    the next wake recalls it like any memory — on a new provider or on this one after
+    `begin_wake` — because by then a compacted transcript may no longer hold it."""
     _, searcher = fake_mempalace
     palace = tmp_path / "palace"
     provider = MemPalaceMemoryProvider(palace, reranker=None)
@@ -857,6 +857,9 @@ def test_the_tool_and_a_later_wake_still_find_what_this_wake_seeded(fake_mempala
     assert "AMBER-FOX-17" in tool.run("codename")
     later = MemPalaceMemoryProvider(palace, reranker=None)
     assert "AMBER-FOX-17" in later.context(_scope(query="codename"))
+    # The same provider serving a second wake in one process (`WakeAgent.wake()` again).
+    provider.begin_wake()
+    assert "AMBER-FOX-17" in provider.context(_scope(query="codename"))
 
 
 def test_only_a_seeded_exchange_is_kept_out_and_it_is_matched_by_file_name(

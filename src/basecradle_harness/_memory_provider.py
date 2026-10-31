@@ -123,6 +123,15 @@ class MemoryProvider(ABC):
         """Prompt-ready memory to inject at Turn 0, or ``None``. Default: no-op."""
         return None
 
+    def begin_wake(self) -> None:
+        """A new wake begins on this provider. Default: no-op.
+
+        One provider can serve more than one wake in a process (a library caller that calls
+        ``WakeAgent.wake()`` again), so state a provider keeps *for one wake* is reset here, never
+        in the constructor alone. The MemPalace adapter forgets which files the previous wake filed
+        from its seeded backlog (issue #746), so a later wake recalls them like any memory.
+        """
+
     def close(self) -> None:
         """Release any resources (e.g. close the store). Default: no-op."""
 

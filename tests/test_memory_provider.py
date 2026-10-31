@@ -896,6 +896,32 @@ def test_turn0_recall_skips_what_this_wake_filed_from_its_seed_and_the_tool_does
     assert "AMBER-FOX-17" in tool.run("codename", n_results=3)
 
 
+def test_every_wake_begins_on_the_memory_provider_and_a_raising_hook_costs_nothing(
+    platform, tmp_path
+):
+    """`wake()` may run twice in one process, so per-wake provider state is reset per wake.
+
+    MemPalace keeps the files a wake filed from its seeded backlog out of *that* wake's recall
+    (issue #746); a second wake inheriting the record would never recall them. The hook is guarded
+    like every memory hook: one that raises is logged and the wake goes on.
+    """
+    _serve_messages(platform, {"messages": [], "next_cursor": None})
+
+    class Counting(RecordingProvider):
+        begun = 0
+
+        def begin_wake(self):
+            Counting.begun += 1
+            raise RuntimeError("a provider bug")
+
+    agent = _wake(tmp_path, Counting())
+
+    agent.wake()
+    agent.wake()
+
+    assert Counting.begun == 2
+
+
 def test_a_raising_hook_never_breaks_the_wake(platform, tmp_path):
     """observe/context that raise degrade gracefully — the wake still completes."""
 
