@@ -663,6 +663,27 @@ def test_the_tail_skips_a_last_block_that_cannot_carry_one(router, provider):
     assert marks(body(route)) == ["messages[1][0]"]
 
 
+def test_a_tail_on_a_kept_reply_never_reaches_the_kept_blocks(router, provider):
+    """The tail is a mark on the request: a kept reply it lands on stays unmarked in the memo, so the
+    next request carries exactly one tail and never a stale fifth breakpoint."""
+    route = router.post(MESSAGES).mock(
+        side_effect=[
+            reply(tool_use("toolu_01K", TOOL.name, {"label": "a"}), stop_reason="tool_use"),
+            reply(text("ok")),
+            reply(text("ok")),
+        ]
+    )
+    convo = [Message.user("go")]
+    step = provider.chat(convo, tools=[TOOL])
+    convo += [step, Message.tool("toolu_01K", "")]  # an empty result: the tail walks onto the call
+    provider.chat(convo, tools=[TOOL])
+    assert marks(body(route, 1)) == ["messages[1][0]", "tools[0]"]
+    _, kept, _ = provider._replies[id(step)]
+    assert kept == [tool_use("toolu_01K", TOOL.name, {"label": "a"})]  # unmarked, as it arrived
+    provider.chat([*convo, Message.user("again")], tools=[TOOL])
+    assert marks(body(route, 2)) == ["messages[2][1]", "tools[0]"]
+
+
 def test_the_tails_slot_is_reserved_when_the_anchor_is_the_last_block(router, provider):
     """No block after the anchor can carry a tail, and the chain still takes two: one fixed split."""
     route = router.post(MESSAGES).mock(return_value=reply(text("ok")))

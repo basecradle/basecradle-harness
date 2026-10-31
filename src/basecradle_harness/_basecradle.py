@@ -989,7 +989,7 @@ _OWNED_GOOGLE = frozenset(
 #: The anthropic build's own wiring (issue #725). The rest of ``model_params.json`` is checked against
 #: the SDK's ``messages.create`` signature when the adapter is built, so a key that is neither owned
 #: here nor named there fails at startup. ``cache_control`` is deliberately **not** owned: it is the
-#: template of the harness's one breakpoint (its TTL), which the adapter reads (`_anthropic`).
+#: template of every breakpoint the harness places (its TTL), which the adapter reads (`_anthropic`).
 _OWNED_ANTHROPIC = frozenset(
     {
         "model",

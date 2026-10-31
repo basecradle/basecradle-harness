@@ -25,8 +25,9 @@ for an agentic loop).
   is now **60 positions** (about 18 sequential tool steps of the previous wake), down from 80. The
   split is fixed: the tail's slot is reserved on every request, and a library caller that anchors
   more than three turns keeps its latest three, with a WARNING.
-- **The cost of a single-step wake.** It writes its brief and turn at 1.25× instead of 1× and never
-  reads them back: about $0.006 a wake at Opus 5.5 rates.
+- **The cost of a single-step wake.** It writes its brief and turn at the write rate (1.25× at the
+  five-minute TTL, 2× at the hour) instead of 1× and never reads them back: about $0.006 a wake at
+  Opus 5.5 rates and five minutes.
 - **Live, `claude-haiku-5-5`, a 14-step wake of the same shape as #726's wake B.** Before: every
   step read `cached_tokens=12094` while `tokens_in` grew from 18,499 to 21,279, 100,961 uncached
   input tokens across steps 2–14. After: step 2 read 17,923 of 18,297, step 14 read 20,779 of

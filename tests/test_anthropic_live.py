@@ -109,21 +109,27 @@ def test_a_chat_reply_and_its_line(caplog):
 
 @needs_key
 def test_the_second_call_on_the_same_prefix_reads_the_cache(caplog):
-    """The fleet's first explicit-cache path: the breakpoint we place must be read back."""
+    """The fleet's first explicit-cache path: the anchor we place must be read back.
+
+    Each call changes the brief and the turn after the anchored charter, so the tail entry one call
+    writes can never serve the next (issue #729) and the only entry they share is the anchor's. The
+    second and third calls each read exactly that entry; with the anchor unmarked they read nothing.
+    """
+    nonce = uuid.uuid4().hex  # so no earlier run's tail entry matches a brief
     adapter = _provider()
-    convo = [Message.system(CHARTER), Message.system("brief"), Message.user("Topic 3?")]
-    anchored = anchor_cacheable_prefix(convo, stable=1, mode=EXPLICIT)
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        adapter.chat(anchored)
-        adapter.chat(anchor_cacheable_prefix(convo, stable=1, mode=EXPLICIT))
-    first, second = _lines(caplog, "llm provider=")
-    assert (
-        int(_field(first, "cache_write_tokens") or 0) > 0
-        or int(_field(first, "cached_tokens") or 0) > 0
-    )
-    cached = int(_field(second, "cached_tokens"))
-    assert cached > 0, second
-    assert cached >= int(_field(first, "cache_write_tokens") or cached)
+        for n in (3, 4, 5):
+            convo = [
+                Message.system(CHARTER),
+                Message.system(f"[{nonce}] brief {n}"),
+                Message.user(f"Topic {n}?"),
+            ]
+            adapter.chat(anchor_cacheable_prefix(convo, stable=1, mode=EXPLICIT))
+    first, second, third = _lines(caplog, "llm provider=")
+    assert sum(_cache(first)) > 0, first
+    anchor = _cache(second)[0]
+    assert 0 < anchor < sum(_cache(first)), second
+    assert _cache(third)[0] == anchor, third
 
 
 def _cache(line: str) -> tuple[int, int]:
@@ -133,8 +139,12 @@ def _cache(line: str) -> tuple[int, int]:
 
 @needs_key
 def test_with_nothing_anchored_the_tool_list_is_read_back(caplog):
-    """A first wake (issue #726): no frozen turn, so the breakpoint is the tool list's, and step 2
-    reads exactly what step 1 wrote."""
+    """A first wake (issue #726): no frozen turn, so the anchor's breakpoint is the tool list's.
+
+    Each call sends a different brief, so the tail entry one call writes (#729) cannot serve the
+    next and the only entry they share is the tool list's. The second and third calls each read
+    exactly that entry; with the tool list unmarked they read nothing.
+    """
     nonce = uuid.uuid4().hex
     tools = [
         ToolSpec(
@@ -144,15 +154,17 @@ def test_with_nothing_anchored_the_tool_list_is_read_back(caplog):
         )
         for n in range(1, 13)
     ]
-    convo = [Message.system("brief"), Message.user("Reply with exactly the word: ok")]
     adapter = _provider()
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=tools)
-        adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=tools)
-    first, second = _lines(caplog, "llm provider=")
-    read, written = _cache(first)
-    assert written > 0, first
-    assert _cache(second)[0] == read + written, second
+        for n in range(3):
+            brief = Message.system(f"[{nonce}] brief {n}")
+            convo = [brief, Message.user("Reply with exactly the word: ok")]
+            adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=tools)
+    first, second, third = _lines(caplog, "llm provider=")
+    assert sum(_cache(first)) > 0, first
+    entry = _cache(second)[0]
+    assert 0 < entry < sum(_cache(first)), second
+    assert _cache(third)[0] == entry, third
 
 
 @needs_key

@@ -41,8 +41,11 @@ breakpoints Anthropic allows are spent as **anchor + tail + two chained**:
   loop). No later wake can read a tail entry, since the next wake's prefix lacks this wake's brief;
   the next step of this wake can, and that read is the point. It goes on step 1 too: the step 1 →
   step 2 read is the largest (the whole brief), and a wake cannot know at step 1 whether a step 2 is
-  coming. A single-step wake pays a 0.25× write premium on its brief and turn for that, and the
-  decision to pay it is recorded on issue #729.
+  coming. A single-step wake pays a write premium on its brief and turn for that (0.25× at the
+  five-minute TTL, 1× at the hour), and the decision to pay it is recorded on issue #729. The read
+  holds while one step adds fewer than `LOOKBACK` positions: a step past that (a reply of many
+  server-tool calls or citation blocks, which Anthropic does not count as runs) leaves the next
+  step's tail blind, and that step falls back to the anchor's entry — a rewrite, never a failure.
 - **No anchor, the tool list.** On a first wake the frozen transcript is empty (the charter rides
   the per-wake brief), so the engine anchors nothing. The stable/volatile boundary is then the end
   of ``tools``, which renders first, and the last tool definition carries the breakpoint — the one
@@ -771,8 +774,8 @@ class AnthropicProvider:
             return
         if len(marked) > anchors:
             _log.warning(
-                "%d turns were anchored for caching; Anthropic takes at most %d breakpoints and the "
-                "request's tail takes one, so the latest %d are kept.",
+                "%d turns were anchored for caching; Anthropic takes at most %d breakpoints and one "
+                "is reserved for the request's tail, so the latest %d are kept.",
                 len(marked),
                 MAX_BREAKPOINTS,
                 anchors,

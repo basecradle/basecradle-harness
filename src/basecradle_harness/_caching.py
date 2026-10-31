@@ -130,7 +130,9 @@ Everything left of that line is byte-identical to what the last wake sent, and e
 was recomposed *this* wake. So the boundary an explicit breakpoint wants is the boundary that already
 exists — the last message of the frozen transcript — and marking it needs no new notion of what is
 stable. Anchoring any further right would write a cache entry over the brief (a snapshot of a moment,
-different on the next wake) and buy a cache write that can never be read.
+different on the next wake) that no later wake can read. (The *next step* of the same wake can, which
+is why the Anthropic adapter adds a tail breakpoint of its own on every request, issue #729; that is
+the adapter's placement, never the engine's anchor.)
 
 Two constraints from the wire, both load-bearing:
 
@@ -143,7 +145,8 @@ Two constraints from the wire, both load-bearing:
 
 The engine states the boundary once; the adapter translates it into the vendor's breakpoints, which
 may be more than one (issue #726: Anthropic's lookback window reaches 20 positions per breakpoint, so
-its adapter chains more back from the anchor, and marks the tool list when nothing is anchored).
+its adapter chains more back from the anchor, and marks the tool list when nothing is anchored; issue
+#729: it marks the request's last block too, so each step of a wake reads the one before it).
 
 The anchor is **copy-on-write**: it is stamped onto a *copy* of the turn, never onto the object the
 session persists. A `cache_anchor` written into the stored history would still be there on the next
