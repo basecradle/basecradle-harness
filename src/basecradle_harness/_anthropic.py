@@ -94,7 +94,10 @@ The wire translation
   text-and-calls rendering. They are **not persisted**: they are opaque vendor state of unbounded
   size, and the transcript's Context Discipline would have to bound a new class for them. A later
   wake replays the conversation as text and calls; earlier thinking is dropped from the front, which
-  Anthropic allows.
+  Anthropic allows. What a later wake does keep of a server tool is its **record**: each
+  ``server_tool_use`` block becomes a `ServerToolUse` on the reply (name + what it ran on), which the
+  transcript persists and the engine shows beside the turn (`_server_tools`, issue #727), so a page
+  this agent fetched yesterday is not a claim it can no longer back.
 - **Preserved thinking binds a thinking block to everything sent before it** (the history-editing
   check: enforced for accounts created on or after 2026-08-31, a 400 on a replayed block whose prefix
   changed). The harness does change a prefix inside one wake — a batched wake's second turn no longer
@@ -183,7 +186,13 @@ from basecradle_harness._exceptions import (
     ProviderTimeoutError,
 )
 from basecradle_harness._faults import is_out_of_funds, is_too_large
-from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
+from basecradle_harness._messages import (
+    ImageContent,
+    Message,
+    ServerToolUse,
+    ToolCall,
+    ToolSpec,
+)
 from basecradle_harness._observability import (
     generation_id,
     generation_of,
@@ -193,6 +202,7 @@ from basecradle_harness._observability import (
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._secret import Sealed
+from basecradle_harness._server_tools import record, summarize
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
@@ -1032,15 +1042,22 @@ def _reply(blocks: Sequence[Mapping[str, Any]]) -> Message:
     """A turn's blocks as a harness assistant `Message`: its text, its client calls, its sources.
 
     Thinking is the model's reasoning, not its reply, and is left out; a server tool's blocks are
-    the vendor's to run and stay in the kept blocks only. A server tool's failure — which Anthropic
-    reports inside the 200 as an error object where a success is a list — is logged.
+    the vendor's to run and stay in the kept blocks only — but each ``server_tool_use`` is reported
+    on the reply as a `ServerToolUse` (its name and what it was run on), the record a later wake
+    reads instead of the blocks it will never see (issue #727). A server tool's failure — which
+    Anthropic reports inside the 200 as an error object where a success is a list — is logged.
     """
     texts: list[str] = []
     calls: list[ToolCall] = []
     citations: list[dict[str, str]] = []
+    used: list[ServerToolUse] = []
     for block in blocks:
         kind = block.get("type")
-        if kind == "text":
+        if kind == "server_tool_use":
+            used.append(
+                ServerToolUse(name=block.get("name") or "", input=summarize(block.get("input")))
+            )
+        elif kind == "text":
             texts.append(block.get("text") or "")
             for cited in block.get("citations") or ():
                 if isinstance(cited, Mapping) and cited.get("url"):
@@ -1066,7 +1083,9 @@ def _reply(blocks: Sequence[Mapping[str, Any]]) -> Message:
     text = "".join(texts)
     if text and citations:
         text += format_citations(citations)
-    return Message.assistant(content=text or None, tool_calls=calls)
+    reply = Message.assistant(content=text or None, tool_calls=calls)
+    reply.server_tools = record(used)
+    return reply
 
 
 def _wire_usage(usage: Any) -> dict[str, Any] | None:

@@ -68,6 +68,8 @@ from basecradle_harness._messages import (
 from basecradle_harness._observability import MAIN, describe_provider, kv, truncated
 from basecradle_harness._provider import Provider
 from basecradle_harness._retry import Retry, _default_backoff, connection_reason
+from basecradle_harness._server_tools import bound as bound_server_tools
+from basecradle_harness._server_tools import with_records
 from basecradle_harness._timeouts import bind_scale, last_timeout
 from basecradle_harness._tools import ToolRegistry
 
@@ -839,11 +841,19 @@ class Engine:
             sleep=self._sleep,
         )
         last_exc: ProviderError | None = None
+        # Server-side tool activity is shown beside the turn it happened in (issue #727): a system
+        # note per recorded turn, spliced into the request only — never into `messages`, which is
+        # the transcript. Composed once per call; every retry sends the same request.
+        shown = with_records(messages)
         try:
             for _ in range(attempts):
                 bind_scale(self.provider, retry.timeout_scale)
                 try:
-                    return self.provider.chat(messages, tools=tools)
+                    reply = self.provider.chat(shown, tools=tools)
+                    # Bounded where every reply arrives, so the turn the model reads on the next
+                    # step and the turn the disk keeps are the same record (`_server_tools.bound`).
+                    reply.server_tools = bound_server_tools(reply.server_tools)
+                    return reply
                 except _TRANSIENT as exc:
                     last_exc = exc
                     if not retry.again(

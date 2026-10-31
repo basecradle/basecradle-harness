@@ -97,6 +97,8 @@ from basecradle_harness._messages import (
     ImageContent,
     Message,
     Role,
+    ServerToolRecord,
+    ServerToolUse,
     ToolCall,
     ToolResult,
     ToolSpec,
@@ -313,6 +315,8 @@ __all__ = [
     "FrameSampling",
     "CodeExecutionTrace",
     "CodeExecutionFile",
+    "ServerToolRecord",
+    "ServerToolUse",
     # Errors
     "HarnessError",
     "PolicyError",

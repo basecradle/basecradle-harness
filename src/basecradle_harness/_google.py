@@ -135,7 +135,14 @@ from basecradle_harness._google_rates import (
     grounding_units,
     known,
 )
-from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec, VideoContent
+from basecradle_harness._messages import (
+    ImageContent,
+    Message,
+    ServerToolUse,
+    ToolCall,
+    ToolSpec,
+    VideoContent,
+)
 from basecradle_harness._observability import (
     HELPER,
     finish_reason,
@@ -147,6 +154,7 @@ from basecradle_harness._observability import (
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._secret import Sealed as _Sealed
+from basecradle_harness._server_tools import record
 from basecradle_harness._timeouts import (
     METADATA_TIMEOUT,
     CallTimeout,
@@ -981,12 +989,24 @@ class GoogleProvider:
 
         Thought-summary parts (``thought=True``, present only when an operator asks for
         ``include_thoughts``) are the model's reasoning, not its reply, and are left out.
+
+        The built-ins Gemini ran itself are recorded on the reply (issue #727): an
+        ``executable_code`` part is a ``code_execution`` use with its code, and each page in the
+        candidate's ``url_context_metadata`` is a ``url_context`` use with its URL — so a later
+        wake can see that the run or the read happened.
         """
         parts = getattr(getattr(candidate, "content", None), "parts", None) or []
         texts: list[str] = []
         calls: list[ToolCall] = []
+        used: list[ServerToolUse] = []
         for part in parts:
             if getattr(part, "thought", None):
+                continue
+            executed = getattr(part, "executable_code", None)
+            if executed is not None:
+                used.append(
+                    ServerToolUse(name="code_execution", input=getattr(executed, "code", "") or "")
+                )
                 continue
             call = getattr(part, "function_call", None)
             if call is not None:
@@ -1013,7 +1033,14 @@ class GoogleProvider:
                     self.model,
                     blocked,
                 )
-        return Message.assistant(content="".join(texts) or None, tool_calls=calls)
+        read = getattr(getattr(candidate, "url_context_metadata", None), "url_metadata", None)
+        for page in read or ():
+            url = getattr(page, "retrieved_url", None)
+            if url:
+                used.append(ServerToolUse(name="url_context", input=url))
+        reply = Message.assistant(content="".join(texts) or None, tool_calls=calls)
+        reply.server_tools = record(used)
+        return reply
 
     # --- lifecycle --------------------------------------------------------------
 

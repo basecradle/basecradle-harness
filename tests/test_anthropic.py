@@ -1300,3 +1300,30 @@ def test_resolved_config_passes_a_good_file(tmp_path, monkeypatch):
     (home / "model_params.json").write_text(json.dumps(good))
     monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(home))
     assert resolved_model_params("anthropic") == (good, ["model"])
+
+
+# === the record a later wake reads (issue #727) ================================================
+
+
+def test_each_server_tool_use_is_recorded_on_the_reply(router, provider):
+    fetch = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01F",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com"},
+    }
+    router.post(MESSAGES).mock(
+        return_value=reply(SEARCH_USE, SEARCH_RESULT, fetch, text("Title: Example Domain."))
+    )
+    answer = provider.chat([Message.user("search, then fetch")])
+    assert [(u.name, u.input) for u in answer.server_tools.uses] == [
+        ("web_search", "q"),
+        ("web_fetch", "https://example.com"),
+    ]
+    assert answer.tool_calls == []  # never a call for the harness to run
+    assert "example.com" not in answer.content.split("Sources:")[0]  # never the turn's own words
+
+
+def test_a_turn_with_no_server_tool_carries_no_record(router, provider):
+    router.post(MESSAGES).mock(return_value=reply(text("hi")))
+    assert provider.chat([Message.user("hi")]).server_tools is None

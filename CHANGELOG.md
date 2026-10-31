@@ -7,6 +7,50 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.161.0] - 2026-10-31
+
+### Added: server-side tool activity leaves a record a later wake can read (issue #727)
+
+A server-side tool runs inside the vendor's model call, and its blocks are vendor state the
+transcript never kept. So a later wake saw only the turn's text: live on `claude-haiku-5-5`, a wake
+fetched `https://example.com` and truthfully posted its title, and the next wake, seeing a post with
+no fetch before it, publicly retracted the true post. The harness had hidden the evidence of the
+agent's own action from it.
+
+- **Each assistant turn now persists a `ServerToolRecord`**: one `ServerToolUse` per use, the tool's
+  name and what it ran on (`web_fetch: https://example.com`). Four adapters report it: Anthropic
+  (`server_tool_use` blocks), OpenAI Responses (named server items: `web_search_call`,
+  `code_interpreter_call`, `file_search_call`, `image_generation_call`, `mcp_call` and any
+  `*_search_call`; never `function_call` or `computer_call`, which are the client's), the native
+  xAI SDK (the server-side `tool_calls` it already declined to dispatch), and Gemini
+  (`executable_code` parts and `url_context_metadata`). OpenRouter's `openrouter:web_search` and
+  xAI's `search_parameters` over the `openai` SDK name no call, so their turns carry none; their
+  `Sources:` footer is what persists.
+- **Every later call shows it to the model** as one system note immediately after the turn and its
+  tool results: *"Server-side tools ran during your turn above…"*. It is spliced into the request
+  only (`_server_tools.with_records`, in `Engine._chat`), never into the transcript, so compaction's
+  cut rules, the recovery's walks and the persisted shape are untouched, and it is composed from
+  persisted data alone, so it is byte-stable and costs the prefix cache nothing.
+- **It is bounded, and the bound is a term of the compaction proof.** At most 4 uses listed per turn,
+  each name at most 40 and each input at most 160 characters on one line, the rest counted: never
+  more than `NOTE_CAP` = 1,059 characters a turn. `persisted_step_cap()` is now 7,203 (was 6,144), so
+  the single-turn guarantee needs a ceiling of 115,248 (was 98,304); the 128 K floor still clears it.
+  The budget warning names the new term.
+- **It is its own section on the `context attribution` line**, `history_server_tools`, and the
+  sections still sum to `total`. The compaction summarizer is shown it too, so a summary can keep that
+  the fetch happened and the identifier harvest can keep its URL.
+- **It is never the turn's content and never a `ToolCall`.** A mining provider is never handed it
+  (a sentinel in `test_mining.py` proves the model saw it and the memory provider did not), and the
+  recovery never counts, heals or re-issues it.
+- `ServerToolRecord` and `ServerToolUse` are exported for a third-party adapter to report its own.
+
+### Fixed: the budget warning's step remedy was one short at a step cap not divisible by 3
+
+`max_safe_steps` solved the inequality with `limit × (1 − COMPACT_AT)` while the warning measures
+the headroom above the *integer* threshold. The two differ by under a token, invisible while the
+step cap was 6,144; at 7,203 it quoted a step budget one below the largest that clears the warning.
+It now inverts the trigger exactly.
+
 ## [0.160.0] - 2026-10-31
 
 ### Added: Anthropic's explicit cache covers the steps of one wake (issue #729)

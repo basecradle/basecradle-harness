@@ -29,8 +29,9 @@ answers however it honestly can (`context_limit`), ``None`` when it cannot, and 
 **Compaction fires at half the ceiling, never near it** — headroom for the reply, for the
 summarization call itself, and for estimate error. That threshold is only safe because *no single
 turn can leap over it*: the persisted growth of one turn is bounded by what a tool call may leave
-behind — its result (`TOOL_RESULT_CAP`, 4 KB) **and its arguments** (`TOOL_ARGS_CAP`, 2 KB) — times
-`DEFAULT_MAX_STEPS` (24), ≈ 49 K tokens, which cannot cross from under-half to over-full on any
+behind — its result (`TOOL_RESULT_CAP`, 4 KB) **and its arguments** (`TOOL_ARGS_CAP`, 2 KB), plus
+the record of the server-side tools its model call ran (`_server_tools.NOTE_CAP`, ~1 KB, issue
+#727) — times `DEFAULT_MAX_STEPS` (24), ≈ 58 K tokens, which cannot cross from under-half to over-full on any
 budget at or above the floor. **Those two caps are prerequisites of this file**, not neighbors of
 it: relax either and the 50% threshold stops being a safe distance. That is why they are *defined*
 here and merely *enforced* in `_session` — the proof and its inputs live together, where they cannot
@@ -40,7 +41,7 @@ right-hand side of the inequality below *unbounded*, so the guarantee it states 
 
 **And the proof has a precondition, so the harness states it out loud (issue #287).** Written as an
 inequality, the guarantee is
-`limit × (1 - COMPACT_AT) > (TOOL_RESULT_CAP + TOOL_ARGS_CAP) × max_steps ÷ chars-per-token` —
+`limit × (1 - COMPACT_AT) > persisted_step_cap() × max_steps ÷ chars-per-token` —
 headroom above the threshold must exceed what one tool-heavy turn can add. Two operator knobs move
 those terms: `HARNESS_MAX_CONTEXT_TOKENS` shrinks the left side, `HARNESS_MAX_STEPS` grows the right.
 Either can walk an agent out of the guarantee, and **nothing about that is visible** — compaction runs
@@ -116,6 +117,9 @@ from basecradle_harness._engine import DEFAULT_MAX_STEPS
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import kv
 from basecradle_harness._provider import Provider
+from basecradle_harness._server_tools import NOTE_CAP as SERVER_TOOLS_NOTE_CAP
+from basecradle_harness._server_tools import chars as record_chars
+from basecradle_harness._server_tools import render as render_record
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -359,8 +363,12 @@ def persisted_step_cap() -> int:
     Counting only the result — as this arithmetic did until issue #301 — was likewise not a tight
     estimate but a wrong one, because the arguments were not capped *at all*: the term it omitted was
     unbounded. Both mistakes have the same shape, and this function is where they stay fixed.
+
+    **And the record of the server-side tools the step's model call ran** (issue #727): one
+    `ServerToolRecord` per assistant turn, persisted and replayed as a note of at most
+    `_server_tools.NOTE_CAP` characters. It is small, and "small" is not a bound — so it is a term.
     """
-    return TOOL_RESULT_CAP + TOOL_ARGS_CAP
+    return TOOL_RESULT_CAP + TOOL_ARGS_CAP + SERVER_TOOLS_NOTE_CAP
 
 
 def worst_case_turn_tokens(max_steps: int) -> int:
@@ -385,10 +393,11 @@ def min_safe_limit(max_steps: int) -> int:
     """The smallest context budget that still guarantees no single turn can leap the threshold.
 
     Solve `limit × (1 - COMPACT_AT) >= worst_case_turn_tokens(max_steps)` for `limit`. At the shipped
-    constants (4 KB result + 2 KB arguments per step, 24 steps, half-ceiling trigger) this is ~98 K —
-    under the 128 K floor, which is why an agent that never touches the knobs is safe by construction
-    and never hears a word about any of this. **That margin is what sizes `TOOL_ARGS_CAP`**: at a 4 KB
-    argument cap this lands at 131,072, *above* the floor, and every stock agent would start warning.
+    constants (4 KB result + 2 KB arguments + the ~1 KB server-tool note per step, 24 steps,
+    half-ceiling trigger) this is ~115 K — under the 128 K floor, which is why an agent that never
+    touches the knobs is safe by construction and never hears a word about any of this. **That margin
+    is what sizes `TOOL_ARGS_CAP`** (and `_server_tools`' caps): at a 4 KB argument cap this lands at
+    148,016, *above* the floor, and every stock agent would start warning.
 
     **This budget is itself safe** — it is the smallest value that *clears* the bar, not the largest
     that fails it. So the warning quotes it as "to at least N", never "above N": `threshold()` floors
@@ -406,8 +415,15 @@ def max_safe_steps(limit: int) -> int:
     ceiling that is the model's real window, raising `HARNESS_MAX_CONTEXT_TOKENS` above it would move
     the threshold past the wall and compaction would never fire in time — strictly worse. There the
     honest fix is to spend fewer steps per turn, so the warning quotes this number instead.
+
+    **It inverts the trigger exactly, so it reads the headroom the trigger reads**: the ceiling less
+    its *integer* threshold (`int()` hands a token back), never ``limit × (1 - COMPACT_AT)``. The two
+    differ by under a token, which was invisible while the step cap was a multiple of
+    `WORST_CASE_CHARS_PER_TOKEN`; at any other cap the float form quoted a budget one step short of
+    the largest one that clears the warning.
     """
-    return int(limit * (1.0 - COMPACT_AT) * WORST_CASE_CHARS_PER_TOKEN / persisted_step_cap())
+    headroom = limit - int(limit * COMPACT_AT)
+    return int(headroom * WORST_CASE_CHARS_PER_TOKEN / persisted_step_cap())
 
 
 def is_context_overflow(text: str) -> bool:
@@ -582,7 +598,8 @@ class ContextBudget:
         _log.warning(
             "context budget %d (source=%s) leaves %d tokens of headroom above the compaction "
             "threshold, below the %d a single tool-heavy turn can add (%d chars of result + "
-            "arguments per step x %d steps at %.1f chars/token): a turn may overshoot the ceiling "
+            "arguments + server-tool record per step x %d steps at %.1f chars/token): a turn may "
+            "overshoot the ceiling "
             "before compaction, which runs only *between* turns, can fire. The over-length rescue "
             "(emergency compaction + retry) still applies. %s",
             limit.tokens,
@@ -898,7 +915,7 @@ def _cut_index(history: list[Message], head: int, keep_chars: int) -> int | None
     chosen = boundaries[-1]  # the floor: the newest real user turn always survives
     tail = 0
     for index in reversed(range(head, len(history))):
-        tail += message_chars(history[index])
+        tail += replayed_chars(history[index])
         if _is_boundary(history[index]) and tail <= keep_chars:
             chosen = index
     return chosen if chosen > head else None
@@ -965,6 +982,10 @@ def _render(messages: Sequence[Message]) -> str:
             f"{call.name} {json.dumps(arguments, ensure_ascii=False, default=str)}"
             for call, arguments in zip(message.tool_calls, _bounded_arguments(message))
         ]
+        if record_chars(message):
+            # What the model read beside this turn, so the summary can keep that a fetch, a search
+            # or a run happened — and the identifier harvest can keep the URL it ran on (#727).
+            lines.append(render_record(message.server_tools))  # type: ignore[arg-type]
         blocks.append("\n".join(line for line in lines if line))
     return "\n\n".join(blocks)
 
@@ -1103,9 +1124,20 @@ def message_chars(message: Message) -> int:
     return total
 
 
+def replayed_chars(message: Message) -> int:
+    """What one transcript turn costs on replay: its own characters plus its server-tool note.
+
+    A turn's `ServerToolRecord` is shown to the model as a system note of its own beside the turn
+    (`_server_tools.with_records`, issue #727), so it is not part of `message_chars` — which measures
+    the message itself, and which a request already carrying the notes must not count twice — but it
+    is part of what keeping the turn costs, which is what the transcript arithmetic sizes.
+    """
+    return message_chars(message) + record_chars(message)
+
+
 def _chars(messages: Sequence[Message]) -> int:
     """The whole transcript's cost in characters — the quantity the token estimate scales."""
-    return sum(message_chars(message) for message in messages)
+    return sum(replayed_chars(message) for message in messages)
 
 
 def request_chars(messages: Sequence[Message], tools: Sequence[ToolSpec] | None = None) -> int:
@@ -1118,7 +1150,9 @@ def request_chars(messages: Sequence[Message], tools: Sequence[ToolSpec] | None 
     characters of them. Images and clips are not counted, for the reason `message_chars` gives and
     one more: a timeout's floor and output term already dwarf what a picture adds to reading.
     """
-    total = _chars(messages)
+    # The messages as handed to the adapter, which already carry any server-tool notes as turns of
+    # their own (`_server_tools.with_records`), so each is counted once, as itself.
+    total = sum(message_chars(message) for message in messages)
     for tool in tools or ():
         total += (
             len(tool.name)

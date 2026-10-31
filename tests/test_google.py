@@ -1516,3 +1516,36 @@ def test_a_per_prompt_model_bills_one_grounding_unit_however_many_queries(router
             "cost=0.035 cost_basis=computed"
         )
     ]
+
+
+# === the built-ins Gemini ran are recorded for a later wake (issue #727) =======================
+
+
+def test_code_execution_and_url_context_are_recorded_on_the_reply(router, key_file):
+    provider = build(key_file, builtin_tools=["code_execution", "url_context"])
+    response = body(
+        text("Let me compute. "),
+        {"executableCode": {"language": "PYTHON", "code": "print(2**10)"}},
+        {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1024\n"}},
+        text("It is 1024."),
+    )
+    response["candidates"][0]["urlContextMetadata"] = {
+        "urlMetadata": [
+            {
+                "retrievedUrl": "https://example.com",
+                "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_SUCCESS",
+            }
+        ]
+    }
+    router.post(GENERATE).mock(return_value=httpx.Response(200, json=response))
+    reply = provider.chat([Message.user("2^10, and read example.com")])
+    assert [(u.name, u.input) for u in reply.server_tools.uses] == [
+        ("code_execution", "print(2**10)"),
+        ("url_context", "https://example.com"),
+    ]
+    assert reply.content == "Let me compute. It is 1024."
+
+
+def test_a_gemini_turn_with_no_built_in_carries_no_record(router, provider):
+    router.post(GENERATE).mock(return_value=ok(text("hi")))
+    assert provider.chat([Message.user("go")]).server_tools is None

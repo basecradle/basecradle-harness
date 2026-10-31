@@ -20,6 +20,11 @@ payload. A handful of small dataclasses are the whole vocabulary:
 - `CodeExecutionTrace` — what a server-side code-execution turn did: the source
   it ran and the files it produced. Surfaced (transiently) on an assistant
   `Message` so the Asset bridge can harvest it; see `_code.py`.
+- `ServerToolUse` + `ServerToolRecord` — which server-side tools the vendor ran
+  inside one model call, and on what. Persisted on the assistant `Message` and
+  shown to the model on later calls, so a later wake can see the work happened;
+  see `_server_tools.py`. An adapter that can read its vendor's server-tool
+  activity reports it; one that cannot reports nothing.
 """
 
 from __future__ import annotations
@@ -151,6 +156,38 @@ class CodeExecutionTrace:
 
 
 @dataclass
+class ServerToolUse:
+    """One server-side tool the vendor ran inside a model call — its name and what it was given.
+
+    `name` is the tool as the model knows it (``web_fetch``, ``web_search``, ``code_execution``);
+    `input` is one line saying what it was run on (the URL, the query, the code), composed by the
+    adapter that read the vendor's response (`_server_tools.summarize`). It is **not** a `ToolCall`:
+    the harness never ran it, never will, and the Delivery Guarantee's recovery reads every
+    `ToolCall` in a transcript as a call the harness dispatched (issue #727).
+    """
+
+    name: str
+    input: str = ""
+
+
+@dataclass
+class ServerToolRecord:
+    """What server-side tools ran in one assistant turn — the evidence a later wake reads (#727).
+
+    A server tool runs inside the vendor's model call, so its blocks are vendor state the transcript
+    never keeps; without this record a later wake sees a claim ("I fetched the page") with no action
+    before it, and a careful model retracts a true statement. The record is bounded
+    (`_server_tools.bound`: at most `MAX_LISTED` uses, each name and input capped, the rest counted
+    in `unlisted`), persisted on the turn, and rendered to the model as a short system note beside
+    the turn on every later call (`_server_tools.with_records`). It is never part of the turn's
+    `content`, so a mining provider — which files the model's own words — is never handed it.
+    """
+
+    uses: list[ServerToolUse] = field(default_factory=list)
+    unlisted: int = 0
+
+
+@dataclass
 class ToolCall:
     """A model's request to invoke one tool.
 
@@ -210,6 +247,10 @@ class Message:
     never match at all (so the message was re-driven and answered twice), and the
     body is *peer-controlled*, so a peer could forge another message's rendered line
     into their own and steer the classifier (issue #297).
+
+    `server_tools` is set only on an assistant turn during which the vendor ran server-side tools
+    (`ServerToolRecord`, issue #727). It **is** serialized — it is the one trace of those tools a
+    later wake can read — and it is never a `ToolCall`, never `content`.
     """
 
     role: Role
@@ -222,6 +263,7 @@ class Message:
     cache_anchor: bool = False
     injected: bool = False
     items: list[str] = field(default_factory=list)
+    server_tools: ServerToolRecord | None = None
 
     @classmethod
     def system(cls, content: str) -> Message:
@@ -277,6 +319,13 @@ class Message:
             data["injected"] = True
         if self.items:
             data["items"] = list(self.items)
+        if self.server_tools is not None and (self.server_tools.uses or self.server_tools.unlisted):
+            record: dict[str, Any] = {
+                "uses": [{"name": u.name, "input": u.input} for u in self.server_tools.uses]
+            }
+            if self.server_tools.unlisted:
+                record["unlisted"] = self.server_tools.unlisted
+            data["server_tools"] = record
         return data
 
     @classmethod
@@ -294,7 +343,22 @@ class Message:
             videos=[_video_from_dict(v) for v in data.get("videos", [])],
             injected=bool(data.get("injected", False)),
             items=list(data.get("items", [])),
+            server_tools=_record_from_dict(data.get("server_tools")),
         )
+
+
+def _record_from_dict(data: Any) -> ServerToolRecord | None:
+    """Rebuild a `ServerToolRecord` from `Message.to_dict` output — ``None`` when there is none."""
+    if not isinstance(data, dict):
+        return None
+    uses = [
+        ServerToolUse(name=str(use.get("name") or ""), input=str(use.get("input") or ""))
+        for use in data.get("uses") or ()
+        if isinstance(use, dict)
+    ]
+    unlisted = data.get("unlisted") or 0
+    unlisted = unlisted if isinstance(unlisted, int) and not isinstance(unlisted, bool) else 0
+    return ServerToolRecord(uses=uses, unlisted=max(0, unlisted)) if uses or unlisted else None
 
 
 def _video_from_dict(data: dict[str, Any]) -> VideoContent:

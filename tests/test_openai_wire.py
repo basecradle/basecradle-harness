@@ -172,3 +172,65 @@ def test_a_union_root_tool_schema_reaches_the_openai_wires_verbatim():
     assert function_tool_to_responses(spec)["parameters"] is spec.parameters
     # And the union the harness folded away for xAI is still there for these two.
     assert spec.parameters["anyOf"] == [{"required": ["text"]}, {"required": ["html"]}]
+
+
+# === server-side tool items are recorded, client calls are not (issue #727) ====================
+
+
+def test_server_side_items_are_recorded_and_client_calls_are_not():
+    from basecradle_harness._openai_wire import message_from_responses
+
+    reply = message_from_responses(
+        {
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "dallas weather", "sources": []},
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_2",
+                    "status": "completed",
+                    "action": {"type": "open_page", "url": "https://example.com"},
+                },
+                {
+                    "type": "code_interpreter_call",
+                    "id": "ci_1",
+                    "container_id": "cntr_1",
+                    "code": "print(2**10)",
+                    "outputs": [{"type": "logs", "logs": "1024"}],
+                },
+                {"type": "x_search_call", "id": "xs_1", "action": {"query": "from:nova"}},
+                {
+                    "type": "computer_call",
+                    "id": "cu_1",
+                    "call_id": "c9",
+                    "action": {"type": "click"},
+                },
+                {"type": "function_call", "call_id": "c1", "name": "echo", "arguments": "{}"},
+                {
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "Done.", "annotations": []}],
+                },
+            ]
+        }
+    )
+    assert [(u.name, u.input) for u in reply.server_tools.uses] == [
+        ("web_search", "dallas weather"),
+        ("web_search", "https://example.com"),
+        ("code_interpreter", "print(2**10)"),
+        ("x_search", "from:nova"),
+    ]
+    assert [c.name for c in reply.tool_calls] == ["echo"]
+    assert reply.content == "Done."
+
+
+def test_a_responses_turn_with_no_server_item_carries_no_record():
+    from basecradle_harness._openai_wire import message_from_responses
+
+    reply = message_from_responses(
+        {"output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}]}
+    )
+    assert reply.server_tools is None

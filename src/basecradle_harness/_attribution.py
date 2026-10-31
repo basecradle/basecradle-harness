@@ -74,6 +74,7 @@ from basecradle_harness._context import is_summary, message_chars
 from basecradle_harness._engine import is_step_note
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import kv
+from basecradle_harness._server_tools import chars as record_chars
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -94,7 +95,12 @@ UNIT = "chars"
 #: or the sum silently stops closing, and the alternative — letting the lookup raise — throws away
 #: the whole line over one odd message. It should read ``0`` forever; if it ever does not, that is
 #: itself the finding.
-_SECTIONS = ("charter", "summary", "steps", "user", "assistant", "tool", "other")
+#:
+#: ``server_tools`` is the record of server-side tool activity a turn carries (issue #727): shown to
+#: the model as a system note of its own beside the turn (`_server_tools.with_records`), persisted
+#: forever, and therefore its own section rather than folded into ``assistant``, whose growth it
+#: does not share.
+_SECTIONS = ("charter", "summary", "steps", "user", "assistant", "tool", "server_tools", "other")
 
 
 def log_context_attribution(
@@ -156,6 +162,7 @@ def attribute(
     images = 0
     for message in history:
         text[_section(message)] += message_chars(message)
+        text["server_tools"] += record_chars(message)
         images += _image_chars(message)
     if brief is not None:
         images += _image_chars(brief)
