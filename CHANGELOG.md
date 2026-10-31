@@ -7,6 +7,40 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.166.0] - 2026-10-31
+
+### Fixed: drawers filed under MemPalace 3.10 read as filed under 3.11, and the palace check names the rest (issue #751)
+
+MemPalace 3.11.0 added `CONVO_CHUNKER_VERSION = 2`. It reads an exchange drawer with no
+`convo_chunker_version` as filed by an older chunker, and 3.10.0 and earlier never wrote the
+field. So under 3.11 every conversation drawer a palace held before the upgrade drops out of
+MemPalace's mined set and content-hash map. Measured on palaces built under 3.10.0 and mined under
+3.11.0: in place, a `mempalace mine` of `conversations/` deletes each such file's drawers and files
+it again through the miner's chunker (one exchange the observe had filed as 3 drawers came back as
+13, the shredding 0.164.0 removed); after a home move it files a second copy beside the old
+drawers, which it keeps. The fleet stays on MemPalace 3.10.0 until it moves deliberately; this
+release is what makes the move safe for the harness's own drawers.
+
+- **The observe stamps the installed `convo_chunker_version`** on every drawer it files, read from
+  the library (3.11's `file_conversation_exchange` writes the same value). A drawer filed from now
+  on is never stale by construction.
+- **`basecradle-harness-palace-check --stamp-chunker-version`** (`--dry-run` to preview) stamps the
+  drawers the observe filed before the upgrade with the installed version and changes nothing else.
+  A drawer counts as the observe's only when its id is the one `file_conversation_exchange` derives
+  from its own wing, room, source file, filing time and text, and it carries the fields the observe
+  stamps. Drawers MemPalace's miner filed (the observe's path before 0.164.0) were really cut by
+  the older chunker, so they are never touched. Each stamped drawer is read back by id; the step is
+  idempotent and a no-op before 3.11. Recall is unchanged.
+- **The report counts version-stale files apart from unfiled ones**, on a line printed on every
+  MemPalace: `conversation files version-stale: <n> (observe-filed <a>, miner-filed <b>), <why>`,
+  followed when `<n>` is not 0 by what a mine would do. A version-stale file now runs the forecast
+  in place too. Before, an in-place palace on 3.11 printed no forecast, and the NOC rename gate fell
+  back to `not yet registered at this location: 0` and passed, while a mine would have re-chunked
+  every file. Each such file's `reason:` line now says `version-stale`, which of the two outcomes
+  a mine would have, and whether `--stamp-chunker-version` makes it current, where before it said
+  "for a reason this check cannot name". The `next observe (dry run):` line is unchanged byte for
+  byte.
+
 ## [0.165.0] - 2026-10-31
 
 ### Fixed: `--pool-diagnosis` reads MemPalace 3.11's search, and CI runs the real-palace suite (issue #742)

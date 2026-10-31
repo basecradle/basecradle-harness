@@ -122,6 +122,25 @@ def test_each_drawer_carries_what_mempalaces_miner_decides_by(fake_mempalace, tm
     assert drawer["room"] == "general"  # MemPalace's own room detection, as the miner does it
 
 
+def test_the_installed_chunker_version_is_stamped_where_mempalace_defines_one(
+    fake_mempalace, tmp_path, monkeypatch
+):
+    """MemPalace 3.11 reads an exchange drawer with no ``convo_chunker_version`` as unfiled (#751).
+
+    The value is the library's own constant, never one written here: the fake defines 7, and 7 is
+    what is stamped. Where MemPalace defines none (the test above, 3.10 and earlier), nothing is.
+    """
+    convo_miner, _ = fake_mempalace
+    monkeypatch.setattr(sys.modules["mempalace.palace"], "CONVO_CHUNKER_VERSION", 7, raising=False)
+    provider = MemPalaceMemoryProvider(tmp_path / "palace")
+
+    provider.observe(MemoryExchange(user="Where do I live?", assistant="Dallas.", scope=_scope()))
+
+    (drawer,) = convo_miner.filed
+    assert drawer["extra_metadata"]["convo_chunker_version"] == 7
+    assert set(_mempalace.OBSERVE_STAMP) <= set(drawer["extra_metadata"])
+
+
 def test_a_long_exchange_is_split_at_lines_into_the_fewest_drawers(fake_mempalace, tmp_path):
     convo_miner, _ = fake_mempalace
     provider = MemPalaceMemoryProvider(tmp_path / "palace")

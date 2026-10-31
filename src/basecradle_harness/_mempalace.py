@@ -384,7 +384,13 @@ class MemPalaceMemoryProvider(MemoryProvider):
         - ``content_hash`` — computed exactly as the miner computes it (`content_hashes`), so a
           moved home's files are recognised by content and registered, never filed again
           (issue #606). On every drawer: ``file_conversation_exchange`` stamps each one chunk 0,
-          and a chunk 0 with no hash is what the palace check counts as unrecognisable.
+          and a chunk 0 with no hash is what the palace check counts as unrecognisable;
+        - ``convo_chunker_version`` — the installed MemPalace's own constant (`chunker_version`),
+          where it defines one (3.11 and later). MemPalace's miner reads an exchange drawer
+          without it as filed by an older chunker, so it is no longer filed (issue #751). 3.11's
+          ``file_conversation_exchange`` stamps the same value itself, and its value wins
+          (``setdefault``). The harness stamps it too, so a drawer it files is current whatever
+          upstream's write path does.
 
         Under MemPalace's own per-file lock (``mine_lock``), the one a concurrent ``mempalace
         mine`` takes for this file before it re-checks whether it is filed. If anything raises
@@ -415,6 +421,9 @@ class MemPalaceMemoryProvider(MemoryProvider):
                     "chunk_total": len(pieces),
                     "content_hash": ",".join(content_hashes(path)),
                 }
+                version = chunker_version()
+                if version is not None:
+                    stamp["convo_chunker_version"] = version
                 room = convo_miner.detect_convo_room(text)
                 for piece in pieces:
                     drawer = convo_miner.file_conversation_exchange(
@@ -1163,6 +1172,55 @@ def _unfile(collection, source_file: str) -> bool:
             exc_info=True,
         )
         return False
+
+
+#: The fields `MemPalaceMemoryProvider._file` stamps on every drawer, and that MemPalace's own
+#: ``file_conversation_exchange`` never writes by itself: one half of what makes a drawer
+#: recognisably the observe's (`filed_by_observe`).
+OBSERVE_STAMP = ("source_mtime", "chunk_total", "content_hash")
+
+
+def chunker_version() -> int | None:
+    """The installed MemPalace's ``CONVO_CHUNKER_VERSION``, or ``None`` before it defined one (3.11).
+
+    Read from the library and never written down here, so a later chunker revision is stamped as
+    itself (issue #751).
+    """
+    version = getattr(_import("palace"), "CONVO_CHUNKER_VERSION", None)
+    return version if isinstance(version, int) else None
+
+
+def filed_by_observe(drawer_id: str, meta: dict, document: str) -> bool:
+    """Whether a drawer is one the harness's observe filed (`MemPalaceMemoryProvider._file`).
+
+    Decided by structure, never by content (issue #751):
+
+    - the drawer is in the observe's wing and is not a registry row;
+    - it carries every field of `OBSERVE_STAMP`;
+    - and its id is the one ``file_conversation_exchange`` derives from the drawer's own wing,
+      room, ``source_file``, ``filed_at`` and text (``ids.make_exchange_drawer_id``).
+
+    A drawer MemPalace's miner filed (the observe's path before 0.164.0) has an id derived from
+    its chunk index instead (``make_convo_drawer_id``), so it never matches. The two recipes hash
+    different inputs with SHA-256.
+    """
+    if meta.get("wing") != _CONVERSATIONS_WING or meta.get("room") == _REGISTRY_ROOM:
+        return False
+    if any(meta.get(key) is None for key in OBSERVE_STAMP):
+        return False
+    try:
+        derived = _import("ids").make_exchange_drawer_id(
+            str(meta.get("wing")),
+            str(meta.get("room")),
+            str(meta.get("source_file")),
+            str(meta.get("filed_at")),
+            document or "",
+        )
+    except ImportError:
+        raise
+    except Exception:  # noqa: BLE001 - an id that cannot be derived is not provably ours
+        return False
+    return derived == drawer_id
 
 
 def content_hashes(path: Path) -> list[str]:

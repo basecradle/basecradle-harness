@@ -271,6 +271,7 @@ It opens the palace exactly as a wake resolves it from that `HARNESS_HOME` (an i
 - how many chunk-0 drawers predate MemPalace 3.7 (with no `content_hash`; after a move, their files would re-mine as new drawers, so this should be 0);
 - how many conversation files have no row at their current path;
 - how many conversation files are filed short of the drawers they record (a filing cut off partway, which a mine deletes and files again; this should be 0);
+- how many conversation files are **version-stale**, on a line of its own that is printed on every MemPalace: `conversation files version-stale: <n> (observe-filed <a>, miner-filed <b>), <why>`. MemPalace 3.11 added a `convo_chunker_version` to every exchange drawer and reads a drawer without one as filed by an older chunker. 3.10 and earlier never wrote it, so on 3.11 every drawer filed before the upgrade drops out of MemPalace's record of what is filed. A mine then deletes such a file's drawers and files it again through its chunker (in place), or files it a second time beside its old drawers, which it keeps (after a move). Before 3.11 the count is 0 and the tail says the installed MemPalace defines no version. A version-stale file also triggers the forecast below, in place too, and its `reason:` line says which of the two a mine would do;
 - MemPalace's own dry-run forecast of what a `mempalace mine` of the conversation files would do. Its line still begins `next observe (dry run):`, because the NOC's rename flow matches it word for word; since 0.164.0 the observe files only its own exchange and never mines the directory;
 - on its last line, how many registry rows recall returns for the home directory's own name. This must be 0.
 
@@ -291,6 +292,20 @@ basecradle-harness-palace-check --register-off-wing /home/<user>/harness        
 - **It is safe to run twice.** A registered file is known by its path, so a second run registers nothing.
 
 After it, the report's forecast reads `0 files -> mined as new drawers`.
+
+`--stamp-chunker-version` is for **upgrading MemPalace to 3.11 or later**, and it **writes to the palace**. Run it once after the upgrade, before any `mempalace mine` and before a home move. It writes the installed MemPalace's `convo_chunker_version` onto every drawer the harness's observe filed under an older MemPalace, so MemPalace reads them as filed again:
+
+```bash
+basecradle-harness-palace-check --stamp-chunker-version --dry-run /home/<user>/harness   # says what it would do
+basecradle-harness-palace-check --stamp-chunker-version /home/<user>/harness             # does it, then reports
+```
+
+- **Only the observe's own drawers.** A drawer is the observe's when its id is the one MemPalace's `file_conversation_exchange` derives from that drawer's own wing, room, source file, filing time and text, and it carries the fields the observe stamps. That is decided by structure, never by content. The observe files each exchange whole (0.164.0 and later), so no older chunker ever cut those drawers, and the version is true of them.
+- **Never MemPalace's miner's drawers.** Drawers filed by the miner (the observe's path before 0.164.0) really were cut by the older chunker. They are left to MemPalace and counted as `miner-filed` on the version-stale line.
+- **Nothing else changes.** Every stamped drawer is read back by id and must hold exactly its old metadata plus the version; it exits 1 otherwise. Recall is unchanged.
+- **It is safe to run twice.** A stamped drawer is current, so a second run stamps nothing. On a MemPalace with no chunker version it does nothing and says so.
+
+From 0.166.0 the observe stamps the version itself on every drawer it files (MemPalace 3.11 does too), so only drawers filed before the upgrade need this.
 
 **Does a move make recall worse?** Three probes can say a palace serves; they cannot say a move left recall as good as it was. `--sample N` probes N drawers instead, and prints only the ones that miss:
 
