@@ -404,5 +404,11 @@ def test_a_mixed_server_and_client_group_is_continued_with_the_step_note_aboard(
     convo = [ask, step]
     convo += [Message.tool(call.id, "posted") for call in step.tool_calls]
     convo.append(Message.system("Current Time: 2026-10-31 12:00:00 UTC\nStep 2 of 24."))
-    answer = adapter.chat(convo, tools=[POST_TOOL])  # a 400 here is the defect
-    assert "example domain" in (answer.content or "").lower() or answer.tool_calls
+    # The gate is that Anthropic accepts the continuation at all: before the fold it was a 400.
+    answer = adapter.chat(convo, tools=[POST_TOOL])
+    # And that the folded message is accepted again on a later step, replayed with the server
+    # tool's result now in the reply after it.
+    convo += [answer, *(Message.tool(call.id, "posted") for call in answer.tool_calls)]
+    convo.append(Message.user("Thanks. Reply with the page's title only."))
+    final = adapter.chat(convo, tools=[POST_TOOL])
+    assert "example domain" in (final.content or "").lower()

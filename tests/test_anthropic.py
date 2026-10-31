@@ -1379,7 +1379,39 @@ def test_a_trailing_note_after_a_pending_server_tool_is_folded_into_the_result(r
         {"type": "text", "text": "7"},
         {"type": "text", "text": SYSTEM_LABEL + "Step 2 of 24."},
     ]
-    assert result["cache_control"] == TAIL  # the tail moved with the note it was on
+    # The tail is placed after the fold, so it lands on the folded result itself.
+    assert result["cache_control"] == TAIL
+
+
+def test_a_breakpoint_on_a_folded_note_moves_to_the_result_it_now_ends(router, provider):
+    fetch = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01Q",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com"},
+    }
+    route = router.post(MESSAGES).mock(
+        side_effect=[
+            reply(fetch, tool_use("toolu_01D", TOOL.name, {"label": "x"}), stop_reason="tool_use"),
+            reply(text("the page is up and the number is 7")),
+            reply(text("done")),
+        ]
+    )
+    convo = [Message.user("fetch it and get the number")]
+    step = provider.chat(convo, tools=[TOOL])
+    note = Message.system("Step 2 of 24.")
+    convo += [step, Message.tool("toolu_01D", "7"), note]
+    convo.append(provider.chat(convo, tools=[TOOL]))
+    # A later step: the folded message is now mid-request, so the tail is elsewhere and only an
+    # anchor on the folded note can put a breakpoint on it.
+    note.cache_anchor = True
+    convo.append(Message.user("and then?"))
+    provider.chat(convo, tools=[TOOL])
+    sent = body(route, 2)["messages"]
+    (result,) = sent[2]["content"]
+    assert result["cache_control"] == {"type": "ephemeral"}  # the anchor moved to the result
+    assert all("cache_control" not in block for block in result["content"])  # never nested
+    assert sent[-1]["content"][-1]["cache_control"] == TAIL  # and the tail is the request's end
 
 
 def test_a_server_tool_already_answered_in_its_reply_leaves_the_next_message_alone(
