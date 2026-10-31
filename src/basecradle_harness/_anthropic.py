@@ -29,16 +29,31 @@ Explicit caching — the fleet's first ``cache_mode = "explicit"``
 Anthropic caches only a prefix the client **marks**, so this is the adapter #277 built the engine's
 breakpoint for. The engine stamps `Message.cache_anchor` on the last turn of the frozen transcript
 (`_caching.anchor_cacheable_prefix`); here that becomes ``cache_control: {"type": "ephemeral"}`` on
-the anchored turn's last block — a system block when the anchor is the charter. Three properties
-make the mark pay out, and each one fails silently when broken:
+the anchored turn's last block — a system block when the anchor is the charter. Two placements are
+the adapter's own, because only the adapter knows the wire's positions (issue #726):
+
+- **No anchor, the tool list.** On a first wake the frozen transcript is empty (the charter rides
+  the per-wake brief), so the engine anchors nothing. The stable/volatile boundary is then the end
+  of ``tools``, which renders first, and the last tool definition carries the one breakpoint — so
+  every step after the first reads the tool list instead of paying for it again.
+- **The lookback chain.** A breakpoint finds an earlier entry only within `LOOKBACK` (20) positions
+  of itself, and the entry a wake can find is the one the previous wake wrote at *its* anchor. A
+  wake that added 20 positions or more (about seven sequential tool steps) would leave the next
+  wake's anchor blind, rewriting the whole prefix at the write rate. So up to three more
+  breakpoints are chained back from the anchor, `LOOKBACK` apart, reaching 80 positions; a hit is a
+  read and the write is charged once, so they cost nothing (`AnthropicProvider._place_breakpoints`).
+
+Every placement is on the request only: copy-on-write, never persisted, and never counted by the
+thinking-replay digest (`_Stream` reads every block without its ``cache_control``). Three properties
+make the marks pay out, and each one fails silently when broken:
 
 - **The render order is tools → system → messages**, so the tool list is part of every cached
   prefix and must be byte-stable for a given agent: server tools first in a fixed order, then the
   function tools **sorted by name** (`_wire_tools`), whatever order the registry handed over.
 - **The TTL** is five minutes unless ``model_params.json`` sets
-  ``"cache_control": {"type": "ephemeral", "ttl": "1h"}``. That key is the template of the one
-  breakpoint the harness places, never Anthropic's top-level automatic-caching field: a second,
-  automatic breakpoint at the volatile tail would write a cache entry no later wake can read.
+  ``"cache_control": {"type": "ephemeral", "ttl": "1h"}``. That key is the template of every
+  breakpoint the harness places, never Anthropic's top-level automatic-caching field: an automatic
+  breakpoint at the volatile tail would write a cache entry no later wake can read.
 - **The proof is the response**, never a declaration: ``usage.cache_read_input_tokens`` rides the
   ``llm`` line as ``cached_tokens=``, and the write beside it as ``cache_write_tokens=`` (writes
   bill at 1.25x for five minutes and 2x for an hour, so the cost needs them). A prefix under the
@@ -220,6 +235,19 @@ _THINKING = frozenset({"thinking", "redacted_thinking"})
 
 #: Block types a ``cache_control`` breakpoint may ride. A thinking block cannot carry one.
 _MARKABLE = frozenset({"text", "image", "document", "tool_use", "tool_result"})
+
+#: How far back one breakpoint looks for an entry an earlier request wrote: *"The system checks at
+#: most 20 positions for each breakpoint, counting the breakpoint itself as the first."* A position is
+#: a content block, except that a run of consecutive ``tool_use`` blocks is one position and so is a
+#: run of consecutive ``tool_result`` blocks (`_RUNS`). Anthropic's prompt-caching documentation,
+#: read 2026-10-31 (issue #726).
+LOOKBACK = 20
+
+#: The most ``cache_control`` breakpoints one request may carry; a fifth is a 400.
+MAX_BREAKPOINTS = 4
+
+#: The block types whose consecutive runs Anthropic counts as a single lookback position.
+_RUNS = frozenset({"tool_use", "tool_result"})
 
 #: The server tools' result blocks, and the server-tool name each answers — for the error log.
 _RESULTS = {
@@ -641,16 +669,87 @@ class AnthropicProvider:
             if message.cache_anchor:
                 self._mark(blocks)
         self._replies = {key: kept for key, kept in self._replies.items() if key in present}
+        sent = [*system, *(block for turn in wire for block in turn["content"])]
+        # The tool list renders before the first system or message block, so its end is the
+        # position just before them: an entry a first wake wrote there is still worth reaching.
+        self._place_breakpoints(sent, first=-1 if tools else 0)
+        if tools and not any("cache_control" in block for block in sent):
+            # No frozen turn to anchor (a first wake: the charter rides the brief, so the frozen
+            # transcript is empty). The stable/volatile boundary is then the end of the tool list,
+            # which renders first and is the same bytes on every call of this agent.
+            tools[-1]["cache_control"] = self._template()
         return system, wire, stream
+
+    def _template(self) -> dict[str, Any]:
+        """A fresh breakpoint: the operator's ``cache_control`` (its TTL), else the 5-minute one."""
+        return dict(self._cache_control or {"type": "ephemeral"})
 
     def _mark(self, blocks: list[dict[str, Any]]) -> None:
         """Put the breakpoint on the last block that can carry one, in place (a fresh dict)."""
         for position in range(len(blocks) - 1, -1, -1):
-            if blocks[position].get("type") in _MARKABLE:
-                blocks[position]["cache_control"] = dict(
-                    self._cache_control or {"type": "ephemeral"}
-                )
+            if _markable(blocks[position]):
+                blocks[position]["cache_control"] = self._template()
                 return
+
+    def _place_breakpoints(self, blocks: list[dict[str, Any]], *, first: int = 0) -> None:
+        """Walk back from the anchor's breakpoint, adding one every `LOOKBACK` positions (#726).
+
+        `blocks` is the request's system blocks and then every message block, in send order; `first`
+        is the earliest position an entry can sit at (-1 when a tool list precedes them). The
+        anchor's breakpoint finds an entry only within `LOOKBACK` positions of itself, and the entry
+        a wake can find is the one the *previous* wake wrote at its own anchor — the end of the
+        transcript as it stood then. So a previous wake that added `LOOKBACK` or more positions of
+        work (about seven sequential tool steps: a call, its result and a step note each) leaves this wake's anchor blind to it, and the whole
+        prefix is written again at the write rate: more than sending no breakpoint at all.
+
+        Each added breakpoint starts a lookback window of its own, so they are chained back from the
+        anchor, each on the earliest position the window before it still reaches. Spaced exactly
+        `LOOKBACK` apart the windows tile with no gap, and the reach is `LOOKBACK` × `MAX_BREAKPOINTS`
+        positions behind the anchor (80). A breakpoint that hits is a read; the write is charged once,
+        for the span after the hit, so the extra breakpoints cost nothing.
+
+        Nothing is added when the earliest breakpoint's own window already reaches `first`, and the
+        request never carries more than the vendor's four: a caller that anchored more keeps its latest
+        four, with a WARNING, rather than a 400. Each lands on the **last** block of its position (a
+        run of parallel calls or results is one position), and only on a block that can carry one;
+        where the earliest reachable position cannot, the next later one is taken, which narrows the
+        reach and never opens a gap. Every block is counted as a position except the runs Anthropic
+        names, so an uncertain count can only overstate a distance, which also never opens a gap.
+        """
+        marked = [index for index, block in enumerate(blocks) if "cache_control" in block]
+        if not marked:
+            return
+        if len(marked) > MAX_BREAKPOINTS:
+            _log.warning(
+                "%d turns were anchored for caching and Anthropic takes at most %d breakpoints; "
+                "keeping the latest %d.",
+                len(marked),
+                MAX_BREAKPOINTS,
+                MAX_BREAKPOINTS,
+            )
+            for index in marked[:-MAX_BREAKPOINTS]:
+                del blocks[index]["cache_control"]
+            marked = marked[-MAX_BREAKPOINTS:]
+        positions = _positions(blocks)
+        earliest = marked[0]
+        for _ in range(MAX_BREAKPOINTS - len(marked)):
+            reach = positions[earliest] - LOOKBACK
+            if reach < first:
+                return
+            candidate = next(
+                (
+                    index
+                    for index in range(earliest)
+                    if positions[index] >= reach
+                    and _markable(blocks[index])
+                    and positions[index + 1] != positions[index]
+                ),
+                None,
+            )
+            if candidate is None:
+                return
+            blocks[candidate]["cache_control"] = self._template()
+            earliest = candidate
 
     # --- lifecycle --------------------------------------------------------------
 
@@ -680,7 +779,12 @@ class _Stream:
 
     def __init__(self, system: list[dict[str, Any]], tools: list[dict[str, Any]]) -> None:
         self._hash = hashlib.sha256()
-        self._feed({"system": [_unmarked(block) for block in system], "tools": tools})
+        self._feed(
+            {
+                "system": [_unmarked(block) for block in system],
+                "tools": [_unmarked(tool) for tool in tools],
+            }
+        )
 
     def add(self, role: str, block: Mapping[str, Any]) -> None:
         self._feed({"role": role, "block": _unmarked(block)})
@@ -697,6 +801,32 @@ class _Stream:
 def _unmarked(block: Mapping[str, Any]) -> dict[str, Any]:
     """`block` without its ``cache_control`` — a breakpoint never changes what a prefix *is*."""
     return {key: value for key, value in block.items() if key != "cache_control"}
+
+
+def _markable(block: Mapping[str, Any]) -> bool:
+    """Whether `block` can carry a breakpoint: a markable type, and not empty (*"Empty text blocks
+    cannot be cached"*; an empty tool result is held to the same rule)."""
+    kind = block.get("type")
+    if kind not in _MARKABLE:
+        return False
+    if kind == "text":
+        return bool(block.get("text"))
+    if kind == "tool_result":
+        return bool(block.get("content"))
+    return True
+
+
+def _positions(blocks: Sequence[Mapping[str, Any]]) -> list[int]:
+    """Each block's lookback position: one per block, a run of `_RUNS` blocks of one type sharing one."""
+    positions: list[int] = []
+    position, previous = -1, None
+    for block in blocks:
+        kind = block.get("type")
+        if kind not in _RUNS or kind != previous:
+            position += 1
+        positions.append(position)
+        previous = kind
+    return positions
 
 
 def validated_params(

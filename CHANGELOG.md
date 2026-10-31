@@ -7,6 +7,34 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.159.0] - 2026-10-31
+
+### Fixed: Anthropic's explicit cache on a first wake and after a long wake (issue #726)
+
+Two gaps of the one-breakpoint shape on the `anthropic` adapter, both measured live on
+`claude-haiku-5-5`. The engine still states the boundary once (its anchor); the adapter, which alone
+knows the wire's positions, now turns it into the breakpoints Anthropic needs.
+
+- **A first wake caches its tool list.** With the charter in the per-wake brief, a first wake has no
+  frozen transcript and the engine anchors nothing, so the tool list (~4K tokens, rendered first) was
+  billed in full on every step. With nothing anchored, the last tool definition now carries the
+  breakpoint. Live: step 1 wrote 6,370 tokens; steps 2 and 3 read 6,370 each.
+- **A long wake no longer makes the next wake miss.** A breakpoint finds an earlier entry only within
+  20 positions of itself, and a sequential tool step persists three, so a previous wake of about
+  seven steps left the anchor blind and the whole prefix was rewritten at the write rate. The adapter
+  now chains up to three more breakpoints back from the anchor, exactly 20 positions apart (a run of
+  parallel calls, or of their results, is one position), reaching 80 positions. A hit is a read and
+  the write is billed once, so they cost nothing. Live: after a 14-step wake (42 positions), the next
+  wake's first call read the previous entry in full (12,094 tokens); with the chain disabled, the live
+  gate's 45-position sequence read 0 of 5,293.
+- Every breakpoint is placed on the request only, never persisted, never on a block that cannot carry
+  one, and never counted by the thinking-replay digest. With a tool list present, the chain reaches
+  one position further, to the end of the tools, where a first wake's entry sits.
+- **A request never carries more than Anthropic's four breakpoints.** A library caller that anchored
+  more turns was sent a 400 (since 0.158.0); it now keeps the latest four, with a WARNING.
+- New live gates: `test_with_nothing_anchored_the_tool_list_is_read_back`,
+  `test_a_long_previous_wake_is_found_through_the_lookback_chain`.
+
 ## [0.158.0] - 2026-10-31
 
 ### Added: Claude, direct — the `anthropic` provider adapter (issue #725)
