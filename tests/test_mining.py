@@ -40,7 +40,7 @@ from basecradle_harness._mempalace import (
     _OPEN_TAG,
     MemPalaceMemoryProvider,
 )
-from basecradle_harness._messages import Message
+from basecradle_harness._messages import Message, ServerToolUse, ToolCall
 from basecradle_harness._mining import _LEGACY_RECALL_HEADING as LEGACY_HEADING
 from basecradle_harness._mining import (
     _LEGACY_SUMMARIZE_INSTRUCTION,
@@ -53,6 +53,7 @@ from basecradle_harness._mining import (
 )
 from basecradle_harness._policy import SHELL
 from basecradle_harness._rerank import MemPalaceReranker
+from basecradle_harness._server_tools import record
 
 BC_URL = "https://basecradle.com"
 FAKE_TOKEN = "bc_uat_KqI8zFxkQ0OZ8vYwT7mWcVtR3nSdLpEa"
@@ -271,6 +272,47 @@ def test_no_part_of_the_brief_reaches_the_mined_exchange(platform, tmp_path, mon
     # And what *is* mined is the dialogue: the peer's message and the model's own words.
     assert "Where does John live?" in mined
     assert "John lives in Dallas." in mined
+
+
+SERVER_TOOL_SENTINEL = "https://example.com/SENTINEL-SERVER-TOOL-do-not-mine-this-record"
+
+
+class _FetchingModel(_CannedModel):
+    """Step 1 ran a server-side fetch and calls a client tool; step 2 answers. Records every view."""
+
+    def __init__(self):
+        super().__init__(text="The page is titled Example Domain.")
+        self.views: list[list[Message]] = []
+
+    def chat(self, messages, tools=None):
+        self.views.append(list(messages))
+        if len(self.views) == 1:
+            reply = Message.assistant(
+                tool_calls=[ToolCall(id="c1", name="shell_capable", arguments={})]
+            )
+            reply.server_tools = record([ServerToolUse("web_fetch", SERVER_TOOL_SENTINEL)])
+            return reply
+        return Message.assistant(content=self.text)
+
+
+def test_the_server_tool_record_is_shown_to_the_model_and_never_mined(platform, tmp_path):
+    """Issue #727's surface: the note beside a turn is harness-composed, so it is never mined.
+
+    Both halves, as above: the model's second call must have *seen* the record, or the absence
+    from the mined exchange proves nothing.
+    """
+    provider = Recorder()
+    model = _FetchingModel()
+    agent = _agent(tmp_path, provider, model)
+
+    agent.wake()
+
+    assert len(model.views) >= 2  # a later call may be the no-reply informer's; it sees it too
+    assert SERVER_TOOL_SENTINEL in "\n".join(m.content or "" for m in model.views[1])
+    assert provider.observed, "the turn was never mined at all"
+    mined = "\n".join(e.user + "\n" + e.assistant for e in provider.observed)
+    assert SERVER_TOOL_SENTINEL not in mined
+    assert "The page is titled Example Domain." in mined
 
 
 def test_a_canned_stuck_note_is_never_mined_as_the_agents_words(platform, tmp_path, monkeypatch):

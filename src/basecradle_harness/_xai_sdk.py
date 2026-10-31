@@ -100,7 +100,7 @@ from basecradle_harness._exceptions import (
     ProviderToolSchemaError,
 )
 from basecradle_harness._faults import is_out_of_funds, is_too_large, refused_tool_schema
-from basecradle_harness._messages import ImageContent, Message, ToolCall, ToolSpec
+from basecradle_harness._messages import ImageContent, Message, ServerToolUse, ToolCall, ToolSpec
 from basecradle_harness._observability import (
     finish_reason,
     generation_id,
@@ -112,6 +112,7 @@ from basecradle_harness._observability import (
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._schema import UnrepresentableSchema, normalize_object_root
 from basecradle_harness._secret import Secret
+from basecradle_harness._server_tools import record, summarize
 from basecradle_harness._timeouts import call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
@@ -712,7 +713,17 @@ class XaiSdkProvider:
         return chat_mod.image(image.url)
 
     def _from_wire(self, response: Any) -> Message:
-        """The SDK's ``Response`` as a harness assistant `Message` (text + tool calls + sources)."""
+        """The SDK's ``Response`` as a harness assistant `Message` (text + tool calls + sources).
+
+        The calls grok already ran **server-side** are not the harness's to run (`_is_client_side`),
+        but they are recorded on the reply — one `ServerToolUse` each, the tool's name and what it
+        ran on — so a later wake can see that the search or the run happened (issue #727).
+        """
+        used = [
+            ServerToolUse(name=tc.function.name or "", input=_server_input(tc.function.arguments))
+            for tc in response.tool_calls
+            if not self._is_client_side(tc)
+        ]
         tool_calls = [
             ToolCall(
                 id=tc.id,
@@ -729,7 +740,9 @@ class XaiSdkProvider:
         footer = format_citations(citations)
         if footer:
             content = f"{content}\n\n{footer}" if content else footer
-        return Message.assistant(content=content, tool_calls=tool_calls)
+        reply = Message.assistant(content=content, tool_calls=tool_calls)
+        reply.server_tools = record(used)
+        return reply
 
     def _is_client_side(self, tool_call: Any) -> bool:
         """True unless xAI already ran this tool call **server-side** (issue #183).
@@ -797,6 +810,16 @@ class XaiSdkProvider:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _server_input(arguments: Any) -> str:
+    """A server-side call's JSON arguments as one line of what it ran on — the raw text if not JSON."""
+    if not arguments:
+        return ""
+    try:
+        return summarize(json.loads(arguments))
+    except (TypeError, ValueError):
+        return str(arguments)
 
 
 class _grpc_error_context:

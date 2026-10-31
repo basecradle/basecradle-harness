@@ -1271,3 +1271,47 @@ def test_a_failed_rebuild_reports_the_deadline_that_runs_not_the_one_asked_for(r
     assert provider.last_timeout == applied
     provider.chat([Message.user("Hi")])  # the same deadline again: the fast path
     assert provider.last_timeout == applied
+
+
+def test_server_side_calls_are_recorded_for_a_later_wake():
+    # Issue #727: grok's server-side calls are never dispatched (issue #183) — but they ran, and a
+    # later wake that cannot see that they ran reads the grounded answer as an unbacked claim.
+    provider = _provider(
+        _response(
+            content="One recent AI headline …",
+            tool_calls=[
+                {
+                    "id": "s1",
+                    "name": "web_search",
+                    "arguments": {"query": "ai news"},
+                    "type": _TYPE.TOOL_CALL_TYPE_WEB_SEARCH_TOOL,
+                },
+                {
+                    "id": "s2",
+                    "name": "code_execution",
+                    "arguments": {"code": "print(1)"},
+                    "type": _TYPE.TOOL_CALL_TYPE_CODE_EXECUTION_TOOL,
+                },
+                {
+                    "id": "f1",
+                    "name": "get_weather",
+                    "arguments": {"city": "Dallas"},
+                    "type": _TYPE.TOOL_CALL_TYPE_CLIENT_SIDE_TOOL,
+                },
+            ],
+        )
+    )
+    reply = provider.chat([Message.user("news?")], tools=[WEATHER_TOOL])
+
+    assert [(u.name, u.input) for u in reply.server_tools.uses] == [
+        ("web_search", "ai news"),
+        ("code_execution", "print(1)"),
+    ]
+    assert [c.name for c in reply.tool_calls] == ["get_weather"]
+
+
+def test_a_turn_with_only_client_calls_carries_no_record():
+    provider = _provider(
+        _response(tool_calls=[{"id": "f1", "name": "get_weather", "arguments": {"city": "Dallas"}}])
+    )
+    assert provider.chat([Message.user("weather?")], tools=[WEATHER_TOOL]).server_tools is None

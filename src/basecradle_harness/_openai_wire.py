@@ -29,9 +29,11 @@ from basecradle_harness._messages import (
     CodeExecutionFile,
     CodeExecutionTrace,
     Message,
+    ServerToolUse,
     ToolCall,
     ToolSpec,
 )
+from basecradle_harness._server_tools import record, summarize
 
 #: What a surface with no video part says when a video reaches it anyway. **Unreachable under the
 #: gate** — `_assets.model_sees_video` fails closed and only an adapter that declared
@@ -310,7 +312,11 @@ def message_from_responses(data: Mapping[str, Any]) -> Message:
     Code Interpreter wrote); ``function_call`` items become `ToolCall`s for the engine to run;
     ``code_interpreter_call`` items contribute their executed source and container id. Every
     other item type (``web_search_call``, ``reasoning``, and future built-ins) is resolved
-    server-side and intentionally skipped here.
+    server-side and contributes nothing to the reply's text or calls.
+
+    A server-side tool item (`_is_server_tool_item`) is, however, **recorded**: one `ServerToolUse`
+    per item — the tool's name and what it ran on (a search's query, a page's URL, the code) — so a
+    later wake can see that it ran (issue #727). The items themselves are not kept anywhere.
 
     When the turn ran code, the executed source + output-file handles are surfaced on the
     `Message` as a `CodeExecutionTrace` (transient) so the Asset bridge can store them; with no
@@ -330,9 +336,12 @@ def message_from_responses(data: Mapping[str, Any]) -> Message:
     code_container: str | None = None
     output_files: list[CodeExecutionFile] = []
     seen_file_ids: set[str] = set()
+    used: list[ServerToolUse] = []
 
     for item in output:
         kind = item.get("type")
+        if _is_server_tool_item(kind):
+            used.append(_server_tool_use(kind, item))
         if kind == "message":
             for part in item.get("content") or []:
                 if part.get("type") == "output_text":
@@ -371,7 +380,56 @@ def message_from_responses(data: Mapping[str, Any]) -> Message:
         if (code_blocks or output_files)
         else None
     )
-    return Message(role="assistant", content=content, tool_calls=tool_calls, code_execution=trace)
+    return Message(
+        role="assistant",
+        content=content,
+        tool_calls=tool_calls,
+        code_execution=trace,
+        server_tools=record(used),
+    )
+
+
+#: The Responses output items that are tools the **vendor** ran, by type. Named, never inferred
+#: from a ``_call`` suffix: ``function_call``, ``computer_call``, ``local_shell_call`` and
+#: ``custom_tool_call`` end the same way and are calls for the *client* to run. A ``*_search_call``
+#: is admitted by its suffix, because every vendor search (``web_search_call``, xAI's
+#: ``x_search_call``) is one.
+_SERVER_TOOL_ITEMS = frozenset(
+    {"code_interpreter_call", "file_search_call", "image_generation_call", "mcp_call"}
+)
+
+#: An item's fields that are never what it *ran on* — identifiers, state, and the (possibly large)
+#: outputs — so the summary of a tool's input never reads them.
+_NOT_INPUT = frozenset(
+    {"id", "type", "status", "results", "result", "outputs", "output", "container_id", "error"}
+)
+
+
+def _is_server_tool_item(kind: Any) -> bool:
+    return isinstance(kind, str) and (kind in _SERVER_TOOL_ITEMS or kind.endswith("_search_call"))
+
+
+#: The item states a vendor reports for a server-side call that did not complete.
+_FAILED_STATUSES = frozenset({"failed", "incomplete"})
+
+
+def _server_tool_use(kind: str, item: Mapping[str, Any]) -> ServerToolUse:
+    """One server-side tool item as a `ServerToolUse`: its tool's name, what it ran on, and whether
+    the vendor reported it failed."""
+    status = item.get("status")
+    failed = status if status in _FAILED_STATUSES else ("failed" if item.get("error") else "")
+    if kind == "mcp_call":
+        # The remote tool's own name leads, so a long argument list can never cut it off.
+        label = "/".join(str(part) for part in (item.get("server_label"), item.get("name")) if part)
+        given = f"{label} {item.get('arguments') or ''}".strip()
+        return ServerToolUse(name="mcp", input=given, failed=failed)
+    action = item.get("action")
+    given = action if isinstance(action, Mapping) and action else item
+    return ServerToolUse(
+        name=kind.removesuffix("_call"),
+        input=summarize({k: v for k, v in given.items() if k not in _NOT_INPUT}),
+        failed=failed,
+    )
 
 
 def _tool_call_from_responses(item: Mapping[str, Any]) -> ToolCall:

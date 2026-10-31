@@ -431,7 +431,9 @@ def _model_facing_strings():
     )
     from basecradle_harness._install import prompt_text
     from basecradle_harness._mcp import McpServerConfig, _about, _withholding, withheld_refusal
+    from basecradle_harness._messages import ServerToolRecord, ServerToolUse
     from basecradle_harness._policy import SHELL
+    from basecradle_harness._server_tools import render
 
     now = __import__("datetime").datetime(2026, 7, 14, tzinfo=__import__("datetime").timezone.utc)
     noted = McpServerConfig(name="pw", command="x", note="Headless Chromium on this box.")
@@ -460,6 +462,10 @@ def _model_facing_strings():
         or "",
         # Issue #623: what the model is told about the software it runs under.
         "harness": render_harness(),
+        # Issue #727: the note that shows a turn's server-side tool activity on later calls.
+        "server-tool record": render(
+            ServerToolRecord(uses=[ServerToolUse("web_fetch", "https://example.com")], unlisted=2)
+        ),
         "tool defect": render_defects(["memory — failed to load"]) or "",
         "safety opt-out": render_safety(["mcp: filesystem"]) or "",
         # Issue #553: what the model is told about its MCP servers and the tools it does not get.

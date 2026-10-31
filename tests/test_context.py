@@ -15,6 +15,7 @@ the test tells it to.
 from __future__ import annotations
 
 import logging
+import math
 import re
 import time
 
@@ -53,6 +54,7 @@ from basecradle_harness._context import (
 )
 from basecradle_harness._engine import DEFAULT_MAX_STEPS
 from basecradle_harness._exceptions import ProviderContextLengthError
+from basecradle_harness._server_tools import NOTE_CAP as SERVER_TOOLS_NOTE_CAP
 
 # The fabricated cast, per repo convention.
 JOHN = "John Doe"
@@ -1031,12 +1033,15 @@ def test_an_unrelated_exceeds_the_maximum_is_not_the_wall(text):
 def test_the_worst_case_is_derived_from_the_constants_not_hardcoded():
     # The whole point of deriving it: tune a cap or the step budget and the guarantee's arithmetic
     # follows automatically. A literal 30_000 here would rot the day either constant moved.
-    assert worst_case_turn_tokens(DEFAULT_MAX_STEPS) == int(
-        (TOOL_RESULT_CAP + TOOL_ARGS_CAP) * DEFAULT_MAX_STEPS / WORST_CASE_CHARS_PER_TOKEN
+    # The last term is the reserve summary's server-tool record (issue #727): one more model call.
+    assert worst_case_turn_tokens(DEFAULT_MAX_STEPS) == math.ceil(
+        (
+            (TOOL_RESULT_CAP + TOOL_ARGS_CAP + SERVER_TOOLS_NOTE_CAP) * DEFAULT_MAX_STEPS
+            + SERVER_TOOLS_NOTE_CAP
+        )
+        / WORST_CASE_CHARS_PER_TOKEN
     )
-    assert worst_case_turn_tokens(2 * DEFAULT_MAX_STEPS) == 2 * worst_case_turn_tokens(
-        DEFAULT_MAX_STEPS
-    )
+    assert worst_case_turn_tokens(2 * DEFAULT_MAX_STEPS) > worst_case_turn_tokens(DEFAULT_MAX_STEPS)
     # `min_safe_limit` is that same inequality solved for the ceiling.
     assert min_safe_limit(DEFAULT_MAX_STEPS) * (1 - COMPACT_AT) >= worst_case_turn_tokens(
         DEFAULT_MAX_STEPS
@@ -1050,9 +1055,10 @@ def test_the_arguments_cap_is_an_input_to_the_proof_not_a_neighbor_of_it(monkeyp
     **unbounded**, so the inequality this file is built on did not hold at all. A change that caps the
     arguments without teaching the proof about them would leave exactly that gap, one size smaller and
     just as silent — which is why `persisted_step_cap` exists and why this test watches it rather than
-    a literal.
+    a literal. The record of a step's server-side tools (issue #727) is a third term for the same
+    reason: it persists per step and is replayed forever.
     """
-    assert persisted_step_cap() == TOOL_RESULT_CAP + TOOL_ARGS_CAP
+    assert persisted_step_cap() == TOOL_RESULT_CAP + TOOL_ARGS_CAP + SERVER_TOOLS_NOTE_CAP
 
     worst_case = worst_case_turn_tokens(DEFAULT_MAX_STEPS)
     needed = min_safe_limit(DEFAULT_MAX_STEPS)
@@ -1070,8 +1076,9 @@ def test_the_shipped_caps_keep_the_default_install_inside_the_guarantee():
     """The floor must clear the bar *with the arguments counted* — or every stock agent warns.
 
     This is the constraint that sizes `TOOL_ARGS_CAP`. The 128 K floor leaves 64 K of headroom above
-    the threshold, and one turn can now add ~49 K of it (6 KB per step x 24 steps at 3 chars/token).
-    Raise the argument cap to the result cap's 4 KB and the minimum safe ceiling lands at 131_072 —
+    the threshold, and one turn can now add ~61 K of it (~7.5 KB per step x 24 steps at 3 chars/token:
+    the result, the arguments and, since issue #727, the server-tool note).
+    Raise the argument cap to the result cap's 4 KB and the minimum safe ceiling lands at 155_390 —
     *above* the floor — and the default install starts warning about a guarantee it has not actually
     lost. A warning that fires on every stock agent is a warning nobody reads.
     """
