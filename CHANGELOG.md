@@ -25,8 +25,10 @@ fetch from inside code execution. Forcing a direct call at the default is a 400 
 - Measured on `claude-haiku-5-5` under a harness-shaped brief, eight requests an arm: at the default,
   3 of 4 direct fetches and 8 of 14 direct searches failed. With the fix, 0 of 8 and 0 of 9 failed,
   and a fetch from the sandbox still succeeded.
-- The live gate now forces a direct call to each tool with `tool_choice` and requires the result to
-  be a direct call that succeeded. It is red at the old default.
+- The live gate now forces a direct call to each tool with `tool_choice` and requires a direct call
+  that succeeded, with no failed result. It is red at the old default.
+- The tool list's bytes change, so each Anthropic agent's cached prefix is written once more on its
+  first wake after the upgrade.
 
 ## [0.161.3] - 2026-10-31
 

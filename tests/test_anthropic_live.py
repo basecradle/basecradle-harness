@@ -257,10 +257,10 @@ def test_a_web_search_runs_server_side_and_its_fee_is_logged(caplog):
     media = _lines(caplog, "media provider=anthropic kind=search.web")
     assert sum(int(_field(line, "count")) for line in media) == searches  # one per billed call
     assert sum(float(_field(line, "cost")) for line in media) == pytest.approx(searches * 0.01)
-    # With dynamic filtering (web_search_20260318) the search runs inside Anthropic's code
-    # execution and the model cites its sources in its own words, when it does: no citation blocks
-    # arrive, so no Sources: footer is built (measured 2026-10-31). What is pinned is the vendor's
-    # own result — a successful search result list carrying real URLs, kept for the next step.
+    # With dynamic filtering (web_search_20260318) a search the model runs from Anthropic's code
+    # execution comes back with no citation blocks, so no Sources: footer is built (measured
+    # 2026-10-31); since issue #740 it may also call the search directly. Neither is pinned: what
+    # is pinned is the vendor's own result — a successful result list carrying real URLs.
     assert answer.content
     kept = next(iter(adapter._replies.values()))[1]
     results = [b["content"] for b in kept if b.get("type") == "web_search_tool_result"]
@@ -307,9 +307,9 @@ def test_a_web_tool_called_directly_runs(caplog, builtin, prompt, result_type):
     assert "server tool failed" not in caplog.text
     kept = next(iter(adapter._replies.values()))[1]
     results = [block for block in kept if block.get("type") == result_type]
-    assert results
+    # The forced call is direct; the model may follow it with one from the sandbox, which is fine.
+    assert any(result.get("caller") == {"type": "direct"} for result in results), results
     for result in results:
-        assert result.get("caller") == {"type": "direct"}
         content = result["content"]
         assert not (isinstance(content, dict) and content.get("error_code")), content
 

@@ -237,9 +237,9 @@ DEFAULT_BASE_URL = "https://api.anthropic.com"
 #: code_execution environment"*) while the brief names it as a tool it holds; when it calls one
 #: directly anyway it wraps its arguments (``{"params": {"url": …}}``) or sends ``{}``, and the tool
 #: answers ``invalid_tool_input``. Measured 2026-10-31 on ``claude-haiku-5-5`` under a
-#: harness-shaped brief, eight requests an arm: 3 of 4 direct fetches and 8 of 14 direct searches
-#: failed at the default, 0 of 8 and 0 of 9 with these callers, and a fetch from the sandbox still
-#: succeeded.
+#: harness-shaped brief with ``code_execution_20260521`` declared, eight requests an arm: 3 of 4
+#: direct fetches and 8 of 14 direct searches failed at the default, 0 of 8 and 0 of 9 with these
+#: callers, and a fetch from the sandbox still succeeded, reporting ``code_execution_20260120``.
 WEB_CALLERS = ("direct", "code_execution_20260120")
 
 #: The server tools this adapter sends, by the builtin name a tool plugin resolves to → the tool
@@ -432,7 +432,7 @@ class AnthropicProvider:
         self._anthropic = require_anthropic()
         self._params, self._cache_control = validated_params(default_params, self._anthropic)
         self._builtins = [
-            copy.deepcopy(dict(BUILTINS[name])) for name in BUILTINS if name in set(builtin_tools)
+            copy.deepcopy(BUILTINS[name]) for name in BUILTINS if name in set(builtin_tools)
         ]
         #: Each reply this adapter returned, by identity, with its raw blocks and the digest of the
         #: prefix it was produced on — what the next step sends back (see the module docstring).
@@ -1028,7 +1028,7 @@ def _wire_tools(builtins: list[dict[str, Any]], tools: Sequence[ToolSpec] | None
         }
         for spec in sorted(tools or (), key=lambda spec: spec.name)
     ]
-    return [copy.deepcopy(tool) for tool in builtins] + declared
+    return [dict(tool) for tool in builtins] + declared
 
 
 def _rendered(message: Message) -> list[dict[str, Any]]:

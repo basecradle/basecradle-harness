@@ -314,7 +314,7 @@ def test_both_web_tools_may_be_called_directly_and_from_the_sandbox(router):
         sent = {tool["name"]: tool for tool in body(route, call)["tools"]}
         for name in ("web_fetch", "web_search"):
             assert sent[name]["allowed_callers"] == ["direct", "code_execution_20260120"]
-    # The definition the adapter holds is its own copy: what one request sent cannot reach the next.
+    # The definition the adapter holds is its own copy, so nothing done to it reaches the module's.
     adapter._builtins[0]["allowed_callers"].append("tampered")
     assert BUILTINS["web_search"]["allowed_callers"] == ["direct", "code_execution_20260120"]
 
