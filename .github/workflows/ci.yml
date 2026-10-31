@@ -51,7 +51,10 @@ jobs:
   #
   # It runs only when the change touches what the suite tests (the lock, `pyproject.toml`, a
   # palace module, the suite itself or this workflow); otherwise every step after the check is
-  # skipped, which reports success, as `commit-trailers` does. It is not yet in the gate's
+  # skipped, which reports success, as `commit-trailers` does. The palace modules are the ones
+  # that read or write a palace, and the memory seam they implement. The suite imports far more
+  # (through `_palace_check`, most of the package), so a change elsewhere that breaks a real
+  # palace is not caught here: that is the scope the capital approved, stated rather than implied. It is not yet in the gate's
   # `needs`: it becomes required once it has run green on main (the capital's decision, #742).
   mempalace:
     name: mempalace (${{ matrix.mempalace }})
@@ -82,7 +85,8 @@ jobs:
           fi
           # A diff that cannot be computed (a push whose before is all zeros or not in the
           # clone) runs the suite: the doubt goes to running it, never to skipping it.
-          if ! changed=$(git diff --name-only "$base" "$head" 2>/dev/null); then
+          # Three dots: the change's own files, never what moved on main since it branched.
+          if ! changed=$(git diff --name-only "$base...$head" 2>/dev/null); then
             echo "run=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -91,6 +95,8 @@ jobs:
             case "$file" in
               uv.lock | pyproject.toml | .github/workflows/ci.yml \
                 | src/basecradle_harness/_mempalace.py | src/basecradle_harness/_palace_*.py \
+                | src/basecradle_harness/_memory_provider.py | src/basecradle_harness/_mining.py \
+                | src/basecradle_harness/_rerank.py | src/basecradle_harness/_scrub.py \
                 | tests/conftest.py | tests/test_*_real.py | scripts/isolated_home.py)
                 run=true
                 ;;
@@ -121,8 +127,13 @@ jobs:
           )
           uv pip install "mempalace==$floor"
       - name: Which MemPalace
+        id: versions
         if: steps.paths.outputs.run == 'true'
-        run: uv run --no-sync python -c "import mempalace; print('mempalace', mempalace.__version__)"
+        run: |
+          set -euo pipefail
+          uv run --no-sync python -c "import mempalace; print('mempalace', mempalace.__version__)"
+          # The model ships with chromadb, so the cache is keyed on the chromadb installed.
+          echo "chromadb=$(uv run --no-sync python -c 'import chromadb; print(chromadb.__version__)')" >> "$GITHUB_OUTPUT"
       # The default embedding model (about 80 MB) lands in ~/.cache/chroma on first use, and the
       # suite's throwaway HOME links that directory only when the real home already holds it
       # (scripts/isolated_home.py), so a miss downloads it here, under the real home, first.
@@ -131,7 +142,7 @@ jobs:
         if: steps.paths.outputs.run == 'true'
         with:
           path: ~/.cache/chroma
-          key: chroma-onnx-all-MiniLM-L6-v2
+          key: chroma-onnx-all-MiniLM-L6-v2-chromadb-${{ steps.versions.outputs.chromadb }}
       - name: Download the embedding model
         if: steps.paths.outputs.run == 'true' && steps.model.outputs.cache-hit != 'true'
         run: >-

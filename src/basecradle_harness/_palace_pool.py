@@ -34,7 +34,8 @@ calls it with ``n_results=F``, the fetch width):
 5. **The fold** (MemPalace 3.11, ``_fold_copies_across_sources``; issue #742): hits whose text is
    identical, at least ``_FOLD_MIN_CHARS`` long and from **different source files** become one hit,
    the best-ranked, which lists the others under ``also_in``; copies within one file stay separate.
-   When folding leaves fewer than ``F`` hits while the vector half's query came back full, MemPalace
+   When folding leaves fewer than ``F`` hits, at least one of them carrying ``also_in``, while the
+   vector half's query came back full, MemPalace
    repeats the whole search with the vector half four times wider (``_scaled_pool_limits``), up to
    ``_MAX_POOL_SCALE`` times and never past ``_MAX_FOLD_POOL`` candidates. A MemPalace without the
    fold skips this step.

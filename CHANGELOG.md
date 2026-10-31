@@ -32,8 +32,9 @@ The harness supports MemPalace 3.9.0 through 3.11.0: the real-palace suite passe
 fleet's MemPalace pin does not move with this release.
 
 - **A new CI job, `mempalace`, runs `pytest -m mempalace`** on a pull request or a push to `main`
-  that touches the lock, `pyproject.toml`, a palace module (`_mempalace.py`, `_palace_*.py`), the
-  real-palace tests, their conftest or home helper, or the workflow, twice: on the locked MemPalace
+  that touches the lock, `pyproject.toml`, a palace module (`_mempalace.py`, `_palace_*.py`,
+  `_memory_provider.py`, `_mining.py`, `_rerank.py`, `_scrub.py`), the real-palace tests, their
+  conftest or home helper, or the workflow, twice: on the locked MemPalace
   and on the floor `pyproject.toml` declares, read from it. The embedding model is cached. On any
   other change its steps are skipped and it reports success. It is not yet part of the required
   gate; it joins it once it has run green on `main`.
