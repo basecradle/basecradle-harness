@@ -157,7 +157,7 @@ def usage_of(usage: Any, *, written_ttl: str = "5m") -> Usage | None:
 
     The written tokens are split by the ``cache_creation`` breakdown when the response carries one;
     a response that reports a write and no breakdown is read at `written_ttl`, the one TTL the
-    adapter asked for on its one breakpoint. Read defensively, as a mapping or as attributes: this
+    adapter asked for on every breakpoint it placed. Read defensively, as a mapping or as attributes: this
     is the logging path, where a surprise in a vendor object costs the cost field, never the turn.
     """
     if usage is None:

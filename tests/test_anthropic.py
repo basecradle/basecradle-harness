@@ -9,6 +9,7 @@ adapter proves they left). The responses are bodies we wrote from Anthropic's do
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 
@@ -38,10 +39,15 @@ from basecradle_harness import (
 )
 from basecradle_harness._anthropic import (
     BUILTINS,
+    CHAINED,
     DEFAULT_BASE_URL,
+    LOOKBACK,
+    MAX_BREAKPOINTS,
     PAUSE_CONTINUATIONS,
     SYSTEM_LABEL,
+    _positions,
     _Stream,
+    _unmarked,
 )
 from basecradle_harness._basecradle import _provider_from_config, resolved_model_params
 from basecradle_harness._caching import EXPLICIT, anchor_cacheable_prefix
@@ -58,6 +64,9 @@ TOOL = ToolSpec(
     parameters={"type": "object", "properties": {"label": {"type": "string"}}},
 )
 OTHER_TOOL = ToolSpec(name="add", description="Adds two numbers.", parameters={})
+
+#: The breakpoint template with no TTL configured — what every placement carries, the tail's included.
+TAIL = {"type": "ephemeral"}
 
 
 @pytest.fixture(autouse=True)
@@ -253,7 +262,14 @@ def test_leading_system_turns_are_the_system_prompt_and_later_ones_are_labelled(
     assert sent["messages"] == [
         {"role": "user", "content": [text("hello")]},
         {"role": "assistant", "content": [text("hi")]},
-        {"role": "user", "content": [text(SYSTEM_LABEL + "the per-wake brief"), text("again")]},
+        {
+            "role": "user",
+            # The request's last block carries the tail breakpoint (issue #729).
+            "content": [
+                text(SYSTEM_LABEL + "the per-wake brief"),
+                text("again", cache_control=TAIL),
+            ],
+        },
     ]
     assert sent["model"] == MODEL and sent["max_tokens"] == 4096 and "stream" not in sent
 
@@ -281,7 +297,7 @@ def test_a_steps_results_travel_as_one_user_message_with_the_results_first(route
         "content": [
             {"type": "tool_result", "tool_use_id": "toolu_01A", "content": "1"},
             {"type": "tool_result", "tool_use_id": "toolu_01B", "content": "2"},
-            text(SYSTEM_LABEL + "Step 2 of 50."),
+            text(SYSTEM_LABEL + "Step 2 of 50.", cache_control=TAIL),
         ],
     }
 
@@ -326,6 +342,7 @@ def test_an_image_is_an_image_block(router, provider):
         {
             "type": "image",
             "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="},
+            "cache_control": TAIL,
         },
     ]
 
@@ -359,7 +376,11 @@ def test_the_anchor_becomes_cache_control_on_the_anchored_turns_last_block(route
         "role": "assistant",
         "content": [text("reply", cache_control={"type": "ephemeral"})],
     }
-    assert "cache_control" not in json.dumps(sent["messages"][2])
+    # The brief is never marked; the new turn after it carries the tail (issue #729).
+    assert sent["messages"][2] == {
+        "role": "user",
+        "content": [text(SYSTEM_LABEL + "brief"), text("now", cache_control=TAIL)],
+    }
     assert "cache_control" not in sent  # never the top-level automatic field
     assert not any(message.cache_anchor for message in convo)  # copy-on-write: history is clean
 
@@ -382,7 +403,9 @@ def test_a_one_hour_ttl_rides_the_breakpoint(router):
     convo = [Message.system("charter"), Message.user("hello")]
     adapter.chat(anchor_cacheable_prefix(convo, stable=1, mode=EXPLICIT))
     sent = body(route)
-    assert sent["system"] == [text("charter", cache_control={"type": "ephemeral", "ttl": "1h"})]
+    hour = {"type": "ephemeral", "ttl": "1h"}
+    assert sent["system"] == [text("charter", cache_control=hour)]
+    assert sent["messages"] == [{"role": "user", "content": [text("hello", cache_control=hour)]}]
     assert "cache_control" not in sent
 
 
@@ -422,33 +445,34 @@ def test_with_nothing_anchored_the_last_tool_carries_the_breakpoint(router):
     convo = [Message.system("brief"), Message.user("hello")]
     adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=[TOOL, OTHER_TOOL])
     sent = body(route)
-    assert marks(sent) == ["tools[2]"]
+    assert marks(sent) == ["messages[0][0]", "tools[2]"]
     assert sent["tools"][2]["name"] == TOOL.name  # the last after sorting, not the last handed over
     assert sent["system"] == [text("brief")]
     assert "cache_control" not in sent
 
 
-def test_with_nothing_anchored_and_no_tools_nothing_is_marked(router, provider):
+def test_with_nothing_anchored_and_no_tools_only_the_tail_is_marked(router, provider):
     route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
     provider.chat([Message.system("brief"), Message.user("hello")])
-    assert marks(body(route)) == []
+    assert marks(body(route)) == ["messages[0][0]"]
 
 
 def test_an_anchored_turn_leaves_the_tool_list_unmarked(router, provider):
     route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
     provider.chat(anchored(chatter(3)), tools=[TOOL])
-    assert marks(body(route)) == ["messages[2][0]"]
+    # The anchor (question 2) merges with the brief and the new turn, which carries the tail.
+    assert marks(body(route)) == ["messages[2][2]", "messages[2][0]"]
 
 
 @pytest.mark.parametrize(
     ("frozen", "expected"),
     [
-        # The anchor's own window (positions 19..0) already reaches the start: nothing to add.
-        (20, ["messages[19][0]"]),
-        # Position 0 is one past the anchor's window, so one breakpoint is added there.
-        (21, ["messages[20][0]", "messages[0][0]"]),
-        # Twenty apart, tiling the windows with no gap, and never more than four in all.
-        (100, ["messages[99][0]", "messages[79][0]", "messages[59][0]", "messages[39][0]"]),
+        # The anchor's own window (positions 19..0) already reaches the start: tail + anchor only.
+        (20, ["messages[20][1]", "messages[19][0]"]),
+        # Position 0 is one past the anchor's window, so one breakpoint is added there: three.
+        (21, ["messages[20][2]", "messages[20][0]", "messages[0][0]"]),
+        # Twenty apart, tiling the windows with no gap: tail + anchor + two chained, never more.
+        (100, ["messages[100][1]", "messages[99][0]", "messages[79][0]", "messages[59][0]"]),
     ],
 )
 def test_breakpoints_chain_back_from_the_anchor_twenty_positions_apart(
@@ -458,8 +482,9 @@ def test_breakpoints_chain_back_from_the_anchor_twenty_positions_apart(
     provider.chat(anchored(chatter(frozen)))
     sent = body(route)
     assert marks(sent) == expected
-    # Never through the brief or the new turn (an odd-length transcript merges into their message).
-    assert "cache_control" not in json.dumps(sent["messages"][-1]["content"][-2:])
+    # The tail is the new turn; the brief before it is never marked.
+    assert sent["messages"][-1]["content"][-1] == text("now", cache_control=TAIL)
+    assert "cache_control" not in sent["messages"][-1]["content"][-2]
 
 
 def test_a_run_of_parallel_calls_or_of_their_results_is_one_position(router, provider):
@@ -474,7 +499,7 @@ def test_a_run_of_parallel_calls_or_of_their_results_is_one_position(router, pro
     provider.chat(anchored(frozen))
     sent = body(route)
     # "done" is position 25; twenty back is position 5, step 2's run of calls, marked on its last.
-    assert marks(sent) == ["messages[25][0]", "messages[5][2]"]
+    assert marks(sent) == ["messages[26][1]", "messages[25][0]", "messages[5][2]"]
     assert [block["type"] for block in sent["messages"][5]["content"]] == ["tool_use"] * 3
 
 
@@ -488,17 +513,17 @@ def test_a_breakpoint_skips_a_block_that_cannot_carry_one(provider):
     assert [i for i, block in enumerate(blocks) if "cache_control" in block] == [6, 24]
 
 
-def test_a_callers_own_anchors_count_against_the_four(router, provider):
+def test_a_callers_own_anchors_count_against_the_three_the_tail_leaves(router, provider):
     route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
     frozen = chatter(100)
     for index in (51, 71, 99):  # assistant turns, so no two merge
         frozen[index] = Message(role="assistant", content=f"answer {index}", cache_anchor=True)
     provider.chat([*frozen, Message.user("now")])
     assert marks(body(route)) == [
+        "messages[100][0]",
         "messages[99][0]",
         "messages[71][0]",
         "messages[51][0]",
-        "messages[31][0]",
     ]
 
 
@@ -507,10 +532,10 @@ def test_with_a_tool_list_the_chain_reaches_back_past_the_first_block(router, pr
     anchor at 19 (whose own window ends at 0) gets one more breakpoint to reach it."""
     route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
     provider.chat(anchored(chatter(20)), tools=[TOOL])
-    assert marks(body(route)) == ["messages[19][0]", "messages[0][0]"]
+    assert marks(body(route)) == ["messages[20][1]", "messages[19][0]", "messages[0][0]"]
 
 
-def test_more_than_four_anchors_keep_the_latest_four(router, provider, caplog):
+def test_more_anchors_than_the_tail_leaves_room_for_keep_the_latest_three(router, provider, caplog):
     route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
     frozen = chatter(12)
     for index in (1, 3, 5, 7, 9):
@@ -518,10 +543,10 @@ def test_more_than_four_anchors_keep_the_latest_four(router, provider, caplog):
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
         provider.chat([*frozen, Message.user("now")])
     assert marks(body(route)) == [
+        "messages[12][0]",
         "messages[9][0]",
         "messages[7][0]",
         "messages[5][0]",
-        "messages[3][0]",
     ]
     assert any("at most 4 breakpoints" in r.getMessage() for r in caplog.records)
 
@@ -546,10 +571,125 @@ def test_moving_a_breakpoint_never_strips_the_thinking(router, provider):
     first = provider.chat(convo, tools=[TOOL])  # nothing anchored: the tool list is marked
     follow = [*convo, first, Message.tool("toolu_01T", "7")]
     provider.chat(anchor_cacheable_prefix(follow, stable=1, mode=EXPLICIT), tools=[TOOL])
-    assert marks(body(route, 0)) == ["tools[0]"]
+    assert marks(body(route, 0)) == ["messages[0][0]", "tools[0]"]
     second = body(route, 1)
-    assert marks(second) == ["messages[0][0]"]
+    assert marks(second) == ["messages[2][0]", "messages[0][0]"]
     assert second["messages"][1]["content"][0] == thinking("plan")
+
+
+# === the tail breakpoint: the steps of one wake (issue #729) =================================
+
+
+def flat(sent: dict) -> list[dict]:
+    """A request's system blocks and then every message block, in send order — the positions."""
+    return [
+        *sent.get("system", ()),
+        *(block for turn in sent["messages"] for block in turn["content"]),
+    ]
+
+
+def tail_of(sent: dict) -> int:
+    """The index, in `flat` order, of the request's last marked block: its tail breakpoint."""
+    return max(i for i, block in enumerate(flat(sent)) if "cache_control" in block)
+
+
+def test_the_split_is_anchor_tail_and_two_chained():
+    assert CHAINED == 2 and MAX_BREAKPOINTS == 4
+    assert LOOKBACK * (1 + CHAINED) == 60  # the reach behind the anchor the module docstring states
+
+
+def test_each_step_reads_the_tail_the_step_before_it_wrote(router, provider):
+    """A three-step wake on a long transcript: every request carries all four breakpoints, and step
+    *k + 1* re-sends step *k*'s request byte for byte up to step *k*'s tail, within one lookback
+    window of its own tail — so the brief and the wake's tool chain are read, not re-billed."""
+    steps = [
+        reply(tool_use(f"toolu_01W{n}", TOOL.name, {"label": str(n)}), stop_reason="tool_use")
+        for n in range(3)
+    ]
+    route = router.post(MESSAGES).mock(side_effect=[*steps, reply(text("done"))])
+    frozen = chatter(100)
+    convo = [*frozen, Message.system("brief"), Message.user("now")]
+    for n in range(4):
+        answer = provider.chat(
+            anchor_cacheable_prefix(convo, stable=len(frozen), mode=EXPLICIT), tools=[TOOL]
+        )
+        if answer.tool_calls:
+            convo += [
+                answer,
+                Message.tool(answer.tool_calls[0].id, "7"),
+                Message.system(f"Step {n + 2} of 50."),
+            ]
+    requests = [body(route, n) for n in range(4)]
+    for sent in requests:
+        assert len(marks(sent)) == MAX_BREAKPOINTS
+        assert marks(sent)[1:] == ["messages[99][0]", "messages[79][0]", "messages[59][0]"]
+        assert "cache_control" not in json.dumps(sent["tools"])  # an anchor: the tools are unmarked
+    for before, after in itertools.pairwise(requests):
+        end = tail_of(before)
+        assert [_unmarked(b) for b in flat(after)[: end + 1]] == [
+            _unmarked(b) for b in flat(before)[: end + 1]
+        ]
+        assert "system" not in after and before["tools"] == after["tools"]
+        positions = _positions(flat(after))
+        assert positions[tail_of(after)] - positions[end] < LOOKBACK
+    # The brief rides inside every tail entry and is never itself a breakpoint.
+    brief = text(SYSTEM_LABEL + "brief")
+    assert all(brief in flat(sent) for sent in requests)
+
+
+def test_a_first_wake_step_reads_the_tail_and_keeps_the_tool_list(router, provider):
+    """Nothing anchored: the tool list (for the next wake) and the tail (for the next step)."""
+    route = router.post(MESSAGES).mock(
+        side_effect=[
+            reply(tool_use("toolu_01F", TOOL.name, {"label": "a"}), stop_reason="tool_use"),
+            reply(text("done")),
+        ]
+    )
+    convo = [Message.system("brief"), Message.user("hello")]
+    first = provider.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=[TOOL])
+    convo += [first, Message.tool("toolu_01F", "7")]
+    provider.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=[TOOL])
+    assert marks(body(route, 0)) == ["messages[0][0]", "tools[0]"]
+    assert marks(body(route, 1)) == ["messages[2][0]", "tools[0]"]
+
+
+def test_the_tail_skips_a_last_block_that_cannot_carry_one(router, provider):
+    """An empty tool result cannot be cached, so the tail lands on the calls before it."""
+    route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
+    call = ToolCall("toolu_01E", "add", {"a": 1})
+    provider.chat(
+        [Message.user("go"), Message.assistant(tool_calls=[call]), Message.tool("toolu_01E", "")]
+    )
+    assert marks(body(route)) == ["messages[1][0]"]
+
+
+def test_a_tail_on_a_kept_reply_never_reaches_the_kept_blocks(router, provider):
+    """The tail is a mark on the request: a kept reply it lands on stays unmarked in the memo, so the
+    next request carries exactly one tail and never a stale fifth breakpoint."""
+    route = router.post(MESSAGES).mock(
+        side_effect=[
+            reply(tool_use("toolu_01K", TOOL.name, {"label": "a"}), stop_reason="tool_use"),
+            reply(text("ok")),
+            reply(text("ok")),
+        ]
+    )
+    convo = [Message.user("go")]
+    step = provider.chat(convo, tools=[TOOL])
+    convo += [step, Message.tool("toolu_01K", "")]  # an empty result: the tail walks onto the call
+    provider.chat(convo, tools=[TOOL])
+    assert marks(body(route, 1)) == ["messages[1][0]", "tools[0]"]
+    _, kept, _ = provider._replies[id(step)]
+    assert kept == [tool_use("toolu_01K", TOOL.name, {"label": "a"})]  # unmarked, as it arrived
+    provider.chat([*convo, Message.user("again")], tools=[TOOL])
+    assert marks(body(route, 2)) == ["messages[2][1]", "tools[0]"]
+
+
+def test_the_tails_slot_is_reserved_when_the_anchor_is_the_last_block(router, provider):
+    """No block after the anchor can carry a tail, and the chain still takes two: one fixed split."""
+    route = router.post(MESSAGES).mock(return_value=reply(text("ok")))
+    frozen = chatter(101)  # ends on a user turn, so the request is well-formed with nothing after
+    provider.chat(anchor_cacheable_prefix(frozen, stable=len(frozen), mode=EXPLICIT))
+    assert marks(body(route)) == ["messages[100][0]", "messages[80][0]", "messages[60][0]"]
 
 
 # === the llm line, the cost, and the search fee ==============================================
@@ -661,7 +801,8 @@ def test_a_paused_turn_is_resumed_with_the_paused_content_unchanged(router, prov
         answer = provider.chat([Message.user("search it")])
     assert answer.content == "answer" and not answer.tool_calls
     resumed = body(route, 1)["messages"]
-    assert resumed[0] == {"role": "user", "content": [text("search it")]}
+    # The tail stays where the paused turn's request put it: the continuation is that request again.
+    assert resumed[0] == {"role": "user", "content": [text("search it", cache_control=TAIL)]}
     assert resumed[1] == {
         "role": "assistant",
         "content": [thinking("t1"), SEARCH_USE, SEARCH_RESULT],
@@ -706,7 +847,7 @@ def test_a_server_tool_beside_a_client_tool_goes_back_with_the_client_result(rou
         tool_use("toolu_01C", TOOL.name, {"label": "x"}),
     ]
     assert sent[2]["content"] == [
-        {"type": "tool_result", "tool_use_id": "toolu_01C", "content": "7"}
+        {"type": "tool_result", "tool_use_id": "toolu_01C", "content": "7", "cache_control": TAIL}
     ]
 
 

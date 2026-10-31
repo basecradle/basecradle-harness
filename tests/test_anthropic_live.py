@@ -72,6 +72,12 @@ CHARTER = (
 )
 
 
+#: The input tokens at the end of a request that no breakpoint covers — the turn's closing tokens,
+#: 4 on ``claude-haiku-5-5`` when measured (2026-10-31); the bound leaves room for a model that
+#: counts a few more, and is far below the brief a missed tail would leave uncached.
+CLOSING_TOKENS = 16
+
+
 def _provider(**tuning) -> AnthropicProvider:
     tuning.setdefault("max_tokens", 2048)
     return AnthropicProvider(MODEL, api_key=KEY, **tuning)
@@ -103,21 +109,27 @@ def test_a_chat_reply_and_its_line(caplog):
 
 @needs_key
 def test_the_second_call_on_the_same_prefix_reads_the_cache(caplog):
-    """The fleet's first explicit-cache path: the breakpoint we place must be read back."""
+    """The fleet's first explicit-cache path: the anchor we place must be read back.
+
+    Each call changes the brief and the turn after the anchored charter, so the tail entry one call
+    writes can never serve the next (issue #729) and the only entry they share is the anchor's. The
+    second and third calls each read exactly that entry; with the anchor unmarked they read nothing.
+    """
+    nonce = uuid.uuid4().hex  # so no earlier run's tail entry matches a brief
     adapter = _provider()
-    convo = [Message.system(CHARTER), Message.system("brief"), Message.user("Topic 3?")]
-    anchored = anchor_cacheable_prefix(convo, stable=1, mode=EXPLICIT)
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        adapter.chat(anchored)
-        adapter.chat(anchor_cacheable_prefix(convo, stable=1, mode=EXPLICIT))
-    first, second = _lines(caplog, "llm provider=")
-    assert (
-        int(_field(first, "cache_write_tokens") or 0) > 0
-        or int(_field(first, "cached_tokens") or 0) > 0
-    )
-    cached = int(_field(second, "cached_tokens"))
-    assert cached > 0, second
-    assert cached >= int(_field(first, "cache_write_tokens") or cached)
+        for n in (3, 4, 5):
+            convo = [
+                Message.system(CHARTER),
+                Message.system(f"[{nonce}] brief {n}"),
+                Message.user(f"Topic {n}?"),
+            ]
+            adapter.chat(anchor_cacheable_prefix(convo, stable=1, mode=EXPLICIT))
+    first, second, third = _lines(caplog, "llm provider=")
+    assert sum(_cache(first)) > 0, first
+    anchor = _cache(second)[0]
+    assert 0 < anchor < sum(_cache(first)), second
+    assert _cache(third)[0] == anchor, third
 
 
 def _cache(line: str) -> tuple[int, int]:
@@ -127,8 +139,12 @@ def _cache(line: str) -> tuple[int, int]:
 
 @needs_key
 def test_with_nothing_anchored_the_tool_list_is_read_back(caplog):
-    """A first wake (issue #726): no frozen turn, so the breakpoint is the tool list's, and step 2
-    reads exactly what step 1 wrote."""
+    """A first wake (issue #726): no frozen turn, so the anchor's breakpoint is the tool list's.
+
+    Each call sends a different brief, so the tail entry one call writes (#729) cannot serve the
+    next and the only entry they share is the tool list's. The second and third calls each read
+    exactly that entry; with the tool list unmarked they read nothing.
+    """
     nonce = uuid.uuid4().hex
     tools = [
         ToolSpec(
@@ -138,24 +154,28 @@ def test_with_nothing_anchored_the_tool_list_is_read_back(caplog):
         )
         for n in range(1, 13)
     ]
-    convo = [Message.system("brief"), Message.user("Reply with exactly the word: ok")]
     adapter = _provider()
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=tools)
-        adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=tools)
-    first, second = _lines(caplog, "llm provider=")
-    read, written = _cache(first)
-    assert written > 0, first
-    assert _cache(second)[0] == read + written, second
+        for n in range(3):
+            brief = Message.system(f"[{nonce}] brief {n}")
+            convo = [brief, Message.user("Reply with exactly the word: ok")]
+            adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), tools=tools)
+    first, second, third = _lines(caplog, "llm provider=")
+    assert sum(_cache(first)) > 0, first
+    entry = _cache(second)[0]
+    assert 0 < entry < sum(_cache(first)), second
+    assert _cache(third)[0] == entry, third
 
 
 @needs_key
 def test_a_long_previous_wake_is_found_through_the_lookback_chain(caplog):
-    """A wake 45 positions past the last entry: only the chained breakpoints can reach it (#726).
+    """A wake 44 positions past the last entry: only the chained breakpoints can reach it (#726).
 
-    The first request anchors position 9 and writes there. The second anchors position 54, whose own
-    window (54..35) cannot see 9; its chain adds 34 and 14, and 14's window (14..0) holds the entry.
-    So a read equal to the first request's whole write is the chain, and nothing else, finding it.
+    The first request ends on its anchor, position 10, so its one breakpoint writes its whole prompt
+    there (no block after the anchor can carry a tail, #729). The second anchors position 54, whose
+    own window (54..35) cannot see 10; its chain adds 34 and 14, and 14's window (14..0) holds the
+    entry. So a read equal to the first request's whole prompt is the chain, and nothing else,
+    finding it: the second request's tail (position 56) and anchor windows see no entry.
     """
     nonce = uuid.uuid4().hex
     head = Message.user(f"[{nonce}]\n{CHARTER}\nQuestion 0.")
@@ -165,13 +185,41 @@ def test_a_long_previous_wake_is_found_through_the_lookback_chain(caplog):
     ]
     adapter = _provider()
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        for frozen in (turns[:10], turns[:55]):
-            convo = [*frozen, Message.system("brief"), Message.user("Reply with the word: ok")]
-            adapter.chat(anchor_cacheable_prefix(convo, stable=len(frozen), mode=EXPLICIT))
+        first = turns[:11]  # ends on a user turn, the anchor
+        adapter.chat(anchor_cacheable_prefix(first, stable=len(first), mode=EXPLICIT))
+        frozen = turns[:55]
+        convo = [*frozen, Message.system("brief"), Message.user("Reply with the word: ok")]
+        adapter.chat(anchor_cacheable_prefix(convo, stable=len(frozen), mode=EXPLICIT))
     first, second = _lines(caplog, "llm provider=")
     read, written = _cache(first)
     assert written > 0, first
     assert _cache(second)[0] == read + written, second
+
+
+@needs_key
+def test_the_next_step_of_a_wake_reads_the_brief_through_the_tail(caplog):
+    """Within one wake (issue #729): step 2 re-sends step 1's whole request and reads all of it.
+
+    A first wake, so nothing is anchored and the one tool is under the cacheable minimum: before the
+    tail breakpoint, step 2 read nothing at all and re-sent the brief in full. Step 1's tail sits on
+    the new user turn; step 2's sits on the tool result two positions later, inside its window. So
+    step 2 reads exactly what step 1 wrote, and that write is step 1's whole prompt — tools, brief
+    and turn — but for the few tokens that close a request, which Anthropic counts as input and no
+    breakpoint can cover (4 on ``claude-haiku-5-5``, measured 2026-10-31).
+    """
+    brief = Message.system(f"[{uuid.uuid4().hex}]\n{CHARTER}")
+    convo = [brief, Message.user("Get the secret number for 'blue', then tell me what it is.")]
+    adapter = _provider()
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        step = adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), [NUMBER_TOOL])
+        assert step.tool_calls, "the model did not call the tool"
+        convo += [step, *(Message.tool(call.id, "42") for call in step.tool_calls)]
+        adapter.chat(anchor_cacheable_prefix(convo, stable=0, mode=EXPLICIT), [NUMBER_TOOL])
+    first, second = _lines(caplog, "llm provider=")
+    read, written = _cache(first)
+    assert written > 0, first
+    assert _cache(second)[0] == read + written, second
+    assert int(_field(first, "tokens_in")) - (read + written) <= CLOSING_TOKENS, first
 
 
 @needs_key
