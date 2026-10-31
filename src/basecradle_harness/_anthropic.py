@@ -69,8 +69,9 @@ The wire translation
   changed). The harness does change a prefix inside one wake — a batched wake's second turn no longer
   carries the first turn's brief, and a compaction between turns rewrites what came before. So each
   kept reply records a digest of the exact wire prefix it was produced on (`_Stream`), and a replay
-  whose prefix no longer matches sends that reply — and every later one, as Anthropic's own chain
-  rule requires — without its thinking blocks. Text, calls and server-tool blocks still go back.
+  whose prefix no longer matches sends that reply without its thinking blocks. Every later reply
+  produced before that strip then mismatches by itself, which is Anthropic's chain rule; one
+  produced after it, on the stripped prefix, still matches and keeps its thinking. Text, calls and server-tool blocks still go back.
 - **``pause_turn``.** A server tool's long turn may pause; the adapter resends the paused assistant
   content unchanged and continues, up to `PAUSE_CONTINUATIONS` times, each continuation its own
   billed call with its own ``llm`` line. A turn still paused after that is a transient response
@@ -339,7 +340,7 @@ class AnthropicProvider:
         self._timeout_scale = 1.0
         self._fixed_timeout = timeout
         self._anthropic = require_anthropic()
-        self._params, self._cache_control = _validated_params(self._anthropic, default_params)
+        self._params, self._cache_control = validated_params(default_params, self._anthropic)
         self._builtins = [dict(BUILTINS[name]) for name in BUILTINS if name in set(builtin_tools)]
         #: Each reply this adapter returned, by identity, with its raw blocks and the digest of the
         #: prefix it was produced on — what the next step sends back (see the module docstring).
@@ -510,7 +511,10 @@ class AnthropicProvider:
         return call_cost(
             self.model,
             usage_of(usage, written_ttl=ttl),
-            geo=self._params.get("inference_geo"),
+            # Where the call actually ran, as Anthropic reports it (``global`` or ``us``, measured
+            # live) — so a geography set through extra_body or a workspace default is priced too.
+            # A response that reports none falls back to what the request asked for.
+            geo=getattr(usage, "inference_geo", None) or self._params.get("inference_geo"),
             tier=getattr(usage, "service_tier", None),
             speed=getattr(usage, "speed", None),
         )
@@ -590,7 +594,6 @@ class AnthropicProvider:
             index += 1
         stream = _Stream(system, tools)
         wire: list[dict[str, Any]] = []
-        stripping = False
         present: set[int] = set()
         for message in messages[index:]:
             role, blocks = "user", []
@@ -599,9 +602,12 @@ class AnthropicProvider:
                 kept = self._replies.get(id(message))
                 if kept is not None and kept[0] is message:
                     present.add(id(message))
-                    if not stripping and stream.digest() != kept[2]:
-                        stripping = True  # the chain is broken from here on (see the docstring)
-                    blocks = _replayed(kept[1], message, strip=stripping)
+                    # Each kept reply is judged on its own digest. No latch is needed for Anthropic's
+                    # chain rule: the digest covers the stream *as sent*, so once an earlier reply
+                    # goes back stripped, every later reply produced before that strip mismatches by
+                    # itself — and one produced after it (on the stripped prefix) still matches, and
+                    # keeps the thinking its own tool round needs.
+                    blocks = _replayed(kept[1], message, strip=stream.digest() != kept[2])
                 else:
                     blocks = _rendered(message)
             elif message.role == "tool":
@@ -693,14 +699,32 @@ def _unmarked(block: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in block.items() if key != "cache_control"}
 
 
-def _validated_params(anthropic: Any, params: Mapping[str, Any]) -> tuple[dict[str, Any], Any]:
+def validated_params(
+    params: Mapping[str, Any], anthropic: Any = None
+) -> tuple[dict[str, Any], Any]:
     """`params` checked against what ``messages.create`` takes: ``(params, breakpoint template)``.
 
-    A key the SDK does not name, a harness-owned key, a sampling parameter, or an unusable
+    A key the SDK does not name, a harness-owned key (top level or inside ``extra_body``, where the
+    SDK would let it override the harness's wiring), a sampling parameter, or an unusable
     ``cache_control`` is an `AnthropicConfigError` here, at startup, rather than an SDK
-    ``TypeError`` or a vendor 400 inside a wake.
+    ``TypeError`` or a vendor 400 inside a wake. The one reader of all four, shared by the adapter
+    and ``--resolved-config`` (`_basecradle.resolved_model_params`). `anthropic` is the SDK module;
+    ``None`` imports it, and only the unknown-key check — the one that needs the SDK's signature —
+    is skipped where it is not installed.
     """
     params = dict(params)
+    extra_body = params.get("extra_body")
+    owned = (
+        sorted(set(extra_body) & (OWNED_PARAMS | {"cache_control"}))
+        if isinstance(extra_body, Mapping)
+        else []
+    )
+    if owned:
+        raise AnthropicConfigError(
+            "invalid_model_params",
+            f"model_params.json's extra_body sets {', '.join(owned)}, which the harness composes "
+            "itself on every call; in extra_body it would override that wiring.",
+        )
     cache_control = params.pop("cache_control", None)
     refused = refused_params(params, params.get("extra_body"))
     if refused:
@@ -710,8 +734,15 @@ def _validated_params(anthropic: Any, params: Mapping[str, Any]) -> tuple[dict[s
             "with a 400 (and every model does from API version 2026-10-21). Remove them; tune the "
             "model with output_config.effort instead.",
         )
-    accepted = set(inspect.signature(anthropic.resources.messages.Messages.create).parameters)
-    unknown = sorted(set(params) - (accepted - OWNED_PARAMS - {"self"}))
+    if anthropic is None:
+        try:
+            anthropic = require_anthropic()
+        except ProviderError:
+            anthropic = None
+    unknown: list[str] = []
+    if anthropic is not None:
+        accepted = set(inspect.signature(anthropic.resources.messages.Messages.create).parameters)
+        unknown = sorted(set(params) - (accepted - OWNED_PARAMS - {"self"}))
     if unknown:
         raise AnthropicConfigError(
             "invalid_model_params",
@@ -789,7 +820,10 @@ def _replayed(
 
 
 def _assistant(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    return {"role": "assistant", "content": [dict(block) for block in blocks]}
+    """A paused turn's content as the assistant message that resumes it — minus empty text blocks,
+    which are a 400 on the way back in (as in `_replayed`)."""
+    kept = [dict(b) for b in blocks if not (b.get("type") == "text" and not b.get("text"))]
+    return {"role": "assistant", "content": kept}
 
 
 def _image_block(image: ImageContent) -> dict[str, Any]:

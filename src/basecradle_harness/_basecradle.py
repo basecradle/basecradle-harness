@@ -95,7 +95,7 @@ from basecradle_harness._anthropic import (
 )
 from basecradle_harness._anthropic import (
     AnthropicProvider,
-    refused_params,
+    validated_params,
 )
 from basecradle_harness._code import CODE_EXECUTION_BUILTIN, CodeExecutionBridge
 from basecradle_harness._context import Compactor, ContextBudget
@@ -1153,14 +1153,11 @@ def resolved_model_params(sdk: str) -> tuple[dict[str, Any], list[str]]:
         "anthropic": _OWNED_ANTHROPIC,
     }.get(sdk, _OWNED_OPENAI)
     if sdk == "anthropic":
-        # A sampling parameter is a 400 on every wake of a Claude 5.x brain, so it is refused here,
-        # where `--resolved-config` exits nonzero on it, as well as at the adapter's build.
-        refused = refused_params(loaded, loaded.get("extra_body"))
-        if refused:
-            raise ValueError(
-                f"model_params.json sets {', '.join(refused)}, which every Claude 5.x model "
-                "refuses with a 400. Remove them; tune the model with output_config.effort."
-            )
+        # The adapter's own startup checks — a sampling parameter (a 400 on every wake of a Claude
+        # 5.x brain), a key the SDK does not take, an owned key inside extra_body, an unusable
+        # cache_control — run here too, so `--resolved-config` exits nonzero on exactly what a
+        # wake would refuse. `AnthropicConfigError` is a `ValueError`.
+        validated_params({key: value for key, value in loaded.items() if key not in owned})
     stripped = set(loaded) & owned
     if sdk in ("xai-sdk", "openrouter") and "extra_body" in loaded:
         stripped.add("extra_body")

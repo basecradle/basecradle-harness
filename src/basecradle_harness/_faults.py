@@ -45,7 +45,11 @@ import re
 #: (issue #655) refuses a project whose billing is off with a 403 that the Google adapter reads by its
 #: structured ``BILLING_DISABLED`` reason first; the text alternatives below are its two wordings —
 #: *"The billing account for the owning project is disabled …"* and *"This API method requires
-#: billing to be enabled"*.
+#: billing to be enabled"*. Anthropic (issue #725) states its own two account-blocked shapes in prose
+#: too: *"Your credit balance is too low …"* (the ``credit balance`` alternative) and a spend limit
+#: the account set itself, *"You have reached your specified API usage limits. You will regain access
+#: on …"* — which heals only with a human raising the limit or the period rolling over, the billing
+#: class's own shape rather than a rate limit's.
 _OUT_OF_FUNDS_PHRASES = re.compile(
     r"insufficient[ _-]?(?:quota|funds|credit|balance)"
     r"|out of (?:credit|credits|funds|quota)"
@@ -57,7 +61,8 @@ _OUT_OF_FUNDS_PHRASES = re.compile(
     r"|check your plan and billing"
     r"|exceeded your current quota"
     r"|billing[ _](?:account (?:for the owning project )?is )?disabled"
-    r"|requires billing to be enabled",
+    r"|requires billing to be enabled"
+    r"|reached your specified (?:api )?usage limits?",
     re.IGNORECASE,
 )
 

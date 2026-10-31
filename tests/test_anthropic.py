@@ -892,3 +892,97 @@ def test_the_off_box_resolver_names_the_same_stems():
         provider="anthropic", sdk="anthropic", model=MODEL, opt_in="anthropic_search,code_execution"
     )
     assert {"web_search", "web_fetch", "code_execution"} <= set(report["builtins"])
+
+
+# === review findings, pinned ================================================================
+
+
+def test_a_reply_produced_after_a_strip_keeps_its_own_thinking(router, provider):
+    """Only a reply whose own prefix changed loses its thinking — never one made on the new prefix."""
+    route = router.post(MESSAGES).mock(
+        side_effect=[
+            reply(thinking("one", "SigA"), text("first answer")),
+            reply(
+                thinking("two", "SigC"),
+                tool_use("toolu_01T", TOOL.name, {}),
+                stop_reason="tool_use",
+            ),
+            reply(text("done")),
+        ]
+    )
+    first = provider.chat(
+        [Message.system("charter"), Message.system("brief 1"), Message.user("one")]
+    )
+    convo = [
+        Message.system("charter"),
+        Message.user("one"),
+        first,
+        Message.system("brief 2"),
+        Message.user("two"),
+    ]
+    step = provider.chat(convo, tools=[TOOL])
+    convo += [step, Message.tool("toolu_01T", "7")]
+    provider.chat(convo, tools=[TOOL])
+    sent = json.dumps(body(route, 2))
+    assert "SigA" not in sent  # its prefix lost brief 1
+    assert "SigC" in sent  # produced on the stripped prefix, replayed onto exactly that prefix
+
+
+def test_a_paused_turns_empty_text_block_is_not_sent_back(router, provider):
+    route = router.post(MESSAGES).mock(
+        side_effect=[reply(text(""), SEARCH_USE, stop_reason="pause_turn"), reply(text("ok"))]
+    )
+    provider.chat([Message.user("search")])
+    assert body(route, 1)["messages"][1] == {"role": "assistant", "content": [SEARCH_USE]}
+
+
+def test_the_served_geography_is_what_is_priced(router, provider, caplog):
+    router.post(MESSAGES).mock(
+        return_value=reply(
+            text("ok"), used=usage(input_tokens=50_000, output_tokens=0, inference_geo="us")
+        )
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("a")])
+    assert _money(50_000 * 0.10 * 1.1 / 1_000_000) in llm_lines(caplog)[0]
+
+
+def test_a_spend_limit_is_the_billing_class(router, provider):
+    router.post(MESSAGES).mock(
+        return_value=failure(
+            400,
+            "invalid_request_error",
+            "You have reached your specified API usage limits. You will regain access on "
+            "2026-11-01 at 00:00 UTC.",
+        )
+    )
+    with pytest.raises(ProviderBillingError):
+        provider.chat([Message.user("hi")])
+
+
+@pytest.mark.parametrize("owned", ["tools", "system", "messages", "cache_control"])
+def test_extra_body_cannot_override_the_harnesss_wiring(owned):
+    with pytest.raises(AnthropicConfigError) as caught:
+        AnthropicProvider(MODEL, api_key=FAKE_KEY, extra_body={owned: []})
+    assert caught.value.reason == "invalid_model_params"
+
+
+@pytest.mark.parametrize(
+    "params", [{"reasoning_effort": "low"}, {"cache_control": {"type": "persistent"}}]
+)
+def test_resolved_config_refuses_what_startup_refuses(tmp_path, monkeypatch, params):
+    home = tmp_path / "config"
+    home.mkdir()
+    (home / "model_params.json").write_text(json.dumps(params))
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(home))
+    with pytest.raises(ValueError):
+        resolved_model_params("anthropic")
+
+
+def test_resolved_config_passes_a_good_file(tmp_path, monkeypatch):
+    home = tmp_path / "config"
+    home.mkdir()
+    good = {"max_tokens": 4096, "output_config": {"effort": "low"}, "model": "ignored"}
+    (home / "model_params.json").write_text(json.dumps(good))
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(home))
+    assert resolved_model_params("anthropic") == (good, ["model"])

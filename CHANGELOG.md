@@ -43,12 +43,12 @@ Messages API, peer to `openai`, `xai-sdk`, `openrouter` and `google-genai`. It i
   also answers `context_limit()` (`max_input_tokens`) and `supports_vision()`
   (`capabilities.image_input`).
 - **Faults by nature.** 429/529/5xx transient, 504 a timeout, 401/403 the credential,
-  `billing_error` or a low credit balance the billing class, an over-length prompt the context
+  `billing_error`, a low credit balance or a reached spend limit the billing class, an over-length prompt the context
   class, `refusal` final (logged with its category). `model_context_window_exceeded` joins the
   truncation vocabulary. The SDK's own retries are off.
 - **Cost, computed** (`_anthropic_rates`, `cost_basis=computed`): the uncached, 5-minute-write,
   1-hour-write and read tokens at their own rates, Claude Haiku 5.5's higher row above a 100,000-token
-  prompt, 1.1× for `inference_geo: "us"`. Web search is a priced `media` line (`kind=search.web`, $10
+  prompt, 1.1× for US-only inference as `usage.inference_geo` reports it. Web search is a priced `media` line (`kind=search.web`, $10
   per 1,000). New `llm` fields on this provider, each present only when reported:
   `cache_write_tokens=`, `web_search_requests=`, `web_fetch_requests=`, `code_execution_requests=`.
   Container time on a call with neither web tool is a stated gap, warned once per wake.
