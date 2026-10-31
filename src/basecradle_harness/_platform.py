@@ -19,7 +19,8 @@ The contract is small, to match the rest of the kit:
 
 - `PlatformContext` — the live handle: client + current timeline (+ where temp
   files may live).
-- `PlatformTool` — a `Tool` subclass that declares `requires = {BASECRADLE}` and
+- `PlatformTool` — a `Tool` subclass that declares `requires = {BASECRADLE}` (by default; a
+  tool that only reads which timeline it is on, like `memory_search`, clears it) and
   receives a context via `bind`. Its `context` property is the one place a
   subclass reaches the client and timeline; calling it unbound raises a clear,
   model-readable error rather than an `AttributeError`.
@@ -118,7 +119,9 @@ class PlatformTool(Tool):
     Subclasses implement `run` exactly as any tool does, and reach the SDK client
     and current timeline through `self.context`. They inherit
     `requires = {BASECRADLE}`, so a profile that forbade platform I/O would refuse
-    them at registration — the shipped `locked()` profile permits it.
+    them at registration — the shipped `locked()` profile permits it. A subclass that
+    makes no platform call and only reads the bound timeline (`MemPalaceSearchTool`,
+    issue #733) overrides it with an empty set.
 
     The context is bound by the hosting agent after construction (see
     `bind_platform_tools`). Before that, `self.context` raises `PlatformError`,

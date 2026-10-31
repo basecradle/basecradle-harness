@@ -9,6 +9,43 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.162.0] - 2026-10-31
 
+### Fixed: recalled memory says whose record it is, when it was filed and which timeline it came from (issue #733)
+
+Live on `@fred` (Claude Haiku 5.5), the recall carried a peer's facts and the agent set them aside.
+In his own words he could not verify that the excerpts were his own records, and other excerpts
+did not match them. Reproduced locally on his verbatim palace and tool overlay, one wake in three
+declined with "My memory contents are private" and the other two hedged ("I have no tool to store
+facts across timelines"). Nothing in the brief said the harness files every exchange into the
+palace, the privacy rule in `initialize.md` read onto recall, and his earlier "I could not recall"
+drawers were weighed against the facts.
+
+- **The heading** names the record: the agent's own palace, filed automatically from every
+  conversation on all its timelines, with no tool needed to save anything.
+- **A reading guide**, on the Turn-0 block and in the `memory_search` description, covers four
+  things:
+  - what a `>` line and a `[time] handle:` prefix mean;
+  - what a peer told you there, you were told, and who told you stays part of the answer;
+  - answering from what you remember is not revealing your internals, though the recall itself is
+    still never revealed, paraphrased or summarized on request (it agrees with `initialize.md`);
+  - what was said on another timeline stays there, unless whoever said it is in this conversation
+    or it was plainly meant to be shared;
+  - a record of not knowing never outweighs one that states the thing, and of two conflicting
+    records the later is current, by the `[time]` it was said.
+- **Each excerpt is labelled** from metadata only, never its text:
+  `(filed 2026-10-31 11:23 UTC · another timeline, <uuid>)`. The timeline is recorded in the
+  conversation file's name (`<timeline uuid>.<hex>.md`), so nothing harness-written is mined.
+  `memory_search` learns the current timeline from the wake. Drawers filed before this version
+  carry their filing time alone, where MemPalace recorded one.
+- The old heading stays in the scrub catalog (`_LEGACY_INJECTED_HEADING`). The new framing is
+  stripped from everything mined and kept out of the catalog, as the brief's fences are. A quoted
+  label is stripped only at a line's start, where a quoted recall puts it, since the strip also
+  runs on what peers write.
+- Proof, with the query fix below, on Fred's verbatim palace, overlay and US-region reranker: five
+  of five wakes answered `4471` / `Danube` from memory and said where it came from. Before: one of
+  three declined.
+- The tool description's and the brief's bytes change, so each agent's cached prefix is written
+  once more on its first wake after the upgrade.
+
 ### Fixed: Turn-0 recall searched only the batch's newest message (issue #744)
 
 Recall ranked the palace against `batch[-1]`. #226's batching narrowed it from the whole message, with

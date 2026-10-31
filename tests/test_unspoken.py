@@ -413,6 +413,7 @@ def _model_facing_strings():
     other surface — the brief, the nudges, the guidance the engine feeds back — where the word
     would be a lie the model then reasons from.
     """
+    from basecradle_harness import _mempalace
     from basecradle_harness._brief import (
         render_brain,
         render_budget,
@@ -491,6 +492,10 @@ def _model_facing_strings():
         "truncation note": _TRUNCATED_NOTE,
         "mention nudge": MENTION_NUDGE,
         "one-on-one nudge": ONE_ON_ONE_NUDGE,
+        # Issue #733: how the model is told to read its recalled memories, on both surfaces.
+        "recall heading": _mempalace._INJECTED_HEADING,
+        "recall reading guide": _mempalace._READING_GUIDE,
+        "memory_search description": _mempalace.MemPalaceSearchTool.description,
     }
 
 

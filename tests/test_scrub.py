@@ -25,9 +25,16 @@ import types
 import pytest
 
 from basecradle_harness import _scrub
-from basecradle_harness._mempalace import _CLOSE_TAG, _INJECTED_HEADING, _OPEN_TAG
+from basecradle_harness._mempalace import _CLOSE_TAG, _OPEN_TAG
+from basecradle_harness._mining import (
+    _LEGACY_INJECTED_HEADING,
+    MIN_UNIT_CHARS,
+    Verdict,
+    _normalize,
+    catalog,
+    classify,
+)
 from basecradle_harness._mining import _LEGACY_RECALL_HEADING as LEGACY_HEADING
-from basecradle_harness._mining import MIN_UNIT_CHARS, Verdict, _normalize, catalog, classify
 from basecradle_harness._wake import _COMPACTION_OBSERVE_NOTE, _STUCK_NOTE
 
 # --- real memories, for the "provably intact" half of the gate ---------------------------------
@@ -49,7 +56,7 @@ REAL = {
 
 POLLUTED = {
     "junk-legacy": LEGACY_HEADING,
-    "junk-fenced": f"{_INJECTED_HEADING}\n{_OPEN_TAG}\n{_CLOSE_TAG}",
+    "junk-fenced": f"{_LEGACY_INJECTED_HEADING}\n{_OPEN_TAG}\n{_CLOSE_TAG}",
     "junk-compaction": _COMPACTION_OBSERVE_NOTE,
     "junk-stuck": _STUCK_NOTE,
 }
