@@ -109,7 +109,7 @@ def log_context_attribution(
     tools: Sequence[ToolSpec] | None = None,
     brief: Message | None = None,
     brief_sections: Mapping[str, int] | None = None,
-    source: str | None = None,
+    session: str | None = None,
 ) -> None:
     """Emit the one attribution line for the payload in `convo` — and never break the turn.
 
@@ -126,7 +126,9 @@ def log_context_attribution(
         brief_sections: What each named part of the brief contributed
             (`_brief.brief_section_sizes`), or ``None`` for a caller that composed no brief or
             does not track its parts (the library API). Reported as ``brief_<part>=``.
-        source: The session's channel key, so a line can be tied to the conversation it measured.
+        session: The session's channel key, so a line can be tied to the conversation it
+            measured. ``session=`` on the line — never ``source=``, which is the fleet-wide probe
+            stamp the NOC extracts off every line (issue #759).
 
     A failure here is a WARNING and nothing more. Observability never breaks a turn — and this one
     is pure arithmetic over data structures, so a failure means a real defect worth seeing rather
@@ -134,7 +136,7 @@ def log_context_attribution(
     """
     try:
         fields = attribute(
-            convo, tools=tools, brief=brief, brief_sections=brief_sections, source=source
+            convo, tools=tools, brief=brief, brief_sections=brief_sections, session=session
         )
     except Exception:  # noqa: BLE001 - a measurement must never cost a turn
         _log.warning("Could not attribute the assembled context; continuing.", exc_info=True)
@@ -148,7 +150,7 @@ def attribute(
     tools: Sequence[ToolSpec] | None = None,
     brief: Message | None = None,
     brief_sections: Mapping[str, int] | None = None,
-    source: str | None = None,
+    session: str | None = None,
 ) -> dict[str, Any]:
     """The line's fields, in the order they are rendered. See `log_context_attribution`.
 
@@ -171,7 +173,7 @@ def attribute(
     history_chars = sum(text.values())
     fields: dict[str, Any] = {
         "unit": UNIT,
-        "source": source,
+        "session": session,
         "total": tool_chars + brief_chars + history_chars + images,
         "messages": len(history),
         "tools": tool_chars,

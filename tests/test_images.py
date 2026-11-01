@@ -417,6 +417,17 @@ def test_a_transport_failure_is_relayed_to_the_model(tool):
     assert "could not reach the image API" in result
 
 
+def test_a_gateway_timeout_is_relayed_as_out_of_time_never_as_unreachable(tool):
+    """A 504 is a timeout on every vendor (issue #759): the API answered, and ran out of time."""
+    body = {"error": {"message": "upstream timed out", "type": "timeout", "code": 504}}
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(IMAGES_URL).mock(return_value=httpx.Response(504, json=body))
+        result = tool.run(prompt="a cat")
+
+    assert "did not answer in time" in result and "upstream timed out" in result
+    assert "could not reach" not in result
+
+
 # --- the request timeout (issue #219) ----------------------------------------
 
 

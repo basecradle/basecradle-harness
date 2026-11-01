@@ -376,7 +376,7 @@ def render(report: Report, *, applied: bool) -> str:
         "summary: "
         + kv(
             scrub=len(report.scrub),
-            held=len(report.held),
+            held_files=len(report.held),
             review=len(report.review),
             keep=report.kept,
             total=report.total,
@@ -504,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode="apply" if args.apply else "dry-run",
                 drawers=report.total,
                 scrub=len(report.scrub),
-                held=len(report.held),
+                held_files=len(report.held),
                 review=len(report.review),
                 deleted=deleted if args.apply else None,
                 files_removed=removed if args.apply else None,

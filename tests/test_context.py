@@ -1095,7 +1095,9 @@ def test_an_env_budget_too_small_for_the_guarantee_warns_and_names_the_numbers(c
         resolved = budget(provider, override=20_000).limit()
 
     warning = next(r.message for r in caplog.records if r.message.startswith("context budget"))
-    assert "20000" in warning and "source=env" in warning
+    assert "20000" in warning and "(read from env)" in warning
+    # Never `source=` in prose: that name is the probe stamp the NOC reads off every line (#759).
+    assert "source=" not in warning
     assert str(worst_case_turn_tokens(DEFAULT_MAX_STEPS)) in warning  # what a turn can add
     assert "10000 tokens of headroom" in warning  # what it actually has
     assert f"at least {min_safe_limit(DEFAULT_MAX_STEPS)}" in warning  # how to restore it
@@ -1141,7 +1143,7 @@ def test_a_small_adapter_ceiling_warns_but_never_tells_you_to_raise_it_past_the_
         budget(provider).limit()
 
     warning = next(r.message for r in caplog.records if r.message.startswith("context budget"))
-    assert "source=adapter" in warning
+    assert "(read from adapter)" in warning and "source=" not in warning
     assert f"Lower HARNESS_MAX_STEPS to {max_safe_steps(32_000)}" in warning
     # The env path's remedy sentence must never appear here. An operator skimming the journal for an
     # actionable number would otherwise raise the budget past the model's real ceiling — turning the

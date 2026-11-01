@@ -428,7 +428,7 @@ class Session:
             tools=self.engine.tools.specs(),
             brief=brief,
             brief_sections=self._brief_sections,
-            source=self.source,
+            session=self.source,
         )
         # Two halves of the same question, asked of every adapter and answered by the ones that can
         # (`_caching`). *Where* the stable prefix ends: an explicit-cache provider (Anthropic) gets a

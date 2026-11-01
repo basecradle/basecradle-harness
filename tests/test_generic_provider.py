@@ -453,7 +453,9 @@ def test_the_generic_build_says_so_once(generic_env, caplog):
         _build().close()
 
     (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("provider ")]
-    assert line == "provider profile=generic provider=openroutr surface=chat host=llm.example.com"
+    assert (
+        line == "provider profile=generic provider=openroutr sdk_surface=chat host=llm.example.com"
+    )
 
 
 def test_a_mistyped_sdk_is_named_as_no_adapter_not_as_another_vendors(generic_env):

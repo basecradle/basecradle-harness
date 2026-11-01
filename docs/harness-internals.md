@@ -884,15 +884,17 @@ the defect, not a shorter spelling.
 
 - **The grammar.** One `llm` line per model-call **attempt**, whatever the outcome. Fields in `kv()`
   order — and the order is the contract, because the NOC's column regexes were written against it:
-  `provider` `purpose` `kind` `endpoint` `model` `duration` `tokens_*` `cached_tokens`
-  `tokens_reasoning` `cost` `outcome` `reason` `detail`, then that purpose's own extras. `kv` drops
+  `provider` `purpose` `kind` `endpoint` `residency` `model` `duration` `tokens_in` `tokens_out`
+  `tokens_total` `cached_tokens` `cache_write_tokens` `tokens_reasoning` `cost` `cost_basis`
+  `outcome` `reason` `detail`, then that purpose's own extras (`docs/telemetry.md` is the contract
+  for every one of them). `kv` drops
   whatever is `None`, so a brain call is byte-identical to what it always was apart from
   `purpose=main`.
 
   ```
   INFO  llm provider=openai purpose=main model=gpt-5.4-mini duration=3.41s tokens_in=4210 tokens_out=96 tokens_total=4306
-  INFO  llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
-  INFO  llm provider=openrouter purpose=helper kind=image.describe endpoint=Novita model=google/gemini-3-flash duration=1.50s tokens_in=812 tokens_out=96 cost=0.0021 outcome=ok subject=cat.png
+  INFO  llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_total=5423 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
+  INFO  llm provider=openrouter purpose=helper kind=image.describe endpoint=Novita model=google/gemini-3-flash duration=1.50s tokens_in=812 tokens_out=96 tokens_total=908 cost=0.0021 outcome=ok subject=cat.png
   ERROR llm provider=openrouter purpose=helper kind=video.describe model=google/gemini-3-flash outcome=fallback reason=config:missing_api_key subject=clip.mp4
   ```
 
@@ -1009,7 +1011,7 @@ derived from the vendor. The shape of the change:
   server-side built-in arriving anyway is refused by name rather than dropped.
 - **The surface default is per vendor class**: `_surface_for` takes the provider, and only a
   generic vendor over the `openai` SDK defaults to `chat`.
-- **A generic build writes one INFO line**, `provider profile=generic provider=… surface=… host=…`.
+- **A generic build writes one INFO line**, `provider profile=generic provider=… sdk_surface=… host=…`.
   A misspelled known vendor is a well-formed slug and now runs generic rather than refusing, and
   this line is the only trace that it lost that vendor's conventions. INFO and not WARNING, because
   for a real generic vendor it is the expected state on every wake. Its head is deliberately not

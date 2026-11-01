@@ -934,9 +934,9 @@ def test_the_llm_line_shape(router, provider, caplog):
         provider.chat([Message.user("go")])
     line = _llm_line(caplog)
     assert re.fullmatch(
-        r"llm provider=google purpose=main endpoint=us model=gemini-3\.8-flash "
+        r"llm provider=google purpose=main residency=us model=gemini-3\.8-flash "
         r"duration=\d+\.\d\ds tokens_in=1200 tokens_out=100 tokens_total=1300 cached_tokens=1000 "
-        r"cost=\S+ cost_basis=computed generation_id=resp-0123456789abcdef",
+        r"tokens_reasoning=70 cost=\S+ cost_basis=computed generation_id=resp-0123456789abcdef",
         line,
     ), line
 
@@ -968,8 +968,12 @@ def test_a_model_without_a_rate_gets_no_cost_and_one_warning(router, key_file, c
         p.chat([Message.user("go again")])
     llm = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
     assert len(llm) == 2 and all("cost=" not in line for line in llm)
-    warnings = [r for r in caplog.records if "No published rate" in r.getMessage()]
+    warnings = [r for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
     assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert warnings[0].getMessage() == (
+        "cost unpriced provider=google model=gemini-9-experimental charge=tokens "
+        "reason=unknown_model"
+    )
 
 
 def test_a_priority_tier_call_is_not_priced_at_standard_rates(router, provider, caplog):
@@ -1385,9 +1389,9 @@ def test_a_search_writes_a_helper_llm_line_and_meters_its_grounding_fee(router, 
         provider.search("weather in chicago")
     (llm,) = _lines_starting(caplog, "llm ")
     assert re.fullmatch(
-        r"llm provider=google purpose=helper kind=search\.grounding endpoint=us "
+        r"llm provider=google purpose=helper kind=search\.grounding residency=us "
         r"model=gemini-3\.8-flash duration=\d+\.\d\ds tokens_in=20 tokens_out=120 "
-        r"tokens_total=4140 cost=\S+ cost_basis=computed \S*outcome=ok\S* "
+        r"tokens_total=140 cost=\S+ cost_basis=computed \S*outcome=ok\S* "
         r"generation_id=resp-0123456789abcdef",
         llm,
     ), llm
@@ -1622,3 +1626,33 @@ def test_a_url_gemini_could_not_read_and_a_failed_run_are_marked_failed(router, 
     run, page = provider.chat([Message.user("go")]).server_tools.uses
     assert (run.name, run.failed) == ("code_execution", "OUTCOME_FAILED")
     assert (page.name, page.failed) == ("url_context", "URL_RETRIEVAL_STATUS_ERROR")
+
+
+def test_an_unpriceable_grounding_fee_is_one_counted_gap_per_wake(router, provider, caplog):
+    """A per-query model whose response lists no queries to count: the fee is real and unstated,
+    so it is one ``cost unpriced charge=grounding`` line, not a sentence per search (issue #759)."""
+    router.post(GENERATE).mock(return_value=grounded(text("Sunny."), queries=()))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"), tool_meter():
+        provider.search("weather")
+        provider.search("weather again")
+    assert _lines_starting(caplog, "cost unpriced ") == [
+        "cost unpriced provider=google model=gemini-3.8-flash charge=grounding reason=not_reported"
+    ]
+
+
+def test_a_builtins_tool_prompt_is_billed_input_but_never_the_compaction_trigger(
+    router, provider, caplog
+):
+    """A fetched page arrives as tool-use input tokens: billed, so on ``tokens_in`` — but nothing in
+    the transcript replays it, so the context budget's trigger reads the prompt alone (#759)."""
+    usage = {
+        "promptTokenCount": 1200,
+        "candidatesTokenCount": 30,
+        "toolUsePromptTokenCount": 150_000,
+        "trafficType": "ON_DEMAND",
+    }
+    router.post(GENERATE).mock(return_value=ok(text("hi"), usage=usage))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("read the page")])
+    assert " tokens_in=151200 tokens_out=30 tokens_total=151230 " in _llm_line(caplog)
+    assert provider.last_tokens_in == 1200

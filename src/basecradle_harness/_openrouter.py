@@ -888,6 +888,18 @@ def _from_status_error(exc) -> ProviderError:
         # A 413 that is not a context overflow (checked above): the request body was too large.
         # Deterministic and file-shaped — reported once, never retried, never modified (issue #336).
         return ProviderPayloadTooLargeError(message, status_code=status, body=body, **told)
+    if status == 504:
+        # A deadline ran out — OpenRouter's or the upstream's, never the budget the harness fitted —
+        # so it is a timeout on every vendor (issue #759): one retry with more time, which a router
+        # may also route elsewhere, never three re-sends into the same wall (issue #589). The
+        # router's own account of the failure rides it, as it rides every other refusal.
+        return ProviderTimeoutError(
+            f"OpenRouter's deadline ran out (HTTP 504): {message}",
+            status_code=status,
+            body=body,
+            vendor_deadline=True,
+            **told,
+        )
     if status >= 500:
         # OpenRouter (or the upstream it routed to) fell over on its own side — transient, so the
         # engine re-requests it (issue #284). It matters *most* here: this adapter disables the SDK's

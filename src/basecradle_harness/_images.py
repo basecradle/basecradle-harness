@@ -81,6 +81,7 @@ from basecradle_harness._assets import _describe, _download, _upload
 from basecradle_harness._exceptions import (
     ProviderConnectionError,
     ProviderError,
+    ProviderTimeoutError,
 )
 from basecradle_harness._media import (
     decode_image_payload,
@@ -418,6 +419,9 @@ class GenerateImageTool(_ImageTool):
                 response = client.images.generate(model=self._model, prompt=prompt, n=1, **coverage)
                 call.cost = self._cost(response)
             image_bytes = self._decode(response)
+        except ProviderTimeoutError as exc:
+            # Reached, and out of time — a gateway's 504 included (#759): never "could not reach".
+            return f"Error generating image: the image API did not answer in time: {exc}"
         except ProviderConnectionError as exc:
             return f"Error generating image: could not reach the image API: {exc}"
         except ProviderError as exc:
@@ -572,6 +576,8 @@ class EditImageTool(_ImageTool):
                 )
                 call.cost = self._cost(response)
             image_bytes = self._decode(response)
+        except ProviderTimeoutError as exc:
+            return f"Error editing image: the image API did not answer in time: {exc}"
         except ProviderConnectionError as exc:
             return f"Error editing image: could not reach the image API: {exc}"
         except ProviderError as exc:

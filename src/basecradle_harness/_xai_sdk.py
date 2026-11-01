@@ -108,6 +108,7 @@ from basecradle_harness._observability import (
     generation_of,
     log_llm_call,
     log_server_tools,
+    reasoning_apart,
     serving_endpoint,
     token_counts,
 )
@@ -382,7 +383,9 @@ class XaiSdkProvider:
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
-            usage=usage,
+            # xAI reports its reasoning beside the completion, never inside it (32 + 9 + 94 = 135 in
+            # its own example), so the line folds it into the output it is billed as (issue #759).
+            usage=reasoning_apart(usage),
             # Asked of every adapter, answered by the ones that can: this SDK reaches xAI directly,
             # so the vendor *is* the endpoint — there is no upstream to name, and the field is
             # omitted rather than faked with a restatement of `provider=xai`.

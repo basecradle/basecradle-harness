@@ -742,7 +742,7 @@ def test_the_llm_line_grammar(router, provider, caplog):
     rest = duration_and_rest.split(" ", 1)[1]
     assert rest == (
         "tokens_in=44000 tokens_out=200 tokens_total=44200 cached_tokens=40000 "
-        f"cost={cost:.6f} cost_basis=computed cache_write_tokens=3000 "
+        f"cache_write_tokens=3000 cost={cost:.6f} cost_basis=computed "
         "generation_id=msg_01GrammarGrammar"
     ).replace(f"cost={cost:.6f}", _money(cost))
     assert provider.last_tokens_in == 44_000
@@ -782,7 +782,10 @@ def test_an_unknown_model_gets_no_cost_and_one_warning(router, caplog):
         adapter.chat([Message.user("a")])
         adapter.chat([Message.user("b")])
     assert all("cost=" not in line for line in llm_lines(caplog))
-    assert sum("No published rate" in r.getMessage() for r in caplog.records) == 1
+    gaps = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
+    assert gaps == [
+        "cost unpriced provider=anthropic model=claude-future-9 charge=tokens reason=unknown_model"
+    ]
 
 
 def test_us_inference_is_priced_at_the_multiplier(router, caplog):
@@ -1005,7 +1008,15 @@ def test_a_refusal_is_final_and_logged_with_its_category(router, provider, caplo
         answer = provider.chat([Message.user("…")])
     assert answer.content is None and not answer.tool_calls
     assert len(router.calls) == 1
-    assert "category=cyber" in caplog.text
+    refused = [r for r in caplog.records if r.getMessage().startswith("llm refused ")]
+    assert [r.getMessage() for r in refused] == [
+        (
+            "llm refused provider=anthropic purpose=main model=claude-haiku-5-5 category=cyber "
+            "generation_id=msg_01FakeFakeFakeFake"
+        )
+    ]
+    assert refused[0].levelno == logging.WARNING
+    assert "Declined." in caplog.text  # Anthropic's own words, kept for a human beside the fact
     assert provider.last_finish_reason == "refusal"
 
 

@@ -57,7 +57,11 @@ from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from basecradle_harness._exceptions import ProviderConnectionError, ProviderError
+from basecradle_harness._exceptions import (
+    ProviderConnectionError,
+    ProviderError,
+    ProviderTimeoutError,
+)
 from basecradle_harness._idempotency import ASSET
 from basecradle_harness._messages import FrameSampling, ImageContent, ToolResult, VideoContent
 from basecradle_harness._platform import PlatformTool
@@ -448,6 +452,8 @@ class AssetsTool(PlatformTool):
         data = _download(file.url)
         try:
             transcript = transcriber.transcribe(data, file.filename, file.content_type, key)
+        except ProviderTimeoutError as exc:
+            return f"Error transcribing audio: the transcription API did not answer in time: {exc}"
         except ProviderConnectionError as exc:
             return f"Error transcribing audio: could not reach the transcription API: {exc}"
         except ProviderError as exc:

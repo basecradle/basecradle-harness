@@ -119,7 +119,7 @@ from basecradle_harness._mcp import McpImageStore, McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
 from basecradle_harness._model_params import load_model_params
-from basecradle_harness._observability import LOG_FORMAT, log_unspoken
+from basecradle_harness._observability import LOG_FORMAT, kv, log_unspoken
 from basecradle_harness._openai import (
     DEFAULT_SURFACE as OPENAI_DEFAULT_SURFACE,
 )
@@ -1607,11 +1607,16 @@ def _generic_openai_provider(
     # (``openroutr``) is a well-formed slug and so runs generic; without this line nothing would
     # say the agent lost that vendor's conventions. INFO, not WARNING: for a real generic vendor it
     # is the expected state on every wake, and a warning nobody acts on is one nobody reads.
+    # Built through `kv`, so a host or a slug is scrubbed, bounded and quoted like any value, and the
+    # adapter's surface is `sdk_surface=` — `surface=` is a memory recall's (issue #759).
     _log.info(
-        "provider profile=generic provider=%s surface=%s host=%s",
-        provider,
-        surface,
-        urlsplit(endpoint).netloc or endpoint,
+        "provider %s",
+        kv(
+            profile="generic",
+            provider=provider,
+            sdk_surface=surface,
+            host=urlsplit(endpoint).netloc or endpoint,
+        ),
     )
     # Read past the guards, as on every other branch: a config mismatch names its own fix rather
     # than being masked by a malformed tuning file the wake would never use.

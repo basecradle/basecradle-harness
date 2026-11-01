@@ -384,6 +384,10 @@ class Retry:
         if not retryable(reason, is_config=is_config) or self.attempt >= self.attempts:
             return False
         timing: dict[str, Any] = {}
+        if getattr(exc, "vendor_deadline", False) is True:
+            # The deadline that ran out was the vendor's own (a gateway's 504), not the budget the
+            # harness fitted, so that budget is not the one the attempt ran out of (issue #759).
+            timed_out_after = None
         if reason == "timeout":
             if self._timeout_retries >= TIMEOUT_RETRIES:
                 return False

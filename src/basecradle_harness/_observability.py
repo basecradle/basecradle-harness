@@ -145,10 +145,16 @@ DELIVERY_ID_ENV = "BASECRADLE_DELIVERY_ID"
 #: candidate is a *path* — one hop for a flat field, two for a nested one (the cached count lives
 #: under a details block on the HTTP wires and flat on the xAI proto). First hit wins, so one
 #: reader serves every adapter and a provider that reports nothing logs nothing.
+#:
+#: **Every field means one thing on every vendor** (`docs/telemetry.md` → ``llm``, issue #759): a
+#: vendor whose own numbers mean something else — Anthropic's prompt in three disjoint parts,
+#: Google's tool-use prompt reported apart, xAI's reasoning reported apart from its completion —
+#: is translated into this vocabulary once, at its own adapter's boundary, and never branched on
+#: here. ``tokens_total`` is not read at all: it is ``tokens_in`` + ``tokens_out`` by definition
+#: (`token_counts`), so no vendor's own total can disagree with the two fields beside it.
 _TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
     "tokens_in": (("input_tokens",), ("prompt_tokens",)),
     "tokens_out": (("output_tokens",), ("completion_tokens",)),
-    "tokens_total": (("total_tokens",),),
     # Prompt caching is the difference between paying full freight on a 750k-token prefix and
     # paying the cache-read rate for it (~5.4× cheaper, measured live) — and until it is on the
     # line, whether caching is working at all can only be *inferred*. OpenRouter's own
@@ -159,7 +165,30 @@ _TOKEN_FIELDS: dict[str, tuple[tuple[str, ...], ...]] = {
         ("input_tokens_details", "cached_tokens"),  # OpenAI Responses
         ("cached_prompt_text_tokens",),  # the xAI gRPC proto
     ),
+    # The part of the prompt written to the cache on this call — billed at its own rate, so a
+    # cache that is written on every call and read on none is visible as the cost it is.
+    "cache_write_tokens": (
+        ("prompt_tokens_details", "cache_write_tokens"),  # the Chat wire: OpenAI, OpenRouter
+        ("input_tokens_details", "cache_write_tokens"),  # OpenAI Responses
+    ),
+    # The part of the output spent reasoning, on every purpose (`_REASONING_FIELDS`).
+    "tokens_reasoning": (
+        ("completion_tokens_details", "reasoning_tokens"),  # the Chat wire: OpenAI, OpenRouter
+        ("output_tokens_details", "reasoning_tokens"),  # OpenAI Responses
+        ("reasoning_tokens",),  # flat: the xAI gRPC proto
+    ),
 }
+
+#: The fields `token_counts` renders, in the `llm` line's order: ``tokens_total`` sits between
+#: the two it sums, where the line has always carried it.
+_TOKEN_ORDER = (
+    "tokens_in",
+    "tokens_out",
+    "tokens_total",
+    "cached_tokens",
+    "cache_write_tokens",
+    "tokens_reasoning",
+)
 
 #: Where a provider states the call's **dollar cost**, when it states one at all. OpenRouter
 #: returns it on every response (``usage.cost``, already in USD), as do some OpenAI-compatible
@@ -226,16 +255,11 @@ _UPSTREAM_COST_FIELDS: tuple[tuple[str, ...], ...] = (("cost_details", "upstream
 #: existed.
 BYOK_BILLING = "byok"
 
-#: Where a provider states how many of the completion's tokens went to **reasoning**. Deliberately
-#: kept out of `_TOKEN_FIELDS` — that dict is the shared ``llm`` line's field set, and adding a
-#: field there would change the bytes of a line the fleet dashboard already extracts on. This is
-#: read by whichever caller wants it (`reasoning_tokens`), so a new line kind can carry the fact
-#: without renegotiating the old one.
-_REASONING_FIELDS: tuple[tuple[str, ...], ...] = (
-    ("completion_tokens_details", "reasoning_tokens"),  # the Chat wire: OpenAI, OpenRouter
-    ("output_tokens_details", "reasoning_tokens"),  # OpenAI Responses
-    ("reasoning_tokens",),  # flat, where a vendor reports it that way
-)
+#: Where a provider states how many of the completion's tokens went to **reasoning** — the same
+#: paths `_TOKEN_FIELDS` reads for ``tokens_reasoning``, one tuple, so `reasoning_tokens` and the
+#: line can never disagree. Until issue #759 the field was read only by the non-brain callers and
+#: never reached a ``purpose=main`` line; it is now part of the shared reader, on every purpose.
+_REASONING_FIELDS: tuple[tuple[str, ...], ...] = _TOKEN_FIELDS["tokens_reasoning"]
 
 
 #: Where a provider names the **upstream that actually served the call**. A router is not a server:
@@ -481,9 +505,13 @@ class LlmCall:
     seconds: float | None = None
     usage: Any = None
     endpoint: str | None = None
+    residency: str | None = None
     cost: float | None = None
     finish_reason: str | None = None
     generation_id: str | None = None
+    #: What the caller is using the model for — the ``purpose=`` of its line, and of any line the
+    #: adapter writes for the call itself (`log_llm_refused`). Set by `capture_llm_call`.
+    purpose: str = HELPER
 
 
 #: The capture handle for the model call currently in flight, or ``None`` — which is the ordinary
@@ -496,7 +524,7 @@ _CAPTURE: ContextVar[LlmCall | None] = ContextVar("llm_capture", default=None)
 
 
 @contextmanager
-def capture_llm_call() -> Iterator[LlmCall]:
+def capture_llm_call(purpose: str = HELPER) -> Iterator[LlmCall]:
     """Hold back the `llm` line an adapter would emit, so its caller writes the one line instead.
 
     The seam a **non-brain** model call wraps its provider call in (issue #485). Inside this block
@@ -510,7 +538,9 @@ def capture_llm_call() -> Iterator[LlmCall]:
     (worse) leaving the good path with no ``outcome=`` at all, since an adapter has no notion of
     one. One attempt, one line, one outcome.
 
-    Yields the `LlmCall` the adapter fills; if the call raises, it comes back empty.
+    Yields the `LlmCall` the adapter fills; if the call raises, it comes back empty. `purpose` is
+    the caller's (``helper`` for the describer, the only capturing caller), carried on the record so
+    a line the adapter itself writes for the call — a refusal — names the same purpose.
 
     **Wrap exactly one model call, on this thread, and nothing else.** Three properties of an
     ambient capture fail invisibly otherwise, and they are stated rather than left to be
@@ -521,7 +551,7 @@ def capture_llm_call() -> Iterator[LlmCall]:
     second. No shipped adapter does any of the three — that is the assumption to re-check before
     adding one.
     """
-    call = LlmCall()
+    call = LlmCall(purpose=purpose)
     token = _CAPTURE.set(call)
     try:
         yield call
@@ -538,8 +568,8 @@ def log_llm_call(
     kind: str | None = None,
     usage: Any = None,
     endpoint: str | None = None,
+    residency: str | None = None,
     cost: float | None = None,
-    tokens_reasoning: int | None = None,
     finish_reason: str | None = None,
     outcome: str | None = None,
     reason: str | None = None,
@@ -567,8 +597,8 @@ def log_llm_call(
     line and never spelled as a new head.
 
     **Field order is the contract** and matches what the NOC's column regexes were written against:
-    ``provider purpose kind endpoint model duration tokens_* cached_tokens tokens_reasoning cost
-    cost_basis outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
+    ``provider purpose kind endpoint residency model duration tokens_in tokens_out tokens_total
+    cached_tokens cache_write_tokens tokens_reasoning cost cost_basis outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
     ``picked``), and last of all ``generation_id`` — the vendor's own id for the call (issue #634),
     rendered last so that no column written before it moves — and then, after even that,
     ``billing=byok`` on a call the provider billed directly (issue #653, `BYOK_BILLING`), for the
@@ -584,11 +614,10 @@ def log_llm_call(
     converter). Each is omitted, cleanly, by a provider with no answer — a direct-to-vendor SDK has
     no serving endpoint distinct from itself, and most vendors report tokens but never dollars. A
     provider that reports none of them still gets its provider/model/duration line, which is the
-    part that is always true. **One direct-to-vendor adapter fills ``endpoint`` differently**, by the
-    capital's ruling on issue #655: Google's Vertex AI is addressed by *location*, so its line names
-    the location the call was sent to (``endpoint=us``, ``endpoint=global``) — the residency fact the
-    operator chose — and its ``cost`` is computed from Google's published rates (`_COST_FIELDS`).
-    ``global`` is Google's choice of where to run, not a place, so it says no more than that. A cost
+    part that is always true. ``endpoint`` is the serving upstream **only**; where a vendor runs a
+    call is ``residency`` (issue #759, retiring #655's reading of ``endpoint`` on Google): Vertex's
+    location (``residency=us``, ``residency=global``) and Anthropic's ``inference_geo``. ``global``
+    is the vendor's choice of where to run, not a place, so it says no more than that. A cost
     that is computed (a `ComputedCost`, Google's or OpenAI's) is followed by ``cost_basis=computed``;
     a vendor-stated one carries no basis, so its line is unchanged (`COST_BASIS_COMPUTED`).
 
@@ -615,6 +644,7 @@ def log_llm_call(
         # explicit `purpose` is a caller writing its own line and is never captured.
         captured.provider, captured.model, captured.seconds = provider, model, seconds
         captured.usage, captured.endpoint, captured.cost = usage, endpoint, cost
+        captured.residency = residency
         captured.finish_reason, captured.generation_id = finish_reason, generation_id
         return
     if purpose is None:
@@ -631,7 +661,7 @@ def log_llm_call(
         # the same absence spelled ``0``. A **non-zero** one is kept: the xAI adapter reads its cost
         # off the *response* rather than off usage, so a real charge beside an unreported usage
         # block is a fact this line must not swallow. Honest absence cuts both ways.
-        counts, tokens_reasoning = {}, None
+        counts = {}
         cost = cost if _charged(cost) else None
     _log.log(
         level,
@@ -641,10 +671,10 @@ def log_llm_call(
             purpose=purpose,
             kind=kind,
             endpoint=endpoint,
+            residency=residency,
             model=model,
             duration=None if seconds is None else _secs(seconds),
             **counts,
-            tokens_reasoning=tokens_reasoning,
             cost=_money(cost),
             cost_basis=cost_basis(cost),
             outcome=outcome,
@@ -952,6 +982,46 @@ def log_cost_unpriced(*, provider: str, charge: str, reason: str, model: str | N
 CONTAINER_TIME = "container_time"
 NOT_REPORTED = "not_reported"
 
+#: The rest of the ``cost unpriced`` vocabulary (`docs/telemetry.md` → ``cost unpriced``), spelled
+#: once so every adapter states the same gap in the same words (issue #759): the call's **tokens**
+#: and a search's **grounding** fee are the charges; a model the rate table does not carry, a tier
+#: (or long-context band) it does not carry, and a host whose prices are not the table's are the
+#: reasons.
+TOKENS_CHARGE = "tokens"
+GROUNDING_CHARGE = "grounding"
+UNKNOWN_MODEL = "unknown_model"
+UNPRICED_TIER = "unpriced_tier"
+UNPRICED_HOST = "unpriced_host"
+
+
+#: The head a vendor's **content refusal** is written on (`log_llm_refused`). Like `RETRY_HEAD`, it
+#: is not `` llm provider=``, so a refusal is never counted as a second call beside its `llm` line.
+REFUSED_HEAD = "llm refused"
+
+
+def log_llm_refused(
+    *, provider: str, model: str, category: Any = None, generation_id: str | None = None
+) -> None:
+    """One WARNING per model call the vendor refused on content grounds (issue #759).
+
+    A refusal is the vendor's final word on the content and is never retried; this line makes it a
+    counted fact a refusal rate can be compared on, where it was one vendor's sentence. Written by
+    the adapter right after the call's `llm` line, so ``purpose`` is the one a `capture_llm_call`
+    block names, and ``main`` outside one. ``category`` is the vendor's own, as a `slug`.
+    """
+    captured = _CAPTURE.get()
+    _log.warning(
+        "%s %s",
+        REFUSED_HEAD,
+        kv(
+            provider=provider,
+            purpose=MAIN if captured is None else captured.purpose,
+            model=model,
+            category=slug(category),
+            generation_id=generation_id,
+        ),
+    )
+
 
 class ToolMeter:
     """What a harness tool's **billed vendor work** recorded while it ran, for its `tool` line.
@@ -1093,13 +1163,53 @@ def token_counts(usage: Any) -> dict[str, int]:
     """
     if usage is None:
         return {}
-    counts: dict[str, int] = {}
+    read: dict[str, int] = {}
     for field, paths in _TOKEN_FIELDS.items():
         value = _first(usage, paths)
         if isinstance(value, bool) or not isinstance(value, int):
             continue
-        counts[field] = value
-    return counts
+        read[field] = value
+    if "tokens_in" in read and "tokens_out" in read:
+        # Exactly the two it sums, never the vendor's own total (issue #759): Vertex's counts the
+        # tool-use prompt and xAI's counts reasoning its completion excludes, so "total" meant
+        # three different things on three vendors.
+        read["tokens_total"] = read["tokens_in"] + read["tokens_out"]
+    return {field: read[field] for field in _TOKEN_ORDER if field in read}
+
+
+def reasoning_apart(usage: Any) -> dict[str, Any] | None:
+    """`usage` from a vendor that reports its reasoning **apart from** its output, in the shared
+    vocabulary — the reasoning folded into the output it was billed as (issue #759).
+
+    On most wires the output count already includes the reasoning, and ``reasoning_tokens`` is a
+    breakdown of it. xAI reports it beside the output instead, on every surface: its Chat
+    Completions example is 32 prompt + 9 completion + 94 reasoning = 135, and its Responses example
+    32 + 9 + 110 = 151 (docs.x.ai, read 2026-10-31). Read as-is, ``tokens_out`` would omit the
+    reasoning xAI bills as output. So the adapter that knows its vendor does this hands the line
+    this translation — the vendor's convention, applied at its own boundary, never a branch in the
+    shared reader. ``None`` for no usage, and the counts unchanged when none is reasoning.
+    """
+    counts = token_counts(usage)
+    if not counts:
+        return None
+    wire: dict[str, Any] = {}
+    if "tokens_in" in counts:
+        wire["prompt_tokens"] = counts["tokens_in"]
+    if "tokens_out" in counts:
+        wire["completion_tokens"] = counts["tokens_out"] + counts.get("tokens_reasoning", 0)
+    details = {
+        name: counts[field]
+        for name, field in (
+            ("cached_tokens", "cached_tokens"),
+            ("cache_write_tokens", "cache_write_tokens"),
+        )
+        if field in counts
+    }
+    if details:
+        wire["prompt_tokens_details"] = details
+    if "tokens_reasoning" in counts:
+        wire["completion_tokens_details"] = {"reasoning_tokens": counts["tokens_reasoning"]}
+    return wire
 
 
 def usage_reported(usage: Any) -> bool:

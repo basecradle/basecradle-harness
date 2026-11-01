@@ -437,6 +437,20 @@ def grounding_cost(model: str, *, queries: int | None, sourced: bool) -> Compute
     return ComputedCost(queries * scheme.per_query)
 
 
+def grounding_tokens_free(model: str) -> bool:
+    """Whether a grounded call's tool-use input tokens are **not charged** on `model` (Gemini 3).
+
+    The same rule `call_cost` prices by, so the line's ``tokens_in`` and its ``cost`` agree on which
+    tokens were billed (issue #759).
+    """
+    return _grounding(model).free_tokens
+
+
+def grounding_known(model: str) -> bool:
+    """Whether the table carries a grounding scheme for `model` (a snapshot priced as its alias)."""
+    return _model_key(model) in GROUNDING
+
+
 def grounding_units(model: str, queries: int | None) -> int | None:
     """How many units a grounded call is billed for: its queries, or one prompt on a per-prompt model."""
     scheme = GROUNDING.get(_model_key(model))

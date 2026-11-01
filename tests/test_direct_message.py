@@ -384,3 +384,41 @@ def test_an_unbound_tool_says_so_rather_than_raising_an_attribute_error():
     # The PlatformTool contract: a tool that was never wired explains itself.
     with pytest.raises(PlatformError):
         DirectMessageTool(token=TOKEN).run(body="hello")
+
+
+# --- the two journal lines (issue #759) --------------------------------------
+
+
+def _dm_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.getMessage().startswith("direct_message ")]
+
+
+@respx.mock
+def test_a_delivery_is_one_kv_line_with_a_quoted_title(tool, caplog):
+    respx.post(NTFY_URL).mock(return_value=httpx.Response(200))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        tool.run(body="hello")
+    assert _dm_lines(caplog) == ['direct_message sent bytes=5 title="BaseCradle DM from @nova"']
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    ("answer", "slug"),
+    [
+        (httpx.Response(401, text="unauthorized"), "refused"),
+        (httpx.Response(502, text="bad gateway"), "server_error"),
+        (httpx.ConnectError("no route to host"), "transport"),
+    ],
+)
+def test_a_failed_delivery_names_why_as_a_slug_and_the_text_as_its_error(
+    tool, caplog, answer, slug
+):
+    route = respx.post(NTFY_URL)
+    if isinstance(answer, Exception):
+        route.mock(side_effect=answer)
+    else:
+        route.mock(return_value=answer)
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        tool.run(body="hello")
+    (line,) = _dm_lines(caplog)
+    assert line.startswith(f"direct_message failed bytes=5 reason={slug} error=")

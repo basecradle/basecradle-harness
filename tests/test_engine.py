@@ -432,7 +432,7 @@ def test_a_text_only_model_gets_the_honest_caption_and_a_loud_warning(caplog):
     # Its own head, not the image one generalized: two different events, two independent consumers.
     assert line.startswith("watch video withheld from the model ")
     assert "clip.mp4" in line and "z-ai/glm-5.2" in line
-    assert 'reason="model has no image input"' in line
+    assert line.endswith(" reason=no_image_input")
 
 
 class BrokenClipTool(Tool):

@@ -36,6 +36,7 @@ from basecradle_harness._exceptions import (
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
+    ProviderTimeoutError,
 )
 from basecradle_harness._observability import (
     HELPER,
@@ -484,3 +485,35 @@ def test_a_helper_retry_reads_the_same_way(caplog):
     line = retry_line(caplog)
     assert "purpose=helper" in line and "kind=image.describe" in line and "subject=cat.png" in line
     assert not re.search(LLM_CALL_GATE, line)
+
+
+# === A vendor's deadline is a timeout, and not the harness's budget (issue #759) ================
+
+
+def test_a_vendor_deadline_is_retried_once_and_never_named_as_the_harness_budget(caplog):
+    """A gateway's 504 is retried as a timeout — once, with more time — but the deadline that ran
+    out was the vendor's, so the line names no ``timeout=`` it cannot know."""
+    gateway = ProviderTimeoutError(
+        "OpenRouter's deadline ran out (HTTP 504): upstream timed out",
+        status_code=504,
+        vendor_deadline=True,
+        provider_code="504",
+    )
+    bounded = retry(purpose=MAIN, kind=None, extra={}, sleep=lambda _s: None)
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert bounded.again(gateway, reason="timeout", timed_out_after=60.0) is True
+        assert bounded.again(gateway, reason="timeout", timed_out_after=120.0) is False
+    line = retry_line(caplog)
+    assert " reason=timeout " in line and " timeout_scale=" in line
+    assert " timeout=" not in line and " next_timeout=" not in line
+    assert " provider_code=504 " in line  # the router's own account still rides it
+
+
+def test_the_harness_budget_is_named_when_it_was_the_one_that_ran_out(caplog):
+    bounded = retry(purpose=MAIN, kind=None, extra={}, sleep=lambda _s: None)
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        assert bounded.again(
+            ProviderTimeoutError("read timed out"), reason="timeout", timed_out_after=60.0
+        )
+    line = retry_line(caplog)
+    assert " timeout=60.00s " in line and " next_timeout=" in line

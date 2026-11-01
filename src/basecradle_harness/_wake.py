@@ -151,7 +151,7 @@ from basecradle_harness._describer import (
     describer_stack_from_env,
     describer_surface_from_env,
 )
-from basecradle_harness._engine import compose_hooks, is_truncation_note
+from basecradle_harness._engine import OUTPUT_BUDGET, compose_hooks, is_truncation_note
 from basecradle_harness._exceptions import (
     EngineError,
     HarnessError,
@@ -2370,7 +2370,7 @@ class WakeAgent:
                 asset=asset.content.uuid,
                 filename=asset.content.file.filename,
                 model=model,
-                reason="model has no vision input",
+                reason="no_vision_input",
             ),
         )
 
@@ -2995,10 +2995,9 @@ class WakeAgent:
                 kind=kind,
                 timeline=self.timeline_uuid,
                 delivery=delivery_id(),
-                reason=(
-                    "the model's final text was cut off at the output budget, so the turn is "
-                    "unfinished; leaving it pending, and this wake resumes it once the pass ends"
-                ),
+                # The model's final text was cut off at the output budget, so the turn is
+                # unfinished: it stays pending, and this wake resumes it once the pass ends.
+                reason=OUTPUT_BUDGET,
             ),
         )
         return True
@@ -3880,10 +3879,12 @@ class WakeAgent:
                     item,
                     claim,
                     kind,
+                    "compacted_away",
                     "the turn that carried it was compacted out of the transcript, so what it "
                     "did — and whether it already spoke — cannot be known",
                 )
-            return self._redrive(item, claim, "the wake died before the model ever saw it", kind)
+            # The wake died before the model ever saw it.
+            return self._redrive(item, claim, "died_before_model", kind)
 
         work = _turn_work(session.history, turn)
         if _turn_narration(work) is not None:
@@ -3906,7 +3907,7 @@ class WakeAgent:
         # would only reproduce it. What still lands here is a turn that produced nothing, or one
         # whose model call **raised** after producing text and carries the `[turn failed: …]` note;
         # both are re-driven for the same reason they always were — nothing in either one ran.)
-        disposition = self._redrive(item, claim, "the wake died inside the model call", kind)
+        disposition = self._redrive(item, claim, "died_in_model_call", kind)
         if disposition == _OURS:
             session.excise(turn)
         return disposition
@@ -3988,7 +3989,8 @@ class WakeAgent:
                 timeline=self.timeline_uuid,
                 handle=_handle_of(item),
                 resume=f"{attempt}/{RESUME_CEILING}",
-                reason="the wake died mid-tool-chain; finishing the turn it started",
+                # The wake died mid-tool-chain; this one finishes the turn it started.
+                reason="died_mid_tool_chain",
             ),
         )
         # The turn's own content, which the dead wake persisted before it ever called the model.
@@ -4107,6 +4109,7 @@ class WakeAgent:
             disposition = self._drop(
                 item,
                 kind,
+                "context_length",
                 "the interrupted turn is over the model's context ceiling and cannot be "
                 f"compacted: {error}",
             )
@@ -4140,18 +4143,22 @@ class WakeAgent:
                 posted=None,
             )
             disposition = self._drop(
-                item, kind, f"the resumed turn hit a permanent provider failure: {verbatim(exc)}"
+                item,
+                kind,
+                "payload_too_large",
+                f"the resumed turn hit a permanent provider failure: {verbatim(exc)}",
             )
         except Exception as exc:  # noqa: BLE001 - one item's failure must not take the wake down
             # Anything else — the provider is down or too slow, the box is unhappy. Do not take the
             # whole wake down over it; the other items on this timeline still deserve an answer.
             # Nothing is lost: this wake's claim on the item is in-flight, so the next wake finds it
             # orphaned again and resumes against a transcript carrying whatever this attempt managed.
-            if not isinstance(exc, ProviderTimeoutError):
+            if not _turn_timed_out(exc):
                 # A fault of the provider, the platform or the harness — an exhausted 5xx or 429, a
-                # dropped connection, a platform refusal, a bug. It says nothing about whether this
-                # turn can be finished, and it is the path an outage takes, so it does not count
-                # toward the resume ceiling (issue #589): the item waits for the cause to clear.
+                # dropped connection, a platform refusal, a bug, or a deadline that was the vendor's
+                # own (a gateway's 504, issue #759). It says nothing about whether this turn can be
+                # finished, and it is the path an outage takes, so it does not count toward the
+                # resume ceiling (issue #589): the item waits for the cause to clear.
                 self.claims.recount(
                     self.timeline_uuid, uuid, kind=kind, resumes=claim.resumes, reason=claim.reason
                 )
@@ -4283,7 +4290,8 @@ class WakeAgent:
                 resumes=resumes,
                 tool_calls=tool_calls,
                 note=_uuid_of(note),
-                reason=reason,
+                reason="resume_ceiling",
+                detail=reason,
             ),
         )
         return _FINAL
@@ -4309,7 +4317,7 @@ class WakeAgent:
         _log.warning(
             "%s %s",
             head("wake stalled", YELLOW),
-            kv(item=uuid, kind=kind, timeline=self.timeline_uuid, reason=reason),
+            kv(item=uuid, kind=kind, timeline=self.timeline_uuid, reason="batch_mate"),
         )
         return True
 
@@ -4390,7 +4398,7 @@ class WakeAgent:
             )
         session.persist()
 
-    def _abandon(self, item: object, claim: Claim, kind: str, why: str) -> str:
+    def _abandon(self, item: object, claim: Claim, kind: str, why: str, detail: str) -> str:
         """Take an orphan over in order to **drop** it — the at-most-once trade, made deliberately.
 
         The compare-and-swap is not ceremony: a rival wake could be recovering this same orphan and
@@ -4401,18 +4409,20 @@ class WakeAgent:
         uuid = item.content.uuid
         if not self.claims.reclaim(self.timeline_uuid, uuid, kind=kind, owner=claim.wake):
             return _PENDING
-        return self._drop(item, kind, why)
+        return self._drop(item, kind, why, detail)
 
-    def _drop(self, item: object, kind: str, why: str) -> str:
+    def _drop(self, item: object, kind: str, why: str, detail: str) -> str:
         """Abandon this item, and say so at ERROR — **a drop is never silent, for any kind.**
 
         The residual at-most-once case, reached from exactly two places (a resume that cannot fit in
         the model's context window; a turn a compaction destroyed). `abandoned` is a *settled* phase,
         so the record may pass the item and nothing stalls behind it: a loud drop, never a silent
-        pin. The caller must already own the claim.
+        pin. The caller must already own the claim. `why` is the line's slug (``compacted_away``,
+        ``context_length``, ``payload_too_large``); `detail` is the sentence, kept on the line beside
+        it and as the claim's own abandon reason, which is not a log field (issue #759).
         """
         uuid = item.content.uuid
-        self.claims.abandon(self.timeline_uuid, uuid, kind=kind, reason=why)
+        self.claims.abandon(self.timeline_uuid, uuid, kind=kind, reason=detail)
         _log.error(
             "dropped %s",
             kv(
@@ -4421,6 +4431,7 @@ class WakeAgent:
                 timeline=self.timeline_uuid,
                 handle=_handle_of(item),
                 reason=why,
+                detail=detail,
             ),
         )
         return _FINAL
@@ -4828,7 +4839,7 @@ class WakeAgent:
         _log.warning(
             "%s %s",
             head("degraded", YELLOW),
-            kv(timeline=self.timeline_uuid, reason=str(error)),
+            kv(timeline=self.timeline_uuid, reason=error.reason, detail=str(error)),
         )
         return _STUCK_NOTE
 
@@ -4969,6 +4980,19 @@ def _evidence_lost(history: list[Message], item: object) -> bool:
 #: The creates that are a *visible timeline action* — the ones the speech ledger counts and the
 #: no-reply informer is asking about. A webhook endpoint is a create, but not something a peer sees.
 _TIMELINE_ACTIONS = frozenset({MESSAGE, ASSET, TASK})
+
+
+def _turn_timed_out(exc: BaseException) -> bool:
+    """Whether a failed resume ran out of **the budget the harness fitted to it** (issue #589).
+
+    That is the one timeout that says something about the turn: its in-wake retry already doubled
+    the budget and it still ran out, so the turn is too much to finish in time, and it counts toward
+    the resume ceiling. A deadline that was the vendor's own — a gateway's 504, which is a timeout on
+    every vendor (issue #759) — is not: doubling the harness's budget does not move it, and a
+    vendor's gateway timing out is what an outage looks like. It takes the outage path, as every
+    5xx always has, so an outage never turns into a stall.
+    """
+    return isinstance(exc, ProviderTimeoutError) and not getattr(exc, "vendor_deadline", False)
 
 
 def _turn_acted(work: list[Message]) -> bool:
@@ -5790,7 +5814,7 @@ def resolved_config() -> dict[str, object]:
       **not** reported: below the override it comes from the adapter's live `context_limit` capability
       (an API call against a provider this path never builds and holds no key for), so a number here
       would be a guess — and a guessed field in the file the drift audit trusts is worse than an
-      absent one. The wake logs the resolved limit and its source (``context limit limit=… source=…``)
+      absent one. The wake logs the resolved limit and its source (``context limit limit=… limit_source=…``)
       on the run that actually resolves it.
     - ``wake_breaker_max`` / ``wake_breaker_window`` / ``wake_breaker_cooldown`` — the cross-wake
       breaker's tunables as the wake resolves them (`_breaker.breaker_settings_from_env`, issue

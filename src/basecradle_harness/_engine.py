@@ -84,6 +84,13 @@ from basecradle_harness._tools import ToolRegistry
 
 _log = logging.getLogger("basecradle_harness")
 
+#: The ``reason=`` slugs this module's lines carry, and the wake's for the same facts
+#: (`docs/telemetry.md`; issue #759): a reply the vendor stopped at the output budget; a model that
+#: takes no image input; a clip whose frames would not decode — the describer's word for that too.
+OUTPUT_BUDGET = "output_budget"
+NO_IMAGE_INPUT = "no_image_input"
+UNDECODABLE_VIDEO = "undecodable_video"
+
 #: How many **extra** times the engine re-requests a provider call that failed *transiently* — an
 #: unparseable body (`ProviderResponseError`, issue #259), the provider's own 5xx
 #: (`ProviderServerError`, issue #284), or a routed upstream's 429 (`ProviderRateLimitError`, issue
@@ -631,7 +638,9 @@ class Engine:
             try:
                 caption, frames = _frames_of(clip)
             except ValueError as exc:
-                self._log_video_withheld(clip, f"could not sample frames: {exc}")
+                self._log_video_withheld(
+                    clip, UNDECODABLE_VIDEO, detail=f"could not sample frames: {exc}"
+                )
                 messages.append(
                     Message(role="user", content=_unsampled_caption(clip, exc), injected=True)
                 )
@@ -644,7 +653,7 @@ class Engine:
         if described is not None:
             messages.append(Message(role="user", content=described, injected=True))
             return
-        self._log_video_withheld(clip, "model has no image input")
+        self._log_video_withheld(clip, NO_IMAGE_INPUT)
         messages.append(Message(role="user", content=_withheld_caption([clip]), injected=True))
 
     def _show_images(
@@ -766,10 +775,12 @@ class Engine:
         _, model = describe_provider(self.provider)
         _log.warning(
             "view image withheld from a model with no vision %s",
-            kv(images=names, model=model, reason="model has no image input"),
+            kv(images=names, model=model, reason=NO_IMAGE_INPUT),
         )
 
-    def _log_video_withheld(self, clip: VideoContent, reason: str) -> None:
+    def _log_video_withheld(
+        self, clip: VideoContent, reason: str, detail: str | None = None
+    ) -> None:
         """The loud, greppable record that a watched clip did not reach the model (#471).
 
         `_log_images_withheld`'s video sibling, and a separate line rather than a shared one — see
@@ -780,7 +791,7 @@ class Engine:
         _, model = describe_provider(self.provider)
         _log.warning(
             "watch video withheld from the model %s",
-            kv(video=_media_name(clip), model=model, reason=reason),
+            kv(video=_media_name(clip), model=model, reason=reason, detail=detail),
         )
 
     def _chat(self, messages: list[Message], tools: Sequence[ToolSpec] | None) -> Message:
@@ -879,8 +890,12 @@ class Engine:
                 bind_scale(self.provider, 1.0)
         assert last_exc is not None  # the loop only exits here after catching at least once
         # A timeout names the budget it ran out of, so "the answer needed more than N seconds" is
-        # read off the journal. Any other fault's budget says nothing about it and is left off.
-        budget = last_timeout(self.provider) if _reason(last_exc) == "timeout" else None
+        # read off the journal. Any other fault's budget says nothing about it and is left off —
+        # and so does a vendor's own deadline (a gateway's 504), which was not the harness's (#759).
+        timed_out = _reason(last_exc) == "timeout" and not getattr(
+            last_exc, "vendor_deadline", False
+        )
+        budget = last_timeout(self.provider) if timed_out else None
         _log.error(
             "%s on %d attempt(s)%s; giving up: %s",
             _fault(last_exc),
@@ -970,7 +985,7 @@ class Engine:
                 step=step,
                 max_steps=self.max_steps,
                 outcome="unfinished" if ending else "continued",
-                reason="the vendor stopped this reply at the output budget",
+                reason=OUTPUT_BUDGET,
             ),
         )
 
@@ -1013,7 +1028,8 @@ class Engine:
         except Exception as exc:  # surface as EngineError; the wake posts the canned note
             _log.warning("Reserve summary call failed after the step budget was spent: %s", exc)
             raise EngineError(
-                f"Step budget of {self.max_steps} spent and the reserve summary call failed: {exc}"
+                f"Step budget of {self.max_steps} spent and the reserve summary call failed: {exc}",
+                reason="reserve_failed",
             ) from exc
         if not (reply.content and reply.content.strip()):
             # No usable text — most often a lone tool call, since withholding the harness's
@@ -1022,7 +1038,8 @@ class Engine:
             # back to the canned note (the documented last resort).
             _log.warning("Reserve summary produced no text; falling back to the canned note.")
             raise EngineError(
-                f"Step budget of {self.max_steps} spent and the reserve summary produced no text."
+                f"Step budget of {self.max_steps} spent and the reserve summary produced no text.",
+                reason="reserve_empty",
             )
         # Persist a clean text-only turn — drop any tool calls the model emitted alongside the
         # text (they were never run, and a dangling tool-call turn would break the next wake). The

@@ -544,7 +544,11 @@ class ContextBudget:
             self._limit = Limit(*(self._from_adapter() or (DEFAULT_CONTEXT_LIMIT, "default")))
         _log.info(
             "context limit %s",
-            kv(limit=self._limit.tokens, source=self._limit.source, compact_at=self.threshold()),
+            kv(
+                limit=self._limit.tokens,
+                limit_source=self._limit.source,
+                compact_at=self.threshold(),
+            ),
         )
         self._warn_if_unguaranteed(self._limit)
         return self._limit
@@ -607,7 +611,7 @@ class ContextBudget:
                 else "No step budget satisfies the guarantee at this ceiling."
             )
         _log.warning(
-            "context budget %d (source=%s) leaves %d tokens of headroom above the compaction "
+            "context budget %d (read from %s) leaves %d tokens of headroom above the compaction "
             "threshold, below the %d a single tool-heavy turn can add (%d chars of result + "
             "arguments + server-tool record per step x %d steps, plus the reserve summary's "
             "record, at %.1f chars/token): a turn may "
@@ -797,7 +801,7 @@ class Compactor:
             kv(
                 tokens_in=tokens_in,
                 limit=limit.tokens,
-                source=limit.source,
+                limit_source=limit.source,
                 threshold=self.budget.threshold(),
                 messages=f"{len(dropped) + len(history) - 1}→{len(history)}",
                 chars=f"{before_chars}→{_chars(history)}",
