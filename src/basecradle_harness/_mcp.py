@@ -132,6 +132,7 @@ from basecradle_harness._assets import (
 from basecradle_harness._install import config_home
 from basecradle_harness._media import sniff_media_ext
 from basecradle_harness._messages import ImageContent, ToolResult
+from basecradle_harness._observability import MCP_EXECUTOR
 from basecradle_harness._secret import Secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 from basecradle_harness._venv import with_interpreter_bin
@@ -1222,6 +1223,7 @@ class McpTool(Tool):
     """
 
     requires: frozenset[str] = frozenset()
+    executor = MCP_EXECUTOR
 
     def __init__(
         self,

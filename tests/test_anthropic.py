@@ -52,6 +52,7 @@ from basecradle_harness._anthropic import (
 from basecradle_harness._basecradle import _provider_from_config, resolved_model_params
 from basecradle_harness._caching import EXPLICIT, anchor_cacheable_prefix
 from basecradle_harness._observability import TRUNCATED_FINISH_REASONS
+from tests.conftest import tool_lines
 
 MODEL = "claude-haiku-5-5"
 FAKE_KEY = "sk-ant-api03-FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake-0000AA"
@@ -741,14 +742,21 @@ def test_the_llm_line_grammar(router, provider, caplog):
     rest = duration_and_rest.split(" ", 1)[1]
     assert rest == (
         "tokens_in=44000 tokens_out=200 tokens_total=44200 cached_tokens=40000 "
-        f"cost={cost:.6f} cost_basis=computed cache_write_tokens=3000 web_search_requests=2 "
-        "web_fetch_requests=1 "
+        f"cost={cost:.6f} cost_basis=computed cache_write_tokens=3000 "
         "generation_id=msg_01GrammarGrammar"
     ).replace(f"cost={cost:.6f}", _money(cost))
     assert provider.last_tokens_in == 44_000
-    media = [m for m in (r.getMessage() for r in caplog.records) if m.startswith("media ")]
-    assert media == [
-        "media provider=anthropic kind=search.web model=claude-haiku-5-5 count=2 cost=0.02 cost_basis=computed"
+    # Each server tool the call ran is its own `tool` line, joined to the call by its id (#758).
+    assert tool_lines(caplog) == [
+        (
+            "tool name=web_search executor=server provider=anthropic kind=search.web "
+            "model=claude-haiku-5-5 count=2 outcome=ok cost=0.02 cost_basis=computed "
+            "generation_id=msg_01GrammarGrammar"
+        ),
+        (
+            "tool name=web_fetch executor=server provider=anthropic model=claude-haiku-5-5 "
+            "count=1 outcome=ok generation_id=msg_01GrammarGrammar"
+        ),
     ]
 
 
@@ -763,8 +771,8 @@ def test_a_call_with_no_search_carries_no_search_field(router, provider, caplog)
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         provider.chat([Message.user("hi")])
     (line,) = llm_lines(caplog)
-    assert "web_search_requests" not in line and "cache_write_tokens" not in line
-    assert not [r for r in caplog.records if r.getMessage().startswith("media ")]
+    assert "cache_write_tokens" not in line
+    assert not tool_lines(caplog)
 
 
 def test_an_unknown_model_gets_no_cost_and_one_warning(router, caplog):
@@ -943,17 +951,29 @@ def test_a_renamed_call_id_rides_the_replayed_block(router, provider):
     assert ids == ["toolu_01X", "toolu_01X-1"]
 
 
-def test_a_server_tool_error_inside_a_200_is_logged_and_the_turn_goes_on(router, provider, caplog):
+def test_a_server_tool_error_inside_a_200_is_its_tool_line_and_the_turn_goes_on(
+    router, provider, caplog
+):
+    """The failed search was not billed ("will not be billed"), so it carries no fee — and it is
+    still counted: it ran, and failed (issue #758)."""
     error = {
         "type": "web_search_tool_result",
         "tool_use_id": "srvtoolu_01S",
         "content": {"type": "web_search_tool_result_error", "error_code": "max_uses_exceeded"},
     }
     router.post(MESSAGES).mock(return_value=reply(SEARCH_USE, error, text("I could not search.")))
-    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         answer = provider.chat([Message.user("search")])
     assert answer.content == "I could not search."
-    assert "error_code=max_uses_exceeded" in caplog.text
+    (record,) = [r for r in caplog.records if r.getMessage().startswith("tool ")]
+    assert record.levelno == logging.WARNING
+    assert tool_lines(caplog) == [
+        (
+            "tool name=web_search executor=server provider=anthropic kind=search.web "
+            "model=claude-haiku-5-5 count=1 outcome=error reason=max_uses_exceeded "
+            "generation_id=msg_01FakeFakeFakeFake"
+        )
+    ]
 
 
 def test_citations_become_a_sources_footer(router, provider):
@@ -1015,10 +1035,23 @@ def test_code_execution_without_web_tools_states_the_container_gap_once(router, 
         "input": {"command": "echo 2"},
     }
     router.post(MESSAGES).mock(return_value=reply(use, ran, text("2")))
-    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         adapter.chat([Message.user("a")])
         adapter.chat([Message.user("b")])
-    assert sum("container time" in r.getMessage() for r in caplog.records) == 1
+    gaps = [r for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
+    assert [(r.levelno, r.getMessage()) for r in gaps] == [
+        (
+            logging.WARNING,
+            "cost unpriced provider=anthropic charge=container_time reason=not_reported",
+        )
+    ]
+    # The run itself is a code_execution line on each call, counted off its result block.
+    assert tool_lines(caplog) == 2 * [
+        (
+            "tool name=code_execution executor=server provider=anthropic model=claude-haiku-5-5 "
+            "count=1 outcome=ok generation_id=msg_01FakeFakeFakeFake"
+        )
+    ]
 
 
 def test_code_execution_beside_web_fetch_states_no_gap(router, caplog):
@@ -1039,7 +1072,7 @@ def test_code_execution_beside_web_fetch_states_no_gap(router, caplog):
     router.post(MESSAGES).mock(return_value=reply(ran, text("ok")))
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
         adapter.chat([Message.user("a")])
-    assert "container time" not in caplog.text
+    assert "cost unpriced" not in caplog.text
 
 
 # === the Models API =========================================================================

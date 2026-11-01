@@ -33,7 +33,7 @@ import logging
 import os
 
 from basecradle_harness._exceptions import ProviderError
-from basecradle_harness._observability import media_timer
+from basecradle_harness._observability import metered
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._openai_rates import priced_host, transcription_cost
 from basecradle_harness._secret import reveal, secret
@@ -101,7 +101,7 @@ class Transcriber:
         openai = require_openai_sdk()
         client = openai.OpenAI(api_key=key, base_url=self._base_url, timeout=self._timeout)
         with (
-            media_timer(provider="openai", kind="audio.transcribe", model=self._model) as call,
+            metered(provider="openai", kind="audio.transcribe", model=self._model) as call,
             sdk_error_context(openai),
         ):
             response = client.audio.transcriptions.create(
@@ -114,7 +114,7 @@ class Transcriber:
         """What this transcription cost at OpenAI's published rates (issue #657), or ``None``.
 
         OpenAI states the audio's duration (or, for a token-billed model, its tokens) and no price,
-        so the figure is computed (`_openai_rates.transcription_cost`) and the media line tags it
+        so the figure is computed (`_openai_rates.transcription_cost`) and the tool line tags it
         ``cost_basis=computed``. A call that cannot be priced says so in a WARNING.
         """
         if not priced_host(self._base_url):

@@ -11,8 +11,8 @@
 #
 # Powerful (web search, and a per-query fee) → opt_in everywhere (issue #168): off by default on
 # every provider, active only when this file is dropped into an agent's tools/ overlay. Its spend is
-# logged: the grounded call's own llm line (purpose=helper kind=search.grounding) and a priced media
-# line for the grounding fee.
+# logged: the grounded call's own llm line (purpose=helper kind=search.grounding) and the grounding
+# fee on this tool's own tool line.
 from basecradle_harness import GoogleSearchTool, ToolPlugin, Vendor
 
 PLUGIN = ToolPlugin(

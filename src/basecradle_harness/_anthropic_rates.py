@@ -28,8 +28,8 @@ What is priced, and what is not
 - **Model calls** (`call_cost`): standard tier, standard speed. ``inference_geo="us"`` applies the
   page's 1.1x multiplier to every token category; global routing (the default) is the list price.
 - **Web search** (`web_search_cost`): $10 per 1,000 searches, counted from
-  ``usage.server_tool_use.web_search_requests``, as its own priced ``media`` line (``kind=search.web``,
-  the head the fleet's tool spend is read from). The search results it feeds back are already in the
+  ``usage.server_tool_use.web_search_requests``, on the call's ``web_search`` ``tool`` line
+  (``kind=search.web``, the head the fleet's tool spend is read from). The search results it feeds back are already in the
   call's input tokens. "If an error occurs during web search, the web search will not be billed",
   and the count Anthropic reports is the billed one.
 - **Web fetch**: "no additional charges beyond standard token costs" — nothing to price.
@@ -37,8 +37,8 @@ What is priced, and what is not
   fetch.** With either of those declared "there are no additional charges for code execution tool
   calls"; without them Anthropic bills execution time per container beyond 1,550 free hours a month
   per organization, and no response states the time or where the organization stands against the
-  allowance. Any figure would be a guess, so the adapter states the gap once per wake as a WARNING
-  (`CONTAINER_GAP`) instead.
+  allowance. Any figure would be a guess, so the adapter states the gap once per wake instead, as a
+  ``cost unpriced charge=container_time reason=not_reported`` WARNING.
 """
 
 from __future__ import annotations
@@ -70,15 +70,6 @@ US_INFERENCE_MULTIPLIER = 1.1
 #: The ``inference_geo`` values a request may carry and the multiplier the page states for each.
 #: Unset is global routing. A value the page prices nowhere is not priced.
 _GEO_MULTIPLIERS = {"": 1.0, "global": 1.0, "us": US_INFERENCE_MULTIPLIER}
-
-#: The WARNING the adapter writes, once per wake, when code execution ran on a request that declared
-#: neither web search nor web fetch — see the module docstring for why it is a stated gap.
-CONTAINER_GAP = (
-    "Anthropic bills code-execution container time beyond 1,550 free hours a month per organization "
-    "($0.05 per container-hour) on a request that declares neither web search nor web fetch, and no "
-    "response states the time used. Code-execution charges are therefore not priced on any line this "
-    "wake; read them off the Anthropic Console's usage page."
-)
 
 
 @dataclass(frozen=True)

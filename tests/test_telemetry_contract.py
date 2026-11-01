@@ -44,9 +44,16 @@ from basecradle_harness import (
 )
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._describer import Describer
-from basecradle_harness._engine import _reason
+from basecradle_harness._engine import Engine, _reason
+from basecradle_harness._observability import ComputedCost, metered
+from basecradle_harness._tools import Tool, ToolRegistry
 from tests.conftest import FAKE_KEY as OPENAI_KEY
-from tests.conftest import out_message, out_web_search_call, responses_body
+from tests.conftest import (
+    out_code_interpreter_call,
+    out_message,
+    out_web_search_call,
+    responses_body,
+)
 from tests.test_anthropic import FAKE_KEY as ANTHROPIC_KEY
 from tests.test_anthropic import MESSAGES as ANTHROPIC_MESSAGES
 from tests.test_anthropic import MODEL as ANTHROPIC_MODEL
@@ -777,6 +784,126 @@ def attribution(**_):
     log_context_attribution([Message.user("hi")], source="timeline:contract")
 
 
+_CODE_USE = {
+    "type": "server_tool_use",
+    "id": "srvtoolu_01ContractCode",
+    "name": "bash_code_execution",
+    "input": {"command": "echo 2"},
+}
+_CODE_RAN = {
+    "type": "bash_code_execution_tool_result",
+    "tool_use_id": "srvtoolu_01ContractCode",
+    "content": {
+        "type": "bash_code_execution_result",
+        "stdout": "2\n",
+        "stderr": "",
+        "return_code": 0,
+        "content": [],
+    },
+}
+
+
+@scenario
+def anthropic_sandbox(router, **_):
+    """Code run with neither web tool declared — container time Anthropic bills and never states —
+    beside a fetch that failed inside the 200."""
+    fetch = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01ContractFetch",
+        "name": "web_fetch",
+        "input": {"url": "https://example.com/gone"},
+    }
+    failed = {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": "srvtoolu_01ContractFetch",
+        "content": {"type": "web_fetch_tool_result_error", "error_code": "url_not_accessible"},
+    }
+    router.post(ANTHROPIC_MESSAGES).mock(
+        return_value=anthropic_reply(
+            _CODE_USE, _CODE_RAN, fetch, failed, anthropic_text("2"), message_id="msg_01Sandbox"
+        )
+    )
+    adapter = AnthropicProvider(
+        ANTHROPIC_MODEL, api_key=ANTHROPIC_KEY, max_tokens=4096, builtin_tools=["code_execution"]
+    )
+    adapter.chat([Message.user("run it, and read the page")])
+    adapter.close()
+
+
+@scenario
+def openai_container(router, **_):
+    payload = responses_body(out_code_interpreter_call(code="print(1)"), out_message("1"))
+    payload["model"] = "gpt-6-sol"
+    router.post(f"{OPENAI_HOST}/responses").mock(return_value=_ok(payload))
+    adapter = OpenAIProvider(
+        model="gpt-6-sol",
+        api_key=OPENAI_KEY,
+        base_url=OPENAI_HOST,
+        surface="responses",
+        max_retries=0,
+        builtin_tools=["code_interpreter"],
+    )
+    adapter.chat([Message.user("run it")])
+    adapter.close()
+
+
+@scenario
+def google_builtins(router, key, **_):
+    """Gemini's own built-ins on a main turn: a code run, and a page it could not read."""
+    response = google_body(
+        {"executableCode": {"language": "PYTHON", "code": "print(2**10)"}},
+        {"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": "1024\n"}},
+        google_text("It is 1024."),
+    )
+    response["candidates"][0]["urlContextMetadata"] = {
+        "urlMetadata": [
+            {
+                "retrievedUrl": "https://example.com/gone",
+                "urlRetrievalStatus": "URL_RETRIEVAL_STATUS_ERROR",
+            }
+        ]
+    }
+    router.post(GENERATE).mock(return_value=_ok(response))
+    adapter = build(key, builtin_tools=["code_execution", "url_context"])
+    adapter.chat([Message.user("2^10, and read example.com/gone")])
+    adapter.close()
+
+
+class _ImageTool(Tool):
+    """A harness tool that buys one image, as every media tool does: through the meter."""
+
+    name = "generate_image"
+    description = "Generate an image."
+
+    def run(self, **_: object) -> str:
+        with metered(provider="openai", kind="image.generate", model="gpt-image-2.5-flare") as call:
+            call.cost = ComputedCost(0.12505)
+        return "Generated and posted."
+
+
+class _McpTool(Tool):
+    """A tool an MCP server serves through the harness's proxy (`McpTool` declares the same)."""
+
+    name = "workmail__send_email"
+    description = "Send an email."
+    executor = "mcp"
+
+    def run(self, **_: object) -> str:
+        return "sent"
+
+
+@scenario
+def harness_and_mcp_tools(**_):
+    """The engine's own dispatch — the path every harness and MCP tool takes in a wake."""
+    registry = ToolRegistry()
+    for tool in (_ImageTool(), _McpTool()):
+        registry.register(tool)
+    engine = Engine(provider=None, tools=registry)  # type: ignore[arg-type]
+    engine._run_tool("generate_image", {"prompt": "a red cube"})
+    engine._run_tool("workmail__send_email", {"to": "john@example.com"})
+    engine._run_tool("no_such_tool", {})
+
+
 def _gateway_timeout(reasons: dict[str, str], name: str, call: Callable[[], object]) -> None:
     try:
         call()
@@ -865,21 +992,7 @@ def _sums(line: Line) -> bool:
     return tokens_total == tokens_in + tokens_out
 
 
-def _static_tool_fields(sites: list[Site]) -> set[str]:
-    return {name for site in sites if site.head == "tool" for name in site.fields}
-
-
 WITNESSES: dict[str, Callable[[Rendered, list[Site]], bool]] = {
-    # A server-side tool writes no `tool` line, and the engine's tool line names no executor.
-    "T5": lambda r, s: (
-        not r.heads("anthropic", "tool") and "executor" not in _static_tool_fields(s)
-    ),
-    # The vendor reported its server tools; nothing on any line counts them.
-    "T6": lambda r, s: (
-        not r.heads("xai", "tool")
-        and not r.heads("openrouter", "tool")
-        and not any("web_search_requests" in r.llm(n).fields for n in ("xai", "openrouter"))
-    ),
     "F1": lambda r, s: any(
         "cache_write_tokens" not in r.llm(n).fields
         for n in ("openai_chat", "openai_responses", "openrouter")
@@ -1040,6 +1153,7 @@ def test_every_violation_row_is_still_true(contract, sites, rendered):
             holds = any(h == head and n == name and _in_scope(v, **w) for h, n, w in emitted)
         elif v.form == "prose":
             until_head, _, until_field = (v.until or "").partition(".")
+            until_field, _, until_value = until_field.partition("=")
             if v.until is not None:
                 assert (
                     contract.allows(until_head, until_field)
@@ -1047,9 +1161,16 @@ def test_every_violation_row_is_still_true(contract, sites, rendered):
                     else (until_head in contract.heads)
                 ), f"{v.id}: `{v.until}` is not in the contract"
             present = v.text in (SRC / v.module).read_text(encoding="utf-8")
-            replaced = v.until is not None and any(
-                h == until_head and (not until_field or n == until_field) for h, n, _ in emitted
-            )
+            if until_value:  # a value is a rendered fact: only a rendered line can carry it
+                replaced = any(
+                    line.head == until_head and line.fields.get(until_field) == until_value
+                    for lines in rendered.lines.values()
+                    for line in lines
+                )
+            else:
+                replaced = v.until is not None and any(
+                    h == until_head and (not until_field or n == until_field) for h, n, _ in emitted
+                )
             holds = present and not replaced
         elif v.form == "reason-prose":
             holds = any(site.head == v.arg and site.prose_reason for site in sites)
@@ -1068,6 +1189,83 @@ def test_every_violation_row_is_still_true(contract, sites, rendered):
 
 def test_every_witness_has_its_row(contract):
     assert set(WITNESSES) == {v.id for v in contract.of("test")}
+
+
+#: The tool lines each scenario must render, as ``(name, executor, outcome)``: every adapter's
+#: server-side tools and the engine's harness and MCP tools, on the one head (issue #758).
+EXPECTED_TOOLS = {
+    "openai_responses": {("web_search", "server", "ok")},
+    "openai_container": {("code_execution", "server", "ok")},
+    "openrouter": {("web_search", "server", "ok")},
+    "xai": {("web_search", "server", "ok")},
+    "google_builtins": {("code_execution", "server", "ok"), ("url_context", "server", "error")},
+    "anthropic": {
+        ("web_search", "server", "ok"),
+        ("web_fetch", "server", "ok"),
+        ("code_execution", "server", "ok"),
+    },
+    "anthropic_sandbox": {("code_execution", "server", "ok"), ("web_fetch", "server", "error")},
+    "harness_and_mcp_tools": {
+        ("generate_image", "harness", "ok"),
+        ("workmail__send_email", "mcp", "ok"),
+        ("no_such_tool", "harness", "error"),
+    },
+}
+
+
+def test_every_executor_writes_the_one_tool_line(rendered):
+    for name, expected in EXPECTED_TOOLS.items():
+        lines = [line for line in rendered.heads(name, "tool") if "outcome" in line.fields]
+        found = {
+            (line.fields["name"], line.fields["executor"], line.fields["outcome"]) for line in lines
+        }
+        assert found == expected, name
+        for line in lines:
+            if line.fields["executor"] == "server":
+                # Timed by its call's `llm` line, and joined to it by that call's id.
+                assert "duration" not in line.fields and int(line.fields["count"]) >= 1, line
+                assert line.fields["generation_id"] == rendered.llm(name).fields["generation_id"]
+                assert line.fields["provider"] == rendered.llm(name).fields["provider"]
+            else:
+                assert "duration" in line.fields and "generation_id" not in line.fields, line
+            assert ("reason" in line.fields) == (line.fields["outcome"] == "error"), line
+    # No other scenario writes a tool line it was not expected to.
+    assert {n for n in rendered.lines if rendered.heads(n, "tool")} == set(EXPECTED_TOOLS)
+
+
+def test_a_tool_fee_rides_its_tool_line_and_never_the_llm_line(rendered):
+    (search,) = rendered.heads("anthropic", "tool")[:1]
+    assert search.fields["name"] == "web_search"
+    assert (search.fields["kind"], search.fields["cost"]) == ("search.web", "0.02")
+    assert search.fields["cost_basis"] == "computed"
+    (image,) = [
+        l for l in rendered.heads("harness_and_mcp_tools", "tool") if "outcome" in l.fields
+    ][:1]
+    assert image.fields == {
+        "name": "generate_image",
+        "executor": "harness",
+        "provider": "openai",
+        "kind": "image.generate",
+        "model": "gpt-image-2.5-flare",
+        "duration": image.fields["duration"],
+        "outcome": "ok",
+        "cost": "0.12505",
+        "cost_basis": "computed",
+    }
+    retired = {"web_search_requests", "web_fetch_requests", "code_execution_requests"}
+    assert not any(
+        retired & set(line.fields) for lines in rendered.lines.values() for line in lines
+    )
+
+
+def test_an_unpriced_container_is_one_counted_line_on_both_vendors(rendered):
+    for name, provider in (("anthropic_sandbox", "anthropic"), ("openai_container", "openai")):
+        (gap,) = rendered.heads(name, "cost unpriced")
+        assert gap.fields == {
+            "provider": provider,
+            "charge": "container_time",
+            "reason": "not_reported",
+        }
 
 
 def test_the_line_parser_reads_the_grammar_and_rejects_prose():

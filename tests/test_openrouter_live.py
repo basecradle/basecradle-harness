@@ -187,7 +187,12 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
     )
     try:
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            provider.chat([Message.user("What is the capital of France? One word.")])
+            # A question the model must search for: with the built-in merely *offered*, a question
+            # it can answer alone runs no search (measured 2026-10-31: no `server_tool_use_details`
+            # at all), and then neither the #280 shape nor the tool line below is exercised.
+            provider.chat(
+                [Message.user("Search the web: what is today's top headline on bbc.com? One line.")]
+            )
         pool = _live_pool(provider)
     finally:
         provider.close()
@@ -197,6 +202,15 @@ def test_the_live_endpoint_stays_real_when_a_server_side_search_runs(caplog):
         f"endpoint={endpoint!r} with a server-side search active — issue #280 exactly: the search "
         f"tool's upstream logged as the model's. Real pool: {sorted(pool)}"
     )
+    # The searches OpenRouter reports running (``server_tool_use_details``) are a `tool` line beside
+    # the call's `llm` line, joined to it by the call's id (issue #758) — checked against the wire.
+    tools = [
+        m
+        for m in (r.getMessage() for r in caplog.records)
+        if m.startswith("tool name=web_search executor=server provider=openrouter ")
+    ]
+    assert len(tools) == 1 and int(_field(tools[0], "count")) >= 1, tools
+    assert _field(tools[0], "generation_id") == _field(_llm_line(caplog), "generation_id")
 
 
 def _generation(provider: OpenRouterProvider, generation: str):

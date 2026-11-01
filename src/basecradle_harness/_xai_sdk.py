@@ -102,10 +102,12 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._faults import is_out_of_funds, is_too_large, refused_tool_schema
 from basecradle_harness._messages import ImageContent, Message, ServerToolUse, ToolCall, ToolSpec
 from basecradle_harness._observability import (
+    ServerToolTally,
     finish_reason,
     generation_id,
     generation_of,
     log_llm_call,
+    log_server_tools,
     serving_endpoint,
     token_counts,
 )
@@ -399,8 +401,41 @@ class XaiSdkProvider:
             # ``x-request-id``, so a support request names the call either way.
             generation_id=generation_id(response),
         )
+        # The tools grok ran server-side inside this call, one `tool` line each (issue #758).
+        log_server_tools(
+            self._server_tallies(response),
+            provider=self.provider,
+            model=self.model,
+            generation_id=generation_id(response),
+        )
         with generation_of(response):
             return self._from_wire(response)
+
+    def _server_tallies(self, response: Any) -> dict[str, ServerToolTally]:
+        """Each server-side tool's uses on this call, and the first one xAI reports did not finish.
+
+        The count is ``usage.server_side_tools_used`` — one entry per use, which is how the SDK's own
+        ``server_side_tool_usage`` counts it — named by xAI's ``ServerSideTool`` enum, which names the
+        capability (``web_search``, ``x_search``, ``code_execution``) rather than the sub-operations
+        grok's search calls itself by. A failure is a server-side ``tool_calls`` entry whose
+        ``status`` is ``FAILED`` or ``INCOMPLETE``, matched to its tool by its ``ToolCallType``.
+        """
+        usage = getattr(response, "usage", None)
+        tools = self._xai.chat.usage_pb2.ServerSideTool
+        tallies: dict[str, ServerToolTally] = {}
+        for value in getattr(usage, "server_side_tools_used", None) or ():
+            name = _enum_name(tools, value, "SERVER_SIDE_TOOL_")
+            tallies.setdefault(name, ServerToolTally()).count += 1
+        types = self._xai.chat.chat_pb2.ToolCallType
+        statuses = self._xai.chat.chat_pb2.ToolCallStatus
+        unfinished = {statuses.TOOL_CALL_STATUS_FAILED, statuses.TOOL_CALL_STATUS_INCOMPLETE}
+        for call in getattr(response, "tool_calls", None) or ():
+            if self._is_client_side(call) or getattr(call, "status", None) not in unfinished:
+                continue
+            name = _enum_name(types, call.type, "TOOL_CALL_TYPE_").removesuffix("_tool")
+            tally = tallies.setdefault(name, ServerToolTally(count=1))
+            tally.reason = tally.reason or _enum_name(statuses, call.status, "TOOL_CALL_STATUS_")
+        return tallies
 
     def _sample(
         self,
@@ -906,3 +941,13 @@ class _grpc_error_context:
         # message once the config is fixed; propagating leaves it re-drivable (issue #336; CLAUDE.md →
         # Provider Capabilities, "a bad model_params.json key propagates on the first raise").
         raise ProviderError(message) from exc
+
+
+def _enum_name(enum: Any, value: Any, prefix: str) -> str:
+    """A proto enum value as the harness's lowercase name: ``SERVER_SIDE_TOOL_WEB_SEARCH`` →
+    ``web_search``. A value the installed SDK does not name keeps its number, never a guess."""
+    try:
+        name = enum.Name(value)
+    except (ValueError, TypeError):
+        return f"{prefix.lower()}{value}"
+    return name.removeprefix(prefix).lower()

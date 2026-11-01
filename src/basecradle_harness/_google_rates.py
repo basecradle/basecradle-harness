@@ -38,7 +38,7 @@ ran on one of them gets no cost.
 Grounding with Google Search (issue #656)
 -----------------------------------------
 A grounded call carries a charge that is not tokens, so it is priced apart (`grounding_cost`) and
-logged on its own ``media`` line. Two schemes, by model family, both from `SOURCE`: the Gemini 3
+logged on the ``web_search`` tool's own ``tool`` line. Two schemes, by model family, both from `SOURCE`: the Gemini 3
 models bill **each grounding query** ($14 per 1,000, the queries Google lists in
 ``webSearchQueries``) and do not charge the input tokens grounding feeds back; the Gemini 2.5 models
 bill **each grounding prompt** once however many queries it made ($35 per 1,000), with no such

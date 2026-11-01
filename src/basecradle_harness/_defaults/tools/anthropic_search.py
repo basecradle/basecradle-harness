@@ -10,8 +10,8 @@
 #
 # Powerful (web search, and a per-search fee) → opt_in everywhere (issue #168): off by default on
 # every provider, active only when this file is dropped into an agent's tools/ overlay. Its spend is
-# logged: $10 per 1,000 searches as a priced media line (kind=search.web), with the call's own search
-# count on its llm line (web_search_requests=).
+# logged: one tool line per call that searched (executor=server kind=search.web), its uses in count=
+# and $10 per 1,000 billed searches in cost=.
 from basecradle_harness import ToolPlugin, Vendor
 
 PLUGIN = ToolPlugin(

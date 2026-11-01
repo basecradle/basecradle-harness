@@ -43,7 +43,7 @@ from basecradle_harness import (
 from basecradle_harness._describer import VIDEO_PART_LABELS, describer_from_env
 from basecradle_harness._google import GoogleProvider
 from basecradle_harness._google_rates import Usage, call_cost
-from basecradle_harness._observability import _money
+from basecradle_harness._observability import ComputedCost, _money, tool_meter
 
 pytestmark = pytest.mark.live
 
@@ -311,16 +311,20 @@ def test_url_context_reads_a_page_beside_the_function_declarations():
 
 @needs_key
 def test_a_search_is_grounded_cited_and_priced(caplog):
-    with _provider() as provider, caplog.at_level(logging.INFO, logger="basecradle_harness"):
+    with (
+        _provider() as provider,
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        tool_meter() as meter,
+    ):
         answer = provider.search("Who won the most recent FIFA World Cup final?")
     assert "\n\nSources:\n- " in answer, answer
     llm = _llm_line(caplog)
     assert _field(llm, "purpose") == "helper" and _field(llm, "kind") == "search.grounding", llm
     assert _field(llm, "cost") is not None and _field(llm, "cost_basis") == "computed", llm
-    fee = next(
-        m for m in (r.getMessage() for r in caplog.records) if m.startswith("media provider=google")
-    )
-    queries = int(_field(fee, "count"))
+    # The fee rides the `web_search` tool's own line, through the meter the engine opens (#758).
+    fee = meter.fields()
+    assert (fee["provider"], fee["kind"]) == ("google", "search.grounding"), fee
+    queries = fee["count"]
     assert queries >= 1, fee
-    assert _field(fee, "cost") == _money(queries * 0.014), fee
-    assert _field(fee, "cost_basis") == "computed", fee
+    assert fee["cost"] == pytest.approx(queries * 0.014), fee
+    assert isinstance(fee["cost"], ComputedCost), fee

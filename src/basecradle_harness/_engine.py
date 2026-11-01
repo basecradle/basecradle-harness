@@ -65,7 +65,16 @@ from basecradle_harness._messages import (
     ToolSpec,
     VideoContent,
 )
-from basecradle_harness._observability import MAIN, describe_provider, kv, truncated
+from basecradle_harness._observability import (
+    HARNESS_EXECUTOR,
+    MAIN,
+    ToolMeter,
+    describe_provider,
+    kv,
+    log_tool,
+    tool_meter,
+    truncated,
+)
 from basecradle_harness._provider import Provider
 from basecradle_harness._retry import Retry, _default_backoff, connection_reason
 from basecradle_harness._server_tools import bound as bound_server_tools
@@ -1064,41 +1073,88 @@ class Engine:
             # configured built-in gets targeted guidance back to its working (automatic) path;
             # a genuinely unknown name still gets the generic error below.
             if name in self.server_builtins:
-                self._log_tool(name, started, error=f"{name!r} is server-side, not a function")
+                self._log_tool(
+                    name,
+                    started,
+                    reason="server_side",
+                    error=f"{name!r} is server-side, not a function",
+                )
                 return _server_builtin_guidance(name)
             if name in self.withheld_tools:
-                self._log_tool(name, started, error=f"{name!r} is withheld")
+                self._log_tool(name, started, reason="withheld", error=f"{name!r} is withheld")
                 return f"Error: {self.withheld_tools[name]}"
-            self._log_tool(name, started, error=f"no tool named {name!r}")
+            self._log_tool(name, started, reason="unknown_tool", error=f"no tool named {name!r}")
             return f"Error: no tool named {name!r}."
+        executor = getattr(tool, "executor", HARNESS_EXECUTOR)
         # The harness's own elision marker, copied out of the model's context into a call it is
         # making (issue #576): run it, and a fragment goes out saying "the full value was sent".
         # Refused on both seams, the live dispatch and the recovery's `run_tool`, because both
         # arrive here — told apart only in what the model is told happened (`refusal`).
         marker = archive_marker(arguments)
         if marker is not None:
-            self._log_tool(name, started, error="arguments carry a harness elision marker")
+            self._log_tool(
+                name,
+                started,
+                executor=executor,
+                reason="elision_marker",
+                error="arguments carry a harness elision marker",
+            )
             return refusal(marker, reissue=reissue)
-        try:
-            result = tool.run(**arguments)
-        except Exception as exc:  # noqa: BLE001 - any tool failure becomes model-readable
-            self._log_tool(name, started, error=str(exc))
-            return f"Error running {name!r}: {exc}"
-        self._log_tool(name, started)
+        # The meter a tool that buys vendor work records it on (`_observability.metered`), so the
+        # run's one `tool` line carries the vendor, model and fee (issue #758).
+        with tool_meter() as meter:
+            try:
+                result = tool.run(**arguments)
+            except Exception as exc:  # noqa: BLE001 - any tool failure becomes model-readable
+                self._log_tool(
+                    name,
+                    started,
+                    executor=executor,
+                    meter=meter,
+                    reason="exception",
+                    error=str(exc),
+                )
+                return f"Error running {name!r}: {exc}"
+        self._log_tool(name, started, executor=executor, meter=meter)
         return result
 
-    def _log_tool(self, name: str, started: datetime, *, error: str | None = None) -> None:
-        """One INFO line per tool run — plus a WARNING carrying the error text when it failed.
+    def _log_tool(
+        self,
+        name: str,
+        started: datetime,
+        *,
+        executor: str = HARNESS_EXECUTOR,
+        meter: ToolMeter | None = None,
+        reason: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        """The run's one `tool` line — plus a WARNING carrying the error text when it failed.
 
-        The INFO line is the ledger entry (name, duration, outcome) that says a tool ran at all;
-        the WARNING is what a log filter set to `WARNING` and above still sees, so a tool failing
-        in production surfaces without anyone having to trawl `INFO`. The error text goes only
-        into the WARNING — the model still receives it as the tool's result, exactly as before.
+        The INFO line is the ledger entry (name, executor, duration, outcome — and the vendor work
+        the tool's meter recorded) that says a tool ran at all; the WARNING is what a log filter set
+        to `WARNING` and above still sees, so a tool failing in production surfaces without anyone
+        having to trawl `INFO`. The error text goes only into the WARNING — the model still receives
+        it as the tool's result, exactly as before.
+
+        A tool whose vendor call failed and that turned the failure into text for the model (every
+        media tool does, so the model can read why) still failed: its meter holds the fault, so the
+        line says ``outcome=error`` with the fault's slug rather than reporting a refusal as a run.
         """
         elapsed = (self._clock() - started).total_seconds()
-        _log.info("tool %s", kv(name=name, duration=f"{elapsed:.2f}s", outcome=_outcome(error)))
-        if error is not None:
-            _log.warning("tool %s", kv(name=name, error=error))
+        work = meter.fields() if meter is not None else {}
+        failure = meter.failure if meter is not None else None
+        if reason is None and failure is not None:
+            reason = _reason(failure) if isinstance(failure, ProviderError) else "exception"
+            error = str(failure)
+        log_tool(
+            name=name,
+            executor=executor,
+            outcome=_outcome(reason),
+            seconds=elapsed,
+            reason=reason,
+            error=error,
+            **work,
+        )
 
 
 def _unique_call_ids(reply: Message) -> Message:
@@ -1254,9 +1310,9 @@ def _step_action(reply: Message, extend: bool) -> str:
     return "hook continue" if extend else "final reply"
 
 
-def _outcome(error: str | None) -> str:
+def _outcome(reason: str | None) -> str:
     """``ok`` or ``error`` — the one word a tool line's outcome field can carry."""
-    return "ok" if error is None else "error"
+    return "ok" if reason is None else "error"
 
 
 def _server_builtin_guidance(name: str) -> str:

@@ -7,6 +7,84 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.167.0] - 2026-10-31
+
+### Changed: one `tool` line whoever executed the tool (issue #758)
+
+Slice 2 of the telemetry contract (`docs/telemetry.md` → Tools): a tool is one `tool name=` line
+whether the harness ran it, an MCP server served it, or the vendor ran it server-side inside a model
+call. Before, a tool was two things — the engine's `tool` line (calls and errors) and a separate
+`media` line (duration and cost) — and a server-side tool wrote no tool line at all, its counts sat
+on the `llm` line, and on xAI and OpenRouter it showed only as a larger `cost=`. Known Violations
+T1–T9 are struck. **The NOC reads every line this changes** (*Tool Cost*, *Tool Calls*, *Tool
+Errors*, and the three retired `llm` columns), so this release rolls only after the NOC reads both
+shapes; the capital orders it.
+
+- **`executor=harness|mcp|server`** on every `tool` line. A tool class declares it (`Tool.executor`,
+  `harness` by default; `McpTool` is `mcp`).
+- **A harness tool's vendor work rides its own line**: `provider=`, `kind=`, `model=`, `count=` and
+  its fee (`cost=`, `cost_basis=`), recorded while it ran on a meter the engine opens around every
+  tool run (`_observability.metered`, which replaces `media_timer`). The media tools (image, video,
+  transcription) and the Gemini grounded search write through it. `duration=` is now the whole run,
+  the upload included. A tool whose vendor call failed and that turned the failure into text for the
+  model is `outcome=error` with the fault's slug, where before it read `outcome=ok`.
+- **A failed run names why, as a slug** (`reason=unknown_tool|withheld|server_side|elision_marker|
+  exception`, or a vendor fault: `rate_limited`, `server_error`, `timeout`, …); the WARNING companion
+  carrying the error text is unchanged.
+- **Server-side tools write `tool` lines** (`executor=server`), one per model call per tool, right
+  after that call's `llm` line and joined to it by its `generation_id=`, with the uses in `count=`
+  and no `duration=`: Anthropic's `web_search` / `web_fetch` / `code_execution`; OpenAI Responses'
+  server items (on any endpoint, `code_interpreter` named `code_execution`); xAI's
+  `server_side_tools_used`; OpenRouter's `server_tool_use_details.web_search_requests` (native SDK and
+  the `openai` SDK aimed at it); Gemini's code execution and URL context on a main turn. The web
+  search fee (OpenAI and Anthropic, $10 per 1,000 billed searches) rides the `web_search` line.
+- **A server-side tool the vendor reports failed** is that line's `outcome=error reason=<the
+  vendor's code>` at WARNING — Anthropic's `error_code` inside a 200 (before, a prose WARNING), a
+  Gemini page it could not read, an OpenAI or xAI call whose status is `failed` or `incomplete`.
+- **Unpriced code-container time** (Anthropic and OpenAI) is one `cost unpriced
+  charge=container_time reason=not_reported` WARNING per wake, replacing two prose WARNINGs in two
+  vendors' words (`CONTAINER_GAP`, removed from both rate modules).
+- **Retired**: the `media` head (`log_media_call`, `media_timer`) and the `llm` fields
+  `web_search_requests`, `web_fetch_requests` and `code_execution_requests`.
+- **The conformance test** renders every executor (each adapter's server tools, a metered harness
+  tool, an MCP tool, the engine's own refusal) and checks each line's shape, and a `prose` witness
+  can now name the value its structured replacement carries (`until cost unpriced.charge=tokens`),
+  so one head can replace several gaps row by row.
+- **The OpenRouter live search test asks a question the model must search for.** Measured
+  2026-10-31: with the built-in merely offered, *"What is the capital of France?"* runs no search,
+  so OpenRouter reports no `server_tool_use_details` and the test exercised neither issue #280's
+  shape nor the tool line.
+
+### Added: the telemetry contract, and a conformance test that fails on vocabulary outside it (issue #757)
+
+The fleet's telemetry is contract-first (@origin, 2026-10-31): the dashboards exist to compare
+vendors, which only works if every vendor's facts land in the same lines with the same meanings.
+Until now that contract existed only implicitly. This writes it down and enforces it; no emitted
+line changes, and the package does not change.
+
+- **`docs/telemetry.md`** defines every head the harness emits and every field on each — one
+  meaning per field name on every head, who fills it, and when it is absent — as the **target**
+  contract: a tool is one `tool` line whoever executed it (`media` and the NOC's `browser` retire
+  into it), `cache_write_tokens` and `tokens_reasoning` are shared `llm` fields, `endpoint` is the
+  serving upstream only and `residency` is its own field, `tokens_total` is `tokens_in` +
+  `tokens_out`, a 504 is `timeout` everywhere, and refusals and unpriced charges have shared heads.
+- **Known Violations** lists every departure of today's emission from it, each with the issue that
+  removes it (slice 2, tools, #758; slice 3, fields, #759) and a witness the test checks: 45 rows
+  as written, 36 in this release, which strikes slice 2's nine. Beyond the capital's audit it
+  records what writing the contract turned up: on xAI, `tokens_out` excludes the reasoning tokens
+  xAI bills (its own documented example: 32 + 9 + 94 = 135), so `tokens_total` is not `tokens_in` +
+  `tokens_out`; `source=`, `held=` and `surface=` each carry two or three meanings, and the NOC
+  extracts `source=` off every line as the probe stamp; `reason=` is prose rather than a slug on ten
+  heads; and three structured lines are `%`-formatted, bypassing `kv`'s scrubbing and quoting.
+- **`tests/test_telemetry_contract.py`** reads the page and fails the build on any head or field
+  outside it — statically over every emission site in the package (each `kv` call, each
+  `%`-formatted structured line, each `extra=` handed to the `llm` emitters), and at runtime through a
+  representative call on every provider adapter's own log path (the real SDKs against respx). The
+  violations table is its only allowlist, and a row whose departure has disappeared fails the build
+  until it is struck, so the table is always exactly today's.
+- **Charter**: the ruling, and the rule that a vendor/contract misfit stops the arc and goes up
+  `needs-capital` as a design question before the vendor lands.
+
 ## [0.166.0] - 2026-10-31
 
 ### Fixed: drawers filed under MemPalace 3.10 read as filed under 3.11, and the palace check names the rest (issue #751)

@@ -17,8 +17,9 @@ configuration — ``AI_MODEL``, ``AI_CREDENTIALS_FILE``, ``AI_LOCATION``, ``AI_P
 residency as the turn that asked for it.
 
 What it costs is on the journal, by `@origin`'s condition on #656: the grounded call's own ``llm``
-line (``purpose=helper kind=search.grounding``, its tokens priced from Google's table), and a
-``media`` line for the grounding fee (``kind=search.grounding``), priced at list.
+line (``purpose=helper kind=search.grounding``, its tokens priced from Google's table), and this
+tool's own ``tool`` line, which carries the grounding fee (``kind=search.grounding``), priced at
+list — recorded on the meter the engine opens around the run (issue #758).
 """
 
 from __future__ import annotations

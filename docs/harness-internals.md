@@ -896,15 +896,15 @@ the defect, not a shorter spelling.
   ERROR llm provider=openrouter purpose=helper kind=video.describe model=google/gemini-3-flash outcome=fallback reason=config:missing_api_key subject=clip.mp4
   ```
 
-  `kind` is **thing then verb** (`image.describe`, `video.describe`), matching the media lines'
+  `kind` is **thing then verb** (`image.describe`, `video.describe`), matching the media tools'
   existing vocabulary (`video.generate`, `audio.transcribe`) rather than inventing a second word
   order for the same idea. A `purpose=main` line carries **no** `kind` — the brain has one job.
 
 - **Two axes, and conflating them is the mistake to avoid.** `purpose` is a **field on model
   calls**. *Spend category* (main / memory / helper / tools) is the **dashboard's construct**,
   derived from the line class: the first three are `purpose=` values on the `llm` head, and *tools*
-  is the ` media provider=` head, which carries no `purpose` because a media generation is not a
-  model call. The NOC pins that every `cost=` the harness writes belongs to exactly one of the four;
+  is the ` tool name=` head (issue #758; the ` media provider=` head before it), which carries no
+  `purpose` because a tool's fee is not a model call. The NOC pins that every `cost=` the harness writes belongs to exactly one of the four;
   the harness pins its own half — **a rerank or describe attempt logs exactly one `llm` line, and no
   other line carries its `cost=`**.
 

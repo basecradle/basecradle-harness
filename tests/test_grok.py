@@ -25,6 +25,7 @@ from basecradle_harness import (
     GrokGenerateVideoTool,
     PlatformContext,
 )
+from tests.conftest import run_through_engine, tool_lines
 
 BC_URL = "https://basecradle.com"
 XAI_BASE = "https://api.x.ai.test/v1"
@@ -586,10 +587,10 @@ def test_the_timeout_reaches_the_grok_http_client(edit_tool, monkeypatch):
     assert captured["timeout"] == grok.DEFAULT_TIMEOUT
 
 
-# --- the media log line (issue #272) -----------------------------------------
+# --- the tool line names the vendor work (issues #272, #758) ---------------
 
 
-def test_a_grok_generation_logs_one_media_line(image_tool, caplog):
+def test_a_grok_generation_logs_one_tool_line(image_tool, caplog):
     import logging
 
     captured = {}
@@ -597,9 +598,9 @@ def test_a_grok_generation_logs_one_media_line(image_tool, caplog):
         mock.post(IMAGES_URL).mock(return_value=httpx.Response(200, json=image_b64()))
         _mock_upload(mock, captured)
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            image_tool.run(prompt="a neon skyline")
+            run_through_engine(image_tool, prompt="a neon skyline")
 
-    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    line = tool_lines(caplog)[0]
     assert "provider=xai" in line
     assert "kind=image.generate" in line
     assert "model=grok-imagine-image-2.0" in line
@@ -626,17 +627,17 @@ def test_a_video_generation_times_the_submit_and_poll_span(video_tool, caplog):
         )
         _mock_upload(mock, captured)
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            video_tool.run(prompt="a drone shot over the ocean")
+            run_through_engine(video_tool, prompt="a drone shot over the ocean")
 
-    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    line = tool_lines(caplog)[0]
     assert "kind=video.generate" in line and "provider=xai" in line
 
 
-# --- the provider-reported cost on the media line (issue #329) ---------------
+# --- the provider-reported cost on the tool line (issues #329, #758) ---------
 
 
 def _media_line(caplog):
-    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    return tool_lines(caplog)[0]
 
 
 def test_media_cost_usd_converts_ticks_and_degrades_to_none():
@@ -656,7 +657,7 @@ def test_media_cost_usd_converts_ticks_and_degrades_to_none():
     assert _media_cost_usd(None) is None
 
 
-def test_image_media_line_carries_the_xai_reported_cost(image_tool, caplog):
+def test_image_tool_line_carries_the_xai_reported_cost(image_tool, caplog):
     import logging
 
     captured = {}
@@ -667,14 +668,14 @@ def test_image_media_line_carries_the_xai_reported_cost(image_tool, caplog):
         )
         _mock_upload(mock, captured)
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            image_tool.run(prompt="a neon skyline")
+            run_through_engine(image_tool, prompt="a neon skyline")
 
     line = _media_line(caplog)
     assert "kind=image.generate" in line
     assert "cost=0.02" in line
 
 
-def test_image_media_line_omits_cost_when_xai_states_none(image_tool, caplog):
+def test_image_tool_line_omits_cost_when_xai_states_none(image_tool, caplog):
     """A body with no usage block must not invent a cost — the field is simply absent."""
     import logging
 
@@ -683,12 +684,12 @@ def test_image_media_line_omits_cost_when_xai_states_none(image_tool, caplog):
         mock.post(IMAGES_URL).mock(return_value=httpx.Response(200, json=image_b64()))
         _mock_upload(mock, captured)
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            image_tool.run(prompt="a neon skyline")
+            run_through_engine(image_tool, prompt="a neon skyline")
 
     assert "cost=" not in _media_line(caplog)
 
 
-def test_edit_media_line_carries_the_xai_reported_cost(edit_tool, caplog):
+def test_edit_tool_line_carries_the_xai_reported_cost(edit_tool, caplog):
     import logging
 
     captured = {}
@@ -700,14 +701,14 @@ def test_edit_media_line_carries_the_xai_reported_cost(edit_tool, caplog):
         )
         _mock_upload(mock, captured)
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            edit_tool.run(image=SOURCE_UUID, prompt="recolor the car red")
+            run_through_engine(edit_tool, image=SOURCE_UUID, prompt="recolor the car red")
 
     line = _media_line(caplog)
     assert "kind=image.edit" in line
     assert "cost=0.03" in line
 
 
-def test_video_media_line_carries_cost_from_the_done_poll_body_not_the_submit(video_tool, caplog):
+def test_video_tool_line_carries_cost_from_the_done_poll_body_not_the_submit(video_tool, caplog):
     """The determination this issue asked to verify, pinned: the async video charge rides the
     completed `done` poll body (xAI's final response), not the submit — which returns only a
     request_id. The pending poll carries no usage either, so a cost on the line can only have come
@@ -739,14 +740,14 @@ def test_video_media_line_carries_cost_from_the_done_poll_body_not_the_submit(vi
         )
         _mock_upload(mock, captured)
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            video_tool.run(prompt="a drone shot over the ocean", duration=15)
+            run_through_engine(video_tool, prompt="a drone shot over the ocean", duration=15)
 
     line = _media_line(caplog)
     assert "kind=video.generate" in line
     assert "cost=2.1" in line
 
 
-def test_video_media_line_omits_cost_when_the_done_body_states_none(video_tool, caplog):
+def test_video_tool_line_omits_cost_when_the_done_body_states_none(video_tool, caplog):
     import logging
 
     captured = {}
@@ -764,6 +765,6 @@ def test_video_media_line_omits_cost_when_the_done_body_states_none(video_tool, 
         )
         _mock_upload(mock, captured)
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            video_tool.run(prompt="a drone shot over the ocean")
+            run_through_engine(video_tool, prompt="a drone shot over the ocean")
 
     assert "cost=" not in _media_line(caplog)

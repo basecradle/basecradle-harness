@@ -147,12 +147,14 @@ server-side fallback on Haiku 5.5): logged with its ``stop_details`` category, n
 Cost — computed, never vendor-stated
 ------------------------------------
 Anthropic states no price, so ``cost=`` is computed from its published rates
-(`basecradle_harness._anthropic_rates`) and tagged ``cost_basis=computed``. A web search's fee
-($10 per 1,000) is a priced ``media`` line (``kind=search.web``), and the ``llm`` line carries the
-call's own count as ``web_search_requests=`` beside it — with ``web_fetch_requests=`` and
-``code_execution_requests=``, which cost nothing extra and are the journal's only evidence that a
-server tool ran (each field rendered only when non-zero). ``provider=anthropic``; no ``endpoint=``, the
-vendor *is* the endpoint.
+(`basecradle_harness._anthropic_rates`) and tagged ``cost_basis=computed``. Each server tool a call
+ran writes one ``tool`` line beside the call's ``llm`` line (``executor=server``, the uses in
+``count=``, the call's ``generation_id=``; issue #758): ``web_search`` carries its fee ($10 per 1,000
+billed searches, ``kind=search.web``), and ``web_fetch`` and ``code_execution``, which cost nothing
+extra, are the journal's evidence that the tool ran. A tool Anthropic reports failed inside the 200
+is that line's ``outcome=error reason=<error_code>``. Container time, which no response states, is one
+``cost unpriced charge=container_time reason=not_reported`` line per wake. ``provider=anthropic``; no
+``endpoint=``, the vendor *is* the endpoint.
 
 Stateless per turn: the full conversation is sent every call and the harness owns history. This
 adapter never streams; every call carries the harness's fitted budget as its ``timeout``, which is
@@ -173,7 +175,6 @@ from itertools import pairwise
 from typing import Any
 
 from basecradle_harness._anthropic_rates import (
-    CONTAINER_GAP,
     call_cost,
     known,
     server_tool_requests,
@@ -204,10 +205,15 @@ from basecradle_harness._messages import (
     ToolSpec,
 )
 from basecradle_harness._observability import (
+    CONTAINER_TIME,
+    NOT_REPORTED,
+    ServerToolTally,
     generation_id,
     generation_of,
+    log_cost_unpriced,
     log_llm_call,
-    log_media_call,
+    log_server_tools,
+    slug,
     token_counts,
 )
 from basecradle_harness._openai_wire import format_citations
@@ -273,10 +279,6 @@ PAUSE_CONTINUATIONS = 8
 #: its system prompt at the top level only. The Google adapter's label, for the same reason.
 SYSTEM_LABEL = "[System]\n"
 
-#: The ``kind`` a web search's per-use fee is logged under — the literal OpenAI's fee uses, so the
-#: fleet's tool-spend column counts both.
-SEARCH_KIND = "search.web"
-
 #: The cache-control TTLs Anthropic offers, and the one the breakpoint gets when none is configured.
 CACHE_TTLS = ("5m", "1h")
 DEFAULT_CACHE_TTL = "5m"
@@ -321,7 +323,7 @@ _RESULTS = {
 }
 
 #: The result blocks that mean code ran in Anthropic's sandbox — what the container-time gap is
-#: stated on (`_anthropic_rates.CONTAINER_GAP`).
+#: stated on (a ``cost unpriced charge=container_time`` line, `_anthropic_rates` → What is priced).
 _CODE_RESULTS = frozenset(
     {
         "code_execution_tool_result",
@@ -572,7 +574,7 @@ class AnthropicProvider:
                     break
 
     def _call(self, request: dict[str, Any]) -> Any:
-        """One billed ``messages.create``, its ``llm`` line, and its search fee's ``media`` line."""
+        """One billed ``messages.create``, its ``llm`` line, and a ``tool`` line per server tool."""
         started = time.monotonic()
         with _mapped_errors(self._anthropic):
             response = self._client.value.messages.create(**request)
@@ -580,8 +582,8 @@ class AnthropicProvider:
         wire = _wire_usage(usage)
         self.last_tokens_in = token_counts(wire).get("tokens_in")
         self.last_finish_reason = getattr(response, "stop_reason", None) or None
-        searches = server_tool_requests(usage, "web_search_requests")
         written = _count(getattr(usage, "cache_creation_input_tokens", None))
+        generation = generation_id({"id": getattr(response, "id", None)})
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -589,27 +591,19 @@ class AnthropicProvider:
             usage=wire,
             cost=self._cost(usage),
             finish_reason=self.last_finish_reason,
-            extra={
-                "cache_write_tokens": written,
-                "web_search_requests": searches or None,
-                # Free, but the only trace in the journal that a server tool ran at all: none of a
-                # server tool's blocks reach the persisted transcript (see the module docstring).
-                "web_fetch_requests": server_tool_requests(usage, "web_fetch_requests") or None,
-                "code_execution_requests": (
-                    server_tool_requests(usage, "code_execution_requests") or None
-                ),
-            },
-            generation_id=generation_id({"id": getattr(response, "id", None)}),
+            extra={"cache_write_tokens": written},
+            generation_id=generation,
         )
-        if searches:
-            log_media_call(
-                provider=self.provider,
-                kind=SEARCH_KIND,
-                model=self.model,
-                seconds=None,
-                count=searches,
-                cost=web_search_cost(searches),
-            )
+        tallies = _server_tallies(usage, [_raw(block) for block in response.content or ()])
+        # The fee is on the searches Anthropic billed — a failed one is not — never the tally.
+        billed = server_tool_requests(usage, "web_search_requests")
+        log_server_tools(
+            tallies,
+            provider=self.provider,
+            model=self.model,
+            generation_id=generation,
+            fees={"web_search": web_search_cost(billed) if billed else None},
+        )
         return response
 
     def _cost(self, usage: Any) -> float | None:
@@ -635,13 +629,14 @@ class AnthropicProvider:
         )
 
     def _state_code_gap(self, blocks: Sequence[Mapping[str, Any]]) -> None:
-        """One WARNING per wake when code ran on a request whose container time Anthropic bills."""
+        """One ``cost unpriced`` line per wake when code ran on a request whose container time Anthropic
+        bills and no response states (`_anthropic_rates` → What is priced)."""
         if self._gap_stated or not any(block.get("type") in _CODE_RESULTS for block in blocks):
             return
         if any(tool["name"] in ("web_search", "web_fetch") for tool in self._builtins):
             return  # free beside either: "no additional charges for code execution tool calls"
         self._gap_stated = True
-        _log.warning(CONTAINER_GAP)
+        log_cost_unpriced(provider=self.provider, charge=CONTAINER_TIME, reason=NOT_REPORTED)
 
     def _info_or_none(self) -> Any:
         """The Models API record, or ``None`` when it cannot be read — the fail-safe reads' form."""
@@ -1150,7 +1145,8 @@ def _reply(blocks: Sequence[Mapping[str, Any]]) -> Message:
     the vendor's to run and stay in the kept blocks only — but each ``server_tool_use`` is reported
     on the reply as a `ServerToolUse` (its name and what it was run on), the record a later wake
     reads instead of the blocks it will never see (issue #727). A server tool's failure — which
-    Anthropic reports inside the 200 as an error object where a success is a list — is logged.
+    Anthropic reports inside the 200 as an error object where a success is a list — is marked on
+    that record; the journal's record of it is the call's ``tool`` line (`_server_tallies`).
     """
     texts: list[str] = []
     calls: list[ToolCall] = []
@@ -1183,19 +1179,51 @@ def _reply(blocks: Sequence[Mapping[str, Any]]) -> Message:
                 failed = by_id.get(block.get("tool_use_id") or "")
                 if failed is not None:
                     # The record says so: a fetch that never read the page is not evidence it did.
+                    # The journal says so on the call's `tool` line (`_server_tallies`).
                     failed.failed = str(content.get("error_code") or "failed")
-                _log.warning(
-                    "Anthropic's %s server tool failed inside the turn (error_code=%s); the model "
-                    "was told and carried on.",
-                    _RESULTS[kind],
-                    content.get("error_code"),
-                )
     text = "".join(texts)
     if text and citations:
         text += format_citations(citations)
     reply = Message.assistant(content=text or None, tool_calls=calls)
     reply.server_tools = record(used)
     return reply
+
+
+#: The harness's name for each server tool Anthropic counts on ``usage.server_tool_use``, by the
+#: count's field — the names the tool lines carry and the agent knows the tools by.
+_SERVER_COUNTS = {
+    "web_search": "web_search_requests",
+    "web_fetch": "web_fetch_requests",
+    "code_execution": "code_execution_requests",
+}
+
+
+def _server_tallies(usage: Any, blocks: Sequence[Mapping[str, Any]]) -> dict[str, ServerToolTally]:
+    """Each server tool's uses on one call, and the first error code its result blocks carried.
+
+    The count is what Anthropic reports on ``usage.server_tool_use`` — the billed one, which
+    excludes a search that failed ("will not be billed") — or, where that is lower, the result
+    blocks this response carries for the tool, so a use that failed is still counted. The failure
+    is Anthropic's own ``error_code`` from inside the 200 (``max_uses_exceeded``), read off the
+    result block wherever it lands: a mixed group's server tool runs on the call after the one
+    that asked for it (issue #737), so its result, and its failure, belong to that later call.
+    """
+    tallies: dict[str, ServerToolTally] = {}
+    results: dict[str, int] = {}
+    for block in blocks:
+        name = _RESULTS.get(block.get("type"))
+        if name is None:
+            continue
+        results[name] = results.get(name, 0) + 1
+        content = block.get("content")
+        if isinstance(content, Mapping) and "error_code" in content:
+            tally = tallies.setdefault(name, ServerToolTally())
+            tally.reason = tally.reason or slug(content.get("error_code") or "failed")
+    for name, field in _SERVER_COUNTS.items():
+        count = max(server_tool_requests(usage, field), results.get(name, 0))
+        if count:
+            tallies.setdefault(name, ServerToolTally()).count = count
+    return tallies
 
 
 def _wire_usage(usage: Any) -> dict[str, Any] | None:

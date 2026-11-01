@@ -89,8 +89,10 @@ every turn. So Search is a harness-run tool instead (`basecradle_harness._google
 calls ``web_search``, and the harness makes **one grounded call** (`GoogleProvider.search`) with
 ``google_search`` as its only tool — the shape Vertex documents — and hands back the answer with a
 ``Sources:`` footer built from the grounding metadata. That call writes its own ``llm`` line
-(``purpose=helper kind=search.grounding``), and its grounding fee, which is not tokens, its own
-priced ``media`` line (`_google_rates.grounding_cost`).
+(``purpose=helper kind=search.grounding``), and its grounding fee, which is not tokens, rides the
+``web_search`` tool's own ``tool`` line (`_google_rates.grounding_cost`, recorded on the tool's
+meter). The built-ins Gemini runs on a main turn (code execution, URL context) write one ``tool`` line
+each beside the turn's ``llm`` line (``executor=server``; issue #758).
 
 Stateless per turn: the full conversation is sent every call and the harness owns history. This
 adapter never streams.
@@ -149,7 +151,10 @@ from basecradle_harness._observability import (
     generation_id,
     generation_of,
     log_llm_call,
-    log_media_call,
+    log_server_tools,
+    meter_failure,
+    meter_tool,
+    tally_server_tools,
     token_counts,
 )
 from basecradle_harness._openai_wire import format_citations
@@ -179,7 +184,7 @@ SDK = "google-genai"
 BUILTINS = {"code_execution": "code_execution", "url_context": "url_context"}
 
 #: The ``kind`` the grounded search call and its fee are logged under — one name for the ``llm``
-#: line and the ``media`` line, so the two halves of one search are one grep apart.
+#: line and the ``tool`` line, so the two halves of one search are one grep apart.
 SEARCH_KIND = "search.grounding"
 
 #: The variables the brain's Vertex configuration is read from, when the caller passes none.
@@ -738,8 +743,16 @@ class GoogleProvider:
             finish_reason=self.last_finish_reason,
             generation_id=response_id,
         )
+        used = _server_uses(candidate)
+        # The built-ins Gemini ran on this call, one `tool` line each beside its `llm` line (#758).
+        log_server_tools(
+            tally_server_tools((use.name, use.failed) for use in used),
+            provider=self.provider,
+            model=self.model,
+            generation_id=response_id,
+        )
         with generation_of({"id": response_id}):
-            return self._from_wire(response, candidate, reason)
+            return self._from_wire(response, candidate, reason, used)
 
     def search(self, query: str) -> str:
         """Answer `query` with Google Search grounding, in one call of its own (issue #656).
@@ -751,9 +764,10 @@ class GoogleProvider:
         Two lines, both ``kind=search.grounding``: the call's ``llm`` line as ``purpose=helper`` —
         it is a model call the brain made on the agent's behalf, never the brain's own turn — with
         its tokens priced from the table (grounding's own input tokens exempt where Google says so),
-        and a ``media`` line for the grounding fee, which is not tokens and is the fleet's tool
-        spend. A fee the table cannot state is logged without ``cost=`` and one WARNING. Raises the
-        same typed `ProviderError`s as `chat`; the tool hands the model their text.
+        and the grounding fee, which is not tokens and is the fleet's tool spend, recorded on the
+        running tool's meter (`meter_tool`) so it rides the ``web_search`` tool's own ``tool`` line.
+        A fee the table cannot state is recorded without a cost and stated in one WARNING. Raises
+        the same typed `ProviderError`s as `chat`; the tool hands the model their text.
         """
         types = self._types
         budget = call_timeout(
@@ -772,11 +786,16 @@ class GoogleProvider:
         )
         contents = [types.Content(role="user", parts=[types.Part(text=query)])]
         started = time.monotonic()
-        with _mapped_errors(self._genai):
-            self._refresh_token(budget)
-            response = self._client.models.generate_content(
-                model=self.model, contents=contents, config=config
-            )
+        try:
+            with _mapped_errors(self._genai):
+                self._refresh_token(budget)
+                response = self._client.models.generate_content(
+                    model=self.model, contents=contents, config=config
+                )
+        except ProviderError as exc:
+            # The tool hands the model the text; its `tool` line still says the search failed.
+            meter_failure(exc, provider=self.provider, kind=SEARCH_KIND, model=self.model)
+            raise
         seconds = time.monotonic() - started
         meta = getattr(response, "usage_metadata", None)
         candidate = _first_candidate(response)
@@ -803,11 +822,10 @@ class GoogleProvider:
                     "model, or no grounding queries listed to count); its fee carries no cost=.",
                     self.model,
                 )
-            log_media_call(
+            meter_tool(
                 provider=self.provider,
                 kind=SEARCH_KIND,
                 model=self.model,
-                seconds=None,
                 count=grounding_units(self.model, queries),
                 cost=fee,
             )
@@ -984,35 +1002,28 @@ class GoogleProvider:
 
     # --- Gemini -> harness ----------------------------------------------------
 
-    def _from_wire(self, response: Any, candidate: Any, reason: str | None) -> Message:
+    def _from_wire(
+        self, response: Any, candidate: Any, reason: str | None, used: list[ServerToolUse]
+    ) -> Message:
         """The first candidate as a harness assistant `Message` (text + function calls).
 
         Thought-summary parts (``thought=True``, present only when an operator asks for
         ``include_thoughts``) are the model's reasoning, not its reply, and are left out.
 
-        The built-ins Gemini ran itself are recorded on the reply (issue #727): an
-        ``executable_code`` part is a ``code_execution`` use with its code, and each page in the
-        candidate's ``url_context_metadata`` is a ``url_context`` use with its URL — so a later
-        wake can see that the run or the read happened.
+        The built-ins Gemini ran itself (`_server_uses`) are recorded on the reply (issue #727), so
+        a later wake can see that the run or the read happened.
         """
         parts = getattr(getattr(candidate, "content", None), "parts", None) or []
         texts: list[str] = []
         calls: list[ToolCall] = []
-        used: list[ServerToolUse] = []
         for part in parts:
             if getattr(part, "thought", None):
                 continue
-            executed = getattr(part, "executable_code", None)
-            if executed is not None:
-                used.append(
-                    ServerToolUse(name="code_execution", input=getattr(executed, "code", "") or "")
-                )
-                continue
-            outcome = getattr(getattr(part, "code_execution_result", None), "outcome", None)
-            if outcome is not None and used and used[-1].name == "code_execution":
-                verdict = getattr(outcome, "name", None) or str(outcome)
-                if verdict != "OUTCOME_OK":
-                    used[-1].failed = verdict
+            if (
+                getattr(part, "executable_code", None) is not None
+                or getattr(getattr(part, "code_execution_result", None), "outcome", None)
+                is not None
+            ):
                 continue
             call = getattr(part, "function_call", None)
             if call is not None:
@@ -1039,14 +1050,6 @@ class GoogleProvider:
                     self.model,
                     blocked,
                 )
-        read = getattr(getattr(candidate, "url_context_metadata", None), "url_metadata", None)
-        for page in read or ():
-            url = getattr(page, "retrieved_url", None)
-            if url:
-                status = getattr(page, "url_retrieval_status", None)
-                status = getattr(status, "name", None) or (str(status) if status else "")
-                failed = "" if status in ("", "URL_RETRIEVAL_STATUS_SUCCESS") else status
-                used.append(ServerToolUse(name="url_context", input=url, failed=failed))
         reply = Message.assistant(content="".join(texts) or None, tool_calls=calls)
         reply.server_tools = record(used)
         return reply
@@ -1149,6 +1152,42 @@ def _is_gemini(model: str) -> bool:
 def _wire_id(call_id: str) -> str | None:
     """The id to send back for a call: the model's own, or nothing for one the adapter made up."""
     return None if not call_id or call_id.startswith(LOCAL_CALL_ID_PREFIX) else call_id
+
+
+def _server_uses(candidate: Any) -> list[ServerToolUse]:
+    """The built-ins Gemini ran on a call, one `ServerToolUse` per use, in the order it ran them.
+
+    An ``executable_code`` part is a ``code_execution`` use with its code (its
+    ``code_execution_result`` part, when not ``OUTCOME_OK``, marks it failed), and each page in the
+    candidate's ``url_context_metadata`` is a ``url_context`` use with its URL. Read once per call,
+    for both the reply's record (issue #727) and the call's ``tool`` lines (issue #758), so the two
+    can never count differently. Thought parts are skipped, as the reply skips them.
+    """
+    parts = getattr(getattr(candidate, "content", None), "parts", None) or []
+    used: list[ServerToolUse] = []
+    for part in parts:
+        if getattr(part, "thought", None):
+            continue
+        executed = getattr(part, "executable_code", None)
+        if executed is not None:
+            used.append(
+                ServerToolUse(name="code_execution", input=getattr(executed, "code", "") or "")
+            )
+            continue
+        outcome = getattr(getattr(part, "code_execution_result", None), "outcome", None)
+        if outcome is not None and used and used[-1].name == "code_execution":
+            verdict = getattr(outcome, "name", None) or str(outcome)
+            if verdict != "OUTCOME_OK":
+                used[-1].failed = verdict
+    read = getattr(getattr(candidate, "url_context_metadata", None), "url_metadata", None)
+    for page in read or ():
+        url = getattr(page, "retrieved_url", None)
+        if url:
+            status = getattr(page, "url_retrieval_status", None)
+            status = getattr(status, "name", None) or (str(status) if status else "")
+            failed = "" if status in ("", "URL_RETRIEVAL_STATUS_SUCCESS") else status
+            used.append(ServerToolUse(name="url_context", input=url, failed=failed))
+    return used
 
 
 def _first_candidate(response: Any) -> Any:

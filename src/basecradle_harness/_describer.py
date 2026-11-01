@@ -187,7 +187,7 @@ DESCRIBER_PROJECT_VAR = "HARNESS_DESCRIBER_PROJECT"
 _VERTEX_PROVIDER = "google"
 
 #: The ``kind=`` a describe carries on its `llm` line — the *job* within the ``helper`` category
-#: (issue #485). **Thing then verb**, matching the media lines' own vocabulary (``video.generate``,
+#: (issue #485). **Thing then verb**, matching the media tools' own vocabulary (``video.generate``,
 #: ``audio.transcribe``) rather than inventing a second word order for the same idea. Constants
 #: rather than literals at four call sites, because a job name is a dashboard column's gate.
 IMAGE_KIND = "image.describe"
@@ -660,7 +660,7 @@ class Describer:
             # `capture_llm_call` holds back the adapter's own line, so the one `llm` line this
             # attempt writes is written below — where the outcome is known (issue #485). Before it,
             # a describe emitted an untagged `llm` line the dashboard read as the *brain's*, plus a
-            # `media provider=describer` line, and that head is the dashboard's **tools** category,
+            # `media provider=describer` line, and that head was the dashboard's **tools** category,
             # which a model call is not. One attempt, one line, one category. It wraps **exactly
             # one** model call by its own contract, so a retry gets a fresh block rather than a
             # second call inside this one.

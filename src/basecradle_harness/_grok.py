@@ -81,7 +81,7 @@ from basecradle_harness._media import (
     sniff_media_ext,
     uuid_list,
 )
-from basecradle_harness._observability import media_timer
+from basecradle_harness._observability import metered
 from basecradle_harness._platform import PlatformTool, explain
 from basecradle_harness._secret import reveal, secret
 
@@ -140,7 +140,7 @@ def _media_cost_usd(body: Any) -> float | None:
     xAI reports the exact charge on the wire for image and video generation, not just chat, under
     ``usage.cost_in_usd_ticks`` (docs.x.ai → Cost Tracking). Read it where the provider states it
     and convert by the tick constant. A body carrying no usage/cost — an older API, an unexpected
-    shape, a non-numeric field — yields ``None``, so the media line simply logs no ``cost=``: the
+    shape, a non-numeric field — yields ``None``, so the tool line simply logs no ``cost=``: the
     same honest absence an OpenAI media call has, never a fabricated figure. For the **async video
     flow** the usage rides the completed (``done``) poll body (the REST analog of the SDK's final
     ``VideoResponse``), not the submit response, which returns only a ``request_id``.
@@ -329,7 +329,7 @@ class GrokGenerateImageTool(_GrokMediaTool):
             payload["resolution"] = resolution
 
         try:
-            with media_timer(provider="xai", kind="image.generate", model=self._model) as call:
+            with metered(provider="xai", kind="image.generate", model=self._model) as call:
                 body = self._request(key, "POST", "images/generations", json=payload)
                 call.cost = _media_cost_usd(body)  # xAI states the charge on the sync body
             image_bytes = decode_image_payload(
@@ -446,7 +446,7 @@ class GrokEditImageTool(_GrokMediaTool):
                 payload["image"] = sources[0]
             else:
                 payload["images"] = sources
-            with media_timer(provider="xai", kind="image.edit", model=self._model) as call:
+            with metered(provider="xai", kind="image.edit", model=self._model) as call:
                 body = self._request(key, "POST", "images/edits", json=payload)
                 call.cost = _media_cost_usd(body)  # xAI states the charge on the sync body
             image_bytes = decode_image_payload(
@@ -610,7 +610,7 @@ class GrokGenerateVideoTool(_GrokMediaTool):
             # The timed span is submit → done (the poll loop *is* the generation on this
             # endpoint); the clip download that follows is transfer, not model time. The charge
             # rides the completed `done` poll body, so cost comes back from `_await_video`.
-            with media_timer(provider="xai", kind="video.generate", model=self._model) as call:
+            with metered(provider="xai", kind="video.generate", model=self._model) as call:
                 request_id = self._submit(key, payload)
                 video_url, call.cost = self._await_video(key, request_id)
             video_bytes = _download(video_url)
