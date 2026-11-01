@@ -68,7 +68,7 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 
 ### `llm`
 
-**One line per billed model call, whatever its purpose or outcome** (`_observability.log_llm_call`, the only emitter). The head `llm provider=` is byte-frozen: it is the NOC's anchor for every call, cost, and duration series. A call that never reached a model is not a call and never writes this head (see `llm retry`).
+**One line per model-call attempt the caller ends, whatever its purpose or outcome** (`_observability.log_llm_call`, the only emitter). For the brain that is every call that answered; a brain call that raised writes none (the wake's failure lines carry it). For a non-brain caller (`purpose=memory|helper`) it is every attempt it gives up on or accepts, with its `outcome` — including a `fallback` that never reached a vendor (a config-class fault), which then carries no `duration`, tokens or cost. An attempt that failed and **is retried** writes `llm retry` instead, never this head. The head `llm provider=` is byte-frozen: it is the NOC's anchor for every call, cost, and duration series.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
@@ -117,6 +117,9 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 | `provider_code` | As on `llm`. | `_retry.diagnostics`. | As on `llm`. |
 | `routing_attempt` | As on `llm`. | `_retry.diagnostics`. | As on `llm`. |
 | `attempts` | As on `llm`. | `_retry.diagnostics`. | As on `llm`. |
+| `timeout` | The budget the timed-out attempt ran out of, seconds. | `_retry.Retry`. | `reason` is not `timeout`, or the budget is unknown. |
+| `timeout_scale` | The multiple of the fitted budget the retry gets. | `_retry.Retry`. | `reason` is not `timeout`. |
+| `next_timeout` | The budget the retry gets, seconds. | `_retry.Retry`. | As `timeout`. |
 | `next_in` | Seconds until the next attempt. | `_retry.Retry`. | Never. |
 | `surface` | As on `llm`. | The reranker. | Not a rerank. |
 | `subject` | As on `llm`. | The describer. | Not a describe. |
@@ -134,6 +137,17 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 | `category` | The vendor's own refusal category, as a slug. | The adapter. | The vendor gave none. |
 | `generation_id` | Common. | The adapter. | The response named none. |
 
+### `provider`
+
+The one trace that a vendor runs under the generic OpenAI-compatible profile (`_basecradle`), written once per wake: a misspelled known vendor is a legal slug and runs generic, and this line is what says it lost its conventions.
+
+| Field | Meaning | Filled By | Absent When |
+|---|---|---|---|
+| `profile` | `generic`. | `_basecradle`. | Never. |
+| `provider` | Common. | `_basecradle`. | Never. |
+| `sdk_surface` | The SDK surface the adapter speaks (`chat`, `responses`). | `_basecradle`. | Never. |
+| `host` | The endpoint's host. | `_basecradle`. | Never. |
+
 ### `turn truncated`
 
 A brain reply the vendor stopped at the output budget (`_engine._note_truncation`).
@@ -150,7 +164,7 @@ A brain reply the vendor stopped at the output budget (`_engine._note_truncation
 
 ### `usage unreported`
 
-One INFO note, once per wake per model and kind, when a helper call's vendor stated no usage (`_describer._note_unreported_usage`).
+One INFO note, once per wake per model and kind, when a helper call's vendor returned a usage block of nothing but zeros — usage in the shape of an answer that states nothing (`_describer._note_unreported_usage`). A call with no usage block at all writes no note.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
@@ -204,6 +218,23 @@ One WARNING, once per wake per gap, naming a charge that is real and that the ha
 | `model` | Common. | The adapter or tool. | The charge is not per-model. |
 | `charge` | What carries no price: `tokens`, `container_time`, `grounding`, `search`. | The adapter or tool. | Never. |
 | `reason` | `unknown_model`, `unpriced_tier`, `unpriced_host`, `not_reported`. | The adapter or tool. | Never. |
+
+### `direct_message sent`
+
+The off-platform push to @origin's phone, delivered (`_direct_message`).
+
+| Field | Meaning | Filled By | Absent When |
+|---|---|---|---|
+| `bytes` | The payload's size in bytes. | `_direct_message`. | Never. |
+| `title` | The notification's title. | `_direct_message`. | Never. |
+
+### `direct_message failed`
+
+| Field | Meaning | Filled By | Absent When |
+|---|---|---|---|
+| `bytes` | As on `direct_message sent`. | `_direct_message`. | Never. |
+| `reason` | Why delivery failed, as a slug. | `_direct_message`. | Never. |
+| `error` | Common. | `_direct_message`. | Never. |
 
 ### `tool_call_ids rewritten`
 
@@ -305,7 +336,7 @@ A permanent or billing model failure reported to the timeline (`_wake._report_pr
 | `reason` | The failure's slug (`payload_too_large`, `out_of_funds`). | The wake. | Never. |
 | `provider` | Common. | The wake. | A probe line. |
 | `item` | Common. | The wake. | A billing onset. |
-| `timeline` | Common. | The wake. | Never. |
+| `timeline` | Common. | The wake. | A probe line. |
 | `delivery` | Common. | The environment. | As Common. |
 | `source` | Common. | `_log_grammar`. | Real traffic. |
 | `agent` | Common. | `_log_grammar`. | Real traffic. |
@@ -318,7 +349,7 @@ The debounced repeat for every later wake an out-of-funds account blocks (`_repo
 |---|---|---|---|
 | `reason` | As on `wake reported_failure`. | The wake. | Never. |
 | `provider` | Common. | The wake. | A probe line. |
-| `timeline` | Common. | The wake. | Never. |
+| `timeline` | Common. | The wake. | A probe line. |
 | `delivery` | Common. | The environment. | As Common. |
 | `source` | Common. | `_log_grammar`. | Real traffic. |
 | `agent` | Common. | `_log_grammar`. | Real traffic. |
@@ -413,12 +444,12 @@ The cross-wake circuit breaker's trip (`_breaker.breaker_tripped_line`). NOC-ala
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
-| `timeline` | Common. | The breaker. | Never. |
-| `count` | Wakes counted in the window. | The breaker. | Never. |
-| `threshold` | Common: the wake count that trips. | The breaker. | Never. |
-| `window` | The counting window, seconds. | The breaker. | Never. |
-| `cooldown` | The configured cooldown, seconds. | The breaker. | Never. |
-| `hold` | How long this wake will hold, seconds. | The breaker. | Never. |
+| `timeline` | Common. | The breaker. | A probe line, which carries only `source` and `agent`. |
+| `count` | Wakes counted in the window. | The breaker. | A probe line, which carries only `source` and `agent`. |
+| `threshold` | Common: the wake count that trips. | The breaker. | A probe line, which carries only `source` and `agent`. |
+| `window` | The counting window, seconds. | The breaker. | A probe line, which carries only `source` and `agent`. |
+| `cooldown` | The configured cooldown, seconds. | The breaker. | A probe line, which carries only `source` and `agent`. |
+| `hold` | How long this wake will hold, seconds. | The breaker. | A probe line, which carries only `source` and `agent`. |
 | `source` | Common. | `_log_grammar`. | Real traffic. |
 | `agent` | Common. | `_log_grammar`. | Real traffic. |
 
@@ -527,7 +558,7 @@ What the request the model is about to read is made of, in characters, summing e
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
-| `tokens_in` | As on `llm`: the provider's own count that triggered compaction. | `_context`. | Never. |
+| `tokens_in` | As on `llm`: the provider's own count that triggered compaction. | `_context`. | `emergency=yes` — the provider rejected the context, so there is no count. |
 | `limit` | Common. | `_context`. | Never. |
 | `limit_source` | As on `context limit`. | `_context`. | Never. |
 | `threshold` | Common: the token count compaction triggers at. | `_context`. | Never. |
@@ -540,13 +571,13 @@ What the request the model is about to read is made of, in characters, summing e
 
 ### `memory`
 
-One line per memory-system operation that is not a recall (`_wake`, `_mempalace`).
+One line per memory-system operation other than a retrieval's report, which is `memory recall` (`_wake`, `_mempalace`). The wake writes its own `op=recall` and `op=observe` guard lines here when the provider's hook fails.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `op` | The operation: `recall`, `observe`, `search`, `palace-binding`. | The caller. | Never. |
 | `result` | How it ended, where it did not simply succeed: `failed`, `skipped`, `unfile_failed`. | The caller. | The operation succeeded. |
-| `provider` | Common: the memory software. | The caller. | The wake's own guard line, which does not know it. |
+| `provider` | Common: the memory software. | The caller. | The wake's own guard line, which does not know it; `op=palace-binding`. |
 | `surface` | As on `llm`. | `_mempalace`. | Not a search. |
 | `reason` | Why, as a slug. | `_mempalace`. | Nothing to explain. |
 | `keys` | The field names of an error envelope upstream returned. | `_mempalace`. | Not that failure. |
@@ -634,21 +665,30 @@ A line manufactured by the fleet's own instrumentation (`basecradle-harness-log-
 
 ## Known Violations
 
-Where today's emission departs from the target above. The conformance test reads this table: a `field` or `head` witness allows exactly that vocabulary outside the contract, and every row must still be true — a row whose violation has disappeared **fails the build until it is struck from this table**, so the table is always exactly today's departures. Witness forms: `head <head>` and `field <head>.<field>` (vocabulary outside the contract, seen in source or in a rendered line); `prose <file> "<text>"` (prose still at that site, quoted exactly as the source spells it); `reason-prose <head>` (a `reason=` on that head that the scan reads as a sentence, an f-string, or an exception's text); `test` (a behavioral check the test runs by this row's ID).
+Where today's emission departs from the target above. The conformance test reads this table: a `field` or `head` witness allows exactly that vocabulary outside the contract, and every row must still be true — a row whose violation has disappeared **fails the build until it is struck from this table**, so the table is always exactly today's departures. Witness forms, each true exactly while its departure stands:
+
+- `head <head>: <fields>` — a head outside the contract, allowed with exactly those fields.
+- `field <head>.<field>` — a field outside the contract on that head; with `@<adapter>` it is allowed only from that adapter (`_<adapter>.py`, and that adapter's rendered lines).
+- `prose <file> "<text>"` — a fact still recorded only as prose: the text at that site, quoted exactly as the source spells it; with `until <head>` (or `until <head>.<field>`) the row is also over once its structured replacement is emitted, whether or not a sentence restating it stays.
+- `reason-prose <head>` — a `reason=` on that head that the scan reads as a sentence, an f-string or an exception's text, following a variable to its assignments and a parameter to the calls that fill it.
+- `unescaped <head>` — a structured line spelled as a `%`-format string rather than built through `kv`, so its values are never flattened, scrubbed, bounded or quoted.
+- `test` — a behavioral check the test runs by this row's ID.
+
+A prose line that carries a field the NOC extracts off every line (`provider=`, `source=`) feeds a column whatever its head, so the test also fails on any such prose that no `prose` row names.
 
 The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758)), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759)).
 
 | ID | Violation | Witness | Removed By |
 |---|---|---|---|
-| T1 | A media generation's duration and cost, and a server-side search fee, are written on a separate `media` head (`log_media_call`, `media_timer`) instead of the `tool` line — and the NOC's *Tool Cost* reads `media`+`browser` while *Tool Calls* reads `tool`: two definitions of "tool". | `head media` | Slice 2 |
-| T2 | Anthropic counts server-side web searches as an `llm` field, beside the `media kind=search.web` fee line for the same searches: one fact on two lines. | `field llm.web_search_requests` | Slice 2 |
-| T3 | Anthropic counts server-side fetches as an `llm` field; every other adapter's fetch is a `tool name=web_fetch` line. | `field llm.web_fetch_requests` | Slice 2 |
-| T4 | Anthropic counts server-side code executions as an `llm` field. | `field llm.code_execution_requests` | Slice 2 |
+| T1 | A media generation's duration and cost, and a server-side search fee, are written on a separate `media` head (`log_media_call`, `media_timer`) instead of the `tool` line — and the NOC's *Tool Cost* reads `media`+`browser` while *Tool Calls* reads `tool`: two definitions of "tool". | `head media: provider kind model count duration cost cost_basis` | Slice 2 |
+| T2 | Anthropic counts server-side web searches as an `llm` field, beside the `media kind=search.web` fee line for the same searches: one fact on two lines. | `field llm.web_search_requests @anthropic` | Slice 2 |
+| T3 | Anthropic counts server-side fetches as an `llm` field. Elsewhere a fetch is the harness's own `web_fetch` tool and its `tool` line — except Gemini's server-side `url_context`, which writes nothing. | `field llm.web_fetch_requests @anthropic` | Slice 2 |
+| T4 | Anthropic counts server-side code executions as an `llm` field. | `field llm.code_execution_requests @anthropic` | Slice 2 |
 | T5 | The `tool` line carries no `executor`, `provider`, `kind`, `model`, `count`, `reason`, `cost`, or `generation_id`, and a vendor's server-side tool writes no `tool` line at all. | `test` | Slice 2 |
 | T6 | xAI reports the server-side tools it used (`server_side_tools_used`) and OpenRouter its web searches (`server_tool_use_details.web_search_requests`); the harness logs neither, so on those vendors a server tool shows only as a larger `cost=`. | `test` | Slice 2 |
-| T7 | A server-side tool that failed inside a 200 is recorded only as prose. | `prose _anthropic.py "server tool failed inside the turn"` | Slice 2 |
-| T8 | Unpriced code-container time is recorded only as prose (`CONTAINER_GAP`, Anthropic and OpenAI, in different words). | `prose _anthropic.py "_log.warning(CONTAINER_GAP)"` | Slice 2 |
-| T9 | The same, OpenAI's spelling. | `prose _openai.py "_state_gap("container""` | Slice 2 |
+| T7 | A server-side tool that failed inside a 200 is recorded only as prose. | `prose _anthropic.py "server tool failed inside the turn" until tool.executor` | Slice 2 |
+| T8 | Unpriced code-container time is recorded only as prose (`CONTAINER_GAP`, Anthropic and OpenAI, in different words). | `prose _anthropic.py "_log.warning(CONTAINER_GAP)" until cost unpriced` | Slice 2 |
+| T9 | The same, OpenAI's spelling. | `prose _openai.py "_state_gap("container"" until cost unpriced` | Slice 2 |
 | F1 | OpenAI and OpenRouter hand the harness a cache-write count (`prompt_tokens_details.cache_write_tokens`, `input_tokens_details.cache_write_tokens`); only Anthropic logs `cache_write_tokens`, and only through the purpose-specific `extra` slot. | `test` | Slice 3 |
 | F2 | The `capture_llm_call` path drops `extra`, so a helper call on Anthropic loses `cache_write_tokens` that the same adapter writes on a main call: the same provider emits different fields by purpose. | `test` | Slice 3 |
 | F3 | No adapter puts `tokens_reasoning` on a `purpose=main` line, though OpenAI, OpenRouter, xAI and Google all report it. | `test` | Slice 3 |
@@ -656,26 +696,35 @@ The slices are the issues that remove each row: **slice 2 — tools** ([#758](ht
 | F5 | xAI reports reasoning tokens apart from `completion_tokens` (its documented example: 32 + 9 + 94 = 135), so on both xAI cells `tokens_out` excludes the reasoning it bills and `tokens_total` ≠ `tokens_in` + `tokens_out`. | `test` | Slice 3 |
 | F6 | Google's `tokens_in` excludes the prompt tokens a built-in tool added (`toolUsePromptTokenCount`), and its `tokens_total` is Vertex's own total rather than `tokens_in` + `tokens_out`. | `test` | Slice 3 |
 | F7 | Google writes its Vertex location in `endpoint=`, which means the serving upstream everywhere else. | `test` | Slice 3 |
-| F8 | No adapter writes `residency`: Anthropic reads `inference_geo` for pricing and never logs it. | `test` | Slice 3 |
+| F8 | No adapter writes `residency`: Anthropic reads `inference_geo` for pricing and never logs it, and Google's location is in `endpoint=`. | `test` | Slice 3 |
 | F9 | Anthropic prices a call on any `AI_BASE_URL`; OpenAI refuses to price a host that is not its own and says so once. A computed cost is stated only for the host whose rates the table transcribes. | `test` | Slice 3 |
 | F10 | An HTTP 504 is `server_error` on OpenAI and OpenRouter and `timeout` on Anthropic and Google. | `test` | Slice 3 |
-| F11 | A content refusal is recorded only as prose. | `prose _anthropic.py "Anthropic refused the turn for"` | Slice 3 |
-| F12 | Token-cost gaps are recorded only as prose, each vendor in its own words. | `prose _anthropic.py "No published rate for Anthropic model"` | Slice 3 |
-| F13 | The same, OpenAI's spelling. | `prose _openai.py "No published rate for OpenAI model"` | Slice 3 |
-| F14 | The same, OpenAI's unpriced-host gap. | `prose _openai.py "not %s: OpenAI bills its data-residency"` | Slice 3 |
-| F15 | The same, Google's unpriced grounding fee. | `prose _google.py "Google Search grounding on %r is not priced"` | Slice 3 |
-| F16 | `source=` means the context ceiling's provenance on two context heads, beside its fleet-wide meaning (the probe stamp the NOC's `source` label extracts off every line). | `field context limit.source` | Slice 3 |
-| F17 | The same, on `context compact`. | `field context compact.source` | Slice 3 |
-| F18 | `source=` is the session's channel key on `context attribution`. | `field context attribution.source` | Slice 3 |
-| F19 | `held=` is a file count on `palace scrub`, beside its meaning of a duration on `Wake breaker RESET`. | `field palace scrub.held` | Slice 3 |
-| F20 | `reason=` is a sentence on `turn truncated`, not a slug. | `reason-prose turn truncated` | Slice 3 |
-| F21 | The same, on `wake truncated_turn`. | `reason-prose wake truncated_turn` | Slice 3 |
-| F22 | The same, on `resuming`. | `reason-prose resuming` | Slice 3 |
-| F23 | The same, on `view image withheld from a model with no vision`. | `reason-prose view image withheld from a model with no vision` | Slice 3 |
-| F24 | The same, on `image degraded to text`. | `reason-prose image degraded to text` | Slice 3 |
-| F25 | `reason=` is an exception's text on `degraded`. | `reason-prose degraded` | Slice 3 |
-| F26 | `reason=` is a sentence handed in by the caller on `dropped` and `re-driving`. | `prose _wake.py "the wake died inside the model call"` | Slice 3 |
-| F27 | The same, on `wake stalled`. | `prose _wake.py "stalled after {resumes} failed resume(s)"` | Slice 3 |
+| F11 | A content refusal is recorded only as prose. | `prose _anthropic.py "Anthropic refused the turn for" until llm refused` | Slice 3 |
+| F12 | Token-cost gaps are recorded only as prose, each vendor in its own words: Anthropic's unknown model. | `prose _anthropic.py "No published rate for Anthropic model" until cost unpriced` | Slice 3 |
+| F13 | The same: OpenAI's unknown model. | `prose _openai.py "No published rate for OpenAI model" until cost unpriced` | Slice 3 |
+| F14 | The same: OpenAI's unpriced host. | `prose _openai.py "not %s: OpenAI bills its data-residency" until cost unpriced` | Slice 3 |
+| F15 | The same: OpenAI's unpriced tier or long context. | `prose _openai.py "OpenAI call on %r not priced" until cost unpriced` | Slice 3 |
+| F16 | The same: Google's unknown model. | `prose _google.py "No published rate for Vertex model" until cost unpriced` | Slice 3 |
+| F17 | The same: Google's unpriced grounding fee. | `prose _google.py "Google Search grounding on %r is not priced" until cost unpriced` | Slice 3 |
+| F18 | `source=` means the context ceiling's provenance on `context limit`, beside its fleet-wide meaning (the probe stamp the NOC's `source` label extracts off every line). | `field context limit.source` | Slice 3 |
+| F19 | The same, on `context compact`. | `field context compact.source` | Slice 3 |
+| F20 | The same, on the `context budget … (source=…)` prose warning, which the NOC's `source` label reads like any other line. | `prose _context.py "(source=%s)"` | Slice 3 |
+| F21 | `source=` is the session's channel key on `context attribution`. | `field context attribution.source` | Slice 3 |
+| F22 | `held=` is a file count on `palace scrub`, beside its meaning of a duration on `Wake breaker RESET`. | `field palace scrub.held` | Slice 3 |
+| F23 | `surface=` is the SDK surface on the generic-profile line, beside its meaning of a memory recall's surface (`turn0`, `tool`). | `field provider.surface` | Slice 3 |
+| F24 | `reason=` is a sentence, not a slug, on `turn truncated`. | `reason-prose turn truncated` | Slice 3 |
+| F25 | The same, on `wake truncated_turn`. | `reason-prose wake truncated_turn` | Slice 3 |
+| F26 | The same, on `resuming`. | `reason-prose resuming` | Slice 3 |
+| F27 | The same, on `view image withheld from a model with no vision`. | `reason-prose view image withheld from a model with no vision` | Slice 3 |
+| F28 | The same, on `watch video withheld from the model`. | `reason-prose watch video withheld from the model` | Slice 3 |
+| F29 | The same, on `image degraded to text`. | `reason-prose image degraded to text` | Slice 3 |
+| F30 | The same, handed in by every caller, on `dropped`. | `reason-prose dropped` | Slice 3 |
+| F31 | The same, on `re-driving`. | `reason-prose re-driving` | Slice 3 |
+| F32 | The same, on `wake stalled`. | `reason-prose wake stalled` | Slice 3 |
+| F33 | `reason=` is an exception's text on `degraded`. | `reason-prose degraded` | Slice 3 |
+| F34 | The generic-profile line is a `%`-format string, not built through `kv`. | `unescaped provider` | Slice 3 |
+| F35 | The same, on `direct_message sent` (whose `title=` is a Python `repr`). | `unescaped direct_message sent` | Slice 3 |
+| F36 | The same, on `direct_message failed`, whose `reason=` is the exception's text, unscrubbed and unbounded. | `unescaped direct_message failed` | Slice 3 |
 
 ### Outside This Repository
 
