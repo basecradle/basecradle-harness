@@ -25,7 +25,7 @@ INFO llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2
 - **Fields**: `key=value` pairs, separated by single spaces. A value is a bare token, or a double-quoted string when it holds a space, an `=` or a quote (`kv` quotes it, flattens it to one line, scrubs credential shapes, and bounds it at 240 characters — except the unspoken `text`, which is never bounded).
 - **Absence is honest.** A field with nothing to say is omitted — never written empty, never written as a placeholder, and never as a zero the vendor did not state. `0` is kept where it is a fact ("posted nothing").
 - **Consumers key on field names, never on positions** — with two anchors that are positional: the head itself (`llm provider=` is the fleet's anchor for every model call), and `billing`, which is always last on an `llm` line.
-- **Units are fixed.** `duration` and every other time is seconds with a trailing `s` (`3.41s`); `cost` is plain fixed-point US dollars (`0.0445`, never scientific notation, never negative); `chars` counts characters the model or a reader sees, never bytes; every `tokens_*` field is a count of tokens as the vendor billed them.
+- **Units are fixed.** `duration` and every other length of time is seconds with a trailing `s` (`3.41s`); a moment in time is ISO 8601 in UTC with a trailing `Z` (`2026-11-01T03:12:40Z`); `cost` is plain fixed-point US dollars (`0.0445`, never scientific notation, never negative); `chars` counts characters the model or a reader sees, never bytes; every `tokens_*` field is a count of tokens as the vendor billed them.
 
 A line that is not of this shape is a **prose line** — see [Prose Lines](#prose-lines). Prose carries no fields.
 
@@ -53,7 +53,9 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 | `handle` | The platform handle of the item's author. |
 | `duration` | Wall time of the unit the head names, in seconds. |
 | `chars` | A character count of the text the head names. |
-| `count` | How many of the head's subject this line accounts for. |
+| `count` | How many of the head's subject this line accounts for — in `unit`, where the line carries one. |
+| `unit` | The unit the line's quantities are counted in. |
+| `executor` | Who ran the work the line names: `harness`, `mcp`, or `server` (the vendor, inside a model call). |
 | `cost` | US dollars charged for the unit, as the vendor stated it or as the harness computed it from the vendor's published rates. |
 | `cost_basis` | `computed` when `cost` is the harness's arithmetic over published rates; absent when the vendor stated the figure. Never present without `cost`. |
 | `generation_id` | The vendor's own id for the **model call** (OpenRouter `gen-…`, OpenAI `chatcmpl-…`/`resp_…`, Anthropic `msg_…`, xAI and Google response ids). On a tool line, the id of the model call the tool ran inside. |
@@ -197,7 +199,7 @@ The describer answering again from its once-per-wake memo instead of calling a m
 | `name` | The tool's name as the agent knows it (`messages`, `generate_image`, `web_search`, `web_fetch`, `code_execution`, an MCP tool's name). A server-side tool carries the harness name of the capability, not the vendor's internal block type. | The engine; an adapter for a server-side tool. | Never. |
 | `executor` | Who ran it: `harness`, `mcp`, or `server` (the vendor, inside a model call). | The engine; the adapter. | Never. |
 | `provider` | The vendor that ran or billed the tool's work — the brain's vendor for a server-side tool; the media or search vendor a harness tool called. | Whoever knows the vendor. | The tool reaches no billed vendor (platform tools, memory). |
-| `kind` | The shape of the work, for metered media and search: `image.generate`, `image.edit`, `video.generate`, `audio.transcribe`, `search.web`, `search.grounding`. | The tool or adapter. | Unmetered work. |
+| `kind` | The shape of the work, for metered media and search: `image.generate`, `image.edit`, `video.generate`, `audio.transcribe`, `search.web`, `search.grounding`. One dotted vocabulary with `charge`'s `kind`. | The tool or adapter. | Unmetered work. |
 | `model` | The vendor model the tool's work ran on. | The tool or adapter. | The tool used no model. |
 | `count` | Billed or executed units on this line: searches, grounding queries, fetches, executions. A server-side tool writes one line per model call per tool, with its uses counted here — every use, a failed one included, so it can exceed the units a fee was charged on. | The tool or adapter. | A harness run whose work stated no units (one image, one transcription). Always present on `executor=server`. |
 | `duration` | Wall time of the run — for a media tool, the generation and the upload that follows it. | The engine. | `executor=server` — the work ran inside a model call its `llm` line already timed. |
@@ -218,6 +220,51 @@ One WARNING, once per wake per gap, naming a charge that is real and that the ha
 | `model` | Common. | The adapter or tool. | The charge is not per-model. |
 | `charge` | What carries no price: `tokens`, `container_time`, `grounding`, `search`. | The adapter or tool. | Never. |
 | `reason` | `unknown_model`, `unpriced_tier`, `unpriced_host`, `not_reported`. | The adapter or tool. | Never. |
+
+A `container_time` gap is the charge the next head would carry: the day a vendor states its container time, that charge is written as a priced `charge kind=compute.container` line and leaves this one.
+
+### `charge`
+
+**One line per billed resource instance**: a dollar a vendor bills by a quantity of a resource — browser session minutes, container hours, a 15-minute GPU block, bytes, storage — rather than per call (@origin, 2026-11-01, on basecradle-noc#1153). It is neither a tool *use* nor a model call, so it has a head of its own, and every resource-billed product fits it without a new one.
+
+```text
+charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit=<billing unit> count=<quantity in that unit> [duration=<s>] [started=<iso>] [resource=<vendor resource id>] [generation_id=<model call it belongs to>] outcome=ok|error [reason=<slug>] cost=<usd> [cost_basis=computed] [vendor_usage=<vendor's own raw figure> vendor_unit=<its unit>]
+```
+
+- **Which head.** If the dollar can be attributed to one request from that request's own response, it is not a charge: tokens are on the `llm` line, a per-search fee on the `tool` line. If it is billed by a quantity of a resource across zero or more requests, it is a `charge`.
+- **When it is written.** Once the vendor's figures are final. A late line is fine (the Steel launcher waits for its usage to land); two lines for one instance never are. An estimate written ahead of the final figure would be a contract change (`cost_basis=estimated` with a `supersedes=`), not built.
+- **A charge nobody can price writes no `charge` line**: its gap is a `cost unpriced` line, as container time is today.
+- **The dashboards are the registry's, not this page's.** Every charge today is tool-adjacent, so *Tool Cost* reads the dollars on `tool` and `charge` lines while *Tool Calls* reads `tool` lines only; a future `kind` family that is not tool-adjacent (`seat.*`) is a registry bucket change, never a contract change. *Spend by Provider* already sums every `cost=` on any head.
+
+| Field | Meaning | Filled By | Absent When |
+|---|---|---|---|
+| `provider` | The vendor that bills the resource. | The producer. | Never. |
+| `kind` | What was bought, in the dotted vocabulary the `tool` line's `kind` uses, so one query reads a family's spend whether a vendor bills it per use or per resource: `browser.session`, `compute.container`, `compute.gpu`, `storage.cache`, and any `tool` kind (`image.generate`, …). A new value is a change to this page. | The producer. | Never. |
+| `executor` | Common: who ran the thing that incurred the charge. | The producer. | Never. |
+| `unit` | Common: the billing unit `count` is in — `minute`, `hour`, `block_15m`, `gb`, `gb_month`, `seat_month`. An open set, listed here as it grows. | The producer. | Never. |
+| `count` | Common: the billed quantity, in `unit`, rounded the way the vendor rounds it. | The producer. | Never. |
+| `duration` | Common: how long the resource instance ran. | The producer. | The resource has no run time (bytes, storage). |
+| `started` | The moment the resource instance started. | The producer. | The vendor states no start. |
+| `resource` | The vendor's own id for the billed resource instance (a Steel session id, a container id). | The producer. | The vendor names no instance. |
+| `generation_id` | Common: the one model call the charge belongs to (container time inside a call). | The adapter. | The charge belongs to no single model call. |
+| `outcome` | `ok` or `error`: whether the resource instance's run ended cleanly. A charge is written either way, because the vendor bills either way. | The producer. | Never. |
+| `reason` | Why the run ended in error, as a slug. The vocabulary is listed here as producers adopt it; none emits one yet. | The producer. | `outcome=ok`. |
+| `cost` | Common: US dollars billed for the instance. | The producer. | Never (see above: an unpriceable charge writes `cost unpriced`, not `charge`). |
+| `cost_basis` | Common. | `cost_basis()`, or the producer by the same rule. | As Common. |
+| `vendor_usage` | The vendor's own raw figure for the instance, verbatim, when it reports one in a unit this page cannot yet price (Steel's `creditsUsed`) — kept for calibrating a computed `cost`. Generic, never a vendor-named field. | The producer. | The vendor reports no such figure. |
+| `vendor_unit` | The unit `vendor_usage` is in (`credits`). | The producer. | `vendor_usage` is absent; never present without it. |
+
+The first producer is the NOC's Steel browser launcher (see [Outside This Repository](#outside-this-repository)); nothing in this repository writes a `charge` line yet. Its per-session spend line:
+
+```text
+INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=7 duration=402.18s started=2026-11-01T03:12:40Z resource=01a19518-4c40-7c41-9f3e-5d8c1a2b4e60 outcome=ok cost=0.07 cost_basis=computed vendor_usage=14 vendor_unit=credits
+```
+
+And the container time Anthropic and OpenAI do not report today (`cost unpriced charge=container_time reason=not_reported`), the day either vendor states it:
+
+```text
+INFO charge provider=anthropic kind=compute.container executor=server unit=hour count=0.15 duration=540.00s resource=container_01Kq3vYk8NfT2mWc7RbJpLsX generation_id=msg_01Hn4wQz9PcR5tVb2LmXyKdE outcome=ok cost=0.0075 cost_basis=computed
+```
 
 ### `direct_message sent`
 
@@ -673,7 +720,7 @@ Where today's emission departs from the target above. The conformance test reads
 
 - `head <head>: <fields>` — a head outside the contract, allowed with exactly those fields.
 - `field <head>.<field>` — a field outside the contract on that head; with `@<adapter>` it is allowed only from that adapter (`_<adapter>.py`, and that adapter's rendered lines).
-- `prose <file> "<text>"` — a fact still recorded only as prose: the text at that site, quoted exactly as the source spells it; with `until <head>` (or `until <head>.<field>`) the row is also over once its structured replacement is emitted, whether or not a sentence restating it stays. With `until <head>.<field>=<value>` the replacement is a line carrying that value, which only a rendered line can show — so one head may replace several gaps (`cost unpriced`, by `charge`), each row over only when its own charge is emitted.
+- `prose <file> "<text>"` — a fact still recorded only as prose: the text at that site, quoted exactly as the source spells it; with `until <head>` (or `until <head>.<field>`) the row is also over once its structured replacement is emitted, whether or not a sentence restating it stays. With `until <head>.<field>=<value>` the replacement is a line carrying that value, which only a rendered line can show — so one head may replace several gaps (`cost unpriced`, by its `charge` field), each row over only when its own charge is emitted.
 - `reason-prose <head>` — a `reason=` on that head that the scan reads as a sentence, an f-string or an exception's text, following a variable to its assignments and a parameter to the calls that fill it.
 - `unescaped <head>` — a structured line spelled as a `%`-format string rather than built through `kv`, so its values are never flattened, scrubbed, bounded or quoted.
 - `test` — a behavioral check the test runs by this row's ID.
@@ -687,7 +734,7 @@ The slices are the issues that remove each row: **slice 2 — tools** ([#758](ht
 
 ### Outside This Repository
 
-The NOC's Steel browser launcher writes its own `browser provider=` head, which the target retires into the `tool` line with `executor=mcp`. It is not emitted here, so it is not witnessed here; slice 2 carries it to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
+The NOC's Steel browser launcher writes its own `browser provider=` head. Its per-session spend line retires into the [`charge`](#charge) line (@origin, 2026-11-01: a session is billed by the minute, not per tool use, so it is not a `tool` line); its lifecycle lines stay on a NOC-only head that no column reads. It is not emitted here, so it is not witnessed here; the launcher's move is basecradle-noc#1153's. Slice 2 carried the rest to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
 
 ## Changing the Contract
 
