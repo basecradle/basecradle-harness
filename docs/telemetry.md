@@ -218,10 +218,10 @@ One WARNING, once per wake per gap, naming a charge that is real and that the ha
 |---|---|---|---|
 | `provider` | Common. | The adapter or tool. | Never. |
 | `model` | Common. | The adapter or tool. | The charge is not per-model. |
-| `charge` | What carries no price: `tokens`, `container_time`, `grounding`, `search`. | The adapter or tool. | Never. |
-| `reason` | `unknown_model`, `unpriced_tier`, `unpriced_host`, `not_reported`. | The adapter or tool. | Never. |
+| `charge` | What carries no price: `tokens`, `container_time`, `browser_time`, `grounding`, `search`. | The adapter, tool or producer. | Never. |
+| `reason` | `unknown_model`, `unpriced_tier`, `unpriced_host`, `not_reported`. | The adapter, tool or producer. | Never. |
 
-A `container_time` gap is the charge the next head would carry: the day a vendor states its container time, that charge is written as a priced `charge kind=compute.container` line and leaves this one.
+A `container_time` or `browser_time` gap is the charge the next head would carry: the day a vendor states its container time, or a browser vendor's session minutes get a rate card, that charge is written as a priced `charge kind=compute.container` or `charge kind=browser.session` line and leaves this one. **The rule for the next value:** a gap in a charge billed per call or per use is named for what is billed (`tokens`, `grounding`, `search`); a gap in a charge billed by a quantity of a resource is `<resource>_time` (or `_bytes`, `_storage` for a resource with no run time), and its row here names the [`charge`](#charge) `kind` that retires it. Either way it is generic in spelling, never a vendor's name or word, and a new value is a change to this page.
 
 ### `charge`
 
@@ -248,7 +248,7 @@ charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit
 | `resource` | The vendor's own id for the billed resource instance (a Steel session id, a container id). | The producer. | The vendor names no instance. |
 | `generation_id` | Common: the one model call the charge belongs to (container time inside a call). | The adapter. | The charge belongs to no single model call. |
 | `outcome` | `ok` or `error`: whether the resource instance's run ended cleanly. A charge is written either way, because the vendor bills either way. | The producer. | Never. |
-| `reason` | Why the run ended in error, as a slug. The vocabulary is listed here as producers adopt it; none emits one yet. | The producer. | `outcome=ok`. |
+| `reason` | Why the run ended in error, as a slug: `crashed` (the instance died while running), `startup_failed` (it never became usable), `timeout` (a deadline ran out — the vendor's or the producer's — as on `llm`). Generic in spelling, so every vendor's failures map onto the same words: Steel's `browser_crashed` → `crashed`, `startup_failed` → `startup_failed`, `creation_timeout` → `timeout`. A vendor's word that fits none is a change to this page, never written verbatim. | The producer. | `outcome=ok`. |
 | `cost` | Common: US dollars billed for the instance. | The producer. | Never (see above: an unpriceable charge writes `cost unpriced`, not `charge`). |
 | `cost_basis` | Common. | `cost_basis()`, or the producer by the same rule. | As Common. |
 | `vendor_usage` | The vendor's own raw figure for the instance, verbatim, when it reports one in a unit this page cannot yet price (Steel's `creditsUsed`) — kept for calibrating a computed `cost`. Generic, never a vendor-named field. | The producer. | The vendor reports no such figure. |
@@ -258,6 +258,18 @@ The first producer is the NOC's Steel browser launcher (see [Outside This Reposi
 
 ```text
 INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=7 duration=402.18s started=2026-11-01T03:12:40Z resource=01a19518-4c40-7c41-9f3e-5d8c1a2b4e60 outcome=ok cost=0.07 cost_basis=computed vendor_usage=14 vendor_unit=credits
+```
+
+A session Steel released as `browser_crashed`, billed for the minutes it ran:
+
+```text
+INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=2 duration=71.40s started=2026-11-01T03:20:05Z resource=01a19518-5b12-7d03-8e6a-2c4f9b7d1e83 outcome=error reason=crashed cost=0.02 cost_basis=computed vendor_usage=4 vendor_unit=credits
+```
+
+A session on a Steel plan whose per-minute rate the launcher's table lacks writes no `charge` line, and one `cost unpriced` gap instead:
+
+```text
+WARNING cost unpriced provider=steel charge=browser_time reason=unpriced_tier
 ```
 
 And the container time Anthropic and OpenAI do not report today (`cost unpriced charge=container_time reason=not_reported`), the day either vendor states it:

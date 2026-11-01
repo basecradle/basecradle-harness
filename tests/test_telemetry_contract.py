@@ -1277,9 +1277,19 @@ _SECONDS = re.compile(r"\d+\.\d+s")
 _DOLLARS = re.compile(r"\d+(?:\.\d+)?")
 
 
-def _charge_section() -> str:
-    section = DOC.read_text(encoding="utf-8").split("\n### `charge`\n", 1)[1]
+def _section(head: str) -> str:
+    section = DOC.read_text(encoding="utf-8").split(f"\n### `{head}`\n", 1)[1]
     return section.split("\n### ", 1)[0].split("\n## ", 1)[0]
+
+
+def _charge_section() -> str:
+    return _section("charge")
+
+
+def _row(head: str, field: str) -> str:
+    """The table row for one field of one head, whole."""
+    (row,) = [line for line in _section(head).splitlines() if line.startswith(f"| `{field}` |")]
+    return row
 
 
 def _charge_blocks() -> list[str]:
@@ -1335,7 +1345,8 @@ def test_the_charge_grammar_block_is_the_table(contract):
 
 def test_every_charge_example_on_the_page_is_a_conforming_line(contract):
     examples = _charge_examples()
-    assert [line.head for line in examples] == ["charge", "charge"]  # Steel, then container time
+    # Steel's clean session, Steel's crashed one, then container time.
+    assert [line.head for line in examples] == ["charge", "charge", "charge"]
     for line in examples:
         fields = line.fields
         assert not _stray(contract, line), line.message
@@ -1348,6 +1359,55 @@ def test_every_charge_example_on_the_page_is_a_conforming_line(contract):
         assert _DOLLARS.fullmatch(fields["cost"]), line.message
         assert "duration" not in fields or _SECONDS.fullmatch(fields["duration"]), line.message
         assert "started" not in fields or _ISO_UTC.fullmatch(fields["started"]), line.message
+
+
+#: The `charge` line's `reason` vocabulary (issue #768): generic words every vendor's failures map
+#: onto, posted for the NOC's Steel launcher (basecradle-noc#1153). A slug added to or struck from
+#: the page's row fails unless this set changes with it.
+CHARGE_REASONS = frozenset({"crashed", "startup_failed", "timeout"})
+#: What a `cost unpriced` line may name as carrying no price (`browser_time`: issue #768).
+UNPRICED_CHARGES = frozenset({"tokens", "container_time", "browser_time", "grounding", "search"})
+UNPRICED_REASONS = frozenset({"unknown_model", "unpriced_tier", "unpriced_host", "not_reported"})
+
+
+def _vocabulary(head: str, field: str, after: str, before: str) -> set[str]:
+    """The slugs a row lists between two phrases of its Meaning cell."""
+    listed = _row(head, field).split(after, 1)[1].split(before, 1)[0]
+    return set(re.findall(r"`([a-z_]+)`", listed))
+
+
+def test_the_charge_reason_vocabulary_is_the_page(contract):
+    # A slug of the vocabulary is defined, not merely named: `<slug>` (its meaning).
+    assert set(re.findall(r"`([a-z_]+)` \(", _row("charge", "reason"))) == CHARGE_REASONS
+    for line in _charge_examples():
+        assert line.fields.get("reason", "crashed") in CHARGE_REASONS, line.message
+
+
+def test_the_cost_unpriced_vocabulary_is_the_page_and_every_gap_speaks_it(contract, rendered):
+    assert _vocabulary("cost unpriced", "charge", "no price:", " |") == UNPRICED_CHARGES
+    assert _vocabulary("cost unpriced", "reason", "| `reason` |", " |") == UNPRICED_REASONS
+    gaps = [
+        line for lines in rendered.lines.values() for line in lines if line.head == "cost unpriced"
+    ]
+    assert gaps  # the scenarios render gaps, so this check reads real lines
+    for line in gaps:
+        assert line.fields["charge"] in UNPRICED_CHARGES, line.message
+        assert line.fields["reason"] in UNPRICED_REASONS, line.message
+    # The browser gap the page shows under `charge` is a conforming `cost unpriced` line.
+    (record,) = [
+        record.removeprefix("WARNING ")
+        for block in _charge_blocks()
+        for record in block.splitlines()
+        if record.startswith("WARNING ")
+    ]
+    gap = parse_line(record)
+    assert gap is not None and gap.head == "cost unpriced", record
+    assert not _stray(contract, gap), record
+    assert gap.fields == {
+        "provider": "steel",
+        "charge": "browser_time",
+        "reason": "unpriced_tier",
+    }
 
 
 def test_a_charge_field_outside_the_contract_is_refused(contract):
