@@ -316,14 +316,16 @@ def test_a_real_send_reports_the_payload_it_assembled(tmp_path, caplog):
     )
 
 
-def test_the_line_names_its_unit_and_its_source(tmp_path, caplog):
+def test_the_line_names_its_unit_and_its_session(tmp_path, caplog):
     """A number with no unit is not a measurement — and one with no subject is not one either."""
     session = build(tmp_path, text("done"))
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         session.send("hello")
     line = lines(caplog)[0]
     assert line["unit"] == "chars"
-    assert line["source"] == "timeline:0198e3f1-0000-7000-8000-000000000001"
+    assert line["session"] == "timeline:0198e3f1-0000-7000-8000-000000000001"
+    # Never `source=`: that name is the fleet's probe stamp, extracted off every line (#759).
+    assert "source" not in line
 
 
 def test_one_line_per_assembled_turn(tmp_path, caplog):

@@ -437,6 +437,11 @@ def grounding_cost(model: str, *, queries: int | None, sourced: bool) -> Compute
     return ComputedCost(queries * scheme.per_query)
 
 
+def grounding_known(model: str) -> bool:
+    """Whether the table carries a grounding scheme for `model` (a snapshot priced as its alias)."""
+    return _model_key(model) in GROUNDING
+
+
 def grounding_units(model: str, queries: int | None) -> int | None:
     """How many units a grounded call is billed for: its queries, or one prompt on a per-prompt model."""
     scheme = GROUNDING.get(_model_key(model))

@@ -7,6 +7,58 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.168.0] - 2026-10-31
+
+### Changed: every field one meaning on every vendor (issue #759)
+
+Slice 3 of the telemetry contract (`docs/telemetry.md`): Known Violations F1–F36 are struck, and the
+table now lists no departure. **Several of these change values the NOC extracts** — the token
+metrics on xAI and Google, `cache_write_tokens` (newly filled on OpenAI and OpenRouter), the
+`endpoint` label on Google, and the `source` label, which the context lines stop feeding — so the
+capital orders this release behind the matching NOC change.
+
+- **One shared token reader, on every purpose.** `cache_write_tokens` and `tokens_reasoning` are
+  first-class fields of `_observability.token_counts` (both rendered after `cached_tokens`, on the
+  brain's `purpose=main` lines too), so a helper call carries exactly the fields its adapter's main
+  call does: Anthropic's describer line no longer loses its cache write, and Anthropic's
+  `output_tokens_details.thinking_tokens` is read. `log_llm_call` no longer takes a
+  `tokens_reasoning=` argument; the usage carries it.
+- **`tokens_total` is exactly `tokens_in` + `tokens_out`**, never the vendor's own total.
+  **xAI's and Google's counts rise on the dashboards:** xAI reports its reasoning beside the
+  completion, on both surfaces (32 + 9 + 94 = 135 in its own example), so both xAI cells now fold it
+  into `tokens_out` (`_observability.reasoning_apart`); Google's `tokens_in` now counts the prompt a
+  built-in tool added (`tool_use_prompt_token_count`).
+- **`endpoint=` is the serving upstream only; `residency=` is where the vendor ran the call**:
+  Google's Vertex location moves from `endpoint=` to `residency=`, and Anthropic logs
+  `inference_geo` there (else the geography the request pinned).
+- **Anthropic prices only its own host.** A call through any other `AI_BASE_URL` carries no `cost=`
+  and states the gap once, as OpenAI does.
+- **An HTTP 504 is `timeout` on every vendor.** On OpenAI and OpenRouter it now takes the timeout
+  path — one retry with twice the fitted budget — instead of up to three `server_error` re-sends
+  into the same deadline. A deadline that was the vendor's own (`ProviderTimeoutError.vendor_deadline`)
+  is never named as the harness's: its retry line carries `timeout_scale=` and no `timeout=` /
+  `next_timeout=`. OpenRouter's own account of the failure (`provider_code=`, …) still rides it.
+- **Two shared heads replace each vendor's prose.** `llm refused` (Anthropic's refusal, with
+  `category=`; its explanation stays as a prose line for a human) and `cost unpriced
+  charge=tokens|grounding reason=unknown_model|unpriced_tier|unpriced_host|not_reported` for every
+  token-cost and grounding gap on Anthropic, OpenAI and Google, once per wake per gap.
+- **One meaning per field name.** The context ceiling's provenance is `limit_source=` on `context
+  limit` and `context compact` (and the budget warning's prose no longer says `source=`);
+  `context attribution`'s session key is `session=` (the `log_context_attribution` and `attribute`
+  parameter is renamed to match); `palace scrub`'s file count is `held_files=`; the generic-profile
+  line's surface is `sdk_surface=`.
+- **`reason=` is a slug** on the ten heads that carried a sentence, with the sentence moved to
+  `detail=` where one is worth keeping: `turn truncated` and `wake truncated_turn`
+  (`output_budget`), `resuming` (`died_mid_tool_chain`), the two vision-withheld lines
+  (`no_image_input`, `undecodable_video`) and `image degraded to text` (`no_vision_input`),
+  `dropped` (`compacted_away`, `context_length`, `payload_too_large`), `re-driving`
+  (`died_before_model`, `died_in_model_call`), `wake stalled` (`resume_ceiling`, `batch_mate`) and
+  `degraded` (`reserve_failed`, `reserve_empty`, carried on `EngineError.reason`). The claim store's
+  own abandon reason keeps its sentence.
+- **Every structured line is built through `kv`**: the generic-profile line and both
+  `direct_message` lines, whose `reason=` is now a slug (`transport`, `server_error`, `refused`)
+  with the scrubbed text in `error=`.
+
 ## [0.167.0] - 2026-10-31
 
 ### Changed: one `tool` line whoever executed the tool (issue #758)

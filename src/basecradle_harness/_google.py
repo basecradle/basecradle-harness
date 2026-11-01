@@ -134,6 +134,7 @@ from basecradle_harness._google_rates import (
     call_cost,
     from_usage_metadata,
     grounding_cost,
+    grounding_known,
     grounding_units,
     known,
 )
@@ -146,10 +147,15 @@ from basecradle_harness._messages import (
     VideoContent,
 )
 from basecradle_harness._observability import (
+    GROUNDING_CHARGE,
     HELPER,
+    NOT_REPORTED,
+    TOKENS_CHARGE,
+    UNKNOWN_MODEL,
     finish_reason,
     generation_id,
     generation_of,
+    log_cost_unpriced,
     log_llm_call,
     log_server_tools,
     meter_failure,
@@ -571,7 +577,7 @@ class GoogleProvider:
         self._signed_calls: dict[int, tuple[ToolCall, bytes]] = {}
         #: The models already warned about for having no rate in the table, so the warning is once
         #: per model per wake rather than once per call.
-        self._unpriced: set[str] = set()
+        self._unpriced: set[tuple[str, str]] = set()
         #: The built-ins' wire entries, built once; sent ahead of the function declarations.
         self._builtins = [
             self._types.Tool(**{BUILTINS[name]: _builtin_config(self._types, name)})
@@ -736,9 +742,9 @@ class GoogleProvider:
             model=self.model,
             seconds=time.monotonic() - started,
             usage=usage,
-            # A direct-to-vendor SDK has no upstream to name, so the field carries where the call
-            # ran: the residency fact an operator chose this provider for.
-            endpoint=self.location,
+            # A direct-to-vendor SDK has no upstream to name, so there is no `endpoint=`; where the
+            # call ran — the residency fact an operator chose this provider for — is `residency=`.
+            residency=self.location,
             cost=self._cost(meta),
             finish_reason=self.last_finish_reason,
             generation_id=response_id,
@@ -803,7 +809,7 @@ class GoogleProvider:
             provider=self.provider,
             purpose=HELPER,
             kind=SEARCH_KIND,
-            endpoint=self.location,
+            residency=self.location,
             model=self.model,
             seconds=seconds,
             usage=_wire_usage(meta),
@@ -817,10 +823,11 @@ class GoogleProvider:
         if sources:
             fee = grounding_cost(self.model, queries=queries, sourced=True)
             if fee is None:
-                _log.warning(
-                    "Google Search grounding on %r is not priced (no published scheme for the "
-                    "model, or no grounding queries listed to count); its fee carries no cost=.",
-                    self.model,
+                # No published scheme for the model, or a per-query scheme whose queries the
+                # response did not list to count.
+                self._state_gap(
+                    GROUNDING_CHARGE,
+                    UNKNOWN_MODEL if not grounding_known(self.model) else NOT_REPORTED,
                 )
             meter_tool(
                 provider=self.provider,
@@ -850,14 +857,8 @@ class GoogleProvider:
 
     def _cost(self, meta: Any, *, grounded: bool = False) -> float | None:
         """This call's dollars at Google's published rates — computed, never vendor-stated (#655)."""
-        if not known(self.model) and self.model not in self._unpriced:
-            self._unpriced.add(self.model)
-            _log.warning(
-                "No published rate for Vertex model %r in the harness's table, so its calls carry "
-                "no cost= on the llm line. Add the model's row to _google_rates.RATES from Google's "
-                "pricing page.",
-                self.model,
-            )
+        if not known(self.model):
+            self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL)
         return call_cost(
             self.model,
             self.location or "",
@@ -865,6 +866,13 @@ class GoogleProvider:
             service_tier=self._default_params.get("service_tier"),
             grounded=grounded,
         )
+
+    def _state_gap(self, charge: str, reason: str) -> None:
+        """One ``cost unpriced`` WARNING per gap per wake (issue #759)."""
+        if (charge, reason) in self._unpriced:
+            return
+        self._unpriced.add((charge, reason))
+        log_cost_unpriced(provider=self.provider, model=self.model, charge=charge, reason=reason)
 
     # --- harness -> Gemini ----------------------------------------------------
 
@@ -1214,25 +1222,26 @@ def _wire_usage(meta: Any) -> dict[str, Any] | None:
     """Vertex's ``usage_metadata`` in the harness's usage vocabulary (the chat-wire spelling).
 
     One translation, here at the vendor boundary, so the shared readers need no Gemini branch:
-    ``tokens_in`` is the prompt (its cached part included), ``tokens_out`` is the reply **plus** the
+    ``tokens_in`` is every input token billed — the prompt (its cached part included) **plus** the
+    prompt a built-in tool added (``tool_use_prompt_token_count``, a fetched page or a search's
+    results, billed at the input rate; issue #759) — ``tokens_out`` is the reply **plus** the
     thinking, because thinking is billed as output exactly as a reasoning model's is on every other
-    wire, and ``tokens_reasoning`` is the thinking alone.
+    wire, and ``tokens_reasoning`` is the thinking alone. Vertex's own ``total_token_count`` is not
+    carried: the line's total is ``tokens_in`` + ``tokens_out`` by definition.
     """
     if meta is None:
         return None
     prompt = getattr(meta, "prompt_token_count", None)
+    tool_prompt = getattr(meta, "tool_use_prompt_token_count", None)
     reply = getattr(meta, "candidates_token_count", None)
     thoughts = getattr(meta, "thoughts_token_count", None)
-    if prompt is None and reply is None and thoughts is None:
+    if prompt is None and tool_prompt is None and reply is None and thoughts is None:
         return None
     usage: dict[str, Any] = {}
-    if isinstance(prompt, int):
-        usage["prompt_tokens"] = prompt
+    if isinstance(prompt, int) or isinstance(tool_prompt, int):
+        usage["prompt_tokens"] = (prompt or 0) + (tool_prompt or 0)
     if isinstance(reply, int) or isinstance(thoughts, int):
         usage["completion_tokens"] = (reply or 0) + (thoughts or 0)
-    total = getattr(meta, "total_token_count", None)
-    if isinstance(total, int):
-        usage["total_tokens"] = total
     cached = getattr(meta, "cached_content_token_count", None)
     if isinstance(cached, int):
         usage["prompt_tokens_details"] = {"cached_tokens": cached}

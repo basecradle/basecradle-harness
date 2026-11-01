@@ -142,7 +142,8 @@ Faults, by nature
 of a read timeout; 401/403 are the credential; a ``billing_error`` or a credit-balance refusal is
 the billing class; an over-length prompt is the context class; every other 400 propagates. A
 ``stop_reason: "refusal"`` is Anthropic's final word on the content (the 5.x models have no
-server-side fallback on Haiku 5.5): logged with its ``stop_details`` category, never retried.
+server-side fallback on Haiku 5.5): an ``llm refused`` line with its ``stop_details`` category,
+never retried.
 
 Cost — computed, never vendor-stated
 ------------------------------------
@@ -153,8 +154,11 @@ ran writes one ``tool`` line beside the call's ``llm`` line (``executor=server``
 billed searches, ``kind=search.web``), and ``web_fetch`` and ``code_execution``, which cost nothing
 extra, are the journal's evidence that the tool ran. A tool Anthropic reports failed inside the 200
 is that line's ``outcome=error reason=<error_code>``. Container time, which no response states, is one
-``cost unpriced charge=container_time reason=not_reported`` line per wake. ``provider=anthropic``; no
-``endpoint=``, the vendor *is* the endpoint.
+``cost unpriced charge=container_time reason=not_reported`` line per wake. The rates are the price on
+Anthropic's own host only: a call through any other ``AI_BASE_URL`` carries no ``cost=``, stated once
+as ``cost unpriced charge=tokens reason=unpriced_host``, and a model the table lacks once as
+``reason=unknown_model``. ``provider=anthropic``; no ``endpoint=``, the vendor *is* the endpoint; where
+the call ran (``inference_geo``) is ``residency=``.
 
 Stateless per turn: the full conversation is sent every call and the harness owns history. This
 adapter never streams; every call carries the harness's fitted budget as its ``timeout``, which is
@@ -177,6 +181,7 @@ from typing import Any
 from basecradle_harness._anthropic_rates import (
     call_cost,
     known,
+    priced_host,
     server_tool_requests,
     usage_of,
     web_search_cost,
@@ -207,11 +212,15 @@ from basecradle_harness._messages import (
 from basecradle_harness._observability import (
     CONTAINER_TIME,
     NOT_REPORTED,
+    TOKENS_CHARGE,
+    UNKNOWN_MODEL,
+    UNPRICED_HOST,
     ServerToolTally,
     generation_id,
     generation_of,
     log_cost_unpriced,
     log_llm_call,
+    log_llm_refused,
     log_server_tools,
     slug,
     token_counts,
@@ -537,13 +546,16 @@ class AnthropicProvider:
             )
         if response.stop_reason == "refusal":
             details = getattr(response, "stop_details", None)
-            _log.warning(
-                "Anthropic refused the turn for %s (category=%s): %s The refusal is final; the turn "
-                "is not retried.",
-                self.model,
-                getattr(details, "category", None),
-                getattr(details, "explanation", None) or "no explanation given.",
+            log_llm_refused(
+                provider=self.provider,
+                model=self.model,
+                category=getattr(details, "category", None),
+                generation_id=generation_id({"id": getattr(response, "id", None)}),
             )
+            explanation = getattr(details, "explanation", None)
+            if explanation:
+                # Anthropic's own words, for a human reading the journal; the fact is the line above.
+                _log.warning("Anthropic's explanation of the refusal: %s", explanation)
         reply = _reply(blocks)
         self._mark_late_failures(blocks)
         self._replies[id(reply)] = (reply, blocks, digest)
@@ -582,16 +594,15 @@ class AnthropicProvider:
         wire = _wire_usage(usage)
         self.last_tokens_in = token_counts(wire).get("tokens_in")
         self.last_finish_reason = getattr(response, "stop_reason", None) or None
-        written = _count(getattr(usage, "cache_creation_input_tokens", None))
         generation = generation_id({"id": getattr(response, "id", None)})
         log_llm_call(
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
             usage=wire,
+            residency=self._residency(usage),
             cost=self._cost(usage),
             finish_reason=self.last_finish_reason,
-            extra={"cache_write_tokens": written},
             generation_id=generation,
         )
         tallies = _server_tallies(usage, [_raw(block) for block in response.content or ()])
@@ -606,26 +617,44 @@ class AnthropicProvider:
         )
         return response
 
+    def _residency(self, usage: Any) -> str | None:
+        """Where the call ran, as Anthropic reports it (``global`` or ``us``, measured live).
+
+        A geography set through ``extra_body`` or a workspace default is reported too; a response
+        that reports none falls back to what the request asked for, and a request that asked for
+        none to nothing — the ``residency=`` field and the price both read this one answer.
+        """
+        geo = getattr(usage, "inference_geo", None) or self._params.get("inference_geo")
+        return geo if isinstance(geo, str) and geo.strip() else None
+
     def _cost(self, usage: Any) -> float | None:
-        """This call's dollars at Anthropic's published rates — computed, never vendor-stated."""
-        if not known(self.model) and self.model not in self._unpriced:
-            self._unpriced.add(self.model)
-            _log.warning(
-                "No published rate for Anthropic model %r in the harness's table, so its calls "
-                "carry no cost= on the llm line. Add the model's row to _anthropic_rates.RATES from "
-                "Anthropic's pricing page.",
-                self.model,
-            )
+        """This call's dollars at Anthropic's published rates — computed, never vendor-stated.
+
+        Only for Anthropic's own host (issue #759): a proxy or gateway named by ``AI_BASE_URL``
+        charges its own price, so a call there carries no ``cost=`` and the gap is stated once, as
+        the OpenAI adapter states it. An unknown model is stated once the same way.
+        """
+        if not priced_host(self.base_url):
+            self._state_gap(UNPRICED_HOST)
+            return None
+        if not known(self.model):
+            self._state_gap(UNKNOWN_MODEL)
         ttl = (self._cache_control or {}).get("ttl") or DEFAULT_CACHE_TTL
         return call_cost(
             self.model,
             usage_of(usage, written_ttl=ttl),
-            # Where the call actually ran, as Anthropic reports it (``global`` or ``us``, measured
-            # live) — so a geography set through extra_body or a workspace default is priced too.
-            # A response that reports none falls back to what the request asked for.
-            geo=getattr(usage, "inference_geo", None) or self._params.get("inference_geo"),
+            geo=self._residency(usage),
             tier=getattr(usage, "service_tier", None),
             speed=getattr(usage, "speed", None),
+        )
+
+    def _state_gap(self, reason: str) -> None:
+        """One ``cost unpriced charge=tokens`` WARNING per gap per wake."""
+        if reason in self._unpriced:
+            return
+        self._unpriced.add(reason)
+        log_cost_unpriced(
+            provider=self.provider, model=self.model, charge=TOKENS_CHARGE, reason=reason
         )
 
     def _state_code_gap(self, blocks: Sequence[Mapping[str, Any]]) -> None:
@@ -1233,7 +1262,10 @@ def _wire_usage(usage: Any) -> dict[str, Any] | None:
     One translation, at the vendor boundary, so the shared readers need no Anthropic branch:
     ``tokens_in`` is the whole prompt — Anthropic reports it in three disjoint parts, uncached,
     cache-written and cache-read — and ``cached_tokens`` is the read part, the witness that caching
-    is doing anything. ``tokens_out`` includes the thinking, which is billed as output.
+    is doing anything, and ``cache_write_tokens`` the written part, billed at its own rate.
+    ``tokens_out`` includes the thinking, which is billed as output, and ``tokens_reasoning`` is the
+    thinking alone (``output_tokens_details.thinking_tokens``) — on every purpose, since the
+    describer's line reads this same translation (issue #759).
     """
     if usage is None:
         return None
@@ -1244,13 +1276,19 @@ def _wire_usage(usage: Any) -> dict[str, Any] | None:
     written = _count(getattr(usage, "cache_creation_input_tokens", None)) or 0
     read = _count(getattr(usage, "cache_read_input_tokens", None))
     prompt = (uncached or 0) + written + (read or 0)
-    wire: dict[str, Any] = {
-        "prompt_tokens": prompt,
-        "completion_tokens": output or 0,
-        "total_tokens": prompt + (output or 0),
-    }
+    wire: dict[str, Any] = {"prompt_tokens": prompt, "completion_tokens": output or 0}
+    details: dict[str, int] = {}
     if read is not None:
-        wire["prompt_tokens_details"] = {"cached_tokens": read}
+        details["cached_tokens"] = read
+    if written:
+        details["cache_write_tokens"] = written
+    if details:
+        wire["prompt_tokens_details"] = details
+    thinking = _count(
+        getattr(getattr(usage, "output_tokens_details", None), "thinking_tokens", None)
+    )
+    if thinking is not None:
+        wire["completion_tokens_details"] = {"reasoning_tokens": thinking}
     return wire
 
 
@@ -1323,7 +1361,12 @@ def _from_status_error(exc: Any) -> ProviderError:
             retry_after=retry_after,
         )
     if status == 504:
-        return ProviderTimeoutError(f"Anthropic's deadline ran out (HTTP 504): {message}")
+        return ProviderTimeoutError(
+            f"Anthropic's deadline ran out (HTTP 504): {message}",
+            status_code=status,
+            body=text,
+            vendor_deadline=True,
+        )
     if status >= 500:
         return ProviderServerError(
             f"Anthropic failed on its own side (HTTP {status}{f', {kind}' if kind else ''}).",

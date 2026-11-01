@@ -10,7 +10,7 @@ Every line the harness writes to its journal, every field on each line, what eac
 - When a vendor reports something this contract cannot hold, or cannot report something it holds, **the work stops.** The misfit is filed `needs-capital` as a design question about the existing system — what the misfit is, and what it says about the contract — and goes to the founders through the capital. The contract changes first, for every adapter whose vendor has the datum, and only then does the vendor land.
 - Where today's emission differs from this page, the difference is listed under [Known Violations](#known-violations), each with the issue that removes it. That table is the only place a departure may live.
 
-This page describes the **target** contract. A field the target defines that no adapter emits yet (`residency`) is part of the contract all the same; a field adapters emit today that the target retires is not, and is listed as a violation until it is gone.
+This page describes the **target** contract. A field the target defines that no adapter emits yet is part of the contract all the same; a field adapters emit today that the target retires is not, and is listed as a violation until it is gone.
 
 ## The Grammar
 
@@ -233,7 +233,7 @@ The off-platform push to @origin's phone, delivered (`_direct_message`).
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `bytes` | As on `direct_message sent`. | `_direct_message`. | Never. |
-| `reason` | Why delivery failed, as a slug. | `_direct_message`. | Never. |
+| `reason` | `transport` (ntfy never answered), `server_error` (it failed on its own side), or `refused` (its verdict on the request, a 4xx). | `_direct_message`. | Never. |
 | `error` | Common. | `_direct_message`. | Never. |
 
 ### `tool_call_ids rewritten`
@@ -324,7 +324,8 @@ An item abandoned after its resumes failed `RESUME_CEILING` times, or a batch-ma
 | `resumes` | Resumes attempted. | The wake. | A batch-mate's line. |
 | `tool_calls` | Tool calls the stalled turn made. | The wake. | A batch-mate's line. |
 | `note` | The uuid of the stall note posted. | The wake. | A batch-mate's line. |
-| `reason` | Why, as a slug. | The wake. | Never. |
+| `reason` | `resume_ceiling` (the turn's resumes failed `RESUME_CEILING` times) or `batch_mate` (abandoned with the turn that carried it). | The wake. | Never. |
+| `detail` | The harness's sentence on how the last resume failed. | The wake. | A batch-mate's line. |
 
 ### `wake reported_failure`
 
@@ -384,7 +385,8 @@ A turn that ended on the canned stuck note because even its reserve call failed.
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `timeline` | Common. | The wake. | Never. |
-| `reason` | Why the turn degraded, as a slug. | The wake. | Never. |
+| `reason` | `reserve_failed` (the reserve summary call raised) or `reserve_empty` (it wrote no text). | The wake. | Never. |
+| `detail` | The engine's sentence on what failed. | The wake. | Never. |
 
 ### `claim refused`
 
@@ -416,7 +418,8 @@ An item abandoned at ERROR. A drop is never silent.
 | `kind` | `message` or `task`. | The wake. | Never. |
 | `timeline` | Common. | The wake. | Never. |
 | `handle` | Common. | The wake. | Never. |
-| `reason` | Why, as a slug. | The wake. | Never. |
+| `reason` | `compacted_away` (the turn that carried it was compacted out of the transcript), `context_length` (the resumed turn is over the ceiling and cannot be compacted), or `payload_too_large` (the resumed turn hit that permanent failure). | The wake. | Never. |
+| `detail` | The harness's sentence, with any vendor text in it. | The wake. | Never. |
 
 ### `re-driving`
 
@@ -426,7 +429,7 @@ An item abandoned at ERROR. A drop is never silent.
 | `kind` | `message` or `task`. | The wake. | Never. |
 | `timeline` | Common. | The wake. | Never. |
 | `handle` | Common. | The wake. | Never. |
-| `reason` | Why, as a slug. | The wake. | Never. |
+| `reason` | `died_before_model` (the wake died before the model saw the item) or `died_in_model_call` (it died inside the model call). | The wake. | Never. |
 
 ### `recovered`
 
@@ -514,7 +517,8 @@ The cross-wake circuit breaker's trip (`_breaker.breaker_tripped_line`). NOC-ala
 |---|---|---|---|
 | `video` | The withheld clip's name. | The engine. | Never. |
 | `model` | The brain's model. | The engine. | Never. |
-| `reason` | Why, as a slug. | The engine. | Never. |
+| `reason` | `no_image_input` (the model takes no image input) or `undecodable_video` (its frames would not decode). | The engine. | Never. |
+| `detail` | The decoder's account of the failure. | The engine. | `reason=no_image_input`. |
 
 ### `image degraded to text`
 
@@ -676,46 +680,10 @@ Where today's emission departs from the target above. The conformance test reads
 
 A prose line that carries a field the NOC extracts off every line (`provider=`, `source=`) feeds a column whatever its head, so the test also fails on any such prose that no `prose` row names.
 
-The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759)).
+The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759), whose rows F1–F36 are struck). No departure stands today.
 
 | ID | Violation | Witness | Removed By |
 |---|---|---|---|
-| F1 | OpenAI and OpenRouter hand the harness a cache-write count (`prompt_tokens_details.cache_write_tokens`, `input_tokens_details.cache_write_tokens`); only Anthropic logs `cache_write_tokens`, and only through the purpose-specific `extra` slot. | `test` | Slice 3 |
-| F2 | The `capture_llm_call` path drops `extra`, so a helper call on Anthropic loses `cache_write_tokens` that the same adapter writes on a main call: the same provider emits different fields by purpose. | `test` | Slice 3 |
-| F3 | No adapter puts `tokens_reasoning` on a `purpose=main` line, though OpenAI, OpenRouter, xAI and Google all report it. | `test` | Slice 3 |
-| F4 | Anthropic discards `output_tokens_details.thinking_tokens`, so `tokens_reasoning` is absent on its lines for every purpose. | `test` | Slice 3 |
-| F5 | xAI reports reasoning tokens apart from `completion_tokens` (its documented example: 32 + 9 + 94 = 135), so on both xAI cells `tokens_out` excludes the reasoning it bills and `tokens_total` ≠ `tokens_in` + `tokens_out`. | `test` | Slice 3 |
-| F6 | Google's `tokens_in` excludes the prompt tokens a built-in tool added (`toolUsePromptTokenCount`), and its `tokens_total` is Vertex's own total rather than `tokens_in` + `tokens_out`. | `test` | Slice 3 |
-| F7 | Google writes its Vertex location in `endpoint=`, which means the serving upstream everywhere else. | `test` | Slice 3 |
-| F8 | No adapter writes `residency`: Anthropic reads `inference_geo` for pricing and never logs it, and Google's location is in `endpoint=`. | `test` | Slice 3 |
-| F9 | Anthropic prices a call on any `AI_BASE_URL`; OpenAI refuses to price a host that is not its own and says so once. A computed cost is stated only for the host whose rates the table transcribes. | `test` | Slice 3 |
-| F10 | An HTTP 504 is `server_error` on OpenAI and OpenRouter and `timeout` on Anthropic and Google. | `test` | Slice 3 |
-| F11 | A content refusal is recorded only as prose. | `prose _anthropic.py "Anthropic refused the turn for" until llm refused` | Slice 3 |
-| F12 | Token-cost gaps are recorded only as prose, each vendor in its own words: Anthropic's unknown model. | `prose _anthropic.py "No published rate for Anthropic model" until cost unpriced.charge=tokens` | Slice 3 |
-| F13 | The same: OpenAI's unknown model. | `prose _openai.py "No published rate for OpenAI model" until cost unpriced.charge=tokens` | Slice 3 |
-| F14 | The same: OpenAI's unpriced host. | `prose _openai.py "not %s: OpenAI bills its data-residency" until cost unpriced.charge=tokens` | Slice 3 |
-| F15 | The same: OpenAI's unpriced tier or long context. | `prose _openai.py "OpenAI call on %r not priced" until cost unpriced.charge=tokens` | Slice 3 |
-| F16 | The same: Google's unknown model. | `prose _google.py "No published rate for Vertex model" until cost unpriced.charge=tokens` | Slice 3 |
-| F17 | The same: Google's unpriced grounding fee. | `prose _google.py "Google Search grounding on %r is not priced" until cost unpriced.charge=grounding` | Slice 3 |
-| F18 | `source=` means the context ceiling's provenance on `context limit`, beside its fleet-wide meaning (the probe stamp the NOC's `source` label extracts off every line). | `field context limit.source` | Slice 3 |
-| F19 | The same, on `context compact`. | `field context compact.source` | Slice 3 |
-| F20 | The same, on the `context budget … (source=…)` prose warning, which the NOC's `source` label reads like any other line. | `prose _context.py "(source=%s)"` | Slice 3 |
-| F21 | `source=` is the session's channel key on `context attribution`. | `field context attribution.source` | Slice 3 |
-| F22 | `held=` is a file count on `palace scrub`, beside its meaning of a duration on `Wake breaker RESET`. | `field palace scrub.held` | Slice 3 |
-| F23 | `surface=` is the SDK surface on the generic-profile line, beside its meaning of a memory recall's surface (`turn0`, `tool`). | `field provider.surface` | Slice 3 |
-| F24 | `reason=` is a sentence, not a slug, on `turn truncated`. | `reason-prose turn truncated` | Slice 3 |
-| F25 | The same, on `wake truncated_turn`. | `reason-prose wake truncated_turn` | Slice 3 |
-| F26 | The same, on `resuming`. | `reason-prose resuming` | Slice 3 |
-| F27 | The same, on `view image withheld from a model with no vision`. | `reason-prose view image withheld from a model with no vision` | Slice 3 |
-| F28 | The same, on `watch video withheld from the model`. | `reason-prose watch video withheld from the model` | Slice 3 |
-| F29 | The same, on `image degraded to text`. | `reason-prose image degraded to text` | Slice 3 |
-| F30 | The same, handed in by every caller, on `dropped`. | `reason-prose dropped` | Slice 3 |
-| F31 | The same, on `re-driving`. | `reason-prose re-driving` | Slice 3 |
-| F32 | The same, on `wake stalled`. | `reason-prose wake stalled` | Slice 3 |
-| F33 | `reason=` is an exception's text on `degraded`. | `reason-prose degraded` | Slice 3 |
-| F34 | The generic-profile line is a `%`-format string, not built through `kv`. | `unescaped provider` | Slice 3 |
-| F35 | The same, on `direct_message sent` (whose `title=` is a Python `repr`). | `unescaped direct_message sent` | Slice 3 |
-| F36 | The same, on `direct_message failed`, whose `reason=` is the exception's text, unscrubbed and unbounded. | `unescaped direct_message failed` | Slice 3 |
 
 ### Outside This Repository
 

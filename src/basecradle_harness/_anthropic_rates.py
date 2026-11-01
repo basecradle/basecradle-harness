@@ -47,6 +47,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 from basecradle_harness._observability import ComputedCost
 
@@ -235,6 +236,18 @@ def server_tool_requests(usage: Any, name: str) -> int:
         extra = getattr(block, "model_extra", None)
         value = extra.get(name) if isinstance(extra, Mapping) else None
     return _count(value) or 0
+
+
+#: The one host these rates are the list price on. A proxy or gateway reached through
+#: ``AI_BASE_URL`` sets its own price, so a call there is unpriced (issue #759), as on OpenAI.
+PRICED_HOST = "api.anthropic.com"
+
+
+def priced_host(base_url: str | None) -> bool:
+    """Whether `base_url` is Anthropic's own API host, the one these rates are the price on."""
+    if not base_url:
+        return True
+    return (urlsplit(base_url).hostname or "").lower() == PRICED_HOST
 
 
 def known(model: str) -> bool:

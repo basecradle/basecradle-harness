@@ -126,7 +126,6 @@ from basecradle_harness._observability import (
     describe_provider,
     kv,
     log_llm_call,
-    reasoning_tokens,
     truncated,
     usage_reported,
 )
@@ -664,7 +663,7 @@ class Describer:
             # which a model call is not. One attempt, one line, one category. It wraps **exactly
             # one** model call by its own contract, so a retry gets a fresh block rather than a
             # second call inside this one.
-            with capture_llm_call() as call:
+            with capture_llm_call(HELPER) as call:
                 try:
                     reply = provider.chat([turn], None)
                 except ProviderError as exc:
@@ -787,12 +786,13 @@ class Describer:
             purpose=HELPER,
             kind=kind,
             endpoint=call.endpoint,
+            residency=call.residency,
             model=self.model,
             seconds=seconds,
+            # Every token field — cache writes and reasoning included — is read off the usage the
+            # adapter recorded by the one shared reader, so a helper line carries exactly the
+            # fields the same adapter's main line does (issue #759).
             usage=call.usage,
-            # Read the same way the reranker reads it, so the two purposes' lines carry the same
-            # facts under the same names — one grep syntax across the whole grammar.
-            tokens_reasoning=reasoning_tokens(call.usage),
             cost=call.cost,
             outcome="ok" if reason is None else "fallback",
             reason=reason,

@@ -1076,9 +1076,13 @@ def test_an_all_zero_usage_block_is_omitted_rather_than_printed_as_zeros(caplog)
             provider="openrouter",
             model="google/gemini-3.8-flash",
             seconds=12.26,
-            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            usage={
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "completion_tokens_details": {"reasoning_tokens": 0},
+            },
             cost=0.0,
-            tokens_reasoning=0,
             outcome="ok",
         )
 
@@ -1182,3 +1186,52 @@ def test_a_captured_call_carries_the_finish_reason_but_the_line_never_prints_it(
 
     assert call.finish_reason == "length"
     assert not [r for r in caplog.records if r.getMessage().startswith("llm ")]
+
+
+# === issue #759: one meaning per token field, and the refusal head ==============================
+
+
+def test_reasoning_reported_apart_is_folded_into_the_output_it_was_billed_as():
+    """xAI's own example: 32 prompt + 9 completion + 94 reasoning = 135 (docs.x.ai)."""
+    from basecradle_harness._observability import reasoning_apart
+
+    wire = reasoning_apart(
+        {
+            "prompt_tokens": 32,
+            "completion_tokens": 9,
+            "total_tokens": 135,
+            "prompt_tokens_details": {"cached_tokens": 6},
+            "completion_tokens_details": {"reasoning_tokens": 94},
+        }
+    )
+    assert token_counts(wire) == {
+        "tokens_in": 32,
+        "tokens_out": 103,
+        "tokens_total": 135,
+        "cached_tokens": 6,
+        "tokens_reasoning": 94,
+    }
+    assert reasoning_apart(None) is None
+    # No reasoning reported: the counts are the wire's own.
+    plain = reasoning_apart({"prompt_tokens": 10, "completion_tokens": 4})
+    assert token_counts(plain) == {"tokens_in": 10, "tokens_out": 4, "tokens_total": 14}
+
+
+def test_the_total_is_the_sum_of_its_two_fields_never_the_vendors_own():
+    counts = token_counts({"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 99})
+    assert counts["tokens_total"] == 14
+    # Half a count is no total: an honest absence, never a sum with a hole in it.
+    assert "tokens_total" not in token_counts({"prompt_tokens": 10, "total_tokens": 10})
+
+
+def test_a_refusal_inside_a_capture_names_the_callers_purpose(caplog):
+    from basecradle_harness._observability import HELPER, capture_llm_call, log_llm_refused
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        log_llm_refused(provider="anthropic", model="claude-haiku-5-5", category="Cyber Risk")
+        with capture_llm_call(HELPER):
+            log_llm_refused(provider="anthropic", model="claude-haiku-5-5")
+    assert [r.getMessage() for r in caplog.records] == [
+        "llm refused provider=anthropic purpose=main model=claude-haiku-5-5 category=cyber_risk",
+        "llm refused provider=anthropic purpose=helper model=claude-haiku-5-5",
+    ]

@@ -755,6 +755,21 @@ def anthropic_proxy(router, **_):
 
 
 @scenario
+def anthropic_refusal(router, **_):
+    """A content refusal: the vendor's final word, written as a counted fact on its own head."""
+    router.post(ANTHROPIC_MESSAGES).mock(
+        return_value=anthropic_reply(
+            stop_reason="refusal",
+            stop_details={"type": "refusal", "category": "cyber", "explanation": "Declined."},
+            message_id="msg_01Refused",
+        )
+    )
+    adapter = AnthropicProvider(ANTHROPIC_MODEL, api_key=ANTHROPIC_KEY, max_tokens=4096)
+    adapter.chat([Message.user("…")])
+    adapter.close()
+
+
+@scenario
 def anthropic_describer(router, **_):
     used = {k: v for k, v in _ANTHROPIC_USAGE.items() if k != "server_tool_use"}
     router.post(ANTHROPIC_MESSAGES).mock(
@@ -781,7 +796,7 @@ def rerank(router, **_):
 
 @scenario
 def attribution(**_):
-    log_context_attribution([Message.user("hi")], source="timeline:contract")
+    log_context_attribution([Message.user("hi")], session="timeline:contract")
 
 
 _CODE_USE = {
@@ -986,45 +1001,9 @@ def _tokens(line: Line) -> tuple[int, int, int]:
     )
 
 
-def _sums(line: Line) -> bool:
-    """Whether the line's ``tokens_total`` is exactly ``tokens_in`` + ``tokens_out``."""
-    tokens_in, tokens_out, tokens_total = _tokens(line)
-    return tokens_total == tokens_in + tokens_out
-
-
-WITNESSES: dict[str, Callable[[Rendered, list[Site]], bool]] = {
-    "F1": lambda r, s: any(
-        "cache_write_tokens" not in r.llm(n).fields
-        for n in ("openai_chat", "openai_responses", "openrouter")
-    ),
-    "F2": lambda r, s: (
-        "cache_write_tokens" in r.llm("anthropic").fields
-        and "cache_write_tokens" not in r.llm("anthropic_describer").fields
-    ),
-    "F3": lambda r, s: any(
-        "tokens_reasoning" not in r.llm(n).fields
-        for n in (
-            "openai_chat",
-            "openai_responses",
-            "openrouter",
-            "xai",
-            "xai_openai",
-            "google_chat",
-        )
-    ),
-    "F4": lambda r, s: all(
-        "tokens_reasoning" not in r.llm(n).fields for n in ("anthropic", "anthropic_describer")
-    ),
-    "F5": lambda r, s: any(not _sums(r.llm(n)) for n in ("xai", "xai_openai")),
-    # 1,200 prompt + 400 tool-use prompt tokens were billed as input.
-    "F6": lambda r, s: _tokens(r.llm("google_chat"))[0] < 1_600 or not _sums(r.llm("google_chat")),
-    "F7": lambda r, s: "endpoint" in r.llm("google_chat").fields,
-    "F8": lambda r, s: any(
-        "residency" not in r.llm(n).fields for n in ("anthropic", "google_chat")
-    ),
-    "F9": lambda r, s: "cost" in r.llm("anthropic_proxy").fields,
-    "F10": lambda r, s: len(set(r.reasons.values())) > 1,
-}
+#: One `test` row's witness: true exactly while its departure stands. Empty while no `test` row
+#: stands — slice 3 (issue #759) struck F1–F10, and each became a regression test below.
+WITNESSES: dict[str, Callable[[Rendered, list[Site]], bool]] = {}
 
 
 # === the checks =================================================================================
@@ -1306,3 +1285,143 @@ def test_the_scan_reads_a_reason_through_its_callers(tmp_path):
     assert found["direct_message sent"].unescaped and found["direct_message sent"].fields == {
         "bytes"
     }
+
+
+# === the fields with one meaning on every vendor (issue #759, rows F1–F10 struck) ================
+
+#: Each scenario's token fields, exactly — what every vendor's usage reads as in the one vocabulary.
+#: ``tokens_total`` is ``tokens_in`` + ``tokens_out`` on every line, never the vendor's own total.
+EXPECTED_TOKENS = {
+    # OpenAI and OpenRouter state a cache write and reasoning on both wires (F1, F3).
+    "openai_chat": {
+        "tokens_in": 1000,
+        "tokens_out": 200,
+        "tokens_total": 1200,
+        "cached_tokens": 600,
+        "cache_write_tokens": 300,
+        "tokens_reasoning": 50,
+    },
+    "openai_responses": {
+        "tokens_in": 1000,
+        "tokens_out": 200,
+        "tokens_total": 1200,
+        "cached_tokens": 600,
+        "cache_write_tokens": 300,
+        "tokens_reasoning": 50,
+    },
+    "openrouter": {
+        "tokens_in": 1000,
+        "tokens_out": 200,
+        "tokens_total": 1200,
+        "cached_tokens": 600,
+        "cache_write_tokens": 300,
+        "tokens_reasoning": 50,
+    },
+    # xAI's reasoning is billed as output and reported beside it: 32 + (9 + 94) = 135 (F5).
+    "xai": {
+        "tokens_in": 32,
+        "tokens_out": 103,
+        "tokens_total": 135,
+        "cached_tokens": 6,
+        "tokens_reasoning": 94,
+    },
+    "xai_openai": {
+        "tokens_in": 32,
+        "tokens_out": 103,
+        "tokens_total": 135,
+        "cached_tokens": 6,
+        "tokens_reasoning": 94,
+    },
+    # 1,200 prompt + 400 tool-use prompt tokens are input; 30 reply + 70 thinking are output (F6).
+    "google_chat": {
+        "tokens_in": 1600,
+        "tokens_out": 100,
+        "tokens_total": 1700,
+        "cached_tokens": 1000,
+        "tokens_reasoning": 70,
+    },
+    # Anthropic's prompt in its three parts, its write, and its thinking — on every purpose (F2, F4).
+    "anthropic": {
+        "tokens_in": 44000,
+        "tokens_out": 200,
+        "tokens_total": 44200,
+        "cached_tokens": 40000,
+        "cache_write_tokens": 3000,
+        "tokens_reasoning": 120,
+    },
+    "anthropic_describer": {
+        "tokens_in": 44000,
+        "tokens_out": 200,
+        "tokens_total": 44200,
+        "cached_tokens": 40000,
+        "cache_write_tokens": 3000,
+        "tokens_reasoning": 120,
+    },
+}
+
+_TOKEN_FIELD_NAMES = (
+    "tokens_in",
+    "tokens_out",
+    "tokens_total",
+    "cached_tokens",
+    "cache_write_tokens",
+    "tokens_reasoning",
+)
+
+
+def test_every_vendor_fills_the_token_fields_with_one_meaning(rendered):
+    for name, expected in EXPECTED_TOKENS.items():
+        fields = rendered.llm(name).fields
+        found = {key: int(fields[key]) for key in _TOKEN_FIELD_NAMES if key in fields}
+        assert found == expected, name
+
+
+def test_a_helper_line_carries_every_token_field_its_adapters_main_line_does(rendered):
+    main, helper = rendered.llm("anthropic").fields, rendered.llm("anthropic_describer").fields
+    assert {k: main.get(k) for k in _TOKEN_FIELD_NAMES} == {
+        k: helper.get(k) for k in _TOKEN_FIELD_NAMES
+    }
+
+
+def test_tokens_total_is_exactly_in_plus_out_on_every_line(rendered):
+    for name, lines in rendered.lines.items():
+        for line in lines:
+            if line.head == "llm" and "tokens_total" in line.fields:
+                tokens_in, tokens_out, tokens_total = _tokens(line)
+                assert tokens_total == tokens_in + tokens_out, (name, line.message)
+
+
+def test_endpoint_is_the_serving_upstream_and_residency_where_the_vendor_ran(rendered):
+    for name in ("google_chat", "google_search", "anthropic", "anthropic_describer"):
+        fields = rendered.llm(name).fields
+        assert "endpoint" not in fields, name
+        assert fields["residency"] == "us", name
+
+
+def test_a_computed_cost_is_stated_only_for_the_host_its_table_transcribes(rendered):
+    assert "cost" not in rendered.llm("anthropic_proxy").fields
+    (gap,) = rendered.heads("anthropic_proxy", "cost unpriced")
+    assert gap.fields == {
+        "provider": "anthropic",
+        "model": ANTHROPIC_MODEL,
+        "charge": "tokens",
+        "reason": "unpriced_host",
+    }
+
+
+def test_a_gateway_timeout_is_timeout_on_every_vendor(rendered):
+    assert rendered.reasons == dict.fromkeys(
+        ("openai", "openrouter", "anthropic", "google"), "timeout"
+    )
+
+
+def test_a_refusal_is_one_counted_line_beside_its_call(rendered):
+    (line,) = rendered.heads("anthropic_refusal", "llm refused")
+    assert line.fields == {
+        "provider": "anthropic",
+        "purpose": "main",
+        "model": ANTHROPIC_MODEL,
+        "category": "cyber",
+        "generation_id": "msg_01Refused",
+    }
+    assert len(rendered.heads("anthropic_refusal", "llm")) == 1

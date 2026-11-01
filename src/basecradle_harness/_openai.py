@@ -71,6 +71,10 @@ from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
     CONTAINER_TIME,
     NOT_REPORTED,
+    TOKENS_CHARGE,
+    UNKNOWN_MODEL,
+    UNPRICED_HOST,
+    UNPRICED_TIER,
     ServerToolTally,
     finish_reason,
     generation_id,
@@ -79,6 +83,7 @@ from basecradle_harness._observability import (
     log_cost_unpriced,
     log_llm_call,
     log_server_tools,
+    reasoning_apart,
     reported_cost,
     routed_web_searches,
     serving_endpoint,
@@ -87,7 +92,6 @@ from basecradle_harness._observability import (
     token_counts,
 )
 from basecradle_harness._openai_rates import (
-    LONG_CONTEXT_THRESHOLD,
     call_cost,
     known,
     priced_host,
@@ -351,6 +355,10 @@ class OpenAIProvider:
         #: is unpriced *by construction*: no table, and no cost-gap WARNING about a table that was
         #: never its own.
         self._computes_cost = provider == "openai"
+        #: Whether the vendor reports its reasoning **beside** the output rather than inside it, so
+        #: the line folds it in (`reasoning_apart`, issue #759). xAI does, on both surfaces; an
+        #: equality on the known vendor, so every other endpoint keeps the wire's own reading.
+        self._reasoning_apart = provider == "xai"
         #: The cost gaps already stated this wake (an unknown model, an unpriced host, a container),
         #: so each WARNING is written once per adapter — one wake — rather than once per call.
         self._gaps_stated: set[str] = set()
@@ -559,7 +567,7 @@ class OpenAIProvider:
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
-            usage=usage,
+            usage=reasoning_apart(usage) if self._reasoning_apart else usage,
             endpoint=serving_endpoint(data),
             cost=cost,
             # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
@@ -580,13 +588,7 @@ class OpenAIProvider:
         if not self._computes_cost or not self._priced_endpoint():
             return None
         if not known(self.model):
-            self._state_gap(
-                f"model:{self.model}",
-                "No published rate for OpenAI model %r in the harness's table, so its calls carry "
-                "no cost= on the llm line. Add the model's row to _openai_rates.RATES from OpenAI's "
-                "pricing page.",
-                self.model,
-            )
+            self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL)
         tokens = usage_of(usage)
         served = data.get("service_tier")
         cost = call_cost(
@@ -597,16 +599,9 @@ class OpenAIProvider:
         )
         if cost is None and tokens is not None and known(self.model):
             # A model the table carries, on a call it still cannot price: a non-Standard tier, or a
-            # prompt past the long-context threshold on a model with no long-context row.
-            self._state_gap(
-                f"call:{served}:{tokens.input > LONG_CONTEXT_THRESHOLD}",
-                "OpenAI call on %r not priced (service_tier=%s, input_tokens=%d): the harness's "
-                "table carries Standard rates only, and this model's long-context row where OpenAI "
-                "states one. This kind of call carries no cost= for the rest of the wake.",
-                self.model,
-                served,
-                tokens.input,
-            )
+            # prompt past the long-context threshold on a model with no long-context row — both a
+            # rate band the table does not carry. Stated once per wake.
+            self._state_gap(TOKENS_CHARGE, UNPRICED_TIER)
         return cost
 
     def _log_server_tools(self, data: Mapping[str, Any]) -> None:
@@ -641,21 +636,22 @@ class OpenAIProvider:
         """Whether this client is aimed at OpenAI's own host — stating the gap once when not."""
         if priced_host(self.base_url):
             return True
-        self._state_gap(
-            "host",
-            "This OpenAI client is aimed at %s, not %s: OpenAI bills its data-residency and FedRAMP "
-            "endpoints with an uplift and a proxy's price is its own, so no call here is priced.",
-            self.base_url,
-            "api.openai.com",
-        )
+        # OpenAI bills its data-residency and FedRAMP endpoints with an uplift, and a proxy's price
+        # is its own, so no call on any other host is priced.
+        self._state_gap(TOKENS_CHARGE, UNPRICED_HOST)
         return False
 
-    def _state_gap(self, key: str, message: str, *args: Any) -> None:
-        """One WARNING per cost gap per wake — the same rule `GoogleProvider` keeps for its table."""
+    def _state_gap(self, charge: str, reason: str) -> None:
+        """One ``cost unpriced`` WARNING per gap per wake — the rule every rate table keeps.
+
+        A gap is what the line says, so two calls the table cannot price for the same reason (a
+        Flex tier, then a long prompt) are one gap and one line, never two identical ones.
+        """
+        key = f"{charge}:{reason}"
         if key in self._gaps_stated:
             return
         self._gaps_stated.add(key)
-        _log.warning(message, *args)
+        log_cost_unpriced(provider=self.provider, model=self.model, charge=charge, reason=reason)
 
     def context_limit(self) -> int | None:
         """This model's context ceiling, if the endpoint this adapter is aimed at states one (#276).
@@ -827,6 +823,16 @@ def _from_status_error(exc) -> ProviderError:
         # A 413 that is not a context overflow (checked above): the request body was simply too
         # large. Deterministic and file-shaped — reported, never retried, never modified (issue #336).
         return ProviderPayloadTooLargeError(message, status_code=status, body=body)
+    if status == 504:
+        # A deadline ran out — the endpoint's or a gateway's own, never the budget the harness
+        # fitted — so it is a timeout on every vendor (issue #759): retried once with more time,
+        # never re-sent into the same wall three times the way a plain 5xx is (issue #589).
+        return ProviderTimeoutError(
+            f"The provider's deadline ran out (HTTP 504): {message}",
+            status_code=status,
+            body=body,
+            vendor_deadline=True,
+        )
     if status >= 500:
         # The provider fell over on its own side — transient, so the engine re-requests it
         # (issue #284). The SDK also retries 5xx internally; this class is what makes the policy

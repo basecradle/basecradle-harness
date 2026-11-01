@@ -604,7 +604,7 @@ def test_the_report_gives_held_findings_their_own_section_and_states_why(quoting
     assert f"HELD — {len(quote_ids)} chunk(s)" in text
     assert f"held: {_scrub._HELD_SIBLINGS.format(others=2)}" in text
     assert str(real_file) in text
-    assert f"held={len(quote_ids)}" in text
+    assert f"held_files={len(quote_ids)}" in text
     for quote in _quoted_catalog_lines().values():
         assert quote in text  # full text here too: a hold is judged on what it holds
 

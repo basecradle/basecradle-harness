@@ -1555,7 +1555,7 @@ def test_the_image_degrade_is_logged_loudly(platform, tmp_path, caplog):
 
     line = _line(caplog, "image degraded to text")
     assert "diagram.png" in line
-    assert "model has no vision input" in line
+    assert line.endswith(" reason=no_vision_input")
     assert TIMELINE_UUID in line
 
 
@@ -1633,7 +1633,7 @@ def test_a_describer_that_cannot_answer_leaves_the_plain_degrade_untouched(
 
     assert provider.last_images == []
     assert "diagram.png" in provider.prompts[0]
-    assert "model has no vision input" in _line(caplog, "image degraded to text")
+    assert _line(caplog, "image degraded to text").endswith(" reason=no_vision_input")
 
 
 class _BlindViewer(_TextOnlyProvider):

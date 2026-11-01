@@ -57,6 +57,7 @@ from collections.abc import Callable
 
 import httpx
 
+from basecradle_harness._observability import kv
 from basecradle_harness._platform import PlatformTool
 from basecradle_harness._secret import reveal, secret
 
@@ -97,8 +98,14 @@ class _DeliveryFailed(Exception):
     """ntfy could not be reached or refused the message, with a model-readable reason.
 
     Its message is always safe to show: it names the status or the transport failure, and any
-    response text it carries has been through `_redact`.
+    response text it carries has been through `_redact`. `slug` is the same fact as the line's
+    ``reason=``: ``transport`` (ntfy never answered), ``server_error`` (it failed on its own side),
+    or ``refused`` (its verdict on this request, a 4xx).
     """
+
+    def __init__(self, message: str, slug: str) -> None:
+        super().__init__(message)
+        self.slug = slug
 
 
 class DirectMessageTool(PlatformTool):
@@ -198,10 +205,13 @@ class DirectMessageTool(PlatformTool):
         try:
             self._publish(token, title, payload)
         except _DeliveryFailed as exc:
-            logger.warning("direct_message failed bytes=%d reason=%s", size, exc)
+            # Through `kv`, so the reason is a slug and the text is scrubbed, bounded and quoted.
+            logger.warning(
+                "direct_message failed %s", kv(bytes=size, reason=exc.slug, error=str(exc))
+            )
             return f"Couldn't deliver the direct message to @origin: {exc} Nothing was sent."
 
-        logger.info("direct_message sent bytes=%d title=%r", size, title)
+        logger.info("direct_message sent %s", kv(bytes=size, title=title))
         sent = (
             f"Sent — that message is a push notification on @origin's phone now ({size:,} bytes)."
         )
@@ -257,22 +267,25 @@ class DirectMessageTool(PlatformTool):
         }
         url = f"{self._base_url}/{self._topic}"
 
-        reason = "no attempt was made."
+        reason, slug = "no attempt was made.", "transport"
         with httpx.Client(timeout=self._timeout) as client:
             for attempt in range(2):  # one try, at most one retry
                 try:
                     response = client.post(url, content=payload, headers=headers)
                 except httpx.RequestError as exc:
-                    reason = f"couldn't reach ntfy.sh ({exc})."
+                    reason, slug = f"couldn't reach ntfy.sh ({exc}).", "transport"
                 else:
                     if response.status_code < 300:
                         return
                     reason = _refusal(response, token)
                     if response.status_code < 500:
-                        break  # ntfy's verdict on this request; a retry sends the same thing
+                        # ntfy's verdict on this request; a retry sends the same thing
+                        slug = "refused"
+                        break
+                    slug = "server_error"
                 if attempt == 0:
                     self._sleep(self._retry_delay)
-        raise _DeliveryFailed(reason)
+        raise _DeliveryFailed(reason, slug)
 
 
 def _refusal(response: httpx.Response, token: str) -> str:

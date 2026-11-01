@@ -256,7 +256,8 @@ def test_a_gpt_6_sol_brain_call_logs_a_computed_cost(router, sol, caplog):
     (line,) = _lines(caplog, "llm ")
     assert re.fullmatch(
         r"llm provider=openai purpose=main model=gpt-6-sol duration=\d+\.\d\ds tokens_in=10000 "
-        r"tokens_out=500 tokens_total=10500 cached_tokens=6000 cost=0\.0147 cost_basis=computed "
+        r"tokens_out=500 tokens_total=10500 cached_tokens=6000 cache_write_tokens=1000 "
+        r"tokens_reasoning=100 cost=0\.0147 cost_basis=computed "
         r"generation_id=resp-fake0001",
         line,
     ), line
@@ -317,8 +318,11 @@ def test_an_unknown_model_logs_no_cost_and_warns_once(router, caplog):
         provider.chat([Message.user("go")])
     lines = _lines(caplog, "llm ")
     assert len(lines) == 2 and all(" cost=" not in line for line in lines)
-    warnings = [r for r in caplog.records if "No published rate" in r.getMessage()]
+    warnings = [r for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
     assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    assert warnings[0].getMessage() == (
+        "cost unpriced provider=openai model=gpt-7-nova charge=tokens reason=unknown_model"
+    )
 
 
 def test_a_flex_call_logs_no_cost(router, sol, caplog):
@@ -350,7 +354,9 @@ def test_another_host_is_never_priced_and_says_so_once(router, caplog):
         "tool name=web_search executor=server provider=openai kind=search.web model=gpt-6-sol "
         "count=1 outcome=ok generation_id=resp-fake0001"
     )
-    assert sum("not api.openai.com" in r.getMessage() for r in caplog.records) == 1
+    assert _lines(caplog, "cost unpriced ") == [
+        "cost unpriced provider=openai model=gpt-6-sol charge=tokens reason=unpriced_host"
+    ]
 
 
 def test_an_xai_endpoint_behind_the_openai_sdk_is_never_priced_from_openais_table(router, caplog):
@@ -419,7 +425,7 @@ def test_an_image_breakdown_that_does_not_add_up_is_not_priced():
 
 
 def test_a_known_model_on_a_call_the_table_cannot_price_is_a_stated_gap(router, caplog):
-    """A Flex call, and a long prompt on a model with no long-context row: one WARNING each."""
+    """A Flex call, and a long prompt on a model with no long-context row: one stated gap."""
     provider = OpenAIProvider(model="gpt-5.4-mini", api_key=FAKE_KEY, surface="responses")
     long_prompt = _usage(input_tokens=300_000, total_tokens=300_500)
     router.post(f"{OPENAI}/responses").mock(
@@ -432,7 +438,8 @@ def test_a_known_model_on_a_call_the_table_cannot_price_is_a_stated_gap(router, 
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         for _ in range(3):
             provider.chat([Message.user("go")])
-    gaps = [r.getMessage() for r in caplog.records if "not priced (service_tier=" in r.getMessage()]
-    assert len(gaps) == 2
-    assert "service_tier=flex" in gaps[0] and "input_tokens=300000" in gaps[1]
+    # The Flex tier and the long-context band are one gap in the contract's words: one line.
+    assert _lines(caplog, "cost unpriced ") == [
+        "cost unpriced provider=openai model=gpt-5.4-mini charge=tokens reason=unpriced_tier"
+    ]
     assert all(" cost=" not in line for line in _lines(caplog, "llm "))

@@ -26,7 +26,16 @@ class PlatformError(HarnessError):
 
 
 class EngineError(HarnessError):
-    """The agent loop could not produce a final reply (e.g. it hit the step limit)."""
+    """The agent loop could not produce a final reply (e.g. it hit the step limit).
+
+    `reason` names why as a slug, for the ``degraded`` line's ``reason=`` (issue #759):
+    ``reserve_failed`` (the reserve summary call raised) or ``reserve_empty`` (it wrote no text);
+    the message stays the human sentence, on the line's ``detail=``.
+    """
+
+    def __init__(self, message: str, *, reason: str = "engine_error") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class ProviderError(HarnessError):
@@ -89,7 +98,36 @@ class ProviderTimeoutError(ProviderConnectionError):
     way (issue #589's second defect: three minutes burned per step). A timeout is retried **once,
     with a materially larger budget** (`basecradle_harness._timeouts.TIMEOUT_RETRY_SCALE`), or not
     at all.
+
+    **An HTTP 504 is one too, on every vendor** (issue #759): a deadline ran out, the vendor's or
+    the harness's, and a second identical request into a server-side deadline is the same wall
+    #589 measured. `vendor_deadline` says whose: ``True`` when the deadline that ran out was the
+    vendor's or a gateway's own — not the budget the harness fitted — so the retry line names no
+    ``timeout=`` it cannot know. Vertex's 504 is the exception: its deadline *is* the harness's
+    fitted budget, sent as ``X-Server-Timeout``. An HTTP timeout carries the response's
+    `status_code` and `body`, and a router's own account of the failure (`_retry.diagnostics`).
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        body: str = "",
+        vendor_deadline: bool = False,
+        retry_after: float | None = None,
+        provider_code: str | None = None,
+        routing_attempt: int | None = None,
+        routing_attempts: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+        self.vendor_deadline = vendor_deadline
+        self.retry_after = retry_after
+        self.provider_code = provider_code
+        self.routing_attempt = routing_attempt
+        self.routing_attempts = routing_attempts
 
 
 class ProviderToolSchemaError(ProviderError):
