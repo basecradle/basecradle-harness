@@ -251,12 +251,17 @@ def test_a_web_search_runs_server_side_and_its_fee_is_logged(caplog):
         answer = adapter.chat(
             [Message.user("Search the web: what is the current stable version of Python? Cite it.")]
         )
-    llm = _lines(caplog, "llm provider=")
-    searches = sum(int(_field(line, "web_search_requests") or 0) for line in llm)
-    assert searches >= 1, llm
-    media = _lines(caplog, "media provider=anthropic kind=search.web")
-    assert sum(int(_field(line, "count")) for line in media) == searches  # one per billed call
-    assert sum(float(_field(line, "cost")) for line in media) == pytest.approx(searches * 0.01)
+    calls = {_field(line, "generation_id") for line in _lines(caplog, "llm provider=")}
+    tools = _lines(
+        caplog, "tool name=web_search executor=server provider=anthropic kind=search.web"
+    )
+    uses = sum(int(_field(line, "count")) for line in tools)
+    assert uses >= 1, tools
+    # One line per call that searched, joined to that call's `llm` line by its id (issue #758).
+    assert {_field(line, "generation_id") for line in tools} <= calls
+    # The fee is $10 per 1,000 *billed* searches; a failed use is counted and not billed.
+    billed = sum(float(_field(line, "cost") or 0) for line in tools) / 0.01
+    assert billed == pytest.approx(round(billed)) and 1 <= round(billed) <= uses, tools
     # With dynamic filtering (web_search_20260318) a search the model runs from Anthropic's code
     # execution comes back with no citation blocks, so no Sources: footer is built (measured
     # 2026-10-31); since issue #740 it may also call the search directly. Neither is pinned: what

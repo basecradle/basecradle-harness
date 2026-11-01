@@ -12,6 +12,7 @@ fake `Response` (the SDK's `Response` is a thin proto reader; the adapter only t
 from __future__ import annotations
 
 import json
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -38,7 +39,7 @@ from basecradle_harness import (
 from basecradle_harness._engine import _TRANSIENT
 from basecradle_harness._retry import connection_reason
 from basecradle_harness._xai_sdk import CONVERSATION_METADATA_KEY
-from tests.conftest import mail_tool
+from tests.conftest import mail_tool, tool_lines
 
 _TYPE = chat_pb2.ToolCallType
 
@@ -1315,3 +1316,103 @@ def test_a_turn_with_only_client_calls_carries_no_record():
         _response(tool_calls=[{"id": "f1", "name": "get_weather", "arguments": {"city": "Dallas"}}])
     )
     assert provider.chat([Message.user("weather?")], tools=[WEATHER_TOOL]).server_tools is None
+
+
+# === the tools grok ran server-side are tool lines (issue #758) =================================
+
+_STATUS = chat_pb2.ToolCallStatus
+
+
+def _used(response, *tools, generation="0199a2b4-7c3e-7f00-8a1b-2c3d4e5f6a7d"):
+    """`response` with a usage block listing `tools` (``ServerSideTool`` values) and an id."""
+    response.usage = SimpleNamespace(
+        prompt_tokens=10, completion_tokens=2, server_side_tools_used=list(tools)
+    )
+    response.id = generation
+    return response
+
+
+def test_each_server_side_tool_grok_used_is_one_tool_line(caplog):
+    from xai_sdk.chat import usage_pb2
+
+    tools = usage_pb2.ServerSideTool
+    response = _used(
+        _response(content="ok"),
+        tools.SERVER_SIDE_TOOL_WEB_SEARCH,
+        tools.SERVER_SIDE_TOOL_X_SEARCH,
+        tools.SERVER_SIDE_TOOL_WEB_SEARCH,
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider(response).chat([Message.user("news?")])
+
+    assert tool_lines(caplog) == [
+        (
+            "tool name=web_search executor=server provider=xai kind=search.web model=grok-4.3 "
+            "count=2 outcome=ok generation_id=0199a2b4-7c3e-7f00-8a1b-2c3d4e5f6a7d"
+        ),
+        (
+            "tool name=x_search executor=server provider=xai model=grok-4.3 count=1 outcome=ok "
+            "generation_id=0199a2b4-7c3e-7f00-8a1b-2c3d4e5f6a7d"
+        ),
+    ]
+
+
+def test_a_server_side_call_that_did_not_finish_is_an_error_line_and_still_counted(caplog):
+    """Two failed X searches the usage block does not list are still two uses, and failed."""
+    response = _used(
+        _response(
+            content="I could not search X.",
+            tool_calls=[
+                {
+                    "id": f"x{n}",
+                    "name": "x_keyword_search",
+                    "arguments": {"query": "ai"},
+                    "type": _TYPE.TOOL_CALL_TYPE_X_SEARCH_TOOL,
+                }
+                for n in (1, 2)
+            ],
+        )
+    )
+    response.tool_calls[0].status = _STATUS.TOOL_CALL_STATUS_FAILED
+    response.tool_calls[1].status = _STATUS.TOOL_CALL_STATUS_INCOMPLETE
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider(response).chat([Message.user("x?")])
+
+    (record,) = [r for r in caplog.records if r.getMessage().startswith("tool ")]
+    assert record.levelno == logging.WARNING
+    assert tool_lines(caplog) == [
+        (
+            "tool name=x_search executor=server provider=xai model=grok-4.3 count=2 outcome=error "
+            "reason=failed generation_id=0199a2b4-7c3e-7f00-8a1b-2c3d4e5f6a7d"
+        )
+    ]
+
+
+def test_a_finished_server_side_call_and_a_client_call_write_no_error_line(caplog):
+    response = _used(
+        _response(
+            content="ok",
+            tool_calls=[
+                {
+                    "id": "f1",
+                    "name": "get_weather",
+                    "arguments": {},
+                    "type": _TYPE.TOOL_CALL_TYPE_CLIENT_SIDE_TOOL,
+                },
+                {
+                    "id": "s1",
+                    "name": "web_search",
+                    "arguments": {},
+                    "type": _TYPE.TOOL_CALL_TYPE_WEB_SEARCH_TOOL,
+                },
+            ],
+        )
+    )
+    response.tool_calls[
+        0
+    ].status = _STATUS.TOOL_CALL_STATUS_FAILED  # a client call is ours to judge
+    response.tool_calls[1].status = _STATUS.TOOL_CALL_STATUS_COMPLETED
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        _provider(response).chat([Message.user("weather?")], tools=[WEATHER_TOOL])
+
+    assert tool_lines(caplog) == []

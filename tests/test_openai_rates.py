@@ -3,7 +3,8 @@
 OpenAI states tokens and no price, so the harness prices the call from `_openai_rates`. These pin the
 table's arithmetic against hand-worked figures, every case where the honest answer is *no figure*,
 and the lines the adapter and the media tools write: ``cost=`` tagged ``cost_basis=computed`` on the
-``llm`` line, a priced ``media`` line per web search, a stated gap for containers, and nothing at all
+``llm`` line, a priced ``web_search`` ``tool`` line per call that searched, a ``cost unpriced`` line
+for containers, and nothing at all
 computed for an endpoint that is not OpenAI.
 """
 
@@ -16,7 +17,6 @@ import pytest
 from basecradle_harness import Message, OpenAIProvider
 from basecradle_harness._observability import ComputedCost
 from basecradle_harness._openai_rates import (
-    CONTAINER_GAP,
     RATES,
     SOURCE,
     Usage,
@@ -36,6 +36,7 @@ from tests.conftest import (
     out_message,
     out_web_search_call,
     responses_body,
+    tool_lines,
 )
 
 OPENAI = "https://api.openai.com/v1"
@@ -259,27 +260,51 @@ def test_a_gpt_6_sol_brain_call_logs_a_computed_cost(router, sol, caplog):
         r"generation_id=resp-fake0001",
         line,
     ), line
-    assert not _lines(caplog, "media ")
+    assert not tool_lines(caplog)
 
 
-def test_a_web_search_gets_its_own_priced_media_line(router, sol, caplog):
+def test_a_web_search_is_a_server_tool_line_carrying_its_fee(router, sol, caplog):
     output = (out_web_search_call(query="a"), out_web_search_call(query="b"), out_message("x"))
     router.post(f"{OPENAI}/responses").mock(return_value=httpx.Response(200, json=_body(*output)))
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         sol.chat([Message.user("search")])
-    assert _lines(caplog, "media ") == [
-        "media provider=openai kind=search.web model=gpt-6-sol count=2 cost=0.02 cost_basis=computed"
+    assert tool_lines(caplog) == [
+        (
+            "tool name=web_search executor=server provider=openai kind=search.web model=gpt-6-sol "
+            "count=2 outcome=ok cost=0.02 cost_basis=computed generation_id=resp-fake0001"
+        )
     ]
 
 
-def test_a_container_is_a_stated_gap_once_per_wake(router, sol, caplog):
+def test_a_page_read_is_a_use_and_not_a_billed_search(router, sol, caplog):
+    """An ``open_page`` action is a web search *use*; OpenAI charges only for a ``search`` action."""
+    opened = out_web_search_call()
+    opened["action"] = {"type": "open_page", "url": "https://example.com/a"}
+    output = (out_web_search_call(query="a"), opened, out_message("x"))
+    router.post(f"{OPENAI}/responses").mock(return_value=httpx.Response(200, json=_body(*output)))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        sol.chat([Message.user("search")])
+    (line,) = tool_lines(caplog)
+    assert " count=2 " in line and " cost=0.01 " in line
+
+
+def test_a_container_is_a_code_execution_line_and_a_stated_gap_once_per_wake(router, sol, caplog):
     output = (out_code_interpreter_call(code="print(1)"), out_message("1"))
     router.post(f"{OPENAI}/responses").mock(return_value=httpx.Response(200, json=_body(*output)))
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         sol.chat([Message.user("run")])
         sol.chat([Message.user("again")])
-    gaps = [r for r in caplog.records if r.getMessage() == CONTAINER_GAP]
+    assert tool_lines(caplog) == 2 * [
+        (
+            "tool name=code_execution executor=server provider=openai model=gpt-6-sol count=1 "
+            "outcome=ok generation_id=resp-fake0001"
+        )
+    ]
+    gaps = [r for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
     assert len(gaps) == 1 and gaps[0].levelno == logging.WARNING
+    assert gaps[0].getMessage() == (
+        "cost unpriced provider=openai charge=container_time reason=not_reported"
+    )
 
 
 def test_an_unknown_model_logs_no_cost_and_warns_once(router, caplog):
@@ -321,9 +346,9 @@ def test_another_host_is_never_priced_and_says_so_once(router, caplog):
         provider.chat([Message.user("go")])
         provider.chat([Message.user("go")])
     assert all(" cost=" not in line for line in _lines(caplog, "llm "))
-    assert (
-        _lines(caplog, "media ")[0]
-        == "media provider=openai kind=search.web model=gpt-6-sol count=1"
+    assert tool_lines(caplog)[0] == (
+        "tool name=web_search executor=server provider=openai kind=search.web model=gpt-6-sol "
+        "count=1 outcome=ok generation_id=resp-fake0001"
     )
     assert sum("not api.openai.com" in r.getMessage() for r in caplog.records) == 1
 
@@ -344,7 +369,13 @@ def test_an_xai_endpoint_behind_the_openai_sdk_is_never_priced_from_openais_tabl
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         provider.chat([Message.user("go")])
     assert " cost=" not in _lines(caplog, "llm ")[0]
-    assert not _lines(caplog, "media ")
+    # xAI ran the search and says so in the item, so it is a tool line — with no OpenAI fee on it.
+    assert tool_lines(caplog) == [
+        (
+            "tool name=web_search executor=server provider=xai kind=search.web model=gpt-6-sol "
+            "count=1 outcome=ok generation_id=resp-fake0001"
+        )
+    ]
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 

@@ -29,6 +29,7 @@ from typing import Any
 
 from basecradle_harness._exceptions import PolicyError
 from basecradle_harness._messages import ToolResult, ToolSpec
+from basecradle_harness._observability import HARNESS_EXECUTOR
 from basecradle_harness._policy import Policy
 
 # The JSON Schema for a tool that takes no arguments.
@@ -46,12 +47,18 @@ class Tool(ABC):
       defaults to "no arguments".
     - `requires` — capability names this tool needs (e.g. ``{SHELL}``). Empty by
       default — a pure tool needs nothing and loads under any policy.
+
+    `executor` says who runs it, for its ``tool`` log line: ``harness`` (this process, the
+    default) or ``mcp`` (an MCP server the tool proxies to). A tool that buys vendor work records
+    it with `basecradle_harness._observability.metered`, and its line carries that work's vendor,
+    model and fee (`docs/telemetry.md` → Tools).
     """
 
     name: str
     description: str
     parameters: dict[str, Any] = NO_PARAMETERS
     requires: frozenset[str] = frozenset()
+    executor: str = HARNESS_EXECUTOR
 
     @abstractmethod
     def run(self, **kwargs: Any) -> str | ToolResult:

@@ -77,12 +77,15 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
+    ServerToolTally,
     finish_reason,
     generation_id,
     generation_id_header,
     generation_of,
     log_llm_call,
+    log_server_tools,
     reported_cost,
+    routed_web_searches,
     serving_endpoint,
     stamp_generation_id,
     token_counts,
@@ -466,6 +469,16 @@ class OpenRouterProvider:
             finish_reason=reason,
             # OpenRouter's generation id (``gen-…``), the id its feedback and refund path asks for
             # (issue #634). The body's ``id`` equals the ``X-Generation-Id`` header on a success.
+            generation_id=generation_id(data),
+        )
+        # The web searches OpenRouter ran for the call (its ``openrouter:web_search`` server tool),
+        # one `tool` line beside the call's `llm` line (issue #758). OpenRouter names no call and
+        # states the searches' fee only inside ``usage.cost``, so the line carries the count alone.
+        searches = routed_web_searches(usage)
+        log_server_tools(
+            {"web_search": ServerToolTally(count=searches)} if searches else {},
+            provider=self.provider,
+            model=self.model,
             generation_id=generation_id(data),
         )
         self._restore_annotations(data)

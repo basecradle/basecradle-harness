@@ -26,6 +26,7 @@ from basecradle_harness import (
     PlatformContext,
     PlatformError,
 )
+from tests.conftest import run_through_engine, tool_lines
 
 BC_URL = "https://basecradle.com"
 IMAGES_BASE = "https://api.openai.test/v1"
@@ -718,12 +719,12 @@ def test_edit_relays_an_images_api_error(edit_tool):
     assert "bad mask" in result  # the provider's reason reaches the model, not "HTTP 400"
 
 
-# --- the media log line (issue #272) -----------------------------------------
+# --- the tool line names the vendor work (issues #272, #758) ---------------
 
 
-def test_a_generation_logs_one_media_line(tool, caplog):
-    """Image work is slow and expensive, so the journal names the vendor, the kind, and the
-    time the *generation* took (not the Asset upload that follows it)."""
+def test_a_generation_logs_one_tool_line(tool, caplog):
+    """Image work is slow and expensive, so the run's one ``tool`` line names the vendor, the kind
+    and the model its meter recorded, beside the run's duration (issue #758)."""
     import logging
 
     with respx.mock(assert_all_called=True) as mock:
@@ -735,15 +736,15 @@ def test_a_generation_logs_one_media_line(tool, caplog):
             return_value=httpx.Response(201, json=asset_response())
         )
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            tool.run(prompt="a red cube on a white table")
+            run_through_engine(tool, prompt="a red cube on a white table")
 
-    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    line = tool_lines(caplog)[0]
     assert "provider=openai" in line
     assert "kind=image.generate" in line
     assert "model=gpt-image-2.5-flare" in line
 
 
-# --- the computed cost on the media line (issue #657) ------------------------
+# --- the computed cost on the tool line (issues #657, #758) ------------------
 
 OPENAI_IMAGES = "https://api.openai.com/v1"
 
@@ -764,8 +765,8 @@ def _generate_on_openai(client, caplog, body):
             return_value=httpx.Response(201, json=asset_response())
         )
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            tool.run(prompt="a red cube on a white table")
-    return next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+            run_through_engine(tool, prompt="a red cube on a white table")
+    return tool_lines(caplog)[0]
 
 
 def test_a_generation_on_openai_is_priced_from_its_token_usage(client, caplog):

@@ -37,13 +37,14 @@ What is priced, and what is not
   Images endpoint the harness calls reports no cached count, so none is applied.
 - **Transcription** (`transcription_cost`): per minute of audio where the response reports a duration
   (``gpt-transcribe``), by tokens where it reports tokens (``gpt-4o-transcribe``).
-- **Web search** (`web_search_cost`): $10 per 1,000 search calls, as its own priced line — the search
-  content tokens it feeds back are already in the call's input tokens ("billed at model rates").
+- **Web search** (`web_search_cost`): $10 per 1,000 search calls, on the call's ``web_search`` ``tool``
+  line — the search content tokens it feeds back are already in the call's input tokens ("billed at
+  model rates").
 - **Not priced: code-interpreter containers.** The page bills a container per 20-minute session by
   memory size, and "eligible" sessions by the minute with a five-minute minimum. Which applies, and how
   long a session lived, is nowhere in a response, so any figure would be a guess. The adapter states
-  that gap once per wake as a WARNING (`CONTAINER_GAP`) rather than log a number it cannot stand
-  behind or stay silent about a charge it knows exists.
+  that gap once per wake as a ``cost unpriced charge=container_time reason=not_reported`` WARNING
+  rather than log a number it cannot stand behind or stay silent about a charge it knows exists.
 - **Not priced: data-residency and FedRAMP endpoints.** The page adds a 10% uplift there; the table is
   for OpenAI's own host (`PRICED_HOST`), and a call anywhere else is unpriced and warned about.
 """
@@ -80,15 +81,6 @@ _STANDARD_ASKED = frozenset({"", "auto", "default"})
 
 #: OpenAI's charge per web search call: "$10.00 / 1k calls" (Web search, all models).
 WEB_SEARCH_PER_CALL = 10.00 / 1_000
-
-#: The WARNING the adapter writes, once per wake, when a code-interpreter container ran — see the
-#: module docstring for why it is a stated gap rather than a figure.
-CONTAINER_GAP = (
-    "OpenAI bills code-interpreter containers per session (a 20-minute session at $0.03 for 1 GB, "
-    "or by the minute with a five-minute minimum for eligible sessions), and no response says which "
-    "applies or how long the session lived. Container charges are therefore not priced on any line "
-    "this wake; read them off OpenAI's usage dashboard."
-)
 
 
 @dataclass(frozen=True)

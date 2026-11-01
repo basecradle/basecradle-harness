@@ -194,11 +194,14 @@ def test_a_web_search_logs_one_priced_line_per_search_call(caplog):
     finally:
         provider.close()
 
-    line = _line(caplog, "media provider=openai kind=search.web")
-    count = int(_field(line, "count"))
-    assert count >= 1
-    assert _field(line, "cost") == f"{count * 0.01:.8f}".rstrip("0").rstrip(".")
+    line = _line(caplog, "tool name=web_search executor=server provider=openai kind=search.web")
+    uses = int(_field(line, "count"))
+    assert uses >= 1
+    # $10 per 1,000 *search* actions; a page read (``open_page``) is a use and not a billed search.
+    searches = float(_field(line, "cost")) / 0.01
+    assert searches == pytest.approx(round(searches)) and 1 <= round(searches) <= uses, line
     assert _field(line, "cost_basis") == "computed"
+    assert _field(line, "generation_id") == _field(_line(caplog, "llm "), "generation_id")
 
 
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")

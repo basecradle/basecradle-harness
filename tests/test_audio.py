@@ -17,6 +17,7 @@ import respx
 from basecradle import BaseCradle
 
 from basecradle_harness import AssetsTool, PlatformContext, PlatformError, Transcriber
+from tests.conftest import run_through_engine, tool_lines
 
 BC_URL = "https://basecradle.com"
 AUDIO_BASE = "https://api.openai.test/v1"
@@ -302,10 +303,10 @@ def test_listen_loads_under_the_locked_profile(client):
     assert "assets" in registry
 
 
-# --- the media log line (issue #272) -----------------------------------------
+# --- the tool line names the vendor work (issues #272, #758) ---------------
 
 
-def test_a_transcription_logs_one_media_line(tool, caplog):
+def test_a_transcription_logs_one_tool_line(tool, caplog):
     import logging
 
     with respx.mock(assert_all_called=True) as mock:
@@ -315,13 +316,13 @@ def test_a_transcription_logs_one_media_line(tool, caplog):
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(AUDIO_URL).mock(return_value=httpx.Response(200, json={"text": TRANSCRIPT}))
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            tool.run(action="listen", uuid=A_AUDIO)
+            run_through_engine(tool, action="listen", uuid=A_AUDIO)
 
-    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    line = tool_lines(caplog)[0]
     assert "provider=openai" in line and "kind=audio.transcribe" in line
 
 
-# --- the computed cost on the media line (issue #657) ------------------------
+# --- the computed cost on the tool line (issues #657, #758) ------------------
 
 
 def test_a_transcription_on_openai_is_priced_per_minute_of_audio(client, caplog):
@@ -339,7 +340,7 @@ def test_a_transcription_on_openai_is_priced_per_minute_of_audio(client, caplog)
         mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
         mock.post(f"{base}/audio/transcriptions").mock(return_value=httpx.Response(200, json=body))
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-            tool.run(action="listen", uuid=A_AUDIO)
+            run_through_engine(tool, action="listen", uuid=A_AUDIO)
 
-    line = next(m for m in (r.getMessage() for r in caplog.records) if m.startswith("media "))
+    line = tool_lines(caplog)[0]
     assert line.endswith(" cost=0.00675 cost_basis=computed"), line

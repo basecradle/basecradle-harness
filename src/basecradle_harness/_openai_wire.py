@@ -432,6 +432,27 @@ def _server_tool_use(kind: str, item: Mapping[str, Any]) -> ServerToolUse:
     )
 
 
+#: The harness's name for a server tool whose Responses item names it otherwise — the name the
+#: agent knows the capability by, which its ``tool`` line carries (`server_tool_uses`).
+_HARNESS_NAMES = {"code_interpreter": "code_execution"}
+
+
+def server_tool_uses(output: Any) -> list[tuple[str, str]]:
+    """``(name, failure)`` for each server-side tool item a Responses ``output`` holds (issue #758).
+
+    The same items, read the same way, as the reply's record (`_server_tool_use`) — so the journal
+    and what a later wake is shown can never count differently — under the harness's name for the
+    capability (``code_execution``, not the vendor's ``code_interpreter``).
+    """
+    uses: list[tuple[str, str]] = []
+    for item in output or ():
+        kind = item.get("type") if isinstance(item, Mapping) else None
+        if _is_server_tool_item(kind):
+            use = _server_tool_use(kind, item)
+            uses.append((_HARNESS_NAMES.get(use.name, use.name), use.failed))
+    return uses
+
+
 def _tool_call_from_responses(item: Mapping[str, Any]) -> ToolCall:
     """A Responses ``function_call`` item as a harness `ToolCall` (arguments parsed)."""
     raw_args = item.get("arguments") or "{}"

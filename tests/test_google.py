@@ -62,8 +62,9 @@ from basecradle_harness._google import (
     credentials_file_state,
 )
 from basecradle_harness._google_rates import Usage, call_cost
-from basecradle_harness._observability import truncated
+from basecradle_harness._observability import ComputedCost, tool_meter, truncated
 from basecradle_harness._timeouts import CONNECT_TIMEOUT, TIMEOUT_RETRY_SCALE
+from tests.conftest import run_through_engine, tool_lines
 
 MODEL = "gemini-3.8-flash"
 PROJECT = "nova-project"
@@ -1261,7 +1262,8 @@ def test_no_representation_of_the_adapter_emits_its_key_or_token(router, provide
 # cannot — Vertex refuses a search tool beside function calling — so `GoogleProvider.search` makes a
 # separate call whose only tool is ``google_search``, and `GoogleSearchTool` hands its answer to the
 # agent as ``web_search``. These pin what goes on the wire, the two lines a search writes (its
-# ``llm`` line as a helper call, its grounding fee as a priced ``media`` line), and the honest gaps.
+# ``llm`` line as a helper call, its grounding fee on the tool's own ``tool`` line), and the honest
+# gaps.
 
 GROUNDED_USAGE = {
     "promptTokenCount": 20,
@@ -1375,9 +1377,11 @@ def test_a_search_returns_the_grounded_answer_with_its_sources(router, provider)
     )
 
 
-def test_a_search_writes_a_helper_llm_line_and_a_priced_grounding_line(router, provider, caplog):
+def test_a_search_writes_a_helper_llm_line_and_meters_its_grounding_fee(router, provider, caplog):
+    """The tokens are the helper call's `llm` line; the fee rides the `web_search` tool's own `tool`
+    line, through the meter the engine opens around the run (issue #758)."""
     router.post(GENERATE).mock(return_value=grounded(text("Sunny.")))
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"), tool_meter() as meter:
         provider.search("weather in chicago")
     (llm,) = _lines_starting(caplog, "llm ")
     assert re.fullmatch(
@@ -1387,12 +1391,16 @@ def test_a_search_writes_a_helper_llm_line_and_a_priced_grounding_line(router, p
         r"generation_id=resp-0123456789abcdef",
         llm,
     ), llm
-    assert _lines_starting(caplog, "media ") == [
-        (
-            "media provider=google kind=search.grounding model=gemini-3.8-flash count=2 "
-            "cost=0.028 cost_basis=computed"
-        )
-    ]
+    fields = meter.fields()
+    assert fields == {
+        "provider": "google",
+        "kind": "search.grounding",
+        "model": "gemini-3.8-flash",
+        "count": 2,
+        "cost": pytest.approx(0.028),
+    }
+    assert isinstance(fields["cost"], ComputedCost)
+    assert not _lines_starting(caplog, "tool ")  # the line is the engine's, never the adapter's
 
 
 def test_grounding_tokens_are_not_charged_on_a_gemini_3_search(
@@ -1418,19 +1426,23 @@ def test_the_brains_own_turns_still_pay_for_tool_use_tokens(_pinned_billing_day)
 
 def test_a_search_that_returned_no_sources_is_not_billed_a_grounding_fee(router, provider, caplog):
     router.post(GENERATE).mock(return_value=grounded(text("I could not find that."), chunks=[]))
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"), tool_meter() as meter:
         answer = provider.search("something unfindable")
     assert answer == "I could not find that."
-    assert not _lines_starting(caplog, "media ")
+    assert meter.fields() == {}
 
 
 def test_a_fee_that_cannot_be_counted_is_logged_without_a_cost_and_warned(router, provider, caplog):
     router.post(GENERATE).mock(return_value=grounded(text("Sunny."), queries=()))
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"), tool_meter() as meter:
         provider.search("weather")
-    assert _lines_starting(caplog, "media ") == [
-        "media provider=google kind=search.grounding model=gemini-3.8-flash"
-    ]
+    assert meter.fields() == {
+        "provider": "google",
+        "kind": "search.grounding",
+        "model": "gemini-3.8-flash",
+        "count": None,
+        "cost": None,
+    }
     assert any(
         r.levelno == logging.WARNING and "grounding" in r.getMessage() for r in caplog.records
     )
@@ -1501,6 +1513,50 @@ def test_a_brain_with_no_model_gets_a_readable_error(monkeypatch):
     assert "AI_MODEL" in GoogleSearchTool().run(query="weather")
 
 
+def _search_env(monkeypatch, key_file):
+    monkeypatch.setenv("AI_MODEL", MODEL)
+    monkeypatch.setenv("AI_CREDENTIALS_FILE", str(key_file))
+    monkeypatch.setenv("AI_LOCATION", "us")
+
+
+def test_a_search_run_is_one_tool_line_carrying_its_grounding_fee(
+    router, key_file, monkeypatch, caplog
+):
+    """Through the engine's dispatch, as a wake runs it: the fee is on the tool's own line (#758)."""
+    _search_env(monkeypatch, key_file)
+    router.post(GENERATE).mock(return_value=grounded(text("Sunny.")))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        assert run_through_engine(GoogleSearchTool(), query="weather").startswith("Sunny.")
+    (line,) = tool_lines(caplog)
+    assert re.fullmatch(
+        r"tool name=web_search executor=harness provider=google kind=search\.grounding "
+        r"model=gemini-3\.8-flash count=2 duration=\d+\.\d\ds outcome=ok cost=0\.028 "
+        r"cost_basis=computed",
+        line,
+    ), line
+
+
+def test_a_search_that_failed_is_an_error_line_though_the_model_reads_text(
+    router, key_file, monkeypatch, caplog
+):
+    _search_env(monkeypatch, key_file)
+    router.post(GENERATE).mock(
+        return_value=httpx.Response(
+            400, json={"error": {"code": 400, "message": "x", "status": "INVALID_ARGUMENT"}}
+        )
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        answer = run_through_engine(GoogleSearchTool(), query="weather")
+    assert answer.startswith("Error searching the web:")
+    line, warning = tool_lines(caplog)
+    assert re.fullmatch(
+        r"tool name=web_search executor=harness provider=google kind=search\.grounding "
+        r"model=gemini-3\.8-flash duration=\d+\.\d\ds outcome=error reason=provider_error",
+        line,
+    ), line
+    assert warning.startswith("tool name=web_search error=")
+
+
 def test_a_per_prompt_model_bills_one_grounding_unit_however_many_queries(router, key_file, caplog):
     """Gemini 2.5 bills the grounded prompt once ($35 per 1,000), so `count=` is 1, not the queries."""
     provider = build(key_file)
@@ -1508,14 +1564,10 @@ def test_a_per_prompt_model_bills_one_grounding_unit_however_many_queries(router
     router.post(GENERATE.replace(MODEL, "gemini-2.5-flash")).mock(
         return_value=grounded(text("Sunny."), queries=("a", "b", "c"))
     )
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"), tool_meter() as meter:
         provider.search("weather")
-    assert _lines_starting(caplog, "media ") == [
-        (
-            "media provider=google kind=search.grounding model=gemini-2.5-flash count=1 "
-            "cost=0.035 cost_basis=computed"
-        )
-    ]
+    assert meter.fields()["count"] == 1
+    assert meter.fields()["cost"] == pytest.approx(0.035)
 
 
 # === the built-ins Gemini ran are recorded for a later wake (issue #727) =======================

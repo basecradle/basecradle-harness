@@ -7,9 +7,10 @@ happened**, in lean ``key=value`` text. Nothing here hand-prefixes ``[Harness]``
 name into the message — that would duplicate the identifier journald already carries.
 
 Three emitters live here because they are cross-cutting: the per-call **LLM** line (written by
-every provider adapter), the per-generation **media** line (written by every image/video/audio
-tool), and the ``kv`` formatter they share. The other lines — the wake bookends, the step
-ledger, the per-tool line — are written where the fact is known (`_wake`, `_engine`) but format
+every provider adapter), the per-use **tool** line (written by the engine for a harness or MCP
+tool, and by an adapter for a tool its vendor ran server-side — one head whoever executed it,
+`docs/telemetry.md` → Tools), and the ``kv`` formatter they share. The other lines — the wake
+bookends, the step ledger — are written where the fact is known (`_wake`, `_engine`) but format
 through `kv` all the same, so one grep syntax reads the whole stream.
 
 What is deliberately *not* logged: prompts, request bodies, response bodies, and API keys. A log
@@ -51,8 +52,7 @@ import logging
 import math
 import os
 import re
-import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -191,7 +191,7 @@ class ComputedCost(float):
     """A dollar figure the harness **computed** from a vendor's published rates.
 
     A plain ``float`` everywhere it is used — summed, formatted, compared — and the one bit of
-    provenance it carries is its type: `log_llm_call` and `log_media_call` render
+    provenance it carries is its type: `log_llm_call` and `log_tool` render
     ``cost_basis=computed`` beside any cost that is one. The provenance travels *with the figure*
     rather than as a second argument because a figure passes through hands that never knew it was
     computed: a non-brain caller writes its own line from what `capture_llm_call` recorded (the
@@ -321,7 +321,7 @@ def head(text: str, color: str) -> str:
 
     Which lines get a head, and it is a rule rather than a list: **a head is colored when it states
     a verdict about a unit of work** — did it start, end, fail, get skipped, get blocked, recover —
-    and left plain when it names a *fact*: ``llm``, ``tool``, ``media``, ``unspoken``, ``posted``,
+    and left plain when it names a *fact*: ``llm``, ``tool``, ``unspoken``, ``posted``,
     ``step``, ``memory``, ``context …``. Color everything and the signal is gone; and those
     fact-heads are also the anchors the fleet dashboard extracts on (`` llm provider=``,
     `` tool name=``, `` unspoken timeline=``), which a head span would sit inside.
@@ -756,88 +756,330 @@ def log_llm_retry(
     _log.warning("%s %s", RETRY_HEAD, kv(**_generation_last(fields, None)))
 
 
-def log_media_call(
-    *,
-    provider: str,
-    kind: str,
-    model: str,
-    seconds: float | None,
-    cost: float | None = None,
-    count: int | None = None,
-) -> None:
-    """One INFO line per media generation or per-use tool charge: provider, what, how long, cost.
+#: Who ran a tool, as the ``executor=`` field of its `tool` line says (`docs/telemetry.md` → Tools).
+#: The harness's own tool classes, a tool an MCP server serves through the harness's proxy, and a
+#: tool the **vendor** ran server-side inside a model call — three executors, one head.
+HARNESS_EXECUTOR = "harness"
+MCP_EXECUTOR = "mcp"
+SERVER_EXECUTOR = "server"
 
-    ``kind`` is the shape of the work (``image.generate``, ``image.edit``, ``video.generate``,
-    ``audio.transcribe``) — the media endpoints are slow and expensive, so their duration is the
-    number an operator actually wants. A *failed* generation is not logged here: the engine's
-    per-tool line already carries its duration and error text, and a second line would only say
-    the same thing twice.
+#: The ``kind=`` a server-side tool's line carries, by the harness name of the capability — only for
+#: the shapes the contract names (`docs/telemetry.md` → ``tool`` → ``kind``). A tool absent here
+#: (a fetch, a code run, an X search) carries no ``kind``, never an invented one.
+SERVER_TOOL_KINDS: Mapping[str, str] = {"web_search": "search.web"}
 
-    **The same line carries a server-side tool's per-use fee** (issues #656, #657): ``search.web``
-    for OpenAI's web search (billed per search call) and ``search.grounding`` for Gemini's Google
-    Search grounding (billed per grounding query). Those charges are not model tokens, so they do
-    not belong in the `llm` line's ``cost=``; and the fleet's tool-spend category is a positive gate
-    on this ``media provider=`` head (basecradle-noc#626), so a fee written on any *new* head would be
-    a dollar nobody counts. ``count`` is the billed units — calls, queries — and ``seconds`` is
-    ``None`` for such a line, because the work ran inside a model call the `llm` line already timed.
+_SLUG_CHARS = re.compile(r"[^a-z0-9_:.-]+")
 
-    ``cost`` is the dollar charge as the provider stated it (xAI's ``usage.cost_in_usd_ticks`` on the
-    grok media cells), or — where the vendor states no price, which is OpenAI, Google and Anthropic — as the
-    harness computed it from the vendor's published rates (a `ComputedCost`, which renders
-    ``cost_basis=computed`` after it, `COST_BASIS_COMPUTED`). The same honest-absence contract
-    `log_llm_call` keeps, through the same `_money` formatter (see `_money` for the one cost
-    convention that spans both): a charge the harness cannot price is omitted, never guessed.
+
+def slug(text: Any) -> str | None:
+    """A vendor's own code or status as a ``reason=`` slug: lowercased, every other run an ``_``.
+
+    For the codes a vendor already spells as a slug (``max_uses_exceeded``) this is the identity; for
+    an enum name (``OUTCOME_FAILED``, ``URL_RETRIEVAL_STATUS_ERROR``) it is the same word in the
+    contract's one spelling. ``None`` for nothing to say.
     """
-    _log.info(
-        "media %s",
+    if text is None:
+        return None
+    word = _SLUG_CHARS.sub("_", str(text).strip().lower()).strip("_")
+    return word or None
+
+
+def log_tool(
+    *,
+    name: str,
+    executor: str,
+    outcome: str,
+    seconds: float | None = None,
+    reason: str | None = None,
+    error: str | None = None,
+    provider: str | None = None,
+    kind: str | None = None,
+    model: str | None = None,
+    count: int | None = None,
+    cost: float | None = None,
+    generation_id: str | None = None,
+) -> None:
+    """**The** `tool` line — one per tool use, whoever executed it (issue #758).
+
+    The engine writes it for a harness tool and an MCP tool (``executor=harness|mcp``, with the run's
+    ``duration``); an adapter writes it for a tool its vendor ran inside a model call
+    (``executor=server``, no ``duration`` — the `llm` line already timed that call — the uses in
+    ``count``, and the ``generation_id`` of the call, so the tool joins to its `llm` line). A harness
+    tool that bought vendor work (an image, a transcription, a grounded search) carries that work's
+    ``provider``, ``kind``, ``model`` and fee, recorded on its `ToolMeter` while it ran.
+
+    Before this, a tool was two things: the engine's ``tool`` line (calls and errors) and a separate
+    ``media`` line (duration and cost), while a server-side tool wrote no tool line at all and its
+    counts sat on the `llm` line — so the fleet's *Tool Calls* and *Tool Cost* read two different
+    definitions of "tool", and a vendor's server tool was visible only as a larger ``cost=``.
+
+    ``cost`` is the tool's **own fee** — never model tokens, which stay on the `llm` line — rendered
+    through the same `_money` formatter as every other dollar, with ``cost_basis=computed`` beside a
+    `ComputedCost`. A failed run (``outcome=error``) names why as a slug in ``reason``; when there is
+    foreign text to show, ``error`` writes it on a second, WARNING ``tool`` line carrying only
+    ``name`` and ``error``, as before. A server-side failure has a vendor code and no text, so it has
+    no companion and is itself written at WARNING, where a severity filter still sees it.
+    """
+    failed_server = executor == SERVER_EXECUTOR and outcome == "error"
+    _log.log(
+        logging.WARNING if failed_server else logging.INFO,
+        "tool %s",
         kv(
+            name=name,
+            executor=executor,
             provider=provider,
             kind=kind,
             model=model,
             count=count,
             duration=None if seconds is None else _secs(seconds),
+            outcome=outcome,
+            reason=reason,
             cost=_money(cost),
             cost_basis=cost_basis(cost),
+            generation_id=generation_id,
         ),
+    )
+    if error is not None:
+        _log.warning("tool %s", kv(name=name, error=error))
+
+
+def log_server_tool(
+    *,
+    name: str,
+    provider: str,
+    model: str,
+    count: int,
+    generation_id: str | None,
+    reason: str | None = None,
+    cost: float | None = None,
+) -> None:
+    """One `tool` line for a tool the vendor ran server-side: one per model call per tool.
+
+    ``name`` is the harness's name for the capability (``web_search``, ``web_fetch``,
+    ``code_execution``), never the vendor's block type; ``count`` is the uses the vendor reported on
+    this call; ``reason`` is the vendor's own code for a use that failed, which makes the line
+    ``outcome=error``.
+    """
+    log_tool(
+        name=name,
+        executor=SERVER_EXECUTOR,
+        outcome="ok" if reason is None else "error",
+        reason=reason,
+        provider=provider,
+        kind=SERVER_TOOL_KINDS.get(name),
+        model=model,
+        count=count,
+        cost=cost,
+        generation_id=generation_id,
     )
 
 
-class MediaCall:
-    """The mutable handle `media_timer` yields, so a caller can record the call's cost.
+@dataclass
+class ServerToolTally:
+    """One server-side tool's uses on one model call, and the first failure the vendor reported."""
 
-    A media call's charge is knowable only *after* the vendor responds and its body is read — which
-    happens inside the timed block. So the timer hands back this handle; the tool sets ``cost`` from
-    the response body (a provider-stated USD float, a `ComputedCost` priced from the response's
-    usage, or ``None`` when neither is possible) and the timer logs it on a clean exit. A block that
-    never sets it leaves it ``None``, and the line omits ``cost=``.
+    count: int = 0
+    reason: str | None = None
+
+
+def tally_server_tools(uses: Iterable[tuple[str, str | None]]) -> dict[str, ServerToolTally]:
+    """``(name, failure)`` pairs — one per use — tallied per tool, in the order first seen.
+
+    ``failure`` is the vendor's code or status for a use that did not complete (falsy for one that
+    did); the first one a tool reports becomes its line's ``reason``.
+    """
+    found: dict[str, ServerToolTally] = {}
+    for name, failure in uses:
+        tally = found.setdefault(name, ServerToolTally())
+        tally.count += 1
+        if failure and tally.reason is None:
+            tally.reason = slug(failure)
+    return found
+
+
+def log_server_tools(
+    tallies: Mapping[str, ServerToolTally],
+    *,
+    provider: str,
+    model: str,
+    generation_id: str | None,
+    fees: Mapping[str, float | None] | None = None,
+) -> None:
+    """`log_server_tool` for every tool in `tallies` that ran — the adapters' one call site."""
+    for name, tally in tallies.items():
+        if tally.count:
+            log_server_tool(
+                name=name,
+                provider=provider,
+                model=model,
+                count=tally.count,
+                generation_id=generation_id,
+                reason=tally.reason,
+                cost=(fees or {}).get(name),
+            )
+
+
+#: Where a **router** counts the web searches it ran for a call: OpenRouter's
+#: ``usage.server_tool_use_details.web_search_requests``, on both its native SDK and the ``openai`` SDK
+#: aimed at it. OpenRouter folds the searches' fee into ``usage.cost`` and states it nowhere apart, so
+#: the count is the fact; the dollars stay on the `llm` line.
+_ROUTED_SEARCH_FIELDS: tuple[tuple[str, ...], ...] = (
+    ("server_tool_use_details", "web_search_requests"),
+)
+
+
+def routed_web_searches(usage: Any) -> int:
+    """How many web searches a router reports it ran on a call — ``0`` when it reports none."""
+    value = _first(usage, _ROUTED_SEARCH_FIELDS) if usage is not None else None
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def log_cost_unpriced(*, provider: str, charge: str, reason: str, model: str | None = None) -> None:
+    """One WARNING naming a real charge the harness cannot price (`docs/telemetry.md`).
+
+    The caller states it **once per wake per gap**: a missing dollar is then a counted fact a
+    dashboard can compare across vendors, rather than an absence nobody sees or a sentence in each
+    vendor's own words. ``charge`` is what carries no price (``container_time``, …) and ``reason``
+    why (``not_reported``, …); ``model`` is omitted where the charge is not per model.
+    """
+    _log.warning(
+        "cost unpriced %s", kv(provider=provider, model=model, charge=charge, reason=reason)
+    )
+
+
+#: The ``charge=`` and ``reason=`` of a code sandbox's container time, which Anthropic and OpenAI
+#: both bill and no response of either states — the one shared spelling of that gap.
+CONTAINER_TIME = "container_time"
+NOT_REPORTED = "not_reported"
+
+
+class ToolMeter:
+    """What a harness tool's **billed vendor work** recorded while it ran, for its `tool` line.
+
+    The engine opens one around every tool run (`tool_meter`); a tool that calls a vendor records
+    each unit of work on it through `metered` (or `meter_tool`), and the engine writes what was
+    recorded onto the run's one `tool` line — the vendor, the shape of the work, the model, and the
+    fee. A tool that buys nothing records nothing and its line is the platform tool's line it always
+    was. Outside an engine (a library caller running a tool by hand) there is no meter, no tool line,
+    and recording is a no-op.
+
+    More than one unit in one run is summed: ``count`` becomes the units, and the fee the total of
+    the units that **finished** — a failed unit bought nothing — tagged computed when any part of it
+    is the harness's arithmetic, and absent when a finished unit's fee was, because a partial total
+    would be a figure nobody can stand behind. The vendor, kind and model are the first unit's.
+
+    **Recording can never raise into a wake.** The fee and the count come off a vendor body, often
+    in a ``tools/`` overlay tool someone wrote in an afternoon, and the meter is read *after* the
+    tool has already acted — so a figure that is not a real, finite, non-negative number (a string,
+    a bool, ``nan``) is dropped as it is recorded, as `_money` drops it from every other line, and a
+    count that is not a positive ``int`` likewise.
     """
 
-    __slots__ = ("cost",)
+    __slots__ = ("_units", "failure")
 
     def __init__(self) -> None:
-        self.cost: float | None = None
+        self._units: list[tuple[str, str, str, int | None, float | None, bool]] = []
+        self.failure: Exception | None = None
+
+    def record(
+        self,
+        *,
+        provider: str,
+        kind: str,
+        model: str,
+        count: Any = None,
+        cost: Any = None,
+        failed: bool = False,
+    ) -> None:
+        units = (
+            count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else None
+        )
+        fee = cost if _money(cost) is not None else None
+        self._units.append((provider, kind, model, units, fee, failed))
+
+    def fields(self) -> dict[str, Any]:
+        """The `log_tool` keywords this run's recorded work fills (empty when it recorded none)."""
+        if not self._units:
+            return {}
+        provider, kind, model, count, _, _ = self._units[0]
+        if len(self._units) > 1:
+            count = sum(unit[3] if unit[3] is not None else 1 for unit in self._units)
+        costs = [unit[4] for unit in self._units if not unit[5]]
+        cost: float | None = None
+        if costs and all(c is not None for c in costs):
+            total = math.fsum(costs)  # type: ignore[arg-type]
+            computed = any(isinstance(c, ComputedCost) for c in costs)
+            cost = ComputedCost(total) if computed else total
+        return {"provider": provider, "kind": kind, "model": model, "count": count, "cost": cost}
+
+
+_METER: ContextVar[ToolMeter | None] = ContextVar("basecradle_harness_tool_meter", default=None)
 
 
 @contextmanager
-def media_timer(*, provider: str, kind: str, model: str) -> Iterator[MediaCall]:
-    """Time a media generation and log it — the call-site form of `log_media_call`.
+def tool_meter() -> Iterator[ToolMeter]:
+    """Open the `ToolMeter` a tool run records its vendor work on — the engine's half."""
+    meter = ToolMeter()
+    token = _METER.set(meter)
+    try:
+        yield meter
+    finally:
+        _METER.reset(token)
 
-    Wraps just the vendor call, so the duration is the *generation*, not the Asset upload that
-    follows it (an operator asking "why did that take two minutes?" means the model, not the
-    file transfer). Yields a `MediaCall` whose ``cost`` the caller may set from the response body;
-    it is logged on a clean exit. A block that raises logs nothing and lets the error through
-    untouched: the tool relays the failure to the model and the engine's tool line records it.
+
+def meter_tool(
+    *, provider: str, kind: str, model: str, count: Any = None, cost: Any = None
+) -> None:
+    """Record one finished unit of vendor work on the running tool's meter (a no-op with none)."""
+    meter = _METER.get()
+    if meter is not None:
+        meter.record(provider=provider, kind=kind, model=model, count=count, cost=cost)
+
+
+def meter_failure(exc: Exception, *, provider: str, kind: str, model: str) -> None:
+    """Record that the running tool's vendor work failed — what it was buying, and the fault.
+
+    The tool usually turns the error into text for the model, so the engine would otherwise read the
+    run as a success; the meter is how its ``tool`` line still says ``outcome=error`` with the
+    fault's slug and the vendor it failed at. A no-op outside a tool run.
     """
-    call = MediaCall()
-    started = time.monotonic()
-    yield call
-    log_media_call(
-        provider=provider,
-        kind=kind,
-        model=model,
-        seconds=time.monotonic() - started,
-        cost=call.cost,
-    )
+    meter = _METER.get()
+    if meter is not None:
+        meter.record(provider=provider, kind=kind, model=model, failed=True)
+        meter.failure = exc
+
+
+class MeteredCall:
+    """The handle `metered` yields, so a tool can record the charge its vendor's answer states.
+
+    The charge is knowable only *after* the vendor responds and its body is read — inside the block.
+    The tool sets ``cost`` (a vendor-stated USD figure, a `ComputedCost`, or leaves it ``None`` when
+    neither is possible) and ``count`` (billed units, where there is more than one).
+    """
+
+    __slots__ = ("cost", "count")
+
+    def __init__(self) -> None:
+        self.cost: float | None = None
+        self.count: int | None = None
+
+
+@contextmanager
+def metered(*, provider: str, kind: str, model: str) -> Iterator[MeteredCall]:
+    """Record one unit of a harness tool's vendor work — the tool's half of the meter.
+
+    Wraps the vendor call. On a clean exit the unit is recorded with whatever charge the block set;
+    on a raise the meter keeps the failure (so the run's `tool` line says ``outcome=error`` with the
+    fault's slug and the vendor and model it was buying from, even when the tool turns the error into
+    text for the model) and the error goes through untouched.
+    """
+    call = MeteredCall()
+    try:
+        yield call
+    except Exception as exc:
+        meter_failure(exc, provider=provider, kind=kind, model=model)
+        raise
+    meter_tool(provider=provider, kind=kind, model=model, count=call.count, cost=call.cost)
 
 
 def token_counts(usage: Any) -> dict[str, int]:
@@ -1169,14 +1411,14 @@ def _money(cost: Any) -> str | None:
     free" is a fact worth logging.
 
     **The one cost convention, across every line kind.** ``cost=`` is emitted by the LLM line, the
-    media line, and any future line for a provider-billed call, all through this one formatter — so
+    tool line, and any future line for a provider-billed call, all through this one formatter — so
     it is always plain decimal USD, ``cost=([0-9.]+)``-matchable, whatever the kind. That uniformity
     is load-bearing: the dashboard splits **LLM cost** from **tool cost** on the line *head*
     (`` llm provider=`` vs everything else), not on the cost field. So the invariant is exactly that
     ``cost=`` keeps this shape on every kind, and the `` llm provider=`` head never appears on a
-    non-LLM line (a media line begins ``media ``). A call carries ``cost=`` **when the provider
-    states the figure** (OpenRouter's ``usage.cost``, xAI's ticks) — and on the two vendors that
-    state none, Google's Vertex AI, OpenAI and Anthropic, when the call's model and tier are in the
+    non-LLM line (a tool line begins ``tool ``). A call carries ``cost=`` **when the provider
+    states the figure** (OpenRouter's ``usage.cost``, xAI's ticks) — and on the three vendors that
+    state none — Google's Vertex AI, OpenAI and Anthropic — when the call's model and tier are in the
     harness's transcription of the vendor's published rates (issues #655, #657 and #725,
     `_google_rates`, `_openai_rates`, `_anthropic_rates`), tagged ``cost_basis=computed``. Nowhere else is a figure derived, because a
     stale table is worse than an honest gap.

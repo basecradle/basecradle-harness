@@ -43,6 +43,22 @@ RESPONSES_URL = f"{BASE_URL}/responses"
 FAKE_KEY = "sk-test-0123456789abcdefghijklmnop"
 
 
+def run_through_engine(tool, **arguments):
+    """Run `tool` as a wake does — through the engine's dispatch, which writes the run's ``tool``
+    line, with the vendor work its meter recorded (issue #758)."""
+    from basecradle_harness._engine import Engine
+    from basecradle_harness._tools import ToolRegistry
+
+    registry = ToolRegistry()
+    registry.register(tool)
+    return Engine(provider=None, tools=registry)._run_tool(tool.name, arguments)
+
+
+def tool_lines(caplog) -> list[str]:
+    """Every ``tool`` line a test's capture holds, plain, in order."""
+    return [plain(m) for m in (r.getMessage() for r in caplog.records) if m.startswith("tool ")]
+
+
 class _HTTPCoreBothMocker(HTTPCoreMocker):
     """respx's transport mocker, patching **both** HTTPX families this suite drives.
 

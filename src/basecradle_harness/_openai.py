@@ -32,9 +32,11 @@ Cost — stated where the endpoint states it, computed where OpenAI states none
 Pointed at OpenRouter, the response carries its own dollar figure and the line reports it. Pointed
 at **OpenAI**, which returns tokens and no price, the line's ``cost=`` is computed from OpenAI's
 published Standard rates (`basecradle_harness._openai_rates`, issue #657) and tagged
-``cost_basis=computed``; a web search's per-call fee gets its own priced ``media`` line
+``cost_basis=computed``; a web search's per-call fee rides that call's ``web_search`` ``tool`` line
 (``kind=search.web``), and a code-interpreter container — whose charge no response describes — is a
-stated gap, one WARNING per wake. Pointed at xAI, nothing is computed: the xAI surfaces state their
+stated gap, one ``cost unpriced charge=container_time`` WARNING per wake. Every server-side tool a
+Responses call ran, on any endpoint, is a ``tool`` line beside the call's ``llm`` line
+(``executor=server``; issue #758). Pointed at xAI, nothing is computed: the xAI surfaces state their
 own prices where they state any, and a table of OpenAI's rates says nothing about xAI's.
 """
 
@@ -67,19 +69,24 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._faults import is_out_of_funds
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
+    CONTAINER_TIME,
+    NOT_REPORTED,
+    ServerToolTally,
     finish_reason,
     generation_id,
     generation_id_header,
     generation_of,
+    log_cost_unpriced,
     log_llm_call,
-    log_media_call,
+    log_server_tools,
     reported_cost,
+    routed_web_searches,
     serving_endpoint,
     stamp_generation_id,
+    tally_server_tools,
     token_counts,
 )
 from basecradle_harness._openai_rates import (
-    CONTAINER_GAP,
     LONG_CONTEXT_THRESHOLD,
     call_cost,
     known,
@@ -97,6 +104,7 @@ from basecradle_harness._openai_wire import (
     message_from_chat,
     message_from_responses,
     message_to_input,
+    server_tool_uses,
 )
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
@@ -473,7 +481,7 @@ class OpenAIProvider:
             response = self._client.responses.create(**payload)
         data = response.model_dump()
         self._log_call(started, data)
-        self._log_tool_fees(data)
+        self._log_server_tools(data)
         with generation_of(data):
             return message_from_responses(data)
 
@@ -506,6 +514,15 @@ class OpenAIProvider:
             response = self._client.chat.completions.create(**payload)
         data = response.model_dump()
         self._log_call(started, data)
+        # A router reached over this surface counts the web searches it ran for the call (OpenRouter's
+        # ``server_tool_use_details``); a vendor that runs none reports nothing and writes no line.
+        searches = routed_web_searches(data.get("usage"))
+        log_server_tools(
+            {"web_search": ServerToolTally(count=searches)} if searches else {},
+            provider=self.provider,
+            model=self.model,
+            generation_id=generation_id(data),
+        )
         with generation_of(data):
             return message_from_chat(data)
 
@@ -592,30 +609,33 @@ class OpenAIProvider:
             )
         return cost
 
-    def _log_tool_fees(self, data: Mapping[str, Any]) -> None:
-        """The per-use charges a Responses call's server-side tools ran up, beside its token cost.
+    def _log_server_tools(self, data: Mapping[str, Any]) -> None:
+        """A ``tool`` line per server-side tool a Responses call ran, beside its ``llm`` line (#758).
 
-        A web search is billed per search call on top of the tokens, so it gets its own priced
-        ``media`` line (``kind=search.web``) — the head the fleet's tool spend is read from. A
+        One line per tool, the uses in ``count=`` and a use the vendor reported ``failed`` or
+        ``incomplete`` as the line's ``reason=``, on every endpoint this adapter is aimed at — the
+        items are the vendor's own account of what it ran. Two charges are OpenAI's alone. A web
+        search is billed per *search* call on top of the tokens, so the ``web_search`` line carries
+        that fee (an ``open_page`` or ``find_in_page`` action is a use, and not a billed search). A
         code-interpreter container is billed per session and no response says how long one lived,
-        so it is a stated gap (`CONTAINER_GAP`), never a figure. Only for OpenAI: an xAI or
-        OpenRouter endpoint states its own tool charges where it states any.
+        so it is one ``cost unpriced charge=container_time`` line per wake, never a figure.
         """
-        if not self._computes_cost:
-            return
         output = data.get("output")
-        calls = search_calls(output)
-        if calls:
-            log_media_call(
-                provider=self.provider,
-                kind="search.web",
-                model=self.model,
-                seconds=None,
-                count=calls,
-                cost=web_search_cost(calls) if self._priced_endpoint() else None,
-            )
-        if ran_container(output):
-            self._state_gap("container", "%s", CONTAINER_GAP)
+        fees: dict[str, float | None] = {}
+        if self._computes_cost:
+            calls = search_calls(output)
+            if calls and self._priced_endpoint():
+                fees["web_search"] = web_search_cost(calls)
+        log_server_tools(
+            tally_server_tools(server_tool_uses(output)),
+            provider=self.provider,
+            model=self.model,
+            generation_id=generation_id(data),
+            fees=fees,
+        )
+        if self._computes_cost and ran_container(output) and "container" not in self._gaps_stated:
+            self._gaps_stated.add("container")
+            log_cost_unpriced(provider=self.provider, charge=CONTAINER_TIME, reason=NOT_REPORTED)
 
     def _priced_endpoint(self) -> bool:
         """Whether this client is aimed at OpenAI's own host — stating the gap once when not."""

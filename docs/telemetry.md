@@ -10,7 +10,7 @@ Every line the harness writes to its journal, every field on each line, what eac
 - When a vendor reports something this contract cannot hold, or cannot report something it holds, **the work stops.** The misfit is filed `needs-capital` as a design question about the existing system — what the misfit is, and what it says about the contract — and goes to the founders through the capital. The contract changes first, for every adapter whose vendor has the datum, and only then does the vendor land.
 - Where today's emission differs from this page, the difference is listed under [Known Violations](#known-violations), each with the issue that removes it. That table is the only place a departure may live.
 
-This page describes the **target** contract. A field the target defines that no adapter emits yet (`residency`, `executor`) is part of the contract all the same; a field adapters emit today that the target retires (`web_search_requests`) is not, and is listed as a violation until it is gone.
+This page describes the **target** contract. A field the target defines that no adapter emits yet (`residency`) is part of the contract all the same; a field adapters emit today that the target retires is not, and is listed as a violation until it is gone.
 
 ## The Grammar
 
@@ -190,7 +190,7 @@ The describer answering again from its once-per-wake memo instead of calling a m
 
 ### `tool`
 
-**One line per tool use, whoever executed it** — a harness tool, an MCP server's tool, or a tool the vendor ran server-side inside a model call. Tool calls and tool spend are both read off this one head; there is no second definition of "tool". A failed run writes a second, WARNING `tool` line carrying `name` and `error`.
+**One line per tool use, whoever executed it** — a harness tool, an MCP server's tool, or a tool the vendor ran server-side inside a model call (`_observability.log_tool`, the only emitter). Tool calls and tool spend are both read off this one head; there is no second definition of "tool". The engine writes the line for a harness or MCP tool, with what the tool's vendor work recorded on its meter while it ran (`_observability.metered`); the engine's own refusal of a call (an unknown or withheld name) is `executor=harness`, since the harness is what answered it. An adapter writes the line for a server-side tool, one line per model call per tool, right after that call's `llm` line — or before it, when the caller holds its `llm` line back to judge the answer (`capture_llm_call`); `generation_id` is the join either way. A failed harness or MCP run writes a second, WARNING `tool` line carrying `name` and `error`; a failed server-side tool has a vendor code and no text, so it has no companion and its line is itself a WARNING.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
@@ -199,14 +199,14 @@ The describer answering again from its once-per-wake memo instead of calling a m
 | `provider` | The vendor that ran or billed the tool's work — the brain's vendor for a server-side tool; the media or search vendor a harness tool called. | Whoever knows the vendor. | The tool reaches no billed vendor (platform tools, memory). |
 | `kind` | The shape of the work, for metered media and search: `image.generate`, `image.edit`, `video.generate`, `audio.transcribe`, `search.web`, `search.grounding`. | The tool or adapter. | Unmetered work. |
 | `model` | The vendor model the tool's work ran on. | The tool or adapter. | The tool used no model. |
-| `count` | Billed or executed units on this line: searches, grounding queries, fetches, executions. A server-side tool writes one line per model call per tool, with its uses counted here. | The tool or adapter. | One unmetered use. |
-| `duration` | Wall time of the run. | The engine. | `executor=server` — the work ran inside a model call its `llm` line already timed. |
+| `count` | Billed or executed units on this line: searches, grounding queries, fetches, executions. A server-side tool writes one line per model call per tool, with its uses counted here — every use, a failed one included, so it can exceed the units a fee was charged on. | The tool or adapter. | A harness run whose work stated no units (one image, one transcription). Always present on `executor=server`. |
+| `duration` | Wall time of the run — for a media tool, the generation and the upload that follows it. | The engine. | `executor=server` — the work ran inside a model call its `llm` line already timed. |
 | `outcome` | `ok` or `error`. | The engine; the adapter from the vendor's result block. | The WARNING companion line. |
-| `reason` | Why it failed, as a slug — for a server-side tool, the vendor's own error code (`max_uses_exceeded`). | Whoever saw the failure. | `outcome=ok`. |
+| `reason` | Why it failed, as a slug. The engine's own refusals: `unknown_tool`, `withheld`, `server_side` (a server-side built-in called as a function), `elision_marker`; a tool that raised: `exception`; a harness tool's vendor call that failed: the fault slug, as on `llm` (`rate_limited`, `server_error`, `transport`, `timeout`, `invalid_response`, `provider_error`). For a server-side tool, the vendor's own code or status, lowercased (`max_uses_exceeded`, `url_retrieval_status_error`, `outcome_failed`, `failed`, `incomplete`). | Whoever saw the failure. | `outcome=ok`. |
 | `error` | Common; on the WARNING companion line only. | The engine. | `outcome=ok`. |
 | `cost` | US dollars of the tool's own fee — never model tokens, which are on the `llm` line. | The tool or adapter. | No fee, or a fee nobody can price (see `cost unpriced`). |
 | `cost_basis` | Common. | `cost_basis()`. | As Common. |
-| `generation_id` | Common: the model call the tool ran inside, so a tool joins to its `llm` line. | The adapter. | `executor` is not `server`. |
+| `generation_id` | Common: the model call the tool ran inside, so a tool joins to its `llm` line. | The adapter. | `executor` is not `server`, or the call's response named no id. |
 
 ### `cost unpriced`
 
@@ -669,26 +669,17 @@ Where today's emission departs from the target above. The conformance test reads
 
 - `head <head>: <fields>` — a head outside the contract, allowed with exactly those fields.
 - `field <head>.<field>` — a field outside the contract on that head; with `@<adapter>` it is allowed only from that adapter (`_<adapter>.py`, and that adapter's rendered lines).
-- `prose <file> "<text>"` — a fact still recorded only as prose: the text at that site, quoted exactly as the source spells it; with `until <head>` (or `until <head>.<field>`) the row is also over once its structured replacement is emitted, whether or not a sentence restating it stays.
+- `prose <file> "<text>"` — a fact still recorded only as prose: the text at that site, quoted exactly as the source spells it; with `until <head>` (or `until <head>.<field>`) the row is also over once its structured replacement is emitted, whether or not a sentence restating it stays. With `until <head>.<field>=<value>` the replacement is a line carrying that value, which only a rendered line can show — so one head may replace several gaps (`cost unpriced`, by `charge`), each row over only when its own charge is emitted.
 - `reason-prose <head>` — a `reason=` on that head that the scan reads as a sentence, an f-string or an exception's text, following a variable to its assignments and a parameter to the calls that fill it.
 - `unescaped <head>` — a structured line spelled as a `%`-format string rather than built through `kv`, so its values are never flattened, scrubbed, bounded or quoted.
 - `test` — a behavioral check the test runs by this row's ID.
 
 A prose line that carries a field the NOC extracts off every line (`provider=`, `source=`) feeds a column whatever its head, so the test also fails on any such prose that no `prose` row names.
 
-The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758)), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759)).
+The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759)).
 
 | ID | Violation | Witness | Removed By |
 |---|---|---|---|
-| T1 | A media generation's duration and cost, and a server-side search fee, are written on a separate `media` head (`log_media_call`, `media_timer`) instead of the `tool` line — and the NOC's *Tool Cost* reads `media`+`browser` while *Tool Calls* reads `tool`: two definitions of "tool". | `head media: provider kind model count duration cost cost_basis` | Slice 2 |
-| T2 | Anthropic counts server-side web searches as an `llm` field, beside the `media kind=search.web` fee line for the same searches: one fact on two lines. | `field llm.web_search_requests @anthropic` | Slice 2 |
-| T3 | Anthropic counts server-side fetches as an `llm` field. Elsewhere a fetch is the harness's own `web_fetch` tool and its `tool` line — except Gemini's server-side `url_context`, which writes nothing. | `field llm.web_fetch_requests @anthropic` | Slice 2 |
-| T4 | Anthropic counts server-side code executions as an `llm` field. | `field llm.code_execution_requests @anthropic` | Slice 2 |
-| T5 | The `tool` line carries no `executor`, `provider`, `kind`, `model`, `count`, `reason`, `cost`, or `generation_id`, and a vendor's server-side tool writes no `tool` line at all. | `test` | Slice 2 |
-| T6 | xAI reports the server-side tools it used (`server_side_tools_used`) and OpenRouter its web searches (`server_tool_use_details.web_search_requests`); the harness logs neither, so on those vendors a server tool shows only as a larger `cost=`. | `test` | Slice 2 |
-| T7 | A server-side tool that failed inside a 200 is recorded only as prose. | `prose _anthropic.py "server tool failed inside the turn" until tool.executor` | Slice 2 |
-| T8 | Unpriced code-container time is recorded only as prose (`CONTAINER_GAP`, Anthropic and OpenAI, in different words). | `prose _anthropic.py "_log.warning(CONTAINER_GAP)" until cost unpriced` | Slice 2 |
-| T9 | The same, OpenAI's spelling. | `prose _openai.py "_state_gap("container"" until cost unpriced` | Slice 2 |
 | F1 | OpenAI and OpenRouter hand the harness a cache-write count (`prompt_tokens_details.cache_write_tokens`, `input_tokens_details.cache_write_tokens`); only Anthropic logs `cache_write_tokens`, and only through the purpose-specific `extra` slot. | `test` | Slice 3 |
 | F2 | The `capture_llm_call` path drops `extra`, so a helper call on Anthropic loses `cache_write_tokens` that the same adapter writes on a main call: the same provider emits different fields by purpose. | `test` | Slice 3 |
 | F3 | No adapter puts `tokens_reasoning` on a `purpose=main` line, though OpenAI, OpenRouter, xAI and Google all report it. | `test` | Slice 3 |
@@ -700,12 +691,12 @@ The slices are the issues that remove each row: **slice 2 — tools** ([#758](ht
 | F9 | Anthropic prices a call on any `AI_BASE_URL`; OpenAI refuses to price a host that is not its own and says so once. A computed cost is stated only for the host whose rates the table transcribes. | `test` | Slice 3 |
 | F10 | An HTTP 504 is `server_error` on OpenAI and OpenRouter and `timeout` on Anthropic and Google. | `test` | Slice 3 |
 | F11 | A content refusal is recorded only as prose. | `prose _anthropic.py "Anthropic refused the turn for" until llm refused` | Slice 3 |
-| F12 | Token-cost gaps are recorded only as prose, each vendor in its own words: Anthropic's unknown model. | `prose _anthropic.py "No published rate for Anthropic model" until cost unpriced` | Slice 3 |
-| F13 | The same: OpenAI's unknown model. | `prose _openai.py "No published rate for OpenAI model" until cost unpriced` | Slice 3 |
-| F14 | The same: OpenAI's unpriced host. | `prose _openai.py "not %s: OpenAI bills its data-residency" until cost unpriced` | Slice 3 |
-| F15 | The same: OpenAI's unpriced tier or long context. | `prose _openai.py "OpenAI call on %r not priced" until cost unpriced` | Slice 3 |
-| F16 | The same: Google's unknown model. | `prose _google.py "No published rate for Vertex model" until cost unpriced` | Slice 3 |
-| F17 | The same: Google's unpriced grounding fee. | `prose _google.py "Google Search grounding on %r is not priced" until cost unpriced` | Slice 3 |
+| F12 | Token-cost gaps are recorded only as prose, each vendor in its own words: Anthropic's unknown model. | `prose _anthropic.py "No published rate for Anthropic model" until cost unpriced.charge=tokens` | Slice 3 |
+| F13 | The same: OpenAI's unknown model. | `prose _openai.py "No published rate for OpenAI model" until cost unpriced.charge=tokens` | Slice 3 |
+| F14 | The same: OpenAI's unpriced host. | `prose _openai.py "not %s: OpenAI bills its data-residency" until cost unpriced.charge=tokens` | Slice 3 |
+| F15 | The same: OpenAI's unpriced tier or long context. | `prose _openai.py "OpenAI call on %r not priced" until cost unpriced.charge=tokens` | Slice 3 |
+| F16 | The same: Google's unknown model. | `prose _google.py "No published rate for Vertex model" until cost unpriced.charge=tokens` | Slice 3 |
+| F17 | The same: Google's unpriced grounding fee. | `prose _google.py "Google Search grounding on %r is not priced" until cost unpriced.charge=grounding` | Slice 3 |
 | F18 | `source=` means the context ceiling's provenance on `context limit`, beside its fleet-wide meaning (the probe stamp the NOC's `source` label extracts off every line). | `field context limit.source` | Slice 3 |
 | F19 | The same, on `context compact`. | `field context compact.source` | Slice 3 |
 | F20 | The same, on the `context budget … (source=…)` prose warning, which the NOC's `source` label reads like any other line. | `prose _context.py "(source=%s)"` | Slice 3 |
@@ -728,7 +719,7 @@ The slices are the issues that remove each row: **slice 2 — tools** ([#758](ht
 
 ### Outside This Repository
 
-The NOC's Steel browser launcher writes its own `browser provider=` head, which the target retires into the `tool` line with `executor=mcp`. It is not emitted here, so it is not witnessed here; slice 2 carries it to the NOC through the capital, together with the NOC columns that read the retired fields (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`).
+The NOC's Steel browser launcher writes its own `browser provider=` head, which the target retires into the `tool` line with `executor=mcp`. It is not emitted here, so it is not witnessed here; slice 2 carries it to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
 
 ## Changing the Contract
 

@@ -88,7 +88,7 @@ from basecradle_harness._media import (
     slugify,
     uuid_list,
 )
-from basecradle_harness._observability import media_timer
+from basecradle_harness._observability import metered
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._openai_rates import image_cost, priced_host
 from basecradle_harness._platform import PlatformTool, explain
@@ -205,7 +205,7 @@ class _ImageTool(PlatformTool):
 
     #: The image model this tool calls. Named by each subclass rather than shared, because
     #: OpenAI ships one 2.5 variant per operation at the identical price — Flare generates,
-    #: Sunburst edits. The ``media_timer(model=…)`` log line follows it.
+    #: Sunburst edits. The run's ``tool`` line (``model=…``, recorded through `metered`) follows it.
     MODEL: str
 
     def __init__(
@@ -243,7 +243,7 @@ class _ImageTool(PlatformTool):
         """What this call cost at OpenAI's published image rates (issue #657), or ``None``.
 
         OpenAI states no price on an Images response, only its token usage, so the figure is
-        computed (`_openai_rates.image_cost`) and the media line tags it ``cost_basis=computed``.
+        computed (`_openai_rates.image_cost`) and the tool line tags it ``cost_basis=computed``.
         A call that cannot be priced — another host, a model or a usage shape the table does not
         carry — says so in a WARNING, so the missing figure is a stated gap and never a silent one.
         """
@@ -412,7 +412,7 @@ class GenerateImageTool(_ImageTool):
         try:
             openai, client = self._client(key)
             with (
-                media_timer(provider="openai", kind="image.generate", model=self._model) as call,
+                metered(provider="openai", kind="image.generate", model=self._model) as call,
                 sdk_error_context(openai),
             ):
                 response = client.images.generate(model=self._model, prompt=prompt, n=1, **coverage)
@@ -564,7 +564,7 @@ class EditImageTool(_ImageTool):
         try:
             openai, client = self._client(key)
             with (
-                media_timer(provider="openai", kind="image.edit", model=self._model) as call,
+                metered(provider="openai", kind="image.edit", model=self._model) as call,
                 sdk_error_context(openai),
             ):
                 response = client.images.edit(

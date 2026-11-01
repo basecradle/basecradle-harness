@@ -1,4 +1,4 @@
-"""The shared log seam: the key=value formatter, token normalization, and the LLM/media lines.
+"""The shared log seam: the key=value formatter, token normalization, and the LLM and tool lines.
 
 These pin the *contract the journal reads* — Better Stack's Live Tail greps these lines, so
 their shape is an interface, not an implementation detail. Nothing here touches a model or the
@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from basecradle_harness import ToolRegistry
+from basecradle_harness import Tool, ToolRegistry
 from basecradle_harness._engine import Engine
 from basecradle_harness._observability import (
     BLUE,
@@ -30,16 +30,24 @@ from basecradle_harness._observability import (
     finish_reason,
     head,
     kv,
+    log_cost_unpriced,
     log_llm_call,
-    log_media_call,
+    log_server_tool,
+    log_tool,
     log_unspoken,
-    media_timer,
+    meter_tool,
+    metered,
     reported_cost,
+    routed_web_searches,
     serving_endpoint,
+    slug,
+    tally_server_tools,
     token_counts,
+    tool_meter,
     truncated,
     usage_reported,
 )
+from tests.conftest import tool_lines
 
 # --- the key=value formatter -------------------------------------------------
 
@@ -440,160 +448,296 @@ def test_a_negative_or_non_finite_cost_is_omitted_so_the_line_stays_greppable(ca
     so the field is omitted rather than logged un-matchable. Both line kinds share `_money`."""
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=-0.02)
-        log_media_call(
-            provider="xai",
-            kind="video.generate",
-            model="grok-imagine-video-1.5",
-            seconds=1,
-            cost=-1.0,
-        )
+        log_tool(name="grok_generate_video", executor="harness", outcome="ok", cost=-1.0)
         log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=float("inf"))
-        log_media_call(
-            provider="xai",
-            kind="image.generate",
-            model="grok-imagine-image-quality",
-            seconds=1,
-            cost=float("nan"),
-        )
+        log_tool(name="grok_generate_image", executor="harness", outcome="ok", cost=float("nan"))
 
     assert all("cost=" not in r.getMessage() for r in caplog.records)
 
 
-# --- the media line ----------------------------------------------------------
+# --- the tool line: one head whoever executed the tool (issue #758) ------------------------------
 
 
-def test_the_media_line_names_the_provider_kind_model_and_duration(caplog):
+@pytest.fixture
+def plain(monkeypatch):
+    """The bytes a line carries with color off, so an exact comparison reads the fields alone."""
+    monkeypatch.setenv(NO_COLOR_ENV, "1")
+
+
+def test_a_harness_tool_line_carries_its_vendor_work_in_the_contracts_order(caplog, plain):
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        log_media_call(
-            provider="xai", kind="video.generate", model="grok-imagine-video-1.5", seconds=61
+        log_tool(
+            name="grok_generate_video",
+            executor="harness",
+            outcome="ok",
+            seconds=61,
+            provider="xai",
+            kind="video.generate",
+            model="grok-imagine-video-1.5",
+            cost=2.1,  # one 15s 720p clip ≈ $2.10 — real dollars, stated by xAI
         )
 
     assert caplog.records[0].getMessage() == (
-        "media provider=xai kind=video.generate model=grok-imagine-video-1.5 duration=61.00s"
+        "tool name=grok_generate_video executor=harness provider=xai kind=video.generate "
+        "model=grok-imagine-video-1.5 duration=61.00s outcome=ok cost=2.1"
     )
 
 
-def test_the_media_timer_logs_a_completed_generation(caplog):
+def test_a_platform_tool_line_names_only_what_it_knows(caplog, plain):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_tool(name="messages", executor="harness", outcome="ok", seconds=0.12)
+
+    assert caplog.records[0].getMessage() == (
+        "tool name=messages executor=harness duration=0.12s outcome=ok"
+    )
+
+
+def test_a_failed_run_names_its_reason_and_writes_the_error_on_a_warning(caplog, plain):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_tool(
+            name="messages",
+            executor="harness",
+            outcome="error",
+            seconds=0.5,
+            reason="exception",
+            error="the platform said no",
+        )
+
+    info, warning = caplog.records
+    assert info.levelno == logging.INFO
+    assert info.getMessage() == (
+        "tool name=messages executor=harness duration=0.50s outcome=error reason=exception"
+    )
+    assert warning.levelno == logging.WARNING
+    assert warning.getMessage() == 'tool name=messages error="the platform said no"'
+
+
+def test_a_server_tool_line_has_a_count_the_calls_id_and_no_duration(caplog, plain):
+    """The work ran inside a model call its `llm` line already timed; the id joins the two."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_server_tool(
+            name="web_search",
+            provider="anthropic",
+            model="claude-haiku-5-5",
+            count=2,
+            generation_id="msg_01ContractSearch",
+            cost=ComputedCost(0.02),
+        )
+
+    (record,) = caplog.records
+    assert record.levelno == logging.INFO
+    assert record.getMessage() == (
+        "tool name=web_search executor=server provider=anthropic kind=search.web "
+        "model=claude-haiku-5-5 count=2 outcome=ok cost=0.02 cost_basis=computed "
+        "generation_id=msg_01ContractSearch"
+    )
+
+
+def test_a_server_tool_the_vendor_reports_failed_is_a_warning_with_its_code(caplog, plain):
+    """No error text to carry, so no companion: the line itself is the WARNING."""
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_server_tool(
+            name="web_fetch",
+            provider="anthropic",
+            model="claude-haiku-5-5",
+            count=1,
+            generation_id="msg_01ContractFetch",
+            reason="max_uses_exceeded",
+        )
+
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        "tool name=web_fetch executor=server provider=anthropic model=claude-haiku-5-5 count=1 "
+        "outcome=error reason=max_uses_exceeded generation_id=msg_01ContractFetch"
+    )
+
+
+def test_server_tool_uses_are_tallied_per_tool_with_the_first_failure_as_a_slug():
+    found = tally_server_tools(
+        [("code_execution", ""), ("url_context", "URL_RETRIEVAL_STATUS_ERROR"), ("url_context", "")]
+    )
+
+    assert {name: (t.count, t.reason) for name, t in found.items()} == {
+        "code_execution": (1, None),
+        "url_context": (2, "url_retrieval_status_error"),
+    }
+    assert slug("max_uses_exceeded") == "max_uses_exceeded"
+    assert slug("OUTCOME_FAILED") == "outcome_failed"
+    assert slug("  ") is None
+
+
+def test_a_routers_web_search_count_is_read_and_nothing_else_is():
+    assert routed_web_searches({"server_tool_use_details": {"web_search_requests": 2}}) == 2
+    assert routed_web_searches({"server_tool_use_details": {"web_search_requests": 0}}) == 0
+    assert routed_web_searches({"server_tool_use_details": {"web_search_requests": True}}) == 0
+    assert routed_web_searches({}) == 0
+    assert routed_web_searches(None) == 0
+
+
+def test_an_unpriced_charge_is_one_warning_naming_the_charge_and_why(caplog):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_cost_unpriced(provider="openai", charge="container_time", reason="not_reported")
+
+    (record,) = caplog.records
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        "cost unpriced provider=openai charge=container_time reason=not_reported"
+    )
+
+
+# --- the tool meter: a harness tool's vendor work, onto its run's one line ------------------------
+#
+# xAI reports the exact charge for image and video generation on the wire, and the OpenAI and
+# Google tables compute theirs — real money the tool-cost dashboard must see. It is known only after
+# the vendor responds, inside the tool, while the line is the engine's; the meter carries it across.
+
+
+def test_metered_work_lands_on_the_running_tools_meter():
     with (
-        caplog.at_level(logging.INFO, logger="basecradle_harness"),
-        media_timer(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"),
+        tool_meter() as meter,
+        metered(provider="xai", kind="image.generate", model="grok-imagine-image-2.0") as call,
+    ):
+        call.cost = 0.02
+
+    assert meter.fields() == {
+        "provider": "xai",
+        "kind": "image.generate",
+        "model": "grok-imagine-image-2.0",
+        "count": None,
+        "cost": 0.02,
+    }
+    assert meter.failure is None
+
+
+def test_a_block_that_never_prices_its_call_leaves_the_cost_absent():
+    with (
+        tool_meter() as meter,
+        metered(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"),
     ):
         pass
 
-    line = caplog.records[0].getMessage()
-    assert line.startswith(
-        "media provider=openai kind=image.generate model=gpt-image-2.5-flare duration="
-    )
+    assert meter.fields()["cost"] is None
 
 
-def test_a_failed_generation_logs_nothing_and_lets_the_error_through(caplog):
+def test_a_failed_unit_is_kept_on_the_meter_and_the_error_goes_through():
+    """The tool turns the error into text for the model; the meter is how the line still says it
+    failed, and what it was buying."""
+    failure = RuntimeError("the API said no")
+    with (
+        tool_meter() as meter,
+        pytest.raises(RuntimeError),
+        metered(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"),
+    ):
+        raise failure
+
+    assert meter.failure is failure
+    assert meter.fields()["provider"] == "openai" and meter.fields()["cost"] is None
+
+
+def test_metered_work_outside_a_tool_run_records_nothing_and_raises_nothing():
+    with metered(provider="openai", kind="audio.transcribe", model="gpt-transcribe") as call:
+        call.cost = 0.01
+    meter_tool(provider="google", kind="search.grounding", model="gemini-3.8-flash", count=1)
+    with tool_meter() as meter:
+        pass
+
+    assert meter.fields() == {}
+
+
+def test_several_units_are_summed_and_a_partial_total_is_never_stated():
+    with tool_meter() as whole:
+        meter_tool(
+            provider="google", kind="search.grounding", model="m", count=2, cost=ComputedCost(0.028)
+        )
+        meter_tool(provider="google", kind="search.grounding", model="m", cost=ComputedCost(0.014))
+    with tool_meter() as partial:
+        meter_tool(provider="google", kind="search.grounding", model="m", cost=0.01)
+        meter_tool(provider="google", kind="search.grounding", model="m")
+
+    assert whole.fields()["count"] == 3
+    assert whole.fields()["cost"] == pytest.approx(0.042)
+    assert isinstance(whole.fields()["cost"], ComputedCost)
+    assert partial.fields()["count"] == 2 and partial.fields()["cost"] is None
+
+
+def test_a_failed_unit_adds_no_fee_and_a_partly_computed_total_says_computed():
+    """A failed unit bought nothing, so the finished unit's fee stands; and a total any part of
+    which is the harness's arithmetic is never presented as a figure the vendor stated."""
+    with tool_meter() as meter:
+        meter_tool(provider="xai", kind="image.edit", model="m", cost=0.02)
+        with pytest.raises(RuntimeError), metered(provider="xai", kind="image.edit", model="m"):
+            raise RuntimeError("the second edit failed")
+    with tool_meter() as mixed:
+        meter_tool(provider="openai", kind="image.generate", model="m", cost=0.02)
+        meter_tool(provider="openai", kind="image.generate", model="m", cost=ComputedCost(0.03))
+
+    assert meter.fields()["count"] == 2 and meter.fields()["cost"] == pytest.approx(0.02)
+    assert isinstance(meter.failure, RuntimeError)
+    assert isinstance(mixed.fields()["cost"], ComputedCost)
+    assert mixed.fields()["cost"] == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("cost", ["0.5", True, float("nan"), float("inf"), -0.01, object()])
+def test_a_figure_that_is_not_a_fee_is_dropped_as_it_is_recorded(cost):
+    with tool_meter() as meter:
+        meter_tool(provider="xai", kind="image.generate", model="m", count="2", cost=cost)
+
+    assert meter.fields()["cost"] is None and meter.fields()["count"] is None
+
+
+class _SloppyTool(Tool):
+    """An overlay tool that records its vendor's figure as the body spelled it."""
+
+    name = "sloppy_media"
+    description = "Buys an image and records a bad figure."
+
+    def run(self, **_):
+        with metered(provider="xai", kind="image.generate", model="m") as call:
+            call.cost, call.count = "0.5", 2.0
+        return "Generated and posted."
+
+
+def test_a_bad_figure_from_an_overlay_tool_never_raises_into_the_wake(caplog):
+    """The tool has already acted when its line is written: a figure it got wrong must cost the
+    field, never the turn (the run's result still reaches the model)."""
+    registry = ToolRegistry()
+    registry.register(_SloppyTool())
+    engine = Engine(provider=None, tools=registry)
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        try:
-            with media_timer(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"):
-                raise RuntimeError("the API said no")
-        except RuntimeError:
-            pass
+        assert engine._run_tool("sloppy_media", {}) == "Generated and posted."
 
-    # The tool relays the failure to the model and the engine's tool line records it; a media
-    # line here would time a call that never produced anything.
-    assert not caplog.records
+    (line,) = tool_lines(caplog)
+    assert line.startswith("tool name=sloppy_media executor=harness provider=xai ")
+    assert " outcome=ok" in line and "cost=" not in line and "count=" not in line
 
 
-# --- the provider-reported cost on the media line (issue #329) ---------------
-#
-# xAI reports the exact charge for image and video generation on the wire, so a media generation
-# is real money the tool-cost dashboard must see. The cost rides the same `_money` formatter as the
-# LLM line, so a media `cost=` is byte-identical to an LLM `cost=` — the dashboard splits LLM cost
-# from tool cost on the line *head*, never on the cost field.
+# --- one cost shape on every line kind (issue #329) ------------------------------------------------
 
 _COST_RE = re.compile(r"(?:^| )cost=([0-9.]+)(?: |$)")
 
 
-def test_the_media_line_carries_the_cost_when_the_provider_states_it(caplog):
+def test_a_non_numeric_tool_cost_is_dropped_rather_than_crashing_the_wake(caplog):
+    """A fee comes straight off a vendor body, so a surprise there costs the *field*, never the
+    turn — the same guard the LLM cost has, since both render through `_money`."""
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        log_media_call(
-            provider="xai",
-            kind="video.generate",
-            model="grok-imagine-video-1.5",
-            seconds=61,
-            cost=2.1,  # one 15s 720p clip ≈ $2.10 — real dollars, previously invisible
-        )
-
-    assert caplog.records[0].getMessage() == (
-        "media provider=xai kind=video.generate model=grok-imagine-video-1.5 duration=61.00s cost=2.1"
-    )
-
-
-def test_the_media_line_omits_cost_when_the_provider_states_none(caplog):
-    """A call with no stated and no computable cost has no `cost=` — absent, not a fabricated `cost=0`."""
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        log_media_call(
-            provider="openai", kind="image.generate", model="gpt-image-2.5-flare", seconds=3.4
-        )
+        log_tool(name="grok_generate_image", executor="harness", outcome="ok", cost="free")  # type: ignore[arg-type]
 
     assert "cost=" not in caplog.records[0].getMessage()
 
 
-def test_a_non_numeric_media_cost_is_dropped_rather_than_crashing_the_wake(caplog):
-    """A media cost comes straight off a vendor body, so a surprise there costs the *field*, never
-    the turn — the same guard the LLM cost has, since both render through `_money`."""
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        log_media_call(
-            provider="xai",
-            kind="image.generate",
-            model="grok-imagine-image-quality",
-            seconds=2,
-            cost="free",  # type: ignore[arg-type]
-        )
-
-    assert "cost=" not in caplog.records[0].getMessage()
-
-
-def test_media_and_llm_cost_render_in_the_same_plain_decimal_shape(caplog):
-    """Item 4 of #329: `cost=` must stay `cost=([0-9.]+)`-matchable — the same shape — on every
-    line kind, and the ` llm provider=` head must never appear on a non-LLM line."""
+def test_tool_and_llm_cost_render_in_the_same_plain_decimal_shape(caplog):
+    """`cost=` must stay `cost=([0-9.]+)`-matchable — the same shape — on every line kind, and the
+    ` llm provider=` head must never appear on a non-LLM line."""
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_llm_call(provider="xai", model="grok-4.3", seconds=1, cost=0.0038)
-        log_media_call(
-            provider="xai",
-            kind="image.generate",
-            model="grok-imagine-image-quality",
-            seconds=2,
-            cost=0.0038,
-        )
+        log_tool(name="grok_generate_image", executor="harness", outcome="ok", cost=0.0038)
 
-    llm, media = (r.getMessage() for r in caplog.records[:2])
+    llm, tool = (r.getMessage() for r in caplog.records[:2])
     assert _COST_RE.search(llm).group(1) == "0.0038"
-    assert _COST_RE.search(media).group(1) == "0.0038"  # identical, plain decimal, on both kinds
-    # The head split the dashboard keys on: a media line is never mistaken for an LLM line.
-    assert media.startswith("media ") and not media.startswith("llm ")
-
-
-def test_the_media_timer_logs_the_cost_recorded_on_its_handle(caplog):
-    """The charge is known only after the vendor responds, inside the timed block — so the timer
-    yields a handle the tool sets, and logs it on a clean exit."""
-    with (
-        caplog.at_level(logging.INFO, logger="basecradle_harness"),
-        media_timer(
-            provider="xai", kind="image.generate", model="grok-imagine-image-quality"
-        ) as call,
-    ):
-        call.cost = 0.02
-
-    line = caplog.records[0].getMessage()
-    assert line.startswith("media provider=xai kind=image.generate")
-    assert "cost=0.02" in line
-
-
-def test_the_media_timer_omits_cost_when_its_handle_is_left_unset(caplog):
-    """A block that never prices its call leaves the handle untouched — the line carries no `cost=`."""
-    with (
-        caplog.at_level(logging.INFO, logger="basecradle_harness"),
-        media_timer(provider="openai", kind="image.generate", model="gpt-image-2.5-flare"),
-    ):
-        pass
-
-    assert "cost=" not in caplog.records[0].getMessage()
+    assert _COST_RE.search(tool).group(1) == "0.0038"  # identical, plain decimal, on both kinds
+    # The head split the dashboard keys on: a tool line is never mistaken for an LLM line.
+    assert tool.startswith("tool ") and not tool.startswith("llm ")
 
 
 # --- a computed cost names its basis (issues #655, #656, #657) --------------
@@ -654,25 +798,6 @@ def test_a_captured_computed_cost_keeps_its_basis_on_the_callers_line(caplog):
         )
 
     assert " cost=0.002 cost_basis=computed " in caplog.records[0].getMessage()
-
-
-def test_a_per_use_tool_fee_is_a_media_line_with_a_count_and_no_duration(caplog):
-    """A web search's or a grounding query's fee: billed units, no duration of its own."""
-    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
-        log_media_call(
-            provider="google",
-            kind="search.grounding",
-            model="gemini-3.8-flash",
-            seconds=None,
-            count=2,
-            cost=ComputedCost(0.028),
-        )
-
-    assert caplog.records[0].getMessage() == (
-        "media provider=google kind=search.grounding model=gemini-3.8-flash count=2 cost=0.028 "
-        "cost_basis=computed"
-    )
-    assert _COST_RE.search(caplog.records[0].getMessage()).group(1) == "0.028"
 
 
 def test_computed_cost_arithmetic_is_a_plain_float():
@@ -871,18 +996,17 @@ def test_the_color_setting_is_read_per_line_not_frozen_at_import(monkeypatch):
 
 
 def test_the_fact_heads_stay_plain_so_the_dashboards_extraction_anchors_survive(caplog):
-    # `llm`, `media` and `unspoken` name a *fact*, not a verdict — and the fleet dashboard extracts
-    # on their heads with the following field attached (` llm provider=`, ` unspoken timeline=`).
-    # A head span would sit exactly in that gap.
+    # `llm` and `unspoken` name a *fact*, not a verdict — and the fleet dashboard extracts on their
+    # heads with the following field attached (` llm provider=`, ` unspoken timeline=`). A head span
+    # would sit exactly in that gap. (`tool` is the same, and is the next test: its line carries a
+    # verdict field too.)
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_llm_call(provider="openai", model="gpt-5.4-mini", seconds=1.0)
-        log_media_call(provider="xai", kind="image.generate", model="grok-2-image", seconds=2.0)
         log_unspoken("thinking out loud", timeline="019e77")
 
     lines = [r.getMessage() for r in caplog.records]
     assert "\x1b" not in "".join(lines)
     assert any(m.startswith("llm provider=") for m in lines)
-    assert any(m.startswith("media provider=") for m in lines)
     assert any(m.startswith("unspoken timeline=") for m in lines)
 
 
@@ -894,7 +1018,7 @@ def test_the_tool_lines_outcome_is_colored_but_its_head_is_not(caplog):
 
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         engine._log_tool("memory", started)
-        engine._log_tool("memory", started, error="boom")
+        engine._log_tool("memory", started, reason="exception", error="boom")
 
     lines = [r.getMessage() for r in caplog.records]
     assert all(m.startswith("tool name=memory") for m in lines)
