@@ -1248,9 +1248,10 @@ def test_an_unpriced_container_is_one_counted_line_on_both_vendors(rendered):
         }
 
 
-#: The `charge` head's field set, exactly as posted to the NOC on issue #766: the grammar the Steel
-#: launcher (basecradle-noc#1153) builds against. A row added to or struck from the page's table
-#: without changing this set fails, so the page and the posted grammar cannot drift apart.
+#: The `charge` head's field set: the grammar posted for the NOC on issue #766, which the Steel
+#: launcher (basecradle-noc#1153) builds against. A row added to or struck from the page's table, or
+#: a field added to or dropped from its grammar block, fails unless this set changes with it, so the
+#: page and the posted grammar cannot drift apart.
 CHARGE_FIELDS = frozenset(
     {
         "provider",
@@ -1270,17 +1271,32 @@ CHARGE_FIELDS = frozenset(
         "vendor_unit",
     }
 )
-#: The fields no `charge` line is ever without (their rows' Absent When is "Never").
-CHARGE_REQUIRED = frozenset({"provider", "kind", "executor", "unit", "count", "outcome", "cost"})
+_CHARGE_ROW = re.compile(r"^\| `(?P<field>[^`]+)` \|.*\| (?P<absent>[^|]+) \|$")
+_ISO_UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z")
+_SECONDS = re.compile(r"\d+\.\d+s")
+_DOLLARS = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _charge_section() -> str:
+    section = DOC.read_text(encoding="utf-8").split("\n### `charge`\n", 1)[1]
+    return section.split("\n### ", 1)[0].split("\n## ", 1)[0]
+
+
+def _charge_blocks() -> list[str]:
+    return re.findall(r"```text\n(.*?)```", _charge_section(), re.DOTALL)
+
+
+def _charge_required() -> set[str]:
+    """The fields whose row's Absent When is "Never": every `charge` line carries them."""
+    rows = [_CHARGE_ROW.match(line) for line in _charge_section().splitlines()]
+    return {row["field"] for row in rows if row and row["absent"].startswith("Never")}
 
 
 def _charge_examples() -> list[Line]:
     """The journal lines the page shows under `charge`, parsed the way the NOC reads the journal."""
-    section = DOC.read_text(encoding="utf-8").split("\n### `charge`\n", 1)[1]
-    section = section.split("\n### ", 1)[0].split("\n## ", 1)[0]
     records = [
         record.removeprefix("INFO ")
-        for block in re.findall(r"```text\n(.*?)```", section, re.DOTALL)
+        for block in _charge_blocks()
         for record in block.splitlines()
         if record.startswith("INFO ")
     ]
@@ -1297,17 +1313,41 @@ def test_charge_carries_exactly_the_posted_field_set(contract):
     assert contract.heads["charge"] == CHARGE_FIELDS
 
 
+def test_the_charge_grammar_block_is_the_table(contract):
+    """The one-line grammar the NOC builds from names every row, and brackets exactly the optional."""
+    (grammar,) = [block.strip() for block in _charge_blocks() if block.startswith("charge ")]
+    named, required, depth = set(), set(), 0
+    for token in re.finditer(r"\[|\]|(?P<key>[a-z_]+)=", grammar):
+        if token[0] == "[":
+            depth += 1
+        elif token[0] == "]":
+            depth -= 1
+        else:
+            named.add(token["key"])
+            if depth == 0:
+                required.add(token["key"])
+    assert depth == 0, grammar
+    assert named == CHARGE_FIELDS
+    assert required == _charge_required()
+    assert {"provider", "kind", "executor", "unit", "count", "outcome", "cost"} == required
+    assert "stated" not in grammar  # `cost_basis` is `computed`, or absent for a stated cost
+
+
 def test_every_charge_example_on_the_page_is_a_conforming_line(contract):
     examples = _charge_examples()
     assert [line.head for line in examples] == ["charge", "charge"]  # Steel, then container time
     for line in examples:
         fields = line.fields
         assert not _stray(contract, line), line.message
-        assert CHARGE_REQUIRED <= set(fields), line.message
+        assert _charge_required() <= set(fields), line.message
         assert ("vendor_usage" in fields) == ("vendor_unit" in fields), line.message
         assert ("reason" in fields) == (fields["outcome"] == "error"), line.message
         # `cost_basis` means one thing fleet-wide: `computed`, or absent for a vendor-stated cost.
         assert fields.get("cost_basis", "computed") == "computed", line.message
+        # The grammar's fixed units.
+        assert _DOLLARS.fullmatch(fields["cost"]), line.message
+        assert "duration" not in fields or _SECONDS.fullmatch(fields["duration"]), line.message
+        assert "started" not in fields or _ISO_UTC.fullmatch(fields["started"]), line.message
 
 
 def test_a_charge_field_outside_the_contract_is_refused(contract):

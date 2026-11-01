@@ -53,7 +53,7 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 | `handle` | The platform handle of the item's author. |
 | `duration` | Wall time of the unit the head names, in seconds. |
 | `chars` | A character count of the text the head names. |
-| `count` | How many of the head's subject this line accounts for. |
+| `count` | How many of the head's subject this line accounts for — in `unit`, where the line carries one. |
 | `unit` | The unit the line's quantities are counted in. |
 | `executor` | Who ran the work the line names: `harness`, `mcp`, or `server` (the vendor, inside a model call). |
 | `cost` | US dollars charged for the unit, as the vendor stated it or as the harness computed it from the vendor's published rates. |
@@ -257,13 +257,13 @@ charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit
 The first producer is the NOC's Steel browser launcher (see [Outside This Repository](#outside-this-repository)); nothing in this repository writes a `charge` line yet. Its per-session spend line:
 
 ```text
-INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=7 duration=402.18s started=2026-11-01T03:12:40Z resource=019a3d6e-7c41-7b2a-9f3e-5d8c1a2b4e60 outcome=ok cost=0.07 cost_basis=computed vendor_usage=0 vendor_unit=credits
+INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=7 duration=402.18s started=2026-11-01T03:12:40Z resource=01a19518-4c40-7c41-9f3e-5d8c1a2b4e60 outcome=ok cost=0.07 cost_basis=computed vendor_usage=14 vendor_unit=credits
 ```
 
 And the container time Anthropic and OpenAI do not report today (`cost unpriced charge=container_time reason=not_reported`), the day either vendor states it:
 
 ```text
-INFO charge provider=anthropic kind=compute.container executor=server unit=hour count=0.05 duration=180.00s generation_id=msg_01XFDUDYJgAACzvnptvVoYEL outcome=ok cost=0.0025 cost_basis=computed
+INFO charge provider=anthropic kind=compute.container executor=server unit=hour count=0.15 duration=540.00s resource=container_01Kq3vYk8NfT2mWc7RbJpLsX generation_id=msg_01Hn4wQz9PcR5tVb2LmXyKdE outcome=ok cost=0.0075 cost_basis=computed
 ```
 
 ### `direct_message sent`
@@ -720,7 +720,7 @@ Where today's emission departs from the target above. The conformance test reads
 
 - `head <head>: <fields>` — a head outside the contract, allowed with exactly those fields.
 - `field <head>.<field>` — a field outside the contract on that head; with `@<adapter>` it is allowed only from that adapter (`_<adapter>.py`, and that adapter's rendered lines).
-- `prose <file> "<text>"` — a fact still recorded only as prose: the text at that site, quoted exactly as the source spells it; with `until <head>` (or `until <head>.<field>`) the row is also over once its structured replacement is emitted, whether or not a sentence restating it stays. With `until <head>.<field>=<value>` the replacement is a line carrying that value, which only a rendered line can show — so one head may replace several gaps (`cost unpriced`, by `charge`), each row over only when its own charge is emitted.
+- `prose <file> "<text>"` — a fact still recorded only as prose: the text at that site, quoted exactly as the source spells it; with `until <head>` (or `until <head>.<field>`) the row is also over once its structured replacement is emitted, whether or not a sentence restating it stays. With `until <head>.<field>=<value>` the replacement is a line carrying that value, which only a rendered line can show — so one head may replace several gaps (`cost unpriced`, by its `charge` field), each row over only when its own charge is emitted.
 - `reason-prose <head>` — a `reason=` on that head that the scan reads as a sentence, an f-string or an exception's text, following a variable to its assignments and a parameter to the calls that fill it.
 - `unescaped <head>` — a structured line spelled as a `%`-format string rather than built through `kv`, so its values are never flattened, scrubbed, bounded or quoted.
 - `test` — a behavioral check the test runs by this row's ID.
