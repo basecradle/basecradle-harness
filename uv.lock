@@ -1,11 +1,11 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.10"
 resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version == '3.13.*'",
     "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
-    "(python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'emscripten') or (python_full_version == '3.11.*' and sys_platform == 'emscripten')",
+    "python_full_version == '3.11.*' or (python_full_version == '3.12.*' and sys_platform != 'emscripten')",
     "python_full_version < '3.11'",
 ]
 
@@ -285,7 +285,7 @@ resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version == '3.13.*'",
     "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
-    "(python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'emscripten') or (python_full_version == '3.11.*' and sys_platform == 'emscripten')",
+    "python_full_version == '3.11.*' or (python_full_version == '3.12.*' and sys_platform != 'emscripten')",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/8d/f4/f22114d30d3435e38c6af2b4870f37b864403dca6ae7af747a289ce0a18e/av-18.1.0.tar.gz", hash = "sha256:47bfc286e1bc9de7ab4681fc2b575cd2460a66919d31ffe1bd5aa54fae531a28", size = 4451061, upload-time = "2026-08-12T22:28:18.761Z" }
 wheels = [
@@ -1907,7 +1907,7 @@ resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version == '3.13.*'",
     "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
-    "(python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'emscripten') or (python_full_version == '3.11.*' and sys_platform == 'emscripten')",
+    "python_full_version == '3.11.*' or (python_full_version == '3.12.*' and sys_platform != 'emscripten')",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/d0/ad/fed0499ce6a338d2a03ebae59cd15093910c8875328855781952abf6c2fe/numpy-2.4.6.tar.gz", hash = "sha256:f3a3570c4a2a16746ac2c31a7c7c7b0c186b95ce902e33db6f28094ed7387dda", size = 20735807, upload-time = "2026-05-18T23:37:14.07Z" }
 wheels = [
@@ -2041,7 +2041,7 @@ resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version == '3.13.*'",
     "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
-    "(python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'emscripten') or (python_full_version == '3.11.*' and sys_platform == 'emscripten')",
+    "python_full_version == '3.11.*' or (python_full_version == '3.12.*' and sys_platform != 'emscripten')",
 ]
 dependencies = [
     { name = "flatbuffers" },
@@ -3227,7 +3227,7 @@ resolution-markers = [
     "python_full_version >= '3.14'",
     "python_full_version == '3.13.*'",
     "python_full_version == '3.12.*' and sys_platform == 'emscripten'",
-    "(python_full_version >= '3.11' and python_full_version < '3.13' and sys_platform != 'emscripten') or (python_full_version == '3.11.*' and sys_platform == 'emscripten')",
+    "python_full_version == '3.11.*' or (python_full_version == '3.12.*' and sys_platform != 'emscripten')",
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/2e/43/25a8dcd3feedd735039a8f0b5b7e3b118232b5eae288c4fd9ab200d41094/rpds_py-2026.5.1.tar.gz", hash = "sha256:07b24fea40541e28570e5b795a4a38fbdcd12550c06bd0748005ecc8116ca256", size = 64459, upload-time = "2026-05-28T12:02:13.232Z" }
 wheels = [
@@ -3847,7 +3847,7 @@ wheels = [
 
 [[package]]
 name = "xai-sdk"
-version = "1.20.0"
+version = "1.21.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -3860,9 +3860,9 @@ dependencies = [
     { name = "requests" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/bf/2b/a03f4a0495e279ece44920bba9da85abe15c3a14ec8eecd683608db63763/xai_sdk-1.20.0.tar.gz", hash = "sha256:ae10fd1713b20a852ffc9909d83233550a3193bd718f77a891ca1485f08e5fb3", size = 473156, upload-time = "2026-09-24T18:05:37.484Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/15/06/2990dff5f9499465f5d0dd7250d752e282f924bd0d819cfa32290495ce1c/xai_sdk-1.21.0.tar.gz", hash = "sha256:1c85e8c2c55b64da95bf9e5b0620ce683062c13a971e508b72ebf1025750d1d1", size = 476668, upload-time = "2026-10-23T19:46:58.705Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/55/be/ac8c239f2a38172fb59763d6715bbf24864e24319ccdd7a09894c7644d1c/xai_sdk-1.20.0-py3-none-any.whl", hash = "sha256:cfd64983c48c78a647460a2e8ee136e6a35929249989b6c9be6387fdf86d661f", size = 281393, upload-time = "2026-09-24T18:05:35.82Z" },
+    { url = "https://files.pythonhosted.org/packages/5b/0b/e7a295b3901310e543e7cb644db65ada17b7bda192ceaf2d678c328b3b8b/xai_sdk-1.21.0-py3-none-any.whl", hash = "sha256:405acae81e9f6ebb2da6df2a173d82685f81bd8c83b0ae073d164b3575202e75", size = 283666, upload-time = "2026-10-23T19:46:57.106Z" },
 ]
 
 [[package]]
