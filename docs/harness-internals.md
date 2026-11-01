@@ -1011,7 +1011,7 @@ derived from the vendor. The shape of the change:
   server-side built-in arriving anyway is refused by name rather than dropped.
 - **The surface default is per vendor class**: `_surface_for` takes the provider, and only a
   generic vendor over the `openai` SDK defaults to `chat`.
-- **A generic build writes one INFO line**, `provider profile=generic provider=… surface=… host=…`.
+- **A generic build writes one INFO line**, `provider profile=generic provider=… sdk_surface=… host=…`.
   A misspelled known vendor is a well-formed slug and now runs generic rather than refusing, and
   this line is the only trace that it lost that vendor's conventions. INFO and not WARNING, because
   for a real generic vendor it is the expected state on every wake. Its head is deliberately not

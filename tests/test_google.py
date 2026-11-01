@@ -1390,8 +1390,8 @@ def test_a_search_writes_a_helper_llm_line_and_meters_its_grounding_fee(router, 
     (llm,) = _lines_starting(caplog, "llm ")
     assert re.fullmatch(
         r"llm provider=google purpose=helper kind=search\.grounding residency=us "
-        r"model=gemini-3\.8-flash duration=\d+\.\d\ds tokens_in=4020 tokens_out=120 "
-        r"tokens_total=4140 cost=\S+ cost_basis=computed \S*outcome=ok\S* "
+        r"model=gemini-3\.8-flash duration=\d+\.\d\ds tokens_in=20 tokens_out=120 "
+        r"tokens_total=140 cost=\S+ cost_basis=computed \S*outcome=ok\S* "
         r"generation_id=resp-0123456789abcdef",
         llm,
     ), llm
@@ -1638,3 +1638,21 @@ def test_an_unpriceable_grounding_fee_is_one_counted_gap_per_wake(router, provid
     assert _lines_starting(caplog, "cost unpriced ") == [
         "cost unpriced provider=google model=gemini-3.8-flash charge=grounding reason=not_reported"
     ]
+
+
+def test_a_builtins_tool_prompt_is_billed_input_but_never_the_compaction_trigger(
+    router, provider, caplog
+):
+    """A fetched page arrives as tool-use input tokens: billed, so on ``tokens_in`` — but nothing in
+    the transcript replays it, so the context budget's trigger reads the prompt alone (#759)."""
+    usage = {
+        "promptTokenCount": 1200,
+        "candidatesTokenCount": 30,
+        "toolUsePromptTokenCount": 150_000,
+        "trafficType": "ON_DEMAND",
+    }
+    router.post(GENERATE).mock(return_value=ok(text("hi"), usage=usage))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("read the page")])
+    assert " tokens_in=151200 tokens_out=30 tokens_total=151230 " in _llm_line(caplog)
+    assert provider.last_tokens_in == 1200

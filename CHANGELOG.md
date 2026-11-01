@@ -27,7 +27,10 @@ capital orders this release behind the matching NOC change.
   **xAI's and Google's counts rise on the dashboards:** xAI reports its reasoning beside the
   completion, on both surfaces (32 + 9 + 94 = 135 in its own example), so both xAI cells now fold it
   into `tokens_out` (`_observability.reasoning_apart`); Google's `tokens_in` now counts the prompt a
-  built-in tool added (`tool_use_prompt_token_count`).
+  built-in tool added (`tool_use_prompt_token_count`) — except on a Gemini 3 grounded search, where
+  Google does not charge them and the computed cost already excluded them. The compaction trigger
+  (`last_tokens_in`) still reads the prompt alone: a fetched page is billed, but the transcript
+  never replays it.
 - **`endpoint=` is the serving upstream only; `residency=` is where the vendor ran the call**:
   Google's Vertex location moves from `endpoint=` to `residency=`, and Anthropic logs
   `inference_geo` there (else the geography the request pinned).
@@ -37,7 +40,12 @@ capital orders this release behind the matching NOC change.
   path — one retry with twice the fitted budget — instead of up to three `server_error` re-sends
   into the same deadline. A deadline that was the vendor's own (`ProviderTimeoutError.vendor_deadline`)
   is never named as the harness's: its retry line carries `timeout_scale=` and no `timeout=` /
-  `next_timeout=`. OpenRouter's own account of the failure (`provider_code=`, …) still rides it.
+  `next_timeout=`, and the engine's give-up line names no budget. OpenRouter's own account of the
+  failure (`provider_code=`, …) still rides it. **A vendor's deadline never counts toward the
+  resume ceiling**: a resume that ends on one takes the outage path, as every 5xx always has, so a
+  gateway outage cannot stall a peer's message (this also changes Anthropic, whose 504 was already a
+  timeout and was counted). The image and transcription tools tell the model the API *did not
+  answer in time*, never that it *could not be reached*.
 - **Two shared heads replace each vendor's prose.** `llm refused` (Anthropic's refusal, with
   `category=`; its explanation stays as a prose line for a human) and `cost unpriced
   charge=tokens|grounding reason=unknown_model|unpriced_tier|unpriced_host|not_reported` for every

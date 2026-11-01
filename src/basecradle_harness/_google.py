@@ -135,6 +135,7 @@ from basecradle_harness._google_rates import (
     from_usage_metadata,
     grounding_cost,
     grounding_known,
+    grounding_tokens_free,
     grounding_units,
     known,
 )
@@ -732,7 +733,10 @@ class GoogleProvider:
             )
         meta = getattr(response, "usage_metadata", None)
         usage = _wire_usage(meta)
-        self.last_tokens_in = token_counts(usage).get("tokens_in")
+        # The compaction trigger measures the context the transcript replays, so it reads the prompt
+        # alone: a built-in's tool-use tokens (a fetched page) are billed input on the line, but
+        # nothing persists them, and counting them would compact a small conversation (#759).
+        self.last_tokens_in = token_counts(_wire_usage(meta, tool_prompt=False)).get("tokens_in")
         candidate = _first_candidate(response)
         reason = _finish_name(candidate)
         self.last_finish_reason = finish_reason({"finish_reason": reason})
@@ -812,7 +816,9 @@ class GoogleProvider:
             residency=self.location,
             model=self.model,
             seconds=seconds,
-            usage=_wire_usage(meta),
+            # Grounding's own input tokens are not charged on Gemini 3, so they are not billed input
+            # on its line either — the count and the computed cost read one rule (issue #759).
+            usage=_wire_usage(meta, tool_prompt=not grounding_tokens_free(self.model)),
             cost=self._cost(meta, grounded=True),
             outcome="ok",
             generation_id=generation_id({"id": getattr(response, "response_id", None)}),
@@ -1218,7 +1224,7 @@ def _block_reason(response: Any) -> str | None:
     return str(getattr(value, "value", value)).upper() or None
 
 
-def _wire_usage(meta: Any) -> dict[str, Any] | None:
+def _wire_usage(meta: Any, *, tool_prompt: bool = True) -> dict[str, Any] | None:
     """Vertex's ``usage_metadata`` in the harness's usage vocabulary (the chat-wire spelling).
 
     One translation, here at the vendor boundary, so the shared readers need no Gemini branch:
@@ -1227,19 +1233,21 @@ def _wire_usage(meta: Any) -> dict[str, Any] | None:
     results, billed at the input rate; issue #759) — ``tokens_out`` is the reply **plus** the
     thinking, because thinking is billed as output exactly as a reasoning model's is on every other
     wire, and ``tokens_reasoning`` is the thinking alone. Vertex's own ``total_token_count`` is not
-    carried: the line's total is ``tokens_in`` + ``tokens_out`` by definition.
+    carried: the line's total is ``tokens_in`` + ``tokens_out`` by definition. `tool_prompt` is
+    ``False`` where those tokens are not billed input (a Gemini 3 grounded search) or not the
+    question (the compaction trigger, which measures what the transcript replays).
     """
     if meta is None:
         return None
     prompt = getattr(meta, "prompt_token_count", None)
-    tool_prompt = getattr(meta, "tool_use_prompt_token_count", None)
+    tool_prompt_count = getattr(meta, "tool_use_prompt_token_count", None) if tool_prompt else None
     reply = getattr(meta, "candidates_token_count", None)
     thoughts = getattr(meta, "thoughts_token_count", None)
-    if prompt is None and tool_prompt is None and reply is None and thoughts is None:
+    if prompt is None and tool_prompt_count is None and reply is None and thoughts is None:
         return None
     usage: dict[str, Any] = {}
-    if isinstance(prompt, int) or isinstance(tool_prompt, int):
-        usage["prompt_tokens"] = (prompt or 0) + (tool_prompt or 0)
+    if isinstance(prompt, int) or isinstance(tool_prompt_count, int):
+        usage["prompt_tokens"] = (prompt or 0) + (tool_prompt_count or 0)
     if isinstance(reply, int) or isinstance(thoughts, int):
         usage["completion_tokens"] = (reply or 0) + (thoughts or 0)
     cached = getattr(meta, "cached_content_token_count", None)

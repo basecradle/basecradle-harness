@@ -347,8 +347,15 @@ def test_a_resume_hold_that_ends_in_a_latch_claims_nothing_more(platform, tmp_pa
         ProviderBillingError("Insufficient credits", status_code=402),
         ProviderServerError("upstream error", status_code=502),
         ProviderConnectionError("Could not reach OpenRouter: connection reset"),
+        # A gateway's 504 is a timeout (issue #759), but the deadline was the vendor's: doubling the
+        # harness's budget cannot move it, so it says nothing about the turn either.
+        ProviderTimeoutError(
+            "OpenRouter's deadline ran out (HTTP 504): upstream timed out",
+            status_code=504,
+            vendor_deadline=True,
+        ),
     ],
-    ids=["out-of-funds", "5xx", "transport"],
+    ids=["out-of-funds", "5xx", "transport", "vendor-deadline"],
 )
 def test_an_outage_during_a_resume_never_counts_toward_the_ceiling(platform, tmp_path, fault):
     """A fault of the provider says nothing about whether the turn can be finished — and it is the

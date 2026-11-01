@@ -555,7 +555,7 @@ What the request the model is about to read is made of, in characters, summing e
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `limit` | Common. | `ContextBudget`. | Never. |
-| `limit_source` | Where the ceiling came from: `env`, `provider`, `default`. | `ContextBudget`. | Never. |
+| `limit_source` | Where the ceiling came from: `env`, `adapter`, `default`. | `ContextBudget`. | Never. |
 | `compact_at` | The token count compaction triggers at. | `ContextBudget`. | Never. |
 
 ### `context compact`

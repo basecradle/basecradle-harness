@@ -890,8 +890,12 @@ class Engine:
                 bind_scale(self.provider, 1.0)
         assert last_exc is not None  # the loop only exits here after catching at least once
         # A timeout names the budget it ran out of, so "the answer needed more than N seconds" is
-        # read off the journal. Any other fault's budget says nothing about it and is left off.
-        budget = last_timeout(self.provider) if _reason(last_exc) == "timeout" else None
+        # read off the journal. Any other fault's budget says nothing about it and is left off —
+        # and so does a vendor's own deadline (a gateway's 504), which was not the harness's (#759).
+        timed_out = _reason(last_exc) == "timeout" and not getattr(
+            last_exc, "vendor_deadline", False
+        )
+        budget = last_timeout(self.provider) if timed_out else None
         _log.error(
             "%s on %d attempt(s)%s; giving up: %s",
             _fault(last_exc),

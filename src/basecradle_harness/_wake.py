@@ -4153,11 +4153,12 @@ class WakeAgent:
             # whole wake down over it; the other items on this timeline still deserve an answer.
             # Nothing is lost: this wake's claim on the item is in-flight, so the next wake finds it
             # orphaned again and resumes against a transcript carrying whatever this attempt managed.
-            if not isinstance(exc, ProviderTimeoutError):
+            if not _turn_timed_out(exc):
                 # A fault of the provider, the platform or the harness — an exhausted 5xx or 429, a
-                # dropped connection, a platform refusal, a bug. It says nothing about whether this
-                # turn can be finished, and it is the path an outage takes, so it does not count
-                # toward the resume ceiling (issue #589): the item waits for the cause to clear.
+                # dropped connection, a platform refusal, a bug, or a deadline that was the vendor's
+                # own (a gateway's 504, issue #759). It says nothing about whether this turn can be
+                # finished, and it is the path an outage takes, so it does not count toward the
+                # resume ceiling (issue #589): the item waits for the cause to clear.
                 self.claims.recount(
                     self.timeline_uuid, uuid, kind=kind, resumes=claim.resumes, reason=claim.reason
                 )
@@ -4981,6 +4982,19 @@ def _evidence_lost(history: list[Message], item: object) -> bool:
 _TIMELINE_ACTIONS = frozenset({MESSAGE, ASSET, TASK})
 
 
+def _turn_timed_out(exc: BaseException) -> bool:
+    """Whether a failed resume ran out of **the budget the harness fitted to it** (issue #589).
+
+    That is the one timeout that says something about the turn: its in-wake retry already doubled
+    the budget and it still ran out, so the turn is too much to finish in time, and it counts toward
+    the resume ceiling. A deadline that was the vendor's own — a gateway's 504, which is a timeout on
+    every vendor (issue #759) — is not: doubling the harness's budget does not move it, and a
+    vendor's gateway timing out is what an outage looks like. It takes the outage path, as every
+    5xx always has, so an outage never turns into a stall.
+    """
+    return isinstance(exc, ProviderTimeoutError) and not getattr(exc, "vendor_deadline", False)
+
+
 def _turn_acted(work: list[Message]) -> bool:
     """Did this turn's work already make a visible timeline action? Read off the transcript (#596).
 
@@ -5800,7 +5814,7 @@ def resolved_config() -> dict[str, object]:
       **not** reported: below the override it comes from the adapter's live `context_limit` capability
       (an API call against a provider this path never builds and holds no key for), so a number here
       would be a guess — and a guessed field in the file the drift audit trusts is worse than an
-      absent one. The wake logs the resolved limit and its source (``context limit limit=… source=…``)
+      absent one. The wake logs the resolved limit and its source (``context limit limit=… limit_source=…``)
       on the run that actually resolves it.
     - ``wake_breaker_max`` / ``wake_breaker_window`` / ``wake_breaker_cooldown`` — the cross-wake
       breaker's tunables as the wake resolves them (`_breaker.breaker_settings_from_env`, issue
