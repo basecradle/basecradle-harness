@@ -1,4 +1,4 @@
-"""The shared log seam: the key=value formatter, token normalization, and the LLM/media lines.
+"""The shared log seam: the key=value formatter, token normalization, and the LLM and tool lines.
 
 These pin the *contract the journal reads* — Better Stack's Live Tail greps these lines, so
 their shape is an interface, not an implementation detail. Nothing here touches a model or the
@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from basecradle_harness import ToolRegistry
+from basecradle_harness import Tool, ToolRegistry
 from basecradle_harness._engine import Engine
 from basecradle_harness._observability import (
     BLUE,
@@ -47,6 +47,7 @@ from basecradle_harness._observability import (
     truncated,
     usage_reported,
 )
+from tests.conftest import tool_lines
 
 # --- the key=value formatter -------------------------------------------------
 
@@ -658,6 +659,57 @@ def test_several_units_are_summed_and_a_partial_total_is_never_stated():
     assert whole.fields()["cost"] == pytest.approx(0.042)
     assert isinstance(whole.fields()["cost"], ComputedCost)
     assert partial.fields()["count"] == 2 and partial.fields()["cost"] is None
+
+
+def test_a_failed_unit_adds_no_fee_and_a_partly_computed_total_says_computed():
+    """A failed unit bought nothing, so the finished unit's fee stands; and a total any part of
+    which is the harness's arithmetic is never presented as a figure the vendor stated."""
+    with tool_meter() as meter:
+        meter_tool(provider="xai", kind="image.edit", model="m", cost=0.02)
+        with pytest.raises(RuntimeError), metered(provider="xai", kind="image.edit", model="m"):
+            raise RuntimeError("the second edit failed")
+    with tool_meter() as mixed:
+        meter_tool(provider="openai", kind="image.generate", model="m", cost=0.02)
+        meter_tool(provider="openai", kind="image.generate", model="m", cost=ComputedCost(0.03))
+
+    assert meter.fields()["count"] == 2 and meter.fields()["cost"] == pytest.approx(0.02)
+    assert isinstance(meter.failure, RuntimeError)
+    assert isinstance(mixed.fields()["cost"], ComputedCost)
+    assert mixed.fields()["cost"] == pytest.approx(0.05)
+
+
+@pytest.mark.parametrize("cost", ["0.5", True, float("nan"), float("inf"), -0.01, object()])
+def test_a_figure_that_is_not_a_fee_is_dropped_as_it_is_recorded(cost):
+    with tool_meter() as meter:
+        meter_tool(provider="xai", kind="image.generate", model="m", count="2", cost=cost)
+
+    assert meter.fields()["cost"] is None and meter.fields()["count"] is None
+
+
+class _SloppyTool(Tool):
+    """An overlay tool that records its vendor's figure as the body spelled it."""
+
+    name = "sloppy_media"
+    description = "Buys an image and records a bad figure."
+
+    def run(self, **_):
+        with metered(provider="xai", kind="image.generate", model="m") as call:
+            call.cost, call.count = "0.5", 2.0
+        return "Generated and posted."
+
+
+def test_a_bad_figure_from_an_overlay_tool_never_raises_into_the_wake(caplog):
+    """The tool has already acted when its line is written: a figure it got wrong must cost the
+    field, never the turn (the run's result still reaches the model)."""
+    registry = ToolRegistry()
+    registry.register(_SloppyTool())
+    engine = Engine(provider=None, tools=registry)
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        assert engine._run_tool("sloppy_media", {}) == "Generated and posted."
+
+    (line,) = tool_lines(caplog)
+    assert line.startswith("tool name=sloppy_media executor=harness provider=xai ")
+    assert " outcome=ok" in line and "cost=" not in line and "count=" not in line
 
 
 # --- one cost shape on every line kind (issue #329) ------------------------------------------------

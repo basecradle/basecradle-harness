@@ -642,7 +642,7 @@ def _media_line(caplog):
 
 def test_media_cost_usd_converts_ticks_and_degrades_to_none():
     """The tick→dollar conversion, and the honest-absence guard: a body with no numeric cost yields
-    None (never a fabricated figure), so the media line simply omits `cost=`."""
+    None (never a fabricated figure), so the tool line simply omits `cost=`."""
     from basecradle_harness._grok import _media_cost_usd
 
     # xAI's own documented example: 200000000 ticks = $0.02 (1 tick = 1e-10 USD).

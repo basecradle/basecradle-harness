@@ -418,7 +418,10 @@ class XaiSdkProvider:
         ``server_side_tool_usage`` counts it — named by xAI's ``ServerSideTool`` enum, which names the
         capability (``web_search``, ``x_search``, ``code_execution``) rather than the sub-operations
         grok's search calls itself by. A failure is a server-side ``tool_calls`` entry whose
-        ``status`` is ``FAILED`` or ``INCOMPLETE``, matched to its tool by its ``ToolCallType``.
+        ``status`` is ``FAILED`` or ``INCOMPLETE``, matched to its tool by its ``ToolCallType``. A
+        tool the usage block does not list but whose calls failed is counted by those failed calls,
+        so a use that failed is never missing from the line (one search's sub-operations share its
+        type, so that count can exceed the searches; it is never below them).
         """
         usage = getattr(response, "usage", None)
         tools = self._xai.chat.usage_pb2.ServerSideTool
@@ -429,12 +432,16 @@ class XaiSdkProvider:
         types = self._xai.chat.chat_pb2.ToolCallType
         statuses = self._xai.chat.chat_pb2.ToolCallStatus
         unfinished = {statuses.TOOL_CALL_STATUS_FAILED, statuses.TOOL_CALL_STATUS_INCOMPLETE}
+        failed: dict[str, int] = {}
         for call in getattr(response, "tool_calls", None) or ():
             if self._is_client_side(call) or getattr(call, "status", None) not in unfinished:
                 continue
             name = _enum_name(types, call.type, "TOOL_CALL_TYPE_").removesuffix("_tool")
-            tally = tallies.setdefault(name, ServerToolTally(count=1))
+            failed[name] = failed.get(name, 0) + 1
+            tally = tallies.setdefault(name, ServerToolTally())
             tally.reason = tally.reason or _enum_name(statuses, call.status, "TOOL_CALL_STATUS_")
+        for name, count in failed.items():
+            tallies[name].count = max(tallies[name].count, count)
         return tallies
 
     def _sample(

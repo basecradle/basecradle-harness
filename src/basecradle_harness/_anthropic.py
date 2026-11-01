@@ -1208,21 +1208,22 @@ def _server_tallies(usage: Any, blocks: Sequence[Mapping[str, Any]]) -> dict[str
     result block wherever it lands: a mixed group's server tool runs on the call after the one
     that asked for it (issue #737), so its result, and its failure, belong to that later call.
     """
-    tallies: dict[str, ServerToolTally] = {}
     results: dict[str, int] = {}
+    failures: dict[str, str | None] = {}
     for block in blocks:
         name = _RESULTS.get(block.get("type"))
         if name is None:
             continue
         results[name] = results.get(name, 0) + 1
         content = block.get("content")
-        if isinstance(content, Mapping) and "error_code" in content:
-            tally = tallies.setdefault(name, ServerToolTally())
-            tally.reason = tally.reason or slug(content.get("error_code") or "failed")
+        if isinstance(content, Mapping) and "error_code" in content and not failures.get(name):
+            failures[name] = slug(content.get("error_code") or "failed")
+    # In one fixed order (search, fetch, code), so a call's lines read the same on every call.
+    tallies: dict[str, ServerToolTally] = {}
     for name, field in _SERVER_COUNTS.items():
         count = max(server_tool_requests(usage, field), results.get(name, 0))
         if count:
-            tallies.setdefault(name, ServerToolTally()).count = count
+            tallies[name] = ServerToolTally(count=count, reason=failures.get(name))
     return tallies
 
 

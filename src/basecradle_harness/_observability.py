@@ -963,15 +963,22 @@ class ToolMeter:
     was. Outside an engine (a library caller running a tool by hand) there is no meter, no tool line,
     and recording is a no-op.
 
-    More than one unit in one run is summed: ``count`` becomes the units, and the fee the total —
-    computed only if every unit's was, and absent if any unit's was absent, because a partial total
-    would be a figure nobody can stand behind.
+    More than one unit in one run is summed: ``count`` becomes the units, and the fee the total of
+    the units that **finished** — a failed unit bought nothing — tagged computed when any part of it
+    is the harness's arithmetic, and absent when a finished unit's fee was, because a partial total
+    would be a figure nobody can stand behind. The vendor, kind and model are the first unit's.
+
+    **Recording can never raise into a wake.** The fee and the count come off a vendor body, often
+    in a ``tools/`` overlay tool someone wrote in an afternoon, and the meter is read *after* the
+    tool has already acted — so a figure that is not a real, finite, non-negative number (a string,
+    a bool, ``nan``) is dropped as it is recorded, as `_money` drops it from every other line, and a
+    count that is not a positive ``int`` likewise.
     """
 
     __slots__ = ("_units", "failure")
 
     def __init__(self) -> None:
-        self._units: list[tuple[str, str, str, int | None, float | None]] = []
+        self._units: list[tuple[str, str, str, int | None, float | None, bool]] = []
         self.failure: Exception | None = None
 
     def record(
@@ -980,23 +987,28 @@ class ToolMeter:
         provider: str,
         kind: str,
         model: str,
-        count: int | None = None,
-        cost: float | None = None,
+        count: Any = None,
+        cost: Any = None,
+        failed: bool = False,
     ) -> None:
-        self._units.append((provider, kind, model, count, cost))
+        units = (
+            count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else None
+        )
+        fee = cost if _money(cost) is not None else None
+        self._units.append((provider, kind, model, units, fee, failed))
 
     def fields(self) -> dict[str, Any]:
         """The `log_tool` keywords this run's recorded work fills (empty when it recorded none)."""
         if not self._units:
             return {}
-        provider, kind, model, count, _ = self._units[0]
+        provider, kind, model, count, _, _ = self._units[0]
         if len(self._units) > 1:
             count = sum(unit[3] if unit[3] is not None else 1 for unit in self._units)
-        costs = [unit[4] for unit in self._units]
+        costs = [unit[4] for unit in self._units if not unit[5]]
         cost: float | None = None
-        if all(c is not None for c in costs):
+        if costs and all(c is not None for c in costs):
             total = math.fsum(costs)  # type: ignore[arg-type]
-            computed = all(isinstance(c, ComputedCost) for c in costs)
+            computed = any(isinstance(c, ComputedCost) for c in costs)
             cost = ComputedCost(total) if computed else total
         return {"provider": provider, "kind": kind, "model": model, "count": count, "cost": cost}
 
@@ -1016,7 +1028,7 @@ def tool_meter() -> Iterator[ToolMeter]:
 
 
 def meter_tool(
-    *, provider: str, kind: str, model: str, count: int | None = None, cost: float | None = None
+    *, provider: str, kind: str, model: str, count: Any = None, cost: Any = None
 ) -> None:
     """Record one finished unit of vendor work on the running tool's meter (a no-op with none)."""
     meter = _METER.get()
@@ -1033,7 +1045,7 @@ def meter_failure(exc: Exception, *, provider: str, kind: str, model: str) -> No
     """
     meter = _METER.get()
     if meter is not None:
-        meter.record(provider=provider, kind=kind, model=model)
+        meter.record(provider=provider, kind=kind, model=model, failed=True)
         meter.failure = exc
 
 

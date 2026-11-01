@@ -1234,8 +1234,9 @@ def test_every_executor_writes_the_one_tool_line(rendered):
 
 
 def test_a_tool_fee_rides_its_tool_line_and_never_the_llm_line(rendered):
-    (search,) = rendered.heads("anthropic", "tool")[:1]
-    assert search.fields["name"] == "web_search"
+    (search,) = [
+        line for line in rendered.heads("anthropic", "tool") if line.fields["name"] == "web_search"
+    ]
     assert (search.fields["kind"], search.fields["cost"]) == ("search.web", "0.02")
     assert search.fields["cost_basis"] == "computed"
     (image,) = [

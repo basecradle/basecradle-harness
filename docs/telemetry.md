@@ -190,7 +190,7 @@ The describer answering again from its once-per-wake memo instead of calling a m
 
 ### `tool`
 
-**One line per tool use, whoever executed it** — a harness tool, an MCP server's tool, or a tool the vendor ran server-side inside a model call (`_observability.log_tool`, the only emitter). Tool calls and tool spend are both read off this one head; there is no second definition of "tool". The engine writes the line for a harness or MCP tool, with what the tool's vendor work recorded on its meter while it ran (`_observability.metered`); an adapter writes it for a server-side tool, one line per model call per tool, right after that call's `llm` line. A failed harness or MCP run writes a second, WARNING `tool` line carrying `name` and `error`; a failed server-side tool has a vendor code and no text, so it has no companion and its line is itself a WARNING.
+**One line per tool use, whoever executed it** — a harness tool, an MCP server's tool, or a tool the vendor ran server-side inside a model call (`_observability.log_tool`, the only emitter). Tool calls and tool spend are both read off this one head; there is no second definition of "tool". The engine writes the line for a harness or MCP tool, with what the tool's vendor work recorded on its meter while it ran (`_observability.metered`); the engine's own refusal of a call (an unknown or withheld name) is `executor=harness`, since the harness is what answered it. An adapter writes the line for a server-side tool, one line per model call per tool, right after that call's `llm` line — or before it, when the caller holds its `llm` line back to judge the answer (`capture_llm_call`); `generation_id` is the join either way. A failed harness or MCP run writes a second, WARNING `tool` line carrying `name` and `error`; a failed server-side tool has a vendor code and no text, so it has no companion and its line is itself a WARNING.
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
@@ -199,14 +199,14 @@ The describer answering again from its once-per-wake memo instead of calling a m
 | `provider` | The vendor that ran or billed the tool's work — the brain's vendor for a server-side tool; the media or search vendor a harness tool called. | Whoever knows the vendor. | The tool reaches no billed vendor (platform tools, memory). |
 | `kind` | The shape of the work, for metered media and search: `image.generate`, `image.edit`, `video.generate`, `audio.transcribe`, `search.web`, `search.grounding`. | The tool or adapter. | Unmetered work. |
 | `model` | The vendor model the tool's work ran on. | The tool or adapter. | The tool used no model. |
-| `count` | Billed or executed units on this line: searches, grounding queries, fetches, executions. A server-side tool writes one line per model call per tool, with its uses counted here — every use, a failed one included, so it can exceed the units a fee was charged on. | The tool or adapter. | One unmetered harness use. Always present on `executor=server`. |
+| `count` | Billed or executed units on this line: searches, grounding queries, fetches, executions. A server-side tool writes one line per model call per tool, with its uses counted here — every use, a failed one included, so it can exceed the units a fee was charged on. | The tool or adapter. | A harness run whose work stated no units (one image, one transcription). Always present on `executor=server`. |
 | `duration` | Wall time of the run — for a media tool, the generation and the upload that follows it. | The engine. | `executor=server` — the work ran inside a model call its `llm` line already timed. |
 | `outcome` | `ok` or `error`. | The engine; the adapter from the vendor's result block. | The WARNING companion line. |
 | `reason` | Why it failed, as a slug. The engine's own refusals: `unknown_tool`, `withheld`, `server_side` (a server-side built-in called as a function), `elision_marker`; a tool that raised: `exception`; a harness tool's vendor call that failed: the fault slug, as on `llm` (`rate_limited`, `server_error`, `transport`, `timeout`, `invalid_response`, `provider_error`). For a server-side tool, the vendor's own code or status, lowercased (`max_uses_exceeded`, `url_retrieval_status_error`, `outcome_failed`, `failed`, `incomplete`). | Whoever saw the failure. | `outcome=ok`. |
 | `error` | Common; on the WARNING companion line only. | The engine. | `outcome=ok`. |
 | `cost` | US dollars of the tool's own fee — never model tokens, which are on the `llm` line. | The tool or adapter. | No fee, or a fee nobody can price (see `cost unpriced`). |
 | `cost_basis` | Common. | `cost_basis()`. | As Common. |
-| `generation_id` | Common: the model call the tool ran inside, so a tool joins to its `llm` line. | The adapter. | `executor` is not `server`. |
+| `generation_id` | Common: the model call the tool ran inside, so a tool joins to its `llm` line. | The adapter. | `executor` is not `server`, or the call's response named no id. |
 
 ### `cost unpriced`
 

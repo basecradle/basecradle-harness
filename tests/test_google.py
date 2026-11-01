@@ -1262,7 +1262,8 @@ def test_no_representation_of_the_adapter_emits_its_key_or_token(router, provide
 # cannot — Vertex refuses a search tool beside function calling — so `GoogleProvider.search` makes a
 # separate call whose only tool is ``google_search``, and `GoogleSearchTool` hands its answer to the
 # agent as ``web_search``. These pin what goes on the wire, the two lines a search writes (its
-# ``llm`` line as a helper call, its grounding fee as a priced ``media`` line), and the honest gaps.
+# ``llm`` line as a helper call, its grounding fee on the tool's own ``tool`` line), and the honest
+# gaps.
 
 GROUNDED_USAGE = {
     "promptTokenCount": 20,

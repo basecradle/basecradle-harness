@@ -27,7 +27,9 @@ shapes; the capital orders it.
   tool run (`_observability.metered`, which replaces `media_timer`). The media tools (image, video,
   transcription) and the Gemini grounded search write through it. `duration=` is now the whole run,
   the upload included. A tool whose vendor call failed and that turned the failure into text for the
-  model is `outcome=error` with the fault's slug, where before it read `outcome=ok`.
+  model is `outcome=error` with the fault's slug, where before it read `outcome=ok`. Recording can
+  never raise into a wake: a fee that is not a real, finite, non-negative number, or a count that is
+  not a positive integer, is dropped as it is recorded, as `cost=` already drops one on every line.
 - **A failed run names why, as a slug** (`reason=unknown_tool|withheld|server_side|elision_marker|
   exception`, or a vendor fault: `rate_limited`, `server_error`, `timeout`, …); the WARNING companion
   carrying the error text is unchanged.
@@ -40,7 +42,8 @@ shapes; the capital orders it.
   search fee (OpenAI and Anthropic, $10 per 1,000 billed searches) rides the `web_search` line.
 - **A server-side tool the vendor reports failed** is that line's `outcome=error reason=<the
   vendor's code>` at WARNING — Anthropic's `error_code` inside a 200 (before, a prose WARNING), a
-  Gemini page it could not read, an OpenAI or xAI call whose status is `failed` or `incomplete`.
+  Gemini page it could not read, an OpenAI or xAI call whose status is `failed` or `incomplete`. A
+  use that failed is still counted, even where the vendor's usage block omits it.
 - **Unpriced code-container time** (Anthropic and OpenAI) is one `cost unpriced
   charge=container_time reason=not_reported` WARNING per wake, replacing two prose WARNINGs in two
   vendors' words (`CONTAINER_GAP`, removed from both rate modules).

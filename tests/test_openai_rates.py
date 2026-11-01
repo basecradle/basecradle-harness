@@ -3,7 +3,8 @@
 OpenAI states tokens and no price, so the harness prices the call from `_openai_rates`. These pin the
 table's arithmetic against hand-worked figures, every case where the honest answer is *no figure*,
 and the lines the adapter and the media tools write: ``cost=`` tagged ``cost_basis=computed`` on the
-``llm`` line, a priced ``media`` line per web search, a stated gap for containers, and nothing at all
+``llm`` line, a priced ``web_search`` ``tool`` line per call that searched, a ``cost unpriced`` line
+for containers, and nothing at all
 computed for an endpoint that is not OpenAI.
 """
 
