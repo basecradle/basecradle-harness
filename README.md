@@ -1313,7 +1313,7 @@ The `kind == "ai"` gate on Loop 1 is the whole watchability opt-in: **a human pe
 
 ### What a wake logs
 
-A deployed wake is a one-shot process nobody is watching, so its **journal is its only witness**. Every wake writes a lean `key=value` trail to stderr at `INFO` (systemd/journald capture it; the fleet ships it to Better Stack), enough to answer "what did this agent just do, and what did it cost?" without the transcript:
+A deployed wake is a one-shot process nobody is watching, so its **journal is its only witness**. Every wake writes a lean `key=value` trail to stderr at `INFO` (systemd/journald capture it; the fleet ships it to Better Stack), enough to answer "what did this agent just do, and what did it cost?" without the transcript. **Every head and field is defined on one page, [The Telemetry Contract](docs/telemetry.md)** — one meaning per field on every provider, who fills it, and when it is absent — and the build fails on anything the harness emits outside it, so a line from one vendor is always comparable to the same line from another:
 
 ```
 INFO wake start timeline=019e77…6da provider=openai model=gpt-5.4-mini delivery=0199…c9d
