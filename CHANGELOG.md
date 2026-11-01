@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added: the `charge` head, for spend billed by quantity of a resource rather than per call (issue #766)
+
+@origin's ruling (2026-11-01, on basecradle-noc#1153): a dollar a vendor bills by a quantity of a
+resource — browser session minutes, container hours, a GPU block, bytes, storage — is neither a
+tool use nor a model call, so it gets one generic head every future resource-billed product fits.
+Contract and test only; nothing in the harness writes a `charge` line yet, and the package does not
+change.
+
+- **`docs/telemetry.md` → Tools → `charge`**: one line per billed resource instance, written once
+  the vendor's figures are final, with the rule for which head a dollar belongs on, the field table
+  (`provider`, `kind` in the `tool` line's dotted vocabulary, `executor`, `unit`, `count`,
+  `duration`, `started`, `resource`, `generation_id`, `outcome`, `reason`, `cost`, `cost_basis`,
+  `vendor_usage`, `vendor_unit`), and two examples: the NOC's Steel launcher's per-session spend
+  line (its first producer), and container time as it will read the day a vendor states it.
+- **Two names held to the one-meaning rule.** The vendor's instance id is `resource`, not
+  `session`, which already names the harness session's channel key on `context attribution`; and
+  `cost_basis` keeps its fleet-wide meaning (`computed`, or absent for a vendor-stated cost), with no
+  `stated` value.
+- `unit` and `executor` join the common fields, now that each is on two heads; the grammar states
+  how a moment in time is written (ISO 8601, UTC, trailing `Z`); *Outside This Repository* says the
+  Steel launcher's spend line retires into `charge`, not `tool`.
+- **`tests/test_telemetry_contract.py`** pins the head's field set to the grammar posted to the NOC,
+  checks every example the page shows against the table, and refuses a `charge` line carrying a
+  field outside it.
+
 ## [0.168.0] - 2026-10-31
 
 ### Changed: every field one meaning on every vendor (issue #759)

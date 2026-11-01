@@ -1248,6 +1248,77 @@ def test_an_unpriced_container_is_one_counted_line_on_both_vendors(rendered):
         }
 
 
+#: The `charge` head's field set, exactly as posted to the NOC on issue #766: the grammar the Steel
+#: launcher (basecradle-noc#1153) builds against. A row added to or struck from the page's table
+#: without changing this set fails, so the page and the posted grammar cannot drift apart.
+CHARGE_FIELDS = frozenset(
+    {
+        "provider",
+        "kind",
+        "executor",
+        "unit",
+        "count",
+        "duration",
+        "started",
+        "resource",
+        "generation_id",
+        "outcome",
+        "reason",
+        "cost",
+        "cost_basis",
+        "vendor_usage",
+        "vendor_unit",
+    }
+)
+#: The fields no `charge` line is ever without (their rows' Absent When is "Never").
+CHARGE_REQUIRED = frozenset({"provider", "kind", "executor", "unit", "count", "outcome", "cost"})
+
+
+def _charge_examples() -> list[Line]:
+    """The journal lines the page shows under `charge`, parsed the way the NOC reads the journal."""
+    section = DOC.read_text(encoding="utf-8").split("\n### `charge`\n", 1)[1]
+    section = section.split("\n### ", 1)[0].split("\n## ", 1)[0]
+    records = [
+        record.removeprefix("INFO ")
+        for block in re.findall(r"```text\n(.*?)```", section, re.DOTALL)
+        for record in block.splitlines()
+        if record.startswith("INFO ")
+    ]
+    lines = [parse_line(record) for record in records]
+    assert all(lines), records
+    return lines  # type: ignore[return-value]
+
+
+def _stray(contract: Contract, line: Line) -> set[str]:
+    return {name for name in line.fields if not _allowed(contract, line.head, name)}
+
+
+def test_charge_carries_exactly_the_posted_field_set(contract):
+    assert contract.heads["charge"] == CHARGE_FIELDS
+
+
+def test_every_charge_example_on_the_page_is_a_conforming_line(contract):
+    examples = _charge_examples()
+    assert [line.head for line in examples] == ["charge", "charge"]  # Steel, then container time
+    for line in examples:
+        fields = line.fields
+        assert not _stray(contract, line), line.message
+        assert CHARGE_REQUIRED <= set(fields), line.message
+        assert ("vendor_usage" in fields) == ("vendor_unit" in fields), line.message
+        assert ("reason" in fields) == (fields["outcome"] == "error"), line.message
+        # `cost_basis` means one thing fleet-wide: `computed`, or absent for a vendor-stated cost.
+        assert fields.get("cost_basis", "computed") == "computed", line.message
+
+
+def test_a_charge_field_outside_the_contract_is_refused(contract):
+    steel = _charge_examples()[0]
+    # The launcher's pre-contract spend fields, and `session`, which already means the harness
+    # session's channel key on `context attribution` and so cannot name a vendor's resource here.
+    for name in ("billed_minutes", "credits_used", "proxy_bytes", "release_reason", "session"):
+        line = parse_line(f"{steel.message} {name}=x")
+        assert line is not None and _stray(contract, line) == {name}
+
+
 def test_the_line_parser_reads_the_grammar_and_rejects_prose():
     line = parse_line('tool name=messages duration=0.12s outcome=ok error="a b=c"')
     assert line is not None and line.head == "tool"
