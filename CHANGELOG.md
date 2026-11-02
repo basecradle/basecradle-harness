@@ -22,10 +22,12 @@ stray word onto the key five times, `instructions devam`).
   unknown name, a missing required one, or arguments that are not an object are refused with what
   was wrong, the tool's parameter names, and the nearest name when one is close — `it has no
   parameter 'instructions_text' (did you mean 'instructions'?). Its parameters are: action, uuid,
-  instructions, activate_at, timeline.` The authority is `run()`'s own signature, so a tool taking
-  `**kwargs` (every MCP proxy) is never refused, and a `TypeError` raised *inside* a tool's body is
-  still that tool's `exception`. On the recovery's re-issue seam the refusal says the first
-  attempt's outcome is unknown, never that nothing was sent.
+  instructions, activate_at, timeline.` The authority is `run()`'s own signature (the callable's
+  own, not the one a decorator's `functools.wraps` points at), so a tool taking `**kwargs` (every
+  MCP proxy) is never refused for a name it did not expect, and the refusal names only parameters
+  the schema advertises. A `TypeError` raised *inside* a tool's body, and a required parameter the
+  schema hides, are still the tool's own `exception`. On the recovery's re-issue seam the refusal
+  says the first attempt's outcome is unknown, never that nothing was sent.
 - **A new engine refusal slug, `reason=invalid_arguments`, on the `tool` line** (`docs/telemetry.md`
   → Tools). These calls were `reason=exception` before; they are still `outcome=error` and still
   excluded from Tool Calls.

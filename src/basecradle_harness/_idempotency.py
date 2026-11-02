@@ -39,10 +39,10 @@ At the instant a tool call executes, the create-shaped calls with results are ex
 counting answered calls at runtime and counting positions at replay time are the same number
 (`completed`, `ordinal_of`). A **counter** would be a second source of truth, and it would drift
 from the first one the moment a create-shaped call was recorded in the transcript without ever
-reaching the tool's create branch (the model passes an unknown kwarg, `run(**arguments)` raises
-`TypeError`, the engine feeds the error back as the result). The counter would say 1; the
-transcript would say 2; the recovery would re-issue under a key the dead wake never used, and the
-platform — never having seen it — would post the message a second time. There is no counter.
+reaching the tool's create branch (the model passes an unknown argument, and the engine refuses
+the call before `run()` and feeds the refusal back as the result — `_arguments`). The counter would
+say 1; the transcript would say 2; the recovery would re-issue under a key the dead wake never used,
+and the platform — never having seen it — would post the message a second time. There is no counter.
 
 This is only possible because the transcript is now persisted *incrementally* (issue #297, piece
 A): at mint time the assistant turn carrying the call is already in the turn's work.

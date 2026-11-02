@@ -113,7 +113,7 @@ def test_a_misspelled_argument_is_refused_with_its_near_match_and_never_reaches_
     assert first == (
         "Error: 'schedule' was not run, and nothing was sent — it has no parameter "
         "'instructions_text' (did you mean 'instructions'?). Its parameters are: action, uuid, "
-        "instructions, activate_at, timeline. Call it again with those parameter names."
+        "instructions, activate_at, timeline. Correct the call before making it again."
     )
     assert "TypeError" not in first and "unexpected keyword" not in first
     # The refused call never ran; the corrected one did, exactly once.
@@ -127,8 +127,11 @@ def test_a_misspelled_argument_is_refused_with_its_near_match_and_never_reaches_
     ]
     assert "outcome=error" in lines[0] and lines[0].endswith(" reason=invalid_arguments")
     assert "outcome=ok" in lines[1]
-    warning = next(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
-    assert "instructions_text" in warning
+    (warning,) = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warning == (
+        "tool name=schedule error=\"it has no parameter 'instructions_text' (did you mean "
+        "'instructions'?). Its parameters are: action, uuid, instructions, activate_at, timeline.\""
+    )
 
 
 @pytest.mark.parametrize(
@@ -199,6 +202,82 @@ def test_several_faults_are_reported_together():
         "it has no parameter 'task_id'; it needs 'action', which this call did not pass. "
         "Its parameters are: action, uuid, instructions, activate_at, timeline."
     )
+
+
+def test_a_tool_with_no_parameters_is_never_told_to_use_parameter_names():
+    class Balance(Tool):
+        name = "balance"
+        description = "Read the balance."
+
+        def run(self):
+            return "$4.00"
+
+    fault = problem(Balance(), {"account": "main"})
+    assert fault == "it has no parameter 'account'. It takes no parameters."
+    assert refusal("balance", fault) == (
+        "Error: 'balance' was not run, and nothing was sent — it has no parameter 'account'. "
+        "It takes no parameters. Correct the call before making it again."
+    )
+
+
+def test_a_keyword_only_parameter_is_judged_like_any_other():
+    class Find(Tool):
+        name = "find"
+        description = "Find."
+        parameters = {"type": "object", "properties": {"query": {}, "limit": {}}}
+
+        def run(self, *, query, limit=10):
+            return "found"
+
+    assert problem(Find(), {"query": "cats"}) is None
+    assert problem(Find(), {"limit": 3}) == (
+        "it needs 'query', which this call did not pass. Its parameters are: query, limit."
+    )
+
+
+def test_a_decorated_run_is_judged_by_the_wrapper_the_engine_calls_never_the_inner_function():
+    """A wrapper that supplies `client` itself binds `{"q": ...}`; the inner `run` alone would not."""
+    import functools
+
+    def with_client(run):
+        @functools.wraps(run)
+        def wrapper(self, **kwargs):
+            return run(self, "the-client", **kwargs)
+
+        return wrapper
+
+    class Search(Tool):
+        name = "search"
+        description = "Search."
+        parameters = {"type": "object", "properties": {"q": {}}}
+
+        @with_client
+        def run(self, client, q=None):
+            return f"{client}: {q}"
+
+    assert problem(Search(), {"q": "cats"}) is None
+    (result,) = _results(_run(Search(), {"q": "cats"}))
+    assert result == "the-client: cats"
+
+
+def test_a_required_name_the_schema_hides_is_the_tools_defect_and_raises_as_one(caplog):
+    """The model was never shown it, so it cannot be told to pass it: the tool's own `exception`."""
+
+    class Broken(Tool):
+        name = "broken"
+        description = "Broken."
+        parameters = {"type": "object", "properties": {"q": {}}}
+
+        def run(self, secret, q=None):
+            return "ran"
+
+    assert problem(Broken(), {"q": "x"}) is None
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        (result,) = _results(_run(Broken(), {"q": "x"}))
+    assert result.startswith("Error running 'broken': ")
+    assert any(r.getMessage().endswith("reason=exception") for r in caplog.records)
+    # Beside a fault the model can fix, only the names it was shown are named.
+    assert problem(Broken(), {"z": 1}) == "it has no parameter 'z'. Its parameters are: q."
 
 
 # --- the recovery's seam ----------------------------------------------------------------------

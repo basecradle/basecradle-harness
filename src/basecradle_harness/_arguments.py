@@ -13,10 +13,14 @@ what was wrong and what the tool accepts, with the nearest name when one is clos
 
 **The authority is `run()`'s own signature, never the schema.** The question is exactly "would this
 call raise before the tool's first line", and only the signature answers it: a tool that takes
-``**kwargs`` (every MCP proxy, whose server validates its own arguments) accepts anything and is
-never refused here; a third-party overlay tool whose schema disagrees with its `run()` is judged by
-what it can actually be called with. The schema decides only which names the model is *shown*, so
-a keyword `run()` takes but the schema never advertised stays out of the message.
+``**kwargs`` (every MCP proxy, whose server validates its own arguments) is never refused for a name
+it was not written to expect; a third-party overlay tool whose schema disagrees with its `run()` is
+judged by what it can actually be called with. The signature read is the callable's *own*, never the
+one a decorator's `functools.wraps` points at: a wrapper that supplies an argument itself takes calls
+the inner function would refuse, and refusing those would invent a ``TypeError``. The schema decides
+only which names the model is *shown*, so a keyword `run()` takes but the schema never advertised
+stays out of the message — and a *required* one the model was never shown is the tool's own defect,
+not the call's, so it is left to raise and be reported as the tool's ``exception``.
 
 This checks the call's **shape** — an object, every name known, every required name present — and
 nothing about the values. Types and enums stay each tool's own business, as they were: the shape is
@@ -46,7 +50,7 @@ def problem(tool: Any, arguments: Any) -> str | None:
     C callable) is never refused: this module exists to explain a ``TypeError``, never to invent one.
     """
     try:
-        parameters = inspect.signature(tool.run).parameters.values()
+        parameters = inspect.signature(tool.run, follow_wrapped=False).parameters.values()
     except (TypeError, ValueError):
         return None
     named = {p.name: p for p in parameters if p.kind in _NAMED}
@@ -68,7 +72,9 @@ def problem(tool: Any, arguments: Any) -> str | None:
         for name, p in named.items()
         if p.default is inspect.Parameter.empty and name not in arguments
     ]
-    if missing:
+    if any(name not in shown for name in missing) and not faults:
+        return None  # a required name the model was never shown: the tool's defect, not the call's
+    if missing := [name for name in missing if name in shown]:
         names = ", ".join(repr(name) for name in missing)
         faults.append(f"it needs {names}, which this call did not pass")
     if not faults:
@@ -94,21 +100,21 @@ def refusal(name: str, fault: str, *, reissue: bool = False) -> str:
             f"sending anything."
         )
     return (
-        f"Error: {name!r} was not run, and nothing was sent — {fault} Call it again with those "
-        f"parameter names."
+        f"Error: {name!r} was not run, and nothing was sent — {fault} Correct the call before "
+        f"making it again."
     )
 
 
 def _shown(tool: Any, named: Mapping[str, inspect.Parameter]) -> list[str]:
     """The parameter names the model may be told about: the schema's, in its order, that `run` takes.
 
-    Falls back to `run`'s own keyword names when the schema lists none it shares — a tool with a
-    malformed or empty schema still gets a useful refusal.
+    Never `run`'s own names beyond those: a name the schema does not advertise is one the model was
+    not offered, and the refusal does not offer it either.
     """
     schema = getattr(tool, "parameters", None)
     properties = schema.get("properties") if isinstance(schema, Mapping) else None
     advertised = list(properties) if isinstance(properties, Mapping) else []
-    return [key for key in advertised if key in named] or list(named)
+    return [key for key in advertised if key in named]
 
 
 def _accepts(shown: list[str]) -> str:

@@ -136,7 +136,8 @@ def archive_marker(arguments: Any) -> str | None:
 
     Searches every string a model can put in a call: the values, and the values inside any list or
     object among them. Keys are not searched; a copied `_session._arguments_stub` carries its marker in
-    a value, and an unexpected key already fails the call on its own. The walk is iterative, so no
+    a value, and an unexpected key is refused by the dispatch (`_arguments`) on any tool that does not
+    take ``**kwargs``. The walk is iterative, so no
     nesting depth a provider can deliver makes it raise.
     """
     pending = [arguments]
