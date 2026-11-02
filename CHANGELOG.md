@@ -38,6 +38,15 @@ stray word onto the key five times, `instructions devam`).
   runs a tool without a model call in the same wake is the recovery re-issuing a dead wake's
   recorded create (`_wake._reissue_interrupted_creates`), and it replays that model's arguments
   verbatim, so a `task_id` its agent does not remember sending is still a model-written key.
+- **A call's arguments decode to an object on every adapter** (`_openai_wire.tool_arguments`). A
+  model that sent `null`, a list or a bare string as a call's arguments had it decoded verbatim by
+  the OpenAI-wire surfaces (`openai`, `openrouter`) and the native xAI adapter, and the wake crashed
+  at the transcript's first save (`'NoneType' object has no attribute 'get'`), before the engine
+  could tell the model anything. A non-object now reads as no arguments, as an empty string already
+  did and as the Anthropic and Google adapters already read one, so the call reaches the dispatch
+  and is refused by name if it needed any. Undecodable arguments on the native xAI path are now the
+  retryable `ProviderResponseError` they are on the other surfaces (issue #259), where they were a
+  bare `JSONDecodeError` nothing retried.
 
 ## [0.168.0] - 2026-10-31
 
