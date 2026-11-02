@@ -1,7 +1,8 @@
 """Checking a tool call's arguments against the tool before it runs (issue #779).
 
-A model's tool-call arguments arrive exactly as the model wrote them: the adapters decode the JSON
-and nothing else, so a key the tool never declared — `instructions_text`, `task_id`, `instructions
+A model's tool-call arguments arrive as the model wrote them: the adapters decode the JSON into an
+object (a non-object reads as no arguments, `_openai_wire.tool_arguments`) and nothing else, so a
+key the tool never declared — `instructions_text`, `task_id`, `instructions
 devam` — reaches the dispatch untouched. Handed straight to `run(**arguments)`, it raised Python's
 own ``TypeError`` (``TasksTool.run() got an unexpected keyword argument 'task_id'``), and that text
 became the tool's result. It names a Python method, never the parameters the tool *does* take, so a

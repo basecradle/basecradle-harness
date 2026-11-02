@@ -443,7 +443,7 @@ def server_tool_uses(output: Any) -> list[tuple[str, str]]:
     return uses
 
 
-def tool_arguments(raw: str | None) -> dict[str, Any]:
+def tool_arguments(raw: str | Mapping[str, Any] | None) -> dict[str, Any]:
     """A tool call's JSON ``arguments`` string, decoded to the **object** every reader of a call assumes.
 
     Shared by every surface that receives arguments as a JSON string — both of this module's and the
@@ -458,8 +458,15 @@ def tool_arguments(raw: str | None) -> dict[str, Any]:
       the persisted transcript's cap, the idempotency ordinal, the resume — and before this a model
       that sent ``null`` crashed the wake at the transcript's first save, before the engine could
       tell it anything. Read as ``{}``, the call reaches the dispatch, which names any required
-      parameter it lacks (`_arguments`).
+      parameter it lacks (`_arguments`). A tool whose parameters are all optional then runs with
+      its defaults, as it already did on those two adapters.
+
+    An OpenAI-compatible endpoint that sends the arguments already parsed, as an object rather than
+    a string, is taken as it is: before, `json.loads` raised a bare ``TypeError`` on it that no
+    retry or report recognized.
     """
+    if isinstance(raw, Mapping):
+        return dict(raw)
     text = raw or "{}"
     try:
         decoded = json.loads(text)

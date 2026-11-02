@@ -19,7 +19,8 @@ broken `tasks` call six times in an hour (`instructions_text`, then `task_id`; a
 stray word onto the key five times, `instructions devam`).
 
 - **The engine checks a call's shape before the tool runs** (`_arguments.py`, `Engine._run_tool`): an
-  unknown name, a missing required one, or arguments that are not an object are refused with what
+  unknown name, a missing required one, or (through the library API) arguments that are not an
+  object are refused with what
   was wrong, the tool's parameter names, and the nearest name when one is close — `it has no
   parameter 'instructions_text' (did you mean 'instructions'?). Its parameters are: action, uuid,
   instructions, activate_at, timeline.` The authority is `run()`'s own signature (the callable's
@@ -34,7 +35,7 @@ stray word onto the key five times, `instructions devam`).
 - **Every shipped tool's schema is pinned to its `run()`** (`tests/test_arguments.py`): the
   properties it advertises are exactly the keywords `run()` takes, and every keyword without a
   default is `required`. They already agreed, `tasks` included, and no harness code builds a
-  tool call's arguments: every adapter decodes the model's JSON and nothing else. The one path that
+  tool call's arguments: every adapter decodes the model's JSON into an object and nothing else. The one path that
   runs a tool without a model call in the same wake is the recovery re-issuing a dead wake's
   recorded create (`_wake._reissue_interrupted_creates`), and it replays that model's arguments
   verbatim, so a `task_id` its agent does not remember sending is still a model-written key.
@@ -42,11 +43,14 @@ stray word onto the key five times, `instructions devam`).
   model that sent `null`, a list or a bare string as a call's arguments had it decoded verbatim by
   the OpenAI-wire surfaces (`openai`, `openrouter`) and the native xAI adapter, and the wake crashed
   at the transcript's first save (`'NoneType' object has no attribute 'get'`), before the engine
-  could tell the model anything. A non-object now reads as no arguments, as an empty string already
-  did and as the Anthropic and Google adapters already read one, so the call reaches the dispatch
-  and is refused by name if it needed any. Undecodable arguments on the native xAI path are now the
-  retryable `ProviderResponseError` they are on the other surfaces (issue #259), where they were a
-  bare `JSONDecodeError` nothing retried.
+  could tell the model anything. A non-object (`null`, a list, a string, a number) now reads as no
+  arguments, as an empty string already did and as the Anthropic and Google adapters already read
+  one, so the call reaches the dispatch and is refused by name if it needed any; a tool whose
+  parameters are all optional runs with its defaults. Arguments an OpenAI-compatible endpoint sends
+  already parsed, as an object, are taken as they are, where `json.loads` raised a bare
+  `TypeError`. Undecodable arguments on the native xAI path are now the retryable
+  `ProviderResponseError` they are on the other surfaces (issue #259), where they were a bare
+  `JSONDecodeError` nothing retried.
 
 ## [0.168.0] - 2026-10-31
 

@@ -323,6 +323,18 @@ def test_an_object_is_kept_and_an_absent_one_is_empty(decode, arguments):
 
 
 @pytest.mark.parametrize("decode", [message_from_chat, message_from_responses])
+def test_arguments_sent_already_parsed_are_taken_as_they_are(decode):
+    shape = _chat_call if decode is message_from_chat else _responses_call
+    data = shape(None)
+    if decode is message_from_chat:
+        data["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] = {"action": "list"}
+    else:
+        data["output"][0]["arguments"] = {"action": "list"}
+    (call,) = decode(data).tool_calls
+    assert call.arguments == {"action": "list"}
+
+
+@pytest.mark.parametrize("decode", [message_from_chat, message_from_responses])
 def test_undecodable_arguments_are_still_the_retryable_response_error(decode):
     shape = _chat_call if decode is message_from_chat else _responses_call
     with pytest.raises(ProviderResponseError, match="Could not decode tool-call arguments"):

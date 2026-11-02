@@ -744,7 +744,8 @@ def test_null_tool_call_arguments_reach_the_dispatch_on_a_persisted_session(
     (result,) = [m.content for m in session.history if m.role == "tool"]
     assert result.startswith("Error: 'tasks' was not run, and nothing was sent — it needs 'action'")
     saved = json.loads((tmp_path / "s.json").read_text())
-    assert '"arguments": {}' in json.dumps(saved)
+    (assistant,) = [m for m in saved if m.get("tool_calls")]
+    assert assistant["tool_calls"][0]["arguments"] == {}
 
 
 # === Construction & configuration ===========================================
