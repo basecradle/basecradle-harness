@@ -17,11 +17,20 @@ import json
 
 import pytest
 
-from basecradle_harness import ImageContent, Message, ProviderError, ToolSpec, VideoContent
+from basecradle_harness import (
+    ImageContent,
+    Message,
+    ProviderError,
+    ProviderResponseError,
+    ToolSpec,
+    VideoContent,
+)
 from basecradle_harness._openai_wire import (
     chat_message_to_wire,
     chat_tool_to_wire,
     function_tool_to_responses,
+    message_from_chat,
+    message_from_responses,
     message_to_input,
 )
 from tests.conftest import mail_tool
@@ -268,3 +277,53 @@ def test_a_failed_server_item_is_marked_and_an_mcp_call_leads_with_its_tool():
     assert (search.name, search.failed) == ("web_search", "failed")
     assert mcp.name == "mcp" and mcp.input.startswith("deepwiki/ask_question {")
     assert mcp.failed == ""
+
+
+# --- a tool call's arguments decode to an object, or to none (issue #779) ---------------------
+
+#: What a model can send as a call's `arguments` that decodes but is not an object. Before #779 each
+#: became the call's arguments as-is, and the first transcript save crashed the wake on it
+#: (`'NoneType' object has no attribute 'get'`) before the engine could answer the model.
+_NOT_AN_OBJECT = ["null", "[]", '["create"]', '"create"', "7", "true"]
+
+
+def _chat_call(arguments: str | None) -> dict:
+    function = {"name": "tasks"} | ({} if arguments is None else {"arguments": arguments})
+    return {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "tool_calls": [{"id": "call_1", "type": "function", "function": function}],
+                }
+            }
+        ]
+    }
+
+
+def _responses_call(arguments: str | None) -> dict:
+    item = {"type": "function_call", "id": "fc-1", "call_id": "call_1", "name": "tasks"}
+    return {"output": [item | ({} if arguments is None else {"arguments": arguments})]}
+
+
+@pytest.mark.parametrize("arguments", _NOT_AN_OBJECT)
+@pytest.mark.parametrize("decode", [message_from_chat, message_from_responses])
+def test_arguments_that_decode_to_something_other_than_an_object_read_as_none(decode, arguments):
+    shape = _chat_call if decode is message_from_chat else _responses_call
+    (call,) = decode(shape(arguments)).tool_calls
+    assert call.arguments == {}
+
+
+@pytest.mark.parametrize("arguments", [None, "", '{"action": "list"}'])
+@pytest.mark.parametrize("decode", [message_from_chat, message_from_responses])
+def test_an_object_is_kept_and_an_absent_one_is_empty(decode, arguments):
+    shape = _chat_call if decode is message_from_chat else _responses_call
+    (call,) = decode(shape(arguments)).tool_calls
+    assert call.arguments == ({"action": "list"} if arguments else {})
+
+
+@pytest.mark.parametrize("decode", [message_from_chat, message_from_responses])
+def test_undecodable_arguments_are_still_the_retryable_response_error(decode):
+    shape = _chat_call if decode is message_from_chat else _responses_call
+    with pytest.raises(ProviderResponseError, match="Could not decode tool-call arguments"):
+        decode(shape('{"action": "li'))

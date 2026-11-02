@@ -112,7 +112,7 @@ from basecradle_harness._observability import (
     serving_endpoint,
     token_counts,
 )
-from basecradle_harness._openai_wire import format_citations
+from basecradle_harness._openai_wire import format_citations, tool_arguments
 from basecradle_harness._schema import UnrepresentableSchema, normalize_object_root
 from basecradle_harness._secret import Secret
 from basecradle_harness._server_tools import record, summarize
@@ -773,7 +773,7 @@ class XaiSdkProvider:
             ToolCall(
                 id=tc.id,
                 name=tc.function.name,
-                arguments=json.loads(tc.function.arguments) if tc.function.arguments else {},
+                arguments=tool_arguments(tc.function.arguments),
             )
             for tc in response.tool_calls
             if self._is_client_side(tc)
