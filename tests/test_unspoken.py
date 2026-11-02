@@ -405,6 +405,15 @@ def _shipped_note(filename):
         return _import_file(path).PLUGIN.note
 
 
+#: A representative fault for the argument refusal (issue #779): the near-match form, plus a missing
+#: required name, so every clause `_arguments.problem` can write is in the text the guard reads.
+_ARGUMENT_FAULT = (
+    "it has no parameter 'instructions_text' (did you mean 'instructions'?); it needs 'action', "
+    "which this call did not pass. Its parameters are: action, uuid, instructions, activate_at, "
+    "timeline."
+)
+
+
 def _model_facing_strings():
     """Every shipped string the *model* reads — the surface the operator frame must stay out of.
 
@@ -413,7 +422,7 @@ def _model_facing_strings():
     other surface — the brief, the nudges, the guidance the engine feeds back — where the word
     would be a lie the model then reasons from.
     """
-    from basecradle_harness import _mempalace
+    from basecradle_harness import _arguments, _mempalace
     from basecradle_harness._brief import (
         render_brain,
         render_budget,
@@ -486,6 +495,9 @@ def _model_facing_strings():
         # Issue #576: what a call carrying a harness elision marker gets back, live and on recovery.
         "elision refusal": refusal(gone(900)),
         "elision refusal (re-issue)": refusal(gone(900), reissue=True),
+        # Issue #779: what a call whose arguments cannot bind to the tool gets back, both seams.
+        "argument refusal": _arguments.refusal("tasks", _ARGUMENT_FAULT),
+        "argument refusal (re-issue)": _arguments.refusal("tasks", _ARGUMENT_FAULT, reissue=True),
         # A resume replays the transcript up to the interruption, so the model reads this one as
         # its own account of what happened to it (issue #490) — which puts it squarely on this
         # surface, whatever its `system` role suggests.

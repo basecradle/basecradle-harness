@@ -48,6 +48,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
+from basecradle_harness import _arguments
 from basecradle_harness._assets import model_sees_images, model_sees_video
 from basecradle_harness._elision import archive_marker, refusal
 from basecradle_harness._exceptions import (
@@ -1117,6 +1118,15 @@ class Engine:
                 error="arguments carry a harness elision marker",
             )
             return refusal(marker, reissue=reissue)
+        # A call that cannot bind to `run()` — an unknown, missing or misspelled argument (issue
+        # #779) — is refused in words that name what the tool takes, rather than let Python's own
+        # `TypeError`, which names none of it, become the result the model has to correct from.
+        fault = _arguments.problem(tool, arguments)
+        if fault is not None:
+            self._log_tool(
+                name, started, executor=executor, reason="invalid_arguments", error=fault
+            )
+            return _arguments.refusal(name, fault, reissue=reissue)
         # The meter a tool that buys vendor work records it on (`_observability.metered`), so the
         # run's one `tool` line carries the vendor, model and fee (issue #758).
         with tool_meter() as meter:

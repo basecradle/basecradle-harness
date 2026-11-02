@@ -7,6 +7,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.169.0] - 2026-11-02
+
+### Fixed: a tool call with an unknown or missing argument is refused in words the model can act on (issue #779)
+
+A model's tool-call arguments reach the dispatch exactly as it wrote them, and the engine handed
+them straight to `run(**arguments)`: a key the tool never declared raised Python's own `TypeError`
+(`TasksTool.run() got an unexpected keyword argument 'instructions_text'`), and that text became the
+tool's result. It names a method, never the parameters the tool takes, and `@rowan` repeated the same
+broken `tasks` call six times in an hour (`instructions_text`, then `task_id`; another agent glued a
+stray word onto the key five times, `instructions devam`).
+
+- **The engine checks a call's shape before the tool runs** (`_arguments.py`, `Engine._run_tool`): an
+  unknown name, a missing required one, or arguments that are not an object are refused with what
+  was wrong, the tool's parameter names, and the nearest name when one is close — `it has no
+  parameter 'instructions_text' (did you mean 'instructions'?). Its parameters are: action, uuid,
+  instructions, activate_at, timeline.` The authority is `run()`'s own signature, so a tool taking
+  `**kwargs` (every MCP proxy) is never refused, and a `TypeError` raised *inside* a tool's body is
+  still that tool's `exception`. On the recovery's re-issue seam the refusal says the first
+  attempt's outcome is unknown, never that nothing was sent.
+- **A new engine refusal slug, `reason=invalid_arguments`, on the `tool` line** (`docs/telemetry.md`
+  → Tools). These calls were `reason=exception` before; they are still `outcome=error` and still
+  excluded from Tool Calls.
+- **Every shipped tool's schema is pinned to its `run()`** (`tests/test_arguments.py`): the
+  properties it advertises are exactly the keywords `run()` takes, and every keyword without a
+  default is `required`. They already agreed, `tasks` included, and no harness code builds a
+  tool call's arguments: every adapter decodes the model's JSON and nothing else. The one path that
+  runs a tool without a model call in the same wake is the recovery re-issuing a dead wake's
+  recorded create (`_wake._reissue_interrupted_creates`), and it replays that model's arguments
+  verbatim, so a `task_id` its agent does not remember sending is still a model-written key.
+
 ## [0.168.0] - 2026-10-31
 
 ### Changed: every field one meaning on every vendor (issue #759)
