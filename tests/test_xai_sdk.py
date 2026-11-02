@@ -168,6 +168,26 @@ def test_a_tool_spec_becomes_a_wire_tool_and_a_tool_call_round_trips():
     ]
 
 
+def _raw_call_response(arguments: str):
+    """A response whose one client-side call carries `arguments` verbatim, as the SDK hands it over."""
+    call = SimpleNamespace(id="call_9", function=SimpleNamespace(name="tasks", arguments=arguments))
+    return SimpleNamespace(content="", tool_calls=[call], citations=[])
+
+
+@pytest.mark.parametrize("arguments", ["null", "[]", '"create"', "7"])
+def test_arguments_that_are_not_an_object_read_as_none(arguments):
+    """Issue #779: the same rule as the OpenAI-wire surfaces, from the same function."""
+    reply = _provider(_raw_call_response(arguments)).chat([Message.user("go")])
+    assert reply.tool_calls == [ToolCall(id="call_9", name="tasks", arguments={})]
+
+
+def test_undecodable_arguments_are_the_retryable_response_error():
+    """Before #779 this was a bare `JSONDecodeError`: not a provider fault, so never retried, where
+    the same truncated body on the OpenAI-wire surfaces is re-requested (issue #259)."""
+    with pytest.raises(ProviderResponseError, match="Could not decode tool-call arguments"):
+        _provider(_raw_call_response('{"action": "li')).chat([Message.user("go")])
+
+
 def test_server_side_tool_calls_are_not_surfaced_for_dispatch():
     # Issue #183: grok runs Live Search server-side inside one gRPC turn, then surfaces every tool
     # call it made — the already-executed server-side ones — in Response.tool_calls, each tagged by

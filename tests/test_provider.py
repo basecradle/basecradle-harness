@@ -711,6 +711,43 @@ def test_truncated_tool_call_arguments_on_the_responses_surface_are_retryable(
         responses_provider.chat([Message.user("weather?")], tools=[WEATHER_TOOL])
 
 
+def test_null_tool_call_arguments_reach_the_dispatch_on_a_persisted_session(
+    router, provider, tmp_path
+):
+    """Issue #779: `"arguments": "null"` crashed the wake at the transcript's first save, before the
+    engine could answer. Read as no arguments, the call reaches the dispatch and is refused by name.
+    """
+    from basecradle_harness import Engine, Session, ToolRegistry
+    from basecradle_harness._tasks import TasksTool
+
+    class Tasks(TasksTool):
+        def __init__(self) -> None:  # no platform context: the call is refused before `run`
+            pass
+
+    call = {
+        "id": "call_1",
+        "type": "function",
+        "function": {"name": "tasks", "arguments": "null"},
+    }
+    router.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=completion(tool_calls=[call], finish_reason="tool_calls")),
+            httpx.Response(200, json=completion(content="done")),
+        ]
+    )
+    registry = ToolRegistry()
+    registry.register(Tasks())
+    session = Session("timeline:x", Engine(provider, registry), path=tmp_path / "s.json")
+
+    session.send("list the tasks")
+
+    (result,) = [m.content for m in session.history if m.role == "tool"]
+    assert result.startswith("Error: 'tasks' was not run, and nothing was sent — it needs 'action'")
+    saved = json.loads((tmp_path / "s.json").read_text())
+    (assistant,) = [m for m in saved if m.get("tool_calls")]
+    assert assistant["tool_calls"][0]["arguments"] == {}
+
+
 # === Construction & configuration ===========================================
 
 

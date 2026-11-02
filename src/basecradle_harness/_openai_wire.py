@@ -170,17 +170,7 @@ def message_from_chat(data: Mapping[str, Any]) -> Message:
     tool_calls: list[ToolCall] = []
     for raw in message.get("tool_calls") or []:
         function = raw.get("function", {})
-        raw_args = function.get("arguments") or "{}"
-        try:
-            arguments = json.loads(raw_args)
-        except json.JSONDecodeError as exc:
-            # Undecodable tool-call arguments are the *other* truncation locus — args are often the
-            # largest/last part of a completion, so a body cut short lands here as readily as at the
-            # missing-``choices`` check above. Retryable (`ProviderResponseError`, issue #259), so
-            # this locus doesn't silently drop the message the envelope check now saves.
-            raise ProviderResponseError(
-                f"Could not decode tool-call arguments {raw_args!r}: {exc}"
-            ) from exc
+        arguments = tool_arguments(function.get("arguments"))
         tool_calls.append(ToolCall(id=raw["id"], name=function["name"], arguments=arguments))
 
     content = message.get("content")
@@ -453,17 +443,45 @@ def server_tool_uses(output: Any) -> list[tuple[str, str]]:
     return uses
 
 
+def tool_arguments(raw: str | Mapping[str, Any] | None) -> dict[str, Any]:
+    """A tool call's JSON ``arguments`` string, decoded to the **object** every reader of a call assumes.
+
+    Shared by every surface that receives arguments as a JSON string — both of this module's and the
+    native xAI adapter's — so one rule decodes them all. Two cases, and the second is issue #779's:
+
+    - **Undecodable** is the *other* truncation locus: arguments are often the largest and last part
+      of a completion, so a body cut short lands here as readily as at a missing ``choices``. It is
+      the retryable `ProviderResponseError` (issue #259), never a silent drop.
+    - **Decodable, but not an object** (``null``, a list, a bare string) is read as *no arguments*,
+      exactly as an empty string already was, and as the Anthropic and Google adapters already read
+      a non-object ``input`` / ``args``. A call's arguments are a ``dict`` to everything downstream —
+      the persisted transcript's cap, the idempotency ordinal, the resume — and before this a model
+      that sent ``null`` crashed the wake at the transcript's first save, before the engine could
+      tell it anything. Read as ``{}``, the call reaches the dispatch, which names any required
+      parameter it lacks (`_arguments`). A tool whose parameters are all optional then runs with
+      its defaults, as it already did on those two adapters.
+
+    An OpenAI-compatible endpoint that sends the arguments already parsed, as an object rather than
+    a string, is taken as it is: before, `json.loads` raised a bare ``TypeError`` on it that no
+    retry or report recognized.
+    """
+    if isinstance(raw, Mapping):
+        return dict(raw)
+    text = raw or "{}"
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ProviderResponseError(
+            f"Could not decode tool-call arguments {text!r}: {exc}"
+        ) from exc
+    return decoded if isinstance(decoded, dict) else {}
+
+
 def _tool_call_from_responses(item: Mapping[str, Any]) -> ToolCall:
     """A Responses ``function_call`` item as a harness `ToolCall` (arguments parsed)."""
-    raw_args = item.get("arguments") or "{}"
-    try:
-        arguments = json.loads(raw_args)
-    except json.JSONDecodeError as exc:
-        # Same truncation locus as the chat surface's tool-call args: retryable, not a silent drop.
-        raise ProviderResponseError(
-            f"Could not decode tool-call arguments {raw_args!r}: {exc}"
-        ) from exc
-    return ToolCall(id=item["call_id"], name=item["name"], arguments=arguments)
+    return ToolCall(
+        id=item["call_id"], name=item["name"], arguments=tool_arguments(item.get("arguments"))
+    )
 
 
 def format_citations(citations: Sequence[Mapping[str, Any]]) -> str:
