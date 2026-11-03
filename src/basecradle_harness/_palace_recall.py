@@ -603,6 +603,20 @@ def _digest(ids) -> str:
     return hashlib.sha256("\n".join(ids).encode("utf-8")).hexdigest()[:16]
 
 
+def _routing_words(reranker: MemPalaceReranker) -> str:
+    """The run header's account of where the reranker routes: the ``only`` list, or the ranked order.
+
+    The ``only`` wording is the one this header always printed, so a run with no order configured
+    reads exactly as before (issue #780).
+    """
+    words = (
+        f"order {','.join(reranker.order)}"
+        if reranker.order
+        else f"providers {','.join(reranker.providers)}"
+    )
+    return f"{words}, ignore {','.join(reranker.ignore)}" if reranker.ignore else words
+
+
 def _median(seconds: list[float]) -> str:
     return f"{statistics.median(seconds):.3f}s" if seconds else "n/a"
 
@@ -776,7 +790,7 @@ def main(
     estimated = estimate(probes, mean_chars)
     header = f"mempalace {version}, metric {metric}, rerank model {reranker.model}"
     print(
-        f"end-to-end: {header}, providers {','.join(reranker.providers)}; arms "
+        f"end-to-end: {header}, {_routing_words(reranker)}; arms "
         + "; ".join(f"{arm.name}: {arm.describe()}" for arm in REPORT_ORDER)
     )
     print(

@@ -7,6 +7,38 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.170.0] - 2026-11-03
+
+### Added: the reranker can route by a ranked order — `HARNESS_MEMPALACE_RERANK_ORDER` and `HARNESS_MEMPALACE_RERANK_IGNORE` (issue #780)
+
+The reranker sent its providers list as OpenRouter's `only`, which is an **unordered** set: routing
+inside it is weighted by price, throughput and latency, and the order the list was written in is
+not the order tried. So the fleet's reranker policy — prefer full-precision endpoints, fall back to
+lower (basecradle-noc#1199) — could not be expressed: a tier-ranked list written there would have
+sent most calls to the cheaper fp4 endpoints, the inverse of the policy, green on every read-back.
+
+- **`HARNESS_MEMPALACE_RERANK_ORDER`** — a comma-separated, ranked list of endpoint tags or slugs
+  (`baseten/fp8/us,sail-research/us`), sent as `provider.order` with **no** `only`, beside
+  `allow_fallbacks: true` and `data_collection: "deny"` as before.
+- **`HARNESS_MEMPALACE_RERANK_IGNORE`** — comma-separated slugs sent as `provider.ignore`, with
+  either list; absent when empty.
+- **Measured before it was built.** On the US host, with the head of the order answering 429,
+  OpenRouter's own attempt record read `[BaseTen 429, Sail Research 200]` on every call. The
+  fall-through happens inside the one request, so it costs no client retry. Past the end of the
+  order the call falls into the rest of the model's pool, in OpenRouter's own weighting. Under an
+  order the list is therefore no longer a restriction: a regional host, `data_collection: "deny"`
+  and the ignore list bound the pool.
+- **An order beside a providers list is a config fault**, `reason=config:conflicting_routing` at
+  ERROR once per wake, with plain hybrid recall, never a quiet precedence: whichever list lost
+  would be either an operator's restriction or the order a converge wrote. It is decided in
+  `MemPalaceReranker` itself, so the library API cannot build a request the environment could not.
+  A model with neither list is `config:missing_providers` as before, and an ignore list alone is
+  not a routing list.
+- **`--resolved-config` reports `mempalace_rerank_order` and `mempalace_rerank_ignore`**, each a
+  list, `[]` when unset, read by the parse the reranker sends.
+- **Unchanged for every agent that sets neither variable**: the request is the `only` request it
+  always sent.
+
 ## [0.169.0] - 2026-11-02
 
 ### Fixed: a tool call with an unknown or missing argument is refused in words the model can act on (issue #779)

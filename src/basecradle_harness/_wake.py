@@ -231,6 +231,12 @@ from basecradle_harness._rerank import (
 from basecradle_harness._rerank import (
     base_url_from_env as rerank_base_url_from_env,
 )
+from basecradle_harness._rerank import (
+    ignore_from_env as rerank_ignore_from_env,
+)
+from basecradle_harness._rerank import (
+    order_from_env as rerank_order_from_env,
+)
 from basecradle_harness._secret import secret
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
@@ -5808,6 +5814,13 @@ def resolved_config() -> dict[str, object]:
       configured (``null`` = the SDK's own default host). A regional host is a data-residency
       decision, and one that silently fell off a box would send recalled memories through the
       global host while every other field read the same, so it is reported beside the trio.
+    - ``mempalace_rerank_order`` / ``mempalace_rerank_ignore`` — the reranker's ranked routing list
+      and its banned slugs (issue #780), each as a list, ``[]`` when unset, read by the same function
+      the reranker reads them with. ``order`` is sent as OpenRouter's ``provider.order`` *instead
+      of* the ``only`` list in ``mempalace_rerank_providers``, so a read-back that finds both
+      non-empty has found a reranker that is config-dead (``config:conflicting_routing``), not one
+      that routes by either. Reported because the NOC derives the order daily (basecradle-noc#1199)
+      and must be able to prove the one it wrote is the one the box sends.
     - ``max_context_tokens`` — the operator's context-budget override (`HARNESS_MAX_CONTEXT_TOKENS`;
       issue #276), or ``null`` when unset. ``0`` means compaction is **disabled** on this agent, and
       that is the state worth being able to see from outside. The *resolved* ceiling is deliberately
@@ -5873,6 +5886,8 @@ def resolved_config() -> dict[str, object]:
         ),
         "mempalace_rerank_sdk_version": _dist_version(_RERANK_SDK_DISTRIBUTION),
         "mempalace_rerank_base_url": rerank_base_url_from_env(),
+        "mempalace_rerank_order": list(rerank_order_from_env()),
+        "mempalace_rerank_ignore": list(rerank_ignore_from_env()),
         "describer_model": describer_model_from_env(),
         "describer_providers": list(describer_providers_from_env()),
         "describer_api_key_set": bool((os.environ.get(DESCRIBER_API_KEY_VAR) or "").strip()),
