@@ -25,7 +25,9 @@ line no longer meant what its bytes appeared to say.
   (basecradle-router#398), so userinfo ahead of `/heartbeat/` never ships; a URL without one still
   keeps its host. The box's pattern is quadratic in Python's `re`, so the source matches each
   space-free run once, from its start, and a differential test holds the two to the same bytes.
-  The heartbeat pass now runs before every other rule, as on the box.
+  The heartbeat pass now runs before every other rule, as on the box, and keeps a bearer scheme
+  word that ends the URL's run, so the token after it is still redacted (compact JSON and a query
+  value ending `…=Bearer` shipped it, on the box as well).
 - **`github_pat_` is no longer a stated difference**: the box carries it (basecradle-router#398),
   and `BOX_RULE_SAMPLES` holds it at the box's minimum. `docs/telemetry.md` → The Grammar states the
   value rule, control characters included, as the one definition.

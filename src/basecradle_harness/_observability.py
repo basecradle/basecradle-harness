@@ -203,11 +203,19 @@ _LITERAL_RULES = re.compile(
 #: from the run's start: the lookbehind fails at once everywhere else, and each run is scanned once.
 #: `_heartbeat` then cuts the run where the box's pattern would have begun its match, which is the
 #: leftmost of the run's first ``/heartbeat/`` and its first scheme that ends before the run's last
-#: ``/heartbeat/``. The box's match runs to the end of the run, as this one does, so the bytes
-#: redacted are the box's.
+#: ``/heartbeat/`` with a character after it. The box's match runs to the end of the run, as this one
+#: does, so the bytes redacted are the box's — with one addition, `_TRAILING_BEARER`.
 _HEARTBEAT_RUN = re.compile(r"(?<!\S)\S*/heartbeat/\S+")
 _HEARTBEAT = "/heartbeat/"
 _SCHEME = re.compile(r"https?://")
+
+#: A bearer scheme word ending a heartbeat run, which `_heartbeat` keeps so the bearer rule still
+#: sees it beside its token in the next run. Taken to the run's end, the word went with the URL and
+#: left the token with no rule to match it: compact JSON (``{"url":"https://h/heartbeat/K9",
+#: "auth":"Bearer eyJ…"}``) and a query value ending ``…&access_token=Bearer eyJ…`` shipped the
+#: token, on the box as well. Not glued to a letter or digit, so a heartbeat secret that merely ends
+#: in those letters is never shortened into a kept word.
+_TRAILING_BEARER = re.compile(r"(?<![A-Za-z0-9])(?i:bearer)\Z")
 
 #: One character of the run every **length-gated** redaction rule matches — this module's
 #: rules and the box's ``ai_scrub`` alike. A rule with a minimum length (``sk-…{8,}``,
@@ -268,7 +276,8 @@ def _heartbeat(match: re.Match[str]) -> str:
     scheme = _SCHEME.search(run, 0, run.rindex(_HEARTBEAT, 0, len(run) - 1))
     if scheme:
         start = min(start, scheme.start())
-    return run[:start] + "[redacted]"
+    bearer = _TRAILING_BEARER.search(run, start)
+    return run[:start] + "[redacted]" + (bearer.group() if bearer else "")
 
 
 def _redaction(match: re.Match[str]) -> str:

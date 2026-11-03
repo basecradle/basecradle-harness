@@ -277,7 +277,8 @@ BOX_HEARTBEAT = re.compile(r"(?:https?://\S*)?/heartbeat/\S+")
 
 def test_the_heartbeat_pass_redacts_exactly_the_bytes_the_boxs_rule_does():
     """A differential check over random texts built from the pieces the rule reads, so every
-    interleaving of schemes, ``/heartbeat/``, separators and other characters is tried."""
+    interleaving of schemes, ``/heartbeat/``, separators and other characters is tried. The one
+    addition to the box's bytes, a trailing bearer word, is out of these pieces by construction."""
     pieces = [
         "https://",
         "http://",
@@ -285,10 +286,15 @@ def test_the_heartbeat_pass_redacts_exactly_the_bytes_the_boxs_rule_does():
         "/heartbeat",
         "heartbeat/",
         "h",
+        "s",
+        ":",
         "/",
         "x",
         " ",
         "\n",
+        "\x85",
+        "\u2028",
+        "\u3000",
     ]
     rng = random.Random(806)
     for _ in range(20000):
@@ -301,6 +307,33 @@ def test_a_heartbeat_url_after_another_rules_match_is_still_taken_from_its_schem
     it left the userinfo after it to the scheme-less arm."""
     rendered = scrub("Bearer abcdefgh.https://john:hunter2Secret@uptime.example.com/heartbeat/K9")
     assert "hunter2Secret" not in rendered and "john" not in rendered, rendered
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"url":"https://h.example.com/heartbeat/K9","auth":"Bearer eyJhbGciOiJIUzI1NiJ9.e30.SIG"}',
+        "https://h.example.com/x?token=abc/heartbeat/K9&access_token=Bearer eyJhbGciOiJIUzI1NiJ9.e30",
+        "uptime.example.com/heartbeat/K9;authorization=bearer\teyJhbGciOiJIUzI1NiJ9.e30",
+    ],
+)
+def test_a_bearer_word_ending_a_heartbeat_run_still_redacts_its_token(text):
+    """Taken to the run's end with the URL, the scheme word left its token in the next run with no
+    rule to match it; the heartbeat pass keeps the word for the bearer rule."""
+    rendered = scrub(text)
+    assert "eyJhbGciOiJIUzI1NiJ9" not in rendered and "K9" not in rendered, rendered
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        ("x/heartbeat/K9abcBearer", "x[redacted]"),
+        ("x/heartbeat/K9-bearer", "x[redacted]bearer"),
+    ],
+)
+def test_only_a_bearer_word_not_glued_to_the_secret_is_kept(text, scrubbed):
+    """A heartbeat secret that merely ends in those letters is never shortened into a kept word."""
+    assert scrub(text) == scrubbed
 
 
 @pytest.mark.parametrize("separator", [" ", "\t", "\n"])
