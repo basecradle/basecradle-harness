@@ -17,9 +17,12 @@ request header into its error body (a generic OpenAI-compatible vendor, a proxy'
 have had the credential posted, as written, where peers read it. Not seen live; open by construction.
 
 - **`_report.verbatim` scrubs the text it digs out** with the log scrub's own rules
-  (`_observability.scrub`): a credential-shaped span becomes `[redacted]`, and every other word stays
-  as the vendor wrote it. It is the one place the vendor's words enter both posts and the reason
-  a claim persists (a stall's, a dropped item's), so no reader of it can be the one that forgot.
+  (`_observability.scrub`): a span one of its rules matches becomes `[redacted]` (a bearer or
+  key-in-query rule takes its `Bearer ` or `?api_key=` label with it), and the rest stays as the
+  vendor wrote it. The rules are the log scrub's, over-matches included: a prefix rule has no left
+  boundary, so a word like `task-specification` reads `ta[redacted]` (issue #794). It is the one
+  place the vendor's words enter both posts and the reason a claim persists (a stall's, a dropped
+  item's), so no reader of it can be the one that forgot.
 - **The stall note's quoted error is scrubbed before it is cut**, never after, so no rule is shown a
   credential cut short of its minimum.
 - **The stall note scrubs again at the post**, for a reason a claim persisted before this release.
