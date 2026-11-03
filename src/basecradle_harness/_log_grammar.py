@@ -129,7 +129,7 @@ import sys
 import time
 
 from basecradle_harness._breaker import breaker_tripped_line
-from basecradle_harness._observability import LOG_FORMAT, agent_slug
+from basecradle_harness._observability import LOG_FORMAT, agent_slug, bounded
 from basecradle_harness._report import (
     PROBE_SOURCE,
     billing_onset_line,
@@ -307,7 +307,9 @@ def _read_back(messages: list[str], *, since: float) -> bool:
         if done.returncode == 0 and all(message in done.stdout for message in messages):
             return True
         if done.returncode != 0 and time.monotonic() >= deadline:
-            raise Unprovable(f"journalctl exited {done.returncode}: {done.stderr.strip()[:200]}")
+            raise Unprovable(
+                f"journalctl exited {done.returncode}: {bounded(done.stderr.strip(), 200)}"
+            )
         if time.monotonic() >= deadline:
             return False
         time.sleep(_READBACK_INTERVAL_S)

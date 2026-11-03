@@ -64,7 +64,7 @@ from basecradle_harness._exceptions import (
     ProviderPayloadTooLargeError,
 )
 from basecradle_harness._media import _detail_from_body
-from basecradle_harness._observability import RED, YELLOW, head, kv
+from basecradle_harness._observability import RED, YELLOW, bounded, head, kv
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -176,9 +176,7 @@ def stall_detail(error: BaseException) -> str:
     the text stays in the log where it belongs.
     """
     if isinstance(error, ProviderError):
-        detail = verbatim(error).strip() or type(error).__name__
-        if len(detail) > STALL_DETAIL_CAP:
-            detail = detail[: STALL_DETAIL_CAP - 1].rstrip() + "…"
+        detail = bounded(verbatim(error).strip(), STALL_DETAIL_CAP) or type(error).__name__
         return f"last error: {detail}"
     return f"last error: an internal fault ({type(error).__name__}); the details are in its log"
 

@@ -7,6 +7,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.173.0] - 2026-11-03
+
+### Fixed: a log value is never cut inside a token (issue #787)
+
+`kv` scrubbed a value and then truncated it at 240 characters; the fleet's journal scrub (Vector's
+`ai_scrub`) redacts again after that, and it carries shapes the harness did not (`ghp_…`, `AIza…`,
+`hf_…`). A long value cut mid-token could ship a credential prefix shorter than any rule's minimum
+length, which no layer could redact.
+
+- **One cut, never inside a `[A-Za-z0-9_-]` run** (`_observability.bounded`): the cut backs off to
+  the last character outside a run, so a token is whole (and redactable downstream) or absent; a
+  value that is one run past the bound is omitted. The router's remap cuts by the same rule
+  (basecradle-router#385).
+- **Every site that cut free text bound for a log line uses it:** `kv`, the direct-message tool's
+  ntfy refusal (the `tool` line's `error`), the log-grammar probe's `journalctl` error, and the
+  Vertex and Anthropic inline-media refusals and the prune watermark's read error (exception texts
+  that reach `error=`). The stall note's quoted vendor error is posted rather than logged, and is cut
+  by the same rule.
+- **The source scrub now carries every shape the box scrub does** (GitHub `gh?_`, Google `AIza`,
+  Hugging Face `hf_`, Replicate `r8_`, Steel `ste-`, a Better Stack heartbeat URL, an `api_key=`
+  assignment), plus GitHub's fine-grained `github_pat_`. The harness also runs where no Vector exists,
+  so the source is the first line and the box the second; `docs/telemetry.md` → Credential Scrubbing
+  states which layer owns what, and a test holds one sample per box rule.
+
 ## [0.172.0] - 2026-11-03
 
 ### Fixed: a runaway generation is bounded per attempt (issue #788)

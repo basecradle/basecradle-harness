@@ -885,10 +885,14 @@ def test_the_platform_token_shape_is_scrubbed_too():
 def test_a_long_value_is_bounded():
     """A log line is a breadcrumb to the failure, not a copy of it — the model already got the
     full error as its tool result."""
-    line = kv(error="x" * 5000)
+    line = kv(error="x." * 2500)
 
     assert len(line) < 300
     assert line.endswith("…")  # a bare (space-free) value needs no quoting — just the ellipsis
+
+    # One unbroken token run past the bound is omitted, never cut: half a token is a credential
+    # prefix no redaction rule can match (issue #787; `tests/test_log_value_cut.py`).
+    assert kv(name="t", error="x" * 5000) == "name=t"
 
     # A prose error — the realistic case — is bounded *and* quoted, so the truncation can never
     # leave a dangling half-field for a parser to trip on.

@@ -223,6 +223,7 @@ from basecradle_harness._observability import (
     UNPRICED_HOST,
     UNREADABLE,
     ServerToolTally,
+    bounded,
     generation_id,
     log_cost_unpriced,
     log_llm_call,
@@ -1211,7 +1212,9 @@ def _image_block(image: ImageContent) -> dict[str, Any]:
         header, _, payload = url.partition(",")
         mime = header[len("data:") :].split(";", 1)[0]
         if not mime or ";base64" not in header:
-            raise ProviderError(f"Unsupported inline image URL for Anthropic: {header[:64]!r}.")
+            raise ProviderError(
+                f"Unsupported inline image URL for Anthropic: {bounded(header, 64)!r}."
+            )
         return {"type": "image", "source": {"type": "base64", "media_type": mime, "data": payload}}
     return {"type": "image", "source": {"type": "url", "url": url}}
 

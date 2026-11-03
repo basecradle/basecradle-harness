@@ -57,7 +57,7 @@ from collections.abc import Callable
 
 import httpx
 
-from basecradle_harness._observability import kv
+from basecradle_harness._observability import bounded, kv
 from basecradle_harness._platform import PlatformTool
 from basecradle_harness._secret import reveal, secret
 
@@ -288,9 +288,14 @@ class DirectMessageTool(PlatformTool):
         raise _DeliveryFailed(reason, slug)
 
 
+#: The most of ntfy's refusal body quoted back. Its text reaches the model as the tool's result and
+#: the journal as the ``tool`` line's ``error``, so it is cut by `bounded` — never inside a token.
+_REFUSAL_CAP = 200
+
+
 def _refusal(response: httpx.Response, token: str) -> str:
     """Why ntfy refused, as one model-readable sentence with the token scrubbed out."""
-    detail = _redact(response.text, token).strip()[:200]
+    detail = bounded(_redact(response.text, token).strip(), _REFUSAL_CAP)
     if detail:
         return f"ntfy.sh returned HTTP {response.status_code}: {detail}."
     return f"ntfy.sh returned HTTP {response.status_code}."
