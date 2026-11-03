@@ -64,7 +64,7 @@ from basecradle_harness._google import (
 from basecradle_harness._google_rates import Usage, call_cost
 from basecradle_harness._observability import ComputedCost, tool_meter, truncated
 from basecradle_harness._timeouts import CONNECT_TIMEOUT, TIMEOUT_RETRY_SCALE
-from tests.conftest import run_through_engine, tool_lines
+from tests.conftest import plain, run_through_engine, tool_lines
 
 MODEL = "gemini-3.8-flash"
 PROJECT = "nova-project"
@@ -936,8 +936,9 @@ def test_the_llm_line_shape(router, provider, caplog):
     assert re.fullmatch(
         r"llm provider=google purpose=main residency=us model=gemini-3\.8-flash "
         r"duration=\d+\.\d\ds tokens_in=1200 tokens_out=100 tokens_total=1300 cached_tokens=1000 "
-        r"tokens_reasoning=70 cost=\S+ cost_basis=computed generation_id=resp-0123456789abcdef",
-        line,
+        r"tokens_reasoning=70 cost=\S+ cost_basis=computed outcome=ok "
+        r"generation_id=resp-0123456789abcdef",
+        plain(line),
     ), line
 
 
@@ -1656,3 +1657,33 @@ def test_a_builtins_tool_prompt_is_billed_input_but_never_the_compaction_trigger
         provider.chat([Message.user("read the page")])
     assert " tokens_in=151200 tokens_out=30 tokens_total=151230 " in _llm_line(caplog)
     assert provider.last_tokens_in == 1200
+
+
+def test_a_search_that_fails_ends_on_its_own_failed_helper_line(router, provider, caplog):
+    """A grounding call the vendor fails is a model call that ended with no answer (issue #782)."""
+    from basecradle_harness import ProviderError
+
+    body = {"error": {"code": 503, "message": "unavailable", "status": "UNAVAILABLE"}}
+    router.post(GENERATE).mock(return_value=httpx.Response(503, json=body))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"), pytest.raises(ProviderError):
+        provider.search("weather")
+    (llm,) = [plain(m) for m in _lines_starting(caplog, "llm ")]
+    assert " purpose=helper kind=search.grounding " in llm
+    assert " outcome=failed reason=server_error " in llm and "tokens_in=" not in llm
+
+
+def test_a_search_config_fault_pages_once_per_wake_then_drops_to_debug(router, provider, caplog):
+    """Dead until a human acts: ERROR once in the adapter's life (one wake), DEBUG after (#782)."""
+    from basecradle_harness import ProviderError
+
+    router.post(GENERATE).mock(
+        return_value=_error(
+            401, "Request had invalid authentication credentials.", code="UNAUTHENTICATED"
+        )
+    )
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        for _ in range(2):
+            with pytest.raises(ProviderError):
+                provider.search("weather")
+    levels = [r.levelno for r in caplog.records if plain(r.getMessage()).startswith("llm ")]
+    assert levels == [logging.ERROR, logging.DEBUG]

@@ -78,12 +78,13 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
     ServerToolTally,
+    answered,
     finish_reason,
     generation_id,
     generation_id_header,
-    generation_of,
     log_llm_call,
     log_server_tools,
+    read_answer,
     reported_cost,
     routed_web_searches,
     serving_endpoint,
@@ -451,10 +452,15 @@ class OpenRouterProvider:
         # (issue #490): the same `finish_reason` this line already hands `log_llm_call`, kept where
         # the engine can reach it without a `capture_llm_call` around every brain call.
         self.last_finish_reason = reason
+        seconds = time.monotonic() - started
+        self._restore_annotations(data)
+        # Read the turn before the line is written, so the one billed line says whether it could be
+        # read (issue #782): an unreadable answer is `outcome=fallback reason=invalid_response`.
+        reply, unreadable = read_answer(lambda: message_from_chat(data), data)
         log_llm_call(
             provider=self.provider,
             model=self.model,
-            seconds=time.monotonic() - started,
+            seconds=seconds,
             usage=usage,
             # OpenRouter is a router, so ``provider=openrouter`` names who *dispatched* the call,
             # never who *served* it — and the two matter differently (a model id fans out to
@@ -470,6 +476,7 @@ class OpenRouterProvider:
             # OpenRouter's generation id (``gen-…``), the id its feedback and refund path asks for
             # (issue #634). The body's ``id`` equals the ``X-Generation-Id`` header on a success.
             generation_id=generation_id(data),
+            **answered(unreadable),
         )
         # The web searches OpenRouter ran for the call (its ``openrouter:web_search`` server tool),
         # one `tool` line beside the call's `llm` line (issue #758). OpenRouter names no call and
@@ -481,9 +488,9 @@ class OpenRouterProvider:
             model=self.model,
             generation_id=generation_id(data),
         )
-        self._restore_annotations(data)
-        with generation_of(data):
-            return message_from_chat(data)
+        if unreadable is not None:
+            raise unreadable
+        return reply  # type: ignore[return-value]
 
     def context_limit(self) -> int | None:
         """The **honest** context ceiling behind a router — not the model object's best case (#276).

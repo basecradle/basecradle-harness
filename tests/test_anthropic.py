@@ -12,6 +12,7 @@ from __future__ import annotations
 import itertools
 import json
 import logging
+import re
 
 import httpx
 import httpx2
@@ -52,7 +53,7 @@ from basecradle_harness._anthropic import (
 from basecradle_harness._basecradle import _provider_from_config, resolved_model_params
 from basecradle_harness._caching import EXPLICIT, anchor_cacheable_prefix
 from basecradle_harness._observability import TRUNCATED_FINISH_REASONS
-from tests.conftest import tool_lines
+from tests.conftest import plain, tool_lines
 
 MODEL = "claude-haiku-5-5"
 FAKE_KEY = "sk-ant-api03-FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake-0000AA"
@@ -133,7 +134,9 @@ def body(route, index: int = -1) -> dict:
 
 
 def llm_lines(caplog) -> list[str]:
-    return [m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm provider=")]
+    return [
+        plain(m) for m in (r.getMessage() for r in caplog.records) if m.startswith("llm provider=")
+    ]
 
 
 # === configuration ===========================================================================
@@ -742,7 +745,7 @@ def test_the_llm_line_grammar(router, provider, caplog):
     rest = duration_and_rest.split(" ", 1)[1]
     assert rest == (
         "tokens_in=44000 tokens_out=200 tokens_total=44200 cached_tokens=40000 "
-        f"cache_write_tokens=3000 cost={cost:.6f} cost_basis=computed "
+        f"cache_write_tokens=3000 cost={cost:.6f} cost_basis=computed outcome=ok "
         "generation_id=msg_01GrammarGrammar"
     ).replace(f"cost={cost:.6f}", _money(cost))
     assert provider.last_tokens_in == 44_000
@@ -842,11 +845,20 @@ def test_a_paused_turn_is_resumed_with_the_paused_content_unchanged(router, prov
     assert len(llm_lines(caplog)) == 2  # a line per billed call
 
 
-def test_a_turn_that_never_stops_pausing_is_a_transient_fault(router, provider):
+def test_a_turn_that_never_stops_pausing_is_a_transient_fault(router, provider, caplog):
     router.post(MESSAGES).mock(return_value=reply(SEARCH_USE, stop_reason="pause_turn"))
-    with pytest.raises(ProviderResponseError, match="paused the turn"):
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        pytest.raises(ProviderResponseError, match="paused the turn"),
+    ):
         provider.chat([Message.user("search it")])
     assert len(router.calls) == PAUSE_CONTINUATIONS + 1
+    # Every continuation was billed; the last one, paused yet again, left a turn nobody can use,
+    # and its line says so rather than `ok` (issue #782).
+    lines = llm_lines(caplog)
+    assert len(lines) == PAUSE_CONTINUATIONS + 1
+    assert all(" outcome=ok " in line for line in lines[:-1])
+    assert " outcome=fallback reason=invalid_response " in lines[-1]
 
 
 def test_a_server_tool_beside_a_client_tool_goes_back_with_the_client_result(router, provider):
@@ -1008,14 +1020,15 @@ def test_a_refusal_is_final_and_logged_with_its_category(router, provider, caplo
         answer = provider.chat([Message.user("…")])
     assert answer.content is None and not answer.tool_calls
     assert len(router.calls) == 1
-    refused = [r for r in caplog.records if r.getMessage().startswith("llm refused ")]
-    assert [r.getMessage() for r in refused] == [
-        (
-            "llm refused provider=anthropic purpose=main model=claude-haiku-5-5 category=cyber "
-            "generation_id=msg_01FakeFakeFakeFake"
-        )
-    ]
-    assert refused[0].levelno == logging.WARNING
+    # One refused attempt, one line: the call's own, with the verdict and the category (#782).
+    (refused,) = [r for r in caplog.records if r.getMessage().startswith("llm provider=")]
+    assert re.fullmatch(
+        r"llm provider=anthropic purpose=main model=claude-haiku-5-5 duration=\d+\.\d\ds "
+        r"(?:\S+ )*outcome=refused category=cyber generation_id=msg_01FakeFakeFakeFake",
+        plain(refused.getMessage()),
+    ), refused.getMessage()
+    assert not [r for r in caplog.records if r.getMessage().startswith("llm refused")]
+    assert refused.levelno == logging.WARNING
     assert "Declined." in caplog.text  # Anthropic's own words, kept for a human beside the fact
     assert provider.last_finish_reason == "refusal"
 

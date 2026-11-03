@@ -35,6 +35,7 @@ from tests.conftest import (
     out_code_interpreter_call,
     out_message,
     out_web_search_call,
+    plain,
     responses_body,
     tool_lines,
 )
@@ -257,9 +258,9 @@ def test_a_gpt_6_sol_brain_call_logs_a_computed_cost(router, sol, caplog):
     assert re.fullmatch(
         r"llm provider=openai purpose=main model=gpt-6-sol duration=\d+\.\d\ds tokens_in=10000 "
         r"tokens_out=500 tokens_total=10500 cached_tokens=6000 cache_write_tokens=1000 "
-        r"tokens_reasoning=100 cost=0\.0147 cost_basis=computed "
+        r"tokens_reasoning=100 cost=0\.0147 cost_basis=computed outcome=ok "
         r"generation_id=resp-fake0001",
-        line,
+        plain(line),
     ), line
     assert not tool_lines(caplog)
 

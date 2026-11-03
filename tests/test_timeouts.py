@@ -46,7 +46,6 @@ from basecradle_harness import (
     _timeouts,
 )
 from basecradle_harness._context import request_chars
-from basecradle_harness._observability import RETRY_HEAD
 from basecradle_harness._retry import connection_reason
 from basecradle_harness._timeouts import (
     CONNECT_TIMEOUT,
@@ -62,7 +61,7 @@ from basecradle_harness._timeouts import (
     last_timeout,
     output_cap,
 )
-from tests.conftest import completion, out_message, responses_body
+from tests.conftest import completion, is_retry, out_message, responses_body
 from tests.test_openrouter import completion as openrouter_completion
 
 FAKE_KEY = "sk-test-0123456789abcdef0123456789abcdef"
@@ -503,7 +502,7 @@ def test_the_one_larger_budget_retry_answers_the_slow_call(cell, slow_server, ca
 
     assert reply.content == "the real answer"
     assert len(counter) == 2  # the attempt that ran out of time, and its one retry
-    retry = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    retry = next(r.getMessage() for r in caplog.records if is_retry(r.getMessage()))
     assert "reason=timeout" in retry
     assert (
         f"timeout={fit:.2f}s timeout_scale=2 next_timeout={TIMEOUT_RETRY_SCALE * fit:.2f}s"

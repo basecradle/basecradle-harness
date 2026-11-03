@@ -1,4 +1,4 @@
-"""The vendor's own id for a model call, on the `llm` line and the `llm retry` line (issue #634).
+"""The vendor's own id for a model call, on the `llm` line, its retries' included (issues #634, #782).
 
 On 2026-10-03 three calls served by one upstream ran for 10 to 14 minutes each and came back at the
 131,072-token output cap (basecradle-noc#963). OpenRouter's feedback and refund path is *per
@@ -47,7 +47,6 @@ from basecradle_harness._describer import Describer
 from basecradle_harness._exceptions import ProviderError
 from basecradle_harness._observability import (
     MAIN,
-    RETRY_HEAD,
     generation_id,
     generation_id_header,
     log_llm_call,
@@ -59,6 +58,7 @@ from tests.conftest import FAKE_KEY as OPENAI_KEY
 from tests.conftest import (
     RESPONSES_URL,
     completion,
+    is_retry,
     out_message,
     responses_body,
     wire_tool_call,
@@ -82,14 +82,18 @@ WEATHER_TOOL = ToolSpec(
 
 
 def _llm_line(caplog) -> str:
-    """The one `llm` line — never an ``llm retry`` one, which shares the first word."""
-    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm provider=")]
+    """The one final `llm` line — never an ``outcome=retrying`` one, which shares the head."""
+    lines = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("llm provider=") and not is_retry(r.getMessage())
+    ]
     assert len(lines) == 1, lines
     return lines[0]
 
 
 def _retry_line(caplog) -> str:
-    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
+    lines = [r.getMessage() for r in caplog.records if is_retry(r.getMessage())]
     assert len(lines) == 1, lines
     return lines[0]
 
@@ -428,12 +432,12 @@ def test_a_rerank_that_falls_back_names_every_refused_generation(router, caplog)
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
         _reranker().rerank("cats", [{"text": "a"}, {"text": "b"}], 2, surface="turn0")
 
-    retries = [r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD)]
+    retries = [r.getMessage() for r in caplog.records if is_retry(r.getMessage())]
     assert [_last_field(line) for line in retries] == [f"generation_id={g}" for g in refused[:2]]
-    fallback = _llm_line(caplog)
-    assert "outcome=fallback" in fallback
-    assert fallback.count("generation_id=") == 1
-    assert _last_field(fallback) == f"generation_id={refused[2]}"
+    failed = _llm_line(caplog)
+    assert "outcome=failed" in failed
+    assert failed.count("generation_id=") == 1
+    assert _last_field(failed) == f"generation_id={refused[2]}"
 
 
 class _NamedDescriberProvider:
@@ -470,7 +474,7 @@ def test_a_describe_carries_the_id_its_adapter_recorded(caplog):
 
 # === the NOC's columns ========================================================
 
-#: Every expression the fleet dashboard reads off an `llm` or `llm retry` line, byte-for-byte as
+#: Every expression the fleet dashboard reads off an `llm` line, a retry's included, byte-for-byte as
 #: `basecradle-noc` ``observability/ai-box.json`` spells them (read 2026-10-03). ClickHouse's
 #: ``match()``/``extract()`` are partial matches, which is what `re.search` is.
 NOC_EXPRESSIONS = (

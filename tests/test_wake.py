@@ -5314,6 +5314,35 @@ def test_a_wake_is_bookended_by_a_start_and_an_end_line(platform, tmp_path, capl
     assert re.search(r"duration=\d+\.\d\ds", end)
 
 
+def test_every_model_call_in_a_wake_names_the_wake_and_its_step(
+    platform, tmp_path, caplog, monkeypatch
+):
+    """The wake context rides every `llm` line made inside a wake (issue #782): its timeline, the
+    router's delivery id, and the engine step the call was made in — and leaves with the wake."""
+    from basecradle_harness._observability import _work_fields, log_llm_call
+
+    class _Adapter(CountingProvider):
+        """Writes its `llm` line inside its own call, as every shipped adapter does."""
+
+        def chat(self, messages, tools=None):
+            log_llm_call(provider=self.provider, model=self.model, seconds=0.1)
+            return super().chat(messages, tools)
+
+    monkeypatch.setenv("BASECRADLE_DELIVERY_ID", "dlv-019a4e2c7b1d")
+    serve_messages(platform, page(message(uuid=M0, body="What's the status?")))
+    agent, _ = build_wake(tmp_path, _Adapter())
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        agent.wake()
+
+    calls = [m for m in _lines(caplog) if m.startswith("llm provider=")]
+    assert [m.split(" step=", 1)[1].split(" ", 1)[0] for m in calls] == ["1/24", "2/24"]
+    for line in calls:
+        assert f" timeline={TIMELINE_UUID} " in line and " delivery=dlv-019a4e2c7b1d " in line
+        assert " outcome=ok " in line
+    assert set(_work_fields().values()) == {None}  # nothing outlives the wake
+
+
 def test_the_bookends_are_colored_and_stay_greppable(platform, tmp_path, caplog):
     """The wake's lifecycle in color (issue #414) — GREEN opens, BLUE closes, the verdict its own.
 

@@ -148,23 +148,26 @@ from basecradle_harness._messages import (
     VideoContent,
 )
 from basecradle_harness._observability import (
+    FAILED,
     GROUNDING_CHARGE,
     HELPER,
     NOT_REPORTED,
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
+    answered,
     finish_reason,
     generation_id,
-    generation_of,
     log_cost_unpriced,
     log_llm_call,
     log_server_tools,
     meter_failure,
     meter_tool,
+    read_answer,
     tally_server_tools,
     token_counts,
 )
 from basecradle_harness._openai_wire import format_citations
+from basecradle_harness._retry import diagnostics, fault_slug
 from basecradle_harness._secret import Sealed as _Sealed
 from basecradle_harness._server_tools import record
 from basecradle_harness._timeouts import (
@@ -562,6 +565,8 @@ class GoogleProvider:
         self.last_timeout: float | None = None
         self._timeout_scale = 1.0
         self._fixed_timeout = timeout
+        #: Whether a search's config-class failure has paged in this adapter's life (one wake).
+        self._search_config_reported = False
         self._extra_body = dict(extra_body) if extra_body else None
         self._genai = require_google_genai()
         self._types = self._genai.types
@@ -741,10 +746,16 @@ class GoogleProvider:
         reason = _finish_name(candidate)
         self.last_finish_reason = finish_reason({"finish_reason": reason})
         response_id = generation_id({"id": getattr(response, "response_id", None)})
+        seconds = time.monotonic() - started
+        used = _server_uses(candidate)
+        # Read before the line is written, so the one billed line says whether it could be (#782).
+        reply, unreadable = read_answer(
+            lambda: self._from_wire(response, candidate, reason, used), {"id": response_id}
+        )
         log_llm_call(
             provider=self.provider,
             model=self.model,
-            seconds=time.monotonic() - started,
+            seconds=seconds,
             usage=usage,
             # A direct-to-vendor SDK has no upstream to name, so there is no `endpoint=`; where the
             # call ran — the residency fact an operator chose this provider for — is `residency=`.
@@ -752,8 +763,8 @@ class GoogleProvider:
             cost=self._cost(meta),
             finish_reason=self.last_finish_reason,
             generation_id=response_id,
+            **answered(unreadable),
         )
-        used = _server_uses(candidate)
         # The built-ins Gemini ran on this call, one `tool` line each beside its `llm` line (#758).
         log_server_tools(
             tally_server_tools((use.name, use.failed) for use in used),
@@ -761,8 +772,9 @@ class GoogleProvider:
             model=self.model,
             generation_id=response_id,
         )
-        with generation_of({"id": response_id}):
-            return self._from_wire(response, candidate, reason, used)
+        if unreadable is not None:
+            raise unreadable
+        return reply  # type: ignore[return-value]
 
     def search(self, query: str) -> str:
         """Answer `query` with Google Search grounding, in one call of its own (issue #656).
@@ -803,8 +815,30 @@ class GoogleProvider:
                     model=self.model, contents=contents, config=config
                 )
         except ProviderError as exc:
-            # The tool hands the model the text; its `tool` line still says the search failed.
+            # The tool hands the model the text; its `tool` line still says the search failed, and
+            # the model call that ended with no answer says so on its own line (issue #782).
             meter_failure(exc, provider=self.provider, kind=SEARCH_KIND, model=self.model)
+            fault = fault_slug(exc)
+            # Severity is the taxonomy, as on every non-brain line: a `config:` cause is dead until
+            # a human acts, so it is ERROR (it pages) once in this adapter's life, which is one
+            # wake, and DEBUG after; everything else can succeed next time and is WARNING.
+            level = logging.WARNING
+            if fault.startswith("config:"):
+                level = logging.DEBUG if self._search_config_reported else logging.ERROR
+                self._search_config_reported = True
+            log_llm_call(
+                provider=self.provider,
+                purpose=HELPER,
+                kind=SEARCH_KIND,
+                residency=self.location,
+                model=self.model,
+                seconds=time.monotonic() - started,
+                outcome=FAILED,
+                reason=fault,
+                detail=str(exc),
+                extra=diagnostics(exc),
+                level=level,
+            )
             raise
         seconds = time.monotonic() - started
         meta = getattr(response, "usage_metadata", None)

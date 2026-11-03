@@ -49,8 +49,8 @@ from basecradle_harness._describer import (
     describer_providers_from_env,
 )
 from basecradle_harness._exceptions import ProviderAuthError, ProviderServerError
-from basecradle_harness._observability import RETRY_HEAD
 from basecradle_harness._retry import RETRY_BUDGET_SECONDS
+from tests.conftest import is_retry, plain
 
 DESCRIPTION = "A tabby cat asleep on a windowsill, with the word HELLO written on the glass."
 
@@ -250,7 +250,7 @@ def test_a_faulted_describer_reports_at_error_and_answers_nothing(caplog):
     records = [
         r
         for r in caplog.records
-        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+        if "purpose=helper" in r.getMessage() and "outcome=failed" in r.getMessage()
     ]
     assert [r.levelno for r in records] == [logging.ERROR]  # config-class pages
     assert "reason=config:missing_api_key" in records[0].getMessage()
@@ -269,7 +269,7 @@ def test_a_config_fault_is_reported_once_per_wake_and_then_drops_to_debug(caplog
     levels = [
         r.levelno
         for r in caplog.records
-        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+        if "purpose=helper" in r.getMessage() and "outcome=failed" in r.getMessage()
     ]
     assert levels == [logging.ERROR, logging.DEBUG, logging.DEBUG]
 
@@ -286,7 +286,7 @@ def test_a_provider_that_will_not_build_is_a_config_fault_carrying_the_reason(mo
     line = next(
         r.getMessage()
         for r in caplog.records
-        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+        if "purpose=helper" in r.getMessage() and "outcome=failed" in r.getMessage()
     )
     assert "reason=config:no_provider" in line
     assert "a-sdk-that-does-not-exist" in line  # the vendor's/adapter's own words, relayed
@@ -375,7 +375,7 @@ def test_a_describer_that_raises_falls_back_to_the_withheld_caption(caplog):
     line = next(
         r.getMessage()
         for r in caplog.records
-        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+        if "purpose=helper" in r.getMessage() and "outcome=failed" in r.getMessage()
     )
     # Runtime-class: WARNING, not ERROR — this can succeed next time unchanged.
     assert "reason=provider_error" in line and "upstream 503" in line and "d/model" in line
@@ -623,7 +623,7 @@ def test_a_vendor_error_carrying_the_key_is_redacted_before_it_is_logged(caplog)
     line = next(
         r.getMessage()
         for r in caplog.records
-        if "purpose=helper" in r.getMessage() and "outcome=fallback" in r.getMessage()
+        if "purpose=helper" in r.getMessage() and "outcome=failed" in r.getMessage()
     )
     assert secret not in line
     assert "[redacted]" in line
@@ -656,18 +656,20 @@ class LoggingDescriberProvider(FakeDescriberProvider):
 
 
 def _helper_lines(caplog):
-    """The `llm` lines — **not** the `llm retry` ones (issue #506).
+    """The final `llm` line of each attempt — **not** the ``outcome=retrying`` ones (#506, #782).
 
-    A retry line starts with ``llm`` too, and counting one as a call is exactly the mistake the head
-    split exists to prevent: a refused attempt generated nothing and was billed nothing, and the
-    fleet's ``helper_calls`` keys on `` llm provider=``, whose discriminator is the
-    space-then-``provider=`` immediately after ``llm``.
+    A retry rides the same head, and counting one as a describe is the mistake the fleet's
+    ``helper_calls`` excludes: a refused attempt generated nothing and was billed nothing.
     """
-    return [r for r in caplog.records if r.getMessage().startswith("llm provider=")]
+    return [
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("llm provider=") and not is_retry(r.getMessage())
+    ]
 
 
 def _retry_lines(caplog):
-    return [r for r in caplog.records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
+    return [r for r in caplog.records if is_retry(r.getMessage())]
 
 
 def _no_sleep():
@@ -746,7 +748,7 @@ def test_a_call_that_never_happened_carries_no_duration_and_no_cost(caplog):
         describer.describe_images([ImageContent(url="x", alt="cat.png")])
 
     message = _helper_lines(caplog)[0].getMessage()
-    assert "outcome=fallback" in message and "reason=config:missing_api_key" in message
+    assert "outcome=failed" in message and "reason=config:missing_api_key" in message
     assert "duration=" not in message and "cost=" not in message
 
 
@@ -1144,7 +1146,7 @@ def test_a_transient_429_is_waited_out_and_the_brain_still_gets_its_eyes(caplog)
     assert vision.calls == 2
     assert delays == [1.0]
     # One describe, one `llm` line — a refused attempt generated nothing and was billed nothing, so
-    # it is not a call to count. It gets an `llm retry` WARNING instead.
+    # it is not a call to count. It gets an `outcome=retrying` WARNING instead.
     assert len(_helper_lines(caplog)) == 1
     assert "outcome=ok" in _helper_lines(caplog)[0].getMessage()
     retried = _retry_lines(caplog)
@@ -1186,7 +1188,7 @@ def test_three_429s_fall_back_to_the_withheld_caption_naming_the_upstream(caplog
     assert len(_retry_lines(caplog)) == 2
     message = _helper_lines(caplog)[0].getMessage()
     for field in (
-        "outcome=fallback",
+        "outcome=failed",
         "reason=rate_limited",
         "provider_code=429",
         "routing_attempt=1",
@@ -1212,7 +1214,7 @@ def test_a_re_budget_is_not_a_retry_and_keeps_its_own_llm_line(caplog):
 
     A `length` re-budget asks a **different** question and its extra call answered and was billed,
     so it writes its own `llm` line. A retry re-issues the **identical** question after a refusal
-    that generated nothing, so it writes an `llm retry` WARNING and no `llm` line at all. Folding
+    that generated nothing, so it writes an `outcome=retrying` WARNING with nothing billed on it. Folding
     them together to reach "one line per describe" would delete real spend from ``helper_cost``;
     folding them the other way would count a 429 as a call.
     """
@@ -1324,7 +1326,7 @@ def test_a_regional_routing_refusal_is_config_class_and_asked_once(
             assert describer_from_env(_env()).describe_images([PIXEL]) is None
 
     assert route.call_count == 1
-    assert not [r for r in caplog.records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
+    assert not [r for r in caplog.records if is_retry(r.getMessage())]
     line = _helper_lines(caplog)[0]
     assert line.levelno == logging.ERROR, line.getMessage()
     assert f"reason={reason}" in line.getMessage()
@@ -1492,3 +1494,64 @@ def test_view_twice_in_one_wake_describes_once_and_shows_the_same_words():
     described = [m.content for m in history if m.injected]
     assert len(described) == 2 and described[0] == described[1]
     assert DESCRIPTION in described[0]
+
+
+def test_a_refusal_inside_a_describe_is_the_describes_own_refused_line(caplog):
+    """The vendor's refusal rides the capture to the describer's one line (issue #782): it was
+    billed, so it is `outcome=refused` with the vendor's category, never a `fallback` of ours."""
+    from basecradle_harness._observability import log_llm_call
+
+    class _Refusing(FakeDescriberProvider):
+        def chat(self, messages, tools=None):
+            log_llm_call(
+                provider="anthropic",
+                model="claude-haiku-5-5",
+                seconds=0.5,
+                outcome="refused",
+                category="cyber",
+            )
+            return Message.assistant(content=None)
+
+    describer = Describer(_Refusing(), "d/model")
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
+        assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
+
+    (line,) = [plain(r.getMessage()) for r in _helper_lines(caplog)]
+    assert " outcome=refused category=cyber " in line and " reason=" not in line
+    repeated = next(
+        plain(r.getMessage()) for r in caplog.records if "describe repeated" in r.getMessage()
+    )
+    assert "outcome=refused" in repeated  # the memo names the verdict the first describe had
+
+
+def test_an_answer_the_adapter_could_not_read_is_billed_once_then_decided(caplog):
+    """The vendor answered and billed; the adapter could not read it (issue #782 review). The bill
+    rides one `fallback reason=invalid_response` line, and each decision (retry, give up) is its own
+    line with nothing billed on it."""
+    from basecradle_harness._exceptions import ProviderResponseError
+    from basecradle_harness._observability import answered, log_llm_call
+
+    class _Unreadable(FakeDescriberProvider):
+        def chat(self, messages, tools=None):
+            error = ProviderResponseError("tool-call arguments cut off")
+            log_llm_call(
+                provider=self.provider,
+                model=self.model,
+                seconds=0.4,
+                cost=0.0021,
+                usage={"prompt_tokens": 812, "completion_tokens": 96},
+                **answered(error),
+            )
+            raise error
+
+    describer = Describer(_Unreadable(), "d/model", sleep=lambda _s: None)
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
+
+    lines = [plain(r.getMessage()) for r in caplog.records if "llm provider=" in r.getMessage()]
+    billed = [m for m in lines if "outcome=fallback reason=invalid_response" in m]
+    decided = [m for m in lines if "outcome=retrying" in m or "outcome=failed" in m]
+    assert len(billed) == 3 and all("tokens_in=812" in m and "cost=0.0021" in m for m in billed)
+    assert len(decided) == 3 and not any("tokens_in=" in m or "cost=" in m for m in decided)
+    assert decided[-1].count("outcome=failed") == 1

@@ -50,6 +50,7 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 | `timeline` | The uuid of the BaseCradle timeline the work is for. |
 | `item` | The uuid of the message or task a wake is working. |
 | `delivery` | The router's delivery id that spawned the wake (`BASECRADLE_DELIVERY_ID`); absent when the wake was not spawned by a router. |
+| `step` | The engine step the unit happened in, as `n/max` (`5/24`): where in its turn a model call was made, or a reply was cut off. |
 | `handle` | The platform handle of the item's author. |
 | `duration` | Wall time of the unit the head names, in seconds. |
 | `chars` | A character count of the text the head names. |
@@ -70,74 +71,63 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 
 ### `llm`
 
-**One line per model-call attempt the caller ends, whatever its purpose or outcome** (`_observability.log_llm_call`, the only emitter). For the brain that is every call that answered; a brain call that raised writes none (the wake's failure lines carry it). For a non-brain caller (`purpose=memory|helper`) it is every attempt it gives up on or accepts, with its `outcome` — including a `fallback` that never reached a vendor (a config-class fault), which then carries no `duration`, tokens or cost. An attempt that failed and **is retried** writes `llm retry` instead, never this head. The head `llm provider=` is byte-frozen: it is the NOC's anchor for every call, cost, and duration series.
+**One line per model-call attempt, whatever its purpose and whatever its outcome** (`_observability.log_llm_call`, the only emitter, and `log_llm_retry`, which writes through it). A model call is one unit of work, so it has one head, and how the attempt ended is its `outcome` (issue #782, ruled 2026-11-03). A retry, a refusal, an unusable answer and a final failure are outcomes of the call, never heads of their own. There are two kinds of line. **A billed line** records what the vendor did with an attempt it answered: `ok`, `refused` or `fallback`, with the tokens and cost it billed. **A decision line** records what the harness did with an attempt that brought back no usable answer: `retrying` or `failed`, with nothing billed. An attempt the vendor answered and the harness could not read (a tool call's arguments cut off at the output cap) writes both: its billed `fallback reason=invalid_response` line (the adapter reads the answer before it writes the line, `_observability.read_answer`), then the decision that followed, naming the same `generation_id`. Neither double counts, because only billed lines are calls. Every line carries the fields its outcome requires (see [Outcomes](#outcomes)), so any producer can write its model work here: a harness wake, a Claude Code builder (rendered by the router's `ai_otel_llm` remap), or a library caller. Each fills the fields it has and omits the rest. The head `llm provider=` is byte-frozen. It is the NOC's anchor for every call, cost and duration series, and the NOC counts a **call** as a line on it whose `outcome` is neither `retrying` nor `failed` (basecradle-noc#1212).
 
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `provider` | The vendor that bills the call. | Every adapter. | Never. |
-| `purpose` | What the model was doing for the agent: `main` (the brain's own turn), `memory` (a memory-system call, e.g. the reranker), `helper` (a second model working for the brain, e.g. the describer, or a model call a tool makes). | `log_llm_call`; `main` by default. | Never. |
-| `kind` | The job within `purpose`: `rerank` (memory); `image.describe`, `video.describe`, `search.grounding` (helper). | The non-brain caller. | `purpose=main`. |
+| `purpose` | What the model was doing for the agent: `main` (the brain's own turn, and its compaction summaries), `memory` (a memory-system call, e.g. the reranker), `helper` (a second model working for the brain, e.g. the describer, a model call a tool makes, or a Claude Code builder's auxiliary call). | `log_llm_call`; `main` by default. | Never. |
+| `kind` | The job within `purpose`: `rerank` (memory); `image.describe`, `video.describe`, `search.grounding` (helper). | The caller that names the job. | `purpose=main`, or a producer that names no job (a builder's auxiliary call). |
 | `endpoint` | The **serving upstream** a router dispatched the call to (`StreamLake`, `DeepInfra`), read off the router's own routing metadata. | The router adapters (`serving_endpoint`). | A direct-to-vendor call — the vendor *is* the endpoint. |
 | `residency` | Where the vendor ran the call: the location or inference geography the vendor reports, else the one the request pinned (`us`, `global`, `europe-west4`). `global` means the vendor chose. | Adapters whose vendor reports or accepts a location (Google, Anthropic). | The vendor has no notion of location. |
 | `model` | The model id. | Every adapter. | Never. |
-| `duration` | Seconds the call took; for a call that needed retries, the caller's whole wait. | Every adapter, or the capturing caller. | The call raised before timing (a config-class fault that never reached a vendor). |
-| `tokens_in` | Every input token the vendor billed for the call — uncached, cached, cache-written, and any prompt tokens a server-side tool added. | Every adapter, from vendor usage. | The vendor stated no usage, or stated only zeros. |
+| `duration` | Seconds the call took; for a call that needed retries, the caller's whole wait. | Every adapter, or the capturing caller. | `outcome=retrying` (the wait is on the line that ends the call); a call that never reached a vendor (a config-class fault). |
+| `tokens_in` | Every input token the vendor billed for the call — uncached, cached, cache-written, and any prompt tokens a server-side tool added. | Every adapter, from vendor usage. | The vendor stated no usage, or stated only zeros; always on `retrying` and `failed`. |
 | `tokens_out` | Every output token the vendor billed — the reply **and** any reasoning or thinking. | Every adapter. | As `tokens_in`. |
 | `tokens_total` | Exactly `tokens_in` + `tokens_out`. Never the vendor's own total. | Every adapter. | As `tokens_in`. |
 | `cached_tokens` | The part of `tokens_in` read from the vendor's prompt cache. The only trustworthy witness that caching works. | Every adapter whose vendor reports it. | The vendor reports no cache read. |
 | `cache_write_tokens` | The part of `tokens_in` written to the vendor's prompt cache on this call. | Every adapter whose vendor reports it. | The vendor reports no cache write. |
 | `tokens_reasoning` | The part of `tokens_out` spent on reasoning or thinking. | Every adapter whose vendor reports it, on every purpose. | The vendor reports none — never an invented zero. |
-| `cost` | US dollars for the call's tokens. Tool fees are never folded in when the vendor states them apart (they belong on the tool's line). | Vendor-stated (OpenRouter `usage.cost`, xAI ticks) or computed (`_<vendor>_rates.py`). | Unstated and unpriceable: an unknown model, tier, or host. |
+| `cost` | US dollars for the call's tokens. Tool fees are never folded in when the vendor states them apart (they belong on the tool's line). | Vendor-stated (OpenRouter `usage.cost`, xAI ticks) or computed (`_<vendor>_rates.py`). | Unstated and unpriceable: an unknown model, tier, or host; always on `retrying` and `failed`, which were billed nothing. |
 | `cost_basis` | `computed`, beside a computed `cost`. | `cost_basis()`. | A vendor-stated cost; no cost. |
-| `outcome` | `ok` — the answer was usable; `fallback` — the caller fell back (rerank to hybrid order, describer to the withheld caption). | The non-brain caller, which alone can judge the answer. | `purpose=main`: the brain's turn is judged by the wake, not by its call. |
-| `reason` | Why a `fallback` happened: a fault slug (`rate_limited`, `server_error`, `transport`, `timeout`, `invalid_response`, `context_length`, `payload_too_large`, `api_error`, `provider_error`, `config:<cause>`) or an answer slug (`truncated`, `empty_response`, `missing_parts`, `undecodable_video`, `internal`). | The non-brain caller. | `outcome=ok`. |
-| `detail` | The vendor's or adapter's own text explaining `reason`. | The non-brain caller. | Nothing to explain. |
+| `outcome` | How the attempt ended: `ok`, `refused`, `fallback`, `retrying` or `failed` (see [Outcomes](#outcomes)). | The adapter for an answer it could not read; the caller that judged the attempt; `ok` when nothing judged it. | Never. |
+| `category` | The vendor's own refusal category, as a slug. | The adapter. | Not `outcome=refused`, or the vendor gave none. |
+| `attempt` | The harness's attempt number of the call, as `n/total`: the attempt being retried, or the attempts a final failure made. | `_retry.Retry`; `1/1` on a compaction call, which is never retried. | Not `retrying` or `failed`; a fault found before any vendor was reached (a missing key, an unbuildable SDK), which made no attempt; a producer that does not count them. |
+| `reason` | Why the attempt was not `ok`: a fault slug on `retrying` and `failed` (`rate_limited`, `server_error`, `transport`, `timeout`, `invalid_response`, `context_length`, `payload_too_large`, `tool_schema`, `api_error`, `provider_error`, `internal`, `undecodable_video`, `config:<cause>`), or an answer slug on `fallback` (`truncated`, `empty_response`, `missing_parts`, `parse`, and `invalid_response` for an answer the vendor billed that could not be read). An HTTP 504 is `timeout` on every vendor: a deadline ran out, the vendor's or the harness's. | Whoever saw the fault, or the caller that judged the answer (`_observability.call_outcome` draws the split). | `ok` and `refused`. |
+| `detail` | The vendor's or adapter's own text explaining `reason`. | The caller. | Nothing to explain. |
 | `retry_after` | The wait the vendor asked for on the failed attempt. | `_retry.diagnostics`. | The vendor hinted none. |
 | `provider_code` | The upstream's own status code inside a router's error body. | `_retry.diagnostics` (OpenRouter). | Not a routed failure. |
 | `routing_attempt` | The router's own attempt counter (`0` = reached no upstream). Never the harness's attempt. | `_retry.diagnostics` (OpenRouter). | As `provider_code`. |
 | `attempts` | The router's per-upstream account of who refused (`parasail:429,coreweave:429`). | `_retry.diagnostics` (OpenRouter). | As `provider_code`. |
+| `timeout` | The budget the timed-out attempt ran out of, seconds. | `_retry.Retry`; the engine's give-up. | `reason` is not `timeout`, the budget is unknown, or the deadline was the vendor's. |
+| `timeout_scale` | The multiple of the fitted budget the retry gets. | `_retry.Retry`. | Not `retrying reason=timeout`. |
+| `next_timeout` | The budget the retry gets, seconds. | `_retry.Retry`. | As `timeout`, on `retrying` only. |
+| `next_in` | Seconds until the next attempt. | `_retry.Retry`. | Not `retrying`. |
 | `surface` | Where a memory recall ran: `turn0` (before the turn) or `tool` (the memory tool). | The reranker. | Not `purpose=memory`. |
 | `pool` | How many candidates the reranker was shown. | The reranker. | As `surface`. |
-| `picked` | How many of them it selected. | The reranker. | As `surface`. |
+| `picked` | How many of them it selected. | The reranker. | As `surface`, or no answer to pick from. |
 | `subject` | What a helper call was about: the file names of the media described. | The describer. | Not a describe. |
+| `timeline` | Common: the wake the call belongs to. | The wake (`_observability.in_wake`), ambiently. | The call was made outside a wake (a builder, a library caller). |
+| `delivery` | Common. | The wake, ambiently. | As `timeline`, or as Common. |
+| `step` | Common: the engine step the call was made in, so a wake that died at step 5 of 24 says so on the line of the call that ended it. | The engine (`_observability.at_step`), ambiently. | The call was made outside the engine's step loop (a Turn-0 recall, the reserve summary, a builder). |
 | `generation_id` | The vendor's id for the call. Rendered next to last. | Every adapter (`generation_id`). | The response named none. |
 | `billing` | `byok` — the cost is on the operator's own provider invoice, not the router's credits. Always last. | `_observability.byok`. | Billed the ordinary way. |
 
-### `llm retry`
+#### Outcomes
 
-**One WARNING per failed attempt that is about to be retried** (`_observability.log_llm_retry`). A different head from `llm` on purpose: a refused attempt generated nothing and was billed nothing, so it must never be counted as a call.
+Each outcome has a strict set of fields it requires and a set it never carries, so the contract stays verifiable: `tests/test_telemetry_contract.py` renders every outcome and holds each line to its row. Every line also carries `provider`, `purpose`, `model` and `outcome`.
 
-| Field | Meaning | Filled By | Absent When |
+| Outcome | Means | Requires | Never Carries |
 |---|---|---|---|
-| `provider` | Common. | `_retry.Retry`. | Never. |
-| `purpose` | As on `llm`. | `_retry.Retry`. | Never. |
-| `kind` | As on `llm`. | `_retry.Retry`. | `purpose=main`. |
-| `model` | Common. | `_retry.Retry`. | Never. |
-| `attempt` | The harness's attempt number of this call, as `n/total`. | `_retry.Retry`. | Never. |
-| `reason` | The fault slug (`rate_limited`, `server_error`, `transport`, `timeout`, `invalid_response`). An HTTP 504 is `timeout` on every vendor: a deadline ran out, the vendor's or the harness's. | `_retry.Retry`. | Never. |
-| `retry_after` | As on `llm`. | `_retry.diagnostics`. | As on `llm`. |
-| `provider_code` | As on `llm`. | `_retry.diagnostics`. | As on `llm`. |
-| `routing_attempt` | As on `llm`. | `_retry.diagnostics`. | As on `llm`. |
-| `attempts` | As on `llm`. | `_retry.diagnostics`. | As on `llm`. |
-| `timeout` | The budget the timed-out attempt ran out of, seconds. | `_retry.Retry`. | `reason` is not `timeout`, or the budget is unknown. |
-| `timeout_scale` | The multiple of the fitted budget the retry gets. | `_retry.Retry`. | `reason` is not `timeout`. |
-| `next_timeout` | The budget the retry gets, seconds. | `_retry.Retry`. | As `timeout`. |
-| `next_in` | Seconds until the next attempt. | `_retry.Retry`. | Never. |
-| `surface` | As on `llm`. | The reranker. | Not a rerank. |
-| `subject` | As on `llm`. | The describer. | Not a describe. |
-| `generation_id` | The vendor's id for the refused attempt. | The adapter's error mapper. | The refusal named none. |
+| `ok` | The vendor answered and the answer was used. A billed line. | — | `reason`, `category`, `attempt` |
+| `refused` | The vendor refused the content. That is its final word, never retried, and the call was billed. A billed line. | `duration` | `reason`, `attempt` |
+| `fallback` | The vendor answered (and billed) and the answer could not be used: the caller judged it unusable, or the adapter could not read it (`invalid_response`). A billed line. | `reason` | `category`, `attempt`, `next_in` |
+| `retrying` | No usable answer, and the harness will re-issue the request. A decision line: nothing billed on it. | `attempt`, `reason`, `next_in` | `duration`, `tokens_in`, `tokens_out`, `tokens_total`, `cached_tokens`, `cost`, `cost_basis`, `category` |
+| `failed` | No usable answer, and the harness will not re-issue this request: the call ended there. A decision line: nothing billed on it. A context overflow is `failed` too; the compaction that follows asks a different, smaller question as a call of its own. | `reason` | `tokens_in`, `tokens_out`, `tokens_total`, `cached_tokens`, `cost`, `cost_basis`, `category`, `next_in` |
 
-### `llm refused`
+A `failed` brain call is ERROR when the engine gives up on a transient fault (the page the old prose give-up line raised, one for one) and WARNING otherwise, because the wake's own lines carry the verdict a human acts on (`wake reported_failure`, `wake failed`). A non-brain `failed` line keeps the severity its caller's taxonomy gives it: ERROR once per wake for a `config:` cause, WARNING otherwise. A `retrying` line is always WARNING, and so are `refused` and an unreadable answer's `fallback`. A wake that dies of a model call therefore writes two lines about two units: the call's `llm … outcome=failed timeline=… step=…`, and the wake's own `wake failed`.
 
-**One WARNING per model call the vendor refused on content grounds** — a refusal is the vendor's final word, never retried. The fact lands here so a refusal rate can be compared across vendors.
-
-| Field | Meaning | Filled By | Absent When |
-|---|---|---|---|
-| `provider` | Common. | The adapter. | Never. |
-| `purpose` | As on `llm`. | The adapter. | Never. |
-| `model` | Common. | The adapter. | Never. |
-| `category` | The vendor's own refusal category, as a slug. | The adapter. | The vendor gave none. |
-| `generation_id` | Common. | The adapter. | The response named none. |
+The NOC's reading (basecradle-noc#1212): every series that counts, times or prices **calls** reads the billed lines, `llm provider=` lines whose `outcome` is neither `retrying` nor `failed`. The match is unanchored, because the verdict token is colored on every box. Retries and failures are series of their own, by `provider` and `purpose`.
 
 ### `provider`
 
@@ -159,8 +149,7 @@ A brain reply the vendor stopped at the output budget (`_engine._note_truncation
 | `provider` | Common. | The engine. | Never. |
 | `model` | Common. | The engine. | Never. |
 | `finish_reason` | The vendor's own word for why it stopped (`length`, `max_tokens`, `REASON_MAX_LEN`). | The adapter's `last_finish_reason`. | Never. |
-| `step` | The step the reply was. | The engine. | Never. |
-| `max_steps` | The turn's step budget. | The engine. | Never. |
+| `step` | Common: the step the reply was, as `n/max`. | The engine. | Never. |
 | `outcome` | `unfinished` — the cut-off reply ended the turn, which stays pending; `continued` — the turn went on. | The engine. | Never. |
 | `reason` | `output_budget`. | The engine. | Never. |
 
@@ -186,7 +175,7 @@ The describer answering again from its once-per-wake memo instead of calling a m
 | `kind` | As on `llm`. | The describer. | Never. |
 | `model` | Common. | The describer. | Never. |
 | `subject` | As on `llm`. | The describer. | Never. |
-| `outcome` | `ok` or `fallback`, as the first describe ended. | The describer. | Never. |
+| `outcome` | As the first describe's `llm` line said: `ok`, `refused`, `fallback` or `failed`. | The describer. | Never. |
 
 ## Tools
 
@@ -739,7 +728,7 @@ Where today's emission departs from the target above. The conformance test reads
 
 A prose line that carries a field the NOC extracts off every line (`provider=`, `source=`) feeds a column whatever its head, so the test also fails on any such prose that no `prose` row names.
 
-The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759), whose rows F1–F36 are struck). No departure stands today.
+The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759), whose rows F1–F36 are struck). Issue [#782](https://github.com/basecradle/basecradle-harness/issues/782) retired the `llm retry` and `llm refused` heads into `llm`'s `outcome`, and gave the brain's final failure a line. No departure stands today.
 
 | ID | Violation | Witness | Removed By |
 |---|---|---|---|
@@ -747,6 +736,17 @@ The slices are the issues that remove each row: **slice 2 — tools** ([#758](ht
 ### Outside This Repository
 
 The NOC's Steel browser launcher writes its own `browser provider=` head. Its per-session spend line retires into the [`charge`](#charge) line (@origin, 2026-11-01: a session is billed by the minute, not per tool use, so it is not a `tool` line); its lifecycle lines stay on a NOC-only head that no column reads. It is not emitted here, so it is not witnessed here; the launcher's move is basecradle-noc#1153's. Slice 2 carried the rest to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
+
+The Claude Code builders' model calls reach this contract through the router's `ai_otel_llm` remap (basecradle-router `deploy/vector.yaml`), which renders each `api_request` as an `llm` line. Under issue #782 an `api_error` (Claude Code's final failure, after its own retries) is rendered as `llm … outcome=failed reason=<slug>` with no tokens, and an auxiliary call as `purpose=helper` with no `kind` (basecradle-router#384). A builder's line carries no `timeline`, `delivery` or `step`: it has no wake.
+
+## Where a Signal Lives
+
+@origin, 2026-11-02 (the telemetry audit, basecradle#726, ruling 2): **every meaningful signal has one of two homes.**
+
+- **A chart, with its alert,** for the aggregate somebody watches.
+- **The log stream,** for the per-event detail somebody reads to troubleshoot. The fleet server's logs are where you look when an agent breaks.
+
+"It doesn't fit a chart" never means "drop it". It means "log it". Detail specific to one producer that does not generalize into a shared chart still belongs in the stream, keyed by agent. So nothing operationally meaningful is ever deliberately left out: a signal is charted, or it is logged.
 
 ## Changing the Contract
 

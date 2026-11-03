@@ -897,7 +897,7 @@ the defect, not a shorter spelling.
   INFO  llm provider=openai purpose=main model=gpt-5.4-mini duration=3.41s tokens_in=4210 tokens_out=96 tokens_total=4306
   INFO  llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_total=5423 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
   INFO  llm provider=openrouter purpose=helper kind=image.describe endpoint=Novita model=google/gemini-3-flash duration=1.50s tokens_in=812 tokens_out=96 tokens_total=908 cost=0.0021 outcome=ok subject=cat.png
-  ERROR llm provider=openrouter purpose=helper kind=video.describe model=google/gemini-3-flash outcome=fallback reason=config:missing_api_key subject=clip.mp4
+  ERROR llm provider=openrouter purpose=helper kind=video.describe model=google/gemini-3-flash outcome=failed reason=config:missing_api_key subject=clip.mp4
   ```
 
   `kind` is **thing then verb** (`image.describe`, `video.describe`), matching the media tools'

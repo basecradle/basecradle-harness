@@ -1048,3 +1048,15 @@ def test_a_wake_that_left_a_turn_unfinished_starts_no_more_model_work(platform, 
     assert MarkStore(tmp_path).get(TIMELINE_UUID) == M0
     assert _claim(tmp_path).settled
     assert SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks") == {M1}
+
+
+def test_the_truncation_names_its_step_as_the_llm_line_does(caplog):
+    """One spelling of a position (issue #782): `step=n/max`, never a step and a budget apart."""
+    engine = Engine(_CutOff(), ToolRegistry())
+
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        engine.run([Message.user(BODY)])
+
+    line = next(r for r in caplog.records if r.getMessage().startswith("turn truncated"))
+    assert f" step=1/{engine.max_steps} " in line.getMessage()
+    assert "max_steps=" not in line.getMessage()

@@ -429,6 +429,8 @@ class Tally:
         elif report.outcome == "ok":
             self.outcomes["ok"] += 1
         else:
+            # The retrieval fell back to hybrid order, whether the call failed or its answer was
+            # unusable (`outcome=failed` or `fallback` on its line): this report counts both as one.
             self.outcomes[f"fallback:{report.reason}"] += 1
             self.fallbacks.add(drawer)
         self.search_seconds.append(result.fetch_seconds + result.rerank_seconds)
