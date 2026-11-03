@@ -55,6 +55,7 @@ from basecradle_harness._observability import (
     in_wake,
     metered,
 )
+from basecradle_harness._retry import fault_slug
 from basecradle_harness._tools import Tool, ToolRegistry
 from tests.conftest import FAKE_KEY as OPENAI_KEY
 from tests.conftest import (
@@ -1007,41 +1008,67 @@ def harness_and_mcp_tools(**_):
     engine._run_tool("no_such_tool", {})
 
 
-def _gateway_timeout(reasons: dict[str, str], name: str, call: Callable[[], object]) -> None:
+#: What a fault-slug probe hands the adapter: an HTTP status, or no answer at all.
+TRANSPORT = "transport"
+#: One probe per row of the page's Fault Slugs table, and a second where a row names two statuses
+#: or a range, so a row the adapters read differently from the page is caught on either half.
+FAULT_PROBES: tuple[int | str, ...] = (TRANSPORT, 401, 403, 429, 504, 500, 503, 400, 422)
+
+
+def _fault(reasons: dict[str, str], key: str, call: Callable[[], object]) -> None:
     try:
         call()
     except ProviderError as exc:
-        reasons[name] = _reason(exc)
-    else:  # pragma: no cover - the mock answers 504 and nothing else
-        raise AssertionError(f"{name}: a 504 did not raise")
+        slug = fault_slug(exc)
+        # A transient fault's retry line and its final line name it in the same word.
+        retry = _reason(exc)
+        assert retry in (slug, "provider_error"), f"{key}: retrying says {retry}, failed {slug}"
+        reasons[key] = slug
+    else:  # pragma: no cover - every probe fails the call
+        raise AssertionError(f"{key}: the probe did not raise")
+
+
+def _probe(router, probe: int | str) -> None:
+    """Every adapter's endpoint answers the probe: the status with its vendor's error shape."""
+    routes = {
+        f"{OPENAI_HOST}/chat/completions": {"error": {"message": "x", "type": "x", "code": probe}},
+        OPENROUTER_CHAT: {"error": {"message": "x", "code": probe}},
+        ANTHROPIC_MESSAGES: {"type": "error", "error": {"type": "api_error", "message": "x"}},
+        GENERATE: {"error": {"code": probe, "message": "x", "status": "UNKNOWN"}},
+    }
+    for url, body in routes.items():
+        if probe == TRANSPORT:
+            router.post(url).mock(side_effect=httpx.ConnectError("connection refused"))
+        else:
+            router.post(url).mock(return_value=httpx.Response(probe, json=body))
 
 
 #: A scenario that renders no line by design — it is read through `Rendered.reasons`.
-SILENT = {"gateway_timeouts"}
+SILENT = {"fault_slugs"}
 
 
 @scenario
-def gateway_timeouts(router, key, reasons, **_):
-    """An HTTP 504 through every adapter that speaks HTTP, read as the retry vocabulary's word."""
-    body = {"error": {"message": "upstream timed out", "type": "timeout", "code": 504}}
-    claude_body = {"type": "error", "error": {"type": "api_error", "message": "x"}}
-    vertex_body = {"error": {"code": 504, "message": "x", "status": "DEADLINE_EXCEEDED"}}
-    router.post(f"{OPENAI_HOST}/chat/completions").mock(return_value=httpx.Response(504, json=body))
-    router.post(OPENROUTER_CHAT).mock(return_value=httpx.Response(504, json=body))
-    router.post(ANTHROPIC_MESSAGES).mock(return_value=httpx.Response(504, json=claude_body))
-    router.post(GENERATE).mock(return_value=httpx.Response(504, json=vertex_body))
+def fault_slugs(router, key, reasons, **_):
+    """Every probe through every adapter that speaks HTTP, read as the `reason` its line names.
+
+    The native xAI adapter speaks gRPC, whose codes no HTTP table names, so it is not probed.
+    """
     hi = [Message.user("hi")]
     openai = OpenAIProvider(
         model="gpt-6-sol", api_key=OPENAI_KEY, base_url=OPENAI_HOST, surface="chat", max_retries=0
     )
-    _gateway_timeout(reasons, "openai", lambda: openai.chat(hi))
-    _gateway_timeout(
-        reasons, "openrouter", lambda: openrouter_provider(retries_disabled=True).chat(hi)
-    )
     claude = AnthropicProvider(ANTHROPIC_MODEL, api_key=ANTHROPIC_KEY, max_tokens=4096)
-    _gateway_timeout(reasons, "anthropic", lambda: claude.chat(hi))
     gemini = build(key)
-    _gateway_timeout(reasons, "google", lambda: gemini.chat(hi))
+    adapters: dict[str, Callable[[], object]] = {
+        "openai": lambda: openai.chat(hi),
+        "openrouter": lambda: openrouter_provider(retries_disabled=True).chat(hi),
+        "anthropic": lambda: claude.chat(hi),
+        "google": lambda: gemini.chat(hi),
+    }
+    for probe in FAULT_PROBES:
+        _probe(router, probe)
+        for name, call in adapters.items():
+            _fault(reasons, f"{name} {probe}", call)
     for adapter in (openai, claude, gemini):
         adapter.close()
 
@@ -1176,7 +1203,7 @@ def test_every_scenario_renders_a_line(rendered):
         name for name, lines in rendered.lines.items() if not lines and name not in SILENT
     )
     assert not silent, silent
-    assert len(rendered.reasons) == 4
+    assert len(rendered.reasons) == 4 * len(FAULT_PROBES)
 
 
 def test_a_reason_is_a_slug_unless_the_page_lists_the_head(contract, sites):
@@ -1670,10 +1697,52 @@ def test_a_computed_cost_is_stated_only_for_the_host_its_table_transcribes(rende
     }
 
 
-def test_a_gateway_timeout_is_timeout_on_every_vendor(rendered):
-    assert rendered.reasons == dict.fromkeys(
-        ("openai", "openrouter", "anthropic", "google"), "timeout"
-    )
+def _fault_table() -> list[tuple[str, str]]:
+    """The page's Fault Slugs rows, as (what the producer saw, the `reason` it writes)."""
+    section = DOC.read_text(encoding="utf-8").split("\n#### Fault Slugs\n", 1)[1]
+    section = section.split("\n#", 1)[0]
+    rows = re.findall(r"^\| ([^|`]*(?:`[^`]*`[^|`]*)*) \| `([a-z_:]+)` \|$", section, re.MULTILINE)
+    return [(saw, slug) for saw, slug in rows if saw != "What the Producer Saw"]
+
+
+def _page_slug(probe: int | str) -> str:
+    """The slug the page's table gives a probe: its own row, else the range or catch-all it falls in."""
+    rows = _fault_table()
+    if probe == TRANSPORT:
+        (slug,) = [slug for saw, slug in rows if saw.startswith("No HTTP answer")]
+        return slug
+    named = [slug for saw, slug in rows if f"`{probe}`" in saw]
+    if named:
+        return named[0]
+    family = "`5xx`" if 500 <= int(probe) < 600 else "status"
+    (slug,) = [slug for saw, slug in rows if saw.startswith("Any other") and saw.endswith(family)]
+    return slug
+
+
+def test_the_fault_slug_table_is_one_vocabulary(contract):
+    """The page states the ruled table (issue #786), and every slug in it is in the `reason` row."""
+    assert dict(_fault_table()) == {
+        "No HTTP answer: the connection failed (DNS, TCP, TLS, a reset mid-body)": "transport",
+        "HTTP `401` or `403`": "config:auth",
+        "HTTP `429`": "rate_limited",
+        "HTTP `504`": "timeout",
+        "Any other HTTP `5xx`": "server_error",
+        "Any other HTTP status": "api_error",
+    }
+    listed = _row("llm", "reason")
+    for _, slug in _fault_table():
+        cause = "config:<cause>" if slug.startswith("config:") else slug
+        assert f"`{cause}`" in listed, slug
+
+
+def test_every_http_adapter_names_a_fault_by_the_page(rendered):
+    """A 504 is `timeout` on every vendor, a 401 `config:auth`, … — the table, through each SDK."""
+    expected = {
+        f"{name} {probe}": _page_slug(probe)
+        for probe in FAULT_PROBES
+        for name in ("openai", "openrouter", "anthropic", "google")
+    }
+    assert rendered.reasons == expected
 
 
 def test_a_refusal_is_the_calls_own_line_and_outcome(rendered):
