@@ -523,6 +523,138 @@ def test_a_large_request_is_given_the_time_its_size_needs(cell, slow_server):
     assert provider.last_timeout > ANSWER_AFTER
 
 
+# --- a keepalive cannot hold an attempt open (issue #788) ---------------------------------------
+#
+# The shape that ran `@ping`'s attempt for 941 s against a ~540 s fit: the headers at once, then a
+# keepalive chunk every few seconds (OpenRouter's, measured live 2026-11-03) until the answer, so a
+# read timeout — an idle timer — is reset forever. Scaled from seconds to tenths; every adapter that
+# speaks HTTP is driven against the same real server, so the deadline is proven where it is
+# enforced, at the client's own transport.
+
+KEEPALIVE_EVERY = 0.1
+SMALL_CONNECT = 0.1  # the connect budget, scaled with the rest: the deadline is connect + read
+KEEPALIVE_ANSWER_AFTER = 2.5  # well past the scaled fit, and its one retry's
+KEEPALIVE_CELLS = (*HTTP_CELLS, "anthropic")
+
+
+def _claude_body(text: str) -> dict:
+    return {
+        "id": "msg_01FakeFakeFakeFake",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-haiku-5-5",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 12, "output_tokens": 7},
+    }
+
+
+def _keepalive_handler(answer_after: float):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("content-length") or 0))
+            if self.path.endswith("/responses"):
+                body = responses_body(out_message("the real answer"))
+            elif self.path.endswith("/messages"):
+                body = _claude_body("the real answer")
+            elif self.path.startswith("/api/"):
+                body = openrouter_completion(content="the real answer")
+            else:
+                body = completion(content="the real answer")
+            try:
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("transfer-encoding", "chunked")
+                self.end_headers()
+                started = time.monotonic()
+                while time.monotonic() - started < answer_after:
+                    self._chunk(b"\n")  # JSON allows leading whitespace; the client sees bytes
+                    time.sleep(KEEPALIVE_EVERY)
+                self._chunk(json.dumps(body).encode())
+                self.wfile.write(b"0\r\n\r\n")
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the client gave up at its deadline, which is the point
+
+        def _chunk(self, data: bytes) -> None:
+            self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+            self.wfile.flush()
+
+        def log_message(self, *args):
+            pass
+
+    return Handler
+
+
+@pytest.fixture
+def keepalive_server():
+    servers = []
+
+    def start(answer_after: float) -> str:
+        server = _SlowServer(("127.0.0.1", 0), _keepalive_handler(answer_after))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        servers.append(server)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    yield start
+    for server in servers:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture
+def _no_output_term(monkeypatch):
+    """The scaled fit, with the output cap's term removed too (Anthropic always carries a cap), and
+    the connect budget scaled down with it."""
+    monkeypatch.setattr(_timeouts, "DECODE_TOKENS_PER_SECOND", 10**9)
+    monkeypatch.setattr(_timeouts, "CONNECT_TIMEOUT", SMALL_CONNECT)
+
+
+def _keepalive_provider(cell: str, base: str):
+    if cell == "anthropic":
+        from basecradle_harness import AnthropicProvider
+
+        return AnthropicProvider(
+            "claude-haiku-5-5",
+            api_key="sk-ant-api03-FAKEfakeFAKEfakeFAKEfakeFAKEfakeFAKEfake-0000AA",
+            base_url=base,
+            max_tokens=64,
+        )
+    return _slow_provider(cell, base)
+
+
+@pytest.mark.usefixtures("_small_policy", "_no_output_term")
+@pytest.mark.parametrize("cell", KEEPALIVE_CELLS)
+def test_a_keepalive_never_holds_an_attempt_past_its_budget(cell, keepalive_server):
+    """The incident, reproduced and refused: before issue #788 every one of these answered at 2.5 s,
+    the keepalive having reset the idle timer twenty-five times. Now the attempt ends at its fitted
+    budget with the timeout every adapter already names, which the engine retries at twice it."""
+    provider = _keepalive_provider(cell, keepalive_server(KEEPALIVE_ANSWER_AFTER))
+    started = time.monotonic()
+    with pytest.raises(ProviderTimeoutError) as raised:
+        provider.chat(SMALL)
+    elapsed = time.monotonic() - started
+
+    deadline = provider.last_timeout + SMALL_CONNECT
+    assert TIMEOUT_RETRY_SCALE * deadline < KEEPALIVE_ANSWER_AFTER  # the retry is short of it too
+    # Cut at the deadline — never at the answer. The slack is a slow runner's (request building
+    # before the clock starts, error mapping after it stops), far short of the 2.5 s answer.
+    assert deadline <= elapsed < deadline + 1.0 < KEEPALIVE_ANSWER_AFTER
+    assert connection_reason(raised.value) == "timeout"
+
+
+@pytest.mark.usefixtures("_small_policy", "_no_output_term")
+@pytest.mark.parametrize("cell", KEEPALIVE_CELLS)
+def test_a_keepalive_answer_inside_its_budget_lands(cell, keepalive_server):
+    """The deadline cuts only what overruns: a vendor that keeps the line warm and answers in time
+    is answered."""
+    provider = _keepalive_provider(cell, keepalive_server(0.3))
+    assert provider.chat(SMALL).content == "the real answer"
+    assert provider.last_timeout > 0.3
+
+
 # --- a metadata read is not a model call --------------------------------------------------------
 
 

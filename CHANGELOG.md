@@ -7,6 +7,60 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.172.0] - 2026-11-03
+
+### Fixed: a runaway generation is bounded per attempt (issue #788)
+
+On 2026-11-03 `@ping`'s brain call ran **941 s** and wrote **131,072** output tokens (the model's
+ceiling) before the harness saw an answer it could not use; the retry on another endpoint answered
+in 3.9 s. Nothing bounded the attempt, three ways:
+
+- **The fitted budget is now a deadline on the whole attempt.** The budget reached each HTTP client
+  as a read timeout, which is an idle timer between two chunks, and a non-streaming OpenRouter
+  request is answered with its headers at once and then a keepalive chunk every 3 s until the body
+  is ready (measured live). So on the incident's path the effective budget (~540 s) could never
+  fire. `_deadline.bound_attempts` holds every fitted call's request to connect + generation, at the
+  client's own transport, on the `openai`, `openrouter` (brain and reranker), `anthropic` and
+  `google-genai` adapters: an attempt still running at its deadline ends as the client family's own
+  read timeout, which each adapter already maps to `ProviderTimeoutError` and the engine retries once
+  at twice the budget. Proven against a real loopback server that keeps the line warm. The native
+  xAI adapter's gRPC deadline already bounded the whole call.
+- **The brain's output is capped per attempt: `HARNESS_MAX_OUTPUT_TOKENS`, default 32,768.** No
+  agent set a cap, so every attempt was allowed the vendor's ceiling. The default is twice the
+  largest answer any model meant to write across the fleet's 2,171 brain calls in 30 days (15,799);
+  every call above 16 K was a runaway to 131,072. Sent in each wire's own field; a cap in
+  `model_params.json` wins; Anthropic sends it no higher than the model's maximum. Reported as
+  `max_output_tokens` by `--resolved-config`. A positive integer, and anything else fails at
+  startup.
+- **A tool call cut off at the cap is `reason=truncated`.** `ProviderTruncatedError` (a
+  `ProviderResponseError`, so it is retried as before) is decided once in `read_answer`, from the
+  vendor's stop reason **or** its bill: output tokens at the call's cap. The bill is needed because
+  OpenAI's model behind OpenRouter, cut off inside a tool call, reports `finish_reason:
+  "tool_calls"` (measured live). So the billed line reads `outcome=fallback reason=truncated` and the decision
+  `outcome=retrying reason=truncated`, never `invalid_response`, which the board could not tell from
+  a malformed body. Anthropic returns a cut-off `tool_use` with `input: {}` (measured live), so its
+  adapter judges that case itself and raises before the tool can be dispatched (a cut-off
+  `server_tool_use` too, which would otherwise be replayed with no result; a reply cut off because
+  the context window is full is not this class and spends no retries). `truncated` joins the
+  retryable reasons, mapped identically by the engine, the describer and the reranker. The describer
+  reads it as the verdict it already was there: a cut-off answer gets its one larger budget, never a
+  same-budget retry, and is remembered for the wake.
+- **A cap the operator wrote is theirs wherever they wrote it**: at the top level of
+  `model_params.json` or in its `extra_body`, and a malformed one is sent as written with a WARNING,
+  never overwritten by the default or sent beside it under a second name.
+
+Also fixed, found by the loopback proof: the OpenRouter adapter's citation capture swallowed a
+failed body read, which left the stream consumed, and the SDK's own read then failed on
+`StreamConsumed`, an exception no mapper knows. A connection dropped mid-body was therefore fatal
+on OpenRouter instead of a retryable transport fault; the read's failure now propagates.
+
+**Stated, not built:** with the brain capped at 32,768, every brain call's fit is the 15-minute
+ceiling on every vendor, so a *stuck* attempt (an upstream that accepts the call and never finishes
+it) costs 910 s and one retry at 1,820 s, about 45 minutes; on a vendor that sends no keepalive an
+uncapped call used to cost one 8–12 minute budget plus twice it. A runaway, the incident's shape, ends at the cap in 2–4
+minutes at the speeds it ran. Bounding a stuck attempt to a minute or two needs an idle timer on
+real tokens, which needs streaming: filed as issue #789.
+
 ## [0.171.0] - 2026-11-03
 
 ### Changed: a model call is one line, and how it ended is its `outcome` (issue #782) — breaking for log consumers

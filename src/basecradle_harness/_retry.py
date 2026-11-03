@@ -118,6 +118,7 @@ from basecradle_harness._exceptions import (
     ProviderServerError,
     ProviderTimeoutError,
     ProviderToolSchemaError,
+    ProviderTruncatedError,
 )
 from basecradle_harness._faults import routing_refusal
 from basecradle_harness._observability import (
@@ -154,7 +155,7 @@ RETRY_BACKOFF: tuple[float, ...] = (1.0, 2.0)
 #: policy nothing implements — and a producer missing from that pin is how issue #545 hid, since the
 #: engine was not in it and its ``except`` could reach neither of the transport words.
 RETRYABLE_REASONS = frozenset(
-    {"rate_limited", "server_error", "transport", "timeout", "invalid_response"}
+    {"rate_limited", "server_error", "transport", "timeout", "invalid_response", "truncated"}
 )
 
 
@@ -521,6 +522,8 @@ def fault_slug(exc: BaseException) -> str:
         return "context_length"
     if isinstance(exc, ProviderPayloadTooLargeError):
         return "payload_too_large"
+    if isinstance(exc, ProviderTruncatedError):
+        return "truncated"
     if isinstance(exc, ProviderResponseError):
         return "invalid_response"
     if isinstance(exc, ProviderConnectionError):

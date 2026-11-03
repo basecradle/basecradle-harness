@@ -48,6 +48,7 @@ from basecradle_harness._exceptions import (
     ProviderServerError,
     ProviderTimeoutError,
     ProviderToolSchemaError,
+    ProviderTruncatedError,
 )
 from basecradle_harness._google import GoogleConfigError, GoogleProvider
 from basecradle_harness._google_search import GoogleSearchTool
@@ -327,6 +328,7 @@ __all__ = [
     "ProviderContextLengthError",
     "ProviderConnectionError",
     "ProviderTimeoutError",
+    "ProviderTruncatedError",
     "ProviderAPIError",
     "ProviderAuthError",
     "ProviderBillingError",

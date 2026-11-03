@@ -152,6 +152,7 @@ from basecradle_harness._plugins import (
 from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._search_params import load_search_params
+from basecradle_harness._timeouts import OUTPUT_CAP_KEYS, output_cap
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._tools import Tool
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
@@ -1201,6 +1202,55 @@ def _openai_budget_key(provider: str, surface: str) -> str:
     return "max_completion_tokens" if provider == "openai" else "max_tokens"
 
 
+def _output_budget(
+    params: Mapping[str, Any],
+    explicit: int | None,
+    default: int | None,
+    *,
+    extra_body: Mapping[str, Any] | None = None,
+) -> int | None:
+    """The output cap a build puts on its calls: the caller's, else the operator's, else a default.
+
+    An `explicit` cap is a caller's own (the describer's, issue #488) and always wins. Otherwise a
+    cap the operator wrote in ``model_params.json`` is the agent's own tuning and is sent as written,
+    so nothing is added (``None``): in whichever spelling (`OUTPUT_CAP_KEYS`), at the top level or in
+    the ``extra_body`` this build sends. Only when neither names one does `default` apply: the
+    brain's `HARNESS_MAX_OUTPUT_TOKENS` (issue #788), which bounds what one attempt may write.
+
+    An operator's cap that is not a positive integer is still theirs, and is never overwritten by
+    the default or sent beside it under a second name; it gets a WARNING instead, because the fitted
+    budget (`output_cap`) cannot read it and the vendor may refuse it.
+    """
+    if explicit is not None:
+        return explicit
+    written = operator_output_cap(params, extra_body)
+    if written is not None:
+        if output_cap({written[0]: written[1]}) is None:
+            _log.warning(
+                "model_params.json sets %s=%r, which is not a positive integer: it is sent as "
+                "written, and the harness adds no output cap of its own beside it.",
+                *written,
+            )
+        return None
+    return default
+
+
+def operator_output_cap(
+    params: Mapping[str, Any], extra_body: Mapping[str, Any] | None = None
+) -> tuple[str, Any] | None:
+    """``(key, value)`` of the output cap the operator wrote, or ``None`` when they wrote none.
+
+    The top level first, then ``extra_body`` (its own `extra_body` key on the openai-SDK cells, the
+    split-out one where a build sends it), each in `OUTPUT_CAP_KEYS` order.
+    """
+    nested = params.get("extra_body") if extra_body is None else extra_body
+    for source in (params, nested if isinstance(nested, Mapping) else {}):
+        for key in OUTPUT_CAP_KEYS:
+            if key in source:
+                return key, source[key]
+    return None
+
+
 def _provider_from_config(
     provider: str,
     sdk: str,
@@ -1213,6 +1263,7 @@ def _provider_from_config(
     routing: Sequence[str] | None = None,
     inherit_params: bool = True,
     max_output_tokens: int | None = None,
+    default_output_tokens: int | None = None,
     credentials_file: str | None = None,
     location: str | None = None,
     project: str | None = None,
@@ -1327,8 +1378,9 @@ def _provider_from_config(
             )
         # `routing` is an OpenRouter concept; xAI is a single vendor reached directly, so a pin
         # here would be a body field its endpoint has never heard of. Dropped, not sent.
-        if max_output_tokens is not None:
-            params["max_tokens"] = max_output_tokens
+        cap = _output_budget(params, max_output_tokens, default_output_tokens)
+        if cap is not None:
+            params["max_tokens"] = cap
         return XaiSdkProvider(model, api_key=api_key, builtin_tools=list(builtins), **params)
 
     if sdk == "google-genai":
@@ -1343,8 +1395,11 @@ def _provider_from_config(
         )
         # `routing` is an OpenRouter concept; Vertex is Google's own endpoint, reached directly,
         # and its residency is the *location*. Dropped, not sent.
-        if max_output_tokens is not None:
-            params["max_output_tokens"] = max_output_tokens
+        cap = _output_budget(
+            params, max_output_tokens, default_output_tokens, extra_body=extra_body
+        )
+        if cap is not None:
+            params["max_output_tokens"] = cap
         return GoogleProvider(
             model,
             credentials_file=credentials_file,
@@ -1377,6 +1432,10 @@ def _provider_from_config(
             api_key=api_key,
             base_url=endpoint,
             builtin_tools=list(builtins),
+            # A default, never a value: the Messages API requires `max_tokens` and refuses one past
+            # the model's own maximum, which only the adapter reads (the Models API), so the
+            # adapter applies the harness's default no higher than that ceiling.
+            default_max_tokens=default_output_tokens,
             **params,
         )
 
@@ -1414,8 +1473,9 @@ def _provider_from_config(
             # the same path `model_params.json` uses — so an explicit `routing` **replaces** any
             # inherited pin rather than fighting it (and with `inherit_params=False` there is none).
             params["provider"] = _routing_pin(routing)
-        if max_output_tokens is not None:
-            params["max_tokens"] = max_output_tokens
+        cap = _output_budget(params, max_output_tokens, default_output_tokens)
+        if cap is not None:
+            params["max_tokens"] = cap
         return OpenRouterProvider(
             model,
             api_key=api_key,
@@ -1443,6 +1503,7 @@ def _provider_from_config(
             builtins=builtins,
             load_params=loaded_params,
             max_output_tokens=max_output_tokens,
+            default_output_tokens=default_output_tokens,
         )
     if provider not in OPENAI_SDK_PROVIDERS:
         raise ValueError(
@@ -1471,8 +1532,11 @@ def _provider_from_config(
     # which is a raw crash, not the warned-and-dropped collision policy. Lifting keeps the operator's
     # headers working (they merge, below) instead of silently confiscating a key that works today.
     params_extra_headers = params.pop("extra_headers", None)
-    if max_output_tokens is not None:
-        params[_openai_budget_key(provider, surface)] = max_output_tokens
+    cap = _output_budget(
+        params, max_output_tokens, default_output_tokens, extra_body=params_extra_body
+    )
+    if cap is not None:
+        params[_openai_budget_key(provider, surface)] = cap
     if provider == "xai":
         # xAI's search built-ins ride `search_parameters`, not OpenAI tools entries — so they
         # go through `extra_body`, and nothing is offered as a `builtin_tools` tool here.
@@ -1575,6 +1639,7 @@ def _generic_openai_provider(
     builtins: Sequence[str],
     load_params: Any,
     max_output_tokens: int | None,
+    default_output_tokens: int | None = None,
 ) -> Provider:
     """The **generic** OpenAI-compatible profile: a vendor the harness knows only by name (#670).
 
@@ -1626,8 +1691,11 @@ def _generic_openai_provider(
     # Lifted out, as on every other openai-SDK cell, so an operator's headers merge rather than
     # arriving as a second value for the same keyword.
     params_extra_headers = tuning.pop("extra_headers", None)
-    if max_output_tokens is not None:
-        tuning[_openai_budget_key(provider, surface)] = max_output_tokens
+    cap = _output_budget(
+        tuning, max_output_tokens, default_output_tokens, extra_body=params_extra_body
+    )
+    if cap is not None:
+        tuning[_openai_budget_key(provider, surface)] = cap
     return OpenAIProvider(
         model,
         api_key=api_key,
@@ -1715,7 +1783,12 @@ def _resolve_tools_and_provider() -> tuple[
     _publish_palace_binding(memory)
     bridge = _maybe_code_bridge(provider_name, surface, resolved.builtins)
     provider = _provider_from_config(
-        provider_name, sdk, surface, builtins=resolved.builtins, code_bridge=bridge
+        provider_name,
+        sdk,
+        surface,
+        builtins=resolved.builtins,
+        code_bridge=bridge,
+        default_output_tokens=_max_output_tokens_from_env(),
     )
     return provider, resolved, memory, bridge
 
@@ -2021,6 +2094,35 @@ def _max_steps_from_env() -> int:
     value = int(raw)
     if value <= 0:
         raise ValueError(f"HARNESS_MAX_STEPS must be a positive integer, got {value}.")
+    return value
+
+
+#: What one attempt of the brain may write when nothing else caps it (issue #788): reasoning and
+#: answer together, since every wire counts them as one output. Measured, not guessed: over the
+#: fleet's 2,171 billed brain calls of 2026-10-04 → 2026-11-03 every answer a model meant was under
+#: 16 K output tokens (the largest, 15,799, was z-ai/glm-5.3 at reasoning effort max), and every one
+#: above was a runaway to the vendor's 131,072-token ceiling: 13 of them, the worst running 1,184 s.
+#: Twice the largest real answer, so nothing a model means to write is cut, and a quarter of a
+#: runaway's spend. Per-agent override rides `HARNESS_MAX_OUTPUT_TOKENS`.
+DEFAULT_MAX_OUTPUT_TOKENS = 32_768
+
+
+def _max_output_tokens_from_env() -> int:
+    """Read ``HARNESS_MAX_OUTPUT_TOKENS`` into the brain's per-attempt output cap (issue #788).
+
+    Unset or blank → `DEFAULT_MAX_OUTPUT_TOKENS`. Set → the operator's per-agent cap, a positive
+    integer; anything else fails loudly here, at startup, rather than sending the vendor a cap it
+    refuses on every wake. There is no "uncapped": an attempt allowed to write to the vendor's own
+    ceiling is the incident this exists for, and an operator who wants a larger answer sets a larger
+    number. A cap in ``model_params.json`` (``max_tokens``, ``max_completion_tokens`` or
+    ``max_output_tokens``) is the agent's own tuning and wins over this default.
+    """
+    raw = os.environ.get("HARNESS_MAX_OUTPUT_TOKENS")
+    if raw is None or not raw.strip():
+        return DEFAULT_MAX_OUTPUT_TOKENS
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"HARNESS_MAX_OUTPUT_TOKENS must be a positive integer, got {value}.")
     return value
 
 

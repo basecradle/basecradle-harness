@@ -76,6 +76,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
+from basecradle_harness._deadline import bound_attempts
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
@@ -87,6 +88,7 @@ from basecradle_harness._exceptions import (
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
+    ProviderTruncatedError,
 )
 from basecradle_harness._faults import routing_refusal
 from basecradle_harness._observability import (
@@ -103,6 +105,7 @@ from basecradle_harness._openrouter import (
     PROVIDER,
     ROUTING_METADATA_HEADER,
     _ErrorMapper,
+    _http_client,
     apply_timeout,
     require_openrouter_sdk,
 )
@@ -664,6 +667,8 @@ class MemPalaceReranker:
                 # its memories now, one line says why they were not reranked.
                 retry_config=None,
             )
+            # The fitted budget bounds the whole attempt, not only a silence (issue #788).
+            bound_attempts(_http_client(self._client))
         elif self._openrouter is None:
             # An injected client (the seam tests) still needs the SDK's error module for the shared
             # mapper. Import it here rather than at construction so injection stays cheap.
@@ -877,6 +882,8 @@ def _fault_of(exc: ProviderError) -> tuple[str, bool]:
         return "context_length", False
     if isinstance(exc, ProviderPayloadTooLargeError):
         return "payload_too_large", False
+    if isinstance(exc, ProviderTruncatedError):
+        return "truncated", False
     if isinstance(exc, ProviderResponseError):
         return "invalid_response", False
     if isinstance(exc, ProviderConnectionError):

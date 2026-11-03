@@ -1555,3 +1555,60 @@ def test_an_answer_the_adapter_could_not_read_is_billed_once_then_decided(caplog
     assert len(billed) == 3 and all("tokens_in=812" in m and "cost=0.0021" in m for m in billed)
     assert len(decided) == 3 and not any("tokens_in=" in m or "cost=" in m for m in decided)
     assert decided[-1].count("outcome=failed") == 1
+
+
+# === issue #788: `truncated` is a retryable fault for the brain and a verdict for the describer ===
+
+
+class CutOffProvider(FakeDescriberProvider):
+    """An adapter that read an answer cut off at its cap and could not use it: its billed
+    ``fallback reason=truncated`` line, then `ProviderTruncatedError` — `read_answer`'s shape."""
+
+    def chat(self, messages, tools=None):
+        from basecradle_harness import ProviderTruncatedError
+        from basecradle_harness._observability import FALLBACK, log_llm_call
+
+        self.seen.append((messages, tools))
+        log_llm_call(
+            provider=self.provider,
+            model=self.model,
+            seconds=1.5,
+            usage=USAGE,
+            cost=0.0021,
+            finish_reason="length",
+            outcome=FALLBACK,
+            reason="truncated",
+            level=logging.WARNING,
+        )
+        raise ProviderTruncatedError("cut off at the output cap")
+
+
+def test_a_raised_cut_off_is_re_budgeted_once_never_retried_at_the_same_budget(caplog):
+    """The describer's remedy for a cut answer is its one larger budget (#488). Retrying the same
+    budget buys the same cut: before the fix this made six calls, three at each budget, and its
+    give-up line said ``fallback`` with nothing billed on it."""
+    first, larger = CutOffProvider(), CutOffProvider()
+    describer, asked = _describer(first, larger)
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
+
+    assert (len(first.seen), len(larger.seen)) == (1, 1)
+    assert asked == [IMAGE_OUTPUT_BUDGET * RETRY_BUDGET_FACTOR]
+    lines = [r.getMessage() for r in _helper_lines(caplog)]
+    assert len(lines) == 2 and all("reason=truncated" in line for line in lines)
+    assert all("tokens_in=" in line for line in lines)  # every line is a billed one
+    assert not [line for line in lines if "outcome=retrying" in line]
+
+
+def test_a_describe_truncated_after_its_larger_budget_is_remembered_for_the_wake():
+    """Since #788 ``truncated`` is also a retryable fault word; the memo must still read it as the
+    verdict it is here, or every later look at the same picture pays for two more calls."""
+    first = WireDescriberProvider(finish="length", answer=CUT_OFF)
+    larger = WireDescriberProvider(finish="length", answer=CUT_OFF)
+    describer, _asked = _describer(first, larger)
+    image = [ImageContent(url="x", alt="a.png")]
+
+    assert describer.describe_images(image) is None
+    assert describer.describe_images(image) is None
+    assert (len(first.seen), len(larger.seen)) == (1, 1)

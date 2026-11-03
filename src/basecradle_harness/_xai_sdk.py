@@ -382,7 +382,12 @@ class XaiSdkProvider:
         self.last_finish_reason = reason
         seconds = time.monotonic() - started
         # Read before the line is written, so the one billed line says whether it could be (#782).
-        reply, unreadable = read_answer(lambda: self._from_wire(response), response)
+        reply, unreadable = read_answer(
+            lambda: self._from_wire(response),
+            response,
+            usage=reasoning_apart(usage),
+            cap=output_cap(self._default_params),
+        )
         log_llm_call(
             provider=self.provider,
             model=self.model,

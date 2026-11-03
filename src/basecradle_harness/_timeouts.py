@@ -74,6 +74,16 @@ costs one fit plus twice the fit before the wake fails — ~27 minutes for the i
 the 60 s wall cost three minutes and then looped for an hour. That is the price of a non-streaming
 contract, it is paid only on a genuine hang, and the NOC's Wake Duration Outlier alert is the thing
 that sees it.
+
+**That sentence was false on OpenRouter until issue #788.** The budget reaches an HTTP client as a
+``read`` timeout, which bounds the silence *between two chunks*, and OpenRouter sends a keepalive
+chunk every three seconds while a non-streaming answer is written: the budget never fired, and an
+attempt ran 941 s against a 540 s fit. So the budget is also enforced as a deadline on the whole
+attempt (``connect`` + ``generation``) at each client's transport (`_deadline`). The brain now always
+carries an output cap (`HARNESS_MAX_OUTPUT_TOKENS`, 32,768), so its fit is the ceiling on every
+vendor: a stuck attempt costs 910 s and one retry at 1,820 s (about 45 minutes, where an uncapped
+call on a vendor without keepalives cost one 8–12 minute fit plus twice it), and only an idle timer
+on real tokens — streaming, issue #789 — could tell it from a slow one sooner.
 """
 
 from __future__ import annotations
@@ -105,7 +115,8 @@ PREFILL_TOKENS_PER_SECOND = 1_000
 DECODE_TOKENS_PER_SECOND = 20
 
 #: What a call that carries no output cap is assumed to write. Where a reasoning model at high effort
-#: lands on a long answer — and the term that dominates an uncapped brain call's fit.
+#: lands on a long answer. Since issue #788 the brain is always capped, so this is a library caller's
+#: term (and any adapter built with no cap at all).
 UNCAPPED_OUTPUT_TOKENS = 8_192
 
 #: The most a first attempt is ever given, however large the call. Fifteen minutes: past every fit a

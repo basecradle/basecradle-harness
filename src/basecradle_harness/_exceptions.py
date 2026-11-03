@@ -66,6 +66,23 @@ class ProviderResponseError(ProviderError):
     """
 
 
+class ProviderTruncatedError(ProviderResponseError):
+    """The vendor stopped at the output cap partway through the answer, so it cannot be used.
+
+    The shape of issue #788: a runaway generation writes until the cap, and the tool call it was in
+    the middle of is cut off — arguments that do not parse, or (Anthropic) a ``tool_use`` whose
+    input the API hands back empty. The vendor answered and billed it, and nothing in it can run.
+    A `ProviderResponseError`, so every ``except`` that retries an unreadable answer still retries
+    this one: a runaway is a property of one generation, not of the request (the incident's retry
+    answered in 3.9 s on another endpoint). It exists apart from its parent only so the line can
+    say what happened — ``reason=truncated``, a cap that fired, never ``invalid_response``, a body
+    that did not parse — because the board must tell a runaway from an unreadable answer.
+
+    A cut-off reply that **can** be read (text, or a turn with whole tool calls) is not this: the
+    engine keeps it, and a final text cut off at the cap leaves the turn unfinished (issue #490).
+    """
+
+
 class ProviderConnectionError(ProviderError):
     """The call failed in transport — DNS, TCP, TLS, a connect timeout, or a **read** timeout.
 
