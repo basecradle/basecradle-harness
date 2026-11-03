@@ -49,10 +49,18 @@ from basecradle_harness._describer import Describer
 from basecradle_harness._engine import _REASONS, Engine, _reason
 from basecradle_harness._exceptions import ProviderResponseError, ProviderServerError
 from basecradle_harness._observability import (
+    _VERDICT_VALUES,
+    BLUE,
     DELIVERY_ID_ENV,
+    GREEN,
+    NO_COLOR_ENV,
+    RED,
+    RESET,
+    YELLOW,
     ComputedCost,
     at_step,
     in_wake,
+    kv,
     metered,
 )
 from basecradle_harness._retry import fault_slug
@@ -1874,3 +1882,60 @@ def test_a_call_made_in_a_wake_names_its_wake_and_its_step(rendered):
     assert (rerank.fields["timeline"], rerank.fields["step"]) == (WAKE_TIMELINE, "3/24")
     # Outside a wake there is no wake to name: an adapter's own call carries none of the three.
     assert not {"timeline", "delivery", "step"} & set(rendered.llm("anthropic").fields)
+
+
+# === the palette =================================================================================
+#
+# `docs/telemetry.md` → The Palette defines each color tier once for the whole fleet (issue #799).
+# The harness is held to it from both sides: every tier's SGR is the constant the harness writes,
+# and the `outcome=` vocabulary the page assigns is exactly the one `kv` colors — a value colored
+# that the page does not name, or named that the harness leaves plain, fails here.
+
+_PALETTE_TIER = re.compile(r"^\| (?P<tier>[A-Z][A-Za-z' ]+) \| [A-Za-z]+ \| `(?P<sgr>[^`]+)` \| ")
+_PALETTE_MEMBERS = re.compile(r"^\| (?P<tier>[A-Z][A-Za-z' ]+) \| .+ \| (?P<outcomes>[^|]+) \|$")
+
+
+def _palette() -> tuple[dict[str, str], dict[str, str]]:
+    """The page's tiers (name → SGR) and its `outcome=` values (value → tier name)."""
+    text = DOC.read_text(encoding="utf-8")
+    section = text.partition("\n## The Palette\n")[2].partition("\n## ")[0]
+    assert section, "the contract page has no Palette section"
+    tiers: dict[str, str] = {}
+    outcomes: dict[str, str] = {}
+    for line in section.splitlines():
+        if tier := _PALETTE_TIER.match(line):
+            sgr = tier["sgr"].encode().decode("unicode_escape")
+            tiers[tier["tier"]] = sgr
+        elif members := _PALETTE_MEMBERS.match(line):
+            for value in re.findall(r"`([a-z_]+)`", members["outcomes"]):
+                assert value not in outcomes, f"`outcome={value}` is in two tiers"
+                outcomes[value] = members["tier"]
+    return tiers, outcomes
+
+
+def test_every_palette_tier_is_the_sgr_the_harness_writes():
+    tiers, _ = _palette()
+
+    assert tiers == {
+        "Success": GREEN,
+        "Bookend": BLUE,
+        "Warning": YELLOW,
+        "Operator's Choice": YELLOW,
+        "Failure": RED,
+    }
+
+
+def test_the_outcome_vocabulary_is_the_palettes_in_both_directions(monkeypatch):
+    monkeypatch.delenv(NO_COLOR_ENV, raising=False)
+    tiers, outcomes = _palette()
+
+    assert set(outcomes) == set(_VERDICT_VALUES["outcome"])
+    for value, tier in outcomes.items():
+        assert kv(outcome=value) == f"{tiers[tier]}outcome={value}{RESET}", value
+
+
+def test_a_stopped_wake_is_the_operators_choice_never_a_failure():
+    # The tier the ruling added (issue #799): a deliberate stop shares Yellow's SGR, never Red's.
+    _, outcomes = _palette()
+
+    assert outcomes["stopped"] == "Operator's Choice"
