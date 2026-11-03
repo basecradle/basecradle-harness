@@ -125,8 +125,8 @@ INTERRUPTED = (
 #: re-posted by the next wake — undoing the stop. This one is terminal: nothing reads it back, and it
 #: is capped like any other result.
 STOPPED = (
-    "[Stopped: this wake received SIGTERM while this call was running, before its result could be "
-    "recorded. Its outcome is unknown — it may have completed, completed partially, or never "
+    "[Stopped: this wake received SIGTERM before this call's result could be recorded. Its "
+    "outcome is unknown — it may have completed, completed partially, or never "
     "started. It has NOT been re-run, and will not be: a stopped wake is not resumed. If it matters "
     "here, check for yourself and decide what to do.]"
 )
@@ -571,6 +571,31 @@ class Session:
         if self._turn is turn:
             self._turn = None
         self._save()
+
+    @property
+    def current_turn(self) -> Message | None:
+        """The turn this session last worked on (`send`, `resume`, `working_on`), or ``None``."""
+        return self._turn
+
+    def end_turn_stopped(self) -> bool:
+        """End the current turn on `STOPPED_NOTE` and persist it. True if it was written (#798).
+
+        `_drive` already does this when the stop lands inside the engine. A stop can land anywhere
+        else in a turn — the user turn saved and the model not yet called, a re-issue, a compaction —
+        and the wake calls this then, having judged the turn unfinished; it is never this method's
+        call. It writes nothing while engine work is still in flight and unadopted (the stop landed
+        inside `_drive`'s own `finally`): `history` lacks that work, and saving it would erase the
+        on-disk evidence of calls that already ran. Nor does it write for a turn no longer in
+        `history`. The note goes at the turn's end, which for a resumed turn may not be the tail.
+        """
+        turn = self._turn
+        if turn is None or self._convo is not None:
+            return False
+        if _index_of(self.history, turn) is None:
+            return False
+        self.history.insert(_turn_end(self.history, turn), Message.system(STOPPED_NOTE))
+        self._save()
+        return True
 
     def working_on(self, turn: Message) -> None:
         """Name the turn a caller is about to act on, before `resume` gets there.

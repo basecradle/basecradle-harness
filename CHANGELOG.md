@@ -29,7 +29,8 @@ creates (seen live on `@ping`, 2026-11-03 09:33Z).
 - **The process dies by the signal** (default disposition restored, the signal re-sent), so `sudo`
   dies by -15 and the router's classification holds.
 - **A claim the stop could not write** is settled by the next wake from the turn's own note
-  (`wake stopped … reason=stop_note`) rather than resumed.
+  (`wake stopped … reason=stop_note`) rather than resumed. The note is written wherever in the turn
+  the stop landed, not only inside the model call or a tool.
 - A `SIGKILL` runs none of this: a crash is still resumed as a crash.
 - `docs/telemetry.md` gains `wake end`'s `stopped` outcome and `signal` field and the `wake stopped`
   head; README, `CLAUDE.md` → Delivery Guarantee and the `delivery-guarantee` skill say so.

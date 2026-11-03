@@ -2033,6 +2033,7 @@ class WakeAgent:
             # out, so the entrypoint dies by the signal.
             outcome, stopped_by = "stopped", stop.signal_name
             self._stop_held(stop)
+            self._note_stop(session)
             raise
         finally:
             # This wake is over; its claims are no longer its to keep alive (issue #532). A session
@@ -2139,9 +2140,11 @@ class WakeAgent:
         owners = frozenset(self._wake_ids)
         reason = f"stopped: the wake received SIG{stop.signal_name}"
         for kind in (_MESSAGES, _ASSETS, _EVENTS, _TASKS):
+            # `Exception`, not `OSError`: a claim file that is not UTF-8 raises `UnicodeDecodeError`
+            # from the read, and anything that escaped here would replace the stop on its way out.
             try:
                 held = self.claims.unsettled(self.timeline_uuid, kind=kind)
-            except OSError as error:
+            except Exception as error:  # noqa: BLE001 - nothing may replace the stop
                 _log.warning("Could not read the %s claims to stop them: %s", kind, error)
                 continue
             for uuid in held:
@@ -2150,10 +2153,33 @@ class WakeAgent:
                         self.timeline_uuid, uuid, kind=kind, owners=owners, reason=reason
                     ):
                         continue
-                except OSError as error:
+                except Exception as error:  # noqa: BLE001 - nothing may replace the stop
                     _log.warning("Could not settle the %s %s as stopped: %s", kind, uuid, error)
                     continue
                 self._log_stopped(uuid, kind, reason="signal", signal=stop.signal_name)
+
+    def _note_stop(self, session: Session | None) -> None:
+        """End the turn the stop interrupted on `STOPPED_NOTE`, wherever in it the stop landed (#798).
+
+        The claim settled by `_stop_held` is the primary record, and the note is what backs it when
+        that write fails: the next wake reads it (`_turn_stopped`) and settles the item rather than
+        resuming or re-driving it. `_drive` writes the note when the stop lands inside the engine;
+        this covers every other landing — before the model was called, inside a re-issue, a
+        compaction, a describe. A turn that already ends on its narration finished (and its claim
+        committed with it), and one that already ends on the note needs nothing. Never raises.
+        """
+        if session is None:
+            return
+        try:
+            turn = session.current_turn
+            if turn is None:
+                return
+            work = _turn_work(session.history, turn)
+            if _turn_narration(work) is not None or _turn_stopped(work):
+                return
+            session.end_turn_stopped()
+        except Exception as error:  # noqa: BLE001 - nothing may replace the stop
+            _log.warning("Could not end the stopped turn on its stop note: %s", error)
 
     def _log_stopped(
         self, uuid: str, kind: str, *, reason: str, signal: str | None = None, handle=None

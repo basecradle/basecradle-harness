@@ -309,6 +309,71 @@ def test_a_stopped_turn_whose_claim_could_not_be_settled_is_read_off_its_note(
     assert claim is not None and claim.phase == "abandoned"
 
 
+def test_a_stop_that_lands_outside_the_engine_still_leaves_the_note(
+    platform, tmp_path, caplog, monkeypatch
+):
+    """The user turn is on disk and the model not yet called — `_drive`'s own handler never ran.
+
+    The wake writes the note itself (`_note_stop`), so even with the claim write refused the next
+    wake settles the item as stopped rather than re-driving it as `died_before_model`.
+    """
+
+    def stopped(*args, **kwargs):
+        raise WakeStopped(signal.SIGTERM)
+
+    def refused(self, *args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    with monkeypatch.context() as patch:
+        patch.setattr("basecradle_harness._session.log_context_attribution", stopped)
+        patch.setattr(ClaimStore, "stop", refused)
+        first, _ = build_wake(tmp_path, _Script())
+        with pytest.raises(WakeStopped):
+            first.wake()
+    turns = _transcript(tmp_path)
+    assert [t["role"] for t in turns if t["role"] != "system"] == ["user"]
+    assert turns[-1] == {"role": "system", "content": STOPPED_NOTE}
+
+    caplog.set_level("INFO", logger="basecradle_harness")
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    second, brain = build_wake(tmp_path, _Script())
+    second.wake()
+
+    assert brain.seen == [] and _posts(platform) == []
+    assert "reason=stop_note" in _line(caplog, "wake stopped")
+    assert not any(line.startswith("re-driving") for line in _lines(caplog))
+
+
+def test_a_fault_settling_a_claim_never_replaces_the_stop(platform, tmp_path, monkeypatch):
+    """Not only `OSError`: an undecodable claim raises `UnicodeDecodeError` from the read, and
+    anything escaping `_stop_held` would replace the stop — a RED `wake failed`, exit 1, not -15.
+    """
+
+    def undecodable(self, *args, **kwargs):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ClaimStore, "stop", undecodable)
+        _stop_mid_tool(platform, tmp_path)  # raises WakeStopped, not UnicodeDecodeError
+
+
+def test_a_stop_settles_the_turn_an_earlier_pass_left_in_flight(platform, tmp_path):
+    """A repass (#596) takes a fresh claims identity; what an earlier pass holds is still the wake's.
+
+    The turn pass 1 left cut off is in flight under pass 1's identity, and a stop that lands in
+    pass 2 before the recovery has taken it over must settle it too — or the next wake resumes it.
+    """
+    agent, _ = build_wake(tmp_path, _Script())
+    ClaimStore(tmp_path, wake="pass-1").claim(TIMELINE_UUID, M0, kind="messages")
+    agent.claims.wake = "pass-2"
+    agent._wake_ids = {"pass-1", "pass-2"}
+
+    agent._stop_held(WakeStopped(signal.SIGTERM))
+
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages").phase == "abandoned"
+
+
 # --- a crash is still a crash ---------------------------------------------------------------
 
 
