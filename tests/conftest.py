@@ -9,6 +9,7 @@ responses follow the OpenAI chat-completions / Responses schemas.
 import contextlib
 import importlib.util
 import json
+import os
 import pathlib
 import re
 import sys
@@ -263,6 +264,19 @@ def _isolated_config_home(tmp_path_factory, monkeypatch):
     # The scaffolding catalog reads that home's charter and memoizes the result (`_mining.catalog`),
     # so a catalog built under one test's config home would answer for the next one's.
     _mining._reset()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_rerank_config(monkeypatch):
+    """Clear every ``HARNESS_MEMPALACE_RERANK_*`` variable the running shell exported.
+
+    A test sets the reranker variables it means, and only those. Since issue #780 two of them are
+    mutually exclusive (an order beside a providers list is ``config:conflicting_routing``), so an
+    order exported on a fleet box would turn every test that sets a providers list into a dead
+    reranker — the same leak `_isolated_config_home` closes for the charter.
+    """
+    for name in [var for var in os.environ if var.startswith("HARNESS_MEMPALACE_RERANK_")]:
+        monkeypatch.delenv(name)
 
 
 # `scripts/isolated_home.py` is repo tooling, not shipped code, so it is loaded by path.

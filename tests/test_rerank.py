@@ -36,7 +36,9 @@ from basecradle_harness._rerank import (
     POOL_FLOOR,
     RERANK_API_KEY_VAR,
     RERANK_BASE_URL_VAR,
+    RERANK_IGNORE_VAR,
     RERANK_MODEL_VAR,
+    RERANK_ORDER_VAR,
     RERANK_PROVIDERS_VAR,
     SURFACE_TOOL,
     SURFACE_TURN0,
@@ -260,6 +262,159 @@ def test_reasoning_exclude_is_not_sent_because_the_sdk_drops_it(router):
     reranker().rerank("q", hits(20), 1, surface=SURFACE_TURN0)
 
     assert "exclude" not in json.loads(route.calls.last.request.content)["reasoning"]
+
+
+# === Ordered routing: `order` + `ignore`, never `only` beside it (issue #780) ====
+
+#: A ranked list of endpoint tags, the shape the NOC derives (basecradle-noc#1199).
+ORDER = ("baseten/fp8/us", "sail-research/us")
+#: A fleet-wide ban (basecradle-noc#963).
+IGNORE = ("morph",)
+
+
+def test_an_order_is_sent_as_order_with_no_only_beside_it(router):
+    """The policy on the wire: a ranked ``order``, the ban as ``ignore``, and **no** ``only``.
+
+    ``only`` is an unordered, price-weighted set, so a tier-ranked list sent there ships the
+    inverse of the policy while every read-back stays green. ``allow_fallbacks`` is what walks the
+    list on a 429 — measured live before this shipped: OpenRouter's own attempt record read
+    ``[BaseTen 429, Sail Research 200]`` on every call.
+    """
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+
+    reranker(providers=(), order=ORDER, ignore=IGNORE).rerank(
+        "q", hits(20), 1, surface=SURFACE_TURN0
+    )
+
+    assert json.loads(route.calls.last.request.content)["provider"] == {
+        "order": list(ORDER),
+        "ignore": list(IGNORE),
+        "allow_fallbacks": True,
+        "data_collection": "deny",
+    }
+
+
+def test_an_order_keeps_its_ranking_on_the_wire(router):
+    """The order *is* the meaning, so it reaches OpenRouter exactly as ranked — never sorted."""
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+    ranked = ("sail-research/us", "baseten/fp8/us", "deepinfra/fp4")
+
+    reranker(providers=(), order=ranked).rerank("q", hits(20), 1, surface=SURFACE_TURN0)
+
+    sent = json.loads(route.calls.last.request.content)["provider"]
+    assert sent["order"] == list(ranked)
+    assert "ignore" not in sent  # an empty ban sends no `ignore` at all
+
+
+def test_an_ignore_list_rides_the_only_path_too(router):
+    """A ban is a ban whichever list routes — and adding it changes nothing else about `only`."""
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+
+    reranker(ignore=IGNORE).rerank("q", hits(20), 1, surface=SURFACE_TURN0)
+
+    assert json.loads(route.calls.last.request.content)["provider"] == {
+        "only": list(PROVIDERS),
+        "ignore": list(IGNORE),
+        "allow_fallbacks": True,
+        "data_collection": "deny",
+    }
+
+
+def test_an_order_binds_from_the_environment_without_a_provider_list():
+    bound = reranker_from_env(
+        _rerank_env(
+            **{
+                RERANK_PROVIDERS_VAR: None,
+                RERANK_ORDER_VAR: " baseten/fp8/us , sail-research/us ,",
+                RERANK_IGNORE_VAR: "morph,",
+            }
+        )
+    )
+    assert bound is not None
+    assert bound.fault is None
+    assert bound.order == ORDER
+    assert bound.ignore == IGNORE
+    assert bound.providers == ()
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda: reranker_from_env(_rerank_env(**{RERANK_ORDER_VAR: ",".join(ORDER)})),
+        lambda: MemPalaceReranker(model=MODEL, api_key=FAKE_KEY, providers=PROVIDERS, order=ORDER),
+    ],
+    ids=["environment", "library"],
+)
+def test_an_order_beside_a_provider_list_is_config_dead_never_a_precedence(build, router, caplog):
+    """Both lists set is a config fault, ERROR, and no call — never one silently winning.
+
+    ``only`` is a hard restriction and ``order`` lifts it, so whichever lost would be a restriction
+    an operator wrote or the order a converge wrote, gone without a word. Decided in the reranker,
+    so the library API cannot build the request the environment could not.
+    """
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+    dead = build()
+    assert dead is not None
+    assert dead.fault == "config:conflicting_routing"
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        chosen = dead.rerank("q", hits(20), 2, surface=SURFACE_TURN0)
+
+    assert not route.called
+    assert [hit["text"] for hit in chosen] == ["memory 1", "memory 2"]
+    assert _reason_of(caplog.records) == (logging.ERROR, "config:conflicting_routing")
+
+
+def test_a_library_reranker_with_no_routing_list_is_config_dead_never_an_empty_only(router, caplog):
+    """An empty ``only`` on the wire is a request with no jurisdiction list at all, so the library
+    API reaches the same ``config:missing_providers`` the environment does — and calls nothing."""
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+    dead = MemPalaceReranker(model=MODEL, api_key=FAKE_KEY)
+    assert dead.fault == "config:missing_providers"
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        dead.rerank("q", hits(20), 2, surface=SURFACE_TURN0)
+
+    assert not route.called
+    assert _reason_of(caplog.records) == (logging.ERROR, "config:missing_providers")
+
+
+def test_a_routing_conflict_is_named_before_a_bad_base_url():
+    """One fault at a time, in the order a human fixes them: the key, the routing, the URL."""
+    bound = reranker_from_env(
+        _rerank_env(
+            **{RERANK_ORDER_VAR: ",".join(ORDER), RERANK_BASE_URL_VAR: "us.openrouter.ai/api/v1"}
+        )
+    )
+    assert bound is not None
+    assert bound.fault == "config:conflicting_routing"
+
+
+def test_a_missing_key_outranks_a_routing_conflict():
+    """One fault is named, and the first a human must fix is the credential."""
+    bound = reranker_from_env(
+        _rerank_env(**{RERANK_API_KEY_VAR: None, RERANK_ORDER_VAR: ",".join(ORDER)})
+    )
+    assert bound is not None
+    assert bound.fault == "config:missing_api_key"
+
+
+def test_an_ignore_list_alone_is_still_no_routing_list():
+    """A ban says where not to go; it is not a list of places to go."""
+    bound = reranker_from_env(
+        _rerank_env(**{RERANK_PROVIDERS_VAR: None, RERANK_IGNORE_VAR: ",".join(IGNORE)})
+    )
+    assert bound is not None
+    assert bound.fault == "config:missing_providers"
+
+
+@pytest.mark.parametrize("var", [RERANK_ORDER_VAR, RERANK_IGNORE_VAR])
+@pytest.mark.parametrize("value", [None, "", " , "], ids=["absent", "empty", "blank"])
+def test_an_unset_order_or_ignore_reads_as_empty(var, value):
+    bound = reranker_from_env(_rerank_env(**{var: value}))
+    assert bound is not None
+    assert bound.fault is None
+    assert getattr(bound, "order" if var == RERANK_ORDER_VAR else "ignore") == ()
 
 
 # === Validation ===============================================================

@@ -2139,6 +2139,22 @@ def test_main_resolved_config_prints_ground_truth_json_and_exits_zero(wake_env, 
     # The endpoint overrides (issue #651): `null` is "not declared", the shipped default.
     assert report["ai_base_url"] is None
     assert report["mempalace_rerank_base_url"] is None
+    # The reranker's ordered routing (issue #780): `[]` is "not declared", the shipped default.
+    assert report["mempalace_rerank_order"] == []
+    assert report["mempalace_rerank_ignore"] == []
+
+
+def test_resolved_config_reports_the_rerank_order_and_ignore_as_sent(wake_env, monkeypatch, capsys):
+    """The NOC derives the order daily (basecradle-noc#1199) and must read back the one the box
+    sends: ranked exactly as written, blanks dropped, by the reranker's own parse (issue #780)."""
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_ORDER", " baseten/fp8/us,sail-research/us , ")
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_IGNORE", "morph")
+
+    assert main(["--resolved-config"]) == 0
+    report = json.loads(capsys.readouterr().out)
+
+    assert report["mempalace_rerank_order"] == ["baseten/fp8/us", "sail-research/us"]
+    assert report["mempalace_rerank_ignore"] == ["morph"]
 
 
 @pytest.mark.parametrize(
