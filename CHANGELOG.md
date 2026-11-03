@@ -7,6 +7,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.177.0] - 2026-11-03
+
+### Fixed: a bare HTTP 402 is the billing class on every adapter (issue #796)
+
+A `402 Payment Required` with no vendor-specific body was classified by its nature on the
+Anthropic and OpenRouter adapters and not on the OpenAI and Google ones, where billing was reached
+only through the body (OpenAI's `insufficient_quota`, Google's `BILLING_DISABLED`, or out-of-funds
+text on a 429 or a 401/403), never through a 402's status. A bare 402 there was a plain
+`ProviderAPIError`: `reason=api_error`, propagated, and no funding notice. The
+realistic case was the `openai` SDK under the generic OpenAI-compatible profile, against a vendor
+that refuses an empty balance with a 402 and no quota code.
+
+- **`_openai._from_status_error` and `_google._from_api_error` map a 402 to
+  `ProviderBillingError`**, after the context-overflow check as on Anthropic: `reason=config:billing`,
+  the debounced funding notice, and the item left pending to resume once the account is funded.
+- **Known Violation S1 is struck** from `docs/telemetry.md`, with its witness in
+  `tests/test_telemetry_contract.py`: the Fault Slugs table's `402 → config:billing` row now holds for
+  every producer in this repository, and the conformance test asserts it through each real SDK.
+
 ## [0.176.0] - 2026-11-03
 
 ### Fixed: the credential scrub's prefix rules no longer match inside a word (issue #794)

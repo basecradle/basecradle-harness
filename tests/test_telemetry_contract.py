@@ -1138,18 +1138,10 @@ def _tokens(line: Line) -> tuple[int, int, int]:
     )
 
 
-#: Known Violation S1 (issue #796): a bare 402 is `api_error` on these adapters, not the page's
-#: `config:billing`. Its witness fails once they agree, and the row is struck with it.
-BARE_402_UNCLASSIFIED = ("openai", "google")
-
-
-def _bare_402_unclassified(rendered: Rendered, _: list[Site]) -> bool:
-    return all(rendered.reasons[f"{name} 402"] == "api_error" for name in BARE_402_UNCLASSIFIED)
-
-
 #: One `test` row's witness: true exactly while its departure stands. Slice 3 (issue #759) struck
-#: F1–F10, and each became a regression test below.
-WITNESSES: dict[str, Callable[[Rendered, list[Site]], bool]] = {"S1": _bare_402_unclassified}
+#: F1–F10, and issue #796 struck S1 (a bare 402 is `config:billing` on every adapter); each became
+#: a regression test below.
+WITNESSES: dict[str, Callable[[Rendered, list[Site]], bool]] = {}
 
 
 # === the checks =================================================================================
@@ -1775,8 +1767,6 @@ def test_every_http_adapter_names_a_fault_by_the_page(rendered):
     expected = {
         f"{name} {probe}": _page_slug(probe) for probe in FAULT_PROBES for name in FAULT_ADAPTERS
     }
-    for name in BARE_402_UNCLASSIFIED:  # S1, while it stands
-        expected[f"{name} 402"] = "api_error"
     assert rendered.reasons == expected
 
 

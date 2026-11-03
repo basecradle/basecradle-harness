@@ -1078,6 +1078,7 @@ def _error(
             ),
             ProviderBillingError,
         ),
+        (_error(402, "Payment Required."), ProviderBillingError),  # by its status (#796)
         (
             _error(429, "Resource exhausted. Please try again later.", code="RESOURCE_EXHAUSTED"),
             ProviderRateLimitError,

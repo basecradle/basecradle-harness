@@ -1365,6 +1365,9 @@ def _from_api_error(exc: Any) -> ProviderError:
         return ProviderContextLengthError(message, status_code=status, body=body)
     if status == 413 or (status == 400 and is_too_large(text)):
         return ProviderPayloadTooLargeError(message, status_code=status, body=body)
+    if status == 402:
+        # Payment Required is the billing class by definition, as on every adapter (issue #796).
+        return ProviderBillingError(message, status_code=status, body=body)
     if status in (401, 403):
         if _billing_disabled(details) or is_out_of_funds(text):
             return ProviderBillingError(message, status_code=status, body=body)

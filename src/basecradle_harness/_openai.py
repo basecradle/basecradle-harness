@@ -807,6 +807,7 @@ def _from_status_error(exc) -> ProviderError:
       debounces rather than retrying. The **structured code is checked first and status-independently**
       (so an endpoint that signals out-of-funds as a 401/403 — e.g. xAI-via-``openai``, whose shape is
       unconfirmed — is not swallowed as an auth error), with a text fallback scoped to the 429 body.
+      A bare **402 Payment Required** is the same class by its status alone (issue #796).
     - **Payload too large** — a **413** that is not a context overflow: the request body exceeded the
       endpoint's accept limit. Deterministic and content-shaped, so `ProviderPayloadTooLargeError`
       (reported, the original never modified — issue #336, decision 1), not a retry.
@@ -831,6 +832,12 @@ def _from_status_error(exc) -> ProviderError:
         # status-independent, so a 401/403/429 all resolve to billing here rather than being
         # swallowed as auth/rate-limit below (issue #336). No false-positive risk: this is the
         # vendor's own machine-readable code, not a message-text guess.
+        return ProviderBillingError(message, status_code=status, body=body)
+    if status == 402:
+        # Payment Required is the billing class by definition, whatever the body says: an
+        # OpenAI-compatible vendor under the generic profile may refuse an empty balance with a
+        # bare 402 and no `insufficient_quota` code. Classed by nature, as on every adapter
+        # (issue #796).
         return ProviderBillingError(message, status_code=status, body=body)
     if status in (401, 403):
         return ProviderAuthError(

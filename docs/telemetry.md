@@ -197,7 +197,7 @@ The NOC's reading (basecradle-noc#1212): every series that counts, times or pric
 | Any other HTTP `5xx` | `server_error` |
 | Any other HTTP status | `api_error` |
 
-The ruling set the transport, `401`/`403`, `429`, `504`, `5xx` and catch-all rows. The `402`, `404` and `413` rows are statuses the harness already names by the status alone, carried here so that the table is the harness's words, which is what the ruling adopts for every producer. A bare `402` is not yet `config:billing` on the OpenAI and Google adapters (Known Violation S1).
+The ruling set the transport, `401`/`403`, `429`, `504`, `5xx` and catch-all rows. The `402`, `404` and `413` rows are statuses the harness already names by the status alone, carried here so that the table is the harness's words, which is what the ruling adopts for every producer.
 
 A producer that knows more than the status names the more specific cause, and only from the `reason` row's list. A wait that ran out of the producer's own deadline is `timeout`, not `transport` (`_retry.connection_reason`, from the error's type, else its cause). A refusal whose body the harness reads is named for what the body says: `context_length` (a `400` or `413` that says the context overflowed), `config:billing` (OpenAI's `insufficient_quota`, on any status), a routed refusal's `config:<cause>` (OpenRouter's region and provider-list `404`s), `tool_schema`. A word that is neither in this table nor in that list is a change to this page, never a producer's own.
 
@@ -814,11 +814,10 @@ Where today's emission departs from the target above. The conformance test reads
 
 A prose line that carries a field the NOC extracts off every line (`provider=`, `source=`) feeds a column whatever its head, so the test also fails on any such prose that no `prose` row names.
 
-The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759), whose rows F1–F36 are struck). Issue [#782](https://github.com/basecradle/basecradle-harness/issues/782) retired the `llm retry` and `llm refused` heads into `llm`'s `outcome`, and gave the brain's final failure a line. One departure stands, found when issue #786 stated the fault-slug table: S1, removed by [#796](https://github.com/basecradle/basecradle-harness/issues/796).
+The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759), whose rows F1–F36 are struck). Issue [#782](https://github.com/basecradle/basecradle-harness/issues/782) retired the `llm retry` and `llm refused` heads into `llm`'s `outcome`, and gave the brain's final failure a line. Issue [#796](https://github.com/basecradle/basecradle-harness/issues/796) struck S1, found when issue #786 stated the fault-slug table: a bare `402` is `config:billing` on every adapter. No departure stands today.
 
 | ID | Violation | Witness | Removed By |
 |---|---|---|---|
-| S1 | A bare HTTP `402` is `api_error` on the OpenAI and Google adapters (`_openai._from_status_error`, `_google._from_api_error` have no `402` branch), where [Fault Slugs](#fault-slugs) and the Anthropic and OpenRouter adapters name it `config:billing`. | `test` | [#796](https://github.com/basecradle/basecradle-harness/issues/796) |
 
 ### Outside This Repository
 
