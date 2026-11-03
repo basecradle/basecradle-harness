@@ -35,6 +35,13 @@ creates (seen live on `@ping`, 2026-11-03 09:33Z).
 - `docs/telemetry.md` gains `wake end`'s `stopped` outcome and `signal` field and the `wake stopped`
   head; README, `CLAUDE.md` → Delivery Guarantee and the `delivery-guarantee` skill say so.
 
+### Fixed: a claim record that is not UTF-8 reads as done and never fails the wake
+
+`_read_claim` decoded with `read_text` outside its guard, so a claim file whose bytes were not UTF-8
+raised `UnicodeDecodeError` into every wake that read the claims directory — the bootstrap's orphan
+scan included — instead of degrading to `done` with a WARNING, as its docstring promised and as every
+other unparseable record already did. Found reviewing issue #798.
+
 ## [0.174.0] - 2026-11-03
 
 ### Fixed: a credential a vendor echoed is never posted to a timeline (issue #791)

@@ -571,12 +571,16 @@ def _read_claim(path: Path) -> Claim | None:
     item that was already answered.
     """
     try:
-        raw = path.read_text().strip()
+        stored = path.read_bytes()
     except FileNotFoundError:
         return None
-    if not raw:
-        return Claim(phase=_DONE)  # legacy: the pre-#285 code wrote an empty claim
     try:
+        # Decoded inside the guard, never by `read_text`: bytes that are not UTF-8 are unparseable
+        # contents like any other, and a `UnicodeDecodeError` escaping here failed every wake that
+        # read the claims directory — the bootstrap's orphan scan included — rather than one item.
+        raw = stored.decode("utf-8").strip()
+        if not raw:
+            return Claim(phase=_DONE)  # legacy: the pre-#285 code wrote an empty claim
         data = json.loads(raw)
         return Claim(
             phase=str(data["phase"]),
