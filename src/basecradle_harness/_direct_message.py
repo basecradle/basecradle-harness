@@ -57,7 +57,7 @@ from collections.abc import Callable
 
 import httpx
 
-from basecradle_harness._observability import bounded, kv
+from basecradle_harness._observability import bounded, kv, scrub
 from basecradle_harness._platform import PlatformTool
 from basecradle_harness._secret import reveal, secret
 
@@ -295,7 +295,7 @@ _REFUSAL_CAP = 200
 
 def _refusal(response: httpx.Response, token: str) -> str:
     """Why ntfy refused, as one model-readable sentence with the token scrubbed out."""
-    detail = bounded(_redact(response.text, token).strip(), _REFUSAL_CAP)
+    detail = bounded(scrub(_redact(response.text, token).strip()), _REFUSAL_CAP)
     if detail:
         return f"ntfy.sh returned HTTP {response.status_code}: {detail}."
     return f"ntfy.sh returned HTTP {response.status_code}."

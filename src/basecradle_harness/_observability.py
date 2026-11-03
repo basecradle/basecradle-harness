@@ -126,8 +126,14 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: journal again before it ships, but this package also runs where no Vector exists — a developer's
 #: laptop, anyone's fork — so the harness never leaves a shape it knows of to a layer that may not be
 #: there. The two lists cannot be one list (one is VRL in another repository), so the rule is that
-#: this one is a **superset**: a shape added to ``ai_scrub`` is added here, at no shorter a minimum,
-#: and `tests/test_observability.py` holds one fabricated sample per box rule. Covered: the fleet's
+#: this one is a **superset**: a shape added to ``ai_scrub`` is added here, at no longer a minimum,
+#: and `tests/test_log_value_cut.py` holds one fabricated sample per box rule, each at the box's own
+#: minimum. The one stated difference is the bearer rule, which needs eight characters here so a
+#: diagnosis like "Bearer token missing" keeps its words; no real bearer credential is shorter.
+#: Every alternative is linear in the input (a value is scrubbed before it is cut, so it can be
+#: long): the heartbeat rule anchors on the literal ``/heartbeat/`` rather than scanning back to the
+#: URL's start, which made `re` quadratic on a long run of ``http`` (and leaves the non-secret host
+#: in place). Covered: the fleet's
 #: own key shapes (OpenAI/Anthropic ``sk-``, OpenRouter ``sk-or-``, xAI ``xai-``, BaseCradle
 #: ``bc_uat_``/``bc_isk_``), the box's (GitHub ``gh?_``, Google ``AIza``, Hugging Face ``hf_``,
 #: Replicate ``r8_``, Steel ``ste-``, a Better Stack heartbeat URL, an unanchored ``api_key=``), one
@@ -135,13 +141,14 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: forms.
 _SECRETS = re.compile(
     r"(?:sk-or-|sk-|xai-|bc_[a-z]{3}_)[A-Za-z0-9_-]{8,}"
+    r"|bc_(?:uat|isk)_[A-Za-z0-9]+"
     r"|gh[a-z]_[A-Za-z0-9]{20,}"
     r"|github_pat_[A-Za-z0-9_]{20,}"
     r"|AIza[A-Za-z0-9_-]{20,}"
     r"|hf_[A-Za-z0-9]{20,}"
     r"|r8_[A-Za-z0-9]{20,}"
     r"|ste-[A-Za-z0-9]{20,}"
-    r"|https?://\S*/heartbeat/\S+"
+    r"|/heartbeat/\S+"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)[^&\s]+"
     r"|(?i:api[-_]?key=)[^&\s\"]+"
@@ -150,9 +157,11 @@ _SECRETS = re.compile(
 #: One character of the run every **length-gated** redaction rule matches — this module's
 #: `_SECRETS` and the box's ``ai_scrub`` alike. A rule with a minimum length (``sk-…{8,}``,
 #: ``AIza…{20,}``) cannot redact a credential cut below that minimum, so a cut must never fall inside
-#: such a run (`bounded`). The rules that match a wider charset (bearer, a query value, a heartbeat
-#: URL) have no minimum the cut can undercut on the box, so this class is the whole of the rule. A new
-#: redaction rule with a minimum length over a wider charset widens it.
+#: such a run (`bounded`). On the box, the rules that match a wider charset (bearer, a query value, a
+#: heartbeat URL) have no minimum the cut can undercut, so this class is the whole of the rule there.
+#: This module's own bearer rule does have one over a wider charset, which is why every log-bound
+#: site scrubs **before** it cuts (`scrub`, then `bounded`): no rule here is ever shown a cut text. A
+#: new box rule with a minimum length over a wider charset widens this class.
 _TOKEN_CHAR = re.compile(r"[A-Za-z0-9_-]")
 _TRAILING_RUN = re.compile(r"[A-Za-z0-9_-]+\Z")
 
@@ -170,7 +179,8 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
     the same way whoever writes them.
 
     The result, marker included, is at most `cap` characters. This is the one cut for any free-text
-    value bound for a log line; a site that slices one by hand is the defect this exists to retire.
+    value bound for a log line, and such a value is `scrub`-bed first; a site that slices one by hand
+    is the defect this exists to retire.
     """
     if len(text) <= cap:
         return text
@@ -179,6 +189,16 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
         head = _TRAILING_RUN.sub("", head)
     head = head.rstrip()
     return head + marker if head else ""
+
+
+def scrub(text: str) -> str:
+    """`text` with every credential shape `_SECRETS` knows replaced by ``[redacted]``.
+
+    Run on a whole text **before** `bounded` cuts it, so a rule is never shown a credential cut
+    short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before
+    `kv` sees it calls this first.
+    """
+    return _SECRETS.sub("[redacted]", text)
 
 
 #: The record format every harness line is rendered with — the severity token, a space, the
@@ -472,8 +492,7 @@ def _value(value: Any) -> str:
     greppable.
     """
     text = " ".join(str(value).split())  # collapse newlines/tabs/runs — one record, one line
-    text = _SECRETS.sub("[redacted]", text)
-    text = bounded(text, MAX_VALUE)
+    text = bounded(scrub(text), MAX_VALUE)
     if text and (" " in text or "=" in text or '"' in text):
         return '"' + text.replace('"', "'") + '"'
     return text
@@ -521,7 +540,7 @@ def _full_value(value: str) -> str:
     narration is prose: it will contain spaces, and it may well contain an ``=``.
     """
     text = " ".join(str(value).split())  # collapse newlines/tabs/runs — one record, one line
-    text = _SECRETS.sub("[redacted]", text)
+    text = scrub(text)
     return '"' + text.replace('"', "'") + '"'
 
 

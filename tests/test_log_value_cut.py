@@ -10,12 +10,13 @@ site that truncates a value bound for a log line, and pin the scrub layers' divi
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
 
 from basecradle_harness._exceptions import ProviderError, ProviderServerError
-from basecradle_harness._observability import _SECRETS, MAX_VALUE, _value, bounded, kv
+from basecradle_harness._observability import _SECRETS, MAX_VALUE, _value, bounded, kv, scrub
 from basecradle_harness._report import STALL_DETAIL_CAP, stall_detail
 
 #: A credential of a shape **no** rule anywhere knows — the case the cut's own rule exists for. It is
@@ -63,6 +64,15 @@ def test_the_result_never_exceeds_the_cap(cap):
     assert len(bounded(text, cap)) <= cap
 
 
+@pytest.mark.parametrize("cap", [0, -1])
+def test_a_cap_with_no_room_returns_nothing(cap):
+    assert bounded("abc", cap) == ""
+
+
+def test_a_marker_longer_than_the_cap_returns_nothing():
+    assert bounded("alpha beta", 3, marker=" […]") == ""
+
+
 def test_a_custom_marker_is_counted_inside_the_cap():
     assert bounded("alpha beta gamma", 12, marker=" […]") == "alpha […]"
 
@@ -92,6 +102,26 @@ def test_the_scrub_runs_before_the_cut_so_a_known_shape_is_redacted_whole():
         rendered = _value(PAD[:offset] + key)
         assert "sk-proj" not in rendered
         assert "A1b2" not in rendered
+
+
+def test_a_site_scrubs_before_it_cuts_so_no_source_rule_sees_a_cut_text():
+    """The source's bearer rule needs eight characters over a wider charset than the cut's run, so a
+    bearer token straddling the cut, scrubbed after it, would leave a short prefix the rule misses.
+    `scrub` runs first at every log-bound site, so it is redacted whole."""
+    for offset in range(150, 205):
+        text = ("w " * 120)[:offset] + "Authorization: Bearer ab.cdefghijklmnopqrstuvwxyz"
+        cut = bounded(scrub(text), 200)
+        assert "ab." not in cut, cut
+
+
+def test_the_scrub_is_linear_on_a_long_space_free_text():
+    """A value is scrubbed before it is cut, so it can be as long as a response body. The heartbeat
+    rule once scanned back to a URL's start for every ``http`` in a space-free run: 3 s on 100k
+    characters. Anchored on its literal it is linear; the bound is generous so the test never flakes."""
+    started = time.monotonic()
+    scrub("http://" * 14285)
+    scrub('{"url":"https://x.example.com/a.png"},' * 12000)
+    assert time.monotonic() - started < 1.0
 
 
 # --- the sites that cut a value bound for a log line ---------------------------------------------
@@ -140,14 +170,16 @@ def test_an_unreadable_prune_watermark_never_quotes_part_of_a_token(tmp_path: Pa
     (folder / _PRUNED_THROUGH).write_text("garbage " * 6 + UNKNOWN_SHAPE)
     with pytest.raises(ValueError) as raised:
         store.pruned_through(timeline, kind="messages")
-    assert _no_part_or_whole(str(raised.value)), str(raised.value)
+    quoted = str(raised.value).split("does not hold a uuid:", 1)[1]  # past the tmp path
+    assert _no_part_or_whole(quoted), quoted
 
 
 # --- the scrub layers: the harness carries every shape the box does ------------------------------
 
 #: One fabricated sample per redaction rule the box's ``ai_scrub`` carries (basecradle-router
 #: ``deploy/hosts/*/vector.yaml`` and basecradle-noc ``deploy/vector.yaml``, read 2026-11-03), each
-#: at the **box's own minimum length**, so a harness rule with a longer minimum fails here. A rule
+#: at the **box's own minimum length**, so a harness rule with a longer minimum fails here. The one
+#: stated exception is the bearer rule (`test_a_bearer_word_in_prose_survives_the_harness_scrub`). A rule
 #: added to ``ai_scrub`` is added to `_SECRETS` and to this table in the same change
 #: (`docs/telemetry.md` → Credential Scrubbing).
 BOX_RULE_SAMPLES = {
@@ -155,8 +187,8 @@ BOX_RULE_SAMPLES = {
     "github server token": "ghs_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
     "bearer": "Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc",
     "heartbeat url": "https://uptime.betterstack.com/api/v1/heartbeat/Ab3Cd5Ef7Gh9Ij1K",
-    "basecradle user token": "bc_uat_KqI8zFxk",
-    "basecradle integration key": "bc_isk_KqI8zFxk",
+    "basecradle user token": "bc_uat_K",
+    "basecradle integration key": "bc_isk_K",
     "sk- family": "sk-ant-api03-Ab3Cd5Ef7Gh9",
     "xai": "xai-Ab3Cd5Ef7Gh9Ij1K",
     "google": "AIza" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
@@ -173,6 +205,8 @@ def test_the_harness_redacts_every_shape_the_box_redacts(rule):
     rendered = _value(f"failed with {sample} attached")
     assert "[redacted]" in rendered, rendered
     secret = sample.split("=", 1)[-1] if rule == "api key assignment" else sample[-8:]
+    if rule.startswith("basecradle"):
+        secret = sample  # the box's minimum is one character, so the whole token is the check
     assert secret not in rendered, rendered
 
 
