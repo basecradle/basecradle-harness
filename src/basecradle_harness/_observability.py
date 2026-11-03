@@ -52,6 +52,7 @@ import logging
 import math
 import os
 import re
+import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -145,35 +146,32 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: the box lacks (a GitHub fine-grained ``github_pat_``), and the generic bearer and key-in-query
 #: forms.
 #:
-#: **A vendor prefix matches only where a token starts, never inside a word** (issue #794): every
-#: prefix-anchored alternative sits behind `_TOKEN_START`, so ``task-specification`` and
-#: ``disk-quota-exceeded`` keep their words, in a log line and in a vendor error posted to a timeline
-#: alike. A token starts where no letter or digit precedes it — any script's, so a localized vendor
-#: sentence keeps its words too — which leaves ``_``, ``-``, ``=``, ``/``, ``:``, quotes and
-#: whitespace as left neighbors (``key=sk-…``, ``"sk-…"``, ``OPENAI_KEY sk-…``). No vendor issues a
-#: key glued to a letter or digit, but a *serialization* can glue one, so a token also starts right
-#: after an escape that stands for a separator: a percent-encoding (``Bearer%20sk-…``,
-#: ``key%3Dsk-…``) and a backslash escape (``\nsk-…``, ``\x22sk-…``, ``"sk-…``) end in a
-#: letter or digit, and an error text quoting a request body is exactly where they appear. Each
-#: lookbehind is fixed-width, so the rule stays linear in its input.
-_TOKEN_START = (
-    r"(?:(?<![^\W_])"
-    r"|(?<=%[0-9A-Fa-f]{2})"
-    r"|(?<=\\[nrt])"
-    r"|(?<=\\x[0-9A-Fa-f]{2})"
-    r"|(?<=\\u[0-9A-Fa-f]{4}))"
+#: **A vendor prefix inside a word is a word, not a credential** (issue #794), and the test is
+#: `_is_word`, never a left boundary. A boundary would be a list of the contexts in which
+#: redaction stops, and every serialization adds one: a key glued to a letter or digit is not a
+#: shape any vendor issues, but it is one a percent-encoding (``Bearer%20sk-…``), a backslash
+#: escape (``\nsk-…``), an ANSI color code (``ESC[33msk-…``) or Chinese text (``密钥sk-…``)
+#: produces. So a prefixed match is kept only when **both** hold: a letter, digit or combining mark
+#: precedes it, **and** its run after the prefix holds no digit and no uppercase letter. A random key
+#: of a vendor's length holds one of them with overwhelming certainty; ``task-specification``,
+#: ``disk-quota-exceeded`` and ``risk-assessment-pending`` hold neither. The two residuals are
+#: stated rather than hidden: a glued word whose run holds a digit or a capital is still redacted
+#: (the scrub errs toward redaction), and a glued key made only of lowercase letters, ``_`` and
+#: ``-`` is kept. The rules are spelled once, in `_PREFIXED`, so the prefix `_is_word` strips is
+#: the prefix the rule matched.
+_PREFIXED = (
+    (r"sk-or-|sk-|xai-|bc_[a-z]{3}_", r"[A-Za-z0-9_-]{8,}"),
+    (r"bc_(?:uat|isk)_", r"[A-Za-z0-9]+"),
+    (r"gh[a-z]_", r"[A-Za-z0-9]{20,}"),
+    (r"github_pat_", r"[A-Za-z0-9_]{20,}"),
+    (r"AIza", r"[A-Za-z0-9_-]{20,}"),
+    (r"hf_", r"[A-Za-z0-9]{20,}"),
+    (r"r8_", r"[A-Za-z0-9]{20,}"),
+    (r"ste-", r"[A-Za-z0-9]{20,}"),
 )
+_PREFIX = re.compile("|".join(f"(?:{prefix})" for prefix, _ in _PREFIXED))
 _SECRETS = re.compile(
-    _TOKEN_START + r"(?:"
-    r"(?:sk-or-|sk-|xai-|bc_[a-z]{3}_)[A-Za-z0-9_-]{8,}"
-    r"|bc_(?:uat|isk)_[A-Za-z0-9]+"
-    r"|gh[a-z]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|AIza[A-Za-z0-9_-]{20,}"
-    r"|hf_[A-Za-z0-9]{20,}"
-    r"|r8_[A-Za-z0-9]{20,}"
-    r"|ste-[A-Za-z0-9]{20,}"
-    r")"
+    "(?P<prefixed>" + "|".join(f"(?:{prefix}){body}" for prefix, body in _PREFIXED) + ")"
     r"|/heartbeat/\S+"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)[^&\s]+"
@@ -224,7 +222,27 @@ def scrub(text: str) -> str:
     short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before
     `kv` sees it calls this first.
     """
-    return _SECRETS.sub("[redacted]", text)
+    return _SECRETS.sub(_redaction, text)
+
+
+def _redaction(match: re.Match[str]) -> str:
+    return match.group() if _is_word(match) else "[redacted]"
+
+
+def _is_word(match: re.Match[str]) -> bool:
+    """Whether a prefixed match is part of a word rather than a credential (issue #794).
+
+    Glued to a letter, digit or combining mark (any script), **and** its run after the prefix holds
+    no digit and no uppercase letter — never one without the other, because a key can be glued by a
+    serialization and a word never needs a digit or a capital to be cut. Everything that is not a
+    prefixed match is redacted unconditionally.
+    """
+    if match.lastgroup != "prefixed" or match.start() == 0:
+        return False
+    if unicodedata.category(match.string[match.start() - 1])[0] not in "LNM":
+        return False
+    run = match.group()[_PREFIX.match(match.group()).end() :]
+    return not any(c.isdigit() or c.isupper() for c in run)
 
 
 #: The record format every harness line is rendered with — the severity token, a space, the

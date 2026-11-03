@@ -16,16 +16,21 @@ ordinary words: `task-specification failed` was logged as `ta[redacted] failed`,
 the provider-failure report and the stall note posted a vendor's sentence to peers with words cut
 out of it.
 
-- **A prefix matches only where a token starts** (`_TOKEN_START`): where no letter or digit, in any
-  script, precedes it. `key=sk-…`, `"sk-…"`, `OPENAI_KEY sk-…` and every other separator still
-  redact.
-- **A serialized separator is a token start too**: a percent-encoding (`Bearer%20sk-…`,
-  `key%3Dsk-…`) and a backslash escape (`\n`, `\r`, `\t`, `\xHH`, `\uHHHH`) end in a letter or
-  digit, so a plain alphanumeric lookbehind would have stopped redacting a key quoted inside an
-  encoded request body. Each is a fixed-width lookbehind, so the scrub stays linear.
-- Tests pin both sides for every prefix rule: glued to a letter or digit it matches nothing; after
-  each of seventeen token starts it is redacted. `docs/telemetry.md` → Credential Scrubbing states
-  the boundary as part of the rule; the README says a vendor's word is posted whole.
+- **A prefixed match is a word only when both hold** (`_observability._is_word`): a letter, digit
+  or combining mark (any script) precedes it, **and** its run after the prefix holds no digit and no
+  uppercase letter. A random key holds one with overwhelming certainty (a random 20-character base62 run is all
+  lowercase about once in 35 million); `task-specification`,
+  `disk-quota-exceeded` and `risk-assessment-pending` hold neither. Every other match is redacted
+  as before.
+- **Not a left boundary, on purpose.** The proposed `(?<![A-Za-z0-9])` lookbehind stops redacting
+  every key a serialization glues to a letter or digit: `Bearer%20sk-…`, `key%253Dsk-…`, `\nsk-…`,
+  an ANSI color code, Chinese or Japanese text written without spaces, `Bearersk-…`. Each was
+  redacted before and is redacted now.
+- **Two stated residuals:** a glued word whose run holds a digit or a capital is still redacted, and
+  a glued key made only of lowercase letters, `_` and `-` is kept.
+- Tests pin both sides: the word cases survive whole, and every prefixed sample is redacted after
+  each of 23 left neighbors. `docs/telemetry.md` → Credential Scrubbing states the rule; the README
+  says a vendor's word is posted whole.
 
 ## [0.175.0] - 2026-11-03
 

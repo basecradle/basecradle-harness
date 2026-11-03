@@ -233,7 +233,7 @@ def test_an_identifier_the_harness_writes_is_not_mistaken_for_a_credential():
     assert not _SECRETS.search("tokens_in=764942 cached_tokens=238277")
 
 
-# --- a vendor prefix matches only where a token starts (issue #794) ------------------------------
+# --- a vendor prefix inside a word is a word, not a credential (issue #794) ---------------------
 
 #: One fabricated sample per **prefix-anchored** rule in `_SECRETS` — the rules a word can contain.
 PREFIX_SAMPLES = {
@@ -253,26 +253,33 @@ PREFIX_SAMPLES = {
 
 BACKSLASH = chr(92)
 
-#: Every left neighbor a token can follow: a separator, or an escape that stands for one in a
-#: serialized body (a percent-encoding and a backslash escape both end in a letter or digit).
-TOKEN_STARTS = {
+#: Every left neighbor a credential can follow. The first group is a separator; the second ends in
+#: a letter or digit — a serialization, a color code, a script written without spaces, a word
+#: glued on by a bug — which is why no left boundary can be the test (`_is_word`).
+LEFT_NEIGHBORS = {
     "start of text": "",
     "space": "key ",
     "equals": "key=",
     "colon": "key:",
     "double quote": '"',
-    "single quote": "'",
     "underscore": "OPENAI_KEY_",
     "hyphen": "x-",
     "slash": "/v1/keys/",
-    "paren": "(",
     "percent-encoded space": "Bearer%20",
-    "percent-encoded equals": "key%3D",
+    "double percent-encoding": "key%253D",
+    "quoted-printable": "key=3D",
     "escaped newline": "body" + BACKSLASH + "n",
-    "escaped tab": "body" + BACKSLASH + "t",
-    "escaped return": "body" + BACKSLASH + "r",
     "hex escape": BACKSLASH + "x22",
     "unicode escape": BACKSLASH + "u0022",
+    "astral escape": BACKSLASH + "U0001f600",
+    "ANSI color": "invalid key \x1b[33m",
+    "Chinese": "API\u5bc6\u94a5",
+    "Japanese": "API\u30ad\u30fc",
+    "Bearer with no space": "Authorization:Bearer",
+    "timestamp": "2026-11-03T10:00:00Z",
+    "letter": "a",
+    "accented letter": "\u00e9",
+    "combining mark": "e\u0301",
 }
 
 
@@ -283,7 +290,10 @@ TOKEN_STARTS = {
         "disk-quota-exceeded-for-org",
         "risk-assessment-pending-review",
         "the task-specification-for-this-run is invalid",
-        "Rísk-assessment-pending-review",  # a localized vendor sentence keeps its words too
+        "laughs_happily_ever_after_and_after",
+        "abc_uat_unknown",
+        "R\u00edsk-assessment-pending-review",  # a localized vendor sentence keeps its words too
+        "G\u00e4ste-registrierungssystem-voll",
     ],
 )
 def test_a_vendor_prefix_inside_a_word_is_not_a_credential(text):
@@ -292,17 +302,28 @@ def test_a_vendor_prefix_inside_a_word_is_not_a_credential(text):
 
 
 @pytest.mark.parametrize("rule", sorted(PREFIX_SAMPLES))
-@pytest.mark.parametrize("glue", ["a", "Z", "7", "é"])
-def test_a_prefix_glued_to_a_letter_or_digit_matches_no_rule(rule, glue):
-    """No vendor issues a key glued to a letter or digit, so a prefix there is part of a word."""
-    text = f"the {glue}{PREFIX_SAMPLES[rule]} field"
-    assert scrub(text) == text
+@pytest.mark.parametrize("left", sorted(LEFT_NEIGHBORS))
+def test_a_credential_after_every_left_neighbor_is_still_redacted(rule, left):
+    """A key glued to a letter or digit is still a key: its run holds a digit or a capital."""
+    prefix = LEFT_NEIGHBORS[left]
+    rendered = scrub(f"{prefix}{PREFIX_SAMPLES[rule]} rejected")
+    assert rendered == f"{prefix}[redacted] rejected", rendered
 
 
-@pytest.mark.parametrize("rule", sorted(PREFIX_SAMPLES))
-@pytest.mark.parametrize("start", sorted(TOKEN_STARTS))
-def test_a_credential_after_every_token_start_is_still_redacted(rule, start):
-    sample = PREFIX_SAMPLES[rule]
-    left = TOKEN_STARTS[start]
-    rendered = scrub(f"{left}{sample} rejected")
-    assert rendered == f"{left}[redacted] rejected", rendered
+@pytest.mark.parametrize("glue", ["a", "7", "\u00e9", "\u5bc6"])
+def test_a_glued_run_with_a_digit_or_a_capital_is_redacted_however_wordlike(glue):
+    """The stated residual, in the safe direction: the scrub errs toward redaction."""
+    assert scrub(f"{glue}sk-specification2") == f"{glue}[redacted]"
+    assert scrub(f"{glue}sk-Specification") == f"{glue}[redacted]"
+
+
+def test_a_prefix_that_holds_a_digit_is_not_read_as_the_run():
+    """``r8_``'s own digit is the prefix, never evidence about the run after it."""
+    assert scrub("xr8_" + "abcdefghijklmnopqrstuvwx") == "xr8_" + "abcdefghijklmnopqrstuvwx"
+    assert scrub("r8_" + "abcdefghijklmnopqrstuvwx") == "[redacted]"
+
+
+def test_an_unglued_lowercase_run_is_still_redacted():
+    """Only a glued match can be a word: at a token start every prefixed run is a credential."""
+    assert scrub("key sk-abcdefghij") == "key [redacted]"
+    assert scrub("x-hf_" + "abcdefghijklmnopqrstuvwx") == "x-[redacted]"
