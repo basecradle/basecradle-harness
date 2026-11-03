@@ -33,8 +33,10 @@ in 3.9 s. Nothing bounded the attempt, three ways:
   `max_output_tokens` by `--resolved-config`. A positive integer, and anything else fails at
   startup.
 - **A tool call cut off at the cap is `reason=truncated`.** `ProviderTruncatedError` (a
-  `ProviderResponseError`, so it is retried as before) is decided once in `read_answer` from the
-  vendor's stop reason, so the billed line reads `outcome=fallback reason=truncated` and the decision
+  `ProviderResponseError`, so it is retried as before) is decided once in `read_answer`, from the
+  vendor's stop reason **or** its bill: output tokens at the call's cap. The bill is needed because
+  OpenAI's model behind OpenRouter, cut off inside a tool call, reports `finish_reason:
+  "tool_calls"` (measured live). So the billed line reads `outcome=fallback reason=truncated` and the decision
   `outcome=retrying reason=truncated`, never `invalid_response`, which the board could not tell from
   a malformed body. Anthropic returns a cut-off `tool_use` with `input: {}` (measured live), so its
   adapter judges that case itself and raises before the tool can be dispatched. `truncated` joins the
