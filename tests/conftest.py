@@ -55,6 +55,29 @@ def run_through_engine(tool, **arguments):
     return Engine(provider=None, tools=registry)._run_tool(tool.name, arguments)
 
 
+#: The `llm` head, at the start of a message or after its severity token (``WARNING llm …``).
+_LLM_HEAD = re.compile(r"(?:^|\s)llm provider=")
+#: The NOC's Phase A exclusion (basecradle-noc#1212): an `llm` line with one of these outcomes is
+#: not a call, so no series that counts, times or prices calls reads it.
+_NOT_A_CALL = re.compile(r"outcome=(retrying|failed)\b")
+
+
+def is_retry(message: str) -> bool:
+    """Is this the `llm` line of an attempt about to be retried (``outcome=retrying``, issue #782)?"""
+    text = plain(message)
+    return bool(_LLM_HEAD.search(text)) and " outcome=retrying" in text
+
+
+def is_call(message: str) -> bool:
+    """Is this an `llm` line the fleet counts as a **call** — neither retrying nor failed (#782)?
+
+    The NOC's own predicate (basecradle-noc#1212): a line on `` llm provider=`` whose ``outcome`` is
+    neither ``retrying`` nor ``failed``. A test that counts calls counts these.
+    """
+    text = plain(message)
+    return bool(_LLM_HEAD.search(text)) and not _NOT_A_CALL.search(text)
+
+
 def tool_lines(caplog) -> list[str]:
     """Every ``tool`` line a test's capture holds, plain, in order."""
     return [plain(m) for m in (r.getMessage() for r in caplog.records) if m.startswith("tool ")]

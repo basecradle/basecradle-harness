@@ -56,9 +56,9 @@ is bounded-retried — at most two more attempts, at most three seconds of sleep
 vendor's own ``Retry-After`` preferred and clamped (`basecradle_harness._retry`). The four live
 fallbacks of 2026-09-16 were every one of them a 429 that cleared inside ~1.3 seconds, and the
 founder's ruling is that a rerank which waits three seconds and works beats one that silently runs
-without the rerank. Each waited attempt writes its own ``llm retry`` WARNING — deliberately **not**
-an ``llm`` line, because a refused call generated nothing and was billed nothing — while the one
-``llm`` line below still says *what happened to the rerank*, once, with a ``duration=`` that
+without the rerank. Each waited attempt writes its own ``outcome=retrying`` WARNING, which no series
+counts as a call because a refused call generated nothing and was billed nothing, while the one
+final line below still says *what happened to the rerank*, once, with a ``duration=`` that
 includes every sleep.
 
 Nothing raises into the wake or into a tool result: the worst outcome of a broken reranker is the
@@ -91,6 +91,7 @@ from basecradle_harness._exceptions import (
 from basecradle_harness._faults import routing_refusal
 from basecradle_harness._observability import (
     MEMORY,
+    call_outcome,
     generation_id,
     log_llm_call,
     reported_cost,
@@ -252,9 +253,9 @@ class RerankReport:
     did not state is ``None``, never ``0``, exactly as the line omits it.
     """
 
-    #: ``ok`` or ``fallback``, as ``outcome=`` says.
+    #: ``ok``, ``fallback`` (an unusable answer) or ``failed`` (no answer), as ``outcome=`` says.
     outcome: str
-    #: The ``reason=`` of a fallback (``rate_limited``, ``config:auth``, ``parse`` …), else ``None``.
+    #: The ``reason=`` of a fallback or failure (``parse``, ``rate_limited``, ``config:auth`` …).
     reason: str | None
     tokens_in: int | None = None
     tokens_out: int | None = None
@@ -543,9 +544,10 @@ class MemPalaceReranker:
         including the failures, and including a failure that still cost money (a call that answered
         with unusable JSON is billed, so its tokens and cost ride the line the same as a success).
         **A retried attempt does not change that count** (issue #506): a refused call generated
-        nothing and was billed nothing, so it writes an ``llm retry`` WARNING and no ``llm`` line.
-        One rerank, one ``llm`` line, whatever it took to get there — which is also what keeps the
-        fleet's ``memory_calls`` an honest count and the rerank-outcomes chart one bar per rerank.
+        nothing and was billed nothing, so it writes an ``outcome=retrying`` WARNING, which the
+        fleet counts as no call. One rerank, one final line, whatever it took to get there, which is
+        also what keeps ``memory_calls`` an honest count and the rerank-outcomes chart one bar per
+        rerank.
         """
         if self._fault:
             self._report_config(self._fault, surface)
@@ -613,9 +615,10 @@ class MemPalaceReranker:
                     pool=len(hits),
                     detail=str(exc),
                     # The same four fields the retry lines carried, from the same function — so the
-                    # final `outcome=fallback` line names the upstream that refused rather than
+                    # final `outcome=failed` line names the upstream that refused rather than
                     # repeating the adapter's fixed sentence, which names nobody.
                     diagnostics=diagnostics(exc),
+                    attempt=retry.label,
                     uncertain_attempts=uncertain,
                 )
                 return []
@@ -687,6 +690,7 @@ class MemPalaceReranker:
         detail: str | None = None,
         diagnostics: Mapping[str, Any] | None = None,
         generation: str | None = None,
+        attempt: str | None = None,
         uncertain_attempts: int = 0,
     ) -> None:
         """The reranker's ``llm`` line — one per rerank attempt, whatever the outcome.
@@ -721,7 +725,7 @@ class MemPalaceReranker:
         counts = token_counts(usage) if stated else {}
         cost = reported_cost(usage)
         self.last_report = RerankReport(
-            outcome="ok" if reason is None else "fallback",
+            outcome=call_outcome(reason),
             reason=reason,
             tokens_in=counts.get("tokens_in"),
             tokens_out=counts.get("tokens_out"),
@@ -737,7 +741,8 @@ class MemPalaceReranker:
             seconds=seconds,
             usage=usage,
             cost=reported_cost(usage),
-            outcome="ok" if reason is None else "fallback",
+            outcome=call_outcome(reason),
+            attempt=attempt,
             reason=reason,
             detail=detail,
             # The vendor's own account of the fault (issue #506) sits between the harness's `reason`

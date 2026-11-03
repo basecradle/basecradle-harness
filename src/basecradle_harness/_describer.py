@@ -84,8 +84,8 @@ same bounded retry the reranker takes — at most two more attempts, at most thr
 the vendor's ``Retry-After`` preferred and clamped (`basecradle_harness._retry`). It is a different
 thing from the ``length`` re-budget above and the two must not be merged: a re-budget asks a
 **different** question and its extra call answered and was billed, so it earns its own ``llm`` line;
-a retry re-issues the **identical** question after a refusal that generated nothing, so it earns an
-``llm retry`` WARNING and no ``llm`` line at all.
+a retry re-issues the **identical** question after a refusal that generated nothing, so its line is
+an ``outcome=retrying`` WARNING with no tokens and no cost.
 
 The describer's output is **model-generated text about peer content**. It is injected as context
 and nothing more: never executed, never a tool call, and never mined as the agent's own words — it
@@ -106,22 +106,15 @@ from typing import TYPE_CHECKING, Any
 
 from basecradle_harness._assets import model_sees_video
 from basecradle_harness._exceptions import (
-    ProviderAPIError,
-    ProviderAuthError,
-    ProviderBillingError,
-    ProviderConnectionError,
-    ProviderContextLengthError,
     ProviderError,
-    ProviderPayloadTooLargeError,
-    ProviderRateLimitError,
-    ProviderResponseError,
-    ProviderServerError,
 )
-from basecradle_harness._faults import routing_refusal
 from basecradle_harness._messages import ImageContent, Message, VideoContent
 from basecradle_harness._observability import (
     HELPER,
+    OK,
+    REFUSED,
     LlmCall,
+    call_outcome,
     capture_llm_call,
     describe_provider,
     kv,
@@ -129,7 +122,7 @@ from basecradle_harness._observability import (
     truncated,
     usage_reported,
 )
-from basecradle_harness._retry import RETRYABLE_REASONS, Retry, connection_reason, diagnostics
+from basecradle_harness._retry import RETRYABLE_REASONS, Retry, diagnostics, fault_slug
 from basecradle_harness._timeouts import bind_scale, last_timeout
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -369,7 +362,11 @@ class Describer:
         #: arriving, `view`, `watch`) reads the words already bought instead of paying for them a
         #: second time, and the agent reads the same description each time. ``None`` is a failure
         #: remembered on purpose (`_once` says which failures are), never a missing entry.
-        self._described: OrderedDict[Hashable, str | None] = OrderedDict()
+        #: Each perception's answer and the `outcome` its first describe's line carried, so a
+        #: repeat names the same verdict (`describe repeated`).
+        self._described: OrderedDict[Hashable, tuple[str | None, str]] = OrderedDict()
+        #: The `outcome` of the last line `_report` wrote: read by `_once` to memoize it.
+        self._last_outcome = OK
 
     def describe_images(self, images: list[ImageContent]) -> str | None:
         """The pictures in words, or ``None`` if the describer could not answer.
@@ -454,7 +451,7 @@ class Describer:
         """
         if key in self._described:
             self._described.move_to_end(key)
-            text = self._described[key]
+            text, outcome = self._described[key]
             _log.debug(
                 "describe repeated %s",
                 kv(
@@ -462,13 +459,13 @@ class Describer:
                     kind=kind,
                     model=self.model,
                     subject=subject,
-                    outcome="ok" if text is not None else "fallback",
+                    outcome=outcome,
                 ),
             )
             return text
         text, reason = describe()
         if reason is None or reason not in RETRYABLE_REASONS:
-            self._described[key] = text if reason is None else None
+            self._described[key] = (text if reason is None else None, self._last_outcome)
             if len(self._described) > DESCRIPTION_MEMO_CAP:
                 self._described.popitem(last=False)
         return text if reason is None else None
@@ -601,8 +598,8 @@ class Describer:
         "One call" means **one answer**, not one request: a transient refusal (a 429, a 5xx, a
         transport blip) is re-issued here under the shared bounded policy, and the ``llm`` line this
         writes describes the attempt that finally answered — with a ``duration=`` covering the whole
-        wait. A refused attempt writes an ``llm retry`` WARNING instead, because it generated
-        nothing and was billed nothing, so it is not a call to count (issue #506).
+        wait. A refused attempt writes an ``outcome=retrying`` WARNING instead, because it generated
+        nothing and was billed nothing, so it is not a call to count (issues #506, #782).
         """
         try:
             provider = self._provider_for(budget)
@@ -624,7 +621,7 @@ class Describer:
         # are different things: a re-budget asks the model a **different** question (more room),
         # which is a second call that answered and was billed and therefore earns its own `llm`
         # line; a retry re-issues the **identical** question after a refusal that generated nothing,
-        # which earns an `llm retry` WARNING and no `llm` line at all.
+        # which earns an `outcome=retrying` WARNING with nothing billed on it.
         retry = Retry(
             provider=describe_provider(provider)[0],
             model=self.model,
@@ -667,7 +664,7 @@ class Describer:
                 try:
                     reply = provider.chat([turn], None)
                 except ProviderError as exc:
-                    failure, fault = exc, _fault_of(exc)
+                    failure, fault = exc, fault_slug(exc)
                 except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
                     # An adapter is allowed to raise something the taxonomy has never seen; that is
                     # a runtime-class unknown, not a reason to take the wake down over a picture —
@@ -702,8 +699,9 @@ class Describer:
                 started=started,
                 retried=retry.retried,
                 # The same four fields the retry lines carried, from the same function — so the
-                # final `outcome=fallback` names the upstream that refused.
+                # final `outcome=failed` names the upstream that refused.
                 diagnostics=diagnostics(failure),
+                attempt=retry.label,
             )
             return None, fault
         text = (getattr(reply, "content", None) or "").strip()
@@ -740,6 +738,7 @@ class Describer:
         started: float | None = None,
         retried: bool = False,
         diagnostics: Mapping[str, Any] | None = None,
+        attempt: str | None = None,
     ) -> None:
         """The one `llm` line this describe attempt writes, whatever happened (issue #485).
 
@@ -781,6 +780,12 @@ class Describer:
         # Ahead of the line it explains, so a human reading the journal top-down meets the reason
         # before the hole.
         self._note_unreported_usage(provider, kind=kind, call=call)
+        # The verdict (issue #782): a refusal is the vendor's own word on the content and says so,
+        # with its category and no reason of ours beside it; otherwise an answer slug is a
+        # `fallback` and any other reason a `failed` call that never answered.
+        refused = call.outcome == REFUSED
+        outcome = REFUSED if refused else call_outcome(reason)
+        self._last_outcome = outcome
         log_llm_call(
             provider=provider,
             purpose=HELPER,
@@ -794,9 +799,11 @@ class Describer:
             # fields the same adapter's main line does (issue #759).
             usage=call.usage,
             cost=call.cost,
-            outcome="ok" if reason is None else "fallback",
-            reason=reason,
-            detail=detail,
+            outcome=outcome,
+            category=call.category if refused else None,
+            attempt=attempt,
+            reason=None if refused else reason,
+            detail=None if refused else detail,
             # The vendor's own account of the fault (issue #506) reads next to the `reason` it
             # explains, and is absent on every line with nothing to explain.
             extra={**(diagnostics or {}), "subject": subject},
@@ -1210,53 +1217,6 @@ def _watched_facts(name: str, watched: Any) -> str | None:
     # still has something left to say.
     tail = "" if watched.clause is None or watched.span is not None else f" — {watched.clause}"
     return f"(Watched {head} {name} ({video_facts(info)}){tail}.)"
-
-
-def _fault_of(exc: ProviderError) -> str:
-    """A provider fault → the ``reason=`` this line carries, and its class by the ``config:`` prefix.
-
-    The same taxonomy `_rerank._fault_of` draws, and for the same reason: **config-class** is *dead
-    until a human acts* — a rejected key, an unfunded account, a model id that does not exist —
-    while **runtime-class** is everything that can succeed next time unchanged. A 402 sits with the
-    bad key rather than beside the 429 above it precisely because a rate limit heals with time and
-    an empty account heals only when somebody puts money in it.
-
-    OpenRouter's two routing refusals (issue #651) are config-class as well, and are named for their
-    cause rather than filed with a missing model: both arrive as a 404, and an ``AI_BASE_URL`` on a
-    regional host is where they come from — no endpoint for the describer model in the region, or
-    none the ``HARNESS_DESCRIBER_PROVIDERS`` list permits there.
-
-    A generic 4xx is runtime-class deliberately: it is far more likely a fixable harness/config
-    defect than a permanent property of the pool, and reporting it as config-class would page a
-    human for something the next release fixes.
-
-    Ordered most-specific first, because these classes subclass one another.
-    """
-    if isinstance(exc, ProviderAuthError):
-        return "config:auth"
-    if isinstance(exc, ProviderBillingError):
-        return "config:billing"
-    if isinstance(exc, ProviderRateLimitError):
-        return "rate_limited"
-    if isinstance(exc, ProviderServerError):
-        return "server_error"
-    if isinstance(exc, ProviderContextLengthError):
-        return "context_length"
-    if isinstance(exc, ProviderPayloadTooLargeError):
-        return "payload_too_large"
-    if isinstance(exc, ProviderResponseError):
-        return "invalid_response"
-    if isinstance(exc, ProviderConnectionError):
-        # ``timeout`` or ``transport``, off the cause — the shared read, not a flat word. This
-        # returned ``transport`` unconditionally until issue #545, so a describe that timed out and
-        # a rerank that timed out named the same fault differently on the same box.
-        return connection_reason(exc)
-    if isinstance(exc, ProviderAPIError):
-        refusal = routing_refusal(f"{exc} {getattr(exc, 'body', '') or ''}")
-        if refusal:
-            return f"config:{refusal}"
-        return "config:model_not_found" if getattr(exc, "status_code", None) == 404 else "api_error"
-    return "provider_error"
 
 
 def _names(images: list[ImageContent]) -> str:

@@ -142,8 +142,8 @@ Faults, by nature
 of a read timeout; 401/403 are the credential; a ``billing_error`` or a credit-balance refusal is
 the billing class; an over-length prompt is the context class; every other 400 propagates. A
 ``stop_reason: "refusal"`` is Anthropic's final word on the content (the 5.x models have no
-server-side fallback on Haiku 5.5): an ``llm refused`` line with its ``stop_details`` category,
-never retried.
+server-side fallback on Haiku 5.5): the call's own ``llm`` line says ``outcome=refused`` with its
+``stop_details`` category (issue #782), and it is never retried.
 
 Cost — computed, never vendor-stated
 ------------------------------------
@@ -212,6 +212,7 @@ from basecradle_harness._messages import (
 from basecradle_harness._observability import (
     CONTAINER_TIME,
     NOT_REPORTED,
+    REFUSED,
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
     UNPRICED_HOST,
@@ -220,7 +221,6 @@ from basecradle_harness._observability import (
     generation_of,
     log_cost_unpriced,
     log_llm_call,
-    log_llm_refused,
     log_server_tools,
     slug,
     token_counts,
@@ -545,16 +545,10 @@ class AnthropicProvider:
                 "retrying."
             )
         if response.stop_reason == "refusal":
-            details = getattr(response, "stop_details", None)
-            log_llm_refused(
-                provider=self.provider,
-                model=self.model,
-                category=getattr(details, "category", None),
-                generation_id=generation_id({"id": getattr(response, "id", None)}),
-            )
-            explanation = getattr(details, "explanation", None)
+            explanation = getattr(getattr(response, "stop_details", None), "explanation", None)
             if explanation:
-                # Anthropic's own words, for a human reading the journal; the fact is the line above.
+                # Anthropic's own words, for a human reading the journal; the fact is the call's own
+                # `llm` line, which `_call` wrote as `outcome=refused` (issue #782).
                 _log.warning("Anthropic's explanation of the refusal: %s", explanation)
         reply = _reply(blocks)
         self._mark_late_failures(blocks)
@@ -595,6 +589,9 @@ class AnthropicProvider:
         self.last_tokens_in = token_counts(wire).get("tokens_in")
         self.last_finish_reason = getattr(response, "stop_reason", None) or None
         generation = generation_id({"id": getattr(response, "id", None)})
+        # A content refusal is the vendor's final word and was billed, so it is this call's own
+        # verdict, on its own line, with Anthropic's category (issue #782): one attempt, one line.
+        refused = self.last_finish_reason == "refusal"
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -603,7 +600,12 @@ class AnthropicProvider:
             residency=self._residency(usage),
             cost=self._cost(usage),
             finish_reason=self.last_finish_reason,
+            outcome=REFUSED if refused else None,
+            category=getattr(getattr(response, "stop_details", None), "category", None)
+            if refused
+            else None,
             generation_id=generation,
+            level=logging.WARNING if refused else logging.INFO,
         )
         tallies = _server_tallies(usage, [_raw(block) for block in response.content or ()])
         # The fee is on the searches Anthropic billed — a failed one is not — never the tally.

@@ -70,6 +70,8 @@ from basecradle_harness._observability import (
     HARNESS_EXECUTOR,
     MAIN,
     ToolMeter,
+    _secs,
+    at_step,
     describe_provider,
     kv,
     log_tool,
@@ -77,7 +79,7 @@ from basecradle_harness._observability import (
     truncated,
 )
 from basecradle_harness._provider import Provider
-from basecradle_harness._retry import Retry, _default_backoff, connection_reason
+from basecradle_harness._retry import Retry, _default_backoff, connection_reason, log_brain_failure
 from basecradle_harness._server_tools import bound as bound_server_tools
 from basecradle_harness._server_tools import with_records
 from basecradle_harness._timeouts import bind_scale, last_timeout
@@ -117,7 +119,7 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: are what `_rerank._fault_of` and `_describer._fault_of` emit for this class; the engine simply
 #: never caught the exception that carries them, so the *same* fault was retried on the memory and
 #: describe paths and fatal on the brain's. On 2026-09-20 @glm-5.2 lost a whole wake to
-#: ``The read operation timed out`` with no ``llm retry`` line anywhere in it: ~12 minutes and a
+#: ``The read operation timed out`` with no retry line anywhere in it: ~12 minutes and a
 #: second full step budget to recover what a ≤3s wait would have survived.
 #:
 #: **It was also the pre-#284 shape, in the class #284's own note names.** The `openai` SDK retried
@@ -213,23 +215,6 @@ def _reason(exc: object) -> str:
         if isinstance(exc, kind):
             return reason
     return "provider_error"
-
-
-def _fault(exc: object) -> str:
-    """How the give-up line names the failure — so a journal says *which* transient fault it hit."""
-    if isinstance(exc, ProviderRateLimitError):
-        return f"Provider rate-limited the request (HTTP {exc.status_code})"
-    if isinstance(exc, ProviderServerError):
-        return f"Provider failed on its own side (HTTP {exc.status_code})"
-    if isinstance(exc, ProviderConnectionError):
-        # Named apart, because the two send an operator to different places: a timeout is a call
-        # that ran out of time, and everything else here is the network or the endpoint refusing.
-        return (
-            "Provider call timed out"
-            if connection_reason(exc) == "timeout"
-            else "Could not reach the provider"
-        )
-    return "Provider returned an unparseable response"
 
 
 def _backoff(attempt: int, reason: str) -> float:
@@ -500,74 +485,77 @@ class Engine:
         # and is re-sent on every later turn, the cost this exists to avoid.
         try:
             for step in range(1, self.max_steps + 1):
-                started = self._clock()
-                self.steps_used += 1
-                # Recency beats primacy for a changing value, and a stable prefix keeps the
-                # provider's prompt cache hot — so the counter rides a *trailing* system turn,
-                # re-appended each step, never a mutation of the head of the context.
-                messages.append(Message.system(_step_note(step, self.max_steps, started)))
-                reply = _unique_call_ids(self._chat(messages, specs))
-                # Read **here**, beside the call it describes, never at the return check below: the
-                # adapter's `last_finish_reason` is a *most recent call* field, and between this
-                # line and that check sits arbitrary work (tool dispatch, a turn hook) that a later
-                # change could give a model call of its own. Bound to its own reply, it stays right
-                # whatever grows in between.
-                stopped = getattr(self.provider, "last_finish_reason", None)
-                cut_off = stopped if truncated(stopped) else None
-                messages.append(reply)
-                # **Before the first dispatch, never after — and this one is allowed to fail the
-                # turn.** It is the write that turns "the model asked for these tools" into a
-                # durable fact, and every conclusion the recovery draws from an *absent* tool call
-                # rests on it landing first (issue #297). So it is the one progress call that is
-                # not swallowed: if it cannot be written, no tool may run. Nothing has posted yet,
-                # so the turn dies owing nobody anything, and the next wake picks the message up
-                # with the evidence intact. Swallowing it here would dispatch the tools with no
-                # record that they exist, which is precisely the bug — reached silently, on the
-                # near-full box where it is most likely.
-                if on_progress is not None:
-                    on_progress()
-                pictures: list[ImageContent] = []
-                clips: list[VideoContent] = []
-                for call in reply.tool_calls:
-                    result = self._run_tool(call.name, call.arguments)
-                    text, images, videos = _split_result(result)
-                    messages.append(Message.tool(tool_call_id=call.id, content=text))
-                    _progress(on_progress)
-                    pictures.extend(images)
-                    clips.extend(videos)
-                if pictures or clips:
-                    self._show_media(pictures, clips, messages, shown)
-                    _progress(on_progress)
-                # A post-turn hook may append follow-up turns (e.g. the code-exec bridge
-                # storing output files as Assets and feeding their uuids back) and ask the loop
-                # to continue so the model can use them. It runs *after* any tool results, so a
-                # follow-up turn lands cleanly at the end of the transcript, and it bounds itself:
-                # `max_steps` still caps the whole loop, and the bridge dedups its harvest, so a
-                # settled run surfaces nothing new and the hook returns False on the next pass.
-                extend = bool(self.turn_hook(reply, messages)) if self.turn_hook else False
-                if extend:
-                    # The hook appended turns of its own — and the code-execution bridge does more
-                    # than append: it *creates Assets on the timeline* before it does. Persist, so
-                    # what it did is on the record before the next provider call can be killed
-                    # mid-flight (issue #297).
-                    _progress(on_progress)
-                self._log_step(step, reply, extend, started)
-                ending = not reply.tool_calls and not extend
-                if cut_off:
-                    # **Logged wherever it happens; marked only where it ends the turn.** A reply
-                    # cut off *mid*-turn is not the commit record — the loop runs its tools, or a
-                    # hook extends it, and some later reply is what settles the turn — so marking
-                    # it would stamp a turn that is still working. But it is still the model
-                    # running out of room, which is exactly the thing nothing could see before
-                    # issue #490, and the shape is common: a hook extends on precisely the
-                    # "no tool calls, no text" ending a truncated narration produces.
-                    self._note_truncation(messages, on_progress, step, cut_off, ending=ending)
-                if ending:
-                    # The step-usage line is emitted either way: a turn that was cut off still
-                    # spent the steps it spent, and a hole in that accounting is a hole in the
-                    # wake's own record of what it cost.
-                    _log.info("wake used %d/%d steps", step, self.max_steps)
-                    return reply
+                # Every model call this step makes (the brain's, a describe inside a tool) names
+                # the step on its `llm` line, so a wake that died at step 5 of 24 says so (#782).
+                with at_step(step, self.max_steps):
+                    started = self._clock()
+                    self.steps_used += 1
+                    # Recency beats primacy for a changing value, and a stable prefix keeps the
+                    # provider's prompt cache hot — so the counter rides a *trailing* system turn,
+                    # re-appended each step, never a mutation of the head of the context.
+                    messages.append(Message.system(_step_note(step, self.max_steps, started)))
+                    reply = _unique_call_ids(self._chat(messages, specs))
+                    # Read **here**, beside the call it describes, never at the return check below: the
+                    # adapter's `last_finish_reason` is a *most recent call* field, and between this
+                    # line and that check sits arbitrary work (tool dispatch, a turn hook) that a later
+                    # change could give a model call of its own. Bound to its own reply, it stays right
+                    # whatever grows in between.
+                    stopped = getattr(self.provider, "last_finish_reason", None)
+                    cut_off = stopped if truncated(stopped) else None
+                    messages.append(reply)
+                    # **Before the first dispatch, never after — and this one is allowed to fail the
+                    # turn.** It is the write that turns "the model asked for these tools" into a
+                    # durable fact, and every conclusion the recovery draws from an *absent* tool call
+                    # rests on it landing first (issue #297). So it is the one progress call that is
+                    # not swallowed: if it cannot be written, no tool may run. Nothing has posted yet,
+                    # so the turn dies owing nobody anything, and the next wake picks the message up
+                    # with the evidence intact. Swallowing it here would dispatch the tools with no
+                    # record that they exist, which is precisely the bug — reached silently, on the
+                    # near-full box where it is most likely.
+                    if on_progress is not None:
+                        on_progress()
+                    pictures: list[ImageContent] = []
+                    clips: list[VideoContent] = []
+                    for call in reply.tool_calls:
+                        result = self._run_tool(call.name, call.arguments)
+                        text, images, videos = _split_result(result)
+                        messages.append(Message.tool(tool_call_id=call.id, content=text))
+                        _progress(on_progress)
+                        pictures.extend(images)
+                        clips.extend(videos)
+                    if pictures or clips:
+                        self._show_media(pictures, clips, messages, shown)
+                        _progress(on_progress)
+                    # A post-turn hook may append follow-up turns (e.g. the code-exec bridge
+                    # storing output files as Assets and feeding their uuids back) and ask the loop
+                    # to continue so the model can use them. It runs *after* any tool results, so a
+                    # follow-up turn lands cleanly at the end of the transcript, and it bounds itself:
+                    # `max_steps` still caps the whole loop, and the bridge dedups its harvest, so a
+                    # settled run surfaces nothing new and the hook returns False on the next pass.
+                    extend = bool(self.turn_hook(reply, messages)) if self.turn_hook else False
+                    if extend:
+                        # The hook appended turns of its own — and the code-execution bridge does more
+                        # than append: it *creates Assets on the timeline* before it does. Persist, so
+                        # what it did is on the record before the next provider call can be killed
+                        # mid-flight (issue #297).
+                        _progress(on_progress)
+                    self._log_step(step, reply, extend, started)
+                    ending = not reply.tool_calls and not extend
+                    if cut_off:
+                        # **Logged wherever it happens; marked only where it ends the turn.** A reply
+                        # cut off *mid*-turn is not the commit record — the loop runs its tools, or a
+                        # hook extends it, and some later reply is what settles the turn — so marking
+                        # it would stamp a turn that is still working. But it is still the model
+                        # running out of room, which is exactly the thing nothing could see before
+                        # issue #490, and the shape is common: a hook extends on precisely the
+                        # "no tool calls, no text" ending a truncated narration produces.
+                        self._note_truncation(messages, on_progress, step, cut_off, ending=ending)
+                    if ending:
+                        # The step-usage line is emitted either way: a turn that was cut off still
+                        # spent the steps it spent, and a hole in that accounting is a hole in the
+                        # wake's own record of what it cost.
+                        _log.info("wake used %d/%d steps", step, self.max_steps)
+                        return reply
             # Budget spent with the model still working: the reserve summary is the harness's,
             # never a step the model was promised — it is not counted or announced as one.
             #
@@ -848,11 +836,12 @@ class Engine:
         lowered again whatever happens, so the next step — and any compaction call after this
         turn — runs at the ordinary fit.
 
-        On exhaustion the last error is re-raised (the wake aborts with a clean non-zero exit) — but
-        every retried attempt logs a WARNING — the shared ``llm retry`` line, so a brain retry, a
-        rerank retry and a describe retry read identically in one journal (issue #506) — and the
-        final give-up logs an ERROR naming the failure and the attempt count, so a dropped wake
-        stays diagnosable from the logs alone.
+        On exhaustion the last error is re-raised (the wake aborts with a clean non-zero exit). Every
+        retried attempt writes the shared ``outcome=retrying`` WARNING, so a brain retry, a rerank
+        retry and a describe retry read identically in one journal (issue #506), and the call's end
+        is its own ``llm`` line, ``outcome=failed`` (issue #782): at ERROR for the transient give-up,
+        naming the fault and the attempts, so a dropped wake stays diagnosable from the logs alone;
+        at WARNING for a fault that is not retried, whose verdict is the wake's own line.
         """
         attempts = max(1, self.response_retries + 1)
         provider, model = describe_provider(self.provider)
@@ -871,6 +860,7 @@ class Engine:
         # note is the one it was first shown with for the life of this engine (`_record_notes`), so
         # a record marked mid-wake never changes bytes already sent (issue #737).
         shown = with_records(messages, self._record_notes)
+        began = time.monotonic()
         try:
             for _ in range(attempts):
                 bind_scale(self.provider, retry.timeout_scale)
@@ -886,6 +876,19 @@ class Engine:
                         exc, reason=_reason(exc), timed_out_after=last_timeout(self.provider)
                     ):
                         break
+                except ProviderError as exc:
+                    # Not transient: it propagates on the first raise, as it always has, and the
+                    # call's line says it ended there (issue #782). WARNING, because the verdict a
+                    # human acts on is the wake's own line (a report, a compaction, `wake failed`).
+                    # `again` counts the attempt and, for a fault outside the retry gate, says no.
+                    retry.again(exc, reason=_reason(exc))
+                    log_brain_failure(
+                        self.provider,
+                        exc,
+                        attempt=retry.label,
+                        seconds=time.monotonic() - began,
+                    )
+                    raise
         finally:
             if retry.timeout_scale != 1.0:
                 bind_scale(self.provider, 1.0)
@@ -897,12 +900,16 @@ class Engine:
             last_exc, "vendor_deadline", False
         )
         budget = last_timeout(self.provider) if timed_out else None
-        _log.error(
-            "%s on %d attempt(s)%s; giving up: %s",
-            _fault(last_exc),
-            retry.attempt,
-            "" if budget is None else f" (last budget {budget:.0f}s)",
+        # The give-up is the call's own `llm` line, `outcome=failed` (issue #782), where it was a
+        # prose ERROR: a fact the board needs never lives only in prose. It keeps the ERROR, so the
+        # page it always raised is neither lost nor doubled.
+        log_brain_failure(
+            self.provider,
             last_exc,
+            attempt=retry.label,
+            seconds=time.monotonic() - began,
+            level=logging.ERROR,
+            extra={"timeout": None if budget is None else _secs(budget)},
         )
         raise last_exc
 
@@ -983,8 +990,8 @@ class Engine:
                 provider=provider,
                 model=model,
                 finish_reason=stopped,
-                step=step,
-                max_steps=self.max_steps,
+                # One spelling of a position, the `llm` line's (issue #782): `n/max`.
+                step=f"{step}/{self.max_steps}",
                 outcome="unfinished" if ending else "continued",
                 reason=OUTPUT_BUDGET,
             ),

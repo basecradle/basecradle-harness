@@ -47,6 +47,7 @@ from basecradle_harness._observability import (
     truncated,
     usage_reported,
 )
+from tests.conftest import plain as unstyled
 from tests.conftest import tool_lines
 
 # --- the key=value formatter -------------------------------------------------
@@ -298,8 +299,9 @@ def test_the_llm_line_names_the_provider_model_duration_and_tokens(caplog):
             usage={"prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100},
         )
 
-    assert caplog.records[0].getMessage() == (
-        "llm provider=xai purpose=main model=grok-4.3 duration=2.50s tokens_in=90 tokens_out=10 tokens_total=100"
+    assert unstyled(caplog.records[0].getMessage()) == (
+        "llm provider=xai purpose=main model=grok-4.3 duration=2.50s tokens_in=90 tokens_out=10 "
+        "tokens_total=100 outcome=ok"
     )
 
 
@@ -307,8 +309,8 @@ def test_the_llm_line_still_lands_when_the_sdk_reports_no_usage(caplog):
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_llm_call(provider="openai", model="gpt-5.4-mini", seconds=0.4)
 
-    assert caplog.records[0].getMessage() == (
-        "llm provider=openai purpose=main model=gpt-5.4-mini duration=0.40s"
+    assert unstyled(caplog.records[0].getMessage()) == (
+        "llm provider=openai purpose=main model=gpt-5.4-mini duration=0.40s outcome=ok"
     )
 
 
@@ -331,9 +333,10 @@ def test_the_llm_line_names_the_serving_endpoint_the_cache_hit_and_the_cost(capl
             cost=0.0445,
         )
 
-    assert caplog.records[0].getMessage() == (
+    assert unstyled(caplog.records[0].getMessage()) == (
         "llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2 duration=42.96s "
-        "tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445"
+        "tokens_in=764942 tokens_out=236 tokens_total=765178 cached_tokens=238277 cost=0.0445 "
+        "outcome=ok"
     )
 
 
@@ -354,10 +357,10 @@ def test_a_byok_line_carries_the_upstream_cost_and_names_the_biller_last(caplog)
             generation_id="gen-1791300000-AbCdEfGhIjKlMnOpQrSt",
         )
 
-    assert caplog.records[0].getMessage() == (
+    assert unstyled(caplog.records[0].getMessage()) == (
         "llm provider=openrouter purpose=helper kind=image.describe endpoint=Google "
         "model=google/gemini-3.6-flash duration=1.50s tokens_in=42 tokens_out=111 tokens_total=153 "
-        "cost=0.000288 subject=cat.png "
+        "cost=0.000288 outcome=ok subject=cat.png "
         "generation_id=gen-1791300000-AbCdEfGhIjKlMnOpQrSt billing=byok"
     )
 
@@ -380,7 +383,7 @@ def test_a_byok_line_with_no_upstream_figure_still_names_the_biller(caplog):
 
 
 def test_a_non_byok_line_is_byte_identical_and_carries_no_billing(caplog):
-    """The line a call billed the ordinary way writes is exactly what it wrote before #653."""
+    """The line a call billed the ordinary way carries no ``billing`` at all (issue #653)."""
     usage = {"prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100, "cost": 0.0445}
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_llm_call(
@@ -392,9 +395,9 @@ def test_a_non_byok_line_is_byte_identical_and_carries_no_billing(caplog):
             generation_id="gen-1",
         )
 
-    assert caplog.records[0].getMessage() == (
+    assert unstyled(caplog.records[0].getMessage()) == (
         "llm provider=openrouter purpose=main model=z-ai/glm-5.2 duration=2.50s "
-        "tokens_in=90 tokens_out=10 tokens_total=100 cost=0.0445 generation_id=gen-1"
+        "tokens_in=90 tokens_out=10 tokens_total=100 cost=0.0445 outcome=ok generation_id=gen-1"
     )
 
 
@@ -751,9 +754,9 @@ def test_a_computed_cost_is_followed_by_its_basis_on_the_llm_line(caplog):
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
         log_llm_call(provider="openai", model="gpt-6-sol", seconds=1, cost=ComputedCost(0.0147))
 
-    assert caplog.records[0].getMessage() == (
+    assert unstyled(caplog.records[0].getMessage()) == (
         "llm provider=openai purpose=main model=gpt-6-sol duration=1.00s cost=0.0147 "
-        "cost_basis=computed"
+        "cost_basis=computed outcome=ok"
     )
 
 
@@ -1005,7 +1008,9 @@ def test_the_fact_heads_stay_plain_so_the_dashboards_extraction_anchors_survive(
         log_unspoken("thinking out loud", timeline="019e77")
 
     lines = [r.getMessage() for r in caplog.records]
-    assert "\x1b" not in "".join(lines)
+    # The heads are plain; the one colored span is the `outcome=` verdict, wrapped whole, which
+    # every `llm` line carries since issue #782.
+    assert "\x1b" not in "".join(m.replace(f"{GREEN}outcome=ok{RESET}", "") for m in lines)
     assert any(m.startswith("llm provider=") for m in lines)
     assert any(m.startswith("unspoken timeline=") for m in lines)
 
@@ -1224,14 +1229,31 @@ def test_the_total_is_the_sum_of_its_two_fields_never_the_vendors_own():
     assert "tokens_total" not in token_counts({"prompt_tokens": 10, "total_tokens": 10})
 
 
-def test_a_refusal_inside_a_capture_names_the_callers_purpose(caplog):
-    from basecradle_harness._observability import HELPER, capture_llm_call, log_llm_refused
+def test_a_refusal_is_the_calls_own_outcome_and_a_capture_keeps_it_for_its_caller(caplog):
+    """One refused attempt, one line (issue #782): ``outcome=refused`` with the vendor's category.
 
-    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
-        log_llm_refused(provider="anthropic", model="claude-haiku-5-5", category="Cyber Risk")
-        with capture_llm_call(HELPER):
-            log_llm_refused(provider="anthropic", model="claude-haiku-5-5")
-    assert [r.getMessage() for r in caplog.records] == [
-        "llm refused provider=anthropic purpose=main model=claude-haiku-5-5 category=cyber_risk",
-        "llm refused provider=anthropic purpose=helper model=claude-haiku-5-5",
-    ]
+    Inside a capture the adapter's line is held back and the refusal rides the record, so the
+    caller's one line can say it.
+    """
+    from basecradle_harness._observability import HELPER, capture_llm_call
+
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_llm_call(
+            provider="anthropic",
+            model="claude-haiku-5-5",
+            seconds=1.0,
+            outcome="refused",
+            category="Cyber Risk",
+            level=logging.WARNING,
+        )
+        with capture_llm_call(HELPER) as call:
+            log_llm_call(
+                provider="anthropic", model="claude-haiku-5-5", seconds=1.0, outcome="refused"
+            )
+    (line,) = [unstyled(r.getMessage()) for r in caplog.records]
+    assert line == (
+        "llm provider=anthropic purpose=main model=claude-haiku-5-5 duration=1.00s "
+        "outcome=refused category=cyber_risk"
+    )
+    assert caplog.records[0].levelno == logging.WARNING
+    assert (call.outcome, call.category) == ("refused", None)

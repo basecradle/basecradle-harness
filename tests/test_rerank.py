@@ -31,7 +31,6 @@ from basecradle_harness._mempalace import (
     DEFAULT_N_RESULTS,
     MemPalaceMemoryProvider,
 )
-from basecradle_harness._observability import RETRY_HEAD
 from basecradle_harness._rerank import (
     POOL_FLOOR,
     RERANK_API_KEY_VAR,
@@ -50,6 +49,7 @@ from basecradle_harness._rerank import (
     validated_picks,
 )
 from basecradle_harness._retry import RETRY_BUDGET_SECONDS
+from tests.conftest import is_retry
 
 # A fabricated OpenRouter endpoint and a correctly-shaped fake key — never a real credential.
 BASE_URL = "https://openrouter.test/api/v1"
@@ -145,22 +145,22 @@ def _no_sleep():
 
 
 def llm_lines(records, purpose="purpose=memory"):
-    """The `llm` lines — **not** the `llm retry` ones, which is the whole head split (issue #506).
+    """The final `llm` line of each call — **not** its ``outcome=retrying`` ones (issues #506, #782).
 
-    A retry line starts with ``llm`` too, and a helper that matched on that prefix would count a
-    refused attempt as a call. That is the fleet dashboard's own bug in miniature: its
-    ``memory_calls`` keys on `` llm provider=``, and the discriminator is the space-then-``provider=``
-    immediately after ``llm``.
+    A retry rides the same head, and a helper that matched on the head alone would count a refused
+    attempt as a call: the fleet's ``memory_calls`` excludes ``outcome=retrying`` for that reason.
     """
     return [
         r
         for r in records
-        if r.getMessage().startswith("llm provider=") and purpose in r.getMessage()
+        if r.getMessage().startswith("llm provider=")
+        and purpose in r.getMessage()
+        and not is_retry(r.getMessage())
     ]
 
 
 def retry_lines(records):
-    return [r for r in records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
+    return [r for r in records if is_retry(r.getMessage())]
 
 
 @pytest.fixture
@@ -513,7 +513,7 @@ def test_a_fault_with_no_call_reports_no_tokens(router):
     measured = MemPalaceReranker(model=MODEL, fault="config:missing_api_key")
     measured.rerank("q", hits(20), 2, surface=SURFACE_TOOL)
     assert measured.fault == "config:missing_api_key"
-    assert measured.last_report == RerankReport(outcome="fallback", reason="config:missing_api_key")
+    assert measured.last_report == RerankReport(outcome="failed", reason="config:missing_api_key")
 
 
 def test_a_retried_timeout_is_reported_as_an_uncertain_attempt_and_a_429_is_not(router):
@@ -564,7 +564,9 @@ def test_the_rerank_line_is_the_shared_llm_line_carrying_purpose_memory(router, 
     line = next(
         r
         for r in caplog.records
-        if r.getMessage().startswith("llm ") and "purpose=memory" in r.getMessage()
+        if r.getMessage().startswith("llm ")
+        and "purpose=memory" in r.getMessage()
+        and not is_retry(r.getMessage())
     )
     message = line.getMessage()
     assert line.levelno == logging.INFO
@@ -907,7 +909,9 @@ def test_a_config_fault_is_reported_once_per_wake(router, caplog):
     levels = [
         r.levelno
         for r in caplog.records
-        if r.getMessage().startswith("llm ") and "purpose=memory" in r.getMessage()
+        if r.getMessage().startswith("llm ")
+        and "purpose=memory" in r.getMessage()
+        and not is_retry(r.getMessage())
     ]
     assert levels == [logging.ERROR, logging.DEBUG, logging.DEBUG]
 
@@ -955,7 +959,11 @@ def test_a_rerank_attempt_logs_exactly_one_llm_line_and_the_cost_only_once(route
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
         reranker().rerank("q", hits(20), 8, surface=SURFACE_TURN0)
 
-    llm = [r for r in caplog.records if r.getMessage().startswith("llm ")]
+    llm = [
+        r
+        for r in caplog.records
+        if r.getMessage().startswith("llm ") and not is_retry(r.getMessage())
+    ]
     costed = [r for r in caplog.records if "cost=" in r.getMessage()]
     assert len(llm) == 1
     assert costed == llm  # the dollar is on that line and on no other
@@ -1092,7 +1100,8 @@ def test_three_429s_exhaust_the_bound_and_fall_back_naming_the_upstream(router, 
     assert len(final) == 1
     message = final[0].getMessage()
     for field in (
-        "outcome=fallback",
+        "outcome=failed",
+        "attempt=3/3",
         "reason=rate_limited",
         "provider_code=429",
         "routing_attempt=2",

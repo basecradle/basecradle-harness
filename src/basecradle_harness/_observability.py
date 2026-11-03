@@ -92,8 +92,8 @@ NO_COLOR_ENV = "NO_COLOR"
 #: The keys whose **value** is a verdict rather than data, and the vocabulary each one colors by.
 #:
 #: This is the second half of the color contract and the reason it lives in `kv` rather than at a
-#: call site: `outcome` is a *closed* vocabulary written by two emitters (`_wake`'s bookend,
-#: `_engine`'s per-tool line), so coloring it by value in one place means every `outcome=` token in
+#: call site: `outcome` is a *closed* vocabulary written by several emitters (`_wake`'s bookend,
+#: the `tool` line, the `llm` line), so coloring it by value in one place means every `outcome=` token in
 #: the stream reads the same, and a third emitter gets it right by construction. A value outside the
 #: vocabulary is left **plain** — the same honest-absence rule `cost` and `endpoint` keep: an
 #: unrecognized verdict is not guessed at a color.
@@ -103,7 +103,16 @@ NO_COLOR_ENV = "NO_COLOR"
 #: out and pastes into a query — and coloring them would put escape bytes inside the very tokens the
 #: line exists to hand over.
 _VERDICT_VALUES: dict[str, dict[str, str]] = {
-    "outcome": {"ok": GREEN, "error": RED},
+    # The `llm` line's verdicts (issue #782) join the vocabulary: a final failure reads as an error
+    # does, and the three degradations (retried, refused, unusable) as the warning they are.
+    "outcome": {
+        "ok": GREEN,
+        "error": RED,
+        "failed": RED,
+        "retrying": YELLOW,
+        "refused": YELLOW,
+        "fallback": YELLOW,
+    },
 }
 
 #: Credential shapes scrubbed out of any logged value — defense in depth at the *source*, so a
@@ -482,6 +491,95 @@ MAIN = "main"
 MEMORY = "memory"
 HELPER = "helper"
 
+#: The verdict on one model-call attempt: the ``outcome=`` **every** `llm` line carries (issue
+#: #782). Before it, one unit of work (a model call) was described on four heads at four outcomes
+#: (`llm`, ``llm retry``, ``llm refused``, and nothing at all for a brain call that raised), so a
+#: producer with no wake had nowhere to put a failure. Now the head says *what* (a model call) and
+#: this field says *how it ended*, with the fields each outcome requires (`docs/telemetry.md` →
+#: ``llm`` → Outcomes):
+#:
+#: - ``ok``: the vendor answered and the answer was used.
+#: - ``refused``: the vendor refused the content. That is its final word, and the call was billed.
+#: - ``fallback``: the vendor answered and the caller judged the answer unusable. This is a
+#:   non-brain caller only, with an answer slug in `ANSWER_REASONS`.
+#: - ``retrying``: the attempt failed and will be re-issued. Nothing was generated or billed.
+#: - ``failed``: the attempt failed and nothing will re-issue it, so the call ended with no answer.
+OK = "ok"
+REFUSED = "refused"
+FALLBACK = "fallback"
+RETRYING = "retrying"
+FAILED = "failed"
+
+#: The `reason` slugs that judge an **answer**, not a fault: the vendor answered (and billed), and
+#: the caller could not use what came back. Every other reason is a fault slug, so the call it ends
+#: is ``failed``. `call_outcome` is the one place the split is drawn.
+ANSWER_REASONS = frozenset(
+    {"truncated", "empty_response", "missing_parts", "undecodable_video", "internal", "parse"}
+)
+
+
+def call_outcome(reason: str | None) -> str:
+    """The `outcome` of a non-brain call whose caller judged it, by the one `reason` it carries.
+
+    No reason means ``ok``. An answer slug means ``fallback``: the call answered, and the caller
+    fell back from what it said. Any other reason (a fault slug, or ``config:<cause>``) means
+    ``failed``, because there was no answer to judge.
+    """
+    if reason is None:
+        return OK
+    return FALLBACK if reason in ANSWER_REASONS else FAILED
+
+
+@dataclass(frozen=True)
+class WorkContext:
+    """Where a model call sits in the harness's own work. These are the optional fields of its line.
+
+    ``timeline`` and ``delivery`` say which wake the call belongs to. They are set once by the wake
+    (`in_wake`), and ``delivery`` is the router's id (`delivery_id`), which is the wake's identity
+    wherever one exists. ``step`` is the engine step the call was made in, as ``n/max`` (`at_step`),
+    so a wake that died at step 5 of 24 says so on the line of the call that killed it. Each is
+    absent outside its context: a library caller has no wake, a Turn-0 recall has no step, and a
+    Claude Code builder has neither. A producer fills the fields it has and omits the rest.
+    """
+
+    timeline: str | None = None
+    delivery: str | None = None
+    step: str | None = None
+
+
+#: The ambient `WorkContext`, for `capture_llm_call`'s reason: the `llm` line is written inside the
+#: provider adapter, layers below the wake and the engine that know where the call sits, so
+#: threading two parameters through every adapter would be the alternative.
+#: The default is one shared, frozen instance: nothing can mutate it in place.
+_NO_WORK = WorkContext()
+_WORK: ContextVar[WorkContext] = ContextVar("llm_work", default=_NO_WORK)
+
+
+@contextmanager
+def in_wake(timeline: str | None) -> Iterator[None]:
+    """Stamp every model call made inside the block with its wake's ``timeline`` and ``delivery``."""
+    token = _WORK.set(WorkContext(timeline=timeline, delivery=delivery_id(), step=_WORK.get().step))
+    try:
+        yield
+    finally:
+        _WORK.reset(token)
+
+
+@contextmanager
+def at_step(step: int, max_steps: int) -> Iterator[None]:
+    """Stamp every model call made inside the block with the engine step it was made in."""
+    work = _WORK.get()
+    token = _WORK.set(WorkContext(work.timeline, work.delivery, f"{step}/{max_steps}"))
+    try:
+        yield
+    finally:
+        _WORK.reset(token)
+
+
+def _work_fields() -> dict[str, str | None]:
+    work = _WORK.get()
+    return {"timeline": work.timeline, "delivery": work.delivery, "step": work.step}
+
 
 @dataclass
 class LlmCall:
@@ -509,8 +607,12 @@ class LlmCall:
     cost: float | None = None
     finish_reason: str | None = None
     generation_id: str | None = None
-    #: What the caller is using the model for — the ``purpose=`` of its line, and of any line the
-    #: adapter writes for the call itself (`log_llm_refused`). Set by `capture_llm_call`.
+    #: ``refused`` when the vendor refused the content (issue #782), with its own ``category``, so a
+    #: capturing caller's one line can say so. ``None`` for every call the vendor answered.
+    outcome: str | None = None
+    category: str | None = None
+    #: What the caller is using the model for: the ``purpose=`` of its line. Set by
+    #: `capture_llm_call`.
     purpose: str = HELPER
 
 
@@ -572,6 +674,8 @@ def log_llm_call(
     cost: float | None = None,
     finish_reason: str | None = None,
     outcome: str | None = None,
+    category: Any = None,
+    attempt: str | None = None,
     reason: str | None = None,
     detail: str | None = None,
     extra: Mapping[str, Any] | None = None,
@@ -591,6 +695,13 @@ def log_llm_call(
     from the brain's**, so a second model's spend read as the first's. One grammar is what lets a
     dashboard split them; the fields are spelled identically across all three so one grep syntax
     reads them all.
+
+    **And one line whatever the outcome** (issue #782): ``outcome`` is on every line, ``ok`` when
+    nobody judged the call. A retried attempt (`log_llm_retry`), a refusal (``outcome=refused`` with
+    the vendor's ``category``), a caller's ``fallback`` and a final ``failed`` all ride this head,
+    each with the fields its outcome requires (`docs/telemetry.md` → ``llm`` → Outcomes), so a
+    producer with no wake has somewhere to put a failure. The wake context (`WorkContext`) rides
+    every line made inside a wake.
 
     **The head is byte-frozen at** ``llm provider=``. It is the fleet dashboard's anchor for the
     whole family (and the denominator of its extraction alarm), so a purpose is added *inside* the
@@ -646,9 +757,13 @@ def log_llm_call(
         captured.usage, captured.endpoint, captured.cost = usage, endpoint, cost
         captured.residency = residency
         captured.finish_reason, captured.generation_id = finish_reason, generation_id
+        captured.outcome, captured.category = outcome, slug(category)
         return
     if purpose is None:
         purpose = MAIN
+    if outcome is None:
+        # Every line states its verdict (issue #782): a call no one judged was answered and used.
+        outcome = OK
     counts = token_counts(usage)
     if usage is not None and not usage_reported(usage):
         # A usage block of nothing but zeros is not usage (issue #488) — it is the vendor reporting
@@ -678,6 +793,8 @@ def log_llm_call(
             cost=_money(cost),
             cost_basis=cost_basis(cost),
             outcome=outcome,
+            category=slug(category),
+            attempt=attempt,
             reason=reason,
             detail=detail,
             **_trailing(extra, generation_id, usage),
@@ -688,7 +805,10 @@ def log_llm_call(
 def _trailing(
     extra: Mapping[str, Any] | None, generation: str | None, usage: Any
 ) -> dict[str, Any]:
-    """The `llm` line's tail: `extra`, then ``generation_id``, then ``billing`` (issue #653).
+    """The `llm` line's tail: `extra`, the wake context, ``generation_id``, then ``billing``.
+
+    The wake context (``timeline``, ``delivery``, ``step``: `WorkContext`, issue #782) follows the
+    caller's own extras, so every field the NOC already extracted stays ahead of it.
 
     ``billing`` names who bills the ``cost=`` on the line, and is stated only where the vendor said
     the call ran on the operator's own key (`byok`). It is rendered after everything, so on a BYOK
@@ -696,7 +816,7 @@ def _trailing(
     was before the field existed. Read off `usage`, never passed: one carried in `extra` is
     replaced rather than splatted beside it, for `_generation_last`'s reason.
     """
-    fields = _generation_last(extra, generation)
+    fields = _generation_last({**(extra or {}), **_work_fields()}, generation)
     fields.pop("billing", None)
     fields["billing"] = BYOK_BILLING if byok(usage) else None
     return fields
@@ -715,22 +835,6 @@ def _generation_last(extra: Mapping[str, Any] | None, generation: str | None) ->
     return fields
 
 
-#: The head a **retry** line wears — and the one property of it that is load-bearing is what it is
-#: *not*: it does not contain `` llm provider=``, the literal the fleet's whole model-call family
-#: keys on (`basecradle-noc` ``observability/ai-box.json``: ``llm_calls``, ``memory_calls``,
-#: ``helper_calls``, and every cost / duration / outcome column hanging off them). The discriminator
-#: is the space-then-``provider=`` immediately after ``llm``; ``llm retry provider=`` has a word in
-#: between and matches none of them.
-#:
-#: That is deliberate rather than convenient. A failed attempt that never reached a model generated
-#: nothing and was billed nothing, so it is **not a call** — counting it would inflate *Calls by
-#: Model*, drag a failure's wait into the duration average, and put a NULL on the rerank-outcomes
-#: chart the founder reads. `tests/test_retry.py` runs the NOC's own expressions against a real
-#: retry line and a real `llm` line and asserts the split, because a head that *looks* safe is not
-#: the same as one checked against the regex that reads it.
-RETRY_HEAD = "llm retry"
-
-
 def log_llm_retry(
     *,
     provider: str,
@@ -743,47 +847,43 @@ def log_llm_retry(
     diagnostics: Mapping[str, Any] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> None:
-    """One WARNING per **failed, about-to-be-retried** attempt (issue #506).
+    """One WARNING `llm` line, ``outcome=retrying``, per failed attempt about to be retried.
 
-    Its own head (`RETRY_HEAD`), never the `llm` one — see there for the whole reason, which is that
-    a 429 is not a call. What it *is* is the only record that a wake waited: the final `llm` line
-    carries ``outcome=ok`` and a ``duration=`` that silently includes the sleeps, so without this
-    line a recovered rerank is indistinguishable from a fast one and the fault that nearly cost the
-    agent its memories leaves no trace at all.
+    Since issue #782 a retry is an **outcome of the call, not a head of its own**: it was ``llm
+    retry``, which kept a refused attempt out of every column keyed on `` llm provider=`` by having
+    a word in between. The NOC now counts a call as a line on that head whose ``outcome`` is not
+    ``retrying`` or ``failed`` (basecradle-noc#1212), which is the same split stated as a verdict
+    instead of as a spelling, and which a builder or any other producer can write too.
+
+    What it records is still the only trace that a wake waited: the final line carries
+    ``outcome=ok`` and a ``duration=`` that silently includes the sleeps, so without this line a
+    recovered rerank is indistinguishable from a fast one. It carries no tokens and no cost,
+    because the attempt generated nothing and was billed nothing.
 
     ``attempt`` arrives pre-rendered as ``"1/3"`` rather than as two numbers, because the *other*
     counter on this line is OpenRouter's own (``routing_attempt=``) and two attempt counters under
-    one key is a line nobody can read.
+    one key is a line nobody can read. ``diagnostics`` is `basecradle_harness._retry.diagnostics`,
+    the vendor's own account of the fault, built by one function so that these fields and the ones
+    on the final ``outcome=failed`` line can never disagree. ``extra`` is the call site's own
+    trailing context (the timeout budgets, ``surface=`` for a rerank, ``subject=`` for a describe).
 
-    ``diagnostics`` is `basecradle_harness._retry.diagnostics` — the vendor's own account of the
-    fault, built by one function so that these fields and the ones on the final ``outcome=fallback``
-    line can never disagree. Its ``generation_id`` (issue #634) is rendered last, as on the `llm`
-    line: the id a vendor's refund path asks for, and a refused attempt is exactly the one needing
-    it. ``extra`` is the call site's own trailing context (``surface=`` for a rerank, ``subject=``
-    for a describe), so a retry is greppable beside the line it belongs to.
-
-    **WARNING, always.** A retry is a degradation that recovered; it is not an error (nothing was
-    lost) and it is not routine (something went wrong). Logging it at INFO would hide a rising 429
-    rate inside the ordinary chatter of a healthy wake, which is exactly how this class of fault
-    stayed invisible until a dashboard happened to show it.
+    **WARNING, always.** A retry is a degradation that recovered: not an error, and not routine.
     """
     # Merged as dicts rather than splatted as keywords: a call site whose `extra` happened to carry
     # one of these names would otherwise raise `TypeError: got multiple values` from inside an
-    # `except` block in a wake — a logging call taking the wake down over a field name. A merge
-    # overrides instead, which is the right failure for an observability line.
-    fields: dict[str, Any] = {
-        "provider": provider,
-        "purpose": purpose,
-        "kind": kind,
-        "model": model,
-        "attempt": attempt,
-        "reason": reason,
-        **(diagnostics or {}),
-        "next_in": _secs(next_in),
-        **(extra or {}),
-    }
-    # The vendor's id for the refused attempt (issue #634) rides last, as on the `llm` line.
-    _log.warning("%s %s", RETRY_HEAD, kv(**_generation_last(fields, None)))
+    # `except` block in a wake, which is a logging call taking the wake down over a field name.
+    log_llm_call(
+        provider=provider,
+        model=model,
+        seconds=None,
+        purpose=purpose,
+        kind=kind,
+        outcome=RETRYING,
+        attempt=attempt,
+        reason=reason,
+        extra={**(diagnostics or {}), "next_in": _secs(next_in), **(extra or {})},
+        level=logging.WARNING,
+    )
 
 
 #: Who ran a tool, as the ``executor=`` field of its `tool` line says (`docs/telemetry.md` → Tools).
@@ -992,35 +1092,6 @@ GROUNDING_CHARGE = "grounding"
 UNKNOWN_MODEL = "unknown_model"
 UNPRICED_TIER = "unpriced_tier"
 UNPRICED_HOST = "unpriced_host"
-
-
-#: The head a vendor's **content refusal** is written on (`log_llm_refused`). Like `RETRY_HEAD`, it
-#: is not `` llm provider=``, so a refusal is never counted as a second call beside its `llm` line.
-REFUSED_HEAD = "llm refused"
-
-
-def log_llm_refused(
-    *, provider: str, model: str, category: Any = None, generation_id: str | None = None
-) -> None:
-    """One WARNING per model call the vendor refused on content grounds (issue #759).
-
-    A refusal is the vendor's final word on the content and is never retried; this line makes it a
-    counted fact a refusal rate can be compared on, where it was one vendor's sentence. Written by
-    the adapter right after the call's `llm` line, so ``purpose`` is the one a `capture_llm_call`
-    block names, and ``main`` outside one. ``category`` is the vendor's own, as a `slug`.
-    """
-    captured = _CAPTURE.get()
-    _log.warning(
-        "%s %s",
-        REFUSED_HEAD,
-        kv(
-            provider=provider,
-            purpose=MAIN if captured is None else captured.purpose,
-            model=model,
-            category=slug(category),
-            generation_id=generation_id,
-        ),
-    )
 
 
 class ToolMeter:
@@ -1446,7 +1517,7 @@ def generation_of(response: Any) -> Iterator[None]:
 
     The shape of basecradle-noc#963: a body arrives, the `llm` line is written with its id, and
     reading the turn out of it then fails (tool-call arguments cut off at the output cap) — so the
-    ``llm retry reason=invalid_response`` line that follows names the same generation.
+    ``outcome=retrying reason=invalid_response`` line that follows names the same generation.
     """
     try:
         yield

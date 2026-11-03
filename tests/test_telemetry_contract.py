@@ -7,7 +7,7 @@ everything:
 
 - **Statically**, every structured emission site in the package: each `kv(...)` that becomes a
   journal record, each ``%``-formatted line shaped like one, and the ``extra=`` literals handed to
-  the `llm` and `llm retry` emitters — with its head and its literal field names. This is what makes
+  the `llm` emitters — with its head and its literal field names. This is what makes
   a new head or field *anywhere* fail the build, including on paths no test drives.
 - **At runtime**, a representative call through every provider adapter's own log path, rendered by
   the real SDK against respx (the fixtures the adapters' own suites use). This is the half the
@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import ast
 import logging
+import os
 import re
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,7 +47,14 @@ from basecradle_harness import (
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._describer import Describer
 from basecradle_harness._engine import Engine, _reason
-from basecradle_harness._observability import ComputedCost, metered
+from basecradle_harness._exceptions import ProviderServerError
+from basecradle_harness._observability import (
+    DELIVERY_ID_ENV,
+    ComputedCost,
+    at_step,
+    in_wake,
+    metered,
+)
 from basecradle_harness._tools import Tool, ToolRegistry
 from tests.conftest import FAKE_KEY as OPENAI_KEY
 from tests.conftest import (
@@ -98,10 +107,15 @@ NOT_JOURNAL = {
 #: Heads whose field names are partly computed (a usage block's token counts, the attribution
 #: partition, a caller's own extras), so the static scan cannot list all of them. Each is rendered
 #: by the runtime half below; a computed field on any **other** head fails the scan.
-RUNTIME_RENDERED = {"llm", "llm retry", "context attribution"}
+RUNTIME_RENDERED = {"llm", "context attribution"}
 
 #: The emitters that take an ``extra=`` mapping of trailing fields, and the head each writes.
-EXTRA_EMITTERS = {"log_llm_call": "llm", "log_llm_retry": "llm retry", "Retry": "llm retry"}
+EXTRA_EMITTERS = {
+    "log_llm_call": "llm",
+    "log_llm_retry": "llm",
+    "Retry": "llm",
+    "log_brain_failure": "llm",
+}
 
 #: Field names the NOC extracts off **every** line, whatever its head. On a prose line they still
 #: feed a column, so a prose format string carrying one must be named by a `prose` row.
@@ -444,7 +458,7 @@ def _raw_sites(module: _Module) -> list[Site]:
 
 
 def _extra_sites(module: _Module) -> list[Site]:
-    """The ``extra=`` literals handed to the `llm` / `llm retry` emitters, read as fields."""
+    """The ``extra=`` literals handed to the `llm` emitters, read as fields."""
     sites = []
     for call in ast.walk(module.tree):
         head = EXTRA_EMITTERS.get(_called(call) or "")
@@ -455,11 +469,11 @@ def _extra_sites(module: _Module) -> list[Site]:
                 keys = _dict_keys(keyword.value, module.enclosing(call))
                 if keys:
                     sites.append(Site(module.name, call.lineno, head, keys))
-    if module.name == "_retry.py":  # `diagnostics` rides both heads (`_retry.diagnostics`)
+    if module.name == "_retry.py":  # `diagnostics` rides every failed attempt's `llm` line
         (function,) = [f for f in module.functions if f.name == "diagnostics"]  # type: ignore[attr-defined]
         (returned,) = [n.value for n in ast.walk(function) if isinstance(n, ast.Return)]
         keys = _dict_keys(returned, function) or set()
-        sites += [Site(module.name, function.lineno, h, set(keys)) for h in ("llm", "llm retry")]  # type: ignore[attr-defined]
+        sites.append(Site(module.name, function.lineno, "llm", set(keys)))  # type: ignore[attr-defined]
     return sites
 
 
@@ -794,6 +808,49 @@ def rerank(router, **_):
     reranker().rerank("what is the plan", hits(3), 2, surface="turn0")
 
 
+#: The wake a scenario's model calls are made in: a real UUIDv7 and a router-shaped delivery id.
+WAKE_TIMELINE = "019a4e2c-7b1d-7f3e-9c2a-5d8e1f6a3b40"
+WAKE_DELIVERY = "dlv-019a4e2c7b1d"
+
+
+@contextmanager
+def _a_wake():
+    """Inside a wake, as `Wake.wake` runs one: every `llm` line names its timeline and delivery."""
+    previous = os.environ.get(DELIVERY_ID_ENV)
+    os.environ[DELIVERY_ID_ENV] = WAKE_DELIVERY
+    try:
+        with in_wake(WAKE_TIMELINE):
+            yield
+    finally:
+        if previous is None:
+            os.environ.pop(DELIVERY_ID_ENV, None)
+        else:
+            os.environ[DELIVERY_ID_ENV] = previous
+
+
+@scenario
+def brain_failure(router, **_):
+    """A brain call the vendor keeps failing (5xx): one retry, then the engine's give-up (#782)."""
+    body = {"error": {"message": "upstream unavailable", "code": 503}}
+    router.post(OPENROUTER_CHAT).mock(return_value=httpx.Response(503, json=body))
+    engine = Engine(
+        openrouter_provider(retries_disabled=True),
+        ToolRegistry(),
+        response_retries=1,
+        sleep=lambda _s: None,
+    )
+    with _a_wake(), pytest.raises(ProviderServerError):
+        engine.run([Message.user("hi")])
+
+
+@scenario
+def rerank_unusable(router, **_):
+    """A rerank the vendor answered with nothing the reranker can use: the caller's ``fallback``."""
+    router.post(RERANK_CHAT).mock(return_value=_ok(rerank_completion("no picks in here")))
+    with _a_wake(), at_step(3, 24):
+        reranker().rerank("what is the plan", hits(3), 2, surface="tool")
+
+
 @scenario
 def attribution(**_):
     log_context_attribution([Message.user("hi")], session="timeline:contract")
@@ -1034,7 +1091,9 @@ def _emitted(sites: list[Site], rendered: Rendered) -> list[tuple[str, str, dict
 
 
 def test_the_page_parses_into_heads_fields_and_violations(contract):
-    assert {"llm", "llm retry", "tool", "wake start", "wake end", "unspoken"} <= set(contract.heads)
+    assert {"llm", "tool", "wake start", "wake end", "unspoken"} <= set(contract.heads)
+    # Issue #782: a retry and a refusal are outcomes of the call, never heads of their own.
+    assert not {"llm retry", "llm refused"} & set(contract.heads)
     assert {"provider", "purpose", "tokens_in", "cache_write_tokens", "residency", "billing"} <= (
         contract.heads["llm"]
     )
@@ -1586,13 +1645,71 @@ def test_a_gateway_timeout_is_timeout_on_every_vendor(rendered):
     )
 
 
-def test_a_refusal_is_one_counted_line_beside_its_call(rendered):
-    (line,) = rendered.heads("anthropic_refusal", "llm refused")
-    assert line.fields == {
-        "provider": "anthropic",
-        "purpose": "main",
-        "model": ANTHROPIC_MODEL,
-        "category": "cyber",
-        "generation_id": "msg_01Refused",
-    }
-    assert len(rendered.heads("anthropic_refusal", "llm")) == 1
+def test_a_refusal_is_the_calls_own_line_and_outcome(rendered):
+    """One refused attempt, one line (issue #782): it was billed, so it is a call, and its verdict."""
+    (line,) = rendered.heads("anthropic_refusal", "llm")
+    assert line.fields["outcome"] == "refused"
+    assert line.fields["category"] == "cyber"
+    assert line.fields["generation_id"] == "msg_01Refused"
+    assert "reason" not in line.fields
+
+
+#: The fields every `llm` line carries, whatever its outcome.
+LLM_ALWAYS = frozenset({"provider", "purpose", "model", "outcome"})
+
+
+def _outcomes() -> dict[str, tuple[set[str], set[str]]]:
+    """The page's Outcomes table: each outcome's required and never-carried fields."""
+    table = DOC.read_text(encoding="utf-8").split("\n#### Outcomes\n", 1)[1].split("\n### ", 1)[0]
+    found: dict[str, tuple[set[str], set[str]]] = {}
+    for row in table.splitlines():
+        cells = [cell.strip() for cell in row.strip("|").split("|")]
+        if len(cells) == 4 and cells[0].startswith("`"):
+            names = [set(re.findall(r"`([a-z_]+)`", cell)) for cell in cells]
+            (outcome,) = names[0]
+            found[outcome] = (names[2], names[3])
+    return found
+
+
+def test_the_outcomes_table_is_the_vocabulary_and_names_only_llm_fields(contract):
+    outcomes = _outcomes()
+    assert set(outcomes) == {"ok", "refused", "fallback", "retrying", "failed"}
+    for required, never in outcomes.values():
+        assert required <= contract.heads["llm"] and never <= contract.heads["llm"]
+        assert not required & never
+    assert LLM_ALWAYS <= contract.heads["llm"]
+
+
+def test_every_llm_line_carries_exactly_what_its_outcome_requires(rendered):
+    """Strict fields per outcome, checked on rendered lines (issue #782): the contract stays
+    verifiable because an outcome's line can neither omit what it owes nor carry what it must not."""
+    outcomes = _outcomes()
+    seen: set[str] = set()
+    for scenario, lines in rendered.lines.items():
+        for line in (line for line in lines if line.head == "llm"):
+            fields = set(line.fields)
+            outcome = line.fields.get("outcome")
+            assert outcome in outcomes, (scenario, line.message)
+            required, never = outcomes[outcome]
+            assert LLM_ALWAYS | required <= fields, (scenario, line.message)
+            assert not never & fields, (scenario, line.message)
+            seen.add(outcome)
+    assert seen == set(outcomes), f"no scenario renders {sorted(set(outcomes) - seen)}"
+
+
+def test_a_call_made_in_a_wake_names_its_wake_and_its_step(rendered):
+    """The wake context rides every model call made inside it, ambiently (issue #782)."""
+    retrying, failed = rendered.heads("brain_failure", "llm")
+    for line in (retrying, failed):
+        assert line.fields["timeline"] == WAKE_TIMELINE, line.message
+        assert line.fields["delivery"] == WAKE_DELIVERY, line.message
+        assert line.fields["step"] == "1/24", line.message
+        assert line.fields["purpose"] == "main", line.message
+    assert retrying.fields["outcome"] == "retrying" and retrying.fields["attempt"] == "1/2"
+    assert failed.fields["outcome"] == "failed" and failed.fields["attempt"] == "2/2"
+    assert failed.fields["reason"] == "server_error"
+    (rerank,) = rendered.heads("rerank_unusable", "llm")
+    assert rerank.fields["outcome"] == "fallback" and rerank.fields["reason"] == "parse"
+    assert (rerank.fields["timeline"], rerank.fields["step"]) == (WAKE_TIMELINE, "3/24")
+    # Outside a wake there is no wake to name: an adapter's own call carries none of the three.
+    assert not {"timeline", "delivery", "step"} & set(rendered.llm("anthropic").fields)

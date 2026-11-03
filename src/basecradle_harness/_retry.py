@@ -83,35 +83,51 @@ rather than giving up, because OpenRouter re-routes on the retry — another pin
 while the limited one recovers, which is the same reasoning that made ``allow_fallbacks`` true
 inside the pinned list (issue #468).
 
-The line a retry writes is **not** an ``llm`` line
----------------------------------------------------
+A retry is an outcome of the call, never a call
+-----------------------------------------------
 A failed attempt that never reached a model generated nothing and was billed nothing, so it is not a
-call and must join no series that counts calls. The fleet's dashboard keys its whole model-call
-family on the literal `` llm provider=`` (`basecradle-noc` ``observability/ai-box.json``:
-``llm_calls``, ``memory_calls``, ``helper_calls`` and every cost/duration/outcome column hanging off
-them), so a retry line matching that head would inflate *Calls by Model*, drag failed attempts into
-the duration average, and put a NULL outcome on the rerank-outcomes chart.
-`basecradle_harness._observability.RETRY_HEAD` is
-``llm retry``, which does not contain `` llm provider=`` — the space-then-``provider=`` immediately
-after ``llm`` is the discriminator — and `tests/test_retry.py` runs the NOC's own expression against
-both lines to prove it, because a head that *looks* safe is not the same as one that has been
-checked against the regex that reads it.
+call and must join no series that counts calls. Since issue #782 it is written on the one ``llm``
+head with ``outcome=retrying``, and the final give-up with ``outcome=failed``. The fleet counts a
+call as a line on `` llm provider=`` whose ``outcome`` is neither of those (basecradle-noc#1212), so
+the split is a verdict the line states, not a spelling that happens to dodge a regex.
+`tests/test_retry.py` runs the NOC's expressions against these lines to prove it.
 
 The corollary, which is the one a later "consistency" pass will get backwards: an attempt that the
-vendor **answered** still writes its own ``llm`` line even when its answer was unusable — a
-truncated description was generated and billed (issue #488), and suppressing its line to reach "one
-line per describe" would delete real spend from ``helper_cost``. The rule is *a line per billed
-call*, and a 429 is not one.
+vendor **answered** still writes its own ``outcome=fallback`` line even when its answer was
+unusable. A truncated description was generated and billed (issue #488), and suppressing its line to
+reach "one line per describe" would delete real spend from ``helper_cost``. The rule is *one line
+per attempt*, and only an answered attempt's line carries tokens and a cost.
 """
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Mapping
 from typing import Any
 
-from basecradle_harness._exceptions import ProviderTimeoutError
-from basecradle_harness._observability import _secs, log_llm_retry
+from basecradle_harness._exceptions import (
+    ProviderAPIError,
+    ProviderAuthError,
+    ProviderBillingError,
+    ProviderConnectionError,
+    ProviderContextLengthError,
+    ProviderError,
+    ProviderPayloadTooLargeError,
+    ProviderRateLimitError,
+    ProviderResponseError,
+    ProviderServerError,
+    ProviderTimeoutError,
+)
+from basecradle_harness._faults import routing_refusal
+from basecradle_harness._observability import (
+    FAILED,
+    MAIN,
+    _secs,
+    describe_provider,
+    log_llm_call,
+    log_llm_retry,
+)
 from basecradle_harness._timeouts import TIMEOUT_RETRY_SCALE
 
 #: How many **extra** attempts a transient fault earns: 2 retries, so 3 attempts in all. Small on
@@ -263,7 +279,7 @@ def diagnostics(exc: object) -> dict[str, Any]:
     ``baseten, coreweave, parasail, modal`` refused.
 
     Returned as a dict so the same fields, under the same names and in the same order, ride
-    **both** the retry line and the final ``outcome=fallback`` line — one function, so the two can
+    **both** the retry line and the final ``outcome=failed`` line — one function, so the two can
     never disagree about what a failure looked like.
 
     The fifth, ``generation_id``, is the vendor's own id for the failed attempt (issue #634), which
@@ -348,6 +364,11 @@ class Retry:
         self._timeout_retries = 0
 
     @property
+    def label(self) -> str:
+        """The attempts made so far, as the line's ``attempt=`` renders them: ``n/total``."""
+        return f"{self.attempt}/{self.attempts}"
+
+    @property
     def retried(self) -> bool:
         """Did this call take more than one attempt?
 
@@ -408,7 +429,7 @@ class Retry:
             model=self.model,
             purpose=self.purpose,
             kind=self.kind,
-            attempt=f"{self.attempt}/{self.attempts}",
+            attempt=self.label,
             reason=reason,
             next_in=wait,
             diagnostics=diagnostics(exc),
@@ -461,3 +482,88 @@ def _retry_after(exc: object) -> float | None:
     if isinstance(hinted, bool) or not isinstance(hinted, (int, float)):
         return None
     return float(hinted) if hinted > 0 else None
+
+
+def fault_slug(exc: ProviderError) -> str:
+    """A provider fault → the ``reason=`` its `llm` line carries, its class by the ``config:`` prefix.
+
+    The describer's and, since issue #782, the brain's: a brain call that ends ``outcome=failed``
+    names its fault in the same words a describe does. The same taxonomy `_rerank._fault_of` draws
+    (which keeps its own for its unknown-model read), and for the same reason: **config-class** is *dead
+    until a human acts* — a rejected key, an unfunded account, a model id that does not exist —
+    while **runtime-class** is everything that can succeed next time unchanged. A 402 sits with the
+    bad key rather than beside the 429 above it precisely because a rate limit heals with time and
+    an empty account heals only when somebody puts money in it.
+
+    OpenRouter's two routing refusals (issue #651) are config-class as well, and are named for their
+    cause rather than filed with a missing model: both arrive as a 404, and an ``AI_BASE_URL`` on a
+    regional host is where they come from — no endpoint for the describer model in the region, or
+    none the ``HARNESS_DESCRIBER_PROVIDERS`` list permits there.
+
+    A generic 4xx is runtime-class deliberately: it is far more likely a fixable harness/config
+    defect than a permanent property of the pool, and reporting it as config-class would page a
+    human for something the next release fixes.
+
+    Ordered most-specific first, because these classes subclass one another.
+    """
+    if isinstance(exc, ProviderAuthError):
+        return "config:auth"
+    if isinstance(exc, ProviderBillingError):
+        return "config:billing"
+    if isinstance(exc, ProviderRateLimitError):
+        return "rate_limited"
+    if isinstance(exc, ProviderServerError):
+        return "server_error"
+    if isinstance(exc, ProviderContextLengthError):
+        return "context_length"
+    if isinstance(exc, ProviderPayloadTooLargeError):
+        return "payload_too_large"
+    if isinstance(exc, ProviderResponseError):
+        return "invalid_response"
+    if isinstance(exc, ProviderConnectionError):
+        # ``timeout`` or ``transport``, off the cause — the shared read, not a flat word. This
+        # returned ``transport`` unconditionally until issue #545, so a describe that timed out and
+        # a rerank that timed out named the same fault differently on the same box.
+        return connection_reason(exc)
+    if isinstance(exc, ProviderAPIError):
+        refusal = routing_refusal(f"{exc} {getattr(exc, 'body', '') or ''}")
+        if refusal:
+            return f"config:{refusal}"
+        return "config:model_not_found" if getattr(exc, "status_code", None) == 404 else "api_error"
+    return "provider_error"
+
+
+def log_brain_failure(
+    provider: object,
+    exc: ProviderError,
+    *,
+    attempt: str | None,
+    seconds: float | None,
+    level: int = logging.WARNING,
+    extra: Mapping[str, Any] | None = None,
+) -> None:
+    """The `llm` line, ``outcome=failed``, for a brain call that ended with no answer (issue #782).
+
+    A brain call that raised used to write no line at all: the wake's failure lines, or a prose
+    ERROR, were its only record, so "where did this wake die, and of what" was read off prose, and
+    a producer with no wake had nothing to compare it with. This is the brain's one final line, in
+    the same words a describe's failure uses (`fault_slug`) and with the vendor's own account of
+    the fault (`diagnostics`). It carries no tokens and no cost: the attempt was not billed.
+
+    ``level`` is the caller's, because severity is a page: the engine's transient give-up keeps
+    the ERROR its prose line always had, and every other failure is WARNING, since the wake's own
+    lines already carry the verdict a human is paged on.
+    """
+    name, model = describe_provider(provider)
+    log_llm_call(
+        provider=name,
+        model=model,
+        seconds=seconds,
+        purpose=MAIN,
+        outcome=FAILED,
+        attempt=attempt,
+        reason=fault_slug(exc),
+        detail=str(exc),
+        extra={**diagnostics(exc), **(extra or {})},
+        level=level,
+    )

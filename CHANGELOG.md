@@ -7,6 +7,54 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.171.0] - 2026-11-03
+
+### Changed: a model call is one line, and how it ended is its `outcome` (issue #782) — breaking for log consumers
+
+The telemetry contract described one unit of work, a model call, on four heads at four outcomes:
+`llm` (it answered), `llm retry` (an attempt about to be re-issued), `llm refused` (a content
+refusal, written beside its call's line), and nothing at all for a brain call that raised, whose
+only record was a prose ERROR or the wake's own failure line. So a producer with no wake (a Claude
+Code builder) had nowhere to put a failure, and a wake that died at step 5 of 24 never said where.
+Ruled by the capital on 2026-11-03, from the telemetry audit with @origin (basecradle#726):
+
+- **One `llm` line per attempt, and `outcome` on every one**: `ok`, `refused`, `fallback`,
+  `retrying`, `failed`. Each requires and forbids its own fields (`docs/telemetry.md` → `llm` →
+  Outcomes), and `tests/test_telemetry_contract.py` renders all five and holds every line to its row.
+  `purpose=main` lines now carry `outcome=ok`.
+- **`llm retry` is retired** into `llm … outcome=retrying`, with every field it carried. It still has
+  no tokens and no cost: nothing was generated or billed.
+- **`llm refused` is retired** into the call's own line: `outcome=refused category=…` at WARNING. A
+  refusal was billed, so it is one attempt and one line, where it was two.
+- **The brain's final failure has a line**: `llm … outcome=failed attempt=n/m reason=<fault slug>`.
+  The engine's transient give-up replaces the old prose ERROR with this line, still at ERROR, so the
+  page it raised is neither lost nor doubled. A fault that is never retried (auth, billing, context
+  length, payload too large) writes it at WARNING, because the wake's own lines carry the verdict. A
+  failed compaction call writes it too. The brain names its faults in the describer's words
+  (`_retry.fault_slug`, moved there from `_describer`).
+- **A non-brain fault is `failed`, not `fallback`.** `fallback` now means only "the model answered
+  and the answer was unusable" (`truncated`, `empty_response`, `missing_parts`,
+  `undecodable_video`, `internal`, `parse`); a rerank or describe that got no answer is
+  `outcome=failed`, with `attempt=` where an attempt was made. The *Memory System Rerank Outcomes*
+  chart grows a `failed` series accordingly.
+- **The wake context rides every model call made in a wake, ambiently**: `timeline=`, `delivery=`,
+  and `step=n/max` for a call made in the engine's step loop (`_observability.in_wake`, `at_step`).
+  It applies to the brain, a rerank and a describe alike. Each is absent outside its context.
+- **`turn truncated` spells its position the same way**: `step=5/24`, replacing `step=5
+  max_steps=24`.
+- **`kind` is absent wherever a producer names no job**, not only on `purpose=main`: a builder's
+  auxiliary call is `purpose=helper` with no `kind` (basecradle-router#384).
+- **The new outcome words are colored as verdicts**: `failed` red, and `retrying`, `refused` and
+  `fallback` yellow.
+- **The contract records @origin's routing template** (basecradle#726, ruling 2): every meaningful
+  signal is a chart with its alert, or a log-stream line. A signal that does not fit a chart is
+  logged, never dropped.
+
+**Rollout order is load-bearing.** The fleet's dashboards count a call as a line on `llm provider=`
+whose `outcome` matches neither `retrying` nor `failed` (unanchored: the token is colored on every
+box). basecradle-noc#1212 adds that exclusion, and this release must not reach a box before it is
+live, or retries and failures would be counted as calls.
+
 ## [0.170.0] - 2026-11-03
 
 ### Added: the reranker can route by a ranked order — `HARNESS_MEMPALACE_RERANK_ORDER` and `HARNESS_MEMPALACE_RERANK_IGNORE` (issue #780)

@@ -64,7 +64,7 @@ from basecradle_harness._google import (
 from basecradle_harness._google_rates import Usage, call_cost
 from basecradle_harness._observability import ComputedCost, tool_meter, truncated
 from basecradle_harness._timeouts import CONNECT_TIMEOUT, TIMEOUT_RETRY_SCALE
-from tests.conftest import run_through_engine, tool_lines
+from tests.conftest import plain, run_through_engine, tool_lines
 
 MODEL = "gemini-3.8-flash"
 PROJECT = "nova-project"
@@ -936,8 +936,9 @@ def test_the_llm_line_shape(router, provider, caplog):
     assert re.fullmatch(
         r"llm provider=google purpose=main residency=us model=gemini-3\.8-flash "
         r"duration=\d+\.\d\ds tokens_in=1200 tokens_out=100 tokens_total=1300 cached_tokens=1000 "
-        r"tokens_reasoning=70 cost=\S+ cost_basis=computed generation_id=resp-0123456789abcdef",
-        line,
+        r"tokens_reasoning=70 cost=\S+ cost_basis=computed outcome=ok "
+        r"generation_id=resp-0123456789abcdef",
+        plain(line),
     ), line
 
 

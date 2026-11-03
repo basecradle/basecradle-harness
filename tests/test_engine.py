@@ -31,8 +31,8 @@ from basecradle_harness import (
     ToolResult,
     VideoContent,
 )
-from basecradle_harness._observability import RETRY_HEAD
 from basecradle_harness._retry import RETRY_BUDGET_SECONDS
+from tests.conftest import is_retry, plain
 
 
 class ScriptedProvider:
@@ -996,8 +996,9 @@ def test_retries_are_bounded_and_the_last_error_propagates():
 
 
 def test_the_give_up_leaves_a_diagnosable_log_trail(caplog):
-    """On exhaustion the engine logs a WARNING per retry and an ERROR naming the attempt count, so
-    a dropped wake is diagnosable from logs alone (definition-of-done point 2)."""
+    """On exhaustion the engine logs a WARNING per retry and the call's own ERROR ``outcome=failed``
+    line naming the fault and the attempt count, so a dropped wake is diagnosable from logs alone
+    (definition-of-done point 2; issue #782 made the give-up a structured line, not prose)."""
     provider = AlwaysTruncatedProvider()
     _delays, spy = _no_sleep()
     engine = Engine(provider, ToolRegistry(), response_retries=2, sleep=spy)
@@ -1008,17 +1009,20 @@ def test_the_give_up_leaves_a_diagnosable_log_trail(caplog):
     ):
         engine.run([Message.user("hi")])
 
-    warnings = [r for r in caplog.records if r.getMessage().startswith(f"{RETRY_HEAD} ")]
-    errors = [r for r in caplog.records if r.levelname == "ERROR" and "unparseable" in r.message]
+    warnings = [r for r in caplog.records if is_retry(r.getMessage())]
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert len(warnings) == 2  # one per retry attempt
     assert [w.levelname for w in warnings] == ["WARNING", "WARNING"]
     # The shared grammar since issue #506: a brain retry, a rerank retry and a describe retry read
-    # identically in one journal, and none of them wears the `llm provider=` head a dashboard counts
-    # calls on — a refused attempt generated nothing and was billed nothing.
+    # identically in one journal, as `outcome=retrying`, which no column counts as a call (#782).
     assert "attempt=1/3 reason=invalid_response" in warnings[0].getMessage()
     assert "attempt=2/3 reason=invalid_response" in warnings[1].getMessage()
-    assert len(errors) == 1  # the final give-up
-    assert "on 3 attempt(s)" in errors[0].message  # names the attempt count
+    assert len(errors) == 1  # the final give-up, and nothing else at ERROR
+    final = plain(errors[0].getMessage())
+    assert final.startswith("llm provider=") and " purpose=main " in final
+    assert " outcome=failed attempt=3/3 reason=invalid_response " in final
+    assert " step=1/" in final  # where the wake died
+    assert "tokens_in=" not in final and "cost=" not in final  # nothing was billed
 
 
 class ServerErrorProvider:
@@ -1120,7 +1124,7 @@ def test_a_rate_limit_is_retried_and_recovers(caplog):
     # The *shared* schedule, not the 0.5s server-hiccup beat: a rate limit is a capacity window a
     # half-second does not outlast.
     assert delays == [1.0]
-    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    line = next(r.getMessage() for r in caplog.records if is_retry(r.getMessage()))
     assert "reason=rate_limited" in line and "next_in=1.00s" in line
 
 
@@ -1241,7 +1245,7 @@ def test_a_read_timeout_is_retried_then_succeeds(caplog):
     # The 0.5s server-hiccup beat, not the rate limit's patient schedule: this call already waited
     # out the whole client timeout, so what it needs next is a re-route rather than more waiting.
     assert delays == [0.5]
-    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    line = next(r.getMessage() for r in caplog.records if is_retry(r.getMessage()))
     assert "reason=timeout" in line, line
 
 
@@ -1256,7 +1260,7 @@ def test_a_bare_connect_failure_is_retried_and_named_transport(caplog):
 
     assert provider.calls == 2
     assert delays == [0.5]
-    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    line = next(r.getMessage() for r in caplog.records if is_retry(r.getMessage()))
     assert "reason=transport" in line, line
 
 
@@ -1280,7 +1284,7 @@ def test_a_timeout_an_sdk_wrapped_reads_the_same_word_as_a_bare_one(caplog):
     with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
         assert Engine(provider, ToolRegistry(), sleep=spy).run([Message.user("hi")]).content
 
-    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith(RETRY_HEAD))
+    line = next(r.getMessage() for r in caplog.records if is_retry(r.getMessage()))
     assert "reason=timeout" in line, line
 
 
@@ -1319,7 +1323,7 @@ def test_a_timeout_that_never_clears_is_retried_once_and_no_more():
 
 def test_the_give_up_line_names_a_timeout_apart_from_a_transport_drop(caplog):
     """The two send an operator to different places, so the final ERROR must not blur them into the
-    unparseable-response fallback every non-429, non-5xx fault used to land in."""
+    unparseable-response reason every non-429, non-5xx fault used to land in."""
     _, spy = _no_sleep()
 
     with caplog.at_level(logging.ERROR, logger="basecradle_harness"):
@@ -1338,10 +1342,9 @@ def test_the_give_up_line_names_a_timeout_apart_from_a_transport_drop(caplog):
                 sleep=spy,
             ).run([Message.user("hi")])
 
-    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert any("Provider call timed out" in m for m in errors), errors
-    assert any("Could not reach the provider" in m for m in errors), errors
-    assert not any("unparseable" in m for m in errors), errors
+    errors = [plain(r.getMessage()) for r in caplog.records if r.levelname == "ERROR"]
+    assert [m.split(" reason=", 1)[1].split(" ", 1)[0] for m in errors] == ["timeout", "transport"]
+    assert all(" outcome=failed attempt=1/1 " in m for m in errors), errors
 
 
 def test_response_retries_zero_still_disables_the_transport_retry():
@@ -1354,3 +1357,42 @@ def test_response_retries_zero_still_disables_the_transport_retry():
 
     assert provider.calls == 1
     assert delays == []
+
+
+# === The brain's final failure is its own `llm` line (issue #782) ================================
+
+
+def test_a_fault_that_is_never_retried_ends_on_its_own_warning_line(caplog):
+    """A permanent fault propagates on the first raise, as it always has, and now says so on the
+    call's own line: `outcome=failed` at WARNING, with the step it happened at. WARNING, because
+    the wake's own lines carry the verdict that pages; nothing new reaches ERROR."""
+    provider = AuthFailingProvider()
+    engine = Engine(provider, ToolRegistry(), response_retries=2, sleep=lambda _s: None)
+
+    with (
+        caplog.at_level(logging.DEBUG, logger="basecradle_harness"),
+        pytest.raises(ProviderAuthError),
+    ):
+        engine.run([Message.user("hi")])
+
+    assert provider.calls == 1  # never retried
+    (line,) = [r for r in caplog.records if plain(r.getMessage()).startswith("llm provider=")]
+    text = plain(line.getMessage())
+    assert line.levelno == logging.WARNING
+    assert " purpose=main " in text and " outcome=failed attempt=1/3 reason=config:auth " in text
+    assert " step=1/" in text and "tokens_in=" not in text and "cost=" not in text
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_a_successful_call_after_a_retry_ends_ok_and_is_the_only_call(caplog):
+    """One retry, then an answer: a `retrying` line and the adapter's own `ok` line, never a
+    `failed` one — the give-up is written only when nothing will re-issue the call."""
+    provider = FlakyProvider(fails=1, reply=Message.assistant(content="the real answer"))
+    engine = Engine(provider, ToolRegistry(), sleep=lambda _s: None)
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        engine.run([Message.user("hi")])
+
+    lines = [plain(r.getMessage()) for r in caplog.records]
+    assert sum(1 for m in lines if is_retry(m)) == 1
+    assert not any("outcome=failed" in m for m in lines)

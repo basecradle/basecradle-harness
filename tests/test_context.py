@@ -55,6 +55,7 @@ from basecradle_harness._context import (
 from basecradle_harness._engine import DEFAULT_MAX_STEPS
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._server_tools import NOTE_CAP as SERVER_TOOLS_NOTE_CAP
+from tests.conftest import plain
 
 # The fabricated cast, per repo convention.
 JOHN = "John Doe"
@@ -1322,3 +1323,21 @@ def test_a_later_compaction_carries_the_earlier_summarys_items_forward():
         "one preserved, and an orphan from two compactions ago reads as 'never seen' again"
     )
     assert "m-9" not in summary.items  # the newest turn survived the cut, so it is not evidence
+
+
+def test_a_failed_summarization_call_is_its_own_failed_llm_line(caplog):
+    """A compaction call is a brain call (`purpose=main`), so one that ended with no answer says so
+    on its own `llm` line, as the engine's do (issue #782), beside the prose for a human."""
+    from basecradle_harness._exceptions import ProviderServerError
+
+    provider = ScriptedProvider(ProviderServerError("the model is down", status_code=503))
+    provider.last_tokens_in = 100_000
+    history = conversation(20)
+
+    with caplog.at_level(logging.WARNING):
+        assert compactor(provider).maybe_compact(history) is False
+
+    (line,) = [r.getMessage() for r in caplog.records if " outcome=failed" in plain(r.getMessage())]
+    assert plain(line).startswith("llm provider=")
+    assert " purpose=main " in plain(line) and " reason=server_error " in plain(line)
+    assert "summarization call errored" in caplog.text

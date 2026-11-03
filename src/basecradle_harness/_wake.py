@@ -203,6 +203,7 @@ from basecradle_harness._observability import (
     delivery_id,
     describe_provider,
     head,
+    in_wake,
     kv,
     log_unspoken,
 )
@@ -1889,7 +1890,24 @@ class WakeAgent:
         sit the LLM, tool, and posted-message lines — so a wake reads end-to-end in the journal
         without the transcript. The end line rides a ``finally``: a wake that *crashes* is the
         one whose outcome matters most, and it still reports what it had done by then.
+
+        **Every model call made inside it names this wake** (issue #782): its `llm` line carries
+        ``timeline`` and ``delivery`` (`in_wake`), whoever makes the call — the brain, a rerank, a
+        describe — so a call that ended the wake can be joined to it on the board.
         """
+        with in_wake(self.timeline_uuid):
+            return self._wake(
+                trigger=trigger, event_trigger=event_trigger, asset_trigger=asset_trigger
+            )
+
+    def _wake(
+        self,
+        *,
+        trigger: str | None,
+        event_trigger: str | None,
+        asset_trigger: str | None,
+    ) -> list[object]:
+        """The body of `wake`, run inside its wake context."""
         started = time.monotonic()
         delivery = delivery_id()
         provider, model = describe_provider(self.harness.provider)

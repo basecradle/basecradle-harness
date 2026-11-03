@@ -25,7 +25,6 @@ import re
 import httpx
 import pytest
 
-from basecradle_harness._describer import _fault_of as describer_fault_of
 from basecradle_harness._engine import _reason as engine_reason
 from basecradle_harness._exceptions import (
     ProviderAuthError,
@@ -43,7 +42,7 @@ from basecradle_harness._observability import (
     LOG_FORMAT,
     MAIN,
     MEMORY,
-    RETRY_HEAD,
+    NO_COLOR_ENV,
     log_llm_call,
 )
 from basecradle_harness._rerank import RERANK_KIND
@@ -58,6 +57,8 @@ from basecradle_harness._retry import (
     diagnostics,
     retryable,
 )
+from basecradle_harness._retry import fault_slug as describer_fault_of
+from tests.conftest import is_retry
 
 #: The NOC's model-call gate, byte-for-byte as `basecradle-noc` ``observability/ai-box.json`` spells
 #: it. Every column in the family is anchored on it — ``llm_calls`` (and therefore the *Log
@@ -92,7 +93,7 @@ def lines(caplog) -> list[str]:
 
 
 def retry_line(caplog) -> str:
-    return next(line for line in lines(caplog) if RETRY_HEAD in line)
+    return next(line for line in lines(caplog) if is_retry(line))
 
 
 def rerank_llm_line(caplog) -> str:
@@ -402,17 +403,37 @@ def test_a_routing_attempt_of_zero_survives(caplog):
     assert "routing_attempt=0" in retry_line(caplog)
 
 
-# === The head: a retry is not a call ==========================================
+# === The head is shared: a retry is an outcome, and not a call ===============
 
 
-@pytest.fixture
-def both_lines(caplog):
+#: The NOC's Phase A exclusion (basecradle-noc#1212), spelled as `ai-box.json` ANDs it onto every
+#: column that counts, times or prices calls: a line on the head whose ``outcome`` is ``retrying``
+#: or ``failed`` is not a call (issue #782). **No leading space**: the verdict token is colored on
+#: every box (`_observability`, issue #414), so the byte before ``outcome=`` is an escape's, not a
+#: space. `MEMORY_OUTCOME` and the NOC's ``wake_failed`` are unanchored for the same reason.
+NOT_A_CALL = r"outcome=(retrying|failed)"
+
+
+def counted(line: str, *gates: str) -> bool:
+    """Would a call column gated on `LLM_CALL_GATE` and `gates` count this line?"""
+    return all(re.search(g, line) for g in (LLM_CALL_GATE, *gates)) and not re.search(
+        NOT_A_CALL, line
+    )
+
+
+@pytest.fixture(params=["colored", "no_color"])
+def both_lines(request, caplog, monkeypatch):
     """A real retry line and a real final line, from the emitters production uses.
 
     Never hand-written strings: the whole point of this file is that the bytes the fleet reads are
     the bytes this package writes, and a fixture that spelled them itself would prove nothing about
-    the emitter.
+    the emitter. Run both ways the fleet renders a line: colored (every box's default) and with
+    ``NO_COLOR`` set, because a predicate that passes on one can miss the other.
     """
+    if request.param == "colored":
+        monkeypatch.delenv(NO_COLOR_ENV, raising=False)
+    else:
+        monkeypatch.setenv(NO_COLOR_ENV, "1")
     with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
         retry(sleep=lambda _s: None).again(rate_limit(retry_after=1), reason="rate_limited")
         log_llm_call(
@@ -424,52 +445,47 @@ def both_lines(caplog):
             outcome="ok",
             extra={"surface": "turn0", "pool": 20, "picked": 10},
         )
-    return retry_line(caplog), rerank_llm_line(caplog)
+    return retry_line(caplog), next(line for line in lines(caplog) if not is_retry(line))
 
 
-def test_the_retry_line_is_invisible_to_every_column_that_counts_calls(both_lines):
-    """The NOC's own gate, run against both lines — the assertion this feature turns on.
+def test_the_retry_line_is_on_the_head_and_counted_as_no_call(both_lines):
+    """The NOC's own gate and its Phase A exclusion, run against both lines.
 
-    A retry line matching `` llm provider=`` would inflate *Calls by Model*, drag a failure's wait
-    into the duration average, and put a NULL on the rerank-outcomes chart the founder reads. The
-    discriminator is the space-then-``provider=`` immediately after ``llm``.
+    A retry is one unit of model work at one outcome (issue #782), so it rides the one head. That it
+    is not a call is now a verdict the line states (``outcome=retrying``), and every column that
+    counts calls excludes it: counting it would inflate *Calls by Model*, drag a failure's wait into
+    the duration average, and put a series nobody named on the rerank-outcomes chart.
     """
     retried, final = both_lines
 
-    assert not re.search(LLM_CALL_GATE, retried), retried
-    assert re.search(LLM_CALL_GATE, final), final
-    # `memory_calls` / `memory_cost` / `memory_duration_s` / `memory_outcome` all AND the two.
-    assert PURPOSE_MEMORY in retried  # it *is* a memory-purpose event …
-    assert not re.search(rf"{LLM_CALL_GATE}.*{PURPOSE_MEMORY}", retried)  # … and still not a call
-    assert re.search(rf"{LLM_CALL_GATE}.*{PURPOSE_MEMORY}", final)
+    assert re.search(LLM_CALL_GATE, retried), retried
+    assert not counted(retried) and not counted(retried, PURPOSE_MEMORY), retried
+    assert counted(final) and counted(final, PURPOSE_MEMORY), final
 
 
-def test_the_retry_line_moves_no_other_ungated_column(both_lines):
-    """The columns a new line class moves by accident are the ungated ones.
+def test_the_retry_line_moves_no_other_column(both_lines):
+    """The columns a new outcome moves by accident are the ones that read it without the exclusion.
 
-    `_log_grammar`'s rule, applied to a second synthetic-looking line: carry no field that is a
-    witness parent for another column, and never a field an ungated extractor reads.
+    A retry carries no outcome the outcome charts name, no duration (nothing was measured) and none
+    of the router's or the probe's labels.
     """
     retried, _final = both_lines
 
-    assert not re.search(MEMORY_OUTCOME, retried)  # no outcome: nothing was decided
+    assert not re.search(MEMORY_OUTCOME, retried)  # `outcome=retrying` is not `ok|fallback`
     assert not re.search(MEMORY_DURATION, retried)  # no duration: nothing was measured
     assert not re.search(RERANK_ON, retried)  # `memory_rerank_on`'s denominator
     assert not re.search(STAGE_LABEL, retried)
     assert not re.search(SOURCE_LABEL, retried)
     assert not re.search(WAKE_OUTCOME_GATE, retried)
+    assert "tokens_in=" not in retried and "cost=" not in retried  # nothing was billed
 
 
 def test_the_retry_line_is_a_warning_and_names_its_provider(both_lines):
-    """WARNING because a retry is a degradation that recovered — not an error, not routine.
-
-    ``provider=`` is deliberately *kept*: it is an ungated label that is also written on
-    ``wake start``, so a retry line populating it is honest rather than contaminating.
-    """
+    """WARNING because a retry is a degradation that recovered — not an error, not routine."""
     retried, _final = both_lines
 
-    assert retried.startswith("WARNING ")
-    assert "provider=openrouter" in retried
+    assert retried.startswith("WARNING llm provider=openrouter ")
+    assert "outcome=retrying" in retried
 
 
 def test_a_helper_retry_reads_the_same_way(caplog):
@@ -484,7 +500,7 @@ def test_a_helper_retry_reads_the_same_way(caplog):
 
     line = retry_line(caplog)
     assert "purpose=helper" in line and "kind=image.describe" in line and "subject=cat.png" in line
-    assert not re.search(LLM_CALL_GATE, line)
+    assert not counted(line, PURPOSE_HELPER)
 
 
 # === A vendor's deadline is a timeout, and not the harness's budget (issue #759) ================

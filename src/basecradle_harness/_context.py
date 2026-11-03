@@ -114,9 +114,11 @@ from dataclasses import dataclass
 
 from basecradle_harness._elision import EXCERPT_OPENING
 from basecradle_harness._engine import DEFAULT_MAX_STEPS
+from basecradle_harness._exceptions import ProviderError
 from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import kv
 from basecradle_harness._provider import Provider
+from basecradle_harness._retry import log_brain_failure
 from basecradle_harness._server_tools import NOTE_CAP as SERVER_TOOLS_NOTE_CAP
 from basecradle_harness._server_tools import chars as record_chars
 from basecradle_harness._server_tools import render as render_record
@@ -860,6 +862,9 @@ class Compactor:
                 tools=None,
             )
         except Exception as exc:  # noqa: BLE001 - a failed compaction degrades; it never breaks a wake
+            if isinstance(exc, ProviderError):
+                # A brain call that ended with no answer, stated on its own line (issue #782).
+                log_brain_failure(self.provider, exc, attempt="1/1", seconds=None)
             _log.warning("Context compaction failed: the summarization call errored: %s", exc)
             return None
         summary = (reply.content or "").strip()
