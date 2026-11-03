@@ -46,7 +46,7 @@ from basecradle_harness import (
 )
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._describer import Describer
-from basecradle_harness._engine import Engine, _reason
+from basecradle_harness._engine import _REASONS, Engine, _reason
 from basecradle_harness._exceptions import ProviderResponseError, ProviderServerError
 from basecradle_harness._observability import (
     DELIVERY_ID_ENV,
@@ -55,6 +55,7 @@ from basecradle_harness._observability import (
     in_wake,
     metered,
 )
+from basecradle_harness._retry import fault_slug
 from basecradle_harness._tools import Tool, ToolRegistry
 from tests.conftest import FAKE_KEY as OPENAI_KEY
 from tests.conftest import (
@@ -159,7 +160,8 @@ class Contract:
 _HEAD = re.compile(r"^### `(?P<head>[^`]+)`$")
 _FIELD_ROW = re.compile(r"^\| `(?P<field>[^`]+)` \|")
 _VIOLATION_ROW = re.compile(
-    r"^\| (?P<id>[TF]\d+) \| .+ \| `(?P<witness>[^`]+)` \| Slice \d \|$", re.MULTILINE
+    r"^\| (?P<id>[TFS]\d+) \| .+ \| `(?P<witness>[^`]+)` \| (?:Slice \d|\[#\d+\]\(\S+\)) \|$",
+    re.MULTILINE,
 )
 _PROSE_WITNESS = re.compile(r'^(?P<module>\S+) "(?P<text>.*)"(?: until (?P<until>.+))?$')
 _FIELD_WITNESS = re.compile(r"^(?P<head>.+)\.(?P<field>[a-z_]+)(?: @(?P<scope>[a-z_]+))?$")
@@ -1007,41 +1009,80 @@ def harness_and_mcp_tools(**_):
     engine._run_tool("no_such_tool", {})
 
 
-def _gateway_timeout(reasons: dict[str, str], name: str, call: Callable[[], object]) -> None:
+#: What a fault-slug probe hands the adapter: an HTTP status, or no answer at all.
+TRANSPORT = "transport"
+#: One probe per row of the page's Fault Slugs table, and a second where a row names two statuses
+#: or a range, so a row the adapters read differently from the page is caught on either half.
+FAULT_PROBES: tuple[int | str, ...] = (
+    TRANSPORT, 401, 403, 402, 404, 413, 429, 504, 500, 503, 400, 422
+)  # fmt: skip
+#: The HTTP adapters, and the reranker, whose line is read rather than its classifier.
+FAULT_ADAPTERS = ("openai", "openrouter", "anthropic", "google")
+#: Every word the retry line can say: the engine's table, and the two a connection failure splits.
+RETRY_REASONS = frozenset({reason for _, reason in _REASONS} | {"timeout", "transport"})
+
+
+def _fault(reasons: dict[str, str], key: str, call: Callable[[], object]) -> None:
     try:
         call()
     except ProviderError as exc:
-        reasons[name] = _reason(exc)
-    else:  # pragma: no cover - the mock answers 504 and nothing else
-        raise AssertionError(f"{name}: a 504 did not raise")
+        slug = fault_slug(exc)
+        # A transient fault's retry line and its final line name it in the same word, and a fault
+        # the engine never retries has no retry word.
+        retry = _reason(exc)
+        expected = slug if slug in RETRY_REASONS else "provider_error"
+        assert retry == expected, f"{key}: retrying says {retry}, failed says {slug}"
+        reasons[key] = slug
+    else:  # pragma: no cover - every probe fails the call
+        raise AssertionError(f"{key}: the probe did not raise")
+
+
+def _probe(router, probe: int | str) -> None:
+    """Every adapter's endpoint answers the probe: the status with its vendor's error shape."""
+    routes = {
+        f"{OPENAI_HOST}/chat/completions": {"error": {"message": "x", "type": "x", "code": probe}},
+        OPENROUTER_CHAT: {"error": {"message": "x", "code": probe}},
+        ANTHROPIC_MESSAGES: {"type": "error", "error": {"type": "api_error", "message": "x"}},
+        GENERATE: {"error": {"code": probe, "message": "x", "status": "UNKNOWN"}},
+    }
+    for url, body in routes.items():
+        if probe == TRANSPORT:
+            router.post(url).mock(side_effect=httpx.ConnectError("connection refused"))
+        else:
+            router.post(url).mock(return_value=httpx.Response(probe, json=body))
 
 
 #: A scenario that renders no line by design — it is read through `Rendered.reasons`.
-SILENT = {"gateway_timeouts"}
+SILENT: set[str] = set()
 
 
 @scenario
-def gateway_timeouts(router, key, reasons, **_):
-    """An HTTP 504 through every adapter that speaks HTTP, read as the retry vocabulary's word."""
-    body = {"error": {"message": "upstream timed out", "type": "timeout", "code": 504}}
-    claude_body = {"type": "error", "error": {"type": "api_error", "message": "x"}}
-    vertex_body = {"error": {"code": 504, "message": "x", "status": "DEADLINE_EXCEEDED"}}
-    router.post(f"{OPENAI_HOST}/chat/completions").mock(return_value=httpx.Response(504, json=body))
-    router.post(OPENROUTER_CHAT).mock(return_value=httpx.Response(504, json=body))
-    router.post(ANTHROPIC_MESSAGES).mock(return_value=httpx.Response(504, json=claude_body))
-    router.post(GENERATE).mock(return_value=httpx.Response(504, json=vertex_body))
+def fault_slugs(router, key, reasons, **_):
+    """Every probe through every adapter that speaks HTTP, read as the `reason` it names.
+
+    An adapter's fault is read through `_retry.fault_slug` (its `failed` line's word) and
+    `_engine._reason` (its retry line's); the reranker, which has its own mapper, writes its
+    `failed` line, and that line is read. The native xAI adapter speaks gRPC, whose codes no HTTP
+    table names, so it is not probed.
+    """
     hi = [Message.user("hi")]
     openai = OpenAIProvider(
         model="gpt-6-sol", api_key=OPENAI_KEY, base_url=OPENAI_HOST, surface="chat", max_retries=0
     )
-    _gateway_timeout(reasons, "openai", lambda: openai.chat(hi))
-    _gateway_timeout(
-        reasons, "openrouter", lambda: openrouter_provider(retries_disabled=True).chat(hi)
-    )
     claude = AnthropicProvider(ANTHROPIC_MODEL, api_key=ANTHROPIC_KEY, max_tokens=4096)
-    _gateway_timeout(reasons, "anthropic", lambda: claude.chat(hi))
     gemini = build(key)
-    _gateway_timeout(reasons, "google", lambda: gemini.chat(hi))
+    adapters: dict[str, Callable[[], object]] = {
+        "openai": lambda: openai.chat(hi),
+        "openrouter": lambda: openrouter_provider(retries_disabled=True).chat(hi),
+        "anthropic": lambda: claude.chat(hi),
+        "google": lambda: gemini.chat(hi),
+    }
+    for probe in FAULT_PROBES:
+        _probe(router, probe)
+        for name, call in adapters.items():
+            _fault(reasons, f"{name} {probe}", call)
+        # A fresh reranker per probe: a `config:` failure after the first in its life is DEBUG.
+        reranker().rerank("what is the plan", hits(3), 2, surface="turn0")
     for adapter in (openai, claude, gemini):
         adapter.close()
 
@@ -1089,9 +1130,18 @@ def _tokens(line: Line) -> tuple[int, int, int]:
     )
 
 
-#: One `test` row's witness: true exactly while its departure stands. Empty while no `test` row
-#: stands — slice 3 (issue #759) struck F1–F10, and each became a regression test below.
-WITNESSES: dict[str, Callable[[Rendered, list[Site]], bool]] = {}
+#: Known Violation S1 (issue #796): a bare 402 is `api_error` on these adapters, not the page's
+#: `config:billing`. Its witness fails once they agree, and the row is struck with it.
+BARE_402_UNCLASSIFIED = ("openai", "google")
+
+
+def _bare_402_unclassified(rendered: Rendered, _: list[Site]) -> bool:
+    return all(rendered.reasons[f"{name} 402"] == "api_error" for name in BARE_402_UNCLASSIFIED)
+
+
+#: One `test` row's witness: true exactly while its departure stands. Slice 3 (issue #759) struck
+#: F1–F10, and each became a regression test below.
+WITNESSES: dict[str, Callable[[Rendered, list[Site]], bool]] = {"S1": _bare_402_unclassified}
 
 
 # === the checks =================================================================================
@@ -1176,7 +1226,7 @@ def test_every_scenario_renders_a_line(rendered):
         name for name, lines in rendered.lines.items() if not lines and name not in SILENT
     )
     assert not silent, silent
-    assert len(rendered.reasons) == 4
+    assert len(rendered.reasons) == len(FAULT_ADAPTERS) * len(FAULT_PROBES)
 
 
 def test_a_reason_is_a_slug_unless_the_page_lists_the_head(contract, sites):
@@ -1670,10 +1720,66 @@ def test_a_computed_cost_is_stated_only_for_the_host_its_table_transcribes(rende
     }
 
 
-def test_a_gateway_timeout_is_timeout_on_every_vendor(rendered):
-    assert rendered.reasons == dict.fromkeys(
-        ("openai", "openrouter", "anthropic", "google"), "timeout"
-    )
+def _fault_table() -> list[tuple[str, str]]:
+    """The page's Fault Slugs rows, as (what the producer saw, the `reason` it writes)."""
+    section = DOC.read_text(encoding="utf-8").split("\n#### Fault Slugs\n", 1)[1]
+    section = section.split("\n#", 1)[0]
+    rows = re.findall(r"^\| ([^|`]*(?:`[^`]*`[^|`]*)*) \| `([a-z_:]+)` \|$", section, re.MULTILINE)
+    return [(saw, slug) for saw, slug in rows if saw != "What the Producer Saw"]
+
+
+def _page_slug(probe: int | str) -> str:
+    """The slug the page's table gives a probe: its own row, else the range or catch-all it falls in."""
+    rows = _fault_table()
+    if probe == TRANSPORT:
+        (slug,) = [slug for saw, slug in rows if saw.startswith("No HTTP answer")]
+        return slug
+    named = [slug for saw, slug in rows if f"`{probe}`" in saw]
+    if named:
+        return named[0]
+    family = "`5xx`" if 500 <= int(probe) < 600 else "status"
+    (slug,) = [slug for saw, slug in rows if saw.startswith("Any other") and saw.endswith(family)]
+    return slug
+
+
+def test_the_fault_slug_table_is_one_vocabulary():
+    """The page states the ruled table (issue #786), and every slug in it is in the `reason` row."""
+    assert dict(_fault_table()) == {
+        "No HTTP answer: the connection failed, or broke before an answer was read "
+        "(DNS, TCP, TLS, a reset)": "transport",
+        "HTTP `401` or `403`": "config:auth",
+        "HTTP `402`": "config:billing",
+        "HTTP `404`": "config:model_not_found",
+        "HTTP `413`": "payload_too_large",
+        "HTTP `429`": "rate_limited",
+        "HTTP `504`": "timeout",
+        "Any other HTTP `5xx`": "server_error",
+        "Any other HTTP status": "api_error",
+    }
+    listed = _row("llm", "reason")
+    for _, slug in _fault_table():
+        cause = "config:<cause>" if slug.startswith("config:") else slug
+        assert f"`{cause}`" in listed, slug
+
+
+def test_every_http_adapter_names_a_fault_by_the_page(rendered):
+    """A 504 is `timeout` on every vendor, a 401 `config:auth`, … — the table, through each SDK."""
+    expected = {
+        f"{name} {probe}": _page_slug(probe) for probe in FAULT_PROBES for name in FAULT_ADAPTERS
+    }
+    for name in BARE_402_UNCLASSIFIED:  # S1, while it stands
+        expected[f"{name} 402"] = "api_error"
+    assert rendered.reasons == expected
+
+
+def test_the_reranker_names_a_fault_by_the_page(rendered):
+    """The reranker's own mapper (`_rerank._fault_of`) writes the table's words on its line."""
+    failed = [
+        line.fields["reason"]
+        for line in rendered.heads("fault_slugs", "llm")
+        if line.fields["purpose"] == "memory" and line.fields["outcome"] == "failed"
+    ]
+    assert failed == [_page_slug(probe) for probe in FAULT_PROBES]
 
 
 def test_a_refusal_is_the_calls_own_line_and_outcome(rendered):
