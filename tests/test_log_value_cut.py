@@ -327,3 +327,25 @@ def test_an_unglued_lowercase_run_is_still_redacted():
     """Only a glued match can be a word: at a token start every prefixed run is a credential."""
     assert scrub("key sk-abcdefghij") == "key [redacted]"
     assert scrub("x-hf_" + "abcdefghijklmnopqrstuvwx") == "x-[redacted]"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "api_key=hunterpass",
+        "bearer abcdefghijk",
+        "/heartbeat/abcdefghij",
+        "?token=abcdefgh",
+    ],
+)
+@pytest.mark.parametrize("glue", ["x", "7", "密"])
+def test_a_non_prefix_rule_is_redacted_whatever_precedes_it(secret, glue):
+    """Only a vendor prefix can be part of a word: every other rule redacts wherever it matches,
+    lowercase value and glued neighbor included."""
+    assert "[redacted]" in scrub(f"config {glue}{secret}")
+    assert secret.split("=")[-1].split("/")[-1] not in scrub(f"config {glue}{secret}")
+
+
+@pytest.mark.parametrize("glue", ["7", "é", "密"])
+def test_a_word_glued_by_a_digit_a_combining_mark_or_any_script_is_kept(glue):
+    assert scrub(f"{glue}sk-specification") == f"{glue}sk-specification"

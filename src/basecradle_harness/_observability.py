@@ -157,8 +157,9 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: ``disk-quota-exceeded`` and ``risk-assessment-pending`` hold neither. The two residuals are
 #: stated rather than hidden: a glued word whose run holds a digit or a capital is still redacted
 #: (the scrub errs toward redaction), and a glued key made only of lowercase letters, ``_`` and
-#: ``-`` is kept. The rules are spelled once, in `_PREFIXED`, so the prefix `_is_word` strips is
-#: the prefix the rule matched.
+#: ``-`` is kept. The rules are spelled once, in `_PREFIXED`. `_PREFIX` can strip a longer prefix
+#: than the alternative that matched (``xsk-or-…`` matched as ``sk-``), and that never changes the
+#: verdict: every prefix is lowercase letters, ``_`` and ``-``, which are never evidence of a key.
 _PREFIXED = (
     (r"sk-or-|sk-|xai-|bc_[a-z]{3}_", r"[A-Za-z0-9_-]{8,}"),
     (r"bc_(?:uat|isk)_", r"[A-Za-z0-9]+"),
@@ -233,9 +234,10 @@ def _is_word(match: re.Match[str]) -> bool:
     """Whether a prefixed match is part of a word rather than a credential (issue #794).
 
     Glued to a letter, digit or combining mark (any script), **and** its run after the prefix holds
-    no digit and no uppercase letter — never one without the other, because a key can be glued by a
-    serialization and a word never needs a digit or a capital to be cut. Everything that is not a
-    prefixed match is redacted unconditionally.
+    no digit and no uppercase letter — never one without the other, because a serialization can glue
+    a key to a letter, and a key's run always holds a digit or a capital with overwhelming
+    certainty. A glued word whose run holds one is still redacted: the scrub errs toward redaction.
+    Every match that is not a prefixed one is redacted unconditionally.
     """
     if match.lastgroup != "prefixed" or match.start() == 0:
         return False

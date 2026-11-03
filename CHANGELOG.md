@@ -29,7 +29,7 @@ out of it.
 - **Two stated residuals:** a glued word whose run holds a digit or a capital is still redacted, and
   a glued key made only of lowercase letters, `_` and `-` is kept.
 - Tests pin both sides: the word cases survive whole, and every prefixed sample is redacted after
-  each of 23 left neighbors. `docs/telemetry.md` → Credential Scrubbing states the rule; the README
+  each of 23 left neighbors, and every non-prefix rule is redacted glued to a letter or digit. `docs/telemetry.md` → Credential Scrubbing states the rule; the README
   says a vendor's word is posted whole.
 
 ## [0.175.0] - 2026-11-03
