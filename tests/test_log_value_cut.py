@@ -10,13 +10,23 @@ site that truncates a value bound for a log line, and pin the scrub layers' divi
 
 from __future__ import annotations
 
+import random
+import re
 import time
 from pathlib import Path
 
 import pytest
 
 from basecradle_harness._exceptions import ProviderError, ProviderServerError
-from basecradle_harness._observability import MAX_VALUE, _value, bounded, kv, scrub
+from basecradle_harness._observability import (
+    _HEARTBEAT_RUN,
+    MAX_VALUE,
+    _heartbeat,
+    _value,
+    bounded,
+    kv,
+    scrub,
+)
 from basecradle_harness._report import STALL_DETAIL_CAP, stall_detail
 
 #: A credential of a shape **no** rule anywhere knows — the case the cut's own rule exists for. It is
@@ -117,9 +127,13 @@ def test_a_site_scrubs_before_it_cuts_so_no_source_rule_sees_a_cut_text():
 def test_the_scrub_is_linear_on_a_long_space_free_text():
     """A value is scrubbed before it is cut, so it can be as long as a response body. The heartbeat
     rule once scanned back to a URL's start for every ``http`` in a space-free run: 3 s on 100k
-    characters. Anchored on its literal it is linear; the bound is generous so the test never flakes."""
+    characters, and the box's own pattern does the same in `re`. Matched once per space-free run, from
+    the run's start, it is linear; the bound is generous so the test never flakes."""
     started = time.monotonic()
     scrub("http://" * 14285)
+    scrub("http://" * 14285 + "/heartbeat/K9")
+    scrub("http://" * 14285 + " x/heartbeat/K9")
+    scrub("/heartbeat/" * 9090)
     scrub('{"url":"https://x.example.com/a.png"},' * 12000)
     assert time.monotonic() - started < 1.0
 
@@ -185,6 +199,7 @@ def test_an_unreadable_prune_watermark_never_quotes_part_of_a_token(tmp_path: Pa
 BOX_RULE_SAMPLES = {
     "github token (gh?_)": "ghp_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
     "github server token": "ghs_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "github fine-grained token": "github_pat_" + "11ABCDEFG0abcdefghij",
     "bearer": "Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc",
     "heartbeat url": "https://uptime.betterstack.com/api/v1/heartbeat/Ab3Cd5Ef7Gh9Ij1K",
     "basecradle user token": "bc_uat_K",
@@ -210,9 +225,121 @@ def test_the_harness_redacts_every_shape_the_box_redacts(rule):
     assert secret not in rendered, rendered
 
 
-def test_a_github_fine_grained_token_is_redacted_too():
-    """A shape the box does not carry yet; the source carries it anyway."""
-    assert "[redacted]" in _value("token github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv")
+def test_a_github_fine_grained_token_is_redacted_whole():
+    """The box carries ``github_pat_`` too (basecradle-router#398); its run takes ``_``, so the
+    redaction reaches past the underscore inside the token rather than stopping at it."""
+    rendered = _value("token github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv")
+    assert rendered == '"token [redacted]"'
+
+
+# --- a heartbeat URL, from its scheme when it has one (basecradle-router#398) ---------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        # Userinfo before the host is a credential of its own, so a URL with a scheme goes whole.
+        (
+            "GET https://john:hunter2Secret@uptime.example.com/api/v1/heartbeat/Ab3Cd5Ef7Gh9 failed",
+            "GET [redacted] failed",
+        ),
+        ("ping http://uptime.example.com/api/v1/heartbeat/Ab3Cd5Ef7Gh9", "ping [redacted]"),
+        # Without one the host stays: it is not the secret, and nothing marks where the URL began.
+        (
+            "curl uptime.example.com/api/v1/heartbeat/Ab3Cd5Ef7Gh9",
+            "curl uptime.example.com/api/v1[redacted]",
+        ),
+        # The box's match begins at the earliest of the two, and runs to the end of the run.
+        (
+            'url="https://john:pw@a.example.com/r?to=https://b.example.com/heartbeat/K9",x',
+            'url="[redacted]',
+        ),
+        ("a/heartbeat/K9,https://john:pw@b.example.com/x", "a[redacted]"),
+        # A scheme only after the last ``/heartbeat/`` starts nothing.
+        ("x/heartbeat/K9?next=https://example.com", "x[redacted]"),
+        # ``/heartbeat/`` needs something after it to be a URL's secret.
+        (
+            "https://john:pw@example.com/heartbeat/ done",
+            "https://john:pw@example.com/heartbeat/ done",
+        ),
+        ("https:///heartbeat/K9", "[redacted]"),
+    ],
+)
+def test_a_heartbeat_url_is_redacted_where_the_boxs_rule_begins(text, scrubbed):
+    """The box's rule is ``(?:https?://\\S*)?/heartbeat/\\S+``; these are its bytes, applied linearly."""
+    assert scrub(text) == scrubbed
+
+
+#: The box's heartbeat rule as written in ``ai_scrub`` (basecradle-router ``4e0c50a``). Quadratic in
+#: `re` on a long space-free run, so it is only ever run here, on short texts.
+BOX_HEARTBEAT = re.compile(r"(?:https?://\S*)?/heartbeat/\S+")
+
+
+def test_the_heartbeat_pass_redacts_exactly_the_bytes_the_boxs_rule_does():
+    """A differential check over random texts built from the pieces the rule reads, so every
+    interleaving of schemes, ``/heartbeat/``, separators and other characters is tried. The one
+    addition to the box's bytes, a trailing bearer word, is out of these pieces by construction."""
+    pieces = [
+        "https://",
+        "http://",
+        "/heartbeat/",
+        "/heartbeat",
+        "heartbeat/",
+        "h",
+        "s",
+        ":",
+        "/",
+        "x",
+        " ",
+        "\n",
+        "\x85",
+        "\u2028",
+        "\u3000",
+    ]
+    rng = random.Random(806)
+    for _ in range(20000):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 12)))
+        assert _HEARTBEAT_RUN.sub(_heartbeat, text) == BOX_HEARTBEAT.sub("[redacted]", text), text
+
+
+def test_a_heartbeat_url_after_another_rules_match_is_still_taken_from_its_scheme():
+    """The heartbeat pass runs first: a bearer run stops at the scheme's ``:``, and in one alternation
+    it left the userinfo after it to the scheme-less arm."""
+    rendered = scrub("Bearer abcdefgh.https://john:hunter2Secret@uptime.example.com/heartbeat/K9")
+    assert "hunter2Secret" not in rendered and "john" not in rendered, rendered
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"url":"https://h.example.com/heartbeat/K9","auth":"Bearer eyJhbGciOiJIUzI1NiJ9.e30.SIG"}',
+        "https://h.example.com/x?token=abc/heartbeat/K9&access_token=Bearer eyJhbGciOiJIUzI1NiJ9.e30",
+        "uptime.example.com/heartbeat/K9;authorization=bearer\teyJhbGciOiJIUzI1NiJ9.e30",
+    ],
+)
+def test_a_bearer_word_ending_a_heartbeat_run_still_redacts_its_token(text):
+    """Taken to the run's end with the URL, the scheme word left its token in the next run with no
+    rule to match it; the heartbeat pass keeps the word for the bearer rule."""
+    rendered = scrub(text)
+    assert "eyJhbGciOiJIUzI1NiJ9" not in rendered and "K9" not in rendered, rendered
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        ("x/heartbeat/K9abcBearer", "x[redacted]"),
+        ("x/heartbeat/K9-bearer", "x[redacted]bearer"),
+    ],
+)
+def test_only_a_bearer_word_not_glued_to_the_secret_is_kept(text, scrubbed):
+    """A heartbeat secret that merely ends in those letters is never shortened into a kept word."""
+    assert scrub(text) == scrubbed
+
+
+@pytest.mark.parametrize("separator", [" ", "\t", "\n"])
+def test_a_heartbeat_url_in_each_of_several_runs_is_redacted_in_each(separator):
+    runs = [f"https://john:pw{n}@example.com/heartbeat/K{n}" for n in range(3)]
+    assert scrub(separator.join(runs)) == separator.join(["[redacted]"] * 3)
 
 
 def test_a_bearer_word_in_prose_survives_the_harness_scrub():

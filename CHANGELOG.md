@@ -9,6 +9,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.177.0] - 2026-11-03
 
+### Fixed: a log value's control characters are spaces, and the scrub matches the box's (issue #806)
+
+The fleet has one value grammar, and the router's `logfmt.log_fields` and its `ai_otel_llm`
+`detail=` remap had gone one step past the harness's: they turn every control character into a
+space, and the harness left ESC, NUL and the C1 range in. A vendor error body quoted into a log line
+could carry a raw ESC that painted the reader's terminal or Better Stack's rendered view, so the
+line no longer meant what its bytes appeared to say.
+
+- **`_value` and `_full_value` flatten every control character (Unicode `Cc`: C0, DEL, C1) to a
+  space** before collapsing whitespace, through one shared `_flatten`. The router's witness case
+  (`tests/vector/ai_otel_llm.yaml`) renders to the router's bytes exactly, and the harness's own
+  paint, applied after a value is rendered, keeps its escape sequences.
+- **A heartbeat URL with a scheme is redacted from the scheme on**, as the box's `ai_scrub` now is
+  (basecradle-router#398), so userinfo ahead of `/heartbeat/` never ships; a URL without one still
+  keeps its host. The box's pattern is quadratic in Python's `re`, so the source matches each
+  space-free run once, from its start, and a differential test holds the two to the same bytes.
+  The heartbeat pass now runs before every other rule, as on the box, and keeps a bearer scheme
+  word that ends the URL's run, so the token after it is still redacted (compact JSON and a query
+  value ending `…=Bearer` shipped it, on the box as well).
+- **`github_pat_` is no longer a stated difference**: the box carries it (basecradle-router#398),
+  and `BOX_RULE_SAMPLES` holds it at the box's minimum. `docs/telemetry.md` → The Grammar states the
+  value rule, control characters included, as the one definition.
+
 ### Fixed: a bare HTTP 402 is the billing class on every adapter (issue #796)
 
 A `402 Payment Required` with no vendor-specific body was classified by its nature on the

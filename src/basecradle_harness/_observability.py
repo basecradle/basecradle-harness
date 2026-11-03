@@ -136,15 +136,12 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: and `tests/test_log_value_cut.py` holds one fabricated sample per box rule, each at the box's own
 #: minimum. The one stated difference is the bearer rule, which needs eight characters here so a
 #: diagnosis like "Bearer token missing" keeps its words; no real bearer credential is shorter.
-#: Every alternative is linear in the input (a value is scrubbed before it is cut, so it can be
-#: long): the heartbeat rule anchors on the literal ``/heartbeat/`` rather than scanning back to the
-#: URL's start, which made `re` quadratic on a long run of ``http`` (and leaves the non-secret host
-#: in place). Covered: the fleet's
+#: Every rule is linear in the input (a value is scrubbed before it is cut, so it can be long); the
+#: heartbeat rule is the one that needs care to stay so (`_HEARTBEAT_RUN`). Covered: the fleet's
 #: own key shapes (OpenAI/Anthropic ``sk-``, OpenRouter ``sk-or-``, xAI ``xai-``, BaseCradle
-#: ``bc_uat_``/``bc_isk_``), the box's (GitHub ``gh?_``, Google ``AIza``, Hugging Face ``hf_``,
-#: Replicate ``r8_``, Steel ``ste-``, a Better Stack heartbeat URL, an unanchored ``api_key=``), one
-#: the box lacks (a GitHub fine-grained ``github_pat_``), and the generic bearer and key-in-query
-#: forms.
+#: ``bc_uat_``/``bc_isk_``), the box's (GitHub ``gh?_`` and fine-grained ``github_pat_``, Google
+#: ``AIza``, Hugging Face ``hf_``, Replicate ``r8_``, Steel ``ste-``, a Better Stack heartbeat URL,
+#: an unanchored ``api_key=``), and the generic bearer and key-in-query forms.
 #:
 #: **A vendor prefix inside a word is a word, not a credential** (issue #794), and the test is
 #: `_is_word`, never a left boundary. A boundary would be a list of the contexts in which
@@ -183,13 +180,42 @@ _PREFIX_RULES = re.compile("|".join(f"(?:{prefix}){body}" for prefix, body in _P
 #: same holds between two rules: an assignment whose value is a bearer header
 #: (``AUTH_API_KEY=Bearer eyJ…``) takes every ``Bearer`` and the token together, where it once took
 #: ``Bearer`` as the whole value and left the token after the space; every, because a token stored
-#: with its scheme and sent with another reads ``Bearer Bearer eyJ…``.
+#: with its scheme and sent with another reads ``Bearer Bearer eyJ…``. The heartbeat URL runs first
+#: of all, alone (`_HEARTBEAT_RUN`).
 _LITERAL_RULES = re.compile(
-    r"/heartbeat/\S+"
-    r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
+    r"(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*[^&\s]+"
     r"|(?i:api[-_]?key=)(?:(?i:bearer)\s+)*[^&\s\"]+"
 )
+
+#: A Better Stack heartbeat URL, whose secret is its path, redacted by the box's rule
+#: ``(?:https?://\S*)?/heartbeat/\S+`` (basecradle-router#398): a URL with a scheme from the scheme
+#: on, so userinfo before the host (``https://john:…@host/…/heartbeat/…``) never ships; one without
+#: (``curl uptime.example.com/api/v1/heartbeat/…``) from ``/heartbeat/`` on, keeping its host, which
+#: is not the secret. **It runs first, before every other rule**, as the box's does: a rule that
+#: matched first and stopped inside the URL (a bearer run takes ``…https`` and stops at the ``:``)
+#: would leave the rest of it, userinfo included, to the scheme-less arm alone; and this pattern
+#: starts only at a run's start, which a match ending mid-run in one alternation would skip.
+#:
+#: **The box's pattern is not used here, because in `re` it is quadratic**: every ``https?://`` in a
+#: space-free run scans to the run's end before it fails, and ``"http://" * 8000`` took 2.9 s. So this
+#: pattern matches a whole space-free run that holds ``/heartbeat/`` and something after it, and only
+#: from the run's start: the lookbehind fails at once everywhere else, and each run is scanned once.
+#: `_heartbeat` then cuts the run where the box's pattern would have begun its match, which is the
+#: leftmost of the run's first ``/heartbeat/`` and its first scheme that ends before the run's last
+#: ``/heartbeat/`` with a character after it. The box's match runs to the end of the run, as this one
+#: does, so the bytes redacted are the box's — with one addition, `_TRAILING_BEARER`.
+_HEARTBEAT_RUN = re.compile(r"(?<!\S)\S*/heartbeat/\S+")
+_HEARTBEAT = "/heartbeat/"
+_SCHEME = re.compile(r"https?://")
+
+#: A bearer scheme word ending a heartbeat run, which `_heartbeat` keeps so the bearer rule still
+#: sees it beside its token in the next run. Taken to the run's end, the word went with the URL and
+#: left the token with no rule to match it: compact JSON (``{"url":"https://h/heartbeat/K9",
+#: "auth":"Bearer eyJ…"}``) and a query value ending ``…&access_token=Bearer eyJ…`` shipped the
+#: token, on the box as well. Not glued to a letter or digit, so a heartbeat secret that merely ends
+#: in those letters is never shortened into a kept word.
+_TRAILING_BEARER = re.compile(r"(?<![A-Za-z0-9])(?i:bearer)\Z")
 
 #: One character of the run every **length-gated** redaction rule matches — this module's
 #: rules and the box's ``ai_scrub`` alike. A rule with a minimum length (``sk-…{8,}``,
@@ -231,14 +257,27 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
 def scrub(text: str) -> str:
     """`text` with every credential shape the scrub knows replaced by ``[redacted]``.
 
-    Two passes, in order: `_LITERAL_RULES`, then the prefix rules (`_PREFIXED`). The second pass
-    keeps a match `_is_word` reads as a word, as written.
+    Three passes, in order: the heartbeat URL (`_HEARTBEAT_RUN`), the other literal rules
+    (`_LITERAL_RULES`), then the prefix rules (`_PREFIXED`). The last keeps a match `_is_word`
+    reads as a word, as written.
 
     Run on a whole text **before** `bounded` cuts it, so a rule is never shown a credential cut
     short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before
     `kv` sees it calls this first.
     """
+    text = _HEARTBEAT_RUN.sub(_heartbeat, text)
     return _PREFIX_RULES.sub(_redaction, _LITERAL_RULES.sub("[redacted]", text))
+
+
+def _heartbeat(match: re.Match[str]) -> str:
+    """A space-free run holding a heartbeat URL, redacted from where the box's rule would begin."""
+    run = match.group()
+    start = run.index(_HEARTBEAT)
+    scheme = _SCHEME.search(run, 0, run.rindex(_HEARTBEAT, 0, len(run) - 1))
+    if scheme:
+        start = min(start, scheme.start())
+    bearer = _TRAILING_BEARER.search(run, start)
+    return run[:start] + "[redacted]" + (bearer.group() if bearer else "")
 
 
 def _redaction(match: re.Match[str]) -> str:
@@ -505,8 +544,9 @@ def kv(**fields: Any) -> str:
     Values are rendered by `_value`, never interpolated raw, because **some of them are not the
     harness's text**: a tool's exception message, an SDK refusal, a provider's error body. Left
     raw, such a value could put a newline in the middle of a record (splitting one leveled line
-    into unleveled fragments a severity filter shows decapitated), forge a field by containing
-    ``outcome=ok``, run to the length of a whole response body, or carry a credential. A parser
+    into unleveled fragments a severity filter shows decapitated), paint the reader's view with an
+    ESC of its own, forge a field by containing ``outcome=ok``, run to the length of a whole
+    response body, or carry a credential. A parser
     reading this stream must be able to trust that the fields it sees are the fields the harness
     wrote.
 
@@ -545,15 +585,14 @@ def _field(key: str, rendered: str, *, colored: bool) -> str:
 def _value(value: Any) -> str:
     """One field's value: single-line, redacted, bounded, and quoted when it isn't a bare token.
 
-    Four jobs, in order — flatten (a record is one line), scrub (`scrub`), truncate
-    (`MAX_VALUE`, by `bounded`, never inside a token), then quote anything holding a space or an
-    ``=`` so it reads as *one* value rather than as extra fields. Scrub before the cut, so every shape
-    this module knows is redacted whole; the cut's own rule protects the shapes only the box knows.
-    A plain uuid, duration, or count passes through untouched, which is what keeps the common line
-    greppable.
+    Four jobs, in order — flatten (`_flatten`: one line, no control character), scrub (`scrub`),
+    truncate (`MAX_VALUE`, by `bounded`, never inside a token), then quote anything holding a space
+    or an ``=`` so it reads as *one* value rather than as extra fields. Scrub before the cut, so every
+    shape this module knows is redacted whole; the cut's own rule protects the shapes only the box
+    knows. A plain uuid, duration, or count passes through untouched, which is what keeps the common
+    line greppable.
     """
-    text = " ".join(str(value).split())  # collapse newlines/tabs/runs — one record, one line
-    text = bounded(scrub(text), MAX_VALUE)
+    text = bounded(scrub(_flatten(value)), MAX_VALUE)
     if text and (" " in text or "=" in text or '"' in text):
         return '"' + text.replace('"', "'") + '"'
     return text
@@ -600,9 +639,27 @@ def _full_value(value: str) -> str:
     one field that has nowhere else to live (see `log_unspoken`). Quoted unconditionally, because a
     narration is prose: it will contain spaces, and it may well contain an ``=``.
     """
-    text = " ".join(str(value).split())  # collapse newlines/tabs/runs — one record, one line
-    text = scrub(text)
+    text = scrub(_flatten(value))
     return '"' + text.replace('"', "'") + '"'
+
+
+#: One C0 or C1 control character, or DEL: Unicode's ``Cc`` category exactly, which is what the
+#: router's ``logfmt._CONTROL`` and the ``\p{Cc}`` of its ``ai_otel_llm`` remap match, so the fleet's
+#: three renderers flatten the same bytes (issue #806).
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _flatten(value: Any) -> str:
+    """`value` as one line holding no control character: each becomes a space, then every run of
+    whitespace is one space, trimmed at both ends.
+
+    **A control character in a value is never legitimate.** A newline would split one record into
+    unleveled fragments; an ESC (a vendor's error body can quote one) would paint the reader's
+    terminal, or Better Stack's rendered view, with a color this module did not choose, so the line
+    no longer means what its bytes appear to say. The harness's own color (`head`, `_field`) is
+    applied after a value is rendered, so it is never removed by this.
+    """
+    return " ".join(_CONTROL.sub(" ", str(value)).split())
 
 
 def delivery_id() -> str | None:
