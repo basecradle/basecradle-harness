@@ -43,7 +43,7 @@ from basecradle_harness._basecradle import (
 )
 from basecradle_harness._deadline import _budget, bound_attempts
 from basecradle_harness._observability import read_answer
-from tests.conftest import completion, is_retry, out_message, responses_body
+from tests.conftest import completion, is_retry, out_function_call, out_message, responses_body
 from tests.test_openrouter import completion as openrouter_completion
 from tests.test_openrouter import wire_tool_call
 
@@ -557,3 +557,55 @@ def test_an_uncapped_call_is_judged_by_its_stop_reason_alone():
     usage = {"completion_tokens": 131_072}
     _reply, error = read_answer(read, {"choices": [{"finish_reason": "stop"}]}, usage=usage)
     assert not isinstance(error, ProviderTruncatedError)
+
+
+def _openai_cut(surface: str) -> dict:
+    """A tool call cut off at a 30-token cap, as each OpenAI surface returns it."""
+    if surface == "responses":
+        call = out_function_call(call_id="call_0", name="post", arguments={})
+        call["arguments"] = '{"body": "Lighthouse stands'
+        body = responses_body(call)
+        body["status"] = "incomplete"
+        body["incomplete_details"] = {"reason": "max_output_tokens"}
+        body["usage"] = {
+            "input_tokens": 45,
+            "output_tokens": 30,
+            "total_tokens": 75,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": 0},
+        }
+        return body
+    cut = {
+        "id": "call_0",
+        "type": "function",
+        "function": {"name": "post", "arguments": '{"body": "Lighthouse stands'},
+    }
+    body = completion(tool_calls=[cut], finish_reason="length")
+    body["usage"] = {"prompt_tokens": 45, "completion_tokens": 30, "total_tokens": 75}
+    return body
+
+
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+def test_the_openai_adapter_writes_a_cut_off_tool_call_as_truncated(caplog, surface):
+    """The same verdict on both OpenAI surfaces (issue #788): billed `fallback reason=truncated`,
+    raised as the retryable `ProviderTruncatedError`."""
+    from basecradle_harness import OpenAIProvider
+
+    provider = OpenAIProvider(
+        model="gpt-5.4-mini",
+        api_key=FAKE_KEY,
+        base_url="https://openai.test/v1",
+        surface=surface,
+        **{"max_output_tokens" if surface == "responses" else "max_completion_tokens": 30},
+    )
+    url = f"https://openai.test/v1/{'responses' if surface == 'responses' else 'chat/completions'}"
+    with respx.mock(assert_all_called=True) as router:
+        router.post(url).mock(return_value=httpx.Response(200, json=_openai_cut(surface)))
+        with (
+            caplog.at_level(logging.INFO, logger="basecradle_harness"),
+            pytest.raises(ProviderTruncatedError),
+        ):
+            provider.chat([Message.user("post a poem")])
+
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
+    assert "outcome=fallback" in line and "reason=truncated" in line
