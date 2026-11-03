@@ -371,7 +371,8 @@ Another pass of the same wake, because work arrived while it ran.
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `timeline` | Common. | The wake. | Never. |
-| `outcome` | `ok` (every reconcile returned) or `error`. | The wake. | Never. |
+| `outcome` | `ok` (every reconcile returned), `error`, or `stopped` (the wake received SIGTERM — the router's `stop-wake` — and settled what it held; it matches the router's own `stage=wake outcome=stopped`, and is not a failure: the fleet's `wake_failed` reads `outcome=error` only). | The wake. | Never. |
+| `signal` | The signal that stopped the wake, without its `SIG` prefix: `TERM`. | The wake. | `outcome` is not `stopped`. |
 | `turns` | Turns the engine ran. | The engine. | Never. |
 | `steps` | Model steps used, as `used/budget`. | The engine. | Never. |
 | `posted` | Messages the agent posted. `0` is legitimate: silence is an answer. | The wake. | Never. |
@@ -414,6 +415,19 @@ An item abandoned after its resumes failed `RESUME_CEILING` times, or a batch-ma
 | `note` | The uuid of the stall note posted. | The wake. | A batch-mate's line. |
 | `reason` | `resume_ceiling` (the turn's resumes failed `RESUME_CEILING` times) or `batch_mate` (abandoned with the turn that carried it). | The wake. | Never. |
 | `detail` | The harness's sentence on how the last resume failed. | The wake. | A batch-mate's line. |
+
+### `wake stopped`
+
+An item a stopped wake held in flight, settled so no later wake resumes or re-drives it (issue #798). WARNING: deliberate and visible, never a page.
+
+| Field | Meaning | Filled By | Absent When |
+|---|---|---|---|
+| `item` | Common. | The wake. | Never. |
+| `kind` | `messages`, `assets`, `webhook_events` or `tasks`. | The wake. | Never. |
+| `timeline` | Common. | The wake. | Never. |
+| `handle` | Common. | The wake. | `reason=signal` (the stopping wake reads the claims, not the items). |
+| `signal` | As on `wake end`. | The wake. | `reason=stop_note`. |
+| `reason` | `signal` (the stopping wake settled it itself) or `stop_note` (a later wake found the turn ending on the stop note, the stopping wake having been unable to write the claim). | The wake. | Never. |
 
 ### `wake reported_failure`
 

@@ -243,7 +243,10 @@ from basecradle_harness._rerank import (
     order_from_env as rerank_order_from_env,
 )
 from basecradle_harness._secret import secret
-from basecradle_harness._session import INTERRUPTED, Session, turn_work
+from basecradle_harness._session import INTERRUPTED, STOPPED_NOTE, Session, turn_work
+from basecradle_harness._stop import WakeStopped
+from basecradle_harness._stop import die as die_by_signal
+from basecradle_harness._stop import install as install_stop_handler
 from basecradle_harness._timeouts import output_cap
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
@@ -1210,6 +1213,34 @@ class ClaimStore:
         )
         self._held.pop((timeline, kind, uuid), None)
 
+    def stop(
+        self, timeline: str, uuid: str, *, kind: str, owners: frozenset[str], reason: str
+    ) -> bool:
+        """Settle an in-flight claim one of `owners` holds as **stopped**. True if this did it.
+
+        A stopped wake's own last act (issue #798): every item it still holds in flight is settled,
+        so no later wake resumes or re-drives what a human stopped. The phase is `abandoned` — final,
+        prunable, read everywhere exactly as a drop is — and `reason` says it was a stop.
+
+        Compare, then write, under the directory's exclusive lock, exactly as `recount` does — and
+        the owner compared is the **effective** one (`effective_owner`), because a take-over this
+        wake won and was stopped before it could rewrite the claim leaves the claim naming the wake
+        it took over from. `owners` is every claims identity this wake has used: a repass takes a
+        fresh one (#596), and the turn an earlier pass left cut off is still this wake's to stop.
+        Anything else — settled, pruned, or a live rival's — is not ours, and is left alone.
+        """
+        path = self._path(timeline, kind, uuid)
+        with _locked(path.parent, shared=False, required=False):
+            current = self.read(timeline, uuid, kind=kind)
+            if current is None or current.settled:
+                return False
+            owner = self.effective_owner(timeline, uuid, kind=kind, claim=current)
+            if owner.wake not in owners:
+                return False
+            self._write(path, Claim(phase=_ABANDONED, at=time.time(), reason=reason))
+        self._held.pop((timeline, kind, uuid), None)
+        return True
+
     def unsettled(self, timeline: str, *, kind: str) -> list[str]:
         """The uuids of every item of `kind` on `timeline` whose claim is not yet final.
 
@@ -1948,6 +1979,10 @@ class WakeAgent:
         self._breaker_held = False
         self._begin_memory_wake()
         outcome = "error"  # only a clean return past the reconciles earns another verdict
+        stopped_by: str | None = None  # the signal that stopped the wake, when one did (#798)
+        # Every claims identity this wake takes — one per pass (#596) — so a stop can tell the claims
+        # that are this wake's to settle from a rival's.
+        self._wake_ids: set[str] = set()
         session: Session | None = None
         try:
             session = self.harness.session(self.source)
@@ -1991,6 +2026,14 @@ class WakeAgent:
             self._forget_settled(session)
             outcome = "ok"
             return posted + self.speech.posts
+        except WakeStopped as stop:
+            # SIGTERM (issue #798): the wake was stopped, and a stop is a stop. Whatever it still
+            # holds in flight is settled here, so no later wake resumes or re-drives it — the
+            # session has already ended the running turn on `STOPPED_NOTE`. Then the stop goes on
+            # out, so the entrypoint dies by the signal.
+            outcome, stopped_by = "stopped", stop.signal_name
+            self._stop_held(stop)
+            raise
         finally:
             # This wake is over; its claims are no longer its to keep alive (issue #532). A session
             # reused after it must not go on refreshing what it left in flight.
@@ -2009,6 +2052,7 @@ class WakeAgent:
                 kv(
                     timeline=self.timeline_uuid,
                     outcome=outcome,
+                    signal=stopped_by,
                     turns=engine.turns_run,
                     steps=f"{engine.steps_used}/{engine.max_steps}",
                     # Everything that reached a timeline: the harness's own posts (probe acks) plus
@@ -2075,11 +2119,58 @@ class WakeAgent:
         # A fresh identity per *pass*, not per process: an agent that wakes twice in one
         # process must see its own earlier wake's abandoned claims as orphaned, not as "mine".
         self.claims.wake = uuid4().hex
+        self._wake_ids.add(self.claims.wake)
         posted += self._wake_messages(session, trigger)
         posted += self._wake_assets(session, asset_trigger)
         posted += self._wake_events(session, event_trigger)
         posted += self._wake_tasks(session)
         return posted
+
+    def _stop_held(self, stop: WakeStopped) -> None:
+        """Settle every item this wake holds in flight as **stopped** (issue #798).
+
+        Read off the claims rather than kept in memory, because what this wake holds is exactly what
+        the claims directory says it holds: an item an earlier pass left cut off (a fresh identity
+        since, so not in `ClaimStore`'s own held set), or one a take-over this wake won and was
+        stopped inside. Best-effort per item — a claim it cannot write stays in flight, and the turn's
+        `STOPPED_NOTE` is what then tells the next wake (`_turn_stopped`). Never raises: this runs
+        inside the grace window, and the stop must reach the entrypoint.
+        """
+        owners = frozenset(self._wake_ids)
+        reason = f"stopped: the wake received SIG{stop.signal_name}"
+        for kind in (_MESSAGES, _ASSETS, _EVENTS, _TASKS):
+            try:
+                held = self.claims.unsettled(self.timeline_uuid, kind=kind)
+            except OSError as error:
+                _log.warning("Could not read the %s claims to stop them: %s", kind, error)
+                continue
+            for uuid in held:
+                try:
+                    if not self.claims.stop(
+                        self.timeline_uuid, uuid, kind=kind, owners=owners, reason=reason
+                    ):
+                        continue
+                except OSError as error:
+                    _log.warning("Could not settle the %s %s as stopped: %s", kind, uuid, error)
+                    continue
+                self._log_stopped(uuid, kind, reason="signal", signal=stop.signal_name)
+
+    def _log_stopped(
+        self, uuid: str, kind: str, *, reason: str, signal: str | None = None, handle=None
+    ) -> None:
+        """One `wake stopped` line per item a stop settled — never silent, never a page (#798)."""
+        _log.warning(
+            "%s %s",
+            head("wake stopped", YELLOW),
+            kv(
+                item=uuid,
+                kind=kind,
+                timeline=self.timeline_uuid,
+                handle=handle,
+                signal=signal,
+                reason=reason,
+            ),
+        )
 
     def _truncation_latched(self) -> bool:
         """Did this pass stop early only because a turn was cut off at the output budget? (#596)
@@ -3919,6 +4010,22 @@ class WakeAgent:
         if _turn_narration(work) is not None:
             return self._committed(item, kind)
 
+        if _turn_stopped(work):
+            # The wake was stopped (SIGTERM, issue #798) and could not settle this claim itself —
+            # but its turn says so. A stop is a stop: never resumed, never re-driven.
+            if not self.claims.reclaim(
+                self.timeline_uuid, item.content.uuid, kind=kind, owner=claim.wake
+            ):
+                return _PENDING
+            self.claims.abandon(
+                self.timeline_uuid,
+                item.content.uuid,
+                kind=kind,
+                reason="stopped: the turn that carried it ended on the stop note",
+            )
+            self._log_stopped(item.content.uuid, kind, reason="stop_note", handle=_handle_of(item))
+            return _FINAL
+
         if any(message.tool_calls for message in work) or _turn_cut_off(work):
             already = self._resumed_outcome(turn)
             if already is not None:
@@ -5011,6 +5118,15 @@ def _evidence_lost(history: list[Message], item: object) -> bool:
 _TIMELINE_ACTIONS = frozenset({MESSAGE, ASSET, TASK})
 
 
+def _turn_stopped(work: list[Message]) -> bool:
+    """Did this turn's work end on the stop note — was its wake stopped, not crashed? (#798)
+
+    Exact match on the harness's own constant, on a `system` turn — the role only the harness
+    writes — so nothing a peer or the model says can make a crashed turn read as stopped.
+    """
+    return bool(work) and work[-1].role == "system" and work[-1].content == STOPPED_NOTE
+
+
 def _turn_timed_out(exc: BaseException) -> bool:
     """Whether a failed resume ran out of **the budget the harness fitted to it** (issue #589).
 
@@ -6088,9 +6204,16 @@ def main(argv: list[str] | None = None) -> int:
     # above: those exit before here, so their machine-readable stdout stays uncontaminated.
     _configure_logging()
 
+    # A stop is a stop (issue #798): SIGTERM unwinds the wake, which settles what it holds and says
+    # `outcome=stopped`, and the process then dies by that signal — so the router's own
+    # classification of the exit holds. Installed here, never on import: only this entrypoint owns
+    # its process's signals.
+    install_stop_handler()
     try:
         agent = WakeAgent.from_env(timeline=args.timeline)
         agent.wake(trigger=args.message, event_trigger=args.event, asset_trigger=args.asset)
+    except WakeStopped as stop:
+        die_by_signal(stop)
     except StaleTimelineError:
         # The delivery names a timeline the not-found 404 at bootstrap says no longer exists
         # (an HQ rotation the agent itself did, a burst that outran a deletion, a never-existed

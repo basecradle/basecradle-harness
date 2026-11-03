@@ -112,6 +112,8 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
         "retrying": YELLOW,
         "refused": YELLOW,
         "fallback": YELLOW,
+        # A wake SIGTERM stopped (issue #798): deliberate, never a failure, so never RED.
+        "stopped": YELLOW,
     },
 }
 

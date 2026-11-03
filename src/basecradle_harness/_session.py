@@ -97,6 +97,7 @@ from basecradle_harness._engine import Engine
 from basecradle_harness._exceptions import ProviderContextLengthError
 from basecradle_harness._idempotency import create_kind
 from basecradle_harness._messages import ImageContent, Message, ToolCall
+from basecradle_harness._stop import WakeStopped
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -116,6 +117,26 @@ INTERRUPTED = (
     "recorded. Its outcome is unknown — it may have completed, completed partially, or never "
     "started. It has NOT been re-run, because re-running it could repeat something that already "
     "happened. If it matters here, check for yourself and decide what to do.]"
+)
+
+#: The result a **stopped** wake gives each call it left unanswered (issue #798, `_stop`). Not
+#: `INTERRUPTED`, and the difference is load-bearing: the recovery finds the creates to re-issue by
+#: that sentinel's exact text (`_idempotency.interrupted`), so a stopped call carrying it would be
+#: re-posted by the next wake — undoing the stop. This one is terminal: nothing reads it back, and it
+#: is capped like any other result.
+STOPPED = (
+    "[Stopped: this wake received SIGTERM while this call was running, before its result could be "
+    "recorded. Its outcome is unknown — it may have completed, completed partially, or never "
+    "started. It has NOT been re-run, and will not be: a stopped wake is not resumed. If it matters "
+    "here, check for yourself and decide what to do.]"
+)
+
+#: What a turn a stopped wake was running ends on (issue #798). It is the transcript's own record
+#: that the turn was stopped rather than crashed, so a later wake that finds the turn's claim still
+#: in flight (the stopping wake could not write it) settles the item as stopped instead of resuming
+#: it — read by exact match (`_wake._turn_stopped`), so it is one constant and never composed.
+STOPPED_NOTE = (
+    "[turn stopped: this wake received SIGTERM before the turn finished; it is not resumed]"
 )
 
 #: How the elided result is split around the marker: enough head to keep the shape and the
@@ -446,8 +467,15 @@ class Session:
         # `finally`.
         self._convo, self._adopted, self._at = convo, adopted, at
         failing = False  # is an exception already on its way out through the `finally`?
+        stopped = False  # is it a stop (SIGTERM, issue #798) rather than a failure?
         try:
             reply = self.engine.run(convo, on_progress=self._progress_hook())
+        except WakeStopped:
+            # A stop, not a failure: the `finally` gives every call left unanswered the terminal
+            # `STOPPED` result, never the `INTERRUPTED` sentinel the recovery re-issues creates
+            # from, and ends the turn on the note that says it was stopped.
+            failing = stopped = True
+            raise
         except Exception as exc:
             # A failed run — most pointedly the engine's reserve-summary fallback erroring —
             # still did work worth keeping (the counter notes, every assistant tool-call turn,
@@ -469,7 +497,11 @@ class Session:
             # may well survive this failure (the recovery catches, and goes on to answer other
             # messages on the same `Session`), and every later provider call in it would 400 on a
             # dangling `tool_call_id` that only a restart would repair.
-            heal_interrupted_calls(work)
+            heal_interrupted_calls(work, result=STOPPED if stopped else INTERRUPTED)
+            if stopped:
+                # After the healed results, never before them: a result must follow the turn that
+                # issued its call, and the note is the last thing the stopped turn says.
+                work.append(Message.system(STOPPED_NOTE))
             self.history[at:at] = work
             #: Where the work this run produced ended up, so the over-length rescue can rewind
             #: exactly it — `history[-n:]` would be the wrong messages on a resume.
@@ -996,7 +1028,7 @@ def _index_of(history: list[Message], turn: Message) -> int | None:
     return None
 
 
-def heal_interrupted_calls(history: list[Message]) -> int:
+def heal_interrupted_calls(history: list[Message], *, result: str = INTERRUPTED) -> int:
     """Give every unanswered tool call a result. Returns how many were healed (issue #297).
 
     **This is not tidiness; it is the difference between a recoverable agent and a bricked one.**
@@ -1013,6 +1045,9 @@ def heal_interrupted_calls(history: list[Message]) -> int:
     say, and because the model reading it is perfectly capable of going and looking. A resume
     replaces this text for the one class of call it *can* safely re-issue (a platform create, under
     the key the dead wake used); everything else keeps it.
+
+    `result` is `INTERRUPTED` everywhere but one place: a wake that is being **stopped** (issue
+    #798) heals its own turn with `STOPPED`, which the recovery never re-issues from.
     """
     healed = 0
     index = 0
@@ -1032,7 +1067,7 @@ def heal_interrupted_calls(history: list[Message]) -> int:
         answered = {r.tool_call_id for r in history[index + 1 : after] if r.role == "tool"}
         missing = [call for call in turn.tool_calls if call.id not in answered]
         for offset, call in enumerate(missing):
-            history.insert(after + offset, Message.tool(tool_call_id=call.id, content=INTERRUPTED))
+            history.insert(after + offset, Message.tool(tool_call_id=call.id, content=result))
         healed += len(missing)
         index = after + len(missing)
     return healed

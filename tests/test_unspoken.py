@@ -422,7 +422,7 @@ def _model_facing_strings():
     other surface — the brief, the nudges, the guidance the engine feeds back — where the word
     would be a lie the model then reasons from.
     """
-    from basecradle_harness import _arguments, _mempalace
+    from basecradle_harness import _arguments, _mempalace, _session
     from basecradle_harness._brief import (
         render_brain,
         render_budget,
@@ -502,6 +502,9 @@ def _model_facing_strings():
         # its own account of what happened to it (issue #490) — which puts it squarely on this
         # surface, whatever its `system` role suggests.
         "truncation note": _TRUNCATED_NOTE,
+        # Issue #798: what a stopped wake leaves in the transcript for every later turn to read.
+        "stopped result": _session.STOPPED,
+        "stop note": _session.STOPPED_NOTE,
         "mention nudge": MENTION_NUDGE,
         "one-on-one nudge": ONE_ON_ONE_NUDGE,
         # Issue #733: how the model is told to read its recalled memories, on both surfaces.

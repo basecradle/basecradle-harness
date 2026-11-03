@@ -7,6 +7,33 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.175.0] - 2026-11-03
+
+### Fixed: a stopped wake is a stop, and the next wake no longer resumes it (issue #798)
+
+The router's `stop-wake` (basecradle-router#386) SIGTERMs every process in a wake and SIGKILLs what
+is left about two seconds later. The harness trapped nothing, so a stop looked exactly like a crash:
+the next organic wake resumed the stopped turn as `reason=died_mid_tool_chain` and re-issued its
+creates (seen live on `@ping`, 2026-11-03 09:33Z).
+
+- **`basecradle-harness-wake` traps SIGTERM** (`_stop`), and only the entrypoint does: the first one
+  unwinds the wake as `WakeStopped` (a `BaseException`, so no `except Exception` survives it); a
+  second is ignored, since the router signals every process and `sudo` relays.
+- **The running turn records the stop**: every call it left unanswered gets the terminal `STOPPED`
+  result — never `INTERRUPTED`, which the recovery re-issues creates from — and the turn ends on
+  `STOPPED_NOTE`.
+- **Every claim the wake holds is settled** as stopped, by every claims identity the wake used and
+  through a take-over it had not yet rewritten, each logged `wake stopped … reason=signal` (WARNING).
+- **`wake end … outcome=stopped signal=TERM`**, matching the router's `stage=wake outcome=stopped`;
+  the fleet's `wake_failed` (`outcome=error`) does not match it. `stopped` is colored YELLOW.
+- **The process dies by the signal** (default disposition restored, the signal re-sent), so `sudo`
+  dies by -15 and the router's classification holds.
+- **A claim the stop could not write** is settled by the next wake from the turn's own note
+  (`wake stopped … reason=stop_note`) rather than resumed.
+- A `SIGKILL` runs none of this: a crash is still resumed as a crash.
+- `docs/telemetry.md` gains `wake end`'s `stopped` outcome and `signal` field and the `wake stopped`
+  head; README, `CLAUDE.md` → Delivery Guarantee and the `delivery-guarantee` skill say so.
+
 ## [0.174.0] - 2026-11-03
 
 ### Fixed: a credential a vendor echoed is never posted to a timeline (issue #791)
