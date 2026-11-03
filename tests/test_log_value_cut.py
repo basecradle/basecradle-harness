@@ -231,3 +231,121 @@ def test_an_identifier_the_harness_writes_is_not_mistaken_for_a_credential():
     ):
         assert _value(value) == value
     assert not _SECRETS.search("tokens_in=764942 cached_tokens=238277")
+
+
+# --- a vendor prefix inside a word is a word, not a credential (issue #794) ---------------------
+
+#: One fabricated sample per **prefix-anchored** rule in `_SECRETS` — the rules a word can contain.
+PREFIX_SAMPLES = {
+    "sk-": "sk-ant-api03-Ab3Cd5Ef7Gh9",
+    "sk-or-": "sk-or-v1-0f3a9c2b7d4e6f8a",
+    "xai-": "xai-Ab3Cd5Ef7Gh9Ij1K",
+    "bc_???_": "bc_tok_Ab3Cd5Ef7Gh9",
+    "bc_uat_": "bc_uat_K",
+    "bc_isk_": "bc_isk_K",
+    "gh?_": "ghp_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "github_pat_": "github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv",
+    "AIza": "AIza" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "hf_": "hf_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "r8_": "r8_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "ste-": "ste-" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+}
+
+BACKSLASH = chr(92)
+
+#: Every left neighbor a credential can follow. The first group is a separator; the second ends in
+#: a letter or digit — a serialization, a color code, a script written without spaces, a word
+#: glued on by a bug — which is why no left boundary can be the test (`_is_word`).
+LEFT_NEIGHBORS = {
+    "start of text": "",
+    "space": "key ",
+    "equals": "key=",
+    "colon": "key:",
+    "double quote": '"',
+    "underscore": "OPENAI_KEY_",
+    "hyphen": "x-",
+    "slash": "/v1/keys/",
+    "percent-encoded space": "Bearer%20",
+    "double percent-encoding": "key%253D",
+    "quoted-printable": "key=3D",
+    "escaped newline": "body" + BACKSLASH + "n",
+    "hex escape": BACKSLASH + "x22",
+    "unicode escape": BACKSLASH + "u0022",
+    "astral escape": BACKSLASH + "U0001f600",
+    "ANSI color": "invalid key \x1b[33m",
+    "Chinese": "API\u5bc6\u94a5",
+    "Japanese": "API\u30ad\u30fc",
+    "Bearer with no space": "Authorization:Bearer",
+    "timestamp": "2026-11-03T10:00:00Z",
+    "letter": "a",
+    "accented letter": "\u00e9",
+    "combining mark": "e\u0301",
+}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "task-specification failed",
+        "disk-quota-exceeded-for-org",
+        "risk-assessment-pending-review",
+        "the task-specification-for-this-run is invalid",
+        "laughs_happily_ever_after_and_after",
+        "abc_uat_unknown",
+        "R\u00edsk-assessment-pending-review",  # a localized vendor sentence keeps its words too
+        "G\u00e4ste-registrierungssystem-voll",
+    ],
+)
+def test_a_vendor_prefix_inside_a_word_is_not_a_credential(text):
+    assert scrub(text) == text
+    assert _value(text) == (f'"{text}"' if " " in text else text)
+
+
+@pytest.mark.parametrize("rule", sorted(PREFIX_SAMPLES))
+@pytest.mark.parametrize("left", sorted(LEFT_NEIGHBORS))
+def test_a_credential_after_every_left_neighbor_is_still_redacted(rule, left):
+    """A key glued to a letter or digit is still a key: its run holds a digit or a capital."""
+    prefix = LEFT_NEIGHBORS[left]
+    rendered = scrub(f"{prefix}{PREFIX_SAMPLES[rule]} rejected")
+    assert rendered == f"{prefix}[redacted] rejected", rendered
+
+
+@pytest.mark.parametrize("glue", ["a", "7", "\u00e9", "\u5bc6"])
+def test_a_glued_run_with_a_digit_or_a_capital_is_redacted_however_wordlike(glue):
+    """The stated residual, in the safe direction: the scrub errs toward redaction."""
+    assert scrub(f"{glue}sk-specification2") == f"{glue}[redacted]"
+    assert scrub(f"{glue}sk-Specification") == f"{glue}[redacted]"
+
+
+def test_a_prefix_that_holds_a_digit_is_not_read_as_the_run():
+    """``r8_``'s own digit is the prefix, never evidence about the run after it."""
+    assert scrub("xr8_" + "abcdefghijklmnopqrstuvwx") == "xr8_" + "abcdefghijklmnopqrstuvwx"
+    assert scrub("r8_" + "abcdefghijklmnopqrstuvwx") == "[redacted]"
+
+
+def test_an_unglued_lowercase_run_is_still_redacted():
+    """Only a glued match can be a word: at a token start every prefixed run is a credential."""
+    assert scrub("key sk-abcdefghij") == "key [redacted]"
+    assert scrub("x-hf_" + "abcdefghijklmnopqrstuvwx") == "x-[redacted]"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "api_key=hunterpass",
+        "bearer abcdefghijk",
+        "/heartbeat/abcdefghij",
+        "?token=abcdefgh",
+    ],
+)
+@pytest.mark.parametrize("glue", ["x", "7", "密"])
+def test_a_non_prefix_rule_is_redacted_whatever_precedes_it(secret, glue):
+    """Only a vendor prefix can be part of a word: every other rule redacts wherever it matches,
+    lowercase value and glued neighbor included."""
+    assert "[redacted]" in scrub(f"config {glue}{secret}")
+    assert secret.split("=")[-1].split("/")[-1] not in scrub(f"config {glue}{secret}")
+
+
+@pytest.mark.parametrize("glue", ["7", "é", "密"])
+def test_a_word_glued_by_a_digit_a_combining_mark_or_any_script_is_kept(glue):
+    assert scrub(f"{glue}sk-specification") == f"{glue}sk-specification"

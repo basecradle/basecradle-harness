@@ -52,6 +52,7 @@ import logging
 import math
 import os
 import re
+import unicodedata
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -144,15 +145,34 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: Replicate ``r8_``, Steel ``ste-``, a Better Stack heartbeat URL, an unanchored ``api_key=``), one
 #: the box lacks (a GitHub fine-grained ``github_pat_``), and the generic bearer and key-in-query
 #: forms.
+#:
+#: **A vendor prefix inside a word is a word, not a credential** (issue #794), and the test is
+#: `_is_word`, never a left boundary. A boundary would be a list of the contexts in which
+#: redaction stops, and every serialization adds one: a key glued to a letter or digit is not a
+#: shape any vendor issues, but it is one a percent-encoding (``Bearer%20sk-…``), a backslash
+#: escape (``\nsk-…``), an ANSI color code (``ESC[33msk-…``) or Chinese text (``密钥sk-…``)
+#: produces. So a prefixed match is kept only when **both** hold: a letter, digit or combining mark
+#: precedes it, **and** its run after the prefix holds no digit and no uppercase letter. A random key
+#: of a vendor's length holds one of them with overwhelming certainty; ``task-specification``,
+#: ``disk-quota-exceeded`` and ``risk-assessment-pending`` hold neither. The two residuals are
+#: stated rather than hidden: a glued word whose run holds a digit or a capital is still redacted
+#: (the scrub errs toward redaction), and a glued key made only of lowercase letters, ``_`` and
+#: ``-`` is kept. The rules are spelled once, in `_PREFIXED`. `_PREFIX` can strip a longer prefix
+#: than the alternative that matched (``xsk-or-…`` matched as ``sk-``), and that never changes the
+#: verdict: every prefix is lowercase letters, ``_`` and ``-``, which are never evidence of a key.
+_PREFIXED = (
+    (r"sk-or-|sk-|xai-|bc_[a-z]{3}_", r"[A-Za-z0-9_-]{8,}"),
+    (r"bc_(?:uat|isk)_", r"[A-Za-z0-9]+"),
+    (r"gh[a-z]_", r"[A-Za-z0-9]{20,}"),
+    (r"github_pat_", r"[A-Za-z0-9_]{20,}"),
+    (r"AIza", r"[A-Za-z0-9_-]{20,}"),
+    (r"hf_", r"[A-Za-z0-9]{20,}"),
+    (r"r8_", r"[A-Za-z0-9]{20,}"),
+    (r"ste-", r"[A-Za-z0-9]{20,}"),
+)
+_PREFIX = re.compile("|".join(f"(?:{prefix})" for prefix, _ in _PREFIXED))
 _SECRETS = re.compile(
-    r"(?:sk-or-|sk-|xai-|bc_[a-z]{3}_)[A-Za-z0-9_-]{8,}"
-    r"|bc_(?:uat|isk)_[A-Za-z0-9]+"
-    r"|gh[a-z]_[A-Za-z0-9]{20,}"
-    r"|github_pat_[A-Za-z0-9_]{20,}"
-    r"|AIza[A-Za-z0-9_-]{20,}"
-    r"|hf_[A-Za-z0-9]{20,}"
-    r"|r8_[A-Za-z0-9]{20,}"
-    r"|ste-[A-Za-z0-9]{20,}"
+    "(?P<prefixed>" + "|".join(f"(?:{prefix}){body}" for prefix, body in _PREFIXED) + ")"
     r"|/heartbeat/\S+"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)[^&\s]+"
@@ -203,7 +223,28 @@ def scrub(text: str) -> str:
     short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before
     `kv` sees it calls this first.
     """
-    return _SECRETS.sub("[redacted]", text)
+    return _SECRETS.sub(_redaction, text)
+
+
+def _redaction(match: re.Match[str]) -> str:
+    return match.group() if _is_word(match) else "[redacted]"
+
+
+def _is_word(match: re.Match[str]) -> bool:
+    """Whether a prefixed match is part of a word rather than a credential (issue #794).
+
+    Glued to a letter, digit or combining mark (any script), **and** its run after the prefix holds
+    no digit and no uppercase letter — never one without the other, because a serialization can glue
+    a key to a letter, and a key's run always holds a digit or a capital with overwhelming
+    certainty. A glued word whose run holds one is still redacted: the scrub errs toward redaction.
+    Every match that is not a prefixed one is redacted unconditionally.
+    """
+    if match.lastgroup != "prefixed" or match.start() == 0:
+        return False
+    if unicodedata.category(match.string[match.start() - 1])[0] not in "LNM":
+        return False
+    run = match.group()[_PREFIX.match(match.group()).end() :]
+    return not any(c.isdigit() or c.isupper() for c in run)
 
 
 #: The record format every harness line is rendered with — the severity token, a space, the

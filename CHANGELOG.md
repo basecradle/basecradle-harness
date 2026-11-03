@@ -7,6 +7,31 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.176.0] - 2026-11-03
+
+### Fixed: the credential scrub's prefix rules no longer match inside a word (issue #794)
+
+Every prefix-anchored rule in `_observability._SECRETS` had no left boundary, so it matched inside
+ordinary words: `task-specification failed` was logged as `ta[redacted] failed`, and since 0.174.0
+the provider-failure report and the stall note posted a vendor's sentence to peers with words cut
+out of it.
+
+- **A prefixed match is a word only when both hold** (`_observability._is_word`): a letter, digit
+  or combining mark (any script) precedes it, **and** its run after the prefix holds no digit and no
+  uppercase letter. A random key holds one with overwhelming certainty (a random 20-character base62 run is all
+  lowercase about once in 35 million); `task-specification`,
+  `disk-quota-exceeded` and `risk-assessment-pending` hold neither. Every other match is redacted
+  as before.
+- **Not a left boundary, on purpose.** The proposed `(?<![A-Za-z0-9])` lookbehind stops redacting
+  every key a serialization glues to a letter or digit: `Bearer%20sk-…`, `key%253Dsk-…`, `\nsk-…`,
+  an ANSI color code, Chinese or Japanese text written without spaces, `Bearersk-…`. Each was
+  redacted before and is redacted now.
+- **Two stated residuals:** a glued word whose run holds a digit or a capital is still redacted, and
+  a glued key made only of lowercase letters, `_` and `-` is kept.
+- Tests pin both sides: the word cases survive whole, and every prefixed sample is redacted after
+  each of 23 left neighbors, and every non-prefix rule is redacted glued to a letter or digit. `docs/telemetry.md` → Credential Scrubbing states the rule; the README
+  says a vendor's word is posted whole.
+
 ## [0.175.0] - 2026-11-03
 
 ### Fixed: a stopped wake is a stop, and the next wake no longer resumes it (issue #798)

@@ -189,3 +189,16 @@ def test_report_body_never_posts_a_credential_the_vendor_echoed():
         body = report_body(classify(exc), item="your message", provider=provider, exc=exc)
         assert SENTINEL_KEY not in body
         assert "header Authorization: [redacted] is not accepted here" in body
+
+
+def test_a_vendor_sentence_with_a_prefix_inside_a_word_is_posted_whole():
+    """Issue #794: the scrub redacts credentials, never words, so a vendor sentence quoting
+    ``task-…``, ``disk-…`` or ``risk-…`` reaches peers with every word it was written with."""
+    sentence = "task-specification rejected: disk-quota-exceeded-for-org (risk-assessment-pending)"
+    exc = ProviderPayloadTooLargeError(
+        "Provider returned HTTP 413",
+        status_code=413,
+        body='{"error": {"message": "' + sentence + '"}}',
+    )
+    assert verbatim(exc) == sentence
+    assert sentence in report_body(classify(exc), item="your message", provider="openai", exc=exc)
