@@ -819,3 +819,22 @@ def test_a_lexical_drop_is_charged_to_a_probe_only_when_it_cost_the_pool():
     assert tally.dropped == 2 and not tally.dropped_probes
     tally.add(probe, result(in_pool=False), arm)
     assert tally.dropped == 4 and tally.dropped_probes == {"drawer-a-00"}
+
+
+@pytest.mark.parametrize(
+    ("routing", "words"),
+    [
+        ({"providers": ("deepinfra", "baseten")}, "providers deepinfra,baseten"),
+        (
+            {"order": ("baseten/fp8/us", "sail-research/us"), "ignore": ("morph",)},
+            "order baseten/fp8/us,sail-research/us, ignore morph",
+        ),
+    ],
+    ids=["only", "order"],
+)
+def test_the_run_header_names_the_routing_the_reranker_sends(routing, words):
+    """An ``only`` run reads exactly as it always did; an ordered one says so (issue #780)."""
+    reranker = MemPalaceReranker(
+        model="z-ai/glm-5.3-flash", api_key="sk-or-v1-0123456789abcdef0123456789abcdef", **routing
+    )
+    assert _palace_recall._routing_words(reranker) == words

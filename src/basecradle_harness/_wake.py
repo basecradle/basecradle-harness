@@ -5818,8 +5818,8 @@ def resolved_config() -> dict[str, object]:
       and its banned slugs (issue #780), each as a list, ``[]`` when unset, read by the same function
       the reranker reads them with. ``order`` is sent as OpenRouter's ``provider.order`` *instead
       of* the ``only`` list in ``mempalace_rerank_providers``, so a read-back that finds both
-      non-empty has found a reranker that is config-dead (``config:conflicting_routing``), not one
-      that routes by either. Reported because the NOC derives the order daily (basecradle-noc#1199)
+      non-empty with ``mempalace_rerank_model`` set has found a reranker that is config-dead
+      (``config:conflicting_routing``), not one that routes by either. Reported because the NOC derives the order daily (basecradle-noc#1199)
       and must be able to prove the one it wrote is the one the box sends.
     - ``max_context_tokens`` — the operator's context-budget override (`HARNESS_MAX_CONTEXT_TOKENS`;
       issue #276), or ``null`` when unset. ``0`` means compaction is **disabled** on this agent, and

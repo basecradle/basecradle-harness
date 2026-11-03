@@ -552,7 +552,9 @@ library API. So it is built here (`_rerank.py`), with no MemPalace fork and no M
   when the model is set and **never** falls back to `AI_API_KEY` — an agent brained by `openai` or
   `xai-sdk` reranks on OpenRouter without either credential learning about the other. Routing is
   pinned by `HARNESS_MEMPALACE_RERANK_PROVIDERS` → `provider: {only, allow_fallbacks: true,
-  data_collection: "deny"}`, and the slug list lives in **config, never in code**: which endpoints
+  data_collection: "deny"}` — or, for a ranked preference, `HARNESS_MEMPALACE_RERANK_ORDER` →
+  `provider.order` with no `only`, never both (issue #780; the `memory-palace` skill carries the
+  measurement) — and the slug list lives in **config, never in code**: which endpoints
   are acceptable is a jurisdiction decision with a date on it, and a vendor list baked into a package
   rots the way a vendor cap table does. The **list** is the jurisdiction guarantee and the fallback
   flag is not (issue #468): `only` restricts the pool outright whatever `allow_fallbacks` says, so a

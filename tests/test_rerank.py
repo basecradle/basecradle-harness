@@ -365,6 +365,31 @@ def test_an_order_beside_a_provider_list_is_config_dead_never_a_precedence(build
     assert _reason_of(caplog.records) == (logging.ERROR, "config:conflicting_routing")
 
 
+def test_a_library_reranker_with_no_routing_list_is_config_dead_never_an_empty_only(router, caplog):
+    """An empty ``only`` on the wire is a request with no jurisdiction list at all, so the library
+    API reaches the same ``config:missing_providers`` the environment does — and calls nothing."""
+    route = router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=completion(picks(1))))
+    dead = MemPalaceReranker(model=MODEL, api_key=FAKE_KEY)
+    assert dead.fault == "config:missing_providers"
+
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        dead.rerank("q", hits(20), 2, surface=SURFACE_TURN0)
+
+    assert not route.called
+    assert _reason_of(caplog.records) == (logging.ERROR, "config:missing_providers")
+
+
+def test_a_routing_conflict_is_named_before_a_bad_base_url():
+    """One fault at a time, in the order a human fixes them: the key, the routing, the URL."""
+    bound = reranker_from_env(
+        _rerank_env(
+            **{RERANK_ORDER_VAR: ",".join(ORDER), RERANK_BASE_URL_VAR: "us.openrouter.ai/api/v1"}
+        )
+    )
+    assert bound is not None
+    assert bound.fault == "config:conflicting_routing"
+
+
 def test_a_missing_key_outranks_a_routing_conflict():
     """One fault is named, and the first a human must fix is the credential."""
     bound = reranker_from_env(

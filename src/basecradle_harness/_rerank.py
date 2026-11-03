@@ -42,8 +42,8 @@ the searcher produced, so no model-authored text can enter them.
 **Failure is never fatal, and its loudness is graded** — the distinction is the point:
 
 - **Config-class** — a model configured with no key, no routing list, or two of them (an ``only``
-  list and an ``order``, issue #780), the ``openrouter`` SDK not installed, a rejected key (401/403), an unfunded account (402), a model id that does not
-  exist, a base URL that is not one, and OpenRouter's two routing refusals: no endpoint for the
+  list and an ``order``, issue #780), the ``openrouter`` SDK not installed, a rejected key
+  (401/403), an unfunded account (402), a model id that does not exist, a base URL that is not one, and OpenRouter's two routing refusals: no endpoint for the
   model in a regional host's region, or none the provider list permits (both 404, issue #651).
   Every one of these is *dead until a human acts*, so it falls back to plain hybrid
   and logs at **ERROR**, once per wake. A silently-dead reranker is the exact failure this repo
@@ -129,7 +129,7 @@ RERANK_API_KEY_VAR = "HARNESS_MEMPALACE_RERANK_API_KEY"
 
 #: A comma-separated list of OpenRouter provider slugs the rerank call may route to, sent as
 #: ``provider: {only: [...], allow_fallbacks: true, data_collection: "deny"}``. Required whenever
-#: the model is set, and deliberately **not defaulted in code**: which endpoints are acceptable is
+#: the model is set, unless `RERANK_ORDER_VAR` is, and deliberately **not defaulted in code**: which endpoints are acceptable is
 #: a jurisdiction/data-policy decision with a date on it, and a vendor list baked into a package
 #: rots the way a vendor cap table does (`basecradle_harness._openrouter` carries that lesson).
 #: Configuration is where a list that changes belongs. **The list is the guarantee; the fallback
@@ -335,9 +335,9 @@ def reranker_from_env(env: Mapping[str, str] | None = None) -> MemPalaceReranker
     here — so the reranker would be dead while paging nobody.
 
     The routing needs exactly one list: `RERANK_PROVIDERS_VAR` (``only``) or `RERANK_ORDER_VAR`
-    (``order``). Neither is ``config:missing_providers``; both is ``config:conflicting_routing``,
-    which the reranker itself decides (`MemPalaceReranker`), so the library API cannot reach a
-    request the environment could not.
+    (``order``) — `routing_fault`, which the reranker applies to itself too, so the library API
+    cannot reach a request the environment could not. One fault is named at a time, in the order a
+    human would fix them: the key, then the routing, then the base URL.
 
     Side-effect-free: it reads six environment variables and constructs nothing. The
     ``openrouter`` SDK is imported, and its client built, on the first call that actually reranks —
@@ -355,8 +355,8 @@ def reranker_from_env(env: Mapping[str, str] | None = None) -> MemPalaceReranker
     fault: str | None = None
     if not api_key:
         fault = "config:missing_api_key"
-    elif not providers and not order:
-        fault = "config:missing_providers"
+    elif routing := routing_fault(providers, order):
+        fault = routing
     elif base_url is not None and not _is_http_url(base_url):
         fault = "config:invalid_base_url"
     return MemPalaceReranker(
@@ -368,6 +368,21 @@ def reranker_from_env(env: Mapping[str, str] | None = None) -> MemPalaceReranker
         base_url=base_url,
         fault=fault,
     )
+
+
+def routing_fault(providers: Sequence[str], order: Sequence[str]) -> str | None:
+    """The config fault in a reranker's routing lists, or ``None`` when exactly one is given.
+
+    Neither is ``config:missing_providers``: an empty ``only`` on the wire would be a request with no
+    jurisdiction list at all. Both is ``config:conflicting_routing``, never a precedence: ``only`` is
+    a hard restriction and ``order`` lifts it, so whichever silently lost would be either a
+    restriction an operator wrote or the order a converge wrote (issue #780).
+    """
+    if providers and order:
+        return "config:conflicting_routing"
+    if not providers and not order:
+        return "config:missing_providers"
+    return None
 
 
 def _is_http_url(value: str) -> bool:
@@ -393,8 +408,9 @@ class MemPalaceReranker:
         order: A ranked list of endpoint tags or slugs, sent as ``order`` with **no** ``only``
             (issue #780; `RERANK_ORDER_VAR`). The router tries them in sequence, falls through on
             a 429, and past the end falls into the rest of the pool. Exactly one of ``providers``
-            and ``order`` is given: both is the config fault ``config:conflicting_routing``,
-            decided here so no caller can build a request that drops one of them.
+            and ``order`` is given (`routing_fault`): both is ``config:conflicting_routing`` and
+            neither is ``config:missing_providers``, decided here so no caller can build a
+            request that drops a list or sends an empty one.
         ignore: Provider slugs never to route to, sent as ``ignore`` with either list
             (`RERANK_IGNORE_VAR`). Empty sends no ``ignore`` at all.
         base_url: The OpenRouter API root to call (a regional host, issue #651), passed to the SDK
@@ -435,9 +451,9 @@ class MemPalaceReranker:
         self.ignore = tuple(ignore)
         self.base_url = base_url
         self._api_key = Secret(api_key)  # out of every representation (issue #599)
-        if fault is None and self.providers and self.order:
-            fault = "config:conflicting_routing"
-        self._fault = fault
+        # Decided here as well as in `reranker_from_env`, so a direct construction can never send
+        # an empty `only` or drop one of two lists (issue #780).
+        self._fault = fault or routing_fault(self.providers, self.order)
         self._client = client
         self._timeout = timeout
         self._sleep = sleep
