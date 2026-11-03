@@ -472,7 +472,9 @@ class OpenRouterProvider:
         self._restore_annotations(data)
         # Read the turn before the line is written, so the one billed line says whether it could be
         # read (issue #782): an unreadable answer is `outcome=fallback reason=invalid_response`.
-        reply, unreadable = read_answer(lambda: message_from_chat(data), data)
+        reply, unreadable = read_answer(
+            lambda: message_from_chat(data), data, usage=usage, cap=output_cap(self._default_params)
+        )
         log_llm_call(
             provider=self.provider,
             model=self.model,

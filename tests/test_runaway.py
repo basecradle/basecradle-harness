@@ -524,3 +524,36 @@ def test_a_connection_dropped_mid_body_on_openrouter_is_a_retryable_transport_fa
         router.post(OPENROUTER_CHAT).mock(return_value=httpx.Response(200, stream=Dropped()))
         with pytest.raises(ProviderConnectionError):
             provider.chat([Message.user("hi")])
+
+
+@pytest.mark.parametrize(("billed", "reason"), [(30, "truncated"), (29, "invalid_response")])
+def test_an_answer_billed_at_its_cap_is_truncated_whatever_its_stop_reason_says(
+    caplog, billed, reason
+):
+    """Measured live on 2026-11-03: cut off at ``max_tokens`` inside a tool call, OpenAI's model
+    behind OpenRouter reports ``finish_reason: "tool_calls"`` with exactly the cap billed. The bill
+    is the fact; one token under the cap is a body that did not parse, and stays that."""
+    cut = wire_tool_call(id="call_0", name="post", arguments='{"body": "Lighthouse stands')
+    body = openrouter_completion(tool_calls=[cut], finish_reason="tool_calls")
+    body["usage"] = {"prompt_tokens": 45, "completion_tokens": billed, "total_tokens": 45 + billed}
+    provider = OpenRouterProvider("openai/gpt-4.1-mini", api_key=FAKE_KEY, max_tokens=30)
+    with respx.mock(assert_all_called=True) as router:
+        router.post(OPENROUTER_CHAT).mock(return_value=httpx.Response(200, json=body))
+        with (
+            caplog.at_level(logging.INFO, logger="basecradle_harness"),
+            pytest.raises(ProviderResponseError) as raised,
+        ):
+            provider.chat([Message.user("post a poem")])
+
+    assert isinstance(raised.value, ProviderTruncatedError) is (reason == "truncated")
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
+    assert f"reason={reason}" in line
+
+
+def test_an_uncapped_call_is_judged_by_its_stop_reason_alone():
+    def read():
+        raise ValueError("unterminated string")
+
+    usage = {"completion_tokens": 131_072}
+    _reply, error = read_answer(read, {"choices": [{"finish_reason": "stop"}]}, usage=usage)
+    assert not isinstance(error, ProviderTruncatedError)

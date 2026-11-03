@@ -1529,7 +1529,12 @@ _T = TypeVar("_T")
 
 
 def read_answer(
-    read: Callable[[], _T], response: Any, *, finish: str | None = None
+    read: Callable[[], _T],
+    response: Any,
+    *,
+    finish: str | None = None,
+    usage: Any = None,
+    cap: int | None = None,
 ) -> tuple[_T | None, Exception | None]:
     """Read the vendor's answer **before** the call's line is written: ``(reply, None)`` or
     ``(None, the error)`` (issue #782).
@@ -1549,22 +1554,34 @@ def read_answer(
     lost the billed line, and with it the spend, on exactly the bodies nobody anticipated. The
     original exception is what the adapter raises; only the line is changed.
 
-    **Except when the vendor says it stopped at the output cap** (issue #788). Then the answer was
-    not malformed, it was cut off: a runaway generation wrote until the cap, and the tool call it
-    was in the middle of does not parse. The error becomes `ProviderTruncatedError`, the original
-    chained as its cause, so the billed line says ``reason=truncated`` and the decision that follows
-    says the same. The stop reason is `finish`, the vendor's own word, when the adapter has already
-    read it, and otherwise read off `response` (`finish_reason`).
+    **Except when the answer stopped at the output cap** (issue #788). Then it was not malformed, it
+    was cut off: a runaway generation wrote until the cap, and the tool call it was in the middle of
+    does not parse. The error becomes `ProviderTruncatedError`, the original chained as its cause,
+    so the billed line says ``reason=truncated`` and the decision that follows says the same. Either
+    of two facts says the cap fired, and both are needed:
+
+    - **the vendor's stop reason** — `finish` when the adapter already read it, else read off
+      `response` (`finish_reason`);
+    - **the bill** — the output the vendor billed (`usage`) reached the cap the call carried (`cap`).
+      The stop reason alone is not the vendor's word on this everywhere: cut off inside a tool call,
+      OpenAI's model behind OpenRouter reports ``finish_reason: "tool_calls"`` with exactly
+      ``max_tokens`` billed (measured live, 2026-11-03). A billed output at the cap is the cap
+      firing whatever the stop reason says.
     """
     try:
         with generation_of(response):
             return read(), None
     except Exception as exc:  # noqa: BLE001 - the line is written, then the original re-raised
-        stopped = finish if finish is not None else finish_reason(response)
-        if not truncated(stopped) or isinstance(exc, ProviderTruncatedError):
+        if isinstance(exc, ProviderTruncatedError):
             return None, exc
+        stopped = finish if finish is not None else finish_reason(response)
+        written = token_counts(usage).get("tokens_out") if usage is not None else None
+        at_cap = cap is not None and written is not None and written >= cap
+        if not truncated(stopped) and not at_cap:
+            return None, exc
+        why = stopped if truncated(stopped) else f"{written} of {cap} tokens"
         cut = ProviderTruncatedError(
-            f"The answer stopped at the output cap ({stopped}) before it could be read: {exc}"
+            f"The answer stopped at the output cap ({why}) before it could be read: {exc}"
         )
         cut.__cause__ = exc
         return None, stamp_generation_id(cut, generation_id(response))

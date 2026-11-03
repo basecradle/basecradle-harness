@@ -756,6 +756,8 @@ class GoogleProvider:
             lambda: self._from_wire(response, candidate, reason, used),
             {"id": response_id},
             finish=self.last_finish_reason,
+            usage=usage,
+            cap=output_cap(self._default_params),
         )
         log_llm_call(
             provider=self.provider,

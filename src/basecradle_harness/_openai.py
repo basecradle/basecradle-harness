@@ -498,7 +498,12 @@ class OpenAIProvider:
         seconds = time.monotonic() - started
         data = response.model_dump()
         # Read before the line is written, so the one billed line says whether it could be (#782).
-        reply, unreadable = read_answer(lambda: message_from_responses(data), data)
+        reply, unreadable = read_answer(
+            lambda: message_from_responses(data),
+            data,
+            usage=data.get("usage"),
+            cap=output_cap(self._default_params),
+        )
         self._log_call(seconds, data, unreadable)
         self._log_server_tools(data)
         if unreadable is not None:
@@ -534,7 +539,12 @@ class OpenAIProvider:
             response = self._client.chat.completions.create(**payload)
         seconds = time.monotonic() - started
         data = response.model_dump()
-        reply, unreadable = read_answer(lambda: message_from_chat(data), data)
+        reply, unreadable = read_answer(
+            lambda: message_from_chat(data),
+            data,
+            usage=data.get("usage"),
+            cap=output_cap(self._default_params),
+        )
         self._log_call(seconds, data, unreadable)
         # A router reached over this surface counts the web searches it ran for the call (OpenRouter's
         # ``server_tool_use_details``); a vendor that runs none reports nothing and writes no line.
