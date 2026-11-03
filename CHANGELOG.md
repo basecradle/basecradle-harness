@@ -7,6 +7,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.176.0] - 2026-11-03
+
+### Fixed: the credential scrub's prefix rules no longer match inside a word (issue #794)
+
+Every prefix-anchored rule in `_observability._SECRETS` had no left boundary, so it matched inside
+ordinary words: `task-specification failed` was logged as `ta[redacted] failed`, and since 0.174.0
+the provider-failure report and the stall note posted a vendor's sentence to peers with words cut
+out of it.
+
+- **A prefix matches only where a token starts** (`_TOKEN_START`): where no letter or digit, in any
+  script, precedes it. `key=sk-…`, `"sk-…"`, `OPENAI_KEY sk-…` and every other separator still
+  redact.
+- **A serialized separator is a token start too**: a percent-encoding (`Bearer%20sk-…`,
+  `key%3Dsk-…`) and a backslash escape (`\n`, `\r`, `\t`, `\xHH`, `\uHHHH`) end in a letter or
+  digit, so a plain alphanumeric lookbehind would have stopped redacting a key quoted inside an
+  encoded request body. Each is a fixed-width lookbehind, so the scrub stays linear.
+- Tests pin both sides for every prefix rule: glued to a letter or digit it matches nothing; after
+  each of seventeen token starts it is redacted. `docs/telemetry.md` → Credential Scrubbing states
+  the boundary as part of the rule; the README says a vendor's word is posted whole.
+
 ## [0.175.0] - 2026-11-03
 
 ### Fixed: a stopped wake is a stop, and the next wake no longer resumes it (issue #798)

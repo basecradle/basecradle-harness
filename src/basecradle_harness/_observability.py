@@ -144,7 +144,27 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: Replicate ``r8_``, Steel ``ste-``, a Better Stack heartbeat URL, an unanchored ``api_key=``), one
 #: the box lacks (a GitHub fine-grained ``github_pat_``), and the generic bearer and key-in-query
 #: forms.
+#:
+#: **A vendor prefix matches only where a token starts, never inside a word** (issue #794): every
+#: prefix-anchored alternative sits behind `_TOKEN_START`, so ``task-specification`` and
+#: ``disk-quota-exceeded`` keep their words, in a log line and in a vendor error posted to a timeline
+#: alike. A token starts where no letter or digit precedes it — any script's, so a localized vendor
+#: sentence keeps its words too — which leaves ``_``, ``-``, ``=``, ``/``, ``:``, quotes and
+#: whitespace as left neighbors (``key=sk-…``, ``"sk-…"``, ``OPENAI_KEY sk-…``). No vendor issues a
+#: key glued to a letter or digit, but a *serialization* can glue one, so a token also starts right
+#: after an escape that stands for a separator: a percent-encoding (``Bearer%20sk-…``,
+#: ``key%3Dsk-…``) and a backslash escape (``\nsk-…``, ``\x22sk-…``, ``"sk-…``) end in a
+#: letter or digit, and an error text quoting a request body is exactly where they appear. Each
+#: lookbehind is fixed-width, so the rule stays linear in its input.
+_TOKEN_START = (
+    r"(?:(?<![^\W_])"
+    r"|(?<=%[0-9A-Fa-f]{2})"
+    r"|(?<=\\[nrt])"
+    r"|(?<=\\x[0-9A-Fa-f]{2})"
+    r"|(?<=\\u[0-9A-Fa-f]{4}))"
+)
 _SECRETS = re.compile(
+    _TOKEN_START + r"(?:"
     r"(?:sk-or-|sk-|xai-|bc_[a-z]{3}_)[A-Za-z0-9_-]{8,}"
     r"|bc_(?:uat|isk)_[A-Za-z0-9]+"
     r"|gh[a-z]_[A-Za-z0-9]{20,}"
@@ -153,6 +173,7 @@ _SECRETS = re.compile(
     r"|hf_[A-Za-z0-9]{20,}"
     r"|r8_[A-Za-z0-9]{20,}"
     r"|ste-[A-Za-z0-9]{20,}"
+    r")"
     r"|/heartbeat/\S+"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)[^&\s]+"

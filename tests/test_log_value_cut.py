@@ -231,3 +231,78 @@ def test_an_identifier_the_harness_writes_is_not_mistaken_for_a_credential():
     ):
         assert _value(value) == value
     assert not _SECRETS.search("tokens_in=764942 cached_tokens=238277")
+
+
+# --- a vendor prefix matches only where a token starts (issue #794) ------------------------------
+
+#: One fabricated sample per **prefix-anchored** rule in `_SECRETS` — the rules a word can contain.
+PREFIX_SAMPLES = {
+    "sk-": "sk-ant-api03-Ab3Cd5Ef7Gh9",
+    "sk-or-": "sk-or-v1-0f3a9c2b7d4e6f8a",
+    "xai-": "xai-Ab3Cd5Ef7Gh9Ij1K",
+    "bc_???_": "bc_tok_Ab3Cd5Ef7Gh9",
+    "bc_uat_": "bc_uat_K",
+    "bc_isk_": "bc_isk_K",
+    "gh?_": "ghp_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "github_pat_": "github_pat_11ABCDEFG0abcdefghij_klmnopqrstuv",
+    "AIza": "AIza" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "hf_": "hf_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "r8_": "r8_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "ste-": "ste-" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+}
+
+BACKSLASH = chr(92)
+
+#: Every left neighbor a token can follow: a separator, or an escape that stands for one in a
+#: serialized body (a percent-encoding and a backslash escape both end in a letter or digit).
+TOKEN_STARTS = {
+    "start of text": "",
+    "space": "key ",
+    "equals": "key=",
+    "colon": "key:",
+    "double quote": '"',
+    "single quote": "'",
+    "underscore": "OPENAI_KEY_",
+    "hyphen": "x-",
+    "slash": "/v1/keys/",
+    "paren": "(",
+    "percent-encoded space": "Bearer%20",
+    "percent-encoded equals": "key%3D",
+    "escaped newline": "body" + BACKSLASH + "n",
+    "escaped tab": "body" + BACKSLASH + "t",
+    "escaped return": "body" + BACKSLASH + "r",
+    "hex escape": BACKSLASH + "x22",
+    "unicode escape": BACKSLASH + "u0022",
+}
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "task-specification failed",
+        "disk-quota-exceeded-for-org",
+        "risk-assessment-pending-review",
+        "the task-specification-for-this-run is invalid",
+        "Rísk-assessment-pending-review",  # a localized vendor sentence keeps its words too
+    ],
+)
+def test_a_vendor_prefix_inside_a_word_is_not_a_credential(text):
+    assert scrub(text) == text
+    assert _value(text) == (f'"{text}"' if " " in text else text)
+
+
+@pytest.mark.parametrize("rule", sorted(PREFIX_SAMPLES))
+@pytest.mark.parametrize("glue", ["a", "Z", "7", "é"])
+def test_a_prefix_glued_to_a_letter_or_digit_matches_no_rule(rule, glue):
+    """No vendor issues a key glued to a letter or digit, so a prefix there is part of a word."""
+    text = f"the {glue}{PREFIX_SAMPLES[rule]} field"
+    assert scrub(text) == text
+
+
+@pytest.mark.parametrize("rule", sorted(PREFIX_SAMPLES))
+@pytest.mark.parametrize("start", sorted(TOKEN_STARTS))
+def test_a_credential_after_every_token_start_is_still_redacted(rule, start):
+    sample = PREFIX_SAMPLES[rule]
+    left = TOKEN_STARTS[start]
+    rendered = scrub(f"{left}{sample} rejected")
+    assert rendered == f"{left}[redacted] rejected", rendered
