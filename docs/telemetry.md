@@ -82,6 +82,32 @@ The two lists cannot be one list, because one is VRL in another repository, so t
 
 **A vendor's words posted to a timeline are scrubbed by the same rules** (issue #791). The provider-failure report and the stall note quote a vendor's error text to peers, and a timeline has no box layer behind it, so `_report.verbatim` runs `scrub` over that text the moment it is dug out of the error, before the stall note's cut, and the stall note scrubs again at the post for a reason persisted on a claim before the scrub existed. What a rule matches becomes `[redacted]`, its label included (`Bearer `, `?api_key=`), and the rest of the vendor's sentence is unchanged; the rules are the log scrub's, so a timeline post carries exactly the redactions a log line would, over-matches included.
 
+## The Palette
+
+The fleet's journal is colored with four ANSI SGR colors and a reset (@origin, 2026-08-17), and **this section is where each tier is defined, once, for the whole fleet**: the harness, the router (its daemon lines and its `ai_otel_llm` remap) and the NOC's color corpus adopt these values, so a color means the same thing in a Live Tail whichever program wrote the line. A color wraps a **whole token** — a head, or a whole `key=value` pair — and never lands inside one, so every substring search over the plain line still matches the colored one. A token no tier names is plain: an unrecognized verdict is never guessed at a color. A non-empty `NO_COLOR` turns every harness line plain (`_observability.color_enabled`).
+
+| Tier | Color | SGR | Means |
+|---|---|---|---|
+| Success | Green | `\x1b[32m` | A unit of work began or ended well, or recovered. |
+| Bookend | Blue | `\x1b[34m` | The neutral close of a wake, whatever its verdict; the `outcome=` pair on the same line carries the verdict. |
+| Warning | Yellow | `\x1b[33m` | In-between: a skip, a deferral, a block, a retry, a degradation. Nothing failed yet, and something did not go as asked. |
+| Operator's Choice | Yellow | `\x1b[33m` | Neither success nor failure: an outcome an operator chose, such as stopping a wake (the capital, 2026-11-03, issue #799). It is never Red, because nothing failed. |
+| Failure | Red | `\x1b[31m` | A unit of work failed. |
+
+Every colored token is followed by the reset, `\x1b[0m`. The two Yellow tiers share one SGR on purpose: a reader sees *neither success nor failure* at a glance, and the tier's name says which kind.
+
+The harness's members (`_observability._VERDICT_VALUES` for the `outcome=` pairs, `_observability.head` for the heads):
+
+| Tier | Heads | `outcome=` Values |
+|---|---|---|
+| Success | `wake start`, `wake continuing`, `wake billing_recovered`, `Wake breaker RESET`, `palace scrub` (an apply that found nothing to remove) | `ok` |
+| Bookend | `wake end` | — |
+| Warning | `wake skipped`, `wake deferred`, `wake truncated_turn`, `wake stalled`, `wake billing_blocked`, `degraded`, `Wake breaker TRIPPED`, `palace scrub` (a dry run) | `retrying`, `refused`, `fallback` |
+| Operator's Choice | `wake stopped` | `stopped` |
+| Failure | `wake failed`, `wake reported_failure`, `post failed`, `cleanup failed`, `cleanup blocked`, `palace scrub failed`, `palace scrub` (an apply that removed what the harness mined) | `error`, `failed` |
+
+The Operator's Choice tier's members across the fleet today: `outcome=stopped` (the router's `stage=wake` line, and the harness's `wake end`), `event=wake_stopped` (the router), and the harness's `wake stopped`. The router's members of the other tiers are its own `logfmt.PALETTE`, pinned by its `tests/test_logfmt.py`. `tests/test_telemetry_contract.py` holds the harness to this section: the SGR of every tier, and the `outcome=` vocabulary in both directions.
+
 ## Model Calls
 
 ### `llm`

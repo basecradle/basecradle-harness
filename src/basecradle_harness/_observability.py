@@ -71,7 +71,10 @@ MAX_VALUE = 240
 #: The ANSI SGR codes the fleet's journal is colored with (founder decision, 2026-08-17). Four
 #: colors and a reset, shared with the router's and the NOC's own lines so one palette reads
 #: across the whole Live Tail: GREEN for a good outcome, RED for a bad one, YELLOW for the
-#: in-between (a skip, a decline, a block), BLUE for the neutral bookend that closes a wake.
+#: in-between (a skip, a decline, a block) and for an operator's choice (a stop: neither success
+#: nor failure, issue #799), BLUE for the neutral bookend that closes a wake. The tiers are defined
+#: once for the fleet in `docs/telemetry.md` → The Palette, which `test_telemetry_contract.py`
+#: holds this module to.
 GREEN = "\x1b[32m"
 BLUE = "\x1b[34m"
 YELLOW = "\x1b[33m"
@@ -112,7 +115,7 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
         "retrying": YELLOW,
         "refused": YELLOW,
         "fallback": YELLOW,
-        # A wake SIGTERM stopped (issue #798): deliberate, never a failure, so never RED.
+        # A wake SIGTERM stopped (issue #798): the Operator's Choice tier (issue #799), never RED.
         "stopped": YELLOW,
     },
 }
