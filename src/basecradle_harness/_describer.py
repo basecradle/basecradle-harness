@@ -671,8 +671,10 @@ class Describer:
                     # An adapter is allowed to raise something the taxonomy has never seen; that is
                     # a runtime-class unknown, not a reason to take the wake down over a picture —
                     # and not a reason to retry either: an unrecognised fault is one the policy
-                    # cannot say is transient.
-                    self._bill_unreadable(subject, kind=kind, call=call)
+                    # cannot say is transient. An answer the adapter read and could not use is still
+                    # billed on its own line, as below; the adapter said so by recording `fallback`.
+                    if call.outcome == FALLBACK:
+                        self._bill_unreadable(subject, kind=kind, call=call)
                     self._report(
                         subject,
                         kind=kind,
@@ -690,6 +692,9 @@ class Describer:
             # and failed (`_observability.read_answer`); any other fault reached no answer.
             if call.outcome == FALLBACK:
                 self._bill_unreadable(subject, kind=kind, call=call)
+                # That attempt's time is on its own line, so the wait this describe's last line
+                # reports starts after it: summed over billed lines, no second is counted twice.
+                started = time.monotonic()
             # Outside the capture block: the wait is not part of the call it follows.
             if retry.again(
                 failure,

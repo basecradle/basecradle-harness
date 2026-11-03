@@ -58,7 +58,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from basecradle_harness._exceptions import ProviderError, ProviderResponseError
+from basecradle_harness._exceptions import ProviderError
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -1523,7 +1523,7 @@ def stamp_generation_id(error: BaseException, generation: str | None) -> BaseExc
 _T = TypeVar("_T")
 
 
-def read_answer(read: Callable[[], _T], response: Any) -> tuple[_T | None, ProviderError | None]:
+def read_answer(read: Callable[[], _T], response: Any) -> tuple[_T | None, Exception | None]:
     """Read the vendor's answer **before** the call's line is written: ``(reply, None)`` or
     ``(None, the error)`` (issue #782).
 
@@ -1535,15 +1535,21 @@ def read_answer(read: Callable[[], _T], response: Any) -> tuple[_T | None, Provi
     decision (``retrying`` or ``failed``) follows on its own unbilled line. The error is returned,
     stamped with the response's id (`generation_of`), for the adapter to raise once its lines are
     written.
+
+    **Any** exception a read raises is caught, not only `ProviderResponseError`: a vendor's body
+    malformed in a shape the parser did not foresee (a null tool-call ``function``) raises whatever
+    the parser trips on, and the call was billed all the same. Catching only the taxonomy's class
+    lost the billed line, and with it the spend, on exactly the bodies nobody anticipated. The
+    original exception is what the adapter raises; only the line is changed.
     """
     try:
         with generation_of(response):
             return read(), None
-    except ProviderResponseError as exc:
+    except Exception as exc:  # noqa: BLE001 - the line is written, then the original re-raised
         return None, exc
 
 
-def answered(error: ProviderError | None) -> dict[str, Any]:
+def answered(error: Exception | None) -> dict[str, Any]:
     """The verdict fields of an answered call's line, given what `read_answer` returned."""
     if error is None:
         return {}

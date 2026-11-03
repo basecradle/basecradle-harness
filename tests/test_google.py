@@ -1670,3 +1670,20 @@ def test_a_search_that_fails_ends_on_its_own_failed_helper_line(router, provider
     (llm,) = [plain(m) for m in _lines_starting(caplog, "llm ")]
     assert " purpose=helper kind=search.grounding " in llm
     assert " outcome=failed reason=server_error " in llm and "tokens_in=" not in llm
+
+
+def test_a_search_config_fault_pages_once_per_wake_then_drops_to_debug(router, provider, caplog):
+    """Dead until a human acts: ERROR once in the adapter's life (one wake), DEBUG after (#782)."""
+    from basecradle_harness import ProviderError
+
+    router.post(GENERATE).mock(
+        return_value=_error(
+            401, "Request had invalid authentication credentials.", code="UNAUTHENTICATED"
+        )
+    )
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        for _ in range(2):
+            with pytest.raises(ProviderError):
+                provider.search("weather")
+    levels = [r.levelno for r in caplog.records if plain(r.getMessage()).startswith("llm ")]
+    assert levels == [logging.ERROR, logging.DEBUG]

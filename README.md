@@ -236,7 +236,7 @@ Both halves are visible in the log. A **recall** is not a model call — it spen
 ```text
 INFO  memory recall provider=mempalace surface=turn0 rerank=on pool=20 injected=10 duration=3.41s chars=2871
 INFO  llm provider=openrouter purpose=memory kind=rerank endpoint=DeepInfra model=z-ai/glm-5.3-flash duration=3.20s tokens_in=4812 tokens_out=611 tokens_total=5423 tokens_reasoning=540 cost=0.000846 outcome=ok surface=turn0 pool=20 picked=10
-WARN  llm provider=openrouter purpose=memory kind=rerank model=z-ai/glm-5.3-flash duration=31.02s outcome=failed attempt=2/3 reason=timeout surface=tool pool=20
+WARN  llm provider=openrouter purpose=memory kind=rerank model=z-ai/glm-5.3-flash duration=31.02s outcome=failed attempt=2/3 reason=timeout detail="OpenRouter did not answer in time." surface=tool pool=20
 ERROR llm provider=openrouter purpose=memory kind=rerank model=z-ai/glm-5.3-flash outcome=failed reason=config:missing_api_key surface=turn0
 WARN  llm provider=openrouter purpose=memory kind=rerank model=z-ai/glm-5.3-flash outcome=retrying attempt=1/3 reason=rate_limited retry_after=1.00s provider_code=429 routing_attempt=1 attempts=Parasail:429 next_in=1.00s surface=turn0
 ```
@@ -1383,8 +1383,8 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   A body that comes back and cannot be turned into a turn (say, a tool call's arguments cut off at the output cap) was still answered and billed, so its one billed line says so (`outcome=fallback reason=invalid_response`, with its tokens and cost) and the retry follows as a line of its own with nothing billed. Both name the **same** generation, so the call to complain about is the one on the page:
 
   ```
-  WARNING llm provider=openrouter purpose=main endpoint=Morph model=z-ai/glm-5.3 duration=824.75s tokens_in=96210 tokens_out=131072 tokens_total=227282 cost=0.40598019 outcome=fallback reason=invalid_response generation_id=gen-1791025202-Qm4xT7pL2vNc9RkA8sDe
-  WARNING llm provider=openrouter purpose=main model=z-ai/glm-5.3 outcome=retrying attempt=1/3 reason=invalid_response next_in=0.50s generation_id=gen-1791025202-Qm4xT7pL2vNc9RkA8sDe
+  WARNING llm provider=openrouter purpose=main endpoint=Morph model=z-ai/glm-5.3 duration=824.75s tokens_in=96210 tokens_out=131072 tokens_total=227282 cost=0.40598019 outcome=fallback reason=invalid_response timeline=019a4e2c-7b1d-7f3e-9c2a-5d8e1f6a3b40 step=7/24 generation_id=gen-1791025202-Qm4xT7pL2vNc9RkA8sDe
+  WARNING llm provider=openrouter purpose=main model=z-ai/glm-5.3 outcome=retrying attempt=1/3 reason=invalid_response next_in=0.50s timeline=019a4e2c-7b1d-7f3e-9c2a-5d8e1f6a3b40 step=7/24 generation_id=gen-1791025202-Qm4xT7pL2vNc9RkA8sDe
   ```
 - **One `tool` line per tool use, whoever executed it** — `executor=harness` (the harness's own tools), `executor=mcp` (a tool an MCP server serves through the harness's proxy), or `executor=server` (a tool the model's vendor ran inside a model call). Tool calls, tool errors and tool spend are all read off this one head ([the contract](docs/telemetry.md#tool)). A failing tool's error is fed back *to the model* as its result, which made it invisible to the operator, so a failed run is `outcome=error` with a slug `reason=` (`unknown_tool`, `withheld`, `invalid_arguments`, `exception`, a vendor fault such as `rate_limited`, or the vendor's own code for a server-side tool) and, where there is error text, a second `WARNING` `tool` line carrying it. A media tool that turns its vendor's refusal into text for the model is still `outcome=error`. A call whose arguments cannot bind to the tool — an unknown, missing or misspelled name — never reaches it: the model is told what was wrong, the tool's parameter names and the nearest one when a name is close, and the line says `reason=invalid_arguments`.
 

@@ -34,11 +34,16 @@ Ruled by the capital on 2026-11-03, from the telemetry audit with @origin (basec
   (`_retry.fault_slug`, moved there from `_describer`).
 - **Billed lines and decision lines.** `ok`, `refused` and `fallback` are the billed line of an
   attempt the vendor answered, with its tokens and cost. `retrying` and `failed` are the harness's
-  decision about an attempt that brought back no usable answer, and carry nothing billed. Every
-  adapter now reads its answer **before** writing the call's line (`_observability.read_answer`),
-  so an answer it cannot read (a tool call's arguments cut off at the output cap) is `fallback
-  reason=invalid_response` with its bill, followed by the decision, and is never written `ok`. A
-  describe whose answer could not be read does the same.
+  decision about an attempt that brought back no usable answer, and carry nothing billed. The
+  OpenAI, OpenRouter, Google and xAI adapters now read their answer **before** writing the call's
+  line (`_observability.read_answer`, which catches whatever the read raises, not only the
+  taxonomy's class), so an answer one cannot read (a tool call's arguments cut off at the output
+  cap, a null tool-call `function`) is `fallback reason=invalid_response` with its bill, followed by
+  the decision, and is never written `ok`. Anthropic's reply read cannot fail; its turn that never
+  stops pausing marks its last billed continuation the same way. A describe whose answer could not
+  be read does the same, and its next line's `duration` starts after that billed attempt. Visible
+  on the board: a brain line can now say `outcome=fallback` (WARNING), and an unreadable describe
+  writes a billed line plus its decision where it wrote one line.
 - **A non-brain fault is `failed`, not `fallback`.** `fallback` now means only "the model answered
   and the answer could not be used" (`truncated`, `empty_response`, `missing_parts`, `parse`,
   `invalid_response`). A rerank or describe that got no answer is `outcome=failed`, with
@@ -48,7 +53,10 @@ Ruled by the capital on 2026-11-03, from the telemetry audit with @origin (basec
 - **Every model call that ends with no answer says so**: a brain adapter raising outside the
   taxonomy (`reason=provider_error`), a Google Search grounding call, and a tool-schema refusal the
   adapter could not recover from (new slug `tool_schema`).
-- **A describer refusal is WARNING** whatever text came with it, as the brain's is.
+- **A describer refusal is WARNING** whatever text came with it, as the brain's is, so a
+  level-based panel sees it.
+- **A Google Search grounding call that fails for a `config:` cause pages once per wake** (ERROR,
+  then DEBUG), as the reranker and the describer do.
 - **The wake context rides every model call made in a wake, ambiently**: `timeline=`, `delivery=`,
   and `step=n/max` for a call made in the engine's step loop (`_observability.in_wake`, `at_step`).
   It applies to the brain, a rerank and a describe alike. Each is absent outside its context.

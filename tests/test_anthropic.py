@@ -845,11 +845,20 @@ def test_a_paused_turn_is_resumed_with_the_paused_content_unchanged(router, prov
     assert len(llm_lines(caplog)) == 2  # a line per billed call
 
 
-def test_a_turn_that_never_stops_pausing_is_a_transient_fault(router, provider):
+def test_a_turn_that_never_stops_pausing_is_a_transient_fault(router, provider, caplog):
     router.post(MESSAGES).mock(return_value=reply(SEARCH_USE, stop_reason="pause_turn"))
-    with pytest.raises(ProviderResponseError, match="paused the turn"):
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        pytest.raises(ProviderResponseError, match="paused the turn"),
+    ):
         provider.chat([Message.user("search it")])
     assert len(router.calls) == PAUSE_CONTINUATIONS + 1
+    # Every continuation was billed; the last one, paused yet again, left a turn nobody can use,
+    # and its line says so rather than `ok` (issue #782).
+    lines = llm_lines(caplog)
+    assert len(lines) == PAUSE_CONTINUATIONS + 1
+    assert all(" outcome=ok " in line for line in lines[:-1])
+    assert " outcome=fallback reason=invalid_response " in lines[-1]
 
 
 def test_a_server_tool_beside_a_client_tool_goes_back_with_the_client_result(router, provider):

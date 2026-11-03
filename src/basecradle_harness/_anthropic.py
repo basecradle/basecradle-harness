@@ -211,14 +211,15 @@ from basecradle_harness._messages import (
 )
 from basecradle_harness._observability import (
     CONTAINER_TIME,
+    FALLBACK,
     NOT_REPORTED,
     REFUSED,
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
     UNPRICED_HOST,
+    UNREADABLE,
     ServerToolTally,
     generation_id,
-    generation_of,
     log_cost_unpriced,
     log_llm_call,
     log_server_tools,
@@ -530,12 +531,12 @@ class AnthropicProvider:
         request["timeout"] = self._anthropic.Timeout(**budget.phases())
         blocks: list[dict[str, Any]] = []
         response: Any = None
-        for _ in range(PAUSE_CONTINUATIONS + 1):
+        for continuation in range(PAUSE_CONTINUATIONS + 1):
             if blocks:
                 # Resume a paused turn: the paused content goes back unchanged as the assistant's
                 # turn, and the response continues it (Anthropic's documented continuation).
                 request["messages"] = [*request["messages"][:base], _assistant(blocks)]
-            response = self._call(request)
+            response = self._call(request, last=continuation == PAUSE_CONTINUATIONS)
             blocks.extend(_raw(block) for block in response.content or ())
             if response.stop_reason != "pause_turn":
                 break
@@ -554,8 +555,7 @@ class AnthropicProvider:
         self._mark_late_failures(blocks)
         self._replies[id(reply)] = (reply, blocks, digest)
         self._state_code_gap(blocks)
-        with generation_of({"id": getattr(response, "id", None)}):
-            return reply
+        return reply
 
     def _mark_late_failures(self, blocks: Sequence[Mapping[str, Any]]) -> None:
         """Mark on its own record a server tool whose failure arrived in this later reply (#737).
@@ -579,7 +579,7 @@ class AnthropicProvider:
                     mark_failed(message, ids.index(target), reason)
                     break
 
-    def _call(self, request: dict[str, Any]) -> Any:
+    def _call(self, request: dict[str, Any], *, last: bool = False) -> Any:
         """One billed ``messages.create``, its ``llm`` line, and a ``tool`` line per server tool."""
         started = time.monotonic()
         with _mapped_errors(self._anthropic):
@@ -592,6 +592,9 @@ class AnthropicProvider:
         # A content refusal is the vendor's final word and was billed, so it is this call's own
         # verdict, on its own line, with Anthropic's category (issue #782): one attempt, one line.
         refused = self.last_finish_reason == "refusal"
+        # The last continuation the turn may take, paused yet again: billed, and the turn it was
+        # meant to finish cannot be used, so its line says so before `chat` raises (issue #782).
+        unfinished = last and self.last_finish_reason == "pause_turn"
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -600,12 +603,13 @@ class AnthropicProvider:
             residency=self._residency(usage),
             cost=self._cost(usage),
             finish_reason=self.last_finish_reason,
-            outcome=REFUSED if refused else None,
+            outcome=REFUSED if refused else (FALLBACK if unfinished else None),
+            reason=UNREADABLE if unfinished else None,
             category=getattr(getattr(response, "stop_details", None), "category", None)
             if refused
             else None,
             generation_id=generation,
-            level=logging.WARNING if refused else logging.INFO,
+            level=logging.WARNING if refused or unfinished else logging.INFO,
         )
         tallies = _server_tallies(usage, [_raw(block) for block in response.content or ()])
         # The fee is on the searches Anthropic billed — a failed one is not — never the tally.

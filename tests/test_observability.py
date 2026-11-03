@@ -1257,3 +1257,43 @@ def test_a_refusal_is_the_calls_own_outcome_and_a_capture_keeps_it_for_its_calle
     )
     assert caplog.records[0].levelno == logging.WARNING
     assert (call.outcome, call.category) == ("refused", None)
+
+
+def test_a_billed_answer_the_parser_trips_on_is_still_billed_once(router, provider, caplog):
+    """An answer malformed in a shape the parser never foresaw raises whatever it trips on, and was
+    billed all the same: its line is still written, `fallback reason=invalid_response`, with its
+    tokens, and the original exception is what propagates (issue #782 review)."""
+    import httpx
+
+    from basecradle_harness import Message
+    from tests.conftest import CHAT_URL
+
+    body = {
+        "id": "chatcmpl-0123456789abcdef",
+        "object": "chat.completion",
+        "created": 1791030923,
+        "model": "gpt-5.4-mini",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": "tool_calls",
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": "call_0", "type": "function", "function": None}],
+                },
+            }
+        ],
+        "usage": {"prompt_tokens": 90, "completion_tokens": 10, "total_tokens": 100},
+    }
+    router.post(CHAT_URL).mock(return_value=httpx.Response(200, json=body))
+    with (
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        pytest.raises(AttributeError),
+    ):
+        provider.chat([Message.user("hi")])
+    (line,) = [
+        unstyled(r.getMessage()) for r in caplog.records if r.getMessage().startswith("llm ")
+    ]
+    assert " tokens_in=90 " in line
+    assert " outcome=fallback reason=invalid_response " in line

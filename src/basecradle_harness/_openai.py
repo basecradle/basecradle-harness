@@ -488,10 +488,11 @@ class OpenAIProvider:
         started = time.monotonic()
         with self._mapped_errors():
             response = self._client.responses.create(**payload)
+        seconds = time.monotonic() - started
         data = response.model_dump()
         # Read before the line is written, so the one billed line says whether it could be (#782).
         reply, unreadable = read_answer(lambda: message_from_responses(data), data)
-        self._log_call(started, data, unreadable)
+        self._log_call(seconds, data, unreadable)
         self._log_server_tools(data)
         if unreadable is not None:
             raise unreadable
@@ -524,9 +525,10 @@ class OpenAIProvider:
         started = time.monotonic()
         with self._mapped_errors():
             response = self._client.chat.completions.create(**payload)
+        seconds = time.monotonic() - started
         data = response.model_dump()
         reply, unreadable = read_answer(lambda: message_from_chat(data), data)
-        self._log_call(started, data, unreadable)
+        self._log_call(seconds, data, unreadable)
         # A router reached over this surface counts the web searches it ran for the call (OpenRouter's
         # ``server_tool_use_details``); a vendor that runs none reports nothing and writes no line.
         searches = routed_web_searches(data.get("usage"))
@@ -541,7 +543,7 @@ class OpenAIProvider:
         return reply  # type: ignore[return-value]
 
     def _log_call(
-        self, started: float, data: Mapping[str, Any], unreadable: ProviderError | None = None
+        self, seconds: float, data: Mapping[str, Any], unreadable: Exception | None = None
     ) -> None:
         """The one INFO line this call earns: provider, endpoint, model, duration, tokens, cost.
 
@@ -574,7 +576,8 @@ class OpenAIProvider:
         log_llm_call(
             provider=self.provider,
             model=self.model,
-            seconds=time.monotonic() - started,
+            # Timed before the read, so the line measures the vendor's call and nothing of ours.
+            seconds=seconds,
             usage=reasoning_apart(usage) if self._reasoning_apart else usage,
             endpoint=serving_endpoint(data),
             cost=cost,

@@ -167,7 +167,7 @@ from basecradle_harness._observability import (
     token_counts,
 )
 from basecradle_harness._openai_wire import format_citations
-from basecradle_harness._retry import fault_slug
+from basecradle_harness._retry import diagnostics, fault_slug
 from basecradle_harness._secret import Sealed as _Sealed
 from basecradle_harness._server_tools import record
 from basecradle_harness._timeouts import (
@@ -565,6 +565,8 @@ class GoogleProvider:
         self.last_timeout: float | None = None
         self._timeout_scale = 1.0
         self._fixed_timeout = timeout
+        #: Whether a search's config-class failure has paged in this adapter's life (one wake).
+        self._search_config_reported = False
         self._extra_body = dict(extra_body) if extra_body else None
         self._genai = require_google_genai()
         self._types = self._genai.types
@@ -816,6 +818,14 @@ class GoogleProvider:
             # The tool hands the model the text; its `tool` line still says the search failed, and
             # the model call that ended with no answer says so on its own line (issue #782).
             meter_failure(exc, provider=self.provider, kind=SEARCH_KIND, model=self.model)
+            fault = fault_slug(exc)
+            # Severity is the taxonomy, as on every non-brain line: a `config:` cause is dead until
+            # a human acts, so it is ERROR (it pages) once in this adapter's life, which is one
+            # wake, and DEBUG after; everything else can succeed next time and is WARNING.
+            level = logging.WARNING
+            if fault.startswith("config:"):
+                level = logging.DEBUG if self._search_config_reported else logging.ERROR
+                self._search_config_reported = True
             log_llm_call(
                 provider=self.provider,
                 purpose=HELPER,
@@ -824,9 +834,10 @@ class GoogleProvider:
                 model=self.model,
                 seconds=time.monotonic() - started,
                 outcome=FAILED,
-                reason=fault_slug(exc),
+                reason=fault,
                 detail=str(exc),
-                level=logging.WARNING,
+                extra=diagnostics(exc),
+                level=level,
             )
             raise
         seconds = time.monotonic() - started
