@@ -847,18 +847,31 @@ def brain_failure(router, **_):
         engine.run([Message.user("hi")])
 
 
-@scenario
-def unreadable_answer(router, **_):
-    """The vendor answers (and bills) at the output cap with a tool call's arguments cut off: the
-    one billed line says `fallback reason=invalid_response`, and the give-up is its own line."""
+def _cut_tool_call_answer(router, finish_reason: str) -> None:
+    """A tool call whose arguments stop mid-string, with the stop reason the vendor gave."""
     cut_off = wire_tool_call(id="call_0", name="get_weather", arguments={"city": "Dallas"})
     cut_off["function"]["arguments"] = '{"city": "Dal'
     router.post(GENERATION_CHAT_URL).mock(
-        return_value=_ok(_openrouter_body(tool_calls=[cut_off], finish_reason="length"))
+        return_value=_ok(_openrouter_body(tool_calls=[cut_off], finish_reason=finish_reason))
     )
     engine = Engine(_generation_openrouter(), ToolRegistry(), response_retries=0)
     with _a_wake(), pytest.raises(ProviderResponseError):
         engine.run([Message.user("weather?")])
+
+
+@scenario
+def unreadable_answer(router, **_):
+    """The vendor answers (and bills) a tool call whose arguments do not parse, having stopped of
+    its own accord: the one billed line says `fallback reason=invalid_response`, and the give-up is
+    its own line."""
+    _cut_tool_call_answer(router, "stop")
+
+
+@scenario
+def truncated_answer(router, **_):
+    """The same unreadable tool call, but the vendor says it stopped at the output cap (issue
+    #788): a runaway cut off, so both lines say `reason=truncated`, never `invalid_response`."""
+    _cut_tool_call_answer(router, "length")
 
 
 @scenario
@@ -1723,6 +1736,18 @@ def test_an_unreadable_answer_is_billed_once_and_the_give_up_bills_nothing(rende
     assert (billed.fields["outcome"], billed.fields["reason"]) == ("fallback", "invalid_response")
     assert "tokens_in" in billed.fields and billed.fields["purpose"] == "main"
     assert (given_up.fields["outcome"], given_up.fields["reason"]) == ("failed", "invalid_response")
+    assert "tokens_in" not in given_up.fields and "cost" not in given_up.fields
+    assert billed.fields["generation_id"] == given_up.fields["generation_id"]
+
+
+def test_an_answer_cut_off_at_the_cap_is_written_as_truncated_on_both_lines(rendered):
+    """A runaway is told apart from an unreadable answer (issue #788): the cap fired, so the billed
+    line is `fallback reason=truncated` with its bill, and the decision that follows says the same,
+    naming the same generation."""
+    billed, given_up = rendered.heads("truncated_answer", "llm")
+    assert (billed.fields["outcome"], billed.fields["reason"]) == ("fallback", "truncated")
+    assert "tokens_in" in billed.fields
+    assert (given_up.fields["outcome"], given_up.fields["reason"]) == ("failed", "truncated")
     assert "tokens_in" not in given_up.fields and "cost" not in given_up.fields
     assert billed.fields["generation_id"] == given_up.fields["generation_id"]
 

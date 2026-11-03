@@ -601,6 +601,28 @@ def test_the_retry_scale_reaches_the_wire(router, provider):
     assert route.calls.last.request.extensions["timeout"]["read"] == first * TIMEOUT_RETRY_SCALE
 
 
+def test_a_keepalive_body_cannot_hold_the_call_past_its_budget(router, provider, monkeypatch):
+    """The budget `_phased` sets is also a deadline on the whole attempt (issue #788): a body that
+    trickles in a byte at a time is cut once the budget has passed, as a timeout, never read to its
+    end. Measured on a fake clock that moves a minute per chunk."""
+    from basecradle_harness import ProviderTimeoutError, _deadline
+
+    now = [0.0]
+    monkeypatch.setattr(_deadline, "_clock", lambda: now[0])
+
+    class Keepalive(httpx.SyncByteStream):
+        def __iter__(self):
+            for _ in range(60):
+                now[0] += 60.0
+                yield b"\n"
+            yield json.dumps({"candidates": []}).encode()
+
+    router.post(GENERATE).mock(return_value=httpx.Response(200, stream=Keepalive()))
+    with pytest.raises(ProviderTimeoutError):
+        provider.chat([Message.user("hello")])
+    assert now[0] <= provider.last_timeout + CONNECT_TIMEOUT + 60.0
+
+
 def test_the_sdk_never_retries_on_its_own(router, provider):
     """One request per call: the engine's bounded retry is the only retry policy (`_retry`)."""
     route = router.post(GENERATE).mock(return_value=httpx.Response(503, json={"error": {}}))

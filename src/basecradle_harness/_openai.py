@@ -53,6 +53,7 @@ from typing import Any
 
 from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._context import is_context_overflow, request_chars
+from basecradle_harness._deadline import bound_attempts
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
@@ -364,9 +365,15 @@ class OpenAIProvider:
         #: so each WARNING is written once per adapter — one wake — rather than once per call.
         self._gaps_stated: set[str] = set()
         self._openai = openai
+        # The SDK's own default client (its connection limits and redirects), with the fitted budget
+        # held as a deadline on the whole attempt rather than only on a silence (issue #788): a
+        # router fronted by this SDK sends keepalives while a non-streaming answer is written.
+        http_client = openai.DefaultHttpxClient()
+        bound_attempts(http_client)
         self._client = openai.OpenAI(
             api_key=key,
             base_url=base_url or None,
+            http_client=http_client,
             # No client-wide timeout: every request passes its own — a model turn the one fitted to
             # it (`_timeout_args`), a metadata read `METADATA_TIMEOUT` (`context_limit`).
             max_retries=max_retries,

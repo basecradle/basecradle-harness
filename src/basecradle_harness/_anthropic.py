@@ -133,8 +133,9 @@ an agent runs Anthropic's defaults by default. Two keys are checked at startup i
 vendor: a key the SDK does not name, and **``temperature`` / ``top_p`` / ``top_k``**, which are a 400
 on every 5.x model and an error on every model from API version 2026-10-21 — a config fault the
 operator sees once, never a 400 on every wake. ``max_tokens`` is required by the API; unset, the
-adapter sends the model's own maximum from the Models API, the nearest thing to *uncapped* this
-API has.
+adapter sends the harness's per-attempt default (`HARNESS_MAX_OUTPUT_TOKENS`, issue #788), lowered to
+the model's own maximum from the Models API when that is smaller; a library caller that passes no
+default gets that maximum, the nearest thing to *uncapped* this API has.
 
 Faults, by nature
 -----------------
@@ -188,6 +189,7 @@ from basecradle_harness._anthropic_rates import (
 )
 from basecradle_harness._caching import EXPLICIT
 from basecradle_harness._context import is_context_overflow, request_chars
+from basecradle_harness._deadline import bound_attempts
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
@@ -200,6 +202,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
     ProviderServerError,
     ProviderTimeoutError,
+    ProviderTruncatedError,
 )
 from basecradle_harness._faults import is_out_of_funds, is_too_large
 from basecradle_harness._messages import (
@@ -215,6 +218,7 @@ from basecradle_harness._observability import (
     NOT_REPORTED,
     REFUSED,
     TOKENS_CHARGE,
+    TRUNCATED,
     UNKNOWN_MODEL,
     UNPRICED_HOST,
     UNREADABLE,
@@ -224,7 +228,9 @@ from basecradle_harness._observability import (
     log_llm_call,
     log_server_tools,
     slug,
+    stamp_generation_id,
     token_counts,
+    truncated,
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._secret import Sealed
@@ -404,6 +410,10 @@ class AnthropicProvider:
             given, no key is required and nothing is built.
         builtin_tools: The server tools to send on every turn, by builtin name (`BUILTINS`). A name
             this adapter does not send is ignored — no plugin resolves one for this provider.
+        default_max_tokens: The ``max_tokens`` a call carries when `default_params` names none —
+            the brain's `HARNESS_MAX_OUTPUT_TOKENS` (issue #788) — lowered to the model's own
+            maximum when that is smaller, because the API refuses a cap above it. ``None`` sends the
+            model's maximum, as before.
         default_params: ``messages.create`` keywords applied to every call, from the operator's
             ``model_params.json`` — ``max_tokens``, ``output_config``, ``thinking``,
             ``stop_sequences``, ``inference_geo``, ``service_tier``, ``metadata``, ``extra_body``,
@@ -428,10 +438,14 @@ class AnthropicProvider:
         timeout: float | None = None,
         client: Any | None = None,
         builtin_tools: Sequence[str] = (),
+        default_max_tokens: int | None = None,
         **default_params: Any,
     ) -> None:
         self.model = model
         self.provider = PROVIDER
+        #: The cap a call carries when ``model_params.json`` sets no ``max_tokens`` (issue #788),
+        #: sent no higher than the model's own maximum. ``None`` sends that maximum.
+        self._default_max_tokens = default_max_tokens
         #: The total prompt Anthropic reported for the most recent call (issue #276): its uncached,
         #: cache-written and cache-read tokens together.
         self.last_tokens_in: int | None = None
@@ -471,10 +485,15 @@ class AnthropicProvider:
             )
         #: The endpoint this adapter was built with.
         self.base_url = base_url or DEFAULT_BASE_URL
+        # The SDK's own default client, with the fitted budget held as a deadline on the whole
+        # attempt rather than only on a silence (issue #788).
+        http_client = self._anthropic.DefaultHttpxClient()
+        bound_attempts(http_client)
         self._client = Sealed(
             self._anthropic.Anthropic(
                 api_key=key,
                 base_url=self.base_url,
+                http_client=http_client,
                 # The engine's bounded retry is the one policy for every adapter (`_retry`); the
                 # SDK's own two retries would compose with it and re-send a timed-out request into
                 # the same wall.
@@ -551,6 +570,17 @@ class AnthropicProvider:
                 # Anthropic's own words, for a human reading the journal; the fact is the call's own
                 # `llm` line, which `_call` wrote as `outcome=refused` (issue #782).
                 _log.warning("Anthropic's explanation of the refusal: %s", explanation)
+        if _cut_off(response):
+            # The cap fired inside a tool call: Anthropic hands back its ``tool_use`` with the input
+            # it could not finish as ``{}`` (measured live, 2026-11-03), which is the API's stand-in
+            # and not the call the model was making. It cannot run, so the turn is the runaway
+            # class of issue #788 — retried, never dispatched — and its line already says so.
+            raise stamp_generation_id(
+                ProviderTruncatedError(
+                    "Anthropic stopped at max_tokens inside a tool call, so its input is incomplete."
+                ),
+                generation_id({"id": getattr(response, "id", None)}),
+            )
         reply = _reply(blocks)
         self._mark_late_failures(blocks)
         self._replies[id(reply)] = (reply, blocks, digest)
@@ -595,6 +625,8 @@ class AnthropicProvider:
         # The last continuation the turn may take, paused yet again: billed, and the turn it was
         # meant to finish cannot be used, so its line says so before `chat` raises (issue #782).
         unfinished = last and self.last_finish_reason == "pause_turn"
+        # A tool call cut off at `max_tokens` cannot be run, so it is billed as what it is (#788).
+        cut = _cut_off(response)
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -603,13 +635,13 @@ class AnthropicProvider:
             residency=self._residency(usage),
             cost=self._cost(usage),
             finish_reason=self.last_finish_reason,
-            outcome=REFUSED if refused else (FALLBACK if unfinished else None),
-            reason=UNREADABLE if unfinished else None,
+            outcome=REFUSED if refused else (FALLBACK if unfinished or cut else None),
+            reason=TRUNCATED if cut else (UNREADABLE if unfinished else None),
             category=getattr(getattr(response, "stop_details", None), "category", None)
             if refused
             else None,
             generation_id=generation,
-            level=logging.WARNING if refused or unfinished else logging.INFO,
+            level=logging.WARNING if refused or unfinished or cut else logging.INFO,
         )
         tallies = _server_tallies(usage, [_raw(block) for block in response.content or ()])
         # The fee is on the searches Anthropic billed — a failed one is not — never the tally.
@@ -704,7 +736,8 @@ class AnthropicProvider:
                     f"The Models API states no max_tokens for {self.model}, and the Messages API "
                     "requires one: set max_tokens in model_params.json."
                 )
-            request["max_tokens"] = ceiling
+            default = self._default_max_tokens
+            request["max_tokens"] = min(default, ceiling) if default else ceiling
         wire_tools = _wire_tools(self._builtins, tools)
         system, wire, stream = self._to_wire(messages, wire_tools)
         request["model"] = self.model
@@ -1145,6 +1178,18 @@ def _fold_into_results(blocks: list[dict[str, Any]]) -> None:
     if marked is not None:
         last["cache_control"] = marked
     blocks[:] = results
+
+
+def _cut_off(response: Any) -> bool:
+    """Whether `response` stopped at its output cap while writing a client tool call (issue #788).
+
+    Text cut off at the cap is still an answer (the engine keeps it and leaves the turn unfinished,
+    issue #490); a ``tool_use`` cut off is not, because the API returns its input as ``{}``.
+    """
+    if not truncated(getattr(response, "stop_reason", None)):
+        return False
+    content = list(getattr(response, "content", None) or ())
+    return bool(content) and getattr(content[-1], "type", None) == "tool_use"
 
 
 def _assistant(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

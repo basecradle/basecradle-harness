@@ -107,6 +107,7 @@ from typing import TYPE_CHECKING, Any
 from basecradle_harness._assets import model_sees_video
 from basecradle_harness._exceptions import (
     ProviderError,
+    ProviderTruncatedError,
 )
 from basecradle_harness._messages import ImageContent, Message, VideoContent
 from basecradle_harness._observability import (
@@ -674,7 +675,7 @@ class Describer:
                     # cannot say is transient. An answer the adapter read and could not use is still
                     # billed on its own line, as below; the adapter said so by recording `fallback`.
                     if call.outcome == FALLBACK:
-                        self._bill_unreadable(subject, kind=kind, call=call)
+                        self._bill_unreadable(subject, kind=kind, call=call, failure=exc)
                     self._report(
                         subject,
                         kind=kind,
@@ -691,7 +692,7 @@ class Describer:
             # The adapter says which it was: it records `fallback` exactly when it read the answer
             # and failed (`_observability.read_answer`); any other fault reached no answer.
             if call.outcome == FALLBACK:
-                self._bill_unreadable(subject, kind=kind, call=call)
+                self._bill_unreadable(subject, kind=kind, call=call, failure=failure)
                 # That attempt's time is on its own line, so the wait this describe's last line
                 # reports starts after it: summed over billed lines, no second is counted twice.
                 started = time.monotonic()
@@ -725,16 +726,20 @@ class Describer:
         )
         return (text or None), reason
 
-    def _bill_unreadable(self, subject: str, *, kind: str, call: LlmCall) -> None:
+    def _bill_unreadable(
+        self, subject: str, *, kind: str, call: LlmCall, failure: Exception
+    ) -> None:
         """The billed line of an attempt the vendor answered and the adapter then could not read.
 
         The adapter recorded the answer (its usage, its cost) before the read failed, so the vendor
         billed it: it is a call, and its line is ``outcome=fallback reason=invalid_response`` with
         that bill. Nothing is written when the attempt never reached an answer, because then there
-        is nothing billed to record and the failure line alone says what happened.
+        is nothing billed to record and the failure line alone says what happened. An answer the
+        vendor cut off at the output cap says ``reason=truncated`` instead (issue #788).
         """
         if call.provider is not None:
-            self._report(subject, kind=kind, call=call, reason=UNREADABLE, answered=True)
+            reason = _TRUNCATED if isinstance(failure, ProviderTruncatedError) else UNREADABLE
+            self._report(subject, kind=kind, call=call, reason=reason, answered=True)
 
     def _provider_for(self, budget: int) -> Provider | None:
         """This describer at `budget` output tokens — built once per budget, or the one it holds.

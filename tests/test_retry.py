@@ -36,6 +36,7 @@ from basecradle_harness._exceptions import (
     ProviderResponseError,
     ProviderServerError,
     ProviderTimeoutError,
+    ProviderTruncatedError,
 )
 from basecradle_harness._observability import (
     HELPER,
@@ -138,6 +139,7 @@ def _chained(exc: ProviderConnectionError, cause: BaseException) -> ProviderConn
         (rate_limit(), "rate_limited"),
         (ProviderServerError("oops", status_code=503), "server_error"),
         (ProviderResponseError("EOF while parsing a value"), "invalid_response"),
+        (ProviderTruncatedError("stopped at the output cap inside a tool call"), "truncated"),
         (ProviderConnectionError("no route"), "transport"),
         (
             _chained(ProviderConnectionError("timed out"), httpx.ReadTimeout("read")),
@@ -238,6 +240,9 @@ def test_the_reason_set_is_exactly_the_runtime_faults_a_second_request_can_fix()
         "transport",
         "timeout",
         "invalid_response",
+        # A tool call cut off at the output cap (issue #788): a runaway belongs to one generation,
+        # and the incident's own retry answered in 3.9 s on another endpoint.
+        "truncated",
     }
 
 

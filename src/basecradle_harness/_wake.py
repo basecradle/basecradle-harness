@@ -105,6 +105,7 @@ from basecradle_harness._basecradle import (
     _context_messages_from_env,
     _incoming_text,
     _max_context_tokens_from_env,
+    _max_output_tokens_from_env,
     _max_steps_from_env,
     _messages_since,
     _onboard_from_env,
@@ -240,6 +241,7 @@ from basecradle_harness._rerank import (
 )
 from basecradle_harness._secret import secret
 from basecradle_harness._session import INTERRUPTED, Session, turn_work
+from basecradle_harness._timeouts import output_cap
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
 from basecradle_harness._version import __version__
 
@@ -5847,6 +5849,11 @@ def resolved_config() -> dict[str, object]:
       would be a guess — and a guessed field in the file the drift audit trusts is worse than an
       absent one. The wake logs the resolved limit and its source (``context limit limit=… limit_source=…``)
       on the run that actually resolves it.
+    - ``max_output_tokens`` — the most one brain attempt may write (issue #788): the cap in
+      ``model_params.json`` when it names one, else `HARNESS_MAX_OUTPUT_TOKENS`, else the shipped
+      32,768. Never ``null``: there is no uncapped brain. On Anthropic the call carries this or the
+      model's own maximum, whichever is smaller (the adapter reads that maximum from the Models API,
+      which this path never calls). A malformed knob fails this report as it fails a wake.
     - ``wake_breaker_max`` / ``wake_breaker_window`` / ``wake_breaker_cooldown`` — the cross-wake
       breaker's tunables as the wake resolves them (`_breaker.breaker_settings_from_env`, issue
       #592), the cooldown already defaulted to the window. A value that would make every wake fail
@@ -5893,6 +5900,7 @@ def resolved_config() -> dict[str, object]:
         **_cost_report(provider_name, sdk, os.environ.get("AI_MODEL") or ""),
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
+        "max_output_tokens": output_cap(model_params) or _max_output_tokens_from_env(),
         "wake_breaker_max": breaker_max,
         "wake_breaker_window": breaker_window if breaker_max > 0 else None,
         "wake_breaker_cooldown": breaker_cooldown if breaker_max > 0 else None,

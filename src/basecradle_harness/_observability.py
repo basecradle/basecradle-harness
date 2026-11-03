@@ -58,7 +58,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
-from basecradle_harness._exceptions import ProviderError
+from basecradle_harness._exceptions import ProviderError, ProviderTruncatedError
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -514,6 +514,11 @@ FAILED = "failed"
 #: that did not parse, a tool call's arguments cut off. Its billed line says `fallback` with this
 #: reason (`read_answer`), and the harness's decision about the call follows on its own line.
 UNREADABLE = "invalid_response"
+
+#: The `reason` of an answer the vendor cut off at the output cap (issue #788): on the billed line
+#: of an unreadable answer whose stop reason was the cap (`read_answer`), and on the decision line
+#: that follows it. Also an answer slug a caller judges by (`ANSWER_REASONS`): the describer's.
+TRUNCATED = "truncated"
 
 #: The `reason` slugs that judge an **answer**, not a fault: the vendor answered (and billed), and
 #: the caller could not use what came back. Every other reason is a fault slug, so the call it ends
@@ -1523,7 +1528,9 @@ def stamp_generation_id(error: BaseException, generation: str | None) -> BaseExc
 _T = TypeVar("_T")
 
 
-def read_answer(read: Callable[[], _T], response: Any) -> tuple[_T | None, Exception | None]:
+def read_answer(
+    read: Callable[[], _T], response: Any, *, finish: str | None = None
+) -> tuple[_T | None, Exception | None]:
     """Read the vendor's answer **before** the call's line is written: ``(reply, None)`` or
     ``(None, the error)`` (issue #782).
 
@@ -1541,19 +1548,34 @@ def read_answer(read: Callable[[], _T], response: Any) -> tuple[_T | None, Excep
     the parser trips on, and the call was billed all the same. Catching only the taxonomy's class
     lost the billed line, and with it the spend, on exactly the bodies nobody anticipated. The
     original exception is what the adapter raises; only the line is changed.
+
+    **Except when the vendor says it stopped at the output cap** (issue #788). Then the answer was
+    not malformed, it was cut off: a runaway generation wrote until the cap, and the tool call it
+    was in the middle of does not parse. The error becomes `ProviderTruncatedError`, the original
+    chained as its cause, so the billed line says ``reason=truncated`` and the decision that follows
+    says the same. The stop reason is `finish`, the vendor's own word, when the adapter has already
+    read it, and otherwise read off `response` (`finish_reason`).
     """
     try:
         with generation_of(response):
             return read(), None
     except Exception as exc:  # noqa: BLE001 - the line is written, then the original re-raised
-        return None, exc
+        stopped = finish if finish is not None else finish_reason(response)
+        if not truncated(stopped) or isinstance(exc, ProviderTruncatedError):
+            return None, exc
+        cut = ProviderTruncatedError(
+            f"The answer stopped at the output cap ({stopped}) before it could be read: {exc}"
+        )
+        cut.__cause__ = exc
+        return None, stamp_generation_id(cut, generation_id(response))
 
 
 def answered(error: Exception | None) -> dict[str, Any]:
     """The verdict fields of an answered call's line, given what `read_answer` returned."""
     if error is None:
         return {}
-    return {"outcome": FALLBACK, "reason": UNREADABLE, "level": logging.WARNING}
+    reason = TRUNCATED if isinstance(error, ProviderTruncatedError) else UNREADABLE
+    return {"outcome": FALLBACK, "reason": reason, "level": logging.WARNING}
 
 
 @contextmanager

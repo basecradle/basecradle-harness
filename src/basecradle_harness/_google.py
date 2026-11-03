@@ -116,6 +116,7 @@ import httpx
 
 from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._context import is_context_overflow, request_chars
+from basecradle_harness._deadline import bound_attempts
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
@@ -640,6 +641,8 @@ class GoogleProvider:
         self.base_url = base_url or None
         self._credentials = _Sealed(credentials)
         self._http = httpx.Client(follow_redirects=True, event_hooks={"request": [self._phased]})
+        # After `_phased`, which sets the timeout the deadline is read from (issue #788).
+        bound_attempts(self._http)
         options: dict[str, Any] = {"httpx_client": self._http}
         if base_url:
             options["base_url"] = base_url
@@ -750,7 +753,9 @@ class GoogleProvider:
         used = _server_uses(candidate)
         # Read before the line is written, so the one billed line says whether it could be (#782).
         reply, unreadable = read_answer(
-            lambda: self._from_wire(response, candidate, reason, used), {"id": response_id}
+            lambda: self._from_wire(response, candidate, reason, used),
+            {"id": response_id},
+            finish=self.last_finish_reason,
         )
         log_llm_call(
             provider=self.provider,

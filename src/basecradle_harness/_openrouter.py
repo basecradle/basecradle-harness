@@ -62,6 +62,7 @@ import httpx
 
 from basecradle_harness._caching import AUTOMATIC
 from basecradle_harness._context import is_context_overflow, request_chars
+from basecradle_harness._deadline import bound_attempts
 from basecradle_harness._exceptions import (
     ProviderAPIError,
     ProviderAuthError,
@@ -159,12 +160,19 @@ class _ResponseCapture:
         self.last: Any = None
 
     def __call__(self, response: httpx.Response) -> None:
-        # Read (and cache) the body so both this hook and the SDK's own parse can consume it; a
-        # streaming/binary/error body that isn't JSON simply leaves `last` as None.
+        # Read (and cache) the body so both this hook and the SDK's own parse can consume it.
+        #
+        # A failure to *read* is not observation's to swallow (issue #788): it is the call failing —
+        # a connection dropped mid-body, or the whole-attempt deadline (`_deadline`) cutting a
+        # keepalive stream — and it propagates to the SDK exactly as its own read would have raised
+        # it, so the adapter maps it to the transport or timeout class the engine retries. Swallowed,
+        # it left the stream consumed and the SDK's own read failed on `StreamConsumed`, which no
+        # mapper knows: a retryable fault turned into a fatal one.
+        self.last = None
+        response.read()
         try:
-            response.read()
             self.last = response.json()
-        except Exception:  # noqa: BLE001 - observation is best-effort; never disturb the SDK call
+        except Exception:  # noqa: BLE001 - a body that isn't JSON simply leaves `last` as None
             self.last = None
 
 
@@ -188,6 +196,11 @@ def _watch_responses(client: Any, capture: _ResponseCapture) -> None:
             "request": list(hooks.get("request", ())),
             "response": [*hooks.get("response", ()), capture],
         }
+
+
+def _http_client(client: Any) -> Any:
+    """The ``httpx`` client an ``openrouter`` SDK client drives, or ``None`` (a test double)."""
+    return getattr(getattr(client, "sdk_configuration", None), "client", None)
 
 
 def apply_timeout(client: Any, budget: CallTimeout) -> bool:
@@ -389,6 +402,9 @@ class OpenRouterProvider:
         # against a model call measured in seconds.
         self._capture = _ResponseCapture()
         _watch_responses(self._client, self._capture)
+        # The fitted budget is a deadline on the whole attempt, not only on a silence: OpenRouter
+        # sends a keepalive every few seconds while a non-streaming answer is written (issue #788).
+        bound_attempts(_http_client(self._client))
 
     @property
     def tuning(self) -> dict[str, Any]:

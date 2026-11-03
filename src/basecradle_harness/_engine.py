@@ -58,6 +58,7 @@ from basecradle_harness._exceptions import (
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
+    ProviderTruncatedError,
 )
 from basecradle_harness._messages import (
     ImageContent,
@@ -199,6 +200,7 @@ _RETRY_BACKOFF_BASE = 0.5
 _REASONS: tuple[tuple[type[Exception], str], ...] = (
     (ProviderRateLimitError, "rate_limited"),
     (ProviderServerError, "server_error"),
+    (ProviderTruncatedError, "truncated"),
     (ProviderResponseError, "invalid_response"),
 )
 
