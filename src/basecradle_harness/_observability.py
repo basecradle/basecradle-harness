@@ -181,13 +181,14 @@ _PREFIX_RULES = re.compile("|".join(f"(?:{prefix}){body}" for prefix, body in _P
 #: ``task-runner-bearer …`` lost its bearer value the same way. A prefix run cannot reach across the
 #: ``[redacted]`` the first pass leaves, so the second pass never undoes it. Inside this pass the
 #: same holds between two rules: an assignment whose value is a bearer header
-#: (``AUTH_API_KEY=Bearer eyJ…``) takes the ``Bearer`` and the token together, where it once took
-#: ``Bearer`` as the whole value and left the token after the space.
+#: (``AUTH_API_KEY=Bearer eyJ…``) takes every ``Bearer`` and the token together, where it once took
+#: ``Bearer`` as the whole value and left the token after the space; every, because a token stored
+#: with its scheme and sent with another reads ``Bearer Bearer eyJ…``.
 _LITERAL_RULES = re.compile(
     r"/heartbeat/\S+"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
-    r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)?[^&\s]+"
-    r"|(?i:api[-_]?key=)(?:(?i:bearer)\s+)?[^&\s\"]+"
+    r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*[^&\s]+"
+    r"|(?i:api[-_]?key=)(?:(?i:bearer)\s+)*[^&\s\"]+"
 )
 
 #: One character of the run every **length-gated** redaction rule matches — this module's
@@ -230,8 +231,8 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
 def scrub(text: str) -> str:
     """`text` with every credential shape the scrub knows replaced by ``[redacted]``.
 
-    Two passes, in order: `_LITERAL_RULES`, then the prefix rules (`_PREFIXED`), a prefixed match
-    that `_is_word` reads as a word kept as written.
+    Two passes, in order: `_LITERAL_RULES`, then the prefix rules (`_PREFIXED`). The second pass
+    keeps a match `_is_word` reads as a word, as written.
 
     Run on a whole text **before** `bounded` cuts it, so a rule is never shown a credential cut
     short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before

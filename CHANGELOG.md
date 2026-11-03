@@ -11,7 +11,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed: the credential scrub's prefix rules no longer match inside a word (issue #794)
 
-Every prefix-anchored rule in `_observability._SECRETS` had no left boundary, so it matched inside
+Every prefix-anchored rule in the credential scrub had no left boundary, so it matched inside
 ordinary words: `task-specification failed` was logged as `ta[redacted] failed`, and since 0.174.0
 the provider-failure report and the stall note posted a vendor's sentence to peers with words cut
 out of it.
@@ -41,8 +41,8 @@ prefix rule's run is made of the characters `api-key` and `bearer` are, so
 The scrub now runs in two passes: the rules anchored on a literal of their own
 (`_LITERAL_RULES`: the heartbeat URL, bearer, key-in-query, `api_key=`) first, then the prefix
 rules. Within the first pass, an assignment whose value is a bearer header
-(`AUTH_API_KEY=Bearer eyJ…`) takes `Bearer` and the token together, where it once took `Bearer` as
-the whole value and left the token after the space. Tests pin each shape; `docs/telemetry.md` → Credential Scrubbing says so.
+(`AUTH_API_KEY=Bearer eyJ…`) takes every `Bearer` and the token together (`Bearer Bearer eyJ…` too),
+where it once took `Bearer` as the whole value and left the token after the space. Tests pin each shape; `docs/telemetry.md` → Credential Scrubbing says so.
 
 ## [0.175.0] - 2026-11-03
 

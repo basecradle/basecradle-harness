@@ -364,6 +364,12 @@ def test_a_word_glued_by_a_digit_a_combining_mark_or_any_script_is_kept(glue):
         ("disk-proxy-Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc", "eyJhbGciOiJIUzI1NiJ9"),
         ("AUTH_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc", "eyJhbGciOiJIUzI1NiJ9"),
         ("https://example.com/v1?api_key=Bearer eyJhbGciOiJIUzI1NiJ9", "eyJhbGciOiJIUzI1NiJ9"),
+        ("AUTH_API_KEY=Bearer Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig", "eyJhbGciOiJIUzI1NiJ9"),
+        (
+            "GET /v1/models?api_key=Bearer Bearer eyJhbGciOiJIUzI1NiJ9 HTTP/1.1",
+            "eyJhbGciOiJIUzI1NiJ9",
+        ),
+        ("?token=Bearer\tBearer s3cr3tValue9", "s3cr3tValue9"),
     ],
 )
 def test_a_literal_rule_after_a_prefix_run_still_redacts_its_value(text, value):
@@ -373,3 +379,16 @@ def test_a_literal_rule_after_a_prefix_run_still_redacts_its_value(text, value):
     rendered = scrub(f"failed: {text} rejected")
     assert value not in rendered, rendered
     assert "[redacted]" in rendered
+    assert rendered.startswith("failed: ") and rendered.endswith(" rejected"), rendered
+
+
+@pytest.mark.parametrize(
+    ("text", "kept"),
+    [
+        ("task-runner-api-key=abc123secret", "task-runner-"),
+        ("risk-model_api_key=hunter2xyz", "risk-model_"),
+        ("task-runner-bearer abcdefgh123", "task-runner-"),
+    ],
+)
+def test_the_word_before_a_literal_rule_keeps_its_letters(text, kept):
+    assert scrub(text) == f"{kept}[redacted]"
