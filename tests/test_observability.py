@@ -22,6 +22,8 @@ from basecradle_harness._observability import (
     RESET,
     YELLOW,
     ComputedCost,
+    _full_value,
+    _value,
     byok,
     capture_llm_call,
     color_enabled,
@@ -905,6 +907,60 @@ def test_a_bare_token_value_stays_unquoted_so_the_common_line_greps_cleanly():
     assert kv(timeline="019e7750-66ee-7f53-829f-13a8a710b6da", posted=3, duration="1.20s") == (
         "timeline=019e7750-66ee-7f53-829f-13a8a710b6da posted=3 duration=1.20s"
     )
+
+
+# --- a control character in a value is a space (issue #806) ---------------------------------------
+
+#: The fleet's shared witness: basecradle-router ``tests/vector/ai_otel_llm.yaml``, the case "a detail
+#: renders by the fleet's one value rule, byte for byte with the router's log_fields" (router
+#: ``307bcc9``, basecradle-router#396). Its input holds a ``"``, a ``'``, two backslashes, a newline,
+#: an ESC and a C1 control character (``\x85``); the router's ``log_fields`` and its ``detail=``
+#: remap both render it to `ROUTER_WITNESS_RENDERED`, and so must the harness, or the fleet has two
+#: dialects of one grammar.
+ROUTER_WITNESS_INPUT = "upstream said \" stage=wake outcome=failed duration=99999.0s\nit's C:\\path\\x\x1b[31m red\x85end"
+ROUTER_WITNESS_RENDERED = (
+    "\"upstream said ' stage=wake outcome=failed duration=99999.0s it's C:\\path\\x [31m red end\""
+)
+
+
+@pytest.mark.parametrize("render", [_value, _full_value])
+def test_a_value_renders_the_routers_witness_byte_for_byte(render):
+    assert render(ROUTER_WITNESS_INPUT) == ROUTER_WITNESS_RENDERED
+
+
+@pytest.mark.parametrize(
+    "control", ["\x00", "\x07", "\x1b", "\x7f", "\x80", "\x85", "\x9b", "\x9f"]
+)
+@pytest.mark.parametrize("render", [_value, _full_value])
+def test_every_control_character_in_a_value_is_one_space(control, render):
+    """C0, DEL and C1 alike: an ESC or a CSI (``\x9b``) quoted from a vendor's error body would paint
+    the reader's terminal, a NUL or a BEL would mean something to it, and none is legitimate text."""
+    rendered = render(f"before{control}after")
+    assert rendered == '"before after"'
+
+
+def test_a_run_of_control_characters_and_whitespace_is_one_space():
+    assert _value("\x1b\x00 a\x1b\x1b\n\x85 b \x7f") == '"a b"'
+
+
+def test_a_values_escape_is_removed_while_the_harness_paint_stays(monkeypatch):
+    """The harness's own color is applied after a value is rendered, so the control rule strips what
+    a value carried and never what `kv` or `head` painted."""
+    monkeypatch.delenv(NO_COLOR_ENV, raising=False)
+    line = head("wake end", BLUE) + " " + kv(outcome="error", error=f"vendor said {RED}boom{RESET}")
+
+    assert line == (
+        f'{BLUE}wake end{RESET} {RED}outcome=error{RESET} error="vendor said [31mboom [0m"'
+    )
+    assert line.count("\x1b") == 4  # the head's two and the verdict's two; none from the value
+
+
+def test_the_unspoken_text_keeps_no_control_character(caplog):
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        log_unspoken("I will \x1b[2Jclear\x07 nothing", timeline="t")
+
+    (record,) = caplog.records
+    assert record.getMessage().endswith('text="I will [2Jclear nothing"')
 
 
 # --- the ANSI verdict colors (issue #414) ------------------------------------
