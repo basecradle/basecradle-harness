@@ -42,12 +42,13 @@ import respx
 from basecradle_harness import Message, MessagesTool, Session, Tool, ToolCall
 from basecradle_harness._session import INTERRUPTED, STOPPED, STOPPED_NOTE
 from basecradle_harness._stop import WakeStopped
-from basecradle_harness._wake import ClaimStore
+from basecradle_harness._wake import ClaimStore, SeenStore
 from tests.conftest import plain
 from tests.test_wake import (
     BC_URL,
     M0,
     REPLY,
+    T0,
     TIMELINE_UUID,
     _posts,
     asset_page,
@@ -57,6 +58,7 @@ from tests.test_wake import (
     message,
     page,
     serve_messages,
+    task,
     task_page,
     timeline,
 )
@@ -246,6 +248,32 @@ def test_a_wake_stopped_inside_the_model_call_is_not_re_driven(platform, tmp_pat
     assert brain.seen == []
     assert _posts(platform) == []
     assert not any(line.startswith("re-driving") for line in _lines(caplog))
+
+
+def test_a_stopped_task_is_recorded_handled_and_never_re_run(platform, tmp_path, caplog):
+    """A task has no cursor — its queue is the platform's `activated` list — so settling its claim
+    as stopped must also get it into the seen-set, or it would be re-offered on every wake.
+    """
+    platform.get("/tasks").mock(
+        return_value=httpx.Response(
+            200, json=task_page(task(uuid=T0, instructions="Survey the owls, then report."))
+        )
+    )
+    platform.get("/messages").mock(return_value=httpx.Response(200, json=page()))
+    brain = _Script(_calls(("c1", "survey", {})))
+    first, _ = build_wake(tmp_path, brain, tools=[MessagesTool(), _Stopped()])
+    with pytest.raises(WakeStopped):
+        first.wake()
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, T0, kind="tasks").phase == "abandoned"
+
+    caplog.set_level("INFO", logger="basecradle_harness")
+    survey = _Stopped()
+    second, brain = build_wake(tmp_path, _Script(), tools=[MessagesTool(), survey])
+    second.wake()
+
+    assert brain.seen == [] and survey.runs == 0
+    assert T0 in SeenStore(tmp_path).all(TIMELINE_UUID, kind="tasks")
+    assert not any(line.startswith(("resuming", "re-driving")) for line in _lines(caplog))
 
 
 def test_a_stopped_turn_whose_claim_could_not_be_settled_is_read_off_its_note(
