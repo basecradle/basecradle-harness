@@ -639,8 +639,9 @@ def test_a_keepalive_never_holds_an_attempt_past_its_budget(cell, keepalive_serv
 
     deadline = provider.last_timeout + SMALL_CONNECT
     assert TIMEOUT_RETRY_SCALE * deadline < KEEPALIVE_ANSWER_AFTER  # the retry is short of it too
-    # Cut at the deadline, within a keepalive or two of it — never at the answer.
-    assert deadline <= elapsed < deadline + 4 * KEEPALIVE_EVERY
+    # Cut at the deadline — never at the answer. The slack is a slow runner's (request building
+    # before the clock starts, error mapping after it stops), far short of the 2.5 s answer.
+    assert deadline <= elapsed < deadline + 1.0 < KEEPALIVE_ANSWER_AFTER
     assert connection_reason(raised.value) == "timeout"
 
 

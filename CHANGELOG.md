@@ -39,8 +39,15 @@ in 3.9 s. Nothing bounded the attempt, three ways:
   "tool_calls"` (measured live). So the billed line reads `outcome=fallback reason=truncated` and the decision
   `outcome=retrying reason=truncated`, never `invalid_response`, which the board could not tell from
   a malformed body. Anthropic returns a cut-off `tool_use` with `input: {}` (measured live), so its
-  adapter judges that case itself and raises before the tool can be dispatched. `truncated` joins the
-  retryable reasons, mapped identically by the engine, the describer and the reranker.
+  adapter judges that case itself and raises before the tool can be dispatched (a cut-off
+  `server_tool_use` too, which would otherwise be replayed with no result; a reply cut off because
+  the context window is full is not this class and spends no retries). `truncated` joins the
+  retryable reasons, mapped identically by the engine, the describer and the reranker. The describer
+  reads it as the verdict it already was there: a cut-off answer gets its one larger budget, never a
+  same-budget retry, and is remembered for the wake.
+- **A cap the operator wrote is theirs wherever they wrote it**: at the top level of
+  `model_params.json` or in its `extra_body`, and a malformed one is sent as written with a WARNING,
+  never overwritten by the default or sent beside it under a second name.
 
 Also fixed, found by the loopback proof: the OpenRouter adapter's citation capture swallowed a
 failed body read, which left the stream consumed, and the SDK's own read then failed on
@@ -48,8 +55,9 @@ failed body read, which left the stream consumed, and the SDK's own read then fa
 on OpenRouter instead of a retryable transport fault; the read's failure now propagates.
 
 **Stated, not built:** with the brain capped at 32,768, every brain call's fit is the 15-minute
-ceiling, so a *stuck* attempt (an upstream that keeps the line warm and writes nothing) costs up
-to 15 minutes and one retry at up to 30. A runaway, the incident's shape, ends at the cap in 2–4
+ceiling on every vendor, so a *stuck* attempt (an upstream that accepts the call and never finishes
+it) costs 910 s and one retry at 1,820 s, about 45 minutes; on a vendor that sends no keepalive an
+uncapped call used to cost one 8–12 minute budget plus twice it. A runaway, the incident's shape, ends at the cap in 2–4
 minutes at the speeds it ran. Bounding a stuck attempt to a minute or two needs an idle timer on
 real tokens, which needs streaming: filed as issue #789.
 

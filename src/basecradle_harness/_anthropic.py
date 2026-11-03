@@ -230,7 +230,6 @@ from basecradle_harness._observability import (
     slug,
     stamp_generation_id,
     token_counts,
-    truncated,
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._secret import Sealed
@@ -1181,15 +1180,21 @@ def _fold_into_results(blocks: list[dict[str, Any]]) -> None:
 
 
 def _cut_off(response: Any) -> bool:
-    """Whether `response` stopped at its output cap while writing a client tool call (issue #788).
+    """Whether `response` stopped at its output cap while writing a tool call (issue #788).
 
     Text cut off at the cap is still an answer (the engine keeps it and leaves the turn unfinished,
-    issue #490); a ``tool_use`` cut off is not, because the API returns its input as ``{}``.
+    issue #490); a tool call cut off is not. A client ``tool_use`` comes back with its input as
+    ``{}``, and a ``server_tool_use`` ends the reply with no result, which the next request would
+    replay as a pending server call. Both are retried, never dispatched or replayed.
+
+    Only ``max_tokens``, the cap, and never the other stop reason `truncated` accepts
+    (``model_context_window_exceeded``): a reply cut off because the context is full is cut off the
+    same way on every retry, so it is not the runaway class and must not spend the retries.
     """
-    if not truncated(getattr(response, "stop_reason", None)):
+    if getattr(response, "stop_reason", None) != "max_tokens":
         return False
     content = list(getattr(response, "content", None) or ())
-    return bool(content) and getattr(content[-1], "type", None) == "tool_use"
+    return bool(content) and getattr(content[-1], "type", None) in ("tool_use", "server_tool_use")
 
 
 def _assistant(blocks: Sequence[Mapping[str, Any]]) -> dict[str, Any]:

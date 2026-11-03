@@ -152,7 +152,7 @@ from basecradle_harness._plugins import (
 from basecradle_harness._policy import Policy
 from basecradle_harness._provider import Provider
 from basecradle_harness._search_params import load_search_params
-from basecradle_harness._timeouts import output_cap
+from basecradle_harness._timeouts import OUTPUT_CAP_KEYS, output_cap
 from basecradle_harness._token import SelfHealingBaseCradle, mint_token
 from basecradle_harness._tools import Tool
 from basecradle_harness._unspoken import NoReplyInformer, SpeechLedger, is_one_on_one
@@ -1203,20 +1203,51 @@ def _openai_budget_key(provider: str, surface: str) -> str:
 
 
 def _output_budget(
-    params: Mapping[str, Any], explicit: int | None, default: int | None
+    params: Mapping[str, Any],
+    explicit: int | None,
+    default: int | None,
+    *,
+    extra_body: Mapping[str, Any] | None = None,
 ) -> int | None:
     """The output cap a build puts on its calls: the caller's, else the operator's, else a default.
 
     An `explicit` cap is a caller's own (the describer's, issue #488) and always wins. Otherwise a
-    cap the operator wrote in ``model_params.json``, in whichever spelling (`output_cap`), is the
-    agent's own tuning and is sent as written, so nothing is added (``None``). Only when neither
-    names one does `default` apply: the brain's `HARNESS_MAX_OUTPUT_TOKENS` (issue #788), which
-    bounds what one attempt may write.
+    cap the operator wrote in ``model_params.json`` is the agent's own tuning and is sent as written,
+    so nothing is added (``None``): in whichever spelling (`OUTPUT_CAP_KEYS`), at the top level or in
+    the ``extra_body`` this build sends. Only when neither names one does `default` apply: the
+    brain's `HARNESS_MAX_OUTPUT_TOKENS` (issue #788), which bounds what one attempt may write.
+
+    An operator's cap that is not a positive integer is still theirs, and is never overwritten by
+    the default or sent beside it under a second name; it gets a WARNING instead, because the fitted
+    budget (`output_cap`) cannot read it and the vendor may refuse it.
     """
     if explicit is not None:
         return explicit
-    if default is not None and output_cap(params) is None:
-        return default
+    written = operator_output_cap(params, extra_body)
+    if written is not None:
+        if output_cap({written[0]: written[1]}) is None:
+            _log.warning(
+                "model_params.json sets %s=%r, which is not a positive integer: it is sent as "
+                "written, and the harness adds no output cap of its own beside it.",
+                *written,
+            )
+        return None
+    return default
+
+
+def operator_output_cap(
+    params: Mapping[str, Any], extra_body: Mapping[str, Any] | None = None
+) -> tuple[str, Any] | None:
+    """``(key, value)`` of the output cap the operator wrote, or ``None`` when they wrote none.
+
+    The top level first, then ``extra_body`` (its own `extra_body` key on the openai-SDK cells, the
+    split-out one where a build sends it), each in `OUTPUT_CAP_KEYS` order.
+    """
+    nested = params.get("extra_body") if extra_body is None else extra_body
+    for source in (params, nested if isinstance(nested, Mapping) else {}):
+        for key in OUTPUT_CAP_KEYS:
+            if key in source:
+                return key, source[key]
     return None
 
 
@@ -1364,7 +1395,9 @@ def _provider_from_config(
         )
         # `routing` is an OpenRouter concept; Vertex is Google's own endpoint, reached directly,
         # and its residency is the *location*. Dropped, not sent.
-        cap = _output_budget(params, max_output_tokens, default_output_tokens)
+        cap = _output_budget(
+            params, max_output_tokens, default_output_tokens, extra_body=extra_body
+        )
         if cap is not None:
             params["max_output_tokens"] = cap
         return GoogleProvider(
@@ -1499,7 +1532,9 @@ def _provider_from_config(
     # which is a raw crash, not the warned-and-dropped collision policy. Lifting keeps the operator's
     # headers working (they merge, below) instead of silently confiscating a key that works today.
     params_extra_headers = params.pop("extra_headers", None)
-    cap = _output_budget(params, max_output_tokens, default_output_tokens)
+    cap = _output_budget(
+        params, max_output_tokens, default_output_tokens, extra_body=params_extra_body
+    )
     if cap is not None:
         params[_openai_budget_key(provider, surface)] = cap
     if provider == "xai":
@@ -1656,7 +1691,9 @@ def _generic_openai_provider(
     # Lifted out, as on every other openai-SDK cell, so an operator's headers merge rather than
     # arriving as a second value for the same keyword.
     params_extra_headers = tuning.pop("extra_headers", None)
-    cap = _output_budget(tuning, max_output_tokens, default_output_tokens)
+    cap = _output_budget(
+        tuning, max_output_tokens, default_output_tokens, extra_body=params_extra_body
+    )
     if cap is not None:
         tuning[_openai_budget_key(provider, surface)] = cap
     return OpenAIProvider(

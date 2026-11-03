@@ -80,9 +80,10 @@ that sees it.
 chunk every three seconds while a non-streaming answer is written: the budget never fired, and an
 attempt ran 941 s against a 540 s fit. So the budget is also enforced as a deadline on the whole
 attempt (``connect`` + ``generation``) at each client's transport (`_deadline`). The brain now always
-carries an output cap (`HARNESS_MAX_OUTPUT_TOKENS`), so its fit is the ceiling: a stuck attempt costs
-≤ 15 minutes and one retry at ≤ 30, and only an idle timer on real tokens — streaming, issue #789 —
-could tell it from a slow one sooner.
+carries an output cap (`HARNESS_MAX_OUTPUT_TOKENS`, 32,768), so its fit is the ceiling on every
+vendor: a stuck attempt costs 910 s and one retry at 1,820 s (about 45 minutes, where an uncapped
+call on a vendor without keepalives cost one 8–12 minute fit plus twice it), and only an idle timer
+on real tokens — streaming, issue #789 — could tell it from a slow one sooner.
 """
 
 from __future__ import annotations

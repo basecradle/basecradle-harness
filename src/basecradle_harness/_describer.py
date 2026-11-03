@@ -111,6 +111,7 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._messages import ImageContent, Message, VideoContent
 from basecradle_harness._observability import (
+    ANSWER_REASONS,
     FALLBACK,
     HELPER,
     OK,
@@ -467,7 +468,10 @@ class Describer:
             )
             return text
         text, reason = describe()
-        if reason is None or reason not in RETRYABLE_REASONS:
+        # An answer slug is a verdict on what came back, remembered even where the same word is
+        # also a retryable fault: ``truncated`` is both since issue #788, and a describe truncated
+        # after its larger-budget retry must not be bought again on the next look.
+        if reason is None or reason in ANSWER_REASONS or reason not in RETRYABLE_REASONS:
             self._described[key] = (text if reason is None else None, self._last_outcome)
             if len(self._described) > DESCRIPTION_MEMO_CAP:
                 self._described.popitem(last=False)
@@ -693,6 +697,12 @@ class Describer:
             # and failed (`_observability.read_answer`); any other fault reached no answer.
             if call.outcome == FALLBACK:
                 self._bill_unreadable(subject, kind=kind, call=call, failure=failure)
+                if isinstance(failure, ProviderTruncatedError):
+                    # Cut off at the cap (issue #788): a verdict on the answer, exactly as a
+                    # readable answer that stopped at ``length`` is, and its billed line is the
+                    # describe's line. Never the shared retry at the same budget, which buys the
+                    # same cut; the caller's one larger-budget attempt is the remedy (#488).
+                    return None, _TRUNCATED
                 # That attempt's time is on its own line, so the wait this describe's last line
                 # reports starts after it: summed over billed lines, no second is counted twice.
                 started = time.monotonic()

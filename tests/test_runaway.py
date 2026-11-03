@@ -609,3 +609,78 @@ def test_the_openai_adapter_writes_a_cut_off_tool_call_as_truncated(caplog, surf
 
     (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
     assert "outcome=fallback" in line and "reason=truncated" in line
+
+
+def test_anthropic_never_replays_a_server_tool_call_the_cap_cut_off():
+    """A ``server_tool_use`` that ends a reply at ``max_tokens`` has no result, and the next request
+    would replay it as a pending server call: it is the same runaway class, retried."""
+    adapter = AnthropicProvider(CLAUDE, api_key=ANTHROPIC_KEY, max_tokens=60)
+    cut = {
+        "type": "server_tool_use",
+        "id": "srvtoolu_01FakeFakeFake",
+        "name": "web_search",
+        "input": {},
+    }
+    with respx.mock(assert_all_called=True) as router:
+        router.post(f"{ANTHROPIC_BASE}/v1/messages").mock(
+            return_value=_claude_reply(cut, stop_reason="max_tokens")
+        )
+        with pytest.raises(ProviderTruncatedError):
+            adapter.chat([Message.user("search for lighthouses")])
+    adapter.close()
+
+
+def test_anthropic_a_full_context_window_is_not_the_runaway_class():
+    """``model_context_window_exceeded`` cuts the reply the same way on every retry, so it must not
+    spend the retries the cap's runaway earns: the reply is handed back as before."""
+    adapter = AnthropicProvider(CLAUDE, api_key=ANTHROPIC_KEY, max_tokens=60)
+    cut = {"type": "tool_use", "id": "toolu_01FakeFakeFake", "name": "post", "input": {}}
+    with respx.mock(assert_all_called=True) as router:
+        router.post(f"{ANTHROPIC_BASE}/v1/messages").mock(
+            return_value=_claude_reply(cut, stop_reason="model_context_window_exceeded")
+        )
+        reply = adapter.chat([Message.user("post a poem")])
+    assert [call.name for call in reply.tool_calls] == ["post"]
+    adapter.close()
+
+
+def test_a_cap_in_extra_body_is_the_operators_and_the_default_adds_none_beside_it(brain_env):
+    """``extra_body`` is merged over the request on the wire, so a cap written there is the one the
+    vendor reads; the default must not add a second one the fit and the report would believe."""
+    (brain_env / "model_params.json").write_text(json.dumps({"extra_body": {"max_tokens": 1000}}))
+    built = _provider_from_config("openrouter", "openai", "chat", default_output_tokens=32_768)
+    with respx.mock(assert_all_called=True) as router:
+        route = router.post(OPENROUTER_CHAT).mock(
+            return_value=httpx.Response(200, json=completion(content="ok"))
+        )
+        built.chat([Message.user("hi")])
+
+    body = json.loads(route.calls.last.request.content)
+    assert body["max_tokens"] == 1000
+    assert "max_completion_tokens" not in body and "max_output_tokens" not in body
+
+
+def test_a_malformed_operator_cap_is_sent_as_written_never_overwritten(brain_env, caplog):
+    (brain_env / "model_params.json").write_text(json.dumps({"max_tokens": "8000"}))
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        built = _provider_from_config(
+            "openrouter", "openrouter", "chat", default_output_tokens=32_768
+        )
+    assert built.tuning["max_tokens"] == "8000"
+    assert any("not a positive integer" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize(
+    ("params", "reported"),
+    [
+        ({}, 32_768),
+        ({"max_tokens": 1000}, 1000),
+        ({"extra_body": {"max_completion_tokens": 2000}}, 2000),
+        ({"max_tokens": "8000"}, None),
+    ],
+)
+def test_resolved_config_reports_the_cap_the_calls_carry(brain_env, monkeypatch, params, reported):
+    from basecradle_harness._wake import _reported_output_cap
+
+    monkeypatch.delenv("HARNESS_MAX_OUTPUT_TOKENS", raising=False)
+    assert _reported_output_cap(params) == reported

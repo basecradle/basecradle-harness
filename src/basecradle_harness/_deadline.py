@@ -33,6 +33,9 @@ Why event hooks, and why the request's own timeout
   within one keepalive interval. Against a vendor that sends nothing at all, the idle timer still
   fires as it always did, so the worst case is unchanged there: the silence must outlast the read
   budget, measured from the last byte received.
+- **The clock starts before the request is sent**, so uploading it spends the same budget. The
+  ``write`` phase's own allowance still bounds a stalled upload; a merely slow one now counts
+  against the attempt, which for a request of a few megabytes is seconds of a budget of minutes.
 """
 
 from __future__ import annotations

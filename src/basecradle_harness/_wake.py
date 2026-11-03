@@ -117,6 +117,7 @@ from basecradle_harness._basecradle import (
     _resolve_tools_and_provider,
     _response_retries_from_env,
     base_url_override,
+    operator_output_cap,
     resolved_model_params,
 )
 from basecradle_harness._breaker import (
@@ -5850,10 +5851,12 @@ def resolved_config() -> dict[str, object]:
       absent one. The wake logs the resolved limit and its source (``context limit limit=… limit_source=…``)
       on the run that actually resolves it.
     - ``max_output_tokens`` — the most one brain attempt may write (issue #788): the cap in
-      ``model_params.json`` when it names one, else `HARNESS_MAX_OUTPUT_TOKENS`, else the shipped
-      32,768. Never ``null``: there is no uncapped brain. On Anthropic the call carries this or the
-      model's own maximum, whichever is smaller (the adapter reads that maximum from the Models API,
-      which this path never calls). A malformed knob fails this report as it fails a wake.
+      ``model_params.json`` when it names one (at the top level or in ``extra_body``), else
+      `HARNESS_MAX_OUTPUT_TOKENS`, else the shipped 32,768. ``null`` only when the operator's own
+      cap is not a positive integer: it is sent as written, and is no number. On Anthropic the
+      default is lowered to the model's own maximum when that is smaller (the adapter reads it from
+      the Models API, which this path never calls); an operator's ``max_tokens`` is sent as written.
+      A malformed knob fails this report as it fails a wake.
     - ``wake_breaker_max`` / ``wake_breaker_window`` / ``wake_breaker_cooldown`` — the cross-wake
       breaker's tunables as the wake resolves them (`_breaker.breaker_settings_from_env`, issue
       #592), the cooldown already defaulted to the window. A value that would make every wake fail
@@ -5900,7 +5903,7 @@ def resolved_config() -> dict[str, object]:
         **_cost_report(provider_name, sdk, os.environ.get("AI_MODEL") or ""),
         "active_profile": profile_name,
         "max_context_tokens": _max_context_tokens_from_env(),
-        "max_output_tokens": output_cap(model_params) or _max_output_tokens_from_env(),
+        "max_output_tokens": _reported_output_cap(model_params),
         "wake_breaker_max": breaker_max,
         "wake_breaker_window": breaker_window if breaker_max > 0 else None,
         "wake_breaker_cooldown": breaker_cooldown if breaker_max > 0 else None,
@@ -5960,6 +5963,18 @@ def resolved_config() -> dict[str, object]:
         "model_params": model_params,
         "model_params_stripped": stripped,
     }
+
+
+def _reported_output_cap(model_params: dict[str, object]) -> int | None:
+    """`resolved_config`'s ``max_output_tokens``: the cap the brain's calls carry (issue #788).
+
+    The operator's own, wherever `model_params.json` writes it, else the knob. ``None`` only for an
+    operator's cap that is not a positive integer, which is sent as written and is no number here.
+    """
+    written = operator_output_cap(model_params)
+    if written is None:
+        return _max_output_tokens_from_env()
+    return output_cap({written[0]: written[1]})
 
 
 def _cost_report(provider: str, sdk: str, model: str) -> dict[str, object]:
