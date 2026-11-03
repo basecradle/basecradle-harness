@@ -202,12 +202,14 @@ from basecradle_harness._observability import (
     GREEN,
     RED,
     YELLOW,
+    bounded,
     delivery_id,
     describe_provider,
     head,
     in_wake,
     kv,
     log_unspoken,
+    scrub,
 )
 from basecradle_harness._platform import PlatformContext, bind_platform_tools, explain
 from basecradle_harness._probe import ack_line, verify_probe
@@ -946,7 +948,7 @@ class ClaimStore:
             return None
         through = _as_uuid(raw)
         if through is None:
-            raise ValueError(f"{path} does not hold a uuid: {raw[:64]!r}")
+            raise ValueError(f"{path} does not hold a uuid: {bounded(scrub(raw), 64)!r}")
         return through
 
     def advance_pruned_through(self, timeline: str, *, kind: str, mark: UUID) -> UUID:

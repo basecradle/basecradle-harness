@@ -470,6 +470,25 @@ def test_main_is_unprovable_when_journalctl_cannot_run(journal, monkeypatch, cap
     assert "UNPROVABLE" in capsys.readouterr().err
 
 
+def test_a_long_journalctl_error_is_cut_between_tokens_never_inside_one(
+    journal, monkeypatch, capsys
+):
+    """journalctl's stderr is quoted on the UNPROVABLE line, cut by the one rule every log value
+    is cut by: never inside a token (issue #787)."""
+    unknown = "zq_Q7mT2vXk9LpR4sWn8YbC3dFh6JgK1aEe5Uo0"  # a shape no rule knows; its only z leads
+    monkeypatch.setattr(_log_grammar, "_READBACK_TIMEOUT_S", 0.0)
+
+    def run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "word " * 35 + unknown)
+
+    monkeypatch.setattr(_log_grammar.subprocess, "run", run)
+
+    assert main([BILLING_BLOCKED]) == EX_TEMPFAIL
+    err = capsys.readouterr().err
+    assert "journalctl exited 1" in err
+    assert "z" not in err.split("journalctl exited 1", 1)[1], err
+
+
 @pytest.mark.parametrize("argv", [[], ["billing_blocked", "extra"], ["wake_failed"]])
 def test_a_question_this_build_cannot_answer_is_unprovable_not_failed(argv, capsys, monkeypatch):
     """A manifest naming a column this build does not exercise is a question we never got to ask.

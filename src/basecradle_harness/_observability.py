@@ -119,14 +119,87 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: secret never enters the journal in the first place rather than relying on the shipping layer to
 #: catch it later. An error text is the realistic carrier: an exception from a drop-in tool or MCP
 #: server can embed the request URL (``…?api_key=…``) or an ``Authorization`` header, and a
-#: provider's own 4xx body can echo the key it rejected. Covers the fleet's key shapes (OpenAI
-#: ``sk-``/OpenRouter ``sk-or-``, xAI ``xai-``, BaseCradle ``bc_uat_``) plus the generic
-#: bearer-token and key-in-query-string forms.
+#: provider's own 4xx body can echo the key it rejected.
+#:
+#: **This is the first line, and it carries every shape the box's second line does** (issue #787;
+#: `docs/telemetry.md` → Credential Scrubbing). The fleet's Vector ``ai_scrub`` transform redacts the
+#: journal again before it ships, but this package also runs where no Vector exists — a developer's
+#: laptop, anyone's fork — so the harness never leaves a shape it knows of to a layer that may not be
+#: there. The two lists cannot be one list (one is VRL in another repository), so the rule is that
+#: this one is a **superset**: a shape added to ``ai_scrub`` is added here, at no longer a minimum,
+#: and `tests/test_log_value_cut.py` holds one fabricated sample per box rule, each at the box's own
+#: minimum. The one stated difference is the bearer rule, which needs eight characters here so a
+#: diagnosis like "Bearer token missing" keeps its words; no real bearer credential is shorter.
+#: Every alternative is linear in the input (a value is scrubbed before it is cut, so it can be
+#: long): the heartbeat rule anchors on the literal ``/heartbeat/`` rather than scanning back to the
+#: URL's start, which made `re` quadratic on a long run of ``http`` (and leaves the non-secret host
+#: in place). Covered: the fleet's
+#: own key shapes (OpenAI/Anthropic ``sk-``, OpenRouter ``sk-or-``, xAI ``xai-``, BaseCradle
+#: ``bc_uat_``/``bc_isk_``), the box's (GitHub ``gh?_``, Google ``AIza``, Hugging Face ``hf_``,
+#: Replicate ``r8_``, Steel ``ste-``, a Better Stack heartbeat URL, an unanchored ``api_key=``), one
+#: the box lacks (a GitHub fine-grained ``github_pat_``), and the generic bearer and key-in-query
+#: forms.
 _SECRETS = re.compile(
     r"(?:sk-or-|sk-|xai-|bc_[a-z]{3}_)[A-Za-z0-9_-]{8,}"
+    r"|bc_(?:uat|isk)_[A-Za-z0-9]+"
+    r"|gh[a-z]_[A-Za-z0-9]{20,}"
+    r"|github_pat_[A-Za-z0-9_]{20,}"
+    r"|AIza[A-Za-z0-9_-]{20,}"
+    r"|hf_[A-Za-z0-9]{20,}"
+    r"|r8_[A-Za-z0-9]{20,}"
+    r"|ste-[A-Za-z0-9]{20,}"
+    r"|/heartbeat/\S+"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)[^&\s]+"
+    r"|(?i:api[-_]?key=)[^&\s\"]+"
 )
+
+#: One character of the run every **length-gated** redaction rule matches — this module's
+#: `_SECRETS` and the box's ``ai_scrub`` alike. A rule with a minimum length (``sk-…{8,}``,
+#: ``AIza…{20,}``) cannot redact a credential cut below that minimum, so a cut must never fall inside
+#: such a run (`bounded`). On the box, the rules that match a wider charset (bearer, a query value, a
+#: heartbeat URL) have no minimum the cut can undercut, so this class is the whole of the rule there.
+#: This module's own bearer rule does have one over a wider charset, which is why every log-bound
+#: site scrubs **before** it cuts (`scrub`, then `bounded`): no rule here is ever shown a cut text. A
+#: new box rule with a minimum length over a wider charset widens this class.
+_TOKEN_CHAR = re.compile(r"[A-Za-z0-9_-]")
+_TRAILING_RUN = re.compile(r"[A-Za-z0-9_-]+\Z")
+
+
+def bounded(text: str, cap: int, *, marker: str = "…") -> str:
+    """`text` whole if it fits `cap` characters, else a head of it plus `marker` — never cut mid-token.
+
+    **The cut never falls inside a ``[A-Za-z0-9_-]`` run** (issue #787): it backs up to the last
+    character outside one, so a token is either whole — and redactable by every rule downstream — or
+    absent. Truncating first and redacting later is the order a log pipeline runs in (this module
+    scrubs, then cuts; the box's ``ai_scrub`` redacts after both), and a credential cut short of its
+    rule's minimum length matches no rule at all and ships as a prefix. A text that is one such run
+    past the bound is returned **empty**, which `kv` omits — never half a token. The router's
+    ``ai_otel_llm`` remap cuts by the same rule (basecradle-router#385), so the fleet's lines are cut
+    the same way whoever writes them.
+
+    The result, marker included, is at most `cap` characters. This is the one cut for any free-text
+    value bound for a log line, and such a value is `scrub`-bed first; a site that slices one by hand
+    is the defect this exists to retire.
+    """
+    if len(text) <= cap:
+        return text
+    head = text[: max(cap - len(marker), 0)]
+    if _TOKEN_CHAR.match(text, len(head)):  # the next character continues the head's last run
+        head = _TRAILING_RUN.sub("", head)
+    head = head.rstrip()
+    return head + marker if head else ""
+
+
+def scrub(text: str) -> str:
+    """`text` with every credential shape `_SECRETS` knows replaced by ``[redacted]``.
+
+    Run on a whole text **before** `bounded` cuts it, so a rule is never shown a credential cut
+    short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before
+    `kv` sees it calls this first.
+    """
+    return _SECRETS.sub("[redacted]", text)
+
 
 #: The record format every harness line is rendered with — the severity token, a space, the
 #: message. It is a *contract*, not a preference: neither emitter on an agent box sets a syslog
@@ -412,14 +485,14 @@ def _value(value: Any) -> str:
     """One field's value: single-line, redacted, bounded, and quoted when it isn't a bare token.
 
     Four jobs, in order — flatten (a record is one line), scrub (`_SECRETS`), truncate
-    (`MAX_VALUE`), then quote anything holding a space or an ``=`` so it reads as *one* value
-    rather than as extra fields. A plain uuid, duration, or count passes through untouched, which
-    is what keeps the common line greppable.
+    (`MAX_VALUE`, by `bounded`, never inside a token), then quote anything holding a space or an
+    ``=`` so it reads as *one* value rather than as extra fields. Scrub before the cut, so every shape
+    this module knows is redacted whole; the cut's own rule protects the shapes only the box knows.
+    A plain uuid, duration, or count passes through untouched, which is what keeps the common line
+    greppable.
     """
     text = " ".join(str(value).split())  # collapse newlines/tabs/runs — one record, one line
-    text = _SECRETS.sub("[redacted]", text)
-    if len(text) > MAX_VALUE:
-        text = text[: MAX_VALUE - 1].rstrip() + "…"
+    text = bounded(scrub(text), MAX_VALUE)
     if text and (" " in text or "=" in text or '"' in text):
         return '"' + text.replace('"', "'") + '"'
     return text
@@ -467,7 +540,7 @@ def _full_value(value: str) -> str:
     narration is prose: it will contain spaces, and it may well contain an ``=``.
     """
     text = " ".join(str(value).split())  # collapse newlines/tabs/runs — one record, one line
-    text = _SECRETS.sub("[redacted]", text)
+    text = scrub(text)
     return '"' + text.replace('"', "'") + '"'
 
 

@@ -662,6 +662,6 @@ def test_an_internal_fault_is_named_never_quoted():
 
 
 def test_a_long_vendor_error_is_capped_not_softened():
-    detail = stall_detail(ProviderServerError("x" * 5_000, status_code=502))
-    assert detail.startswith("last error: xxx")
+    detail = stall_detail(ProviderServerError("x " * 2_500, status_code=502))
+    assert detail.startswith("last error: x x")
     assert len(detail) <= len("last error: ") + STALL_DETAIL_CAP

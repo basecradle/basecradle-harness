@@ -156,6 +156,7 @@ from basecradle_harness._observability import (
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
     answered,
+    bounded,
     finish_reason,
     generation_id,
     log_cost_unpriced,
@@ -164,6 +165,7 @@ from basecradle_harness._observability import (
     meter_failure,
     meter_tool,
     read_answer,
+    scrub,
     tally_server_tools,
     token_counts,
 )
@@ -1046,12 +1048,14 @@ class GoogleProvider:
             header, _, payload = url.partition(",")
             mime = header[len("data:") :].split(";", 1)[0] or None
             if mime is None or ";base64" not in header:
-                raise ProviderError(f"Unsupported inline media URL for Vertex: {header[:64]!r}.")
+                raise ProviderError(
+                    f"Unsupported inline media URL for Vertex: {bounded(scrub(header), 64)!r}."
+                )
             return types.Part.from_bytes(data=base64.b64decode(payload), mime_type=mime)
         mime = getattr(media, "content_type", None) or mimetypes.guess_type(url)[0]
         if not mime:
             raise ProviderError(
-                f"Cannot send {url[:80]!r} to Vertex: its media type is not knowable from the URL."
+                f"Cannot send {bounded(scrub(url), 80)!r} to Vertex: its media type is not knowable from the URL."
             )
         return types.Part.from_uri(file_uri=url, mime_type=mime)
 

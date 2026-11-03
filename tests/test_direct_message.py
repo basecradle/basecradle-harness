@@ -343,6 +343,29 @@ def test_a_response_echoing_the_token_is_redacted_out_of_the_error(tool):
 
 
 @respx.mock
+def test_a_long_refusal_is_cut_between_tokens_never_inside_one(tool):
+    """The refusal body becomes the tool's result and the ``tool`` line's ``error``; a cut inside a
+    token would ship a prefix too short for any redaction rule to match (issue #787)."""
+    unknown = "zq_Q7mT2vXk9LpR4sWn8YbC3dFh6JgK1aEe5Uo0"  # a shape no rule knows; its only z leads
+    for offset in range(150, 205):
+        body = ("word " * 50)[:offset] + unknown + " tail"
+        respx.post(NTFY_URL).mock(return_value=httpx.Response(400, text=body))
+        result = tool.run(body="hello")
+        assert unknown in result or "z" not in result, result
+
+
+@respx.mock
+def test_a_long_refusal_is_scrubbed_before_it_is_cut(tool):
+    """A bearer token straddling the cut is redacted whole: scrubbed after the cut, a short prefix
+    would be left that the source's eight-character bearer rule no longer matches (issue #787)."""
+    for offset in range(150, 205):
+        body = ("w " * 120)[:offset] + "Authorization: Bearer ab.cdefghijklmnopqrstuvwxyz"
+        respx.post(NTFY_URL).mock(return_value=httpx.Response(400, text=body))
+        result = tool.run(body="hello")
+        assert "ab." not in result, result
+
+
+@respx.mock
 @pytest.mark.parametrize("response", [httpx.Response(200), httpx.Response(401, text="nope")])
 def test_no_log_record_ever_carries_the_token(tool, caplog, response):
     respx.post(NTFY_URL).mock(return_value=response)

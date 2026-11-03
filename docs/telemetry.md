@@ -22,7 +22,7 @@ INFO llm provider=openrouter purpose=main endpoint=StreamLake model=z-ai/glm-5.2
 
 - **Severity**, then a space. It is the only place severity exists (`_observability.LOG_FORMAT`; the NOC's `level` column reads it).
 - **The head**: one or more words naming *what happened* (`llm`, `wake end`, `memory recall`). A head is a fixed literal, never composed from data. A head that states a verdict about a unit of work is colored as one span (`_observability.head`); a head that names a fact is plain.
-- **Fields**: `key=value` pairs, separated by single spaces. A value is a bare token, or a double-quoted string when it holds a space, an `=` or a quote (`kv` quotes it, flattens it to one line, scrubs credential shapes, and bounds it at 240 characters — except the unspoken `text`, which is never bounded).
+- **Fields**: `key=value` pairs, separated by single spaces. A value is a bare token, or a double-quoted string when it holds a space, an `=` or a quote (`kv` quotes it, flattens it to one line, scrubs credential shapes, and bounds it at 240 characters, never cutting inside a token — except the unspoken `text`, which is never bounded; see [Credential Scrubbing](#credential-scrubbing)).
 - **Absence is honest.** A field with nothing to say is omitted — never written empty, never written as a placeholder, and never as a zero the vendor did not state. `0` is kept where it is a fact ("posted nothing").
 - **Consumers key on field names, never on positions** — with two anchors that are positional: the head itself (`llm provider=` is the fleet's anchor for every model call), and `billing`, which is always last on an `llm` line.
 - **Units are fixed.** `duration` and every other length of time is seconds with a trailing `s` (`3.41s`); a moment in time is ISO 8601 in UTC with a trailing `Z` (`2026-11-01T03:12:40Z`); `cost` is plain fixed-point US dollars (`0.0445`, never scientific notation, never negative); `chars` counts characters the model or a reader sees, never bytes; every `tokens_*` field is a count of tokens as the vendor billed them.
@@ -66,6 +66,19 @@ The fields below mean exactly this wherever they appear. A head's own table repe
 | `threshold` | The configured level the head's decision compares against. |
 | `limit` | The model's context ceiling in tokens. |
 | `held` | How long something was held, in seconds. |
+
+### Credential Scrubbing
+
+A value can carry text that is not the harness's (an exception, a vendor's error body), so a credential can reach a line. Two layers redact it, in order, and each owns a stated part of the job (issue #787):
+
+| Layer | Where | Owns |
+|---|---|---|
+| **Source** | `_observability._SECRETS`, applied by `kv` to every value (and to the unspoken `text`) before the value is cut. | **Every credential shape the harness knows of**, which is a superset of the box's: the fleet's own (`sk-`, `sk-or-`, `xai-`, `bc_uat_`, `bc_isk_`), every shape `ai_scrub` carries (GitHub `gh?_`, Google `AIza`, Hugging Face `hf_`, Replicate `r8_`, Steel `ste-`, a Better Stack heartbeat URL, an `api_key=` assignment), GitHub's fine-grained `github_pat_`, and the bearer and key-in-query forms. It is the only layer off-fleet: a developer's install has no Vector. |
+| **Box** | Vector's `ai_scrub` on each fleet server (basecradle-router `deploy/hosts/*/vector.yaml`, basecradle-noc `deploy/vector.yaml`), after the line is written. | Lines the harness never wrote (another program, a traceback, a router line), the journald metadata no message rule reaches (`_CMDLINE`, dropped `sudo` and Vector events), and a shape the source has not yet adopted. |
+
+The two lists cannot be one list, because one is VRL in another repository, so the rule binding them is: **a shape added to `ai_scrub` is added to `_SECRETS` at no longer a minimum length**, and `tests/test_log_value_cut.py` holds one fabricated sample per box rule at the box's own minimum. The one stated difference is the bearer rule: the box redacts `Bearer` followed by anything, and the source needs eight characters, so a diagnosis like `Bearer token missing` keeps its words. No real bearer credential is shorter. Every source rule is linear in its input, because a value is scrubbed before it is cut and can be as long as a response body: the heartbeat rule matches from the literal `/heartbeat/` and leaves the non-secret host in place.
+
+**A cut never falls inside a token.** A value is scrubbed whole (`_observability.scrub`), then bounded (`_observability.bounded`, 240 characters in `kv`); the cut backs off to the last character outside a `[A-Za-z0-9_-]` run, so a token is either whole, and so redactable by every rule after it, or absent. That run is the character class of every length-gated rule on the box, so a credential cut short of its rule's minimum would match no rule there and ship as a prefix. The source's own rules never see a cut text at all, because every log-bound site scrubs before it cuts. A value that is one such run past the bound is omitted. The router's `ai_otel_llm` remap cuts by the same rule (basecradle-router#385). Every site that truncates free text bound for a log line uses `bounded`: `kv`, the direct-message tool's ntfy refusal, the log-grammar probe's `journalctl` error, and the exception texts that reach `error=` (the Vertex and Anthropic inline-media refusals, the prune watermark's read error); so does the stall note's quoted vendor error, which is posted rather than logged.
 
 ## Model Calls
 
