@@ -151,3 +151,41 @@ def test_report_body_context_length_names_the_window():
 
 def test_verbatim_of_a_plain_provider_error_is_its_str():
     assert verbatim(ProviderError("plain cause")) == "plain cause"
+
+
+# --- a credential in the vendor's words never reaches the timeline (issue #791) -----------------
+
+#: A fabricated, correctly shaped OpenRouter key — the sentinel no posted body may carry.
+SENTINEL_KEY = "sk-or-v1-0f3a9c2b7d4e6f8a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e"
+#: A vendor (or a proxy in front of one) echoing the request's own header into its error body.
+ECHOED = f"Invalid request: header Authorization: Bearer {SENTINEL_KEY} is not accepted here"
+
+
+def _echoing(cls, status):
+    return cls(
+        f"Provider returned HTTP {status}",
+        status_code=status,
+        body='{"error": {"message": "' + ECHOED + '"}}',
+    )
+
+
+def test_verbatim_scrubs_a_credential_and_keeps_every_other_word():
+    """Only the span a credential rule matches changes; the vendor's sentence is otherwise intact."""
+    assert verbatim(_echoing(ProviderPayloadTooLargeError, 413)) == (
+        "Invalid request: header Authorization: [redacted] is not accepted here"
+    )
+    # The `str` fallback (the native xAI gRPC path) is scrubbed the same way.
+    assert verbatim(ProviderError(f"xAI gRPC error (UNAUTHENTICATED): bad key {SENTINEL_KEY}")) == (
+        "xAI gRPC error (UNAUTHENTICATED): bad key [redacted]"
+    )
+
+
+def test_report_body_never_posts_a_credential_the_vendor_echoed():
+    for exc, provider in (
+        (_echoing(ProviderPayloadTooLargeError, 413), "xai"),
+        (_echoing(ProviderContextLengthError, 400), "openai"),
+        (_echoing(ProviderBillingError, 402), "openrouter"),
+    ):
+        body = report_body(classify(exc), item="your message", provider=provider, exc=exc)
+        assert SENTINEL_KEY not in body
+        assert "header Authorization: [redacted] is not accepted here" in body

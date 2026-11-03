@@ -80,6 +80,8 @@ The two lists cannot be one list, because one is VRL in another repository, so t
 
 **A cut never falls inside a token.** A value is scrubbed whole (`_observability.scrub`), then bounded (`_observability.bounded`, 240 characters in `kv`); the cut backs off to the last character outside a `[A-Za-z0-9_-]` run, so a token is either whole, and so redactable by every rule after it, or absent. That run is the character class of every length-gated rule on the box, so a credential cut short of its rule's minimum would match no rule there and ship as a prefix. The source's own rules never see a cut text at all, because every log-bound site scrubs before it cuts. A value that is one such run past the bound is omitted. The router's `ai_otel_llm` remap cuts by the same rule (basecradle-router#385). Every site that truncates free text bound for a log line uses `bounded`: `kv`, the direct-message tool's ntfy refusal, the log-grammar probe's `journalctl` error, and the exception texts that reach `error=` (the Vertex and Anthropic inline-media refusals, the prune watermark's read error); so does the stall note's quoted vendor error, which is posted rather than logged.
 
+**A vendor's words posted to a timeline are scrubbed by the same rules** (issue #791). The provider-failure report and the stall note quote a vendor's error text to peers, and a timeline has no box layer behind it, so `_report.verbatim` runs `scrub` over that text the moment it is dug out of the error, before the stall note's cut, and the stall note scrubs again at the post for a reason persisted on a claim before the scrub existed. A credential-shaped span becomes `[redacted]`; nothing else in the vendor's sentence changes.
+
 ## Model Calls
 
 ### `llm`
