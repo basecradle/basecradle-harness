@@ -6852,3 +6852,27 @@ def test_a_paced_read_beats_before_the_turn_that_follows_it(platform, tmp_path, 
     agent.wake()
 
     assert beats_before_the_model and beats_before_the_model[0] == 0
+
+
+# --- a claim record that is not UTF-8 -------------------------------------------------------
+
+
+def test_an_undecodable_claim_reads_as_done_and_never_fails_the_wake(platform, tmp_path, caplog):
+    """Bytes that are not UTF-8 are unparseable contents like any other: `done`, said out loud.
+
+    `_read_claim` decoded with `read_text` outside its guard, so a `UnicodeDecodeError` escaped
+    and the bootstrap's orphan scan (`ClaimStore.unsettled`) failed every wake on the timeline —
+    one bad file stalling every item behind it, where the docstring promised a skip of one.
+    """
+    stray = "019e7751-0000-7000-8000-000000000001"
+    folder = tmp_path / "claims" / "messages" / TIMELINE_UUID
+    folder.mkdir(parents=True)
+    (folder / f"{stray}.claim").write_bytes(b"\xff\xfe\x00not a record")
+    assert ClaimStore(tmp_path).read(TIMELINE_UUID, stray, kind="messages").phase == "done"
+
+    serve_messages(platform, page(message(uuid=M0, body="What's the status?")))
+    agent, _ = build_wake(tmp_path)
+    caplog.set_level("WARNING", logger="basecradle_harness")
+
+    assert len(agent.wake()) == 1
+    assert any("Unreadable claim record" in r.getMessage() for r in caplog.records)
