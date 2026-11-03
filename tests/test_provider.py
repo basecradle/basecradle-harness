@@ -597,6 +597,21 @@ def test_insufficient_quota_is_billing_even_under_a_non_429_status(router, provi
     assert not isinstance(exc.value, ProviderAuthError)  # the 403 did not win — the quota code did
 
 
+def test_a_bare_402_is_the_billing_class(router, provider):
+    """Payment Required is the billing class by its status alone: an OpenAI-compatible vendor that
+    refuses an empty balance with a 402 and no ``insufficient_quota`` code still gets the funding
+    notice, as it would through every other adapter (issue #796)."""
+    router.post(CHAT_URL).mock(
+        return_value=httpx.Response(402, json={"error": {"message": "Payment Required"}})
+    )
+
+    with pytest.raises(ProviderBillingError) as exc:
+        provider.chat([Message.user("Hi")])
+
+    assert exc.value.status_code == 402
+    assert "Payment Required" in exc.value.body
+
+
 def test_400_relays_the_providers_real_message(router, provider):
     """A 400's body carries the true cause under error.message — kept for the relay."""
     router.post(CHAT_URL).mock(

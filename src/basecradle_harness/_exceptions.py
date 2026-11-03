@@ -316,11 +316,14 @@ class ProviderBillingError(ProviderAPIError):
     the pending work is left pending, so it resumes untouched the moment the account is funded and a
     call succeeds again (`basecradle_harness._report.BillingState`, `_wake`).
 
-    Vendor signals, each mapped by its own adapter: OpenAI — **HTTP 429 with
-    ``error.type == "insufficient_quota"``** (the one 429 that is *not* a rate limit); OpenRouter —
-    **HTTP 402 Payment Required**; xAI (native gRPC) — a ``RESOURCE_EXHAUSTED`` whose detail names
-    credit/quota (the exact wire shape is unconfirmed from xAI's docs, so it is matched defensively —
-    see `basecradle_harness._faults.is_out_of_funds`).
+    Vendor signals, each mapped by its own adapter: every HTTP adapter — **HTTP 402 Payment
+    Required**, whatever its body says of billing (issue #796); OpenAI — **``error.type == "insufficient_quota"``**
+    on any status, usually a 429 (the one 429 that is *not* a rate limit); Anthropic — an
+    ``error.type`` of ``billing_error``; Google — a 401/403 whose ``ErrorInfo`` reason is
+    ``BILLING_DISABLED``; xAI (native gRPC) — a ``RESOURCE_EXHAUSTED`` whose detail names
+    credit/quota (the exact wire shape is unconfirmed from xAI's docs, so it is matched defensively).
+    Beside the structured signals, out-of-funds text (`basecradle_harness._faults.is_out_of_funds`)
+    is read on OpenAI's 429, Google's 401/403 and any Anthropic status.
     """
 
 
