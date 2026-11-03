@@ -142,27 +142,32 @@ Each outcome has a strict set of fields it requires and a set it never carries, 
 
 **Severity is a rule of the line, and every producer follows it** (capital ruling, 2026-11-03, issue #786). A `failed` line is ERROR in exactly two cases:
 
-- **A harness brain call the engine gave up on** after a transient fault exhausted its retries. It replaces the prose ERROR give-up line it retired, one for one, so the page that line raised is unchanged.
-- **A second model's `config:` failure** (`purpose=memory` or `helper`), once per wake, because a config-class fault is dead until a human acts.
+- **A harness brain call the engine gave up on** after a transient fault exhausted its retries. It replaces the prose ERROR give-up line it retired, one for one, so the page that line raised is unchanged. This is the case the ruling names.
+- **A harness second model's `config:` failure** (the reranker, the describer, search grounding), the first in a wake; a repeat in the same wake is DEBUG. A config-class fault is dead until a human acts, so it pages once. This is the second-model rule (`CLAUDE.md` → Second Models), which the ruling leaves as it stands.
 
-Every other `failed` line is WARNING: a brain call that ended any other way (the wake's own lines carry the verdict a human acts on, `wake reported_failure` and `wake failed`), a second model's runtime-class failure, and **every failed call a Claude Code builder makes**, until basecradle#726's open question, whether a builder's failed call pages, is ruled. A `retrying` line is always WARNING, and so are `refused` and an unreadable answer's `fallback`. A wake that dies of a model call therefore writes two lines about two units: the call's `llm … outcome=failed timeline=… step=…`, and the wake's own `wake failed`.
+Every other `failed` line is WARNING: a brain call that ended any other way (the wake's own lines carry the verdict a human acts on, `wake reported_failure` and `wake failed`), a second model's runtime-class failure, and **every failed call a Claude Code builder makes**, its auxiliary `purpose=helper` calls and their `config:` causes included, until basecradle#726's open question, whether a builder's failed call pages, is ruled. A `retrying` line is always WARNING, and so are `refused` and an unreadable answer's `fallback`. A wake that dies of a model call therefore writes two lines about two units: the call's `llm … outcome=failed timeline=… step=…`, and the wake's own `wake failed`.
 
 The NOC's reading (basecradle-noc#1212): every series that counts, times or prices **calls** reads the billed lines, `llm provider=` lines whose `outcome` is neither `retrying` nor `failed`. The match is unanchored, because the verdict token is colored on every box. Retries and failures are series of their own, by `provider` and `purpose`.
 
 #### Fault Slugs
 
-**One vocabulary, every producer** (capital ruling, 2026-11-03, issue #786). A harness adapter, the router's remap of a Claude Code builder's `api_error`, and any producer that comes later name a failed attempt in the same words, so one series counts them all. A fault a producer knows only by what the transport told it is named by this table, and by nothing else:
+**One vocabulary, every producer** (capital ruling, 2026-11-03, issue #786). A harness adapter, the router's remap of a Claude Code builder's `api_error`, and any producer that comes later name a failed attempt in the same words, the harness's, so one series counts them all. A fault a producer knows only by what the transport told it is named by this table, and by nothing else:
 
 | What the Producer Saw | `reason` |
 |---|---|
-| No HTTP answer: the connection failed (DNS, TCP, TLS, a reset mid-body) | `transport` |
+| No HTTP answer: the connection failed, or broke before an answer was read (DNS, TCP, TLS, a reset) | `transport` |
 | HTTP `401` or `403` | `config:auth` |
+| HTTP `402` | `config:billing` |
+| HTTP `404` | `config:model_not_found` |
+| HTTP `413` | `payload_too_large` |
 | HTTP `429` | `rate_limited` |
 | HTTP `504` | `timeout` |
 | Any other HTTP `5xx` | `server_error` |
 | Any other HTTP status | `api_error` |
 
-A producer that knows more than the status names the more specific cause, and only from the `reason` row's list: a wait that ran out of the producer's own deadline is `timeout`, not `transport` (`_retry.connection_reason` reads it off the cause); the harness names an unfunded account `config:billing` (a `402`, or OpenAI's `insufficient_quota` `429`), a missing model `config:model_not_found` (a `404`), and a refusal its vendor's body explains `context_length`, `payload_too_large` or `tool_schema`. A word that is neither in this table nor in that list is a change to this page, never a producer's own.
+The ruling set the transport, `401`/`403`, `429`, `504`, `5xx` and catch-all rows. The `402`, `404` and `413` rows are statuses the harness already names by the status alone, carried here so that the table is the harness's words, which is what the ruling adopts for every producer. A bare `402` is not yet `config:billing` on the OpenAI and Google adapters (Known Violation S1).
+
+A producer that knows more than the status names the more specific cause, and only from the `reason` row's list. A wait that ran out of the producer's own deadline is `timeout`, not `transport` (`_retry.connection_reason`, from the error's type, else its cause). A refusal whose body the harness reads is named for what the body says: `context_length` (a `400` or `413` that says the context overflowed), `config:billing` (OpenAI's `insufficient_quota`, on any status), a routed refusal's `config:<cause>` (OpenRouter's region and provider-list `404`s), `tool_schema`. A word that is neither in this table nor in that list is a change to this page, never a producer's own.
 
 ### `provider`
 
@@ -763,16 +768,17 @@ Where today's emission departs from the target above. The conformance test reads
 
 A prose line that carries a field the NOC extracts off every line (`provider=`, `source=`) feeds a column whatever its head, so the test also fails on any such prose that no `prose` row names.
 
-The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759), whose rows F1–F36 are struck). Issue [#782](https://github.com/basecradle/basecradle-harness/issues/782) retired the `llm retry` and `llm refused` heads into `llm`'s `outcome`, and gave the brain's final failure a line. No departure stands today.
+The slices are the issues that remove each row: **slice 2 — tools** ([#758](https://github.com/basecradle/basecradle-harness/issues/758), whose rows T1–T9 are struck), **slice 3 — fields** ([#759](https://github.com/basecradle/basecradle-harness/issues/759), whose rows F1–F36 are struck). Issue [#782](https://github.com/basecradle/basecradle-harness/issues/782) retired the `llm retry` and `llm refused` heads into `llm`'s `outcome`, and gave the brain's final failure a line. One departure stands, found when issue #786 stated the fault-slug table: S1, removed by [#796](https://github.com/basecradle/basecradle-harness/issues/796).
 
 | ID | Violation | Witness | Removed By |
 |---|---|---|---|
+| S1 | A bare HTTP `402` is `api_error` on the OpenAI and Google adapters (`_openai._from_status_error`, `_google._from_api_error` have no `402` branch), where [Fault Slugs](#fault-slugs) and the Anthropic and OpenRouter adapters name it `config:billing`. | `test` | [#796](https://github.com/basecradle/basecradle-harness/issues/796) |
 
 ### Outside This Repository
 
 The NOC's Steel browser launcher writes its own `browser provider=` head. Its per-session spend line retires into the [`charge`](#charge) line (@origin, 2026-11-01: a session is billed by the minute, not per tool use, so it is not a `tool` line); its lifecycle lines stay on a NOC-only head that no column reads. It is not emitted here, so it is not witnessed here; the launcher's move is basecradle-noc#1153's. Slice 2 carried the rest to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
 
-The Claude Code builders' model calls reach this contract through the router's `ai_otel_llm` remap (basecradle-router `deploy/vector.yaml`), which renders each `api_request` as an `llm` line. Under issue #782 an `api_error` (Claude Code's final failure, after its own retries) is rendered as `llm … outcome=failed reason=<slug>` with no tokens, and an auxiliary call as `purpose=helper` with no `kind` (basecradle-router#384). Its slug is read off the status by [Fault Slugs](#fault-slugs); the remap adopts that table's `transport` and `config:auth` in basecradle-router's follow-up to issue #786, and until then writes `api_error` for both. Its `duration` is absent on `api_error`, where Claude Code reports only the last attempt's time, and its `failed` line is WARNING. A builder's line carries no `timeline`, `delivery` or `step`: it has no wake.
+The Claude Code builders' model calls reach this contract through the router's `ai_otel_llm` remap (basecradle-router `deploy/vector.yaml`), which renders each `api_request` as an `llm` line. Under issue #782 an `api_error` (Claude Code's final failure, after its own retries) is rendered as `llm … outcome=failed reason=<slug>` with no tokens, and an auxiliary call as `purpose=helper` with no `kind` (basecradle-router#384). Its slug is read off the status by [Fault Slugs](#fault-slugs); the remap adopts that table's `transport`, `config:auth`, `config:billing`, `config:model_not_found` and `payload_too_large` in basecradle-router's follow-up to issue #786, and until then writes `api_error` for each. Its `duration` is absent where Claude Code cannot state the whole wait (an `api_error` after more than one attempt, or with no status), and its `failed` line is WARNING. A builder's line carries no `timeline`, `delivery` or `step`: it has no wake.
 
 ## Where a Signal Lives
 
