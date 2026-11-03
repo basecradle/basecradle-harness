@@ -110,9 +110,11 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._messages import ImageContent, Message, VideoContent
 from basecradle_harness._observability import (
+    FALLBACK,
     HELPER,
     OK,
     REFUSED,
+    UNREADABLE,
     LlmCall,
     call_outcome,
     capture_llm_call,
@@ -670,10 +672,10 @@ class Describer:
                     # a runtime-class unknown, not a reason to take the wake down over a picture —
                     # and not a reason to retry either: an unrecognised fault is one the policy
                     # cannot say is transient.
+                    self._bill_unreadable(subject, kind=kind, call=call)
                     self._report(
                         subject,
                         kind=kind,
-                        call=call,
                         reason="provider_error",
                         detail=f"{type(exc).__name__}: {exc}",
                         started=started,
@@ -682,6 +684,12 @@ class Describer:
                     return None, "provider_error"
                 else:
                     break
+            # An answer the vendor billed and the adapter could not read has its own billed line;
+            # the decision below (retry, or give up) is a line of its own with nothing billed (#782).
+            # The adapter says which it was: it records `fallback` exactly when it read the answer
+            # and failed (`_observability.read_answer`); any other fault reached no answer.
+            if call.outcome == FALLBACK:
+                self._bill_unreadable(subject, kind=kind, call=call)
             # Outside the capture block: the wait is not part of the call it follows.
             if retry.again(
                 failure,
@@ -693,7 +701,6 @@ class Describer:
             self._report(
                 subject,
                 kind=kind,
-                call=call,
                 reason=fault,
                 detail=str(failure),
                 started=started,
@@ -712,6 +719,17 @@ class Describer:
             subject, kind=kind, call=call, reason=reason, started=started, retried=retry.retried
         )
         return (text or None), reason
+
+    def _bill_unreadable(self, subject: str, *, kind: str, call: LlmCall) -> None:
+        """The billed line of an attempt the vendor answered and the adapter then could not read.
+
+        The adapter recorded the answer (its usage, its cost) before the read failed, so the vendor
+        billed it: it is a call, and its line is ``outcome=fallback reason=invalid_response`` with
+        that bill. Nothing is written when the attempt never reached an answer, because then there
+        is nothing billed to record and the failure line alone says what happened.
+        """
+        if call.provider is not None:
+            self._report(subject, kind=kind, call=call, reason=UNREADABLE, answered=True)
 
     def _provider_for(self, budget: int) -> Provider | None:
         """This describer at `budget` output tokens — built once per budget, or the one it holds.
@@ -739,6 +757,7 @@ class Describer:
         retried: bool = False,
         diagnostics: Mapping[str, Any] | None = None,
         attempt: str | None = None,
+        answered: bool = False,
     ) -> None:
         """The one `llm` line this describe attempt writes, whatever happened (issue #485).
 
@@ -760,6 +779,11 @@ class Describer:
         a chatty wake cannot turn one defect into a storm.
         """
         level = logging.INFO
+        refused = call is not None and call.outcome == REFUSED
+        if refused:
+            # A refusal is a degradation whatever text came with it (issue #782): WARNING, as the
+            # brain's own refusal line is.
+            level = logging.WARNING
         if reason:
             is_config = reason.startswith("config:")
             level = logging.ERROR if is_config else logging.WARNING
@@ -783,8 +807,12 @@ class Describer:
         # The verdict (issue #782): a refusal is the vendor's own word on the content and says so,
         # with its category and no reason of ours beside it; otherwise an answer slug is a
         # `fallback` and any other reason a `failed` call that never answered.
-        refused = call.outcome == REFUSED
-        outcome = REFUSED if refused else call_outcome(reason)
+        if refused:
+            outcome = REFUSED
+        elif answered:
+            outcome = FALLBACK  # the vendor answered and billed; the answer could not be read
+        else:
+            outcome = call_outcome(reason)
         self._last_outcome = outcome
         log_llm_call(
             provider=provider,
@@ -801,7 +829,7 @@ class Describer:
             cost=call.cost,
             outcome=outcome,
             category=call.category if refused else None,
-            attempt=attempt,
+            attempt=None if refused else attempt,
             reason=None if refused else reason,
             detail=None if refused else detail,
             # The vendor's own account of the fault (issue #506) reads next to the `reason` it

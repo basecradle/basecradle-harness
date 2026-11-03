@@ -42,7 +42,7 @@ agent in the fleet**, whose SDK has retried `APITimeoutError` internally all alo
 What is retried, and what is not
 --------------------------------
 `RETRYABLE_REASONS` is the whole gate, read off the taxonomy the call sites already speak
-(`_rerank._fault_of`, `_describer._fault_of`, `_engine._reason`): the **runtime** class, and only
+(`_rerank._fault_of`, `_retry.fault_slug`, `_engine._reason`): the **runtime** class, and only
 its members that a second identical request can actually fix. Deliberately **out**:
 
 - **config-class** (``config:auth``, ``config:billing``, ``config:model_not_found``) — dead until a
@@ -112,12 +112,12 @@ from basecradle_harness._exceptions import (
     ProviderBillingError,
     ProviderConnectionError,
     ProviderContextLengthError,
-    ProviderError,
     ProviderPayloadTooLargeError,
     ProviderRateLimitError,
     ProviderResponseError,
     ProviderServerError,
     ProviderTimeoutError,
+    ProviderToolSchemaError,
 )
 from basecradle_harness._faults import routing_refusal
 from basecradle_harness._observability import (
@@ -484,7 +484,7 @@ def _retry_after(exc: object) -> float | None:
     return float(hinted) if hinted > 0 else None
 
 
-def fault_slug(exc: ProviderError) -> str:
+def fault_slug(exc: BaseException) -> str:
     """A provider fault → the ``reason=`` its `llm` line carries, its class by the ``config:`` prefix.
 
     The describer's and, since issue #782, the brain's: a brain call that ends ``outcome=failed``
@@ -506,6 +506,9 @@ def fault_slug(exc: ProviderError) -> str:
 
     Ordered most-specific first, because these classes subclass one another.
     """
+    if isinstance(exc, ProviderToolSchemaError):
+        # A vendor refused one tool's schema and the adapter could not recover by dropping it.
+        return "tool_schema"
     if isinstance(exc, ProviderAuthError):
         return "config:auth"
     if isinstance(exc, ProviderBillingError):
@@ -535,7 +538,7 @@ def fault_slug(exc: ProviderError) -> str:
 
 def log_brain_failure(
     provider: object,
-    exc: ProviderError,
+    exc: BaseException,
     *,
     attempt: str | None,
     seconds: float | None,

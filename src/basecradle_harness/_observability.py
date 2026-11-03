@@ -52,13 +52,13 @@ import logging
 import math
 import os
 import re
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
-from basecradle_harness._exceptions import ProviderError
+from basecradle_harness._exceptions import ProviderError, ProviderResponseError
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -510,12 +510,19 @@ FALLBACK = "fallback"
 RETRYING = "retrying"
 FAILED = "failed"
 
+#: The `reason` of an answer the vendor sent (and billed) that the harness could not read: a body
+#: that did not parse, a tool call's arguments cut off. Its billed line says `fallback` with this
+#: reason (`read_answer`), and the harness's decision about the call follows on its own line.
+UNREADABLE = "invalid_response"
+
 #: The `reason` slugs that judge an **answer**, not a fault: the vendor answered (and billed), and
 #: the caller could not use what came back. Every other reason is a fault slug, so the call it ends
-#: is ``failed``. `call_outcome` is the one place the split is drawn.
-ANSWER_REASONS = frozenset(
-    {"truncated", "empty_response", "missing_parts", "undecodable_video", "internal", "parse"}
-)
+#: is ``failed``: that includes ``internal`` (the harness itself raised, perhaps before any call)
+#: and ``undecodable_video`` (the clip never reached a model), because neither is an answer the
+#: vendor billed. `call_outcome` is the one place the split is drawn.
+#: ``invalid_response`` is not here: on its own it is a fault (no answer reached the caller), and
+#: only the billed line of an answer an adapter could not read says ``fallback`` with it (`answered`).
+ANSWER_REASONS = frozenset({"truncated", "empty_response", "missing_parts", "parse"})
 
 
 def call_outcome(reason: str | None) -> str:
@@ -816,7 +823,9 @@ def _trailing(
     was before the field existed. Read off `usage`, never passed: one carried in `extra` is
     replaced rather than splatted beside it, for `_generation_last`'s reason.
     """
-    fields = _generation_last({**(extra or {}), **_work_fields()}, generation)
+    # The context fills only what it knows, so a caller's own value for a key it leaves empty stands.
+    known = {key: value for key, value in _work_fields().items() if value is not None}
+    fields = _generation_last({**(extra or {}), **known}, generation)
     fields.pop("billing", None)
     fields["billing"] = BYOK_BILLING if byok(usage) else None
     return fields
@@ -1509,6 +1518,36 @@ def stamp_generation_id(error: BaseException, generation: str | None) -> BaseExc
         except AttributeError:  # a slotted third-party exception: observability never breaks a turn
             pass
     return error
+
+
+_T = TypeVar("_T")
+
+
+def read_answer(read: Callable[[], _T], response: Any) -> tuple[_T | None, ProviderError | None]:
+    """Read the vendor's answer **before** the call's line is written: ``(reply, None)`` or
+    ``(None, the error)`` (issue #782).
+
+    An adapter used to write its `llm` line the moment the body arrived and read the turn out of it
+    afterwards, so an answer that could not be read (tool-call arguments cut off at the output cap,
+    a malformed body) was written ``outcome=ok`` and then retried, which is one billed attempt saying
+    two contradictory things. Reading first lets the one billed line say what happened: `answered`
+    gives its fields, ``fallback reason=invalid_response`` for an unreadable answer. The harness's
+    decision (``retrying`` or ``failed``) follows on its own unbilled line. The error is returned,
+    stamped with the response's id (`generation_of`), for the adapter to raise once its lines are
+    written.
+    """
+    try:
+        with generation_of(response):
+            return read(), None
+    except ProviderResponseError as exc:
+        return None, exc
+
+
+def answered(error: ProviderError | None) -> dict[str, Any]:
+    """The verdict fields of an answered call's line, given what `read_answer` returned."""
+    if error is None:
+        return {}
+    return {"outcome": FALLBACK, "reason": UNREADABLE, "level": logging.WARNING}
 
 
 @contextmanager

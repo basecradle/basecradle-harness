@@ -1146,7 +1146,7 @@ def test_a_transient_429_is_waited_out_and_the_brain_still_gets_its_eyes(caplog)
     assert vision.calls == 2
     assert delays == [1.0]
     # One describe, one `llm` line — a refused attempt generated nothing and was billed nothing, so
-    # it is not a call to count. It gets an `llm retry` WARNING instead.
+    # it is not a call to count. It gets an `outcome=retrying` WARNING instead.
     assert len(_helper_lines(caplog)) == 1
     assert "outcome=ok" in _helper_lines(caplog)[0].getMessage()
     retried = _retry_lines(caplog)
@@ -1214,7 +1214,7 @@ def test_a_re_budget_is_not_a_retry_and_keeps_its_own_llm_line(caplog):
 
     A `length` re-budget asks a **different** question and its extra call answered and was billed,
     so it writes its own `llm` line. A retry re-issues the **identical** question after a refusal
-    that generated nothing, so it writes an `llm retry` WARNING and no `llm` line at all. Folding
+    that generated nothing, so it writes an `outcome=retrying` WARNING with nothing billed on it. Folding
     them together to reach "one line per describe" would delete real spend from ``helper_cost``;
     folding them the other way would count a 429 as a call.
     """
@@ -1523,3 +1523,35 @@ def test_a_refusal_inside_a_describe_is_the_describes_own_refused_line(caplog):
         plain(r.getMessage()) for r in caplog.records if "describe repeated" in r.getMessage()
     )
     assert "outcome=refused" in repeated  # the memo names the verdict the first describe had
+
+
+def test_an_answer_the_adapter_could_not_read_is_billed_once_then_decided(caplog):
+    """The vendor answered and billed; the adapter could not read it (issue #782 review). The bill
+    rides one `fallback reason=invalid_response` line, and each decision (retry, give up) is its own
+    line with nothing billed on it."""
+    from basecradle_harness._exceptions import ProviderResponseError
+    from basecradle_harness._observability import answered, log_llm_call
+
+    class _Unreadable(FakeDescriberProvider):
+        def chat(self, messages, tools=None):
+            error = ProviderResponseError("tool-call arguments cut off")
+            log_llm_call(
+                provider=self.provider,
+                model=self.model,
+                seconds=0.4,
+                cost=0.0021,
+                usage={"prompt_tokens": 812, "completion_tokens": 96},
+                **answered(error),
+            )
+            raise error
+
+    describer = Describer(_Unreadable(), "d/model", sleep=lambda _s: None)
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"):
+        assert describer.describe_images([ImageContent(url="x", alt="a.png")]) is None
+
+    lines = [plain(r.getMessage()) for r in caplog.records if "llm provider=" in r.getMessage()]
+    billed = [m for m in lines if "outcome=fallback reason=invalid_response" in m]
+    decided = [m for m in lines if "outcome=retrying" in m or "outcome=failed" in m]
+    assert len(billed) == 3 and all("tokens_in=812" in m and "cost=0.0021" in m for m in billed)
+    assert len(decided) == 3 and not any("tokens_in=" in m or "cost=" in m for m in decided)
+    assert decided[-1].count("outcome=failed") == 1

@@ -1657,3 +1657,16 @@ def test_a_builtins_tool_prompt_is_billed_input_but_never_the_compaction_trigger
         provider.chat([Message.user("read the page")])
     assert " tokens_in=151200 tokens_out=30 tokens_total=151230 " in _llm_line(caplog)
     assert provider.last_tokens_in == 1200
+
+
+def test_a_search_that_fails_ends_on_its_own_failed_helper_line(router, provider, caplog):
+    """A grounding call the vendor fails is a model call that ended with no answer (issue #782)."""
+    from basecradle_harness import ProviderError
+
+    body = {"error": {"code": 503, "message": "unavailable", "status": "UNAVAILABLE"}}
+    router.post(GENERATE).mock(return_value=httpx.Response(503, json=body))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"), pytest.raises(ProviderError):
+        provider.search("weather")
+    (llm,) = [plain(m) for m in _lines_starting(caplog, "llm ")]
+    assert " purpose=helper kind=search.grounding " in llm
+    assert " outcome=failed reason=server_error " in llm and "tokens_in=" not in llm

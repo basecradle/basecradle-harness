@@ -47,7 +47,7 @@ from basecradle_harness import (
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._describer import Describer
 from basecradle_harness._engine import Engine, _reason
-from basecradle_harness._exceptions import ProviderServerError
+from basecradle_harness._exceptions import ProviderResponseError, ProviderServerError
 from basecradle_harness._observability import (
     DELIVERY_ID_ENV,
     ComputedCost,
@@ -62,6 +62,7 @@ from tests.conftest import (
     out_message,
     out_web_search_call,
     responses_body,
+    wire_tool_call,
 )
 from tests.test_anthropic import FAKE_KEY as ANTHROPIC_KEY
 from tests.test_anthropic import MESSAGES as ANTHROPIC_MESSAGES
@@ -69,6 +70,9 @@ from tests.test_anthropic import MODEL as ANTHROPIC_MODEL
 from tests.test_anthropic import _no_stray_anthropic_env  # noqa: F401 - autouse fixture
 from tests.test_anthropic import reply as anthropic_reply
 from tests.test_anthropic import text as anthropic_text
+from tests.test_generation_id import OPENROUTER_CHAT_URL as GENERATION_CHAT_URL
+from tests.test_generation_id import _openrouter as _generation_openrouter
+from tests.test_generation_id import _openrouter_body
 from tests.test_google import (  # noqa: F401 - fixtures: the Google suite's own key and auth stub
     GENERATE,
     _no_real_google_auth,
@@ -841,6 +845,20 @@ def brain_failure(router, **_):
     )
     with _a_wake(), pytest.raises(ProviderServerError):
         engine.run([Message.user("hi")])
+
+
+@scenario
+def unreadable_answer(router, **_):
+    """The vendor answers (and bills) at the output cap with a tool call's arguments cut off: the
+    one billed line says `fallback reason=invalid_response`, and the give-up is its own line."""
+    cut_off = wire_tool_call(id="call_0", name="get_weather", arguments={"city": "Dallas"})
+    cut_off["function"]["arguments"] = '{"city": "Dal'
+    router.post(GENERATION_CHAT_URL).mock(
+        return_value=_ok(_openrouter_body(tool_calls=[cut_off], finish_reason="length"))
+    )
+    engine = Engine(_generation_openrouter(), ToolRegistry(), response_retries=0)
+    with _a_wake(), pytest.raises(ProviderResponseError):
+        engine.run([Message.user("weather?")])
 
 
 @scenario
@@ -1695,6 +1713,18 @@ def test_every_llm_line_carries_exactly_what_its_outcome_requires(rendered):
             assert not never & fields, (scenario, line.message)
             seen.add(outcome)
     assert seen == set(outcomes), f"no scenario renders {sorted(set(outcomes) - seen)}"
+
+
+def test_an_unreadable_answer_is_billed_once_and_the_give_up_bills_nothing(rendered):
+    """One billed attempt, one billed line (issue #782 review): the answer could not be read, so
+    its line is `fallback` with its tokens and its id, never `ok`; the engine's give-up follows as a
+    line of its own with nothing billed, naming the same generation."""
+    billed, given_up = rendered.heads("unreadable_answer", "llm")
+    assert (billed.fields["outcome"], billed.fields["reason"]) == ("fallback", "invalid_response")
+    assert "tokens_in" in billed.fields and billed.fields["purpose"] == "main"
+    assert (given_up.fields["outcome"], given_up.fields["reason"]) == ("failed", "invalid_response")
+    assert "tokens_in" not in given_up.fields and "cost" not in given_up.fields
+    assert billed.fields["generation_id"] == given_up.fields["generation_id"]
 
 
 def test_a_call_made_in_a_wake_names_its_wake_and_its_step(rendered):

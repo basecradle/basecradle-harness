@@ -1,4 +1,4 @@
-"""The vendor's own id for a model call, on the `llm` line and the `llm retry` line (issue #634).
+"""The vendor's own id for a model call, on the `llm` line, its retries' included (issues #634, #782).
 
 On 2026-10-03 three calls served by one upstream ran for 10 to 14 minutes each and came back at the
 131,072-token output cap (basecradle-noc#963). OpenRouter's feedback and refund path is *per
@@ -474,7 +474,7 @@ def test_a_describe_carries_the_id_its_adapter_recorded(caplog):
 
 # === the NOC's columns ========================================================
 
-#: Every expression the fleet dashboard reads off an `llm` or `llm retry` line, byte-for-byte as
+#: Every expression the fleet dashboard reads off an `llm` line, a retry's included, byte-for-byte as
 #: `basecradle-noc` ``observability/ai-box.json`` spells them (read 2026-10-03). ClickHouse's
 #: ``match()``/``extract()`` are partial matches, which is what `re.search` is.
 NOC_EXPRESSIONS = (

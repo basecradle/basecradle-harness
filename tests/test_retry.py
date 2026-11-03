@@ -4,7 +4,7 @@ Three things are pinned here and each has an "obviously fine" broken form.
 
 **The gate is the reason vocabulary, and it is pinned against its producers.** `RETRYABLE_REASONS`
 is a set of words, not of exception classes, because the words are what the fleet's dashboards read.
-A set that drifted from `_rerank._fault_of` / `_describer._fault_of` would describe a policy nothing
+A set that drifted from `_rerank._fault_of` / `_retry.fault_slug` would describe a policy nothing
 implements — retrying nothing, or retrying a config fault that is dead until a human acts — and no
 test anywhere else would fail.
 
@@ -533,3 +533,13 @@ def test_the_harness_budget_is_named_when_it_was_the_one_that_ran_out(caplog):
         )
     line = retry_line(caplog)
     assert " timeout=60.00s " in line and " next_timeout=" in line
+
+
+def test_a_tool_schema_refusal_the_adapter_could_not_recover_from_is_named():
+    """Its own slug, never the catch-all (issue #782 review)."""
+    from basecradle_harness._exceptions import ProviderToolSchemaError
+    from basecradle_harness._retry import fault_slug
+
+    exc = ProviderToolSchemaError("bad schema", tool_name="get_weather", reason="unsupported")
+    assert fault_slug(exc) == "tool_schema"
+    assert fault_slug(RuntimeError("adapter bug")) == "provider_error"

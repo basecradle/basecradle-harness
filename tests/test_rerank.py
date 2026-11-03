@@ -1000,7 +1000,7 @@ def test_a_transient_429_is_waited_out_and_the_rerank_still_happens(router, capl
     """The whole feature: one wait, and the agent gets its reranked memories instead of the hybrid's.
 
     The first attempt is refused and the second answers, so the rerank *worked* — and the journal
-    says both things: one ``llm`` line with ``outcome=ok``, and one ``llm retry`` WARNING naming the
+    says both things: one ``llm`` line with ``outcome=ok``, and one ``outcome=retrying`` WARNING naming the
     upstream that refused. A fallback that silently recovered would be indistinguishable from a
     rerank that never stumbled.
     """

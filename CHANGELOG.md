@@ -32,11 +32,23 @@ Ruled by the capital on 2026-11-03, from the telemetry audit with @origin (basec
   length, payload too large) writes it at WARNING, because the wake's own lines carry the verdict. A
   failed compaction call writes it too. The brain names its faults in the describer's words
   (`_retry.fault_slug`, moved there from `_describer`).
+- **Billed lines and decision lines.** `ok`, `refused` and `fallback` are the billed line of an
+  attempt the vendor answered, with its tokens and cost. `retrying` and `failed` are the harness's
+  decision about an attempt that brought back no usable answer, and carry nothing billed. Every
+  adapter now reads its answer **before** writing the call's line (`_observability.read_answer`),
+  so an answer it cannot read (a tool call's arguments cut off at the output cap) is `fallback
+  reason=invalid_response` with its bill, followed by the decision, and is never written `ok`. A
+  describe whose answer could not be read does the same.
 - **A non-brain fault is `failed`, not `fallback`.** `fallback` now means only "the model answered
-  and the answer was unusable" (`truncated`, `empty_response`, `missing_parts`,
-  `undecodable_video`, `internal`, `parse`); a rerank or describe that got no answer is
-  `outcome=failed`, with `attempt=` where an attempt was made. The *Memory System Rerank Outcomes*
-  chart grows a `failed` series accordingly.
+  and the answer could not be used" (`truncated`, `empty_response`, `missing_parts`, `parse`,
+  `invalid_response`). A rerank or describe that got no answer is `outcome=failed`, with
+  `attempt=` where an attempt was made. So are `internal` (the harness raised) and
+  `undecodable_video` (no model was called). The *Memory System Rerank Outcomes* chart grows a
+  `failed` series accordingly.
+- **Every model call that ends with no answer says so**: a brain adapter raising outside the
+  taxonomy (`reason=provider_error`), a Google Search grounding call, and a tool-schema refusal the
+  adapter could not recover from (new slug `tool_schema`).
+- **A describer refusal is WARNING** whatever text came with it, as the brain's is.
 - **The wake context rides every model call made in a wake, ambiently**: `timeline=`, `delivery=`,
   and `step=n/max` for a call made in the engine's step loop (`_observability.in_wake`, `at_step`).
   It applies to the brain, a rerank and a describe alike. Each is absent outside its context.

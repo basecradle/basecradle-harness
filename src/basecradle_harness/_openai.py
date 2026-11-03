@@ -76,13 +76,14 @@ from basecradle_harness._observability import (
     UNPRICED_HOST,
     UNPRICED_TIER,
     ServerToolTally,
+    answered,
     finish_reason,
     generation_id,
     generation_id_header,
-    generation_of,
     log_cost_unpriced,
     log_llm_call,
     log_server_tools,
+    read_answer,
     reasoning_apart,
     reported_cost,
     routed_web_searches,
@@ -488,10 +489,13 @@ class OpenAIProvider:
         with self._mapped_errors():
             response = self._client.responses.create(**payload)
         data = response.model_dump()
-        self._log_call(started, data)
+        # Read before the line is written, so the one billed line says whether it could be (#782).
+        reply, unreadable = read_answer(lambda: message_from_responses(data), data)
+        self._log_call(started, data, unreadable)
         self._log_server_tools(data)
-        with generation_of(data):
-            return message_from_responses(data)
+        if unreadable is not None:
+            raise unreadable
+        return reply  # type: ignore[return-value]
 
     def _with_code_container(self, spec: dict[str, Any]) -> dict[str, Any]:
         """Inject the live ``container`` into the ``code_interpreter`` built-in, per turn.
@@ -521,7 +525,8 @@ class OpenAIProvider:
         with self._mapped_errors():
             response = self._client.chat.completions.create(**payload)
         data = response.model_dump()
-        self._log_call(started, data)
+        reply, unreadable = read_answer(lambda: message_from_chat(data), data)
+        self._log_call(started, data, unreadable)
         # A router reached over this surface counts the web searches it ran for the call (OpenRouter's
         # ``server_tool_use_details``); a vendor that runs none reports nothing and writes no line.
         searches = routed_web_searches(data.get("usage"))
@@ -531,10 +536,13 @@ class OpenAIProvider:
             model=self.model,
             generation_id=generation_id(data),
         )
-        with generation_of(data):
-            return message_from_chat(data)
+        if unreadable is not None:
+            raise unreadable
+        return reply  # type: ignore[return-value]
 
-    def _log_call(self, started: float, data: Mapping[str, Any]) -> None:
+    def _log_call(
+        self, started: float, data: Mapping[str, Any], unreadable: ProviderError | None = None
+    ) -> None:
         """The one INFO line this call earns: provider, endpoint, model, duration, tokens, cost.
 
         Both surfaces report usage, under different names (Responses ``input_tokens`` vs Chat
@@ -577,6 +585,8 @@ class OpenAIProvider:
             # The body's own ``id`` on both surfaces (issue #634): a ``chatcmpl-`` or ``resp_`` id
             # from OpenAI, a uuid from xAI, the ``gen-`` generation id from OpenRouter.
             generation_id=generation_id(data),
+            # An answer the caller could not read says so on this, its one billed line (#782).
+            **answered(unreadable),
         )
 
     def _cost(self, data: Mapping[str, Any], usage: Any) -> float | None:

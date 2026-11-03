@@ -1396,3 +1396,18 @@ def test_a_successful_call_after_a_retry_ends_ok_and_is_the_only_call(caplog):
     lines = [plain(r.getMessage()) for r in caplog.records]
     assert sum(1 for m in lines if is_retry(m)) == 1
     assert not any("outcome=failed" in m for m in lines)
+
+
+def test_an_adapter_raising_outside_the_taxonomy_still_ends_on_a_failed_line(caplog):
+    """A defect in an adapter is still a call that ended with no answer (issue #782 review)."""
+
+    class _Broken:
+        def chat(self, messages, tools=None):
+            raise RuntimeError("adapter bug")
+
+    engine = Engine(_Broken(), ToolRegistry(), sleep=lambda _s: None)
+    with caplog.at_level(logging.DEBUG, logger="basecradle_harness"), pytest.raises(RuntimeError):
+        engine.run([Message.user("hi")])
+
+    (line,) = [plain(r.getMessage()) for r in caplog.records if "llm provider=" in r.getMessage()]
+    assert " outcome=failed attempt=1/3 reason=provider_error " in line

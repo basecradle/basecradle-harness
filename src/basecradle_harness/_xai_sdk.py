@@ -103,11 +103,12 @@ from basecradle_harness._faults import is_out_of_funds, is_too_large, refused_to
 from basecradle_harness._messages import ImageContent, Message, ServerToolUse, ToolCall, ToolSpec
 from basecradle_harness._observability import (
     ServerToolTally,
+    answered,
     finish_reason,
     generation_id,
-    generation_of,
     log_llm_call,
     log_server_tools,
+    read_answer,
     reasoning_apart,
     serving_endpoint,
     token_counts,
@@ -379,10 +380,13 @@ class XaiSdkProvider:
         # (issue #490): the same `finish_reason` this line already hands `log_llm_call`, kept where
         # the engine can reach it without a `capture_llm_call` around every brain call.
         self.last_finish_reason = reason
+        seconds = time.monotonic() - started
+        # Read before the line is written, so the one billed line says whether it could be (#782).
+        reply, unreadable = read_answer(lambda: self._from_wire(response), response)
         log_llm_call(
             provider=self.provider,
             model=self.model,
-            seconds=time.monotonic() - started,
+            seconds=seconds,
             # xAI reports its reasoning beside the completion, never inside it (32 + 9 + 94 = 135 in
             # its own example), so the line folds it into the output it is billed as (issue #759).
             usage=reasoning_apart(usage),
@@ -403,6 +407,7 @@ class XaiSdkProvider:
             # xAI's response id (issue #634) — on its HTTP surface the same value it sends as
             # ``x-request-id``, so a support request names the call either way.
             generation_id=generation_id(response),
+            **answered(unreadable),
         )
         # The tools grok ran server-side inside this call, one `tool` line each (issue #758).
         log_server_tools(
@@ -411,8 +416,9 @@ class XaiSdkProvider:
             model=self.model,
             generation_id=generation_id(response),
         )
-        with generation_of(response):
-            return self._from_wire(response)
+        if unreadable is not None:
+            raise unreadable
+        return reply  # type: ignore[return-value]
 
     def _server_tallies(self, response: Any) -> dict[str, ServerToolTally]:
         """Each server-side tool's uses on this call, and the first one xAI reports did not finish.

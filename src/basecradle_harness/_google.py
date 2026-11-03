@@ -148,23 +148,26 @@ from basecradle_harness._messages import (
     VideoContent,
 )
 from basecradle_harness._observability import (
+    FAILED,
     GROUNDING_CHARGE,
     HELPER,
     NOT_REPORTED,
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
+    answered,
     finish_reason,
     generation_id,
-    generation_of,
     log_cost_unpriced,
     log_llm_call,
     log_server_tools,
     meter_failure,
     meter_tool,
+    read_answer,
     tally_server_tools,
     token_counts,
 )
 from basecradle_harness._openai_wire import format_citations
+from basecradle_harness._retry import fault_slug
 from basecradle_harness._secret import Sealed as _Sealed
 from basecradle_harness._server_tools import record
 from basecradle_harness._timeouts import (
@@ -741,10 +744,16 @@ class GoogleProvider:
         reason = _finish_name(candidate)
         self.last_finish_reason = finish_reason({"finish_reason": reason})
         response_id = generation_id({"id": getattr(response, "response_id", None)})
+        seconds = time.monotonic() - started
+        used = _server_uses(candidate)
+        # Read before the line is written, so the one billed line says whether it could be (#782).
+        reply, unreadable = read_answer(
+            lambda: self._from_wire(response, candidate, reason, used), {"id": response_id}
+        )
         log_llm_call(
             provider=self.provider,
             model=self.model,
-            seconds=time.monotonic() - started,
+            seconds=seconds,
             usage=usage,
             # A direct-to-vendor SDK has no upstream to name, so there is no `endpoint=`; where the
             # call ran — the residency fact an operator chose this provider for — is `residency=`.
@@ -752,8 +761,8 @@ class GoogleProvider:
             cost=self._cost(meta),
             finish_reason=self.last_finish_reason,
             generation_id=response_id,
+            **answered(unreadable),
         )
-        used = _server_uses(candidate)
         # The built-ins Gemini ran on this call, one `tool` line each beside its `llm` line (#758).
         log_server_tools(
             tally_server_tools((use.name, use.failed) for use in used),
@@ -761,8 +770,9 @@ class GoogleProvider:
             model=self.model,
             generation_id=response_id,
         )
-        with generation_of({"id": response_id}):
-            return self._from_wire(response, candidate, reason, used)
+        if unreadable is not None:
+            raise unreadable
+        return reply  # type: ignore[return-value]
 
     def search(self, query: str) -> str:
         """Answer `query` with Google Search grounding, in one call of its own (issue #656).
@@ -803,8 +813,21 @@ class GoogleProvider:
                     model=self.model, contents=contents, config=config
                 )
         except ProviderError as exc:
-            # The tool hands the model the text; its `tool` line still says the search failed.
+            # The tool hands the model the text; its `tool` line still says the search failed, and
+            # the model call that ended with no answer says so on its own line (issue #782).
             meter_failure(exc, provider=self.provider, kind=SEARCH_KIND, model=self.model)
+            log_llm_call(
+                provider=self.provider,
+                purpose=HELPER,
+                kind=SEARCH_KIND,
+                residency=self.location,
+                model=self.model,
+                seconds=time.monotonic() - started,
+                outcome=FAILED,
+                reason=fault_slug(exc),
+                detail=str(exc),
+                level=logging.WARNING,
+            )
             raise
         seconds = time.monotonic() - started
         meta = getattr(response, "usage_metadata", None)

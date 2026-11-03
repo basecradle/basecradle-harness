@@ -116,7 +116,7 @@ DEFAULT_RESPONSE_RETRIES = 2
 #: **`ProviderConnectionError` joined in issue #545, and it is the same story as the 429 one
 #: paragraph down — with the aggravation that the policy already said so.**
 #: `_retry.RETRYABLE_REASONS` has listed ``timeout`` and ``transport`` since it shipped, and both
-#: are what `_rerank._fault_of` and `_describer._fault_of` emit for this class; the engine simply
+#: are what `_rerank._fault_of` and `_retry.fault_slug` emit for this class; the engine simply
 #: never caught the exception that carries them, so the *same* fault was retried on the memory and
 #: describe paths and fatal on the brain's. On 2026-09-20 @glm-5.2 lost a whole wake to
 #: ``The read operation timed out`` with no retry line anywhere in it: ~12 minutes and a
@@ -189,7 +189,7 @@ _TRANSIENT = (
 _RETRY_BACKOFF_BASE = 0.5
 
 #: A transient fault → the ``reason=`` word the shared retry line carries. Spelled as the same
-#: vocabulary `_rerank._fault_of` and `_describer._fault_of` emit, so one grep reads every retry on
+#: vocabulary `_rerank._fault_of` and `_retry.fault_slug` emit, so one grep reads every retry on
 #: the box whatever purpose made the call, and so `_retry.RETRYABLE_REASONS` gates all three the
 #: same way. Ordered most-specific first, because these classes subclass one another.
 #:
@@ -866,10 +866,6 @@ class Engine:
                 bind_scale(self.provider, retry.timeout_scale)
                 try:
                     reply = self.provider.chat(shown, tools=tools)
-                    # Bounded where every reply arrives, so the turn the model reads on the next
-                    # step and the turn the disk keeps are the same record (`_server_tools.bound`).
-                    reply.server_tools = bound_server_tools(reply.server_tools)
-                    return reply
                 except _TRANSIENT as exc:
                     last_exc = exc
                     if not retry.again(
@@ -889,6 +885,23 @@ class Engine:
                         seconds=time.monotonic() - began,
                     )
                     raise
+                except Exception as exc:
+                    # An adapter raised outside the taxonomy (a defect in it, by definition). The
+                    # call still ended with no answer, so it still says so, as `provider_error`.
+                    retry.again(exc, reason="provider_error")
+                    log_brain_failure(
+                        self.provider,
+                        exc,
+                        attempt=retry.label,
+                        seconds=time.monotonic() - began,
+                    )
+                    raise
+                else:
+                    # Bounded where every reply arrives, so the turn the model reads on the next
+                    # step and the turn the disk keeps are the same record (`_server_tools.bound`).
+                    # Outside the `try`: a fault here is the harness's, never the model call's.
+                    reply.server_tools = bound_server_tools(reply.server_tools)
+                    return reply
         finally:
             if retry.timeout_scale != 1.0:
                 bind_scale(self.provider, 1.0)

@@ -58,7 +58,7 @@ import pytest
 
 from basecradle_harness import Message, OpenRouterProvider
 
-from .conftest import plain
+from .conftest import is_retry, plain
 
 pytestmark = pytest.mark.live
 
@@ -107,14 +107,15 @@ def test_live_model_params_reach_the_endpoint():
 
 
 def _llm_line(caplog) -> str:
-    """The `llm` line — **never** an ``llm retry`` one (issue #506).
+    """The call's final `llm` line — **never** an ``outcome=retrying`` one (issues #506, #782).
 
-    The retry head shares the first word, so the prefix must be the frozen `` llm provider=`` head
-    itself: a refused attempt is not a call, and selecting one here would read a retry's fields as
-    if they were a completed call's.
+    A retry rides the same head, so selecting the first `` llm provider=`` line would read a
+    refused attempt's fields as if they were a completed call's.
     """
     return next(
-        m for m in (r.getMessage() for r in caplog.records) if m.startswith("llm provider=")
+        m
+        for m in (r.getMessage() for r in caplog.records)
+        if m.startswith("llm provider=") and not is_retry(m)
     )
 
 
@@ -311,9 +312,8 @@ def _rerank_record(caplog):
     line, and this file (which CI never runs) kept selecting the old head until the NOC's live
     smoke went red on it (issue #504). The selector is the offline suite's (``test_rerank.py``).
 
-    It anchors on the **frozen head** `` llm provider=`` rather than on ``llm ``, because issue #506
-    added an ``llm retry`` line that shares the first word: a 429 that was waited out and recovered
-    would otherwise be selected here as the rerank's own record.
+    A retry rides the same head since issue #782 (``outcome=retrying``), so it is skipped: a 429
+    that was waited out and recovered would otherwise be selected here as the rerank's own record.
     """
     return next(
         r
@@ -321,6 +321,7 @@ def _rerank_record(caplog):
         if r.getMessage().startswith("llm provider=")
         and "purpose=memory" in r.getMessage()
         and "kind=rerank" in r.getMessage()
+        and not is_retry(r.getMessage())
     )
 
 
@@ -491,10 +492,10 @@ def test_a_live_model_with_no_endpoint_in_the_region_names_its_cause(caplog):
         caplog, model=OUT_OF_REGION_MODEL, providers=("alibaba",), base_url=REGIONAL_BASE_URL
     )
     message = plain(record.getMessage())
-    assert _field(message, "outcome") == "fallback", (
+    assert _field(message, "outcome") == "failed", (
         f"{OUT_OF_REGION_MODEL} was served at {REGIONAL_BASE_URL}: it has gained an endpoint in "
         f"the region, so pick a model that has none. {message}"
     )
     assert record.levelno == logging.ERROR, message
     assert _field(message, "reason") == "config:no_region_endpoint", message
-    assert not [r for r in caplog.records if r.getMessage().startswith("llm retry ")]
+    assert not [r for r in caplog.records if is_retry(r.getMessage())]
