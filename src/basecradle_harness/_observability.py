@@ -171,16 +171,27 @@ _PREFIXED = (
     (r"ste-", r"[A-Za-z0-9]{20,}"),
 )
 _PREFIX = re.compile("|".join(f"(?:{prefix})" for prefix, _ in _PREFIXED))
-_SECRETS = re.compile(
-    "(?P<prefixed>" + "|".join(f"(?:{prefix}){body}" for prefix, body in _PREFIXED) + ")"
-    r"|/heartbeat/\S+"
+_PREFIX_RULES = re.compile("|".join(f"(?:{prefix}){body}" for prefix, body in _PREFIXED))
+
+#: The rules anchored on a literal of their own — a heartbeat URL, a bearer header, a key in a query,
+#: an ``api_key=`` assignment — which are redacted wherever they match. **They run in a pass before
+#: the prefix rules**, because their literals are made of the characters a prefix rule's run is: in
+#: one alternation the leftmost match wins, so ``task-runner-api-key=…`` was consumed as the run
+#: ``sk-runner-api-key`` and the value after ``=`` was never matched by anything, and
+#: ``task-runner-bearer …`` lost its bearer value the same way. A prefix run cannot reach across the
+#: ``[redacted]`` the first pass leaves, so the second pass never undoes it. Inside this pass the
+#: same holds between two rules: an assignment whose value is a bearer header
+#: (``AUTH_API_KEY=Bearer eyJ…``) takes the ``Bearer`` and the token together, where it once took
+#: ``Bearer`` as the whole value and left the token after the space.
+_LITERAL_RULES = re.compile(
+    r"/heartbeat/\S+"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
-    r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)[^&\s]+"
-    r"|(?i:api[-_]?key=)[^&\s\"]+"
+    r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)?[^&\s]+"
+    r"|(?i:api[-_]?key=)(?:(?i:bearer)\s+)?[^&\s\"]+"
 )
 
 #: One character of the run every **length-gated** redaction rule matches — this module's
-#: `_SECRETS` and the box's ``ai_scrub`` alike. A rule with a minimum length (``sk-…{8,}``,
+#: rules and the box's ``ai_scrub`` alike. A rule with a minimum length (``sk-…{8,}``,
 #: ``AIza…{20,}``) cannot redact a credential cut below that minimum, so a cut must never fall inside
 #: such a run (`bounded`). On the box, the rules that match a wider charset (bearer, a query value, a
 #: heartbeat URL) have no minimum the cut can undercut, so this class is the whole of the rule there.
@@ -217,13 +228,16 @@ def bounded(text: str, cap: int, *, marker: str = "…") -> str:
 
 
 def scrub(text: str) -> str:
-    """`text` with every credential shape `_SECRETS` knows replaced by ``[redacted]``.
+    """`text` with every credential shape the scrub knows replaced by ``[redacted]``.
+
+    Two passes, in order: `_LITERAL_RULES`, then the prefix rules (`_PREFIXED`), a prefixed match
+    that `_is_word` reads as a word kept as written.
 
     Run on a whole text **before** `bounded` cuts it, so a rule is never shown a credential cut
     short of its own minimum. `kv` does both itself; a site that cuts a text for a log line before
     `kv` sees it calls this first.
     """
-    return _SECRETS.sub(_redaction, text)
+    return _PREFIX_RULES.sub(_redaction, _LITERAL_RULES.sub("[redacted]", text))
 
 
 def _redaction(match: re.Match[str]) -> str:
@@ -237,9 +251,9 @@ def _is_word(match: re.Match[str]) -> bool:
     no digit and no uppercase letter — never one without the other, because a serialization can glue
     a key to a letter, and a key's run always holds a digit or a capital with overwhelming
     certainty. A glued word whose run holds one is still redacted: the scrub errs toward redaction.
-    Every match that is not a prefixed one is redacted unconditionally.
+    Only the prefix pass asks; `_LITERAL_RULES` redacts unconditionally.
     """
-    if match.lastgroup != "prefixed" or match.start() == 0:
+    if match.start() == 0:
         return False
     if unicodedata.category(match.string[match.start() - 1])[0] not in "LNM":
         return False
@@ -530,7 +544,7 @@ def _field(key: str, rendered: str, *, colored: bool) -> str:
 def _value(value: Any) -> str:
     """One field's value: single-line, redacted, bounded, and quoted when it isn't a bare token.
 
-    Four jobs, in order — flatten (a record is one line), scrub (`_SECRETS`), truncate
+    Four jobs, in order — flatten (a record is one line), scrub (`scrub`), truncate
     (`MAX_VALUE`, by `bounded`, never inside a token), then quote anything holding a space or an
     ``=`` so it reads as *one* value rather than as extra fields. Scrub before the cut, so every shape
     this module knows is redacted whole; the cut's own rule protects the shapes only the box knows.

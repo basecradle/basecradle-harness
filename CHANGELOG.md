@@ -32,6 +32,18 @@ out of it.
   each of 23 left neighbors, and every non-prefix rule is redacted glued to a letter or digit. `docs/telemetry.md` → Credential Scrubbing states the rule; the README
   says a vendor's word is posted whole.
 
+### Fixed: a prefix rule no longer swallows an `api_key=` or bearer key name, leaving its value
+
+Found reviewing issue #794, and true before it: in one alternation the leftmost match wins, and a
+prefix rule's run is made of the characters `api-key` and `bearer` are, so
+`task-runner-api-key=abc123secret` was consumed as the run `sk-runner-api-key` and the secret after
+`=` matched nothing (`ta[redacted]=abc123secret` before 0.176.0, untouched since the word rule).
+The scrub now runs in two passes: the rules anchored on a literal of their own
+(`_LITERAL_RULES`: the heartbeat URL, bearer, key-in-query, `api_key=`) first, then the prefix
+rules. Within the first pass, an assignment whose value is a bearer header
+(`AUTH_API_KEY=Bearer eyJ…`) takes `Bearer` and the token together, where it once took `Bearer` as
+the whole value and left the token after the space. Tests pin each shape; `docs/telemetry.md` → Credential Scrubbing says so.
+
 ## [0.175.0] - 2026-11-03
 
 ### Fixed: a stopped wake is a stop, and the next wake no longer resumes it (issue #798)

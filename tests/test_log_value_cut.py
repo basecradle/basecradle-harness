@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from basecradle_harness._exceptions import ProviderError, ProviderServerError
-from basecradle_harness._observability import _SECRETS, MAX_VALUE, _value, bounded, kv, scrub
+from basecradle_harness._observability import MAX_VALUE, _value, bounded, kv, scrub
 from basecradle_harness._report import STALL_DETAIL_CAP, stall_detail
 
 #: A credential of a shape **no** rule anywhere knows — the case the cut's own rule exists for. It is
@@ -180,7 +180,7 @@ def test_an_unreadable_prune_watermark_never_quotes_part_of_a_token(tmp_path: Pa
 #: ``deploy/hosts/*/vector.yaml`` and basecradle-noc ``deploy/vector.yaml``, read 2026-11-03), each
 #: at the **box's own minimum length**, so a harness rule with a longer minimum fails here. The one
 #: stated exception is the bearer rule (`test_a_bearer_word_in_prose_survives_the_harness_scrub`). A rule
-#: added to ``ai_scrub`` is added to `_SECRETS` and to this table in the same change
+#: added to ``ai_scrub`` is added to the source's rules and to this table in the same change
 #: (`docs/telemetry.md` → Credential Scrubbing).
 BOX_RULE_SAMPLES = {
     "github token (gh?_)": "ghp_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
@@ -230,12 +230,12 @@ def test_an_identifier_the_harness_writes_is_not_mistaken_for_a_credential():
         "config:conflicting_routing",
     ):
         assert _value(value) == value
-    assert not _SECRETS.search("tokens_in=764942 cached_tokens=238277")
+    assert scrub("tokens_in=764942 cached_tokens=238277") == "tokens_in=764942 cached_tokens=238277"
 
 
 # --- a vendor prefix inside a word is a word, not a credential (issue #794) ---------------------
 
-#: One fabricated sample per **prefix-anchored** rule in `_SECRETS` — the rules a word can contain.
+#: One fabricated sample per **prefix-anchored** rule (`_observability._PREFIXED`) — the rules a word can contain.
 PREFIX_SAMPLES = {
     "sk-": "sk-ant-api03-Ab3Cd5Ef7Gh9",
     "sk-or-": "sk-or-v1-0f3a9c2b7d4e6f8a",
@@ -349,3 +349,27 @@ def test_a_non_prefix_rule_is_redacted_whatever_precedes_it(secret, glue):
 @pytest.mark.parametrize("glue", ["7", "é", "密"])
 def test_a_word_glued_by_a_digit_a_combining_mark_or_any_script_is_kept(glue):
     assert scrub(f"{glue}sk-specification") == f"{glue}sk-specification"
+
+
+# --- a prefix run never swallows a literal rule's key name -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("task-runner-api-key=abc123secret", "abc123secret"),
+        ("risk-model_api_key=hunter2xyz", "hunter2xyz"),
+        ("sk-runner-pipeline-api-key=abc123secret", "abc123secret"),
+        ("task-runner-bearer abcdefgh123", "abcdefgh123"),
+        ("disk-proxy-Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc", "eyJhbGciOiJIUzI1NiJ9"),
+        ("AUTH_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9.e30.abc", "eyJhbGciOiJIUzI1NiJ9"),
+        ("https://example.com/v1?api_key=Bearer eyJhbGciOiJIUzI1NiJ9", "eyJhbGciOiJIUzI1NiJ9"),
+    ],
+)
+def test_a_literal_rule_after_a_prefix_run_still_redacts_its_value(text, value):
+    """In one alternation the leftmost match wins, and a prefix rule's run is made of the characters
+    ``api-key`` and ``bearer`` are, so it consumed their key name and left the value unmatched.
+    The literal rules run first."""
+    rendered = scrub(f"failed: {text} rejected")
+    assert value not in rendered, rendered
+    assert "[redacted]" in rendered
