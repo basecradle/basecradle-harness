@@ -1,9 +1,9 @@
-"""Shared HTTP plumbing for the OpenAI provider adapters.
+"""HTTP error mapping for the xAI media tools (`_grok`), which call ``api.x.ai`` with ``httpx``.
 
-Both provider adapters — the OpenAI-compatible Chat Completions one and the
-OpenAI Responses one — talk to the same family of endpoints and get the same
-error envelopes back. The mapping from an HTTP error status onto Harness's typed
-provider exceptions is therefore one thing, owned here, not copied per adapter.
+No provider adapter uses this module: every adapter reaches its vendor through the vendor's
+SDK and maps that SDK's errors itself (`_openai._from_status_error` and its siblings). Every
+`ProviderError` a media tool raises is relayed to the model the same way, so this mapping names
+only the auth and rate-limit statuses and leaves every other status a plain `ProviderAPIError`.
 """
 
 from __future__ import annotations
