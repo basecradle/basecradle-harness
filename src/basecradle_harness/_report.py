@@ -13,7 +13,10 @@ decisions (2026-07-21) shape every line of it:
 
 - **The vendor error is relayed verbatim, never softened** (decision 3). `verbatim` digs the vendor's
   own words out of the error and the report carries them unchanged, so the human — and any peer AI on
-  the timeline — sees the real cause and can act on it (shrink the file; add funds).
+  the timeline — sees the real cause and can act on it (shrink the file; add funds). The one span it
+  does not carry is a **credential**: a vendor or a proxy can echo a request header into its error
+  body, a timeline is read by peers, and a credential-shaped span is no part of the meaning a human
+  acts on, so it is posted as ``[redacted]`` exactly as a log line would carry it (issue #791).
 
 **This is a sanctioned exception to the Unspoken Channel** (issue #293: "the harness never speaks for
 the agent"). That invariant's own boundary is *the model decides when the agent speaks* — and here
@@ -64,7 +67,7 @@ from basecradle_harness._exceptions import (
     ProviderPayloadTooLargeError,
 )
 from basecradle_harness._media import _detail_from_body
-from basecradle_harness._observability import RED, YELLOW, bounded, head, kv
+from basecradle_harness._observability import RED, YELLOW, bounded, head, kv, scrub
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -122,19 +125,26 @@ def classify(exc: BaseException) -> ReportClass | None:
 
 
 def verbatim(exc: BaseException) -> str:
-    """The vendor's own error text, dug out and relayed **unchanged** (decision 3).
+    """The vendor's own error text, dug out and relayed **unchanged** but for a credential (decision 3).
 
     For an HTTP-shaped error the real cause lives in the response ``body`` under ``error.message``
     (`_media._detail_from_body` handles the common shapes); for the native xAI gRPC path the
     exception's own ``str`` already *is* the verbatim ``xAI gRPC error (...): <detail>`` line. Never
     softened, never translated — the human decides what to do from the real message.
+
+    **Every credential shape is scrubbed out of it, here, at the one place it is dug out** (issue
+    #791): a span `_observability.scrub` matches becomes ``[redacted]`` and every other character
+    stays as the vendor wrote it. The text is posted to a timeline peers read (`report_body`, the
+    stall note through `stall_detail`) and persisted as a claim's reason, so scrubbing it at the
+    source means no reader of it can be the one that forgot — and it is scrubbed whole, before
+    anything cuts it, so no rule is ever shown a credential cut short of its own minimum.
     """
     body = getattr(exc, "body", "") or ""
     if body:
         detail = _detail_from_body(body)
         if detail:
-            return detail
-    return str(exc)
+            return scrub(detail)
+    return scrub(str(exc))
 
 
 def provider_label(provider: str | None) -> str:
@@ -190,7 +200,12 @@ def stall_body(*, item: str, resumes: int, tool_calls: int, detail: str) -> str:
     **what would help** (ask again, smaller). Every clause is one the harness can back: it counts
     only the resumes that failed on the turn (`_wake.RESUME_CEILING`), so it says that many failed
     and makes no claim about how many tries there were in all.
+
+    `detail` is scrubbed again here, at the post (issue #791). What `stall_detail` hands over is
+    already clean, but a stall can also be posted from a claim's persisted reason, and a claim
+    written before the scrub reached `verbatim` carries the vendor's text as it was.
     """
+    detail = scrub(detail)
     progress = (
         f" It had made {tool_calls} tool call{'s' if tool_calls != 1 else ''} toward it."
         if tool_calls

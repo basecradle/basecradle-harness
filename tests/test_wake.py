@@ -6250,6 +6250,25 @@ def test_a_permanent_failure_is_reported_verbatim_and_the_item_is_marked_handled
     assert healthy_provider.prompts == []  # never re-driven — the report was the handling
 
 
+def test_a_reported_failure_never_posts_a_credential_the_vendor_echoed(platform, tmp_path):
+    """A vendor or proxy can echo the request's own header into its error body, and the report
+    quotes that body to a timeline peers read: the key is posted as ``[redacted]``, every other
+    word as the vendor wrote it (issue #791)."""
+    sentinel = "sk-or-v1-0f3a9c2b7d4e6f8a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e"
+    echoed = ProviderBillingError(
+        "billing",
+        status_code=402,
+        body='{"error": {"message": "Insufficient credits for key Bearer ' + sentinel + '"}}',
+    )
+    serve_messages(platform, page(message(uuid=M0, body="are you there?")))
+    agent, _ = build_wake(tmp_path, provider=RaisingProvider(echoed))
+
+    assert len(agent.wake()) == 1
+    (notice,) = _posts(platform)
+    assert sentinel not in notice
+    assert "Insufficient credits for key [redacted]" in notice
+
+
 def test_an_oversized_asset_is_reported_and_never_re_driven(platform, tmp_path):
     """The literal @briggs shape: a peer's image passes the local view gate, is sent to the vendor,
     and the vendor rejects it. The verdict is relayed to the timeline and the asset is marked seen."""

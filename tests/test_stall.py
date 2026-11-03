@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 
 import httpx
 import pytest
@@ -665,3 +666,82 @@ def test_a_long_vendor_error_is_capped_not_softened():
     detail = stall_detail(ProviderServerError("x " * 2_500, status_code=502))
     assert detail.startswith("last error: x x")
     assert len(detail) <= len("last error: ") + STALL_DETAIL_CAP
+
+
+# --- a credential in the vendor's words never reaches the note (issue #791) ---------------------
+
+#: A fabricated, correctly shaped OpenRouter key — the sentinel no posted note may carry.
+SENTINEL_KEY = "sk-or-v1-0f3a9c2b7d4e6f8a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e"
+#: A timeout whose text names the URL it was calling — a proxy that takes its key in the query.
+ECHOED_TIMEOUT = (
+    f"The read operation timed out calling https://proxy.example.com/v1/chat?api_key={SENTINEL_KEY}"
+)
+
+
+class _StallsEchoingTheKey(_WorksThenStalls):
+    def chat(self, messages, tools=None):
+        try:
+            return super().chat(messages, tools)
+        except ProviderTimeoutError:
+            raise ProviderTimeoutError(ECHOED_TIMEOUT) from None
+
+
+def test_a_stall_detail_scrubs_before_it_cuts():
+    """Scrubbed whole, then cut: a cut first could leave a bearer credential shorter than the rule's
+    eight characters — ``Bearer abc.`` — which no rule would then match."""
+    pad = "x" * (STALL_DETAIL_CAP - len("Bearer abc.") - 1)
+    detail = stall_detail(
+        ProviderServerError(f"{pad} Bearer abc.{SENTINEL_KEY[:20]} rejected", status_code=502)
+    )
+    assert "abc" not in detail
+
+
+def test_a_note_scrubs_a_detail_it_is_handed_raw():
+    """A claim written before the scrub reached `verbatim` carries the vendor's text as it was."""
+    body = stall_body(
+        item="your message", resumes=2, tool_calls=0, detail=f"last error: {ECHOED_TIMEOUT}"
+    )
+    assert SENTINEL_KEY not in body
+    assert "proxy.example.com/v1/chat[redacted]" in body
+
+
+def test_a_stall_note_never_posts_a_credential_the_vendor_echoed(platform, tmp_path):
+    """End to end: the resumes time out with a text echoing the key, and the posted note — and the
+    claim it is persisted on — carry ``[redacted]`` where the key was."""
+    _died_mid_tool_chain(platform, tmp_path, M0)
+    for _ in range(RESUME_CEILING):
+        serve_messages(platform, page(message(uuid=M0, body=BODY)))
+        _wake(tmp_path, _StallsEchoingTheKey(speaks=False)).wake()
+        assert SENTINEL_KEY not in (_claim(tmp_path).reason or "")
+
+    (note,) = _stall_posts(platform)
+    body = json.loads(note.content)["message"]["body"]
+    assert SENTINEL_KEY not in body
+    assert "proxy.example.com/v1/chat[redacted]" in body
+    assert (
+        "The read operation timed out calling" in body
+    )  # every other word, as the vendor wrote it
+
+
+def test_a_stall_posted_from_a_pre_fix_claim_never_posts_its_credential(platform, tmp_path):
+    """A claim persisted by an older harness holds the vendor's raw words; the note posted from it
+    on the next wake is scrubbed at the post."""
+    _died_mid_tool_chain(platform, tmp_path, M0)
+    for _ in range(RESUME_CEILING):
+        serve_messages(platform, page(message(uuid=M0, body=BODY)))
+        with pytest.raises(_Killed):
+            _wake(tmp_path, _DiesMidResume()).wake()
+    store = ClaimStore(tmp_path)
+    claim = _claim(tmp_path)
+    store._write(
+        store._path(TIMELINE_UUID, "messages", M0),
+        replace(claim, reason=f"last error: {ECHOED_TIMEOUT}"),
+    )
+
+    serve_messages(platform, page(message(uuid=M0, body=BODY)))
+    _wake(tmp_path, _WorksThenStalls(speaks=False)).wake()
+
+    (note,) = _stall_posts(platform)
+    body = json.loads(note.content)["message"]["body"]
+    assert SENTINEL_KEY not in body
+    assert "proxy.example.com/v1/chat[redacted]" in body
