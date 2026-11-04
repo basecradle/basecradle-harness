@@ -593,7 +593,7 @@ def test_a_real_wake_sigtermed_inside_the_model_call_logs_stopped_and_dies_by_th
     """
     child = _child(
         """
-        import socket, sys, threading, time
+        import signal, socket, sys, threading, time
         from pathlib import Path
 
         import httpx, respx
@@ -609,15 +609,19 @@ def test_a_real_wake_sigtermed_inside_the_model_call_logs_stopped_and_dies_by_th
         endpoint.listen()
 
         def accept_and_never_answer():
+            # The stop is the main thread's to take: block it here so the kernel can only deliver
+            # it there, where the SDK is waiting on this socket.
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
             connection, _ = endpoint.accept()
-            connection.recv(65536)
-            print("READY", flush=True)  # the request is on the wire; the SDK is reading
+            request = connection.recv(65536)
+            if request.startswith(b"POST /v1/responses"):  # the model call, never a metadata read
+                print("READY", flush=True)  # the request is on the wire; the SDK is reading
             time.sleep(60)
 
         threading.Thread(target=accept_and_never_answer, daemon=True).start()
         brain = OpenAIProvider(
             "gpt-4o",
-            api_key="sk-proj-not-a-real-key-000000000000",
+            api_key="sk-proj-FAKEfakeFAKEfake0123456789abcdef",
             base_url=f"http://127.0.0.1:{endpoint.getsockname()[1]}/v1",
         )
         with respx.mock(base_url=w.BC_URL, assert_all_called=False) as router:
@@ -639,9 +643,12 @@ def test_a_real_wake_sigtermed_inside_the_model_call_logs_stopped_and_dies_by_th
         """,
         tmp_path,
     )
-    _await_ready(child)
-    child.send_signal(signal.SIGTERM)
-    _, err = child.communicate(timeout=60)
+    try:
+        _await_ready(child)
+        child.send_signal(signal.SIGTERM)
+        _, err = child.communicate(timeout=60)
+    finally:
+        child.kill()  # a regressed stop must not leave the child running past the test
 
     assert child.returncode == -signal.SIGTERM, err
     lines = err.splitlines()
