@@ -2248,6 +2248,17 @@ def _quiet_transport_logs(level: int) -> None:
     logging setup does the demotion: it is skipped entirely when an embedding application already
     configured logging (see `_configure_logging`), so importing the harness as a library never
     silences a host application's transport logs.
+
+    **Both HTTPX families are demoted** (`_TRANSPORT_LOGGERS`). The `openai` and `anthropic` SDKs
+    run on HTTPX2, which logs the same line under its own ``httpx2`` logger, so demoting ``httpx``
+    alone left every brain call on those two SDKs in the journal (issue #410 moved `openai` there).
     """
     if level > logging.DEBUG:
-        logging.getLogger("httpx").setLevel(logging.WARNING)
+        for name in _TRANSPORT_LOGGERS:
+            logging.getLogger(name).setLevel(logging.WARNING)
+
+
+#: The loggers of every HTTP client family the harness drives, each of which writes one
+#: ``INFO HTTP Request: …`` line per request: ``httpx`` (the platform SDK, `openrouter`,
+#: `google-genai`, the harness's own HTTP) and ``httpx2`` (`openai`, `anthropic`).
+_TRANSPORT_LOGGERS = ("httpx", "httpx2")
