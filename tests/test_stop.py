@@ -17,8 +17,9 @@ These pin both halves and the line between them:
 - **A crash is still a crash.** A wake killed with no trap (`SIGKILL`) leaves no note and no
   settled claim, and its turn is resumed exactly as before.
 - **The process dies by the signal**, so `sudo` dies by -15 and the router's classification holds;
-  a second SIGTERM (the router signals every process, and `sudo` relays) is ignored. These two run a
-  real process, because a signal's disposition is a property of one.
+  a second SIGTERM (the router signals every process, and `sudo` relays) is ignored. These run a
+  real process, because a signal's disposition is a property of one — and one of them stops a real
+  SDK call blocked on its socket (issue #811).
 
 In-process, a stop is raised the way the handler raises it: `WakeStopped` from wherever the main
 thread happened to be — here, inside a tool, or inside the model call.
@@ -571,5 +572,90 @@ def test_a_real_wake_sigtermed_mid_tool_logs_stopped_and_dies_by_the_signal(tmp_
     end = next(line for line in err.splitlines() if "wake end" in line)
     assert "outcome=stopped" in end and "signal=TERM" in end
     assert any("wake stopped" in line and "reason=signal" in line for line in err.splitlines())
+    claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
+    assert claim is not None and claim.phase == "abandoned"
+
+
+def test_a_real_wake_sigtermed_inside_the_model_call_logs_stopped_and_dies_by_the_signal(
+    tmp_path,
+):
+    """End to end, in a real process, with the stop landing inside a **real** SDK call (issue #811).
+
+    The brain is the shipped `OpenAIProvider` driving the real `openai` SDK over HTTPX2 to a
+    loopback endpoint that accepts the request and never answers, so the main thread is blocked in
+    a socket read when SIGTERM arrives: where `@jt`'s live stop landed, 0.8 s after `context
+    attribution`. The handler must still reach the main thread there, unwind the SDK, and leave
+    both lines and a settled claim before the process dies by -15.
+
+    (What silenced `@jt` was not this: `runuser` caught a second TERM and SIGKILLed the harness
+    about 3 ms after the first, before any handler could log — a launcher fault no in-process code
+    can outrun, recorded on #811.)
+    """
+    child = _child(
+        """
+        import signal, socket, sys, threading, time
+        from pathlib import Path
+
+        import httpx, respx
+
+        from basecradle_harness import MessagesTool
+        from basecradle_harness import _wake
+        from basecradle_harness._openai import OpenAIProvider
+        from tests import test_wake as w
+
+        home = Path(sys.argv[1])
+        endpoint = socket.socket()
+        endpoint.bind(("127.0.0.1", 0))
+        endpoint.listen()
+
+        def accept_and_never_answer():
+            # The stop is the main thread's to take: block it here so the kernel can only deliver
+            # it there, where the SDK is waiting on this socket.
+            signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+            connection, _ = endpoint.accept()
+            request = connection.recv(65536)
+            if request.startswith(b"POST /v1/responses"):  # the model call, never a metadata read
+                print("READY", flush=True)  # the request is on the wire; the SDK is reading
+            time.sleep(60)
+
+        threading.Thread(target=accept_and_never_answer, daemon=True).start()
+        brain = OpenAIProvider(
+            "gpt-4o",
+            api_key="sk-proj-FAKEfakeFAKEfake0123456789abcdef",
+            base_url=f"http://127.0.0.1:{endpoint.getsockname()[1]}/v1",
+        )
+        with respx.mock(base_url=w.BC_URL, assert_all_called=False) as router:
+            router.route(host="127.0.0.1").pass_through()
+            router.get("/users/dashboard").mock(return_value=httpx.Response(200, json=w.dashboard()))
+            router.get(f"/timelines/{w.TIMELINE_UUID}").mock(
+                return_value=httpx.Response(200, json=w.timeline())
+            )
+            for path, body in (
+                ("/assets", w.asset_page()),
+                ("/webhook_events", w.event_page()),
+                ("/tasks", w.task_page()),
+            ):
+                router.get(path).mock(return_value=httpx.Response(200, json=body))
+            w.serve_messages(router, w.page(w.message(uuid=w.M0, body="Look into the owls?")))
+            agent, _ = w.build_wake(home, brain, tools=[MessagesTool()])
+            _wake.WakeAgent.from_env = classmethod(lambda cls, **kwargs: agent)
+            sys.exit(_wake.main(["--timeline", w.TIMELINE_UUID]))
+        """,
+        tmp_path,
+    )
+    try:
+        _await_ready(child)
+        child.send_signal(signal.SIGTERM)
+        _, err = child.communicate(timeout=60)
+    finally:
+        child.kill()  # a regressed stop must not leave the child running past the test
+
+    assert child.returncode == -signal.SIGTERM, err
+    lines = err.splitlines()
+    assert any(line.startswith("INFO context attribution") for line in lines), err
+    assert not any(line.startswith("INFO llm ") or " outcome=ok" in line for line in lines), err
+    end = next(line for line in lines if "wake end" in line)
+    assert "outcome=stopped" in end and "signal=TERM" in end
+    assert any("wake stopped" in line and "reason=signal" in line for line in lines)
     claim = ClaimStore(tmp_path).read(TIMELINE_UUID, M0, kind="messages")
     assert claim is not None and claim.phase == "abandoned"
