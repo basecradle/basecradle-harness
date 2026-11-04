@@ -5526,37 +5526,53 @@ def test_main_logs_a_hard_startup_failure_at_error(platform, wake_env, monkeypat
     assert any(m.startswith("wake failed") and "AI_MODEL" in m for m in errors)
 
 
-def test_httpx_is_demoted_so_its_transport_chatter_leaves_the_journal(monkeypatch):
+@pytest.mark.parametrize("name", ["httpx", "httpx2"])
+def test_httpx_is_demoted_so_its_transport_chatter_leaves_the_journal(monkeypatch, name):
     """The noise this replaces: one `INFO HTTP Request: …` per platform read, model call, and
-    blob fetch. The harness's own lines say the same thing with the context that line lacked."""
+    blob fetch. The harness's own lines say the same thing with the context that line lacked.
+
+    Both families: `openai` and `anthropic` run on HTTPX2, which logs under `httpx2`, and demoting
+    `httpx` alone left every brain call on those SDKs in the journal."""
     from basecradle_harness._basecradle import _configure_logging
 
-    httpx_logger = logging.getLogger("httpx")
-    saved = httpx_logger.level
+    transport_logger = logging.getLogger(name)
+    saved = transport_logger.level
     monkeypatch.delenv("HARNESS_LOG_LEVEL", raising=False)
     try:
-        httpx_logger.setLevel(logging.NOTSET)
+        transport_logger.setLevel(logging.NOTSET)
         with _isolated_root_logging():
             _configure_logging()
-            assert httpx_logger.level == logging.WARNING
+            assert transport_logger.level == logging.WARNING
     finally:
-        httpx_logger.setLevel(saved)
+        transport_logger.setLevel(saved)
 
 
-def test_a_debug_run_keeps_the_transport_lines(monkeypatch):
-    """An operator who turned the level down to DEBUG is asking for the wire — leave httpx be."""
+def test_every_http_family_the_suite_drives_logs_under_a_demoted_name():
+    """The demotion names loggers, so it holds only while each family logs where it is named: a
+    family that moved its request line to another logger would be back in the journal."""
+    import httpx2
+
+    from basecradle_harness._basecradle import _TRANSPORT_LOGGERS
+
+    for family in (httpx, httpx2):
+        assert family._client.logger.name in _TRANSPORT_LOGGERS
+
+
+@pytest.mark.parametrize("name", ["httpx", "httpx2"])
+def test_a_debug_run_keeps_the_transport_lines(monkeypatch, name):
+    """An operator who turned the level down to DEBUG is asking for the wire — leave the clients be."""
     from basecradle_harness._basecradle import _configure_logging
 
-    httpx_logger = logging.getLogger("httpx")
-    saved = httpx_logger.level
+    transport_logger = logging.getLogger(name)
+    saved = transport_logger.level
     monkeypatch.setenv("HARNESS_LOG_LEVEL", "DEBUG")
     try:
-        httpx_logger.setLevel(logging.NOTSET)
+        transport_logger.setLevel(logging.NOTSET)
         with _isolated_root_logging():
             _configure_logging()
-            assert httpx_logger.level == logging.NOTSET  # untouched
+            assert transport_logger.level == logging.NOTSET  # untouched
     finally:
-        httpx_logger.setLevel(saved)
+        transport_logger.setLevel(saved)
 
 
 def test_a_multi_item_wake_reports_its_turn_count_alongside_the_step_total(
