@@ -11,7 +11,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed: the `openai` and `anthropic` SDKs' per-request log line leaves the journal too
 
-At `INFO` the wake CLIs demote the HTTP client's `HTTP Request: POST … "200 OK"` line to `WARNING`,
+At `INFO` the wake and cleanup CLIs demote the HTTP client's `HTTP Request: POST … "200 OK"` line to `WARNING`,
 because the harness's own `llm`, `tool` and `posted` lines say the same thing with the context that
 line lacks. The demotion named only the `httpx` logger. The `openai` SDK (since its 3.0, issue #410)
 and the `anthropic` SDK run on HTTPX2, which logs under `httpx2`, so every brain call on those two

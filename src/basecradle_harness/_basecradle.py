@@ -2224,9 +2224,9 @@ def _configure_logging() -> None:
     setup always wins and a library import never hijacks logging. ``HARNESS_LOG_LEVEL`` tunes
     the level for a noisier or quieter run; the ``INFO`` default is the point.
 
-    ``httpx`` is demoted to ``WARNING`` on the way (`_quiet_transport_logs`) — at ``INFO`` it
-    narrates every HTTP call the platform SDK and the model SDKs make, which was the single
-    loudest thing in the journal and said nothing the harness's own lines don't say better.
+    ``httpx`` and ``httpx2`` are demoted to ``WARNING`` on the way (`_quiet_transport_logs`) — at
+    ``INFO`` each narrates every HTTP call the platform SDK and the model SDKs make, which was the
+    single loudest thing in the journal and said nothing the harness's own lines don't say better.
     """
     if logging.getLogger().handlers:
         return
@@ -2236,7 +2236,7 @@ def _configure_logging() -> None:
 
 
 def _quiet_transport_logs(level: int) -> None:
-    """Demote ``httpx``'s per-request chatter to ``WARNING`` — the harness's own lines replace it.
+    """Demote the HTTP clients' per-request chatter to ``WARNING`` — the harness's own lines replace it.
 
     ``INFO HTTP Request: POST https://api.openai.com/v1/responses "HTTP/1.1 200 OK"`` fired once
     per platform read, model call, and asset fetch: the dominant noise in Live Tail, and pure

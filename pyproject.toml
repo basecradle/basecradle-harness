@@ -163,7 +163,7 @@ Issues = "https://github.com/basecradle/basecradle-harness/issues"
 # offline — the SDK's httpx transport is respx-mocked, so it never touches the network.
 # `google-genai` too: the Google adapter hands the SDK its own `httpx` client, which respx mocks, and
 # the tests stub the service-account token refresh (the one call `google-auth` makes over `requests`).
-# `anthropic` too: its client runs on `httpx`, which respx mocks, so the adapter's real request bodies
+# `anthropic` too: its client runs on HTTPX2, which respx mocks (`conftest._HTTPCoreBothMocker`), so the adapter's real request bodies
 # — the cache breakpoint above all — are read off the wire offline.
 # `ruff`'s floor is a correctness constraint, not a preference: the *default rule set is
 # version-dependent* (0.16 took it from 59 rules to 413, and it now formats Python blocks inside
