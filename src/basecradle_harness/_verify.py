@@ -60,7 +60,7 @@ import sys
 import traceback
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
 
@@ -652,7 +652,7 @@ def _record_success(root: Path, report: VerifyReport) -> str | None:
         "provider": report.declared_provider,
         "declared_files": len(report.declared_files),
         "opt_in": list(report.granted),
-        "checked": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "checked": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     try:
         path.write_text(json.dumps(body, indent=2, sort_keys=True) + "\n", encoding="utf-8")

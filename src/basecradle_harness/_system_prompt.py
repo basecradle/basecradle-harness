@@ -46,7 +46,7 @@ the locked policy gates shell/exec, which this never touches.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from basecradle_harness._install import _prompts_installed, config_home
@@ -259,7 +259,7 @@ class SystemPromptEditTool(Tool):
         if not path.exists():
             return None
         current = path.read_text(encoding="utf-8")
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         backup = path.with_name(f"{path.name}.{stamp}.bak")
         suffix = 1
         while backup.exists():

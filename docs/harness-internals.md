@@ -654,8 +654,8 @@ issue #484 — one noun, three senses. What follows is unchanged by that move ex
   install,
   and an extra would force a NOC wrapper allow-list change plus a per-agent inventory edit across
   the fleet for a capability every agent is supposed to have.
-- **The `av` floor is 17, not the 18 the issue named, and the reason is this package's own Python
-  floor.** `av` 18 dropped Python 3.10 (`requires_python >=3.11`); the Stack pins 3.10+ and CI runs
+- **The `av` floor was 17, not the 18 the issue named, and the reason was this package's own Python
+  floor** (raised to 3.11 by issue #816, which moved the `av` floor to 18 and `pillow` to `>=13,<14`). `av` 18 dropped Python 3.10 (`requires_python >=3.11`); the Stack pins 3.10+ and CI runs
   it. A floor of 18 makes `basecradle-harness` uninstallable on 3.10 — so the range spans the two
   majors the matrix actually resolves (17.x on 3.10, 18.x on 3.11+), and CI's 3.10→3.14 legs
   exercise **both**. `pillow` is `>=12,<13` rather than the issue's `>=11,<12`, which would have

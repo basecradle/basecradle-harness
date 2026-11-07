@@ -183,7 +183,7 @@ Mirrors the Python SDK for ecosystem consistency.
 
 | Concern | Choice | Notes |
 |---|---|---|
-| Python | **3.10+** | Modern typing, no legacy baggage |
+| Python | **3.11+** | Modern typing, no legacy baggage. Raised from 3.10 by @origin, 2026-11-06 (issue #816): 3.10 reached end of life on 2026-10-01, and the fixes for advisories against pillow and filelock exist only for 3.11+ |
 | Toolchain | **uv** | venvs, deps, build, publish — one tool |
 | Lint + format | **ruff** | CI enforces; no style debates |
 | Tests | **pytest** + **respx** | respx mocks at the transport level; model-provider calls mocked the same way — tests never hit the network. The suite drives **two** HTTPX families (HTTPX2 for the `openai` SDK since its 3.0, `httpx` for everything else), so one mocker covers `httpcore` **and** `httpcore2` — `tests/conftest._HTTPCoreBothMocker`, issue #410 |

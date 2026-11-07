@@ -5,7 +5,7 @@ description = "The safe, modular native harness for BaseCradle — an AI Researc
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [{ name = "Drawk Kwast" }]
 keywords = ["basecradle", "ai", "agents", "agentic", "framework", "harness"]
 classifiers = [
@@ -13,7 +13,6 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -37,18 +36,16 @@ dependencies = [
     # no-shell boundary: its wheels bundle FFmpeg, so frames are decoded **in-process** — no
     # `ffmpeg` subprocess, no apt package, nothing for `Policy.locked()` to have an opinion about.
     #
-    # The `av` floor is 17, not 18, and the reason is this package's own Python floor: `av` 18
-    # dropped Python 3.10 (`requires_python >=3.11`), which the Stack pins at 3.10+ and CI still
-    # exercises. A floor of 18 would make `basecradle-harness` uninstallable on 3.10. So the range
-    # spans the two majors the matrix actually resolves — 17.x on 3.10, 18.x on 3.11+ — and CI's
-    # 3.10→3.14 legs exercise **both**, which is what makes the wider range honest rather than
-    # hopeful. `<19` keeps the next major from arriving unreviewed. Raise the floor to 18 the day
-    # the Python floor moves to 3.11, not before.
-    "av>=17,<19",
+    # The `av` floor is 18. It was 17 while this package supported Python 3.10, which `av` 18
+    # dropped; the Python floor moved to 3.11 (@origin, 2026-11-06, issue #816), and with it this
+    # one, as its own comment had said it would. `<19` keeps the next major from arriving
+    # unreviewed.
+    "av>=18,<19",
     # Pillow encodes the sampled frames as JPEG (`VideoFrame.to_image()` hands back a PIL image).
-    # Floor is the current major, major-capped in this repo's usual style; 12.x ships wheels for
-    # every Python in the CI matrix (cp310–cp315).
-    "pillow>=12,<13",
+    # Floor is the current major, major-capped in this repo's usual style. 13 is the floor, not
+    # merely allowed: every fix for the advisories against 12.x is in 13.0.0 (issue #816), so a
+    # range that still admitted 12 would let a resolver keep a vulnerable install.
+    "pillow>=13,<14",
 ]
 
 # The harness reaches an LLM only through a vendor's official SDK — never hand-rolled HTTP.
@@ -220,8 +217,8 @@ ignore = [
     # PYI034 non-self-return-type — flake8-pyi is written for stub files. These are runtime
     # classes (the provider adapters and their `_ErrorMapper`s), none of them subclassed anywhere
     # in the package or its tests, so the concrete return type on `__enter__` is both accurate and
-    # what a reader wants. `Self` needs `typing_extensions` on Python 3.10, which the core refuses
-    # to take on ("every dependency is debt") for a type-checker this repo's CI does not run.
+    # what a reader wants. `typing.Self` exists on every supported Python (3.11+), but rewriting
+    # the adapters' annotations for it buys nothing for a type-checker this repo's CI does not run.
     "PYI034",
     # RUF022 unsorted-dunder-all — `__all__` is ordered by concept and carries section comments
     # ("# The agent", "# The context budget", …) that document what each group *is*. Alphabetizing

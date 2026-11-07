@@ -165,7 +165,7 @@ def test_a_usage_block_with_no_counts_is_no_usage():
 
 
 def test_the_billing_day_is_googles_pacific_day():
-    late_utc = datetime.datetime(2027, 1, 1, 5, 0, tzinfo=datetime.timezone.utc)
+    late_utc = datetime.datetime(2027, 1, 1, 5, 0, tzinfo=datetime.UTC)
     assert billing_day(late_utc) == datetime.date(2026, 12, 31)
 
 

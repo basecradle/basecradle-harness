@@ -76,7 +76,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
 
@@ -1342,10 +1342,10 @@ def _filed(raw: object) -> str | None:
     if not isinstance(raw, str) or "T" not in raw:
         return None  # nothing recorded, or a date with no time: a minute is never invented
     try:
-        stamp = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        stamp = datetime.fromisoformat(raw.strip())
     except ValueError:
         return None
-    return stamp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return stamp.astimezone(UTC).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _timeline_of(hit: dict) -> str | None:

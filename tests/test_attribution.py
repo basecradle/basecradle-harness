@@ -8,7 +8,7 @@ second is what makes those shares true; the third is what makes them useful.
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -35,7 +35,7 @@ from tests.test_session import ScriptedProvider, calls_tool, text
 
 # Aware UTC, matching what `Engine` actually feeds `_step_note` (`datetime.now(timezone.utc)`) —
 # the note labels itself UTC, so the fixture should be the same kind of value the note renders.
-NOW = datetime(2026, 7, 26, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 26, 12, 0, 0, tzinfo=UTC)
 
 
 class Weather(Tool):

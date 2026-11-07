@@ -80,7 +80,7 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -478,8 +478,9 @@ def _parse_created_at(value: str) -> datetime:
     ``datetime.fromisoformat``, both load-bearing so the read-pace math (`ReadPacer`) never
     crashes a wake on a real-world stamp:
 
-    - **Trailing ``Z``.** ``fromisoformat`` did not accept the ``Z`` military-UTC suffix until
-      Python 3.11, but we target 3.10+, so ``Z`` is normalized to ``+00:00`` first.
+    - **Trailing ``Z`` or ``z``.** ``fromisoformat`` takes an uppercase ``Z`` from Python 3.11,
+      but still refuses a lowercase ``z`` on every version (3.11 and 3.14 checked), so both are
+      normalized to ``+00:00`` first.
     - **A naive stamp is assumed UTC.** Every agent runs UTC on the box and the platform emits
       UTC; a stamp that somehow arrives without an offset is made tz-aware as UTC, so
       subtracting it from an aware ``now`` never raises the naive/aware ``TypeError``.
@@ -489,7 +490,7 @@ def _parse_created_at(value: str) -> datetime:
         text = text[:-1] + "+00:00"
     parsed = datetime.fromisoformat(text)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
+        return parsed.replace(tzinfo=UTC)
     return parsed
 
 

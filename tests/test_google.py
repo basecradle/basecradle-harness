@@ -123,9 +123,9 @@ def _no_real_google_auth(monkeypatch):
 
     def refresh(self, request):
         self.token = FAKE_TOKEN
-        self.expiry = datetime.datetime.now(datetime.timezone.utc).replace(
-            tzinfo=None
-        ) + datetime.timedelta(hours=1)
+        self.expiry = datetime.datetime.now(datetime.UTC).replace(tzinfo=None) + datetime.timedelta(
+            hours=1
+        )
 
     def forbidden(*args, **kwargs):
         raise AssertionError("a test reached a real Google credential or endpoint")
@@ -1209,9 +1209,9 @@ def test_an_expired_token_is_refreshed_by_the_adapter_on_its_own_terms(
     def refresh(self, request):
         transports.append(type(request).__name__)
         self.token = FAKE_TOKEN
-        self.expiry = datetime.datetime.now(datetime.timezone.utc).replace(
-            tzinfo=None
-        ) + datetime.timedelta(hours=1)
+        self.expiry = datetime.datetime.now(datetime.UTC).replace(tzinfo=None) + datetime.timedelta(
+            hours=1
+        )
 
     monkeypatch.setattr(service_account.Credentials, "refresh", refresh)
     router.post(GENERATE).mock(return_value=ok(text("hi")))

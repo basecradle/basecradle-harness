@@ -78,7 +78,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
 from urllib.parse import quote, unquote
@@ -1391,7 +1391,7 @@ class ReadPacer:
         self.floor_seconds = float(floor_seconds)
         # Injectable seams (mirror `WakeBreaker`'s): production uses the wall clock and a real
         # sleep; a test drives `clock` directly and records `sleep` so it asserts without waiting.
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._sleep = sleep or time.sleep
 
     @classmethod
@@ -5469,7 +5469,7 @@ def _now_line() -> str:
     explicit and a conversion instruction rides with the anchor: when a peer names a locale,
     convert from UTC to that timezone first, because the local day can differ from the UTC day.
     """
-    n = datetime.now(timezone.utc)
+    n = datetime.now(UTC)
     anchor = f"Current Time: {n:%Y-%m-%d %H:%M:%S} UTC (+00:00, {n:%A})"
     return f"{anchor}\n{_NOW_LINE_INSTRUCTION}"
 

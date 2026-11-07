@@ -8,7 +8,7 @@ emitters are asserted through `caplog`.
 
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -1078,7 +1078,7 @@ def test_the_fact_heads_stay_plain_so_the_dashboards_extraction_anchors_survive(
 def test_the_tool_lines_outcome_is_colored_but_its_head_is_not(caplog):
     # The one line carrying both halves of the split: ` tool name=` is a dashboard anchor and stays
     # plain, while its `outcome=` is a verdict and does not.
-    started = datetime(2026, 8, 17, tzinfo=timezone.utc)
+    started = datetime(2026, 8, 17, tzinfo=UTC)
     engine = Engine(provider=None, tools=ToolRegistry(), clock=lambda: started)
 
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):

@@ -24,7 +24,7 @@ import shutil
 import sys
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from importlib import metadata
 from pathlib import Path
@@ -4432,7 +4432,7 @@ def test_an_activated_task_reads_as_a_message_to_the_room():
 
 # The fixtures' `created_at` is `2026-06-04T00:00:00.000Z`; a clock pinned to that same
 # instant makes a message's age exactly 0, so the paced delay is the full read-time.
-PACE_CREATED = datetime(2026, 6, 4, 0, 0, 0, tzinfo=timezone.utc)
+PACE_CREATED = datetime(2026, 6, 4, 0, 0, 0, tzinfo=UTC)
 
 
 class RecordingSleep:
@@ -5264,7 +5264,7 @@ def test_parse_created_at_handles_z_suffix_and_naive_stamps():
     assert offset == PACE_CREATED
 
     naive = _parse_created_at("2026-06-04T00:00:00")  # no offset → assumed UTC, aware
-    assert naive == PACE_CREATED and naive.tzinfo is timezone.utc
+    assert naive == PACE_CREATED and naive.tzinfo is UTC
 
 
 # --- the wake's log trail (issue #272) ----------------------------------------

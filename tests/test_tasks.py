@@ -10,7 +10,7 @@ constitution asks (mock at the transport level, never the live API).
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -33,7 +33,7 @@ T_ONE = "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"
 T_TWO = "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70"
 
 # A fixed "now" so relative offsets resolve deterministically.
-FIXED_NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+FIXED_NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=UTC)
 
 
 # --- wire payload builders ---------------------------------------------------
