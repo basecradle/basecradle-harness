@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from basecradle_harness._tools import Tool
@@ -343,7 +343,7 @@ def _default_path() -> Path:
 
 def _now() -> str:
     """An ISO 8601 UTC timestamp for created_at / updated_at."""
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _migrate(conn: sqlite3.Connection) -> None:

@@ -10,6 +10,7 @@ once the model has answered, so a viewed image is never re-sent.
 import json
 import logging
 import re
+from datetime import UTC
 
 import httpx
 import pytest
@@ -686,9 +687,9 @@ def test_a_step_counter_note_precedes_every_provider_call():
 
 
 def test_the_counter_note_carries_a_fresh_timestamp():
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    stamp = datetime(2026, 7, 4, 20, 4, 12, tzinfo=timezone.utc)
+    stamp = datetime(2026, 7, 4, 20, 4, 12, tzinfo=UTC)
     provider = ScriptedProvider(Message.assistant(content="done"))
     engine = Engine(provider, ToolRegistry(), clock=lambda: stamp)
     history = [Message.user("go")]

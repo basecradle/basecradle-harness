@@ -45,7 +45,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from basecradle_harness import _arguments
@@ -429,7 +429,7 @@ class Engine:
         #: call, never a step the model was promised.
         self.steps_used = 0
         self.turns_run = 0
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._clock = clock or (lambda: datetime.now(UTC))
         self._sleep = sleep or time.sleep
 
     def run(

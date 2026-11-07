@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import itertools
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from basecradle import BaseCradleError
 
@@ -274,20 +274,20 @@ def _normalize_activate_at(value: str) -> str:
         when = _utcnow() + timedelta(seconds=amount * _UNIT_SECONDS[unit])
         return when.isoformat()
 
-    # Absolute ISO-8601. fromisoformat (3.10) doesn't take a trailing 'Z', so map
-    # it to the equivalent offset; a naive timestamp is treated as UTC.
+    # Absolute ISO-8601; `fromisoformat` takes a trailing 'Z' on every supported Python (3.11+).
+    # A naive timestamp is treated as UTC.
     try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         raise ValueError(
             f"activate_at {value!r} is not a relative offset (like '+2h') "
             "or an ISO-8601 timestamp (like '2026-06-10T15:00:00Z')."
         ) from None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed.isoformat()
 
 
 def _utcnow() -> datetime:
     """Current UTC time. A seam tests patch to make relative offsets deterministic."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)

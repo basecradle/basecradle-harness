@@ -255,7 +255,7 @@ def describe_memory_provider(provider: MemoryProvider) -> tuple[str, str | None]
       ``harness_version``, and a second copy would imply a pin that does not exist. ``None`` for
       a custom provider too — the harness does not know which distribution ships someone else's
       class (a module's name is not its distribution's, and the stdlib's index of the two is
-      incomplete on Python 3.10), and inventing a guess is worse than a null in a field a drift
+      incomplete), and inventing a guess is worse than a null in a field a drift
       audit reads. ``mempalace`` with ``None``, though, is not a shrug but a **defect signal**:
       the provider bound (binding is lazy — the extra is imported only on the first
       `observe`/`context`) while its package is absent, so the agent will lose its palace at the

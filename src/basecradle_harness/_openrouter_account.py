@@ -50,7 +50,7 @@ import os
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -252,7 +252,7 @@ class OpenRouterAccountBalanceTool(Tool):
 
     def _now_utc(self) -> datetime:
         """Wall-clock now, in UTC — the ``as of`` stamp on a freshly-read figure."""
-        return datetime.now(timezone.utc)
+        return datetime.now(UTC)
 
 
 def _parse_credits(data: dict[str, Any]) -> _Credits:

@@ -7,6 +7,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.179.0] - 2026-11-07
+
+### Changed: Python 3.11 is the floor, and `pillow` moves to 13 for its security fixes (issue #816)
+
+**Breaking for anyone on Python 3.10:** `requires-python` is now `>=3.11`, so pip will not install this release on 3.10 and keeps that environment on 0.178.0. Python 3.10 reached end of life on 2026-10-01, and @origin raised the floor on 2026-11-06. Every box the fleet runs is on Python 3.12.
+
+The reason is security. The first dependency scan of this repository's `uv.lock` (issue #816) found about 45 advisories against `pillow` 12.3.0, 6 of them Critical, and nine against `filelock` 3.29.4. Every fix for both is in a release that supports only 3.11+: `pillow` 13.0.0 and `filelock` 4.2.1. `pillow` is a base dependency, and the old `pillow>=12,<13` range held every install below the fix, the fleet's included.
+
+- **`pillow>=13,<14`**, up from `>=12,<13`. 13 is the floor, so no resolver can keep a 12.x install. The harness only uses Pillow to encode PyAV-decoded video frames as JPEG, and never opens bytes a peer sent. Most of the 12.x decoder advisories therefore had no path through harness code, but any other code in the same environment could reach them.
+- **`av>=18,<19`**, up from `>=17,<19`. The floor rises to 18, as the range's own comment said it would on the day the Python floor reached 3.11.
+- **`filelock` is not a direct dependency.** It reaches the `mempalace` extra through `huggingface-hub`, and a fresh install already resolves 4.x on 3.11+. The lock moves to 4.2.1.
+
+The other 28 advisories that scan found were against packages a fresh install already resolves past, so they were fixed in `uv.lock` alone without a release (#817). Four chromadb advisories have no fix and no reach (they are in ChromaDB's HTTP server, and MemPalace opens only an embedded client). They are dismissed with that reason in `osv-scanner.toml`, which the scan reads (#818).
+
 ## [0.178.0] - 2026-11-04
 
 ### Fixed: the `openai` and `anthropic` SDKs' per-request log line leaves the journal too

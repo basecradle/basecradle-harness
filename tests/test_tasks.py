@@ -10,7 +10,7 @@ constitution asks (mock at the transport level, never the live API).
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -33,7 +33,7 @@ T_ONE = "019e7751-4a1b-7c2d-8e3f-1a2b3c4d5e6f"
 T_TWO = "019e7752-5b2c-7d3e-9f40-2b3c4d5e6f70"
 
 # A fixed "now" so relative offsets resolve deterministically.
-FIXED_NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=timezone.utc)
+FIXED_NOW = datetime(2026, 6, 9, 12, 0, 0, tzinfo=UTC)
 
 
 # --- wire payload builders ---------------------------------------------------
@@ -366,6 +366,13 @@ def test_normalize_relative_offsets(value, expected, monkeypatch):
 
 def test_normalize_absolute_with_trailing_z():
     assert _normalize_activate_at("2026-06-10T15:00:00Z") == "2026-06-10T15:00:00+00:00"
+
+
+def test_normalize_a_date_with_no_time_is_refused_even_with_a_z():
+    # The old `.replace("Z", "+00:00")` turned "2026-06-10Z" into "2026-06-10+00:00", which
+    # `fromisoformat` reads as midnight with "+" as the separator: a time nobody wrote.
+    with pytest.raises(ValueError, match="ISO-8601"):
+        _normalize_activate_at("2026-06-10Z")
 
 
 def test_normalize_absolute_naive_is_read_as_utc():

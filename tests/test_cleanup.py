@@ -1189,7 +1189,7 @@ def test_a_refused_dangling_symlink_is_not_mistaken_for_a_removal(tmp_path):
 def test_an_artifact_the_box_will_not_even_stat_is_reported_and_never_ends_the_sweep(
     tmp_path, caplog
 ):
-    # On Python 3.10 `Path.is_dir` re-raises every OSError but ENOENT/ENOTDIR/EBADF/ELOOP, so a
+    # Up to Python 3.12 `Path.is_dir` re-raises every OSError but ENOENT/ENOTDIR/EBADF/ELOOP, so a
     # `stat` refused EACCES escapes an unguarded look — out of `_remove`, out of `sweep`, past
     # `main`'s handler — abandoning every orphan behind it with nothing in `blocked` and a raw
     # traceback where the one-line diagnosis belongs.

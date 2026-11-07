@@ -55,7 +55,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from typing import Any
 
 from basecradle_harness._observability import ComputedCost
@@ -470,13 +470,13 @@ def known(model: str) -> bool:
 
 def billing_day(now: datetime | None = None) -> date:
     """The billing day it is in Google's billing timezone — UTC where the zone data is missing."""
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     try:
         from zoneinfo import ZoneInfo
 
         return now.astimezone(ZoneInfo(_BILLING_TZ)).date()
     except Exception:  # noqa: BLE001 - a box without tz data prices by the UTC day, never fails
-        return now.astimezone(timezone.utc).date()
+        return now.astimezone(UTC).date()
 
 
 def _tiers(model: str, location: str, day: date) -> tuple[Tier, Tier] | None:
