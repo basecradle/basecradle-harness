@@ -170,7 +170,8 @@ the one behavioral difference the fence makes there.
 ## CI and bot PRs
 
 This repo's CI uses **no** Actions secrets (lint + tests on public inputs), so a bot-authored PR
-runs CI normally and needs no actor guard. The one workflow that reads secrets,
-`dependency-security-scan.yml`, runs only on its schedule and `workflow_dispatch`, never on a PR. If a secret-dependent workflow is ever added, generalize
+runs CI normally and needs no actor guard. The two workflows that read secrets never run on a
+PR: `dependency-security-scan.yml` runs on its schedule and `workflow_dispatch`, and
+`needs-human-alert.yml` on an issue being labelled. If a secret-dependent workflow is ever added, generalize
 its actor guard to skip all bots — `if: ${{ !endsWith(github.actor, '[bot]') }}` — because
 bot-triggered PRs run in a restricted context where Actions secrets resolve empty.

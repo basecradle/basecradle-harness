@@ -742,6 +742,19 @@ def test_nothing_it_writes_can_mention_a_github_account() -> None:
         assert "@" not in bare.replace("`@origin`", ""), plan.title
 
 
+def test_a_stray_backtick_upstream_cannot_free_a_mention() -> None:
+    # One upstream backtick would pair with the span opened around "@evil" and leave the
+    # name bare. Every backtick left in the cell must be one this scan put around an @name.
+    title = "Fix in `parse() reported by @evil and @org/pkg"
+    plan = sole(scan_of(pypi("httpx", "GHSA-1111-2222-3333", "high", title=title)).plans([]))
+
+    assert plan.body is not None
+    row = next(line for line in plan.body.splitlines() if "GHSA-1111-2222-3333" in line)
+    title_cell = row.split(" | ")[-1]
+    assert title_cell == "Fix in parse() reported by `@evil` and `@org/pkg` |"
+    assert re.sub(r"`@[\w\-/.]+`", "", title_cell).count("`") == 0
+
+
 def test_a_change_comment_cannot_mention_a_github_account_either() -> None:
     filed = sole(scan_of(pypi("h11", "GHSA-4444-5555-6666", "low")).plans([]))
     plan = sole(
