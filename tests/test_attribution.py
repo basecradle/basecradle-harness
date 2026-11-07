@@ -33,7 +33,7 @@ from basecradle_harness._context import TOOL_RESULT_CAP
 from basecradle_harness._engine import _step_note, is_step_note
 from tests.test_session import ScriptedProvider, calls_tool, text
 
-# Aware UTC, matching what `Engine` actually feeds `_step_note` (`datetime.now(timezone.utc)`) —
+# Aware UTC, matching what `Engine` actually feeds `_step_note` (`datetime.now(UTC)`) —
 # the note labels itself UTC, so the fixture should be the same kind of value the note renders.
 NOW = datetime(2026, 7, 26, 12, 0, 0, tzinfo=UTC)
 

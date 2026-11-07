@@ -368,6 +368,13 @@ def test_normalize_absolute_with_trailing_z():
     assert _normalize_activate_at("2026-06-10T15:00:00Z") == "2026-06-10T15:00:00+00:00"
 
 
+def test_normalize_a_date_with_no_time_is_refused_even_with_a_z():
+    # The old `.replace("Z", "+00:00")` turned "2026-06-10Z" into "2026-06-10+00:00", which
+    # `fromisoformat` reads as midnight with "+" as the separator: a time nobody wrote.
+    with pytest.raises(ValueError, match="ISO-8601"):
+        _normalize_activate_at("2026-06-10Z")
+
+
 def test_normalize_absolute_naive_is_read_as_utc():
     assert _normalize_activate_at("2026-06-10T15:00:00") == "2026-06-10T15:00:00+00:00"
 

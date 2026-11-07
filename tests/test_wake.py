@@ -5256,7 +5256,7 @@ def test_pace_max_builds_env_tunable(monkeypatch):
 
 
 def test_parse_created_at_handles_z_suffix_and_naive_stamps():
-    """The ISO parse normalizes a `Z` suffix (3.10-safe) and assumes UTC for a naive stamp."""
+    """The ISO parse normalizes a `Z` or `z` suffix and assumes UTC for a naive stamp."""
     z = _parse_created_at("2026-06-04T00:00:00.000Z")
     assert z == PACE_CREATED and z.tzinfo is not None
 

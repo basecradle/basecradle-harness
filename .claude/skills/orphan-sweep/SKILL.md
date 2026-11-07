@@ -1,6 +1,6 @@
 ---
 name: orphan-sweep
-description: The reasoning behind the orphan sweep's OS fence and its error classification — the fleet unit's systemd sandbox (ProtectHome=read-only + ReadWritePaths) and the NOC's three measurements on systemd 255, why the fence is around the home and not around memory, why only a refused write fails the run and every other fault stays a WARNING, why _present exists, the Path.is_dir version split across 3.10–3.14, and shutil.rmtree's abandoned walk. Use before editing _cleanup.py (the purge, stranded-temp and claims passes, _note_blocked, _present, _locked, LockUnavailable), the sweep's exit status or log levels, or anything that proposes a change to the basecradle-harness-cleanup unit's sandbox. The invariants live in CLAUDE.md → Config Home → Security invariants (the memory-persists and OS-fence bullets); the sweep's mechanics are in docs/harness-internals.md; this skill carries the reasoning.
+description: The reasoning behind the orphan sweep's OS fence and its error classification — the fleet unit's systemd sandbox (ProtectHome=read-only + ReadWritePaths) and the NOC's three measurements on systemd 255, why the fence is around the home and not around memory, why only a refused write fails the run and every other fault stays a WARNING, why _present exists, the Path.is_dir version split across 3.11–3.14, and shutil.rmtree's abandoned walk. Use before editing _cleanup.py (the purge, stranded-temp and claims passes, _note_blocked, _present, _locked, LockUnavailable), the sweep's exit status or log levels, or anything that proposes a change to the basecradle-harness-cleanup unit's sandbox. The invariants live in CLAUDE.md → Config Home → Security invariants (the memory-persists and OS-fence bullets); the sweep's mechanics are in docs/harness-internals.md; this skill carries the reasoning.
 ---
 
 # Orphan Sweep — The OS Fence and the Refused-Write Rule
@@ -36,7 +36,7 @@ Where a removal is the unit of judgement the bound is **errno-agnostic** — eve
 
 ## Two Traps a Refactor Will Undo
 
-- **Looking can be refused too, and the version matrix splits on how.** Up to 3.12 `Path.is_dir` re-raises everything but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an unguarded `stat` escapes the sweep and abandons every orphan behind it with nothing in `blocked`; from 3.13 it swallows the same error and the refusal only shows up at the `unlink`, where `_present` has to catch it. Miss either and the sweep is silently green on half the matrix — a local run is one Python, CI's matrix is five.
+- **Looking can be refused too, and the version matrix splits on how.** Up to 3.12 `Path.is_dir` re-raises everything but `ENOENT`/`ENOTDIR`/`EBADF`/`ELOOP`, so an unguarded `stat` escapes the sweep and abandons every orphan behind it with nothing in `blocked`; from 3.13 it swallows the same error and the refusal only shows up at the `unlink`, where `_present` has to catch it. Miss either and the sweep is silently green on half the matrix — a local run is one Python, CI's matrix is four.
 - **`shutil.rmtree` abandons its walk on the first error**, a vanished sibling included, so the best-effort salvage pass has to run for every error class, or a half-purged directory reads as gone.
 
 ## The Honest Limit

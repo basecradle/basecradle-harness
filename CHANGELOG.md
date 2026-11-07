@@ -19,7 +19,7 @@ The reason is security. The first dependency scan of this repository's `uv.lock`
 - **`av>=18,<19`**, up from `>=17,<19`. The floor rises to 18, as the range's own comment said it would on the day the Python floor reached 3.11.
 - **`filelock` is not a direct dependency.** It reaches the `mempalace` extra through `huggingface-hub`, and a fresh install already resolves 4.x on 3.11+. The lock moves to 4.2.1.
 
-The other 28 advisories that scan found were against packages a fresh install already resolves past, so they were fixed in `uv.lock` alone without a release (#817). Four chromadb advisories have no fix and no reach (they are in ChromaDB's HTTP server, and MemPalace opens only an embedded client). They are dismissed in the scan's configuration with that reason.
+The other 28 advisories that scan found were against packages a fresh install already resolves past, so they were fixed in `uv.lock` alone without a release (#817). Four chromadb advisories have no fix and no reach (they are in ChromaDB's HTTP server, and MemPalace opens only an embedded client). They are dismissed with that reason in `osv-scanner.toml`, which the scan reads (#818).
 
 ## [0.178.0] - 2026-11-04
 
