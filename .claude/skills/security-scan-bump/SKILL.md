@@ -1,0 +1,41 @@
+---
+name: security-scan-bump
+description: The response procedure for when the daily dependency scan files its `[SECURITY] Dependency Advisories Against main (Daily Scan)` issue (or its `Could Not Reach a Verdict` issue) on this repository — ship a minimal `uv.lock` bump on its own branch (or a `pyproject.toml` range move that ships in a release), read the Critical and High advisories against the harness and the fleet, verify the scan is clean, close by hand. Use when that issue is open, when an advisory against a package in `uv.lock` turns up any other way, when the scan's run is red, or before dismissing an advisory in `osv-scanner.toml`. How the scan works lives in CLAUDE.md → "Responding to the Daily Dependency Scan"; this skill carries the steps.
+---
+
+# Responding to the Daily Dependency Scan
+
+`.github/workflows/dependency-security-scan.yml` runs `osv-scanner` against `uv.lock` on `main` every day (the schedule is the workflow's `cron`); the decisions are in `scripts/dependency_security_scan.py`. A finding arrives as one issue, `[SECURITY] Dependency Advisories Against main (Daily Scan)`, carrying `needs-human` when anything is rated High or Critical (it has paged `@origin`) and `needs-capital` otherwise. It is the capital's `security-scan-bump` procedure, carried for what applies to a Python package the NOC deploys to the fleet.
+
+## What the Issue Does on Its Own
+
+- **It updates itself and never closes itself.** A new advisory is added with a comment and its label; one re-rated High or Critical after it was filed lower pages then; one that stops being reported is noted; a clean scan says so once. Close it by hand once the fix is on `main` and a scan run is clean.
+- **Closing the issue dismisses nothing.** While an advisory stands, the next scan files a new issue, and pages again if it is High or Critical.
+- **`Daily Dependency Security Scan Could Not Reach a Verdict`** is the other issue it can file (`needs-capital`): `osv-scanner` crashed, could not read `uv.lock`, or could not reach the OSV API (it exits 127 with an empty report, which is why the exit status is checked against the report). Read the run log, fix it, and re-run the workflow by hand; the run that reaches a verdict closes that issue itself. Until then the clock is stopped. A run that dies before it can file anything (the App token will not mint, the `osv-scanner` download fails its checksum) is only a red run in the Actions tab, and the heartbeat pages when a day and its grace pass with no ping.
+
+## Procedure
+
+1. **Note each advisory from the issue:** package, locked version, advisory id, severity. Read the advisory for the minimum fixed version: `https://api.osv.dev/v1/vulns/<id>` lists the `fixed` events under `affected[].ranges`. Find where the package enters: `uv tree --frozen --all-groups --invert --package <package>` names the base install, the extra, or the dev group that pulls it in.
+2. `git checkout main && git pull origin main`, then `git checkout -b bump-<package>-cves`.
+3. **Bump to the minimum version that resolves the advisory**, unless a larger upgrade is independently justified: `uv lock --upgrade-package <package>==<fixed version>` (repeat the flag for each package). It works for transitive packages too. A bare `--upgrade-package <package>` takes the newest release instead, which can drag in unrelated packages. **Read the lock diff line by line; every changed package is named in the PR body, with what forced it.**
+   - **Lock with a uv at least as new as the one that last wrote `uv.lock`.** An older uv rewrites the lock's `revision` downwards, an unrelated change riding a security fix. `uvx --from uv uv lock …` runs a current uv when the system one is behind (on 2026-11-07 the system uv 0.12.13 rewrote `revision = 5` to `3`; uv 0.13.7 kept it, #817).
+   - **A fix that requires a newer Python than this package's `requires-python` floor cannot be locked.** uv resolves one universal lock for every supported Python, and refuses (`only supports >=3.11`). That is not something a bump can solve: the floor is a Stack decision, and the alternative is a dismissal. Raise it on the security issue with `needs-capital` (issue #816 is the first case: pillow 13 and filelock 4 dropped Python 3.10).
+   - **A fix outside a range `pyproject.toml` declares** (a floor below it, or a cap above it, as `pillow>=12,<13` sat below pillow 13.0.0) is a range move, and that ships in a release: the version bump and the CHANGELOG entry go in the same PR, and the capital tags it (CLAUDE.md → Releasing; the `harness-release-deploy` skill). Until the NOC converges that release, the fleet still runs the vulnerable version.
+4. **Verify locally: the advisory is gone and nothing else broke.** Query the live OSV database for the branch's `uv.lock` and for `main`'s as a control: `main` must still report the advisory and the branch must not. A clean result on the branch proves nothing until the same query reports the advisory on `main`. The workflow's scanner is the `osv-scanner` release its `Install osv-scanner` step pins (version and checksum), and it queries the same API. Then `uv sync --locked`, `uv run pytest`, `uv run ruff check .`, `uv run ruff format --check .`; when a package in the `mempalace` extra moved, also `uv run --extra mempalace pytest -m mempalace` (then `uv sync` to restore the dev venv).
+5. **Open the bump PR.** Title: `Bump <package> <old> → <new> for <advisory-id>` (two: `for <id> and <id>`; many: `for N advisories`). The body is the advisory table (severity, package, advisory, fixed in), every changed package, the reach, and the verification. It names the security issue as `Part of #<n>`, never with a closing keyword: the issue closes by hand after the scan is clean. The self-review is a read-only review agent (CLAUDE.md → Conventions); then arm auto-merge and confirm the arming took.
+6. **After it merges, prove the scan clean against `main`.** Re-run the workflow (`Dependency Security Scan`, *Run workflow*, branch `main`) or wait for the next scheduled run. This bot has no Actions write, so a dispatch is the capital's (`needs-capital`, with the exact `gh workflow run` command). **Never dispatch it on the bump branch to check the fix:** a run on any branch writes to the same issue as `main`'s, so it would report the advisory resolved while `main` still carries it, and the next run on `main` would file it as new and page again. Step 4's local check is the branch check. That run comments "is clean" on the issue; then close the issue by hand with the run link.
+7. **Read the Critical and High advisories against the harness, on the security issue.** The bump is the fix either way, but which advisories had reach decides whether there is anything else to do. Each advisory states its own preconditions; check them against how the harness actually calls the package (a decoder the harness never opens peer bytes with, a server the harness never runs). The lock governs this repository's CI and development environment, never a user's install and never the fleet's venvs, so state for each whether a fresh install of `basecradle-harness` could still resolve the vulnerable version (then step 3's range move applies) and ask the capital what the deployed venvs hold: the NOC is the only one that can read a box.
+8. **An open PR that went red on the same advisory** recovers once the bump is on `main`: bring it up to date with `gh pr update-branch <n>`. Dependabot's own PRs refuse `@dependabot rebase` from the App, so use the same command for them.
+
+## Dismissing an Advisory That Does Not Apply
+
+Add it to `osv-scanner.toml` at the repository root, beside `uv.lock` (`osv-scanner` reads it from the lockfile's directory, which is how the workflow finds it):
+
+```toml
+[[IgnoredVulns]]
+id = "GHSA-xxxx-xxxx-xxxx"
+ignoreUntil = 2027-01-31  # a date, so the dismissal is re-read rather than forgotten
+reason = "Why this advisory has no reach here, and who decided."
+```
+
+Dismissing an advisory is a decision on reach, so it goes on the security issue with its reasoning before the PR that adds it. A High or Critical dismissal is the capital's call (`needs-capital`); never dismiss one on your own reading alone. "No fix exists for a Python we support" is not a reach finding: it is the Python-floor decision in step 3, and it is the capital's too.

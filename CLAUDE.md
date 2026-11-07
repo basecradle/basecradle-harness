@@ -226,6 +226,18 @@ Two standing invariants:
 
 The full four-owner pipeline (captain builds → capital tags and publishes → NOC converges → capital verifies on @jt), the capital's tag command, the contractual workflow/env names, and the on-box verify commands live in the **`harness-release-deploy` skill**.
 
+## Responding to the Daily Dependency Scan
+
+**`uv.lock` is audited on a clock (issue #816), not only when Dependabot happens to open a PR.** Dependabot does not move a transitive pin, and the first reading found advisories against twelve packages (#817). `.github/workflows/dependency-security-scan.yml` runs `osv-scanner` against `uv.lock` on `main` every day (the schedule is the workflow's `cron`). The scanner is pinned by version and checksum, so a bump is by hand. It queries the live OSV database and files what it finds as one issue, `[SECURITY] Dependency Advisories Against main (Daily Scan)`, authored by `basecradle-ai[bot]`; an issue with that title by anyone else is ignored, because this repository is public. The issue is updated in place while it stands, silent while nothing changes, and never closed by the workflow.
+
+- **Severity and routing.** An advisory is as severe as the most severe rating its records carry: the CVSS score, or GitHub's own rating. High or Critical carries `needs-human` and pages `@origin` (his ruling, 2026-11-05, basecradle#750). Anything lower, an unrated advisory included, carries `needs-capital`.
+- **No verdict is never clean.** A scan that cannot reach a verdict files its own `needs-capital` issue, `Daily Dependency Security Scan Could Not Reach a Verdict`, and the run that recovers closes it.
+- **The heartbeat.** Every run that reaches a verdict pings the Better Stack heartbeat `basecradle-harness Dependency Scan` (group `github.com`). The ping URL is the repository secret `DEPENDENCY_SCAN_HEARTBEAT_URL`, write-only. A run that dies before it can file anything therefore pages within a day plus grace.
+- **Where the decisions live.** They are in `scripts/dependency_security_scan.py`, tested, a port of the capital's by way of basecradle-python#317; this repository owns its copy. The workflow only applies them, as `basecradle-ai[bot]` through a minted App token, because a label `GITHUB_TOKEN` applies starts no workflow and would page nobody. It runs only on its schedule and `workflow_dispatch`, never on a PR, and this bot cannot dispatch it: a by-hand run is the capital's.
+- **The lock pins this repo's CI and dev environment, not what a user or the fleet installs.** A lock bump needs no release. A fix outside a `pyproject.toml` range (a floor below it, or a cap above it) needs the range moved, and that ships in a release the NOC must converge before the fleet has it. A fix that needs a newer Python than `requires-python` cannot be locked at all, which is a capital decision.
+- **Dismissals.** An advisory that does not apply is dismissed in `osv-scanner.toml` (`[[IgnoredVulns]]`, with its reason and an `ignoreUntil`), never by closing the issue. A High or Critical dismissal is the capital's call.
+- **To respond,** invoke the `security-scan-bump` skill.
+
 ## Where to Start
 
 Work arrives one dispatched issue per session (Cross-Repo Handoffs → "You work what you were dispatched, and only that"); the backlog is never where your next task comes from. Read the dispatched issue in full, and go plan-first for anything non-trivial. The architecture above is settled.

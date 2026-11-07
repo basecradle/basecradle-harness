@@ -1,0 +1,52 @@
+# Advisories the daily dependency scan (.github/workflows/dependency-security-scan.yml) does
+# not report, each a decision on reach recorded with its reason. A High or Critical
+# dismissal is the capital's call; every one carries an ignoreUntil so it is re-read rather
+# than forgotten, and the day it lapses the scan files the advisory as new and routes it.
+# The procedure is the security-scan-bump skill.
+
+# chromadb 1.5.9 (the mempalace extra), four advisories with no fixed release. Each sits in
+# ChromaDB's HTTP server: the collections endpoints honouring trust_remote_code, tenant
+# authorization, and SimpleRBACAuthorizationProvider. MemPalace 3.11.0 opens only an
+# embedded PersistentClient (its wheel holds no HttpClient, no server, no trust_remote_code),
+# so none of the four reaches the harness. Approved by the capital, 2026-11-07, issue #816.
+# OSV carries each as a GHSA record and a PYSEC twin, and both are listed.
+
+[[IgnoredVulns]]
+id = "GHSA-f4j7-r4q5-qw2c"
+ignoreUntil = 2027-02-05
+reason = "Critical; ChromaDB HTTP server only (pre-auth code injection via trust_remote_code on the collections endpoint). MemPalace uses an embedded PersistentClient. Capital, 2026-11-07, issue #816."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-311"
+ignoreUntil = 2027-02-05
+reason = "PYSEC twin of GHSA-f4j7-r4q5-qw2c; same reach. Capital, 2026-11-07, issue #816."
+
+[[IgnoredVulns]]
+id = "GHSA-36p7-vc44-83pf"
+ignoreUntil = 2027-02-05
+reason = "Critical; ChromaDB HTTP server only (code injection via trust_remote_code on a collection update). MemPalace uses an embedded PersistentClient. Capital, 2026-11-07, issue #816."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-3814"
+ignoreUntil = 2027-02-05
+reason = "PYSEC twin of GHSA-36p7-vc44-83pf; same reach. Capital, 2026-11-07, issue #816."
+
+[[IgnoredVulns]]
+id = "GHSA-2wm9-hf6c-p5cr"
+ignoreUntil = 2027-02-05
+reason = "High; ChromaDB HTTP server only (cross-tenant access for authenticated users). MemPalace uses an embedded PersistentClient with no tenants or auth. Capital, 2026-11-07, issue #816."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-3813"
+ignoreUntil = 2027-02-05
+reason = "PYSEC twin of GHSA-2wm9-hf6c-p5cr; same reach. Capital, 2026-11-07, issue #816."
+
+[[IgnoredVulns]]
+id = "GHSA-xph7-9rjv-w5fr"
+ignoreUntil = 2027-02-05
+reason = "High; ChromaDB HTTP server only (SimpleRBACAuthorizationProvider ignores scope). MemPalace uses an embedded PersistentClient with no authorization provider. Capital, 2026-11-07, issue #816."
+
+[[IgnoredVulns]]
+id = "PYSEC-2026-3815"
+ignoreUntil = 2027-02-05
+reason = "PYSEC twin of GHSA-xph7-9rjv-w5fr; same reach. Capital, 2026-11-07, issue #816."
