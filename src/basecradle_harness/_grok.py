@@ -81,7 +81,7 @@ from basecradle_harness._media import (
     sniff_media_ext,
     uuid_list,
 )
-from basecradle_harness._observability import metered
+from basecradle_harness._observability import metered, tool_failed
 from basecradle_harness._platform import PlatformTool, explain
 from basecradle_harness._secret import reveal, secret
 
@@ -310,10 +310,16 @@ class GrokGenerateImageTool(_GrokMediaTool):
     ) -> str:
         """Generate the image, upload it, and report the new asset for the model to read."""
         if not prompt or not prompt.strip():
-            return "Error: 'grok_generate_image' needs a 'prompt' describing what to draw."
+            return tool_failed(
+                "Error: 'grok_generate_image' needs a 'prompt' describing what to draw.",
+                reason="invalid_arguments",
+            )
         key = self._key()
         if not key:
-            return "Error: no API key for image generation. Set AI_API_KEY to the agent's xAI key."
+            return tool_failed(
+                "Error: no API key for image generation. Set AI_API_KEY to the agent's xAI key.",
+                reason="config:missing_api_key",
+            )
 
         # response_format=b64_json so the image comes back inline (no second fetch); aspect_ratio
         # and resolution are sent only when set, so the default call is always the valid core.
@@ -336,9 +342,15 @@ class GrokGenerateImageTool(_GrokMediaTool):
                 body, download=_download, subject="the xAI image API"
             )
         except ProviderConnectionError as exc:
-            return f"Error generating image: could not reach the xAI image API: {exc}"
+            return tool_failed(
+                f"Error generating image: could not reach the xAI image API: {exc}",
+                reason="transport",
+            )
         except ProviderError as exc:
-            return f"Error generating image: {provider_error_message(exc, 'the xAI image API')}"
+            return tool_failed(
+                f"Error generating image: {provider_error_message(exc, 'the xAI image API')}",
+                reason="provider_error",
+            )
 
         target = timeline or self.context.timeline
         ext = sniff_media_ext(image_bytes, "jpg")
@@ -418,16 +430,23 @@ class GrokEditImageTool(_GrokMediaTool):
     ) -> str:
         """Edit the source image(s), upload the result, and report the new asset for the model."""
         if not prompt or not prompt.strip():
-            return "Error: 'grok_edit_image' needs a 'prompt' describing the change to make."
+            return tool_failed(
+                "Error: 'grok_edit_image' needs a 'prompt' describing the change to make.",
+                reason="invalid_arguments",
+            )
         uuids = uuid_list(image)
         if not uuids:
-            return (
+            return tool_failed(
                 "Error: 'grok_edit_image' needs at least one source 'image' asset uuid. "
-                "Use the assets tool's 'list' to find one."
+                "Use the assets tool's 'list' to find one.",
+                reason="invalid_arguments",
             )
         key = self._key()
         if not key:
-            return "Error: no API key for image editing. Set AI_API_KEY to the agent's xAI key."
+            return tool_failed(
+                "Error: no API key for image editing. Set AI_API_KEY to the agent's xAI key.",
+                reason="config:missing_api_key",
+            )
 
         # response_format=b64_json so the edited image comes back inline (no second fetch);
         # decode_image_payload handles a url response too, so a vendor default never drops it.
@@ -453,9 +472,14 @@ class GrokEditImageTool(_GrokMediaTool):
                 body, download=_download, subject="the xAI image API"
             )
         except ProviderConnectionError as exc:
-            return f"Error editing image: could not reach the xAI image API: {exc}"
+            return tool_failed(
+                f"Error editing image: could not reach the xAI image API: {exc}", reason="transport"
+            )
         except ProviderError as exc:
-            return f"Error editing image: {provider_error_message(exc, 'the xAI image API')}"
+            return tool_failed(
+                f"Error editing image: {provider_error_message(exc, 'the xAI image API')}",
+                reason="provider_error",
+            )
 
         target = timeline or self.context.timeline
         ext = sniff_media_ext(image_bytes, "jpg")
@@ -579,13 +603,17 @@ class GrokGenerateVideoTool(_GrokMediaTool):
         # said in a sentence the model can act on. An `image` alone is legal image-to-video: xAI
         # animates the still with no instruction (issue #477).
         if not (prompt and prompt.strip()) and not (image and image.strip()):
-            return (
+            return tool_failed(
                 "Error: 'grok_generate_video' needs a 'prompt' describing the video, or an "
-                "'image' asset uuid to animate (or both)."
+                "'image' asset uuid to animate (or both).",
+                reason="invalid_arguments",
             )
         key = self._key()
         if not key:
-            return "Error: no API key for video generation. Set AI_API_KEY to the agent's xAI key."
+            return tool_failed(
+                "Error: no API key for video generation. Set AI_API_KEY to the agent's xAI key.",
+                reason="config:missing_api_key",
+            )
 
         # Send ``prompt`` only when there is one: an empty string is not the same request as an
         # absent field, and image-to-video's whole new mode is *no instruction at all*.
@@ -615,11 +643,20 @@ class GrokGenerateVideoTool(_GrokMediaTool):
                 video_url, call.cost = self._await_video(key, request_id)
             video_bytes = _download(video_url)
         except ProviderConnectionError as exc:
-            return f"Error generating video: could not reach the xAI video API: {exc}"
+            return tool_failed(
+                f"Error generating video: could not reach the xAI video API: {exc}",
+                reason="transport",
+            )
         except ProviderError as exc:
-            return f"Error generating video: {provider_error_message(exc, 'the xAI video API')}"
+            return tool_failed(
+                f"Error generating video: {provider_error_message(exc, 'the xAI video API')}",
+                reason="provider_error",
+            )
         except httpx.HTTPError as exc:
-            return f"Error generating video: couldn't download the produced video: {exc}"
+            return tool_failed(
+                f"Error generating video: couldn't download the produced video: {exc}",
+                reason="transport",
+            )
 
         target = timeline or self.context.timeline
         ext = sniff_media_ext(video_bytes, "mp4")

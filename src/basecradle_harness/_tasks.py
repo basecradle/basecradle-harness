@@ -58,6 +58,7 @@ from datetime import UTC, datetime, timedelta
 from basecradle import BaseCradleError
 
 from basecradle_harness._idempotency import TASK
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._platform import PlatformTool, explain
 
 # How many tasks one `list` returns. The cap keeps a pathological timeline from
@@ -152,19 +153,31 @@ class TasksTool(PlatformTool):
             # transcript, which records this call either way (issue #297 — see `PlatformTool.key`).
             key = self.key(TASK)
             if not instructions or not activate_at:
-                return "Error: 'create' needs both 'instructions' and 'activate_at'."
+                return tool_failed(
+                    "Error: 'create' needs both 'instructions' and 'activate_at'.",
+                    reason="invalid_arguments",
+                )
             return self._create(target, instructions, activate_at, key)
         if action == "list":
             return self._list(target)
         if action == "read":
             if not uuid:
-                return "Error: 'read' needs the task's uuid. Use 'list' to find it."
+                return tool_failed(
+                    "Error: 'read' needs the task's uuid. Use 'list' to find it.",
+                    reason="invalid_arguments",
+                )
             return self._read(uuid)
         if action == "cancel":
             if not uuid:
-                return "Error: 'cancel' needs the task's uuid. Use 'list' to find it."
+                return tool_failed(
+                    "Error: 'cancel' needs the task's uuid. Use 'list' to find it.",
+                    reason="invalid_arguments",
+                )
             return self._cancel(uuid)
-        return f"Error: unknown action {action!r}. Use 'create', 'list', 'read', or 'cancel'."
+        return tool_failed(
+            f"Error: unknown action {action!r}. Use 'create', 'list', 'read', or 'cancel'.",
+            reason="invalid_arguments",
+        )
 
     # --- create --------------------------------------------------------------
 
@@ -184,7 +197,7 @@ class TasksTool(PlatformTool):
         try:
             when = _normalize_activate_at(activate_at)
         except ValueError as error:
-            return f"Error: {error}"
+            return tool_failed(f"Error: {error}", reason="invalid_arguments")
         client = self.context.client
         task = client.timelines.get(timeline).tasks.create(
             instructions=instructions, activate_at=when, idempotency_key=key
@@ -235,7 +248,9 @@ class TasksTool(PlatformTool):
             task = client.tasks.get(uuid)
             task.cancel()
         except BaseCradleError as error:
-            return f"Error: couldn't cancel task {uuid}: {explain(error)}"
+            return tool_failed(
+                f"Error: couldn't cancel task {uuid}: {explain(error)}", reason="platform_error"
+            )
         return f"Cancelled the task. {_describe(task)}"
 
 

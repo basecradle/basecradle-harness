@@ -89,7 +89,7 @@ from basecradle_harness._media import (
     slugify,
     uuid_list,
 )
-from basecradle_harness._observability import metered
+from basecradle_harness._observability import metered, tool_failed
 from basecradle_harness._openai import require_openai_sdk, sdk_error_context
 from basecradle_harness._openai_rates import image_cost, priced_host
 from basecradle_harness._platform import PlatformTool, explain
@@ -394,12 +394,16 @@ class GenerateImageTool(_ImageTool):
     ) -> str:
         """Generate the image, upload it, and report the new asset for the model to read."""
         if not prompt or not prompt.strip():
-            return "Error: 'generate_image' needs a 'prompt' describing what to draw."
+            return tool_failed(
+                "Error: 'generate_image' needs a 'prompt' describing what to draw.",
+                reason="invalid_arguments",
+            )
         key = self._key()
         if not key:
-            return (
+            return tool_failed(
                 "Error: no API key for image generation. Set AI_API_KEY "
-                "(or pass api_key= to GenerateImageTool)."
+                "(or pass api_key= to GenerateImageTool).",
+                reason="config:missing_api_key",
             )
 
         coverage = self._coverage_params(
@@ -421,11 +425,18 @@ class GenerateImageTool(_ImageTool):
             image_bytes = self._decode(response)
         except ProviderTimeoutError as exc:
             # Reached, and out of time — a gateway's 504 included (#759): never "could not reach".
-            return f"Error generating image: the image API did not answer in time: {exc}"
+            return tool_failed(
+                f"Error generating image: the image API did not answer in time: {exc}",
+                reason="timeout",
+            )
         except ProviderConnectionError as exc:
-            return f"Error generating image: could not reach the image API: {exc}"
+            return tool_failed(
+                f"Error generating image: could not reach the image API: {exc}", reason="transport"
+            )
         except ProviderError as exc:
-            return f"Error generating image: {_provider_message(exc)}"
+            return tool_failed(
+                f"Error generating image: {_provider_message(exc)}", reason="provider_error"
+            )
 
         target = timeline or self.context.timeline
         name = _image_filename(filename, prompt, output_format)
@@ -524,25 +535,30 @@ class EditImageTool(_ImageTool):
     ) -> str:
         """Edit the source image(s), upload the result, and report the new asset."""
         if not prompt or not prompt.strip():
-            return "Error: 'edit_image' needs a 'prompt' describing the change to make."
+            return tool_failed(
+                "Error: 'edit_image' needs a 'prompt' describing the change to make.",
+                reason="invalid_arguments",
+            )
         uuids = uuid_list(image)
         if not uuids:
-            return (
+            return tool_failed(
                 "Error: 'edit_image' needs at least one source 'image' asset uuid. "
-                "Use the assets tool's 'list' to find one."
+                "Use the assets tool's 'list' to find one.",
+                reason="invalid_arguments",
             )
         key = self._key()
         if not key:
-            return (
+            return tool_failed(
                 "Error: no API key for image editing. Set AI_API_KEY "
-                "(or pass api_key= to EditImageTool)."
+                "(or pass api_key= to EditImageTool).",
+                reason="config:missing_api_key",
             )
 
         try:
             sources = [self._source_part(uuid) for uuid in uuids]
             mask_part = self._source_part(mask) if mask else None
         except _SourceError as exc:
-            return str(exc)
+            return tool_failed(str(exc), reason="platform_error")
 
         coverage = self._coverage_params(
             size=size,
@@ -577,11 +593,18 @@ class EditImageTool(_ImageTool):
                 call.cost = self._cost(response)
             image_bytes = self._decode(response)
         except ProviderTimeoutError as exc:
-            return f"Error editing image: the image API did not answer in time: {exc}"
+            return tool_failed(
+                f"Error editing image: the image API did not answer in time: {exc}",
+                reason="timeout",
+            )
         except ProviderConnectionError as exc:
-            return f"Error editing image: could not reach the image API: {exc}"
+            return tool_failed(
+                f"Error editing image: could not reach the image API: {exc}", reason="transport"
+            )
         except ProviderError as exc:
-            return f"Error editing image: {_provider_message(exc)}"
+            return tool_failed(
+                f"Error editing image: {_provider_message(exc)}", reason="provider_error"
+            )
 
         target = timeline or self.context.timeline
         name = _image_filename(filename, prompt, output_format)

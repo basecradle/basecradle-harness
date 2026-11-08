@@ -49,6 +49,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._tools import Tool
 
 # Where the store lives when no explicit path is given: under the agent's home
@@ -300,24 +301,27 @@ class MemoryTool(Tool):
         """Dispatch on `action`. Returns a message written for the model to read."""
         if action == "write":
             if not key or value is None:
-                return "Error: 'write' needs both a key and a value."
+                return tool_failed(
+                    "Error: 'write' needs both a key and a value.", reason="invalid_arguments"
+                )
             return self.store.write(key, value)
         if action == "read":
             if not key:
-                return "Error: 'read' needs a key."
+                return tool_failed("Error: 'read' needs a key.", reason="invalid_arguments")
             return self.store.read(key)
         if action == "list":
             return self.store.list()
         if action == "delete":
             if not key:
-                return "Error: 'delete' needs a key."
+                return tool_failed("Error: 'delete' needs a key.", reason="invalid_arguments")
             return self.store.delete(key)
         if action == "search":
             if not query or not query.strip():
-                return "Error: 'search' needs a query."
+                return tool_failed("Error: 'search' needs a query.", reason="invalid_arguments")
             return self.store.search(query)
-        return (
-            f"Error: unknown action {action!r}. Use 'write', 'read', 'list', 'delete', or 'search'."
+        return tool_failed(
+            f"Error: unknown action {action!r}. Use 'write', 'read', 'list', 'delete', or 'search'.",
+            reason="invalid_arguments",
         )
 
     def close(self) -> None:

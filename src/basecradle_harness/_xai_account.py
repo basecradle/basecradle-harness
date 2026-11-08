@@ -74,6 +74,7 @@ from typing import Any
 
 import httpx
 
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._secret import reveal, secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 
@@ -98,6 +99,11 @@ class _BalanceUnavailable(Exception):
     return string by `run`. Its message is always safe to show the model — it names *what* went
     wrong (a status code, a shape problem), never the key or the raw payload.
     """
+
+    def __init__(self, message: str, *, slug: str = "provider_error") -> None:
+        super().__init__(message)
+        #: The `tool` line's `reason` for this failure (issue #822).
+        self.slug = slug
 
 
 @dataclass(frozen=True)
@@ -187,9 +193,10 @@ class XaiAccountBalanceTool(Tool):
         """Report the live credit remaining, or a clear reason it is unavailable."""
         key = reveal(self._management_key) or os.environ.get("XAI_MANAGEMENT_KEY")
         if not key:
-            return (
+            return tool_failed(
                 "xAI account balance unavailable — XAI_MANAGEMENT_KEY is not configured. Set it "
-                "to a read-only xAI Management Key (console.x.ai → Settings → Management Keys)."
+                "to a read-only xAI Management Key (console.x.ai → Settings → Management Keys).",
+                reason="config:missing_api_key",
             )
 
         cached = self._cached_balance()
@@ -206,10 +213,11 @@ class XaiAccountBalanceTool(Tool):
                 headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
             )
         except UnicodeEncodeError:
-            return (
+            return tool_failed(
                 "xAI account balance unavailable — XAI_MANAGEMENT_KEY contains a non-ASCII "
                 "character, so it cannot be sent as a header; check for a smart quote or a "
-                "non-breaking space picked up when it was pasted."
+                "non-breaking space picked up when it was pasted.",
+                reason="config:auth",
             )
 
         with client_cm as client:
@@ -217,15 +225,15 @@ class XaiAccountBalanceTool(Tool):
             try:
                 team = self._team(client)
             except _BalanceUnavailable as exc:
-                return f"xAI account balance unavailable — {exc}"
+                return tool_failed(f"xAI account balance unavailable — {exc}", reason=exc.slug)
 
             # The two figures are *alternatives*, not a chain: the preview is the answer, the
             # ledger is context, and either can fail without taking the other down with it.
             try:
                 cycle: _Cycle | None = self._cycle(client, team)
-                no_cycle = ""
+                no_cycle, cycle_slug = "", "provider_error"
             except _BalanceUnavailable as exc:
-                cycle, no_cycle = None, str(exc)
+                cycle, no_cycle, cycle_slug = None, str(exc), exc.slug
             try:
                 posted: float | None = self._posted(client, team)
             except _BalanceUnavailable:
@@ -237,7 +245,7 @@ class XaiAccountBalanceTool(Tool):
         elif posted is not None:
             text = _render_posted_only(posted, no_cycle, as_of)
         else:
-            return f"xAI account balance unavailable — {no_cycle}"
+            return tool_failed(f"xAI account balance unavailable — {no_cycle}", reason=cycle_slug)
 
         if self._cache_ttl > 0:
             self._cached = (self._clock() + self._cache_ttl, text)
@@ -296,13 +304,16 @@ class XaiAccountBalanceTool(Tool):
         try:
             response = client.get(f"{self._base_url}{path}")
         except httpx.RequestError as exc:
-            raise _BalanceUnavailable(f"couldn't reach the xAI Management API ({exc}).") from None
+            raise _BalanceUnavailable(
+                f"couldn't reach the xAI Management API ({exc}).", slug="transport"
+            ) from None
 
         status = response.status_code
         if status in (401, 403):
             raise _BalanceUnavailable(
                 f"the xAI Management API rejected the key (HTTP {status}); it needs read-only "
-                "billing scope (BillingRead). Check XAI_MANAGEMENT_KEY."
+                "billing scope (BillingRead). Check XAI_MANAGEMENT_KEY.",
+                slug="config:auth",
             )
         if status >= 400:
             raise _BalanceUnavailable(

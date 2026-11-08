@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 from basecradle import BaseCradleError
 
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._platform import PlatformTool, explain
 
 if TYPE_CHECKING:
@@ -97,7 +98,9 @@ class ConfirmedTimelineAction(PlatformTool):
             subject = self.context.client.timelines.get(target)
             self._perform(subject)
         except BaseCradleError as error:
-            return f"Couldn't {self.verb} the timeline: {explain(error)}"
+            return tool_failed(
+                f"Couldn't {self.verb} the timeline: {explain(error)}", reason="platform_error"
+            )
         return self.succeeded(subject)
 
     # --- the gate ------------------------------------------------------------
@@ -112,21 +115,24 @@ class ConfirmedTimelineAction(PlatformTool):
         try:
             subject = self.context.client.timelines.get(target)
         except BaseCradleError as error:
-            return (
+            return tool_failed(
                 f"Refused to {self.verb} timeline {target}: this is irreversible. "
                 f"{self.consequence} To proceed, call {self.name} again with confirm={target}. "
-                f"(Couldn't preview the timeline first: {explain(error)}.)"
+                f"(Couldn't preview the timeline first: {explain(error)}.)",
+                reason="platform_error",
             )
         if confirm is None:
             why = "No confirm was passed."
         else:
             why = f"The confirm you passed ({confirm!r}) does not match this timeline's uuid."
-        return (
+        text = (
             f"Refused to {self.verb} timeline {subject.name!r} (uuid={subject.uuid}), which "
             f"currently has {len(subject.items)} item(s). {why} {self.consequence} If you "
             f"really mean to {self.verb} THIS timeline, call {self.name} again with "
             f"confirm={subject.uuid}."
         )
+        # No confirm is the gate's own first step, a preview delivered; a wrong one is a bad call.
+        return text if confirm is None else tool_failed(text, reason="invalid_arguments")
 
     # --- subclass operation --------------------------------------------------
 

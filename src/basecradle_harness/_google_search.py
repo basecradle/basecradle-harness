@@ -28,6 +28,7 @@ import os
 from typing import Any
 
 from basecradle_harness._exceptions import ProviderError
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._tools import Tool
 
 
@@ -60,23 +61,29 @@ class GoogleSearchTool(Tool):
     def run(self, query: str) -> str:
         query = (query or "").strip()
         if not query:
-            return "Error: web_search needs a non-empty query."
+            return tool_failed(
+                "Error: web_search needs a non-empty query.", reason="invalid_arguments"
+            )
         from basecradle_harness._google import GoogleConfigError
 
         try:
             return self._searcher().search(query)
-        except (ProviderError, GoogleConfigError) as exc:
+        except GoogleConfigError as exc:
             # A config fault's text names the setting and never the key (`credentials_path`).
-            return f"Error searching the web: {exc}"
+            return tool_failed(f"Error searching the web: {exc}", reason=f"config:{exc.reason}")
+        except ProviderError as exc:
+            return tool_failed(f"Error searching the web: {exc}", reason="provider_error")
 
     def _searcher(self) -> Any:
         if self._provider is None:
             model = (os.environ.get("AI_MODEL") or "").strip()
+            from basecradle_harness._google import GoogleConfigError, GoogleProvider
+
             if not model:
-                raise ProviderError(
-                    "no AI_MODEL is set, so there is no Gemini model to search with."
+                raise GoogleConfigError(
+                    "missing_model",
+                    "no AI_MODEL is set, so there is no Gemini model to search with.",
                 )
-            from basecradle_harness._google import GoogleProvider
 
             # Built from the brain's environment exactly as the brain is (`GoogleProvider`'s
             # ``credentials_file=None`` path), and without its `model_params.json`: that file tunes

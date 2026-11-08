@@ -105,6 +105,7 @@ from basecradle_harness._messages import (
     ToolSpec,
     VideoContent,
 )
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openrouter import OpenRouterProvider
 from basecradle_harness._openrouter_account import OpenRouterAccountBalanceTool
@@ -226,6 +227,7 @@ __all__ = [
     # Tools, registry, and the safety boundary
     "Tool",
     "ToolRegistry",
+    "tool_failed",
     "Secret",
     "MemoryTool",
     "WebFetchTool",

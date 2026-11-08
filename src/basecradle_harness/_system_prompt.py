@@ -50,6 +50,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from basecradle_harness._install import _prompts_installed, config_home
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 
 # The one file these tools ever touch, relative to the config home. Named as a constant so the
@@ -113,11 +114,12 @@ class SystemPromptReadTool(Tool):
             # NOT this file (`system_prompt_text`). Reporting the file (or handing out an edit
             # token) would misrepresent the live persona and invite an edit that cannot land, so
             # decline honestly instead — symmetric with the edit tool's refusal.
-            return (
+            return tool_failed(
                 "This config home's prompts are not installed, so there is no editable "
                 "system-prompt.md yet (your live charter, if any, comes from the environment or "
                 "the packaged default, which this tool does not manage). Run "
-                "basecradle-harness-install to install the config-home prompts first."
+                "basecradle-harness-install to install the config-home prompts first.",
+                reason="config:prompts_not_installed",
             )
         path = _target()
         if not path.exists():
@@ -189,9 +191,10 @@ class SystemPromptEditTool(Tool):
             # config-home system-prompt.md only when prompts are manifest-installed
             # (`system_prompt_text`). If they are not, an edit here would be silently ignored next
             # wake — so refuse rather than write an edit that never lands.
-            return (
+            return tool_failed(
                 "Cannot edit: this config home's prompts are not installed, so an edit here would "
-                "not take effect on your next wake. Run basecradle-harness-install first."
+                "not take effect on your next wake. Run basecradle-harness-install first.",
+                reason="config:prompts_not_installed",
             )
         path = _target()
         current = _read_current(path)
@@ -240,11 +243,13 @@ class SystemPromptEditTool(Tool):
                 f"No system prompt is set yet ({path} is empty or absent). To author one, call "
                 f"system_prompt_edit again with confirm={token}."
             )
-        return (
+        text = (
             f"Refused to edit your system prompt: nothing was written. {why} Your proposed new "
             f"content is {len(proposed)} character(s). {state} (A successful edit snapshots the "
             "old prompt as a .bak first and takes effect next wake.)"
         )
+        # No confirm is the gate's own first step, a preview delivered; a wrong one is a bad call.
+        return text if confirm is None else tool_failed(text, reason="invalid_arguments")
 
     def _snapshot(self, path: Path) -> Path | None:
         """Save the current file as a timestamped ``.bak`` beside it, returning that path.

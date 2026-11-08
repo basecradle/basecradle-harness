@@ -48,7 +48,7 @@ from basecradle import BaseCradleError
 
 from basecradle_harness._governance import _resolve_user, _UserNotFound
 from basecradle_harness._idempotency import MESSAGE
-from basecradle_harness._observability import RED, head, kv
+from basecradle_harness._observability import RED, head, kv, tool_failed
 from basecradle_harness._platform import PlatformTool, explain
 
 _log = logging.getLogger("basecradle_harness")
@@ -109,15 +109,21 @@ class UsersTool(PlatformTool):
                 return self._list()
             if action == "read":
                 if not user:
-                    return "Error: 'read' needs a 'user' (a handle like '@john' or a uuid)."
+                    return tool_failed(
+                        "Error: 'read' needs a 'user' (a handle like '@john' or a uuid).",
+                        reason="invalid_arguments",
+                    )
                 return self._read(user)
             if action == "me":
                 return self._me()
         except _UserNotFound as error:
-            return f"Error: {error}"
+            return tool_failed(f"Error: {error}", reason="invalid_arguments")
         except BaseCradleError as error:
-            return f"Couldn't read users: {explain(error)}"
-        return f"Error: unknown action {action!r}. Use 'list', 'read', or 'me'."
+            return tool_failed(f"Couldn't read users: {explain(error)}", reason="platform_error")
+        return tool_failed(
+            f"Error: unknown action {action!r}. Use 'list', 'read', or 'me'.",
+            reason="invalid_arguments",
+        )
 
     # --- list ----------------------------------------------------------------
 
@@ -232,7 +238,10 @@ class MessagesTool(PlatformTool):
                 return self._list(timeline or self.context.timeline)
             if action == "read":
                 if not uuid:
-                    return "Error: 'read' needs the message's uuid. Use 'list' to find it."
+                    return tool_failed(
+                        "Error: 'read' needs the message's uuid. Use 'list' to find it.",
+                        reason="invalid_arguments",
+                    )
                 return self._read(uuid)
             if action == "create":
                 # The key is minted **before** the validation below, not after, and the order is
@@ -242,7 +251,10 @@ class MessagesTool(PlatformTool):
                 # mint here would silently shift every later ordinal in the turn.
                 key = self.key(MESSAGE)
                 if not body:
-                    return "Error: 'create' needs a 'body' — the text of the message to post."
+                    return tool_failed(
+                        "Error: 'create' needs a 'body' — the text of the message to post.",
+                        reason="invalid_arguments",
+                    )
                 return self._create(timeline or self.context.timeline, body, key)
         except BaseCradleError as error:
             if action == "create":
@@ -261,8 +273,14 @@ class MessagesTool(PlatformTool):
                         error=explain(error),
                     ),
                 )
-            return f"Couldn't {action} {'a message' if action == 'create' else 'messages'}: {explain(error)}"
-        return f"Error: unknown action {action!r}. Use 'list', 'read', or 'create'."
+            return tool_failed(
+                f"Couldn't {action} {'a message' if action == 'create' else 'messages'}: {explain(error)}",
+                reason="platform_error",
+            )
+        return tool_failed(
+            f"Error: unknown action {action!r}. Use 'list', 'read', or 'create'.",
+            reason="invalid_arguments",
+        )
 
     # --- list ----------------------------------------------------------------
 

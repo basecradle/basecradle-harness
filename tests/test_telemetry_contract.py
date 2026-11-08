@@ -1485,14 +1485,15 @@ def test_the_charge_grammar_block_is_the_table(contract):
 
 def test_every_charge_example_on_the_page_is_a_conforming_line(contract):
     examples = _charge_examples()
-    # Steel's clean session, Steel's crashed one, then container time.
-    assert [line.head for line in examples] == ["charge", "charge", "charge"]
+    # Steel's clean session, its crashed one, its cost divergence, then container time.
+    assert [line.head for line in examples] == ["charge"] * 4
     for line in examples:
         fields = line.fields
         assert not _stray(contract, line), line.message
         assert _charge_required() <= set(fields), line.message
         assert ("vendor_usage" in fields) == ("vendor_unit" in fields), line.message
-        assert ("reason" in fields) == (fields["outcome"] == "error"), line.message
+        assert ("reason" in fields) == (fields["outcome"] != "ok"), line.message
+        assert fields["outcome"] in {"ok", "degraded", "error"}, line.message
         # `cost_basis` means one thing fleet-wide: `computed`, or absent for a vendor-stated cost.
         assert fields.get("cost_basis", "computed") == "computed", line.message
         # The grammar's fixed units.
@@ -1504,7 +1505,9 @@ def test_every_charge_example_on_the_page_is_a_conforming_line(contract):
 #: The `charge` line's `reason` vocabulary (issue #768): generic words every vendor's failures map
 #: onto, posted for the NOC's Steel launcher (basecradle-noc#1153). A slug added to or struck from
 #: the page's row fails unless this set changes with it.
-CHARGE_REASONS = frozenset({"crashed", "startup_failed", "timeout"})
+CHARGE_REASONS = frozenset(
+    {"crashed", "startup_failed", "timeout", "cost_divergence", "no_rate_card"}
+)
 #: What a `cost unpriced` line may name as carrying no price (`browser_time`: issue #768).
 UNPRICED_CHARGES = frozenset({"tokens", "container_time", "browser_time", "grounding", "search"})
 UNPRICED_REASONS = frozenset({"unknown_model", "unpriced_tier", "unpriced_host", "not_reported"})

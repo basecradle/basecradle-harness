@@ -64,6 +64,7 @@ from basecradle_harness._exceptions import (
 )
 from basecradle_harness._idempotency import ASSET
 from basecradle_harness._messages import FrameSampling, ImageContent, ToolResult, VideoContent
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._platform import PlatformTool
 
 if TYPE_CHECKING:  # type-only: neither is a runtime dependency of this module
@@ -267,7 +268,10 @@ class AssetsTool(PlatformTool):
         if action not in self.actions:
             return _unknown(action, self.actions)
         if action in _UUID_ACTIONS and (not uuid or not uuid.strip()):
-            return f"Error: {action!r} needs the asset's uuid. Use 'list' to find it."
+            return tool_failed(
+                f"Error: {action!r} needs the asset's uuid. Use 'list' to find it.",
+                reason="invalid_arguments",
+            )
 
         target = timeline or self.context.timeline
         if action == "list":
@@ -289,7 +293,10 @@ class AssetsTool(PlatformTool):
             # transcript, which records this call either way (issue #297 — see `PlatformTool.key`).
             key = self.key(ASSET)
             if content is None or not filename:
-                return "Error: 'create' needs both 'content' and a 'filename'."
+                return tool_failed(
+                    "Error: 'create' needs both 'content' and a 'filename'.",
+                    reason="invalid_arguments",
+                )
             return self._create(target, content, filename, description, key)
         return self._post_image(target, image, filename, description)
 
@@ -374,7 +381,8 @@ class AssetsTool(PlatformTool):
         meta = _describe(asset)
         result = image_input(asset.content.file)
         if isinstance(result, str):
-            return f"{meta}\n({result})"  # a reason it can't be shown — not raw bytes
+            # A reason it can't be shown — not raw bytes.
+            return tool_failed(f"{meta}\n({result})", reason="invalid_arguments", error=result)
         return ToolResult(text=meta, images=[result])
 
     # --- watch ---------------------------------------------------------------
@@ -407,7 +415,8 @@ class AssetsTool(PlatformTool):
         )
         result = video_input(asset.content.file, sampling)
         if isinstance(result, str):
-            return f"{meta}\n({result})"  # a reason it can't be watched — never raw bytes
+            # A reason it can't be watched — never raw bytes.
+            return tool_failed(f"{meta}\n({result})", reason="invalid_arguments", error=result)
         return ToolResult(text=f"{meta}\n({clip_facts(result)})", videos=[result])
 
     # --- listen --------------------------------------------------------------
@@ -429,35 +438,50 @@ class AssetsTool(PlatformTool):
         meta = _describe(asset)
 
         if not _is_audio(file.content_type):
-            return (
+            return tool_failed(
                 f"{meta}\n(not an audio file — 'listen' is for audio. Use 'read' for text, "
-                "'view' for images, 'watch' for video.)"
+                "'view' for images, 'watch' for video.)",
+                reason="invalid_arguments",
+                error="not an audio file",
             )
         if file.byte_size <= 0:
-            return f"{meta}\n(empty file — nothing to hear.)"
+            return tool_failed(
+                f"{meta}\n(empty file — nothing to hear.)",
+                reason="invalid_arguments",
+                error="empty file",
+            )
         if file.byte_size > MAX_AUDIO_BYTES:
-            return (
+            return tool_failed(
                 f"{meta}\n({file.byte_size} bytes, over the {MAX_AUDIO_BYTES}-byte "
-                "transcription limit — too large to listen to.)"
+                "transcription limit — too large to listen to.)",
+                reason="invalid_arguments",
+                error="over the transcription size limit",
             )
 
         transcriber = self._transcriber or Transcriber()
         key = transcriber.key
         if not key:
-            return (
+            return tool_failed(
                 "Error: no API key for transcription. Set AI_API_KEY "
-                "(or pass a configured Transcriber to AssetsTool)."
+                "(or pass a configured Transcriber to AssetsTool).",
+                reason="config:missing_api_key",
             )
 
         data = _download(file.url)
         try:
             transcript = transcriber.transcribe(data, file.filename, file.content_type, key)
         except ProviderTimeoutError as exc:
-            return f"Error transcribing audio: the transcription API did not answer in time: {exc}"
+            return tool_failed(
+                f"Error transcribing audio: the transcription API did not answer in time: {exc}",
+                reason="timeout",
+            )
         except ProviderConnectionError as exc:
-            return f"Error transcribing audio: could not reach the transcription API: {exc}"
+            return tool_failed(
+                f"Error transcribing audio: could not reach the transcription API: {exc}",
+                reason="transport",
+            )
         except ProviderError as exc:
-            return f"Error transcribing audio: {exc}"
+            return tool_failed(f"Error transcribing audio: {exc}", reason="provider_error")
 
         if not transcript.strip():
             return f"{meta}\n(transcribed, but no speech was detected.)"
@@ -517,17 +541,19 @@ class AssetsTool(PlatformTool):
         """
         store = self.context.mcp_images
         if store is None or len(store) == 0:
-            return (
+            return tool_failed(
                 "Error: no captured images to post. An image only becomes postable after a tool "
                 "(e.g. a browser screenshot) returns one this wake; captures do not survive a "
-                "restart."
+                "restart.",
+                reason="invalid_arguments",
             )
         ref = (image or "latest").strip()
         stashed = store.get(ref)
         if stashed is None:
-            return (
+            return tool_failed(
                 f"Error: no captured image {ref!r}. Use the reference shown in the tool result "
-                "(e.g. 'mcp-image-1'), or 'latest' for the most recent capture."
+                "(e.g. 'mcp-image-1'), or 'latest' for the most recent capture.",
+                reason="invalid_arguments",
             )
         name = filename or _capture_filename(stashed.mimetype)
         asset = _upload(self.context.client, timeline, stashed.data, name, description)
@@ -549,7 +575,9 @@ def _unknown(action: str, actions: tuple[str, ...]) -> str:
     defect as a schema that does.
     """
     offered = ", ".join(repr(name) for name in actions)
-    return f"Error: unknown action {action!r}. Use {offered}."
+    return tool_failed(
+        f"Error: unknown action {action!r}. Use {offered}.", reason="invalid_arguments"
+    )
 
 
 def _description(actions: tuple[str, ...]) -> str:

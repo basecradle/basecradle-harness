@@ -32,6 +32,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from basecradle_harness._assets import _is_text, _media_type
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._tools import Tool
 
 # The largest body to read, mirroring the assets tool's inline cap: 256 KiB is
@@ -103,7 +104,9 @@ class WebFetchTool(Tool):
     def run(self, url: str | None = None) -> str:
         """Fetch the URL and return its readable content for the model to read."""
         if not url or not url.strip():
-            return "Error: 'web_fetch' needs a 'url' to fetch."
+            return tool_failed(
+                "Error: 'web_fetch' needs a 'url' to fetch.", reason="invalid_arguments"
+            )
         url = url.strip()
 
         try:
@@ -118,9 +121,10 @@ class WebFetchTool(Tool):
                 finally:
                     response.close()
         except WebFetchError as exc:
-            return f"Couldn't fetch {url!r}: {exc}"
+            return tool_failed(f"Couldn't fetch {url!r}: {exc}", reason="fetch_failed")
         except httpx.RequestError as exc:
-            return f"Couldn't reach {url!r}: {exc}"
+            reason = "timeout" if isinstance(exc, httpx.TimeoutException) else "transport"
+            return tool_failed(f"Couldn't reach {url!r}: {exc}", reason=reason)
 
     # --- the validated redirect walk -----------------------------------------
 
@@ -152,9 +156,10 @@ class WebFetchTool(Tool):
     def _render(self, response: httpx.Response) -> str:
         """Turn the final response into model-readable text, capped and type-aware."""
         if response.status_code >= 400:
-            return (
+            return tool_failed(
                 f"The server returned HTTP {response.status_code} for "
-                f"{response.url}. Nothing to read."
+                f"{response.url}. Nothing to read.",
+                reason="fetch_failed",
             )
 
         content_type = response.headers.get("content-type", "")
