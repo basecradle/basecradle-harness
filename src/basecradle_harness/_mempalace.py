@@ -86,7 +86,7 @@ from basecradle_harness._memory_provider import (
     MemoryProvider,
     MemoryScope,
 )
-from basecradle_harness._observability import _secs, kv
+from basecradle_harness._observability import _secs, kv, tool_failed
 from basecradle_harness._platform import PlatformTool
 from basecradle_harness._rerank import (
     SURFACE_TOOL,
@@ -666,6 +666,10 @@ class MemPalaceMemoryProvider(MemoryProvider):
                 _log_search_failure(result, surface=surface)
                 if found is not None:
                     return found
+                # Reads as no hits from here on, so the tool's answer is an honest-looking "nothing
+                # matches": its line must not say `ok`. A no-op on a Turn-0 recall, which is no tool
+                # run. Fixed words: the upstream text can carry the query, a peer's words.
+                tool_failed("", reason="memory_error", error="the memory search failed upstream")
             raw = [hit for hit in (raw or []) if isinstance(hit, dict) and hit.get("text")]
             hits = [hit for hit in raw if hit.get("room") != _REGISTRY_ROOM]
             sentinels = len(raw) - len(hits)
@@ -788,7 +792,7 @@ class MemPalaceSearchTool(PlatformTool):
         the model can refine and try again instead of reading silence as "I know nothing."
         """
         if not query or not query.strip():
-            return "Error: 'memory_search' needs a query."
+            return tool_failed("Error: 'memory_search' needs a query.", reason="invalid_arguments")
         hits = self.provider.search(
             query.strip(), _bounded(n_results, self.provider.n_results), surface=SURFACE_TOOL
         )

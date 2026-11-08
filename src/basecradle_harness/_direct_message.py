@@ -57,7 +57,7 @@ from collections.abc import Callable
 
 import httpx
 
-from basecradle_harness._observability import bounded, kv, scrub
+from basecradle_harness._observability import bounded, kv, scrub, tool_failed
 from basecradle_harness._platform import PlatformTool
 from basecradle_harness._secret import reveal, secret
 
@@ -174,29 +174,32 @@ class DirectMessageTool(PlatformTool):
     def run(self, body: str | None = None) -> str:
         """Push `body` to @origin's phone, or return the reason it did not go."""
         if not body or not body.strip():
-            return (
+            return tool_failed(
                 f"Error: {self.name!r} needs a non-empty 'body' — the message to send. "
-                "Nothing was sent."
+                "Nothing was sent.",
+                reason="invalid_arguments",
             )
 
         payload = body.encode("utf-8")
         size = len(payload)
         if size > MAX_BODY_BYTES:
-            return (
+            return tool_failed(
                 f"Error: that body is {size:,} bytes of UTF-8, over the "
                 f"{MAX_BODY_BYTES:,}-byte limit ntfy enforces — shorten it by at least "
                 f"{size - MAX_BODY_BYTES:,} bytes and send it again. Nothing was sent, and "
                 "nothing was truncated for you: which words to drop is your call, not this "
                 "tool's. (Note bytes, not characters — non-ASCII text costs more than one byte "
-                "per character.)"
+                "per character.)",
+                reason="invalid_arguments",
             )
 
         token = reveal(self._token) or os.environ.get(TOKEN_ENV)
         if not token:
-            return (
+            return tool_failed(
                 f"Error: {self.name!r} has no publish credential — {TOKEN_ENV} is unset or "
                 "empty in this agent's environment, so it cannot reach @origin's phone. "
-                "Nothing was sent, and this is not something you can fix from here."
+                "Nothing was sent, and this is not something you can fix from here.",
+                reason="config:missing_api_key",
             )
 
         sender = self._sender()
@@ -209,7 +212,10 @@ class DirectMessageTool(PlatformTool):
             logger.warning(
                 "direct_message failed %s", kv(bytes=size, reason=exc.slug, error=str(exc))
             )
-            return f"Couldn't deliver the direct message to @origin: {exc} Nothing was sent."
+            return tool_failed(
+                f"Couldn't deliver the direct message to @origin: {exc} Nothing was sent.",
+                reason=exc.slug,
+            )
 
         logger.info("direct_message sent %s", kv(bytes=size, title=title))
         sent = (

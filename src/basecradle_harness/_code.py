@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 from basecradle_harness._assets import _describe, _download, _upload
 from basecradle_harness._media import media_filename, sniff_media_ext
 from basecradle_harness._messages import CodeExecutionTrace, Message
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._openai import require_openai_sdk
 from basecradle_harness._platform import PlatformTool, explain
 
@@ -131,13 +132,18 @@ class CodeExecutionBridge:
             file = asset.content.file
             data = _download(file.url)
         except Exception as error:  # noqa: BLE001 - any read failure becomes model-readable text
-            return f"Couldn't read asset {asset_uuid!r}: {_reason(error)}"
+            return tool_failed(
+                f"Couldn't read asset {asset_uuid!r}: {_reason(error)}", reason="platform_error"
+            )
         filename = file.filename or f"{asset_uuid}.bin"
         try:
             container_id = self._ensure_container()
             path = self._upload_input(container_id, data, filename)
         except Exception as error:  # noqa: BLE001 - container failure is model-readable, not fatal
-            return f"Couldn't stage asset {asset_uuid!r} into the code sandbox: {_reason(error)}"
+            return tool_failed(
+                f"Couldn't stage asset {asset_uuid!r} into the code sandbox: {_reason(error)}",
+                reason="provider_error",
+            )
         return (
             f"Staged asset {asset_uuid!r} into the code sandbox as {path!r} "
             f"({len(data)} bytes). Read it from that path in your code."
@@ -339,9 +345,10 @@ class CodeAttachTool(PlatformTool):
     def run(self, asset_uuid: str) -> str:  # type: ignore[override]
         bridge = self.context.code_bridge
         if bridge is None:
-            return (
+            return tool_failed(
                 "Code execution is not active for this agent, so there is nothing to attach a "
-                "file to. (The code_attach tool needs the code_interpreter built-in enabled.)"
+                "file to. (The code_attach tool needs the code_interpreter built-in enabled.)",
+                reason="config:code_execution_inactive",
             )
         return bridge.stage_asset(asset_uuid)
 

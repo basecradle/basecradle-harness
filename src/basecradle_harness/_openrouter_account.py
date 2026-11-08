@@ -55,6 +55,7 @@ from typing import Any
 
 import httpx
 
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._secret import reveal, secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 
@@ -80,6 +81,11 @@ class _BalanceUnavailable(Exception):
     return string by `run`. Its message is always safe to show the model — it names *what* went
     wrong (a status code, a shape problem), never the key or the raw payload.
     """
+
+    def __init__(self, message: str, *, slug: str = "provider_error") -> None:
+        super().__init__(message)
+        #: The `tool` line's `reason` for this failure (issue #822).
+        self.slug = slug
 
 
 @dataclass(frozen=True)
@@ -163,11 +169,12 @@ class OpenRouterAccountBalanceTool(Tool):
         """Report the credit remaining, or a clear reason it is unavailable."""
         key = reveal(self._management_key) or os.environ.get("OPENROUTER_MANAGEMENT_KEY")
         if not key:
-            return (
+            return tool_failed(
                 "OpenRouter account balance unavailable — OPENROUTER_MANAGEMENT_KEY is not "
                 "configured. Set it to an OpenRouter Management key "
                 "(openrouter.ai/settings/management-keys → Create New Key); an ordinary "
-                "inference API key is not accepted on this endpoint."
+                "inference API key is not accepted on this endpoint.",
+                reason="config:missing_api_key",
             )
 
         cached = self._cached_balance(key)
@@ -185,13 +192,14 @@ class OpenRouterAccountBalanceTool(Tool):
             ) as client:
                 credits = self._credits(client)
         except UnicodeEncodeError:
-            return (
+            return tool_failed(
                 "OpenRouter account balance unavailable — OPENROUTER_MANAGEMENT_KEY contains a "
                 "non-ASCII character, so it cannot be sent as a header; check for a smart quote "
-                "or a non-breaking space picked up when it was pasted."
+                "or a non-breaking space picked up when it was pasted.",
+                reason="config:auth",
             )
         except _BalanceUnavailable as exc:
-            return f"OpenRouter account balance unavailable — {exc}"
+            return tool_failed(f"OpenRouter account balance unavailable — {exc}", reason=exc.slug)
 
         text = _render(credits, self._now_utc())
         if self._cache_ttl > 0:
@@ -215,13 +223,16 @@ class OpenRouterAccountBalanceTool(Tool):
         try:
             response = client.get(f"{self._base_url}{path}")
         except httpx.RequestError as exc:
-            raise _BalanceUnavailable(f"couldn't reach the OpenRouter API ({exc}).") from None
+            raise _BalanceUnavailable(
+                f"couldn't reach the OpenRouter API ({exc}).", slug="transport"
+            ) from None
 
         status = response.status_code
         if status in (401, 403):
             raise _BalanceUnavailable(
                 f"OpenRouter rejected the key (HTTP {status}); this endpoint needs a Management "
-                "key, not an inference API key. Check OPENROUTER_MANAGEMENT_KEY."
+                "key, not an inference API key. Check OPENROUTER_MANAGEMENT_KEY.",
+                slug="config:auth",
             )
         if status >= 400:
             raise _BalanceUnavailable(f"OpenRouter returned HTTP {status} trying to {action}.")

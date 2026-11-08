@@ -111,7 +111,7 @@ The harness's members (`_observability._VERDICT_VALUES` for the `outcome=` pairs
 |---|---|---|
 | Success | `wake start`, `wake continuing`, `wake billing_recovered`, `Wake breaker RESET`, `palace scrub` (an apply that found nothing to remove) | `ok` |
 | Bookend | `wake end` | — |
-| Warning | `wake skipped`, `wake deferred`, `wake truncated_turn`, `wake stalled`, `wake billing_blocked`, `degraded`, `Wake breaker TRIPPED`, `palace scrub` (a dry run) | `retrying`, `refused`, `fallback` |
+| Warning | `wake skipped`, `wake deferred`, `wake truncated_turn`, `wake stalled`, `wake billing_blocked`, `degraded`, `Wake breaker TRIPPED`, `palace scrub` (a dry run) | `degraded`, `retrying`, `refused`, `fallback` |
 | Operator's Choice | `wake stopped` | `stopped` |
 | Failure | `wake failed`, `wake reported_failure`, `post failed`, `cleanup failed`, `cleanup blocked`, `palace scrub failed`, `palace scrub` (an apply that removed what the harness mined) | `error`, `failed` |
 
@@ -258,6 +258,8 @@ The describer answering again from its once-per-wake memo instead of calling a m
 
 **One line per tool use, whoever executed it** — a harness tool, an MCP server's tool, or a tool the vendor ran server-side inside a model call (`_observability.log_tool`, the only emitter). Tool calls and tool spend are both read off this one head; there is no second definition of "tool". The engine writes the line for a harness or MCP tool, with what the tool's vendor work recorded on its meter while it ran (`_observability.metered`); the engine's own refusal of a call (an unknown or withheld name) is `executor=harness`, since the harness is what answered it. An adapter writes the line for a server-side tool, one line per model call per tool, right after that call's `llm` line — or before it, when the caller holds its `llm` line back to judge the answer (`capture_llm_call`); `generation_id` is the join either way. A failed harness or MCP run writes a second, WARNING `tool` line carrying `name` and `error`; a failed server-side tool has a vendor code and no text, so it has no companion and its line is itself a WARNING.
 
+**A tool that answers the model with its failure has still failed** (issue #822). Feeding a failure back is how a model recovers, so most failures reach the engine as a plain string. The tool says so through `_observability.tool_failed`, which returns the text unchanged and records the verdict on the run's meter; an MCP server says so with `isError`. The verdict is structural and never read off the result's text, because a shell command or a fetched page may begin with the word `Error`.
+
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
 | `name` | The tool's name as the agent knows it (`messages`, `generate_image`, `web_search`, `web_fetch`, `code_execution`, an MCP tool's name). A server-side tool carries the harness name of the capability, not the vendor's internal block type. | The engine; an adapter for a server-side tool. | Never. |
@@ -267,12 +269,24 @@ The describer answering again from its once-per-wake memo instead of calling a m
 | `model` | The vendor model the tool's work ran on. | The tool or adapter. | The tool used no model. |
 | `count` | Billed or executed units on this line: searches, grounding queries, fetches, executions. A server-side tool writes one line per model call per tool, with its uses counted here — every use, a failed one included, so it can exceed the units a fee was charged on. | The tool or adapter. | A harness run whose work stated no units (one image, one transcription). Always present on `executor=server`. |
 | `duration` | Wall time of the run — for a media tool, the generation and the upload that follows it. | The engine. | `executor=server` — the work ran inside a model call its `llm` line already timed. |
-| `outcome` | `ok` or `error`. | The engine; the adapter from the vendor's result block. | The WARNING companion line. |
-| `reason` | Why it failed, as a slug. The engine's own refusals: `unknown_tool`, `withheld`, `server_side` (a server-side built-in called as a function), `elision_marker`, `invalid_arguments` (the call's arguments cannot bind to the tool's `run()` — an unknown, missing or misspelled name, or not an object; refused before the tool runs); a tool that raised: `exception`; a harness tool's vendor call that failed: the fault slug, as on `llm` (`rate_limited`, `server_error`, `transport`, `timeout`, `invalid_response`, `provider_error`). For a server-side tool, the vendor's own code or status, lowercased (`max_uses_exceeded`, `url_retrieval_status_error`, `outcome_failed`, `failed`, `incomplete`). | Whoever saw the failure. | `outcome=ok`. |
+| `outcome` | `ok`, `degraded` or `error` (see [Tool Outcomes](#tool-outcomes)). No harness or adapter path writes `degraded` on this head today. | The engine; the adapter from the vendor's result block. | The WARNING companion line. |
+| `reason` | Why it was not `ok`, as a slug. The engine's own refusals: `unknown_tool`, `withheld`, `server_side` (a server-side built-in called as a function), `elision_marker`, `invalid_arguments` (the call's arguments cannot bind to the tool's `run()` — an unknown, missing or misspelled name, or not an object; refused before the tool runs — or the tool itself refused what it was given: a required value for this action missing, an unknown action, a wrong confirm, an asset of the wrong kind or size); a tool that raised: `exception`; a harness tool's vendor call that failed: the fault slug, as on `llm` (`rate_limited`, `server_error`, `transport`, `timeout`, `invalid_response`, `provider_error`); `config:<cause>` for a setup fault only a human can fix, such as `config:missing_api_key`, `config:auth`, `config:running_as_root`, `config:prompts_not_installed`; `memory_error` (the memory search failed, so its "no matches" means nothing); `platform_error` (the BaseCradle platform refused or failed the call); `tool_error` (an MCP server's own `isError` verdict); `fetch_failed` (`web_fetch` refused the URL, could not complete it, or the server answered with an error status); `refused` (a push service's verdict on the request); `output_limit` (a shell command killed for passing the output cap). For a server-side tool, the vendor's own code or status, lowercased (`max_uses_exceeded`, `url_retrieval_status_error`, `outcome_failed`, `failed`, `incomplete`). | Whoever saw the failure. | `outcome=ok`. |
 | `error` | Common; on the WARNING companion line only. | The engine. | `outcome=ok`. |
 | `cost` | US dollars of the tool's own fee — never model tokens, which are on the `llm` line. | The tool or adapter. | No fee, or a fee nobody can price (see `cost unpriced`). |
 | `cost_basis` | Common. | `cost_basis()`. | As Common. |
 | `generation_id` | Common: the model call the tool ran inside, so a tool joins to its `llm` line. | The adapter. | `executor` is not `server`, or the call's response named no id. |
+
+#### Tool Outcomes
+
+**One dimension, carried by two heads: `outcome` on `tool` and on `charge`, with one vocabulary** (issue #822). It is what makes Tools a sibling of Wake, Helper LLM and Memory on the fleet's *Outcomes* charts. The field keeps the name every sibling head uses; `tool_outcome` is the NOC's name for the label it extracts from it.
+
+| Outcome | Means | `reason` |
+|---|---|---|
+| `ok` | The work was done. The answer may still be bad news: a shell command that exited nonzero, or a confirm gate's preview. | Absent. |
+| `degraded` | The work was done and is usable, with a shortfall the line names. | Required. |
+| `error` | The work was not done, or cannot be used. | Required. |
+
+A `charge` is on this dimension because a billed resource is tool-adjacent (see [`charge`](#charge)), and the shortfall known today is one about money: Steel's stated cost and the rate card disagreeing. It is never a `tool` line, because a session is billed by the minute across zero or more tool uses (@origin, 2026-11-01). A clean `charge` is not a tool use, so a chart of tool outcomes counts every `tool` line (the WARNING companion excluded, as `tool_calls` excludes it) and a `charge` only when it is not `ok`, which keeps the chart's total equal to the tool calls plus the sessions that went wrong.
 
 ### `cost unpriced`
 
@@ -292,7 +306,7 @@ A `container_time` or `browser_time` gap is the charge the next head would carry
 **One line per billed resource instance**: a dollar a vendor bills by a quantity of a resource — browser session minutes, container hours, a 15-minute GPU block, bytes, storage — rather than per call (@origin, 2026-11-01, on basecradle-noc#1153). It is neither a tool *use* nor a model call, so it has a head of its own, and every resource-billed product fits it without a new one.
 
 ```text
-charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit=<billing unit> count=<quantity in that unit> [duration=<s>] [started=<iso>] [resource=<vendor resource id>] [generation_id=<model call it belongs to>] outcome=ok|error [reason=<slug>] cost=<usd> [cost_basis=computed] [vendor_usage=<vendor's own raw figure> vendor_unit=<its unit>]
+charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit=<billing unit> count=<quantity in that unit> [duration=<s>] [started=<iso>] [resource=<vendor resource id>] [generation_id=<model call it belongs to>] outcome=ok|degraded|error [reason=<slug>] cost=<usd> [cost_basis=computed] [vendor_usage=<vendor's own raw figure> vendor_unit=<its unit>]
 ```
 
 - **Which head.** If the dollar can be attributed to one request from that request's own response, it is not a charge: tokens are on the `llm` line, a per-search fee on the `tool` line. If it is billed by a quantity of a resource across zero or more requests, it is a `charge`.
@@ -311,8 +325,8 @@ charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit
 | `started` | The moment the resource instance started. | The producer. | The vendor states no start. |
 | `resource` | The vendor's own id for the billed resource instance (a Steel session id, a container id). | The producer. | The vendor names no instance. |
 | `generation_id` | Common: the one model call the charge belongs to (container time inside a call). | The adapter. | The charge belongs to no single model call. |
-| `outcome` | `ok` or `error`: whether the resource instance's run ended cleanly. A charge is written either way, because the vendor bills either way. | The producer. | Never. |
-| `reason` | Why the run ended in error, as a slug: `crashed` (the instance died while running), `startup_failed` (it never became usable), `timeout` (a deadline ran out — the vendor's or the producer's — as on `llm`). Generic in spelling, so every vendor's failures map onto the same words: Steel's `browser_crashed` → `crashed`, `startup_failed` → `startup_failed`, `creation_timeout` → `timeout`. A vendor's word that fits none is a change to this page, never written verbatim. | The producer. | `outcome=ok`. |
+| `outcome` | `ok`, `degraded` or `error` (see [Tool Outcomes](#tool-outcomes)): `error` when the resource instance's run did not end cleanly, `degraded` when it did and the line's own figure cannot be vouched for. A run that failed is `error` even when its figure is also in doubt. A charge is written either way, because the vendor bills either way. | The producer. | Never. |
+| `reason` | Why the line is not `ok`, as a slug. On `error`: `crashed` (the instance died while running), `startup_failed` (it never became usable), `timeout` (a deadline ran out — the vendor's or the producer's — as on `llm`). On `degraded`: `cost_divergence` (the vendor's stated cost and the published rates disagree), `no_rate_card` (a stated cost with no published rate to check it against), `stated_cost_<why>` (the vendor would not state the cost, so `cost` is computed: `stated_cost_unreachable`, `stated_cost_http_<status>`, `stated_cost_malformed`, `stated_cost_not_usd`, `stated_cost_unavailable`). Generic in spelling, so every vendor's failures map onto the same words: Steel's `browser_crashed` → `crashed`, `startup_failed` → `startup_failed`, `creation_timeout` → `timeout`. A vendor's word that fits none is a change to this page, never written verbatim. | The producer. | `outcome=ok`. |
 | `cost` | Common: US dollars billed for the instance. | The producer. | Never (see above: an unpriceable charge writes `cost unpriced`, not `charge`). |
 | `cost_basis` | Common. | `cost_basis()`, or the producer by the same rule. | As Common. |
 | `vendor_usage` | The vendor's own raw figure for the instance, verbatim, when it reports one in a unit this page cannot yet price (Steel's `creditsUsed`) — kept for calibrating a computed `cost`. Generic, never a vendor-named field. | The producer. | The vendor reports no such figure. |
@@ -328,6 +342,12 @@ A session Steel released as `browser_crashed`, billed for the minutes it ran:
 
 ```text
 INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=2 duration=71.40s started=2026-11-01T03:20:05Z resource=01a19518-5b12-7d03-8e6a-2c4f9b7d1e83 outcome=error reason=crashed cost=0.02 cost_basis=computed vendor_usage=4 vendor_unit=credits
+```
+
+A session whose stated cost the published rates do not reproduce:
+
+```text
+INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=8 duration=471.02s started=2026-11-08T14:02:11Z resource=01a19518-7e44-7a12-b3c0-6f1d8e2a9c07 outcome=degraded reason=cost_divergence cost=0.0633
 ```
 
 A session on a Steel plan whose per-minute rate the launcher's table lacks writes no `charge` line, and one `cost unpriced` gap instead:
@@ -824,7 +844,7 @@ The slices are the issues that remove each row: **slice 2 — tools** ([#758](ht
 
 ### Outside This Repository
 
-The NOC's Steel browser launcher writes its own `browser provider=` head. Its per-session spend line retires into the [`charge`](#charge) line (@origin, 2026-11-01: a session is billed by the minute, not per tool use, so it is not a `tool` line); its lifecycle lines stay on a NOC-only head that no column reads. It is not emitted here, so it is not witnessed here; the launcher's move is basecradle-noc#1153's. Slice 2 carried the rest to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
+The NOC's Steel browser launcher writes its own `browser provider=` head. Its per-session spend line retires into the [`charge`](#charge) line (@origin, 2026-11-01: a session is billed by the minute, not per tool use, so it is not a `tool` line); its lifecycle lines stay on a NOC-only head that no column reads. It is not emitted here, so it is not witnessed here; the launcher's move is basecradle-noc#1153's. A cost shortfall is stated on the `charge` line's own `outcome` (issue #822), so the launcher's `session.ended` companion is detail, never a second verdict a chart reads. Slice 2 carried the rest to the NOC through the capital, together with the NOC columns that read what this repository retired in slice 2 (*Tool Cost* off `media`/`browser`; `web_search_requests`, `web_fetch_requests`, `code_execution_requests` off `llm`), which read the `tool` line instead.
 
 The Claude Code builders' model calls reach this contract through the router's `ai_otel_llm` remap (basecradle-router `deploy/vector.yaml`), which renders each `api_request` as an `llm` line. Under issue #782 an `api_error` (Claude Code's final failure, after its own retries) is rendered as `llm … outcome=failed reason=<slug>` with no tokens, and an auxiliary call as `purpose=helper` with no `kind` (basecradle-router#384). Its slug is read off the status by [Fault Slugs](#fault-slugs); the remap adopts that table's `transport`, `config:auth`, `config:billing`, `config:model_not_found` and `payload_too_large` in basecradle-router's follow-up to issue #786, and until then writes `api_error` for each. Its `duration` is absent where Claude Code cannot state the whole wait (an `api_error` after more than one attempt, or with no status), and its `failed` line is WARNING. A builder's line carries no `timeline`, `delivery` or `step`: it has no wake.
 

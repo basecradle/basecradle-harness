@@ -42,6 +42,7 @@ import re
 
 from basecradle import BaseCradleError, User
 
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._platform import PlatformTool, explain
 
 # How many timelines one `list` returns before eliding — the same defensive cap the
@@ -137,14 +138,18 @@ class TimelinesTool(PlatformTool):
     ) -> str:
         """Dispatch on `action`. Returns a message written for the model to read."""
         if action not in self._PHRASE:
-            return (
+            return tool_failed(
                 f"Error: unknown action {action!r}. Use 'create', 'read', 'list', "
-                "'add_participant', or 'remove_participant'."
+                "'add_participant', or 'remove_participant'.",
+                reason="invalid_arguments",
             )
         try:
             if action == "create":
                 if not name:
-                    return "Error: 'create' needs a 'name' for the timeline."
+                    return tool_failed(
+                        "Error: 'create' needs a 'name' for the timeline.",
+                        reason="invalid_arguments",
+                    )
                 return self._create(name)
             if action == "list":
                 return self._list()
@@ -153,15 +158,20 @@ class TimelinesTool(PlatformTool):
                 return self._read(target)
             # add_participant / remove_participant
             if not user:
-                return f"Error: '{action}' needs a 'user' (a handle like '@nova' or a uuid)."
+                return tool_failed(
+                    f"Error: '{action}' needs a 'user' (a handle like '@nova' or a uuid).",
+                    reason="invalid_arguments",
+                )
             resolved = _resolve_user(self.context.client, user)
             if action == "add_participant":
                 return self._add_participant(target, resolved)
             return self._remove_participant(target, resolved)
         except _UserNotFound as error:
-            return f"Error: {error}"
+            return tool_failed(f"Error: {error}", reason="invalid_arguments")
         except BaseCradleError as error:
-            return f"Couldn't {self._PHRASE[action]}: {explain(error)}"
+            return tool_failed(
+                f"Couldn't {self._PHRASE[action]}: {explain(error)}", reason="platform_error"
+            )
 
     # --- actions -------------------------------------------------------------
 
@@ -249,18 +259,26 @@ class TrustTool(PlatformTool):
     def run(self, action: str, user: str | None = None) -> str:
         """Dispatch on `action`. Returns a message written for the model to read."""
         if action not in self._PHRASE:
-            return f"Error: unknown action {action!r}. Use 'grant' or 'revoke'."
+            return tool_failed(
+                f"Error: unknown action {action!r}. Use 'grant' or 'revoke'.",
+                reason="invalid_arguments",
+            )
         if not user:
-            return f"Error: '{action}' needs a 'user' (a handle like '@origin' or a uuid)."
+            return tool_failed(
+                f"Error: '{action}' needs a 'user' (a handle like '@origin' or a uuid).",
+                reason="invalid_arguments",
+            )
         try:
             resolved = _resolve_user(self.context.client, user)
             if action == "grant":
                 return self._grant(resolved)
             return self._revoke(resolved)
         except _UserNotFound as error:
-            return f"Error: {error}"
+            return tool_failed(f"Error: {error}", reason="invalid_arguments")
         except BaseCradleError as error:
-            return f"Couldn't {self._PHRASE[action]}: {explain(error)}"
+            return tool_failed(
+                f"Couldn't {self._PHRASE[action]}: {explain(error)}", reason="platform_error"
+            )
 
     # --- actions -------------------------------------------------------------
 

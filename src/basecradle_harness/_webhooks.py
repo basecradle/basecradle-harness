@@ -51,6 +51,7 @@ import itertools
 from basecradle import BaseCradleError
 
 from basecradle_harness._idempotency import WEBHOOK_ENDPOINT
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._platform import PlatformTool, explain
 
 # How many endpoints/events one `list` returns. The cap keeps a pathological
@@ -136,9 +137,10 @@ class WebhookEndpointsTool(PlatformTool):
     ) -> str:
         """Dispatch on `action`. Returns a message written for the model to read."""
         if action not in self._PHRASE:
-            return (
+            return tool_failed(
                 f"Error: unknown action {action!r}. Use 'create', 'list', 'enable', "
-                "'disable', or 'rotate'."
+                "'disable', or 'rotate'.",
+                reason="invalid_arguments",
             )
         try:
             if action == "create":
@@ -146,20 +148,28 @@ class WebhookEndpointsTool(PlatformTool):
                 # transcript, which records this call either way (#297 — see `PlatformTool.key`).
                 key = self.key(WEBHOOK_ENDPOINT)
                 if not description:
-                    return "Error: 'create' needs a 'description' for the endpoint."
+                    return tool_failed(
+                        "Error: 'create' needs a 'description' for the endpoint.",
+                        reason="invalid_arguments",
+                    )
                 return self._create(timeline or self.context.timeline, description, key)
             if action == "list":
                 return self._list(timeline or self.context.timeline)
             # enable / disable / rotate — keyed off the endpoint's own uuid.
             if not uuid:
-                return f"Error: '{action}' needs the endpoint's uuid. Use 'list' to find it."
+                return tool_failed(
+                    f"Error: '{action}' needs the endpoint's uuid. Use 'list' to find it.",
+                    reason="invalid_arguments",
+                )
             if action == "enable":
                 return self._set_enabled(uuid, enabled=True)
             if action == "disable":
                 return self._set_enabled(uuid, enabled=False)
             return self._rotate(uuid)
         except BaseCradleError as error:
-            return f"Couldn't {self._PHRASE[action]}: {explain(error)}"
+            return tool_failed(
+                f"Couldn't {self._PHRASE[action]}: {explain(error)}", reason="platform_error"
+            )
 
     # --- actions -------------------------------------------------------------
 
@@ -282,12 +292,17 @@ class WebhookEventsTool(PlatformTool):
                 return self._list(timeline or self.context.timeline, endpoint)
             if action == "read":
                 if not uuid:
-                    return "Error: 'read' needs the event's uuid. Use 'list' to find it."
+                    return tool_failed(
+                        "Error: 'read' needs the event's uuid. Use 'list' to find it.",
+                        reason="invalid_arguments",
+                    )
                 return self._read(uuid)
         except BaseCradleError as error:
             verb = "list the events" if action == "list" else "read the event"
-            return f"Couldn't {verb}: {explain(error)}"
-        return f"Error: unknown action {action!r}. Use 'list' or 'read'."
+            return tool_failed(f"Couldn't {verb}: {explain(error)}", reason="platform_error")
+        return tool_failed(
+            f"Error: unknown action {action!r}. Use 'list' or 'read'.", reason="invalid_arguments"
+        )
 
     # --- actions -------------------------------------------------------------
 

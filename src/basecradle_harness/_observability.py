@@ -113,6 +113,8 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
         "ok": GREEN,
         "error": RED,
         "failed": RED,
+        # Done and usable with a named shortfall (issue #822): the launcher's `charge` line.
+        "degraded": YELLOW,
         "retrying": YELLOW,
         "refused": YELLOW,
         "fallback": YELLOW,
@@ -1321,11 +1323,13 @@ class ToolMeter:
     count that is not a positive ``int`` likewise.
     """
 
-    __slots__ = ("_units", "failure")
+    __slots__ = ("_units", "failure", "verdict")
 
     def __init__(self) -> None:
         self._units: list[tuple[str, str, str, int | None, float | None, bool]] = []
         self.failure: Exception | None = None
+        #: ``(reason, error)`` from `tool_failed`: this run failed, with no vendor work to blame.
+        self.verdict: tuple[str, str] | None = None
 
     def record(
         self,
@@ -1393,6 +1397,26 @@ def meter_failure(exc: Exception, *, provider: str, kind: str, model: str) -> No
     if meter is not None:
         meter.record(provider=provider, kind=kind, model=model, failed=True)
         meter.failure = exc
+
+
+def tool_failed(text: str, *, reason: str, error: str | None = None) -> str:
+    """Record that the running tool failed, and hand back ``text`` for the model, unchanged.
+
+    **A tool that answers the model with its failure has still failed.** Feeding the failure back
+    is how a model recovers, and it also leaves the engine holding a plain string, so without this
+    the `tool` line reads ``outcome=ok`` for a call that did nothing — and *Tool Outcomes* shows
+    green for a tool failing on every call (issue #822). Read the verdict structurally, never off
+    the text: a shell command or a fetched page may well begin with the word "Error".
+
+    ``reason`` is a slug from the `tool` line's vocabulary (``docs/telemetry.md``). ``error`` is what
+    the WARNING companion carries, the text itself when not given. Vendor work that recorded its own
+    failure on the meter outranks this, since it knows the fault's precise slug. A no-op outside a
+    tool run, so a tool author can write ``return tool_failed("Error: …", reason="…")`` freely.
+    """
+    meter = _METER.get()
+    if meter is not None:
+        meter.verdict = (reason, text.removeprefix("Error: ") if error is None else error)
+    return text
 
 
 class MeteredCall:

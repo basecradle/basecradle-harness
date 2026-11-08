@@ -1188,6 +1188,7 @@ class Engine:
         A tool whose vendor call failed and that turned the failure into text for the model (every
         media tool does, so the model can read why) still failed: its meter holds the fault, so the
         line says ``outcome=error`` with the fault's slug rather than reporting a refusal as a run.
+        A tool with no vendor work to blame says the same through `tool_failed` (issue #822).
         """
         elapsed = (self._clock() - started).total_seconds()
         work = meter.fields() if meter is not None else {}
@@ -1195,6 +1196,8 @@ class Engine:
         if reason is None and failure is not None:
             reason = _reason(failure) if isinstance(failure, ProviderError) else "exception"
             error = str(failure)
+        elif reason is None and meter is not None and meter.verdict is not None:
+            reason, error = meter.verdict
         log_tool(
             name=name,
             executor=executor,

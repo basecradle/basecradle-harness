@@ -132,7 +132,7 @@ from basecradle_harness._assets import (
 from basecradle_harness._install import config_home
 from basecradle_harness._media import sniff_media_ext
 from basecradle_harness._messages import ImageContent, ToolResult
-from basecradle_harness._observability import MCP_EXECUTOR
+from basecradle_harness._observability import MCP_EXECUTOR, tool_failed
 from basecradle_harness._secret import Secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 from basecradle_harness._venv import with_interpreter_bin
@@ -1258,7 +1258,15 @@ class McpTool(Tool):
         root = self._client.workdir
         named = _named_files(kwargs, root) if root is not None else None
         result = self._client.call_tool(self._remote_name, dict(kwargs))
-        return _render_tool_result(result, self._images, named)
+        rendered = _render_tool_result(result, self._images, named)
+        if result.get("isError"):
+            # The server's own verdict, a real field on the result (issue #822): its text is
+            # what the model reads, and without this the `tool` line would say `outcome=ok`.
+            tool_failed(
+                rendered.text if isinstance(rendered, ToolResult) else rendered,
+                reason="tool_error",
+            )
+        return rendered
 
 
 def mcp_tool_name(server: str, tool: str) -> str:

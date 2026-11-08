@@ -2158,6 +2158,20 @@ class Weather(Tool):
 
 Every shipped tool, adapter and client that keeps a credential does the same.
 
+**Say when a call failed.** Hand the model its failure as text so it can recover, and mark it, so the `tool` line says `outcome=error` instead of `outcome=ok`:
+
+```python
+from basecradle_harness import tool_failed
+
+
+def run(self, city: str) -> str:
+    if not city:
+        return tool_failed("Error: 'weather' needs a city.", reason="invalid_arguments")
+    return fetch_weather(city)
+```
+
+The returned text is unchanged, so the model reads exactly what you wrote. An exception you let escape is marked for you (`reason=exception`). The `reason` slugs are listed in [`docs/telemetry.md`](docs/telemetry.md#tool).
+
 ## Plug in an MCP server
 
 The harness is an [MCP](https://modelcontextprotocol.io) **client**. Drop one server config into the config home's `mcp/` dir and that server's tools join your agent's active tool set on the next wake — no code change, the same drop-in model as `tools/`.

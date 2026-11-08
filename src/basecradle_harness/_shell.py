@@ -77,6 +77,7 @@ import signal
 import subprocess
 import threading
 
+from basecradle_harness._observability import tool_failed
 from basecradle_harness._policy import SHELL
 from basecradle_harness._tools import Tool
 from basecradle_harness._venv import path_preamble, with_interpreter_bin
@@ -240,13 +241,18 @@ class ShellTool(Tool):
         # directly (bypassing the registry's load-time refusal) must never hand the
         # model a root shell. See `load_refusal` / `_ROOT_REFUSAL` (issue #253).
         if _running_as_root():
-            return f"Error: {_ROOT_REFUSAL}"
+            return tool_failed(f"Error: {_ROOT_REFUSAL}", reason="config:running_as_root")
         if not command or not command.strip():
-            return "Error: 'shell' needs a 'command' to run."
+            return tool_failed(
+                "Error: 'shell' needs a 'command' to run.", reason="invalid_arguments"
+            )
 
         cwd = workdir or self._workdir or os.path.expanduser("~")
         if not os.path.isdir(cwd):
-            return f"Error: workdir {cwd!r} is not a directory."
+            return tool_failed(
+                f"Error: workdir {cwd!r} is not a directory.",
+                reason="invalid_arguments" if workdir else "config:workdir_missing",
+            )
         seconds = self._resolve_timeout(timeout)
 
         try:
@@ -261,7 +267,7 @@ class ShellTool(Tool):
                 start_new_session=True,  # own process group so a timeout kills children too
             )
         except OSError as exc:
-            return f"Couldn't start a shell: {exc}"
+            return tool_failed(f"Couldn't start a shell: {exc}", reason="exception")
 
         # Read output on a background thread so we can bound BOTH how long we wait (the
         # timeout) and how much we buffer (the output cap) — `communicate()` can do
@@ -276,15 +282,24 @@ class ShellTool(Tool):
             _kill_group(proc)
             reader.join(self._drain_timeout)  # bounded: an escaped grandchild can't hang us
             self._reap(proc)
-            return self._format(pump.text(), timed_out=seconds)
+            return tool_failed(
+                self._format(pump.text(), timed_out=seconds),
+                reason="timeout",
+                error=f"the command ran past its {seconds}s timeout and was killed",
+            )
 
         if pump.capped and proc.poll() is None:
             # Still producing after passing the output cap → over budget; stop it.
             _kill_group(proc)
             self._reap(proc)
-            return self._format(pump.text(), over_cap=True)
+            return tool_failed(
+                self._format(pump.text(), over_cap=True),
+                reason="output_limit",
+                error=f"the command passed the {self._max_output}-character output limit and was killed",
+            )
 
-        # Finished on its own (or produced more than the cap but already exited).
+        # Finished on its own (or produced more than the cap but already exited). A nonzero exit
+        # is the command's answer, which the tool delivered: `outcome=ok`, never a tool failure.
         self._reap(proc)
         return self._format(pump.text(), returncode=proc.returncode)
 

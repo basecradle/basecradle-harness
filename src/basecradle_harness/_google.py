@@ -239,7 +239,7 @@ class GoogleConfigError(ValueError):
 
     `reason` is a stable slug a caller can file a fault under (the describer reports it as
     ``config:<reason>``): ``missing_credentials_file``, ``unreadable_credentials_file``,
-    ``invalid_credentials_file``, ``missing_location``, ``missing_project``, or
+    ``invalid_credentials_file``, ``missing_location``, ``missing_project``, ``missing_model``, or
     ``invalid_model_params``. The message never carries the file's contents.
     """
 

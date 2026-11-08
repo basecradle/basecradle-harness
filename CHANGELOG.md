@@ -7,6 +7,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.180.0] - 2026-11-08
+
+### Fixed: a tool that answers the model with its failure says `outcome=error` (issue #822)
+
+The `tool` line already carried `outcome=` and `reason=`, and it was wrong for most failures. A tool hands its failure back as text so the model can recover, so the engine saw a plain string and wrote `outcome=ok`: a platform refusal, a missing argument, an MCP server's `isError`. A chart of tool outcomes would have shown green for a tool failing on every call.
+
+- **`tool_failed(text, reason=…)`** marks the running tool's use as failed and returns `text` unchanged, so nothing the model reads changes. It is exported from the package, for `tools/` overlay authors too. Every shipped tool's failure path uses it, and `tests/test_tool_outcomes.py` fails on a new one that does not.
+- **An MCP server's `isError` is the verdict**, read off the result's field: `reason=tool_error`.
+- **New `reason=` slugs on `tool`:** `platform_error`, `tool_error`, `fetch_failed`, `output_limit`, `refused`, `memory_error`, and `config:<cause>`; `invalid_arguments` now also covers what a tool refuses itself. A shell command's nonzero exit stays `ok`, because the tool delivered its answer; a command killed for its timeout or output cap is `error`.
+- **Expect `tool_errors` to step up** at rollout. Nothing started failing; those failures were being counted as successes.
+
+### Added: one tool outcome dimension, `outcome` = `ok | degraded | error` (issue #822)
+
+`docs/telemetry.md` → *Tool Outcomes*. `outcome` on `tool` and on `charge`, one vocabulary, with `reason=` required whenever it is not `ok`. `degraded` joins the palette's Warning tier. `charge` gains `outcome=degraded` and the reasons `cost_divergence`, `no_rate_card` and `stated_cost_<why>`, so a cost shortfall is stated on the billed line.
+
 ## [0.179.0] - 2026-11-07
 
 ### Changed: Python 3.11 is the floor, and `pillow` moves to 13 for its security fixes (issue #816)
