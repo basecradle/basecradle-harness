@@ -1250,6 +1250,14 @@ def _model_body(input_modalities):
             "default_parameters": {"temperature": 1, "top_p": 0.95},
             "supported_voices": None,
             "links": {"details": "/api/v1/models/z-ai/glm-5.2-20260616/endpoints"},
+            # Required by the SDK's `Model` as of 1.3.127 (absent in 1.3.94), and served by the live
+            # API. Without it the SDK refuses the whole record and every read here is None (#828).
+            "endpoints": [
+                "/api/v1/chat/completions",
+                "/api/v1/completions",
+                "/api/v1/messages",
+                "/api/v1/responses",
+            ],
         }
     }
 
