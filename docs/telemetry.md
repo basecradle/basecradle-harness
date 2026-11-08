@@ -329,19 +329,19 @@ charge provider=<biller> kind=<what was bought> executor=harness|mcp|server unit
 | `reason` | Why the line is not `ok`, as a slug. On `error`: `crashed` (the instance died while running), `startup_failed` (it never became usable), `timeout` (a deadline ran out — the vendor's or the producer's — as on `llm`). On `degraded`: `cost_divergence` (the vendor's stated cost and the published rates disagree), `no_rate_card` (a stated cost with no published rate to check it against), `stated_cost_<why>` (the vendor would not state the cost, so `cost` is computed: `stated_cost_unreachable`, `stated_cost_http_<status>`, `stated_cost_malformed`, `stated_cost_not_usd`, `stated_cost_unavailable`). Generic in spelling, so every vendor's failures map onto the same words: Steel's `browser_crashed` → `crashed`, `startup_failed` → `startup_failed`, `creation_timeout` → `timeout`. A vendor's word that fits none is a change to this page, never written verbatim. | The producer. | `outcome=ok`. |
 | `cost` | Common: US dollars billed for the instance. | The producer. | Never (see above: an unpriceable charge writes `cost unpriced`, not `charge`). |
 | `cost_basis` | Common. | `cost_basis()`, or the producer by the same rule. | As Common. |
-| `vendor_usage` | The vendor's own raw figure for the instance, verbatim, when it reports one in a unit this page cannot yet price (Steel's `creditsUsed`) — kept for calibrating a computed `cost`. Generic, never a vendor-named field. | The producer. | The vendor reports no such figure. |
+| `vendor_usage` | The vendor's own raw figure for the instance, verbatim, when it reports one in a unit this page cannot yet price (a plan's credits, say) — kept for calibrating a computed `cost`. Generic, never a vendor-named field. | The producer. | The vendor reports no such figure. |
 | `vendor_unit` | The unit `vendor_usage` is in (`credits`). | The producer. | `vendor_usage` is absent; never present without it. |
 
-The first producer is the NOC's Steel browser launcher (see [Outside This Repository](#outside-this-repository)); nothing in this repository writes a `charge` line yet. Its per-session spend line:
+The first producer is the NOC's Steel browser launcher (see [Outside This Repository](#outside-this-repository)); nothing in this repository writes a `charge` line yet. Its per-session spend line, whose `cost` is the dollar Steel states, so it carries no `cost_basis`:
 
 ```text
-INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=7 duration=402.18s started=2026-11-01T03:12:40Z resource=01a19518-4c40-7c41-9f3e-5d8c1a2b4e60 outcome=ok cost=0.07 cost_basis=computed vendor_usage=14 vendor_unit=credits
+INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=7 duration=402.18s started=2026-11-01T03:12:40Z resource=01a19518-4c40-7c41-9f3e-5d8c1a2b4e60 outcome=ok cost=0.07
 ```
 
 A session Steel released as `browser_crashed`, billed for the minutes it ran:
 
 ```text
-INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=2 duration=71.40s started=2026-11-01T03:20:05Z resource=01a19518-5b12-7d03-8e6a-2c4f9b7d1e83 outcome=error reason=crashed cost=0.02 cost_basis=computed vendor_usage=4 vendor_unit=credits
+INFO charge provider=steel kind=browser.session executor=mcp unit=minute count=2 duration=71.40s started=2026-11-01T03:20:05Z resource=01a19518-5b12-7d03-8e6a-2c4f9b7d1e83 outcome=error reason=crashed cost=0.02
 ```
 
 A session whose stated cost the published rates do not reproduce:
