@@ -1293,12 +1293,14 @@ NOT_REPORTED = "not_reported"
 #: once so every adapter states the same gap in the same words (issue #759): the call's **tokens**
 #: and a search's **grounding** fee are the charges; a model the rate table does not carry, a tier
 #: (or long-context band) it does not carry, and a host whose prices are not the table's are the
-#: reasons.
+#: reasons. A price read live from the vendor rather than from a table adds one more (issue #844):
+#: the price source itself could not be read on this wake.
 TOKENS_CHARGE = "tokens"
 GROUNDING_CHARGE = "grounding"
 UNKNOWN_MODEL = "unknown_model"
 UNPRICED_TIER = "unpriced_tier"
 UNPRICED_HOST = "unpriced_host"
+RATES_UNAVAILABLE = "rates_unavailable"
 
 
 class ToolMeter:

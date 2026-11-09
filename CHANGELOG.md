@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.183.0] - 2026-11-09
+
+### Added: refuseless is a known vendor, priced from its own live price list (issue #844)
+
+`AI_PROVIDER=refuseless` is now a vendor the harness knows, so the slug and a key are the whole configuration: the `openai` SDK on its Chat Completions surface, at `https://api.refuseless.com/v1` unless `AI_BASE_URL` says otherwise. Its calls log `llm provider=refuseless`, so *Spend by Provider* gets its own bucket.
+
+- **Every call is priced from the vendor's live `pricing`.** A refuseless completion states tokens and no dollars, but each row of `GET /v1/models` carries the model's effective price per million tokens. The adapter reads that list once per wake, from the host its calls go to and with the agent's own key, and logs `cost=` as `prompt_tokens × input_per_m + completion_tokens × output_per_m` over a million, tagged `cost_basis=computed`. There is no rate table for this vendor, by decision.
+- **A price it cannot state is omitted, never estimated.** One `cost unpriced charge=tokens` WARNING per gap per wake: `rates_unavailable` (a new reason, added to `docs/telemetry.md`) when the list could not be read, `unknown_model` when it has no row for the model, `not_reported` when the row has no usable US-dollar price. The list is not re-read in that wake, and no earlier wake's price is used.
+- **The context budget reads the model's window from the same list** (`context_length`), with no second request.
+- **Chat only.** `AI_SDK_SURFACE=responses` is refused at startup for this vendor, and an ungated server-side built-in is refused by name rather than dropped. No routing key or vendor header is sent.
+- **`--resolved-config`** reports `cost_basis: "computed"`, `cost_rates_source` naming the list at the agent's host, and `cost_model_priced: null`, since only a wake knows whether the list prices the model.
+
+
 ## [0.182.0] - 2026-11-09
 
 ### Added: an OpenRouter brain gets its own reasoning back with its tool results (issue #839)

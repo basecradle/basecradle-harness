@@ -297,7 +297,9 @@ One WARNING, once per wake per gap, naming a charge that is real and that the ha
 | `provider` | Common. | The adapter or tool. | Never. |
 | `model` | Common. | The adapter or tool. | The charge is not per-model. |
 | `charge` | What carries no price: `tokens`, `container_time`, `browser_time`, `grounding`, `search`. | The adapter, tool or producer. | Never. |
-| `reason` | `unknown_model`, `unpriced_tier`, `unpriced_host`, `not_reported`. | The adapter, tool or producer. | Never. |
+| `reason` | `unknown_model`, `unpriced_tier`, `unpriced_host`, `not_reported`, `rates_unavailable`. | The adapter, tool or producer. | Never. |
+
+**A price read live, not from a table.** refuseless publishes its price on its models list rather than in a response, so its `cost=` is computed from that list (`cost_basis=computed`: the arithmetic is the harness's, over the rates the vendor publishes) and its gaps are worded the way every table's are. `rates_unavailable` is the one reason only a live source can have: the list could not be read on this wake, so none of the wake's calls is priced. `unknown_model` is a model the list has no row for, and `not_reported` a row that states no usable US-dollar price for what the call billed (no `pricing`, another currency, a missing rate).
 
 A `container_time` or `browser_time` gap is the charge the next head would carry: the day a vendor states its container time, or a browser vendor's session minutes get a rate card, that charge is written as a priced `charge kind=compute.container` or `charge kind=browser.session` line and leaves this one. **The rule for the next value:** a gap in a charge billed per call or per use is named for what is billed (`tokens`, `grounding`, `search`); a gap in a charge billed by a quantity of a resource is `<resource>_time` (or `_bytes`, `_storage` for a resource with no run time), and the sentence above names the [`charge`](#charge) `kind` that retires it. Either way it is generic in spelling, never a vendor's name or word, and a new value is a change to this page.
 

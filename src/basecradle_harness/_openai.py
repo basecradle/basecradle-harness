@@ -38,6 +38,12 @@ stated gap, one ``cost unpriced charge=container_time`` WARNING per wake. Every 
 Responses call ran, on any endpoint, is a ``tool`` line beside the call's ``llm`` line
 (``executor=server``; issue #758). Pointed at xAI, nothing is computed: the xAI surfaces state their
 own prices where they state any, and a table of OpenAI's rates says nothing about xAI's.
+
+Pointed at **refuseless**, which returns tokens and no price but publishes a live ``pricing`` object
+on every row of its models list, the cost is computed from that list, read once per wake from the
+same host with the same key (`_catalog`), and tagged ``cost_basis=computed``
+(`basecradle_harness._refuseless_pricing`, issue #844). There is no table for it, by decision: a
+figure the list cannot state is a ``cost unpriced charge=tokens`` gap, never an estimate.
 """
 
 from __future__ import annotations
@@ -72,6 +78,7 @@ from basecradle_harness._messages import Message, ToolSpec
 from basecradle_harness._observability import (
     CONTAINER_TIME,
     NOT_REPORTED,
+    RATES_UNAVAILABLE,
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
     UNPRICED_HOST,
@@ -114,6 +121,8 @@ from basecradle_harness._openai_wire import (
     reasoning_to_send_back,
     server_tool_uses,
 )
+from basecradle_harness._refuseless_pricing import call_cost as listed_call_cost
+from basecradle_harness._refuseless_pricing import pricing_of
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
@@ -195,6 +204,10 @@ _AFFINITY: dict[tuple[str, str], _Affinity | None] = {
     # cell at all: that combination is chat-only and `_basecradle._provider_from_config` refuses it.)
     # See `_caching` for why xAI is the opposite situation rather than a precedent against this.
     ("openrouter", "chat"): None,
+    # A decided **no** (issue #844). refuseless documents no routing key on its Chat Completions
+    # surface, and a field it never asked for is at best ignored and at worst a 400 on every wake.
+    # Its only surface: Responses is refused for it (`_basecradle._VENDOR_SURFACES`).
+    ("refuseless", "chat"): None,
 }
 
 
@@ -279,9 +292,11 @@ class OpenAIProvider:
     """
 
     #: How this adapter's endpoints reach their prompt cache (issue #277). Every endpoint this one
-    #: adapter is aimed at — OpenAI, xAI, and OpenRouter's GLM endpoints — caches a repeated prefix
-    #: **automatically**, with nothing on the wire, so the engine places no breakpoint and the
-    #: caching that already works (verified live: a `cached_tokens: 238277` hit) is untouched.
+    #: adapter is aimed at — OpenAI, xAI, OpenRouter's GLM endpoints, and refuseless (which prices
+    #: cached input itself and documents nothing a client could mark, issue #844) — caches a
+    #: repeated prefix **automatically**, with nothing on the wire, so the engine places no
+    #: breakpoint and the caching that already works (verified live: a `cached_tokens: 238277` hit)
+    #: is untouched.
     #:
     #: The stated exception, so it is not a silent trap: pointed at an **explicit-cache model
     #: through a router** (``anthropic/claude-*`` via OpenRouter), this declaration is wrong — that
@@ -359,6 +374,17 @@ class OpenAIProvider:
         #: is unpriced *by construction*: no table, and no cost-gap WARNING about a table that was
         #: never its own.
         self._computes_cost = provider == "openai"
+        #: Whether this vendor states its models' price and context window on its **models list**
+        #: rather than anywhere a call or a single-model read would carry them (issue #844):
+        #: refuseless publishes a ``pricing`` object and a ``context_length`` per row of
+        #: ``GET /v1/models`` and documents no single-model read. An equality on the known vendor,
+        #: so no other endpoint is ever sent a list read it did not need.
+        self._reads_catalog = provider == "refuseless"
+        #: That list, read at most once per adapter — one wake — and held whatever it answered:
+        #: the rows by model id, or ``None`` when the read failed. A failure is never retried in
+        #: the same wake, and nothing read on an earlier wake is ever used (`_catalog`).
+        self._catalog_rows: dict[str, Mapping[str, Any]] | None = None
+        self._catalog_read = False
         #: Whether the vendor reports its reasoning **beside** the output rather than inside it, so
         #: the line folds it in (`reasoning_apart`, issue #759). xAI does, on both surfaces; an
         #: equality on the known vendor, so every other endpoint keeps the wire's own reading.
@@ -620,7 +646,10 @@ class OpenAIProvider:
 
         ``None`` for any endpoint but OpenAI's own, and for anything the table cannot price; each
         gap that will recur all wake is stated once, so a missing figure is never a silent one.
+        refuseless is priced from its own live list instead (`_listed_cost`).
         """
+        if self._reads_catalog:
+            return self._listed_cost(data, usage)
         if not self._computes_cost or not self._priced_endpoint():
             return None
         if not known(self.model):
@@ -639,6 +668,63 @@ class OpenAIProvider:
             # rate band the table does not carry. Stated once per wake.
             self._state_gap(TOKENS_CHARGE, UNPRICED_TIER)
         return cost
+
+    def _listed_cost(self, data: Mapping[str, Any], usage: Any) -> float | None:
+        """This call's dollars at the price the vendor's own models list states (issue #844).
+
+        Priced by the model the **response** names (the configured one when it names none), from
+        that model's row of the list `_catalog` read this wake. Every way the figure cannot be
+        stated is one ``cost unpriced charge=tokens`` gap, once per wake: ``rates_unavailable`` when
+        the list could not be read, ``unknown_model`` when it has no row for the model, and
+        ``not_reported`` when the row states no usable US-dollar price for what this call billed
+        (`_refuseless_pricing.pricing_of` and `call_cost` say exactly when).
+        """
+        rows = self._catalog()
+        if rows is None:
+            self._state_gap(TOKENS_CHARGE, RATES_UNAVAILABLE)
+            return None
+        named = data.get("model")
+        model = named if isinstance(named, str) and named else self.model
+        row = rows.get(model)
+        if row is None:
+            self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL, model=model)
+            return None
+        pricing = pricing_of(row)
+        cost = None if pricing is None else listed_call_cost(pricing, usage_of(usage))
+        if cost is None:
+            self._state_gap(TOKENS_CHARGE, NOT_REPORTED, model=model)
+        return cost
+
+    def _catalog(self) -> dict[str, Mapping[str, Any]] | None:
+        """The vendor's models list as rows by id, read on the first ask and held for the wake.
+
+        Read through the SDK's own models API, so it goes to the host every call goes to, with the
+        agent's own key, and its unmodeled fields (``pricing``, ``context_length``) survive
+        `model_dump()` exactly as the OpenRouter context read relies on. One attempt per wake: a
+        failure is held as ``None`` and stated once here, and each reader states its own
+        consequence (`_listed_cost` a ``rates_unavailable`` gap, `context_limit` the floor), so an
+        unreachable list costs one request, never one per call.
+        """
+        if self._catalog_read:
+            return self._catalog_rows
+        self._catalog_read = True
+        try:
+            page = self._client.models.list(timeout=METADATA_TIMEOUT)
+            rows: dict[str, Mapping[str, Any]] = {}
+            for item in page:
+                row = item.model_dump() if hasattr(item, "model_dump") else item
+                if isinstance(row, Mapping) and isinstance(row.get("id"), str):
+                    rows[row["id"]] = row
+        except Exception as exc:  # noqa: BLE001 - a price list must never break a wake
+            _log.warning(
+                "Could not read the model list from %s, so this wake's calls carry no cost= and "
+                "the context limit falls to its floor: %s",
+                self.base_url,
+                exc,
+            )
+            return None
+        self._catalog_rows = rows
+        return rows
 
     def _log_server_tools(self, data: Mapping[str, Any]) -> None:
         """A ``tool`` line per server-side tool a Responses call ran, beside its ``llm`` line (#758).
@@ -677,17 +763,20 @@ class OpenAIProvider:
         self._state_gap(TOKENS_CHARGE, UNPRICED_HOST)
         return False
 
-    def _state_gap(self, charge: str, reason: str) -> None:
+    def _state_gap(self, charge: str, reason: str, *, model: str | None = None) -> None:
         """One ``cost unpriced`` WARNING per gap per wake — the rule every rate table keeps.
 
         A gap is what the line says, so two calls the table cannot price for the same reason (a
-        Flex tier, then a long prompt) are one gap and one line, never two identical ones.
+        Flex tier, then a long prompt) are one gap and one line, never two identical ones. `model`
+        names the model the gap is about when that is not the configured one (a response naming
+        another model id, issue #844).
         """
-        key = f"{charge}:{reason}"
+        model = model or self.model
+        key = f"{charge}:{reason}:{model}"
         if key in self._gaps_stated:
             return
         self._gaps_stated.add(key)
-        log_cost_unpriced(provider=self.provider, model=self.model, charge=charge, reason=reason)
+        log_cost_unpriced(provider=self.provider, model=model, charge=charge, reason=reason)
 
     def context_limit(self) -> int | None:
         """This model's context ceiling, if the endpoint this adapter is aimed at states one (#276).
@@ -702,24 +791,21 @@ class OpenAIProvider:
           That is the deliberate cost of refusing a static model→limit table (issue #276,
           requirement 2): a table would answer today and lie after the next model launch, silently.
           An OpenAI agent that wants its real 400 K window sets `HARNESS_MAX_CONTEXT_TOKENS`.
+        - Pointed at **refuseless**, the models *list* states ``context_length`` per row and no
+          single-model read is documented, so the row comes from the list `_catalog` reads once for
+          this wake's pricing too (issue #844): one request answers both.
 
         Never fatal: any failure degrades to ``None``, and the wake runs exactly as before.
         """
+        if self._reads_catalog:
+            rows = self._catalog()
+            return _stated_context(rows.get(self.model) if rows is not None else None)
         try:
             model = self._client.models.retrieve(self.model, timeout=METADATA_TIMEOUT)
         except Exception as exc:  # noqa: BLE001 - degrade to the floor; never break a wake
             _log.warning("Could not read %s's context limit from the provider: %s", self.model, exc)
             return None
-        data = model.model_dump() if hasattr(model, "model_dump") else {}
-        if not isinstance(data, Mapping):
-            return None
-        # The spellings an OpenAI-compatible endpoint uses for the same fact. OpenAI itself uses
-        # none of them, which is the honest answer, not a gap to paper over.
-        for key in ("context_length", "context_window", "max_context_length"):
-            value = data.get(key)
-            if not isinstance(value, bool) and isinstance(value, int) and value > 0:
-                return value
-        return None
+        return _stated_context(model.model_dump() if hasattr(model, "model_dump") else None)
 
     # --- SDK exceptions → the harness provider error hierarchy ----------------
 
@@ -740,6 +826,21 @@ class OpenAIProvider:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _stated_context(data: Any) -> int | None:
+    """The context window a models-API record states, in any spelling an endpoint uses, or ``None``.
+
+    The spellings an OpenAI-compatible endpoint uses for the same fact. OpenAI itself uses none of
+    them, which is the honest answer, not a gap to paper over.
+    """
+    if not isinstance(data, Mapping):
+        return None
+    for key in ("context_length", "context_window", "max_context_length"):
+        value = data.get(key)
+        if not isinstance(value, bool) and isinstance(value, int) and value > 0:
+            return value
+    return None
 
 
 def sdk_error_context(openai):

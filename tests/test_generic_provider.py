@@ -174,8 +174,8 @@ def test_unset_is_still_the_default_vendor():
     assert normalize_provider(None) == normalize_provider("") == "openai"
 
 
-def test_the_known_vendors_are_exactly_the_five_with_conventions():
-    assert KNOWN_PROVIDERS == ("openai", "xai", "openrouter", "google", "anthropic")
+def test_the_known_vendors_are_exactly_the_six_with_conventions():
+    assert KNOWN_PROVIDERS == ("openai", "xai", "openrouter", "google", "anthropic", "refuseless")
 
 
 # --- the generic profile's preconditions ----------------------------------------------------------

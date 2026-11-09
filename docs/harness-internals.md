@@ -1020,7 +1020,7 @@ derived from the vendor. The shape of the change:
   for a real generic vendor it is the expected state on every wake. Its head is deliberately not
   `llm provider=`, which the fleet counts as model calls.
 - **The probes refuse what the wake refuses**: `--resolved-config` applies the built-in refusal
-  (`_require_no_generic_builtins`; only an operator's ungated plugin can trigger it), and
+  (`_require_no_server_builtins`; only an operator's ungated plugin can trigger it), and
   `basecradle-harness-resolve` applies the SDK half (`_require_generic_sdk`). The host half is a
   deployment fact the pure resolver is never handed.
 - A describer naming a generic vendor of its own is refused **in its own variables' names**
