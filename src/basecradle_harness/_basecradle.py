@@ -127,6 +127,7 @@ from basecradle_harness._openai import (
     SURFACES as OPENAI_SURFACES,
 )
 from basecradle_harness._openai import (
+    ModelCatalog,
     OpenAIProvider,
 )
 from basecradle_harness._openrouter import (
@@ -640,7 +641,7 @@ DEFAULT_SDK = "openai"
 #: vendor that bills the account*, so any other slug is a legal provider with the generic
 #: OpenAI-compatible profile (`is_generic_provider`). The set is closed only in the sense that
 #: matters — a vendor not named here gets **no** convention, never a guessed one.
-KNOWN_PROVIDERS = ("openai", "xai", "openrouter", "google", "anthropic")
+KNOWN_PROVIDERS = ("openai", "xai", "openrouter", "google", "anthropic", "refuseless")
 
 #: The shape every provider token must have, known or not. It is the NOC dashboard's own extraction
 #: (``provider=([A-Za-z0-9._-]+)``) narrowed to the lowercase this layer normalizes to, so a token
@@ -652,6 +653,16 @@ _PROVIDER_SLUG = re.compile(r"[a-z0-9._-]+")
 #: OpenAI-compatible gateways implement. ``responses`` stays an explicit opt-in there, and the
 #: ``openai``/``xai`` defaults (``responses``) are untouched — this is per vendor *class*, not per SDK.
 GENERIC_DEFAULT_SURFACE = "chat"
+
+#: A known vendor that narrows the ``openai`` SDK's surfaces to the ones its endpoint documents, as
+#: ``(surfaces, default)`` — read by `_surface_for`, so the wake, ``--resolved-config``, the
+#: describer's own stack and the off-box resolver refuse the same cell in the same words. refuseless
+#: documents Chat Completions and no Responses endpoint (issue #844), so it defaults to ``chat`` and
+#: a ``responses`` setting is a startup error rather than a 404 on every wake. (OpenRouter's
+#: chat-only cell predates this and is still refused at the build, `_provider_from_config`.)
+_VENDOR_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
+    "refuseless": (("chat",), "chat"),
+}
 
 
 def normalize_provider(raw: str | None) -> str:
@@ -762,10 +773,10 @@ def _surface_for(sdk: str, raw: str | None, provider: str = DEFAULT_PROVIDER) ->
     env) and the deterministic off-box resolver (`_resolve.resolve_stems`, which takes a
     ``--surface`` argument and must never depend on the environment it happens to run in).
 
-    `provider` changes exactly one thing: the **default** for a generic vendor over the ``openai``
-    SDK is `GENERIC_DEFAULT_SURFACE` (issue #670). The set a provided value is validated against is
-    the SDK's, whoever the vendor — the per-vendor *refusals* (OpenRouter is chat-only over this
-    SDK) stay where every other vendor rule lives, in `_provider_from_config`.
+    `provider` changes two things over the ``openai`` SDK: the **default** for a generic vendor is
+    `GENERIC_DEFAULT_SURFACE` (issue #670), and a known vendor in `_VENDOR_SURFACES` narrows the
+    SDK's set to the surfaces its endpoint documents, with its own default (refuseless, issue #844).
+    OpenRouter's older chat-only refusal stays in `_provider_from_config`, where it was written.
     """
     raw = (raw or "").strip().lower()
     spec = _SDK_SURFACES.get(sdk)
@@ -780,11 +791,23 @@ def _surface_for(sdk: str, raw: str | None, provider: str = DEFAULT_PROVIDER) ->
     if sdk == "openai" and is_generic_provider(provider):
         default = GENERIC_DEFAULT_SURFACE
     if not raw:
-        return default
+        return (
+            _VENDOR_SURFACES[provider][1]
+            if sdk == "openai" and provider in _VENDOR_SURFACES
+            else default
+        )
     if raw not in surfaces:
         raise ValueError(
             f"Unknown AI_SDK_SURFACE {raw!r} for AI_SDK={sdk!r}; expected one of {surfaces}."
         )
+    if sdk == "openai" and provider in _VENDOR_SURFACES:
+        documented, vendor_default = _VENDOR_SURFACES[provider]
+        if raw not in documented:
+            raise ValueError(
+                f"AI_PROVIDER={provider!r} documents only the {documented} surface over the openai "
+                f"SDK, but AI_SDK_SURFACE={raw!r}. Unset AI_SDK_SURFACE (it defaults to "
+                f"{vendor_default!r}) or set it to one of {documented}."
+            )
     return raw
 
 
@@ -827,6 +850,9 @@ _PROVIDER_BASE_URLS = {
     # OpenRouter's OpenAI-compatible chat endpoint — the default base_url whether reached through
     # the native openrouter SDK or the openai SDK pointed here (both speak its chat wire).
     "openrouter": "https://openrouter.ai/api/v1",
+    # refuseless's documented OpenAI-compatible root (docs.refuseless.com, issue #844): chat
+    # completions, completions and the models list whose live `pricing` prices every call.
+    "refuseless": "https://api.refuseless.com/v1",
 }
 
 #: xAI Live-Search sources, keyed by the built-in tool name the plugins activate.
@@ -873,7 +899,7 @@ def _xai_search_parameters(builtins: Sequence[str]) -> dict[str, Any] | None:
 #: vendor read as already-decided. A *generic* vendor (`is_generic_provider`) is reachable through
 #: the same adapter but is not a cell of this matrix: it has no conventions to decide, so it gets
 #: none — by construction, never by a lookup that happens to miss (issue #670).
-OPENAI_SDK_PROVIDERS = ("openai", "xai", "openrouter")
+OPENAI_SDK_PROVIDERS = ("openai", "xai", "openrouter", "refuseless")
 
 _OWNED_OPENAI = frozenset(
     {
@@ -1269,6 +1295,7 @@ def _provider_from_config(
     location: str | None = None,
     project: str | None = None,
     inherit_endpoint: bool = True,
+    catalog: ModelCatalog | None = None,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -1341,6 +1368,10 @@ def _provider_from_config(
     #   (issue #655): a describer on Google carries its **own** service-account key and place, never
     #   the brain's. ``None`` falls back to the brain's ``AI_*`` variables, exactly as ``api_key``
     #   falls back to ``AI_API_KEY`` — which is why the describer always passes all three.
+    # - ``catalog`` — the models list a caller shares across the adapters it builds on one key in
+    #   one wake (issue #844): the describer builds one per output budget, and each would otherwise
+    #   read the vendor's price list again and state each price gap again. Only a vendor priced from
+    #   its own list reads it (refuseless); every other branch ignores it.
     # - ``inherit_endpoint`` — ``False`` drops ``AI_BASE_URL``. A describer on the brain's stack
     #   shares its endpoint by design; one on a *different* vendor must never be pointed at the
     #   brain's (issue #655), so it reaches its own vendor's default host.
@@ -1509,9 +1540,10 @@ def _provider_from_config(
     if provider not in OPENAI_SDK_PROVIDERS:
         raise ValueError(
             f"AI_PROVIDER={provider!r} is not reached through the openai SDK — over it the harness "
-            "knows 'openai', 'xai' (api.x.ai) and 'openrouter' (openrouter.ai), and reaches any "
-            "vendor it does not know at its AI_BASE_URL. For AI_PROVIDER=google, set "
-            "AI_SDK=google-genai; for AI_PROVIDER=anthropic, set AI_SDK=anthropic."
+            "knows 'openai', 'xai' (api.x.ai), 'openrouter' (openrouter.ai) and 'refuseless' "
+            "(api.refuseless.com), and reaches any vendor it does not know at its AI_BASE_URL. For "
+            "AI_PROVIDER=google, set AI_SDK=google-genai; for AI_PROVIDER=anthropic, set "
+            "AI_SDK=anthropic."
         )
     if provider == "openrouter" and surface != "chat":
         # OpenRouter's Responses API is beta upstream, so the openai-SDK-at-OpenRouter cell is
@@ -1558,6 +1590,28 @@ def _provider_from_config(
                 extra_headers=params_extra_headers,
                 harness_body=harness_extra_body,
             ),
+            **params,
+        )
+    if provider == "refuseless":
+        # refuseless over the openai SDK (issue #844): its chat wire, at its own host unless
+        # AI_BASE_URL says otherwise, with nothing vendor-specific added — no routing key (a decided
+        # `None` in `_openai._AFFINITY`), no header, no pin (`routing` is an OpenRouter concept and
+        # is dropped, as on openai and xai). It runs no server-side built-in, so one active here is
+        # refused by name rather than silently dropped by the chat surface. The adapter prices its
+        # calls from the vendor's own live models list (`OpenAIProvider._listed_cost`).
+        _require_no_server_builtins(provider, builtins)
+        return OpenAIProvider(
+            model,
+            api_key=api_key,
+            base_url=base_url,
+            provider=provider,
+            surface=surface,
+            extra_body=params_extra_body,
+            extra_headers=params_extra_headers,
+            reported_tuning=_reported_tuning(
+                params, extra_body=params_extra_body, extra_headers=params_extra_headers
+            ),
+            catalog=catalog,
             **params,
         )
     if provider == "openrouter":
@@ -1615,18 +1669,33 @@ def _provider_from_config(
     )
 
 
-def _require_no_generic_builtins(provider: str, builtins: Sequence[str]) -> None:
-    """Refuse a server-side built-in on a generic vendor — the one place that rule is spelled.
+#: The known vendors that run no server-side built-in on any surface the harness reaches them over
+#: (issue #844), so a built-in active for one is a configuration the harness cannot honour — exactly
+#: as for a generic vendor.
+_NO_SERVER_BUILTINS = ("refuseless",)
 
-    Every shipped built-in is gated on a known vendor, so this fires only for an operator's own
-    ``tools/`` plugin that offers one ungated. Read by the build and by ``--resolved-config``, so the
-    probe exits nonzero exactly when every wake would refuse, rather than reading green over it.
+
+def _require_no_server_builtins(provider: str, builtins: Sequence[str]) -> None:
+    """Refuse a server-side built-in on a vendor that runs none — the one place that rule is spelled.
+
+    A generic vendor runs none (issue #670), and neither does a known vendor in
+    `_NO_SERVER_BUILTINS`. Every shipped built-in is gated on a vendor that runs it, so this fires
+    only for an operator's own ``tools/`` plugin that offers one ungated. Read by the build and by
+    ``--resolved-config``, so the probe exits nonzero exactly when every wake would refuse, rather
+    than reading green over it.
     """
-    if builtins and is_generic_provider(provider):
+    if not builtins:
+        return
+    if is_generic_provider(provider):
         raise ValueError(
             f"AI_PROVIDER={provider!r} is a generic OpenAI-compatible vendor, which runs no "
             f"server-side built-in, but {sorted(builtins)} are active. Remove those tools from "
             "this agent's tools/ overlay."
+        )
+    if provider in _NO_SERVER_BUILTINS:
+        raise ValueError(
+            f"AI_PROVIDER={provider!r} runs no server-side built-in, but {sorted(builtins)} are "
+            "active. Remove those tools from this agent's tools/ overlay."
         )
 
 
@@ -1668,7 +1737,7 @@ def _generic_openai_provider(
     The output budget takes the chat wire's ``max_tokens`` (or ``max_output_tokens`` on Responses),
     the field every OpenAI-compatible gateway documents (`_openai_budget_key`).
     """
-    _require_no_generic_builtins(provider, builtins)
+    _require_no_server_builtins(provider, builtins)
     # The one trace that this vendor got the generic profile. A misspelled known vendor
     # (``openroutr``) is a well-formed slug and so runs generic; without this line nothing would
     # say the agent lost that vendor's conventions. INFO, not WARNING: for a real generic vendor it

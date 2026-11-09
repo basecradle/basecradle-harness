@@ -1168,6 +1168,13 @@ def describer_from_env(env: Any = None) -> Describer | None:
         brain_location = (os.environ.get("AI_LOCATION") or "").strip().lower()
         inherit_endpoint = inherit_endpoint and credential["location"].lower() == brain_location
 
+    from basecradle_harness._openai import ModelCatalog
+
+    # One models list for every budget this describer builds: they share a key, a host and a wake,
+    # so a vendor priced from its own list (refuseless, issue #844) is read once and states each
+    # price gap once, rather than once per budget.
+    catalog = ModelCatalog()
+
     def build(budget: int) -> Provider:
         """This describer's adapter, capped at `budget` output tokens (issue #488).
 
@@ -1188,6 +1195,7 @@ def describer_from_env(env: Any = None) -> Describer | None:
             # provider as its own (an OpenRouter regional host stays regional either way).
             inherit_endpoint=inherit_endpoint,
             max_output_tokens=budget,
+            catalog=catalog,
             **credential,
         )
 

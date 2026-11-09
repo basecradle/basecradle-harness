@@ -659,6 +659,59 @@ def openrouter(router, **_):
     openrouter_provider(retries_disabled=True).chat([Message.user("hi")])
 
 
+#: refuseless's API root and model, and its models list as the vendor serves it (issue #844): the
+#: effective price at the top level, the list price beside it under `regular`.
+REFUSELESS_HOST = "https://api.refuseless.com/v1"
+REFUSELESS_MODEL = "glm-5.3-flash-abliterated"
+_REFUSELESS_MODELS = {
+    "object": "list",
+    "data": [
+        {
+            "id": REFUSELESS_MODEL,
+            "object": "model",
+            "created": 0,
+            "owned_by": "refuseless",
+            "context_length": 1048576,
+            "pricing": {
+                "currency": "USD",
+                "input_per_m": 0.12,
+                "cached_input_per_m": 0.025,
+                "output_per_m": 0.45,
+                "discounted": True,
+                "regular": {"input_per_m": 0.14, "cached_input_per_m": 0.035, "output_per_m": 0.5},
+            },
+        }
+    ],
+}
+
+
+def _refuseless(router, models: httpx.Response) -> None:
+    usage = {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200}
+    router.get(f"{REFUSELESS_HOST}/models").mock(return_value=models)
+    router.post(f"{REFUSELESS_HOST}/chat/completions").mock(
+        return_value=_ok(_chat_completion(REFUSELESS_MODEL, usage, call_id="chatcmpl-Contract0002"))
+    )
+    adapter = OpenAIProvider(
+        model=REFUSELESS_MODEL,
+        api_key=OPENAI_KEY,
+        base_url=REFUSELESS_HOST,
+        provider="refuseless",
+        surface="chat",
+    )
+    adapter.chat([Message.user("hi")])
+    adapter.close()
+
+
+@scenario
+def refuseless(router, **_):
+    _refuseless(router, _ok(_REFUSELESS_MODELS))
+
+
+@scenario
+def refuseless_unpriced(router, **_):
+    _refuseless(router, httpx.Response(503, json={"error": {"message": "unavailable"}}))
+
+
 #: xAI's own documented example (docs.x.ai, Chat Completions reference): the reasoning is reported
 #: apart from the completion, and the total counts both — 32 + 9 + 94 = 135.
 _XAI_USAGE = {"prompt_tokens": 32, "completion_tokens": 9, "reasoning_tokens": 94, "total": 135}
@@ -1510,7 +1563,9 @@ CHARGE_REASONS = frozenset(
 )
 #: What a `cost unpriced` line may name as carrying no price (`browser_time`: issue #768).
 UNPRICED_CHARGES = frozenset({"tokens", "container_time", "browser_time", "grounding", "search"})
-UNPRICED_REASONS = frozenset({"unknown_model", "unpriced_tier", "unpriced_host", "not_reported"})
+UNPRICED_REASONS = frozenset(
+    {"unknown_model", "unpriced_tier", "unpriced_host", "not_reported", "rates_unavailable"}
+)
 
 
 def _vocabulary(head: str, field: str, after: str, before: str) -> set[str]:
@@ -1631,6 +1686,8 @@ EXPECTED_TOKENS = {
         "cache_write_tokens": 300,
         "tokens_reasoning": 50,
     },
+    # refuseless states the three counts and nothing else: no cache split, no reasoning (#844).
+    "refuseless": {"tokens_in": 1000, "tokens_out": 200, "tokens_total": 1200},
     # xAI's reasoning is billed as output and reported beside it: 32 + (9 + 94) = 135 (F5).
     "xai": {
         "tokens_in": 32,
@@ -1720,6 +1777,24 @@ def test_a_computed_cost_is_stated_only_for_the_host_its_table_transcribes(rende
         "model": ANTHROPIC_MODEL,
         "charge": "tokens",
         "reason": "unpriced_host",
+    }
+
+
+def test_a_live_listed_price_is_computed_and_a_list_it_cannot_read_is_one_gap(rendered):
+    """refuseless (issue #844): 1,000 × $0.12/M + 200 × $0.45/M = $0.00021, read off the vendor's own
+    list, never its `regular` price; an unreadable list is a `rates_unavailable` gap, no figure."""
+    priced = rendered.llm("refuseless").fields
+    assert priced["provider"] == "refuseless"
+    assert float(priced["cost"]) == pytest.approx(0.00021)
+    assert priced["cost_basis"] == "computed"
+    assert not rendered.heads("refuseless", "cost unpriced")
+    assert "cost" not in rendered.llm("refuseless_unpriced").fields
+    (gap,) = rendered.heads("refuseless_unpriced", "cost unpriced")
+    assert gap.fields == {
+        "provider": "refuseless",
+        "model": REFUSELESS_MODEL,
+        "charge": "tokens",
+        "reason": "rates_unavailable",
     }
 
 

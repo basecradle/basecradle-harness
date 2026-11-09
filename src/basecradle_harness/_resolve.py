@@ -234,8 +234,8 @@ def resolve_stems(
 
     Args:
         provider: ``AI_PROVIDER`` — the vendor that bills the account: a known one (``openai`` |
-            ``xai`` | ``openrouter`` | ``google``) or any other slug, which takes the generic
-            OpenAI-compatible profile (issue #670). A malformed slug raises, and so does a generic
+            ``xai`` | ``openrouter`` | ``google`` | ``anthropic`` | ``refuseless``) or any other
+            slug, which takes the generic OpenAI-compatible profile (issue #670). A malformed slug raises, and so does a generic
             vendor on any SDK but ``openai``, exactly as a wake's `_config_from_env` would. The
             generic profile's other precondition, ``AI_BASE_URL``, is a deployment fact this pure
             resolver is never handed, so it is not checked here.

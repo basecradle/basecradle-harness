@@ -92,9 +92,15 @@ except ImportError:  # pragma: no cover - Windows; the package must still import
     fcntl = None  # type: ignore[assignment]
 from basecradle import BaseCradle, BaseCradleError, NotFoundError
 
-from basecradle_harness import _anthropic_rates, _google_rates, _openai_rates
+from basecradle_harness import (
+    _anthropic_rates,
+    _google_rates,
+    _openai_rates,
+    _refuseless_pricing,
+)
 from basecradle_harness._assets import _describe, _is_image, image_input, model_sees_images
 from basecradle_harness._basecradle import (
+    _PROVIDER_BASE_URLS,
     DEFAULT_CONTEXT_MESSAGES,
     _as_turn,
     _as_uuid,
@@ -112,7 +118,7 @@ from basecradle_harness._basecradle import (
     _parse_created_at,
     _profile_from_env,
     _recent,
-    _require_no_generic_builtins,
+    _require_no_server_builtins,
     _resolve_tools,
     _resolve_tools_and_provider,
     _response_retries_from_env,
@@ -5777,7 +5783,11 @@ def resolved_config() -> dict[str, object]:
       reason: whether it states a price is a fact about its responses that no configuration can
       know, so the basis is not claimed — its ``llm`` line carries the vendor's ``usage.cost`` when
       the endpoint states one (Wiro does). The last two fields are ``null`` unless the basis is
-      computed.
+      computed. **refuseless** (issue #844) is ``"computed"`` from a price read *live*, not
+      transcribed: ``cost_rates_source`` names the list it is read from at the agent's own host
+      (``GET <base_url>/models → data[].pricing``), and ``cost_model_priced`` is ``null``, because
+      whether the list prices the model is known only to the wake that reads it (which states a
+      missing price as a ``cost unpriced`` WARNING).
     - ``active_profile`` — the deploy-selected policy profile, ``"locked"`` or ``"unlocked"``
       (`HARNESS_PROFILE`, fail-closed to ``"locked"``; issue #256). It governs the tool set below:
       under ``"unlocked"`` a policy-forbidden opted-in tool (e.g. ``shell``) appears in ``tools``;
@@ -6022,7 +6032,7 @@ def resolved_config() -> dict[str, object]:
     resolved, memory = _resolve_tools(provider_name, sdk, surface)
     # The build's built-in refusal, applied here too: this path never builds a provider, and a probe
     # that read green over a configuration every wake refuses would be reading a corpse (#670).
-    _require_no_generic_builtins(provider_name, resolved.builtins)
+    _require_no_server_builtins(provider_name, resolved.builtins)
     memory_name, memory_version = describe_memory_provider(memory)
     model_params, stripped = resolved_model_params(sdk)
     breaker_max, breaker_window, breaker_cooldown = breaker_settings_from_env()
@@ -6136,6 +6146,17 @@ def _cost_report(provider: str, sdk: str, model: str) -> dict[str, object]:
             "cost_basis": COST_BASIS_COMPUTED,
             "cost_rates_source": table.SOURCE,
             "cost_model_priced": bool(model) and table.known(model),
+        }
+    if provider == "refuseless":
+        # Priced from the vendor's own live models list, never a table (issue #844). Whether this
+        # model has a priced row is a fact about that list on the wake that reads it, which this
+        # path never calls, so it is not claimed: the wake states a missing price itself.
+        return {
+            "cost_basis": COST_BASIS_COMPUTED,
+            "cost_rates_source": _refuseless_pricing.SOURCE.format(
+                base_url=(base_url_override() or _PROVIDER_BASE_URLS[provider]).rstrip("/")
+            ),
+            "cost_model_priced": None,
         }
     stated = provider == "openrouter" or (provider == "xai" and sdk == "xai-sdk")
     return {
