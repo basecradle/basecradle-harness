@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import re
 import shutil
 from pathlib import Path
 
@@ -371,3 +372,338 @@ def test_a_file_stale_for_both_reasons_is_named_version_stale(palace, capsys):
     reasons = [line for line in out.splitlines() if line.strip().startswith("reason:")]
     assert not any("cannot name" in r for r in reasons)
     assert sum("the observe filed it" in r for r in reasons) == len(OBSERVED)
+
+
+# ---------------------------------------------------------------------------------------------
+# --relocate-source-file (issue #831)
+# ---------------------------------------------------------------------------------------------
+
+LONG = f"{TIMELINE}-mined-long.md"
+
+
+@pytest.fixture
+def moved(tmp_path, palace) -> Path:
+    """The previous ``HARNESS_HOME`` of a palace built there, moved to ``palace``, then aged.
+
+    The shape a rename left on the fleet: every drawer recorded under the old home, the old home
+    gone, and a registry row at the new path for each file a 3.10 mine recognised by content.
+    Aged after the rows are written, so they read as stale the way 3.10's do. Returns the previous
+    home, for ``--previous-home``.
+    """
+    previous = tmp_path / "old" / "harness"
+    old_palace = previous / "mempalace"
+    _build(old_palace)
+    exchange = MemoryExchange(
+        user="[2026-09-03T12:00:00Z] john: the long one",
+        assistant="\n\n".join(f"Part {n}. " + "more of it " * 30 for n in range(8)),
+        scope=SCOPE,
+    )
+    (old_palace / "conversations" / LONG).write_text(_exchange_markdown(exchange), encoding="utf-8")
+    _mine(old_palace)
+    palace.parent.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(previous), str(palace.parent))
+    collection = mp.get_collection(str(palace))
+    for name in (*MINED, LONG):
+        path = str(palace / "conversations" / name)
+        convo_miner._register_file(collection, path, "conversations", "nova", "exchange")
+    _age(palace)
+    return previous
+
+
+def _relocate(capsys, palace: Path, previous: Path, *flags: str) -> str:
+    capsys.readouterr()
+    code = _palace_check.main(
+        [str(palace.parent), "--relocate-source-file", "--previous-home", str(previous), *flags]
+    )
+    out = capsys.readouterr().out
+    assert code == 0, out
+    return out
+
+
+def _mined_ids(palace: Path) -> set[str]:
+    return {
+        drawer_id
+        for drawer_id, (_, meta) in _drawers(palace).items()
+        if Path(str(meta.get("source_file"))).name in (*MINED, LONG)
+        and meta.get("room") != _REGISTRY_ROOM
+    }
+
+
+def _planned(palace: Path) -> int:
+    """The drawers MemPalace's own dry-run mine says it will file."""
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        convo_miner.mine_convos(
+            str(palace / "conversations"),
+            str(palace),
+            wing="conversations",
+            agent="nova",
+            extract_mode="exchange",
+            dry_run=True,
+        )
+    return sum(int(n) for n in re.findall(r"\((\d+) drawers\)", out.getvalue()))
+
+
+@needs_version
+def test_a_relocated_palace_is_re_mined_in_place_with_no_duplicate(moved, palace, capsys):
+    """The issue's definition of done, on a real palace: drawers = planned, duplicates 0."""
+    _report(capsys, palace, "--stamp-chunker-version")
+    aged = _drawers(palace)
+    mined = _mined_ids(palace)
+    here = str((palace / "conversations").resolve())
+    observed = {i for i in aged if i not in mined and aged[i][1].get("room") != _REGISTRY_ROOM}
+    assert mined and observed
+    recall = _recall(MemPalaceMemoryProvider(palace, agent="nova"))
+
+    dry = _relocate(capsys, palace, moved, "--dry-run")
+    assert _drawers(palace) == aged  # a dry run writes nothing
+    assert (
+        f"relocate source_file (dry run): drawers to relocate {len(mined)} in 3 files, "
+        f"files left alone 0, drawers left at another location {len(observed)}"
+    ) in dry
+
+    out = _relocate(capsys, palace, moved)
+    assert (
+        f"relocate source_file: WROTE to this palace: drawers relocated {len(mined)} in 3 files, "
+        f"files left alone 0, drawers left at another location {len(observed)}"
+    ) in out
+
+    relocated = _drawers(palace)
+    assert set(relocated) == set(aged)  # nothing is deleted, nothing is added
+    for drawer_id, (text, meta) in aged.items():
+        if drawer_id in mined:
+            name = Path(str(meta["source_file"])).name
+            assert relocated[drawer_id] == (text, {**meta, "source_file": f"{here}/{name}"})
+        else:
+            assert relocated[drawer_id] == (text, meta)  # registry rows and the observe's
+    assert _recall(MemPalaceMemoryProvider(palace, agent="nova")) == recall
+
+    again = _relocate(capsys, palace, moved)
+    assert "drawers relocated 0 in 0 files" in again
+    assert _drawers(palace) == relocated
+
+    planned = _planned(palace)
+    assert planned
+    _mine(palace)
+    after = _drawers(palace)
+    filed = {
+        i: entry
+        for i, entry in after.items()
+        if Path(str(entry[1].get("source_file"))).name in (*MINED, LONG)
+    }
+    assert len(filed) == planned  # the mine's plan, and no drawer beside it
+    assert {str(entry[1]["source_file"]).rsplit("/", 1)[0] for entry in filed.values()} == {here}
+    assert not any(entry[1].get("room") == _REGISTRY_ROOM for entry in filed.values())
+    assert {i: after[i] for i in observed} == {i: relocated[i] for i in observed}
+
+    _mine(palace)  # a second mine files nothing
+    assert _drawers(palace) == after
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    for query, fact in (("what colour is the shed", "green"), ("code word", "heliotrope")):
+        assert any(fact in str(hit.get("text")) for hit in provider.search(query, 5))
+
+
+def _one_drawer(palace: Path, name: str) -> tuple[str, dict]:
+    return next(
+        (i, meta)
+        for i, (_, meta) in _drawers(palace).items()
+        if Path(str(meta.get("source_file"))).name == name and meta.get("room") != _REGISTRY_ROOM
+    )
+
+
+def _still_exists(palace, moved):
+    path = moved / "mempalace" / "conversations" / LONG
+    path.parent.mkdir(parents=True)
+    path.write_text("still here", encoding="utf-8")
+
+
+def _other_wing(palace, moved):
+    drawer_id, meta = _one_drawer(palace, LONG)
+    mp.get_collection(str(palace)).update(ids=[drawer_id], metadatas=[{**meta, "wing": "notes"}])
+
+
+def _also_here(palace, moved):
+    drawer_id, meta = _one_drawer(palace, LONG)
+    path = str(palace / "conversations" / LONG)
+    mp.get_collection(str(palace)).update(
+        ids=[drawer_id], metadatas=[{**meta, "source_file": path}]
+    )
+
+
+def _third_location(palace, moved):
+    drawer_id, meta = _one_drawer(palace, LONG)
+    mp.get_collection(str(palace)).update(
+        ids=[drawer_id],
+        metadatas=[{**meta, "source_file": f"/somewhere/else/conversations/{LONG}"}],
+    )
+
+
+def _one_current(palace, moved):
+    drawer_id, meta = _one_drawer(palace, LONG)
+    mp.get_collection(str(palace)).update(
+        ids=[drawer_id], metadatas=[{**meta, "convo_chunker_version": VERSION}]
+    )
+
+
+def _all_old_normalize(palace, moved):
+    rows = [
+        (i, meta)
+        for i, (_, meta) in _drawers(palace).items()
+        if Path(str(meta.get("source_file"))).name == LONG and meta.get("room") != _REGISTRY_ROOM
+    ]
+    mp.get_collection(str(palace)).update(
+        ids=[i for i, _ in rows], metadatas=[{**meta, "normalize_version": 1} for _, meta in rows]
+    )
+
+
+def _no_hash(palace, moved):
+    rows = [
+        (i, meta)
+        for i, (_, meta) in _drawers(palace).items()
+        if Path(str(meta.get("source_file"))).name == LONG and meta.get("room") != _REGISTRY_ROOM
+    ]
+    mp.get_collection(str(palace)).update(
+        ids=[i for i, _ in rows], metadatas=[{**meta, "content_hash": ""} for _, meta in rows]
+    )
+
+
+def _changed_here(palace, moved):
+    (palace / "conversations" / LONG).write_text("> something else\n\nentirely\n", encoding="utf-8")
+
+
+def _gone_here(palace, moved):
+    (palace / "conversations" / LONG).unlink()
+
+
+ALONE = "not every drawer is stale by its chunker version alone, the class this relocates"
+
+
+@needs_version
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (_still_exists, "its recorded path still exists, so it was not moved"),
+        (_other_wing, "it has drawers in wing conversations, notes, not only 'conversations'"),
+        (_also_here, "it has drawers recorded somewhere other than the previous home"),
+        (_third_location, "it has drawers recorded somewhere other than the previous home"),
+        (_one_current, ALONE),
+        (_all_old_normalize, ALONE),
+        (_no_hash, "its drawers carry no content hash (filed before MemPalace 3.7)"),
+        (_changed_here, "its content hash is not the one its drawers record"),
+        (_gone_here, "no such file at this location, so a mine never reads it"),
+    ],
+)
+def test_a_file_that_cannot_prove_it_moved_is_left_alone_whole(
+    moved, palace, capsys, mutate, reason
+):
+    _report(capsys, palace, "--stamp-chunker-version")
+    assert len([i for i in _mined_ids(palace) if LONG in _drawers(palace)[i][1]["source_file"]]) > 1
+    mutate(palace, moved)
+    before = _drawers(palace)
+
+    out = _relocate(capsys, palace, moved)
+
+    assert f"  left alone: {LONG}: {reason}" in out
+    assert "drawers relocated" in out and f"in {len(MINED)} files, files left alone 1" in out
+    after = _drawers(palace)
+    for drawer_id, (_, meta) in before.items():
+        if Path(str(meta.get("source_file"))).name == LONG:
+            assert after[drawer_id] == before[drawer_id]  # the whole file, not only the odd drawer
+
+
+@needs_version
+def test_an_observe_filed_file_is_left_alone_because_its_id_is_derived_from_the_path(
+    moved, palace, capsys
+):
+    """Unstamped here, so the observe's drawers are version-stale and reach the check."""
+    before = _drawers(palace)
+    ours = _ours(palace)
+    assert ours
+
+    out = _relocate(capsys, palace, moved)
+
+    names = {Path(str(before[i][1]["source_file"])).name for i in ours}
+    for name in names:
+        assert (
+            f"  left alone: {name}: the observe filed it; --stamp-chunker-version makes it current"
+        ) in out
+    assert _ours(palace) == ours  # the id recipe still holds of every one of them
+
+
+@needs_version
+def test_a_previous_home_no_drawer_names_relocates_nothing(moved, palace, tmp_path, capsys):
+    before = _drawers(palace)
+
+    out = _relocate(capsys, palace, tmp_path / "never" / "lived" / "here")
+
+    assert "drawers relocated 0 in 0 files, files left alone 0" in out
+    assert _drawers(palace) == before
+
+
+@needs_version
+def test_a_running_mine_refuses_the_write(moved, palace, capsys, monkeypatch):
+    def held(path):
+        raise mp.MineAlreadyRunning(path)
+
+    monkeypatch.setattr(mp, "mine_palace_lock", held)
+    before = _drawers(palace)
+
+    code = _palace_check.main(
+        [str(palace.parent), "--relocate-source-file", "--previous-home", str(moved)]
+    )
+
+    assert code == 1
+    assert "refused, nothing written: another writer holds this palace" in capsys.readouterr().out
+    monkeypatch.undo()
+    assert _drawers(palace) == before
+
+
+class _Tampered:
+    """A collection whose ``update`` does something other than what it was asked."""
+
+    def __init__(self, collection, update):
+        self._collection = collection
+        self._update = update
+
+    def __getattr__(self, name):
+        return getattr(self._collection, name)
+
+    def update(self, *, ids, metadatas):
+        self._update(self._collection, ids, metadatas)
+
+
+def _mangles_a_field(collection, ids, metadatas):
+    collection.update(ids=ids, metadatas=[{**meta, "hall": "elsewhere"} for meta in metadatas])
+
+
+def _deletes_a_row(collection, ids, metadatas):
+    collection.update(ids=ids, metadatas=metadatas)
+    row = collection.get(where={"room": _REGISTRY_ROOM}, limit=1, include=[])
+    collection.delete(ids=list(row["ids"]))
+
+
+@needs_version
+@pytest.mark.parametrize("update", [_mangles_a_field, _deletes_a_row])
+def test_a_write_that_changed_anything_else_fails_the_run(
+    moved, palace, capsys, monkeypatch, update
+):
+    _report(capsys, palace, "--stamp-chunker-version")
+    real = mp.get_collection
+    monkeypatch.setattr(mp, "get_collection", lambda *a, **k: _Tampered(real(*a, **k), update))
+    capsys.readouterr()
+
+    code = _palace_check.main(
+        [str(palace.parent), "--relocate-source-file", "--previous-home", str(moved)]
+    )
+
+    assert code == 1
+    assert "FAIL:" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(VERSION is not None, reason="this MemPalace defines a convo_chunker_version")
+def test_without_a_chunker_version_there_is_nothing_to_relocate(palace, tmp_path, capsys):
+    _build(palace)
+
+    out = _relocate(capsys, palace, tmp_path / "old" / "harness")
+
+    assert "nothing to relocate: MemPalace" in out
