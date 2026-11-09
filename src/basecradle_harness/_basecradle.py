@@ -127,6 +127,7 @@ from basecradle_harness._openai import (
     SURFACES as OPENAI_SURFACES,
 )
 from basecradle_harness._openai import (
+    ModelCatalog,
     OpenAIProvider,
 )
 from basecradle_harness._openrouter import (
@@ -1294,6 +1295,7 @@ def _provider_from_config(
     location: str | None = None,
     project: str | None = None,
     inherit_endpoint: bool = True,
+    catalog: ModelCatalog | None = None,
 ) -> Provider:
     """Build the model provider the config selects — the @jt OpenAI-SDK stack by default.
 
@@ -1366,6 +1368,10 @@ def _provider_from_config(
     #   (issue #655): a describer on Google carries its **own** service-account key and place, never
     #   the brain's. ``None`` falls back to the brain's ``AI_*`` variables, exactly as ``api_key``
     #   falls back to ``AI_API_KEY`` — which is why the describer always passes all three.
+    # - ``catalog`` — the models list a caller shares across the adapters it builds on one key in
+    #   one wake (issue #844): the describer builds one per output budget, and each would otherwise
+    #   read the vendor's price list again and state each price gap again. Only a vendor priced from
+    #   its own list reads it (refuseless); every other branch ignores it.
     # - ``inherit_endpoint`` — ``False`` drops ``AI_BASE_URL``. A describer on the brain's stack
     #   shares its endpoint by design; one on a *different* vendor must never be pointed at the
     #   brain's (issue #655), so it reaches its own vendor's default host.
@@ -1605,6 +1611,7 @@ def _provider_from_config(
             reported_tuning=_reported_tuning(
                 params, extra_body=params_extra_body, extra_headers=params_extra_headers
             ),
+            catalog=catalog,
             **params,
         )
     if provider == "openrouter":

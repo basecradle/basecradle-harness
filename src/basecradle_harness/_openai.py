@@ -123,6 +123,7 @@ from basecradle_harness._openai_wire import (
 )
 from basecradle_harness._refuseless_pricing import call_cost as listed_call_cost
 from basecradle_harness._refuseless_pricing import pricing_of
+from basecradle_harness._refuseless_pricing import usage_of as listed_usage
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
 _log = logging.getLogger("basecradle_harness")
@@ -209,6 +210,55 @@ _AFFINITY: dict[tuple[str, str], _Affinity | None] = {
     # Its only surface: Responses is refused for it (`_basecradle._VENDOR_SURFACES`).
     ("refuseless", "chat"): None,
 }
+
+
+class ModelCatalog:
+    """A vendor's models list, read at most once and held whatever it answered (issue #844).
+
+    The rows by model id, or ``None`` when the read failed, plus the price gaps already stated
+    against it. One per wake per credential: an adapter makes its own unless it is handed one, and a
+    caller that builds several adapters on the same key and host in one wake (the describer builds
+    one per output budget) hands each the same catalog, so the list is read once and each gap is
+    stated once however many adapters ask. Never shared across wakes, because a price read on an
+    earlier wake is not this wake's price.
+    """
+
+    def __init__(self) -> None:
+        self._read = False
+        self._rows: dict[str, Mapping[str, Any]] | None = None
+        #: The ``cost unpriced`` gaps already stated against this list, for `OpenAIProvider._state_gap`.
+        self.gaps: set[str] = set()
+
+    def rows(self, client: Any, base_url: str) -> dict[str, Mapping[str, Any]] | None:
+        """The list from `client`'s models API, read on the first ask and held for every later one.
+
+        Read through the SDK's own models API, so it goes to the host every call goes to, with the
+        agent's own key, and its unmodeled fields (``pricing``, ``context_length``) survive
+        `model_dump()` exactly as the OpenRouter context read relies on. One attempt: a failure is
+        held as ``None`` and stated once here, and each reader states its own consequence
+        (`OpenAIProvider._listed_cost` a ``rates_unavailable`` gap, `context_limit` the floor), so an
+        unreachable list costs one request, never one per call.
+        """
+        if self._read:
+            return self._rows
+        self._read = True
+        try:
+            page = client.models.list(timeout=METADATA_TIMEOUT)
+            rows: dict[str, Mapping[str, Any]] = {}
+            for item in page:
+                row = item.model_dump() if hasattr(item, "model_dump") else item
+                if isinstance(row, Mapping) and isinstance(row.get("id"), str):
+                    rows[row["id"]] = row
+        except Exception as exc:  # noqa: BLE001 - a price list must never break a wake
+            _log.warning(
+                "Could not read the model list from %s, so this wake's calls carry no cost= and "
+                "the context limit falls to its floor: %s",
+                base_url,
+                exc,
+            )
+            return None
+        self._rows = rows
+        return rows
 
 
 def require_openai_sdk():
@@ -324,6 +374,7 @@ class OpenAIProvider:
         extra_headers: Mapping[str, str] | None = None,
         code_container: Callable[[], dict[str, Any] | str | None] | None = None,
         reported_tuning: Mapping[str, Any] | None = None,
+        catalog: ModelCatalog | None = None,
         **default_params: Any,
     ) -> None:
         if surface not in SURFACES:
@@ -380,11 +431,9 @@ class OpenAIProvider:
         #: ``GET /v1/models`` and documents no single-model read. An equality on the known vendor,
         #: so no other endpoint is ever sent a list read it did not need.
         self._reads_catalog = provider == "refuseless"
-        #: That list, read at most once per adapter — one wake — and held whatever it answered:
-        #: the rows by model id, or ``None`` when the read failed. A failure is never retried in
-        #: the same wake, and nothing read on an earlier wake is ever used (`_catalog`).
-        self._catalog_rows: dict[str, Mapping[str, Any]] | None = None
-        self._catalog_read = False
+        #: That list, read at most once and held whatever it answered — this adapter's own, or the
+        #: one a caller shares across the adapters it builds on this key in this wake (`ModelCatalog`).
+        self._catalog_store = catalog if catalog is not None else ModelCatalog()
         #: Whether the vendor reports its reasoning **beside** the output rather than inside it, so
         #: the line folds it in (`reasoning_apart`, issue #759). xAI does, on both surfaces; an
         #: equality on the known vendor, so every other endpoint keeps the wire's own reading.
@@ -676,55 +725,30 @@ class OpenAIProvider:
         that model's row of the list `_catalog` read this wake. Every way the figure cannot be
         stated is one ``cost unpriced charge=tokens`` gap, once per wake: ``rates_unavailable`` when
         the list could not be read, ``unknown_model`` when it has no row for the model, and
-        ``not_reported`` when the row states no usable US-dollar price for what this call billed
-        (`_refuseless_pricing.pricing_of` and `call_cost` say exactly when).
+        ``not_reported`` when the vendor did not state what the figure needs: a usable US-dollar
+        rate on the row, both token counts in the usage block, a rate for a cache write
+        (`_refuseless_pricing.pricing_of`, `usage_of` and `call_cost` say exactly when).
         """
+        stated = self._catalog_store.gaps
         rows = self._catalog()
         if rows is None:
-            self._state_gap(TOKENS_CHARGE, RATES_UNAVAILABLE)
+            self._state_gap(TOKENS_CHARGE, RATES_UNAVAILABLE, stated=stated)
             return None
         named = data.get("model")
         model = named if isinstance(named, str) and named else self.model
         row = rows.get(model)
         if row is None:
-            self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL, model=model)
+            self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL, model=model, stated=stated)
             return None
         pricing = pricing_of(row)
-        cost = None if pricing is None else listed_call_cost(pricing, usage_of(usage))
+        cost = None if pricing is None else listed_call_cost(pricing, listed_usage(usage))
         if cost is None:
-            self._state_gap(TOKENS_CHARGE, NOT_REPORTED, model=model)
+            self._state_gap(TOKENS_CHARGE, NOT_REPORTED, model=model, stated=stated)
         return cost
 
     def _catalog(self) -> dict[str, Mapping[str, Any]] | None:
-        """The vendor's models list as rows by id, read on the first ask and held for the wake.
-
-        Read through the SDK's own models API, so it goes to the host every call goes to, with the
-        agent's own key, and its unmodeled fields (``pricing``, ``context_length``) survive
-        `model_dump()` exactly as the OpenRouter context read relies on. One attempt per wake: a
-        failure is held as ``None`` and stated once here, and each reader states its own
-        consequence (`_listed_cost` a ``rates_unavailable`` gap, `context_limit` the floor), so an
-        unreachable list costs one request, never one per call.
-        """
-        if self._catalog_read:
-            return self._catalog_rows
-        self._catalog_read = True
-        try:
-            page = self._client.models.list(timeout=METADATA_TIMEOUT)
-            rows: dict[str, Mapping[str, Any]] = {}
-            for item in page:
-                row = item.model_dump() if hasattr(item, "model_dump") else item
-                if isinstance(row, Mapping) and isinstance(row.get("id"), str):
-                    rows[row["id"]] = row
-        except Exception as exc:  # noqa: BLE001 - a price list must never break a wake
-            _log.warning(
-                "Could not read the model list from %s, so this wake's calls carry no cost= and "
-                "the context limit falls to its floor: %s",
-                self.base_url,
-                exc,
-            )
-            return None
-        self._catalog_rows = rows
-        return rows
+        """The vendor's models list as rows by id — read once, by `ModelCatalog.rows`."""
+        return self._catalog_store.rows(self._client, self.base_url)
 
     def _log_server_tools(self, data: Mapping[str, Any]) -> None:
         """A ``tool`` line per server-side tool a Responses call ran, beside its ``llm`` line (#758).
@@ -763,19 +787,28 @@ class OpenAIProvider:
         self._state_gap(TOKENS_CHARGE, UNPRICED_HOST)
         return False
 
-    def _state_gap(self, charge: str, reason: str, *, model: str | None = None) -> None:
+    def _state_gap(
+        self,
+        charge: str,
+        reason: str,
+        *,
+        model: str | None = None,
+        stated: set[str] | None = None,
+    ) -> None:
         """One ``cost unpriced`` WARNING per gap per wake — the rule every rate table keeps.
 
         A gap is what the line says, so two calls the table cannot price for the same reason (a
         Flex tier, then a long prompt) are one gap and one line, never two identical ones. `model`
         names the model the gap is about when that is not the configured one (a response naming
-        another model id, issue #844).
+        another model id, issue #844). `stated` is the set the gap is remembered in: this adapter's
+        own, or a shared `ModelCatalog`'s, so adapters reading one list state each gap once.
         """
         model = model or self.model
+        stated = self._gaps_stated if stated is None else stated
         key = f"{charge}:{reason}:{model}"
-        if key in self._gaps_stated:
+        if key in stated:
             return
-        self._gaps_stated.add(key)
+        stated.add(key)
         log_cost_unpriced(provider=self.provider, model=model, charge=charge, reason=reason)
 
     def context_limit(self) -> int | None:

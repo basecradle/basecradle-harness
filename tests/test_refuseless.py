@@ -31,10 +31,19 @@ from basecradle_harness._basecradle import (
     _require_no_server_builtins,
     _surface_for,
 )
+from basecradle_harness._describer import (
+    DESCRIBER_API_KEY_VAR,
+    DESCRIBER_MODEL_VAR,
+    DESCRIBER_PROVIDERS_VAR,
+    IMAGE_OUTPUT_BUDGET,
+    VIDEO_OUTPUT_BUDGET,
+    describer_from_env,
+)
 from basecradle_harness._observability import ComputedCost
-from basecradle_harness._openai import _AFFINITY, CACHE_KEY_FIELD, OpenAIProvider
+from basecradle_harness._openai import _AFFINITY, CACHE_KEY_FIELD, ModelCatalog, OpenAIProvider
 from basecradle_harness._openai_rates import Usage
 from basecradle_harness._refuseless_pricing import Pricing, call_cost, pricing_of
+from basecradle_harness._refuseless_pricing import usage_of as listed_usage
 from basecradle_harness._resolve import resolve_stems
 from basecradle_harness._wake import _cost_report
 
@@ -515,3 +524,76 @@ def test_a_wake_sends_the_call_and_one_list_read_with_the_agents_key_and_nothing
             assert field not in body
     llm = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
     assert all("cost=0.00022" in line and "cost_basis=computed" in line for line in llm)
+
+
+# --- one list per credential per wake, however many adapters read it -----------------------------
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"completion_tokens": 200},
+        {"prompt_tokens": 1000},
+        {"prompt_tokens": True, "completion_tokens": 200},
+        {"prompt_tokens": 1000, "completion_tokens": -1},
+        {"prompt_tokens": "1000", "completion_tokens": 200},
+        None,
+    ],
+)
+def test_a_usage_block_missing_either_count_prices_nothing_rather_than_low(usage):
+    """A missing prompt count read as zero would log a small, wrong dollar the dashboard sums."""
+    assert listed_usage(usage) is None
+
+
+def test_a_usage_block_with_both_counts_reads_its_cache_details():
+    usage = {**USAGE, "prompt_tokens_details": {"cached_tokens": 400}}
+    assert listed_usage(usage) == Usage(input=1000, cached=400, output=200)
+
+
+def test_a_missing_count_on_the_wire_is_a_not_reported_gap(gaps):
+    with respx.mock(assert_all_mocked=True) as router:
+        listed = httpx.Response(200, json=_models(_row(MODEL, PLAIN)))
+        (cost,) = _priced(router, listed, reply=_reply(usage={"completion_tokens": 200}))
+    assert cost is None
+    assert gaps() == [
+        f"cost unpriced provider=refuseless model={MODEL} charge=tokens reason=not_reported"
+    ]
+
+
+def test_adapters_handed_one_catalog_read_the_list_once_and_state_a_gap_once(refuseless_env, gaps):
+    catalog = ModelCatalog()
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(return_value=httpx.Response(503, json={}))
+        router.post(f"{HOST}/chat/completions").mock(
+            return_value=httpx.Response(200, json=_reply())
+        )
+        for budget in (2048, 6144, 4096):
+            adapter = _provider_from_config(
+                *_config_from_env(), max_output_tokens=budget, catalog=catalog
+            )
+            adapter.chat([Message.user("hi")])
+            adapter.close()
+    assert models.call_count == 1
+    assert len(gaps()) == 1
+
+
+def test_a_refuseless_describer_reads_the_list_once_across_its_budgets(refuseless_env, gaps):
+    """The describer builds one adapter per output budget (issue #488); they share one list."""
+    refuseless_env.setenv(DESCRIBER_MODEL_VAR, MODEL)
+    refuseless_env.setenv(DESCRIBER_API_KEY_VAR, "sk-rl-describer-0123456789abcdef01234567")
+    refuseless_env.setenv(DESCRIBER_PROVIDERS_VAR, "refuseless")
+    describer = describer_from_env()
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(return_value=httpx.Response(503, json={}))
+        router.post(f"{HOST}/chat/completions").mock(
+            return_value=httpx.Response(200, json=_reply())
+        )
+        for budget in (IMAGE_OUTPUT_BUDGET, VIDEO_OUTPUT_BUDGET):
+            describer._provider_for(budget).chat([Message.user("describe")])
+    assert models.call_count == 1
+    assert (
+        models.calls[0]
+        .request.headers["authorization"]
+        .endswith("describer-0123456789abcdef01234567")
+    )
+    assert len(gaps()) == 1

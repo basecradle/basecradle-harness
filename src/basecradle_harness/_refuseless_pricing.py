@@ -6,13 +6,13 @@ does publish is a ``pricing`` object on every model of ``GET /v1/models``, added
 BaseCradle's request so that its price could be read rather than transcribed. So this module is
 deliberately **not** a rate table, and there is no ``_refuseless_rates.py``: a hand copy of a price
 the vendor publishes live would only be a second, rotting statement of it (@origin). The adapter
-reads the list once per wake (`OpenAIProvider._catalog`) and hands each row here.
+reads the list once per wake per key (`_openai.ModelCatalog`) and hands each row here.
 
 The rules every rate table keeps hold here too:
 
 - **A figure the harness cannot state is omitted, never estimated.** No row for the model, a row
   with no ``pricing``, a ``currency`` other than ``USD``, a rate the call needs that is missing or
-  not a non-negative number, a usage block with no counts: each returns no cost, and the adapter
+  not a non-negative number, a usage block missing either count (`usage_of`): each returns no cost, and the adapter
   states the gap once per wake as a ``cost unpriced charge=tokens`` WARNING. Nothing falls back to a
   constant or to a price read on an earlier wake.
 - **The arithmetic is the call's own facts × the vendor's own rates.** The top-level rates are the
@@ -87,6 +87,30 @@ def pricing_of(row: Mapping[str, Any] | None) -> Pricing | None:
     )
 
 
+def usage_of(usage: Any) -> Usage | None:
+    """A Chat Completions ``usage`` block as a `Usage`, or ``None`` unless it states **both** counts.
+
+    Stricter than the OpenAI table's reader (`_openai_rates.usage_of`), which reads a missing count
+    as zero: here the formula is ``prompt_tokens × input + completion_tokens × output``, and a block
+    missing either term would price the call low rather than not at all, which the dashboard would
+    sum as if it were true. Both must be non-negative integers (never a bool). The cached and
+    cache-write counts are OpenAI's ``prompt_tokens_details`` spellings, read only if present.
+    """
+    if not isinstance(usage, Mapping):
+        return None
+    prompt, completion = _count(usage.get("prompt_tokens")), _count(usage.get("completion_tokens"))
+    if prompt is None or completion is None:
+        return None
+    details = usage.get("prompt_tokens_details")
+    details = details if isinstance(details, Mapping) else {}
+    return Usage(
+        input=prompt,
+        cached=_count(details.get("cached_tokens")) or 0,
+        cache_write=_count(details.get("cache_write_tokens")) or 0,
+        output=completion,
+    )
+
+
 def call_cost(pricing: Pricing, usage: Usage | None) -> ComputedCost | None:
     """This call's dollars at `pricing`, or ``None`` when the arithmetic would need a guess.
 
@@ -102,6 +126,13 @@ def call_cost(pricing: Pricing, usage: Usage | None) -> ComputedCost | None:
     if cached:
         total += cached * pricing.cached_input  # type: ignore[operator]
     return ComputedCost(total / 1_000_000)
+
+
+def _count(value: Any) -> int | None:
+    """`value` as a token count: a non-negative integer, never a bool."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def _rate(value: Any) -> float | None:
