@@ -1924,6 +1924,8 @@ AI_MODEL=z-ai/glm-5.2    # OpenRouter model ids are vendor-prefixed
 #   host (https://us.openrouter.ai/api/v1) that routes only to endpoints inside the region
 ```
 
+**A reasoning model keeps its train of thought through a tool loop, on either path.** When a reply that calls tools carries `reasoning_details` (or only `reasoning`), the harness sends it back unchanged on that assistant message for the rest of the tool loop, as [OpenRouter asks](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens). It lives in memory for that one loop: the transcript never keeps it and a later wake never replays it. On each later step of the loop you pay input tokens for it, usually at the cached rate. With the native SDK, blocks it cannot send unchanged (a block type newer than the installed SDK) are not sent, and a WARNING says so; the plain `reasoning` string goes back in their place.
+
 > **Two ways to reach OpenRouter.**
 > - **`AI_SDK=openrouter`** — OpenRouter's **native** first-party SDK, `pip install 'basecradle-harness[openrouter]'`. It speaks a single `chat` surface (OpenRouter's Responses API is beta upstream), so `AI_SDK_SURFACE` is unset. Its `chat.send` is a typed parameter set, so a [`model_params.json`](#model-parameters--model_paramsjson) key must be one it names.
 > - **`AI_SDK=openai`** — the `openai` SDK pointed at `openrouter.ai`, since OpenRouter speaks the OpenAI chat wire — **chat-only** (`AI_SDK_SURFACE=chat`; the openai adapter defaults to `responses`, which OpenRouter does not serve, so this is the first thing to set). On this path `extra_body` remains the escape hatch for non-standard fields.

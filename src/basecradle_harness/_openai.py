@@ -104,12 +104,14 @@ from basecradle_harness._openai_rates import (
 )
 from basecradle_harness._openai_wire import (
     builtin_to_responses,
-    chat_message_to_wire,
+    chat_messages_to_wire,
+    chat_response_message,
     chat_tool_to_wire,
     function_tool_to_responses,
     message_from_chat,
     message_from_responses,
     message_to_input,
+    reasoning_to_send_back,
     server_tool_uses,
 )
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
@@ -527,7 +529,7 @@ class OpenAIProvider:
     def _chat_turn(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None) -> Message:
         payload: dict[str, Any] = dict(self._default_params)
         payload["model"] = self.model
-        payload["messages"] = [chat_message_to_wire(m) for m in messages]
+        payload["messages"] = chat_messages_to_wire(messages)
         if tools:
             payload["tools"] = [chat_tool_to_wire(t) for t in tools]
         if self._extra_body:
@@ -557,6 +559,10 @@ class OpenAIProvider:
         )
         if unreadable is not None:
             raise unreadable
+        # Only OpenRouter asks for the model's reasoning back (issue #839), and this SDK keeps both
+        # fields verbatim as extras on the way in and out, so the dump is the vendor's own value.
+        if self.provider == "openrouter" and reply.tool_calls:  # type: ignore[union-attr]
+            reply.reasoning = reasoning_to_send_back(chat_response_message(data))  # type: ignore[union-attr]
         return reply  # type: ignore[return-value]
 
     def _log_call(

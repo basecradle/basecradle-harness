@@ -50,7 +50,25 @@ _NO_VIDEO_SURFACE = (
 # === Chat Completions =========================================================
 
 
-def chat_message_to_wire(message: Message) -> dict[str, Any]:
+def chat_messages_to_wire(messages: Sequence[Message]) -> list[dict[str, Any]]:
+    """Serialize a whole request, sending reasoning back only inside the current tool loop.
+
+    Reasoning goes back so a model can continue from where it paused for its tools (issue #839),
+    which is the work after the newest **real** `user` turn: an injected turn is that same work
+    (`Message.injected`), and a later real turn ends it. An earlier turn's blocks stay home: a
+    batched wake's next turn has already changed the prefix they were produced on, and Anthropic
+    binds a thinking block to that prefix (a 400, measured on its own API, `_anthropic._Stream`).
+    """
+    newest = max(
+        (i for i, m in enumerate(messages) if m.role == "user" and not m.injected), default=-1
+    )
+    return [
+        chat_message_to_wire(message, send_reasoning=index > newest)
+        for index, message in enumerate(messages)
+    ]
+
+
+def chat_message_to_wire(message: Message, *, send_reasoning: bool = False) -> dict[str, Any]:
     """Serialize a `Message` into the Chat Completions message shape."""
     if message.role == "tool":
         return {
@@ -81,6 +99,8 @@ def chat_message_to_wire(message: Message) -> dict[str, Any]:
     # An assistant turn that is purely tool calls still needs an explicit null content key.
     if message.role == "assistant" and "content" not in wire:
         wire["content"] = None
+    if send_reasoning and message.reasoning:
+        wire.update(message.reasoning)
     return wire
 
 
@@ -178,6 +198,28 @@ def message_from_chat(data: Mapping[str, Any]) -> Message:
     if citations:
         content = (content or "") + format_citations(citations)
     return Message(role="assistant", content=content, tool_calls=tool_calls)
+
+
+def chat_response_message(data: Any) -> Mapping[str, Any]:
+    """A Chat Completions body's first ``message``, or an empty mapping for any other shape."""
+    choices = data.get("choices") if isinstance(data, Mapping) else None
+    choice = choices[0] if isinstance(choices, list) and choices else None
+    message = choice.get("message") if isinstance(choice, Mapping) else None
+    return message if isinstance(message, Mapping) else {}
+
+
+def reasoning_to_send_back(message: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The reasoning field of a response ``message`` to return with its tool results, or ``None``.
+
+    OpenRouter's ``reasoning_details`` when present, because it alone carries encrypted and
+    summarized blocks, and otherwise the plain ``reasoning`` string; never both. The value is the
+    one the vendor sent, unaltered: OpenRouter requires the blocks' sequence to match the model's.
+    """
+    details = message.get("reasoning_details")
+    if isinstance(details, list) and details:
+        return {"reasoning_details": details}
+    text = message.get("reasoning")
+    return {"reasoning": text} if isinstance(text, str) and text else None
 
 
 def _chat_url_citations(annotations: Any) -> list[Mapping[str, Any]]:
