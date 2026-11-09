@@ -49,6 +49,13 @@ else: MemPalace's miner's drawers really were cut by the older chunker, so they 
 MemPalace and reported. Every report counts both kinds on one line (`stale_line`). It **writes to
 the palace** and has a ``--dry-run`` form.
 
+**One write for a moved palace's re-mine: ``--relocate-source-file``** (issue #831). A 3.11 mine
+purges a file's drawers by their ``source_file``, so a file whose drawers are recorded under a
+previous home is filed a second time beside them. This mode rewrites ``source_file`` on those
+drawers to this location and changes nothing else, so the mine that follows is the in-place case
+(`relocate_source_file`). It takes the previous home as an argument, proves each file separately,
+**writes to the palace**, deletes nothing, and has a ``--dry-run`` form.
+
 **Three probes, or a sample** (issue #606, phase 3). By default the check searches for three real
 drawers (the oldest, middle and newest), which says whether a moved palace serves at all. Three
 cannot say whether a move made recall *worse*, so ``--sample N`` probes N drawers instead, chosen
@@ -673,7 +680,8 @@ def register_off_wing(provider: MemPalaceMemoryProvider, palace: Path, *, dry_ru
 #: What the version-stale line's second half says, printed whenever a file is version-stale.
 STALE_CONSEQUENCE = (
     "a mine re-chunks each version-stale file filed at this location, and files each one filed "
-    "only at another location a second time, beside its old drawers; --stamp-chunker-version "
+    "only at another location a second time, beside its old drawers; --relocate-source-file "
+    "makes a file moved from a previous home the in-place case; --stamp-chunker-version "
     "makes the observe's own current, and MemPalace's miner's are left to MemPalace"
 )
 
@@ -756,6 +764,227 @@ def stamp_chunker_version(palace: Path, *, dry_run: bool) -> int:
         print(
             f"FAIL: {wrong} stamped drawers did not read back as their old metadata plus the "
             "stamp; the palace changed in another way while this ran"
+        )
+        return 1
+    return 0
+
+
+@dataclass
+class Relocation:
+    """What ``--relocate-source-file`` found: the files it proves, and the ones it will not touch."""
+
+    #: Per conversation file name, its drawers as ``(drawer_id, metadata)``.
+    files: dict[str, list[tuple[str, dict]]] = field(default_factory=dict)
+    #: ``(name, reason)`` for each file a mine would duplicate that this cannot prove.
+    left_alone: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def drawers(self) -> int:
+        return sum(len(rows) for rows in self.files.values())
+
+
+def _why_not_relocatable(
+    rows: list[tuple[str, dict, str]], here: Path, old: Path, chunker: int, normalize: int | None
+) -> str | None:
+    """Why this file's drawers may not be rewritten to ``here``, or ``None`` when they may.
+
+    ``rows`` is every real drawer recorded under the file's name, wherever it was filed. A file is
+    moved whole or not at all, and each check names a way the rewrite would be false or useless:
+
+    - the file must be here, or there is nothing for a mine to read;
+    - the recorded path must be gone, or the file was never moved;
+    - every drawer must be at the previous location, so the rewrite does not merge two filings;
+    - every drawer must be in the observe's wing, which is the one a mine of ``conversations/``
+      purges;
+    - no drawer may be the observe's, because its id is derived from ``source_file`` (the rewrite
+      would make `filed_by_observe` false of it) and the mine recognises it by content anyway;
+    - every drawer must be version-stale, because a mine purges a file only when it is;
+    - the content hashes the drawers carry must be today's hashes of the file here, which is what
+      makes it the same file and not merely the same name.
+    """
+    if not here.is_file():
+        return "no such file at this location, so a mine never reads it"
+    try:
+        os.lstat(old)
+    except (FileNotFoundError, NotADirectoryError):
+        pass
+    except OSError as error:
+        return f"its recorded path could not be checked ({type(error).__name__})"
+    else:
+        return "its recorded path still exists, so it was not moved"
+    if {str(meta.get("source_file")) for _, meta, _ in rows} != {str(old)}:
+        return "it has drawers recorded somewhere other than the previous home"
+    wings = sorted({str(meta.get("wing") or "-") for _, meta, _ in rows})
+    if wings != [_CONVERSATIONS_WING]:
+        return f"it has drawers in wing {', '.join(wings)}, not only {_CONVERSATIONS_WING!r}"
+    if any(filed_by_observe(*row) for row in rows):
+        return "the observe filed it; --stamp-chunker-version makes it current"
+    if not all(
+        _exchange_mode(meta) and _version_stale(meta, chunker, normalize) for _, meta, _ in rows
+    ):
+        return "not every drawer is version-stale, so a mine would not purge them"
+    stored = {h for _, meta, _ in rows for h in _hashes(meta)}
+    if not stored:
+        return (
+            "its drawers carry no content hash (filed before MemPalace 3.7), so nothing proves it"
+        )
+    try:
+        today = set(_today(here))
+    except ImportError:
+        raise
+    except Exception as error:  # noqa: BLE001 - one unreadable file is left alone, and named
+        return f"it could not be read ({type(error).__name__})"
+    if today != stored:
+        return "its content hash is not the one its drawers record"
+    return None
+
+
+def relocation(found: Census, convos: Path, previous: Path, normalize: int | None) -> Relocation:
+    """Which files ``--relocate-source-file`` proves, read off the census.
+
+    A file is considered when a version-stale real drawer is recorded in the previous home's
+    ``conversations`` directory under the file's name: that is exactly what a mine would file a
+    second time. A drawer the miner already reads as current is recognised by its content and
+    needs nothing, so it is not considered and not reported.
+    """
+    chunker = found.chunker
+    out = Relocation()
+    if chunker is None:
+        return out
+    old_dir = str(previous / _CONVERSATIONS_WING)
+    named: dict[str, list[tuple[str, dict, str]]] = {}
+    for row in found.real:
+        named.setdefault(Path(str(row[1].get("source_file") or "")).name, []).append(row)
+    considered = sorted(
+        {
+            Path(str(meta.get("source_file"))).name
+            for _, meta, _ in found.elsewhere
+            if str(Path(str(meta.get("source_file"))).parent) == old_dir
+            and _exchange_mode(meta)
+            and _version_stale(meta, chunker, normalize)
+        }
+    )
+    for name in considered:
+        rows = named[name]
+        why = _why_not_relocatable(rows, convos / name, Path(old_dir) / name, chunker, normalize)
+        if why is None:
+            out.files[name] = [(drawer_id, meta) for drawer_id, meta, _ in rows]
+        else:
+            out.left_alone.append((name, why))
+    return out
+
+
+def _whole_files(files: dict[str, list[tuple[str, dict]]], size: int) -> list[list[str]]:
+    """The files' names in write batches of about ``size`` drawers, never splitting a file.
+
+    One ``update`` is one transaction, so a crash between batches leaves every file either moved
+    or not. A file split across two would be left with drawers at both locations, which a re-run
+    has to refuse.
+    """
+    batches: list[list[str]] = [[]]
+    filled = 0
+    for name, rows in files.items():
+        if batches[-1] and filled + len(rows) > size:
+            batches.append([])
+            filled = 0
+        batches[-1].append(name)
+        filled += len(rows)
+    return [batch for batch in batches if batch]
+
+
+def relocate_source_file(palace: Path, home: Path, previous: Path, *, dry_run: bool) -> int:
+    """Record a moved palace's old-home drawers at this location, so a mine re-chunks them in place.
+
+    MemPalace's mine finds what to purge by ``source_file`` alone, plus the extract mode
+    (``convo_miner._source_file_delete_ids``). After a home move the drawers still name the old
+    path, so a mine of the file here deletes nothing and files every drawer a second time. Measured
+    on a palace mined under 3.10.0, moved and mined under 3.11.0: 215 drawers became 430; with
+    ``source_file`` rewritten first they became exactly the 215 the dry run planned, with no
+    duplicate, and the mine removed the registry rows a rename left at the new path. No other
+    field takes part, so no other field changes, ``source_dir_ino`` included (only ``sync`` reads
+    it, the old drawers do not carry it, and the mine replaces these drawers).
+
+    ``previous`` is the ``HARNESS_HOME`` the palace used to live under, stated by whoever runs
+    this; each file must then prove itself against it (`_why_not_relocatable`). Registry rows are
+    never touched. **Nothing here deletes a drawer**: the count of drawers and rows is compared
+    before and after, and every rewritten drawer is read back by id and must hold exactly its old
+    metadata with the new path. Idempotent: a rewritten drawer is at this location, so a second run
+    finds nothing. Holds MemPalace's per-palace lock for the whole write, because a mine that read
+    the palace before this ran would file the drawers beside themselves. Returns the exit code.
+    """
+    word = "dry run, writes nothing" if dry_run else "WRITES TO THE PALACE"
+    print(f"relocate source_file ({word}):")
+    print(f"  previous home: {previous}")
+    if chunker_version() is None:
+        version = getattr(_import("version"), "__version__", "?")
+        print(f"  nothing to relocate: MemPalace {version} defines no convo_chunker_version")
+        return 0
+    module = _import("palace")
+    previous_palace = previous / palace.relative_to(home)
+    convos = (palace / _CONVERSATIONS_WING).resolve()
+    normalize = getattr(module, "NORMALIZE_VERSION", None)
+    collection = module.get_collection(str(palace), create=False, read_only=dry_run)
+
+    def plan() -> tuple[Census, Relocation]:
+        found = census(collection, palace)
+        return found, relocation(found, convos, previous_palace, normalize)
+
+    def tail(found: Census, moved: Relocation) -> str:
+        return (
+            f"files left alone {len(moved.left_alone)}, drawers left at another location "
+            f"{len(found.elsewhere) - moved.drawers}"
+        )
+
+    if dry_run:
+        found, moved = plan()
+        for name, why in moved.left_alone:
+            print(f"  left alone: {name}: {why}")
+        print(
+            f"relocate source_file (dry run): drawers to relocate {moved.drawers} in "
+            f"{len(moved.files)} files, {tail(found, moved)}"
+        )
+        return 0
+    try:
+        with module.mine_palace_lock(str(palace)):
+            found, moved = plan()
+            for name, why in moved.left_alone:
+                print(f"  left alone: {name}: {why}")
+            return _write_relocation(palace, convos, collection, found, moved, tail(found, moved))
+    except module.MineAlreadyRunning:
+        print("  refused, nothing written: a mine holds this palace")
+        return 1
+
+
+def _write_relocation(
+    palace: Path, convos: Path, collection, found: Census, moved: Relocation, tail: str
+) -> int:
+    """Rewrite ``source_file`` on the proven drawers, whole file at a time, and read each back."""
+    expected = {
+        drawer_id: {**meta, "source_file": str(convos / name)}
+        for name, rows in moved.files.items()
+        for drawer_id, meta in rows
+    }
+    before = _counts(palace)
+    for names in _whole_files(moved.files, _PAGE):
+        ids = [drawer_id for name in names for drawer_id, _ in moved.files[name]]
+        collection.update(ids=ids, metadatas=[expected[drawer_id] for drawer_id in ids])
+    ids = list(expected)
+    wrong = 0
+    for start in range(0, len(ids), _PAGE):
+        batch = ids[start : start + _PAGE]
+        got = collection.get(ids=batch, include=["metadatas"])
+        back = dict(zip(got.get("ids") or [], got.get("metadatas") or []))
+        wrong += sum(back.get(drawer_id) != expected[drawer_id] for drawer_id in batch)
+    after = _counts(palace)
+    print(
+        f"relocate source_file: WROTE to this palace: drawers relocated {len(ids) - wrong} in "
+        f"{len(moved.files)} files, {tail}"
+    )
+    if wrong or before != after:
+        print(
+            f"FAIL: {wrong} drawers did not read back as their old metadata with the new path, "
+            f"or the drawer and row counts moved ({before} -> {after}); the palace changed in "
+            "another way while this ran"
         )
         return 1
     return 0
@@ -1063,6 +1292,13 @@ def _count(value: str) -> int:
     return number
 
 
+def _absolute(value: str) -> Path:
+    """``--previous-home``: an absolute path, because drawers record absolute paths."""
+    if not os.path.isabs(value):
+        raise argparse.ArgumentTypeError(f"not an absolute path: {value!r}")
+    return Path(os.path.abspath(value))
+
+
 def _positive(value: str) -> int:
     try:
         number = int(value)
@@ -1126,10 +1362,28 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--relocate-source-file",
+        action="store_true",
+        help=(
+            "WRITES TO THE PALACE. Before the report, rewrite source_file to this location on the "
+            "drawers of each conversation file filed only under --previous-home, so a mine "
+            "re-chunks it in place instead of filing it a second time. Each file must prove it "
+            "was moved: its recorded path gone, the same content here, every drawer version-stale "
+            "and MemPalace's miner's. Deletes nothing, changes no other field, and a second run "
+            "finds nothing. Add --dry-run to print what it would do."
+        ),
+    )
+    parser.add_argument(
+        "--previous-home",
+        type=_absolute,
+        help="with --relocate-source-file: the HARNESS_HOME this palace used to live under.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help=(
-            "with --register-off-wing or --stamp-chunker-version: print what it would write, and "
+            "with --relocate-source-file, --register-off-wing or --stamp-chunker-version: print "
+            "what it would write, and "
             "write nothing. With --end-to-end: print the probes and the token estimate, and call "
             "no model."
         ),
@@ -1221,10 +1475,11 @@ def main(argv: list[str] | None = None) -> int:
             or args.practice_observe
             or args.register_off_wing
             or args.stamp_chunker_version
+            or args.relocate_source_file
         ):
             parser.error(
                 "--end-to-end runs alone: not with --reranked-pool, --practice-observe, "
-                "--register-off-wing or --stamp-chunker-version"
+                "--register-off-wing, --stamp-chunker-version or --relocate-source-file"
             )
     elif args.token_ceiling is not None:
         parser.error("--token-ceiling applies to --end-to-end")
@@ -1237,10 +1492,12 @@ def main(argv: list[str] | None = None) -> int:
             or args.practice_observe
             or args.register_off_wing
             or args.stamp_chunker_version
+            or args.relocate_source_file
         ):
             parser.error(
                 "--pool-diagnosis runs alone: not with --end-to-end, --reranked-pool, "
-                "--practice-observe, --register-off-wing or --stamp-chunker-version"
+                "--practice-observe, --register-off-wing, --stamp-chunker-version or "
+                "--relocate-source-file"
             )
     elif args.rare_token_probes and not args.end_to_end:
         parser.error("--rare-token-probes applies to --end-to-end or --pool-diagnosis")
@@ -1249,11 +1506,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.reranked_pool and args.sample is None:
         parser.error("--reranked-pool applies to --sample")
     if args.dry_run and not (
-        args.register_off_wing or args.stamp_chunker_version or args.end_to_end
+        args.register_off_wing
+        or args.stamp_chunker_version
+        or args.relocate_source_file
+        or args.end_to_end
     ):
         parser.error(
-            "--dry-run applies to --register-off-wing, --stamp-chunker-version or --end-to-end"
+            "--dry-run applies to --register-off-wing, --stamp-chunker-version, "
+            "--relocate-source-file or --end-to-end"
         )
+    if args.relocate_source_file and args.previous_home is None:
+        parser.error("--relocate-source-file needs --previous-home")
+    if args.previous_home is not None and not args.relocate_source_file:
+        parser.error("--previous-home applies to --relocate-source-file")
 
     reranker = None
     if args.end_to_end:
@@ -1280,6 +1545,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PROG}: name a HARNESS_HOME, or set $HARNESS_HOME", file=sys.stderr)
         return 1
     home = Path(raw_home).expanduser().resolve()
+    if args.previous_home == home:
+        parser.error("--previous-home is this HARNESS_HOME")
     palace = _palace_path(home)
     # `--pool-diagnosis` prints ids, counts and ranks only (issue #633): no path, no upstream text.
     paths = not args.pool_diagnosis
@@ -1297,6 +1564,10 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr)
     try:
         provider = MemPalaceMemoryProvider(palace)
+        if args.relocate_source_file:
+            code = relocate_source_file(palace, home, args.previous_home, dry_run=args.dry_run)
+            if code:
+                return code
         # Before registering: a stamped file is recognised by its content, so the register pass
         # then sees only what is still unfiled (issue #751).
         if args.stamp_chunker_version:

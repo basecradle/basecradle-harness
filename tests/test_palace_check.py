@@ -1110,3 +1110,36 @@ def test_reranked_pool_needs_sample(home, fake, capsys):
     with pytest.raises(SystemExit):
         _palace_check.main(["--reranked-pool", str(home)])
     assert "--reranked-pool applies to --sample" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("argv", "error"),
+    [
+        (["--relocate-source-file"], "--relocate-source-file needs --previous-home"),
+        (["--previous-home", "/home/old/harness"], "--previous-home applies to"),
+        (["--relocate-source-file", "--previous-home", "old/harness"], "not an absolute path"),
+    ],
+)
+def test_relocate_source_file_arguments_are_refused_before_anything_opens(capsys, argv, error):
+    with pytest.raises(SystemExit) as refused:
+        _palace_check.main(argv)
+    assert refused.value.code == 2
+    assert error in capsys.readouterr().err
+
+
+def test_the_previous_home_cannot_be_this_home(home, capsys):
+    with pytest.raises(SystemExit):
+        _palace_check.main(
+            [str(home), "--relocate-source-file", "--previous-home", str(home.resolve())]
+        )
+    assert "--previous-home is this HARNESS_HOME" in capsys.readouterr().err
+
+
+def test_relocation_batches_never_split_a_file():
+    files = {f"{n}.md": [(f"{n}-{i}", {}) for i in range(4)] for n in range(5)}
+    files["big.md"] = [(f"big-{i}", {}) for i in range(11)]
+
+    batches = _palace_check._whole_files(files, 10)
+
+    assert [name for batch in batches for name in batch] == list(files)
+    assert batches == [["0.md", "1.md"], ["2.md", "3.md"], ["4.md"], ["big.md"]]

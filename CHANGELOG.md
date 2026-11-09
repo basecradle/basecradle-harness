@@ -7,6 +7,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.181.0] - 2026-11-08
+
+### Added: `basecradle-harness-palace-check --relocate-source-file` (issue #831)
+
+MemPalace 3.11's re-mine replaces a file's drawers by their recorded `source_file`, so after a home move it files every drawer a second time beside the old ones. Measured on a palace mined under 3.10.0, moved, and mined under 3.11.0: 215 drawers became 430. With `source_file` rewritten first they became exactly the 215 the mine planned, with no duplicate and recall intact.
+
+The new mode takes `--previous-home`, the `HARNESS_HOME` the palace used to live under, and rewrites `source_file` on the drawers of each conversation file filed only there. It has a `--dry-run` form, deletes nothing, and is safe to run twice. A file is rewritten only when it proves it moved (its recorded path gone, the same content hash here, every drawer version-stale, in the `conversations` wing and filed by MemPalace's miner); any other file is left alone and named. Drawers the harness's observe filed are never rewritten, because their ids are derived from `source_file`.
+
 ## [0.180.0] - 2026-11-08
 
 ### Fixed: a tool that answers the model with its failure says `outcome=error` (issue #822)

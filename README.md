@@ -314,6 +314,20 @@ basecradle-harness-palace-check --stamp-chunker-version /home/<user>/harness    
 
 From 0.166.0 the observe stamps the version itself on every drawer it files (MemPalace 3.11 does too), so only drawers filed before the upgrade need this.
 
+`--relocate-source-file` is for **re-mining a palace whose home moved**, and it **writes to the palace**. MemPalace 3.11's re-mine finds what to replace by each drawer's recorded `source_file`, so a conversation file whose drawers are still recorded under the old home is filed a second time beside them, and the old ones stay. This mode rewrites `source_file` on those drawers to the file's location now, so the mine that follows replaces them in place:
+
+```bash
+basecradle-harness-palace-check --relocate-source-file --previous-home /home/<old-user>/harness --dry-run /home/<user>/harness   # says what it would do
+basecradle-harness-palace-check --relocate-source-file --previous-home /home/<old-user>/harness /home/<user>/harness             # does it, then reports
+```
+
+- **`--previous-home` is the `HARNESS_HOME` the palace used to live under.** A drawer is considered only when its recorded path is exactly that home's `conversations` directory.
+- **Each file proves it moved, or is left alone whole and named.** Its recorded path must be gone, the same file must be here with the content hash its drawers record, and every drawer must be in the `conversations` wing, version-stale, filed by MemPalace's miner and at that one previous location. A drawer the harness's observe filed is never rewritten, because its id is derived from its `source_file`.
+- **It deletes nothing and changes no other field.** Every rewritten drawer is read back by id, and the drawer and row counts are compared before and after; it exits 1 if anything else changed. Registry rows are not touched. The mine that follows removes the ones at this location.
+- **It is safe to run twice.** A rewritten drawer is at this location, so a second run finds nothing. It refuses while a mine holds the palace.
+
+The summary line gives `drawers relocated`, `files left alone`, and `drawers left at another location` (what still stands between this palace and a duplicate-free mine).
+
 **Does a move make recall worse?** Three probes can say a palace serves; they cannot say a move left recall as good as it was. `--sample N` probes N drawers instead, and prints only the ones that miss:
 
 ```bash
