@@ -205,7 +205,7 @@ def test_a_measurement_that_raises_is_unknown_never_a_crash(monkeypatch):
             raise RuntimeError("the palace said something about zq7781x")
 
     facts = _palace_pool.measure(
-        Provider(), None, {}, 0, PROBE, {"1": False}, [], self_query=lambda c, d: "yes"
+        Provider(), {}, 0, PROBE, {"1": False}, [], self_query=lambda c, d: "yes"
     )
     assert facts.error == "RuntimeError"
     assert verdict(facts) == "unknown"

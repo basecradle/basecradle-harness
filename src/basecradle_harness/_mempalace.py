@@ -563,6 +563,18 @@ class MemPalaceMemoryProvider(MemoryProvider):
         )
         return hits
 
+    def read_collection(self):
+        """A read-only handle on the drawers collection, open as of this call.
+
+        A handle does not survive this process's next open once the palace has changed on disk:
+        MemPalace closes its cached client when ``chroma.sqlite3``'s inode or mtime has moved, at
+        the next open (every ``search_memories`` is one), and every read through that client then
+        raises ``AttributeError`` for the rest of the process (issue #835). Any process can move
+        it: a wake filing a drawer beside a palace check is enough. So code that mixes searches
+        with direct reads takes its handle here, after the search, and never holds one across it.
+        """
+        return _import("palace").get_collection(str(self.palace_path), create=False, read_only=True)
+
     def distance_threshold(self, collection=None) -> tuple[float | None, str]:
         """The ``max_distance`` `search` passes on this palace, and why: ``(threshold, reason)``.
 
@@ -593,9 +605,7 @@ class MemPalaceMemoryProvider(MemoryProvider):
         else:
             if collection is None:
                 try:
-                    collection = _import("palace").get_collection(
-                        str(self.palace_path), create=False, read_only=True
-                    )
+                    collection = self.read_collection()
                 except Exception:  # noqa: BLE001 - undecided: this search passes no threshold
                     return None, "collection:unopened"
             metric = palace_metric(collection)
