@@ -254,6 +254,12 @@ class Message:
     `server_tools` is set only on an assistant turn during which the vendor ran server-side tools
     (`ServerToolRecord`, issue #727). It **is** serialized — it is the one trace of those tools a
     later wake can read — and it is never a `ToolCall`, never `content`.
+
+    `reasoning` is set only on an assistant turn that called tools, by an adapter whose vendor asks
+    for the model's reasoning back with the tool results (OpenRouter, issue #839): the wire field
+    and its value, held exactly as the vendor sent them. It is **transient**, like `code_execution`:
+    never serialized, so never mined and never replayed by a later wake. Its bound is its life, one
+    run of the tool loop: `Session._drive` clears it the moment that run ends.
     """
 
     role: Role
@@ -267,6 +273,7 @@ class Message:
     injected: bool = False
     items: list[str] = field(default_factory=list)
     server_tools: ServerToolRecord | None = None
+    reasoning: dict[str, Any] | None = None
 
     @classmethod
     def system(cls, content: str) -> Message:

@@ -502,6 +502,12 @@ class Session:
                 # After the healed results, never before them: a result must follow the turn that
                 # issued its call, and the note is the last thing the stopped turn says.
                 work.append(Message.system(STOPPED_NOTE))
+            # The tool loop is over, so the reasoning it sent back is too (issue #839). `history`
+            # is live for the rest of the wake, and the next run over it (a batched turn, a repass)
+            # has changed the prefix those blocks were produced on, which Anthropic refuses
+            # (`_anthropic._Stream`).
+            for message in work:
+                message.reasoning = None
             self.history[at:at] = work
             #: Where the work this run produced ended up, so the over-length rescue can rewind
             #: exactly it — `history[-n:]` would be the wrong messages on a resume.

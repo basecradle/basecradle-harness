@@ -94,8 +94,10 @@ from basecradle_harness._observability import (
 )
 from basecradle_harness._openai_wire import (
     chat_message_to_wire,
+    chat_response_message,
     chat_tool_to_wire,
     message_from_chat,
+    reasoning_to_send_back,
 )
 from basecradle_harness._timeouts import METADATA_TIMEOUT, CallTimeout, call_timeout, output_cap
 
@@ -508,7 +510,29 @@ class OpenRouterProvider:
         )
         if unreadable is not None:
             raise unreadable
+        if reply.tool_calls:  # type: ignore[union-attr]
+            reply.reasoning = self._reasoning_to_keep(data)  # type: ignore[union-attr]
         return reply  # type: ignore[return-value]
+
+    def _reasoning_to_keep(self, data: Mapping[str, Any]) -> dict[str, Any] | None:
+        """What to send back with this reply's tool results, read from the raw body (issue #839).
+
+        The raw body, because it is the vendor's own bytes. The SDK's dump is the check on them:
+        ``chat.send`` validates its messages against the same typed models, drops a field they do
+        not name, and raises on a block type they do not know, so blocks that differ from their
+        dump could not be sent unchanged, or at all. OpenRouter requires them unchanged, so those
+        are not sent, and the plain ``reasoning`` string is what goes back instead.
+        """
+        raw = chat_response_message(self._capture.last)
+        blocks = raw.get("reasoning_details")
+        if blocks and blocks != chat_response_message(data).get("reasoning_details"):
+            _log.warning(
+                "The openrouter SDK cannot send %s's reasoning blocks back unchanged; "
+                "this tool turn resumes with its plain reasoning only.",
+                self.model,
+            )
+            raw = {"reasoning": raw.get("reasoning")}
+        return reasoning_to_send_back(raw)
 
     def context_limit(self) -> int | None:
         """The **honest** context ceiling behind a router — not the model object's best case (#276).
