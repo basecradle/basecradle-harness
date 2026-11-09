@@ -50,25 +50,7 @@ _NO_VIDEO_SURFACE = (
 # === Chat Completions =========================================================
 
 
-def chat_messages_to_wire(messages: Sequence[Message]) -> list[dict[str, Any]]:
-    """Serialize a whole request, sending reasoning back only inside the current tool loop.
-
-    Reasoning goes back so a model can continue from where it paused for its tools (issue #839),
-    which is the work after the newest **real** `user` turn: an injected turn is that same work
-    (`Message.injected`), and a later real turn ends it. An earlier turn's blocks stay home: a
-    batched wake's next turn has already changed the prefix they were produced on, and Anthropic
-    binds a thinking block to that prefix (a 400, measured on its own API, `_anthropic._Stream`).
-    """
-    newest = max(
-        (i for i, m in enumerate(messages) if m.role == "user" and not m.injected), default=-1
-    )
-    return [
-        chat_message_to_wire(message, send_reasoning=index > newest)
-        for index, message in enumerate(messages)
-    ]
-
-
-def chat_message_to_wire(message: Message, *, send_reasoning: bool = False) -> dict[str, Any]:
+def chat_message_to_wire(message: Message) -> dict[str, Any]:
     """Serialize a `Message` into the Chat Completions message shape."""
     if message.role == "tool":
         return {
@@ -99,7 +81,7 @@ def chat_message_to_wire(message: Message, *, send_reasoning: bool = False) -> d
     # An assistant turn that is purely tool calls still needs an explicit null content key.
     if message.role == "assistant" and "content" not in wire:
         wire["content"] = None
-    if send_reasoning and message.reasoning:
+    if message.reasoning:
         wire.update(message.reasoning)
     return wire
 

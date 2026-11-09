@@ -104,7 +104,7 @@ from basecradle_harness._openai_rates import (
 )
 from basecradle_harness._openai_wire import (
     builtin_to_responses,
-    chat_messages_to_wire,
+    chat_message_to_wire,
     chat_response_message,
     chat_tool_to_wire,
     function_tool_to_responses,
@@ -529,7 +529,7 @@ class OpenAIProvider:
     def _chat_turn(self, messages: Sequence[Message], tools: Sequence[ToolSpec] | None) -> Message:
         payload: dict[str, Any] = dict(self._default_params)
         payload["model"] = self.model
-        payload["messages"] = chat_messages_to_wire(messages)
+        payload["messages"] = [chat_message_to_wire(m) for m in messages]
         if tools:
             payload["tools"] = [chat_tool_to_wire(t) for t in tools]
         if self._extra_body:

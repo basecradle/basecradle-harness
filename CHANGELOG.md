@@ -13,8 +13,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 On OpenRouter's chat surface, every tool turn resumed with the model's chain of thought discarded, so it re-derived from the tool result alone why it had called the tool. OpenRouter documents the fix, and Moonshot's and Z.ai's model cards recommend it. A reply that calls tools now keeps its `reasoning_details` (or, with none, its `reasoning` string) and sends it back unchanged on that assistant message, each round of a multi-step loop with its own blocks, through both the native `openrouter` SDK and the `openai` SDK at `openrouter.ai`.
 
-- **It lasts one tool loop.** It is held in memory and goes back only inside the current loop. It is never written to the transcript, never mined, and never replayed by a later wake.
-- **The bytes are the vendor's.** The native SDK drops fields it does not model and refuses block types it does not know, so blocks it could not send unchanged are not sent. A WARNING says so and the plain `reasoning` string goes back in their place.
+- **It lasts one tool loop.** It is held in memory and cleared when the loop ends, so a batched turn or a repass in the same wake never sends it. It is never written to the transcript and never mined.
+- **The blocks are the vendor's.** The native SDK drops what it does not model and refuses block types it does not know, so blocks it could not send unchanged are not sent. A WARNING says so, and the plain `reasoning` string goes back in their place when the reply has one.
 - **Expect `tokens_in` to rise on later steps of a reasoning brain's tool loop**, by about the size of its earlier reasoning. That rise is the only outside sign the blocks arrived. `docs/telemetry.md` is unchanged.
 
 ## [0.181.1] - 2026-11-09

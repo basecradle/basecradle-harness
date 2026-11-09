@@ -21,12 +21,11 @@ from basecradle_harness import (
     Message,
     OpenAIProvider,
     OpenRouterProvider,
+    ProviderAuthError,
     Session,
     Tool,
-    ToolCall,
     ToolRegistry,
 )
-from basecradle_harness._openai_wire import chat_messages_to_wire
 
 BASE_URL = "https://openrouter.test/api/v1"
 CHAT_URL = f"{BASE_URL}/chat/completions"
@@ -167,10 +166,11 @@ def test_a_model_that_reasons_about_nothing_sends_nothing_back(router, build):
     assert "reasoning" not in turn and "reasoning_details" not in turn
 
 
-def test_a_final_answer_keeps_no_reasoning(router):
+@pytest.mark.parametrize("build", [native, through_openai_sdk], ids=["native", "openai_sdk"])
+def test_a_final_answer_keeps_no_reasoning(router, build):
     answer(router, completion(content="Sunny.", reasoning_details=BLOCKS))
 
-    assert native().chat([Message.user("Weather?")]).reasoning is None
+    assert build().chat([Message.user("Weather?")]).reasoning is None
 
 
 @pytest.mark.parametrize(
@@ -230,43 +230,58 @@ def test_each_round_of_a_loop_keeps_its_own_blocks_and_none_of_them_reach_the_di
     assert [t["reasoning_details"] for t in third] == [BLOCKS, LATER_BLOCKS]
     # Stable across the steps of the loop, which is what keeps the prefix cacheable.
     assert third[0] == second[0]
+    # An ASCII value of the blocks: the transcript escapes non-Latin text, so one written in it
+    # could never be found here.
     on_disk = path.read_text()
-    assert "reasoning" not in on_disk and "東京" not in on_disk
+    assert "reasoning" not in on_disk and "ZW5jcnlwdGVk" not in on_disk
 
 
-def _a_turn_with_blocks(call_id):
-    return Message(
-        role="assistant",
-        tool_calls=[ToolCall(id=call_id, name="echo")],
-        reasoning={"reasoning_details": BLOCKS},
+def _after_one_loop(router, *later_bodies):
+    """A session that has finished one tool loop with blocks, and the route its next run will use."""
+    route = answer(
+        router,
+        completion(tool_calls=[call()], reasoning_details=BLOCKS),
+        completion(content="Done."),
+        *later_bodies,
     )
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    session = Session("default", Engine(native(), registry))
+    session.send("Weather?")
+    return session, route
 
 
-def test_a_new_turn_of_the_conversation_ends_the_loop_the_blocks_belonged_to():
-    wire = chat_messages_to_wire(
-        [
-            Message.user("First."),
-            _a_turn_with_blocks("c1"),
-            Message.tool("c1", "ok"),
-            Message.assistant("Answered."),
-            Message.user("Second."),
-            _a_turn_with_blocks("c2"),
-            Message.tool("c2", "ok"),
+def test_a_new_turn_never_sends_a_finished_loops_blocks(router):
+    session, route = _after_one_loop(router, completion(content="Again."))
+
+    session.send("And tomorrow?")
+
+    assert all("reasoning_details" not in t for t in assistant_turns(route.calls[2]))
+
+
+def test_a_repass_never_sends_a_finished_loops_blocks(router):
+    """The shape a position rule misses: continuing a turn on the same `Session`, its user turn
+    still the newest, with a recomposed brief ahead of blocks produced on a different prefix."""
+    session, route = _after_one_loop(router, completion(content="Continued."))
+
+    session.resume(session.history[0], brief="A recomposed brief.")
+
+    assert all("reasoning_details" not in t for t in assistant_turns(route.calls[2]))
+
+
+def test_a_run_that_failed_keeps_no_blocks_either(router):
+    route = router.post(CHAT_URL).mock(
+        side_effect=[
+            httpx.Response(200, json=completion(tool_calls=[call()], reasoning_details=BLOCKS)),
+            httpx.Response(401, json={"error": {"message": "No auth.", "code": 401}}),
         ]
     )
+    registry = ToolRegistry()
+    registry.register(EchoTool())
+    session = Session("default", Engine(native(), registry))
 
-    assert "reasoning_details" not in wire[1]
-    assert wire[5]["reasoning_details"] == BLOCKS
+    with pytest.raises(ProviderAuthError):
+        session.send("Weather?")
 
-
-def test_an_injected_turn_is_the_loops_own_work_and_does_not_end_it():
-    wire = chat_messages_to_wire(
-        [
-            Message.user("Look."),
-            _a_turn_with_blocks("c1"),
-            Message.tool("c1", "ok"),
-            Message(role="user", content="[image]", injected=True),
-        ]
-    )
-
-    assert wire[1]["reasoning_details"] == BLOCKS
+    assert route.call_count == 2
+    assert all(message.reasoning is None for message in session.history)

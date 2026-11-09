@@ -259,7 +259,7 @@ class Message:
     for the model's reasoning back with the tool results (OpenRouter, issue #839): the wire field
     and its value, held exactly as the vendor sent them. It is **transient**, like `code_execution`:
     never serialized, so never mined and never replayed by a later wake. Its bound is its life, one
-    tool loop of one wake (`_openai_wire.chat_messages_to_wire`).
+    run of the tool loop: `Session._drive` clears it the moment that run ends.
     """
 
     role: Role

@@ -93,7 +93,7 @@ from basecradle_harness._observability import (
     token_counts,
 )
 from basecradle_harness._openai_wire import (
-    chat_messages_to_wire,
+    chat_message_to_wire,
     chat_response_message,
     chat_tool_to_wire,
     message_from_chat,
@@ -446,7 +446,7 @@ class OpenRouterProvider:
         self._apply_timeout(messages, tools)
         payload: dict[str, Any] = dict(self._default_params)
         payload["model"] = self.model
-        payload["messages"] = chat_messages_to_wire(messages)
+        payload["messages"] = [chat_message_to_wire(m) for m in messages]
         # Server-side built-ins (web_search) lead the tools array, then the custom function tools —
         # the same order the OpenAI Responses adapter uses. OpenRouter runs the server tools itself
         # and returns the model's answer already grounded, with url_citation annotations.
