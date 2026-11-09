@@ -30,6 +30,7 @@ How the scenarios steer MemPalace, with nothing but text:
 
 from __future__ import annotations
 
+import os
 import random
 import sqlite3
 from pathlib import Path
@@ -204,11 +205,11 @@ def _fillers(n: int) -> list[tuple[str, str, dict]]:
     return [(f"filler-{i:03d}", _filler(i), {}) for i in range(n)]
 
 
-def _diagnose(palace: Path, drawer_id: str):
+def _diagnose(palace: Path, drawer_id: str, *, provider: MemPalaceMemoryProvider | None = None):
     """The mode's facts and verdict for one drawer of ``palace``, with arm 1's pool."""
     from mempalace.palace import get_collection
 
-    provider = MemPalaceMemoryProvider(palace)
+    provider = provider or MemPalaceMemoryProvider(palace)
     collection = get_collection(str(palace), create=False, read_only=True)
     found = _palace_check.census(collection, palace)
     texts = {row[0]: row[2] for row in found.real}
@@ -217,7 +218,6 @@ def _diagnose(palace: Path, drawer_id: str):
     arms = {name: drawer_id in [hit["drawer_id"] for hit in pool] for name, pool in pools.items()}
     facts = _palace_pool.measure(
         provider,
-        collection,
         texts,
         found.total,
         probe,
@@ -328,6 +328,47 @@ def test_crowded(root):
     assert facts.real_rank == 26
     assert facts.first_ask == 40
     assert facts.arms == {"1": False, "2": False, "3": True}
+
+
+@pytest.mark.parametrize("scenario", ["crowded", "shadowed"])
+def test_a_palace_written_during_the_measurement_costs_no_fact(root, monkeypatch, scenario):
+    """Issue #835: a write by any process closes the client under every handle held across a search.
+
+    MemPalace does that at this process's next open, when ``chroma.sqlite3``'s mtime has moved. A
+    wake filing a drawer beside a run did it, and every later probe read ``unknown``. Moving the
+    mtime just before each search the measurement makes is that write, at the two places a handle
+    could be held across one. No drawer changes, so the search and the reconstruction still agree.
+    A shadowed probe is the one that reads through a client after the second search: the merge
+    replay loads its stored embedding.
+    """
+    drawers = {
+        "crowded": _copies(25) + [("probe", P, {})] + _fillers(40),
+        "shadowed": _copies(20) + [("probe", P, {"file": "copy", "chunk_index": 0})] + _fillers(40),
+    }[scenario]
+    palace = _build(root, f"written-{scenario}", drawers)
+    database = palace / "chroma.sqlite3"
+
+    def written():
+        stat = database.stat()
+        os.utime(database, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+    class Written(MemPalaceMemoryProvider):
+        def _ranking(self, *args, **kwargs):
+            written()
+            return super()._ranking(*args, **kwargs)
+
+    searched = _palace_pool._searched
+
+    def written_then_searched(*args, **kwargs):
+        written()
+        return searched(*args, **kwargs)
+
+    monkeypatch.setattr(_palace_pool, "_searched", written_then_searched)
+    facts, word = _diagnose(palace, "probe", provider=Written(palace))
+    assert facts.error is None
+    assert word == scenario
+    assert facts.matches
+    assert facts.vector_self == "yes"
 
 
 def test_cut(root):

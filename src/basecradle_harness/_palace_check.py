@@ -113,9 +113,11 @@ import statistics
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from basecradle_harness._memory_provider import MemoryExchange, MemoryScope, _palace_path
 from basecradle_harness._mempalace import (
@@ -377,15 +379,17 @@ def forecast(palace: Path, agent: str) -> Forecast | None:
     return Forecast(duplicate, new) if duplicate or new else None
 
 
-def accepted_hashes(collection) -> dict | None:
+def accepted_hashes(open_collection: Callable[[], Any]) -> dict | None:
     """MemPalace's own map of the content it will recognise, keyed ``(wing, content_hash)``.
 
     The very map the miner reads to decide that a file at a new path is already filed
     (``prefetch_content_hashes``, with the adapter's extract mode). ``None`` when it cannot be
-    read, so a reason is reported as unknown rather than guessed.
+    read, so a reason is reported as unknown rather than guessed. Handed an opener, never a handle,
+    because it runs after the forecast's dry-run mine, which opens the palace
+    (`MemPalaceMemoryProvider.read_collection`).
     """
     try:
-        return _import("palace").prefetch_content_hashes(collection, extract_mode="exchange")
+        return _import("palace").prefetch_content_hashes(open_collection(), extract_mode="exchange")
     except ImportError:
         raise
     except Exception:  # noqa: BLE001 - a diagnosis input, never a crash of the check
@@ -621,7 +625,7 @@ def register_off_wing(provider: MemPalaceMemoryProvider, palace: Path, *, dry_ru
     if predicted is None:
         print("  refused, nothing written: MemPalace's dry-run output was not readable")
         return 1
-    accepted = accepted_hashes(collection) if predicted.new else {}
+    accepted = accepted_hashes(provider.read_collection) if predicted.new else {}
     if accepted is None:
         print("  refused, nothing written: MemPalace's content-hash map could not be read")
         return 1
@@ -1095,13 +1099,15 @@ def _hashes(meta: dict) -> set[str]:
     return {h for h in str(meta.get("content_hash") or "").split(",") if h}
 
 
-def _self_query(collection, drawer_id: str) -> str:
+def _self_query(open_collection: Callable[[], Any], drawer_id: str) -> str:
     """Whether the vector index returns the drawer for its own stored embedding.
 
     A check on the index, not on the query: "no" means the drawer cannot enter the vector half of
-    any search, whatever is asked.
+    any search, whatever is asked. Handed an opener, never a handle, because it runs after a search
+    (`MemPalaceMemoryProvider.read_collection`).
     """
     try:
+        collection = open_collection()
         got = collection.get(ids=[drawer_id], include=["embeddings"])
         embeddings = got.get("embeddings")
         if embeddings is None or len(embeddings) == 0 or embeddings[0] is None:
@@ -1115,15 +1121,20 @@ def _self_query(collection, drawer_id: str) -> str:
         return f"unknown ({type(error).__name__})"
 
 
-def _vector_rank(collection, query: str, drawer_id: str) -> tuple[int | None, str]:
+def _vector_rank(
+    open_collection: Callable[[], Any], query: str, drawer_id: str
+) -> tuple[int | None, str]:
     """Where the vector half of a top-10 search places the drawer: ``(rank, rendered)``.
 
     Asked exactly as that search asks it, for ``_VECTOR_ASK`` candidates, because the index is
     approximate (HNSW) and what it returns depends on how many results are requested: a drawer
-    absent from a 100-candidate answer can be present in a 300-candidate one.
+    absent from a 100-candidate answer can be present in a 300-candidate one. Handed an opener,
+    as `_self_query` is.
     """
     try:
-        result = collection.query(query_texts=[query], n_results=_VECTOR_ASK, include=["distances"])
+        result = open_collection().query(
+            query_texts=[query], n_results=_VECTOR_ASK, include=["distances"]
+        )
     except Exception as error:  # noqa: BLE001 - a diagnosis line, never a crash of the check
         return None, f"vector rank unknown ({type(error).__name__})"
     ids = (result.get("ids") or [[]])[0]
@@ -1133,9 +1144,7 @@ def _vector_rank(collection, query: str, drawer_id: str) -> tuple[int | None, st
     return rank, f"vector rank {rank}/{_VECTOR_ASK}"
 
 
-def diagnose(
-    provider, collection, index: Index, row: tuple[str, dict, str], hits
-) -> tuple[str, str]:
+def diagnose(provider, index: Index, row: tuple[str, dict, str], hits) -> tuple[str, str]:
     """Why a probe drawer is not in its top 10, as ``(line, verdict)``: ids, counts and ranks only.
 
     How MemPalace 3.9's union search (the harness's ``candidate_strategy``) fills the top k, which
@@ -1199,7 +1208,7 @@ def diagnose(
     else:
         rank = None
         where = f"not in top {_DEEP}"
-    vector, vector_line = _vector_rank(collection, query, drawer_id)
+    vector, vector_line = _vector_rank(provider.read_collection, query, drawer_id)
     vector_known = not vector_line.startswith("vector rank unknown")
     if identical:
         verdict = "twin"
@@ -1211,7 +1220,7 @@ def diagnose(
         verdict = "crowded"
     return (
         f"  why: {verdict}; {where}; {vector_line}; "
-        f"vector self-query {_self_query(collection, drawer_id)}; "
+        f"vector self-query {_self_query(provider.read_collection, drawer_id)}; "
         f"drawers with identical text {copies} ({later} filed later), "
         f"with the same query {index.queries[query] - 1}; top {_TOP}: {identical} identical text, "
         f"{same_query} same query, {same_hash} same content hash, {same_source} same source file"
@@ -1645,7 +1654,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"{len(predicted.new)} files -> mined as new drawers"
                 )
                 convos = palace / _CONVERSATIONS_WING
-                accepted = accepted_hashes(collection) if predicted.new else None
+                accepted = accepted_hashes(provider.read_collection) if predicted.new else None
                 for new_name in predicted.new:
                     print(new_file_diagnosis(found, convos, new_name, accepted))
         if reranker is not None:
@@ -1714,7 +1723,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 if not ok:
                     failing.append(drawer_id)
-                    line, verdict = diagnose(provider, collection, index, row, hits)
+                    line, verdict = diagnose(provider, index, row, hits)
                     verdicts[verdict] += 1
                     print(line)
         if not args.sample:

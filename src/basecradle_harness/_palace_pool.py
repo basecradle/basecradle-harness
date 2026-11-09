@@ -85,6 +85,15 @@ carried to the pool, the rest name the stage that kept the drawer out:
 - **unknown**: the reconstruction does not match the search, or a measurement failed (named by its
   exception class, never its text).
 
+**A palace that changes during the run.** Nothing here holds a palace handle across a search: a
+wake filing a drawer is enough for MemPalace to close the client under one at this process's next
+open, after which every read through that client raises (`MemPalaceMemoryProvider.read_collection`,
+issue #835). Each stretch of direct reads therefore opens its own. A drawer filed mid-run can still
+change a line, because the run reads a palace that is moving: one filed between the reconstruction
+and the search it is checked against can make them differ, which reads ``unknown`` on a line that
+is not already a ``twin`` or ``near-twin``, and the texts compared are the census's, so a copy filed
+after it is not recognised as a copy. Compare two runs only with no wake in flight.
+
 **What it cannot tell.** Why a drawer's head is a poor match for its own embedding (the model is not
 inspectable from here); whether a closet boost moved a vector rank (reported as a count, caught by
 the self-check, not modelled); and what the reranker would have picked had the drawer been in the
@@ -423,28 +432,27 @@ def _searched(palace: Path, query: str, n: int, threshold: float | None) -> list
 
 def measure(
     provider: MemPalaceMemoryProvider,
-    collection,
     texts: dict[str, str],
     total: int,
     probe: Probe,
     arms: dict[str, bool],
     pool: list[dict],
     *,
-    self_query: Callable[[object, str], str],
+    self_query: Callable[[Callable[[], object], str], str],
 ) -> Facts:
     """Every fact about why ``probe``'s drawer is not in arm 1's ``pool``. Never raises."""
     facts = Facts(probe, arms)
     try:
-        _measure(provider, collection, texts, total, facts, pool, self_query)
+        _measure(provider, texts, total, facts, pool, self_query)
     except Exception as error:  # noqa: BLE001 - by class alone: upstream text can quote the query
         facts.error = type(error).__name__
     return facts
 
 
-def _measure(provider, collection, texts, total, facts, pool, self_query) -> None:
+def _measure(provider, texts, total, facts, pool, self_query) -> None:
     probe, drawer = facts.probe, facts.probe.drawer_id
     query = probe.query
-    threshold, _ = provider.distance_threshold(collection)
+    threshold, _ = provider.distance_threshold()
 
     # The copies already in the pool, by the census's own text (a hit's text can be rewritten).
     body = probe.text.strip()
@@ -461,12 +469,15 @@ def _measure(provider, collection, texts, total, facts, pool, self_query) -> Non
     facts.fetch, facts.sentinels = width, sentinels
     facts.capped = width >= TODAY_ASK * _MAX_FETCH_FACTOR
 
-    # The vector half, the merge and the hybrid rank, for the fetch the pool came from.
+    # The vector half, the merge and the hybrid rank, for the fetch the pool came from. A handle
+    # held across a search dies if the palace has changed, so each stretch of direct reads opens
+    # its own after the search before it (`MemPalaceMemoryProvider.read_collection`).
+    collection = provider.read_collection()
     built = reconstruct(collection, query, width, threshold)
     proposed, ranked, kept_n = built.proposed, built.ranked, built.kept
     facts.vector_proposed, facts.vector_kept, facts.pool_scale = len(proposed), kept_n, built.scale
     facts.vector_rank = _rank([hit["drawer_id"] for hit in proposed], drawer)
-    facts.vector_self = self_query(collection, drawer)
+    facts.vector_self = self_query(provider.read_collection, drawer)
     facts.closets = _closets(provider.palace_path)
     order = [hit.get("drawer_id") for hit in ranked]
     facts.candidates = len(order)
@@ -484,6 +495,7 @@ def _measure(provider, collection, texts, total, facts, pool, self_query) -> Non
     facts.matches = searched == order[: len(searched)] and len(searched) == min(width, len(order))
 
     # The lexical half today, its scan window, and the same search with no window.
+    collection = provider.read_collection()
     facts.lexical_asked = _LEXICAL_FACTOR * width
     lexical = list(
         collection.lexical_search(query=query, n_results=facts.lexical_asked, where=None).hits
@@ -750,7 +762,6 @@ def main(
         if not arms[ARM_1.name]:
             facts = measure(
                 provider,
-                collection,
                 texts,
                 found.total,
                 probe,

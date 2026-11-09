@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.181.1] - 2026-11-09
+
+### Fixed: the palace check no longer loses its measurements when the palace is written during a run (issue #835)
+
+`--pool-diagnosis`, `--sample` and `--end-to-end` opened one palace handle and kept it for the whole run. Once anything wrote to the palace, a wake filing a drawer being enough, MemPalace closed the client under that handle at the check's next search, and every read through that client after that raised `AttributeError`. On `@rowan`'s palace this turned five probes into `unknown`; with no wake in flight the same draw read `twin` for all five, and nothing in recall was lost. Each stretch of direct reads now opens its own handle after the search before it. `--sample`'s `vector rank unknown (AttributeError)`, `--end-to-end`'s uncounted lexical drops, a new file's `unknown` reason and `--register-off-wing` refusing because the content-hash map could not be read had the same cause.
+
 ## [0.181.0] - 2026-11-08
 
 ### Added: `basecradle-harness-palace-check --relocate-source-file` (issue #831)

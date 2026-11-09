@@ -334,7 +334,7 @@ class Result:
     stated: bool
 
 
-def lexical_drops(collection, query: str, fetch: int) -> set[str] | None:
+def lexical_drops(provider: MemPalaceMemoryProvider, query: str, fetch: int) -> set[str] | None:
     """The lexical hits MemPalace drops under a threshold for want of a stored embedding (#625).
 
     The union merge asks the backend for ``3 × n_results`` lexical candidates and, under a
@@ -349,6 +349,8 @@ def lexical_drops(collection, query: str, fetch: int) -> set[str] | None:
     if distances_of is None or metric_of is None:
         return None
     try:
+        # Opened here, after the arm's search (`MemPalaceMemoryProvider.read_collection`).
+        collection = provider.read_collection()
         hits = list(collection.lexical_search(query=query, n_results=fetch * 3, where=None).hits)
         scored = distances_of(collection, query, hits, metric_of(collection))
     except Exception:  # noqa: BLE001 - a count that could not be made is reported as unknown
@@ -481,7 +483,6 @@ class Run:
 def measure(
     provider: MemPalaceMemoryProvider,
     reranker: MemPalaceReranker,
-    collection,
     probes: Sequence[Probe],
     ceiling: int,
     *,
@@ -493,7 +494,7 @@ def measure(
     )
     for index, probe in enumerate(probes, 1):
         try:
-            results, stop = _one_probe(provider, reranker, collection, probe, ceiling, run)
+            results, stop = _one_probe(provider, reranker, probe, ceiling, run)
         except KeyboardInterrupt:
             run.stopped = "an interrupt, during a probe that is not counted"
             break
@@ -521,7 +522,6 @@ def measure(
 def _one_probe(
     provider: MemPalaceMemoryProvider,
     reranker: MemPalaceReranker,
-    collection,
     probe: Probe,
     ceiling: int,
     run: Run,
@@ -568,7 +568,7 @@ def _one_probe(
             run.observed_chars += chars[arm.name]
             run.observed_tokens_in += report.tokens_in
         dropped = (
-            lexical_drops(collection, probe.query, width) if arm.max_distance is not None else None
+            lexical_drops(provider, probe.query, width) if arm.max_distance is not None else None
         )
         in_pool, in_final, by_twin = judge(probe, pool, final)
         results.append(
@@ -823,7 +823,6 @@ def main(
     run = measure(
         provider,
         reranker,
-        collection,
         probes,
         ceiling,
         progress=lambda line: print(line, file=sys.stderr, flush=True),
