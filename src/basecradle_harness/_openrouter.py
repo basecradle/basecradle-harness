@@ -570,7 +570,9 @@ class OpenRouterProvider:
         ``None`` on any failure (or a model id without the ``author/slug`` shape the endpoints API
         needs) — the budget then falls to its conservative floor. Also ``None`` when a pin allows
         nothing the live pool offers: OpenRouter would fail that request itself, and the budget is
-        not the right place to discover it.
+        not the right place to discover it. A WARNING names the pin, because a floor nobody asked
+        for compacts a healthy transcript early and nothing else says so (issue #840). An unpinned
+        pool with nothing live says nothing here: that is OpenRouter's outage, not a setting.
         """
         author, _, slug = self.model.partition("/")
         # An OpenRouter model id may carry a routing **variant** — ``z-ai/glm-5.2:free``,
@@ -587,15 +589,20 @@ class OpenRouterProvider:
         except Exception as exc:  # noqa: BLE001 - degrade to the floor; never break a wake
             _log.warning("Could not read %s's context limit from OpenRouter: %s", self.model, exc)
             return None
-        allow, deny = _pinned_slugs(self._default_params.get("provider"))
-        best = 0
-        for endpoint in getattr(getattr(response, "data", None), "endpoints", None) or ():
-            if not _routable(endpoint, allow, deny):
-                continue
-            ceiling = _endpoint_ceiling(endpoint)
-            if ceiling is not None:
-                best = max(best, ceiling)
-        return best or None
+        required, denied = _pinned_slugs(self._default_params.get("provider"))
+        endpoints = getattr(getattr(response, "data", None), "endpoints", None) or ()
+        pool = [endpoint for endpoint in endpoints if _routable(endpoint, required, denied)]
+        ceilings = [ceiling for ceiling in map(_endpoint_ceiling, pool) if ceiling is not None]
+        if endpoints and not ceilings and (required or denied):
+            _log.warning(
+                "%s's OpenRouter routing pin leaves none of its %d endpoints able to serve a "
+                "request (required: %s; denied: %s), so its context limit is unknown.",
+                self.model,
+                len(endpoints),
+                [sorted(slugs) for slugs in required],
+                sorted(denied),
+            )
+        return max(ceilings, default=None)
 
     def supports_vision(self) -> bool | None:
         """Whether this model accepts image input — read from OpenRouter's own model metadata (#228).
@@ -796,8 +803,8 @@ def _slug_set(value: Any) -> frozenset[str]:
     )
 
 
-def _pinned_slugs(routing: Any) -> tuple[frozenset[str] | None, frozenset[str]]:
-    """An operator's ``provider`` preferences as (slugs allowed — or ``None`` for *any* — , denied).
+def _pinned_slugs(routing: Any) -> tuple[tuple[frozenset[str], ...], frozenset[str]]:
+    """An operator's ``provider`` preferences as (each restriction an endpoint must meet, denied).
 
     Only the keys that genuinely **narrow** who may serve the call are read, and each is read for
     what OpenRouter does with it:
@@ -809,7 +816,9 @@ def _pinned_slugs(routing: Any) -> tuple[frozenset[str] | None, frozenset[str]]:
       as a restriction would under-report the ceiling for the common case and compact early.
     - **Both together intersect**, since each is a restriction in its own right: ``only`` bounds the
       candidates and a no-fallback ``order`` bounds them again. Taking ``only`` alone there would
-      report a ceiling from an endpoint the request can never actually reach.
+      report a ceiling from an endpoint the request can never actually reach. They intersect over
+      the **endpoints they name**, never over their spellings, which is why each is kept whole:
+      ``only: ["moonshotai"]`` and ``order: ["moonshotai/mxfp4"]`` share no string and one endpoint.
     - ``ignore`` removes endpoints, and it narrows whether or not anything else is set.
 
     ``sort``, ``quantizations``, ``max_price``, ``data_collection``, ``require_parameters`` and the
@@ -819,25 +828,28 @@ def _pinned_slugs(routing: Any) -> tuple[frozenset[str] | None, frozenset[str]]:
     inferred). Unread preferences leave the pool wide, which is the safe direction (`_routable`).
     """
     if not isinstance(routing, Mapping):
-        return None, frozenset()
-    allow: frozenset[str] | None = None
+        return (), frozenset()
+    required: list[frozenset[str]] = []
     if only := _slug_set(routing.get("only")):
-        allow = only
+        required.append(only)
     if routing.get("allow_fallbacks") is False and (order := _slug_set(routing.get("order"))):
-        allow = order if allow is None else allow & order
-    return allow, _slug_set(routing.get("ignore"))
+        required.append(order)
+    return tuple(required), _slug_set(routing.get("ignore"))
 
 
-def _endpoint_slug(endpoint: Any) -> str | None:
-    """The **routing slug** an operator names in ``only``/``order``/``ignore``, or ``None``.
+#: The two spellings OpenRouter accepts for the priority tier, whatever the provider calls it.
+_PRIORITY_ALIASES = frozenset({"fast", "priority"})
 
-    It is the ``tag``'s leading segment — ``"streamlake/fp8"`` → ``streamlake``,
-    ``"atlas-cloud/fp8"`` → ``atlas-cloud``, ``"alibaba"`` → ``alibaba`` — verified live against
-    every slug this repo has pinned. ``provider_name`` is **not** usable for it: the transform is
-    not mechanical (``"Sail Research"`` → ``sail-research``, but ``"AtlasCloud"`` → ``atlas-cloud``
-    and ``"Io Net"`` → ``io-net``), so deriving a slug from it would silently drop the wrong
-    endpoints — and silently dropping the *largest* one is a ceiling too low, compacting a healthy
-    transcript away.
+
+def _endpoint_tag(endpoint: Any) -> str | None:
+    """The endpoint's full **routing tag**, compared casefolded, or ``None`` if it has none.
+
+    The tag is what an operator's ``only``/``order``/``ignore`` entries are matched against
+    (`_slug_names`). ``provider_name`` is **not** usable for it: the transform is not mechanical
+    (``"Sail Research"`` → ``sail-research``, but ``"AtlasCloud"`` → ``atlas-cloud`` and
+    ``"Io Net"`` → ``io-net``), so deriving a slug from it would silently drop the wrong endpoints —
+    and silently dropping the *largest* one is a ceiling too low, compacting a healthy transcript
+    away.
 
     ``tag`` is a **required** field of the SDK's typed endpoint model, so it cannot go quietly
     missing: a payload without it fails response validation and `context_limit` already degrades to
@@ -847,26 +859,61 @@ def _endpoint_slug(endpoint: Any) -> str | None:
     tag = getattr(endpoint, "tag", None)
     if not isinstance(tag, str):
         return None
-    return tag.partition("/")[0].strip().casefold() or None
+    return tag.strip().casefold() or None
 
 
-def _routable(endpoint: Any, allow: frozenset[str] | None, deny: frozenset[str]) -> bool:
+def _slug_names(slug: str, tag: str, *, priority: bool) -> bool:
+    """Whether one routing entry names the endpoint carrying ``tag``, as OpenRouter reads it.
+
+    A tag is ``provider[/variant][/region][/tier]``, and an entry matches on **whole segments**: the
+    tag itself, or any leading run of its segments. Tier endpoints are no exception, whatever the
+    guide's *"dropping the tier never matches a tier endpoint"* suggests. Measured against
+    ``moonshotai/kimi-k3.1-pro`` on 2026-11-09, reading ``service_tier`` off each generation:
+    ``only: ["moonshotai"]`` beside ``ignore: ["moonshotai/mxfp4"]`` and ``only: ["inference-net/us"]``
+    were each served by a priority endpoint, and ``ignore: ["moonshotai"]`` removed
+    ``moonshotai/highspeed``. The guide's exception is for tiers outside the default pool, which an
+    open-weight model's priority endpoints are not; admitting such a tier through an ``only`` entry
+    can only make a ceiling too high, the safe direction (`_routable`).
+
+    ``fast`` and ``priority`` are one alias for the priority tier however the provider spells it,
+    and they span regions: ``moonshotai/priority`` was served by ``moonshotai/highspeed``, and
+    ``inference-net/fast`` selects both ``inference-net/fast`` and ``inference-net/us/fast``
+    (``routing_funnel`` of a refused request, the same day). So on an endpoint selling that tier
+    (``priority``), what precedes the alias is matched against what precedes the tag's last segment.
+    """
+    if _leads(slug, tag):
+        return True
+    stem, _, tier = slug.rpartition("/")
+    if not (priority and stem and tier in _PRIORITY_ALIASES):
+        return False
+    return _leads(stem, tag.rpartition("/")[0])
+
+
+def _leads(entry: str, tag: str) -> bool:
+    """Whether ``entry`` is ``tag`` itself or a leading run of its whole segments."""
+    return tag == entry or tag.startswith(f"{entry}/")
+
+
+def _routable(endpoint: Any, required: tuple[frozenset[str], ...], denied: frozenset[str]) -> bool:
     """Whether the operator's routing preferences still let this endpoint serve a request.
 
-    An endpoint whose slug cannot be read stays **in** the pool, and the asymmetry is the reason:
+    An endpoint whose tag cannot be read stays **in** the pool, and the asymmetry is the reason:
     a ceiling reported too *high* degrades into the over-length rescue — the request 400s, the
     session compacts and retries, and the failure is visible and self-healing; a ceiling too *low*
     compacts a healthy transcript away early, permanently, and says nothing. Between an honest
     degradation and a silent loss of the conversation, this errs toward keeping the conversation.
     """
-    if allow is None and not deny:
+    if not required and not denied:
         return True
-    slug = _endpoint_slug(endpoint)
-    if slug is None:
+    tag = _endpoint_tag(endpoint)
+    if tag is None:
         return True
-    if allow is not None and slug not in allow:
-        return False
-    return slug not in deny
+    priority = getattr(endpoint, "service_tier", None) == "priority"
+
+    def named(slugs: frozenset[str]) -> bool:
+        return any(_slug_names(slug, tag, priority=priority) for slug in slugs)
+
+    return all(named(slugs) for slugs in required) and not named(denied)
 
 
 def _endpoint_ceiling(endpoint: Any) -> int | None:
@@ -1051,7 +1098,7 @@ def _routing_attempts(attempts: Any) -> str | None:
     rendering means the retry line and the final fallback line cannot spell it two ways.
 
     The provider name is written **exactly as OpenRouter wrote it**, never slugified. This module
-    already carries the reason (`_endpoint_slug`): the name→slug transform is not mechanical
+    already carries the reason (`_endpoint_tag`): the name→slug transform is not mechanical
     (*"AtlasCloud"* → ``atlas-cloud``, *"Io Net"* → ``io-net``), so a derived slug would be a
     plausible-looking fabrication. A name holding a space simply makes `kv` quote the value, exactly
     as it already does for ``endpoint=``.

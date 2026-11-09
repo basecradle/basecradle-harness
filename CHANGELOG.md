@@ -17,6 +17,14 @@ On OpenRouter's chat surface, every tool turn resumed with the model's chain of 
 - **The blocks are the vendor's.** The native SDK drops what it does not model and refuses block types it does not know, so blocks it could not send unchanged are not sent. A WARNING says so, and the plain `reasoning` string goes back in their place when the reply has one.
 - **Expect `tokens_in` to rise on later steps of a reasoning brain's tool loop**, by about the size of its earlier reasoning. That rise is the only outside sign the blocks arrived. `docs/telemetry.md` is unchanged.
 
+### Fixed: an OpenRouter pin written as a full endpoint tag reads its real context limit (issue #840)
+
+The context limit compared only an endpoint tag's first segment against a routing pin, so a pin written as a full tag (`deepinfra/bf16`) matched no endpoint. The budget then fell to its 128,000 floor with nothing to say so, and an agent on a 1,048,576-token model compacted about eight times too early.
+
+- **Pins now match the way OpenRouter routes them**: an entry names an endpoint's whole tag or any leading run of its segments, in `only`, `order` and `ignore`. `fast` and `priority` both name the priority tier, in every region, however the provider spells it. A bare provider slug still covers every endpoint of that provider, including a priority one on an open-weight model.
+- **`only` and a no-fallback `order` now intersect over the endpoints they name**, so `only: ["moonshotai"]` with `order: ["moonshotai/mxfp4"]` no longer reads as an empty pool.
+- **A pin that leaves none of a model's endpoints able to serve a request logs a WARNING naming it**, whether it matched nothing or only dead endpoints. The budget still falls to its floor, and OpenRouter still refuses that request itself.
+
 ## [0.181.1] - 2026-11-09
 
 ### Fixed: the palace check no longer loses its measurements when the palace is written during a run (issue #835)
