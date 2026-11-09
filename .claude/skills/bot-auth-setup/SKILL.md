@@ -78,7 +78,7 @@ on the call itself**, every comment, `pr create`, `pr merge`, label, close, *and
 never a session-level setup step:
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+_x=$-; set +x; GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN; case $_x in *x*) set -x;; esac
 gh issue comment <n> --repo basecradle/basecradle-harness --body "…"
 ```
 
@@ -93,12 +93,20 @@ propagate the substitution's status (checked in both zsh and bash), so assign fi
 `|| exit 1` see the *helper's* status; check non-empty for a mint that "succeeded" with no output;
 only then `export`.
 
+**Why the recipe starts by turning xtrace off** (`basecradle#772`, issue #832): under `set -x` the
+assignment and the `[ -n … ]` test each print the live token to stderr, and stderr is what a
+session transcript captures. `_x=$-; set +x` silences the three commands that hold it and the
+trailing `case` restores the caller's setting; the failure branches exit, so they need no restore.
+Past the recipe the token rides the environment, so a traced `gh` or `git` never expands it. Keep
+any later `$GH_TOKEN` expansion of your own out of a traced shell. `tests/test_secret_trace.py`
+runs this exact line under a trace, in bash and zsh.
+
 **Check the author field on the first write of a session.** §0 removes the @origin fallback, but
 it cannot prove a write landed as the bot — read that back from what GitHub recorded
 (`gh issue comment` prints the URL, whose `#issuecomment-<id>` fragment is the id):
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+_x=$-; set +x; GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN; case $_x in *x*) set -x;; esac
 gh api repos/basecradle/basecradle-harness/issues/comments/<comment-id> --jq '.user.login'
 # → basecradle-harness-ai[bot]
 ```
@@ -119,7 +127,7 @@ prints it, so never call it.
 github.com, so the push is bare — only the mint prefix is needed, in the same Bash call:
 
 ```bash
-GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN
+_x=$-; set +x; GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecradle-harness-ai)" || exit 1; [ -n "$GH_TOKEN" ] || exit 1; export GH_TOKEN; case $_x in *x*) set -x;; esac
 git push origin <branch>
 ```
 
