@@ -122,13 +122,15 @@ jobs:
       # alike, and withheld when a scanner could not reach a verdict: a check that could not
       # answer never answers yes. A run that dies before this step pings nothing, and
       # Better Stack pages when the day and the grace pass. The URL is write-only and never
-      # printed.
+      # printed: the one step here that expands a secret in the shell runs with xtrace off
+      # (issue #832). It is its own process, so there is no caller's setting to restore.
       - name: Ping the basecradle-harness Dependency Scan heartbeat
         if: ${{ success() }}
         env:
           HEARTBEAT_URL: ${{ secrets.DEPENDENCY_SCAN_HEARTBEAT_URL }}
         run: |
           set -euo pipefail
+          set +x
           test -n "$HEARTBEAT_URL" || { echo "no heartbeat URL in the repository's secrets" >&2; exit 1; }
           if [ "$(jq -r '.verdict' "$RUNNER_TEMP/plan.json")" = "error" ]; then
             echo "a scanner reached no verdict: the heartbeat is withheld"
