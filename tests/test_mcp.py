@@ -670,13 +670,17 @@ def test_the_open_and_the_read_are_fenced(tmp_path, monkeypatch):
     opened, closed = [], []
     real_open, real_close = os.open, os.close
 
+    # `mcp.os` is the process's own `os`, so these spies also see every other open and close in the
+    # process (a finalizer, a thread an earlier test left behind). Only this test's files count.
     def spy_open(path, flags, *args):
         fd = real_open(path, flags, *args)
-        opened.append((fd, flags))
+        if str(path).startswith(str(work)):
+            opened.append((fd, flags))
         return fd
 
     def spy_close(fd):
-        closed.append(fd)
+        if any(fd == mine for mine, _ in opened):
+            closed.append(fd)
         real_close(fd)
 
     monkeypatch.setattr(mcp.os, "open", spy_open)
