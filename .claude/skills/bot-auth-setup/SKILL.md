@@ -131,8 +131,8 @@ _x=$-; set +x; GH_TOKEN="$(~/Documents/claude-workspace/shared/fleet-identity/gh
 git push origin <branch>
 ```
 
-Three properties of that helper are load-bearing (`basecradle#544`, `harness#550`; each verified
-with `git credential fill` and a fake token, git 2.55):
+Four properties of that helper are load-bearing (`basecradle#544`, `harness#550`, `harness#837`;
+each verified with `git credential fill` and a fake token, git 2.55):
 
 - **Both injected entries are scoped to `https://github.com`.** An unscoped helper answers for
   **every** host, so any non-GitHub URL the same command touches — a submodule, a redirect, a
@@ -149,6 +149,10 @@ with `git credential fill` and a fake token, git 2.55):
 - **An unset `GH_TOKEN` emits `quit=1`**, so git stops without sending a credential, naming the
   helper as the reason. An unguarded helper answers with an empty password and exit 0, so git
   sends it and the push fails with a generic auth error that names nothing.
+- **`set +x;` is the first statement of `f()`.** Where `sh` is bash (macOS), a parent that exports
+  `SHELLOPTS=xtrace` traces the helper, and without it the `[ -z … ]` test and the
+  `echo password=` line each print the token to stderr. The helper is its own process, so nothing
+  restores the setting.
 
 To re-push a rebased branch, add `--force-with-lease` to the same command — bare works, because
 a push through `origin` keeps `origin/<branch>` current to lease against. Never `--force`.

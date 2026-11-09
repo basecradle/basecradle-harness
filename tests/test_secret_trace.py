@@ -2,13 +2,15 @@
 
 The class is basecradle#772: a traced shell prints every assignment and every expanded test, so a
 secret read into a variable lands in whatever captures stderr. These tests run the repository's
-own bytes, the mint recipe out of the ``bot-auth-setup`` skill and the heartbeat step out of the
-dependency-scan workflow, under a trace. Each has a control that removes the guard and sees the
-secret appear, so a green result means the guard held and not that the trace saw nothing.
+own bytes, the mint recipe out of the ``bot-auth-setup`` skill, the heartbeat step out of the
+dependency-scan workflow and the git credential helper out of ``.claude/settings.json`` (issue
+#837), under a trace. Each has a control that removes the guard and sees the secret appear, so a
+green result means the guard held and not that the trace saw nothing.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,6 +20,7 @@ import pytest
 ROOT = Path(__file__).resolve().parent.parent
 SKILL = ROOT / ".claude" / "skills" / "bot-auth-setup" / "SKILL.md"
 WORKFLOW = ROOT / ".github" / "workflows" / "dependency-security-scan.yml"
+SETTINGS = ROOT / ".claude" / "settings.json"
 
 FAKE_TOKEN = "ghs_Zm9vYmFyYmF6cXV4MDEyMzQ1Njc4OWFiY2Rl"
 FAKE_URL = "https://uptime.example.com/api/v1/heartbeat/Zm9vYmFyYmF6cXV4"
@@ -25,6 +28,8 @@ MINTER = "~/Documents/claude-workspace/shared/fleet-identity/gh-app-token basecr
 RECIPE_GUARD = "_x=$-; set +x; "
 RECIPE_RESTORE = "; case $_x in *x*) set -x;; esac"
 HEARTBEAT_STEP = "- name: Ping the basecradle-harness Dependency Scan heartbeat"
+HELPER_GUARD = "set +x; "
+HELPER_OPEN = "f() { "
 
 SHELLS = {"bash": ["bash", "-xc"], "zsh": ["zsh", "-xc"]}
 
@@ -149,3 +154,88 @@ def test_the_heartbeat_step_without_its_guard_does_print_the_url(tmp_path):
     done, _ = run_heartbeat(tmp_path, script.replace("set +x\n", "", 1))
 
     assert FAKE_URL in done.stderr
+
+
+def fence() -> dict[str, str]:
+    """The ``GIT_CONFIG_*`` pairs of the fail-closed fence, exactly as the session receives them."""
+    env = json.loads(SETTINGS.read_text(encoding="utf-8"))["env"]
+    return {key: value for key, value in env.items() if key.startswith("GIT_CONFIG_")}
+
+
+def helper() -> str:
+    """The helper's shell body: git strips the ``!`` and hands the rest to ``sh``."""
+    return fence()["GIT_CONFIG_VALUE_1"].removeprefix("!")
+
+
+def run_helper(body: str) -> subprocess.CompletedProcess[str]:
+    """Run the helper under a parent's exported ``SHELLOPTS``, the one trace that reaches it.
+
+    Named ``bash`` rather than ``sh``: dash, which is ``sh`` on CI, ignores ``SHELLOPTS``, so a
+    control run there would see no token whether or not the guard exists.
+    """
+    bash = shutil.which("bash")
+    assert bash is not None
+    return subprocess.run(
+        [bash, "-c", f"{body} get"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "SHELLOPTS": "xtrace", "GH_TOKEN": FAKE_TOKEN},
+    )
+
+
+def git_credential_fill(tmp_path: Path, **extra: str) -> subprocess.CompletedProcess[str]:
+    """Ask real git for github.com's credential through the fence, and nothing but the fence."""
+    return subprocess.run(
+        ["git", "credential", "fill"],
+        input="protocol=https\nhost=github.com\n\n",
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+        cwd=tmp_path,
+        env={
+            "PATH": "/usr/bin:/bin:/usr/local/bin",
+            "HOME": str(tmp_path),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_TERMINAL_PROMPT": "0",
+            **fence(),
+            **extra,
+        },
+    )
+
+
+def test_the_credential_helper_prints_no_token_under_an_exported_shellopts():
+    done = run_helper(helper())
+
+    assert done.returncode == 0, done.stderr
+    assert FAKE_TOKEN not in done.stderr
+    assert done.stdout == f"username=x-access-token\npassword={FAKE_TOKEN}\n"
+
+
+def test_the_credential_helper_without_its_guard_does_print_the_token():
+    body = helper()
+    assert body.startswith(HELPER_OPEN + HELPER_GUARD), "the guard must be f's first statement"
+
+    done = run_helper(body.replace(HELPER_GUARD, "", 1))
+
+    assert FAKE_TOKEN in done.stderr
+
+
+def test_git_still_gets_the_token_through_the_guarded_helper(tmp_path):
+    done = git_credential_fill(tmp_path, GH_TOKEN=FAKE_TOKEN, SHELLOPTS="xtrace")
+
+    assert done.returncode == 0, done.stderr
+    assert f"password={FAKE_TOKEN}" in done.stdout
+    # This one bites only where git's ``sh`` is bash; on CI the two ``run_helper`` tests carry it.
+    assert FAKE_TOKEN not in done.stderr
+
+
+def test_the_guarded_helper_still_quits_without_a_token(tmp_path):
+    done = git_credential_fill(tmp_path)
+
+    assert done.returncode != 0
+    assert "told us to quit" in done.stderr
+    assert "password=" not in done.stdout
