@@ -16,6 +16,7 @@ The SDK ships a default 5xx retry (backoff up to an hour), so the error tests in
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -41,7 +42,7 @@ from basecradle_harness import (
     ToolSpec,
 )
 from basecradle_harness._engine import _TRANSIENT
-from basecradle_harness._openrouter import _diagnostics, _routable
+from basecradle_harness._openrouter import _diagnostics, _pinned_slugs, _routable
 from basecradle_harness._retry import connection_reason
 
 # A fabricated OpenRouter endpoint + a correctly-shaped fake key. The SDK posts to
@@ -90,7 +91,7 @@ def wire_tool_call(*, id, name, arguments):
     return {"id": id, "type": "function", "function": {"name": name, "arguments": arguments}}
 
 
-def _provider(*, retries_disabled=False, **kw):
+def _provider(*, retries_disabled=False, model=MODEL, **kw):
     """An `OpenRouterProvider` over an injected SDK client (respx mocks its httpx transport).
 
     ``retries_disabled`` builds the client with ``retry_config=None`` so an error test is not
@@ -100,7 +101,7 @@ def _provider(*, retries_disabled=False, **kw):
     if retries_disabled:
         client_kwargs["retry_config"] = None
     client = OpenRouter(**client_kwargs)
-    return OpenRouterProvider(MODEL, client=client, base_url=BASE_URL, **kw)
+    return OpenRouterProvider(model, client=client, base_url=BASE_URL, **kw)
 
 
 @pytest.fixture
@@ -1120,7 +1121,7 @@ def test_only_and_a_no_fallback_order_intersect(router):
 
 
 def test_a_pin_is_matched_casefolded_and_across_quantization_tags(router):
-    """The slug is the `tag`'s leading segment, so one pin covers a provider's every variant."""
+    """A bare provider slug is a whole leading segment, so it covers that provider's every variant."""
     router.get(ENDPOINTS_URL).mock(
         return_value=httpx.Response(
             200,
@@ -1168,15 +1169,249 @@ def test_an_endpoint_with_no_readable_slug_stays_in_the_pool():
         context_length = 1_048_576
         max_prompt_tokens = None
 
-    assert _routable(_Tagless(), frozenset({"ambient"}), frozenset()) is True
+    assert _routable(_Tagless(), (frozenset({"ambient"}),), frozenset()) is True
 
 
-def test_a_pin_that_allows_nothing_in_the_pool_reports_no_ceiling(router):
+def test_a_pin_that_allows_nothing_in_the_pool_reports_no_ceiling_and_says_so(router, caplog):
     router.get(ENDPOINTS_URL).mock(return_value=httpx.Response(200, json=_pooled_body()))
 
     # OpenRouter would fail that request itself; the budget is not the place to discover a typo, so
-    # it falls to its conservative floor rather than inventing a number.
-    assert _provider(provider={"only": ["nobody-serves-this"]}).context_limit() is None
+    # it falls to its conservative floor rather than inventing a number, and the log names the pin:
+    # a floor nobody asked for is otherwise visible only as a transcript compacted early.
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        assert _provider(provider={"only": ["nobody-serves-this"]}).context_limit() is None
+
+    assert "leaves none of its 3 endpoints" in caplog.text
+    assert "nobody-serves-this" in caplog.text
+
+
+def test_a_pin_that_selects_only_a_dead_endpoint_says_so(router, caplog):
+    router.get(ENDPOINTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=_endpoints_body(
+                _endpoint(name="Ambient", context_length=101_376, status=-5),
+                _endpoint(name="Novita", context_length=1_048_576),
+            ),
+        )
+    )
+
+    # The pin matched, so the floor below it is no typo, and it is as silent as one without this.
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        assert _provider(provider={"only": ["ambient"]}).context_limit() is None
+
+    assert "leaves none of its 2 endpoints" in caplog.text
+
+
+def test_an_unpinned_pool_with_nothing_live_blames_no_pin(router, caplog):
+    router.get(ENDPOINTS_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=_endpoints_body(_endpoint(name="Ambient", context_length=101_376, status=-5)),
+        )
+    )
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        assert _provider().context_limit() is None
+
+    assert "routing pin" not in caplog.text
+
+
+# A pin entry is a routing slug in OpenRouter's own grammar, `provider[/variant][/region][/tier]`,
+# so it can name far less than a whole provider (issue #840). The table below is the live
+# `moonshotai/kimi-k3.1-pro` endpoint list of 2026-11-09, trimmed to the rows that decide a case.
+# A case marked `measured` is what OpenRouter itself did with that pin on that date: the endpoint
+# count in a refused request's `routing_funnel`, or the `service_tier` of the generation it served.
+
+_KIMI = "moonshotai/kimi-k3.1-pro"
+_KIMI_ENDPOINTS = {
+    "deepinfra/bf16": None,
+    "moonshotai/mxfp4": None,
+    "moonshotai/highspeed": "priority",
+    "wafer/us": None,
+    "wafer/mxfp4": None,
+    "inference-net/mxfp4": None,
+    "inference-net/mxfp4/us": None,
+    "inference-net/fast": "priority",
+    "inference-net/us/fast": "priority",
+    "fireworks": None,
+}
+
+
+def _kimi_pool(pin):
+    """The tags a routing pin leaves in the pool, so each case asserts the exact set."""
+    required, denied = _pinned_slugs(pin)
+    return {
+        tag
+        for tag, tier in _KIMI_ENDPOINTS.items()
+        if _routable(SimpleNamespace(tag=tag, service_tier=tier), required, denied)
+    }
+
+
+@pytest.mark.parametrize(
+    ("pin", "pool"),
+    [
+        pytest.param(
+            {"only": ["deepinfra/bf16", "moonshotai/mxfp4"]},
+            {"deepinfra/bf16", "moonshotai/mxfp4"},
+            id="full-tags-exclude-the-priority-sibling",
+        ),
+        pytest.param({"only": ["fireworks"]}, {"fireworks"}, id="a-tag-with-one-segment"),
+        pytest.param(
+            {"only": ["DeepInfra/BF16"]}, {"deepinfra/bf16"}, id="full-tags-are-casefolded"
+        ),
+        pytest.param(
+            {"only": ["inference-net/mxfp4"]},
+            {"inference-net/mxfp4", "inference-net/mxfp4/us"},
+            id="a-variant-covers-its-regions",
+        ),
+        pytest.param(
+            {"only": ["inference-net/mxfp4/us"]},
+            {"inference-net/mxfp4/us"},
+            id="variant-and-region-is-exact",
+        ),
+        pytest.param(
+            {"only": ["moonshotai"]},
+            {"moonshotai/mxfp4", "moonshotai/highspeed"},
+            id="measured-a-base-slug-covers-the-priority-endpoint",
+        ),
+        pytest.param(
+            {"only": ["inference-net/us"]},
+            {"inference-net/us/fast"},
+            id="measured-a-dropped-tier-still-matches",
+        ),
+        pytest.param(
+            {"only": ["moonshotai/highspeed"]},
+            {"moonshotai/highspeed"},
+            id="a-tier-tag-is-exact",
+        ),
+        pytest.param(
+            {"only": ["moonshotai/priority"]},
+            {"moonshotai/highspeed"},
+            id="measured-priority-aliases-the-providers-tier-spelling",
+        ),
+        pytest.param(
+            {"only": ["inference-net/priority"]},
+            {"inference-net/fast", "inference-net/us/fast"},
+            id="measured-the-priority-alias-spans-regions",
+        ),
+        pytest.param(
+            {"only": ["inference-net/fast"]},
+            {"inference-net/fast", "inference-net/us/fast"},
+            id="measured-a-fast-tag-spans-regions-too",
+        ),
+        pytest.param(
+            {"only": ["moonshotai/fast"]},
+            {"moonshotai/highspeed"},
+            id="measured-fast-aliases-the-providers-tier-spelling",
+        ),
+        pytest.param(
+            {"only": ["moonshotai/highspeed"], "ignore": ["moonshotai/priority"]},
+            set(),
+            id="measured-the-alias-works-in-ignore",
+        ),
+        pytest.param(
+            {"only": ["moonshot"]}, set(), id="measured-a-partial-segment-matches-nothing"
+        ),
+        pytest.param({"only": ["wafer/u"]}, set(), id="a-partial-trailing-segment-matches-nothing"),
+        pytest.param(
+            {"ignore": ["moonshotai"]},
+            set(_KIMI_ENDPOINTS) - {"moonshotai/mxfp4", "moonshotai/highspeed"},
+            id="measured-ignoring-a-base-slug-removes-the-priority-endpoint",
+        ),
+        pytest.param(
+            {"only": ["moonshotai"], "ignore": ["moonshotai/mxfp4"]},
+            {"moonshotai/highspeed"},
+            id="measured-ignoring-a-full-tag-leaves-its-sibling",
+        ),
+        pytest.param(
+            {"only": ["inference-net"], "ignore": ["inference-net/mxfp4"]},
+            {"inference-net/fast", "inference-net/us/fast"},
+            id="measured-ignoring-a-variant-removes-its-regions",
+        ),
+        pytest.param(
+            {"only": ["moonshotai"], "order": ["moonshotai/mxfp4"], "allow_fallbacks": False},
+            {"moonshotai/mxfp4"},
+            id="only-and-order-intersect-over-endpoints-never-spellings",
+        ),
+    ],
+)
+def test_a_pin_entry_is_read_in_openrouters_slug_grammar(pin, pool):
+    assert _kimi_pool(pin) == pool
+
+
+def _kimi_body(*tags_and_ceilings):
+    """A live-shaped endpoints payload: each row's tag, real `service_tier`, and given ceiling."""
+    return _endpoints_body(
+        *(
+            {
+                **_endpoint(name=tag.partition("/")[0], context_length=ceiling),
+                "tag": tag,
+                "service_tier": _KIMI_ENDPOINTS[tag],
+            }
+            for tag, ceiling in tags_and_ceilings
+        )
+    )
+
+
+def test_a_full_tag_pin_reads_the_real_ceiling_through_the_sdk(router, caplog):
+    """The incident: both pinned Kimi endpoints advertise 1,048,576 and the agent budgeted 128K."""
+    router.get(f"{BASE_URL}/models/{_KIMI}/endpoints").mock(
+        return_value=httpx.Response(
+            200,
+            json=_kimi_body(
+                ("deepinfra/bf16", 1_048_576),
+                ("moonshotai/mxfp4", 1_048_576),
+                ("moonshotai/highspeed", 1_048_576),
+            ),
+        )
+    )
+    provider = _provider(
+        model=_KIMI,
+        provider={"only": ["deepinfra/bf16", "moonshotai/mxfp4"], "allow_fallbacks": True},
+    )
+
+    with caplog.at_level("WARNING", logger="basecradle_harness"):
+        assert provider.context_limit() == 1_048_576
+
+    assert "leaves none" not in caplog.text
+
+
+def test_a_full_tag_pin_narrows_the_ceiling_to_the_endpoints_it_names(router):
+    router.get(f"{BASE_URL}/models/{_KIMI}/endpoints").mock(
+        return_value=httpx.Response(
+            200,
+            json=_kimi_body(
+                ("moonshotai/mxfp4", 524_288),
+                ("moonshotai/highspeed", 1_048_576),
+            ),
+        )
+    )
+
+    # The sibling priority endpoint is larger here, so a leading-segment match would report its
+    # ceiling for an agent that excluded it by writing the full tag.
+    assert (
+        _provider(model=_KIMI, provider={"only": ["moonshotai/mxfp4"]}).context_limit() == 524_288
+    )
+
+
+def test_the_tier_alias_reads_the_sdks_own_service_tier_field(router):
+    """Only a real SDK-marshalled endpoint proves the field the alias reads is the one on the wire."""
+    router.get(f"{BASE_URL}/models/{_KIMI}/endpoints").mock(
+        return_value=httpx.Response(
+            200,
+            json=_kimi_body(
+                ("moonshotai/mxfp4", 1_048_576),
+                ("moonshotai/highspeed", 524_288),
+            ),
+        )
+    )
+
+    # The standard sibling is the larger one, so admitting it here would be seen in the answer.
+    assert (
+        _provider(model=_KIMI, provider={"only": ["moonshotai/priority"]}).context_limit()
+        == 524_288
+    )
 
 
 def test_a_bare_string_pin_is_not_read_as_a_list_of_characters(router):
