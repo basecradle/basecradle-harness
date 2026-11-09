@@ -411,9 +411,13 @@ def moved(tmp_path, palace) -> Path:
 
 
 def _relocate(capsys, palace: Path, previous: Path, *flags: str) -> str:
-    return _report(
-        capsys, palace, "--relocate-source-file", "--previous-home", str(previous), *flags
+    capsys.readouterr()
+    code = _palace_check.main(
+        [str(palace.parent), "--relocate-source-file", "--previous-home", str(previous), *flags]
     )
+    out = capsys.readouterr().out
+    assert code == 0, out
+    return out
 
 
 def _mined_ids(palace: Path) -> set[str]:
@@ -494,8 +498,9 @@ def test_a_relocated_palace_is_re_mined_in_place_with_no_duplicate(moved, palace
 
     _mine(palace)  # a second mine files nothing
     assert _drawers(palace) == after
-    for query_hits in _recall(MemPalaceMemoryProvider(palace, agent="nova")):
-        assert query_hits
+    provider = MemPalaceMemoryProvider(palace, agent="nova")
+    for query, fact in (("what colour is the shed", "green"), ("code word", "heliotrope")):
+        assert any(fact in str(hit.get("text")) for hit in provider.search(query, 5))
 
 
 def _one_drawer(palace: Path, name: str) -> tuple[str, dict]:
@@ -540,6 +545,17 @@ def _one_current(palace, moved):
     )
 
 
+def _all_old_normalize(palace, moved):
+    rows = [
+        (i, meta)
+        for i, (_, meta) in _drawers(palace).items()
+        if Path(str(meta.get("source_file"))).name == LONG and meta.get("room") != _REGISTRY_ROOM
+    ]
+    mp.get_collection(str(palace)).update(
+        ids=[i for i, _ in rows], metadatas=[{**meta, "normalize_version": 1} for _, meta in rows]
+    )
+
+
 def _no_hash(palace, moved):
     rows = [
         (i, meta)
@@ -559,6 +575,9 @@ def _gone_here(palace, moved):
     (palace / "conversations" / LONG).unlink()
 
 
+ALONE = "not every drawer is stale by its chunker version alone, the class this relocates"
+
+
 @needs_version
 @pytest.mark.parametrize(
     ("mutate", "reason"),
@@ -567,7 +586,8 @@ def _gone_here(palace, moved):
         (_other_wing, "it has drawers in wing conversations, notes, not only 'conversations'"),
         (_also_here, "it has drawers recorded somewhere other than the previous home"),
         (_third_location, "it has drawers recorded somewhere other than the previous home"),
-        (_one_current, "not every drawer is version-stale, so a mine would not purge them"),
+        (_one_current, ALONE),
+        (_all_old_normalize, ALONE),
         (_no_hash, "its drawers carry no content hash (filed before MemPalace 3.7)"),
         (_changed_here, "its content hash is not the one its drawers record"),
         (_gone_here, "no such file at this location, so a mine never reads it"),
@@ -633,9 +653,51 @@ def test_a_running_mine_refuses_the_write(moved, palace, capsys, monkeypatch):
     )
 
     assert code == 1
-    assert "refused, nothing written: a mine holds this palace" in capsys.readouterr().out
+    assert "refused, nothing written: another writer holds this palace" in capsys.readouterr().out
     monkeypatch.undo()
     assert _drawers(palace) == before
+
+
+class _Tampered:
+    """A collection whose ``update`` does something other than what it was asked."""
+
+    def __init__(self, collection, update):
+        self._collection = collection
+        self._update = update
+
+    def __getattr__(self, name):
+        return getattr(self._collection, name)
+
+    def update(self, *, ids, metadatas):
+        self._update(self._collection, ids, metadatas)
+
+
+def _mangles_a_field(collection, ids, metadatas):
+    collection.update(ids=ids, metadatas=[{**meta, "hall": "elsewhere"} for meta in metadatas])
+
+
+def _deletes_a_row(collection, ids, metadatas):
+    collection.update(ids=ids, metadatas=metadatas)
+    row = collection.get(where={"room": _REGISTRY_ROOM}, limit=1, include=[])
+    collection.delete(ids=list(row["ids"]))
+
+
+@needs_version
+@pytest.mark.parametrize("update", [_mangles_a_field, _deletes_a_row])
+def test_a_write_that_changed_anything_else_fails_the_run(
+    moved, palace, capsys, monkeypatch, update
+):
+    _report(capsys, palace, "--stamp-chunker-version")
+    real = mp.get_collection
+    monkeypatch.setattr(mp, "get_collection", lambda *a, **k: _Tampered(real(*a, **k), update))
+    capsys.readouterr()
+
+    code = _palace_check.main(
+        [str(palace.parent), "--relocate-source-file", "--previous-home", str(moved)]
+    )
+
+    assert code == 1
+    assert "FAIL:" in capsys.readouterr().out
 
 
 @pytest.mark.skipif(VERSION is not None, reason="this MemPalace defines a convo_chunker_version")

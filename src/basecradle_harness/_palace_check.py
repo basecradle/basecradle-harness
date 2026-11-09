@@ -783,6 +783,13 @@ class Relocation:
         return sum(len(rows) for rows in self.files.values())
 
 
+def _unfiled(meta: dict, chunker: int, normalize: int | None) -> bool:
+    """Whether MemPalace reads an exchange-mode record as unfiled (``palace._meta_is_current``)."""
+    return meta.get("convo_chunker_version", 1) < chunker or (
+        normalize is not None and meta.get("normalize_version", 1) < normalize
+    )
+
+
 def _why_not_relocatable(
     rows: list[tuple[str, dict, str]], here: Path, old: Path, chunker: int, normalize: int | None
 ) -> str | None:
@@ -798,11 +805,16 @@ def _why_not_relocatable(
       purges;
     - no drawer may be the observe's, because its id is derived from ``source_file`` (the rewrite
       would make `filed_by_observe` false of it) and the mine recognises it by content anyway;
-    - every drawer must be version-stale, because a mine purges a file only when it is;
+    - every drawer must be stale by its chunker version alone, the class measured here (a current
+      drawer is recognised by the mine, and a stale ``normalize_version`` is another migration);
     - the content hashes the drawers carry must be today's hashes of the file here, which is what
       makes it the same file and not merely the same name.
     """
-    if not here.is_file():
+    try:
+        present = here.is_file()
+    except OSError as error:
+        return f"it could not be read ({type(error).__name__})"
+    if not present:
         return "no such file at this location, so a mine never reads it"
     try:
         os.lstat(old)
@@ -822,7 +834,7 @@ def _why_not_relocatable(
     if not all(
         _exchange_mode(meta) and _version_stale(meta, chunker, normalize) for _, meta, _ in rows
     ):
-        return "not every drawer is version-stale, so a mine would not purge them"
+        return "not every drawer is stale by its chunker version alone, the class this relocates"
     stored = {h for _, meta, _ in rows for h in _hashes(meta)}
     if not stored:
         return (
@@ -842,9 +854,10 @@ def _why_not_relocatable(
 def relocation(found: Census, convos: Path, previous: Path, normalize: int | None) -> Relocation:
     """Which files ``--relocate-source-file`` proves, read off the census.
 
-    A file is considered when a version-stale real drawer is recorded in the previous home's
-    ``conversations`` directory under the file's name: that is exactly what a mine would file a
-    second time. A drawer the miner already reads as current is recognised by its content and
+    A file is considered when a real drawer recorded in the previous home's ``conversations``
+    directory under the file's name is one the miner reads as unfiled, by its chunker version or
+    its ``normalize_version``: that is what a mine would file a second time, so it is either
+    relocated here or named. A drawer the miner reads as current is recognised by its content and
     needs nothing, so it is not considered and not reported.
     """
     chunker = found.chunker
@@ -861,7 +874,7 @@ def relocation(found: Census, convos: Path, previous: Path, normalize: int | Non
             for _, meta, _ in found.elsewhere
             if str(Path(str(meta.get("source_file"))).parent) == old_dir
             and _exchange_mode(meta)
-            and _version_stale(meta, chunker, normalize)
+            and _unfiled(meta, chunker, normalize)
         }
     )
     for name in considered:
@@ -909,8 +922,10 @@ def relocate_source_file(palace: Path, home: Path, previous: Path, *, dry_run: b
     never touched. **Nothing here deletes a drawer**: the count of drawers and rows is compared
     before and after, and every rewritten drawer is read back by id and must hold exactly its old
     metadata with the new path. Idempotent: a rewritten drawer is at this location, so a second run
-    finds nothing. Holds MemPalace's per-palace lock for the whole write, because a mine that read
-    the palace before this ran would file the drawers beside themselves. Returns the exit code.
+    finds nothing. Holds MemPalace's per-palace lock from the plan's read to the last write,
+    because a mine that read the palace before this ran would file the drawers beside themselves;
+    every other writer fails against that lock too, an observe included, so run it with the
+    agent's wakes held. Returns the exit code.
     """
     word = "dry run, writes nothing" if dry_run else "WRITES TO THE PALACE"
     print(f"relocate source_file ({word}):")
@@ -923,9 +938,8 @@ def relocate_source_file(palace: Path, home: Path, previous: Path, *, dry_run: b
     previous_palace = previous / palace.relative_to(home)
     convos = (palace / _CONVERSATIONS_WING).resolve()
     normalize = getattr(module, "NORMALIZE_VERSION", None)
-    collection = module.get_collection(str(palace), create=False, read_only=dry_run)
 
-    def plan() -> tuple[Census, Relocation]:
+    def plan(collection) -> tuple[Census, Relocation]:
         found = census(collection, palace)
         return found, relocation(found, convos, previous_palace, normalize)
 
@@ -936,7 +950,7 @@ def relocate_source_file(palace: Path, home: Path, previous: Path, *, dry_run: b
         )
 
     if dry_run:
-        found, moved = plan()
+        found, moved = plan(module.get_collection(str(palace), create=False, read_only=True))
         for name, why in moved.left_alone:
             print(f"  left alone: {name}: {why}")
         print(
@@ -946,25 +960,31 @@ def relocate_source_file(palace: Path, home: Path, previous: Path, *, dry_run: b
         return 0
     try:
         with module.mine_palace_lock(str(palace)):
-            found, moved = plan()
+            collection = module.get_collection(str(palace), create=False, read_only=False)
+            found, moved = plan(collection)
             for name, why in moved.left_alone:
                 print(f"  left alone: {name}: {why}")
             return _write_relocation(palace, convos, collection, found, moved, tail(found, moved))
     except module.MineAlreadyRunning:
-        print("  refused, nothing written: a mine holds this palace")
+        print("  refused, nothing written: another writer holds this palace (a mine, or a wake)")
         return 1
 
 
 def _write_relocation(
     palace: Path, convos: Path, collection, found: Census, moved: Relocation, tail: str
 ) -> int:
-    """Rewrite ``source_file`` on the proven drawers, whole file at a time, and read each back."""
+    """Rewrite ``source_file`` on the proven drawers, whole file at a time, and read each back.
+
+    Counts come from this one handle. Opening the palace again here can invalidate it: when
+    another process has touched ``chroma.sqlite3``, MemPalace's backend closes its clients on the
+    next open, and every collection it had handed out with them (``ChromaBackend._drain_clients``).
+    """
     expected = {
         drawer_id: {**meta, "source_file": str(convos / name)}
         for name, rows in moved.files.items()
         for drawer_id, meta in rows
     }
-    before = _counts(palace)
+    before = (len(found.real), found.registry)
     for names in _whole_files(moved.files, _PAGE):
         ids = [drawer_id for name in names for drawer_id, _ in moved.files[name]]
         collection.update(ids=ids, metadatas=[expected[drawer_id] for drawer_id in ids])
@@ -975,7 +995,8 @@ def _write_relocation(
         got = collection.get(ids=batch, include=["metadatas"])
         back = dict(zip(got.get("ids") or [], got.get("metadatas") or []))
         wrong += sum(back.get(drawer_id) != expected[drawer_id] for drawer_id in batch)
-    after = _counts(palace)
+    fresh = census(collection, palace)
+    after = (len(fresh.real), fresh.registry)
     print(
         f"relocate source_file: WROTE to this palace: drawers relocated {len(ids) - wrong} in "
         f"{len(moved.files)} files, {tail}"
