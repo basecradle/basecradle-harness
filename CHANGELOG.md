@@ -24,6 +24,10 @@ The tool required `OPENROUTER_MANAGEMENT_KEY`, an account-administration credent
 
 ## [0.184.0] - 2026-11-10
 
+### Fixed: `xai_account_balance` never relays a transport error's text
+
+A transport error can quote the request it failed on: h11 rejects a header holding a line break with an error carrying the whole `Authorization` value. The tool relayed that text, so a pasted `XAI_MANAGEMENT_KEY` with a line break reached the tool's answer, the transcript and the `tool` line's WARNING. It now reports only the error's type. Found in review of issue #853, whose OpenRouter sibling had the same flaw.
+
 ### Changed: refuseless serves the Responses surface too, and a Responses call is priced with its cached split (issue #847)
 
 0.183.0 refused `AI_SDK_SURFACE=responses` for `AI_PROVIDER=refuseless`, on the word that the vendor documented no Responses endpoint. The vendor's own API says otherwise: its unknown-endpoint error lists `POST /v1/responses`, and a real call answered in the Responses shape. `responses` is now accepted for refuseless at startup, in `--resolved-config` and in `basecradle-harness-resolve`. `chat` stays the default.
