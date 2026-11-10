@@ -9,6 +9,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.185.0] - 2026-11-10
 
+### Fixed: The log scrub redacts a refuseless API key, a Perplexity API key and an ntfy access token (issue #856)
+
+No rule in `_observability.scrub` matched a refuseless key, so one echoed in a vendor's error body would have reached a log line, the provider-failure report or the stall note whole, and no box layer would have caught it either. Three prefix rules join `_PREFIXED`, each a minimum run of 20 under its vendor's length, and each subject to the rule that a vendor prefix inside a word is a word (issue #794):
+
+- **refuseless**: `abl_[A-Za-z0-9]{20,}`, for `abl_` plus 48 alphanumerics, read off two real keys.
+- **Perplexity**: `pplx-[A-Za-z0-9]{20,}`, for the documented `pplx-` prefix plus 48 alphanumerics.
+- **ntfy**: `tk_[A-Za-z0-9]{20,}`, for the documented `tk_` plus 29 characters (`NTFY_DM_TOKEN`).
+
+A key with no prefix of its own (Wiro's) has no shape a rule can match, and stays uncovered. `docs/telemetry.md` → Credential Scrubbing lists each shape and whose word it is.
+
 ### Changed: `openrouter_account_balance` reads with the agent's own OpenRouter key, and reports that key's own spend and limit (issue #853)
 
 The tool required `OPENROUTER_MANAGEMENT_KEY`, an account-administration credential that can mint and revoke every key on the account, on the word of a 2026-08-28 reading that an inference key was refused on `/credits`. That reading is stale: on 2026-11-10 an ordinary inference key read `GET /credits` and `GET /key` with HTTP 200, on the global host and the `us` and `eu` regional hosts. So the Management key is now an optional override, and the tool reads with an OpenRouter key the agent already holds.

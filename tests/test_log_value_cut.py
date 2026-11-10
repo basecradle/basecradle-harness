@@ -376,6 +376,9 @@ PREFIX_SAMPLES = {
     "hf_": "hf_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
     "r8_": "r8_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
     "ste-": "ste-" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
+    "abl_": "abl_" + "Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3",
+    "pplx-": "pplx-" + "Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1Jf5Gs0Ya8Ue2Ti6Ow4Qe9Pr3",
+    "tk_": "tk_" + "q8m2zr5wk1xt7nb4pv9hc3jd6fs0l",
 }
 
 BACKSLASH = chr(92)
@@ -421,6 +424,9 @@ LEFT_NEIGHBORS = {
         "abc_uat_unknown",
         "R\u00edsk-assessment-pending-review",  # a localized vendor sentence keeps its words too
         "G\u00e4ste-registrierungssystem-voll",
+        "tabl_partitionmaintenancewindow",
+        "kabl_verbindungsueberwachungsdienst",
+        "gtk_window_set_default_size",
     ],
 )
 def test_a_vendor_prefix_inside_a_word_is_not_a_credential(text):
@@ -454,6 +460,46 @@ def test_an_unglued_lowercase_run_is_still_redacted():
     """Only a glued match can be a word: at a token start every prefixed run is a credential."""
     assert scrub("key sk-abcdefghij") == "key [redacted]"
     assert scrub("x-hf_" + "abcdefghijklmnopqrstuvwx") == "x-[redacted]"
+
+
+# --- a refuseless key, the shape @origin read off two real ones (issue #856) ---------------------
+
+#: ``abl_`` plus a 48-character alphanumeric body, 52 characters in all; fabricated.
+REFUSELESS_KEY = PREFIX_SAMPLES["abl_"]
+
+
+def test_the_refuseless_sample_has_the_vendors_shape():
+    assert len(REFUSELESS_KEY) == 52 and REFUSELESS_KEY[4:].isalnum() and REFUSELESS_KEY.isascii()
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        # A value of its own, as a config dump or an env echo carries it.
+        (REFUSELESS_KEY, "[redacted]"),
+        # Free text, ended by punctuation the run does not take.
+        (
+            f"refuseless refused the key {REFUSELESS_KEY}, check AI_API_KEY",
+            "refuseless refused the key [redacted], check AI_API_KEY",
+        ),
+        # Inside a vendor's quoted error body, the realistic carrier.
+        (
+            f'{{"error":{{"message":"Incorrect API key provided: {REFUSELESS_KEY}","code":401}}}}',
+            '{"error":{"message":"Incorrect API key provided: [redacted]","code":401}}',
+        ),
+        (f"'{REFUSELESS_KEY}'", "'[redacted]'"),
+    ],
+)
+def test_a_refuseless_key_is_redacted_whole(text, scrubbed):
+    assert scrub(text) == scrubbed
+    rendered = _value(text)
+    assert REFUSELESS_KEY[4:12] not in rendered and REFUSELESS_KEY[-8:] not in rendered, rendered
+
+
+def test_a_refuseless_key_is_redacted_on_a_log_line():
+    """Through `kv`, which scrubs before it cuts, so a key past the bound is redacted, never halved."""
+    line = kv(error=f"{'x ' * 100}rejected {REFUSELESS_KEY}")
+    assert REFUSELESS_KEY[4:12] not in line and REFUSELESS_KEY[-8:] not in line, line
 
 
 @pytest.mark.parametrize(
