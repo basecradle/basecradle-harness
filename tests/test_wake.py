@@ -2369,15 +2369,18 @@ def test_resolved_config_reports_the_env_its_active_tools_read(wake_env, monkeyp
     configuration wanted. Presence only, never a value — this file is pasted into issues.
 
     `openrouter_account_balance` rides beside it and adds nothing: since issue #853 any one of four
-    OpenRouter keys serves it, so it declares no single key it cannot work without.
+    OpenRouter keys serves it, so it declares no single key it cannot work without, and its gate
+    (issue #862), which tests all four, puts none of the three this agent does not hold in the map.
     """
     monkeypatch.delenv("XAI_MANAGEMENT_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+    monkeypatch.delenv("HARNESS_DESCRIBER_API_KEY", raising=False)
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_API_KEY", "sk-or-fake")  # the key it reads with
     monkeypatch.setenv("AI_PROVIDER", "xai")
     monkeypatch.setenv("AI_SDK", "xai-sdk")
     cfg = tmp_path / "cfg"
     monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
-    install(cfg, provider="xai", opt_in=["xai_account_balance", "openrouter_account_balance"])
+    install(cfg, provider="xai", opt_in=["xai_account_balance"])
 
     report = resolved_config()
 

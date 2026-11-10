@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.187.0] - 2026-11-10
+
+### Changed: The balance read at an agent's own LLM vendor is on by default (issue #862)
+
+@origin's rule of 2026-11-10: every agent can read the available balance at its main LLM vendor, as long as that read exposes no other sensitive account data, and an agent whose reranker is on OpenRouter reads the OpenRouter balance too. 0.185.0 let the OpenRouter tool read with a key the agent already holds; both balance tools were still opt-in, so the rule held on no agent. Now:
+
+- **`openrouter_account_balance` is a benign default, gated on a key the agent holds.** The installer lays it down on every agent with no grant, and its new gate, `OpenRouterKeyHeld`, is met exactly when the tool would find a key: `OPENROUTER_MANAGEMENT_KEY`, else the brain's `AI_API_KEY` under `AI_PROVIDER=openrouter`, else the reranker's key, else the describer's under `HARNESS_DESCRIBER_PROVIDER=openrouter`. An agent holding none gets no tool, not one that answers "not configured" on every wake. The gate and the tool read that order from one function (`_openrouter_account.held_key`). Still no `Vendor` gate, so an agent brained by another vendor whose reranker is on OpenRouter has it.
+- **`refuseless_account_balance` is a benign default** on a refuseless agent; its `Vendor("refuseless")` gate already keeps it off every other.
+- **`xai_account_balance` stays opt-in**: it needs a dedicated Management key, which keeps it a case-by-case grant.
+- **`basecradle-harness-resolve` states what it assumed.** A requirement now names the variables it tests (`Requirement.credential_vars`), so the OpenRouter read resolves under the default `--assume-credentials` on every provider, marked `assumes_credential` with its four keys and listed under `credentials.assumed`, and reports `inactive` with the gate's reason under `--no-assume-credentials`. The four keys are tested, not required, so they stay out of `credentials.wanted` and the box's `tool_env`.
+- **A grant left for a stem that became a default is dropped as moot** on the next install, so deleting the file is respected like any default's rather than read as a strip and restored. `--opt-in` and `--revoke-opt-in` naming a default do nothing, say so in their own warning, and `--revoke-opt-in` no longer deletes a default's file (which the next reconcile would only lay down again).
+- **Fleet effect:** every agent holding an OpenRouter key, and every refuseless agent, gains its balance tool on the reconcile after upgrade, and neither stem is reported under `--resolved-config`'s `opt_in_tools` any more. An inventory that still lists either stem as an opt-in grant reads as drift until the stem is dropped from it.
+
 ## [0.186.0] - 2026-11-10
 
 ### Fixed: A prose log line carrying an exception's text is scrubbed at the source (issue #857)

@@ -65,11 +65,14 @@ def test_only_computes_a_pruned_agents_exact_tools_pin():
         ("openai", "openai", []),
         ("xai", "xai-sdk", ["xai_search", "grok_generate_image", "xai_account_balance"]),
         ("openrouter", "openrouter", ["openrouter_search"]),
-        # The cross-provider row (issue #425): a powerful stem with NO `requires` at all, granted
-        # on an agent brained by a *different* vendor — @briggs's shape. Every other row's opt-ins
-        # are provider-affine and matched to their own row, so none of them would notice a
-        # regression that made a no-requires plugin resolve by provider.
-        ("xai", "xai-sdk", ["openrouter_account_balance"]),
+        # The cross-provider row (issue #425): a powerful stem with no vendor affinity, granted on
+        # an agent brained by a *different* vendor. Every other row's opt-ins are provider-affine
+        # and matched to their own row, so none of them would notice a regression that made a
+        # vendor-agnostic plugin resolve by provider. (`openrouter_account_balance` held this row
+        # until issue #862 made it a default, which every row now carries.)
+        ("xai", "xai-sdk", ["send_direct_message_to_origin"]),
+        # The refuseless agent, whose balance read is a default gated on its vendor (issue #862).
+        ("refuseless", "openai", []),
         # Gemini on Vertex (issue #656): two built-ins and a harness-run `web_search` tool.
         ("google", "google-genai", ["code_execution", "url_context", "google_search"]),
     ],
@@ -87,14 +90,18 @@ def test_matches_resolved_config_on_the_box(monkeypatch, tmp_path, provider, sdk
     monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
     monkeypatch.setenv("AI_PROVIDER", provider)
     monkeypatch.setenv("AI_SDK", sdk)
-    monkeypatch.setenv("AI_API_KEY", "sk-test-key")  # the credential the resolver *assumes*
     monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
     monkeypatch.delenv("HARNESS_MEMORY_PROVIDER", raising=False)
     monkeypatch.delenv("HARNESS_PROFILE", raising=False)
     install(cfg, provider=provider, opt_in=opt_in)
 
-    live = resolved_config()
     computed = resolve_stems(provider=provider, sdk=sdk, opt_in=opt_in)
+    # The box holds every credential the resolver *assumed* — the meaning of "assumed", and the
+    # only box the two answers are about. A credential it assumed and the box lacks would compare
+    # a provisioned agent with an unprovisioned one.
+    for var in computed["credentials"]["assumed"]:
+        monkeypatch.setenv(var, "sk-test-key")
+    live = resolved_config()
 
     assert computed["tools"] == live["tools"]
     assert computed["builtins"] == live["builtins"]
@@ -198,7 +205,14 @@ def test_credential_gated_tools_are_assumed_present_and_say_so():
 
     assert report["credentials"] == {
         "mode": "assumed",
-        "assumed": ["AI_API_KEY"],
+        # AI_API_KEY for the two OpenAI media tools, and the four keys the OpenRouter balance
+        # read's gate tests (a default since issue #862) — tested, so assumed; required by none.
+        "assumed": [
+            "AI_API_KEY",
+            "HARNESS_DESCRIBER_API_KEY",
+            "HARNESS_MEMPALACE_RERANK_API_KEY",
+            "OPENROUTER_MANAGEMENT_KEY",
+        ],
         "needs_env": [],  # none of these three reads an *ungated* var
         "wanted": ["AI_API_KEY"],
     }
@@ -250,7 +264,7 @@ def test_an_ungated_call_time_credential_is_named_though_it_gates_nothing():
     """
     report = resolve_stems(provider="xai", sdk="xai-sdk", opt_in="xai_account_balance")
 
-    assert report["credentials"]["assumed"] == []  # nothing gates on a key — still true
+    assert "XAI_MANAGEMENT_KEY" not in report["credentials"]["assumed"]  # it gates on no key
     assert report["credentials"]["needs_env"] == ["XAI_MANAGEMENT_KEY"]
     assert report["credentials"]["wanted"] == ["XAI_MANAGEMENT_KEY"]
     entry = report["stems"]["xai_account_balance"]
@@ -261,11 +275,102 @@ def test_an_ungated_call_time_credential_is_named_though_it_gates_nothing():
 
 def test_the_openrouter_balance_tool_wants_no_single_key():
     """Issue #853: any one of four OpenRouter keys serves it, so it names none as wanted."""
-    report = resolve_stems(provider="xai", sdk="xai-sdk", opt_in="openrouter_account_balance")
+    report = resolve_stems(provider="xai", sdk="xai-sdk")
 
     assert report["stems"]["openrouter_account_balance"]["status"] == "active"
     assert report["stems"]["openrouter_account_balance"]["needs_env"] == []
     assert "OPENROUTER_MANAGEMENT_KEY" not in report["credentials"]["wanted"]
+
+
+# --- the main-vendor balance reads (issue #862) -------------------------------
+
+_OPENROUTER_KEYS = [
+    "AI_API_KEY",
+    "HARNESS_DESCRIBER_API_KEY",
+    "HARNESS_MEMPALACE_RERANK_API_KEY",
+    "OPENROUTER_MANAGEMENT_KEY",
+]
+
+
+@pytest.mark.parametrize(
+    ("provider", "sdk", "env", "expected"),
+    [
+        # An OpenRouter-brained agent: its brain's key is an OpenRouter key.
+        ("openrouter", "openrouter", {"AI_API_KEY": "sk-or-brain"}, {"openrouter_account_balance"}),
+        # A refuseless-brained agent whose reranker is on OpenRouter reads both balances.
+        (
+            "refuseless",
+            "openai",
+            {"AI_API_KEY": "sk-rl", "HARNESS_MEMPALACE_RERANK_API_KEY": "sk-or-rerank"},
+            {"openrouter_account_balance", "refuseless_account_balance"},
+        ),
+        # An xAI-brained agent with no OpenRouter key gets neither: no tool, not a dead one.
+        ("xai", "xai-sdk", {"AI_API_KEY": "xai-key"}, set()),
+    ],
+)
+def test_each_agent_gets_the_balance_reads_it_holds_a_key_for(
+    monkeypatch, tmp_path, provider, sdk, env, expected
+):
+    """@origin's rule of 2026-11-10 on a real config home, installed with no grant at all.
+
+    Every agent reads the balance at its main LLM vendor, and an agent whose reranker is on
+    OpenRouter reads that balance too, exactly where it holds the key the read needs.
+    """
+    for var in [*_OPENROUTER_KEYS, "HARNESS_DESCRIBER_PROVIDER", "XAI_MANAGEMENT_KEY"]:
+        monkeypatch.delenv(var, raising=False)
+    cfg = tmp_path / "cfg"
+    monkeypatch.setenv("BASECRADLE_CONFIG_HOME", str(cfg))
+    monkeypatch.setenv("HARNESS_HOME", str(tmp_path))
+    monkeypatch.setenv("AI_PROVIDER", provider)
+    monkeypatch.setenv("AI_SDK", sdk)
+    monkeypatch.setenv("AI_BASE_URL", "https://api.example.com/v1")  # read only by a generic vendor
+    monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
+    monkeypatch.delenv("HARNESS_MEMORY_PROVIDER", raising=False)
+    monkeypatch.delenv("HARNESS_PROFILE", raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    install(cfg, provider=provider)
+
+    report = resolved_config()
+
+    balance = {name for name in report["tools"] if name.endswith("_account_balance")}
+    assert balance == expected
+    assert report["opt_in_tools"] == []  # a default, never a grant
+
+
+@pytest.mark.parametrize(
+    ("provider", "sdk"),
+    [("openrouter", "openrouter"), ("refuseless", "openai"), ("xai", "xai-sdk")],
+)
+def test_the_resolver_arm_states_the_keys_the_openrouter_balance_read_assumes(provider, sdk):
+    """The NOC's arm (`resolve-tools`): can this name resolve here, and on what assumption?
+
+    Off the box nothing says which keys an agent holds, so the default answer assumes them and
+    says so: the read resolves on every provider, marked with the four keys its gate tests; with
+    nothing assumed it is inactive and names the gate it failed. Never a silent inclusion, never a
+    silent omission. The refuseless read follows its vendor gate and assumes nothing.
+    """
+    assumed = resolve_stems(provider=provider, sdk=sdk)
+    absent = resolve_stems(provider=provider, sdk=sdk, assume_credentials=False)
+
+    entry = assumed["stems"]["openrouter_account_balance"]
+    assert entry["opt_in"] is False
+    assert entry["status"] == "active"
+    assert entry["assumes_credential"] == _OPENROUTER_KEYS
+    assert "openrouter_account_balance" in assumed["tools"]
+    assert set(_OPENROUTER_KEYS) <= set(assumed["credentials"]["assumed"])
+
+    off = absent["stems"]["openrouter_account_balance"]
+    assert off["status"] == "inactive"
+    assert "needs an OpenRouter key the agent already holds" in off["reason"]
+    assert "openrouter_account_balance" not in absent["tools"]
+
+    refuseless = assumed["stems"]["refuseless_account_balance"]
+    assert refuseless["opt_in"] is False
+    assert refuseless["status"] == ("active" if provider == "refuseless" else "excluded")
+    assert refuseless["assumes_credential"] == []
+    for report in (assumed, absent):
+        assert ("refuseless_account_balance" in report["tools"]) is (provider == "refuseless")
 
 
 def test_wanted_is_the_union_of_both_ways_a_plugin_can_name_a_variable():
@@ -280,7 +385,9 @@ def test_wanted_is_the_union_of_both_ways_a_plugin_can_name_a_variable():
         opt_in="xai_account_balance,openrouter_account_balance,send_direct_message_to_origin",
     )
 
-    assert report["credentials"]["assumed"] == ["NTFY_DM_TOKEN"]  # the gated half
+    # The gated half: the DM tool's token, and the four keys the OpenRouter read's gate tests,
+    # which are assumed (so the read resolves) and wanted by nothing (it requires none of them).
+    assert report["credentials"]["assumed"] == sorted(["NTFY_DM_TOKEN", *_OPENROUTER_KEYS])
     assert report["credentials"]["needs_env"] == ["XAI_MANAGEMENT_KEY"]
     assert report["credentials"]["wanted"] == ["NTFY_DM_TOKEN", "XAI_MANAGEMENT_KEY"]
 

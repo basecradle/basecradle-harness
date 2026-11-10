@@ -73,7 +73,6 @@ from basecradle_harness._memory_provider import (
 from basecradle_harness._observability import install_log_handler, scrub
 from basecradle_harness._plugins import (
     ActivationContext,
-    EnvSet,
     ResolvedTools,
     ToolPlugin,
     claim_plugins,
@@ -92,8 +91,8 @@ from basecradle_harness._version import __version__
 #: one asked is how a wrong pin gets computed.
 _PROFILES: dict[str, Policy] = {"locked": Policy.locked(), "unlocked": Policy.unlocked()}
 
-#: The placeholder value stood in for an assumed credential. Never a real secret — a `EnvSet`
-#: requirement only tests for a non-empty value, so any non-empty string resolves it identically.
+#: The placeholder value stood in for an assumed credential. Never a real secret — a requirement's
+#: `credential_vars` are tested for a non-blank value only, so any such string resolves them alike.
 _ASSUMED = "<assumed>"
 
 #: The two classes of active tool this command can never derive from a stem set, stated in-band
@@ -148,12 +147,14 @@ def _split(names: str | Sequence[str] | None) -> list[str]:
 def _plugin_credentials(plugin: ToolPlugin) -> set[str]:
     """The env vars *this* plugin's activation depends on — its resolved names' conditionality.
 
-    Read off the `EnvSet` requirements themselves rather than a list of known credentials, so a
-    plugin added later (``send_direct_message_to_origin`` gating on ``NTFY_DM_TOKEN`` was the last
-    one) is handled with no change here. `OpenAIKey` is an `EnvSet` subclass, so it is covered by
-    the same walk.
+    Read off each requirement's own `Requirement.credential_vars` rather than a list of known
+    credentials, so a plugin added later (``send_direct_message_to_origin`` gating on
+    ``NTFY_DM_TOKEN`` was one) is handled with no change here. An `EnvSet` (``OpenAIKey`` is one)
+    names its one variable; a gate any one of several keys meets (``openrouter_account_balance``'s
+    `OpenRouterKeyHeld`, issue #862) names each, so under ``--assume-credentials`` it is met and
+    the names it contributes say which keys they are conditional on.
     """
-    return {req.var for req in plugin.requires if isinstance(req, EnvSet)}
+    return {var for req in plugin.requires for var in req.credential_vars}
 
 
 def _credential_vars(plugins: Sequence[ToolPlugin]) -> list[str]:

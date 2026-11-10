@@ -17,6 +17,8 @@ from basecradle_harness import (
     EnvSet,
     OpenAIKey,
     OpenAISurface,
+    OpenRouterAccountBalanceTool,
+    OpenRouterKeyHeld,
     Sdk,
     Tool,
     ToolPlugin,
@@ -424,9 +426,32 @@ def test_removing_the_whole_tools_dir_once_installed_yields_no_tools(tmp_path):
 
 # The powerful tools with no provider affinity at all — opt-in everywhere (issue #168) and
 # available everywhere, so `opt_in` is the *only* thing keeping them off a default-riding agent.
-# They are what makes the disjointness guards below real rather than incidental: a `requires`
-# gate cannot exclude a plugin that declares none.
-_UNIVERSAL_POWER_TOOLS = {"openrouter_account_balance"}
+# They are what makes the disjointness guards below real rather than incidental: a `Vendor` gate
+# cannot exclude a plugin that declares none. (`openrouter_account_balance` was the first of these;
+# since issue #862 it is a benign default, below.)
+_UNIVERSAL_POWER_TOOLS = {
+    "send_direct_message_to_origin",
+    "shell",
+    "system_prompt_read",
+    "system_prompt_edit",
+}
+
+# The balance reads at an agent's own LLM vendor, benign defaults since issue #862 (@origin's rule
+# of 2026-11-10). Each is laid down and loaded like the platform tools, and each gate decides where
+# it appears: the OpenRouter read wherever the agent holds an OpenRouter key, the refuseless read
+# under the refuseless provider. A load with no provider filter carries both.
+_BALANCE_DEFAULTS = {"openrouter_account_balance", "refuseless_account_balance"}
+
+# Every OpenRouter key the balance tool may read with — cleared wherever a test calls `run()` or
+# reads the tool's own key lookup, because both read the process environment at call time.
+_OPENROUTER_KEY_ENV = (
+    "OPENROUTER_MANAGEMENT_KEY",
+    "AI_PROVIDER",
+    "AI_API_KEY",
+    "HARNESS_MEMPALACE_RERANK_API_KEY",
+    "HARNESS_DESCRIBER_API_KEY",
+    "HARNESS_DESCRIBER_PROVIDER",
+)
 
 # The powerful xAI-affine defaults — opt-in everywhere (issue #168), so absent from a default
 # load; available only under provider="xai" (their `requires`) once opted into an overlay.
@@ -446,7 +471,7 @@ def test_a_never_installed_config_home_falls_back_to_benign_defaults_only(tmp_pa
     # set only, no media-gen / web-search auto-armed.
     plugins = load_plugins(tmp_path / "never-installed")
     names = {p.resolved_name for p in plugins}
-    assert names == _DEFAULT_TOOLS
+    assert names == _DEFAULT_TOOLS | _BALANCE_DEFAULTS
     assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS | _UNIVERSAL_POWER_TOOLS) & names)
 
 
@@ -470,7 +495,7 @@ def test_a_freshly_installed_home_loads_benign_tools_only_end_to_end(tmp_path):
 
     plugins = load_plugins(home)
     names = {p.resolved_name for p in plugins}
-    assert names == _DEFAULT_TOOLS
+    assert names == _DEFAULT_TOOLS | _BALANCE_DEFAULTS
     assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS | _UNIVERSAL_POWER_TOOLS) & names)
 
 
@@ -500,17 +525,13 @@ def test_opting_in_xai_account_balance_activates_under_xai_only(tmp_path):
     assert "xai_account_balance" not in {t.name for t in under_openai.tools}
 
 
-def test_the_refuseless_balance_tool_is_opt_in_and_activates_under_refuseless_only(tmp_path):
-    # Issue #848. The xAI sibling's gate, not the OpenRouter sibling's absence of one: the tool
-    # reads the brain's own AI_API_KEY, which is a refuseless key only when the brain is refuseless,
-    # so beside any other brain it would send that vendor's key to refuseless's host.
+def test_the_refuseless_balance_tool_is_a_default_under_refuseless_only(tmp_path):
+    # Issue #848, on by default since issue #862. The xAI sibling's gate, not the OpenRouter
+    # sibling's: the tool reads the brain's own AI_API_KEY, which is a refuseless key only when the
+    # brain is refuseless, so beside any other brain it would send that vendor's key to refuseless's
+    # host. The gate scopes it, so a plain install on a refuseless agent arms it.
     home = tmp_path / "cfg"
     install(home, provider="refuseless")  # no opt_in
-    assert not (home / "tools" / "refuseless_account_balance.py").exists()
-    default = resolve_plugins(load_plugins(home), _ctx(provider="refuseless", AI_API_KEY="sk-rl"))
-    assert "refuseless_account_balance" not in {t.name for t in default.tools}
-
-    install(home, provider="refuseless", opt_in=["refuseless_account_balance"])
     assert (home / "tools" / "refuseless_account_balance.py").exists()
     under = resolve_plugins(load_plugins(home), _ctx(provider="refuseless", AI_API_KEY="sk-rl"))
     assert "refuseless_account_balance" in {t.name for t in under.tools}
@@ -520,45 +541,88 @@ def test_the_refuseless_balance_tool_is_opt_in_and_activates_under_refuseless_on
         assert "refuseless_account_balance" not in {t.name for t in elsewhere.tools}
 
 
-def test_the_openrouter_balance_tool_is_opt_in_and_activates_on_every_provider(tmp_path):
-    # The deliberate divergence from its xAI sibling (issue #425): NO Vendor gate. The ordering
-    # case is an agent brained by another provider that holds a *separate* OpenRouter account, so
-    # a Vendor("openrouter") gate would self-exclude exactly the agent this exists for. It is
-    # still powerful → opt-in everywhere, and never auto-scaffolded.
+# (provider, env) → whether an OpenRouter key is held, in the four ways the tool reads one and the
+# near misses that must not count: another vendor's AI_API_KEY, and a describer key whose describer
+# is not on OpenRouter.
+_HELD_CASES = [
+    ("openrouter", {"AI_API_KEY": "sk-or-brain"}, "AI_API_KEY"),
+    ("xai", {"AI_API_KEY": "xai-key"}, None),
+    ("xai", {"AI_API_KEY": "xai-key", "HARNESS_MEMPALACE_RERANK_API_KEY": "sk-or-rr"}, "rerank"),
+    ("refuseless", {"AI_API_KEY": "sk-rl", "HARNESS_MEMPALACE_RERANK_API_KEY": "sk-or"}, "rerank"),
+    (
+        "openai",
+        {"HARNESS_DESCRIBER_API_KEY": "sk-or-d", "HARNESS_DESCRIBER_PROVIDER": "openrouter"},
+        "describer",
+    ),
+    ("openai", {"HARNESS_DESCRIBER_API_KEY": "sk-x", "HARNESS_DESCRIBER_PROVIDER": "xai"}, None),
+    ("openai", {"HARNESS_DESCRIBER_API_KEY": "sk-x"}, None),  # rides the brain's stack: openai
+    ("google", {"OPENROUTER_MANAGEMENT_KEY": "sk-or-mgmt"}, "management"),
+    ("openrouter", {"AI_API_KEY": "   "}, None),  # a blank value is no key
+    ("anthropic", {}, None),
+]
+
+
+@pytest.mark.parametrize(("provider", "env", "held"), _HELD_CASES)
+def test_the_openrouter_balance_tool_is_offered_exactly_where_it_can_read_a_key(
+    tmp_path, monkeypatch, provider, env, held
+):
+    """Issue #862: on by default, present where an OpenRouter key is held, absent where none is.
+
+    Both directions against the tool's **own** key lookup, read from the same environment: the gate
+    may never offer a tool that would answer "no OpenRouter key is configured", nor withhold one
+    whose key the tool would have read. They agree by construction (`held_key`), and this is what
+    goes red if someone gives either its own copy of the precedence.
+    """
+    for var in _OPENROUTER_KEY_ENV:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("AI_PROVIDER", provider)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
     home = tmp_path / "cfg"
-    install(home, provider="xai")  # no opt_in
-    assert not (home / "tools" / "openrouter_account_balance.py").exists()
+    install(home, provider=provider)  # no opt_in: a default
+    assert (home / "tools" / "openrouter_account_balance.py").exists()
 
-    for provider in ("openai", "xai", "openrouter"):
-        install(home, provider=provider, opt_in=["openrouter_account_balance"])
-        assert (home / "tools" / "openrouter_account_balance.py").exists()  # never pruned
-        resolved = resolve_plugins(load_plugins(home), _ctx(provider=provider, AI_API_KEY="sk"))
-        assert "openrouter_account_balance" in {t.name for t in resolved.tools}
+    resolved = resolve_plugins(load_plugins(home), _ctx(provider=provider, **env))
+    offered = "openrouter_account_balance" in {t.name for t in resolved.tools}
+
+    assert offered is (held is not None)
+    assert offered is (OpenRouterAccountBalanceTool()._credential() is not None)
+    if not offered:
+        reasons = dict(resolved.skipped)
+        assert (
+            "needs an OpenRouter key the agent already holds"
+            in reasons["openrouter_account_balance"]
+        )
 
 
-def test_the_openrouter_balance_tool_activates_without_its_credential(tmp_path, monkeypatch):
-    # Deliberately NOT gated on an OpenRouter key the way the DM tool gates on NTFY_DM_TOKEN: a
-    # missing key must reach the model as a soft, readable "not configured" reason it can act on,
-    # never as a capability that silently is not there (issue #374).
-    #
-    # The delenvs are load-bearing, not hygiene: `run()` resolves its key from the environment at
-    # call time (issue #853), so on a box that actually exports one — the box an operator
-    # debugging this tool is sitting at — this test would make a real HTTPS request, in a file
-    # whose contract is that everything here is offline.
-    for var in (
+def test_the_openrouter_balance_tool_declares_no_single_key_it_cannot_work_without(tmp_path):
+    """Issue #853: any one of four OpenRouter keys serves, so none is declared as required.
+
+    Declaring the Management key, as before, would report a gap on every healthy agent reading
+    with its own key — a report that reddens on a correct configuration (`ToolPlugin.needs_env`).
+    Its gate (issue #862) tests all four and requires none, so it adds none either.
+    """
+    home = tmp_path / "cfg"
+    install(home, provider="openrouter")
+    resolved = resolve_plugins(load_plugins(home), _openrouter_ctx(AI_API_KEY="sk-or"))
+
+    assert "openrouter_account_balance" in {t.name for t in resolved.tools}
+    assert "openrouter_account_balance" not in resolved.env_dependencies
+
+
+def test_the_key_gate_names_the_keys_it_tests_and_requires_none():
+    """What the resolver assumes is not what an operator is asked to provision (issue #862)."""
+    gate = OpenRouterKeyHeld()
+    plugin = ToolPlugin(impl=OpenRouterAccountBalanceTool, requires=(gate,))
+
+    assert set(gate.credential_vars) == {
         "OPENROUTER_MANAGEMENT_KEY",
-        "AI_PROVIDER",
         "AI_API_KEY",
         "HARNESS_MEMPALACE_RERANK_API_KEY",
         "HARNESS_DESCRIBER_API_KEY",
-    ):
-        monkeypatch.delenv(var, raising=False)
-    home = tmp_path / "cfg"
-    install(home, opt_in=["openrouter_account_balance"])
-    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))  # no OpenRouter key
-    tools = {t.name: t for t in resolved.tools}
-    assert "openrouter_account_balance" in tools
-    assert "no OpenRouter key is configured" in tools["openrouter_account_balance"].run()
+    }
+    assert plugin_env_dependencies(plugin) == []
+    assert EnvSet("NTFY_DM_TOKEN").credential_vars == ("NTFY_DM_TOKEN",)  # one var, both senses
 
 
 def test_the_direct_message_tool_is_opt_in_and_provider_agnostic(tmp_path):
@@ -611,20 +675,6 @@ def test_needs_env_reports_the_dependency_without_gating_on_it(tmp_path, monkeyp
 
     assert "xai_account_balance" in {t.name for t in resolved.tools}  # NOT gated on its key
     assert resolved.env_dependencies["xai_account_balance"] == ["XAI_MANAGEMENT_KEY"]
-
-
-def test_the_openrouter_balance_tool_declares_no_single_key_it_cannot_work_without(tmp_path):
-    """Issue #853: any one of four OpenRouter keys serves, so none is declared as required.
-
-    Declaring the Management key, as before, would report a gap on every healthy agent reading
-    with its own key — a report that reddens on a correct configuration (`ToolPlugin.needs_env`).
-    """
-    home = tmp_path / "cfg"
-    install(home, opt_in=["openrouter_account_balance"])
-    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))
-
-    assert "openrouter_account_balance" in {t.name for t in resolved.tools}
-    assert "openrouter_account_balance" not in resolved.env_dependencies
 
 
 def test_env_dependencies_unions_the_gated_and_ungated_declarations():
@@ -709,12 +759,13 @@ def test_default_riding_openrouter_agent_is_benign_only(monkeypatch):
     # A default-riding @glm-5.2-style agent (provider=openrouter, no overlay) gets the benign/
     # platform set only — no media gen, no Live Search, no code execution auto-armed. Every
     # provider-coupled power tool self-excludes because its `requires` names openai/xai, not
-    # openrouter. `openrouter_account_balance` is the case that proves the safety default is the
-    # *capability*, never the vendor (issue #168): its `requires` names nothing at all, so no gate
-    # excludes it here and `opt_in` alone is what keeps it off — which is the whole design.
+    # openrouter, and the vendor-agnostic ones (the DM, the shell, self-authorship) are kept off by
+    # `opt_in` alone, which proves the safety default is the *capability*, never the vendor (issue
+    # #168). The one addition is its own balance read (issue #862): the brain's key is an
+    # OpenRouter key, so the benign default is armed.
     resolved = resolve_plugins(load_plugins(), _openrouter_ctx(AI_API_KEY="sk-or-key"))
     names = {t.name for t in resolved.tools}
-    assert names == _DEFAULT_TOOLS
+    assert names == _DEFAULT_TOOLS | {"openrouter_account_balance"}
     assert not ((_XAI_DEFAULTS | _OPENAI_POWER_TOOLS | _UNIVERSAL_POWER_TOOLS) & names)
     assert resolved.builtins == []  # no web_search / x_search / code_execution armed
 
