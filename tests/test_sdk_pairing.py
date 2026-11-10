@@ -79,9 +79,12 @@ def stack(monkeypatch):
 def test_the_matrix_covers_every_known_vendor_and_every_shipped_sdk():
     # A sixth SDK or a seventh vendor must land in `REACHES` with a decided answer, or this file
     # would silently stop covering it.
-    from basecradle_harness._basecradle import _SDK_SURFACES
+    from basecradle_harness._basecradle import _NATIVE_SDK_VENDORS, _SDK_SURFACES
 
     assert set(REACHES) == set(_SDK_SURFACES)
+    # The build's openai-SDK tail assumes every other shipped SDK is a row of the pairing table: an
+    # SDK added to `_SDK_SURFACES` alone would fall through to it and build an `OpenAIProvider`.
+    assert set(_NATIVE_SDK_VENDORS) == set(_SDK_SURFACES) - {"openai"}
     assert all(provider in KNOWN_PROVIDERS for vendors in REACHES.values() for provider in vendors)
     assert {provider for vendors in REACHES.values() for provider in vendors} == set(
         KNOWN_PROVIDERS
@@ -169,5 +172,8 @@ def test_a_describers_own_stack_is_refused_in_its_own_variables_names(
     assert describer.detail == sdk_pairing_problem(
         provider, sdk, provider_var="HARNESS_DESCRIBER_PROVIDER", sdk_var="HARNESS_DESCRIBER_SDK"
     )
+    # Independently of the rule's own output: the fix it names is in the describer's variable.
+    fix = next(name for name, vendors in REACHES.items() if provider in vendors)
+    assert f"HARNESS_DESCRIBER_SDK={fix}" in describer.detail
     assert "AI_SDK=" not in describer.detail
     assert "AI_PROVIDER=" not in describer.detail

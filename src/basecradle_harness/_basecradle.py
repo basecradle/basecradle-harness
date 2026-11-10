@@ -835,7 +835,8 @@ def _surface_for(sdk: str, raw: str | None, provider: str = DEFAULT_PROVIDER) ->
     catches both a typo (``responsess``) and a surface a single-surface SDK does not speak (a
     value outside its one-element set, e.g. ``chat`` on ``xai-sdk``).
     For an SDK with no surface declaration, an *unset* var resolves to ``""`` and the precise
-    "no adapter yet" error is left to the provider build; a *set* var is the clear error above.
+    "no adapter" error is left to the pairing rule (`sdk_pairing_problem`), which every caller of
+    the config triple runs; a *set* var is the clear error above.
 
     `raw` is passed in rather than read here so the one rule serves both the wake (which reads the
     env) and the deterministic off-box resolver (`_resolve.resolve_stems`, which takes a

@@ -5726,8 +5726,9 @@ def resolved_config() -> dict[str, object]:
     **ground truth, never self-report** (the basecradle#307 failure class, where a capability is a
     corpse while every version/health signal still reads green). It resolves through the **same
     code paths the running agent uses**: the validated ``(provider, sdk, surface)`` triple
-    (`_config_from_env`, which hard-fails a malformed provider slug, a generic vendor with no
-    ``AI_SDK=openai`` or no ``AI_BASE_URL``, or an SDK-mismatched surface) and the
+    (`_config_from_env`, which hard-fails a malformed provider slug, an SDK that cannot reach the
+    vendor (`sdk_pairing_problem`, issues #670 and #846), a generic vendor with no ``AI_BASE_URL``,
+    or an SDK-mismatched surface) and the
     active tool set after the full plugin/memory/MCP/locked-policy resolution (`_resolve_tools`) —
     so the output is what the agent would actually do, not a declared list.
 
