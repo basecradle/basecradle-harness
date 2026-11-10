@@ -152,8 +152,9 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: ``ste-`` do. ntfy generates a token from lowercase letters and digits, and its validator also
 #: admits capitals, ``_`` and ``-`` (``^tk_[-_A-Za-z0-9]{29}$``, ntfy's ``user/util.go``), which is
 #: the run ``tk_`` takes. A generated token with no digit, about 1 in 12,500, is the word residual
-#: below when glued to a letter. A key with no prefix of its own (Wiro's) has no shape a rule can
-#: match.
+#: below when glued to a letter. A key with no prefix of its own (Wiro's) has no shape a prefix rule
+#: can match; it is covered where it travels, as an ``x-api-key`` header value (`_LITERAL_RULES`,
+#: issue #861).
 #:
 #: **A vendor prefix inside a word is a word, not a credential** (issue #794), and the test is
 #: `_is_word`, never a left boundary. A boundary would be a list of the contexts in which
@@ -227,8 +228,28 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: ``Bearer`` as the whole value and left the token after the space; every, because a token stored
 #: with its scheme and sent with another reads ``Bearer Bearer eyJ…``. The heartbeat URL runs first
 #: of all, alone (`_HEARTBEAT_RUN`).
+#:
+#: **An ``x-api-key`` header value is redacted by its name, never its shape** (issue #861), because
+#: the vendor that sends a key there states no shape for it: Wiro's documentation gives its key no
+#: prefix, length or character set. The name is ``x-api-key`` (any case, ``_`` for either hyphen)
+#: followed by ``:`` or ``=>`` (a header dump, a Ruby hash), or by a quote, escaped or not, and then
+#: ``:``, ``=``, ``=>`` or ``,`` (``"x-api-key": "…"``, JSON inside a JSON string, a
+#: ``('x-api-key', '…')`` header tuple); the value may open with a quote, an escaped quote, a bytes
+#: literal's ``b'``, or bearer scheme words, and runs to the next space, quote, backslash or ``&``,
+#: since a key of no stated shape may hold anything else. **A bearer header glued to the value is taken
+#: with it** (``x-api-key: KBearer eyJ…``): the value would otherwise end at the scheme word and
+#: leave its token to no rule, the class `_TRAILING_BEARER` closes for a heartbeat URL. The
+#: unquoted ``X-API-Key=…`` is left to the ``api_key=`` rule below, which always took it with the
+#: wider value it allows. It is the first alternative, so the header's name goes with its value; a
+#: key glued directly before the name loses the ``x-`` to it, which leaves it unmatched only when it
+#: was already shorter than its rule's minimum, which no real key is. A bare ``x-api-key`` with no
+#: value is a word.
+#: Wiro's signing secret is never sent (its ``x-signature`` is an HMAC keyed on the API key), so
+#: there is nothing more to match.
 _LITERAL_RULES = re.compile(
-    r"(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
+    r"(?i:x[-_]api[-_]?key)(?:\\?[\"']\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?[\"'])?"
+    r"(?:(?i:bearer)\s+)*(?:[^\s\"'&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s\"'&\\]+)"
+    r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*[^&\s]+"
     r"|(?i:api[-_]?key=)(?:(?i:bearer)\s+)*[^&\s\"]+"
 )

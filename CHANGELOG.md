@@ -22,6 +22,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 A prefix rule whose run lacks `_` or `-` (`gh?_`, `github_pat_`, `bc_uat_`, `bc_isk_`, `hf_`, `r8_`, `ste-`, `abl_`, `pplx-`) took the letters of a following key's prefix and stopped at its `_` or `-`, so `hf_…aghp_ABC…` left most of the GitHub token in clear, and all of it when the first match was kept as a word. Each such rule now first tries to end where a whole key by its own rule begins and then takes the rest of the glued run with it, written without lookaround so the box's VRL can mirror it (`docs/telemetry.md` → Credential Scrubbing gives the pattern). A match that took a glued key is never kept as a word, so nothing is redacted less than before: a differential fuzz of 600,000 glued and separated samples against 0.185.0's scrub found no text the new one leaves more of.
 
+### Added: An `x-api-key` header value is scrubbed (issue #861)
+
+Wiro states no shape for its API key, which travels as an `x-api-key` header, so a literal rule now redacts that header's value by its name: `x-api-key: …`, `"x-api-key": "…"`, JSON inside a JSON string, a Ruby hash's `=>`, a `('x-api-key', '…')` header tuple and a bytes literal, in any case and with `_` for either hyphen, with a bearer header glued to the value taken along with its token. The unquoted `X-API-Key=…` stays the `api_key=` rule's. A bare `x-api-key` with no value is kept. Wiro's signing secret is never sent, so nothing else of Wiro's travels.
+
 ## [0.185.0] - 2026-11-10
 
 ### Fixed: The log scrub redacts a refuseless API key, a Perplexity API key and an ntfy access token (issue #856)

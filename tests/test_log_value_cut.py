@@ -650,3 +650,78 @@ def test_the_glued_key_form_is_linear():
     scrub("github_pat_" + "a_" * 50_000)
     scrub("abl_" + "Ab3" * 30_000 + "sk")
     assert time.monotonic() - started < 1.0
+
+
+# --- a credential sent as an ``x-api-key`` header value (issue #861) -----------------------------
+
+#: A fabricated header value with no vendor shape, the way Wiro's key has none.
+HEADER_VALUE = "wk9f8e7d6c5b4a3f2e1d0c9b8a"
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        (f"x-api-key: {HEADER_VALUE}", "[redacted]"),
+        (
+            f"X-API-Key: {HEADER_VALUE}\r\nContent-Type: application/json",
+            "[redacted]\r\nContent-Type: application/json",
+        ),
+        (
+            f'{{"x-api-key": "{HEADER_VALUE}", "x-nonce": "1731200000"}}',
+            '{"[redacted]", "x-nonce": "1731200000"}',
+        ),
+        (f"{{'x-api-key': '{HEADER_VALUE}'}}", "{'[redacted]'}"),
+        (f"[(b'x-api-key', b'{HEADER_VALUE}')]", "[(b'[redacted]')]"),
+        # The unquoted assignment is the ``api_key=`` rule's, with the wider value it always took.
+        (f"X-API-Key={HEADER_VALUE}&page=2", "X-[redacted]&page=2"),
+        (f"x_api_key={HEADER_VALUE}", "x_[redacted]"),
+        ("X-API-Key=wk9f,8e7d6;c5b4'a3f2e1", "X-[redacted]"),
+        # A key of no stated shape may hold a comma or a semicolon.
+        ("x-api-key: wk9f,8e7d6;c5b4 sent", "[redacted] sent"),
+        # A Ruby hash, and JSON quoted inside a JSON string.
+        (f'{{"x-api-key"=>"{HEADER_VALUE}"}}', '{"[redacted]"}'),
+        (f"X-Api-Key => {HEADER_VALUE}", "[redacted]"),
+        (f'{{\\"x-api-key\\": \\"{HEADER_VALUE}\\"}}', '{\\"[redacted]\\"}'),
+        # A bearer header glued to the value goes with it, token and all.
+        ("x-api-key: KBearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig", "[redacted]"),
+        (f'"x-api-key": "{HEADER_VALUE}Bearer eyJhbGciOiJIUzI1NiJ9"', '"[redacted]"'),
+        (
+            f'curl -H "x-api-key: {HEADER_VALUE}" https://api.example.com',
+            'curl -H "[redacted]" https://api.example.com',
+        ),
+        (f"x-api-key: Bearer {HEADER_VALUE}", "[redacted]"),
+        (
+            f"the request sent x-api-key:{HEADER_VALUE} and failed",
+            "the request sent [redacted] and failed",
+        ),
+    ],
+)
+def test_an_x_api_key_header_value_is_redacted(text, scrubbed):
+    assert scrub(text) == scrubbed
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x-api-key",
+        "the x-api-key header is missing",
+        "send x-api-key, x-nonce and x-signature",
+        "set the x-api-key header (see the docs)",
+    ],
+)
+def test_a_bare_x_api_key_word_is_untouched(text):
+    assert scrub(text) == text
+
+
+def test_an_x_api_key_header_value_is_redacted_on_a_log_line():
+    line = kv(error=f"401 Unauthorized: x-api-key: {HEADER_VALUE} rejected")
+    assert HEADER_VALUE not in line
+    assert line == 'error="401 Unauthorized: [redacted] rejected"'
+
+
+def test_the_header_rule_is_linear():
+    started = time.monotonic()
+    scrub("x-api-key:" * 20_000)
+    scrub("x-api-key" * 20_000)
+    scrub("x-api-key: " + "a" * 200_000)
+    assert time.monotonic() - started < 1.0
