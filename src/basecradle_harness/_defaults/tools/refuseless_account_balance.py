@@ -12,13 +12,14 @@
 # (basecradle-harness-install --opt-in refuseless_account_balance).
 #
 # `requires=(Vendor("refuseless"),)` — the xAI sibling's gate, not the OpenRouter sibling's absence
-# of one, and the reason is the credential. Both siblings read a *dedicated* account key, so the
-# OpenRouter tool can be offered beside any brain. This one reads AI_API_KEY, which is a refuseless
-# key only when the brain is refuseless: beside any other brain it would send that vendor's key to
-# refuseless's host. So it self-excludes everywhere else.
+# of one, and the reason is the credential. The OpenRouter tool can be offered beside any brain
+# because it also reads OpenRouter keys that serve helpers (the reranker, the describer). This one
+# reads only AI_API_KEY, which is a refuseless key only when the brain is refuseless: beside any
+# other brain it would send that vendor's key to refuseless's host. So it self-excludes everywhere
+# else.
 #
 # `needs_env` names AI_API_KEY because the tool cannot work without it, so it rides
-# `credentials.wanted` and `tool_env` like the siblings' Management keys (issue #427). It is the
+# `credentials.wanted` and `tool_env` like the xAI sibling's Management key (issue #427). It is the
 # brain's own key, so on a healthy refuseless box it is always present and never reads as a gap.
 #
 # Delete this file to disable the tool.

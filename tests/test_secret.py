@@ -193,6 +193,9 @@ HOLDERS = {
     "Transcriber": lambda: Transcriber(api_key=OPENAI),
     "XaiAccountBalanceTool": lambda: XaiAccountBalanceTool(management_key=MANAGEMENT),
     "OpenRouterAccountBalanceTool": lambda: OpenRouterAccountBalanceTool(management_key=MANAGEMENT),
+    "OpenRouterAccountBalanceTool(api_key)": lambda: OpenRouterAccountBalanceTool(
+        api_key=OPENROUTER
+    ),
     "RefuselessAccountBalanceTool": lambda: RefuselessAccountBalanceTool(api_key=REFUSELESS),
     "DirectMessageTool": lambda: DirectMessageTool(token=NTFY),
     "McpServerConfig": _mcp_config,

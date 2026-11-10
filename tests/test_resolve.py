@@ -244,19 +244,28 @@ def test_an_ungated_call_time_credential_is_named_though_it_gates_nothing():
     """The gap #427 closed: a key read at call time, gating nothing, named nowhere machine-readable.
 
     `credentials.assumed` is built from the `EnvSet` requirements, so a tool that reads a key
-    *without* gating on it contributed nothing to it — and `openrouter_account_balance`
-    deliberately declares no `requires` at all (issue #425), so the omission could never close by
-    accident. The tool is active, and the report now says what it needs anyway.
+    *without* gating on it contributed nothing to it — `xai_account_balance` gates on its vendor,
+    never on its Management Key, so the omission could never close by accident. The tool is
+    active, and the report now says what it needs anyway.
     """
+    report = resolve_stems(provider="xai", sdk="xai-sdk", opt_in="xai_account_balance")
+
+    assert report["credentials"]["assumed"] == []  # nothing gates on a key — still true
+    assert report["credentials"]["needs_env"] == ["XAI_MANAGEMENT_KEY"]
+    assert report["credentials"]["wanted"] == ["XAI_MANAGEMENT_KEY"]
+    entry = report["stems"]["xai_account_balance"]
+    assert entry["status"] == "active"  # reported, never gated
+    assert entry["needs_env"] == ["XAI_MANAGEMENT_KEY"]
+    assert entry["assumes_credential"] == []  # it is not conditional on the key — that is the point
+
+
+def test_the_openrouter_balance_tool_wants_no_single_key():
+    """Issue #853: any one of four OpenRouter keys serves it, so it names none as wanted."""
     report = resolve_stems(provider="xai", sdk="xai-sdk", opt_in="openrouter_account_balance")
 
-    assert report["credentials"]["assumed"] == []  # nothing gates — the old answer, still true
-    assert report["credentials"]["needs_env"] == ["OPENROUTER_MANAGEMENT_KEY"]
-    assert report["credentials"]["wanted"] == ["OPENROUTER_MANAGEMENT_KEY"]
-    entry = report["stems"]["openrouter_account_balance"]
-    assert entry["status"] == "active"  # reported, never gated
-    assert entry["needs_env"] == ["OPENROUTER_MANAGEMENT_KEY"]
-    assert entry["assumes_credential"] == []  # it is not conditional on the key — that is the point
+    assert report["stems"]["openrouter_account_balance"]["status"] == "active"
+    assert report["stems"]["openrouter_account_balance"]["needs_env"] == []
+    assert "OPENROUTER_MANAGEMENT_KEY" not in report["credentials"]["wanted"]
 
 
 def test_wanted_is_the_union_of_both_ways_a_plugin_can_name_a_variable():
@@ -272,15 +281,8 @@ def test_wanted_is_the_union_of_both_ways_a_plugin_can_name_a_variable():
     )
 
     assert report["credentials"]["assumed"] == ["NTFY_DM_TOKEN"]  # the gated half
-    assert report["credentials"]["needs_env"] == [
-        "OPENROUTER_MANAGEMENT_KEY",
-        "XAI_MANAGEMENT_KEY",
-    ]
-    assert report["credentials"]["wanted"] == [
-        "NTFY_DM_TOKEN",
-        "OPENROUTER_MANAGEMENT_KEY",
-        "XAI_MANAGEMENT_KEY",
-    ]
+    assert report["credentials"]["needs_env"] == ["XAI_MANAGEMENT_KEY"]
+    assert report["credentials"]["wanted"] == ["NTFY_DM_TOKEN", "XAI_MANAGEMENT_KEY"]
 
 
 def test_wanted_does_not_move_with_the_credential_mode():

@@ -54,10 +54,25 @@ def _mock(mock, response=None):
     )
 
 
+#: Every variable the tool resolves a key or a host from (issue #853). Cleared before each test,
+#: so a box that exports any of them can neither leak a key into a test nor send one anywhere.
+_RESOLVED_VARS = (
+    "OPENROUTER_MANAGEMENT_KEY",
+    "AI_PROVIDER",
+    "AI_API_KEY",
+    "AI_BASE_URL",
+    "HARNESS_MEMPALACE_RERANK_API_KEY",
+    "HARNESS_MEMPALACE_RERANK_BASE_URL",
+    "HARNESS_DESCRIBER_API_KEY",
+    "HARNESS_DESCRIBER_PROVIDER",
+)
+
+
 @pytest.fixture(autouse=True)
 def clear_env(monkeypatch):
     """No ambient credential leaks into a test — each drives the key explicitly."""
-    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+    for var in _RESOLVED_VARS:
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture
@@ -241,8 +256,15 @@ def test_no_key_is_a_clean_unavailable_not_a_crash():
 
     assert not route.called  # no HTTP call at all
     assert result.startswith("OpenRouter account balance unavailable — ")
-    assert "OPENROUTER_MANAGEMENT_KEY" in result
-    assert "openrouter.ai/settings/management-keys" in result  # where the key is minted
+    # Every key it could have read with is named, so the reason says what would fix it.
+    for var in (
+        "OPENROUTER_MANAGEMENT_KEY",
+        "AI_API_KEY",
+        "HARNESS_MEMPALACE_RERANK_API_KEY",
+        "HARNESS_DESCRIBER_API_KEY",
+    ):
+        assert var in result
+    assert "management-keys" not in result  # a Management key is no longer the requirement
 
 
 @pytest.mark.parametrize("status", [401, 403])
@@ -254,8 +276,7 @@ def test_a_rejected_key_names_the_credential_and_never_echoes_it(tool, status):
         result = tool.run()
 
     assert result.startswith("OpenRouter account balance unavailable — ")
-    assert "Management key" in result  # points at the wrong-kind-of-key mistake
-    assert "OPENROUTER_MANAGEMENT_KEY" in result
+    assert f"rejected the key in the management_key argument (HTTP {status})" in result
     assert KEY not in result
     assert "User not found" not in result and "user_secret_42" not in result
 
@@ -437,8 +458,7 @@ def test_a_non_ascii_key_degrades_instead_of_raising(monkeypatch):
 
     assert not route.called  # it never got as far as a request
     assert result.startswith("OpenRouter account balance unavailable — ")
-    assert "non-ASCII" in result
-    assert "OPENROUTER_MANAGEMENT_KEY" in result
+    assert "the management_key argument contains a non-ASCII character" in result
     assert "not-ascii" not in result  # the key is never echoed back
 
 
@@ -559,3 +579,483 @@ def test_the_cache_never_holds_the_key(monkeypatch):
             tool.run()
         assert tool._cached is not None
         assert KEY not in repr(vars(tool))
+
+
+# --- issue #853: the agent's own OpenRouter key, and the key's own figures -----
+#
+# An ordinary inference key reads both `/credits` and `/key` (measured live, 2026-11-10), so the
+# Management key is an optional override. The key is resolved in a fixed order (Management key,
+# the brain's key when the brain bills OpenRouter, the reranker's, the describer's on its own
+# OpenRouter stack), each read at the host its own calls go to. The `/key` body below is the live
+# shape, abridged, with fabricated figures.
+
+INFERENCE = "sk-or-v1-fabricated-inference-key-0000"
+RERANK = "sk-or-v1-fabricated-rerank-key-0000"
+DESCRIBER = "sk-or-v1-fabricated-describer-key-0000"
+KEY_URL = f"{DEFAULT_BASE_URL}/key"
+
+
+def _key_body(usage=1.047832516, limit=None, limit_remaining=None, limit_reset=None) -> dict:
+    """A `/key` response in the live shape: the calling key's own figures, plain USD."""
+    return {
+        "data": {
+            "label": "sk-or-v1-fab...000",
+            "is_management_key": False,
+            "is_provisioning_key": False,
+            "limit": limit,
+            "limit_reset": limit_reset,
+            "limit_remaining": limit_remaining,
+            "usage": usage,
+            "usage_daily": 0,
+            "usage_weekly": 0.934033502,
+            "usage_monthly": 0.990783007,
+            "is_free_tier": False,
+        }
+    }
+
+
+def _mock_both(mock, host=DEFAULT_BASE_URL, credits=None, key=None):
+    """Route `/credits` and `/key` at one host; default to the healthy fabricated bodies."""
+    credits_route = mock.get(f"{host}/credits").mock(
+        return_value=credits or httpx.Response(200, json=_credits_body())
+    )
+    key_route = mock.get(f"{host}/key").mock(
+        return_value=key or httpx.Response(200, json=_key_body())
+    )
+    return credits_route, key_route
+
+
+def _brain_on_openrouter(monkeypatch, key=INFERENCE):
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")
+    monkeypatch.setenv("AI_API_KEY", key)
+
+
+def test_the_brains_own_key_reads_both_endpoints_when_the_brain_bills_openrouter(monkeypatch):
+    _brain_on_openrouter(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        credits, key = _mock_both(mock)
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    for route in (credits, key):
+        assert route.calls.last.request.headers["authorization"] == f"Bearer {INFERENCE}"
+    assert str(key.calls.last.request.url) == "https://openrouter.ai/api/v1/key"
+    assert result.startswith("OpenRouter credits remaining: $376.54 USD (as of ")
+    assert result.endswith(
+        "The key this was read with (AI_API_KEY, your brain's key) has spent $1.05 to date and "
+        "has no spending limit of its own."
+    )
+    assert INFERENCE not in result
+
+
+@pytest.mark.parametrize("provider", ["xai", "openai", "refuseless", "anthropic"])
+def test_another_vendors_brain_key_is_never_sent_to_openrouter(monkeypatch, provider):
+    """The provider check is what keeps another vendor's `AI_API_KEY` off OpenRouter's host."""
+    monkeypatch.setenv("AI_PROVIDER", provider)
+    monkeypatch.setenv("AI_API_KEY", "xai-fabricated-brain-key-0000")
+    with respx.mock(assert_all_called=False) as mock:
+        credits, key = _mock_both(mock)
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert not credits.called and not key.called
+    assert result.startswith("OpenRouter account balance unavailable — no OpenRouter key")
+    assert f"(it is {provider!r} here)" in result
+
+
+def test_the_brains_key_is_read_at_the_brains_own_host(monkeypatch):
+    """A key kept to a regional host is never sent to another (both answer there, live)."""
+    _brain_on_openrouter(monkeypatch)
+    monkeypatch.setenv("AI_BASE_URL", "https://us.openrouter.ai/api/v1/")
+    with respx.mock(assert_all_called=True) as mock:
+        credits, key = _mock_both(mock, host="https://us.openrouter.ai/api/v1")
+        assert "OpenRouter credits remaining: $376.54 USD" in OpenRouterAccountBalanceTool().run()
+
+    assert credits.called and key.called
+
+
+def test_the_rerankers_key_serves_an_agent_brained_elsewhere(monkeypatch):
+    """The #425 case: a brain on another vendor, an OpenRouter key on a helper. No Vendor gate."""
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("AI_API_KEY", "xai-fabricated-brain-key-0000")
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_API_KEY", RERANK)
+    with respx.mock(assert_all_called=True) as mock:
+        credits, key = _mock_both(mock)
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert key.calls.last.request.headers["authorization"] == f"Bearer {RERANK}"
+    assert credits.calls.last.request.headers["authorization"] == f"Bearer {RERANK}"
+    assert "(HARNESS_MEMPALACE_RERANK_API_KEY, your memory reranker's key)" in result
+
+
+def test_the_rerankers_key_is_read_at_the_rerankers_own_host(monkeypatch):
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_API_KEY", RERANK)
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_BASE_URL", "https://eu.openrouter.ai/api/v1")
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock, host="https://eu.openrouter.ai/api/v1")
+        assert "OpenRouter credits remaining" in OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+
+@pytest.mark.parametrize(
+    ("describer_provider", "used"),
+    [
+        pytest.param("openrouter", True, id="own-openrouter-stack"),
+        pytest.param("OpenRouter", True, id="slug-normalized"),
+        pytest.param(None, False, id="rides-the-brains-stack"),
+        pytest.param("google", False, id="own-google-stack"),
+    ],
+)
+def test_the_describers_key_is_read_only_on_its_own_openrouter_stack(
+    monkeypatch, describer_provider, used
+):
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("HARNESS_DESCRIBER_API_KEY", DESCRIBER)
+    if describer_provider is not None:
+        monkeypatch.setenv("HARNESS_DESCRIBER_PROVIDER", describer_provider)
+    with respx.mock(assert_all_called=False) as mock:
+        credits, _ = _mock_both(mock)
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert credits.called is used
+    if used:
+        assert credits.calls.last.request.headers["authorization"] == f"Bearer {DESCRIBER}"
+        assert "(HARNESS_DESCRIBER_API_KEY, your describer's key)" in result
+    else:
+        assert result.startswith("OpenRouter account balance unavailable — no OpenRouter key")
+
+
+def test_the_management_key_overrides_and_its_own_figures_are_not_read(monkeypatch):
+    """Set, it is read first (an agent provisioned with one reads as before); it spends nothing."""
+    monkeypatch.setenv("OPENROUTER_MANAGEMENT_KEY", KEY)
+    _brain_on_openrouter(monkeypatch)
+    with respx.mock(assert_all_called=False) as mock:
+        credits, key = _mock_both(mock)
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert credits.calls.last.request.headers["authorization"] == f"Bearer {KEY}"
+    assert not key.called
+    assert result.endswith(
+        "Read with OPENROUTER_MANAGEMENT_KEY, a Management key, which spends nothing itself and "
+        "so has no usage or spending limit of its own."
+    )
+
+
+def test_the_brains_key_comes_before_the_rerankers(monkeypatch):
+    _brain_on_openrouter(monkeypatch)
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_API_KEY", RERANK)
+    with respx.mock(assert_all_called=True) as mock:
+        credits, _ = _mock_both(mock)
+        OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert credits.calls.last.request.headers["authorization"] == f"Bearer {INFERENCE}"
+
+
+def test_a_key_handed_to_the_tool_reads_nothing_from_the_environment(monkeypatch):
+    _brain_on_openrouter(monkeypatch, key="sk-or-v1-the-environments-key")
+    monkeypatch.setenv("AI_BASE_URL", "https://us.openrouter.ai/api/v1")
+    with respx.mock(assert_all_called=True) as mock:
+        _, key = _mock_both(mock)  # the default host, not AI_BASE_URL's
+        result = OpenRouterAccountBalanceTool(api_key=INFERENCE, cache_ttl=0).run()
+
+    assert key.calls.last.request.headers["authorization"] == f"Bearer {INFERENCE}"
+    assert "The key this was read with (the api_key argument) has spent $1.05" in result
+
+
+def test_a_key_limit_is_reported_with_what_it_allows_and_how_it_resets(monkeypatch):
+    _brain_on_openrouter(monkeypatch)
+    body = _key_body(usage=7.504, limit=10, limit_remaining=2.496, limit_reset="monthly")
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock, key=httpx.Response(200, json=body))
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert result.endswith(
+        "The key this was read with (AI_API_KEY, your brain's key) has spent $7.50 to date; its "
+        "spending limit of $10.00 allows $2.50 more, and resets monthly."
+    )
+    assert "used up" not in result
+
+
+@pytest.mark.parametrize(
+    ("reset", "wording"),
+    [
+        pytest.param("daily", "and resets daily.", id="daily"),
+        pytest.param("weekly", "and resets weekly.", id="weekly"),
+        pytest.param(None, "and does not reset on a schedule.", id="no-reset"),
+        pytest.param(
+            "fortnightly", "on a reset period this tool does not recognize.", id="unknown"
+        ),
+    ],
+)
+def test_the_limits_reset_is_said_and_never_guessed(monkeypatch, reset, wording):
+    _brain_on_openrouter(monkeypatch)
+    body = _key_body(usage=1.0, limit=5.0, limit_remaining=4.0, limit_reset=reset)
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock, key=httpx.Response(200, json=body))
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert result.endswith(wording)
+    assert "fortnightly" not in result  # a vendor string it does not know is never relayed
+
+
+@pytest.mark.parametrize("left", [0.0, 0.004, -1.25])
+def test_a_used_up_key_limit_is_called_out_first(monkeypatch, left):
+    """A key with no limit left cannot pay for a request while the account still has credit."""
+    _brain_on_openrouter(monkeypatch)
+    body = _key_body(usage=10.0, limit=10.0, limit_remaining=left, limit_reset="weekly")
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock, key=httpx.Response(200, json=body))
+        headline, body_line = OpenRouterAccountBalanceTool(cache_ttl=0).run().splitlines()
+
+    assert headline.startswith("OpenRouter credits remaining: $376.54 USD")  # the shape holds
+    assert body_line.startswith("This key's spending limit is used up, so no request made with it")
+
+
+@pytest.mark.parametrize(
+    ("data", "reason"),
+    [
+        pytest.param([], "key response carried no data object", id="data-not-an-object"),
+        pytest.param({"limit": None}, "no usable usage figure", id="no-usage"),
+        pytest.param({"usage": "1.0", "limit": None}, "no usable usage figure", id="usage-string"),
+        pytest.param({"usage": 1.0}, "no usable limit figure", id="limit-absent"),
+        pytest.param({"usage": 1.0, "limit": "10"}, "no usable limit figure", id="limit-string"),
+        pytest.param({"usage": 1.0, "limit": True}, "no usable limit figure", id="limit-bool"),
+        pytest.param(
+            {"usage": 1.0, "limit": 10.0, "limit_reset": "monthly"},
+            "a spending limit but no usable limit_remaining",
+            id="limit-without-remaining",
+        ),
+        pytest.param(
+            {"usage": 1.0, "limit": 10.0, "limit_remaining": 9.0, "limit_reset": 30},
+            "a spending limit but no usable limit_reset",
+            id="reset-not-a-string",
+        ),
+    ],
+)
+def test_an_unusable_key_body_is_unavailable_never_a_partial_answer(monkeypatch, data, reason):
+    """A balance that silently dropped the key's limit would describe a capped key as healthy."""
+    _brain_on_openrouter(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock, key=httpx.Response(200, json={"data": data}))
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert result.startswith("OpenRouter account balance unavailable — ")
+    assert reason in result
+    assert "$" not in result
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_key_on_either_endpoint_names_its_source_and_never_echoes_it(
+    monkeypatch, status
+):
+    """An auth error body can echo what it was handed, so it is never relayed."""
+    _brain_on_openrouter(monkeypatch)
+    body = {"error": {"message": f"No auth credentials found for {INFERENCE}", "code": status}}
+    for broken in ("credits", "key"):
+        responses = {broken: httpx.Response(status, json=body)}
+        with respx.mock(assert_all_called=False) as mock:
+            _mock_both(mock, **responses)
+            result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+        assert result.startswith(
+            f"OpenRouter account balance unavailable — OpenRouter rejected the key in AI_API_KEY "
+            f"(HTTP {status})"
+        )
+        assert "Check that AI_API_KEY holds a current OpenRouter key." in result
+        assert INFERENCE not in result and "No auth credentials" not in result
+
+
+def test_a_failed_key_read_names_the_action(monkeypatch):
+    _brain_on_openrouter(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock, key=httpx.Response(502, text="bad gateway"))
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert result == (
+        "OpenRouter account balance unavailable — OpenRouter returned HTTP 502 trying to read "
+        "this key's own usage."
+    )
+
+
+def test_an_unusable_host_is_a_soft_config_fault_naming_its_variable(monkeypatch):
+    _brain_on_openrouter(monkeypatch)
+    monkeypatch.setenv("AI_BASE_URL", "http://[::1")
+    with respx.mock(assert_all_called=False):
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert result == (
+        "OpenRouter account balance unavailable — AI_BASE_URL is not a usable URL, so there is "
+        "no host to read the account at."
+    )
+
+
+def test_a_cached_figure_is_never_served_for_a_key_read_elsewhere(monkeypatch):
+    """The root is part of the cache entry: the same key repointed to another host re-reads."""
+    clock = _FakeClock()
+    tool = OpenRouterAccountBalanceTool(cache_ttl=30, clock=clock)
+    _brain_on_openrouter(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock)
+        tool.run()
+    monkeypatch.setenv("AI_BASE_URL", "https://us.openrouter.ai/api/v1")
+    with respx.mock(assert_all_called=True) as mock:  # the clock has NOT moved
+        credits, _ = _mock_both(mock, host="https://us.openrouter.ai/api/v1")
+        tool.run()
+
+    assert credits.call_count == 1
+
+
+def test_no_object_holds_the_inference_key_in_plain_view(monkeypatch):
+    """The #599 leak, for the new path: the tool, its cache and the resolved credential."""
+    _brain_on_openrouter(monkeypatch)
+    for tool in (OpenRouterAccountBalanceTool(api_key=INFERENCE), OpenRouterAccountBalanceTool()):
+        credential = tool._credential()
+        assert INFERENCE not in repr(credential) and INFERENCE not in repr(vars(credential))
+        with respx.mock(assert_all_called=True) as mock:
+            _mock_both(mock)
+            tool.run()
+        assert INFERENCE not in repr(vars(tool))
+
+
+# --- review findings on #853: the transport never quotes the key; slugs follow the table ------
+
+
+#: Every control character an environment variable can hold (NUL it cannot), each both ways.
+_CONTROL_KEYS = [
+    *((via, char) for via in ("env", "argument") for char in ("\n", "\r", "\t", "\x7f")),
+    ("argument", "\x00"),
+]
+
+
+@pytest.mark.parametrize(("via", "char"), _CONTROL_KEYS)
+def test_a_key_with_a_control_character_is_refused_before_any_request(monkeypatch, via, char):
+    """h11 rejects such a header with an error quoting the whole header, key included.
+
+    Left to the transport, that error's text was the tool's answer: the key in the transcript the
+    brain's vendor is sent, and in the WARNING the `tool` line writes.
+    """
+    key = f"sk-or-v1-SECRET{char}INNER"
+    if via == "env":
+        _brain_on_openrouter(monkeypatch, key=key)
+        tool, source = OpenRouterAccountBalanceTool(cache_ttl=0), "AI_API_KEY"
+    else:
+        tool, source = (
+            OpenRouterAccountBalanceTool(api_key=key, cache_ttl=0),
+            "the api_key argument",
+        )
+    with respx.mock(assert_all_called=False) as mock:
+        credits, key_route = _mock_both(mock)
+        result = tool.run()
+
+    assert not credits.called and not key_route.called
+    assert result.startswith(
+        f"OpenRouter account balance unavailable — {source} contains a control character"
+    )
+    assert "SECRET" not in result and "INNER" not in result
+
+
+def test_a_transport_error_is_named_by_its_type_never_its_text(monkeypatch):
+    """Whatever a transport error's message carries, only its type reaches the answer."""
+    _brain_on_openrouter(monkeypatch)
+    leaky = httpx.LocalProtocolError(f"Illegal header value b'Bearer {INFERENCE}'")
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(CREDITS_URL).mock(side_effect=leaky)
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert result == (
+        "OpenRouter account balance unavailable — couldn't reach the OpenRouter API "
+        "(LocalProtocolError)."
+    )
+
+
+@pytest.fixture
+def reasons(monkeypatch):
+    """The `tool` line's `reason` for each failure the tool reports, captured at the call."""
+    import basecradle_harness._openrouter_account as module
+
+    seen: list[str] = []
+    real = module.tool_failed
+
+    def capture(text, *, reason):
+        seen.append(reason)
+        return real(text, reason=reason)
+
+    monkeypatch.setattr(module, "tool_failed", capture)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("status", "slug"),
+    [
+        (402, "config:billing"),
+        (404, "config:model_not_found"),
+        (413, "payload_too_large"),
+        (429, "rate_limited"),
+        (500, "server_error"),
+        (503, "server_error"),
+        (504, "timeout"),
+        (400, "api_error"),
+        (302, "api_error"),
+        (401, "config:auth"),
+        (403, "config:auth"),
+    ],
+)
+def test_a_failed_status_is_named_by_the_fault_slug_table(tool, reasons, status, slug):
+    """`docs/telemetry.md` → Fault Slugs: a fault known by its status alone has one name."""
+    with respx.mock(assert_all_called=True) as mock:
+        _mock(mock, httpx.Response(status))
+        assert "unavailable" in tool.run()
+
+    assert reasons == [slug]
+
+
+def test_a_read_that_ran_out_of_time_is_a_timeout_not_a_transport_fault(tool, reasons):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(CREDITS_URL).mock(side_effect=httpx.ReadTimeout("slow"))
+        result = tool.run()
+
+    assert result == (
+        "OpenRouter account balance unavailable — the OpenRouter API did not answer in time "
+        "trying to read the credits remaining."
+    )
+    assert reasons == ["timeout"]
+
+
+@pytest.mark.parametrize(
+    "root", ["us.openrouter.ai/api/v1", "ftp://openrouter.ai/api/v1", "https://"]
+)
+def test_a_schemeless_or_hostless_rerank_host_is_a_config_fault_not_a_network_one(
+    monkeypatch, reasons, root
+):
+    """The reranker judges the same value a config fault; read as `transport`, it never heals."""
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_API_KEY", RERANK)
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_BASE_URL", root)
+    with respx.mock(assert_all_called=False) as mock:
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+        assert not mock.calls
+
+    assert result == (
+        "OpenRouter account balance unavailable — HARNESS_MEMPALACE_RERANK_BASE_URL is not a "
+        "usable URL, so there is no host to read the account at."
+    )
+    assert reasons == ["config:base_url"]
+
+
+def test_a_describer_on_the_brains_vendor_is_read_at_the_brains_host(monkeypatch):
+    """It inherits `AI_BASE_URL` there (`_describer`'s `inherit_endpoint`), so it stays regional."""
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")  # the brain bills OpenRouter, with no key here
+    monkeypatch.setenv("AI_BASE_URL", "https://eu.openrouter.ai/api/v1")
+    monkeypatch.setenv("HARNESS_DESCRIBER_PROVIDER", "openrouter")
+    monkeypatch.setenv("HARNESS_DESCRIBER_API_KEY", DESCRIBER)
+    with respx.mock(assert_all_called=True) as mock:
+        credits, _ = _mock_both(mock, host="https://eu.openrouter.ai/api/v1")
+        OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert credits.calls.last.request.headers["authorization"] == f"Bearer {DESCRIBER}"
+
+
+def test_a_describer_beside_another_brain_never_takes_that_brains_host(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("AI_BASE_URL", "https://api.x.ai/v1")
+    monkeypatch.setenv("HARNESS_DESCRIBER_PROVIDER", "openrouter")
+    monkeypatch.setenv("HARNESS_DESCRIBER_API_KEY", DESCRIBER)
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock)  # OpenRouter's own host, never xAI's
+        assert "OpenRouter credits remaining" in OpenRouterAccountBalanceTool(cache_ttl=0).run()

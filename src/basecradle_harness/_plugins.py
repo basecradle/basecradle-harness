@@ -315,10 +315,10 @@ class ToolPlugin:
     tool, and `--resolved-config` reports it under ``skipped`` with the reason. A `needs_env` var
     does **none** of that: the tool activates, the model sees it, and a call returns a soft,
     readable "not configured" reason it can act on. That is the right shape for a tool whose
-    credential is *dedicated* rather than provider-wide (``openrouter_account_balance``, issue
-    #425 — gating it on its key would make the capability silently not-there rather than
-    reportably unconfigured), and it is exactly why nothing machine-readable knew such a key
-    existed: `_resolve._plugin_credentials` walks `requires`, and an ungated read contributes
+    credential is *dedicated* rather than provider-wide (``xai_account_balance``'s Management Key —
+    gating it on its key would make the capability silently not-there rather than reportably
+    unconfigured, the stance issue #425 set), and it is exactly why nothing machine-readable knew
+    such a key existed: `_resolve._plugin_credentials` walks `requires`, and an ungated read contributes
     nothing to walk. This field is what it walks instead.
 
     It is also right for a provider-wide credential a vendor-gated tool reads (the brain's own
@@ -328,7 +328,9 @@ class ToolPlugin:
     Declare a var here iff the tool **cannot work** without it. A var the tool merely *prefers*
     — ``XAI_TEAM_ID``, whose absence costs one discovery call and nothing else — is deliberately
     **not** declared: it would read as a provisioning gap on every healthy box, and a report that
-    reddens on a correct configuration is one nobody reads twice.
+    reddens on a correct configuration is one nobody reads twice. The same rule leaves a tool that
+    any one of several vars serves with nothing to declare: ``openrouter_account_balance`` reads
+    with the first OpenRouter key it finds of four (issue #853), so no single one is required.
 
     The declaration is about the **plugin** path (the loader instantiates a tool with no
     arguments), so it is accurate there; a library caller wiring the same tool by hand with an

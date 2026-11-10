@@ -442,6 +442,7 @@ def _model_facing_strings():
     from basecradle_harness._install import prompt_text
     from basecradle_harness._mcp import McpServerConfig, _about, _withholding, withheld_refusal
     from basecradle_harness._messages import ServerToolRecord, ServerToolUse
+    from basecradle_harness._openrouter_account import OpenRouterAccountBalanceTool
     from basecradle_harness._policy import SHELL
     from basecradle_harness._refuseless_account import RefuselessAccountBalanceTool
     from basecradle_harness._server_tools import render
@@ -515,6 +516,9 @@ def _model_facing_strings():
         # Issue #848: what the model reads about the refuseless balance tool.
         "refuseless_account_balance description": RefuselessAccountBalanceTool.description,
         "refuseless_account_balance note": _shipped_note("refuseless_account_balance.py"),
+        # Issue #853: what the model reads about the OpenRouter balance tool, rewritten there.
+        "openrouter_account_balance description": OpenRouterAccountBalanceTool.description,
+        "openrouter_account_balance note": _shipped_note("openrouter_account_balance.py"),
     }
 
 

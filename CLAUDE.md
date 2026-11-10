@@ -459,9 +459,11 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   `grok_edit_image`, `grok_generate_video`, `xai_account_balance` (issue #179 — xAI Management
   API credit read, `Vendor("xai")`-gated because it reads an *xAI* account),
   `openrouter_account_balance` (issue #425 — the OpenRouter mirror, and the one account tool with
-  **no** vendor gate: its Management key is dedicated and provider-independent, so gating it on
-  `Vendor("openrouter")` would self-exclude the very case it was built for — an agent brained by
-  another provider that holds a separate OpenRouter account), `refuseless_account_balance` (issue
+  **no** vendor gate: since issue #853 it reads with an OpenRouter key the agent already holds —
+  the optional `OPENROUTER_MANAGEMENT_KEY`, else the brain's `AI_API_KEY` only under
+  `AI_PROVIDER=openrouter`, else the reranker's or the describer's — so gating it on
+  `Vendor("openrouter")` would self-exclude the very case it serves, an agent brained by another
+  provider whose OpenRouter key serves a helper), `refuseless_account_balance` (issue
   #848 — the refuseless credits read, `Vendor("refuseless")`-gated because it reads the brain's own
   `AI_API_KEY`, which is a refuseless key only when the brain is refuseless; ungated, it would send
   another vendor's key to refuseless's host), `system_prompt` (the read+edit
