@@ -580,9 +580,9 @@ def _warn_unmatched_opt_in(named: Sequence[str], shipped_all: dict[str, str]) ->
     defaults = sorted(named_stems & (_tool_stems(shipped_all) - known))
     if defaults:
         _log.warning(
-            "--opt-in/--revoke-opt-in named a default tool, which every agent gets without a grant, "
-            "so it did nothing for: %s. Drop it from the grant list; delete its file from tools/ to "
-            "disable it.",
+            "--opt-in/--revoke-opt-in named a default tool, which needs no grant (it is laid down "
+            "wherever its provider affinity allows), so it did nothing for: %s. Drop it from the "
+            "grant list; delete its file from tools/ to disable it.",
             ", ".join(defaults),
         )
     unknown = sorted(named_stems - set(defaults))

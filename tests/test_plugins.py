@@ -544,19 +544,27 @@ def test_the_refuseless_balance_tool_is_a_default_under_refuseless_only(tmp_path
 # (provider, env) → whether an OpenRouter key is held, in the four ways the tool reads one and the
 # near misses that must not count: another vendor's AI_API_KEY, and a describer key whose describer
 # is not on OpenRouter.
+_RR = "HARNESS_MEMPALACE_RERANK_API_KEY"
 _HELD_CASES = [
     ("openrouter", {"AI_API_KEY": "sk-or-brain"}, "AI_API_KEY"),
     ("xai", {"AI_API_KEY": "xai-key"}, None),
-    ("xai", {"AI_API_KEY": "xai-key", "HARNESS_MEMPALACE_RERANK_API_KEY": "sk-or-rr"}, "rerank"),
-    ("refuseless", {"AI_API_KEY": "sk-rl", "HARNESS_MEMPALACE_RERANK_API_KEY": "sk-or"}, "rerank"),
+    ("xai", {"AI_API_KEY": "xai-key", _RR: "sk-or-rr"}, _RR),
+    ("refuseless", {"AI_API_KEY": "sk-rl", _RR: "sk-or"}, _RR),
     (
         "openai",
         {"HARNESS_DESCRIBER_API_KEY": "sk-or-d", "HARNESS_DESCRIBER_PROVIDER": "openrouter"},
-        "describer",
+        "HARNESS_DESCRIBER_API_KEY",
     ),
     ("openai", {"HARNESS_DESCRIBER_API_KEY": "sk-x", "HARNESS_DESCRIBER_PROVIDER": "xai"}, None),
     ("openai", {"HARNESS_DESCRIBER_API_KEY": "sk-x"}, None),  # rides the brain's stack: openai
-    ("google", {"OPENROUTER_MANAGEMENT_KEY": "sk-or-mgmt"}, "management"),
+    ("google", {"OPENROUTER_MANAGEMENT_KEY": "sk-or-mgmt"}, "OPENROUTER_MANAGEMENT_KEY"),
+    # Precedence: the brain's key outranks a helper's, the Management key outranks both.
+    ("openrouter", {"AI_API_KEY": "sk-or-brain", _RR: "sk-or-rr"}, "AI_API_KEY"),
+    (
+        "openrouter",
+        {"AI_API_KEY": "sk-or-brain", "OPENROUTER_MANAGEMENT_KEY": "sk-or-mgmt"},
+        "OPENROUTER_MANAGEMENT_KEY",
+    ),
     ("openrouter", {"AI_API_KEY": "   "}, None),  # a blank value is no key
     ("anthropic", {}, None),
 ]
@@ -586,7 +594,10 @@ def test_the_openrouter_balance_tool_is_offered_exactly_where_it_can_read_a_key(
     offered = "openrouter_account_balance" in {t.name for t in resolved.tools}
 
     assert offered is (held is not None)
-    assert offered is (OpenRouterAccountBalanceTool()._credential() is not None)
+    credential = OpenRouterAccountBalanceTool()._credential()
+    assert offered is (credential is not None)
+    if credential is not None:
+        assert credential.source == held  # the key the tool reads with, in the documented order
     if not offered:
         reasons = dict(resolved.skipped)
         assert (
