@@ -656,12 +656,14 @@ GENERIC_DEFAULT_SURFACE = "chat"
 
 #: A known vendor that narrows the ``openai`` SDK's surfaces to the ones its endpoint documents, as
 #: ``(surfaces, default)`` — read by `_surface_for`, so the wake, ``--resolved-config``, the
-#: describer's own stack and the off-box resolver refuse the same cell in the same words. refuseless
-#: documents Chat Completions and no Responses endpoint (issue #844), so it defaults to ``chat`` and
-#: a ``responses`` setting is a startup error rather than a 404 on every wake. (OpenRouter's
-#: chat-only cell predates this and is still refused at the build, `_provider_from_config`.)
+#: describer's own stack and the off-box resolver refuse the same cell in the same words, and a
+#: surface outside the vendor's set is a startup error rather than a 404 on every wake. refuseless
+#: serves both surfaces (its unknown-endpoint error lists ``POST /v1/responses``, and a real call
+#: answered in the Responses shape, issue #847), so its entry narrows nothing and only sets its
+#: default: ``chat``, the surface the vendor leads with. (OpenRouter's chat-only cell predates this
+#: table and is still refused at the build, `_provider_from_config`.)
 _VENDOR_SURFACES: dict[str, tuple[tuple[str, ...], str]] = {
-    "refuseless": (("chat",), "chat"),
+    "refuseless": (("chat", "responses"), "chat"),
 }
 
 
@@ -844,7 +846,8 @@ def _surface_for(sdk: str, raw: str | None, provider: str = DEFAULT_PROVIDER) ->
 
     `provider` changes two things over the ``openai`` SDK: the **default** for a generic vendor is
     `GENERIC_DEFAULT_SURFACE` (issue #670), and a known vendor in `_VENDOR_SURFACES` narrows the
-    SDK's set to the surfaces its endpoint documents, with its own default (refuseless, issue #844).
+    SDK's set to the surfaces its endpoint serves, with its own default (refuseless's entry sets only
+    the default, ``chat``: it serves both surfaces, issues #844 and #847).
     OpenRouter's older chat-only refusal stays in `_provider_from_config`, where it was written.
     """
     raw = (raw or "").strip().lower()
@@ -1624,12 +1627,13 @@ def _provider_from_config(
             **params,
         )
     if provider == "refuseless":
-        # refuseless over the openai SDK (issue #844): its chat wire, at its own host unless
-        # AI_BASE_URL says otherwise, with nothing vendor-specific added — no routing key (a decided
-        # `None` in `_openai._AFFINITY`), no header, no pin (`routing` is an OpenRouter concept and
-        # is dropped, as on openai and xai). It runs no server-side built-in, so one active here is
-        # refused by name rather than silently dropped by the chat surface. The adapter prices its
-        # calls from the vendor's own live models list (`OpenAIProvider._listed_cost`).
+        # refuseless over the openai SDK (issue #844): its chat wire by default, or its Responses
+        # wire (issue #847), at its own host unless AI_BASE_URL says otherwise, with nothing
+        # vendor-specific added — no routing key (a decided `None` in `_openai._AFFINITY` on both
+        # surfaces), no header, no pin (`routing` is an OpenRouter concept and is dropped, as on
+        # openai and xai). It runs no server-side built-in on either surface, so one active here is
+        # refused by name rather than silently dropped. The adapter prices its calls from the
+        # vendor's own live models list (`OpenAIProvider._listed_cost`), on both surfaces.
         _require_no_server_builtins(provider, builtins)
         return OpenAIProvider(
             model,

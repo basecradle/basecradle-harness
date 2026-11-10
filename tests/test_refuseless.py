@@ -26,6 +26,7 @@ import respx
 from basecradle_harness import Message
 from basecradle_harness._basecradle import (
     _PROVIDER_BASE_URLS,
+    _VENDOR_SURFACES,
     _config_from_env,
     _provider_from_config,
     _require_no_server_builtins,
@@ -47,7 +48,7 @@ from basecradle_harness._refuseless_pricing import usage_of as listed_usage
 from basecradle_harness._resolve import resolve_stems
 from basecradle_harness._wake import _cost_report
 
-from .conftest import completion
+from .conftest import completion, out_message
 
 VENDOR = "refuseless"
 HOST = "https://api.refuseless.com/v1"
@@ -67,6 +68,13 @@ DISCOUNTED = {
     "regular": {"input_per_m": 0.14, "cached_input_per_m": 0.035, "output_per_m": 0.5},
 }
 USAGE = {"prompt_tokens": 1000, "completion_tokens": 200, "total_tokens": 1200}
+#: The Responses usage block exactly as the capital read it off a real call (issue #847).
+RESPONSES_USAGE = {
+    "input_tokens": 39,
+    "output_tokens": 10,
+    "total_tokens": 49,
+    "input_tokens_details": {"cached_tokens": 0},
+}
 
 
 def _row(model: str, pricing: dict | None, *, context: int = 1048576) -> dict:
@@ -95,6 +103,18 @@ def _reply(model: str = MODEL, usage: dict | None = None) -> dict:
     body["model"] = model
     body["usage"] = USAGE if usage is None else usage
     return body
+
+
+def _responses_reply(model: str = MODEL, usage: dict | None = None) -> dict:
+    """A Responses body in the vendor's shape (issue #847): only the fields it was read to carry."""
+    return {
+        "object": "response",
+        "id": "resp-0f5c1e9a7d3b4c2e8a61",
+        "model": model,
+        "status": "completed",
+        "output": [out_message("ok")],
+        "usage": RESPONSES_USAGE if usage is None else usage,
+    }
 
 
 @pytest.fixture
@@ -191,29 +211,47 @@ def test_ai_base_url_still_overrides_the_default_host(refuseless_env):
     provider.close()
 
 
-def test_the_affinity_cell_is_a_decided_no():
-    assert (VENDOR, "chat") in _AFFINITY
-    assert _AFFINITY[(VENDOR, "chat")] is None
-    assert (VENDOR, "responses") not in _AFFINITY
+@pytest.mark.parametrize("surface", ["chat", "responses"])
+def test_both_affinity_cells_are_a_decided_no(surface):
+    assert (VENDOR, surface) in _AFFINITY
+    assert _AFFINITY[(VENDOR, surface)] is None
 
 
-def test_responses_is_refused_at_startup_because_the_vendor_documents_none(refuseless_env):
+def test_responses_is_accepted_because_the_vendor_serves_it(refuseless_env):
+    """Issue #847: the vendor's own unknown-endpoint error lists ``POST /v1/responses``."""
     refuseless_env.setenv("AI_SDK_SURFACE", "responses")
-    with pytest.raises(ValueError, match=r"'refuseless' documents only the \('chat',\) surface"):
-        _config_from_env()
+    assert _config_from_env() == (VENDOR, "openai", "responses")
+    provider = _provider_from_config(*_config_from_env())
+    assert provider.surface == "responses"
+    assert provider.base_url == HOST
+    assert provider._affinity is None
+    provider.close()
 
 
-def test_every_reader_of_a_surface_refuses_the_same_cell():
+def test_every_reader_of_a_surface_reads_the_same_cell():
     """The describer's own stack and the off-box resolver share `_surface_for`'s rule."""
     assert _surface_for("openai", None, VENDOR) == "chat"
     assert _surface_for("openai", "chat", VENDOR) == "chat"
-    with pytest.raises(ValueError, match="documents only"):
+    assert _surface_for("openai", "responses", VENDOR) == "responses"
+    assert resolve_stems(provider=VENDOR)["ai_sdk_surface"] == "chat"
+    resolved = resolve_stems(provider=VENDOR, surface="responses")
+    assert resolved["ai_sdk_surface"] == "responses"
+    assert resolved["builtins"] == []
+
+
+def test_a_vendor_that_narrows_its_surfaces_is_still_refused_in_one_place(monkeypatch):
+    """refuseless no longer narrows, so the refusal is kept honest with a vendor that does."""
+    monkeypatch.setitem(_VENDOR_SURFACES, VENDOR, (("chat",), "chat"))
+    assert _surface_for("openai", None, VENDOR) == "chat"
+    with pytest.raises(ValueError, match=r"'refuseless' documents only the \('chat',\) surface"):
         _surface_for("openai", "responses", VENDOR)
     with pytest.raises(ValueError, match="documents only"):
         resolve_stems(provider=VENDOR, surface="responses")
-    resolved = resolve_stems(provider=VENDOR)
-    assert resolved["ai_sdk_surface"] == "chat"
-    assert resolved["builtins"] == []
+
+
+def test_a_server_side_built_in_is_refused_on_responses_too(refuseless_env):
+    with pytest.raises(ValueError, match="'refuseless' runs no server-side built-in"):
+        _provider_from_config(VENDOR, "openai", "responses", builtins=["web_search"])
 
 
 @pytest.mark.parametrize("sdk", ["xai-sdk", "openrouter", "google-genai", "anthropic"])
@@ -482,7 +520,7 @@ def _vendor():
 
         def do_POST(self):
             self._record(json.loads(self.rfile.read(int(self.headers.get("content-length") or 0))))
-            self._answer(_reply())
+            self._answer(_responses_reply() if self.path.endswith("/responses") else _reply())
 
         def log_message(self, *args):
             pass
@@ -526,6 +564,48 @@ def test_a_wake_sends_the_call_and_one_list_read_with_the_agents_key_and_nothing
     assert all("cost=0.00022" in line and "cost_basis=computed" in line for line in llm)
 
 
+def test_a_responses_wake_sends_the_responses_call_and_nothing_vendor_specific(
+    refuseless_env, caplog
+):
+    """Issue #847, read off a real loopback server: the cell sends what the vendor documents."""
+    caplog.set_level(logging.INFO, logger="basecradle_harness")
+    with _vendor() as (root, seen):
+        refuseless_env.setenv("AI_BASE_URL", root)
+        refuseless_env.setenv("AI_SDK_SURFACE", "responses")
+        provider = _provider_from_config(*_config_from_env(), default_output_tokens=32768)
+        provider.bind_conversation("timeline:019f6e71-2a12-7b69-a204-0fec1497b9c2")
+        assert provider.chat([Message.user("hi")]).content == "ok"
+        assert provider.chat([Message.user("again")]).content == "ok"
+        provider.close()
+    reads = [r for r in seen if r["method"] == "GET"]
+    calls = [r for r in seen if r["method"] == "POST"]
+    assert [r["path"] for r in reads] == ["/v1/models"]
+    assert [r["path"] for r in calls] == ["/v1/responses"] * 2
+    for request in seen:
+        assert request["headers"]["authorization"] == f"Bearer {FAKE_KEY}"
+        assert "x-grok-conv-id" not in request["headers"]
+        assert "x-openrouter-metadata" not in request["headers"]
+    for call in calls:
+        body = call["body"]
+        assert body["model"] == MODEL
+        assert body["max_output_tokens"] == 32768
+        assert body["input"]
+        # The endpoint is stateless and runs no server tool: no routing key, no stored state.
+        for field in (
+            CACHE_KEY_FIELD,
+            "previous_response_id",
+            "store",
+            "search_parameters",
+            "provider",
+            "tools",
+            "max_tokens",
+        ):
+            assert field not in body
+    llm = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
+    assert len(llm) == 2
+    assert all("cost=0.00000968" in line and "cost_basis=computed" in line for line in llm)
+
+
 # --- one list per credential per wake, however many adapters read it -----------------------------
 
 
@@ -548,6 +628,94 @@ def test_a_usage_block_missing_either_count_prices_nothing_rather_than_low(usage
 def test_a_usage_block_with_both_counts_reads_its_cache_details():
     usage = {**USAGE, "prompt_tokens_details": {"cached_tokens": 400}}
     assert listed_usage(usage) == Usage(input=1000, cached=400, output=200)
+
+
+def test_a_responses_usage_block_reads_in_its_own_spelling():
+    """Issue #847: the Responses surface states ``input_tokens`` and a cached split."""
+    assert listed_usage(RESPONSES_USAGE) == Usage(input=39, cached=0, output=10)
+    cached = {**RESPONSES_USAGE, "input_tokens_details": {"cached_tokens": 24}}
+    assert listed_usage(cached) == Usage(input=39, cached=24, output=10)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"input_tokens": 39},
+        {"output_tokens": 10},
+        {"input_tokens": 39, "output_tokens": None},
+        {"input_tokens": False, "output_tokens": 10},
+        # One count from each spelling is not one call's usage.
+        {"prompt_tokens": 39, "output_tokens": 10},
+        {"input_tokens": 39, "completion_tokens": 10},
+    ],
+)
+def test_a_responses_block_missing_either_count_prices_nothing(usage):
+    assert listed_usage(usage) is None
+
+
+def test_a_spelling_reads_only_its_own_details():
+    """A cached count in the other spelling's details is not this spelling's."""
+    usage = {**RESPONSES_USAGE, "prompt_tokens_details": {"cached_tokens": 24}}
+    usage["input_tokens_details"] = {}
+    assert listed_usage(usage) == Usage(input=39, cached=0, output=10)
+
+
+def _priced_responses(usage: dict, pricing: dict = PLAIN) -> tuple[list[str], list[str]]:
+    """One Responses call on a refuseless adapter: its ``llm`` lines and its ``cost unpriced`` lines."""
+    with respx.mock(assert_all_mocked=True) as router:
+        router.get(f"{HOST}/models").mock(
+            return_value=httpx.Response(200, json=_models(_row(MODEL, pricing)))
+        )
+        call = router.post(f"{HOST}/responses").mock(
+            return_value=httpx.Response(200, json=_responses_reply(usage=usage))
+        )
+        handler = _Lines()
+        logger = logging.getLogger("basecradle_harness")
+        level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        try:
+            adapter = OpenAIProvider(
+                MODEL, api_key=FAKE_KEY, base_url=HOST, provider=VENDOR, surface="responses"
+            )
+            assert adapter.chat([Message.user("hi")]).content == "ok"
+            adapter.close()
+        finally:
+            logger.setLevel(level)
+            logger.removeHandler(handler)
+        assert call.call_count == 1
+    llm = [line for line in handler.lines if line.startswith("llm ")]
+    gaps = [line for line in handler.lines if line.startswith("cost unpriced")]
+    return llm, gaps
+
+
+def test_a_responses_call_with_nothing_cached_is_priced_at_the_input_rate():
+    (line,), gaps = _priced_responses(RESPONSES_USAGE)
+    # 39 × $0.12/M + 10 × $0.50/M
+    assert re.search(r" cost=([0-9.]+)", line).group(1) == "0.00000968"
+    assert "cost_basis=computed" in line
+    assert "tokens_in=39 tokens_out=10" in line
+    assert not gaps
+
+
+def test_a_responses_call_prices_its_cached_tokens_at_the_cached_rate():
+    usage = {**RESPONSES_USAGE, "input_tokens_details": {"cached_tokens": 24}}
+    (line,), gaps = _priced_responses(usage)
+    # (39 − 24) × $0.12/M + 24 × $0.025/M + 10 × $0.50/M
+    expected = (15 * 0.12 + 24 * 0.025 + 10 * 0.5) / 1e6
+    assert float(re.search(r" cost=([0-9.]+)", line).group(1)) == pytest.approx(expected, rel=1e-6)
+    assert "cached_tokens=24" in line
+    assert not gaps
+
+
+def test_a_cached_responses_call_on_a_row_with_no_cached_rate_is_not_reported():
+    usage = {**RESPONSES_USAGE, "input_tokens_details": {"cached_tokens": 24}}
+    pricing = {key: value for key, value in PLAIN.items() if key != "cached_input_per_m"}
+    (line,), gaps = _priced_responses(usage, pricing)
+    assert " cost=" not in line
+    assert gaps == [
+        f"cost unpriced provider=refuseless model={MODEL} charge=tokens reason=not_reported"
+    ]
 
 
 def test_a_missing_count_on_the_wire_is_a_not_reported_gap(gaps):

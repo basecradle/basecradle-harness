@@ -205,10 +205,11 @@ _AFFINITY: dict[tuple[str, str], _Affinity | None] = {
     # cell at all: that combination is chat-only and `_basecradle._provider_from_config` refuses it.)
     # See `_caching` for why xAI is the opposite situation rather than a precedent against this.
     ("openrouter", "chat"): None,
-    # A decided **no** (issue #844). refuseless documents no routing key on its Chat Completions
-    # surface, and a field it never asked for is at best ignored and at worst a 400 on every wake.
-    # Its only surface: Responses is refused for it (`_basecradle._VENDOR_SURFACES`).
+    # A decided **no** on both surfaces (issues #844, #847). refuseless documents no routing key on
+    # either (no `prompt_cache_key`, no conversation header; its Responses endpoint is documented as
+    # stateless), and a field it never asked for is at best ignored and at worst a 400 every wake.
     ("refuseless", "chat"): None,
+    ("refuseless", "responses"): None,
 }
 
 
@@ -426,10 +427,10 @@ class OpenAIProvider:
         #: never its own.
         self._computes_cost = provider == "openai"
         #: Whether this vendor states its models' price and context window on its **models list**
-        #: rather than anywhere a call or a single-model read would carry them (issue #844):
-        #: refuseless publishes a ``pricing`` object and a ``context_length`` per row of
-        #: ``GET /v1/models`` and documents no single-model read. An equality on the known vendor,
-        #: so no other endpoint is ever sent a list read it did not need.
+        #: rather than anywhere a call would carry them (issue #844): refuseless publishes a
+        #: ``pricing`` object and a ``context_length`` per row of ``GET /v1/models``, so one list
+        #: read answers both for the whole wake. An equality on the known vendor, so no other
+        #: endpoint is ever sent a list read it did not need.
         self._reads_catalog = provider == "refuseless"
         #: That list, read at most once and held whatever it answered — this adapter's own, or the
         #: one a caller shares across the adapters it builds on this key in this wake (`ModelCatalog`).
@@ -824,9 +825,9 @@ class OpenAIProvider:
           That is the deliberate cost of refusing a static model→limit table (issue #276,
           requirement 2): a table would answer today and lie after the next model launch, silently.
           An OpenAI agent that wants its real 400 K window sets `HARNESS_MAX_CONTEXT_TOKENS`.
-        - Pointed at **refuseless**, the models *list* states ``context_length`` per row and no
-          single-model read is documented, so the row comes from the list `_catalog` reads once for
-          this wake's pricing too (issue #844): one request answers both.
+        - Pointed at **refuseless**, the models *list* states ``context_length`` per row, so the row
+          comes from the list `_catalog` reads once for this wake's pricing too (issue #844): one
+          request answers both, where a single-model read would be a second.
 
         Never fatal: any failure degrades to ``None``, and the wake runs exactly as before.
         """

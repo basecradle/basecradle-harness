@@ -7,6 +7,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.184.0] - 2026-11-10
+
+### Changed: refuseless serves the Responses surface too, and a Responses call is priced with its cached split (issue #847)
+
+0.183.0 refused `AI_SDK_SURFACE=responses` for `AI_PROVIDER=refuseless`, on the word that the vendor documented no Responses endpoint. The vendor's own API says otherwise: its unknown-endpoint error lists `POST /v1/responses`, and a real call answered in the Responses shape. `responses` is now accepted for refuseless at startup, in `--resolved-config` and in `basecradle-harness-resolve`. `chat` stays the default.
+
+- **Nothing vendor-specific on either surface.** The Responses cell sends no cache-affinity key (a decided *no*, as on chat: the vendor documents none and calls the endpoint stateless), no stored state, and no server-side built-in, which is still refused by name. The output cap goes out as `max_output_tokens`.
+- **A Responses call is priced from the live list, cached tokens included.** The Responses usage block states `input_tokens`, `output_tokens` and `input_tokens_details.cached_tokens` (a part of `input_tokens`), so the call is priced `(input − cached) × input_per_m + cached × cached_input_per_m + output × output_per_m`. Both counts are still required, in one spelling, never a zero default. A call that cached something on a row with no `cached_input_per_m` is a `not_reported` gap. Chat states no cached count, so nothing changes there.
+- The README's affinity matrix now lists refuseless, which it omitted since 0.183.0.
+
 ## [0.183.1] - 2026-11-09
 
 ### Fixed: an SDK that cannot reach a known vendor is refused at startup, not at the first build (issue #846)

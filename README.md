@@ -1237,7 +1237,7 @@ It was not free before that. Measured live on 2026-08-29, a Grok agent re-sendin
 
 #### Every cell of the matrix has a decided answer
 
-The `openai` SDK adapter is aimed at **three** vendors on **two** surfaces, and they do not have the same answer — so each was read off its own vendor's guidance rather than inherited from its neighbour:
+The `openai` SDK adapter is aimed at **four** known vendors on **two** surfaces, and they do not have the same answer — so each was read off its own vendor's guidance rather than inherited from its neighbour:
 
 | `AI_PROVIDER` | Surface | What goes on the wire |
 |---|---|---|
@@ -1245,12 +1245,13 @@ The `openai` SDK adapter is aimed at **three** vendors on **two** surfaces, and 
 | `xai` | `responses` | `prompt_cache_key` in the body |
 | `xai` | `chat` | the `x-grok-conv-id` header |
 | `openrouter` | `chat` | **nothing** — a decided *no*, see [above](#behind-a-router-automatic-means-nothing-to-send--not-a-hit) |
+| `refuseless` | `chat`, `responses` | **nothing** — a decided *no*: the vendor documents no routing key on either surface |
 
 (The native `google-genai` adapter sends nothing either: Gemini's implicit cache needs nothing on the request, and `cached_tokens=` on its line is the witness, as everywhere. Nor does `anthropic`: its cache is reached by the [explicit breakpoint](#prompt-caching--automatic-or-explicit), not by a routing key.)
 
 **OpenAI is sent a key on its own documented advice, not by symmetry with xAI.** OpenAI describes `prompt_cache_key` as helping "requests with the same prefix reach the same cache" and recommends exactly the value the harness already has — "a stable user, workspace, session, or thread ID that matches how your application reuses context" — with the one caution being **cardinality** ("do not generate a new key for every request"), which one stable key per session satisfies by construction. What makes it safe where the OpenRouter pin was not is a property, not a brand: OpenAI's key "[does] not pin requests to a machine", and its machines are its own, so there is no non-caching endpoint for it to stick to. **No live measurement was made** — the fleet runs no OpenAI-brained agent — and that is stated rather than assumed away: whenever one exists, `cached_tokens=` on its log line is the authority, exactly as everywhere else here.
 
-**A "send nothing" is recorded as a decision, not as an absent row.** In a plain lookup table a deliberate *no* and a cell nobody considered look identical, so every buildable cell is present — OpenRouter's with an explicit null — and a test enumerates the cells from the config layer's own wired-provider list and fails the build when one has no answer. Wiring a fourth vendor forces the question instead of inheriting one. A vendor reached under [the generic profile](#any-other-openai-compatible-vendor--the-generic-profile) is never a row: it has no conventions, so it sends nothing on either surface, by construction.
+**A "send nothing" is recorded as a decision, not as an absent row.** In a plain lookup table a deliberate *no* and a cell nobody considered look identical, so every buildable cell is present — OpenRouter's and refuseless's with an explicit null — and a test enumerates the cells from the config layer's own wired-provider list and fails the build when one has no answer. Wiring another vendor forces the question instead of inheriting one. A vendor reached under [the generic profile](#any-other-openai-compatible-vendor--the-generic-profile) is never a row: it has no conventions, so it sends nothing on either surface, by construction.
 
 Everything above is verified the way the gRPC key is: the tests read the **recorded HTTP request** — its real body, its real headers — never a mock's arguments.
 
@@ -2060,13 +2061,14 @@ pip install 'basecradle-harness[openai]'
 AI_PROVIDER=refuseless
 AI_MODEL=glm-5.3-flash-abliterated
 AI_API_KEY=…                    # the agent's refuseless key
-# AI_SDK defaults to openai, the only SDK that reaches it; AI_SDK_SURFACE defaults to chat.
+# AI_SDK defaults to openai, the only SDK that reaches it; AI_SDK_SURFACE defaults to chat
+# (responses is accepted too).
 # AI_BASE_URL is optional: unset, calls go to https://api.refuseless.com/v1.
 ```
 
-- **Chat Completions only.** The vendor documents no Responses endpoint, so `AI_SDK_SURFACE=responses` stops the wake at startup (and `--resolved-config` and `basecradle-harness-resolve` refuse it the same way), and a native SDK is refused for it. The output cap goes out as `max_tokens`.
-- **Nothing vendor-specific on the wire.** No cache-affinity key (a decided *no* in the [affinity matrix](#every-cell-of-the-matrix-has-a-decided-answer): the vendor documents none), no routing header, no pin. The vendor prices cached input itself and documents nothing a client could mark, so the cache mode is `automatic`. It runs no server-side built-in, so an operator's ungated built-in plugin is refused by name rather than silently dropped. It gets no vendor-coupled tool, because no shipped plugin is gated on it.
-- **Cost is computed from the vendor's live price list, never a table.** A completion states tokens and no dollars, but every row of `GET /v1/models` carries a `pricing` object (`currency`, `input_per_m`, `cached_input_per_m`, `output_per_m`, all US dollars per million tokens, discounts applied; `discounted` and `regular` describe the list price and are not read). The adapter reads that list **once per wake per key** (a describer on refuseless shares one read across its output budgets), from the host its calls go to and with that key, and prices each call from the row of the model the response names: `prompt_tokens × input_per_m + completion_tokens × output_per_m`, over a million. Cached tokens would be priced at `cached_input_per_m`, but the usage block states no cached count today and none is invented. The same read supplies the [context budget](#the-context-budget--the-transcript-compacts-itself)'s ceiling from the row's `context_length`.
+- **Chat Completions by default, Responses on request.** The vendor serves both of the `openai` SDK's surfaces ([#847](https://github.com/basecradle/basecradle-harness/issues/847)). `chat` is the default, the surface the vendor leads with; `AI_SDK_SURFACE=responses` reaches its stateless Responses endpoint, where the harness sends the whole conversation on every call as it always does. A native SDK is refused for it. The output cap goes out as `max_tokens` on chat and `max_output_tokens` on Responses.
+- **Nothing vendor-specific on the wire.** No cache-affinity key on either surface (a decided *no* in the [affinity matrix](#every-cell-of-the-matrix-has-a-decided-answer): the vendor documents none), no routing header, no pin. The vendor prices cached input itself and documents nothing a client could mark, so the cache mode is `automatic`. It runs no server-side built-in, so an operator's ungated built-in plugin is refused by name rather than silently dropped. It gets no vendor-coupled tool, because no shipped plugin is gated on it.
+- **Cost is computed from the vendor's live price list, never a table.** A completion states tokens and no dollars, but every row of `GET /v1/models` carries a `pricing` object (`currency`, `input_per_m`, `cached_input_per_m`, `output_per_m`, all US dollars per million tokens, discounts applied; `discounted` and `regular` describe the list price and are not read). The adapter reads that list **once per wake per key** (a describer on refuseless shares one read across its output budgets), from the host its calls go to and with that key, and prices each call from the row of the model the response names: `prompt_tokens × input_per_m + completion_tokens × output_per_m`, over a million. Only the Responses surface states a cached count (`input_tokens_details.cached_tokens`, part of `input_tokens`), so a Responses call is priced `(input_tokens − cached) × input_per_m + cached × cached_input_per_m + output_tokens × output_per_m`; a chat call states none, and none is invented. The same read supplies the [context budget](#the-context-budget--the-transcript-compacts-itself)'s ceiling from the row's `context_length`.
 
   ```text
   llm provider=refuseless purpose=main model=glm-5.3-flash-abliterated duration=1.84s tokens_in=1000 tokens_out=200 tokens_total=1200 cost=0.00021 cost_basis=computed outcome=ok generation_id=chatcmpl-…
