@@ -689,18 +689,19 @@ def is_generic_provider(provider: str) -> bool:
 
 
 def _require_generic_profile(provider: str, sdk: str, endpoint: str | None) -> None:
-    """Refuse a generic vendor the harness could not reach honestly (issue #670) — else nothing.
+    """Refuse a configuration the harness could not reach honestly — else nothing.
 
-    The one place the generic profile's two preconditions are spelled, read by both the config
-    triple (`_config_from_env`, so a wake refuses at startup and ``--resolved-config`` exits
-    nonzero rather than reading green on a box whose every wake would fail) and the provider build
+    The one place the reachability preconditions are spelled, read by both the config triple
+    (`_config_from_env`, so a wake refuses at startup and ``--resolved-config`` exits nonzero
+    rather than reading green on a box whose every wake would fail) and the provider build
     (`_provider_from_config`, which a describer reaches with an endpoint of its own):
 
-    - **``AI_SDK=openai``** — the only generic-wire SDK. Every native SDK reaches exactly one vendor.
+    - **an SDK that reaches the vendor** (`_require_sdk_pairing`) — for a known vendor and a generic
+      one alike (issues #670, #846).
     - **a host** — a vendor the harness has never heard of has no default, and a guessed one sends
       the agent's key to somebody else.
     """
-    _require_generic_sdk(provider, sdk)
+    _require_sdk_pairing(provider, sdk)
     if is_generic_provider(provider) and not endpoint:
         raise ValueError(
             f"AI_PROVIDER={provider!r} is not a vendor the harness knows, so it has no default "
@@ -709,23 +710,90 @@ def _require_generic_profile(provider: str, sdk: str, endpoint: str | None) -> N
         )
 
 
-def _require_generic_sdk(provider: str, sdk: str) -> None:
-    """The SDK half of `_require_generic_profile` — the half that needs no deployment fact.
+#: Each native SDK and the **one** vendor it reaches, with what it reaches there — the pairing
+#: table every reader of the SDK axis consults (`sdk_pairing_problem`), so the config triple, the
+#: off-box resolver, the describer's own stack and the provider build refuse the same cell in the
+#: same words (issue #846). The ``openai`` SDK is not a row: it reaches every vendor in
+#: `OPENAI_SDK_PROVIDERS` with its conventions and any generic vendor at its ``AI_BASE_URL``.
+_NATIVE_SDK_VENDORS: dict[str, tuple[str, str]] = {
+    "xai-sdk": ("xai", "xAI's native endpoint"),
+    "openrouter": ("openrouter", "OpenRouter's native endpoint"),
+    "google-genai": ("google", "Gemini on Vertex AI"),
+    "anthropic": ("anthropic", "Claude on Anthropic's own API"),
+}
 
-    Split out so the off-box resolver (`_resolve.resolve_stems`), which is handed a hypothetical
-    configuration and never an endpoint, refuses the same pairing a wake refuses.
+
+def sdk_pairing_problem(
+    provider: str, sdk: str, *, provider_var: str = "AI_PROVIDER", sdk_var: str = "AI_SDK"
+) -> str | None:
+    """Why `sdk` cannot reach `provider`, in the named variables' words — or ``None`` when it can.
+
+    The pairing rule, spelled once. `provider_var` / `sdk_var` name the variables the operator set,
+    so the describer's own stack is refused in ``HARNESS_DESCRIBER_*`` terms and never told to
+    change the brain's. Four refusals:
+
+    - a **generic** vendor on any SDK but ``openai`` (issue #670);
+    - an SDK the harness ships no adapter for;
+    - a **native** SDK named with a vendor other than the one it reaches (issue #846);
+    - the ``openai`` SDK named with a known vendor it is not wired to reach (``google``,
+      ``anthropic``).
     """
-    if is_generic_provider(provider) and sdk != "openai":
+    if is_generic_provider(provider):
+        if sdk == "openai":
+            return None
         why = (
             "that SDK reaches only its own vendor"
             if sdk in _SDK_SURFACES
             else "the harness ships no adapter by that name"
         )
-        raise ValueError(
-            f"AI_PROVIDER={provider!r} is not a vendor the harness knows, so it is reached as a "
-            f"generic OpenAI-compatible endpoint, which needs AI_SDK=openai (got {sdk!r}: {why}). "
-            f"Known vendors: {', '.join(KNOWN_PROVIDERS)}."
+        return (
+            f"{provider_var}={provider!r} is not a vendor the harness knows, so it is reached as a "
+            f"generic OpenAI-compatible endpoint, which needs {sdk_var}=openai (got {sdk!r}: "
+            f"{why}). Known vendors: {', '.join(KNOWN_PROVIDERS)}."
         )
+    if sdk not in _SDK_SURFACES:
+        return (
+            f"{sdk_var}={sdk!r} has no adapter — the harness ships 'openai' (the OpenAI-wire SDK: "
+            "OpenAI, xAI over api.x.ai, OpenRouter over openrouter.ai, refuseless over "
+            "api.refuseless.com, and any other OpenAI-compatible vendor at its AI_BASE_URL), "
+            "'xai-sdk' (native xAI), 'openrouter' (native OpenRouter), 'google-genai' (Gemini on "
+            "Vertex AI), and 'anthropic' (Claude, direct). Set one of those."
+        )
+    reached_with = " or ".join(
+        [
+            f"{sdk_var}={name}"
+            for name, (vendor, _) in _NATIVE_SDK_VENDORS.items()
+            if vendor == provider
+        ]
+        + ([f"{sdk_var}=openai"] if provider in OPENAI_SDK_PROVIDERS else [])
+    )
+    if sdk in _NATIVE_SDK_VENDORS:
+        vendor, reaches = _NATIVE_SDK_VENDORS[sdk]
+        if provider == vendor:
+            return None
+        return (
+            f"{sdk_var}={sdk} reaches {reaches}, so it requires {provider_var}={vendor} (got "
+            f"{provider!r}). {provider_var}={provider!r} is reached with {reached_with}."
+        )
+    if provider in OPENAI_SDK_PROVIDERS:
+        return None
+    return (
+        f"{provider_var}={provider!r} is not reached through the openai SDK, which knows "
+        f"{', '.join(repr(name) for name in OPENAI_SDK_PROVIDERS)} and reaches any vendor it does "
+        f"not know at its AI_BASE_URL. {provider_var}={provider!r} is reached with {reached_with}."
+    )
+
+
+def _require_sdk_pairing(provider: str, sdk: str) -> None:
+    """Raise `sdk_pairing_problem` as a `ValueError` — the half of the reachability check that
+    needs no deployment fact.
+
+    Split out so the off-box resolver (`_resolve.resolve_stems`), which is handed a hypothetical
+    configuration and never an endpoint, refuses the same pairing a wake refuses.
+    """
+    problem = sdk_pairing_problem(provider, sdk)
+    if problem is not None:
+        raise ValueError(problem)
 
 
 #: ``surface`` is an **SDK-scoped** concept: each SDK adapter declares its own allowed
@@ -817,11 +885,12 @@ def _config_from_env() -> tuple[str, str, str]:
     Read in one place so the provider build and the plugin activation context agree on every
     axis. ``AI_PROVIDER`` is validated here as a **slug** (`normalize_provider`) — it names the
     vendor that bills the account, so any well-formed token is legal and only a malformed one is
-    refused (issue #670); whether that vendor can be *reached* with the configured SDK and host is
-    the provider build's question. ``AI_SDK_SURFACE`` is resolved **SDK-scoped**
-    (`_resolve_surface`) — an unrecognized value is a clear error, never a silent fall-through. The
-    SDK name is not constrained here — whether an adapter exists for it is decided when the provider
-    is built (`_provider_from_config`), so the error names the missing adapter.
+    refused (issue #670). Whether that vendor can be *reached* with the configured SDK and host is
+    checked here too (`_require_generic_profile`), by the same rule the provider build reads, so a
+    pairing every wake refuses — a native SDK named with another vendor, an SDK with no adapter —
+    fails at startup and in ``--resolved-config`` rather than reading green (issue #846).
+    ``AI_SDK_SURFACE`` is resolved **SDK-scoped** (`_resolve_surface`) — an unrecognized value is a
+    clear error, never a silent fall-through.
     """
     provider = normalize_provider(os.environ.get("AI_PROVIDER"))
     sdk = (os.environ.get("AI_SDK") or DEFAULT_SDK).strip().lower()
@@ -1389,17 +1458,12 @@ def _provider_from_config(
     # actionable error, not be masked by a malformed model_params file the wake would never even
     # use. So the read sits at the point of use in each branch, past its guard.
 
-    # A generic vendor's preconditions are checked before any SDK branch, so a native SDK named with
-    # one is refused in the generic profile's words rather than in that SDK's.
+    # The SDK-vendor pairing and a generic vendor's host are checked before any SDK branch, by the
+    # rule the config triple reads (`sdk_pairing_problem`), so every branch below may assume its
+    # SDK reaches `provider` and no branch spells the rule a second time (issue #846).
     _require_generic_profile(provider, sdk, endpoint)
 
     if sdk == "xai-sdk":
-        if provider != "xai":
-            raise ValueError(
-                f"AI_SDK=xai-sdk reaches xAI's native endpoint, so it requires AI_PROVIDER=xai "
-                f"(got {provider!r}). Use AI_SDK=openai for any other vendor (a vendor the harness "
-                "does not know also needs AI_BASE_URL)."
-            )
         params, extra_body = _split_model_params(
             loaded_params(), owned=_OWNED_XAI_SDK, sdk_label="the native xai-sdk"
         )
@@ -1416,12 +1480,6 @@ def _provider_from_config(
         return XaiSdkProvider(model, api_key=api_key, builtin_tools=list(builtins), **params)
 
     if sdk == "google-genai":
-        if provider != "google":
-            raise ValueError(
-                f"AI_SDK=google-genai reaches Gemini on Vertex AI, so it requires "
-                f"AI_PROVIDER=google (got {provider!r}). Use AI_SDK=openai for any other vendor "
-                "(a vendor the harness does not know also needs AI_BASE_URL)."
-            )
         params, extra_body = _split_model_params(
             loaded_params(), owned=_OWNED_GOOGLE, sdk_label="the google-genai SDK"
         )
@@ -1444,12 +1502,6 @@ def _provider_from_config(
         )
 
     if sdk == "anthropic":
-        if provider != "anthropic":
-            raise ValueError(
-                f"AI_SDK=anthropic reaches Claude on Anthropic's own API, so it requires "
-                f"AI_PROVIDER=anthropic (got {provider!r}). Use AI_SDK=openai for any other vendor "
-                "(a vendor the harness does not know also needs AI_BASE_URL)."
-            )
         params, extra_body = _split_model_params(
             loaded_params(), owned=_OWNED_ANTHROPIC, sdk_label="the anthropic SDK"
         )
@@ -1472,13 +1524,6 @@ def _provider_from_config(
         )
 
     if sdk == "openrouter":
-        if provider != "openrouter":
-            raise ValueError(
-                f"AI_SDK=openrouter reaches OpenRouter's native endpoint, so it requires "
-                f"AI_PROVIDER=openrouter (got {provider!r}). Use AI_SDK=openai for any other vendor "
-                "(a vendor the harness does not know also needs AI_BASE_URL), or set "
-                "AI_PROVIDER=openrouter."
-            )
         params, extra_body = _split_model_params(
             loaded_params(), owned=_OWNED_OPENROUTER, sdk_label="the openrouter SDK"
         )
@@ -1517,14 +1562,7 @@ def _provider_from_config(
             **params,
         )
 
-    if sdk != "openai":
-        raise ValueError(
-            f"AI_SDK={sdk!r} has no adapter — the harness ships 'openai' (the OpenAI-wire SDK: "
-            "OpenAI, xAI over api.x.ai, OpenRouter over openrouter.ai, and any other "
-            "OpenAI-compatible vendor at its AI_BASE_URL), 'xai-sdk' (native xAI), 'openrouter' "
-            "(native OpenRouter), 'google-genai' (Gemini on Vertex AI), and 'anthropic' (Claude, "
-            "direct). Set one of those."
-        )
+    # Past the native branches the pairing check leaves only the openai SDK, on a vendor it reaches.
     if is_generic_provider(provider):
         return _generic_openai_provider(
             provider,
@@ -1536,14 +1574,6 @@ def _provider_from_config(
             load_params=loaded_params,
             max_output_tokens=max_output_tokens,
             default_output_tokens=default_output_tokens,
-        )
-    if provider not in OPENAI_SDK_PROVIDERS:
-        raise ValueError(
-            f"AI_PROVIDER={provider!r} is not reached through the openai SDK — over it the harness "
-            "knows 'openai', 'xai' (api.x.ai), 'openrouter' (openrouter.ai) and 'refuseless' "
-            "(api.refuseless.com), and reaches any vendor it does not know at its AI_BASE_URL. For "
-            "AI_PROVIDER=google, set AI_SDK=google-genai; for AI_PROVIDER=anthropic, set "
-            "AI_SDK=anthropic."
         )
     if provider == "openrouter" and surface != "chat":
         # OpenRouter's Responses API is beta upstream, so the openai-SDK-at-OpenRouter cell is

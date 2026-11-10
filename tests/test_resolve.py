@@ -436,12 +436,12 @@ def test_a_provider_mismatched_stem_is_excluded_not_rejected():
 def test_an_unknown_sdk_is_fatal_rather_than_a_different_answer():
     """A typo'd `--sdk` must stop, not quietly resolve a *different* configuration.
 
-    The wake can leave this to the provider build, which fails the moment it tries to reach a
-    model. Nothing downstream of *this* path would ever catch it: `--sdk openroute` simply drops
+    It is refused by the pairing rule a wake's config triple reads (issue #846), in the same words.
+    Nothing downstream of *this* path would ever catch it otherwise: `--sdk openroute` simply drops
     `openrouter_search` (which requires `Sdk("openrouter")`) and returns a report that is short a
     name — an unknown stem's failure wearing a different hat.
     """
-    with pytest.raises(ValueError, match="Unknown sdk"):
+    with pytest.raises(ValueError, match="has no adapter"):
         resolve_stems(provider="openrouter", sdk="openroute", opt_in="openrouter_search")
 
     # …while the correct spelling resolves the server tool, which is what makes it a real hazard.

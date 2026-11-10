@@ -835,9 +835,10 @@ def test_config_from_env_rejects_an_unknown_surface(monkeypatch):
 def test_config_from_env_xai_sdk_single_native_surface(monkeypatch):
     # The native xai-sdk declares one surface ("native"); AI_SDK_SURFACE is left unset → it
     # resolves to that default, and any *other* value fails clearly (issue #165).
+    monkeypatch.setenv("AI_PROVIDER", "xai")
     monkeypatch.setenv("AI_SDK", "xai-sdk")
     monkeypatch.delenv("AI_SDK_SURFACE", raising=False)
-    assert _config_from_env() == ("openai", "xai-sdk", "native")
+    assert _config_from_env() == ("xai", "xai-sdk", "native")
 
     monkeypatch.setenv("AI_SDK_SURFACE", "responses")
     with pytest.raises(ValueError, match="AI_SDK_SURFACE"):
@@ -1065,10 +1066,10 @@ def test_provider_from_config_openai_honors_the_chat_surface(monkeypatch):
 
 
 def test_provider_from_config_rejects_an_unimplemented_sdk(monkeypatch):
-    # Milestone 1 ships only the openai adapter; another SDK name is a clear "no adapter yet".
+    # An SDK name the harness ships no adapter for is a clear "no adapter", naming the ones it ships.
     _set_model_key(monkeypatch)
-    with pytest.raises(ValueError, match="AI_SDK"):
-        _provider_from_config("openai", "anthropic", "responses")
+    with pytest.raises(ValueError, match="AI_SDK='cohere' has no adapter"):
+        _provider_from_config("openai", "cohere", "")
 
 
 def test_provider_from_config_requires_a_model(monkeypatch):

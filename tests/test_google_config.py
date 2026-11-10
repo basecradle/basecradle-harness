@@ -256,7 +256,7 @@ def test_a_google_brain_describer_still_needs_its_own_key_file(
                 "HARNESS_DESCRIBER_PROVIDER": "google",
                 "HARNESS_DESCRIBER_SDK": "openai",
             },
-            "config:missing_credentials_file",
+            "config:no_provider",
         ),
     ],
     ids=[
@@ -267,7 +267,7 @@ def test_a_google_brain_describer_still_needs_its_own_key_file(
         "no-key-file",
         "no-location",
         "key-file-absent",
-        "google-on-the-wrong-sdk-still-needs-its-key-first",
+        "google-on-the-wrong-sdk-is-refused-before-its-key",
     ],
 )
 def test_a_half_configured_describer_is_dead_not_off(

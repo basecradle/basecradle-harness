@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.183.1] - 2026-11-09
+
+### Fixed: an SDK that cannot reach a known vendor is refused at startup, not at the first build (issue #846)
+
+A known vendor named with an SDK that cannot reach it — `AI_PROVIDER=openai AI_SDK=anthropic`, `AI_PROVIDER=refuseless AI_SDK=xai-sdk` — was refused only when a wake built the provider. `--resolved-config` read green and reported a `cost_basis` for it, and `basecradle-harness-resolve` resolved a tool set for it, over a configuration every wake refused. The SDK-vendor pairing is now one rule, checked wherever the SDK axis is read: the wake's startup, `--resolved-config` (which exits nonzero), `basecradle-harness-resolve`, the describer's own stack (a `config:no_provider` fault naming the `HARNESS_DESCRIBER_*` variables) and the build. The refusal names the SDK that does reach the vendor. An `AI_SDK` the harness ships no adapter for is refused at startup too, and `basecradle-harness-resolve` now refuses it in the wake's words (`has no adapter`) rather than its own.
+
 ## [0.183.0] - 2026-11-09
 
 ### Added: refuseless is a known vendor, priced from its own live price list (issue #844)
