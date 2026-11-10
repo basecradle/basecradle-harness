@@ -32,11 +32,11 @@ The tool required `OPENROUTER_MANAGEMENT_KEY`, an account-administration credent
 - **Library API:** `OpenRouterAccountBalanceTool` takes `api_key=` (an OpenRouter API key, whose own figures are read) beside `management_key=`, and its `base_url` now defaults to `None`, meaning the resolved key's own host.
 - The live gate (`tests/test_openrouter_account_live.py`) runs once per key present, `OPENROUTER_MANAGEMENT_KEY` or `OPENROUTER_API_KEY`, and on an inference key checks the key's figures against `/key` read raw. A key that is absent is not a parameter at all, so an arm holding one key reports no skip. Its rejected-key test is renamed `test_a_rejected_key_is_reported_softly_not_as_a_crash`.
 
-## [0.184.0] - 2026-11-10
-
 ### Fixed: `xai_account_balance` never relays a transport error's text
 
 A transport error can quote the request it failed on: h11 rejects a header holding a line break with an error carrying the whole `Authorization` value. The tool relayed that text, so a pasted `XAI_MANAGEMENT_KEY` with a line break reached the tool's answer, the transcript and the `tool` line's WARNING. It now reports only the error's type. Found in review of issue #853, whose OpenRouter sibling had the same flaw.
+
+## [0.184.0] - 2026-11-10
 
 ### Changed: refuseless serves the Responses surface too, and a Responses call is priced with its cached split (issue #847)
 
