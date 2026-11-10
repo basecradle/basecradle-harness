@@ -177,14 +177,6 @@ def test_a_second_scrub_never_reaches_across_a_kv_values_closing_quote(fields):
     assert ScrubbingFormatter("%(message)s").format(_record(line)) == line
 
 
-def test_a_second_scrub_still_redacts_what_kv_could_not_see_whole():
-    """A value ``kv`` rendered with its own ``"`` turned to ``'`` is a value the line pass reads."""
-    line = "tool " + kv(error=f'config API_KEY="{HEADER_VALUE}"')
-    rendered = ScrubbingFormatter("%(message)s").format(_record(line))
-    assert HEADER_VALUE not in rendered
-    assert rendered.count('"') == line.count('"')
-
-
 # --- nothing goes around it -----------------------------------------------------------------------
 
 

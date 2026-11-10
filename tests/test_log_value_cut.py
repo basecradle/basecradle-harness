@@ -725,3 +725,32 @@ def test_the_header_rule_is_linear():
     scrub("x-api-key" * 20_000)
     scrub("x-api-key: " + "a" * 200_000)
     assert time.monotonic() - started < 1.0
+
+
+# --- an assignment's quoted value, and a bearer header glued to a value (review of #857) ---------
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        ('config API_KEY="wk9f8e7d6c5b4a3f2e1d0c9b8a" set', 'config [redacted]" set'),
+        ("api_key='wk9f8e7d6c5b'", "[redacted]"),
+        ("api_key=KBearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0 sent", "[redacted] sent"),
+        ("GET /v1?token=KBearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0&x=1", "GET /v1[redacted]&x=1"),
+        ("GET /v1?api_key=wk9f8e7d6c5b&x=1", "GET /v1[redacted]&x=1"),
+        ("OPENAI_API_KEY=Bearer eyJhbGciOiJIUzI1NiJ9", "OPENAI_[redacted]"),
+    ],
+)
+def test_an_assignments_value_is_redacted_however_it_opens_and_whatever_is_glued_to_it(
+    text, scrubbed
+):
+    assert scrub(text) == scrubbed
+
+
+def test_the_assignment_rules_are_linear():
+    started = time.monotonic()
+    scrub("api_key=" + "a" * 200_000)
+    scrub("api_key=" + ("a" * 5 + "Bearer ") * 20_000)
+    scrub("?token=" + "bearer" * 30_000)
+    scrub('API_KEY="' * 20_000)
+    assert time.monotonic() - started < 1.0

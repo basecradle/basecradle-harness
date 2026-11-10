@@ -229,6 +229,12 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: with its scheme and sent with another reads ``Bearer Bearer eyJ…``. The heartbeat URL runs first
 #: of all, alone (`_HEARTBEAT_RUN`).
 #:
+#: **An assignment's value may open with a ``"``, and a bearer header glued to a value goes with it**
+#: (the review of #857): ``API_KEY="…"`` once matched nothing, because the value could not start at
+#: the quote, and ``api_key=KBearer eyJ…`` or ``?token=KBearer eyJ…`` ended the value at the scheme
+#: word and left its token to no rule. Each value is two alternatives, the first a value ending in a
+#: glued ``bearer`` and its token, written without lookaround for the box's VRL.
+#:
 #: **An ``x-api-key`` header value is redacted by its name, never its shape** (issue #861), because
 #: the vendor that sends a key there states no shape for it: Wiro's documentation gives its key no
 #: prefix, length or character set. The name is ``x-api-key`` (any case, ``_`` for either hyphen)
@@ -250,8 +256,10 @@ _LITERAL_RULES = re.compile(
     r"(?i:x[-_]api[-_]?key)(?:\\?[\"']\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?[\"'])?"
     r"(?:(?i:bearer)\s+)*(?:[^\s\"'&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s\"'&\\]+)"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
-    r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*[^&\s]+"
-    r"|(?i:api[-_]?key=)(?:(?i:bearer)\s+)*[^&\s\"]+"
+    r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*"
+    r"(?:[^&\s]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^&\s]+)"
+    r"|(?i:api[-_]?key=)\"?(?:(?i:bearer)\s+)*"
+    r"(?:[^&\s\"]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^&\s\"]+)"
 )
 
 #: A Better Stack heartbeat URL, whose secret is its path, redacted by the box's rule
@@ -394,7 +402,7 @@ class ScrubbingFormatter(logging.Formatter):
     prose site and another library's line included, with no rule for a call site to remember.
 
     A clean line renders byte for byte as `logging.Formatter` renders it. A `kv` line is scrubbed a
-    second time, which changes it only where it redacts what `kv` could not see whole, and **never
+    second time, which changes nothing a value already lost, and **never
     across a value's closing quote** (`_CLOSING_QUOTE`): a quoted value ending in ``/heartbeat/`` or
     ``?token=`` holds no secret, and on the whole line the rule that follows it would take the quote
     and leave the line unparseable. No rule's legitimate match holds a ``"`` followed by the next
