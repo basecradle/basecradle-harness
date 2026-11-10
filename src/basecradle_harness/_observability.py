@@ -232,16 +232,23 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: **An ``x-api-key`` header value is redacted by its name, never its shape** (issue #861), because
 #: the vendor that sends a key there states no shape for it: Wiro's documentation gives its key no
 #: prefix, length or character set. The name is ``x-api-key`` (any case, ``_`` for either hyphen)
-#: followed by ``:`` or ``=`` (a header dump, ``X-API-Key=…``), or by a quote and then ``:``, ``=``
-#: or ``,`` (``"x-api-key": "…"``, a ``('x-api-key', '…')`` header tuple); the value may open with a
-#: quote, a bytes literal's ``b'``, or bearer scheme words, and runs to the next space, quote,
-#: ``&``, ``,`` or ``;``. It is the first alternative, so the whole name goes with the value rather
-#: than leaving ``x-`` beside an ``api-key=`` match. A bare ``x-api-key`` with no value is a word.
+#: followed by ``:`` or ``=>`` (a header dump, a Ruby hash), or by a quote, escaped or not, and then
+#: ``:``, ``=``, ``=>`` or ``,`` (``"x-api-key": "…"``, JSON inside a JSON string, a
+#: ``('x-api-key', '…')`` header tuple); the value may open with a quote, an escaped quote, a bytes
+#: literal's ``b'``, or bearer scheme words, and runs to the next space, quote, backslash or ``&``,
+#: since a key of no stated shape may hold anything else. **A bearer header glued to the value is taken
+#: with it** (``x-api-key: KBearer eyJ…``): the value would otherwise end at the scheme word and
+#: leave its token to no rule, the class `_TRAILING_BEARER` closes for a heartbeat URL. The
+#: unquoted ``X-API-Key=…`` is left to the ``api_key=`` rule below, which always took it with the
+#: wider value it allows. It is the first alternative, so the header's name goes with its value; a
+#: key glued directly before the name loses the ``x-`` to it, which leaves it unmatched only when it
+#: was already shorter than its rule's minimum, which no real key is. A bare ``x-api-key`` with no
+#: value is a word.
 #: Wiro's signing secret is never sent (its ``x-signature`` is an HMAC keyed on the API key), so
 #: there is nothing more to match.
 _LITERAL_RULES = re.compile(
-    r"(?i:x[-_]api[-_]?key)(?:[\"']\s*[:=,]|\s*[:=])\s*(?:b?[\"'])?(?:(?i:bearer)\s+)*"
-    r"[^\s\"'&,;]+"
+    r"(?i:x[-_]api[-_]?key)(?:\\?[\"']\s*(?:=>|[:=,])|\s*(?::|=>))\s*(?:b?\\?[\"'])?"
+    r"(?:(?i:bearer)\s+)*(?:[^\s\"'&\\]*?(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}|[^\s\"'&\\]+)"
     r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*[^&\s]+"
     r"|(?i:api[-_]?key=)(?:(?i:bearer)\s+)*[^&\s\"]+"

@@ -24,7 +24,7 @@ A prefix rule whose run lacks `_` or `-` (`gh?_`, `github_pat_`, `bc_uat_`, `bc_
 
 ### Added: An `x-api-key` header value is scrubbed (issue #861)
 
-Wiro states no shape for its API key, which travels as an `x-api-key` header, so a literal rule now redacts that header's value by its name: `x-api-key: …`, `X-API-Key=…`, `"x-api-key": "…"`, a `('x-api-key', '…')` header tuple and a bytes literal, in any case and with `_` for either hyphen. A bare `x-api-key` with no value is kept. Wiro's signing secret is never sent, so nothing else of Wiro's travels.
+Wiro states no shape for its API key, which travels as an `x-api-key` header, so a literal rule now redacts that header's value by its name: `x-api-key: …`, `"x-api-key": "…"`, JSON inside a JSON string, a Ruby hash's `=>`, a `('x-api-key', '…')` header tuple and a bytes literal, in any case and with `_` for either hyphen, with a bearer header glued to the value taken along with its token. The unquoted `X-API-Key=…` stays the `api_key=` rule's. A bare `x-api-key` with no value is kept. Wiro's signing secret is never sent, so nothing else of Wiro's travels.
 
 ## [0.185.0] - 2026-11-10
 

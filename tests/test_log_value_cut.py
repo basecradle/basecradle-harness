@@ -672,8 +672,19 @@ HEADER_VALUE = "wk9f8e7d6c5b4a3f2e1d0c9b8a"
         ),
         (f"{{'x-api-key': '{HEADER_VALUE}'}}", "{'[redacted]'}"),
         (f"[(b'x-api-key', b'{HEADER_VALUE}')]", "[(b'[redacted]')]"),
-        (f"X-API-Key={HEADER_VALUE}&page=2", "[redacted]&page=2"),
-        (f"x_api_key={HEADER_VALUE}", "[redacted]"),
+        # The unquoted assignment is the ``api_key=`` rule's, with the wider value it always took.
+        (f"X-API-Key={HEADER_VALUE}&page=2", "X-[redacted]&page=2"),
+        (f"x_api_key={HEADER_VALUE}", "x_[redacted]"),
+        ("X-API-Key=wk9f,8e7d6;c5b4'a3f2e1", "X-[redacted]"),
+        # A key of no stated shape may hold a comma or a semicolon.
+        ("x-api-key: wk9f,8e7d6;c5b4 sent", "[redacted] sent"),
+        # A Ruby hash, and JSON quoted inside a JSON string.
+        (f'{{"x-api-key"=>"{HEADER_VALUE}"}}', '{"[redacted]"}'),
+        (f"X-Api-Key => {HEADER_VALUE}", "[redacted]"),
+        (f'{{\\"x-api-key\\": \\"{HEADER_VALUE}\\"}}', '{\\"[redacted]\\"}'),
+        # A bearer header glued to the value goes with it, token and all.
+        ("x-api-key: KBearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.sig", "[redacted]"),
+        (f'"x-api-key": "{HEADER_VALUE}Bearer eyJhbGciOiJIUzI1NiJ9"', '"[redacted]"'),
         (
             f'curl -H "x-api-key: {HEADER_VALUE}" https://api.example.com',
             'curl -H "[redacted]" https://api.example.com',
