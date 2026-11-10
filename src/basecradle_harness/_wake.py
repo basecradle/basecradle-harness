@@ -6245,7 +6245,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             print(json.dumps(resolved_config(), indent=2, sort_keys=True))
         except (HarnessError, ProviderError, BaseCradleError, ValueError, KeyError) as error:
-            print(f"basecradle-harness-wake: {error}", file=sys.stderr)
+            print(f"basecradle-harness-wake: {scrub(str(error))}", file=sys.stderr)
             return 1
         return 0
 
@@ -6295,6 +6295,6 @@ def main(argv: list[str] | None = None) -> int:
             head("wake failed", RED),
             kv(timeline=args.timeline, error=str(error), delivery=delivery_id()),
         )
-        print(f"basecradle-harness-wake: {error}", file=sys.stderr)
+        print(f"basecradle-harness-wake: {scrub(str(error))}", file=sys.stderr)
         return 1
     return 0

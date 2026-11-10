@@ -326,6 +326,64 @@ def _is_word(match: re.Match[str]) -> bool:
 #: real one does instead of hand-spelling it.
 LOG_FORMAT = "%(levelname)s %(message)s"
 
+
+class ScrubbingFormatter(logging.Formatter):
+    """A `logging.Formatter` whose every rendered record has been through `scrub` (issue #857).
+
+    `kv` scrubs each value it renders, but a **prose** line interpolates its arguments itself
+    (``_log.warning("…: %s", exc)``), and an exception's text is foreign: a vendor's 401 body can echo
+    the key it rejected. So the scrub's floor is here, over the whole record as rendered — message,
+    traceback and stack — and every line a harness entrypoint's handler writes is covered, a future
+    prose site and another library's line included, with no rule for a call site to remember.
+
+    A clean line renders byte for byte as `logging.Formatter` renders it. A `kv` line is scrubbed a
+    second time, which changes it only where it redacts what `kv` could not see whole, and **never
+    across a value's closing quote** (`_CLOSING_QUOTE`): a quoted value ending in ``/heartbeat/`` or
+    ``?token=`` holds no secret, and on the whole line the rule that follows it would take the quote
+    and leave the line unparseable. No rule's legitimate match holds a ``"`` followed by the next
+    field or the line's end. One over-redaction is stated: a bare value ending in ``bearer`` beside a
+    next field of eight or more characters goes with it, as it does on the box.
+
+    It protects only a process whose handler the harness installed (`log_handler`): a library caller
+    that configures its own handler gets `kv`'s scrub and the sites that scrub their own argument
+    (`_openai.ModelCatalog.rows`), and can install this formatter itself.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return '"'.join(scrub(part) for part in _CLOSING_QUOTE.split(super().format(record)))
+
+
+#: A ``kv`` value's closing quote: a ``"`` followed by the next ``key=`` (colored, when it is a
+#: verdict pair), by the reset closing a colored pair, or by the line's end. The formatter scrubs
+#: between them (`ScrubbingFormatter`), so no rule reaches across one.
+_CLOSING_QUOTE = re.compile(
+    r'"(?=[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|\x1b\[0m|[ \t]*(?:\n|\Z))'
+)
+
+
+def log_handler(fmt: str = LOG_FORMAT, stream: Any = None) -> logging.Handler:
+    """The stderr handler every harness entrypoint logs through — `ScrubbingFormatter` over `fmt`.
+
+    The one way an entrypoint configures logging (``logging.basicConfig(handlers=[log_handler()])``),
+    so no entrypoint can write an unscrubbed record; `tests/test_prose_scrub.py` holds every
+    ``basicConfig`` call in the package to it.
+    """
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(ScrubbingFormatter(fmt))
+    return handler
+
+
+def install_log_handler() -> None:
+    """For an entrypoint that keeps Python's default logging: the same output, scrubbed.
+
+    With no handler configured, a ``WARNING`` reaches stderr through `logging.lastResort` as its
+    bare message, unscrubbed. This installs the scrubbing handler in its place, at the same level
+    and in the same format, so the command's stderr reads as it did, minus any credential. A no-op
+    when logging is already configured, so an embedding application's setup always wins.
+    """
+    logging.basicConfig(level=logging.WARNING, handlers=[log_handler("%(message)s")])
+
+
 #: The env var naming this agent's slug when the OS user is not it. The fleet's universal-identity
 #: rule makes the OS user, the GitHub App bot, and the platform handle **one** slug, so the login
 #: name is the right default and this is the escape hatch for a box that departs from it.

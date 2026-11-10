@@ -95,6 +95,7 @@ from basecradle_harness._observability import (
     reasoning_apart,
     reported_cost,
     routed_web_searches,
+    scrub,
     serving_endpoint,
     stamp_generation_id,
     tally_server_tools,
@@ -255,7 +256,7 @@ class ModelCatalog:
                 "Could not read the model list from %s, so this wake's calls carry no cost= and "
                 "the context limit falls to its floor: %s",
                 base_url,
-                exc,
+                scrub(str(exc)),  # a library caller's own handler has no scrub (issue #857)
             )
             return None
         self._rows = rows

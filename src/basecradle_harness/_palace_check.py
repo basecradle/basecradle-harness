@@ -130,6 +130,7 @@ from basecradle_harness._mempalace import (
     content_hashes,
     filed_by_observe,
 )
+from basecradle_harness._observability import log_handler, scrub
 from basecradle_harness._rerank import RERANK_MODEL_VAR, SURFACE_TOOL, reranker_from_env
 from basecradle_harness._version import __version__
 
@@ -1591,7 +1592,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # A sample runs hundreds of searches; one `memory recall` line each would bury the report.
     level = logging.WARNING if args.sample else logging.INFO
-    logging.basicConfig(level=level, format="%(message)s", stream=sys.stderr)
+    logging.basicConfig(level=level, handlers=[log_handler("%(message)s", sys.stderr)])
     try:
         provider = MemPalaceMemoryProvider(palace)
         if args.relocate_source_file:
@@ -1764,7 +1765,7 @@ def main(argv: list[str] | None = None) -> int:
                     f"failed {len(failing)}, failing digest {digest(failing)}"
                 )
     except ImportError as error:
-        print(f"{PROG}: {error}", file=sys.stderr)
+        print(f"{PROG}: {scrub(str(error))}", file=sys.stderr)
         return 1
     return 1 if failing else 0
 
