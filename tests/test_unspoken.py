@@ -443,6 +443,7 @@ def _model_facing_strings():
     from basecradle_harness._mcp import McpServerConfig, _about, _withholding, withheld_refusal
     from basecradle_harness._messages import ServerToolRecord, ServerToolUse
     from basecradle_harness._policy import SHELL
+    from basecradle_harness._refuseless_account import RefuselessAccountBalanceTool
     from basecradle_harness._server_tools import render
 
     now = __import__("datetime").datetime(2026, 7, 14, tzinfo=__import__("datetime").timezone.utc)
@@ -511,6 +512,9 @@ def _model_facing_strings():
         "recall heading": _mempalace._INJECTED_HEADING,
         "recall reading guide": _mempalace._READING_GUIDE,
         "memory_search description": _mempalace.MemPalaceSearchTool.description,
+        # Issue #848: what the model reads about the refuseless balance tool.
+        "refuseless_account_balance description": RefuselessAccountBalanceTool.description,
+        "refuseless_account_balance note": _shipped_note("refuseless_account_balance.py"),
     }
 
 
