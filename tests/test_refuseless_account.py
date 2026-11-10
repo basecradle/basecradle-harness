@@ -1,8 +1,8 @@
 """The refuseless_account_balance tool: the vendor's figures, degraded modes, caching — issue #848.
 
 All HTTP is mocked with respx at the transport; no test reaches the network. The healthy body is the
-exact shape the capital read off ``GET https://api.refuseless.com/v1/credits`` on 2026-11-10, and the
-error bodies follow the vendor's documented envelope (``{"error": {"code", "message", "type"}}``).
+exact shape the capital read off ``GET https://api.refuseless.com/v1/credits`` on 2026-11-10, with the
+per-key spend the vendor added the same day (issue #868), and the error bodies follow the vendor's documented envelope (``{"error": {"code", "message", "type"}}``).
 
 Three properties carry the tool, each pinned below in its "obviously fine" broken form:
 
@@ -47,6 +47,8 @@ def _credits(**overrides) -> dict:
         "reserved": 0,
         "available": 69.999906,
         "key_limit": None,
+        "key_spent": 0.001405,
+        "key_spent_since": None,
         "unit": "usd",
         "updated_at": UPDATED_AT,
     }
@@ -105,7 +107,8 @@ def test_the_live_shape_reads_as_available_with_every_figure_behind_it(tool):
     assert result == (
         "refuseless credit available: $69.999906 USD (as of 2026-11-09T23:57:41Z).\n"
         "Balance $69.999906, of which $0.00 is held by requests in flight (an unused hold returns "
-        "to the balance when its request settles). This key has no spending limit of its own."
+        "to the balance when its request settles). This key has no spending limit of its own. "
+        "This key has been billed $0.001405 in total."
     )
     request = route.calls.last.request
     assert request.headers["authorization"] == f"Bearer {KEY}"
@@ -126,6 +129,75 @@ def test_a_key_limit_is_stated_as_the_vendor_states_it(tool):
     assert result.startswith("refuseless credit available: $4.25 USD")
     assert "This key's spending limit allows $4.25 more." in result
     assert "no spending limit" not in result
+
+
+# --- the key's own spend (issue #868) -------------------------------------------------------------
+
+
+def test_a_counter_with_a_start_says_since_when(tool):
+    body = _credits(key_spent=12.5, key_spent_since=UPDATED_AT - 86400)
+    result, _ = _read(tool, httpx.Response(200, json=body))
+    assert result.endswith("This key has been billed $12.50 since 2026-11-08T23:57:41Z.")
+
+
+@pytest.mark.parametrize("spent", [0, -0.0])
+def test_a_key_that_has_spent_nothing_says_so(tool, spent):
+    result, _ = _read(tool, _ok(_credits(key_spent=spent)))
+    assert result.endswith("This key has been billed $0.00 in total.")
+
+
+def test_an_absent_counter_start_reads_as_null(tool):
+    """``key_spent_since`` left out is the vendor stating no start, as ``null`` does."""
+    result, _ = _read(tool, httpx.Response(200, json=_credits(key_spent_since=...)))
+    assert result.endswith("This key has been billed $0.001405 in total.")
+
+
+def test_a_counter_started_at_the_epoch_is_a_start(tool):
+    result, _ = _read(tool, httpx.Response(200, json=_credits(key_spent_since=0)))
+    assert result.endswith("This key has been billed $0.001405 since 1970-01-01T00:00:00Z.")
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"key_spent": ...},
+        {"key_spent": None},
+        {"key_spent": ..., "key_spent_since": ...},
+        {"key_spent": float("nan")},
+        {"key_spent": float("inf")},
+        {"key_spent": -0.5},
+        {"key_spent": True},
+        {"key_spent": "0.001405"},
+        {"key_spent": 10**400},
+        {"key_spent_since": "2026-11-01T00:00:00Z"},
+        {"key_spent_since": -1},
+        {"key_spent_since": True},
+        {"key_spent_since": 1794268661.5},
+        {"key_spent_since": 10**20},
+    ],
+    ids=[
+        "absent",
+        "null",
+        "both_absent",
+        "nan",
+        "inf",
+        "negative",
+        "bool",
+        "string",
+        "overflow",
+        "since_string",
+        "since_negative",
+        "since_bool",
+        "since_float",
+        "since_overflow",
+    ],
+)
+def test_a_spend_the_vendor_did_not_state_usably_leaves_the_balance_standing(tool, overrides):
+    """The spend is additive: without it the balance still answers, and only its sentence goes."""
+    result, _ = _read(tool, _ok(_credits(**overrides)))
+    assert result.startswith("refuseless credit available: $69.999906 USD")
+    assert result.endswith("This key has no spending limit of its own.")
+    assert "billed" not in result
 
 
 def test_nothing_available_is_called_out_first(tool):

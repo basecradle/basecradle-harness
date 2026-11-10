@@ -4,13 +4,14 @@
 # A plain read-only function Tool (not a server-side built-in): it GETs <base_url>/credits — the
 # host the brain's own calls go to, AI_BASE_URL or api.refuseless.com/v1 — with the agent's own
 # inference key, AI_API_KEY. The call is free. It reports what a new request can spend
-# (`available`), the balance, the part held by requests in flight (`reserved`), and the key's own
-# spending limit (`key_limit`), each as the vendor states it.
+# (`available`), the balance, the part held by requests in flight (`reserved`), the key's own
+# spending limit (`key_limit`), and what the key has been billed (`key_spent`, issue #868), each as
+# the vendor states it.
 #
 # On by default (issue #862): @origin's rule of 2026-11-10 is that every agent can read the
 # available balance at its main LLM vendor, as long as that read exposes no other sensitive account
-# data. This read exposes the account's credit and the key's own limit, nothing else, so it is a
-# benign default. Before #862 it was opt_in (issue #168's account/billing class).
+# data. This read exposes the account's credit, the key's own limit and the key's own billed spend
+# (the per-agent figure @origin asked the vendor for), nothing else, so it is a benign default. Before #862 it was opt_in (issue #168's account/billing class).
 #
 # `requires=(Vendor("refuseless"),)` — the xAI sibling's gate, not the OpenRouter sibling's absence
 # of one, and the reason is the credential. The OpenRouter tool can be offered beside any brain

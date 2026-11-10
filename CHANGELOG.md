@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.188.0] - 2026-11-10
+
+### Added: `refuseless_account_balance` says what the agent's own key has been billed (issue #868)
+
+refuseless added per-key spend to `GET /v1/credits` at @origin's request, because the account balance cannot separate one agent's spend from another's. The tool now ends with the vendor's `key_spent`, *in total* when `key_spent_since` is `null` and *since* that moment when it is not, to the vendor's six decimals. The figure is additive on the vendor's side, so it is parsed as optional: a response without a usable `key_spent`, or with a `key_spent_since` that is anything but `null` or a non-negative integer number of Unix seconds, still answers with the balance and leaves only that sentence out.
+
 ## [0.187.0] - 2026-11-10
 
 ### Changed: The balance read at an agent's own LLM vendor is on by default (issue #862)
