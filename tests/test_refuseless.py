@@ -492,7 +492,7 @@ class _Server(http.server.ThreadingHTTPServer):
 
 @contextlib.contextmanager
 def _vendor():
-    """A fake refuseless on loopback: its models list and its chat endpoint, recording each request."""
+    """A fake refuseless on loopback: its models list and both call surfaces, recording each request."""
     seen: list[dict] = []
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -651,6 +651,31 @@ def test_a_responses_usage_block_reads_in_its_own_spelling():
 )
 def test_a_responses_block_missing_either_count_prices_nothing(usage):
     assert listed_usage(usage) is None
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"cached_tokens": "24"},
+        {"cached_tokens": True},
+        {"cached_tokens": -1},
+        {"cache_write_tokens": 2.5},
+        "24",
+        [24],
+    ],
+)
+def test_a_present_but_unreadable_detail_prices_nothing_rather_than_an_estimate(details):
+    """Read as zero, a cached count would be priced at the full rate, a cache write ignored."""
+    assert listed_usage({**RESPONSES_USAGE, "input_tokens_details": details}) is None
+    assert listed_usage({**USAGE, "prompt_tokens_details": details}) is None
+
+
+def test_an_absent_or_null_detail_is_zero():
+    assert listed_usage({**RESPONSES_USAGE, "input_tokens_details": None}) == Usage(39, 0, 10)
+    assert listed_usage({**RESPONSES_USAGE, "input_tokens_details": {"cached_tokens": None}}) == (
+        Usage(input=39, cached=0, output=10)
+    )
+    assert listed_usage(USAGE) == Usage(input=1000, cached=0, output=200)
 
 
 def test_a_spelling_reads_only_its_own_details():

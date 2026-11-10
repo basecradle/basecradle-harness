@@ -15,6 +15,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Nothing vendor-specific on either surface.** The Responses cell sends no cache-affinity key (a decided *no*, as on chat: the vendor documents none and calls the endpoint stateless), no stored state, and no server-side built-in, which is still refused by name. The output cap goes out as `max_output_tokens`.
 - **A Responses call is priced from the live list, cached tokens included.** The Responses usage block states `input_tokens`, `output_tokens` and `input_tokens_details.cached_tokens` (a part of `input_tokens`), so the call is priced `(input − cached) × input_per_m + cached × cached_input_per_m + output × output_per_m`. Both counts are still required, in one spelling, never a zero default. A call that cached something on a row with no `cached_input_per_m` is a `not_reported` gap. Chat states no cached count, so nothing changes there.
+- **A present but unreadable cached or cache-write count now prices nothing**, on either surface (a `not_reported` gap). It used to read as zero, which priced a cached token at the full input rate, or a cache write as though there were none.
 - The README's affinity matrix now lists refuseless, which it omitted since 0.183.0.
 
 ## [0.183.1] - 2026-11-09

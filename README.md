@@ -2074,9 +2074,9 @@ AI_API_KEY=…                    # the agent's refuseless key
   llm provider=refuseless purpose=main model=glm-5.3-flash-abliterated duration=1.84s tokens_in=1000 tokens_out=200 tokens_total=1200 cost=0.00021 cost_basis=computed outcome=ok generation_id=chatcmpl-…
   ```
 
-- **A price it cannot state is omitted, never estimated.** One `cost unpriced charge=tokens` WARNING per gap per wake, and no `cost=` on the calls it covers: `reason=rates_unavailable` when the list could not be read (it is not retried in that wake, and no earlier wake's price is used), `reason=unknown_model` when the list has no row for the model, and `reason=not_reported` when the vendor did not state what the figure needs (no usable US-dollar rate on the row, a usage block missing either token count, or a cache write, which has no published rate).
+- **A price it cannot state is omitted, never estimated.** One `cost unpriced charge=tokens` WARNING per gap per wake, and no `cost=` on the calls it covers: `reason=rates_unavailable` when the list could not be read (it is not retried in that wake, and no earlier wake's price is used), `reason=unknown_model` when the list has no row for the model, and `reason=not_reported` when the vendor did not state what the figure needs (no usable US-dollar rate on the row, a usage block missing either token count, a Responses call that cached tokens on a row with no `cached_input_per_m`, or a cache write, which has no published rate).
 
-Prove it live with the [live gate](tests/test_refuseless_live.py), which makes one real call and checks its `cost=` against the vendor's list read by a client of its own: `REFUSELESS_LIVE_API_KEY=… uv run --extra openai pytest -m live tests/test_refuseless_live.py -s -v`.
+Prove it live with the [live gate](tests/test_refuseless_live.py), which makes real calls on both surfaces (one on chat; on Responses, a long prefix twice and a tool round trip under a system prompt) and checks each `cost=` against the vendor's list read by a client of its own: `REFUSELESS_LIVE_API_KEY=… uv run --extra openai pytest -m live tests/test_refuseless_live.py -s -v`.
 
 ## Any other OpenAI-compatible vendor — the generic profile
 

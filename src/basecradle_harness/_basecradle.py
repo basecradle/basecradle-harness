@@ -924,7 +924,8 @@ _PROVIDER_BASE_URLS = {
     # the native openrouter SDK or the openai SDK pointed here (both speak its chat wire).
     "openrouter": "https://openrouter.ai/api/v1",
     # refuseless's documented OpenAI-compatible root (docs.refuseless.com, issue #844): chat
-    # completions, completions and the models list whose live `pricing` prices every call.
+    # completions, Responses (issue #847), completions and the models list whose live `pricing`
+    # prices every call.
     "refuseless": "https://api.refuseless.com/v1",
 }
 

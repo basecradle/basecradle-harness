@@ -19,7 +19,10 @@ read from the vendor's list by a client of the test's own, not by the harness. T
 (issue #847) prices its stated cached split too: ``(input − cached) × input_per_m + cached ×
 cached_input_per_m + output × output_per_m``. It sends one long prefix twice so a cache hit is
 possible; a hit is not required, because the vendor's cache is not the harness's to promise, and the
-arithmetic is checked against whatever count the vendor stated.
+arithmetic is checked against whatever count the vendor stated. A third test replays what a real wake
+sends on that surface and the first two do not: a charter (the ``developer`` role), a function tool,
+and a ``function_call`` / ``function_call_output`` pair, scripted rather than asked for so the model's
+choice cannot skip it.
 """
 
 from __future__ import annotations
@@ -30,7 +33,7 @@ import re
 
 import pytest
 
-from basecradle_harness import Message
+from basecradle_harness import Message, ToolCall, ToolSpec
 from basecradle_harness._basecradle import _config_from_env, _provider_from_config
 from basecradle_harness._observability import _money
 
@@ -144,3 +147,52 @@ def test_a_real_responses_call_is_priced_with_its_cached_split(monkeypatch, capl
             f" = ${expected!r} (line: cost={_field(llm, 'cost')})"
         )
         assert _field(llm, "cost") == _money(expected)
+
+
+@needs_key
+def test_a_real_responses_call_takes_a_charter_a_tool_and_a_tool_round_trip(monkeypatch, caplog):
+    """Issue #847: the Responses wire a wake sends — developer role, function tool, call items."""
+    pytest.importorskip("openai")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("AI_PROVIDER", "refuseless")
+    monkeypatch.setenv("AI_MODEL", MODEL)
+    monkeypatch.setenv("AI_API_KEY", KEY)
+    monkeypatch.setenv("AI_SDK_SURFACE", "responses")
+    for var in ("AI_SDK", "AI_BASE_URL"):
+        monkeypatch.delenv(var, raising=False)
+    caplog.set_level(logging.INFO, logger="basecradle_harness")
+
+    weather = ToolSpec(
+        name="get_weather",
+        description="The current weather in a city.",
+        parameters={
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    )
+    history = [
+        Message.system("You are a terse assistant. Answer in one short sentence."),
+        Message.user("What is the weather in Dallas?"),
+        Message.assistant(
+            tool_calls=[ToolCall(id="call_0001", name="get_weather", arguments={"city": "Dallas"})]
+        ),
+        Message.tool("call_0001", '{"city": "Dallas", "sky": "clear", "temperature_f": 71}'),
+    ]
+    provider = _provider_from_config(*_config_from_env(), max_output_tokens=256)
+    try:
+        reply = provider.chat(history, tools=[weather])
+    finally:
+        provider.close()
+
+    print(f"\nreply: {reply.content!r} tool_calls={reply.tool_calls!r}")
+    # The vendor read the tool result: the answer names it, or the model called the tool again.
+    assert reply.content or reply.tool_calls
+    if reply.content:
+        assert "71" in reply.content or "clear" in reply.content.lower(), reply.content
+    lines = [record.getMessage() for record in caplog.records]
+    (llm,) = [line for line in lines if line.startswith("llm ")]
+    print(llm)
+    assert _field(llm, "cost_basis") == "computed"
+    assert (_field(llm, "generation_id") or "").startswith("resp"), llm
+    assert not [line for line in lines if line.startswith("cost unpriced")], lines

@@ -113,7 +113,10 @@ def usage_of(usage: Any) -> Usage | None:
     as zero: here the formula is ``input × input_per_m + output × output_per_m``, and a block
     missing either term would price the call low rather than not at all, which the dashboard would
     sum as if it were true. Both must be non-negative integers (never a bool). The cached and
-    cache-write counts are read from that spelling's ``…_details``, only if present.
+    cache-write counts are read from that spelling's ``…_details``: absent is zero, and present but
+    unreadable (a ``…_details`` that is not an object, a count that is not a non-negative integer)
+    is ``None``, because reading it as zero would price a cached token at the full rate, or a cache
+    write as though there were none — an estimate either way.
     """
     if not isinstance(usage, Mapping):
         return None
@@ -122,14 +125,25 @@ def usage_of(usage: Any) -> Usage | None:
         if prompt is None or completion is None:
             continue
         details = usage.get(details_key)
-        details = details if isinstance(details, Mapping) else {}
-        return Usage(
-            input=prompt,
-            cached=_count(details.get("cached_tokens")) or 0,
-            cache_write=_count(details.get("cache_write_tokens")) or 0,
-            output=completion,
-        )
+        if details is None:
+            details = {}
+        if not isinstance(details, Mapping):
+            return None
+        cached, cache_write = (_optional(details, key) for key in _DETAIL_COUNTS)
+        if cached is None or cache_write is None:
+            return None
+        return Usage(input=prompt, cached=cached, cache_write=cache_write, output=completion)
     return None
+
+
+#: The optional counts a ``…_details`` object may state, in `Usage` order.
+_DETAIL_COUNTS = ("cached_tokens", "cache_write_tokens")
+
+
+def _optional(details: Mapping[str, Any], key: str) -> int | None:
+    """An optional count: zero when absent or ``null``, ``None`` when present and unreadable."""
+    value = details.get(key)
+    return 0 if value is None else _count(value)
 
 
 def call_cost(pricing: Pricing, usage: Usage | None) -> ComputedCost | None:
