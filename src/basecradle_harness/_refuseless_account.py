@@ -21,20 +21,28 @@ account beside another brain would need a dedicated variable for that key, which
 **The figures are the vendor's, never arithmetic of ours.** The call is free (no credit charged, no
 hold placed) and answers::
 
-    {"object": "credits", "balance": 69.999906, "reserved": 0, "available": 69.999906,
-     "key_limit": null, "unit": "usd", "updated_at": 1794268661}
+    {"object": "credits", "balance": 69.989469, "reserved": 0, "available": 69.989469,
+     "key_limit": null, "key_spent": 0.001405, "key_spent_since": null, "unit": "usd",
+     "updated_at": 1794353525}
 
 ``balance`` is the account's total credit, including what in-flight requests hold; ``reserved`` is
 that hold (the vendor pre-authorizes each request and returns what it does not use when the request
 settles); ``available`` is what a new request can reserve, balance less reserved and capped by
 ``key_limit``; ``key_limit`` is what this key's budget (or its workspace's limit) still allows, or
-``null`` when it has none. ``available`` is the headline, because it is the runway: a request is
+``null`` when it has none; ``key_spent`` is what this key has been billed, in total or since
+``key_spent_since`` when that is not ``null`` (issue #868). ``available`` is the headline, because it is the runway: a request is
 refused when it cannot reserve, whatever the balance says. Each figure is shown **to the vendor's
 own precision** — US dollars to six decimal places, which is as far as the vendor states them —
 because none of them is derived here, so there is no subtraction to keep self-consistent, and
 rounding to cents would only make a stated figure disagree with the vendor's own dashboard. ``updated_at`` (the moment the vendor read the balance) is
-the ``as of`` stamp. All fields are required, as the vendor documents them; a response missing one,
-in another unit, or carrying a value that is not a finite number is *unavailable*, never a guess.
+the ``as of`` stamp. The balance fields are required, as the vendor documents them; a response
+missing one, in another unit, or carrying a value that is not a finite number is *unavailable*,
+never a guess. **The key's spend is not one of them** (issue #868): the vendor added ``key_spent``
+and ``key_spent_since`` later, so a response without a usable pair still answers with the balance,
+and only the sentence about the key's spend is left out. A pair is usable when ``key_spent`` is a
+finite, non-negative number and ``key_spent_since`` is ``null`` or a non-negative integer number of
+seconds; a figure whose span cannot be read is not reported, since the span is what makes it a
+figure.
 
 Everything fails **soft**: no key, a rejected key, the rate limit (60 balance reads a minute per
 key), the vendor's ``gateway_down`` (its billing service unreachable), any other non-2xx, an
@@ -117,6 +125,18 @@ class _Credits:
     key_limit: float | None
     #: When the vendor read the balance.
     updated_at: datetime
+    #: What this key has been billed, or ``None`` when the vendor stated no usable figure for it.
+    key_spend: _KeySpend | None = None
+
+
+@dataclass(frozen=True)
+class _KeySpend:
+    """What the calling key has been billed, in US dollars, as the vendor stated it (issue #868)."""
+
+    spent: float
+    #: When the vendor's counter started; ``None`` when it states ``null``, so ``spent`` is the
+    #: key's whole total.
+    since: datetime | None
 
 
 class RefuselessAccountBalanceTool(Tool):
@@ -147,7 +167,8 @@ class RefuselessAccountBalanceTool(Tool):
         "request can still spend, the account balance, the part of it held by requests in flight, "
         "and this key's own spending limit if it has one. Use it to reason about your runway: "
         "throttle or prioritize cheap work when credit is low, or ask a human to top up before you "
-        "run dry mid-task. Takes no arguments, costs nothing, and can see only your own account."
+        "run dry mid-task. It also says what this key has been billed so far. Takes no arguments, "
+        "costs nothing, and can see only your own account."
     )
     parameters = NO_PARAMETERS
 
@@ -324,7 +345,7 @@ def _error_code(response: httpx.Response) -> str | None:
 
 
 def _parse_credits(data: dict[str, Any]) -> _Credits:
-    """The figures out of ``GET /credits``, every documented field required.
+    """The figures out of ``GET /credits``, every balance field required and the key's spend not.
 
     Unavailable for another ``object`` or ``unit`` (``usd``, as documented: a figure in an unstated
     unit is not a dollar), a dollar figure that is not a finite number, a ``key_limit`` that is
@@ -370,7 +391,31 @@ def _parse_credits(data: dict[str, Any]) -> _Credits:
         available=figures["available"],  # type: ignore[arg-type]
         key_limit=limit,
         updated_at=updated_at,
+        key_spend=_key_spend(data),
     )
+
+
+def _key_spend(data: dict[str, Any]) -> _KeySpend | None:
+    """The key's own spend out of ``GET /credits``, or ``None`` when the vendor stated none usably.
+
+    Never required (module docstring): an absent or ``null`` ``key_spent``, one that is not a
+    finite, non-negative number, and a ``key_spent_since`` that is neither ``null`` (absent
+    included) nor a non-negative integer number of seconds each leave the spend out and the balance
+    standing. A negative figure is refused because a key's billed total cannot be one.
+    """
+    spent = _usd(data.get("key_spent"))
+    if spent is None or spent < 0:
+        return None
+    raw = data.get("key_spent_since")
+    if raw is None:
+        return _KeySpend(spent=spent, since=None)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    try:
+        since = datetime.fromtimestamp(raw, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+    return _KeySpend(spent=spent, since=since)
 
 
 def _usd(figure: Any) -> float | None:
@@ -428,6 +473,10 @@ def _render(credits: _Credits) -> str:
         context.append("This key has no spending limit of its own.")
     else:
         context.append(f"This key's spending limit allows {_dollars(credits.key_limit)} more.")
+    spend = credits.key_spend
+    if spend is not None:
+        span = "in total" if spend.since is None else f"since {_stamp(spend.since)}"
+        context.append(f"This key has been billed {_dollars(spend.spent)} {span}.")
     headline = (
         f"refuseless credit available: {_dollars(credits.available)} USD "
         f"(as of {_stamp(credits.updated_at)})."

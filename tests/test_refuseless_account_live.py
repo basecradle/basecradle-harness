@@ -13,7 +13,7 @@ The read is free (the vendor charges no credit and places no hold). A SKIP here 
 pytest exits 0 when every test skips, so read the report. What it pins is a value, never presence:
 the figures the tool shows equal the ones a client of the test's own reads from the same endpoint.
 Run it on a key with no requests in flight, or ``reserved`` and ``available`` can move between the
-two reads.
+two reads; ``key_spent`` too.
 """
 
 from __future__ import annotations
@@ -68,6 +68,8 @@ def test_the_tool_shows_the_figures_the_vendor_holds(monkeypatch):
         "reserved",
         "available",
         "key_limit",
+        "key_spent",
+        "key_spent_since",
         "unit",
         "updated_at",
     }
@@ -83,3 +85,9 @@ def test_the_tool_shows_the_figures_the_vendor_holds(monkeypatch):
     else:
         limit = re.search(r"limit allows \$([0-9,]+\.[0-9]+) more", context).group(1)
         assert _figure(limit) == pytest.approx(body["key_limit"], abs=1e-6)
+    # The key's own spend (issue #868), the figure and its span both the vendor's.
+    spent, span = re.search(
+        r"This key has been billed \$([0-9,]+\.[0-9]+) (in total|since \S+Z)\.", context
+    ).groups()
+    assert _figure(spent) == pytest.approx(body["key_spent"], abs=1e-6)
+    assert (span == "in total") == (body["key_spent_since"] is None)
