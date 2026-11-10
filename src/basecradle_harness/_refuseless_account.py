@@ -79,6 +79,7 @@ from basecradle_harness._basecradle import (
     base_url_override,
     normalize_provider,
 )
+from basecradle_harness._deadline import bound_attempts
 from basecradle_harness._observability import tool_failed
 from basecradle_harness._secret import reveal, secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
@@ -127,6 +128,9 @@ class _Credits:
     updated_at: datetime
     #: What this key has been billed, or ``None`` when the vendor stated no usable figure for it.
     key_spend: _KeySpend | None = None
+    #: Why `key_spend` is ``None``, as the ``key spend`` line's slug: ``not_reported`` (the vendor
+    #: stated no figure) or ``invalid_response`` (it stated one that is not usable).
+    key_spend_fault: str | None = None
 
 
 @dataclass(frozen=True)
@@ -219,25 +223,7 @@ class RefuselessAccountBalanceTool(Tool):
             return cached
 
         try:
-            # Built inside the guard: httpx encodes a header as ASCII at construction, so a pasted
-            # key carrying a smart quote raises before any request exists to fail.
-            with httpx.Client(
-                headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
-            ) as client:
-                credits = _parse_credits(self._get(client, f"{root}/credits"))
-        except httpx.InvalidURL:
-            return tool_failed(
-                "refuseless account balance unavailable — AI_BASE_URL is not a usable URL, so "
-                "there is no host to read the account at.",
-                reason="config:base_url",
-            )
-        except UnicodeEncodeError:
-            return tool_failed(
-                "refuseless account balance unavailable — AI_API_KEY contains a non-ASCII "
-                "character, so it cannot be sent as a header; check for a smart quote or a "
-                "non-breaking space picked up when it was pasted.",
-                reason="config:auth",
-            )
+            credits = read_credits(key, root, timeout=self._timeout)
         except _BalanceUnavailable as exc:
             return tool_failed(f"refuseless account balance unavailable — {exc}", reason=exc.slug)
 
@@ -251,57 +237,6 @@ class RefuselessAccountBalanceTool(Tool):
         root = self._base_url or base_url_override() or _PROVIDER_BASE_URLS[VENDOR]
         return root.rstrip("/")
 
-    def _get(self, client: httpx.Client, url: str) -> dict[str, Any]:
-        """GET ``/credits`` and decode it, mapping every failure to a soft reason."""
-        try:
-            response = client.get(url)
-        except httpx.TimeoutException:
-            raise _BalanceUnavailable(
-                "the refuseless API did not answer in time.", slug="timeout"
-            ) from None
-        except httpx.RequestError as exc:
-            raise _BalanceUnavailable(
-                f"couldn't reach the refuseless API ({type(exc).__name__}).", slug="transport"
-            ) from None
-
-        status = response.status_code
-        if status in (401, 403):
-            raise _BalanceUnavailable(
-                f"refuseless rejected the key (HTTP {status}). Check AI_API_KEY.",
-                slug="config:auth",
-            )
-        if status == 429:
-            raise _BalanceUnavailable(
-                "refuseless is rate-limiting balance reads (HTTP 429; it allows 60 a minute per "
-                "key). Try again in a minute.",
-                slug="rate_limited",
-            )
-        if not 200 <= status < 300:
-            slug = _STATUS_SLUGS.get(status) or ("server_error" if status >= 500 else "api_error")
-            if _error_code(response) == GATEWAY_DOWN:
-                raise _BalanceUnavailable(
-                    f"refuseless's billing service is unreachable (HTTP {status}, gateway_down). "
-                    "Try again shortly.",
-                    slug=slug,
-                )
-            raise _BalanceUnavailable(
-                f"refuseless returned HTTP {status} reading the credit balance.", slug=slug
-            )
-        try:
-            data = response.json()
-        except (ValueError, RecursionError):
-            # `json` raises `RecursionError`, not a `ValueError`, on a deeply nested body.
-            raise _BalanceUnavailable(
-                "refuseless returned an unreadable response reading the credit balance.",
-                slug="invalid_response",
-            ) from None
-        if not isinstance(data, dict):
-            raise _BalanceUnavailable(
-                "refuseless returned an unexpected response reading the credit balance.",
-                slug="invalid_response",
-            )
-        return data
-
     def _cached_balance(self, digest: bytes, root: str) -> str | None:
         """The cached text if it is still fresh **and** was read with this key at this root."""
         if self._cached is None:
@@ -311,6 +246,88 @@ class RefuselessAccountBalanceTool(Tool):
         if same_key and cached_root == root and self._clock() < expiry:
             return text
         return None
+
+
+def read_credits(
+    key: str, root: str, *, timeout: float | httpx.Timeout = DEFAULT_TIMEOUT
+) -> _Credits:
+    """One ``GET <root>/credits`` with `key`, parsed; every failure a `_BalanceUnavailable`.
+
+    The one read both the tool and the wake's ``key spend`` line make (`_key_spend`), so the two
+    cannot judge the same answer differently. The caller has already decided `key` is a refuseless
+    key and `root` is where it goes; this function sends it nowhere else.
+    """
+    try:
+        # Built inside the guard: httpx encodes a header as ASCII at construction, so a pasted key
+        # carrying a smart quote raises before any request exists to fail.
+        with httpx.Client(headers={"Authorization": f"Bearer {key}"}, timeout=timeout) as client:
+            # The timeout is a deadline on the whole attempt, not an idle timer a keepalive resets
+            # (issue #788): the wake's `key spend` line makes this read as the wake ends.
+            bound_attempts(client)
+            return _parse_credits(_get(client, f"{root}/credits"))
+    except httpx.InvalidURL:
+        raise _BalanceUnavailable(
+            "AI_BASE_URL is not a usable URL, so there is no host to read the account at.",
+            slug="config:base_url",
+        ) from None
+    except UnicodeEncodeError:
+        raise _BalanceUnavailable(
+            "AI_API_KEY contains a non-ASCII character, so it cannot be sent as a header; check "
+            "for a smart quote or a non-breaking space picked up when it was pasted.",
+            slug="config:auth",
+        ) from None
+
+
+def _get(client: httpx.Client, url: str) -> dict[str, Any]:
+    """GET ``/credits`` and decode it, mapping every failure to a soft reason."""
+    try:
+        response = client.get(url)
+    except httpx.TimeoutException:
+        raise _BalanceUnavailable(
+            "the refuseless API did not answer in time.", slug="timeout"
+        ) from None
+    except httpx.RequestError as exc:
+        raise _BalanceUnavailable(
+            f"couldn't reach the refuseless API ({type(exc).__name__}).", slug="transport"
+        ) from None
+
+    status = response.status_code
+    if status in (401, 403):
+        raise _BalanceUnavailable(
+            f"refuseless rejected the key (HTTP {status}). Check AI_API_KEY.",
+            slug="config:auth",
+        )
+    if status == 429:
+        raise _BalanceUnavailable(
+            "refuseless is rate-limiting balance reads (HTTP 429; it allows 60 a minute per "
+            "key). Try again in a minute.",
+            slug="rate_limited",
+        )
+    if not 200 <= status < 300:
+        slug = _STATUS_SLUGS.get(status) or ("server_error" if status >= 500 else "api_error")
+        if _error_code(response) == GATEWAY_DOWN:
+            raise _BalanceUnavailable(
+                f"refuseless's billing service is unreachable (HTTP {status}, gateway_down). "
+                "Try again shortly.",
+                slug=slug,
+            )
+        raise _BalanceUnavailable(
+            f"refuseless returned HTTP {status} reading the credit balance.", slug=slug
+        )
+    try:
+        data = response.json()
+    except (ValueError, RecursionError):
+        # `json` raises `RecursionError`, not a `ValueError`, on a deeply nested body.
+        raise _BalanceUnavailable(
+            "refuseless returned an unreadable response reading the credit balance.",
+            slug="invalid_response",
+        ) from None
+    if not isinstance(data, dict):
+        raise _BalanceUnavailable(
+            "refuseless returned an unexpected response reading the credit balance.",
+            slug="invalid_response",
+        )
+    return data
 
 
 #: The statuses `docs/telemetry.md` → Fault Slugs names by the status alone, beyond the two this
@@ -391,31 +408,35 @@ def _parse_credits(data: dict[str, Any]) -> _Credits:
         available=figures["available"],  # type: ignore[arg-type]
         key_limit=limit,
         updated_at=updated_at,
-        key_spend=_key_spend(data),
+        **_key_spend(data),
     )
 
 
-def _key_spend(data: dict[str, Any]) -> _KeySpend | None:
-    """The key's own spend out of ``GET /credits``, or ``None`` when the vendor stated none usably.
+def _key_spend(data: dict[str, Any]) -> dict[str, Any]:
+    """The key's own spend out of ``GET /credits``, as `_Credits` fields: the figure or its fault.
 
     Never required (module docstring): an absent or ``null`` ``key_spent``, one that is not a
     finite, non-negative number, and a ``key_spent_since`` that is neither ``null`` (absent
     included) nor a non-negative integer number of seconds each leave the spend out and the balance
-    standing. A negative figure is refused because a key's billed total cannot be one.
+    standing. A negative figure is refused because a key's billed total cannot be one. An absent or
+    ``null`` ``key_spent`` is ``not_reported``; anything else unusable is ``invalid_response``.
     """
+    if data.get("key_spent") is None:
+        return {"key_spend_fault": "not_reported"}
+    invalid = {"key_spend_fault": "invalid_response"}
     spent = _usd(data.get("key_spent"))
     if spent is None or spent < 0:
-        return None
+        return invalid
     raw = data.get("key_spent_since")
     if raw is None:
-        return _KeySpend(spent=spent, since=None)
+        return {"key_spend": _KeySpend(spent=spent, since=None)}
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
-        return None
+        return invalid
     try:
         since = datetime.fromtimestamp(raw, UTC)
     except (OverflowError, OSError, ValueError):
-        return None
-    return _KeySpend(spent=spent, since=since)
+        return invalid
+    return {"key_spend": _KeySpend(spent=spent, since=since)}
 
 
 def _usd(figure: Any) -> float | None:

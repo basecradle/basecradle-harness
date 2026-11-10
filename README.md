@@ -1456,6 +1456,12 @@ INFO wake end timeline=019e77…6da outcome=ok turns=1 steps=2/24 posted=1 durat
   ```
 
   **A charge nobody can price is a counted line, not a silence.** OpenAI bills a code-interpreter container per session and Anthropic bills code-execution container time (on a request with neither web search nor web fetch), and no response of either says how much, so a wake that ran one writes one `WARNING cost unpriced provider=<vendor> charge=container_time reason=not_reported` — read that charge off the vendor's usage dashboard.
+- **One `key spend` line per wake on a refuseless or OpenRouter brain** ([#868](https://github.com/basecradle/basecradle-harness/issues/868); [the contract](docs/telemetry.md#key-spend)), written just before `wake end`: what the brain's own `AI_API_KEY` has been billed, cumulative, exactly as the vendor states it (refuseless's `key_spent`, OpenRouter's `GET /key` `usage`), so the fleet can reconcile each agent's logged `cost=` against its vendor's bill even when several agents share an account. The figure is `spent=`, never `cost=`, because a cumulative figure on `cost=` would be summed again on every wake. A read that produced no figure is a WARNING with its slug, never silence. The read is free, never holds the wake (a ten-second deadline on the whole attempt), is skipped by a stopped wake, and sends the key only where the brain's own calls go, under `AI_PROVIDER` naming that vendor and a wired brain reporting it. Every other brain writes no line.
+
+  ```
+  INFO key spend provider=refuseless outcome=ok spent=0.001405 as_of=2026-11-10T21:12:05Z timeline=019e77…6da
+  WARNING key spend provider=openrouter outcome=error reason=rate_limited timeline=019e77…6da
+  ```
 - **One line per [context compaction](#the-context-budget--the-transcript-compacts-itself)**, plus one naming the context limit the agent resolved and where it came from — so "which ceiling is this agent actually on, and is it compacting?" is answerable from the journal, never inferred:
 
   ```

@@ -193,6 +193,7 @@ from basecradle_harness._install import (
     prompt_text,
     system_prompt_text,
 )
+from basecradle_harness._key_spend import log_key_spend
 from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs_report
 from basecradle_harness._memory_provider import (
     MemoryExchange,
@@ -2056,6 +2057,12 @@ class WakeAgent:
             # (`_generate_settled`). So the turn count rides alongside the step total: without it
             # a legitimate 3-turn wake reading `steps=30/24` would look like a blown budget rather
             # than three turns of ten.
+            # What the brain's key has been billed, as its vendor states it, for the fleet's
+            # reconciliation of logged cost against billed cost (issue #868). Last before the
+            # bookend, so every call of the wake has settled; never on a stopped wake, which the
+            # router is waiting to see die. It never raises.
+            if stopped_by is None:
+                log_key_spend(provider, timeline=self.timeline_uuid, delivery=delivery)
             engine = self.harness.engine
             _log.info(
                 "%s %s",
