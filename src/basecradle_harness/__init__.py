@@ -108,7 +108,7 @@ from basecradle_harness._messages import (
 from basecradle_harness._observability import tool_failed
 from basecradle_harness._openai import OpenAIProvider
 from basecradle_harness._openrouter import OpenRouterProvider
-from basecradle_harness._openrouter_account import OpenRouterAccountBalanceTool
+from basecradle_harness._openrouter_account import OpenRouterAccountBalanceTool, OpenRouterKeyHeld
 from basecradle_harness._platform import (
     PlatformContext,
     PlatformTool,
@@ -253,6 +253,7 @@ __all__ = [
     "OpenAISurface",
     "EnvSet",
     "OpenAIKey",
+    "OpenRouterKeyHeld",
     "ActivationContext",
     "ResolvedTools",
     "LoadedPlugins",

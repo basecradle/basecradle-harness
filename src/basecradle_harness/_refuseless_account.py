@@ -125,7 +125,9 @@ class RefuselessAccountBalanceTool(Tool):
     A plain read-only `Tool` (no platform client, no policy capability) that calls
     ``GET <base_url>/credits`` with the agent's ``AI_API_KEY``. Its plugin is gated on
     ``Vendor("refuseless")``, because that key is the brain's and is a refuseless key only when the
-    brain is (module docstring), and it is `opt_in` like every account/billing read (issue #168).
+    brain is (module docstring). It is a benign default since issue #862 (@origin, 2026-11-10: every
+    agent reads the balance at its main LLM vendor when the read exposes nothing else sensitive), so
+    that gate alone decides where it appears.
 
     Args:
         api_key: The refuseless key. ``None`` (the default) reads ``AI_API_KEY`` at call time.

@@ -407,7 +407,7 @@ def install(
 
     **Powerful tools are opt-in (issue #168), and the grant is durable (issue #374).** A
     tool-plugin default marked ``opt_in`` (media generation, web/X search, code execution,
-    self-authorship, a shell, an account/billing read, a push to a human's phone) is
+    self-authorship, a shell, a privileged account read, a push to a human's phone) is
     **not** scaffolded for a fresh agent — it ships in the package but stays off until explicitly
     chosen, the same "ships empty" stance as ``mcp/``. Three ways it still lands: it is named in
     ``opt_in`` (a list of plugin file stems, e.g. ``["grok_generate_image"]`` — the ``--opt-in``
@@ -554,6 +554,11 @@ def _power_tool_stems(shipped: dict[str, str]) -> set[str]:
     }
 
 
+def _tool_stems(shipped: dict[str, str]) -> set[str]:
+    """The file stems of every tool-plugin default in `shipped`, powerful and benign alike."""
+    return {rel[len("tools/") : -len(".py")] for rel in shipped if _is_tool_plugin(rel)}
+
+
 def _warn_unmatched_opt_in(named: Sequence[str], shipped_all: dict[str, str]) -> None:
     """Warn (loudly, never silently) for any grant/revoke name that matches no powerful default.
 
@@ -566,7 +571,21 @@ def _warn_unmatched_opt_in(named: Sequence[str], shipped_all: dict[str, str]) ->
     is retired and it is still there — so both flags' names come through here.
     """
     known = _power_tool_stems(shipped_all)
-    unknown = sorted(_stems(named) - known)
+    named_stems = _stems(named) - known
+    # A benign default is laid down on every agent with no grant, so naming one is not a typo but a
+    # grant that has nothing to do — the case a stem leaves behind when it stops being opt-in
+    # (issue #862's balance tools), where a fleet inventory still lists it. Said in its own words,
+    # because "named no powerful tool" and a hint about tool names would send the operator hunting
+    # for a spelling mistake that is not there.
+    defaults = sorted(named_stems & (_tool_stems(shipped_all) - known))
+    if defaults:
+        _log.warning(
+            "--opt-in/--revoke-opt-in named a default tool, which needs no grant (it is laid down "
+            "wherever its provider affinity allows), so it did nothing for: %s. Drop it from the "
+            "grant list; delete its file from tools/ to disable it.",
+            ", ".join(defaults),
+        )
+    unknown = sorted(named_stems - set(defaults))
     if unknown:
         _log.warning(
             "--opt-in/--revoke-opt-in named no powerful tool default and did nothing for: %s. The "
@@ -601,6 +620,13 @@ def _granted_stems(
     A grant for a stem this package does not ship, or does not ship for the active provider, is
     **kept**: a provider switch or a package that re-adds the tool should find the grant intact,
     and `_verify` is where an unshippable grant is reported rather than quietly dropped here.
+
+    A grant for a stem this package ships as a **benign** default is dropped, because there is
+    nothing left for it to grant: the file is laid down on every agent it is relevant to, and its
+    absence is the operator's deletion like any other default's. That is the shape a stem leaves
+    behind when it stops being opt-in (issue #862's balance tools), and keeping the grant would
+    make a later deletion of the file read as a strip and restore it, a rule meant only for a
+    capability someone granted.
     """
     recorded = declared_opt_in(read_declaration(root))
     present = {
@@ -608,7 +634,8 @@ def _granted_stems(
         for rel, text in shipped_all.items()
         if _is_tool_plugin(rel) and plugin_opts_in(text) and root.joinpath(*rel.split("/")).exists()
     }
-    return (recorded | present | explicit) - revoked
+    benign = _tool_stems(shipped_all) - _power_tool_stems(shipped_all)
+    return (recorded | present | explicit) - revoked - benign
 
 
 def _opt_in_scaffold_set(
@@ -663,6 +690,11 @@ def _revoke_grants(
         rel = f"tools/{stem}.py"
         if rel not in shipped_all:
             continue  # not a shipped default; the grant is dropped either way
+        if not plugin_opts_in(shipped_all[rel]):
+            # A benign default was never granted, so there is no grant to withdraw and its file is
+            # not this flag's to remove: deleting it here would see the next reconcile lay it down
+            # again. `_warn_unmatched_opt_in` has already said so.
+            continue
         target = root.joinpath(*rel.split("/"))
         updated.pop(rel, None)
         if not target.exists():
@@ -1316,7 +1348,7 @@ def main(argv: list[str] | None = None) -> int:
             "comma-separated plugin file stems to scaffold despite being powerful/opt-in tools "
             "(issue #168) — e.g. --opt-in generate_image,web_search. Powerful tools (media "
             "generation, web/X search, code execution, self-authorship, a shell, an "
-            "account/billing read, a push to a human's phone) are off by default for a new "
+            "account read needing its own key, a push to a human's phone) are off by default for a new "
             "agent; this is how you grant one. Already-granted ones are kept (grandfathered) "
             "regardless."
         ),

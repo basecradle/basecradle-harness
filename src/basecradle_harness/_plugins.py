@@ -110,6 +110,19 @@ class Requirement(ABC):
     def reason(self) -> str:
         """A short phrase naming what this requirement needs, for the skip log."""
 
+    @property
+    def credential_vars(self) -> tuple[str, ...]:
+        """The environment variables whose *presence* this requirement tests — none by default.
+
+        What ``basecradle-harness-resolve`` assumes present (or absent) when it simulates a
+        configuration off the box (`_resolve._plugin_credentials`), so a credential-gated tool is
+        never silently included or silently omitted. It names what the gate **tests**, which is not
+        always what a configuration **wants provisioned**: an `EnvSet` tests one variable it cannot
+        do without, so it is both (`plugin_env_dependencies`), while a gate met by any one of
+        several keys (`OpenRouterKeyHeld`, issue #862) tests each and requires none.
+        """
+        return ()
+
 
 @dataclass(frozen=True)
 class Vendor(Requirement):
@@ -240,6 +253,10 @@ class EnvSet(Requirement):
     def reason(self) -> str:
         return f"needs {self.var} set"
 
+    @property
+    def credential_vars(self) -> tuple[str, ...]:
+        return (self.var,)
+
 
 @dataclass(frozen=True)
 class OpenAIKey(EnvSet):
@@ -288,7 +305,7 @@ class ToolPlugin:
     existing plugin that sets no `note` is unaffected.
 
     `opt_in` marks a **powerful/dangerous** tool — media generation (image, video, audio),
-    web/X search, code execution, self-authorship, a full shell, an account/billing read, an
+    web/X search, code execution, self-authorship, a full shell, a privileged account read, an
     off-platform push to a human's phone — that must **fail closed**: it is **off by default on every
     provider** (issue #168) and activates **only** when the operator explicitly drops it into an
     agent's ``tools/`` overlay (the same "ships empty" pattern as ``mcp/``). An opt-in plugin
@@ -297,9 +314,15 @@ class ToolPlugin:
     shipped-default → install-then-prune behavior. This is a **capability** classification,
     **provider-agnostic** — the `requires` gate (`Vendor`/`OpenAIKey`/`EnvSet`) decides
     *availability*, never the safety default, and a powerful plugin may legitimately declare
-    **no** gate at all (`openrouter_account_balance`, issue #425), leaving `opt_in` as the only
-    thing keeping it off a default-riding agent. That is the design, not a gap. Detected from source (AST) by `_install.plugin_opts_in` so the
-    installer and loader agree without importing the plugin.
+    **no** gate at all (`system_prompt`, issue #241), leaving `opt_in` as the only thing keeping
+    it off a default-riding agent. That is the design, not a gap. Detected from source (AST) by
+    `_install.plugin_opts_in` so the installer and loader agree without importing the plugin.
+
+    An account/billing read is opt-in only when it exposes more than the balance or needs a
+    credential of its own: @origin's rule of 2026-11-10 (issue #862) makes the balance at an
+    agent's own LLM vendor a benign default wherever the read exposes no other sensitive account
+    data (``openrouter_account_balance``, ``refuseless_account_balance``), while one that needs a
+    dedicated management key stays a case-by-case grant (``xai_account_balance``).
     """
 
     impl: type[Tool] | None = None

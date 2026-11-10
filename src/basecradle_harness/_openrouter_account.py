@@ -38,6 +38,14 @@ brained by another vendor whose OpenRouter key serves a helper. A ``Vendor("open
 would self-exclude exactly that agent. The provider check in step 2 is what keeps another vendor's
 ``AI_API_KEY`` from ever being sent to OpenRouter's host.
 
+**On by default where a key is held** (issue #862). @origin's rule of 2026-11-10: *every agent can
+read the available balance at its main LLM vendor, as long as that read exposes no other sensitive
+account data, and an agent whose reranker is on OpenRouter reads the OpenRouter balance too.* This
+read exposes the account's two credit totals and the calling key's own spend and limit, nothing
+else, so it is a benign default rather than an opt-in. Its gate is `OpenRouterKeyHeld`, which asks
+`held_key` the same question the tool asks when it runs: an agent holding no OpenRouter key gets no
+tool, never one that answers "not configured" on every wake.
+
 **The arithmetic is a subtraction, and it is the whole of it.** ``GET /credits`` returns two
 *lifetime cumulative* totals — ``data.total_credits`` (purchased to date) and ``data.total_usage``
 (used to date) — as plain positive JSON numbers, and the remaining credit is their difference.
@@ -85,7 +93,7 @@ import hmac
 import math
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -96,6 +104,7 @@ import httpx
 from basecradle_harness._basecradle import base_url_override, normalize_provider
 from basecradle_harness._describer import DESCRIBER_API_KEY_VAR, describer_stack_from_env
 from basecradle_harness._observability import tool_failed
+from basecradle_harness._plugins import ActivationContext, Requirement
 from basecradle_harness._rerank import RERANK_API_KEY_VAR, base_url_from_env
 from basecradle_harness._secret import Secret, reveal, secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
@@ -201,8 +210,9 @@ class OpenRouterAccountBalanceTool(Tool):
 
     Unlike its xAI sibling its plugin declares **no `Vendor` requirement**, deliberately (issue
     #425): the ordering case is an agent brained by *another* provider whose OpenRouter key serves
-    a helper, and a ``Vendor("openrouter")`` gate would self-exclude exactly that agent. It stays
-    `opt_in` like every powerful tool (issue #168), because it reaches an account/billing surface.
+    a helper, and a ``Vendor("openrouter")`` gate would self-exclude exactly that agent. It is a
+    benign default since issue #862, gated on `OpenRouterKeyHeld`: present wherever the agent holds
+    an OpenRouter key, absent wherever it holds none.
 
     It degrades to a clear ``"OpenRouter account balance unavailable — <reason>"`` string in every
     failure mode (no key, a rejected key, an unusable host, endpoint unreachable, unexpected
@@ -339,29 +349,25 @@ class OpenRouterAccountBalanceTool(Tool):
             if key:
                 return _Credential(secret(key), source, None, argument_root, None, management)
 
-        key = _env(MANAGEMENT_KEY_VAR)
-        if key:
-            return self._from_env(key, MANAGEMENT_KEY_VAR, "a Management key", None, None, True)
-        key = _env("AI_API_KEY")
-        if key and _active_provider() == VENDOR:
+        held = held_key(os.environ, _active_provider())
+        if held is None:
+            return None
+        var, key = held
+        if var == MANAGEMENT_KEY_VAR:
+            return self._from_env(key, var, "a Management key", None, None, True)
+        if var == "AI_API_KEY":
             root = base_url_override()
-            return self._from_env(key, "AI_API_KEY", "your brain's key", root, "AI_BASE_URL")
-        key = _env(RERANK_API_KEY_VAR)
-        if key:
+            return self._from_env(key, var, "your brain's key", root, "AI_BASE_URL")
+        if var == RERANK_API_KEY_VAR:
             root = base_url_from_env()
             where = "HARNESS_MEMPALACE_RERANK_BASE_URL"
-            return self._from_env(
-                key, RERANK_API_KEY_VAR, "your memory reranker's key", root, where
-            )
-        key = _env(DESCRIBER_API_KEY_VAR)
-        if key and _normalized(describer_stack_from_env()[0]) == VENDOR:
-            # A describer naming the brain's own vendor inherits the brain's host (`_describer`'s
-            # `inherit_endpoint`), so a regional `AI_BASE_URL` keeps its key regional here too.
-            root, where = (base_url_override(), "AI_BASE_URL")
-            if _active_provider() != VENDOR:
-                root, where = None, None
-            return self._from_env(key, DESCRIBER_API_KEY_VAR, "your describer's key", root, where)
-        return None
+            return self._from_env(key, var, "your memory reranker's key", root, where)
+        # A describer naming the brain's own vendor inherits the brain's host (`_describer`'s
+        # `inherit_endpoint`), so a regional `AI_BASE_URL` keeps its key regional here too.
+        root, where = (base_url_override(), "AI_BASE_URL")
+        if _active_provider() != VENDOR:
+            root, where = None, None
+        return self._from_env(key, var, "your describer's key", root, where)
 
     def _from_env(
         self,
@@ -484,9 +490,71 @@ def _unusable_root(credential: _Credential) -> str:
     )
 
 
-def _env(var: str) -> str | None:
-    """An env var's value, stripped, or ``None`` when it is unset or blank."""
-    return (os.environ.get(var) or "").strip() or None
+def _value(env: Mapping[str, str], var: str) -> str | None:
+    """A variable's value in `env`, stripped, or ``None`` when it is unset or blank."""
+    return (env.get(var) or "").strip() or None
+
+
+#: Every variable an OpenRouter key may be read from, in the order `held_key` reads them.
+KEY_VARS = (MANAGEMENT_KEY_VAR, "AI_API_KEY", RERANK_API_KEY_VAR, DESCRIBER_API_KEY_VAR)
+
+
+def held_key(env: Mapping[str, str], provider: str) -> tuple[str, str] | None:
+    """``(variable, key)`` for the OpenRouter key this tool reads with, or ``None`` if none is held.
+
+    The module docstring's order, and the **one** place it is written down: the tool reads its key
+    through this (`OpenRouterAccountBalanceTool._credential`), and its plugin's activation gate asks
+    it the same question (`OpenRouterKeyHeld`), so the tool can never be offered to an agent it
+    would then answer "no OpenRouter key is configured", nor withheld from one whose key it would
+    have read. `provider` is ``AI_PROVIDER`` normalized as a wake reads it, because the brain's
+    ``AI_API_KEY`` is an OpenRouter key only when OpenRouter bills the brain.
+    """
+    describer_on_openrouter = _normalized(describer_stack_from_env(env)[0]) == VENDOR
+    for var, applies in (
+        (MANAGEMENT_KEY_VAR, True),
+        ("AI_API_KEY", provider == VENDOR),
+        (RERANK_API_KEY_VAR, True),
+        (DESCRIBER_API_KEY_VAR, describer_on_openrouter),
+    ):
+        key = _value(env, var)
+        if key and applies:
+            return var, key
+    return None
+
+
+@dataclass(frozen=True)
+class OpenRouterKeyHeld(Requirement):
+    """Met iff the agent already holds an OpenRouter key this tool would read with (issue #862).
+
+    The activation gate of ``openrouter_account_balance``, which is on by default since @origin's
+    rule of 2026-11-10: *every agent can read the available balance at its main LLM vendor, as long
+    as that read exposes no other sensitive account data, and an agent whose reranker is on
+    OpenRouter reads the OpenRouter balance too.* The tool is offered exactly where it can work: an
+    agent holding no OpenRouter key gets no tool, never a tool that answers "not configured" on
+    every wake. The precedence is `held_key`, so the gate and the tool cannot disagree.
+
+    Deliberately **not** a `Vendor` gate (issue #425): an agent brained by another vendor whose
+    OpenRouter key serves its reranker or describer is the case it exists for. And deliberately
+    **not** an `EnvSet`: any one of four keys meets it, so it requires none of them. It names all
+    four as `credential_vars` (what ``basecradle-harness-resolve`` assumes present or absent) but
+    contributes nothing to `plugin_env_dependencies`, so a healthy agent reading with its brain's
+    key never shows three unset variables as gaps in ``tool_env`` (the issue #853 reasoning).
+    """
+
+    def met(self, ctx: ActivationContext) -> bool:
+        return held_key(ctx.env, ctx.provider) is not None
+
+    @property
+    def reason(self) -> str:
+        return (
+            f"needs an OpenRouter key the agent already holds ({MANAGEMENT_KEY_VAR}; AI_API_KEY "
+            f"under AI_PROVIDER=openrouter; {RERANK_API_KEY_VAR}; or {DESCRIBER_API_KEY_VAR} under "
+            "HARNESS_DESCRIBER_PROVIDER=openrouter)"
+        )
+
+    @property
+    def credential_vars(self) -> tuple[str, ...]:
+        return KEY_VARS
 
 
 def _normalized(raw: str | None) -> str:

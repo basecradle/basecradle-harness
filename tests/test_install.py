@@ -12,6 +12,7 @@ no second build, no package surgery.
 """
 
 import json
+import logging
 
 import pytest
 
@@ -693,13 +694,91 @@ def test_every_shipped_power_tool_default_is_classified_opt_in():
         "system_prompt",  # self-authorship: read + edit own system-prompt.md (issue #241)
         "shell",  # full command-line access, unlocked-profile-only (issue #252)
         "xai_account_balance",  # xAI Management API billing read, xai-only (issue #179)
-        "openrouter_account_balance",  # OpenRouter credits read, provider-agnostic (issue #425)
-        "refuseless_account_balance",  # refuseless credits read, refuseless-only (issue #848)
         "send_direct_message_to_origin",  # push notification to @origin's phone (issue #341)
         "google_search",  # Gemini grounding as a harness-run web_search tool (issue #656)
         "url_context",  # Gemini URL context server tool (issue #656)
         "anthropic_search",  # Anthropic web_search server tool (issue #725)
     }
+
+
+def test_the_main_vendor_balance_reads_are_benign_defaults_and_the_xai_one_is_not():
+    """@origin's rule of 2026-11-10 (issue #862), pinned at the classification it rests on.
+
+    Every agent reads the balance at its main LLM vendor when the read exposes nothing else
+    sensitive, so the OpenRouter and refuseless reads are benign defaults; the xAI read needs a
+    dedicated Management key, the case-by-case class, so it stays opt-in.
+    """
+    for stem in ("openrouter_account_balance", "refuseless_account_balance"):
+        assert not plugin_opts_in(_shipped_tool_source(stem)), stem
+    assert plugin_opts_in(_shipped_tool_source("xai_account_balance"))
+
+
+def test_a_plain_install_lays_down_each_vendors_balance_read_where_it_belongs(tmp_path):
+    """No grant: the OpenRouter read lands on every provider, the refuseless read on refuseless only.
+
+    The OpenRouter one declares no provider affinity, because an agent brained by another vendor
+    whose OpenRouter key serves its reranker is the case it exists for (issue #425); whether it
+    then *activates* is its key gate's question, asked at load (`OpenRouterKeyHeld`).
+    """
+    for provider in ("openai", "xai", "openrouter", "google", "anthropic", "refuseless", "wiro"):
+        home = tmp_path / provider
+        install(home, provider=provider)
+        files = _tool_files(home)
+        assert "openrouter_account_balance.py" in files, provider
+        assert ("refuseless_account_balance.py" in files) is (provider == "refuseless"), provider
+        assert "xai_account_balance.py" not in files, provider
+
+
+def test_a_grant_left_behind_for_a_stem_that_became_a_default_is_dropped(tmp_path):
+    """The migration shape #862 leaves: a declared grant for a stem that no longer needs one.
+
+    Kept, it would make the operator's later deletion of the file read as a strip and restore it,
+    a rule meant only for a capability someone granted. Dropped, the file is a default like any
+    other and its deletion is respected.
+    """
+    home = tmp_path / "cfg"
+    install(home, provider="xai")
+    declared = config_home(home) / ".declared.json"
+    record = json.loads(declared.read_text())
+    record["opt_in"] = ["openrouter_account_balance", "xai_account_balance"]  # an old grant set
+    declared.write_text(json.dumps(record))
+
+    report = install(home, provider="xai")
+    assert report.granted == ["xai_account_balance"]
+    assert json.loads(declared.read_text())["opt_in"] == ["xai_account_balance"]
+
+    (home / "tools" / "openrouter_account_balance.py").unlink()  # the operator disables it
+    report = install(home, provider="xai")
+    # Respected, never restored: a deleted default whose source did not change reconciles as
+    # UNCHANGED (no write); a granted one would have come back as RESTORED.
+    assert report.actions["tools/openrouter_account_balance.py"] == UNCHANGED
+    assert not (home / "tools" / "openrouter_account_balance.py").exists()
+
+
+def test_naming_a_default_tool_to_opt_in_or_revoke_does_nothing_and_says_why(tmp_path, caplog):
+    """A fleet inventory may still list a stem that became a default; the flag must not act on it.
+
+    `--opt-in` has nothing to grant, and `--revoke-opt-in` must not delete a default's file: the
+    next reconcile would only lay it down again. The warning names it as a default rather than as
+    a likely typo, so nobody goes hunting for a spelling mistake.
+    """
+    home = tmp_path / "cfg"
+    install(home, provider="xai")
+    with caplog.at_level(logging.WARNING, logger="basecradle_harness"):
+        report = install(
+            home,
+            provider="xai",
+            opt_in=["openrouter_account_balance"],
+            revoke_opt_in=["openrouter_account_balance"],
+        )
+    assert (home / "tools" / "openrouter_account_balance.py").exists()
+    assert "tools/openrouter_account_balance.py" not in {
+        rel for rel, action in report.actions.items() if action == REVOKED
+    }
+    assert report.granted == []
+    text = caplog.text
+    assert "named a default tool" in text and "openrouter_account_balance" in text
+    assert "named no powerful tool default" not in text
 
 
 def test_plugin_relevant_to_gates_on_the_active_provider():
@@ -728,7 +807,8 @@ _OPENAI_DEFAULTS = {"generate_image.py", "edit_image.py", "web_search.py"}
 # provider-affine sets above — eight stems against fifteen shipped ones — so its nine call sites
 # drove the install / prune / revoke paths with **no provider-agnostic** powerful stem at all,
 # which is precisely the shape `openrouter_account_balance` introduced (a powerful default with no
-# `requires` whatever, issue #425). A hand-written list of "every X" tests its author's memory;
+# vendor affinity, issue #425; a benign default since issue #862, and `send_direct_message_to_origin`
+# and `shell` are that shape now). A hand-written list of "every X" tests its author's memory;
 # this one goes red the day a stem is added rather than quietly not covering it.
 _ALL_POWER_STEMS = sorted(_shipped_power_stems())
 # The provider-agnostic half — powerful, but declaring no vendor affinity at all, so it is laid
@@ -803,7 +883,6 @@ _POWER_SCAFFOLD = {
         "code_execution.py",
         "edit_image.py",
         "generate_image.py",
-        "openrouter_account_balance.py",
         "send_direct_message_to_origin.py",
         "shell.py",
         "system_prompt.py",
@@ -814,7 +893,6 @@ _POWER_SCAFFOLD = {
         "grok_edit_image.py",
         "grok_generate_image.py",
         "grok_generate_video.py",
-        "openrouter_account_balance.py",
         "send_direct_message_to_origin.py",
         "shell.py",
         "system_prompt.py",
@@ -822,7 +900,6 @@ _POWER_SCAFFOLD = {
         "xai_search.py",
     },
     "openrouter": {
-        "openrouter_account_balance.py",
         "openrouter_search.py",
         "send_direct_message_to_origin.py",
         "shell.py",
@@ -831,15 +908,12 @@ _POWER_SCAFFOLD = {
     "google": {
         "code_execution.py",
         "google_search.py",
-        "openrouter_account_balance.py",
         "send_direct_message_to_origin.py",
         "shell.py",
         "system_prompt.py",
         "url_context.py",
     },
     "refuseless": {
-        "openrouter_account_balance.py",
-        "refuseless_account_balance.py",
         "send_direct_message_to_origin.py",
         "shell.py",
         "system_prompt.py",
@@ -853,9 +927,9 @@ def test_opting_in_every_power_stem_lays_down_exactly_its_providers_set(tmp_path
 
     The both-directions check the containment assertions never made. "No more" is the safety half
     (issue #168): a stem that is not this provider's must never appear. "No fewer" is the one that
-    was missing, and it is the half `openrouter_account_balance` needs — a powerful default with
-    **no** ``requires`` at all (issue #425), which belongs to every provider and so is invisible to
-    any assertion phrased as "the xAI set is absent".
+    was missing, and it is the half a powerful default with no vendor affinity needs
+    (`send_direct_message_to_origin`, `shell`, `system_prompt`), which belongs to every provider and
+    so is invisible to any assertion phrased as "the xAI set is absent".
     """
     home = tmp_path / "cfg"
     install(home, provider=provider, opt_in=_ALL_POWER_STEMS)
@@ -868,8 +942,8 @@ def test_the_provider_agnostic_power_tools_are_scaffolded_for_every_provider(tmp
 
     The property `_ALL_POWER_STEMS` could not exercise while it was built from the two
     provider-affine media sets (issue #427). It is the whole point of a provider-agnostic power
-    tool: `openrouter_account_balance` exists precisely for an agent brained by another vendor
-    (issue #425), so a scaffold that filtered it by provider would defeat it.
+    tool: `send_direct_message_to_origin` rings @origin's phone from whatever brain an agent runs,
+    so a scaffold that filtered it by provider would defeat it.
     """
     for provider, expected in _POWER_SCAFFOLD.items():
         home = tmp_path / provider

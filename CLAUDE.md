@@ -446,7 +446,7 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   tool — media generation (image, **video**, audio), web/X search, code execution,
   **self-authorship** (an agent editing its own `system-prompt.md`, issue #241), a **full
   shell** (arbitrary on-box command execution as the agent's OS user, issue #252), an
-  **account/billing read** (issues #179, #425), and an
+  **account read that needs a dedicated credential** (issue #179), and an
   **off-platform push to a human's phone** (issue #341) — is **off by
   default on every provider** and activates **only** when explicitly dropped into an agent's
   `tools/` overlay (the same "ships empty" stance as `mcp/`). The powerful defaults (by plugin
@@ -457,16 +457,8 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   — Anthropic's `web_search` server tool), `code_execution` (OpenAI, xAI, Gemini and Claude
   variants), `grok_generate_image`,
   `grok_edit_image`, `grok_generate_video`, `xai_account_balance` (issue #179 — xAI Management
-  API credit read, `Vendor("xai")`-gated because it reads an *xAI* account),
-  `openrouter_account_balance` (issue #425 — the OpenRouter mirror, and the one account tool with
-  **no** vendor gate: since issue #853 it reads with an OpenRouter key the agent already holds —
-  the optional `OPENROUTER_MANAGEMENT_KEY`, else the brain's `AI_API_KEY` only under
-  `AI_PROVIDER=openrouter`, else the reranker's or the describer's — so gating it on
-  `Vendor("openrouter")` would self-exclude the very case it serves, an agent brained by another
-  provider whose OpenRouter key serves a helper), `refuseless_account_balance` (issue
-  #848 — the refuseless credits read, `Vendor("refuseless")`-gated because it reads the brain's own
-  `AI_API_KEY`, which is a refuseless key only when the brain is refuseless; ungated, it would send
-  another vendor's key to refuseless's host), `system_prompt` (the read+edit
+  API credit read, `Vendor("xai")`-gated because it reads an *xAI* account, and opt-in because it
+  needs a dedicated Management key), `system_prompt` (the read+edit
   self-authorship pair — the most powerful, and as of #241 enabled on **no** agent; enablement is
   a per-agent founder decision), `send_direct_message_to_origin` (issue #341 — an ntfy.sh push notification
   to @origin's iPhone, leaving the platform entirely; powerful because it *interrupts a human*
@@ -492,8 +484,8 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   so even if it is ever wired onto a privileged account it never hands the model a root shell. It
   is deliberately narrow (euid 0 only); the fuller sudo/group check stays at the NOC enablement
   preflight, which has the box context the tool lacks. Benign/platform tools (memory, assets, messages,
-  timelines, tasks, trust, lock, delete, users, webhooks, web_fetch) keep the normal
-  shipped-default → install-then-prune behavior. Under `AI_PROVIDER=anthropic` the `web_fetch` name
+  timelines, tasks, trust, lock, delete, users, webhooks, web_fetch, and the main-vendor balance
+  reads below) keep the normal shipped-default → install-then-prune behavior. Under `AI_PROVIDER=anthropic` the `web_fetch` name
   is served by Claude's own server-side fetch (`anthropic_web_fetch`, issue #725) and the harness's
   tool steps aside (`NotVendor`); it stays **benign**, as the tool it replaces is — same capability,
   narrower reach (Anthropic fetches only URLs already in the conversation) — a classification stated
@@ -518,6 +510,24 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   silently-widened capability is exactly what the opt-in rule exists to prevent, and the difference
   between a decision and an oversight is whether it is stated. `view` and `watch` are unaffected —
   they were never powerful (no provider call, nothing spent, in-process decode).
+
+  **The balance read at an agent's own LLM vendor left this set by founder decision too**
+  (issue #862, @origin, 2026-11-10): *every agent can read the available balance at its main LLM
+  vendor, as long as that read exposes no other sensitive account data; an agent whose reranker is
+  on OpenRouter reads the OpenRouter balance too.* So `openrouter_account_balance` and
+  `refuseless_account_balance` are **benign defaults**, and each is gated to where its read can
+  work, never left to answer "not configured" on every wake: the OpenRouter read on
+  `OpenRouterKeyHeld` (met by any key the agent already holds, in the order the tool reads them —
+  `OPENROUTER_MANAGEMENT_KEY`, the brain's `AI_API_KEY` only under `AI_PROVIDER=openrouter`, the
+  reranker's, the describer's under `HARNESS_DESCRIBER_PROVIDER=openrouter` — from the one function
+  both ask, `_openrouter_account.held_key`; deliberately no `Vendor` gate, because an agent brained
+  by another vendor whose OpenRouter key serves a helper is the case it exists for, issue #425),
+  the refuseless read on `Vendor("refuseless")`. **The rule binds the next vendor's balance tool**:
+  a default when it reads with a key the agent already holds and returns the balance and nothing
+  else sensitive; opt-in when it needs a credential of its own, the case-by-case class
+  `xai_account_balance` stays in. A recorded grant for a stem that became a default is dropped as
+  moot (`_install._granted_stems`), and `--opt-in` / `--revoke-opt-in` do nothing for a default
+  and say so.
 
   **And one MCP tool is withheld by founder decision, recorded the same way** (issue #553,
   @origin, 2026-09-22: *"approve both (for now)"*). Playwright MCP's
