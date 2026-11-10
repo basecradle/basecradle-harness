@@ -141,9 +141,19 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: Every rule is linear in the input (a value is scrubbed before it is cut, so it can be long); the
 #: heartbeat rule is the one that needs care to stay so (`_HEARTBEAT_RUN`). Covered: the fleet's
 #: own key shapes (OpenAI/Anthropic ``sk-``, OpenRouter ``sk-or-``, xAI ``xai-``, BaseCradle
-#: ``bc_uat_``/``bc_isk_``), the box's (GitHub ``gh?_`` and fine-grained ``github_pat_``, Google
-#: ``AIza``, Hugging Face ``hf_``, Replicate ``r8_``, Steel ``ste-``, a Better Stack heartbeat URL,
-#: an unanchored ``api_key=``), and the generic bearer and key-in-query forms.
+#: ``bc_uat_``/``bc_isk_``, refuseless ``abl_``, Perplexity ``pplx-``, an ntfy access token
+#: ``tk_``), the box's (GitHub ``gh?_`` and fine-grained ``github_pat_``, Google ``AIza``, Hugging
+#: Face ``hf_``, Replicate ``r8_``, Steel ``ste-``, a Better Stack heartbeat URL, an unanchored
+#: ``api_key=``), and the generic bearer and key-in-query forms. A vendor key is covered only when
+#: its shape can be stated from the vendor's own word (issue #856): refuseless's ``abl_`` plus 48
+#: alphanumerics was read off two real keys, ntfy's ``tk_`` plus 29 is its documentation's, and
+#: Perplexity's ``pplx-`` prefix is its documentation's with gitleaks's 48 alphanumerics. Each of
+#: the three takes a minimum run of 20, under its vendor's length, as ``AIza``, ``hf_``, ``r8_`` and
+#: ``ste-`` do. ntfy generates a token from lowercase letters and digits, and its validator also
+#: admits capitals, ``_`` and ``-`` (``^tk_[-_A-Za-z0-9]{29}$``, ntfy's ``user/util.go``), which is
+#: the run ``tk_`` takes. A generated token with no digit, about 1 in 12,500, is the word residual
+#: below when glued to a letter. A key with no prefix of its own (Wiro's) has no shape a rule can
+#: match.
 #:
 #: **A vendor prefix inside a word is a word, not a credential** (issue #794), and the test is
 #: `_is_word`, never a left boundary. A boundary would be a list of the contexts in which
@@ -168,6 +178,9 @@ _PREFIXED = (
     (r"hf_", r"[A-Za-z0-9]{20,}"),
     (r"r8_", r"[A-Za-z0-9]{20,}"),
     (r"ste-", r"[A-Za-z0-9]{20,}"),
+    (r"abl_", r"[A-Za-z0-9]{20,}"),
+    (r"pplx-", r"[A-Za-z0-9]{20,}"),
+    (r"tk_", r"[A-Za-z0-9_-]{20,}"),
 )
 _PREFIX = re.compile("|".join(f"(?:{prefix})" for prefix, _ in _PREFIXED))
 _PREFIX_RULES = re.compile("|".join(f"(?:{prefix}){body}" for prefix, body in _PREFIXED))
