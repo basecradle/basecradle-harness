@@ -33,6 +33,7 @@ from basecradle_harness._images import GenerateImageTool
 from basecradle_harness._mcp import HttpMcpClient, McpServerConfig, StdioMcpClient, revealed
 from basecradle_harness._openrouter_account import OpenRouterAccountBalanceTool
 from basecradle_harness._platform import PlatformContext
+from basecradle_harness._refuseless_account import RefuselessAccountBalanceTool
 from basecradle_harness._rerank import MemPalaceReranker
 from basecradle_harness._secret import Secret, reveal, secret
 from basecradle_harness._token import SelfHealingBaseCradle
@@ -50,6 +51,7 @@ XAI = "xai-FAKEfakeFAKEfake0123456789abcdefFAKE"
 ANTHROPIC = "sk-ant-api03-FAKEfakeFAKEfake0123456789abcdef-AA"
 OPENROUTER = "sk-or-v1-fakefakefakefake0123456789abcdef0123"
 MANAGEMENT = "mgmt-FAKEfakeFAKEfake0123456789"
+REFUSELESS = "sk-rl-FAKEfakeFAKEfake0123456789abcd"
 NTFY = "tk_fakefakefakefake0123456789"
 PROBE = "probe-secret-FAKE0123456789abcdef"
 MCP_ENV = "ghp_FAKEfakeFAKEfake0123456789abcdef"
@@ -62,6 +64,7 @@ FAKES = (
     ANTHROPIC,
     OPENROUTER,
     MANAGEMENT,
+    REFUSELESS,
     NTFY,
     PROBE,
     MCP_ENV,
@@ -190,6 +193,7 @@ HOLDERS = {
     "Transcriber": lambda: Transcriber(api_key=OPENAI),
     "XaiAccountBalanceTool": lambda: XaiAccountBalanceTool(management_key=MANAGEMENT),
     "OpenRouterAccountBalanceTool": lambda: OpenRouterAccountBalanceTool(management_key=MANAGEMENT),
+    "RefuselessAccountBalanceTool": lambda: RefuselessAccountBalanceTool(api_key=REFUSELESS),
     "DirectMessageTool": lambda: DirectMessageTool(token=NTFY),
     "McpServerConfig": _mcp_config,
     "StdioMcpClient": lambda: StdioMcpClient(_mcp_config(), 5.0),

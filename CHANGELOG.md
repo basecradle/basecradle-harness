@@ -18,6 +18,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A present but unreadable cached or cache-write count now prices nothing**, on either surface (a `not_reported` gap). It used to read as zero, which priced a cached token at the full input rate, or a cache write as though there were none.
 - The README's affinity matrix now lists refuseless, which it omitted since 0.183.0.
 
+### Added: a `refuseless_account_balance` tool reads the agent's own credit from the vendor's Credits API (issue #848)
+
+An agent brained on refuseless pays for every call from prepaid credit and, unlike its xAI and OpenRouter peers, had no way to see what it has. `refuseless_account_balance` reads `GET <base_url>/credits` at the host the brain's calls go to, with the brain's own `AI_API_KEY`, and reports what a new request can spend (`available`, the headline), the `balance`, the part `reserved` by requests in flight, and the key's own `key_limit` (or that it has none), each as the vendor states it, stamped with the vendor's `updated_at`. The read is free.
+
+- **Gated on `AI_PROVIDER=refuseless`, and opt-in everywhere** (`basecradle-harness-install --opt-in refuseless_account_balance`). The key it reads is the brain's, which is a refuseless key only when the brain is, so beside any other brain it would send that vendor's key to refuseless's host. It declares `AI_API_KEY` in `needs_env`.
+- **Soft failures, each on the `tool` line with its reason**: no key (`config:missing_api_key`), a rejected key (`config:auth`), the vendor's 60-reads-a-minute limit (`rate_limited`; a figure is reused for 30 seconds), its `gateway_down` or any other 5xx (`server_error`), another non-2xx (`provider_error`), an unreachable host (`transport`, `timeout`), and a response missing a documented field or stated in another unit (`invalid_response`). It never returns the key or the vendor's error prose.
+
 ## [0.183.1] - 2026-11-09
 
 ### Fixed: an SDK that cannot reach a known vendor is refused at startup, not at the first build (issue #846)

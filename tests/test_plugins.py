@@ -500,6 +500,26 @@ def test_opting_in_xai_account_balance_activates_under_xai_only(tmp_path):
     assert "xai_account_balance" not in {t.name for t in under_openai.tools}
 
 
+def test_the_refuseless_balance_tool_is_opt_in_and_activates_under_refuseless_only(tmp_path):
+    # Issue #848. The xAI sibling's gate, not the OpenRouter sibling's absence of one: the tool
+    # reads the brain's own AI_API_KEY, which is a refuseless key only when the brain is refuseless,
+    # so beside any other brain it would send that vendor's key to refuseless's host.
+    home = tmp_path / "cfg"
+    install(home, provider="refuseless")  # no opt_in
+    assert not (home / "tools" / "refuseless_account_balance.py").exists()
+    default = resolve_plugins(load_plugins(home), _ctx(provider="refuseless", AI_API_KEY="sk-rl"))
+    assert "refuseless_account_balance" not in {t.name for t in default.tools}
+
+    install(home, provider="refuseless", opt_in=["refuseless_account_balance"])
+    assert (home / "tools" / "refuseless_account_balance.py").exists()
+    under = resolve_plugins(load_plugins(home), _ctx(provider="refuseless", AI_API_KEY="sk-rl"))
+    assert "refuseless_account_balance" in {t.name for t in under.tools}
+    assert under.env_dependencies["refuseless_account_balance"] == ["AI_API_KEY"]
+    for provider in ("openai", "xai", "openrouter", "wiro"):
+        elsewhere = resolve_plugins(load_plugins(home), _ctx(provider=provider, AI_API_KEY="sk"))
+        assert "refuseless_account_balance" not in {t.name for t in elsewhere.tools}
+
+
 def test_the_openrouter_balance_tool_is_opt_in_and_activates_on_every_provider(tmp_path):
     # The deliberate divergence from its xAI sibling (issue #425): NO Vendor gate. The ordering
     # case is an agent brained by another provider that holds a *separate* OpenRouter account, so

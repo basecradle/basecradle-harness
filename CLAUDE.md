@@ -461,7 +461,10 @@ The floor, and it is not negotiable: **no capability may be claimed without some
   `openrouter_account_balance` (issue #425 — the OpenRouter mirror, and the one account tool with
   **no** vendor gate: its Management key is dedicated and provider-independent, so gating it on
   `Vendor("openrouter")` would self-exclude the very case it was built for — an agent brained by
-  another provider that holds a separate OpenRouter account), `system_prompt` (the read+edit
+  another provider that holds a separate OpenRouter account), `refuseless_account_balance` (issue
+  #848 — the refuseless credits read, `Vendor("refuseless")`-gated because it reads the brain's own
+  `AI_API_KEY`, which is a refuseless key only when the brain is refuseless; ungated, it would send
+  another vendor's key to refuseless's host), `system_prompt` (the read+edit
   self-authorship pair — the most powerful, and as of #241 enabled on **no** agent; enablement is
   a per-agent founder decision), `send_direct_message_to_origin` (issue #341 — an ntfy.sh push notification
   to @origin's iPhone, leaving the platform entirely; powerful because it *interrupts a human*

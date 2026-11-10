@@ -694,6 +694,7 @@ def test_every_shipped_power_tool_default_is_classified_opt_in():
         "shell",  # full command-line access, unlocked-profile-only (issue #252)
         "xai_account_balance",  # xAI Management API billing read, xai-only (issue #179)
         "openrouter_account_balance",  # OpenRouter credits read, provider-agnostic (issue #425)
+        "refuseless_account_balance",  # refuseless credits read, refuseless-only (issue #848)
         "send_direct_message_to_origin",  # push notification to @origin's phone (issue #341)
         "google_search",  # Gemini grounding as a harness-run web_search tool (issue #656)
         "url_context",  # Gemini URL context server tool (issue #656)
