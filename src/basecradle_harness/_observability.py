@@ -166,24 +166,54 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: ``disk-quota-exceeded`` and ``risk-assessment-pending`` hold neither. The two residuals are
 #: stated rather than hidden: a glued word whose run holds a digit or a capital is still redacted
 #: (the scrub errs toward redaction), and a glued key made only of lowercase letters, ``_`` and
-#: ``-`` is kept. The rules are spelled once, in `_PREFIXED`. `_PREFIX` can strip a longer prefix
-#: than the alternative that matched (``xsk-or-…`` matched as ``sk-``), and that never changes the
-#: verdict: every prefix is lowercase letters, ``_`` and ``-``, which are never evidence of a key.
+#: ``-`` is kept. The rules are spelled once, in `_PREFIXED`, as a prefix, the class of its run and
+#: the run's minimum length. `_PREFIX` can strip a longer prefix than the alternative that matched
+#: (``xsk-or-…`` matched as ``sk-``), and that never changes the verdict: every prefix is lowercase
+#: letters, ``_`` and ``-``, which are never evidence of a key.
+#:
+#: **A narrow run never swallows the head of a key glued after it** (issue #858). A run whose class
+#: lacks ``_`` or ``-`` once took the letters of a following key's prefix (``hf_…aghp_ABC…`` took
+#: ``…agh``) and stopped at its ``_``, so the rest of the second key matched nothing, and a first
+#: match kept as a word kept the second key with it. So a narrow run (`_rule`) first tries to end,
+#: as early as it can, where a **whole key by its own rule** begins (`_GLUED_KEY`), and then takes
+#: everything after it in the widest class, so a third key glued on is redacted with the second;
+#: only when no glued key follows does it match as it always did. That is a negative lookahead
+#: written without one: the box's ``ai_scrub`` is VRL, whose regex has no lookaround, and mirrors
+#: this pattern. A match that took a glued key is never kept as a word (`_is_word`), so nothing
+#: redacted before is redacted less: a match only grows, and what it grows over is redacted with it.
+#: The cost is an over-redaction in the rare glued case: a ``-word`` glued after the second key goes
+#: with it, and so does a lowercase word that held a whole key's shape. A wide run already takes a
+#: glued key whole.
+_WIDE = "[A-Za-z0-9_-]"
 _PREFIXED = (
-    (r"sk-or-|sk-|xai-|bc_[a-z]{3}_", r"[A-Za-z0-9_-]{8,}"),
-    (r"bc_(?:uat|isk)_", r"[A-Za-z0-9]+"),
-    (r"gh[a-z]_", r"[A-Za-z0-9]{20,}"),
-    (r"github_pat_", r"[A-Za-z0-9_]{20,}"),
-    (r"AIza", r"[A-Za-z0-9_-]{20,}"),
-    (r"hf_", r"[A-Za-z0-9]{20,}"),
-    (r"r8_", r"[A-Za-z0-9]{20,}"),
-    (r"ste-", r"[A-Za-z0-9]{20,}"),
-    (r"abl_", r"[A-Za-z0-9]{20,}"),
-    (r"pplx-", r"[A-Za-z0-9]{20,}"),
-    (r"tk_", r"[A-Za-z0-9_-]{20,}"),
+    (r"sk-or-|sk-|xai-|bc_[a-z]{3}_", _WIDE, 8),
+    (r"bc_(?:uat|isk)_", "[A-Za-z0-9]", 1),
+    (r"gh[a-z]_", "[A-Za-z0-9]", 20),
+    (r"github_pat_", "[A-Za-z0-9_]", 20),
+    (r"AIza", _WIDE, 20),
+    (r"hf_", "[A-Za-z0-9]", 20),
+    (r"r8_", "[A-Za-z0-9]", 20),
+    (r"ste-", "[A-Za-z0-9]", 20),
+    (r"abl_", "[A-Za-z0-9]", 20),
+    (r"pplx-", "[A-Za-z0-9]", 20),
+    (r"tk_", _WIDE, 20),
 )
-_PREFIX = re.compile("|".join(f"(?:{prefix})" for prefix, _ in _PREFIXED))
-_PREFIX_RULES = re.compile("|".join(f"(?:{prefix}){body}" for prefix, body in _PREFIXED))
+_PREFIX = re.compile("|".join(f"(?:{prefix})" for prefix, _, _ in _PREFIXED))
+_GLUED_KEY = "|".join(f"(?:{prefix}){run}{{{least}}}" for prefix, run, least in _PREFIXED)
+
+
+def _rule(index: int, prefix: str, run: str, least: int) -> str:
+    """One prefix rule's pattern: a wide run as written, a narrow one ending where a glued key begins.
+
+    The glued alternative is captured as ``glued<index>``, so `_is_word` can tell that a match holds
+    a second key and is never a word."""
+    if run == _WIDE:
+        return f"(?:{prefix}){run}{{{least},}}"
+    glued = f"(?P<glued{index}>{run}{{{least},}}?(?:{_GLUED_KEY}){_WIDE}*)"
+    return f"(?:{prefix})(?:{glued}|{run}{{{least},}})"
+
+
+_PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PREFIXED)))
 
 #: The rules anchored on a literal of their own — a heartbeat URL, a bearer header, a key in a query,
 #: an ``api_key=`` assignment — which are redacted wherever they match. **They run in a pass before
@@ -307,7 +337,13 @@ def _is_word(match: re.Match[str]) -> bool:
     a key to a letter, and a key's run always holds a digit or a capital with overwhelming
     certainty. A glued word whose run holds one is still redacted: the scrub errs toward redaction.
     Only the prefix pass asks; `_LITERAL_RULES` redacts unconditionally.
+
+    **A match that took a glued key is never a word** (issue #858): its glued tail can hold a later
+    key that was no part of any word (``xhf_…ghp_…-sk-…``, whose ``sk-`` follows a ``-``), and judged
+    as one run, all lowercase, it would be kept. No word holds a whole key by a rule's own shape.
     """
+    if any(name.startswith("glued") for name, value in match.groupdict().items() if value):
+        return False
     if match.start() == 0:
         return False
     if unicodedata.category(match.string[match.start() - 1])[0] not in "LNM":

@@ -576,3 +576,77 @@ def test_a_literal_rule_after_a_prefix_run_still_redacts_its_value(text, value):
 )
 def test_the_word_before_a_literal_rule_keeps_its_letters(text, kept):
     assert scrub(text) == f"{kept}[redacted]"
+
+
+# --- a narrow run never swallows the head of a key glued after it (issue #858) -------------------
+
+GLUED_GITHUB = "ghp_ABCdef1234567890ABCdef1234567890abcd"
+
+
+@pytest.mark.parametrize(
+    ("text", "scrubbed"),
+    [
+        # The issue's three reproducers: each once left the second key, or part of it, in clear.
+        ("hf_aaaaaaaaaaaaaaaaaaaaaa" + GLUED_GITHUB, "[redacted]"),
+        (REFUSELESS_KEY + "sk-or-v1-abcdef0123456789", "[redacted]"),
+        ("xhf_aaaaaaaaaaaaaaaaaaaaaa" + GLUED_GITHUB, "x[redacted]"),
+        # A third key glued on goes with the second, and so does a word glued after it.
+        (
+            "hf_aaaaaaaaaaaaaaaaaaaaaa" + GLUED_GITHUB + "r8_Zb3Cd5Ef7Gh9Ij1Kl3Mn9 ok",
+            "[redacted] ok",
+        ),
+        ("hf_aaaaaaaaaaaaaaaaaaaaaa" + GLUED_GITHUB + "-was-rejected ok", "[redacted] ok"),
+        # An all-alphanumeric prefix glued on is a glued key too.
+        (PREFIX_SAMPLES["hf_"] + "AIza" + "Ab3Cd5Ef7-Gh9Ij1Kl3Mn", "[redacted]"),
+    ],
+)
+def test_a_key_glued_after_a_narrow_run_is_redacted_with_it(text, scrubbed):
+    assert scrub(text) == scrubbed
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "",
+        "-sk-cdefghijkl",  # a later key after a ``-``, which no word rule ever kept
+        "-hf_" + "c" * 20,
+    ],
+)
+def test_a_match_that_took_a_glued_key_is_never_a_word(tail):
+    """All lowercase and glued on the left, the chain would read as one word and keep every key in
+    it; the old scrub redacted the later key on its own (the review of #858)."""
+    text = "xhf_" + "a" * 20 + "ghp_" + "b" * 20 + tail
+    assert scrub(text) == "x[redacted]"
+
+
+@pytest.mark.parametrize("first", sorted(PREFIX_SAMPLES))
+@pytest.mark.parametrize("second", sorted(PREFIX_SAMPLES))
+def test_no_part_of_a_second_key_glued_after_a_first_survives(first, second):
+    """Every pair of samples, glued: nothing of the second key's run is left in the line."""
+    second_key = PREFIX_SAMPLES[second]
+    rendered = scrub(f"key {PREFIX_SAMPLES[first]}{second_key} rejected")
+    assert rendered == "key [redacted] rejected", rendered
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "hf_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn rejected",
+        "the token hf_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn_was rejected",
+        "the key hf_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn-is invalid",
+    ],
+)
+def test_a_lone_narrow_key_matches_exactly_as_before(text):
+    """No glued key, no change: the match ends where the narrow run always ended."""
+    key = "hf_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn"
+    assert scrub(text) == text.replace(key, "[redacted]")
+
+
+def test_the_glued_key_form_is_linear():
+    started = time.monotonic()
+    scrub("hf_" + "a" * 200_000)
+    scrub(("hf_" + "a" * 25 + "ghp") * 5_000)
+    scrub("hf_" + ("a" * 21 + "_") * 8_000)
+    scrub("github_pat_" + "a_" * 50_000)
+    scrub("abl_" + "Ab3" * 30_000 + "sk")
+    assert time.monotonic() - started < 1.0
