@@ -152,8 +152,9 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: ``ste-`` do. ntfy generates a token from lowercase letters and digits, and its validator also
 #: admits capitals, ``_`` and ``-`` (``^tk_[-_A-Za-z0-9]{29}$``, ntfy's ``user/util.go``), which is
 #: the run ``tk_`` takes. A generated token with no digit, about 1 in 12,500, is the word residual
-#: below when glued to a letter. A key with no prefix of its own (Wiro's) has no shape a rule can
-#: match.
+#: below when glued to a letter. A key with no prefix of its own (Wiro's) has no shape a prefix rule
+#: can match; it is covered where it travels, as an ``x-api-key`` header value (`_LITERAL_RULES`,
+#: issue #861).
 #:
 #: **A vendor prefix inside a word is a word, not a credential** (issue #794), and the test is
 #: `_is_word`, never a left boundary. A boundary would be a list of the contexts in which
@@ -227,8 +228,21 @@ _PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PR
 #: ``Bearer`` as the whole value and left the token after the space; every, because a token stored
 #: with its scheme and sent with another reads ``Bearer Bearer eyJ…``. The heartbeat URL runs first
 #: of all, alone (`_HEARTBEAT_RUN`).
+#:
+#: **An ``x-api-key`` header value is redacted by its name, never its shape** (issue #861), because
+#: the vendor that sends a key there states no shape for it: Wiro's documentation gives its key no
+#: prefix, length or character set. The name is ``x-api-key`` (any case, ``_`` for either hyphen)
+#: followed by ``:`` or ``=`` (a header dump, ``X-API-Key=…``), or by a quote and then ``:``, ``=``
+#: or ``,`` (``"x-api-key": "…"``, a ``('x-api-key', '…')`` header tuple); the value may open with a
+#: quote, a bytes literal's ``b'``, or bearer scheme words, and runs to the next space, quote,
+#: ``&``, ``,`` or ``;``. It is the first alternative, so the whole name goes with the value rather
+#: than leaving ``x-`` beside an ``api-key=`` match. A bare ``x-api-key`` with no value is a word.
+#: Wiro's signing secret is never sent (its ``x-signature`` is an HMAC keyed on the API key), so
+#: there is nothing more to match.
 _LITERAL_RULES = re.compile(
-    r"(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
+    r"(?i:x[-_]api[-_]?key)(?:[\"']\s*[:=,]|\s*[:=])\s*(?:b?[\"'])?(?:(?i:bearer)\s+)*"
+    r"[^\s\"'&,;]+"
+    r"|(?i:bearer)\s+[A-Za-z0-9._~+/-]{8,}"
     r"|(?i:[?&](?:api[-_]?key|access[-_]?token|token|key)=)(?:(?i:bearer)\s+)*[^&\s]+"
     r"|(?i:api[-_]?key=)(?:(?i:bearer)\s+)*[^&\s\"]+"
 )

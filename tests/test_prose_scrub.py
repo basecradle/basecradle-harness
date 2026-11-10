@@ -54,15 +54,18 @@ SRC = Path(__file__).resolve().parent.parent / "src" / "basecradle_harness"
 
 #: A refuseless key (``abl_`` plus 48 alphanumerics), fabricated.
 REFUSELESS_KEY = "abl_" + "Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3"
+#: A key with no shape of its own, sent as an ``x-api-key`` header value (issue #861); fabricated.
+HEADER_KEY = "wk9f8e7d6c5b4a3f2e1d0c9b8a"
 #: The body of an OpenAI-style key, fabricated.
 OPENAI_KEY = "sk-proj-Ab3Cd5Ef7Gh9Ij1Kl3Mn5Op7"
 #: What a vendor's 401 says when it echoes what it rejected — the realistic carrier.
 ERROR_TEXT = (
-    f"Error code: 401 - Invalid API key: {REFUSELESS_KEY} (Authorization: Bearer {OPENAI_KEY})"
+    f"Error code: 401 - Invalid API key: {REFUSELESS_KEY} "
+    f"(sent as x-api-key: {HEADER_KEY}; Authorization: Bearer {OPENAI_KEY})"
 )
-SECRETS = (REFUSELESS_KEY[4:], OPENAI_KEY[3:])
+SECRETS = (REFUSELESS_KEY[4:], HEADER_KEY, OPENAI_KEY[3:])
 #: A key with no shape a rule knows, read only where its label is: ``API_KEY=…``; fabricated.
-HEADER_VALUE = "wk9f8e7d6c5b4a3f2e1d0c9b8a"
+HEADER_VALUE = HEADER_KEY
 
 
 class Leak(Exception):
