@@ -5870,8 +5870,9 @@ def resolved_config() -> dict[str, object]:
       ``active_profile`` would read ``locked``.
 
       It exists because an env var a tool reads *without gating on it* was, until #427, named in
-      exactly one machine-readable place: nowhere. ``xai_account_balance`` and
-      ``openrouter_account_balance`` read a dedicated Management Key at call time and soft-fail
+      exactly one machine-readable place: nowhere. ``xai_account_balance`` (and
+      ``openrouter_account_balance``, until issue #853 let it read with any OpenRouter key the
+      agent holds) read a dedicated Management Key at call time and soft-fail
       with "not configured" when it is missing — deliberately, so the model gets a readable reason
       rather than a capability that silently is not there (issue #425) — but that made the key
       invisible to every surface that answers *what is this agent configured to do?*. An operator

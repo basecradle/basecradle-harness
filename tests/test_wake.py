@@ -2363,10 +2363,13 @@ def test_resolved_config_reports_active_opt_in_stems(wake_env, monkeypatch, tmp_
 def test_resolved_config_reports_the_env_its_active_tools_read(wake_env, monkeypatch, tmp_path):
     """The operator-facing hole issue #427 closed, in the exact shape that opened it.
 
-    An agent with both account tools opted in reports a tool set that *looks* armed while neither
-    Management Key is provisioned; before this field, the only place either key was named in the
+    An agent with an account tool opted in reports a tool set that *looks* armed while its
+    Management Key is not provisioned; before this field, the only place the key was named in the
     whole repo was a table in README.md, so an operator could not ask the box which keys the
     configuration wanted. Presence only, never a value — this file is pasted into issues.
+
+    `openrouter_account_balance` rides beside it and adds nothing: since issue #853 any one of four
+    OpenRouter keys serves it, so it declares no single key it cannot work without.
     """
     monkeypatch.delenv("XAI_MANAGEMENT_KEY", raising=False)
     monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
@@ -2379,10 +2382,7 @@ def test_resolved_config_reports_the_env_its_active_tools_read(wake_env, monkeyp
     report = resolved_config()
 
     assert {"xai_account_balance", "openrouter_account_balance"} <= set(report["tools"])
-    assert report["tool_env"] == {
-        "OPENROUTER_MANAGEMENT_KEY": False,
-        "XAI_MANAGEMENT_KEY": False,
-    }
+    assert report["tool_env"] == {"XAI_MANAGEMENT_KEY": False}
     # The contract in one sentence: every `false` is an active tool that cannot do its job. Set
     # one, and it flips — the field is read at report time, not frozen at install.
     monkeypatch.setenv("XAI_MANAGEMENT_KEY", "mk-fake")

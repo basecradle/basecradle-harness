@@ -7,6 +7,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.185.0] - 2026-11-10
+
+### Changed: `openrouter_account_balance` reads with the agent's own OpenRouter key, and reports that key's own spend and limit (issue #853)
+
+The tool required `OPENROUTER_MANAGEMENT_KEY`, an account-administration credential that can mint and revoke every key on the account, on the word of a 2026-08-28 reading that an inference key was refused on `/credits`. That reading is stale: on 2026-11-10 an ordinary inference key read `GET /credits` and `GET /key` with HTTP 200, on the global host and the `us` and `eu` regional hosts. So the Management key is now an optional override, and the tool reads with an OpenRouter key the agent already holds.
+
+- **The first key that applies is used, each read at the host its own calls go to:** `OPENROUTER_MANAGEMENT_KEY` when set; else the brain's `AI_API_KEY` when `AI_PROVIDER=openrouter` (at `AI_BASE_URL`, else OpenRouter's host); else the reranker's `HARNESS_MEMPALACE_RERANK_API_KEY` (at `HARNESS_MEMPALACE_RERANK_BASE_URL`, else OpenRouter's host); else the describer's `HARNESS_DESCRIBER_API_KEY` when `HARNESS_DESCRIBER_PROVIDER=openrouter`. The brain's key is never read under another `AI_PROVIDER`, so another vendor's key is never sent to OpenRouter. There is still no `Vendor` gate: an agent brained elsewhere whose OpenRouter key serves a helper is the case it exists for.
+- **The answer gains the key's own figures** from `GET /key`: what the key has spent to date and, when it has a spending limit, what the limit still allows and how it resets. A key whose limit is used up is called out first; a key with no limit says so. Not read for a Management key, which spends nothing itself. The headline is unchanged.
+- **Both reads are required.** Either endpoint failing, or a `/key` body missing `usage`, missing `limit`, or carrying a limit without a usable `limit_remaining`, makes the answer unavailable rather than one that silently drops the key's limit. A rejected key is a `config:auth` reason naming where the key came from (`rejected the key in AI_API_KEY (HTTP 401)`), never the key or the vendor's error prose; an unusable host is `config:base_url`.
+- **The plugin no longer declares `OPENROUTER_MANAGEMENT_KEY` in `needs_env`**, and declares nothing: any one of four keys serves, so none is required, and the Management key would have read as a gap on every healthy agent. `basecradle-harness-resolve` stops listing it under `credentials.wanted`, and `--resolved-config`'s `tool_env` stops reporting it. An agent with the tool opted in and no OpenRouter key at all learns it from the tool's own answer, which names every key it looks for.
+- **Library API:** `OpenRouterAccountBalanceTool` takes `api_key=` (an OpenRouter API key, whose own figures are read) beside `management_key=`, and its `base_url` now defaults to `None`, meaning the resolved key's own host.
+- The live gate (`tests/test_openrouter_account_live.py`) runs once per key present, `OPENROUTER_MANAGEMENT_KEY` or `OPENROUTER_API_KEY`, and on an inference key checks the key's figures against `/key` read raw. A key that is absent is not a parameter at all, so an arm holding one key reports no skip. Its rejected-key test is renamed `test_a_rejected_key_is_reported_softly_not_as_a_crash`.
+
 ## [0.184.0] - 2026-11-10
 
 ### Changed: refuseless serves the Responses surface too, and a Responses call is priced with its cached split (issue #847)

@@ -537,23 +537,28 @@ def test_the_openrouter_balance_tool_is_opt_in_and_activates_on_every_provider(t
 
 
 def test_the_openrouter_balance_tool_activates_without_its_credential(tmp_path, monkeypatch):
-    # Deliberately NOT gated on OPENROUTER_MANAGEMENT_KEY the way the DM tool gates on
-    # NTFY_DM_TOKEN: a missing key must reach the model as a soft, readable "not configured"
-    # reason it can act on, never as a capability that silently is not there (issue #374).
+    # Deliberately NOT gated on an OpenRouter key the way the DM tool gates on NTFY_DM_TOKEN: a
+    # missing key must reach the model as a soft, readable "not configured" reason it can act on,
+    # never as a capability that silently is not there (issue #374).
     #
-    # The delenv is load-bearing, not hygiene: `run()` reads the environment at call time, so on
-    # a box that actually exports the key — the box an operator debugging this tool is sitting at
-    # — this test would make a real HTTPS request, in a file whose contract is that everything
-    # here is offline.
-    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+    # The delenvs are load-bearing, not hygiene: `run()` resolves its key from the environment at
+    # call time (issue #853), so on a box that actually exports one — the box an operator
+    # debugging this tool is sitting at — this test would make a real HTTPS request, in a file
+    # whose contract is that everything here is offline.
+    for var in (
+        "OPENROUTER_MANAGEMENT_KEY",
+        "AI_PROVIDER",
+        "AI_API_KEY",
+        "HARNESS_MEMPALACE_RERANK_API_KEY",
+        "HARNESS_DESCRIBER_API_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
     home = tmp_path / "cfg"
     install(home, opt_in=["openrouter_account_balance"])
-    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))  # no management key
+    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))  # no OpenRouter key
     tools = {t.name: t for t in resolved.tools}
     assert "openrouter_account_balance" in tools
-    assert (
-        "OPENROUTER_MANAGEMENT_KEY is not configured" in tools["openrouter_account_balance"].run()
-    )
+    assert "no OpenRouter key is configured" in tools["openrouter_account_balance"].run()
 
 
 def test_the_direct_message_tool_is_opt_in_and_provider_agnostic(tmp_path):
@@ -586,9 +591,9 @@ def test_the_direct_message_tool_self_excludes_without_its_publish_credential(tm
 #
 # The gap: an env var a tool reads at call time *without gating on it* was declared in no
 # machine-readable place, so `--resolved-config` and `basecradle-harness-resolve` both answered
-# "what is this agent configured to do?" with a tool set including `openrouter_account_balance`
-# and no indication it needs a credential nobody has provisioned. `needs_env` is the declaration;
-# these pin that it reports and — the load-bearing half — that it never *gates*.
+# "what is this agent configured to do?" with a tool set including an account-balance tool and no
+# indication it needs a credential nobody has provisioned. `needs_env` is the declaration; these
+# pin that it reports and — the load-bearing half — that it never *gates*.
 
 
 def test_needs_env_reports_the_dependency_without_gating_on_it(tmp_path, monkeypatch):
@@ -598,14 +603,28 @@ def test_needs_env_reports_the_dependency_without_gating_on_it(tmp_path, monkeyp
     reason the model can act on becomes a capability that silently is not there — the exact
     inversion issue #425 rejected on purpose.
     """
-    monkeypatch.delenv("OPENROUTER_MANAGEMENT_KEY", raising=False)
+    monkeypatch.delenv("XAI_MANAGEMENT_KEY", raising=False)
+    home = tmp_path / "cfg"
+    install(home, provider="xai", opt_in=["xai_account_balance"])
+
+    resolved = resolve_plugins(load_plugins(home), _ctx(provider="xai", sdk="xai-sdk"))
+
+    assert "xai_account_balance" in {t.name for t in resolved.tools}  # NOT gated on its key
+    assert resolved.env_dependencies["xai_account_balance"] == ["XAI_MANAGEMENT_KEY"]
+
+
+def test_the_openrouter_balance_tool_declares_no_single_key_it_cannot_work_without(tmp_path):
+    """Issue #853: any one of four OpenRouter keys serves, so none is declared as required.
+
+    Declaring the Management key, as before, would report a gap on every healthy agent reading
+    with its own key — a report that reddens on a correct configuration (`ToolPlugin.needs_env`).
+    """
     home = tmp_path / "cfg"
     install(home, opt_in=["openrouter_account_balance"])
+    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))
 
-    resolved = resolve_plugins(load_plugins(home), _ctx(AI_API_KEY="sk"))  # no management key
-
-    assert "openrouter_account_balance" in {t.name for t in resolved.tools}  # NOT gated
-    assert resolved.env_dependencies["openrouter_account_balance"] == ["OPENROUTER_MANAGEMENT_KEY"]
+    assert "openrouter_account_balance" in {t.name for t in resolved.tools}
+    assert "openrouter_account_balance" not in resolved.env_dependencies
 
 
 def test_env_dependencies_unions_the_gated_and_ungated_declarations():

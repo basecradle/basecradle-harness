@@ -1,24 +1,48 @@
-"""Read the agent's own OpenRouter credit runway — cost self-awareness (issue #425).
+"""Read the agent's own OpenRouter credit runway — cost self-awareness (issues #425, #853).
 
 The OpenRouter mirror of `_xai_account.py`: same shape, same soft-failure contract, same
 locked-profile-safe plumbing — a plain read-only function `Tool` (no platform client, no policy
-capability, no shell) that makes one authenticated HTTPS GET and returns a figure. An agent
-holding an OpenRouter account can see its remaining credit and reason about its runway: throttle,
+capability, no shell) that makes authenticated HTTPS GETs and returns figures. An agent holding
+an OpenRouter account can see its remaining credit and reason about its runway: throttle,
 prioritize cheap experiments, or ask a human to top up *before* it runs dry as a hard API failure.
 
-It talks to `GET /api/v1/credits` with a dedicated **Management key**
-(`OPENROUTER_MANAGEMENT_KEY`) — an account-administration credential distinct from the inference
-`AI_API_KEY`, minted at ``openrouter.ai/settings/management-keys``. An ordinary inference key is
-rejected there (verified live, 2026-08-28: HTTP 401), which is exactly why the credential is its
-own variable and never `AI_API_KEY`.
+**Which key it reads with (issue #853).** It used to require a dedicated Management key
+(``OPENROUTER_MANAGEMENT_KEY``), on the word of a 2026-08-28 reading that an inference key was
+refused on ``/credits``. That reading is stale: on 2026-11-10 an ordinary inference key
+(``is_management_key: false``) read both ``GET /credits`` and ``GET /key`` with HTTP 200, on the
+global host and on the ``us`` and ``eu`` regional hosts. A Management key can mint and revoke
+every key on the account, so requiring one to read a balance handed out far more power than the
+read needs. The tool now reads with the first of these that applies:
 
-**The arithmetic is a subtraction, and it is the whole of it.** The endpoint returns two
+1. ``OPENROUTER_MANAGEMENT_KEY`` when it is set — an **optional override**, never a requirement,
+   kept so an agent provisioned with one keeps reading exactly as before.
+2. The brain's own ``AI_API_KEY``, when ``AI_PROVIDER`` is ``openrouter`` (the biller, so the key
+   is an OpenRouter key whatever SDK carries it), read at the brain's own host (``AI_BASE_URL``,
+   else OpenRouter's).
+3. The memory reranker's ``HARNESS_MEMPALACE_RERANK_API_KEY``, which is an OpenRouter key by
+   construction (the reranker runs only on OpenRouter), read at the reranker's own host
+   (``HARNESS_MEMPALACE_RERANK_BASE_URL``, else OpenRouter's).
+4. The describer's ``HARNESS_DESCRIBER_API_KEY``, only when ``HARNESS_DESCRIBER_PROVIDER`` names
+   ``openrouter``: a describer riding the brain's stack bills the brain's vendor, which step 2
+   already covers when that vendor is OpenRouter.
+
+The brain comes before the helpers because it is the agent's main vendor, the account the issue
+asked every agent to see. Each key is read **at the host its own calls go to**, so a key kept to
+a regional host is never sent to another. Every key here is one the agent already holds and
+already sends to OpenRouter; none is a new credential, and none can administer anything.
+
+**Why there is still no ``Vendor`` gate** (issue #425). Steps 3 and 4 are the case: an agent
+brained by another vendor whose OpenRouter key serves a helper. A ``Vendor("openrouter")`` gate
+would self-exclude exactly that agent. The provider check in step 2 is what keeps another vendor's
+``AI_API_KEY`` from ever being sent to OpenRouter's host.
+
+**The arithmetic is a subtraction, and it is the whole of it.** ``GET /credits`` returns two
 *lifetime cumulative* totals — ``data.total_credits`` (purchased to date) and ``data.total_usage``
 (used to date) — as plain positive JSON numbers, and the remaining credit is their difference.
 None of the xAI Management API's traps exist here: no cents strings, no inverted sign convention,
-no team-UUID discovery, and **no posted-ledger vs. invoice-preview dichotomy** — one endpoint,
-one figure. Do not go looking for a second surface or invent a degraded tier; there is nothing to
-fall back *to*, so an unusable response is simply an unavailable one.
+no team-UUID discovery, and **no posted-ledger vs. invoice-preview dichotomy**. Do not go looking
+for a second surface or invent a degraded tier; there is nothing to fall back *to*, so an unusable
+response is simply an unavailable one.
 
 Two consequences of "lifetime cumulative" that are easy to get wrong and are load-bearing here:
 
@@ -29,6 +53,14 @@ Two consequences of "lifetime cumulative" that are easy to get wrong and are loa
 - **The difference can legitimately go negative.** Usage can overrun purchased credit, so the
   overdraft callout is kept from the xAI tool rather than assumed impossible.
 
+**The key's own figures** (``GET /key``) sit beside the account's: what the calling key has spent
+to date (``usage``) and, when the key has a spending limit, what of it is left
+(``limit_remaining``) and how the limit resets (``limit_reset``). A key with a limit can be unable
+to pay for a request while the account still holds credit, so a nearly exhausted limit is the
+other runway, and it is called out first when it is used up. Both reads are required: a balance
+that silently dropped the key's limit would describe a key with room to spend as healthy. They are
+not read for a Management key, which spends nothing itself and so has no usage or limit to report.
+
 The figures are **quantized to cents at the parse boundary**, so the subtraction the tool *shows*
 is the subtraction it *did*: the two terms and the headline are mutually consistent by
 construction, and a model that re-does the arithmetic off the context line lands on the headline.
@@ -36,11 +68,12 @@ construction, and a model that re-does the arithmetic off the context line lands
 noise at runway scale and would otherwise let a rounded display contradict an unrounded headline,
 or render a four-tenths-of-a-cent overrun as an alarming ``-$0.00`` overdraft.)
 
-Everything fails **soft**: a missing key, the wrong kind of key, an unreachable endpoint, or an
+Everything fails **soft**: no key, a rejected key, an unusable host, an unreachable endpoint, or an
 unexpected response all return a clear ``"unavailable — <reason>"`` string rather than raising,
 so a billing check never derails a wake. And it is careful with what it exposes: it never logs or
 returns the key, and it never surfaces a response *body* — OpenRouter's 4xx envelope carries an
-``error.message`` and a ``user_id`` that are account detail, so only computed figures leave here.
+``error.message`` (which can echo what it was handed) and a ``user_id`` that is account detail,
+so only computed figures leave here.
 """
 
 from __future__ import annotations
@@ -57,14 +90,22 @@ from typing import Any
 
 import httpx
 
+from basecradle_harness._basecradle import base_url_override, normalize_provider
+from basecradle_harness._describer import DESCRIBER_API_KEY_VAR, describer_stack_from_env
 from basecradle_harness._observability import tool_failed
-from basecradle_harness._secret import reveal, secret
+from basecradle_harness._rerank import RERANK_API_KEY_VAR, base_url_from_env
+from basecradle_harness._secret import Secret, reveal, secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
 
-#: The OpenRouter API root. `/credits` is an account-administration surface reached with a
-#: Management key, not the inference credential — the same endpoint host, a different key.
-#: Overridable only for a proxy or a test double, never to reach another vendor.
+#: The vendor whose account this tool reads — the `AI_PROVIDER` whose `AI_API_KEY` it may use.
+VENDOR = "openrouter"
+
+#: The OpenRouter API root, used for any key that has no host of its own configured. Overridable
+#: only for a proxy or a test double, never to reach another vendor.
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
+#: The optional account-administration credential that, when set, the tool reads with first.
+MANAGEMENT_KEY_VAR = "OPENROUTER_MANAGEMENT_KEY"
 
 #: Per-request HTTP timeout (seconds). A billing read is a quick GET, and a balance check must
 #: never block a wake for long, so this is short — a timeout is a ceiling, not a fixed wait.
@@ -74,6 +115,9 @@ DEFAULT_TIMEOUT = 15.0
 #: model reasoning about its runway may check it more than once in a turn; a short cache keeps
 #: those from each hitting the billing endpoint. ``0`` disables caching entirely.
 DEFAULT_CACHE_TTL = 30.0
+
+#: The ``limit_reset`` periods OpenRouter offers a key's spending limit, rendered as said.
+_RESET_PERIODS = frozenset({"daily", "weekly", "monthly"})
 
 
 class _BalanceUnavailable(Exception):
@@ -88,6 +132,26 @@ class _BalanceUnavailable(Exception):
         super().__init__(message)
         #: The `tool` line's `reason` for this failure (issue #822).
         self.slug = slug
+
+
+@dataclass(frozen=True)
+class _Credential:
+    """The key a read is made with, where it came from, and the host it is read at.
+
+    The key is a `Secret`, so this object's `repr`, `vars()` and pickle never carry it (issue
+    #599); it is revealed only on the line that builds the request.
+    """
+
+    key: Secret
+    #: What a message names as the key's source: an env var, or the constructor argument.
+    source: str
+    #: Whose key it is, in the model's terms (``"your brain's key"``), or ``None`` for an argument.
+    whose: str | None
+    root: str
+    #: The env var the root was read from, or ``None`` when it is OpenRouter's own or an argument.
+    root_source: str | None
+    #: A Management key spends nothing itself, so ``GET /key`` is not read for it.
+    management: bool
 
 
 @dataclass(frozen=True)
@@ -109,29 +173,45 @@ class _Credits:
         return self.purchased_usd - self.used_usd
 
 
+@dataclass(frozen=True)
+class _KeyUsage:
+    """The calling key's own figures off ``GET /key``, in dollars and cents."""
+
+    used_usd: float
+    #: ``None`` when the key has no spending limit of its own.
+    limit_usd: float | None
+    #: What the limit still allows; ``None`` exactly when `limit_usd` is.
+    limit_remaining_usd: float | None
+    #: How the limit resets (``"monthly"``), or ``None`` when it does not reset on a schedule.
+    limit_reset: str | None
+
+
 class OpenRouterAccountBalanceTool(Tool):
     """`openrouter_account_balance` — report the credit remaining on the agent's own OpenRouter
-    account.
+    account, and what the key it reads with has spent.
 
     A plain read-only `Tool` (no platform client, no policy capability) that calls
-    ``GET /api/v1/credits`` with a dedicated `OPENROUTER_MANAGEMENT_KEY`, so an agent holding an
-    OpenRouter account can see its remaining credit and reason about its runway. The figure is
-    ``total_credits − total_usage``: purchased to date, less used to date.
+    ``GET /api/v1/credits`` and ``GET /api/v1/key`` with an OpenRouter key the agent already holds
+    (module docstring: the Management key when set, else the brain's, the reranker's or the
+    describer's). The headline is ``total_credits − total_usage``: purchased to date, less used to
+    date.
 
     Unlike its xAI sibling its plugin declares **no `Vendor` requirement**, deliberately (issue
-    #425). The credential is dedicated and provider-independent, and the ordering case is an agent
-    brained by *another* provider that nonetheless holds an OpenRouter account — a
-    ``Vendor("openrouter")`` gate would self-exclude exactly that agent. It stays `opt_in` like
-    every powerful tool (issue #168), because it reaches an account/billing surface.
+    #425): the ordering case is an agent brained by *another* provider whose OpenRouter key serves
+    a helper, and a ``Vendor("openrouter")`` gate would self-exclude exactly that agent. It stays
+    `opt_in` like every powerful tool (issue #168), because it reaches an account/billing surface.
 
     It degrades to a clear ``"OpenRouter account balance unavailable — <reason>"`` string in every
-    failure mode (no key, an inference key instead of a Management key, endpoint unreachable,
-    unexpected response) rather than raising. It never logs or returns the key or a response body.
+    failure mode (no key, a rejected key, an unusable host, endpoint unreachable, unexpected
+    response) rather than raising. It never logs or returns the key or a response body.
 
     Args:
-        management_key: The Management key. ``None`` (the default) reads
-            `OPENROUTER_MANAGEMENT_KEY` from the environment at call time.
-        base_url: The API root (for a proxy or a test double).
+        api_key: An OpenRouter API key to read with, whose own usage and limit are reported.
+        management_key: A Management key to read with instead; its own figures are not read.
+            Either argument given, nothing is read from the environment for the key; with
+            neither, the key is resolved from the environment at call time (module docstring).
+        base_url: The API root (for a proxy or a test double). ``None`` (the default) reads at
+            the host the resolved key's own calls go to, else OpenRouter's.
         timeout: Per-request timeout in seconds.
         cache_ttl: Seconds to reuse a fetched figure before re-reading; ``0`` disables it.
         clock: The monotonic clock the cache measures against (injectable for tests).
@@ -140,49 +220,55 @@ class OpenRouterAccountBalanceTool(Tool):
     name = "openrouter_account_balance"
     description = (
         "Check the credit remaining on your own OpenRouter account right now, in US dollars — "
-        "the credits purchased on the account to date, less what has been used to date. Use it "
-        "to reason about your runway: throttle or prioritize cheap work when credit is low, or "
-        "ask a human to top up before you run dry mid-task. Takes no arguments and can see only "
-        "your own account, nothing else."
+        "the credits purchased on the account to date, less what has been used to date — and "
+        "what the key you read it with has spent, with how much of that key's own spending limit "
+        "is left if it has one. Use it to reason about your runway: throttle or prioritize cheap "
+        "work when credit is low, or ask a human to top up before you run dry mid-task. Takes no "
+        "arguments and can see only your own account and key, nothing else."
     )
     parameters = NO_PARAMETERS
 
     def __init__(
         self,
         *,
+        api_key: str | None = None,
         management_key: str | None = None,
-        base_url: str = DEFAULT_BASE_URL,
+        base_url: str | None = None,
         timeout: float = DEFAULT_TIMEOUT,
         cache_ttl: float = DEFAULT_CACHE_TTL,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self._management_key = secret(management_key)  # never a plain attribute (issue #599)
-        self._base_url = base_url.rstrip("/")
+        self._api_key = secret(api_key)  # never a plain attribute (issue #599)
+        self._management_key = secret(management_key)
+        self._base_url = base_url
         self._timeout = timeout
         self._cache_ttl = cache_ttl
         self._clock = clock
-        # (monotonic expiry, a digest of the key it was read with, rendered text). The key is part
-        # of the entry because it is resolved from the environment at *call* time: without it, a
-        # figure read for one account — with that account's `as of` stamp — is served as another's
-        # for the rest of the TTL after the credential is repointed. A digest, never the key: a
-        # plain attribute holding it is emitted by `vars()` and by every crash reporter that
-        # expands locals, the leak `Secret` exists to close (issue #599).
-        self._cached: tuple[float, bytes, str] | None = None
+        # (monotonic expiry, a digest of the key it was read with, the root, the source, rendered
+        # text). The key, root and source are part of the entry because all three are resolved at
+        # *call* time: without them, a figure read for one account — with that account's `as of`
+        # stamp — is served as another's for the rest of the TTL after a credential is repointed.
+        # A digest, never the key: a plain attribute holding it is emitted by `vars()` and by every
+        # crash reporter that expands locals, the leak `Secret` exists to close (issue #599).
+        self._cached: tuple[float, bytes, str, str, str] | None = None
 
     def run(self) -> str:
         """Report the credit remaining, or a clear reason it is unavailable."""
-        key = reveal(self._management_key) or os.environ.get("OPENROUTER_MANAGEMENT_KEY")
-        if not key:
+        credential = self._credential()
+        if credential is None:
             return tool_failed(
-                "OpenRouter account balance unavailable — OPENROUTER_MANAGEMENT_KEY is not "
-                "configured. Set it to an OpenRouter Management key "
-                "(openrouter.ai/settings/management-keys → Create New Key); an ordinary "
-                "inference API key is not accepted on this endpoint.",
+                "OpenRouter account balance unavailable — no OpenRouter key is configured for "
+                f"you. This tool reads with {MANAGEMENT_KEY_VAR} when it is set, else your "
+                f"brain's AI_API_KEY when AI_PROVIDER is openrouter (it is {_active_provider()!r} "
+                f"here), else your memory reranker's {RERANK_API_KEY_VAR}, else your describer's "
+                f"{DESCRIBER_API_KEY_VAR} when HARNESS_DESCRIBER_PROVIDER is openrouter; none of "
+                "those is available.",
                 reason="config:missing_api_key",
             )
 
+        key = credential.key.reveal()
         digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).digest()
-        cached = self._cached_balance(digest)
+        cached = self._cached_balance(digest, credential)
         if cached is not None:
             return cached
 
@@ -195,10 +281,24 @@ class OpenRouterAccountBalanceTool(Tool):
             with httpx.Client(
                 headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
             ) as client:
-                credits = self._credits(client)
+                credits = _parse_credits(
+                    self._get(client, credential, "/credits", "read the credits remaining")
+                )
+                usage = None
+                if not credential.management:
+                    usage = _parse_key(
+                        self._get(client, credential, "/key", "read this key's own usage")
+                    )
+        except httpx.InvalidURL:
+            where = credential.root_source or "the base_url argument"
+            return tool_failed(
+                f"OpenRouter account balance unavailable — {where} is not a usable URL, so there "
+                "is no host to read the account at.",
+                reason="config:base_url",
+            )
         except UnicodeEncodeError:
             return tool_failed(
-                "OpenRouter account balance unavailable — OPENROUTER_MANAGEMENT_KEY contains a "
+                f"OpenRouter account balance unavailable — {credential.source} contains a "
                 "non-ASCII character, so it cannot be sent as a header; check for a smart quote "
                 "or a non-breaking space picked up when it was pasted.",
                 reason="config:auth",
@@ -206,27 +306,77 @@ class OpenRouterAccountBalanceTool(Tool):
         except _BalanceUnavailable as exc:
             return tool_failed(f"OpenRouter account balance unavailable — {exc}", reason=exc.slug)
 
-        text = _render(credits, self._now_utc())
+        text = _render(credits, usage, credential, self._now_utc())
         if self._cache_ttl > 0:
-            self._cached = (self._clock() + self._cache_ttl, digest, text)
+            entry = (self._clock() + self._cache_ttl, digest, credential.root, credential.source)
+            self._cached = (*entry, text)
         return text
 
-    # --- the one HTTP call ----------------------------------------------------
+    # --- which key, at which host ----------------------------------------------
 
-    def _credits(self, client: httpx.Client) -> _Credits:
-        """The account's lifetime purchased/used totals — the only surface this tool reads."""
-        data = self._get(client, "/credits", "read the credits remaining")
-        return _parse_credits(data)
+    def _credential(self) -> _Credential | None:
+        """The key this call reads with, in the module docstring's order, or ``None`` if none.
 
-    def _get(self, client: httpx.Client, path: str, action: str) -> dict[str, Any]:
+        Read at call time, so a credential set or repointed after the tool was built is the one
+        used. A key handed to the constructor wins, and then nothing is read from the environment.
+        """
+        argument_root = (self._base_url or DEFAULT_BASE_URL).rstrip("/")
+        for value, source, management in (
+            (self._management_key, "the management_key argument", True),
+            (self._api_key, "the api_key argument", False),
+        ):
+            key = reveal(value)
+            if key:
+                return _Credential(secret(key), source, None, argument_root, None, management)
+
+        key = _env(MANAGEMENT_KEY_VAR)
+        if key:
+            return self._from_env(key, MANAGEMENT_KEY_VAR, "a Management key", None, None, True)
+        key = _env("AI_API_KEY")
+        if key and _active_provider() == VENDOR:
+            root = base_url_override()
+            return self._from_env(key, "AI_API_KEY", "your brain's key", root, "AI_BASE_URL")
+        key = _env(RERANK_API_KEY_VAR)
+        if key:
+            root = base_url_from_env()
+            where = "HARNESS_MEMPALACE_RERANK_BASE_URL"
+            return self._from_env(
+                key, RERANK_API_KEY_VAR, "your memory reranker's key", root, where
+            )
+        key = _env(DESCRIBER_API_KEY_VAR)
+        if key and _normalized(describer_stack_from_env()[0]) == VENDOR:
+            return self._from_env(key, DESCRIBER_API_KEY_VAR, "your describer's key", None, None)
+        return None
+
+    def _from_env(
+        self,
+        key: str,
+        source: str,
+        whose: str,
+        root: str | None,
+        root_var: str | None,
+        management: bool = False,
+    ) -> _Credential:
+        """A credential read from the environment, at its own host unless `base_url` was given."""
+        if self._base_url:
+            root, root_var = self._base_url, None
+        elif not root:
+            root, root_var = DEFAULT_BASE_URL, None
+        return _Credential(secret(key), source, whose, root.rstrip("/"), root_var, management)
+
+    # --- the HTTP calls -------------------------------------------------------
+
+    def _get(
+        self, client: httpx.Client, credential: _Credential, path: str, action: str
+    ) -> dict[str, Any]:
         """GET an API path and decode it, mapping every failure to a soft reason.
 
         Never surfaces the response *body*: OpenRouter's error envelope carries an
-        ``error.message`` and a ``user_id``, and the contract is that only computed figures ever
-        leave this tool.
+        ``error.message`` that can echo what it was handed and a ``user_id``, and the contract is
+        that only computed figures ever leave this tool.
         """
         try:
-            response = client.get(f"{self._base_url}{path}")
+            response = client.get(f"{credential.root}{path}")
         except httpx.RequestError as exc:
             raise _BalanceUnavailable(
                 f"couldn't reach the OpenRouter API ({exc}).", slug="transport"
@@ -235,8 +385,8 @@ class OpenRouterAccountBalanceTool(Tool):
         status = response.status_code
         if status in (401, 403):
             raise _BalanceUnavailable(
-                f"OpenRouter rejected the key (HTTP {status}); this endpoint needs a Management "
-                "key, not an inference API key. Check OPENROUTER_MANAGEMENT_KEY.",
+                f"OpenRouter rejected the key in {credential.source} (HTTP {status}) trying to "
+                f"{action}. Check that {credential.source} holds a current OpenRouter key.",
                 slug="config:auth",
             )
         if status >= 400:
@@ -257,12 +407,13 @@ class OpenRouterAccountBalanceTool(Tool):
 
     # --- caching --------------------------------------------------------------
 
-    def _cached_balance(self, digest: bytes) -> str | None:
-        """The cached text if it is still fresh **and** was read with this key, else ``None``."""
+    def _cached_balance(self, digest: bytes, credential: _Credential) -> str | None:
+        """The cached text if it is still fresh **and** was read with this key, here."""
         if self._cached is None:
             return None
-        expiry, cached_digest, text = self._cached
-        if hmac.compare_digest(cached_digest, digest) and self._clock() < expiry:
+        expiry, cached_digest, root, source, text = self._cached
+        same_read = root == credential.root and source == credential.source
+        if hmac.compare_digest(cached_digest, digest) and same_read and self._clock() < expiry:
             return text
         return None
 
@@ -271,13 +422,31 @@ class OpenRouterAccountBalanceTool(Tool):
         return datetime.now(UTC)
 
 
+def _env(var: str) -> str | None:
+    """An env var's value, stripped, or ``None`` when it is unset or blank."""
+    return (os.environ.get(var) or "").strip() or None
+
+
+def _normalized(raw: str | None) -> str:
+    """A provider slug as the wake reads it, or the raw value when it is not even a slug."""
+    try:
+        return normalize_provider(raw)
+    except ValueError:
+        return (raw or "").strip()
+
+
+def _active_provider() -> str:
+    """``AI_PROVIDER`` as the wake reads it."""
+    return _normalized(os.environ.get("AI_PROVIDER"))
+
+
 def _parse_credits(data: dict[str, Any]) -> _Credits:
     """The two lifetime totals out of ``GET /credits``.
 
     Shape: ``{"data": {"total_credits": 500.0, "total_usage": 123.456789}}`` — plain positive
-    JSON numbers of USD, verified live 2026-08-28. Note the live reading returned
-    ``total_credits`` as a bare integer (``375``), so an integer is as valid here as a float;
-    ``bool`` is not, despite being an `int` subclass in Python.
+    JSON numbers of USD, verified live 2026-08-28 and again 2026-11-10. The live readings returned
+    ``total_credits`` as a bare integer (``375``, ``475``), so an integer is as valid here as a
+    float; ``bool`` is not, despite being an `int` subclass in Python.
 
     **Both fields are required**, because the answer is their difference: purchased-to-date alone
     is not a runway (an account that has bought $500 and spent $500 has none), and a response
@@ -300,6 +469,39 @@ def _parse_credits(data: dict[str, Any]) -> _Credits:
             "credit is total_credits minus total_usage, so both are needed."
         )
     return _Credits(purchased_usd=purchased, used_usd=used)
+
+
+def _parse_key(data: dict[str, Any]) -> _KeyUsage:
+    """The calling key's own figures out of ``GET /key``.
+
+    Shape (verified live 2026-11-10, abridged): ``{"data": {"usage": 1.047832516, "limit": null,
+    "limit_remaining": null, "limit_reset": null, …}}``, every figure plain USD. ``usage`` is
+    required. ``limit`` must be **present**, as a number or ``null``: the vendor states ``null``
+    for "no limit", so a missing field is not that statement, and reading it as one would report
+    a key with a limit as having none. When a limit is set, ``limit_remaining`` is required, and
+    ``limit_reset`` is a period or ``null``. Quantized to cents like the account's figures.
+    """
+    inner = data.get("data")
+    if not isinstance(inner, dict):
+        raise _BalanceUnavailable("OpenRouter's key response carried no data object.")
+    used = _usd(inner, "usage")
+    if used is None:
+        raise _BalanceUnavailable("OpenRouter's key response carried no usable usage figure.")
+    if "limit" not in inner or (inner["limit"] is not None and _usd(inner, "limit") is None):
+        raise _BalanceUnavailable("OpenRouter's key response carried no usable limit figure.")
+    limit = _usd(inner, "limit")
+    if limit is None:
+        return _KeyUsage(used_usd=used, limit_usd=None, limit_remaining_usd=None, limit_reset=None)
+    remaining = _usd(inner, "limit_remaining")
+    reset = inner.get("limit_reset")
+    if remaining is None or not (reset is None or isinstance(reset, str)):
+        missing = "limit_remaining" if remaining is None else "limit_reset"
+        raise _BalanceUnavailable(
+            f"OpenRouter's key response carried a spending limit but no usable {missing}."
+        )
+    return _KeyUsage(
+        used_usd=used, limit_usd=limit, limit_remaining_usd=remaining, limit_reset=reset
+    )
 
 
 def _usd(holder: dict[str, Any], field: str) -> float | None:
@@ -351,13 +553,39 @@ def _stamp(as_of: datetime) -> str:
     return as_of.isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def _render(credits: _Credits, as_of: datetime) -> str:
-    """The headline figure, with the subtraction that produced it shown underneath.
+def _key_line(usage: _KeyUsage | None, credential: _Credential) -> str:
+    """What the key the figures were read with has spent, and what its own limit leaves."""
+    named = credential.source + (f", {credential.whose}" if credential.whose else "")
+    if usage is None:
+        return (
+            f"Read with {named}, which spends nothing itself and so has no usage or spending "
+            "limit of its own."
+        )
+    spent = f"The key this was read with ({named}) has spent {_dollars(usage.used_usd)} to date"
+    if usage.limit_usd is None or usage.limit_remaining_usd is None:
+        return f"{spent} and has no spending limit of its own."
+    if usage.limit_reset is None:
+        reset = "and does not reset on a schedule"
+    elif usage.limit_reset in _RESET_PERIODS:
+        reset = f"and resets {usage.limit_reset}"
+    else:
+        reset = "on a reset period this tool does not recognize"
+    return (
+        f"{spent}; its spending limit of {_dollars(usage.limit_usd)} allows "
+        f"{_dollars(usage.limit_remaining_usd)} more, {reset}."
+    )
+
+
+def _render(
+    credits: _Credits, usage: _KeyUsage | None, credential: _Credential, as_of: datetime
+) -> str:
+    """The headline figure, with the subtraction that produced it and the key's figures beneath.
 
     The headline shape is **uniform** — ``<label>: <$figure> USD (as of <stamp>).`` — so the
-    figure is always in the same place and a reader (or a regex, or the model) never has to parse
-    around a parenthetical that appears only sometimes; an overdraft is called out in the body
-    instead, where it leads so it is not buried.
+    figure is always in the same place and a reader (or a regex, or the model, or the NOC's live
+    probe) never has to parse around a parenthetical that appears only sometimes; an overdraft,
+    or a key whose own limit is used up, is called out in the body instead, where it leads so it
+    is not buried.
 
     The subtraction is **shown**, not merely performed: an agent that meets ``total_credits``
     elsewhere — OpenRouter's own dashboard, another client — can see which number that is and why
@@ -365,10 +593,17 @@ def _render(credits: _Credits, as_of: datetime) -> str:
     cumulative totals that never reset; calling either one a billing cycle's would be false.
     """
     context = ["The account is overdrawn."] if credits.remaining_usd < 0 else []
+    left = usage.limit_remaining_usd if usage is not None else None
+    if left is not None and left <= 0:
+        context.append(
+            "This key's spending limit is used up, so no request made with it can be paid for "
+            "until the limit resets or is raised."
+        )
     context.append(
         f"Live figure — {_dollars(credits.purchased_usd)} of credits purchased to date less the "
         f"{_dollars(credits.used_usd)} used to date."
     )
+    context.append(_key_line(usage, credential))
     headline = (
         f"OpenRouter credits remaining: {_dollars(credits.remaining_usd)} USD "
         f"(as of {_stamp(as_of)})."

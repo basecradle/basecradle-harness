@@ -8,11 +8,12 @@ and reason about its runway: throttle, prioritize cheap work, or ask a human to 
 fails for want of credit.
 
 It reads ``GET <base_url>/credits`` with the agent's **own inference key**, ``AI_API_KEY``, at the
-host its calls go to (``AI_BASE_URL``, else the vendor's default). That is the one way it differs from
-both siblings, and it is why it is gated on ``Vendor("refuseless")``: they each read a *dedicated*
-account credential, so a tool holding one can be offered beside any brain (the OpenRouter tool's
-whole case); this one holds the brain's credential, which is a refuseless key **only when the brain
-is refuseless**. Offered beside any other brain it would send that vendor's key to refuseless's host,
+host its calls go to (``AI_BASE_URL``, else the vendor's default), and it is why it is gated on
+``Vendor("refuseless")``: the brain's credential is a refuseless key **only when the brain is
+refuseless**. The xAI sibling reads a *dedicated* account credential and so is gated only on its
+vendor's account; the OpenRouter sibling also reads OpenRouter keys that serve helpers (the
+reranker, the describer), which is its whole case for having no vendor gate, and it checks
+``AI_PROVIDER`` itself before it reads the brain's key (issue #853). This tool has only the brain's. Offered beside any other brain it would send that vendor's key to refuseless's host,
 which is a credential sent to a stranger, not a balance read. An agent with a separate refuseless
 account beside another brain would need a dedicated variable for that key, which nothing asks for.
 
