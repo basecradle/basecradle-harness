@@ -1,7 +1,9 @@
 """What a refuseless call cost, priced from the vendor's own live price list (issue #844).
 
 refuseless.com returns token usage and **no price**: a Chat Completions body's ``usage`` is exactly
-``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``, and no header states a cost. What it
+``prompt_tokens`` / ``completion_tokens`` / ``total_tokens``, a Responses body's is ``input_tokens`` /
+``output_tokens`` / ``total_tokens`` / ``input_tokens_details`` (issue #847), and no header states a
+cost on either. What it
 does publish is a ``pricing`` object on every model of ``GET /v1/models``, added by the vendor at
 BaseCradle's request so that its price could be read rather than transcribed. So this module is
 deliberately **not** a rate table, and there is no ``_refuseless_rates.py``: a hand copy of a price
@@ -24,10 +26,12 @@ The shape, as the vendor serves it (a dated reading, never a contract this modul
     {"currency": "USD", "input_per_m": …, "cached_input_per_m": …, "output_per_m": …,
      "discounted": true, "regular": {…}}
 
-**Cached input.** The usage block states no cached-token count today, so every prompt token is
-priced at ``input_per_m`` and no split is invented. The day it states one (OpenAI's
-``prompt_tokens_details.cached_tokens``), those tokens are priced at ``cached_input_per_m``, and a
-row without that rate leaves such a call unpriced. A rate the call does not need is never required:
+**Cached input.** The vendor serves both of the ``openai`` SDK's surfaces, and only one states a
+cached count (issue #847). A Chat Completions usage block states none, so every prompt token there
+is priced at ``input_per_m`` and no split is invented. A Responses usage block states
+``input_tokens_details.cached_tokens``, a part of ``input_tokens``, so those tokens are priced at
+``cached_input_per_m`` and the rest of the input at ``input_per_m``; a row without the cached rate
+leaves a call that cached something unpriced. A rate the call does not need is never required:
 a row missing ``cached_input_per_m`` still prices a call that cached nothing, because the figure is
 then exact. A cache *write* count has no published rate at all, so a call that reports one is
 unpriced rather than charged a rate the vendor never stated.
@@ -87,28 +91,59 @@ def pricing_of(row: Mapping[str, Any] | None) -> Pricing | None:
     )
 
 
+#: The two surfaces' spellings of one usage block, as ``(input, output, details)``: Chat Completions
+#: (``prompt_tokens``) and Responses (``input_tokens``, issue #847). The vendor serves both.
+_SPELLINGS = (
+    ("prompt_tokens", "completion_tokens", "prompt_tokens_details"),
+    ("input_tokens", "output_tokens", "input_tokens_details"),
+)
+
+
 def usage_of(usage: Any) -> Usage | None:
-    """A Chat Completions ``usage`` block as a `Usage`, or ``None`` unless it states **both** counts.
+    """A ``usage`` block of either surface as a `Usage`, or ``None`` unless it states **both** counts.
+
+    Read in the Chat Completions spelling (``prompt_tokens`` / ``completion_tokens`` /
+    ``prompt_tokens_details``) or the Responses one (``input_tokens`` / ``output_tokens`` /
+    ``input_tokens_details``, issue #847), whichever states both counts, Chat first; the two are
+    never mixed, because a count from one spelling beside a count from the other is not one call's
+    usage. The cached count is part of the input count on both (the vendor says so of Responses),
+    which is what `call_cost` subtracts.
 
     Stricter than the OpenAI table's reader (`_openai_rates.usage_of`), which reads a missing count
-    as zero: here the formula is ``prompt_tokens × input + completion_tokens × output``, and a block
+    as zero: here the formula is ``input × input_per_m + output × output_per_m``, and a block
     missing either term would price the call low rather than not at all, which the dashboard would
     sum as if it were true. Both must be non-negative integers (never a bool). The cached and
-    cache-write counts are OpenAI's ``prompt_tokens_details`` spellings, read only if present.
+    cache-write counts are read from that spelling's ``…_details``: absent is zero, and present but
+    unreadable (a ``…_details`` that is not an object, a count that is not a non-negative integer)
+    is ``None``, because reading it as zero would price a cached token at the full rate, or a cache
+    write as though there were none — an estimate either way.
     """
     if not isinstance(usage, Mapping):
         return None
-    prompt, completion = _count(usage.get("prompt_tokens")), _count(usage.get("completion_tokens"))
-    if prompt is None or completion is None:
-        return None
-    details = usage.get("prompt_tokens_details")
-    details = details if isinstance(details, Mapping) else {}
-    return Usage(
-        input=prompt,
-        cached=_count(details.get("cached_tokens")) or 0,
-        cache_write=_count(details.get("cache_write_tokens")) or 0,
-        output=completion,
-    )
+    for input_key, output_key, details_key in _SPELLINGS:
+        prompt, completion = _count(usage.get(input_key)), _count(usage.get(output_key))
+        if prompt is None or completion is None:
+            continue
+        details = usage.get(details_key)
+        if details is None:
+            details = {}
+        if not isinstance(details, Mapping):
+            return None
+        cached, cache_write = (_optional(details, key) for key in _DETAIL_COUNTS)
+        if cached is None or cache_write is None:
+            return None
+        return Usage(input=prompt, cached=cached, cache_write=cache_write, output=completion)
+    return None
+
+
+#: The optional counts a ``…_details`` object may state, in `Usage` order.
+_DETAIL_COUNTS = ("cached_tokens", "cache_write_tokens")
+
+
+def _optional(details: Mapping[str, Any], key: str) -> int | None:
+    """An optional count: zero when absent or ``null``, ``None`` when present and unreadable."""
+    value = details.get(key)
+    return 0 if value is None else _count(value)
 
 
 def call_cost(pricing: Pricing, usage: Usage | None) -> ComputedCost | None:

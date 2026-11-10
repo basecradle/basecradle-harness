@@ -255,8 +255,8 @@ def test_every_known_vendor_cell_has_a_decided_affinity_answer():
         # `_provider_from_config` refuses OpenRouter on anything but chat (its Responses API is
         # beta upstream), so that pair is not a cell and needs no answer.
         if not (vendor == "openrouter" and surface != "chat")
-        # Nor is a surface a known vendor's endpoint does not document (refuseless: chat only,
-        # issue #844), refused at startup by the config layer's own table.
+        # Nor is a surface a known vendor's endpoint does not serve, refused at startup by the
+        # config layer's own table (refuseless serves both since issue #847, so none is excluded).
         and surface in _VENDOR_SURFACES.get(vendor, (SURFACES, ""))[0]
     }
 
