@@ -45,6 +45,8 @@ returns the key, and it never surfaces a response *body* — OpenRouter's 4xx en
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
 import os
 import time
@@ -159,11 +161,13 @@ class OpenRouterAccountBalanceTool(Tool):
         self._timeout = timeout
         self._cache_ttl = cache_ttl
         self._clock = clock
-        # (monotonic expiry, the key it was read with, rendered text). The key is part of the
-        # entry because it is resolved from the environment at *call* time: without it, a figure
-        # read for one account — with that account's `as of` stamp — is served as another's for
-        # the rest of the TTL after the credential is repointed.
-        self._cached: tuple[float, str, str] | None = None
+        # (monotonic expiry, a digest of the key it was read with, rendered text). The key is part
+        # of the entry because it is resolved from the environment at *call* time: without it, a
+        # figure read for one account — with that account's `as of` stamp — is served as another's
+        # for the rest of the TTL after the credential is repointed. A digest, never the key: a
+        # plain attribute holding it is emitted by `vars()` and by every crash reporter that
+        # expands locals, the leak `Secret` exists to close (issue #599).
+        self._cached: tuple[float, bytes, str] | None = None
 
     def run(self) -> str:
         """Report the credit remaining, or a clear reason it is unavailable."""
@@ -177,7 +181,8 @@ class OpenRouterAccountBalanceTool(Tool):
                 reason="config:missing_api_key",
             )
 
-        cached = self._cached_balance(key)
+        digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).digest()
+        cached = self._cached_balance(digest)
         if cached is not None:
             return cached
 
@@ -203,7 +208,7 @@ class OpenRouterAccountBalanceTool(Tool):
 
         text = _render(credits, self._now_utc())
         if self._cache_ttl > 0:
-            self._cached = (self._clock() + self._cache_ttl, key, text)
+            self._cached = (self._clock() + self._cache_ttl, digest, text)
         return text
 
     # --- the one HTTP call ----------------------------------------------------
@@ -252,12 +257,12 @@ class OpenRouterAccountBalanceTool(Tool):
 
     # --- caching --------------------------------------------------------------
 
-    def _cached_balance(self, key: str) -> str | None:
+    def _cached_balance(self, digest: bytes) -> str | None:
         """The cached text if it is still fresh **and** was read with this key, else ``None``."""
         if self._cached is None:
             return None
-        expiry, cached_key, text = self._cached
-        if cached_key == key and self._clock() < expiry:
+        expiry, cached_digest, text = self._cached
+        if hmac.compare_digest(cached_digest, digest) and self._clock() < expiry:
             return text
         return None
 

@@ -26,6 +26,10 @@ An agent brained on refuseless pays for every call from prepaid credit and, unli
 - **The tool enforces the gate itself too.** Built by a library caller beside another brain, it reads neither `AI_API_KEY` nor `AI_BASE_URL` and says why (`config:provider`); a caller that hands it both reads nothing from the environment. Its figure cache is keyed on a digest of the key, never the key.
 - **Soft failures, each on the `tool` line with its reason**: no key (`config:missing_api_key`), a rejected key (`config:auth`), the vendor's 60-reads-a-minute limit (`rate_limited`; a figure is reused for 30 seconds), an unusable `AI_BASE_URL` (`config:base_url`), an unreachable host (`transport`, `timeout`), a response missing a documented field or stated in another unit (`invalid_response`), and every other status as `docs/telemetry.md` → Fault Slugs names it (`gateway_down` on a 503 is `server_error`, on a 504 `timeout`). It never returns the key or the vendor's error prose.
 
+### Fixed: `openrouter_account_balance` no longer keeps the Management key in plain view
+
+After one successful read, the tool's figure cache held the revealed `OPENROUTER_MANAGEMENT_KEY` in a plain attribute, so `vars()`, a crash reporter that expands locals, or a `json.dump(…, default=vars)` would emit it (the class `Secret` closed in issue #599). The cache is now keyed on a SHA-256 digest of the key, so a repointed key still never serves another account's figure. Found in review of `refuseless_account_balance` (issue #848), which shares the shape.
+
 ## [0.183.1] - 2026-11-09
 
 ### Fixed: an SDK that cannot reach a known vendor is refused at startup, not at the first build (issue #846)
