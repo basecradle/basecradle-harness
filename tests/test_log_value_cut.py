@@ -377,7 +377,8 @@ PREFIX_SAMPLES = {
     "r8_": "r8_" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
     "ste-": "ste-" + "Ab3Cd5Ef7Gh9Ij1Kl3Mn",
     "abl_": "abl_" + "Kq7Zt2Wm9Rx4Lp6Vn3Hs8Dj5Fb1Gc0Ye7Ua2Ti9Ow4Qe6Nr3",
-    "pplx-": "pplx-" + "Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1Jf5Gs0Ya8Ue2Ti6Ow4Qe9Pr3",
+    # Shorter than a real key's 48, so no secret scanner reads the fabricated sample as one.
+    "pplx-": "pplx-" + "Rm4Tq8Zw2Xk6Lp9Vb3Nc7Hd1",
     "tk_": "tk_" + "q8m2zr5wk1xt7nb4pv9hc3jd6fs0l",
 }
 
@@ -426,7 +427,8 @@ LEFT_NEIGHBORS = {
         "G\u00e4ste-registrierungssystem-voll",
         "tabl_partitionmaintenancewindow",
         "kabl_verbindungsueberwachungsdienst",
-        "gtk_window_set_default_size",
+        "atk_objectgetaccessiblename",
+        "gtk_window_set_default_size_request",  # ``tk_``'s run takes ``_``, so the word rule decides
     ],
 )
 def test_a_vendor_prefix_inside_a_word_is_not_a_credential(text):
@@ -494,6 +496,15 @@ def test_a_refuseless_key_is_redacted_whole(text, scrubbed):
     assert scrub(text) == scrubbed
     rendered = _value(text)
     assert REFUSELESS_KEY[4:12] not in rendered and REFUSELESS_KEY[-8:] not in rendered, rendered
+
+
+@pytest.mark.parametrize(
+    "token", ["tk_" + "q8m2zr5wk-xt7nb4pv9_hc3jd6fs0", "tk_" + "Q8m2zr5wk1xt7nb4pv9hc3jd6fs0l"]
+)
+def test_an_ntfy_token_ntfys_validator_admits_is_redacted_whole(token):
+    """ntfy generates lowercase alphanumerics, and accepts ``^tk_[-_A-Za-z0-9]{29}$`` as provisioned."""
+    assert len(token) == 32
+    assert scrub(f"ntfy refused {token}: unauthorized") == "ntfy refused [redacted]: unauthorized"
 
 
 def test_a_refuseless_key_is_redacted_on_a_log_line():

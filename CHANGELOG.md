@@ -15,7 +15,7 @@ No rule in `_observability.scrub` matched a refuseless key, so one echoed in a v
 
 - **refuseless**: `abl_[A-Za-z0-9]{20,}`, for `abl_` plus 48 alphanumerics, read off two real keys.
 - **Perplexity**: `pplx-[A-Za-z0-9]{20,}`, for the documented `pplx-` prefix plus 48 alphanumerics.
-- **ntfy**: `tk_[A-Za-z0-9]{20,}`, for the documented `tk_` plus 29 characters (`NTFY_DM_TOKEN`).
+- **ntfy**: `tk_[A-Za-z0-9_-]{20,}`, for the documented `tk_` plus 29 characters, the shape of the harness's `NTFY_DM_TOKEN`; the run is ntfy's own validator's, which admits `_` and `-`.
 
 A key with no prefix of its own (Wiro's) has no shape a rule can match, and stays uncovered. `docs/telemetry.md` → Credential Scrubbing lists each shape and whose word it is.
 

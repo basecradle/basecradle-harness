@@ -85,7 +85,7 @@ The two lists cannot be one list, because one is VRL in another repository, so t
 |---|---|---|
 | refuseless | `abl_[A-Za-z0-9]{20,}` | `abl_` plus 48 alphanumerics, 52 characters in all, read off two real keys (@origin, 2026-11-10). |
 | Perplexity | `pplx-[A-Za-z0-9]{20,}` | The `pplx-` prefix is Perplexity's documentation's; the 48 alphanumerics after it are gitleaks's `perplexity-api-key` rule. |
-| ntfy | `tk_[A-Za-z0-9]{20,}` | `tk_` plus 29 characters, 32 in all, from ntfy's documentation (`NTFY_DM_TOKEN`). |
+| ntfy | `tk_[A-Za-z0-9_-]{20,}` | `tk_` plus 29 characters, 32 in all, from ntfy's documentation; the harness holds one as `NTFY_DM_TOKEN`. ntfy generates the body from lowercase letters and digits, and its validator also admits capitals, `_` and `-` (`^tk_[-_A-Za-z0-9]{29}$`, ntfy's `user/util.go`), which is the run this rule takes. A generated token with no digit, about 1 in 12,500, is the word residual stated below when glued to a letter. |
 
 A key with no prefix of its own has no shape a prefix rule can match: Wiro's API key, which travels in an `x-api-key` header, is such a key, and the source does not cover it.
 
