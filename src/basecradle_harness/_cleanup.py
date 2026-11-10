@@ -94,7 +94,7 @@ from basecradle._exceptions import BaseCradleError, ForbiddenError, NotFoundErro
 from basecradle_harness._basecradle import _as_uuid, _client_from_env, _configure_logging
 from basecradle_harness._install import config_home
 from basecradle_harness._mempalace import _CLI_CONFIG_DIR, _CLI_CONFIG_FILE
-from basecradle_harness._observability import RED, head, kv
+from basecradle_harness._observability import RED, head, kv, scrub
 from basecradle_harness._token import TEMP_PREFIX, TEMP_SUFFIX
 from basecradle_harness._version import __version__
 from basecradle_harness._wake import (
@@ -799,7 +799,7 @@ def main(argv: list[str] | None = None) -> int:
         # invisible to a severity filter — and a silently-failing sweep looks exactly like a
         # sweep with nothing to do.
         _log.error("%s %s", head("cleanup failed", RED), kv(error=str(error)))
-        print(f"basecradle-harness-cleanup: {error}", file=sys.stderr)
+        print(f"basecradle-harness-cleanup: {scrub(str(error))}", file=sys.stderr)
         return 1
 
     if blocked:

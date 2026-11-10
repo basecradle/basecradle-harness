@@ -69,7 +69,7 @@ from pathlib import Path
 from basecradle_harness._memory_provider import _palace_path
 from basecradle_harness._mempalace import _CONVERSATIONS_WING, _REGISTRY_ROOM, _import
 from basecradle_harness._mining import Verdict, catalog, classify
-from basecradle_harness._observability import GREEN, RED, YELLOW, head, kv
+from basecradle_harness._observability import GREEN, RED, YELLOW, head, kv, log_handler, scrub
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -486,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
+    logging.basicConfig(level=logging.INFO, handlers=[log_handler("%(message)s", sys.stderr)])
     try:
         palace = resolve_palace(args.palace)
         collection = open_palace(palace)
@@ -513,7 +513,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except (ValueError, ImportError) as error:
         _log.error("%s %s", head("palace scrub failed", RED), kv(error=str(error)))
-        print(f"basecradle-harness-scrub-palace: {error}", file=sys.stderr)
+        print(f"basecradle-harness-scrub-palace: {scrub(str(error))}", file=sys.stderr)
         return 1
     return 0
 

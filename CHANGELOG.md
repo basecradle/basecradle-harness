@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.186.0] - 2026-11-10
+
+### Fixed: A prose log line carrying an exception's text is scrubbed at the source (issue #857)
+
+`kv` scrubs every value it renders, but a prose line interpolates its own arguments (`_log.warning("…: %s", exc)`), so a vendor error body that echoed the key it rejected reached the journal whole on any install with no Vector. It was reproduced on the refuseless model-list read, and sixty-five prose sites had the shape.
+
+- **The floor is the log handler.** Every `basecradle-harness-*` entrypoint now logs through `_observability.log_handler`, whose `ScrubbingFormatter` runs `scrub` over each record as rendered, message, traceback and stack, so every prose site, every future one and every other library's line (`httpx`, an SDK) is covered with nothing for a call site to remember. A clean line renders byte for byte as before.
+- **The refuseless model-list read scrubs its own argument too** (`_openai.ModelCatalog.rows`), so an application that imports the harness with its own logging handler is covered on the path the first refuseless wake takes. Such an application can install `ScrubbingFormatter` itself for the rest.
+- **Every entrypoint's last word to stderr is scrubbed** (`basecradle-harness-wake: …`, the cleanup, resolve, claims, log-grammar, scrub-palace and palace-check commands, and the claims emitter's traceback): on a fleet box stderr is the journal.
+- `tests/test_prose_scrub.py` drives a sentinel key through the exception path of each prose site the issue named, and fails on any `basicConfig` not routed through `log_handler`, any module attaching its own handler or stopping a logger's propagation, and any `print` of an exception's text that does not scrub it. A traceback Python prints for an exception nothing caught never passes a handler, and stays the box layer's.
+
 ## [0.185.0] - 2026-11-10
 
 ### Fixed: The log scrub redacts a refuseless API key, a Perplexity API key and an ntfy access token (issue #856)

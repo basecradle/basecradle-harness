@@ -70,6 +70,7 @@ from basecradle_harness._memory_provider import (
     describe_memory_provider,
     memory_provider_named,
 )
+from basecradle_harness._observability import scrub
 from basecradle_harness._plugins import (
     ActivationContext,
     EnvSet,
@@ -667,7 +668,7 @@ def main(argv: list[str] | None = None) -> int:
         # does not import or is not a `MemoryProvider` (`ImportError`/`TypeError`). Anything else
         # is a defect in the package, and it propagates as a traceback rather than being dressed
         # up as the caller's mistake.
-        print(f"basecradle-harness-resolve: {error}", file=sys.stderr)
+        print(f"basecradle-harness-resolve: {scrub(str(error))}", file=sys.stderr)
         return 1
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0

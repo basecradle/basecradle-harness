@@ -119,7 +119,7 @@ from basecradle_harness._mcp import McpImageStore, McpResolution, load_mcp_tools
 from basecradle_harness._memory_provider import MemoryProvider, memory_provider_from_env
 from basecradle_harness._messages import Message
 from basecradle_harness._model_params import load_model_params
-from basecradle_harness._observability import LOG_FORMAT, kv, log_unspoken
+from basecradle_harness._observability import kv, log_handler, log_unspoken
 from basecradle_harness._openai import (
     DEFAULT_SURFACE as OPENAI_DEFAULT_SURFACE,
 )
@@ -2337,7 +2337,7 @@ def _configure_logging() -> None:
     if logging.getLogger().handlers:
         return
     level = _log_level_from_env()
-    logging.basicConfig(level=level, format=LOG_FORMAT)
+    logging.basicConfig(level=level, handlers=[log_handler()])
     _quiet_transport_logs(level)
 
 
