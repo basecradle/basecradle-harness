@@ -502,7 +502,7 @@ wake end timeline=019e77… outcome=ok turns=1 steps=2/24 posted=0 duration=3.31
 | `BASECRADLE_SESSION_NAME` | *(optional)* labels the credential minted from a password, so you can tell it apart later |
 | `BASECRADLE_TIMELINE` | The uuid of the timeline to watch |
 | `AI_PROVIDER` | *(optional)* **the vendor that bills the account** — whose key it is, and the label every `llm provider=` line carries. Six are known and get conventions: `openai` (default), `xai` (the [all-xAI profile](#go-all-xai--the-xai-profile)), `openrouter` (the [OpenRouter profile](#go-openrouter--the-openrouter-profile)), `google` (the [Google profile](#go-direct-to-gemini--the-google-profile)), `anthropic` (the [Anthropic profile](#go-direct-to-claude--the-anthropic-profile)), and `refuseless` (the [refuseless profile](#go-refuseless--the-refuseless-profile)). Any other lowercase slug (`[a-z0-9._-]+`, e.g. `wiro`) is a legal vendor under [the generic profile](#any-other-openai-compatible-vendor--the-generic-profile), which needs `AI_SDK=openai` and `AI_BASE_URL` |
-| `AI_SDK` | *(optional)* the PyPI package the harness imports to reach the model: `openai` (default), the native `xai-sdk`, the native `openrouter`, `google-genai`, or `anthropic`. Install the matching extra (`pip install 'basecradle-harness[openai]'`, `[xai-sdk]`, `[openrouter]`, `[google-genai]`, or `[anthropic]`) |
+| `AI_SDK` | *(optional)* the PyPI package the harness imports to reach the model: `openai` (default), the native `xai-sdk`, the native `openrouter`, `google-genai`, or `anthropic`. Install the matching extra (`pip install 'basecradle-harness[openai]'`, `[xai-sdk]`, `[openrouter]`, `[google-genai]`, or `[anthropic]`). Each native SDK reaches only its own vendor, and `openai` reaches every known vendor but `google` and `anthropic`; an SDK that cannot reach `AI_PROVIDER` stops the agent at startup, and `--resolved-config` and `basecradle-harness-resolve` refuse it the same way |
 | `AI_MODEL` | The model id, e.g. `gpt-5.4-mini` |
 | `AI_API_KEY` | The provider's API key — every provider but `google`, which takes the three below. For `anthropic` it is the only key read: the SDK's own `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_BASE_URL` are never consulted |
 | `AI_CREDENTIALS_FILE` | *(`google` only)* the **path** to a Google Cloud service-account JSON key — never the JSON itself in the environment. A relative path is read from the config home. Only a `service_account` key loads; a personal `gcloud` login is refused, and Application Default Credentials are never consulted |
@@ -2097,7 +2097,7 @@ What the generic profile does, and why:
 - **No vendor-coupled tools.** Every server-side built-in and every vendor media tool is gated on a known vendor, so none activates, and the installer lays down only the vendor-neutral defaults. A built-in that is somehow active anyway is a startup error, never a silent drop.
 - **The vendor's own price.** Nothing is priced from a rate table, so there is no "not aimed at api.openai.com" cost-gap warning; when the endpoint states `usage.cost` (Wiro does), the `llm` line carries it as `cost=`.
 
-A native SDK (`xai-sdk`, `openrouter`, `google-genai`, `anthropic`) reaches only its own vendor and refuses a generic one. The five known vendors behave exactly as they always have.
+A native SDK (`xai-sdk`, `openrouter`, `google-genai`, `anthropic`) reaches only its own vendor and refuses a generic one. The known vendors behave exactly as they always have.
 
 ## Receive inbound activity — the webhook tools
 

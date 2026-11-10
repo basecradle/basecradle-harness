@@ -1085,6 +1085,7 @@ def describer_from_env(env: Any = None) -> Describer | None:
             _surface_for,
             is_generic_provider,
             normalize_provider,
+            sdk_pairing_problem,
         )
 
         brain = None if own_provider is None else _config_from_env()[0]
@@ -1103,6 +1104,17 @@ def describer_from_env(env: Any = None) -> Describer | None:
                     fault="config:invalid_provider",
                     detail=f"{DESCRIBER_PROVIDER_VAR}={own_provider!r}",
                 )
+            # The pairing rule the brain's config triple reads (issue #846), said here in this
+            # describer's own variables' names: the build's message names the *brain's*, and
+            # following it would change the brain's stack.
+            mismatch = sdk_pairing_problem(
+                own_provider,
+                own_sdk,
+                provider_var=DESCRIBER_PROVIDER_VAR,
+                sdk_var=DESCRIBER_SDK_VAR,
+            )
+            if mismatch is not None:
+                return Describer(None, model, fault="config:no_provider", detail=mismatch)
             provider_name, sdk = own_provider, own_sdk
             surface = _surface_for(own_sdk, own_surface, own_provider)
     except Exception as exc:  # noqa: BLE001 - a describer must never break a wake
@@ -1138,32 +1150,21 @@ def describer_from_env(env: Any = None) -> Describer | None:
     # carries over only to a describer at the brain's own location: sent to another, it would run
     # the describer somewhere other than where it was configured to run.
     inherit_endpoint = own_provider is None or own_provider == brain
-    if own_provider is not None and is_generic_provider(own_provider):
+    if own_provider is not None and is_generic_provider(own_provider) and not inherit_endpoint:
         # Said here rather than left to the build, whose message names the *brain's* variables:
-        # following it (set AI_BASE_URL) would point the brain at the describer's vendor.
-        if own_sdk != "openai":
-            return Describer(
-                None,
-                model,
-                fault="config:no_provider",
-                detail=(
-                    f"{DESCRIBER_PROVIDER_VAR}={own_provider!r} is a vendor the harness does not "
-                    f"know, which is reached only with {DESCRIBER_SDK_VAR}=openai "
-                    f"(got {own_sdk!r})."
-                ),
-            )
-        if not inherit_endpoint:
-            return Describer(
-                None,
-                model,
-                fault="config:no_provider",
-                detail=(
-                    f"{DESCRIBER_PROVIDER_VAR}={own_provider!r} is a vendor the harness does not "
-                    "know, so it has no default host, and a describer on a vendor other than the "
-                    "brain's inherits no AI_BASE_URL. Ride the brain's stack (unset "
-                    f"{DESCRIBER_PROVIDER_VAR} and {DESCRIBER_SDK_VAR}), or name a known vendor."
-                ),
-            )
+        # following it (set AI_BASE_URL) would point the brain at the describer's vendor. (Its SDK
+        # was already refused above, by the pairing rule, when it is not `openai`.)
+        return Describer(
+            None,
+            model,
+            fault="config:no_provider",
+            detail=(
+                f"{DESCRIBER_PROVIDER_VAR}={own_provider!r} is a vendor the harness does not "
+                "know, so it has no default host, and a describer on a vendor other than the "
+                "brain's inherits no AI_BASE_URL. Ride the brain's stack (unset "
+                f"{DESCRIBER_PROVIDER_VAR} and {DESCRIBER_SDK_VAR}), or name a known vendor."
+            ),
+        )
     if provider_name == _VERTEX_PROVIDER:
         brain_location = (os.environ.get("AI_LOCATION") or "").strip().lower()
         inherit_endpoint = inherit_endpoint and credential["location"].lower() == brain_location

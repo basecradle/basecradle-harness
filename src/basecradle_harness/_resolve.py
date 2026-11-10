@@ -53,12 +53,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 from basecradle_harness._basecradle import (
-    _SDK_SURFACES,
     DEFAULT_PROVIDER,
     DEFAULT_SDK,
     KNOWN_PROVIDERS,
     _merge_memory_tools,
-    _require_generic_sdk,
+    _require_sdk_pairing,
     _surface_for,
     normalize_provider,
 )
@@ -235,8 +234,10 @@ def resolve_stems(
     Args:
         provider: ``AI_PROVIDER`` — the vendor that bills the account: a known one (``openai`` |
             ``xai`` | ``openrouter`` | ``google`` | ``anthropic`` | ``refuseless``) or any other
-            slug, which takes the generic OpenAI-compatible profile (issue #670). A malformed slug raises, and so does a generic
-            vendor on any SDK but ``openai``, exactly as a wake's `_config_from_env` would. The
+            slug, which takes the generic OpenAI-compatible profile (issue #670). A malformed slug
+            raises, and so does any `sdk` that cannot reach the vendor (issue #846: a generic
+            vendor on a native SDK, a known vendor on another vendor's SDK, an SDK with no
+            adapter), exactly as a wake's `_config_from_env` would. The
             generic profile's other precondition, ``AI_BASE_URL``, is a deployment fact this pure
             resolver is never handed, so it is not checked here.
         sdk: ``AI_SDK`` — the vendor SDK package the harness would import.
@@ -282,14 +283,12 @@ def resolve_stems(
     """
     provider = normalize_provider(provider)
     sdk = (sdk or DEFAULT_SDK).strip().lower()
-    _require_generic_sdk(provider, sdk)
-    if sdk not in _SDK_SURFACES:
-        # The wake leaves this to the provider build, which fails with "no adapter for that SDK"
-        # the moment it tries to reach a model. This path never builds a provider, so nothing
-        # downstream would catch it — and a typo'd `--sdk` does not error, it silently answers a
-        # *different* question (an `openroute` typo drops `openrouter_search`, and the pin computed
-        # from it is short a name). Same failure class as an unknown stem, so: same hard stop.
-        raise ValueError(f"Unknown sdk {sdk!r}; expected one of {tuple(_SDK_SURFACES)}.")
+    # The pairing rule a wake's `_config_from_env` reads, so this refuses exactly what every wake
+    # refuses (issue #846): a known vendor on another vendor's native SDK, a generic vendor on a
+    # native one, and an SDK with no adapter — which matters most here, because a typo'd `--sdk`
+    # would otherwise silently answer a *different* question (an `openroute` typo drops
+    # `openrouter_search`, and the pin computed from it is short a name).
+    _require_sdk_pairing(provider, sdk)
     resolved_surface = _surface_for(sdk, surface, provider)
     profile = (profile or "locked").strip().lower()
     if profile not in _PROFILES:
