@@ -544,3 +544,18 @@ def test_loads_under_the_locked_default_profile():
     registry.register(OpenRouterAccountBalanceTool())
     assert "openrouter_account_balance" in registry
     assert OpenRouterAccountBalanceTool().parameters == {"type": "object", "properties": {}}
+
+
+def test_the_cache_never_holds_the_key(monkeypatch):
+    """The #599 leak: a plain attribute holding the key is emitted by `vars()` and crash reporters.
+
+    The cache is keyed on the credential so a repointed key never serves another account's figure;
+    it is keyed on a digest of it, so a successful read leaves no plaintext key on the object.
+    """
+    monkeypatch.setenv("OPENROUTER_MANAGEMENT_KEY", KEY)
+    for tool in (OpenRouterAccountBalanceTool(management_key=KEY), OpenRouterAccountBalanceTool()):
+        with respx.mock(assert_all_called=True) as mock:
+            _mock(mock)
+            tool.run()
+        assert tool._cached is not None
+        assert KEY not in repr(vars(tool))
