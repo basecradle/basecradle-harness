@@ -140,9 +140,21 @@ def test_a_counter_with_a_start_says_since_when(tool):
     assert result.endswith("This key has been billed $12.50 since 2026-11-08T23:57:41Z.")
 
 
-def test_a_key_that_has_spent_nothing_says_so(tool):
-    result, _ = _read(tool, httpx.Response(200, json=_credits(key_spent=0)))
+@pytest.mark.parametrize("spent", [0, -0.0])
+def test_a_key_that_has_spent_nothing_says_so(tool, spent):
+    result, _ = _read(tool, _ok(_credits(key_spent=spent)))
     assert result.endswith("This key has been billed $0.00 in total.")
+
+
+def test_an_absent_counter_start_reads_as_null(tool):
+    """``key_spent_since`` left out is the vendor stating no start, as ``null`` does."""
+    result, _ = _read(tool, httpx.Response(200, json=_credits(key_spent_since=...)))
+    assert result.endswith("This key has been billed $0.001405 in total.")
+
+
+def test_a_counter_started_at_the_epoch_is_a_start(tool):
+    result, _ = _read(tool, httpx.Response(200, json=_credits(key_spent_since=0)))
+    assert result.endswith("This key has been billed $0.001405 since 1970-01-01T00:00:00Z.")
 
 
 @pytest.mark.parametrize(

@@ -167,7 +167,7 @@ class RefuselessAccountBalanceTool(Tool):
         "request can still spend, the account balance, the part of it held by requests in flight, "
         "and this key's own spending limit if it has one. Use it to reason about your runway: "
         "throttle or prioritize cheap work when credit is low, or ask a human to top up before you "
-        "run dry mid-task. It also says what this key has been billed so far. Takes no arguments, "
+        "run dry mid-task. It also says what this key has been billed. Takes no arguments, "
         "costs nothing, and can see only your own account."
     )
     parameters = NO_PARAMETERS

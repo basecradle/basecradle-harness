@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+from datetime import UTC, datetime
 
 import httpx
 import pytest
@@ -86,8 +87,14 @@ def test_the_tool_shows_the_figures_the_vendor_holds(monkeypatch):
         limit = re.search(r"limit allows \$([0-9,]+\.[0-9]+) more", context).group(1)
         assert _figure(limit) == pytest.approx(body["key_limit"], abs=1e-6)
     # The key's own spend (issue #868), the figure and its span both the vendor's.
-    spent, span = re.search(
-        r"This key has been billed \$([0-9,]+\.[0-9]+) (in total|since \S+Z)\.", context
-    ).groups()
+    found = re.search(
+        r"This key has been billed \$([0-9,]+\.[0-9]+) (?:in total|since (\S+Z))\.", context
+    )
+    assert found, context
+    spent, since = found.groups()
     assert _figure(spent) == pytest.approx(body["key_spent"], abs=1e-6)
-    assert (span == "in total") == (body["key_spent_since"] is None)
+    if body["key_spent_since"] is None:
+        assert since is None
+    else:
+        stated = datetime.fromtimestamp(body["key_spent_since"], UTC)
+        assert since == stated.isoformat(timespec="seconds").replace("+00:00", "Z")
