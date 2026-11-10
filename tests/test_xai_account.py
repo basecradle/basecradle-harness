@@ -457,6 +457,22 @@ def test_an_unreachable_endpoint_degrades(tool):
     assert "couldn't reach" in result
 
 
+def test_a_transport_error_is_named_by_its_type_never_its_text(tool):
+    """h11 rejects a key holding a line break with an error quoting the whole header, key and all.
+
+    Relayed as text, that error put the key into the tool's answer, the transcript and the `tool`
+    line's WARNING (found in review of issue #853, whose OpenRouter sibling had the same flaw).
+    """
+    leaky = httpx.LocalProtocolError(f"Illegal header value b'Bearer {KEY}'")
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(PREVIEW_URL).mock(side_effect=leaky)
+        mock.get(LEDGER_URL).mock(side_effect=leaky)
+        result = tool.run()
+
+    assert "couldn't reach the xAI Management API (LocalProtocolError)." in result
+    assert KEY not in result and "Illegal header" not in result
+
+
 def test_an_unreadable_response_degrades(tool):
     with respx.mock(assert_all_called=True) as mock:
         _mock_both(

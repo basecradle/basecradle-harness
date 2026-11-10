@@ -304,8 +304,11 @@ class XaiAccountBalanceTool(Tool):
         try:
             response = client.get(f"{self._base_url}{path}")
         except httpx.RequestError as exc:
+            # The error's *type*, never its text: a transport error can quote the request it
+            # failed on, headers included (h11's illegal-header error carries the whole
+            # `Authorization` value), and the contract is that the key never leaves this tool.
             raise _BalanceUnavailable(
-                f"couldn't reach the xAI Management API ({exc}).", slug="transport"
+                f"couldn't reach the xAI Management API ({type(exc).__name__}).", slug="transport"
             ) from None
 
         status = response.status_code
