@@ -4,8 +4,8 @@ The mocked suite (`test_openrouter_account.py`) pins the arithmetic, the renderi
 degraded mode, but it **cannot** catch a drift in the real endpoint's path, auth, or response
 shape — the very things a live account confirms. A fixture only ever replays what we already
 believe. This test builds the real tool with a real key and hits
-``openrouter.ai/api/v1/credits`` (and, on an inference key, ``/key``) for real, so a regression to a wrong path or a changed payload
-fails loudly here.
+``openrouter.ai/api/v1/credits`` (and, on an inference key, ``/key``) for real, so a regression
+to a wrong path or a changed payload fails loudly here.
 
 The headline is checked against an **independent oracle** — the raw ``/credits`` body, fetched
 here rather than through the tool — because a test that reads the payload through the code under
@@ -113,6 +113,7 @@ def _live(key: str, path: str) -> dict:
 def test_reports_the_live_credits_remaining(argument):
     """The tool reads the real account and reports purchased-less-used, not either term."""
     key = KEYS[argument]
+    before = _live(key, "/key") if argument == "api_key" else None
     tool = OpenRouterAccountBalanceTool(cache_ttl=0, **{argument: key})
     result = tool.run()
     print(f"\n{result}\n")  # the figure compared against the account's Credits page
@@ -142,17 +143,24 @@ def test_reports_the_live_credits_remaining(argument):
     if argument == "management_key":
         assert "which spends nothing itself" in result, result  # its own figures are not read
         return
-    # An inference key's own figures, against `/key` read raw.
-    own = _live(key, "/key")
-    print(f"live /key: usage ${own['usage']:,.2f}, limit {own['limit']!r}\n")
+    # An inference key's own figures, against `/key` read raw on both sides of the tool's read:
+    # the key may be spending meanwhile (this repo's other OpenRouter live gate shares it), so the
+    # figure the tool reports must lie between the two raw readings, never merely near one.
+    after = _live(key, "/key")
+    print(f"live /key: usage ${after['usage']:,.2f}, limit {after['limit']!r}\n")
     spent = _SPENT.search(result)
     assert spent, f"no key-usage figure in:\n{result}"
-    assert _usd(spent) == pytest.approx(round(float(own["usage"]), 2), abs=0.01), result
-    if own["limit"] is None:
+    low, high = round(float(before["usage"]), 2), round(float(after["usage"]), 2)
+    assert low - 0.01 <= _usd(spent) <= high + 0.01, (low, high, result)
+    if after["limit"] is None:
         assert "has no spending limit of its own." in result, result
     else:
-        allows = f"allows ${float(own['limit_remaining']):,.2f} more"
-        assert allows.replace("$-", "-$") in result, result
+        allows = re.search(r"allows (-?)\$([\d,]+\.\d{2}) more", result)
+        assert allows, result
+        # Bounded the same way: what the limit allows only falls as the key spends.
+        floor = round(float(after["limit_remaining"]), 2)
+        ceiling = round(float(before["limit_remaining"]), 2)
+        assert floor - 0.01 <= _usd(allows) <= ceiling + 0.01, (floor, ceiling, result)
 
 
 @pytest.mark.skipif(not KEYS, reason=_NO_KEY)

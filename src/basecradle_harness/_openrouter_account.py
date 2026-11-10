@@ -24,12 +24,14 @@ read needs. The tool now reads with the first of these that applies:
    (``HARNESS_MEMPALACE_RERANK_BASE_URL``, else OpenRouter's).
 4. The describer's ``HARNESS_DESCRIBER_API_KEY``, only when ``HARNESS_DESCRIBER_PROVIDER`` names
    ``openrouter``: a describer riding the brain's stack bills the brain's vendor, which step 2
-   already covers when that vendor is OpenRouter.
+   already covers when that vendor is OpenRouter. Read at ``AI_BASE_URL`` when the brain bills
+   OpenRouter too, because the describer then inherits it, else at OpenRouter's host.
 
 The brain comes before the helpers because it is the agent's main vendor, the account the issue
 asked every agent to see. Each key is read **at the host its own calls go to**, so a key kept to
 a regional host is never sent to another. Every key here is one the agent already holds and
-already sends to OpenRouter; none is a new credential, and none can administer anything.
+already sends to OpenRouter; none is a new credential, and none but the optional Management key
+can administer anything.
 
 **Why there is still no ``Vendor`` gate** (issue #425). Steps 3 and 4 are the case: an agent
 brained by another vendor whose OpenRouter key serves a helper. A ``Vendor("openrouter")`` gate
@@ -87,6 +89,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -271,6 +274,18 @@ class OpenRouterAccountBalanceTool(Tool):
         cached = self._cached_balance(digest, credential)
         if cached is not None:
             return cached
+        if any(ord(char) < 32 or ord(char) == 127 for char in key):
+            # Refused before any client exists, never left to the transport: h11 rejects such a
+            # header with an error whose text quotes the whole header, key included, so the
+            # failure itself would carry the key into the tool's answer and the log.
+            return tool_failed(
+                f"OpenRouter account balance unavailable — {credential.source} contains a control "
+                "character (a line break or a tab, picked up when it was pasted), so it cannot be "
+                "sent as a header.",
+                reason="config:auth",
+            )
+        if not _usable_root(credential.root):
+            return _unusable_root(credential)
 
         try:
             # The client is built *inside* the guard, not outside it: httpx encodes a header
@@ -290,12 +305,7 @@ class OpenRouterAccountBalanceTool(Tool):
                         self._get(client, credential, "/key", "read this key's own usage")
                     )
         except httpx.InvalidURL:
-            where = credential.root_source or "the base_url argument"
-            return tool_failed(
-                f"OpenRouter account balance unavailable — {where} is not a usable URL, so there "
-                "is no host to read the account at.",
-                reason="config:base_url",
-            )
+            return _unusable_root(credential)
         except UnicodeEncodeError:
             return tool_failed(
                 f"OpenRouter account balance unavailable — {credential.source} contains a "
@@ -345,7 +355,12 @@ class OpenRouterAccountBalanceTool(Tool):
             )
         key = _env(DESCRIBER_API_KEY_VAR)
         if key and _normalized(describer_stack_from_env()[0]) == VENDOR:
-            return self._from_env(key, DESCRIBER_API_KEY_VAR, "your describer's key", None, None)
+            # A describer naming the brain's own vendor inherits the brain's host (`_describer`'s
+            # `inherit_endpoint`), so a regional `AI_BASE_URL` keeps its key regional here too.
+            root, where = (base_url_override(), "AI_BASE_URL")
+            if _active_provider() != VENDOR:
+                root, where = None, None
+            return self._from_env(key, DESCRIBER_API_KEY_VAR, "your describer's key", root, where)
         return None
 
     def _from_env(
@@ -377,9 +392,16 @@ class OpenRouterAccountBalanceTool(Tool):
         """
         try:
             response = client.get(f"{credential.root}{path}")
-        except httpx.RequestError as exc:
+        except httpx.TimeoutException:
             raise _BalanceUnavailable(
-                f"couldn't reach the OpenRouter API ({exc}).", slug="transport"
+                f"the OpenRouter API did not answer in time trying to {action}.", slug="timeout"
+            ) from None
+        except httpx.RequestError as exc:
+            # The error's *type*, never its text: a transport error can quote the request it
+            # failed on, headers included (h11's illegal-header error carries the whole
+            # `Authorization` value), and the contract is that the key never leaves this tool.
+            raise _BalanceUnavailable(
+                f"couldn't reach the OpenRouter API ({type(exc).__name__}).", slug="transport"
             ) from None
 
         status = response.status_code
@@ -389,8 +411,12 @@ class OpenRouterAccountBalanceTool(Tool):
                 f"{action}. Check that {credential.source} holds a current OpenRouter key.",
                 slug="config:auth",
             )
-        if status >= 400:
-            raise _BalanceUnavailable(f"OpenRouter returned HTTP {status} trying to {action}.")
+        if not 200 <= status < 300:
+            # Named by `docs/telemetry.md` → Fault Slugs, the same words on every producer.
+            slug = _STATUS_SLUGS.get(status) or ("server_error" if status >= 500 else "api_error")
+            raise _BalanceUnavailable(
+                f"OpenRouter returned HTTP {status} trying to {action}.", slug=slug
+            )
         try:
             data = response.json()
         except (ValueError, RecursionError):
@@ -420,6 +446,42 @@ class OpenRouterAccountBalanceTool(Tool):
     def _now_utc(self) -> datetime:
         """Wall-clock now, in UTC — the ``as of`` stamp on a freshly-read figure."""
         return datetime.now(UTC)
+
+
+#: The statuses `docs/telemetry.md` → Fault Slugs names by the status alone, beyond ``401``/``403``,
+#: which this tool words for itself. Any other ``5xx`` is ``server_error`` and any other status (a
+#: ``3xx`` httpx did not follow included) is ``api_error``, as that table rules.
+_STATUS_SLUGS = {
+    402: "config:billing",
+    404: "config:model_not_found",
+    413: "payload_too_large",
+    429: "rate_limited",
+    504: "timeout",
+}
+
+
+def _usable_root(root: str) -> bool:
+    """Whether `root` is an ``http(s)`` URL with a host, the only kind a read can go to.
+
+    Checked before any request, because a schemeless value (``us.openrouter.ai/api/v1``) fails in
+    the transport as ``UnsupportedProtocol``, which would read as a network failure that retrying
+    can fix rather than the configuration fault it is (the reranker judges the same value so).
+    """
+    try:
+        parts = urlsplit(root)
+    except ValueError:
+        return False
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
+
+
+def _unusable_root(credential: _Credential) -> str:
+    """The soft answer for a host the read cannot go to, naming where that host came from."""
+    where = credential.root_source or "the base_url argument"
+    return tool_failed(
+        f"OpenRouter account balance unavailable — {where} is not a usable URL, so there is no "
+        "host to read the account at.",
+        reason="config:base_url",
+    )
 
 
 def _env(var: str) -> str | None:

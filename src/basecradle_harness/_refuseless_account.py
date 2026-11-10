@@ -13,7 +13,8 @@ host its calls go to (``AI_BASE_URL``, else the vendor's default), and it is why
 refuseless**. The xAI sibling reads a *dedicated* account credential and so is gated only on its
 vendor's account; the OpenRouter sibling also reads OpenRouter keys that serve helpers (the
 reranker, the describer), which is its whole case for having no vendor gate, and it checks
-``AI_PROVIDER`` itself before it reads the brain's key (issue #853). This tool has only the brain's. Offered beside any other brain it would send that vendor's key to refuseless's host,
+``AI_PROVIDER`` itself before it reads the brain's key (issue #853). This tool has only the
+brain's. Offered beside any other brain it would send that vendor's key to refuseless's host,
 which is a credential sent to a stranger, not a balance read. An agent with a separate refuseless
 account beside another brain would need a dedicated variable for that key, which nothing asks for.
 

@@ -912,3 +912,150 @@ def test_no_object_holds_the_inference_key_in_plain_view(monkeypatch):
             _mock_both(mock)
             tool.run()
         assert INFERENCE not in repr(vars(tool))
+
+
+# --- review findings on #853: the transport never quotes the key; slugs follow the table ------
+
+
+#: Every control character an environment variable can hold (NUL it cannot), each both ways.
+_CONTROL_KEYS = [
+    *((via, char) for via in ("env", "argument") for char in ("\n", "\r", "\t", "\x7f")),
+    ("argument", "\x00"),
+]
+
+
+@pytest.mark.parametrize(("via", "char"), _CONTROL_KEYS)
+def test_a_key_with_a_control_character_is_refused_before_any_request(monkeypatch, via, char):
+    """h11 rejects such a header with an error quoting the whole header, key included.
+
+    Left to the transport, that error's text was the tool's answer: the key in the transcript the
+    brain's vendor is sent, and in the WARNING the `tool` line writes.
+    """
+    key = f"sk-or-v1-SECRET{char}INNER"
+    if via == "env":
+        _brain_on_openrouter(monkeypatch, key=key)
+        tool, source = OpenRouterAccountBalanceTool(cache_ttl=0), "AI_API_KEY"
+    else:
+        tool, source = (
+            OpenRouterAccountBalanceTool(api_key=key, cache_ttl=0),
+            "the api_key argument",
+        )
+    with respx.mock(assert_all_called=False) as mock:
+        credits, key_route = _mock_both(mock)
+        result = tool.run()
+
+    assert not credits.called and not key_route.called
+    assert result.startswith(
+        f"OpenRouter account balance unavailable — {source} contains a control character"
+    )
+    assert "SECRET" not in result and "INNER" not in result
+
+
+def test_a_transport_error_is_named_by_its_type_never_its_text(monkeypatch):
+    """Whatever a transport error's message carries, only its type reaches the answer."""
+    _brain_on_openrouter(monkeypatch)
+    leaky = httpx.LocalProtocolError(f"Illegal header value b'Bearer {INFERENCE}'")
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(CREDITS_URL).mock(side_effect=leaky)
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert result == (
+        "OpenRouter account balance unavailable — couldn't reach the OpenRouter API "
+        "(LocalProtocolError)."
+    )
+
+
+@pytest.fixture
+def reasons(monkeypatch):
+    """The `tool` line's `reason` for each failure the tool reports, captured at the call."""
+    import basecradle_harness._openrouter_account as module
+
+    seen: list[str] = []
+    real = module.tool_failed
+
+    def capture(text, *, reason):
+        seen.append(reason)
+        return real(text, reason=reason)
+
+    monkeypatch.setattr(module, "tool_failed", capture)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("status", "slug"),
+    [
+        (402, "config:billing"),
+        (404, "config:model_not_found"),
+        (413, "payload_too_large"),
+        (429, "rate_limited"),
+        (500, "server_error"),
+        (503, "server_error"),
+        (504, "timeout"),
+        (400, "api_error"),
+        (302, "api_error"),
+        (401, "config:auth"),
+        (403, "config:auth"),
+    ],
+)
+def test_a_failed_status_is_named_by_the_fault_slug_table(tool, reasons, status, slug):
+    """`docs/telemetry.md` → Fault Slugs: a fault known by its status alone has one name."""
+    with respx.mock(assert_all_called=True) as mock:
+        _mock(mock, httpx.Response(status))
+        assert "unavailable" in tool.run()
+
+    assert reasons == [slug]
+
+
+def test_a_read_that_ran_out_of_time_is_a_timeout_not_a_transport_fault(tool, reasons):
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(CREDITS_URL).mock(side_effect=httpx.ReadTimeout("slow"))
+        result = tool.run()
+
+    assert result == (
+        "OpenRouter account balance unavailable — the OpenRouter API did not answer in time "
+        "trying to read the credits remaining."
+    )
+    assert reasons == ["timeout"]
+
+
+@pytest.mark.parametrize(
+    "root", ["us.openrouter.ai/api/v1", "ftp://openrouter.ai/api/v1", "https://"]
+)
+def test_a_schemeless_or_hostless_rerank_host_is_a_config_fault_not_a_network_one(
+    monkeypatch, reasons, root
+):
+    """The reranker judges the same value a config fault; read as `transport`, it never heals."""
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_API_KEY", RERANK)
+    monkeypatch.setenv("HARNESS_MEMPALACE_RERANK_BASE_URL", root)
+    with respx.mock(assert_all_called=False) as mock:
+        result = OpenRouterAccountBalanceTool(cache_ttl=0).run()
+        assert not mock.calls
+
+    assert result == (
+        "OpenRouter account balance unavailable — HARNESS_MEMPALACE_RERANK_BASE_URL is not a "
+        "usable URL, so there is no host to read the account at."
+    )
+    assert reasons == ["config:base_url"]
+
+
+def test_a_describer_on_the_brains_vendor_is_read_at_the_brains_host(monkeypatch):
+    """It inherits `AI_BASE_URL` there (`_describer`'s `inherit_endpoint`), so it stays regional."""
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")  # the brain bills OpenRouter, with no key here
+    monkeypatch.setenv("AI_BASE_URL", "https://eu.openrouter.ai/api/v1")
+    monkeypatch.setenv("HARNESS_DESCRIBER_PROVIDER", "openrouter")
+    monkeypatch.setenv("HARNESS_DESCRIBER_API_KEY", DESCRIBER)
+    with respx.mock(assert_all_called=True) as mock:
+        credits, _ = _mock_both(mock, host="https://eu.openrouter.ai/api/v1")
+        OpenRouterAccountBalanceTool(cache_ttl=0).run()
+
+    assert credits.calls.last.request.headers["authorization"] == f"Bearer {DESCRIBER}"
+
+
+def test_a_describer_beside_another_brain_never_takes_that_brains_host(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "xai")
+    monkeypatch.setenv("AI_BASE_URL", "https://api.x.ai/v1")
+    monkeypatch.setenv("HARNESS_DESCRIBER_PROVIDER", "openrouter")
+    monkeypatch.setenv("HARNESS_DESCRIBER_API_KEY", DESCRIBER)
+    with respx.mock(assert_all_called=True) as mock:
+        _mock_both(mock)  # OpenRouter's own host, never xAI's
+        assert "OpenRouter credits remaining" in OpenRouterAccountBalanceTool(cache_ttl=0).run()

@@ -1990,7 +1990,7 @@ Live figure — $475.00 of credits purchased to date less the $345.19 used to da
   1. `OPENROUTER_MANAGEMENT_KEY`, when set: an **optional override**, never a requirement. A Management key spends nothing itself, so its own figures are not read.
   2. The brain's `AI_API_KEY`, when `AI_PROVIDER=openrouter`, at `AI_BASE_URL` (else `https://openrouter.ai/api/v1`).
   3. The reranker's `HARNESS_MEMPALACE_RERANK_API_KEY` (an OpenRouter key by construction), at `HARNESS_MEMPALACE_RERANK_BASE_URL` (else OpenRouter's host).
-  4. The describer's `HARNESS_DESCRIBER_API_KEY`, when `HARNESS_DESCRIBER_PROVIDER=openrouter`.
+  4. The describer's `HARNESS_DESCRIBER_API_KEY`, when `HARNESS_DESCRIBER_PROVIDER=openrouter`, at `AI_BASE_URL` when the brain bills OpenRouter too (the describer inherits it), else OpenRouter's host.
 
   The brain's key is never read under another `AI_PROVIDER`, so another vendor's key is never sent to OpenRouter.
 - **No provider gate — deliberately.** Unlike its xAI sibling (which reads an *xAI* account and so carries `Vendor("xai")`), this tool declares **no** vendor requirement: the case it exists for includes an agent brained by *another* provider whose OpenRouter key serves a helper (the reranker, the describer). A `Vendor("openrouter")` gate would self-exclude exactly that agent. It is not gated on a credential either — a missing key comes back as a readable "no OpenRouter key is configured" reason that names every key it looks for, rather than a capability that silently isn't there.
