@@ -70,7 +70,7 @@ from basecradle_harness._memory_provider import (
     describe_memory_provider,
     memory_provider_named,
 )
-from basecradle_harness._observability import scrub
+from basecradle_harness._observability import install_log_handler, scrub
 from basecradle_harness._plugins import (
     ActivationContext,
     EnvSet,
@@ -564,6 +564,7 @@ def main(argv: list[str] | None = None) -> int:
     stdout** — a half-answer an automation might parse is worse than none, and a stem typo
     producing a short pin is the exact failure this command exists to prevent.
     """
+    install_log_handler()  # a WARNING's text is scrubbed (issue #857)
     parser = argparse.ArgumentParser(
         prog="basecradle-harness-resolve",
         description=(

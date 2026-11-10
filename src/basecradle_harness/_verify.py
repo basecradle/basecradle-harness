@@ -83,7 +83,7 @@ from basecradle_harness._log_grammar import COLUMNS as LOG_GRAMMAR_COLUMNS
 from basecradle_harness._log_grammar import IDENTIFIER as LOG_GRAMMAR_IDENTIFIER
 from basecradle_harness._log_grammar import SCRIPT as LOG_GRAMMAR_SCRIPT
 from basecradle_harness._log_grammar import TTL_HOURS as LOG_GRAMMAR_TTL_HOURS
-from basecradle_harness._observability import agent_slug, scrub
+from basecradle_harness._observability import agent_slug, install_log_handler, scrub
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -806,6 +806,7 @@ def main(argv: list[str] | None = None) -> int:
     ``--emit-claims`` prints the claims manifest instead and exits 0 — the ledger's rows are a
     declaration, not a verdict, and must not vanish on a box that is failing.
     """
+    install_log_handler()  # a WARNING's text is scrubbed (issue #857)
     parser = argparse.ArgumentParser(
         prog="basecradle-harness-verify",
         description=(
@@ -928,6 +929,7 @@ def emit_main(argv: list[str] | None = None) -> int:
     component cannot state its claims" is exactly the right failure, and the reason is on stderr,
     which the wrapper keeps (bounded) and shows.
     """
+    install_log_handler()  # a WARNING's text is scrubbed (issue #857)
     parser = argparse.ArgumentParser(
         prog="basecradle-harness-claims",
         description=(

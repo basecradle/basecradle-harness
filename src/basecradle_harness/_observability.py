@@ -337,9 +337,12 @@ class ScrubbingFormatter(logging.Formatter):
     prose site and another library's line included, with no rule for a call site to remember.
 
     A clean line renders byte for byte as `logging.Formatter` renders it. A `kv` line is scrubbed a
-    second time, which changes nothing a value already lost (``[redacted]`` matches no rule); the one
-    thing the whole line exposes that a value alone did not is a bare value ending in ``bearer``
-    beside the next field, which the bearer rule takes with it, as the box's does.
+    second time, which changes it only where it redacts what `kv` could not see whole, and **never
+    across a value's closing quote** (`_CLOSING_QUOTE`): a quoted value ending in ``/heartbeat/`` or
+    ``?token=`` holds no secret, and on the whole line the rule that follows it would take the quote
+    and leave the line unparseable. No rule's legitimate match holds a ``"`` followed by the next
+    field or the line's end. One over-redaction is stated: a bare value ending in ``bearer`` beside a
+    next field of eight or more characters goes with it, as it does on the box.
 
     It protects only a process whose handler the harness installed (`log_handler`): a library caller
     that configures its own handler gets `kv`'s scrub and the sites that scrub their own argument
@@ -347,7 +350,15 @@ class ScrubbingFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        return scrub(super().format(record))
+        return '"'.join(scrub(part) for part in _CLOSING_QUOTE.split(super().format(record)))
+
+
+#: A ``kv`` value's closing quote: a ``"`` followed by the next ``key=`` (colored, when it is a
+#: verdict pair), by the reset closing a colored pair, or by the line's end. The formatter scrubs
+#: between them (`ScrubbingFormatter`), so no rule reaches across one.
+_CLOSING_QUOTE = re.compile(
+    r'"(?=[ \t]+(?:\x1b\[[0-9;]*m)?[A-Za-z_][A-Za-z0-9_]*=|\x1b\[0m|[ \t]*(?:\n|\Z))'
+)
 
 
 def log_handler(fmt: str = LOG_FORMAT, stream: Any = None) -> logging.Handler:
@@ -360,6 +371,17 @@ def log_handler(fmt: str = LOG_FORMAT, stream: Any = None) -> logging.Handler:
     handler = logging.StreamHandler(stream)
     handler.setFormatter(ScrubbingFormatter(fmt))
     return handler
+
+
+def install_log_handler() -> None:
+    """For an entrypoint that keeps Python's default logging: the same output, scrubbed.
+
+    With no handler configured, a ``WARNING`` reaches stderr through `logging.lastResort` as its
+    bare message, unscrubbed. This installs the scrubbing handler in its place, at the same level
+    and in the same format, so the command's stderr reads as it did, minus any credential. A no-op
+    when logging is already configured, so an embedding application's setup always wins.
+    """
+    logging.basicConfig(level=logging.WARNING, handlers=[log_handler("%(message)s")])
 
 
 #: The env var naming this agent's slug when the OS user is not it. The fleet's universal-identity

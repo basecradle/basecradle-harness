@@ -20,6 +20,7 @@ import ast
 import io
 import logging
 import sys
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -36,7 +37,13 @@ from basecradle_harness._exceptions import (
     ProviderError,
 )
 from basecradle_harness._messages import Message
-from basecradle_harness._observability import LOG_FORMAT, ScrubbingFormatter, log_handler
+from basecradle_harness._observability import (
+    LOG_FORMAT,
+    ScrubbingFormatter,
+    install_log_handler,
+    kv,
+    log_handler,
+)
 from basecradle_harness._openai import ModelCatalog, OpenAIProvider
 from basecradle_harness._openrouter import OpenRouterProvider
 from basecradle_harness._session import Session
@@ -54,6 +61,8 @@ ERROR_TEXT = (
     f"Error code: 401 - Invalid API key: {REFUSELESS_KEY} (Authorization: Bearer {OPENAI_KEY})"
 )
 SECRETS = (REFUSELESS_KEY[4:], OPENAI_KEY[3:])
+#: A key with no shape a rule knows, read only where its label is: ``API_KEY=…``; fabricated.
+HEADER_VALUE = "wk9f8e7d6c5b4a3f2e1d0c9b8a"
 
 
 class Leak(Exception):
@@ -145,18 +154,95 @@ def test_the_handler_writes_through_the_formatter_to_its_stream():
     assert not any(secret in stream.getvalue() for secret in SECRETS)
 
 
+# --- a kv line keeps its shape ---------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"error": "GET https://h.example.com/api/v1/heartbeat/", "outcome": "error"},
+        {"error": "no route /heartbeat/", "delivery": "d-1"},
+        {"error": "GET https://h.example.com/v1/models?token=", "outcome": "error"},
+        {"error": "the request was GET /v1?api_key=", "timeline": "0190a8b2"},
+        {"outcome": "error", "error": "GET https://h.example.com/api/v1/heartbeat/"},
+    ],
+)
+def test_a_second_scrub_never_reaches_across_a_kv_values_closing_quote(fields):
+    """A value ending in a rule's literal holds no secret; on the whole line, the rule would take the
+    closing quote and leave the line unparseable (the review of #857)."""
+    line = "wake failed " + kv(**fields)
+    assert ScrubbingFormatter("%(message)s").format(_record(line)) == line
+
+
+def test_a_second_scrub_still_redacts_what_kv_could_not_see_whole():
+    """A value ``kv`` rendered with its own ``"`` turned to ``'`` is a value the line pass reads."""
+    line = "tool " + kv(error=f'config API_KEY="{HEADER_VALUE}"')
+    rendered = ScrubbingFormatter("%(message)s").format(_record(line))
+    assert HEADER_VALUE not in rendered
+    assert rendered.count('"') == line.count('"')
+
+
 # --- nothing goes around it -----------------------------------------------------------------------
 
 
-def test_the_wake_and_cleanup_entrypoints_install_the_scrubbing_handler(monkeypatch):
+def _entrypoints() -> list[tuple[str, str]]:
+    scripts = tomllib.loads((SRC.parent.parent / "pyproject.toml").read_text())["project"][
+        "scripts"
+    ]
+    return [tuple(target.split(":")) for target in scripts.values()]
+
+
+#: The calls that configure logging through the scrubbing handler, any one of which an entrypoint
+#: makes before it does anything else that could log.
+_CONFIGURES = {"_configure_logging", "install_log_handler", "logging.basicConfig"}
+
+
+@pytest.mark.parametrize("target", _entrypoints(), ids=lambda target: ":".join(target))
+def test_every_console_script_configures_the_scrubbing_handler(target):
+    """A command that configures nothing writes a WARNING through `logging.lastResort`, unscrubbed."""
+    module, function = target
+    path = SRC / f"{module.rsplit('.', 1)[1]}.py"
+    (node,) = [
+        n
+        for n in ast.parse(path.read_text(encoding="utf-8")).body
+        if isinstance(n, ast.FunctionDef) and n.name == function
+    ]
+    calls = {ast.unparse(c.func) for c in ast.walk(node) if isinstance(c, ast.Call)}
+    assert calls & _CONFIGURES, f"{module}:{function} never configures logging"
+
+
+def _isolated_root(monkeypatch) -> logging.Logger:
     root = logging.getLogger()
     monkeypatch.setattr(root, "handlers", [])
     monkeypatch.setattr(root, "level", root.level)
+    return root
+
+
+def test_the_wake_and_cleanup_entrypoints_install_the_scrubbing_handler(monkeypatch):
+    root = _isolated_root(monkeypatch)
     _configure_logging()
     (handler,) = root.handlers
     assert isinstance(handler.formatter, ScrubbingFormatter)
     assert handler.formatter._fmt == LOG_FORMAT
-    root.removeHandler(handler)
+
+
+def test_the_other_entrypoints_keep_python_s_default_output_scrubbed(monkeypatch):
+    """`install_log_handler` stands in for `logging.lastResort`: ``WARNING`` and up, bare message."""
+    root = _isolated_root(monkeypatch)
+    install_log_handler()
+    (handler,) = root.handlers
+    assert isinstance(handler.formatter, ScrubbingFormatter)
+    assert handler.formatter._fmt == "%(message)s"
+    assert root.level == logging.WARNING
+
+
+def test_an_embedding_applications_logging_wins(monkeypatch):
+    root = _isolated_root(monkeypatch)
+    own = logging.NullHandler()
+    root.handlers.append(own)
+    install_log_handler()
+    _configure_logging()
+    assert root.handlers == [own]
 
 
 def _calls(name: str):
@@ -166,10 +252,15 @@ def _calls(name: str):
                 yield path.name, node
 
 
-def test_every_entrypoint_configures_logging_through_the_scrubbing_handler():
+def test_every_basic_config_goes_through_the_scrubbing_handler():
     """A ``basicConfig`` with a ``format=`` and no handler installs a formatter that does not scrub."""
     sites = list(_calls("logging.basicConfig"))
-    assert {name for name, _ in sites} == {"_basecradle.py", "_scrub.py", "_palace_check.py"}
+    assert {name for name, _ in sites} == {
+        "_basecradle.py",
+        "_scrub.py",
+        "_palace_check.py",
+        "_observability.py",
+    }
     for name, call in sites:
         keywords = {keyword.arg: keyword.value for keyword in call.keywords}
         assert "format" not in keywords and "stream" not in keywords, name
@@ -178,18 +269,33 @@ def test_every_entrypoint_configures_logging_through_the_scrubbing_handler():
         assert ast.unparse(handlers.elts[0].func) == "log_handler", name
 
 
-def test_no_module_attaches_a_handler_or_formatter_of_its_own():
-    for method in ("addHandler", "setFormatter"):
-        for path in sorted(SRC.rglob("*.py")):
-            if path.name == "_observability.py":
-                continue
-            assert f".{method}(" not in path.read_text(encoding="utf-8"), (path.name, method)
+#: Text that configures logging, or reaches around a handler, by any spelling but the one above.
+_BYPASSES = (
+    ".addHandler(",
+    ".setFormatter(",
+    ".handlers.append(",
+    ".handlers.extend(",
+    "dictConfig",
+    "fileConfig",
+    ".propagate",
+    '"propagate"',
+    "'propagate'",
+    "from logging import",
+    "traceback.print_exc(",
+    "traceback.print_exception(",
+    "captureWarnings",
+)
+
+
+@pytest.mark.parametrize("bypass", _BYPASSES)
+def test_no_module_reaches_around_the_handler(bypass):
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name == "_observability.py" and bypass in (".setFormatter(",):
+            continue
+        assert bypass not in path.read_text(encoding="utf-8"), (path.name, bypass)
 
 
 def test_every_harness_logger_propagates_to_the_handler():
-    for path in sorted(SRC.rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        assert ".propagate" not in text, path.name
     for name, call in _calls("logging.getLogger"):
         if not call.args or name == "_basecradle.py" and ast.unparse(call.args[0]) == "name":
             continue  # the root logger, and `_quiet_transport_logs` naming the HTTP clients
@@ -205,6 +311,10 @@ def _bound_names(tree: ast.AST) -> set[str]:
     return {h.name for h in ast.walk(tree) if isinstance(h, ast.ExceptHandler) and h.name}
 
 
+#: Calls whose result is an exception's text: a traceback rendered to a string.
+_FOREIGN_CALLS = {"traceback.format_exc", "traceback.format_exception", "traceback.format_tb"}
+
+
 def _texts_of(node: ast.AST, errors: set[str]) -> tuple[int, int]:
     """How many times `node` renders an exception's text, and how many of those are scrubbed.
 
@@ -213,7 +323,10 @@ def _texts_of(node: ast.AST, errors: set[str]) -> tuple[int, int]:
         return 0, 0
     if isinstance(node, ast.Call) and ast.unparse(node.func) == "scrub":
         rendered, _ = _texts_of(ast.Tuple(elts=node.args, ctx=ast.Load()), errors)
+        rendered = max(rendered, 1)
         return rendered, rendered
+    if isinstance(node, ast.Call) and ast.unparse(node.func) in _FOREIGN_CALLS:
+        return 1, 0
     if isinstance(node, ast.Name):
         return (1, 0) if node.id in errors else (0, 0)
     rendered = scrubbed = 0
@@ -223,18 +336,25 @@ def _texts_of(node: ast.AST, errors: set[str]) -> tuple[int, int]:
     return rendered, scrubbed
 
 
-def test_every_print_of_an_error_scrubs_it():
-    """An entrypoint's last word goes to stderr directly, which on a box is the journal."""
+#: The calls that write straight to a stream, past every handler: on a box, stderr is the journal.
+_DIRECT_WRITES = {"print", "sys.stderr.write", "sys.stdout.write", "warnings.warn"}
+
+
+def test_every_direct_write_of_an_error_scrubs_it():
+    """An entrypoint's last word goes to stderr directly. Data flow is not followed: an error's text
+    assigned to a name first and written later is the reviewer's to catch."""
     found = 0
     for path in sorted(SRC.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         errors = _bound_names(tree)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and ast.unparse(node.func) == "print":
+            if isinstance(node, ast.Call) and ast.unparse(node.func) in _DIRECT_WRITES:
                 rendered, scrubbed = _texts_of(ast.Tuple(elts=node.args, ctx=ast.Load()), errors)
                 assert rendered == scrubbed, (path.name, node.lineno, ast.unparse(node))
                 found += scrubbed
-    assert found >= 8  # wake (two), cleanup, resolve, claims, log grammar, both palace tools
+    # wake (two), cleanup, resolve, claims (its reason and its traceback), log grammar, both palace
+    # tools
+    assert found >= 9
 
 
 # --- a sentinel wake of every prose site the issue named ------------------------------------------

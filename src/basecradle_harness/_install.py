@@ -87,6 +87,7 @@ from dataclasses import dataclass, field
 from importlib import resources
 from pathlib import Path
 
+from basecradle_harness._observability import install_log_handler
 from basecradle_harness._version import __version__
 
 _log = logging.getLogger("basecradle_harness")
@@ -1276,6 +1277,7 @@ def main(argv: list[str] | None = None) -> int:
     ``--provider`` overrides the env; ``--all-providers`` disables the filter and lays down
     every default (the old provider-blind behavior).
     """
+    install_log_handler()  # a WARNING's text is scrubbed (issue #857)
     parser = argparse.ArgumentParser(
         prog="basecradle-harness-install",
         description=(

@@ -129,7 +129,13 @@ import sys
 import time
 
 from basecradle_harness._breaker import breaker_tripped_line
-from basecradle_harness._observability import LOG_FORMAT, agent_slug, bounded, scrub
+from basecradle_harness._observability import (
+    LOG_FORMAT,
+    agent_slug,
+    bounded,
+    install_log_handler,
+    scrub,
+)
 from basecradle_harness._report import (
     PROBE_SOURCE,
     billing_onset_line,
@@ -324,6 +330,7 @@ def main(argv: list[str] | None = None) -> int:
     exercise is a question we never got to ask); **any other non-zero** the lines were written and
     are not there, which is a real finding about this box.
     """
+    install_log_handler()  # a WARNING's text is scrubbed (issue #857)
     args = sys.argv[1:] if argv is None else argv
     agent = agent_slug()
     try:
