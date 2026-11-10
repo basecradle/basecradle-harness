@@ -604,6 +604,21 @@ def test_a_key_glued_after_a_narrow_run_is_redacted_with_it(text, scrubbed):
     assert scrub(text) == scrubbed
 
 
+@pytest.mark.parametrize(
+    "tail",
+    [
+        "",
+        "-sk-cdefghijkl",  # a later key after a ``-``, which no word rule ever kept
+        "-hf_" + "c" * 20,
+    ],
+)
+def test_a_match_that_took_a_glued_key_is_never_a_word(tail):
+    """All lowercase and glued on the left, the chain would read as one word and keep every key in
+    it; the old scrub redacted the later key on its own (the review of #858)."""
+    text = "xhf_" + "a" * 20 + "ghp_" + "b" * 20 + tail
+    assert scrub(text) == "x[redacted]"
+
+
 @pytest.mark.parametrize("first", sorted(PREFIX_SAMPLES))
 @pytest.mark.parametrize("second", sorted(PREFIX_SAMPLES))
 def test_no_part_of_a_second_key_glued_after_a_first_survives(first, second):

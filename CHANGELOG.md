@@ -20,7 +20,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed: A key glued directly after another key is redacted with it (issue #858)
 
-A prefix rule whose run lacks `_` or `-` (`gh?_`, `github_pat_`, `bc_uat_`, `bc_isk_`, `hf_`, `r8_`, `ste-`, `abl_`, `pplx-`) took the letters of a following key's prefix and stopped at its `_` or `-`, so `hf_…aghp_ABC…` left most of the GitHub token in clear, and all of it when the first match was kept as a word. Each such rule now first tries to end where a whole key by its own rule begins and then takes the rest of the glued run with it, written without lookaround so the box's VRL can mirror it (`docs/telemetry.md` → Credential Scrubbing gives the pattern). A match only grows, so nothing is redacted less than before.
+A prefix rule whose run lacks `_` or `-` (`gh?_`, `github_pat_`, `bc_uat_`, `bc_isk_`, `hf_`, `r8_`, `ste-`, `abl_`, `pplx-`) took the letters of a following key's prefix and stopped at its `_` or `-`, so `hf_…aghp_ABC…` left most of the GitHub token in clear, and all of it when the first match was kept as a word. Each such rule now first tries to end where a whole key by its own rule begins and then takes the rest of the glued run with it, written without lookaround so the box's VRL can mirror it (`docs/telemetry.md` → Credential Scrubbing gives the pattern). A match that took a glued key is never kept as a word, so nothing is redacted less than before: a differential fuzz of 600,000 glued and separated samples against 0.185.0's scrub found no text the new one leaves more of.
 
 ## [0.185.0] - 2026-11-10
 

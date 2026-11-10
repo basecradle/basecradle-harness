@@ -179,10 +179,11 @@ _VERDICT_VALUES: dict[str, dict[str, str]] = {
 #: everything after it in the widest class, so a third key glued on is redacted with the second;
 #: only when no glued key follows does it match as it always did. That is a negative lookahead
 #: written without one: the box's ``ai_scrub`` is VRL, whose regex has no lookaround, and mirrors
-#: this pattern. A match only ever grows, so nothing redacted before is redacted less, and a match
-#: kept as a word before stays kept only if the glued key it now holds has no digit and no capital
-#: (the stated residual). The cost is an over-redaction in the rare glued case: a ``-word`` glued
-#: after the second key goes with it. A wide run already takes a glued key whole.
+#: this pattern. A match that took a glued key is never kept as a word (`_is_word`), so nothing
+#: redacted before is redacted less: a match only grows, and what it grows over is redacted with it.
+#: The cost is an over-redaction in the rare glued case: a ``-word`` glued after the second key goes
+#: with it, and so does a lowercase word that held a whole key's shape. A wide run already takes a
+#: glued key whole.
 _WIDE = "[A-Za-z0-9_-]"
 _PREFIXED = (
     (r"sk-or-|sk-|xai-|bc_[a-z]{3}_", _WIDE, 8),
@@ -201,14 +202,18 @@ _PREFIX = re.compile("|".join(f"(?:{prefix})" for prefix, _, _ in _PREFIXED))
 _GLUED_KEY = "|".join(f"(?:{prefix}){run}{{{least}}}" for prefix, run, least in _PREFIXED)
 
 
-def _rule(prefix: str, run: str, least: int) -> str:
-    """One prefix rule's pattern: a wide run as written, a narrow one ending where a glued key begins."""
+def _rule(index: int, prefix: str, run: str, least: int) -> str:
+    """One prefix rule's pattern: a wide run as written, a narrow one ending where a glued key begins.
+
+    The glued alternative is captured as ``glued<index>``, so `_is_word` can tell that a match holds
+    a second key and is never a word."""
     if run == _WIDE:
         return f"(?:{prefix}){run}{{{least},}}"
-    return f"(?:{prefix})(?:{run}{{{least},}}?(?:{_GLUED_KEY}){_WIDE}*|{run}{{{least},}})"
+    glued = f"(?P<glued{index}>{run}{{{least},}}?(?:{_GLUED_KEY}){_WIDE}*)"
+    return f"(?:{prefix})(?:{glued}|{run}{{{least},}})"
 
 
-_PREFIX_RULES = re.compile("|".join(_rule(*rule) for rule in _PREFIXED))
+_PREFIX_RULES = re.compile("|".join(_rule(i, *rule) for i, rule in enumerate(_PREFIXED)))
 
 #: The rules anchored on a literal of their own — a heartbeat URL, a bearer header, a key in a query,
 #: an ``api_key=`` assignment — which are redacted wherever they match. **They run in a pass before
@@ -332,7 +337,13 @@ def _is_word(match: re.Match[str]) -> bool:
     a key to a letter, and a key's run always holds a digit or a capital with overwhelming
     certainty. A glued word whose run holds one is still redacted: the scrub errs toward redaction.
     Only the prefix pass asks; `_LITERAL_RULES` redacts unconditionally.
+
+    **A match that took a glued key is never a word** (issue #858): its glued tail can hold a later
+    key that was no part of any word (``xhf_…ghp_…-sk-…``, whose ``sk-`` follows a ``-``), and judged
+    as one run, all lowercase, it would be kept. No word holds a whole key by a rule's own shape.
     """
+    if any(name.startswith("glued") for name, value in match.groupdict().items() if value):
+        return False
     if match.start() == 0:
         return False
     if unicodedata.category(match.string[match.start() - 1])[0] not in "LNM":
