@@ -27,23 +27,33 @@ that hold (the vendor pre-authorizes each request and returns what it does not u
 settles); ``available`` is what a new request can reserve, balance less reserved and capped by
 ``key_limit``; ``key_limit`` is what this key's budget (or its workspace's limit) still allows, or
 ``null`` when it has none. ``available`` is the headline, because it is the runway: a request is
-refused when it cannot reserve, whatever the balance says. Each figure is shown **as the vendor
-states it** — US dollars to up to six decimal places — because none of them is derived here, so
-there is no subtraction to keep self-consistent and rounding would only make a stated figure
-disagree with the vendor's own dashboard. ``updated_at`` (the moment the vendor read the balance) is
+refused when it cannot reserve, whatever the balance says. Each figure is shown **to the vendor's
+own precision** — US dollars to six decimal places, which is as far as the vendor states them —
+because none of them is derived here, so there is no subtraction to keep self-consistent, and
+rounding to cents would only make a stated figure disagree with the vendor's own dashboard. ``updated_at`` (the moment the vendor read the balance) is
 the ``as of`` stamp. All fields are required, as the vendor documents them; a response missing one,
 in another unit, or carrying a value that is not a finite number is *unavailable*, never a guess.
 
 Everything fails **soft**: no key, a rejected key, the rate limit (60 balance reads a minute per
 key), the vendor's ``gateway_down`` (its billing service unreachable), any other non-2xx, an
-unreachable host or an unexpected shape each return a clear ``"unavailable — <reason>"`` and record
-the failure on the ``tool`` line (`tool_failed`). It never logs or returns the key, and never
-surfaces a response *body*: the error envelope's ``message`` is the vendor's prose about the account,
-so only the error ``code`` is read, and only to recognize ``gateway_down``.
+unreachable host, an unusable ``AI_BASE_URL`` or an unexpected shape each return a clear
+``"unavailable — <reason>"`` and record the failure on the ``tool`` line (`tool_failed`), a status
+named by `docs/telemetry.md` → Fault Slugs. It never logs, returns or keeps the key in plain view
+(the figure cache is keyed on a digest of it), and never surfaces a response *body*: the error
+envelope's ``message`` is the vendor's prose about the account, so only the error ``code`` is read,
+and only to recognize ``gateway_down``.
+
+**The gate is enforced twice.** The plugin is gated on ``Vendor("refuseless")``, and the tool itself
+refuses to read ``AI_API_KEY`` or ``AI_BASE_URL`` from the environment unless ``AI_PROVIDER`` is
+``refuseless``, so a library caller that builds it beside another brain cannot send that brain's key
+to refuseless's host, or a refuseless key to that brain's. A caller that hands it both explicitly
+reads nothing from the environment.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import math
 import os
 import time
@@ -54,7 +64,11 @@ from typing import Any
 
 import httpx
 
-from basecradle_harness._basecradle import _PROVIDER_BASE_URLS, base_url_override
+from basecradle_harness._basecradle import (
+    _PROVIDER_BASE_URLS,
+    base_url_override,
+    normalize_provider,
+)
 from basecradle_harness._observability import tool_failed
 from basecradle_harness._secret import reveal, secret
 from basecradle_harness._tools import NO_PARAMETERS, Tool
@@ -66,8 +80,8 @@ VENDOR = "refuseless"
 DEFAULT_TIMEOUT = 15.0
 
 #: How long a fetched figure is reused before re-reading (seconds). The vendor allows 60 balance
-#: reads a minute per key, and that key is also the brain's, so a model checking its runway more than
-#: once in a turn reuses the figure rather than spending the allowance. ``0`` disables caching.
+#: reads a minute per key, so a model checking its runway more than once in a turn reuses the figure
+#: rather than spending that allowance. ``0`` disables caching.
 DEFAULT_CACHE_TTL = 30.0
 
 #: The one ``unit`` every figure must be stated in. A figure in an unstated unit is not a dollar.
@@ -116,6 +130,9 @@ class RefuselessAccountBalanceTool(Tool):
         base_url: The API root. ``None`` (the default) reads ``AI_BASE_URL`` at call time and falls
             back to the vendor's own host, which is exactly where the brain's calls go.
         timeout: Per-request timeout in seconds.
+
+    Either of `api_key` and `base_url` left ``None`` is read from the environment, which the tool
+    does only when ``AI_PROVIDER`` is ``refuseless`` (module docstring).
         cache_ttl: Seconds to reuse a fetched figure before re-reading; ``0`` disables it.
         clock: The monotonic clock the cache measures against (injectable for tests).
     """
@@ -144,13 +161,24 @@ class RefuselessAccountBalanceTool(Tool):
         self._timeout = timeout
         self._cache_ttl = cache_ttl
         self._clock = clock
-        # (monotonic expiry, key, root, rendered text). The key and the root are part of the entry
-        # because both are resolved at *call* time: without them, one account's figures would be
-        # served as another's for the rest of the TTL after either is repointed.
-        self._cached: tuple[float, str, str, str] | None = None
+        # (monotonic expiry, digest of the key, root, rendered text). The key and the root are part
+        # of the entry because both are resolved at *call* time: without them, one account's figures
+        # would be served as another's for the rest of the TTL after either is repointed. A digest,
+        # never the key: a plain attribute holding it is emitted by `vars()` and every crash
+        # reporter that expands locals (issue #599).
+        self._cached: tuple[float, bytes, str, str] | None = None
 
     def run(self) -> str:
         """Report the credit, or a clear reason it is unavailable."""
+        if reveal(self._api_key) is None or self._base_url is None:
+            provider = _active_provider()
+            if provider != VENDOR:
+                return tool_failed(
+                    f"refuseless account balance unavailable — AI_PROVIDER is {provider!r}, not "
+                    "'refuseless', so AI_API_KEY is not a refuseless key and AI_BASE_URL is not "
+                    "refuseless's host. This tool reads the account of a refuseless brain only.",
+                    reason="config:provider",
+                )
         key = reveal(self._api_key) or (os.environ.get("AI_API_KEY") or "").strip()
         if not key:
             return tool_failed(
@@ -159,8 +187,9 @@ class RefuselessAccountBalanceTool(Tool):
                 reason="config:missing_api_key",
             )
         root = self._root()
+        digest = hashlib.sha256(key.encode("utf-8", "surrogatepass")).digest()
 
-        cached = self._cached_balance(key, root)
+        cached = self._cached_balance(digest, root)
         if cached is not None:
             return cached
 
@@ -171,6 +200,12 @@ class RefuselessAccountBalanceTool(Tool):
                 headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
             ) as client:
                 credits = _parse_credits(self._get(client, f"{root}/credits"))
+        except httpx.InvalidURL:
+            return tool_failed(
+                "refuseless account balance unavailable — AI_BASE_URL is not a usable URL, so "
+                "there is no host to read the account at.",
+                reason="config:base_url",
+            )
         except UnicodeEncodeError:
             return tool_failed(
                 "refuseless account balance unavailable — AI_API_KEY contains a non-ASCII "
@@ -183,7 +218,7 @@ class RefuselessAccountBalanceTool(Tool):
 
         text = _render(credits)
         if self._cache_ttl > 0:
-            self._cached = (self._clock() + self._cache_ttl, key, root, text)
+            self._cached = (self._clock() + self._cache_ttl, digest, root, text)
         return text
 
     def _root(self) -> str:
@@ -216,16 +251,16 @@ class RefuselessAccountBalanceTool(Tool):
                 "key). Try again in a minute.",
                 slug="rate_limited",
             )
-        if status >= 400:
+        if not 200 <= status < 300:
+            slug = _STATUS_SLUGS.get(status) or ("server_error" if status >= 500 else "api_error")
             if _error_code(response) == GATEWAY_DOWN:
                 raise _BalanceUnavailable(
                     f"refuseless's billing service is unreachable (HTTP {status}, gateway_down). "
                     "Try again shortly.",
-                    slug="server_error",
+                    slug=slug,
                 )
             raise _BalanceUnavailable(
-                f"refuseless returned HTTP {status} reading the credit balance.",
-                slug="server_error" if status >= 500 else "provider_error",
+                f"refuseless returned HTTP {status} reading the credit balance.", slug=slug
             )
         try:
             data = response.json()
@@ -242,14 +277,35 @@ class RefuselessAccountBalanceTool(Tool):
             )
         return data
 
-    def _cached_balance(self, key: str, root: str) -> str | None:
+    def _cached_balance(self, digest: bytes, root: str) -> str | None:
         """The cached text if it is still fresh **and** was read with this key at this root."""
         if self._cached is None:
             return None
-        expiry, cached_key, cached_root, text = self._cached
-        if cached_key == key and cached_root == root and self._clock() < expiry:
+        expiry, cached_digest, cached_root, text = self._cached
+        same_key = hmac.compare_digest(cached_digest, digest)
+        if same_key and cached_root == root and self._clock() < expiry:
             return text
         return None
+
+
+#: The statuses `docs/telemetry.md` → Fault Slugs names by the status alone, beyond the two this
+#: tool words for itself (``401``/``403`` and ``429``). Any other ``5xx`` is ``server_error`` and
+#: any other status (a ``3xx`` httpx did not follow included) is ``api_error``, as that table rules.
+_STATUS_SLUGS = {
+    402: "config:billing",
+    404: "config:model_not_found",
+    413: "payload_too_large",
+    504: "timeout",
+}
+
+
+def _active_provider() -> str:
+    """``AI_PROVIDER`` as the wake reads it, or the raw value when it is not even a slug."""
+    raw = os.environ.get("AI_PROVIDER")
+    try:
+        return normalize_provider(raw)
+    except ValueError:
+        return (raw or "").strip()
 
 
 def _error_code(response: httpx.Response) -> str | None:
@@ -341,6 +397,11 @@ def _dollars(usd: float) -> str:
     return f"-${text}" if usd < 0 and text.strip("0.,") else f"${text}"
 
 
+#: Below this, a figure renders as ``$0.00`` or less (`_dollars` shows six decimals), so the callout
+#: fires on exactly the figures that read as nothing.
+_HALF_MICRODOLLAR = 0.0000005
+
+
 def _stamp(as_of: datetime) -> str:
     """The ``as of`` timestamp, ISO-8601 to the second with a ``Z`` suffix."""
     return as_of.isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -353,7 +414,7 @@ def _render(credits: _Credits) -> str:
     always in the same place; a credit that cannot pay for a request is called out first in the body.
     """
     context = []
-    if credits.available <= 0:
+    if credits.available < _HALF_MICRODOLLAR:  # nothing a request could reserve, as shown
         context.append("No new request can be paid for until the account is topped up.")
     context.append(
         f"Balance {_dollars(credits.balance)}, of which {_dollars(credits.reserved)} is held by "

@@ -837,6 +837,13 @@ _POWER_SCAFFOLD = {
         "system_prompt.py",
         "url_context.py",
     },
+    "refuseless": {
+        "openrouter_account_balance.py",
+        "refuseless_account_balance.py",
+        "send_direct_message_to_origin.py",
+        "shell.py",
+        "system_prompt.py",
+    },
 }
 
 

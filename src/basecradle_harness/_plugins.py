@@ -321,6 +321,10 @@ class ToolPlugin:
     existed: `_resolve._plugin_credentials` walks `requires`, and an ungated read contributes
     nothing to walk. This field is what it walks instead.
 
+    It is also right for a provider-wide credential a vendor-gated tool reads (the brain's own
+    ``AI_API_KEY`` for ``refuseless_account_balance``, issue #848): declared, the report says what
+    the tool reads, and under its gate the key is always there, so it never reads as a gap.
+
     Declare a var here iff the tool **cannot work** without it. A var the tool merely *prefers*
     — ``XAI_TEAM_ID``, whose absence costs one discovery call and nothing else — is deliberately
     **not** declared: it would read as a provisioning gap on every healthy box, and a report that

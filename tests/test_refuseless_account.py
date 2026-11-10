@@ -7,10 +7,11 @@ error bodies follow the vendor's documented envelope (``{"error": {"code", "mess
 Three properties carry the tool, each pinned below in its "obviously fine" broken form:
 
 - **The figures are the vendor's.** ``available`` is the headline because a request is refused when
-  it cannot reserve, whatever the balance says; nothing is rounded or re-derived, so the six decimals
-  the vendor states are the six the model reads.
+  it cannot reserve, whatever the balance says; nothing is re-derived or rounded to cents, so the six
+  decimals the vendor states are the six the model reads.
 - **The key is the brain's, so it goes only where the brain's calls go** — the default host or
-  ``AI_BASE_URL``, read at call time, and the cache is keyed on both.
+  ``AI_BASE_URL``, read at call time and only under ``AI_PROVIDER=refuseless``, and the cache is
+  keyed on both without ever holding the key.
 - **Nothing but figures leaves the tool**: never the key, never the vendor's error prose.
 """
 
@@ -76,7 +77,8 @@ def _error(status: int, code: str) -> httpx.Response:
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
-    """No ambient credential or host reaches a test; each sets what it means."""
+    """A refuseless brain with no ambient credential or host; each test sets what it means."""
+    monkeypatch.setenv("AI_PROVIDER", "refuseless")
     monkeypatch.delenv("AI_API_KEY", raising=False)
     monkeypatch.delenv("AI_BASE_URL", raising=False)
 
@@ -134,6 +136,13 @@ def test_nothing_available_is_called_out_first(tool):
     assert context.startswith("No new request can be paid for until the account is topped up.")
 
 
+@pytest.mark.parametrize("available", [0.0000004, -0.0000004, -1.5])
+def test_a_figure_that_reads_as_nothing_is_called_out_however_it_rounds(tool, available):
+    body = _credits(balance=1.0, reserved=1.0, available=available)
+    result, _ = _read(tool, httpx.Response(200, json=body))
+    assert result.splitlines()[1].startswith("No new request can be paid for")
+
+
 def test_a_healthy_account_carries_no_callout(tool):
     result, _ = _read(tool, httpx.Response(200, json=_credits()))
     assert "topped up" not in result
@@ -150,6 +159,11 @@ def test_a_healthy_account_carries_no_callout(tool):
         (1234.5, "$1,234.50"),
         (0.000001, "$0.000001"),
         (-5.25, "-$5.25"),
+        (0.9999995, "$1.00"),
+        (1.0000005, "$1.000001"),
+        (-0.0000004, "$0.00"),
+        (-0.0000006, "-$0.000001"),
+        (0.00000012, "$0.00"),
     ],
 )
 def test_a_figure_is_shown_to_the_vendors_precision(usd, text):
@@ -176,6 +190,44 @@ def test_ai_base_url_moves_the_read_with_the_brains_calls(monkeypatch, tool):
         )
         assert tool.run().startswith("refuseless credit available:")
     assert route.call_count == 1
+
+
+@pytest.mark.parametrize("provider", [None, "openai", "openrouter", "wiro", "Not A Slug!"])
+def test_the_environment_is_read_only_on_a_refuseless_brain(monkeypatch, provider):
+    """Beside another brain, AI_API_KEY is that vendor's key: it must never go to refuseless."""
+    if provider is None:
+        monkeypatch.delenv("AI_PROVIDER")
+    else:
+        monkeypatch.setenv("AI_PROVIDER", provider)
+    monkeypatch.setenv("AI_API_KEY", "sk-proj-another-vendors-key-0123456789")
+    for tool in (
+        RefuselessAccountBalanceTool(cache_ttl=0),
+        RefuselessAccountBalanceTool(api_key=KEY, cache_ttl=0),  # its host would be AI_BASE_URL's
+        RefuselessAccountBalanceTool(base_url=HOST, cache_ttl=0),
+    ):
+        with respx.mock(assert_all_mocked=True) as mock:
+            result = tool.run()
+            assert not mock.calls
+        assert result.startswith("refuseless account balance unavailable — AI_PROVIDER is ")
+        assert "another-vendors-key" not in result
+
+
+def test_a_caller_that_hands_over_both_reads_nothing_from_the_environment(monkeypatch):
+    monkeypatch.setenv("AI_PROVIDER", "openai")
+    tool = RefuselessAccountBalanceTool(api_key=KEY, base_url=HOST, cache_ttl=0)
+    result, route = _read(tool, httpx.Response(200, json=_credits()))
+    assert result.startswith("refuseless credit available:")
+    assert route.calls.last.request.headers["authorization"] == f"Bearer {KEY}"
+
+
+def test_an_unusable_base_url_is_a_soft_config_fault(monkeypatch):
+    monkeypatch.setenv("AI_BASE_URL", "http://[::1")
+    with respx.mock(assert_all_mocked=True):
+        result = RefuselessAccountBalanceTool(api_key=KEY, cache_ttl=0).run()
+    assert result == (
+        "refuseless account balance unavailable — AI_BASE_URL is not a usable URL, so there is "
+        "no host to read the account at."
+    )
 
 
 def test_no_key_is_a_config_fault_and_sends_nothing():
@@ -207,10 +259,22 @@ def test_a_pasted_non_ascii_key_is_a_soft_config_fault():
         ),
         (_error(503, "upstream_error"), "refuseless returned HTTP 503 reading the credit balance."),
         (_error(404, "not_found"), "refuseless returned HTTP 404 reading the credit balance."),
+        (_error(504, "gateway_down"), "unreachable (HTTP 504, gateway_down)."),
+        (httpx.Response(302, headers={"location": "https://elsewhere.example/"}), "HTTP 302"),
         (httpx.Response(200, text="<!DOCTYPE html>"), "an unreadable response"),
         (httpx.Response(200, json=[1, 2]), "an unexpected response"),
     ],
-    ids=["auth", "rate_limit", "gateway_down", "other_5xx", "4xx", "not_json", "not_object"],
+    ids=[
+        "auth",
+        "rate_limit",
+        "gateway_down",
+        "other_5xx",
+        "4xx",
+        "gateway_timeout",
+        "redirect",
+        "not_json",
+        "not_object",
+    ],
 )
 def test_a_failed_read_is_a_clear_reason_and_never_the_vendors_prose(tool, response, says):
     result, _ = _read(tool, response)
@@ -278,8 +342,10 @@ def _line(tool, caplog, response) -> str:
     registry = ToolRegistry(policy=Policy.locked())
     registry.register(tool)
     with respx.mock(assert_all_mocked=True) as mock:
-        if response is not None:
+        if isinstance(response, httpx.Response):
             mock.get(CREDITS_URL).mock(return_value=response)
+        elif response is not None:
+            mock.get(CREDITS_URL).mock(side_effect=response)
         with caplog.at_level(logging.INFO, logger="basecradle_harness"):
             Engine(provider=None, tools=registry)._run_tool(tool.name, {})  # type: ignore[arg-type]
     (line,) = [
@@ -297,10 +363,33 @@ def _line(tool, caplog, response) -> str:
         (_error(401, "invalid_key"), "outcome=error reason=config:auth"),
         (_error(429, "rate_limited"), "outcome=error reason=rate_limited"),
         (_error(503, "gateway_down"), "outcome=error reason=server_error"),
-        (_error(404, "not_found"), "outcome=error reason=provider_error"),
+        (_error(402, "insufficient_credits"), "outcome=error reason=config:billing"),
+        (_error(404, "not_found"), "outcome=error reason=config:model_not_found"),
+        (_error(413, "too_large"), "outcome=error reason=payload_too_large"),
+        (_error(504, "gateway_down"), "outcome=error reason=timeout"),
+        (_error(500, "upstream_error"), "outcome=error reason=server_error"),
+        (_error(418, "teapot"), "outcome=error reason=api_error"),
+        (httpx.Response(302), "outcome=error reason=api_error"),
         (httpx.Response(200, json=_credits(unit="eur")), "outcome=error reason=invalid_response"),
+        (httpx.ConnectError("refused"), "outcome=error reason=transport"),
+        (httpx.ReadTimeout("slow"), "outcome=error reason=timeout"),
     ],
-    ids=["ok", "auth", "rate_limit", "gateway_down", "4xx", "shape"],
+    ids=[
+        "ok",
+        "auth",
+        "rate_limit",
+        "gateway_down",
+        "402",
+        "404",
+        "413",
+        "504",
+        "500",
+        "418",
+        "302",
+        "shape",
+        "transport",
+        "read_timeout",
+    ],
 )
 def test_one_tool_line_per_call_with_its_verdict(caplog, response, outcome):
     line = _line(RefuselessAccountBalanceTool(api_key=KEY, cache_ttl=0), caplog, response)
@@ -356,6 +445,20 @@ def test_a_cached_figure_is_never_served_for_another_key_or_host(monkeypatch):
         monkeypatch.setenv("AI_BASE_URL", "https://eu.refuseless.example/v1")
         assert tool.run().startswith("refuseless credit available: $1.00 USD")
         assert other.call_count == 1
+
+
+def test_the_cache_never_holds_the_key(monkeypatch):
+    """The #599 leak: a plain attribute holding the key is emitted by `vars()` and crash reporters."""
+    monkeypatch.setenv("AI_API_KEY", KEY)
+    for tool in (RefuselessAccountBalanceTool(api_key=KEY), RefuselessAccountBalanceTool()):
+        with respx.mock(assert_all_mocked=True) as mock:
+            mock.get(CREDITS_URL).mock(return_value=httpx.Response(200, json=_credits()))
+            tool.run()
+        assert tool._cached is not None
+        assert KEY not in repr(vars(tool))
+        assert KEY.encode() not in b"".join(
+            part for part in tool._cached if isinstance(part, bytes)
+        )
 
 
 def test_a_failure_is_never_cached():
