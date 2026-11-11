@@ -185,12 +185,12 @@ def test_any_other_brain_reads_nothing_and_logs_nothing(monkeypatch, caplog, ven
 
 
 @pytest.mark.parametrize(
-    ("env", "brain"),
+    ("configured", "brain"),
     [("refuseless", "unknown"), ("refuseless", "openrouter"), ("openrouter", "refuseless")],
 )
-def test_the_wired_brain_and_the_environment_must_agree(monkeypatch, caplog, env, brain):
+def test_the_wired_brain_and_the_environment_must_agree(monkeypatch, caplog, configured, brain):
     """A test double, or a brain built beside a stale `AI_PROVIDER`, sends the key nowhere."""
-    monkeypatch.setenv("AI_PROVIDER", env)
+    monkeypatch.setenv("AI_PROVIDER", configured)
     with (
         respx.mock(assert_all_mocked=True) as mock,
         caplog.at_level(logging.INFO, logger="basecradle_harness"),
@@ -325,7 +325,65 @@ def test_an_openrouter_read_with_no_figure_is_a_warning_naming_its_slug(
     ((level, line),) = _log(caplog, "openrouter", OPENROUTER, response)
     assert level == "WARNING"
     assert line.startswith(f"key spend provider=openrouter outcome=error reason={reason} ")
-    assert KEY not in caplog.text and PROSE not in caplog.text
+    text = caplog.text
+    assert KEY not in text and PROSE not in text and "openrouter.ai" not in text
+
+
+def test_an_openrouter_read_goes_where_the_brains_calls_go(monkeypatch, caplog):
+    monkeypatch.setenv("AI_PROVIDER", "openrouter")
+    monkeypatch.setenv("AI_BASE_URL", "https://eu.openrouter.ai/api/v1")
+    url = "https://eu.openrouter.ai/api/v1/key"
+    ((_, line),) = _log(caplog, "openrouter", url, httpx.Response(200, json=_key()))
+    assert "outcome=ok spent=1.047832516" in line
+
+
+@pytest.mark.parametrize("raw", ["refuse less", "tele/pathy", ""])
+def test_an_unreadable_provider_reads_nothing(monkeypatch, caplog, raw):
+    monkeypatch.setenv("AI_PROVIDER", raw)
+    with (
+        respx.mock(assert_all_mocked=True) as mock,
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+    ):
+        log_key_spend("refuseless", timeline=TIMELINE, delivery=None)
+    assert not mock.calls
+    assert _lines(caplog) == []
+
+
+def test_a_blank_key_is_a_missing_key(monkeypatch, caplog):
+    monkeypatch.setenv("AI_API_KEY", "  \t ")
+    lines = _log(caplog)
+    assert "reason=config:missing_api_key" in lines[0][1]
+
+
+@pytest.mark.parametrize("spent", [1e300, 5e-324, 1.7976931348623157e308])
+def test_a_figure_too_long_to_carry_is_invalid_never_a_line_without_one(caplog, spent):
+    ((level, line),) = _log(caplog, response=_ok(_credits(key_spent=spent)))
+    assert level == "WARNING"
+    assert "outcome=error reason=invalid_response" in line and "spent=" not in line
+
+
+@pytest.mark.parametrize("vendor", ["refuseless", "openrouter"])
+@pytest.mark.parametrize(
+    ("setting", "reason"),
+    [
+        ({"AI_API_KEY": "abl_0123456789\tabcdef"}, "config:auth"),
+        ({"AI_BASE_URL": "api.example.com/v1"}, "config:base_url"),
+    ],
+    ids=["control_character_key", "schemeless_base_url"],
+)
+def test_a_configuration_fault_is_named_as_one_and_sends_nothing(
+    monkeypatch, caplog, vendor, setting, reason
+):
+    monkeypatch.setenv("AI_PROVIDER", vendor)
+    for name, value in setting.items():
+        monkeypatch.setenv(name, value)
+    with (
+        respx.mock(assert_all_mocked=True) as mock,
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+    ):
+        log_key_spend(vendor, timeline=TIMELINE, delivery=None)
+    assert not mock.calls
+    assert f"outcome=error reason={reason}" in _lines(caplog)[0][1]
 
 
 def test_an_unusable_base_url_is_a_config_fault(monkeypatch, caplog):
@@ -408,6 +466,42 @@ def test_a_refuseless_wake_writes_one_line_just_before_wake_end(platform, tmp_pa
     assert len(spend) == 1 and len(end) == 1 and spend[0] == end[0] - 1
     assert "outcome=ok spent=0.001405" in heads[spend[0]]
     assert route.call_count == 1
+
+
+def test_a_stop_during_the_read_is_a_stop_and_the_wake_still_ends(platform, tmp_path, caplog):
+    """SIGTERM landing inside the read: `wake end … outcome=stopped`, never an escape."""
+    import signal
+
+    caplog.set_level("INFO", logger="basecradle_harness")
+    serve_messages(platform, page(message(uuid=M0, body="How are the owls?")))
+
+    def stopped(request):
+        raise WakeStopped(signal.SIGTERM)  # what the SIGTERM handler raises, from inside the read
+
+    platform.get(REFUSELESS).mock(side_effect=stopped)
+    agent, _ = build_wake(tmp_path, _Brain("refuseless"))
+    with pytest.raises(WakeStopped):
+        agent.wake()
+    (end,) = [plain(r.getMessage()) for r in caplog.records if r.getMessage().find("wake end") >= 0]
+    assert "outcome=stopped" in end and "signal=TERM" in end
+    assert _lines(caplog) == []
+
+
+def test_a_wake_that_failed_writes_no_line(platform, tmp_path, caplog, monkeypatch):
+    caplog.set_level("INFO", logger="basecradle_harness")
+    serve_messages(platform, page(message(uuid=M0, body="How are the owls?")))
+    route = platform.get(REFUSELESS).mock(return_value=httpx.Response(200, json=_credits()))
+    agent, _ = build_wake(tmp_path, _Brain("refuseless"))
+
+    def broken(session):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(agent, "_forget_settled", broken)
+    with pytest.raises(OSError):
+        agent.wake()
+    assert not route.called
+    assert _lines(caplog) == []
+    assert any("outcome=error" in plain(r.getMessage()) for r in caplog.records)
 
 
 def test_a_stopped_wake_writes_no_line(platform, tmp_path, caplog):

@@ -19,8 +19,8 @@ The fleet reconciles each agent's logged `cost=` against what its vendor billed 
 
 - **`spent=`, never `cost=`**: *Spend by Provider* sums every `cost=`, and a cumulative figure there would be counted again on every wake.
 - **No figure is a WARNING on the same head**, `outcome=error` with its slug (a Fault Slug, `not_reported` when the vendor stated none, or `exception`), never silence. The key, the URL and the vendor's body never reach the line.
-- **It never holds or fails a wake**: a ten-second deadline on the whole attempt, no read on a stopped wake, nothing raised. It reads only when `AI_PROVIDER` names the vendor and the wired brain reports it, so a test double or a stale environment sends nothing.
-- The balance read itself is now held to a whole-attempt deadline too (`_deadline.bound_attempts`), on both the tool's read and the line's.
+- **It never holds or fails a wake**: it is the last of the wake's work, held to a ten-second deadline on the whole attempt, and raises nothing but a stop, so a SIGTERM during the read ends the wake as any stop does. A wake that failed or was stopped before it writes none; the next wake's figure is cumulative. It reads only when `AI_PROVIDER` names the vendor and the wired brain reports it, so a test double or a stale environment sends nothing.
+- **`refuseless_account_balance` shares the line's read** (`_refuseless_account.read_credits`), so it is now held to a whole-attempt deadline too (its 15 seconds per phase, 30 in all), and a pasted key carrying a control character or a schemeless `AI_BASE_URL` is now reported as the configuration fault it is (`config:auth`, `config:base_url`) rather than as a network failure (`transport`).
 
 ## [0.187.0] - 2026-11-10
 

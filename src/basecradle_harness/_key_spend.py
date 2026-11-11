@@ -19,9 +19,12 @@ The shape is the contract's (`docs/telemetry.md` → `key spend`), settled with 
 - **A failed read is a WARNING on the same head, ``outcome=error`` with its slug**, never silence:
   the consumer can tell "no figure this wake, because X" from "the read never ran". Only the slug is
   logged — never the key, the URL, the vendor's prose or its body.
-- **It never holds or fails a wake.** It runs as the wake ends (`Wake._wake`), is skipped by a wake
-  that was stopped (the router is waiting for it to die), is bounded by `TIMEOUT` as a deadline on
-  the whole attempt (each read's client carries `_deadline.bound_attempts`), and turns anything it did not foresee into ``reason=exception``.
+- **It never holds or fails a wake.** It is the last of a wake's work (`Wake._wake`), so a wake
+  that failed or was stopped before it writes none, and a SIGTERM during it is an ordinary stop. It
+  is bounded by `TIMEOUT`, held as a deadline on the whole attempt (each read's client carries
+  `_deadline.bound_attempts`, which checks it as each part of the answer arrives), and turns
+  anything it did not foresee into ``reason=exception``. A stop (`WakeStopped`, a
+  `BaseException`) is the one thing it lets through, because a stop is never swallowed.
 - **It reads only where the key is the brain's and the brain is the vendor's.** ``AI_PROVIDER``
   must name the vendor (as the balance tools require before they read ``AI_API_KEY``) **and** the
   wired brain must report it, so a library caller's test double, or a brain built by hand beside a
@@ -51,6 +54,12 @@ _log = logging.getLogger("basecradle_harness")
 
 #: The line's head: a fact, so plain (`_observability.head`'s rule).
 HEAD = "key spend"
+
+#: The longest rendering of a figure the line will carry. A ``float`` the vendor stated can spell
+#: out hundreds of digits (``1e300``, ``5e-324``), which `kv`'s bound would drop or cut, leaving an
+#: ``outcome=ok`` line with no figure or a broken one; no real key's spend is that, so such a
+#: figure is ``invalid_response``.
+SPENT_CHARS = 32
 
 #: Five seconds to connect and five to answer: `_deadline` holds the whole attempt to their sum,
 #: ten seconds, however a vendor keeps the connection alive. The read runs while the wake ends.
@@ -97,13 +106,17 @@ def log_key_spend(brain: str, *, timeline: str | None, delivery: str | None) -> 
     except Exception:  # noqa: BLE001 - nothing the read does may raise into the end of a wake
         _log_failed(vendor, "exception", timeline=timeline, delivery=delivery)
         return
+    spent = _fixed(spend.spent)
+    if len(spent) > SPENT_CHARS:
+        _log_failed(vendor, "invalid_response", timeline=timeline, delivery=delivery)
+        return
     _log.info(
         "%s %s",
         HEAD,
         kv(
             provider=vendor,
             outcome="ok",
-            spent=_fixed(spend.spent),
+            spent=spent,
             since=_stamp(spend.since),
             as_of=_stamp(spend.as_of),
             timeline=timeline,

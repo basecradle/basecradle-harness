@@ -71,6 +71,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -257,6 +258,26 @@ def read_credits(
     cannot judge the same answer differently. The caller has already decided `key` is a refuseless
     key and `root` is where it goes; this function sends it nowhere else.
     """
+    if any(ord(char) < 32 or ord(char) == 127 for char in key):
+        # Refused before any client exists: h11 rejects such a header with an error whose text
+        # quotes the whole header, and the read would report it as a network failure.
+        raise _BalanceUnavailable(
+            "AI_API_KEY contains a control character (a line break or a tab, picked up when it "
+            "was pasted), so it cannot be sent as a header.",
+            slug="config:auth",
+        )
+    try:
+        parts = urlsplit(root)
+        usable = parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:  # an unbalanced ``[`` is not an IPv6 host
+        usable = False
+    if not usable:
+        # A schemeless host fails in the transport as `UnsupportedProtocol`, which would read as a
+        # network failure retrying can fix rather than the configuration fault it is.
+        raise _BalanceUnavailable(
+            "AI_BASE_URL is not a usable URL, so there is no host to read the account at.",
+            slug="config:base_url",
+        )
     try:
         # Built inside the guard: httpx encodes a header as ASCII at construction, so a pasted key
         # carrying a smart quote raises before any request exists to fail.

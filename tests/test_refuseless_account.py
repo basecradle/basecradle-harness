@@ -302,6 +302,30 @@ def test_an_unusable_base_url_is_a_soft_config_fault(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    ("key", "base_url", "slug", "says"),
+    [
+        ("sk-rl-0123\n456789", None, "config:auth", "control character"),
+        (KEY, "api.refuseless.com/v1", "config:base_url", "AI_BASE_URL is not a usable URL"),
+    ],
+    ids=["control_character_key", "schemeless_base_url"],
+)
+def test_a_configuration_fault_is_named_as_one_not_a_network_failure(
+    caplog, key, base_url, slug, says
+):
+    """Both used to fail in the transport and read as `transport` (issue #868's review)."""
+    tool = RefuselessAccountBalanceTool(api_key=key, base_url=base_url, cache_ttl=0)
+    with respx.mock(assert_all_mocked=True) as mock:
+        result = tool.run()
+    assert not mock.calls
+    assert result.startswith("refuseless account balance unavailable — ") and says in result
+    assert key not in result
+    line = _line(
+        RefuselessAccountBalanceTool(api_key=key, base_url=base_url, cache_ttl=0), caplog, None
+    )
+    assert line.endswith(f"outcome=error reason={slug}")
+
+
 def test_no_key_is_a_config_fault_and_sends_nothing():
     tool = RefuselessAccountBalanceTool(cache_ttl=0)
     with respx.mock(assert_all_mocked=True) as mock:

@@ -2035,6 +2035,14 @@ class WakeAgent:
             # a compaction is holding for items that are no longer in flight (issue #289). Last,
             # because it reads the claims the four reconciles have just settled.
             self._forget_settled(session)
+            # What the brain's key has been billed, as its vendor states it, for the fleet's
+            # reconciliation of logged cost against billed cost (issue #868). Last of the work, so
+            # every call of the wake has settled, and inside the `try`, so a SIGTERM landing during
+            # the read is a stop like any other (`except WakeStopped` below) rather than an escape
+            # from the `finally` that would cost the wake its bookend. A wake that failed or was
+            # stopped before this point writes none; the next wake's figure is cumulative. It
+            # raises nothing but a stop.
+            log_key_spend(provider, timeline=self.timeline_uuid, delivery=delivery)
             outcome = "ok"
             return posted + self.speech.posts
         except WakeStopped as stop:
@@ -2057,12 +2065,6 @@ class WakeAgent:
             # (`_generate_settled`). So the turn count rides alongside the step total: without it
             # a legitimate 3-turn wake reading `steps=30/24` would look like a blown budget rather
             # than three turns of ten.
-            # What the brain's key has been billed, as its vendor states it, for the fleet's
-            # reconciliation of logged cost against billed cost (issue #868). Last before the
-            # bookend, so every call of the wake has settled; never on a stopped wake, which the
-            # router is waiting to see die. It never raises.
-            if stopped_by is None:
-                log_key_spend(provider, timeline=self.timeline_uuid, delivery=delivery)
             engine = self.harness.engine
             _log.info(
                 "%s %s",
