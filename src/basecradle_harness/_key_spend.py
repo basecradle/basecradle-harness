@@ -29,6 +29,12 @@ The shape is the contract's (`docs/telemetry.md` → `key spend`), settled with 
   must name the vendor (as the balance tools require before they read ``AI_API_KEY``) **and** the
   wired brain must report it, so a library caller's test double, or a brain built by hand beside a
   stale environment, sends nothing anywhere.
+
+The line's bytes have **one author each**, `key_spend_line` and `key_spend_error_line`, because the
+log-grammar probe renders the head too (issue #871): only five of the fleet's harness agents have a
+brain that writes it, so the NOC's extraction guard cannot watch it off live traffic and watches
+the probe's synthetic instead (`_log_grammar`, basecradle-noc#1369). A second spelling would let
+the probe keep proving a head production no longer writes.
 """
 
 from __future__ import annotations
@@ -49,6 +55,7 @@ from basecradle_harness._basecradle import (
     normalize_provider,
 )
 from basecradle_harness._observability import kv
+from basecradle_harness._report import probe_prefix
 
 _log = logging.getLogger("basecradle_harness")
 
@@ -111,11 +118,9 @@ def log_key_spend(brain: str, *, timeline: str | None, delivery: str | None) -> 
         _log_failed(vendor, "invalid_response", timeline=timeline, delivery=delivery)
         return
     _log.info(
-        "%s %s",
-        HEAD,
-        kv(
+        "%s",
+        key_spend_line(
             provider=vendor,
-            outcome="ok",
             spent=spent,
             since=_stamp(spend.since),
             as_of=_stamp(spend.as_of),
@@ -128,10 +133,69 @@ def log_key_spend(brain: str, *, timeline: str | None, delivery: str | None) -> 
 def _log_failed(vendor: str, slug: str, *, timeline: str | None, delivery: str | None) -> None:
     """The WARNING a read that produced no figure writes, naming why by its slug and nothing else."""
     _log.warning(
-        "%s %s",
-        HEAD,
-        kv(provider=vendor, outcome="error", reason=slug, timeline=timeline, delivery=delivery),
+        "%s",
+        key_spend_error_line(provider=vendor, reason=slug, timeline=timeline, delivery=delivery),
     )
+
+
+def key_spend_line(
+    *,
+    provider: str,
+    spent: str,
+    since: str | None = None,
+    as_of: str | None = None,
+    timeline: str | None = None,
+    delivery: str | None = None,
+    source: str | None = None,
+    agent: str | None = None,
+) -> str:
+    """The ``outcome=ok`` line: the figure the vendor stated, already rendered (`_fixed`, `_stamp`).
+
+    ``key spend provider=… outcome=ok spent=… since=… as_of=… timeline=… delivery=…``
+
+    The only author of these bytes, for the wake and for the log-grammar probe alike (see the
+    module docstring). ``source`` and ``agent`` are the probe-only fields and trail the grammar; a
+    real line passes neither, so it carries no stamp and no leading ``PROBE`` token.
+    """
+    line = f"{HEAD} " + kv(
+        provider=provider,
+        outcome="ok",
+        spent=spent,
+        since=since,
+        as_of=as_of,
+        timeline=timeline,
+        delivery=delivery,
+        source=source,
+        agent=agent,
+    )
+    return probe_prefix(source) + line
+
+
+def key_spend_error_line(
+    *,
+    provider: str,
+    reason: str,
+    timeline: str | None = None,
+    delivery: str | None = None,
+    source: str | None = None,
+    agent: str | None = None,
+) -> str:
+    """The ``outcome=error`` line: no figure this wake, and the slug that says why.
+
+    ``key spend provider=… outcome=error reason=… timeline=… delivery=…``
+
+    Same single-author contract and probe-only fields as `key_spend_line`.
+    """
+    line = f"{HEAD} " + kv(
+        provider=provider,
+        outcome="error",
+        reason=reason,
+        timeline=timeline,
+        delivery=delivery,
+        source=source,
+        agent=agent,
+    )
+    return probe_prefix(source) + line
 
 
 def _refuseless(key: str) -> _Spend:

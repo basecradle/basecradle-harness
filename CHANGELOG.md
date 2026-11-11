@@ -7,6 +7,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.189.0] - 2026-11-10
+
+### Added: The log-grammar probe witnesses the `key spend` head (issue #871)
+
+Only a refuseless or OpenRouter brain writes `key spend` (five of the fleet's thirteen harness agents), and the NOC's extraction guard selects wake lines by agent kind, never by provider, so it could not tell a renamed head from a fleet whose other agents do not write it (basecradle-noc#1369). `basecradle-harness-log-grammar key_spend` now renders the head on every agent, under `basecradle-log-grammar`, led by `PROBE` and stamped `source=probe`, with its claim row `log-grammar:key_spend` emitted beside `log-grammar:billing_blocked`.
+
+- **One line per shape the NOC's three columns read**: an `outcome=ok` line with `spent=`, a second with `since=` too, and an `outcome=error` line with `reason=`.
+- **One author for the bytes.** The wake's line and the probe's are rendered by the same two functions (`_key_spend.key_spend_line`, `key_spend_error_line`), so a rename of the head moves the probe in the same edit; a test renames it and watches both move. The wake's own line is byte for byte what 0.188.0 wrote.
+- **Its values are synthetic**: `provider=log_grammar_probe`, `spent=0`, `since=1970-01-01T00:00:00Z`, `reason=log_grammar_probe`. It is the one probe column that carries `provider=` and `outcome=`, because the head's gate reads them; the NOC's guard confines the `provider` label's count to wake identifiers (basecradle-noc#1261), so the field moves no other column's witness.
+
 ## [0.188.0] - 2026-11-10
 
 ### Added: `refuseless_account_balance` says what the agent's own key has been billed (issue #868)

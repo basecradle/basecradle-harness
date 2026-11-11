@@ -806,16 +806,28 @@ INFO key spend provider=openrouter outcome=ok spent=1.047832516 timeline=019f6e7
 WARNING key spend provider=refuseless outcome=error reason=rate_limited timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2
 ```
 
+Only five of the fleet's harness agents have a brain that writes this head, so the NOC cannot watch it off live traffic; the log-grammar probe renders it on every agent instead (`basecradle-harness-log-grammar key_spend`, issue #871), through the same two renderers (`_key_spend.key_spend_line`, `key_spend_error_line`), under its own identifier, at INFO, led by `PROBE` and stamped `source=probe`. Its `provider`, `reason` and figures are synthetic, and it carries no `timeline`:
+
+```text
+INFO PROBE key spend provider=log_grammar_probe outcome=ok spent=0 source=probe agent=jt
+INFO PROBE key spend provider=log_grammar_probe outcome=ok spent=0 since=1970-01-01T00:00:00Z source=probe agent=jt
+INFO PROBE key spend provider=log_grammar_probe outcome=error reason=log_grammar_probe source=probe agent=jt
+```
+
+A consumer of the figure reads it per agent, so it must block-list `source=probe` as the alarms do, or a probe's `spent=0` reads as the agent's reading.
+
 | Field | Meaning | Filled By | Absent When |
 |---|---|---|---|
-| `provider` | Common: the brain's vendor, whose key was read. | `_key_spend`. | Never. |
+| `provider` | Common: the brain's vendor, whose key was read; `log_grammar_probe` on a probe line, which read no key. | `_key_spend`. | Never. |
 | `outcome` | `ok` (the figure was read) or `error` (it was not). | `_key_spend`. | Never. |
-| `reason` | Why there is no figure, as a slug: the Fault Slugs a balance read can meet (`config:missing_api_key`, `config:auth`, `config:base_url`, `config:billing`, `config:model_not_found`, `payload_too_large`, `rate_limited`, `timeout`, `transport`, `server_error`, `api_error`, `invalid_response`, `provider_error`), **`not_reported`** (the vendor answered and stated no figure for the key), or `exception`. | `_key_spend`. | `outcome=ok`. |
+| `reason` | Why there is no figure, as a slug: the Fault Slugs a balance read can meet (`config:missing_api_key`, `config:auth`, `config:base_url`, `config:billing`, `config:model_not_found`, `payload_too_large`, `rate_limited`, `timeout`, `transport`, `server_error`, `api_error`, `invalid_response`, `provider_error`), **`not_reported`** (the vendor answered and stated no figure for the key), or `exception`; `log_grammar_probe` on a probe line. | `_key_spend`. | `outcome=ok`. |
 | `spent` | US dollars the key has been billed, **cumulative**, exactly as the vendor states it, in plain fixed-point. It is never `cost`: *Spend by Provider* sums every `cost=` on any head, and a cumulative figure there would be counted again on every wake. A consumer diffs it across wakes. | `_key_spend`. | `outcome=error`. |
 | `since` | When the vendor's counter started, so a reset or rebase reads as a break in the series and never as negative spend. | `_key_spend`. | `outcome=error`; the vendor states `null` (refuseless: the counter runs from the key's creation) or no start at all (OpenRouter). |
 | `as_of` | When the vendor read the figure (refuseless's `updated_at`). | `_key_spend`. | `outcome=error`; the vendor states no such moment (OpenRouter), in which case the record's own journal timestamp is the read. |
-| `timeline` | Common. | The wake. | Never. |
+| `timeline` | Common. | The wake. | A probe line. |
 | `delivery` | Common. | The environment. | As Common. |
+| `source` | Common. | `_log_grammar`. | Real traffic. |
+| `agent` | Common. | `_log_grammar`. | Real traffic. |
 
 ## Maintenance
 

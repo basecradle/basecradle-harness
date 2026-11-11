@@ -4,7 +4,10 @@ Every test here exists because the thing it pins fails **silently**: the agent k
 log line moves, and the only witness is an alarm that has quietly stopped hearing. The lines under
 proof appear only on a failure path — a vendor account out of money (`billing_blocked`, the
 founder's page) or a wake-loop breaker tripping (`breaker_tripped`, issue #592) — so nothing in
-production exercises them and no behaviour test covers the bytes an alarm reads.
+production exercises them and no behaviour test covers the bytes an alarm reads. The third column,
+``key_spend`` (issue #871), is not a needle but has the same blindness for another reason: only a
+refuseless or OpenRouter brain writes its head, and no denominator the NOC can spell separates
+those wakes from the rest of the fleet's.
 """
 
 from __future__ import annotations
@@ -17,16 +20,21 @@ from pathlib import Path
 
 import pytest
 
-from basecradle_harness import _log_grammar, _verify
+from basecradle_harness import _key_spend, _log_grammar, _verify
 from basecradle_harness._breaker import breaker_reset_line, breaker_tripped_line
+from basecradle_harness._key_spend import key_spend_error_line, key_spend_line, log_key_spend
 from basecradle_harness._log_grammar import (
     BILLING_BLOCKED,
     BREAKER_TRIPPED,
     COLUMNS,
     EX_TEMPFAIL,
     IDENTIFIER,
+    KEY_SPEND,
+    PROVIDER,
     REASON,
     SCRIPT,
+    SINCE,
+    SPENT,
     TTL_HOURS,
     Unprovable,
     emit,
@@ -59,10 +67,20 @@ REPEAT_CLAUSE = r"wake billing_blocked"
 BREAKER_NEEDLE = r"event=breaker_tripped|CIRCUIT BREAKER TRIPPED|Wake breaker TRIPPED"
 HARNESS_BREAKER_CLAUSE = r"Wake breaker TRIPPED"
 
+#: The NOC's three `key spend` columns (basecradle-noc#1365), exactly as `observability/ai-box.json`
+#: spells them on 2026-11-10. All three gate on the head followed by `provider=`, read outside every
+#: quoted value; `key_spent` then reads `spent=`, `key_spend_since` reads `since=`, and
+#: `key_spend_failures` matches `outcome=error`, unanchored, so the painted token reads as the plain.
+KEY_SPEND_HEAD = r'^([^"]*"[^"]*")*[^"]* key spend provider='
+KEY_SPENT = r'^(?:[^"]*"[^"]*")*?[^"]*?spent=([0-9.]+)'
+KEY_SPEND_SINCE = r'^(?:[^"]*"[^"]*")*?[^"]*?since=([0-9TZ:.+-]+)'
+KEY_SPEND_FAILED = r'^([^"]*"[^"]*")*[^"]*outcome=error'
+
 #: Every column's clauses, so a synthetic can be held to landing on its own column and no other.
 NEEDLES = {
     BILLING_BLOCKED: (ONSET_CLAUSE, REPEAT_CLAUSE),
     BREAKER_TRIPPED: (BREAKER_NEEDLE,),
+    KEY_SPEND: (KEY_SPEND_HEAD,),
 }
 
 #: The fleet's `source` label column, and the block-list predicate the alarm charts carry. A probe
@@ -84,6 +102,17 @@ FORBIDDEN_ON_A_SYNTHETIC = (
     r"model=([A-Za-z0-9._/:-]+)",  # model label
     r"duration=([0-9.]+)s",  # wake_duration_s / llm_duration_s and the per-purpose durations
 )
+
+#: The one exception to `FORBIDDEN_ON_A_SYNTHETIC`, by column: the fields the column under proof
+#: gates on, without which there is no head to prove. `key spend`'s three columns all gate on
+#: ``key spend provider=`` and `key_spend_failures` on ``outcome=error``. Neither moves a neighbour:
+#: since basecradle-noc#1261 the guard confines every count to what its parent counts, the `provider`
+#: label's parent is the `basecradle-wake-*` identifiers (so a probe's `provider=` is in no witness
+#: parent's denominator), and the `outcome` label is gated on `stage=`, `wake end`, ` tool name=` and
+#: ` charge provider=`, none of which this line carries (`ai-box.json`, 2026-11-10).
+REQUIRED_BY_ITS_COLUMN = {
+    KEY_SPEND: (r"provider=([A-Za-z0-9._-]+)", r"outcome=([a-z]+)"),
+}
 
 
 def probe_lines(agent: str = "jt") -> list[str]:
@@ -221,10 +250,29 @@ def test_a_synthetic_line_moves_no_other_columns_witness_parent(column):
     but the fleet's label extractors are naive regexes over the whole message, so a
     ``reason="… provider=x …"`` would populate ``provider`` from inside the quotes.
     """
+    required = REQUIRED_BY_ITS_COLUMN.get(column, ())
     for line in lines(column, agent="jt"):
         for pattern in FORBIDDEN_ON_A_SYNTHETIC:
+            if pattern in required:
+                continue
             assert not re.search(pattern, line), f"{pattern!r} matched {line!r}"
         assert '"' not in line  # no quoted value, so no extractor can read inside one
+
+
+def test_the_exception_admits_only_fields_its_own_column_gates_on():
+    """The exception is narrow by construction: every field it admits is one the column's own gate
+    reads off the line, and it admits nothing on any other column. A field added to it for
+    convenience would be a neighbour's parent riding in on the column's licence."""
+    assert set(REQUIRED_BY_ITS_COLUMN) <= set(COLUMNS)
+    for column, required in REQUIRED_BY_ITS_COLUMN.items():
+        assert set(required) <= set(FORBIDDEN_ON_A_SYNTHETIC)
+        for line in lines(column, agent="jt"):
+            assert re.search(KEY_SPEND_HEAD, line), line
+    # `outcome=` is admitted because `key_spend_failures` reads it; the ` llm provider=` gate the
+    # label's parent stands for is still never matched.
+    for line in lines(KEY_SPEND, agent="jt"):
+        assert not re.search(r" llm provider=", line), line
+        assert not re.search(r"stage=|event=wake_end|wake end| tool name=| charge provider=", line)
 
 
 @pytest.mark.parametrize("column", COLUMNS)
@@ -248,6 +296,97 @@ def test_a_synthetic_line_populates_exactly_the_three_intended_labels(column):
         assert re.search(r" (CRITICAL|ERROR|WARNING|INFO|DEBUG) ", shipped).group(1) == "INFO"
         assert re.search(r"agent=([A-Za-z0-9._-]+)", shipped).group(1) == "jt"
         assert re.search(SOURCE_LABEL, shipped).group(1) == PROBE_SOURCE
+
+
+# --- the key spend head (issue #871) ---------------------------------------------------------
+
+
+def test_the_key_spend_probe_emits_each_shape_the_three_columns_read():
+    """One line per shape the NOC reads: a figure (`key_spent`), a figure with a counter start
+    (`key_spend_since`), and a failed read (`key_spend_failures`). Each column is a separate
+    extraction, so each needs a line that exercises it; one that only read `spent=` would green the
+    head while `since=` rotted."""
+    spent, since, failed = lines(KEY_SPEND, agent="jt")
+
+    assert re.search(KEY_SPENT, spent).group(1) == SPENT
+    assert not re.search(KEY_SPEND_SINCE, spent)
+    assert not re.search(KEY_SPEND_FAILED, spent)
+
+    assert re.search(KEY_SPENT, since).group(1) == SPENT
+    assert re.search(KEY_SPEND_SINCE, since).group(1) == SINCE
+    assert not re.search(KEY_SPEND_FAILED, since)
+
+    assert re.search(KEY_SPEND_FAILED, failed)
+    assert not re.search(KEY_SPENT, failed)
+    assert not re.search(KEY_SPEND_SINCE, failed)
+
+    for line in (spent, since, failed):
+        assert re.search(KEY_SPEND_HEAD, line), line
+
+
+def test_the_key_spend_probe_renders_through_the_wakes_own_renderers():
+    """The synthetic is built by the functions the wake's line is built by, and carries only the
+    probe's synthetic values and the probe-only fields."""
+    spent, since, failed = lines(KEY_SPEND, agent="nova")
+    stamp = {"source": PROBE_SOURCE, "agent": "nova"}
+
+    assert spent == key_spend_line(provider=PROVIDER, spent=SPENT, **stamp)
+    assert since == key_spend_line(provider=PROVIDER, spent=SPENT, since=SINCE, **stamp)
+    assert failed == key_spend_error_line(provider=PROVIDER, reason=REASON, **stamp)
+    assert [plain(line) for line in (spent, since, failed)] == [
+        "PROBE key spend provider=log_grammar_probe outcome=ok spent=0 source=probe agent=nova",
+        (
+            "PROBE key spend provider=log_grammar_probe outcome=ok spent=0 "
+            "since=1970-01-01T00:00:00Z source=probe agent=nova"
+        ),
+        (
+            "PROBE key spend provider=log_grammar_probe outcome=error reason=log_grammar_probe "
+            "source=probe agent=nova"
+        ),
+    ]
+
+
+def _wake_lines(monkeypatch, caplog) -> list[str]:
+    """The `key spend` lines a refuseless wake writes, once with a figure and once without one."""
+    monkeypatch.setenv("AI_PROVIDER", "refuseless")
+    monkeypatch.setenv("AI_API_KEY", "rl-fake-0000000000000000")
+    monkeypatch.setitem(_key_spend._READERS, "refuseless", lambda key: _key_spend._Spend(0.5))
+    with caplog.at_level("INFO", logger="basecradle_harness"):
+        log_key_spend("refuseless", timeline="T", delivery=None)
+        monkeypatch.delenv("AI_API_KEY")
+        log_key_spend("refuseless", timeline="T", delivery=None)
+    return [
+        record(r.getMessage(), level=r.levelname)  # as it reaches the journal, envelope and all
+        for r in caplog.records
+        if "provider=refuseless" in r.getMessage()
+    ]
+
+
+def test_a_head_rename_moves_the_wake_and_the_probe_together(monkeypatch, caplog):
+    """The coupling, proven rather than asserted: rename the head where the wake reads it, and the
+    probe's bytes move in the same edit. A probe holding its own spelling would keep proving
+    ``key spend`` after the wake had started writing something else."""
+    monkeypatch.setattr(_key_spend, "HEAD", "key spent")
+
+    ok, error = _wake_lines(monkeypatch, caplog)
+    assert ok.startswith("INFO key spent provider=refuseless ") and "spent=0.5" in ok
+    assert error.startswith("WARNING key spent provider=refuseless ") and "reason=" in error
+    for line in lines(KEY_SPEND, agent="jt"):
+        assert line.startswith("PROBE key spent provider="), line
+        assert not re.search(KEY_SPEND_HEAD, line), line
+
+
+def test_the_wakes_real_lines_match_the_columns_and_carry_no_stamp(monkeypatch, caplog):
+    """The real lines against the live expressions, and the mirror of the stamp: a real reading
+    carries no ``source=`` and no ``PROBE``, so no block-list can ever drop it."""
+    ok, error = _wake_lines(monkeypatch, caplog)
+
+    assert re.search(KEY_SPENT, ok).group(1) == "0.5"
+    assert re.search(KEY_SPEND_FAILED, error)
+    for line in (ok, error):
+        assert re.search(KEY_SPEND_HEAD, line), line
+        assert not re.search(SOURCE_LABEL, line), line
+        assert PROBE_TOKEN not in line, line
 
 
 # --- the breaker clause (issue #592) ----------------------------------------------------------
