@@ -102,6 +102,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from basecradle_harness._basecradle import base_url_override, normalize_provider
+from basecradle_harness._deadline import bound_attempts
 from basecradle_harness._describer import DESCRIBER_API_KEY_VAR, describer_stack_from_env
 from basecradle_harness._observability import tool_failed
 from basecradle_harness._plugins import ActivationContext, Requirement
@@ -307,12 +308,12 @@ class OpenRouterAccountBalanceTool(Tool):
                 headers={"Authorization": f"Bearer {key}"}, timeout=self._timeout
             ) as client:
                 credits = _parse_credits(
-                    self._get(client, credential, "/credits", "read the credits remaining")
+                    _get(client, credential, "/credits", "read the credits remaining")
                 )
                 usage = None
                 if not credential.management:
                     usage = _parse_key(
-                        self._get(client, credential, "/key", "read this key's own usage")
+                        _get(client, credential, "/key", "read this key's own usage")
                     )
         except httpx.InvalidURL:
             return _unusable_root(credential)
@@ -385,58 +386,6 @@ class OpenRouterAccountBalanceTool(Tool):
             root, root_var = DEFAULT_BASE_URL, None
         return _Credential(secret(key), source, whose, root.rstrip("/"), root_var, management)
 
-    # --- the HTTP calls -------------------------------------------------------
-
-    def _get(
-        self, client: httpx.Client, credential: _Credential, path: str, action: str
-    ) -> dict[str, Any]:
-        """GET an API path and decode it, mapping every failure to a soft reason.
-
-        Never surfaces the response *body*: OpenRouter's error envelope carries an
-        ``error.message`` that can echo what it was handed and a ``user_id``, and the contract is
-        that only computed figures ever leave this tool.
-        """
-        try:
-            response = client.get(f"{credential.root}{path}")
-        except httpx.TimeoutException:
-            raise _BalanceUnavailable(
-                f"the OpenRouter API did not answer in time trying to {action}.", slug="timeout"
-            ) from None
-        except httpx.RequestError as exc:
-            # The error's *type*, never its text: a transport error can quote the request it
-            # failed on, headers included (h11's illegal-header error carries the whole
-            # `Authorization` value), and the contract is that the key never leaves this tool.
-            raise _BalanceUnavailable(
-                f"couldn't reach the OpenRouter API ({type(exc).__name__}).", slug="transport"
-            ) from None
-
-        status = response.status_code
-        if status in (401, 403):
-            raise _BalanceUnavailable(
-                f"OpenRouter rejected the key in {credential.source} (HTTP {status}) trying to "
-                f"{action}. Check that {credential.source} holds a current OpenRouter key.",
-                slug="config:auth",
-            )
-        if not 200 <= status < 300:
-            # Named by `docs/telemetry.md` → Fault Slugs, the same words on every producer.
-            slug = _STATUS_SLUGS.get(status) or ("server_error" if status >= 500 else "api_error")
-            raise _BalanceUnavailable(
-                f"OpenRouter returned HTTP {status} trying to {action}.", slug=slug
-            )
-        try:
-            data = response.json()
-        except (ValueError, RecursionError):
-            # `json` raises `RecursionError` — not a `ValueError` — on a deeply nested body, so
-            # a hostile or broken intermediary could otherwise raise straight out of `run()`.
-            raise _BalanceUnavailable(
-                f"OpenRouter returned an unreadable response trying to {action}."
-            ) from None
-        if not isinstance(data, dict):
-            raise _BalanceUnavailable(
-                f"OpenRouter returned an unexpected response trying to {action}."
-            )
-        return data
-
     # --- caching --------------------------------------------------------------
 
     def _cached_balance(self, digest: bytes, credential: _Credential) -> str | None:
@@ -452,6 +401,103 @@ class OpenRouterAccountBalanceTool(Tool):
     def _now_utc(self) -> datetime:
         """Wall-clock now, in UTC — the ``as of`` stamp on a freshly-read figure."""
         return datetime.now(UTC)
+
+
+def _get(client: httpx.Client, credential: _Credential, path: str, action: str) -> dict[str, Any]:
+    """GET an API path and decode it, mapping every failure to a soft reason.
+
+    Never surfaces the response *body*: OpenRouter's error envelope carries an
+    ``error.message`` that can echo what it was handed and a ``user_id``, and the contract is
+    that only computed figures ever leave this tool.
+    """
+    try:
+        response = client.get(f"{credential.root}{path}")
+    except httpx.TimeoutException:
+        raise _BalanceUnavailable(
+            f"the OpenRouter API did not answer in time trying to {action}.", slug="timeout"
+        ) from None
+    except httpx.RequestError as exc:
+        # The error's *type*, never its text: a transport error can quote the request it
+        # failed on, headers included (h11's illegal-header error carries the whole
+        # `Authorization` value), and the contract is that the key never leaves this tool.
+        raise _BalanceUnavailable(
+            f"couldn't reach the OpenRouter API ({type(exc).__name__}).", slug="transport"
+        ) from None
+
+    status = response.status_code
+    if status in (401, 403):
+        raise _BalanceUnavailable(
+            f"OpenRouter rejected the key in {credential.source} (HTTP {status}) trying to "
+            f"{action}. Check that {credential.source} holds a current OpenRouter key.",
+            slug="config:auth",
+        )
+    if not 200 <= status < 300:
+        # Named by `docs/telemetry.md` → Fault Slugs, the same words on every producer.
+        slug = _STATUS_SLUGS.get(status) or ("server_error" if status >= 500 else "api_error")
+        raise _BalanceUnavailable(
+            f"OpenRouter returned HTTP {status} trying to {action}.", slug=slug
+        )
+    try:
+        data = response.json()
+    except (ValueError, RecursionError):
+        # `json` raises `RecursionError` — not a `ValueError` — on a deeply nested body, so
+        # a hostile or broken intermediary could otherwise raise straight out of `run()`.
+        raise _BalanceUnavailable(
+            f"OpenRouter returned an unreadable response trying to {action}."
+        ) from None
+    if not isinstance(data, dict):
+        raise _BalanceUnavailable(f"OpenRouter returned an unexpected response trying to {action}.")
+    return data
+
+
+def read_key_usage(
+    key: str, root: str, *, timeout: float | httpx.Timeout = DEFAULT_TIMEOUT
+) -> float | None:
+    """What `key` has spent to date, to the vendor's own precision, off ``GET <root>/key``.
+
+    The wake's ``key spend`` line reads it (`_key_spend`, issue #868); the tool's `_parse_key`
+    quantizes the same figure to cents for display, which a reconciliation against the logged
+    ``cost=`` of every call cannot use. ``None`` when the vendor stated no ``usage``; every failure,
+    an unusable figure included, a `_BalanceUnavailable` carrying its slug. The caller has already
+    decided `key` is an OpenRouter key and `root` is where it goes; this sends it nowhere else.
+    """
+    if any(ord(char) < 32 or ord(char) == 127 for char in key):
+        # Refused before any client exists, as the tool refuses it: h11's error quotes the header.
+        raise _BalanceUnavailable("AI_API_KEY contains a control character.", slug="config:auth")
+    credential = _Credential(
+        secret(key), "AI_API_KEY", None, root.rstrip("/"), "AI_BASE_URL", False
+    )
+    if not _usable_root(credential.root):
+        raise _BalanceUnavailable("AI_BASE_URL is not a usable URL.", slug="config:base_url")
+    try:
+        with httpx.Client(headers={"Authorization": f"Bearer {key}"}, timeout=timeout) as client:
+            bound_attempts(client)  # a deadline on the whole attempt, not an idle timer (#788)
+            data = _get(client, credential, "/key", "read this key's own usage")
+    except httpx.InvalidURL:
+        raise _BalanceUnavailable(
+            "AI_BASE_URL is not a usable URL.", slug="config:base_url"
+        ) from None
+    except UnicodeEncodeError:
+        raise _BalanceUnavailable(
+            "AI_API_KEY contains a non-ASCII character.", slug="config:auth"
+        ) from None
+    inner = data.get("data")
+    if not isinstance(inner, dict):
+        raise _BalanceUnavailable(
+            "OpenRouter's key response carried no data object.", slug="invalid_response"
+        )
+    figure = inner.get("usage")
+    if figure is None:
+        return None
+    if isinstance(figure, bool) or not isinstance(figure, (int, float)):
+        raise _BalanceUnavailable("unusable usage", slug="invalid_response")
+    try:
+        usd = float(figure)
+    except OverflowError:
+        raise _BalanceUnavailable("unusable usage", slug="invalid_response") from None
+    if not math.isfinite(usd) or usd < 0:
+        raise _BalanceUnavailable("unusable usage", slug="invalid_response")
+    return usd
 
 
 #: The statuses `docs/telemetry.md` → Fault Slugs names by the status alone, beyond ``401``/``403``,

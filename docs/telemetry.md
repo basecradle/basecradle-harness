@@ -792,6 +792,31 @@ One line per memory-system operation other than a retrieval's report, which is `
 | `max_distance` | `off`, or the threshold in use. | `_mempalace`. | Never. |
 | `reason` | Why, as a slug. | `_mempalace`. | Never. |
 
+## Accounts
+
+### `key spend`
+
+**What the brain's own key has been billed, as its vendor states it, once per wake** (`_key_spend`, issue #868). The fleet reconciles each agent's logged `cost=` against what its vendor billed (basecradle-noc#1365). An account's balance cannot separate one agent from another when several share an account, so the per-agent billed figure is the calling key's cumulative spend. It is read with the brain's `AI_API_KEY` from every vendor that states one: refuseless (`GET /credits` → `key_spent`, `key_spent_since`, `updated_at`) and OpenRouter (`GET /key` → `data.usage`, to the vendor's own precision). Any other brain writes no line.
+
+The line is the last of a wake's work, so every call of the wake has settled and the next record is `wake end`. A wake that failed or was stopped before it writes none (the next wake's figure is cumulative), and a stop that lands during the read ends the wake as any stop does. A read that produced no figure is a WARNING on this same head, with `outcome=error` and its slug, never silence, so a consumer can tell "no figure this wake, because X" from "the read never ran". The read never holds or fails the wake: it is held to a ten-second deadline on the whole attempt (five to connect plus five to answer, summed by `_deadline` and checked as each part of the answer arrives, so a vendor trickling bytes overruns it by at most one idle interval), a figure longer than 32 characters is `invalid_response` rather than a value the 240-character bound would cut, and anything it did not foresee is `reason=exception`. The key, the URL and the vendor's body never reach the line.
+
+```text
+INFO key spend provider=refuseless outcome=ok spent=0.001405 as_of=2026-11-10T21:12:05Z timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2
+INFO key spend provider=openrouter outcome=ok spent=1.047832516 timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2
+WARNING key spend provider=refuseless outcome=error reason=rate_limited timeline=019f6e71-2a12-7b69-a204-0fec1497b9c2
+```
+
+| Field | Meaning | Filled By | Absent When |
+|---|---|---|---|
+| `provider` | Common: the brain's vendor, whose key was read. | `_key_spend`. | Never. |
+| `outcome` | `ok` (the figure was read) or `error` (it was not). | `_key_spend`. | Never. |
+| `reason` | Why there is no figure, as a slug: the Fault Slugs a balance read can meet (`config:missing_api_key`, `config:auth`, `config:base_url`, `config:billing`, `config:model_not_found`, `payload_too_large`, `rate_limited`, `timeout`, `transport`, `server_error`, `api_error`, `invalid_response`, `provider_error`), **`not_reported`** (the vendor answered and stated no figure for the key), or `exception`. | `_key_spend`. | `outcome=ok`. |
+| `spent` | US dollars the key has been billed, **cumulative**, exactly as the vendor states it, in plain fixed-point. It is never `cost`: *Spend by Provider* sums every `cost=` on any head, and a cumulative figure there would be counted again on every wake. A consumer diffs it across wakes. | `_key_spend`. | `outcome=error`. |
+| `since` | When the vendor's counter started, so a reset or rebase reads as a break in the series and never as negative spend. | `_key_spend`. | `outcome=error`; the vendor states `null` (refuseless: the counter runs from the key's creation) or no start at all (OpenRouter). |
+| `as_of` | When the vendor read the figure (refuseless's `updated_at`). | `_key_spend`. | `outcome=error`; the vendor states no such moment (OpenRouter), in which case the record's own journal timestamp is the read. |
+| `timeline` | Common. | The wake. | Never. |
+| `delivery` | Common. | The environment. | As Common. |
+
 ## Maintenance
 
 These are written by the console scripts, not by a wake.

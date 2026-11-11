@@ -193,6 +193,7 @@ from basecradle_harness._install import (
     prompt_text,
     system_prompt_text,
 )
+from basecradle_harness._key_spend import log_key_spend
 from basecradle_harness._mcp import McpImageStore, _timeout_from_env, load_mcp_configs_report
 from basecradle_harness._memory_provider import (
     MemoryExchange,
@@ -2034,6 +2035,14 @@ class WakeAgent:
             # a compaction is holding for items that are no longer in flight (issue #289). Last,
             # because it reads the claims the four reconciles have just settled.
             self._forget_settled(session)
+            # What the brain's key has been billed, as its vendor states it, for the fleet's
+            # reconciliation of logged cost against billed cost (issue #868). Last of the work, so
+            # every call of the wake has settled, and inside the `try`, so a SIGTERM landing during
+            # the read is a stop like any other (`except WakeStopped` below) rather than an escape
+            # from the `finally` that would cost the wake its bookend. A wake that failed or was
+            # stopped before this point writes none; the next wake's figure is cumulative. It
+            # raises nothing but a stop.
+            log_key_spend(provider, timeline=self.timeline_uuid, delivery=delivery)
             outcome = "ok"
             return posted + self.speech.posts
         except WakeStopped as stop:

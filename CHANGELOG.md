@@ -13,6 +13,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 refuseless added per-key spend to `GET /v1/credits` at @origin's request, because the account balance cannot separate one agent's spend from another's. The tool now ends with the vendor's `key_spent`, *in total* when `key_spent_since` is `null` and *since* that moment when it is not, to the vendor's six decimals. The figure is additive on the vendor's side, so it is parsed as optional: a response without a usable `key_spent`, or with a `key_spent_since` that is anything but `null` or a non-negative integer number of Unix seconds, still answers with the balance and leaves only that sentence out.
 
+### Added: A `key spend` line reports what the brain's key has been billed, once per wake (issue #868)
+
+The fleet reconciles each agent's logged `cost=` against what its vendor billed (basecradle-noc#1365). The account balance cannot separate agents that share an account, so the per-agent figure is the key's own cumulative spend. A refuseless or OpenRouter brain now writes one `key spend` line just before `wake end`, read with its own `AI_API_KEY` at the host its calls go to: refuseless's `key_spent` (with `key_spent_since` as `since=` and `updated_at` as `as_of=`) and OpenRouter's `GET /key` `usage`, each to the vendor's own precision. The head is new to [the contract](docs/telemetry.md#key-spend), and its shape was settled with the NOC's consumer before it shipped.
+
+- **`spent=`, never `cost=`**: *Spend by Provider* sums every `cost=`, and a cumulative figure there would be counted again on every wake.
+- **No figure is a WARNING on the same head**, `outcome=error` with its slug (a Fault Slug, `not_reported` when the vendor stated none, or `exception`), never silence. The key, the URL and the vendor's body never reach the line.
+- **It never holds or fails a wake**: it is the last of the wake's work, held to a ten-second deadline on the whole attempt, and raises nothing but a stop, so a SIGTERM during the read ends the wake as any stop does. A wake that failed or was stopped before it writes none; the next wake's figure is cumulative. It reads only when `AI_PROVIDER` names the vendor and the wired brain reports it, so a test double or a stale environment sends nothing.
+- **`refuseless_account_balance` shares the line's read** (`_refuseless_account.read_credits`), so it is now held to a whole-attempt deadline too (its 15 seconds per phase, 30 in all), and a pasted key carrying a control character or a schemeless `AI_BASE_URL` is now reported as the configuration fault it is (`config:auth`, `config:base_url`) rather than as a network failure (`transport`).
+
 ## [0.187.0] - 2026-11-10
 
 ### Changed: The balance read at an agent's own LLM vendor is on by default (issue #862)
