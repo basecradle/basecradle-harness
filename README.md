@@ -774,7 +774,7 @@ basecradle-harness-log-grammar breaker_tripped
 basecradle-harness-log-grammar key_spend
 ```
 
-It renders the column's lines **through the very functions the real failure path renders them with**,
+It renders the column's lines **through the very functions the real lines are rendered with**,
 writes them to journald under its own `basecradle-log-grammar` identifier at INFO, and reads them
 back to prove they landed. Nothing else changes: no model call, no vendor credit, no message, no
 platform I/O. It is wired as a `rare`-class claim so a ledger can fire it on a cadence and notice
@@ -813,8 +813,9 @@ Three properties make it safe to point at a page-the-human alert:
   gate needs the field, but no key was read. A consumer of the figure reads it per agent, so it
   block-lists `source=probe` exactly as the alarms do.
 
-It carries no `provider=`, `stage=`, `outcome=` or other field a neighbouring metric keys on, and
-every value is a bare token — a monitor that manufactures false readings in the instrument beside
+It carries no `provider=`, `stage=`, `outcome=` or other field a neighbouring metric keys on (the
+one exception is `key spend`'s `provider=` and `outcome=`, which its own columns' gate reads and
+which the fleet's guard counts only on wake lines), and every value is a bare token — a monitor that manufactures false readings in the instrument beside
 it is worse than the gap it closes.
 
 ### A stem is not a tool name — `basecradle-harness-resolve`

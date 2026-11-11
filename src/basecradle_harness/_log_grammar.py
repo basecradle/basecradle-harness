@@ -26,7 +26,7 @@ What it does, and the division of labour
 Called as ``basecradle-harness-log-grammar billing_blocked`` — by the NOC's ``run-claim-probe``
 enumerated op, resolved from this agent's root-owned claims manifest and exec'd as the agent's own
 OS user — it renders both clauses **through the very functions the real failure path renders them
-with**, writes them to journald, and reads them back to prove they landed. From there the fleet's
+with** (``key_spend``, below, is not a failure path, and is rendered the same way), writes them to journald, and reads them back to prove they landed. From there the fleet's
 ordinary shipping path (journald → Vector → Better Stack) carries them, and the extraction guard
 reads them off the same live stream it already reads and asserts the column extracted.
 
@@ -51,8 +51,8 @@ one proves the harness's, which the NOC had to carry as an *unwitnessed clause* 
 needle collapses to a single verdict, so the router's witness kept the column reading
 ``populating`` while nothing anywhere said whether the harness's spelling still matched. One line,
 because the harness has one clause. Its ``Wake breaker RESET`` partner is rendered by the same
-module but proven by nothing here: a claim names a NOC column by its exact spelling, and no column
-reads the reset.
+module but proven by nothing here: a claim names the NOC column it proves, and no column reads
+the reset.
 
 The third column: ``key_spend``
 -------------------------------
@@ -177,8 +177,10 @@ from basecradle_harness._report import (
 #: why it is deliberately not the wake identifier.
 IDENTIFIER = "basecradle-log-grammar"
 
-#: The NOC derived columns this probe can exercise, keyed by the column's **exact** spelling. The
-#: claim id is ``log-grammar:<column>`` (the capital's ruling 5): the claims ledger is the one
+#: The NOC derived columns this probe can exercise, each keyed by the column's **exact** spelling —
+#: except ``key_spend``, which names the *head* its three columns (``key_spent``,
+#: ``key_spend_since``, ``key_spend_failures``) read, the claim id basecradle-noc#1369 asked for,
+#: since one fire proves all three. The claim id is ``log-grammar:<column>`` (the capital's ruling 5): the claims ledger is the one
 #: sanctioned meeting point between an emitter and the monitor, and a claim id is shared vocabulary
 #: by design — the same way ``overlay-tool:shell`` is.
 BILLING_BLOCKED = "billing_blocked"
