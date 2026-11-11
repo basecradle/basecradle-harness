@@ -26,7 +26,7 @@ What it does, and the division of labour
 Called as ``basecradle-harness-log-grammar billing_blocked`` — by the NOC's ``run-claim-probe``
 enumerated op, resolved from this agent's root-owned claims manifest and exec'd as the agent's own
 OS user — it renders both clauses **through the very functions the real failure path renders them
-with**, writes them to journald, and reads them back to prove they landed. From there the fleet's
+with** (``key_spend``, below, is not a failure path, and is rendered the same way), writes them to journald, and reads them back to prove they landed. From there the fleet's
 ordinary shipping path (journald → Vector → Better Stack) carries them, and the extraction guard
 reads them off the same live stream it already reads and asserts the column extracted.
 
@@ -51,8 +51,34 @@ one proves the harness's, which the NOC had to carry as an *unwitnessed clause* 
 needle collapses to a single verdict, so the router's witness kept the column reading
 ``populating`` while nothing anywhere said whether the harness's spelling still matched. One line,
 because the harness has one clause. Its ``Wake breaker RESET`` partner is rendered by the same
-module but proven by nothing here: a claim names a NOC column by its exact spelling, and no column
-reads the reset.
+module but proven by nothing here: a claim names the NOC column it proves, and no column reads
+the reset.
+
+The third column: ``key_spend``
+-------------------------------
+
+Not a needle: the ``key spend`` head (issue #868, `_key_spend`) is written on every wake of a
+refuseless or OpenRouter brain. But that is five of the fleet's thirteen harness agents, and the
+extraction guard selects wake identifiers by agent *kind*, never by provider, so every denominator
+the NOC can spell fills on an hour of an OpenAI or xAI agent's traffic alone, and a ``populates``
+watch would read deaf on a healthy fleet (issue #871, basecradle-noc#1369). This identifier fires
+on every agent on a cadence and a format change cannot move it, so the head is witnessed here. The
+NOC reads it through three columns — ``key_spent`` (``spent=``), ``key_spend_since`` (``since=``)
+and ``key_spend_failures`` (``outcome=error``) — so the probe emits three lines, one per shape the
+columns read, each rendered by the renderer the wake itself calls (`_key_spend.key_spend_line`,
+`_key_spend.key_spend_error_line`).
+
+It is the one column here that **must** carry ``provider=`` and ``outcome=``, because all three of
+its expressions gate on the literal ``key spend provider=``: without the field there is no head to
+prove. That is the exception the rule below names, and what licenses it is a fact on the NOC's
+side, re-checked on 2026-11-10 against ``observability/ai-box.json``: since basecradle-noc#1261 the
+guard confines every count to what its parent counts, and the ``provider`` label's parent is the
+``basecradle-wake-*`` identifiers, so a ``provider=`` under this identifier enters no witness
+parent's denominator; the ``outcome`` label is gated on heads this line does not carry. The value
+is a synthetic slug (`PROVIDER`), never a real vendor's, so a consumer that selects by vendor can
+never read the probe's figure as that vendor's. A consumer that selects by **agent** — the NOC's
+per-key reconciler reads every ``key spend`` line by its ``agent=`` — must block-list
+``source=probe`` like every alarm does, or a synthetic ``spent=0`` reads as the agent's reading.
 
 Why it does not page the founder
 --------------------------------
@@ -86,7 +112,9 @@ Three consequences that look like details and are not
   extracted anything, gets no, and calls two healthy columns deaf. A monitor that manufactures
   false positives in an instrument beside it is worse than the gap it closes. The general rule,
   for anything added here later: **carry no field that is a witness parent for another column**,
-  and keep every value a bare token (`kv` quotes a value holding a space, but the fleet's label
+  unless the column under proof gates on that very field and the NOC's guard is shown to confine
+  the parent's count away from this identifier (the ``key_spend`` exception above, and the only
+  one), and keep every value a bare token (`kv` quotes a value holding a space, but the fleet's label
   extractors are naive regexes over the whole message, so a ``reason="… provider=x …"`` would
   populate ``provider`` from *inside* the quotes).
 - **Both clauses are emitted, separately.** The guard asks only whether a column extracted
@@ -129,6 +157,7 @@ import sys
 import time
 
 from basecradle_harness._breaker import breaker_tripped_line
+from basecradle_harness._key_spend import key_spend_error_line, key_spend_line
 from basecradle_harness._observability import (
     LOG_FORMAT,
     agent_slug,
@@ -148,13 +177,16 @@ from basecradle_harness._report import (
 #: why it is deliberately not the wake identifier.
 IDENTIFIER = "basecradle-log-grammar"
 
-#: The NOC derived columns this probe can exercise, keyed by the column's **exact** spelling. The
-#: claim id is ``log-grammar:<column>`` (the capital's ruling 5): the claims ledger is the one
+#: The NOC derived columns this probe can exercise, each keyed by the column's **exact** spelling —
+#: except ``key_spend``, which names the *head* its three columns (``key_spent``,
+#: ``key_spend_since``, ``key_spend_failures``) read, the claim id basecradle-noc#1369 asked for,
+#: since one fire proves all three. The claim id is ``log-grammar:<column>`` (the capital's ruling 5): the claims ledger is the one
 #: sanctioned meeting point between an emitter and the monitor, and a claim id is shared vocabulary
 #: by design — the same way ``overlay-tool:shell`` is.
 BILLING_BLOCKED = "billing_blocked"
 BREAKER_TRIPPED = "breaker_tripped"
-COLUMNS = (BILLING_BLOCKED, BREAKER_TRIPPED)
+KEY_SPEND = "key_spend"
+COLUMNS = (BILLING_BLOCKED, BREAKER_TRIPPED, KEY_SPEND)
 
 #: The console script's own name, so the claims emitter and this module cannot disagree about what
 #: the manifest's ``cmd`` should invoke.
@@ -174,6 +206,17 @@ TTL_HOURS = 1
 #: and a human in a Live Tail should need no lookup to know what they are looking at. A bare token
 #: by construction — see the module docstring on quoted values.
 REASON = "log_grammar_probe"
+
+#: The ``provider=`` the synthetic ``key spend`` lines carry: the same slug as `REASON`, and for the
+#: same reason. The head's gate needs the field, but no vendor's key was read, so naming a real one
+#: would be a made-up fact, and one a consumer selecting by vendor would read as that vendor's.
+PROVIDER = REASON
+
+#: The figures the synthetic ``key spend`` lines carry. They must be values the NOC's extractors
+#: read (``spent=([0-9.]+)``, ``since=([0-9TZ:.+-]+)``), so they are a zero and the Unix epoch:
+#: a reader needs no lookup to see that neither is a key's real spend or counter start.
+SPENT = "0"
+SINCE = "1970-01-01T00:00:00Z"
 
 #: ``EX_TEMPFAIL``. The claims contract's one load-bearing exit code: *we ran and could not
 #: determine the answer*, recorded as ERROR → ``unprovable``. Any **other** non-zero lands as
@@ -213,6 +256,8 @@ def lines(column: str, *, agent: str) -> list[str]:
     of an alarm (the founder's page for ``billing_blocked``, *Circuit Breaker Tripped* for
     ``breaker_tripped``), so it is not a parameter a caller can omit. The breaker line carries
     nothing else: its production fields describe one real trip, and a synthetic has none to report.
+    The ``key spend`` lines carry what the head's three NOC columns read and nothing more: a
+    ``spent=``, then a ``spent=`` with a ``since=``, then an ``outcome=error`` with its ``reason=``.
     """
     if column == BILLING_BLOCKED:
         return [
@@ -221,6 +266,13 @@ def lines(column: str, *, agent: str) -> list[str]:
         ]
     if column == BREAKER_TRIPPED:
         return [breaker_tripped_line(source=PROBE_SOURCE, agent=agent)]
+    if column == KEY_SPEND:
+        stamp = {"source": PROBE_SOURCE, "agent": agent}
+        return [
+            key_spend_line(provider=PROVIDER, spent=SPENT, **stamp),
+            key_spend_line(provider=PROVIDER, spent=SPENT, since=SINCE, **stamp),
+            key_spend_error_line(provider=PROVIDER, reason=REASON, **stamp),
+        ]
     raise Unprovable(f"unknown column: {column}")  # pragma: no cover - `main` validates first
 
 

@@ -742,14 +742,16 @@ def _log_grammar_rows() -> list[dict[str, object]]:
 
     Different in class from every other row here, and deliberately so. The rest of this manifest is
     ``dependency``: *is the capability present after a converge?*, re-proven by the converge floor.
-    A log-grammar claim asks something the floor structurally cannot — *do the bytes a founder-named
-    alarm matches still exist?* — about a line that appears **only when a vendor account runs out of
-    money**. Silence is its normal state, so its proof is a forced exercise on a TTL: `class: rare`
-    (basecradle-noc#509, ratified 2026-08-18).
+    A log-grammar claim asks something the floor structurally cannot — *do the bytes a NOC column
+    matches still exist?* — about a line live traffic cannot vouch for: one that appears **only on a
+    failure path** (an account out of money, a tripped breaker), or one written only by some agents'
+    brains (``key spend``, issue #871). On the agent the claim runs on, silence can be the normal
+    state, so its proof is a forced exercise on a TTL: `class: rare` (basecradle-noc#509, ratified
+    2026-08-18).
 
-    Unconditional, like the two config-home rows above: an agent that cannot emit its billing
-    grammar must have a row in the ledger to be red about, and deriving the set from anything
-    observable here would drop exactly the claim that matters.
+    Unconditional, like the two config-home rows above: an agent that cannot emit the grammar must
+    have a row in the ledger to be red about, and deriving the set from anything observable here
+    would drop exactly the claim that matters.
     """
     return [
         {

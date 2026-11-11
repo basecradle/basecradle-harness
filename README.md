@@ -738,9 +738,9 @@ Two things it does **whatever the state of the box**, and both are the point:
   verdict — a red box that emitted nothing would take its own claims out of the ledger at the exact
   moment the ledger is what would have caught it. The verdict arrives separately, when each row's
   probe runs.
-- **A box with no config home still emits** the four unconditional rows (`harness-config-home`,
-  `harness-package-pin`, `log-grammar:billing_blocked`, `log-grammar:breaker_tripped`), so even a
-  never-installed agent has
+- **A box with no config home still emits** the five unconditional rows (`harness-config-home`,
+  `harness-package-pin`, `log-grammar:billing_blocked`, `log-grammar:breaker_tripped`,
+  `log-grammar:key_spend`), so even a never-installed agent has
   something in the ledger to be red about. Nonzero is reserved for genuinely *not being able to state the claims* — no resolvable
   `$HOME`, an unwritable stdout — and the reason goes to stderr, in one line.
 
@@ -760,14 +760,21 @@ The [wake breaker's](#the-cross-wake-circuit-breaker) trip line is the same shap
 Tripped* (the router's own breaker owns the other two), and it too exists only when something has
 gone wrong.
 
-So the harness exercises its own needle grammar on demand, one alarm column per call:
+The `key spend` line is the third case, for a different reason: it is written on every wake, but
+only by a refuseless or OpenRouter brain, so a monitor that counts an agent's lines cannot tell a
+renamed head from a fleet whose other agents simply do not write it. The fleet's per-key
+reconciliation reads it through three columns: the figure (`spent=`), the counter start
+(`since=`) and the failed read (`outcome=error`).
+
+So the harness exercises its own grammar on demand, one column per call:
 
 ```bash
 basecradle-harness-log-grammar billing_blocked     # 0 = emitted and readable back; 75 = could not ask
 basecradle-harness-log-grammar breaker_tripped
+basecradle-harness-log-grammar key_spend
 ```
 
-It renders the column's lines **through the very functions the real failure path renders them with**,
+It renders the column's lines **through the very functions the real lines are rendered with**,
 writes them to journald under its own `basecradle-log-grammar` identifier at INFO, and reads them
 back to prove they landed. Nothing else changes: no model call, no vendor credit, no message, no
 platform I/O. It is wired as a `rare`-class claim so a ledger can fire it on a cadence and notice
@@ -790,6 +797,9 @@ Three properties make it safe to point at a page-the-human alert:
   [basecradle-log-grammar] INFO PROBE wake reported_failure kind=billing reason=log_grammar_probe source=probe agent=jt
   [basecradle-log-grammar] INFO PROBE wake billing_blocked reason=log_grammar_probe source=probe agent=jt
   [basecradle-log-grammar] INFO PROBE Wake breaker TRIPPED source=probe agent=jt
+  [basecradle-log-grammar] INFO PROBE key spend provider=log_grammar_probe outcome=ok spent=0 source=probe agent=jt
+  [basecradle-log-grammar] INFO PROBE key spend provider=log_grammar_probe outcome=ok spent=0 since=1970-01-01T00:00:00Z source=probe agent=jt
+  [basecradle-log-grammar] INFO PROBE key spend provider=log_grammar_probe outcome=error reason=log_grammar_probe source=probe agent=jt
   ```
 - **One author for the bytes.** Production and probe call the same renderers, so a refactor
   that changes the real line changes the synthetic in the same edit. Two spellings would let the
@@ -798,9 +808,14 @@ Three properties make it safe to point at a page-the-human alert:
   one), because a monitor asking only *"did anything extract?"* would stay green on one working
   clause while another rotted. The breaker's synthetic carries nothing but the stamp and the agent —
   a real trip's `timeline=`, `count=` and `hold=` describe one real trip, and a probe has none.
+  The `key spend` synthetic emits one line per shape its columns read, and its `provider=`,
+  `spent=` and `since=` are synthetic (`log_grammar_probe`, a zero, the Unix epoch): the head's
+  gate needs the field, but no key was read. A consumer of the figure reads it per agent, so it
+  block-lists `source=probe` exactly as the alarms do.
 
-It carries no `provider=`, `stage=`, `outcome=` or other field a neighbouring metric keys on, and
-every value is a bare token — a monitor that manufactures false readings in the instrument beside
+It carries no `provider=`, `stage=`, `outcome=` or other field a neighbouring metric keys on (the
+one exception is `key spend`'s `provider=` and `outcome=`, which its own columns' gate reads and
+which the fleet's guard counts only on wake lines), and every value is a bare token — a monitor that manufactures false readings in the instrument beside
 it is worse than the gap it closes.
 
 ### A stem is not a tool name — `basecradle-harness-resolve`

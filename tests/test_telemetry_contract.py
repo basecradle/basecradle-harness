@@ -288,6 +288,8 @@ def _head_of(call: ast.Call, parent: ast.AST | None, constants: dict[str, str]) 
         for value in parent.left.values:  # f"{head(TEXT, COLOR)} " + kv(...)
             if isinstance(value, ast.FormattedValue) and _named(value.value, "head"):
                 return _literal(value.value.args[0], constants)
+            if isinstance(value, ast.FormattedValue):  # f"{HEAD} " + kv(...), a plain fact head
+                return _literal(value.value, constants)
     args = _log_args(parent) if parent is not None else None
     if not args:
         return None

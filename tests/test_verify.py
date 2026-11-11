@@ -409,6 +409,7 @@ def test_a_box_with_no_config_home_still_has_rows_to_be_red_about(tmp_path):
         "harness-package-pin",
         "log-grammar:billing_blocked",
         "log-grammar:breaker_tripped",
+        "log-grammar:key_spend",
     ]
 
 
@@ -567,6 +568,7 @@ def test_the_emitter_still_states_the_unconditional_rows_with_no_config_home(
         "harness-package-pin",
         "log-grammar:billing_blocked",
         "log-grammar:breaker_tripped",
+        "log-grammar:key_spend",
     ]
 
 
