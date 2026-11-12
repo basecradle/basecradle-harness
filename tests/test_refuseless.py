@@ -38,8 +38,10 @@ from basecradle_harness._describer import (
     DESCRIBER_PROVIDERS_VAR,
     IMAGE_OUTPUT_BUDGET,
     VIDEO_OUTPUT_BUDGET,
+    Describer,
     describer_from_env,
 )
+from basecradle_harness._messages import ImageContent
 from basecradle_harness._observability import ComputedCost, capture_llm_call, log_llm_call
 from basecradle_harness._openai import (
     _AFFINITY,
@@ -47,6 +49,7 @@ from basecradle_harness._openai import (
     LIST_FALLBACK_MAX_AGE,
     LIST_REREAD_AFTER,
     LIST_REREAD_CAP,
+    LIST_REREAD_SLOWDOWN,
     ModelCatalog,
     OpenAIProvider,
 )
@@ -1028,8 +1031,14 @@ def test_another_hosts_list_never_prices_a_call(gaps):
             return_value=httpx.Response(200, json=_reply())
         )
         _wake(router, clock, at=[clock.now])
+        # The same clock, so the list is refused for its host and never for its age.
         adapter = OpenAIProvider(
-            MODEL, api_key=FAKE_KEY, base_url=OTHER_HOST, provider=VENDOR, surface="chat"
+            MODEL,
+            api_key=FAKE_KEY,
+            base_url=OTHER_HOST,
+            provider=VENDOR,
+            surface="chat",
+            catalog=ModelCatalog(clock=clock),
         )
         with capture_llm_call() as call:
             adapter.chat([Message.user("hi")])
@@ -1092,6 +1101,88 @@ def test_a_gap_is_never_rendered_where_nothing_is_missing(caplog, cost, usage):
         seconds=1.0,
         usage=usage,
         cost=cost,
+        cost_gap="rates_unavailable",
+    )
+    (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]
+    assert "cost_gap" not in line
+
+
+def test_a_list_that_hangs_is_waited_on_for_a_fifth_of_the_wake_at_most():
+    """A read is synchronous, so the wait after one is never shorter than the read took, times four."""
+    clock = _Clock()
+    catalog = ModelCatalog(clock=clock)
+    start = clock.now
+
+    def hang(request):
+        clock.now += 60.0  # the read runs to its whole timeout
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    with respx.mock(assert_all_mocked=True) as router:
+        route = router.get(f"{HOST}/models").mock(side_effect=hang)
+        adapter = _adapter(catalog=catalog)
+        adapter.context_limit()
+        assert catalog._next_read - clock.now == LIST_REREAD_SLOWDOWN * 60.0
+        # The first hour of a wake asking every second: the doubling waits alone (5, 10, 20, 40 s)
+        # are shorter than the read, and would spend a quarter of it inside the read.
+        while clock.now < start + 3600:
+            adapter.context_limit()
+            clock.now += 1.0
+        adapter.close()
+    assert route.call_count * 60.0 <= 3600 / (1 + LIST_REREAD_SLOWDOWN)
+
+
+@pytest.mark.parametrize(
+    "listed", [_models(), _models({"object": "model"})], ids=["empty", "no_ids"]
+)
+def test_a_list_that_names_no_model_is_a_failed_read_and_never_replaces_a_good_one(gaps, listed):
+    from basecradle_harness import _openai
+
+    clock = _Clock()
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(
+            side_effect=[
+                httpx.Response(200, json=LIST),
+                httpx.Response(200, json=listed),
+                httpx.Response(200, json=LIST),
+            ]
+        )
+        _wake(router, clock, at=[clock.now])
+        start = clock.now
+        lines = _wake(router, clock, at=[start, start + LIST_REREAD_AFTER])
+        assert models.call_count == 3
+    # Priced from the good list while its own read named nothing, then from its own good read.
+    assert [_cost_of(line) for line in lines] == [pytest.approx(0.00022)] * 2
+    assert _openai._LAST_LISTS[next(iter(_openai._LAST_LISTS))][1]
+    assert not gaps()
+
+
+def test_the_describers_line_carries_the_gap(caplog):
+    caplog.set_level(logging.INFO, logger="basecradle_harness")
+    with respx.mock(assert_all_mocked=True) as router:
+        router.get(f"{HOST}/models").mock(return_value=httpx.Response(503, json={}))
+        router.post(f"{HOST}/chat/completions").mock(
+            return_value=httpx.Response(200, json=_reply())
+        )
+        adapter = _adapter()
+        image = ImageContent(url="data:image/png;base64,iVBORw0KGgo=", alt="cat.png")
+        assert Describer(adapter, MODEL).describe_images([image])
+        adapter.close()
+    (line,) = [plain(r.getMessage()) for r in caplog.records if r.getMessage().startswith("llm ")]
+    assert "purpose=helper" in line
+    assert "cost_gap=rates_unavailable" in line
+    assert " cost=" not in line
+
+
+@pytest.mark.parametrize("outcome", ["retrying", "failed"])
+def test_a_decision_line_never_carries_a_gap(caplog, outcome):
+    caplog.set_level(logging.INFO, logger="basecradle_harness")
+    log_llm_call(
+        provider=VENDOR,
+        model=MODEL,
+        seconds=None,
+        usage=USAGE,
+        outcome=outcome,
+        reason="server_error",
         cost_gap="rates_unavailable",
     )
     (line,) = [r.getMessage() for r in caplog.records if r.getMessage().startswith("llm ")]

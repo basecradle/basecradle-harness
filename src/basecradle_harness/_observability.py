@@ -1143,7 +1143,11 @@ def log_llm_call(
             cost_basis=cost_basis(cost),
             # Only on billed tokens with no cost: a figure that exists is never also reported
             # missing, and a call that reported no usage has nothing a price was missing for.
-            cost_gap=cost_gap if counts and _money(cost) is None else None,
+            cost_gap=(
+                cost_gap
+                if counts and _money(cost) is None and outcome not in (RETRYING, FAILED)
+                else None
+            ),
             outcome=outcome,
             category=slug(category),
             attempt=attempt,
@@ -1441,7 +1445,7 @@ NOT_REPORTED = "not_reported"
 #: and a search's **grounding** fee are the charges; a model the rate table does not carry, a tier
 #: (or long-context band) it does not carry, and a host whose prices are not the table's are the
 #: reasons. A price read live from the vendor rather than from a table adds one more (issue #844):
-#: the price source itself could not be read on this wake.
+#: the price source itself has not been read (issue #874: no longer held unread for the wake).
 TOKENS_CHARGE = "tokens"
 GROUNDING_CHARGE = "grounding"
 UNKNOWN_MODEL = "unknown_model"

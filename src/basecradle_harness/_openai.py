@@ -225,6 +225,11 @@ _AFFINITY: dict[tuple[str, str], _Affinity | None] = {
 #: request (and up to `METADATA_TIMEOUT` of waiting) on every call.
 LIST_REREAD_AFTER = 5.0
 LIST_REREAD_CAP = 300.0
+#: The least wait after a failed read, as a multiple of how long that read took (issue #874). A read
+#: is synchronous, after a call has answered, and is allowed `METADATA_TIMEOUT`: against a list that
+#: hangs, a wait shorter than the read would spend most of the wake waiting on it. Four times the
+#: read keeps the reads under a fifth of the wake, whatever the list does.
+LIST_REREAD_SLOWDOWN = 4.0
 #: The oldest a list another catalog in this process read may be and still price a call this one
 #: cannot (issue #874). A fleet wake is one process and reads its own list, so this bounds only a
 #: long-lived library caller: a list read seconds ago is the price a call made now was billed at,
@@ -257,8 +262,9 @@ class ModelCatalog:
     adapters ask.
 
     **A failed read is never held for the wake.** The next ask at least `LIST_REREAD_AFTER` seconds
-    later reads again, the wait doubling up to `LIST_REREAD_CAP`, and the first read that answers is
-    held from then on. Until one does, a call is priced from the list this process last read on the
+    later reads again, the wait doubling up to `LIST_REREAD_CAP` and never shorter than
+    `LIST_REREAD_SLOWDOWN` times the failed read took, and the first read that answers with a model
+    on it is held from then on. Until one does, a call is priced from the list this process last read on the
     same host with the same key, when that is no older than `LIST_FALLBACK_MAX_AGE`; a call with
     neither is unpriced, and its line says why (``cost_gap=rates_unavailable``).
     """
@@ -293,15 +299,16 @@ class ModelCatalog:
             try:
                 rows = self._read(client)
             except Exception as exc:  # noqa: BLE001 - a price list must never break a wake
-                self._next_read = self._clock() + self._backoff
+                ended = self._clock()
+                self._next_read = ended + max(self._backoff, LIST_REREAD_SLOWDOWN * (ended - now))
                 self._backoff = min(self._backoff * 2, LIST_REREAD_CAP)
                 if not self._warned:
                     self._warned = True
                     _log.warning(
                         "Could not read the model list from %s (%s). Until a later read answers, "
                         "a call is priced from the list this process last read there if it is "
-                        "under %d s old, and otherwise carries no cost= (cost_gap=%s), and the "
-                        "context limit falls to its floor.",
+                        "under %d s old, and otherwise carries no cost= (cost_gap=%s). The "
+                        "context limit falls to its floor for this wake.",
                         base_url,
                         scrub(str(exc)),  # a library caller's own handler has no scrub (#857)
                         LIST_FALLBACK_MAX_AGE,
@@ -316,19 +323,26 @@ class ModelCatalog:
                 return rows
         with _LAST_LISTS_LOCK:
             last = _LAST_LISTS.get(owner)
-        if last is not None and self._clock() - last[0] <= LIST_FALLBACK_MAX_AGE:
+        if last is not None and 0 <= self._clock() - last[0] <= LIST_FALLBACK_MAX_AGE:
             return last[1]
         return None
 
     @staticmethod
     def _read(client: Any) -> dict[str, Mapping[str, Any]]:
-        """One read of the list, as rows by id; raises on anything that is not the list."""
+        """One read of the list, as rows by id; raises on anything that is not the list.
+
+        A list with no model on it is not the list: the agent's own model is served by this host,
+        so an empty answer is the vendor failing, and holding it would unprice the wake exactly as
+        a failed read once did (every call ``unknown_model``) and replace the process's good list.
+        """
         page = client.models.list(timeout=METADATA_TIMEOUT)
         rows: dict[str, Mapping[str, Any]] = {}
         for item in page:
             row = item.model_dump() if hasattr(item, "model_dump") else item
             if isinstance(row, Mapping) and isinstance(row.get("id"), str):
                 rows[row["id"]] = row
+        if not rows:
+            raise ValueError("the models list named no model")
         return rows
 
 
