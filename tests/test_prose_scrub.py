@@ -44,7 +44,7 @@ from basecradle_harness._observability import (
     kv,
     log_handler,
 )
-from basecradle_harness._openai import ModelCatalog, OpenAIProvider
+from basecradle_harness._openai import ModelCatalog, OpenAIProvider, list_owner
 from basecradle_harness._openrouter import OpenRouterProvider
 from basecradle_harness._session import Session
 from basecradle_harness._tools import ToolRegistry
@@ -355,9 +355,13 @@ def test_every_direct_write_of_an_error_scrubs_it():
 # --- a sentinel wake of every prose site the issue named ------------------------------------------
 
 
+_REFUSELESS = "https://api.refuseless.com/v1"
+_REFUSELESS_OWNER = list_owner(_REFUSELESS, "sk-rl-0123456789abcdef0123456789abcdef")
+
+
 def test_the_refuseless_model_list(journal):
     client = SimpleNamespace(models=SimpleNamespace(list=lambda **_: (_ for _ in ()).throw(Leak())))
-    assert ModelCatalog().rows(client, "https://api.refuseless.com/v1") is None
+    assert ModelCatalog().rows(client, _REFUSELESS, _REFUSELESS_OWNER) is None
     _assert_clean(journal(), "Could not read the model list from https://api.refuseless.com/v1")
 
 
@@ -366,7 +370,7 @@ def test_the_refuseless_model_list_is_scrubbed_for_a_library_callers_handler(cap
     still renders no key (the refuseless agent's first wake reads this list)."""
     caplog.set_level(logging.WARNING, logger="basecradle_harness")
     client = SimpleNamespace(models=SimpleNamespace(list=lambda **_: (_ for _ in ()).throw(Leak())))
-    ModelCatalog().rows(client, "https://api.refuseless.com/v1")
+    ModelCatalog().rows(client, _REFUSELESS, _REFUSELESS_OWNER)
     (record,) = [r for r in caplog.records if "model list" in r.getMessage()]
     assert not any(secret in record.getMessage() for secret in SECRETS), record.getMessage()
 

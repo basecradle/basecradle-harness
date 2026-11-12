@@ -78,6 +78,7 @@ def test_one_real_call_is_priced_from_the_vendors_own_list(monkeypatch, caplog):
     assert _field(llm, "provider") == "refuseless"
     assert _field(llm, "model") == MODEL
     assert _field(llm, "cost_basis") == "computed"
+    assert _field(llm, "cost_gap") is None  # issue #874: a priced call names no gap
 
     # The vendor's list, read by a client of the test's own: the harness's parser is not the judge.
     with openai.OpenAI(api_key=KEY, base_url=HOST) as client:
@@ -132,6 +133,7 @@ def test_a_real_responses_call_is_priced_with_its_cached_split(monkeypatch, capl
         print(f"\n{llm}")
         assert _field(llm, "provider") == "refuseless"
         assert _field(llm, "cost_basis") == "computed"
+        assert _field(llm, "cost_gap") is None  # issue #874: a priced call names no gap
         generation = _field(llm, "generation_id") or ""
         assert generation.startswith("resp"), llm  # the Responses shape, not a chat completion
         tokens_in, tokens_out = int(_field(llm, "tokens_in")), int(_field(llm, "tokens_out"))
@@ -194,5 +196,6 @@ def test_a_real_responses_call_takes_a_charter_a_tool_and_a_tool_round_trip(monk
     (llm,) = [line for line in lines if line.startswith("llm ")]
     print(llm)
     assert _field(llm, "cost_basis") == "computed"
+    assert _field(llm, "cost_gap") is None  # issue #874: a priced call names no gap
     assert (_field(llm, "generation_id") or "").startswith("resp"), llm
     assert not [line for line in lines if line.startswith("cost unpriced")], lines

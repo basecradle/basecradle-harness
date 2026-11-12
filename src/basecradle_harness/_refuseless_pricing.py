@@ -8,7 +8,8 @@ does publish is a ``pricing`` object on every model of ``GET /v1/models``, added
 BaseCradle's request so that its price could be read rather than transcribed. So this module is
 deliberately **not** a rate table, and there is no ``_refuseless_rates.py``: a hand copy of a price
 the vendor publishes live would only be a second, rotting statement of it (@origin). The adapter
-reads the list once per wake per key (`_openai.ModelCatalog`) and hands each row here.
+reads the list once per wake per key (`_openai.ModelCatalog`), again after a backoff when a read
+fails (issue #874), and hands each row here.
 
 The rules every rate table keeps hold here too:
 
@@ -16,7 +17,9 @@ The rules every rate table keeps hold here too:
   with no ``pricing``, a ``currency`` other than ``USD``, a rate the call needs that is missing or
   not a non-negative number, a usage block missing either count (`usage_of`): each returns no cost, and the adapter
   states the gap once per wake as a ``cost unpriced charge=tokens`` WARNING. Nothing falls back to a
-  constant or to a price read on an earlier wake.
+  constant. The one list read elsewhere that may price a call is the one this process read on the
+  same host with the same key, no older than `_openai.LIST_FALLBACK_MAX_AGE`, for a catalog whose
+  own read failed (issue #874): the vendor's own figure, read moments before, is not an estimate.
 - **The arithmetic is the call's own facts × the vendor's own rates.** The top-level rates are the
   **effective** price in US dollars per million tokens, discounts applied; ``discounted`` and
   ``regular`` (the list price) are informational and never read.
