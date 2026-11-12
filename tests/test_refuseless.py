@@ -41,6 +41,7 @@ from basecradle_harness._describer import (
     Describer,
     describer_from_env,
 )
+from basecradle_harness._exceptions import ProviderResponseError
 from basecradle_harness._messages import ImageContent
 from basecradle_harness._observability import ComputedCost, capture_llm_call, log_llm_call
 from basecradle_harness._openai import (
@@ -902,19 +903,238 @@ def test_a_priced_call_carries_no_gap():
     assert "cost_gap" not in line
 
 
-@pytest.mark.parametrize(
-    "listed",
-    [_models(_row(OTHER, PLAIN)), _models(_row(MODEL, None))],
-    ids=["unknown_model", "not_reported"],
+# Issue #876. A list read that **answered** was held for the wake whatever it said, and a gap in the
+# row it held (no price for the model, no row at all) was one WARNING per wake and nothing on any
+# call's line: on 2026-11-11 a wake across a vendor gateway outage logged 27 of 27 answered,
+# billed calls with no `cost=` and no line saying so, while another had 1 of 7, and the two read
+# alike. Every gap is now counted on its own line, and a row that could not price a call is read
+# again, the lesson #874 applied to a read that answered.
+
+#: A row the vendor serves with no usable price: the shape a list read during the outage can hold.
+UNPRICED_LIST = _models(_row(MODEL, None))
+NOT_REPORTED_GAP = (
+    f"cost unpriced provider=refuseless model={MODEL} charge=tokens reason=not_reported"
 )
-def test_a_gap_in_the_row_is_the_once_per_wake_line_alone(gaps, listed):
-    """Only the gap that comes and goes within a wake is counted per call."""
+
+
+@pytest.mark.parametrize(
+    ("listed", "gap"),
+    [(UNPRICED_LIST, "not_reported"), (_models(_row(OTHER, PLAIN)), "unknown_model")],
+    ids=["no_price_on_the_row", "no_row"],
+)
+def test_a_list_that_could_not_price_a_call_is_read_again(gaps, listed, gap):
+    """The 27-of-27 wake: the list answered with nothing to price the model by, and was held."""
+    clock = _Clock()
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(
+            side_effect=[httpx.Response(200, json=listed), httpx.Response(200, json=LIST)]
+        )
+        start = clock.now
+        lines = _wake(router, clock, at=[start, start + 1, start + LIST_REREAD_AFTER, start + 9])
+        # The second call is inside the wait, so it sends no read; the third reads, and is priced.
+        assert models.call_count == 2
+    assert [_cost_of(line) for line in lines] == [None, None, 0.00022, 0.00022]
+    assert [f"cost_gap={gap} " in line for line in lines] == [True, True, False, False]
+    assert len(gaps()) == 1
+
+
+@pytest.mark.parametrize(
+    ("listed", "gap"),
+    [(UNPRICED_LIST, "not_reported"), (_models(_row(OTHER, PLAIN)), "unknown_model")],
+    ids=["no_price_on_the_row", "no_row"],
+)
+def test_every_call_the_list_cannot_price_says_so_on_its_own_line(gaps, listed, gap):
     clock = _Clock()
     with respx.mock(assert_all_mocked=True) as router:
         router.get(f"{HOST}/models").mock(return_value=httpx.Response(200, json=listed))
-        lines = _wake(router, clock, at=[clock.now, clock.now + 1])
-    assert all(_cost_of(line) is None and "cost_gap" not in line for line in lines)
+        lines = _wake(router, clock, at=[clock.now, clock.now + 1, clock.now + 2])
+    assert len(lines) == 3
+    for line in lines:
+        assert _cost_of(line) is None
+        assert "cost_basis" not in line
+        assert f"tokens_total=1200 cost_gap={gap} outcome=ok" in line
     assert len(gaps()) == 1
+
+
+def test_a_row_that_never_states_a_price_is_read_again_on_the_failed_reads_backoff():
+    """A model the vendor lists without a price costs a read per backoff, never one per call."""
+    clock = _Clock()
+    catalog = ModelCatalog(clock=clock)
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(
+            return_value=httpx.Response(200, json=UNPRICED_LIST)
+        )
+        router.post(f"{HOST}/chat/completions").mock(
+            return_value=httpx.Response(200, json=_reply())
+        )
+        adapter = _adapter(catalog=catalog)
+        waits = []
+        for _ in range(9):
+            adapter.chat([Message.user("hi")])
+            reads = models.call_count
+            wait = catalog._next_read - clock.now
+            # A call an instant before the wait is over sends no read; one at the wait reads again.
+            clock.now += wait - 0.001
+            adapter.chat([Message.user("hi")])
+            assert models.call_count == reads
+            clock.now += 0.001
+            waits.append(wait)
+        adapter.close()
+    assert waits[:4] == [LIST_REREAD_AFTER * 2**n for n in range(4)]
+    assert waits[-1] == LIST_REREAD_CAP
+
+
+def test_a_reread_that_fails_keeps_the_list_that_answered(gaps):
+    """Re-asking never makes a call worse off: the held list still prices what it priced."""
+    clock = _Clock()
+    other_reply = _reply(model=OTHER)
+    listed = _models(_row(OTHER, PLAIN), _row(MODEL, None, context=524288))
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(
+            side_effect=[httpx.Response(200, json=listed), httpx.Response(503, json={})]
+        )
+        router.post(f"{HOST}/chat/completions").mock(
+            side_effect=[
+                httpx.Response(200, json=_reply()),
+                httpx.Response(200, json=other_reply),
+                httpx.Response(200, json=_reply()),
+            ]
+        )
+        adapter = _adapter(catalog=ModelCatalog(clock=clock))
+        with capture_llm_call() as first:
+            adapter.chat([Message.user("hi")])
+        clock.now += LIST_REREAD_AFTER
+        # The re-read fails: the row it held still prices the other model, and the context limit
+        # still comes from it.
+        with capture_llm_call() as second:
+            adapter.chat([Message.user("hi")])
+        with capture_llm_call() as third:
+            adapter.chat([Message.user("hi")])
+        assert adapter.context_limit() == 524288
+        adapter.close()
+        assert models.call_count == 2
+    assert (first.cost, first.cost_gap) == (None, "not_reported")
+    assert second.cost == pytest.approx(0.00022)
+    assert (third.cost, third.cost_gap) == (None, "not_reported")
+    # Never `rates_unavailable`: a list was read, and nothing warns that one could not be.
+    assert gaps() == [NOT_REPORTED_GAP]
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"completion_tokens": 200},
+        {**USAGE, "prompt_tokens_details": {"cache_write_tokens": 10}},
+        {**USAGE, "prompt_tokens_details": {"cache_write_tokens": -1}},
+    ],
+    ids=["a_count_missing", "a_cache_write", "an_unreadable_detail"],
+)
+def test_a_gap_in_the_calls_own_usage_is_counted_and_never_reread(gaps, usage):
+    """No list can price what the call did not state, so asking the vendor's list again is waste."""
+    clock = _Clock()
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(return_value=httpx.Response(200, json=LIST))
+        router.post(f"{HOST}/chat/completions").mock(
+            return_value=httpx.Response(200, json=_reply(usage=usage))
+        )
+        adapter = _adapter(catalog=ModelCatalog(clock=clock))
+        calls = []
+        for _ in range(3):
+            with capture_llm_call() as call:
+                adapter.chat([Message.user("hi")])
+            calls.append(call)
+            clock.now += LIST_REREAD_CAP
+        adapter.close()
+        assert models.call_count == 1
+    assert [(call.cost, call.cost_gap) for call in calls] == [(None, "not_reported")] * 3
+    assert gaps() == [NOT_REPORTED_GAP]
+
+
+def test_the_wake_across_the_outage_reads_as_what_it_was(gaps, caplog):
+    """Wake B of issue #876, call by call: a usage-less `fallback` attempt, then answered calls
+    priced from a list that answered without a price for the model.
+
+    The fallback reported no usage, so it has no tokens a price is missing for and states no gap.
+    Before, its ``not_reported`` WARNING was written first, and being once per wake it stood for
+    the answered calls' real gap too, with nothing on their lines: 23 unpriced calls read alike to
+    one. Now each answered call says so, and the list is read again until it prices them.
+    """
+    caplog.set_level(logging.INFO, logger="basecradle_harness")
+    clock = _Clock()
+    unreadable = {**completion(content="ok"), "choices": [], "model": MODEL}
+    unreadable.pop("usage", None)
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(
+            side_effect=[httpx.Response(200, json=UNPRICED_LIST), httpx.Response(200, json=LIST)]
+        )
+        router.post(f"{HOST}/chat/completions").mock(
+            side_effect=[httpx.Response(200, json=unreadable)]
+            + [httpx.Response(200, json=_reply())] * 3
+        )
+        adapter = _adapter(catalog=ModelCatalog(clock=clock))
+        # The engine would retry it; the attempt's own billed line is what is under test here.
+        with pytest.raises(ProviderResponseError):
+            adapter.chat([Message.user("hi")])
+        assert not gaps()
+        for moment in (1, 2, LIST_REREAD_AFTER + 1):
+            clock.now = 1000.0 + moment
+            adapter.chat([Message.user("hi")])
+        adapter.close()
+        assert models.call_count == 2
+    llm = [plain(r.getMessage()) for r in caplog.records if r.getMessage().startswith("llm ")]
+    fallback, *lines = llm
+    assert "outcome=fallback" in fallback and "cost_gap" not in fallback
+    assert [_cost_of(line) for line in lines] == [None, None, 0.00022]
+    assert [" cost_gap=not_reported " in line for line in lines] == [True, True, False]
+    assert gaps() == [NOT_REPORTED_GAP]
+    assert any(
+        r.getMessage() == f"Read the model list from {HOST} again, after it could not price a call"
+        for r in caplog.records
+    )
+
+
+def test_one_cached_call_on_a_row_with_no_cached_rate_is_the_one_line_that_says_so(gaps):
+    """The 1-of-7 shape: the calls that cached nothing are priced, and the one that cached is
+    counted on its own line rather than hidden behind a WARNING that reads like the whole wake's."""
+    clock = _Clock()
+    uncached = {key: value for key, value in PLAIN.items() if key != "cached_input_per_m"}
+    cached = {**RESPONSES_USAGE, "input_tokens_details": {"cached_tokens": 24}}
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(
+            side_effect=[
+                httpx.Response(200, json=_models(_row(MODEL, uncached))),
+                httpx.Response(200, json=LIST),
+            ]
+        )
+        router.post(f"{HOST}/responses").mock(
+            side_effect=[
+                httpx.Response(200, json=_responses_reply()),
+                httpx.Response(200, json=_responses_reply(usage=cached)),
+                httpx.Response(200, json=_responses_reply()),
+                httpx.Response(200, json=_responses_reply(usage=cached)),
+            ]
+        )
+        adapter = OpenAIProvider(
+            MODEL,
+            api_key=FAKE_KEY,
+            base_url=HOST,
+            provider=VENDOR,
+            surface="responses",
+            catalog=ModelCatalog(clock=clock),
+        )
+        calls = []
+        for moment in (0, 1, 2, LIST_REREAD_AFTER + 1):
+            clock.now = 1000.0 + moment
+            with capture_llm_call() as call:
+                adapter.chat([Message.user("hi")])
+            calls.append(call)
+        adapter.close()
+        # The row lacked the rate the cached call needed, so the list was read again, and the
+        # read that stated it priced the next cached call.
+        assert models.call_count == 2
+    assert [call.cost_gap for call in calls] == [None, "not_reported", None, None]
+    assert [call.cost is None for call in calls] == [False, True, False, False]
+    assert gaps() == [NOT_REPORTED_GAP]
 
 
 def test_the_wait_between_reads_doubles_up_to_its_cap():

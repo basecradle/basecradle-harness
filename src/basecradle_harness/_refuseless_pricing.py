@@ -149,13 +149,23 @@ def _optional(details: Mapping[str, Any], key: str) -> int | None:
     return 0 if value is None else _count(value)
 
 
+def beyond_any_row(usage: Usage | None) -> bool:
+    """Whether the call's own usage leaves it unpriceable by **any** row (issue #876).
+
+    A block `usage_of` could not read, and a cache write, which the vendor publishes no rate for.
+    Every other way `call_cost` refuses is the row's (no cached rate for a call that cached), and a
+    later read of the list could answer it, so the adapter asks again for those and never for these.
+    """
+    return usage is None or usage.cache_write > 0
+
+
 def call_cost(pricing: Pricing, usage: Usage | None) -> ComputedCost | None:
     """This call's dollars at `pricing`, or ``None`` when the arithmetic would need a guess.
 
     ``None`` for a call with no counts, a call that reports cached tokens on a row with no cached
     rate, and a call that reports a cache write (a charge the vendor publishes no rate for).
     """
-    if usage is None or usage.cache_write > 0:
+    if beyond_any_row(usage):
         return None
     cached = min(usage.cached, usage.input)
     if cached and pricing.cached_input is None:

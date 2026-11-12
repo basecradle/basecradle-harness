@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.191.0] - 2026-11-12
+
+### Fixed: A refuseless price list that answered without a price no longer unprices the rest of the wake, and every unpriced call says why on its own line (issue #876)
+
+On 2026-11-11 a refuseless wake across a vendor gateway outage logged 23 answered, billed calls with token counts and no `cost=`, and no line on any of them saying why; the next process, three seconds later, priced the same model. The wake's list read fell inside the outage and **answered** with no usable price on the model's row, and 0.190.0 re-reads only a list that *failed*, so the row was held for the wake. The once-per-wake `cost unpriced … reason=not_reported` WARNING that should have named it had already been written by the wake's first attempt, an unreadable `fallback` answer with no usage, so the 23 calls' gap had no line of its own, and the wake read like another that had one unpriced attempt.
+
+- **A list that could not price a call is read again.** A gap its row decides (no row for the model, no usable US-dollar rate, no cached rate for a call that cached) re-reads the list on the backoff 0.190.0 gives a failed read (5 s doubling to 5 minutes). The held list keeps pricing what it can until a read answers, and a re-read that fails takes nothing away. A gap the call's own usage decides (a missing count, a cache write, an unreadable detail) never re-reads, because no list could answer it.
+- **Every unpriced call says so on its own line**: `cost_gap=` now carries `unknown_model` and `not_reported` as well as `rates_unavailable`, the same reason as the `cost unpriced` WARNING, which is still written once per wake. `docs/telemetry.md` changes with it.
+- **A call that reported no usage states no gap.** It has no tokens a price is missing for, and its WARNING was what hid the real one.
+- The describer's line carries the new values too. OpenRouter and OpenAI's rate tables are not affected.
+
 ## [0.190.0] - 2026-11-11
 
 ### Fixed: A refuseless price list that could not be read no longer unprices the rest of the wake (issue #874)

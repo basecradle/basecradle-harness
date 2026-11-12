@@ -104,6 +104,7 @@ from basecradle_harness._observability import (
     stamp_generation_id,
     tally_server_tools,
     token_counts,
+    usage_reported,
 )
 from basecradle_harness._openai_rates import (
     call_cost,
@@ -126,8 +127,8 @@ from basecradle_harness._openai_wire import (
     reasoning_to_send_back,
     server_tool_uses,
 )
+from basecradle_harness._refuseless_pricing import beyond_any_row, pricing_of
 from basecradle_harness._refuseless_pricing import call_cost as listed_call_cost
-from basecradle_harness._refuseless_pricing import pricing_of
 from basecradle_harness._refuseless_pricing import usage_of as listed_usage
 from basecradle_harness._timeouts import METADATA_TIMEOUT, call_timeout, output_cap
 
@@ -267,6 +268,12 @@ class ModelCatalog:
     on it is held from then on. Until one does, a call is priced from the list this process last read on the
     same host with the same key, when that is no older than `LIST_FALLBACK_MAX_AGE`; a call with
     neither is unpriced, and its line says why (``cost_gap=rates_unavailable``).
+
+    **Nor is a list that answered and could not price a call** (issue #876). A read made during a
+    vendor outage answered with a row that stated no usable price, and holding it unpriced the
+    other 23 calls of that wake. So an adapter whose call the held list's row could not price
+    calls `recheck`, and the list is read again on the same backoff; the held list stays in use
+    until a read answers, and a read that fails meanwhile never takes it away.
     """
 
     def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
@@ -277,6 +284,9 @@ class ModelCatalog:
         self._backoff = LIST_REREAD_AFTER
         #: Whether the failure WARNING has been written, so an outage is one line, not one per read.
         self._warned = False
+        #: Whether the held list could not price a call, so the next ask past `_next_read` reads it
+        #: again rather than answering from it (`recheck`, issue #876).
+        self._recheck = False
         #: The ``cost unpriced`` gaps already stated against this list, for `OpenAIProvider._state_gap`.
         self.gaps: set[str] = set()
 
@@ -292,9 +302,9 @@ class ModelCatalog:
         (`list_owner`); each reader states its own consequence (`OpenAIProvider._listed_cost` a
         ``rates_unavailable`` gap, `context_limit` the floor).
         """
-        if self._rows is not None:
-            return self._rows
         now = self._clock()
+        if self._rows is not None and not (self._recheck and now >= self._next_read):
+            return self._rows
         if now >= self._next_read:
             try:
                 rows = self._read(client)
@@ -302,6 +312,10 @@ class ModelCatalog:
                 ended = self._clock()
                 self._next_read = ended + max(self._backoff, LIST_REREAD_SLOWDOWN * (ended - now))
                 self._backoff = min(self._backoff * 2, LIST_REREAD_CAP)
+                if self._rows is not None:
+                    # A re-read of a list that answered: what it priced, it still prices, so a
+                    # failure here takes nothing away and needs no line of its own.
+                    return self._rows
                 if not self._warned:
                     self._warned = True
                     _log.warning(
@@ -317,6 +331,12 @@ class ModelCatalog:
             else:
                 if self._warned:
                     _log.info("Read the model list from %s, so calls are priced again", base_url)
+                elif self._recheck:
+                    _log.info(
+                        "Read the model list from %s again, after it could not price a call",
+                        base_url,
+                    )
+                self._warned = self._recheck = False
                 self._rows = rows
                 with _LAST_LISTS_LOCK:
                     _LAST_LISTS[owner] = (self._clock(), rows)
@@ -326,6 +346,22 @@ class ModelCatalog:
         if last is not None and 0 <= self._clock() - last[0] <= LIST_FALLBACK_MAX_AGE:
             return last[1]
         return None
+
+    def recheck(self) -> None:
+        """The held list could not price a call from its row: read it again (issue #876).
+
+        Called by an adapter for a gap the list's row decides (no row for the model, no usable
+        price, no cached rate for a call that cached), never for one the call's own usage decides,
+        which no read could answer. The next ask at least the current backoff from now reads again,
+        and the backoff doubles up to `LIST_REREAD_CAP`, so a model the vendor lists without a price
+        costs one read per backoff, never one per call. Nothing happens while a re-read is already
+        due, or when no list is held (a catalog with none is already reading again).
+        """
+        if self._rows is None or self._recheck:
+            return
+        self._recheck = True
+        self._next_read = self._clock() + self._backoff
+        self._backoff = min(self._backoff * 2, LIST_REREAD_CAP)
 
     @staticmethod
     def _read(client: Any) -> dict[str, Mapping[str, Any]]:
@@ -818,27 +854,42 @@ class OpenAIProvider:
         token counts in the usage block, a rate for a cache write (`_refuseless_pricing.pricing_of`,
         `usage_of` and `call_cost` say exactly when).
 
-        The second value is the line's ``cost_gap``: ``rates_unavailable`` on **every** call made
-        while no list could be read (issue #874), because that is the one gap that comes and goes
-        within a wake, so a count of calls is the only honest measure of it. The other gaps are a
-        property of the model's row and recur on every call alike, so their once-per-wake line says
-        all there is.
+        The second value is the line's ``cost_gap``, the same reason on **every** call it costs a
+        figure (issues #874, #876): any gap here can come and go within a wake (the list is read
+        again, the response names another model, one call caches and the next does not), so a
+        count of calls is the only honest measure of it, and the once-per-wake line alone made a
+        wake with one unpriced call read like one with all of them unpriced.
+
+        A gap the row decides asks the catalog to read the list again (`ModelCatalog.recheck`): a
+        list that answered during a vendor outage with no price on the row was held for the wake
+        and unpriced every call after it. A gap the call's own usage decides
+        (`_refuseless_pricing.beyond_any_row`) asks nothing, because no read could answer it. A
+        call that states no usage at all has no tokens a price is missing for, so it states no gap:
+        its ``not_reported`` WARNING was what made that wake's real gap unreadable, because the
+        WARNING is written once and the usage-less ``fallback`` attempt wrote it first.
         """
         stated = self._catalog_store.gaps
         rows = self._catalog()
         if rows is None:
             self._state_gap(TOKENS_CHARGE, RATES_UNAVAILABLE, stated=stated)
             return None, RATES_UNAVAILABLE
+        if not usage_reported(usage):
+            return None, None
         named = data.get("model")
         model = named if isinstance(named, str) and named else self.model
         row = rows.get(model)
         if row is None:
             self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL, model=model, stated=stated)
-            return None, None
+            self._catalog_store.recheck()
+            return None, UNKNOWN_MODEL
+        counts = listed_usage(usage)
         pricing = pricing_of(row)
-        cost = None if pricing is None else listed_call_cost(pricing, listed_usage(usage))
+        cost = None if pricing is None else listed_call_cost(pricing, counts)
         if cost is None:
             self._state_gap(TOKENS_CHARGE, NOT_REPORTED, model=model, stated=stated)
+            if not beyond_any_row(counts):
+                self._catalog_store.recheck()
+            return None, NOT_REPORTED
         return cost, None
 
     def _catalog(self) -> dict[str, Mapping[str, Any]] | None:
