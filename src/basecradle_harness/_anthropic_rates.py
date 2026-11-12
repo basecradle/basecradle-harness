@@ -31,7 +31,8 @@ What is priced, and what is not
   ``usage.server_tool_use.web_search_requests``, on the call's ``web_search`` ``tool`` line
   (``kind=search.web``, the head the fleet's tool spend is read from). The search results it feeds back are already in the
   call's input tokens. "If an error occurs during web search, the web search will not be billed",
-  and the count Anthropic reports is the billed one.
+  and the count Anthropic reports is the billed one. Anthropic's own host only, as every rate here:
+  a gateway's searches are ``cost_gap=unpriced_host`` on that line (issue #880).
 - **Web fetch**: "no additional charges beyond standard token costs" — nothing to price.
 - **Not priced: code-execution container time on a request that declares neither web search nor web
   fetch.** With either of those declared "there are no additional charges for code execution tool

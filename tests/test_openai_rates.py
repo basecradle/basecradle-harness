@@ -351,12 +351,39 @@ def test_another_host_is_never_priced_and_says_so_once(router, caplog):
         provider.chat([Message.user("go")])
         provider.chat([Message.user("go")])
     assert all(" cost=" not in line for line in _lines(caplog, "llm "))
-    assert tool_lines(caplog)[0] == (
+    # The search fee is OpenAI's list price too, so every search on this host is a counted gap on its
+    # own line, and the gap is named once beside the tokens' (issue #880).
+    searches = [line for line in tool_lines(caplog) if line.startswith("tool name=web_search ")]
+    search = (
         "tool name=web_search executor=server provider=openai kind=search.web model=gpt-6-sol "
-        "count=1 outcome=ok generation_id=resp-fake0001"
+        "count=1 outcome=ok cost_gap=unpriced_host generation_id=resp-fake0001"
     )
+    assert searches == [search, search]
     assert _lines(caplog, "cost unpriced ") == [
-        "cost unpriced provider=openai model=gpt-6-sol charge=tokens reason=unpriced_host"
+        "cost unpriced provider=openai model=gpt-6-sol charge=tokens reason=unpriced_host",
+        "cost unpriced provider=openai model=gpt-6-sol charge=search reason=unpriced_host",
+    ]
+
+
+def test_a_search_on_another_host_that_reported_no_usage_states_only_the_searchs_gap(
+    router, caplog
+):
+    """A call with no usage has no tokens a price is missing for, so it states no tokens gap — even
+    when it searched; the search's own fee is still a counted gap (issue #880)."""
+    provider = OpenAIProvider(
+        model="gpt-6-sol", api_key=FAKE_KEY, base_url="https://proxy.example.com/v1"
+    )
+    body = _body(out_web_search_call(), out_message("x"))
+    del body["usage"]
+    router.post("https://proxy.example.com/v1/responses").mock(
+        return_value=httpx.Response(200, json=body)
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("go")])
+    (search,) = [line for line in tool_lines(caplog) if line.startswith("tool name=web_search ")]
+    assert " cost_gap=unpriced_host " in search, search
+    assert _lines(caplog, "cost unpriced ") == [
+        "cost unpriced provider=openai model=gpt-6-sol charge=search reason=unpriced_host"
     ]
 
 

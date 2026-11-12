@@ -879,19 +879,20 @@ class GoogleProvider:
         queries = _grounding_queries(grounding)
         if sources:
             fee = grounding_cost(self.model, queries=queries, sourced=True)
+            fee_gap = None
             if fee is None:
                 # No published scheme for the model, or a per-query scheme whose queries the
-                # response did not list to count.
-                self._state_gap(
-                    GROUNDING_CHARGE,
-                    UNKNOWN_MODEL if not grounding_known(self.model) else NOT_REPORTED,
-                )
+                # response did not list to count — once per wake here, and on this search's own
+                # `tool` line every time (issue #880).
+                fee_gap = UNKNOWN_MODEL if not grounding_known(self.model) else NOT_REPORTED
+                self._state_gap(GROUNDING_CHARGE, fee_gap)
             meter_tool(
                 provider=self.provider,
                 kind=SEARCH_KIND,
                 model=self.model,
                 count=grounding_units(self.model, queries),
                 cost=fee,
+                cost_gap=fee_gap,
             )
         parts = getattr(getattr(candidate, "content", None), "parts", None) or []
         text = "".join(

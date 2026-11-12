@@ -263,6 +263,7 @@ def test_a_web_search_runs_server_side_and_its_fee_is_logged(caplog):
     # The fee is $10 per 1,000 *billed* searches; a failed use is counted and not billed.
     billed = sum(float(_field(line, "cost") or 0) for line in tools) / 0.01
     assert billed == pytest.approx(round(billed)) and 1 <= round(billed) <= uses, tools
+    assert all(_field(line, "cost_gap") is None for line in tools), tools  # issue #880
     # With dynamic filtering (web_search_20260318) a search the model runs from Anthropic's code
     # execution comes back with no citation blocks, so no Sources: footer is built (measured
     # 2026-10-31); since issue #740 it may also call the search directly. Neither is pinned: what

@@ -202,14 +202,16 @@ def test_a_web_search_logs_one_priced_line_per_search_call(caplog):
     searches = float(_field(line, "cost")) / 0.01
     assert searches == pytest.approx(round(searches)) and 1 <= round(searches) <= uses, line
     assert _field(line, "cost_basis") == "computed"
+    assert _field(line, "cost_gap") is None, line  # issue #880: a priced search names no gap
     assert _field(line, "generation_id") == _field(_line(caplog, "llm "), "generation_id")
 
 
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
-def test_an_images_response_carries_the_usage_split_its_price_reads():
+def test_an_images_response_carries_the_usage_split_its_price_reads(caplog):
     """The Images API reports image and text input apart; without that split there is no price."""
     from openai import OpenAI
 
+    from basecradle_harness._images import GenerateImageTool
     from basecradle_harness._openai_rates import image_cost
 
     client = OpenAI(api_key=KEY, max_retries=0)
@@ -220,6 +222,11 @@ def test_an_images_response_carries_the_usage_split_its_price_reads():
     assert usage is not None and usage.input_tokens_details.text_tokens > 0
     assert usage.output_tokens > 0
     assert image_cost("gpt-image-2.5-flare", usage.model_dump()) is not None
+    # The tool's own reading of the live response prices it and states no gap (issue #880).
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        cost, gap = GenerateImageTool(api_key=KEY)._cost(response)
+    assert cost is not None and gap is None
+    assert not [r for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
 
 
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")
@@ -231,6 +238,8 @@ def test_a_transcription_reports_the_duration_its_price_reads():
 
     from openai import OpenAI
 
+    from basecradle_harness._audio import Transcriber
+    from basecradle_harness._observability import tool_meter
     from basecradle_harness._openai_rates import transcription_cost
 
     buffer = io.BytesIO()
@@ -249,6 +258,12 @@ def test_a_transcription_reports_the_duration_its_price_reads():
     assert transcription_cost("gpt-transcribe", usage.model_dump()) == pytest.approx(
         usage.seconds / 60 * 0.0045
     )
+    # Through the harness's own transcriber, the run's `tool` line is priced and names no gap
+    # (issue #880).
+    with tool_meter() as meter:
+        Transcriber(api_key=KEY).transcribe(buffer.getvalue(), "tone.wav", "audio/wav", KEY)
+    fields = meter.fields()
+    assert fields["cost"] is not None and fields["cost_gap"] is None, fields
 
 
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")

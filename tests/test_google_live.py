@@ -330,3 +330,4 @@ def test_a_search_is_grounded_cited_and_priced(caplog):
     assert queries >= 1, fee
     assert fee["cost"] == pytest.approx(queries * 0.014), fee
     assert isinstance(fee["cost"], ComputedCost), fee
+    assert fee["cost_gap"] is None, fee  # a priced search names no gap (issue #880)

@@ -159,7 +159,9 @@ is that line's ``outcome=error reason=<error_code>``. Container time, which no r
 Anthropic's own host only: a call through any other ``AI_BASE_URL`` carries no ``cost=``, stated once
 per wake as ``cost unpriced charge=tokens reason=unpriced_host``, a model the table lacks as
 ``reason=unknown_model``, and a tier, speed or geography it does not carry as ``reason=unpriced_tier``;
-each call a gap covers also names it on its own line, ``cost_gap=<reason>`` (issue #878). ``provider=anthropic``; no ``endpoint=``, the vendor *is* the endpoint; where
+each call a gap covers also names it on its own line, ``cost_gap=<reason>`` (issue #878). The search
+fee is Anthropic's list price too, so a gateway's ``web_search`` line carries ``cost_gap=unpriced_host``
+and no figure, beside one ``cost unpriced charge=search`` line per wake (issue #880). ``provider=anthropic``; no ``endpoint=``, the vendor *is* the endpoint; where
 the call ran (``inference_geo``) is ``residency=``.
 
 Stateless per turn: the full conversation is sent every call and the harness owns history. This
@@ -218,6 +220,7 @@ from basecradle_harness._observability import (
     FALLBACK,
     NOT_REPORTED,
     REFUSED,
+    SEARCH_CHARGE,
     TOKENS_CHARGE,
     TRUNCATED,
     UNKNOWN_MODEL,
@@ -470,7 +473,7 @@ class AnthropicProvider:
         #: The Models API record for this model, read once (`_model_info`).
         self._info: Any = None
         #: Models already warned about for having no rate, and gaps already stated, this wake.
-        self._unpriced: set[str] = set()
+        self._unpriced: set[tuple[str, str]] = set()
         self._gap_stated = False
         if client is not None:
             self._client = Sealed(client)
@@ -650,14 +653,22 @@ class AnthropicProvider:
             level=logging.WARNING if refused or unfinished or cut else logging.INFO,
         )
         tallies = _server_tallies(usage, [_raw(block) for block in response.content or ()])
-        # The fee is on the searches Anthropic billed — a failed one is not — never the tally.
+        # The fee is on the searches Anthropic billed — a failed one is not — never the tally. It
+        # is Anthropic's list price, so a gateway's searches are a counted gap, as its tokens are.
         billed = server_tool_requests(usage, "web_search_requests")
+        fees: dict[str, float | None] = {}
+        gaps: dict[str, str] = {}
+        if billed and priced_host(self.base_url):
+            fees["web_search"] = web_search_cost(billed)
+        elif billed:
+            gaps["web_search"] = self._state_gap(UNPRICED_HOST, charge=SEARCH_CHARGE)
         log_server_tools(
             tallies,
             provider=self.provider,
             model=self.model,
             generation_id=generation,
-            fees={"web_search": web_search_cost(billed) if billed else None},
+            fees=fees,
+            gaps=gaps,
         )
         return response
 
@@ -708,14 +719,14 @@ class AnthropicProvider:
             return None, UNPRICED_TIER
         return cost, None
 
-    def _state_gap(self, reason: str) -> None:
-        """One ``cost unpriced charge=tokens`` WARNING per gap per wake."""
-        if reason in self._unpriced:
-            return
-        self._unpriced.add(reason)
-        log_cost_unpriced(
-            provider=self.provider, model=self.model, charge=TOKENS_CHARGE, reason=reason
-        )
+    def _state_gap(self, reason: str, *, charge: str = TOKENS_CHARGE) -> str:
+        """One ``cost unpriced`` WARNING per gap per wake; `reason` back, for the line's ``cost_gap``."""
+        if (charge, reason) not in self._unpriced:
+            self._unpriced.add((charge, reason))
+            log_cost_unpriced(
+                provider=self.provider, model=self.model, charge=charge, reason=reason
+            )
+        return reason
 
     def _state_code_gap(self, blocks: Sequence[Mapping[str, Any]]) -> None:
         """One ``cost unpriced`` line per wake when code ran on a request whose container time Anthropic

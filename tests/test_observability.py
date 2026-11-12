@@ -611,8 +611,32 @@ def test_metered_work_lands_on_the_running_tools_meter():
         "model": "grok-imagine-image-2.0",
         "count": None,
         "cost": 0.02,
+        "cost_gap": None,
     }
     assert meter.failure is None
+
+
+def test_a_metered_gap_names_why_a_computed_fee_is_missing_and_never_beside_a_fee():
+    """Issue #880: the reason a tool could not price its work rides the meter to its `tool` line;
+    a priced unit carries none, and a summed run is unpriced by its first unpriced unit's reason."""
+    with (
+        tool_meter() as meter,
+        metered(provider="openai", kind="image.generate", model="gpt-image-9") as call,
+    ):
+        call.cost_gap = "unknown_model"
+    assert meter.fields()["cost"] is None and meter.fields()["cost_gap"] == "unknown_model"
+
+    with (
+        tool_meter() as meter,
+        metered(provider="openai", kind="image.generate", model="gpt-image-2.5-flare") as call,
+    ):
+        call.cost, call.cost_gap = ComputedCost(0.1), "unknown_model"
+    assert meter.fields()["cost_gap"] is None  # a fee and a gap never ride together
+
+    with tool_meter() as meter:
+        meter_tool(provider="google", kind="search.grounding", model="g", cost=ComputedCost(0.01))
+        meter_tool(provider="google", kind="search.grounding", model="g", cost_gap="not_reported")
+    assert meter.fields()["cost"] is None and meter.fields()["cost_gap"] == "not_reported"
 
 
 def test_a_block_that_never_prices_its_call_leaves_the_cost_absent():

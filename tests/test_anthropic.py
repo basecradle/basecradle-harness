@@ -861,6 +861,36 @@ def test_a_proxy_names_its_gap_on_every_call(router, caplog):
     ]
 
 
+def test_a_proxys_web_searches_are_a_counted_gap_never_anthropics_price(router, caplog):
+    """$10 per 1,000 searches is Anthropic's list price, so a gateway's searches carry no figure:
+    each call's `web_search` line says why, and the gap is named once (issue #880)."""
+    adapter = AnthropicProvider(
+        MODEL, api_key=FAKE_KEY, max_tokens=64, base_url="https://proxy.example.com"
+    )
+    searched = usage(server_tool_use={"web_search_requests": 2})
+    router.post("https://proxy.example.com/v1/messages").mock(
+        side_effect=[
+            reply(text("a"), used=searched, message_id="msg_01ProxySearchOne"),
+            reply(text("b"), used=searched, message_id="msg_01ProxySearchTwo"),
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        adapter.chat([Message.user("a")])
+        adapter.chat([Message.user("b")])
+    assert tool_lines(caplog) == [
+        (
+            "tool name=web_search executor=server provider=anthropic kind=search.web "
+            f"model=claude-haiku-5-5 count=2 outcome=ok cost_gap=unpriced_host generation_id={id_}"
+        )
+        for id_ in ("msg_01ProxySearchOne", "msg_01ProxySearchTwo")
+    ]
+    gaps = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
+    assert gaps == [
+        "cost unpriced provider=anthropic model=claude-haiku-5-5 charge=tokens reason=unpriced_host",
+        "cost unpriced provider=anthropic model=claude-haiku-5-5 charge=search reason=unpriced_host",
+    ]
+
+
 def test_a_priced_call_names_no_gap(router, provider, caplog):
     router.post(MESSAGES).mock(return_value=reply(text("ok")))
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):
