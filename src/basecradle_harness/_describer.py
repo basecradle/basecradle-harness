@@ -84,7 +84,7 @@ same bounded retry the reranker takes — at most two more attempts, at most thr
 the vendor's ``Retry-After`` preferred and clamped (`basecradle_harness._retry`). It is a different
 thing from the ``length`` re-budget above and the two must not be merged: a re-budget asks a
 **different** question and its extra call answered and was billed, so it earns its own ``llm`` line;
-a retry re-issues the **identical** question after a refusal that generated nothing, so its line is
+a retry re-issues the **identical** question after a refusal that returned no answer, so its line is
 an ``outcome=retrying`` WARNING with no tokens and no cost.
 
 The describer's output is **model-generated text about peer content**. It is injected as context
@@ -605,8 +605,8 @@ class Describer:
         "One call" means **one answer**, not one request: a transient refusal (a 429, a 5xx, a
         transport blip) is re-issued here under the shared bounded policy, and the ``llm`` line this
         writes describes the attempt that finally answered — with a ``duration=`` covering the whole
-        wait. A refused attempt writes an ``outcome=retrying`` WARNING instead, because it generated
-        nothing and was billed nothing, so it is not a call to count (issues #506, #782).
+        wait. A refused attempt writes an ``outcome=retrying`` WARNING instead, because it returned
+        no answer and no usage to price, so it is not a call to count (issues #506, #782).
         """
         try:
             provider = self._provider_for(budget)
@@ -627,8 +627,8 @@ class Describer:
         # It is *inside* `_attempt` rather than beside the `length` re-budget in `_answer`, and the two
         # are different things: a re-budget asks the model a **different** question (more room),
         # which is a second call that answered and was billed and therefore earns its own `llm`
-        # line; a retry re-issues the **identical** question after a refusal that generated nothing,
-        # which earns an `outcome=retrying` WARNING with nothing billed on it.
+        # line; a retry re-issues the **identical** question after a refusal that returned no answer,
+        # which earns an `outcome=retrying` WARNING with no cost on it.
         retry = Retry(
             provider=describe_provider(provider)[0],
             model=self.model,
@@ -692,7 +692,7 @@ class Describer:
                 else:
                     break
             # An answer the vendor billed and the adapter could not read has its own billed line;
-            # the decision below (retry, or give up) is a line of its own with nothing billed (#782).
+            # the decision below (retry, or give up) is a line of its own with no cost on it (#782).
             # The adapter says which it was: it records `fallback` exactly when it read the answer
             # and failed (`_observability.read_answer`); any other fault reached no answer.
             if call.outcome == FALLBACK:
@@ -744,7 +744,7 @@ class Describer:
         The adapter recorded the answer (its usage, its cost) before the read failed, so the vendor
         billed it: it is a call, and its line is ``outcome=fallback reason=invalid_response`` with
         that bill. Nothing is written when the attempt never reached an answer, because then there
-        is nothing billed to record and the failure line alone says what happened. An answer the
+        is no usage to record and the failure line alone says what happened. An answer the
         vendor cut off at the output cap says ``reason=truncated`` instead (issue #788).
         """
         if call.provider is not None:

@@ -659,7 +659,7 @@ def _helper_lines(caplog):
     """The final `llm` line of each attempt — **not** the ``outcome=retrying`` ones (#506, #782).
 
     A retry rides the same head, and counting one as a describe is the mistake the fleet's
-    ``helper_calls`` excludes: a refused attempt generated nothing and was billed nothing.
+    ``helper_calls`` excludes: a refused attempt returned no answer and no usage to price.
     """
     return [
         r
@@ -1145,8 +1145,8 @@ def test_a_transient_429_is_waited_out_and_the_brain_still_gets_its_eyes(caplog)
 
     assert vision.calls == 2
     assert delays == [1.0]
-    # One describe, one `llm` line — a refused attempt generated nothing and was billed nothing, so
-    # it is not a call to count. It gets an `outcome=retrying` WARNING instead.
+    # One describe, one `llm` line — a refused attempt returned no answer and no usage to price,
+    # so it is not a call to count. It gets an `outcome=retrying` WARNING instead.
     assert len(_helper_lines(caplog)) == 1
     assert "outcome=ok" in _helper_lines(caplog)[0].getMessage()
     retried = _retry_lines(caplog)
@@ -1214,7 +1214,7 @@ def test_a_re_budget_is_not_a_retry_and_keeps_its_own_llm_line(caplog):
 
     A `length` re-budget asks a **different** question and its extra call answered and was billed,
     so it writes its own `llm` line. A retry re-issues the **identical** question after a refusal
-    that generated nothing, so it writes an `outcome=retrying` WARNING with nothing billed on it. Folding
+    that returned no answer, so it writes an `outcome=retrying` WARNING with no cost on it. Folding
     them together to reach "one line per describe" would delete real spend from ``helper_cost``;
     folding them the other way would count a 429 as a call.
     """
@@ -1528,7 +1528,7 @@ def test_a_refusal_inside_a_describe_is_the_describes_own_refused_line(caplog):
 def test_an_answer_the_adapter_could_not_read_is_billed_once_then_decided(caplog):
     """The vendor answered and billed; the adapter could not read it (issue #782 review). The bill
     rides one `fallback reason=invalid_response` line, and each decision (retry, give up) is its own
-    line with nothing billed on it."""
+    line with no cost on it."""
     from basecradle_harness._exceptions import ProviderResponseError
     from basecradle_harness._observability import answered, log_llm_call
 
@@ -1586,7 +1586,7 @@ class CutOffProvider(FakeDescriberProvider):
 def test_a_raised_cut_off_is_re_budgeted_once_never_retried_at_the_same_budget(caplog):
     """The describer's remedy for a cut answer is its one larger budget (#488). Retrying the same
     budget buys the same cut: before the fix this made six calls, three at each budget, and its
-    give-up line said ``fallback`` with nothing billed on it."""
+    give-up line said ``fallback`` with no cost on it."""
     first, larger = CutOffProvider(), CutOffProvider()
     describer, asked = _describer(first, larger)
 

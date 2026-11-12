@@ -7,6 +7,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.193.1] - 2026-11-12
+
+### Fixed: The telemetry contract no longer says a failed or retried attempt is never billed (issue #882)
+
+`docs/telemetry.md` said of every `retrying` and `failed` line "nothing billed on it", and the README, the charter and several docstrings repeated it. That is a claim about the vendor's bill the harness cannot know, and a vendor contradicted it: refuseless settles a streamed request that failed after it began generating at its real token usage, minutes later (confirmed by its founder, 2026-11-12; one of 26 failed or retried attempts on 2026-11-11 was charged). What is true is narrower: such a line carries no cost because the attempt returned no usage to price, and a charge for it shows only in the vendor's own spend counter. Every place that made the claim now says that. Wording only: no line, field or value changed. Earlier entries below keep the wording they shipped with.
+
 ## [0.193.0] - 2026-11-12
 
 ### Fixed: An unpriced image, transcription or search fee says why on its own `tool` line, never in a sentence (issue #880)

@@ -57,7 +57,7 @@ vendor's own ``Retry-After`` preferred and clamped (`basecradle_harness._retry`)
 fallbacks of 2026-09-16 were every one of them a 429 that cleared inside ~1.3 seconds, and the
 founder's ruling is that a rerank which waits three seconds and works beats one that silently runs
 without the rerank. Each waited attempt writes its own ``outcome=retrying`` WARNING, which no series
-counts as a call because a refused call generated nothing and was billed nothing, while the one
+counts as a call because a refused call returned no answer and no usage to price, while the one
 final line below still says *what happened to the rerank*, once, with a ``duration=`` that
 includes every sleep.
 
@@ -546,8 +546,8 @@ class MemPalaceReranker:
         Every exit from this method is logged exactly once, on the one ``llm`` line —
         including the failures, and including a failure that still cost money (a call that answered
         with unusable JSON is billed, so its tokens and cost ride the line the same as a success).
-        **A retried attempt does not change that count** (issue #506): a refused call generated
-        nothing and was billed nothing, so it writes an ``outcome=retrying`` WARNING, which the
+        **A retried attempt does not change that count** (issue #506): a refused call returned
+        no answer and no usage to price, so it writes an ``outcome=retrying`` WARNING, which the
         fleet counts as no call. One rerank, one final line, whatever it took to get there, which is
         also what keeps ``memory_calls`` an honest count and the rerank-outcomes chart one bar per
         rerank.

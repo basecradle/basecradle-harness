@@ -85,9 +85,11 @@ inside the pinned list (issue #468).
 
 A retry is an outcome of the call, never a call
 -----------------------------------------------
-A failed attempt that never reached a model generated nothing and was billed nothing, so it is not a
-call and must join no series that counts calls. Since issue #782 it is written on the one ``llm``
-head with ``outcome=retrying``, and the final give-up with ``outcome=failed``. The fleet counts a
+A failed attempt returned no answer and no usage to price, so it is not a call, carries no cost, and
+must join no series that counts calls (a vendor may still bill one that failed after it began
+generating, which no ``llm`` line can show: `docs/telemetry.md` → Outcomes). Since issue #782 it is
+written on the one ``llm`` head with ``outcome=retrying``, and the final give-up with
+``outcome=failed``. The fleet counts a
 call as a line on `` llm provider=`` whose ``outcome`` is neither of those (basecradle-noc#1212), so
 the split is a verdict the line states, not a spelling that happens to dodge a regex.
 `tests/test_retry.py` runs the NOC's expressions against these lines to prove it.
@@ -554,7 +556,8 @@ def log_brain_failure(
     ERROR, were its only record, so "where did this wake die, and of what" was read off prose, and
     a producer with no wake had nothing to compare it with. This is the brain's one final line, in
     the same words a describe's failure uses (`fault_slug`) and with the vendor's own account of
-    the fault (`diagnostics`). It carries no tokens and no cost: the attempt was not billed.
+    the fault (`diagnostics`). It carries no tokens and no cost: the attempt returned no usage to
+    price.
 
     ``level`` is the caller's, because severity is a page: the engine's transient give-up keeps
     the ERROR its prose line always had, and every other failure is WARNING, since the wake's own
