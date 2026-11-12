@@ -347,6 +347,33 @@ def test_a_transcription_on_openai_is_priced_per_minute_of_audio(client, caplog)
     assert "cost_gap" not in line  # a priced call names no gap (issue #880)
 
 
+def test_the_default_listen_states_a_gap_once_per_wake(client, caplog, monkeypatch):
+    """The plugin builds `AssetsTool(listen=True)` with no transcriber: the one it makes is kept, so
+    the gap it states is not stated again on every listen (issue #880)."""
+    import logging
+
+    monkeypatch.setenv("AI_API_KEY", FAKE_KEY)
+    tool = AssetsTool(listen=True)
+    tool.bind(PlatformContext(client=client, timeline=TIMELINE_UUID))
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BC_URL}/assets/{A_AUDIO}").mock(
+            return_value=httpx.Response(200, json={"asset": audio_asset()})
+        )
+        mock.get(BLOB_URL).mock(return_value=httpx.Response(200, content=MP3_BYTES))
+        mock.post("https://api.openai.com/v1/audio/transcriptions").mock(
+            return_value=httpx.Response(200, json={"text": TRANSCRIPT})  # no usage: not_reported
+        )
+        with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+            for _ in range(3):
+                run_through_engine(tool, action="listen", uuid=A_AUDIO)
+    lines = tool_lines(caplog)
+    assert len(lines) == 3 and all(line.endswith(" cost_gap=not_reported") for line in lines)
+    gaps = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
+    assert gaps == [
+        "cost unpriced provider=openai model=gpt-transcribe charge=audio reason=not_reported"
+    ]
+
+
 def _listen(client, caplog, transcriber, body, *, runs=1):
     import logging
 

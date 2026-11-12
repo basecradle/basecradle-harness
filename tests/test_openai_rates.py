@@ -365,6 +365,28 @@ def test_another_host_is_never_priced_and_says_so_once(router, caplog):
     ]
 
 
+def test_a_search_on_another_host_that_reported_no_usage_states_only_the_searchs_gap(
+    router, caplog
+):
+    """A call with no usage has no tokens a price is missing for, so it states no tokens gap — even
+    when it searched; the search's own fee is still a counted gap (issue #880)."""
+    provider = OpenAIProvider(
+        model="gpt-6-sol", api_key=FAKE_KEY, base_url="https://proxy.example.com/v1"
+    )
+    body = _body(out_web_search_call(), out_message("x"))
+    del body["usage"]
+    router.post("https://proxy.example.com/v1/responses").mock(
+        return_value=httpx.Response(200, json=body)
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("go")])
+    (search,) = [line for line in tool_lines(caplog) if line.startswith("tool name=web_search ")]
+    assert " cost_gap=unpriced_host " in search, search
+    assert _lines(caplog, "cost unpriced ") == [
+        "cost unpriced provider=openai model=gpt-6-sol charge=search reason=unpriced_host"
+    ]
+
+
 def test_an_xai_endpoint_behind_the_openai_sdk_is_never_priced_from_openais_table(router, caplog):
     """The label decides whose rates could apply: OpenAI's say nothing about xAI's."""
     provider = OpenAIProvider(

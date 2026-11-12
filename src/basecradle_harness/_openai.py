@@ -957,7 +957,9 @@ class OpenAIProvider:
         gaps: dict[str, str] = {}
         calls = search_calls(output) if self._computes_cost else 0
         if calls:
-            if self._priced_endpoint():
+            # The host alone, never `_priced_endpoint`: that states the *tokens'* gap, which `_cost`
+            # owns, and which a call that reported no usage must not state at all.
+            if priced_host(self.base_url):
                 fees["web_search"] = web_search_cost(calls)
             else:
                 self._state_gap(SEARCH_CHARGE, UNPRICED_HOST)

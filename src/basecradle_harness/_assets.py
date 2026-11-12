@@ -458,7 +458,12 @@ class AssetsTool(PlatformTool):
                 error="over the transcription size limit",
             )
 
-        transcriber = self._transcriber or Transcriber()
+        # Built once and kept: it reads its key at call time, and it holds the `cost unpriced` gaps
+        # it has stated, which a transcriber built per call would state again on every listen
+        # (issue #880).
+        if self._transcriber is None:
+            self._transcriber = Transcriber()
+        transcriber = self._transcriber
         key = transcriber.key
         if not key:
             return tool_failed(
