@@ -1076,6 +1076,23 @@ def test_a_grounded_search_names_its_token_gap_on_its_own_helper_line(router, ke
     assert all(" purpose=helper " in line for line in _lines_starting(caplog, "llm "))
 
 
+def test_a_location_class_the_table_has_no_row_for_is_an_unpriced_tier(
+    router, key_file, caplog, _pinned_billing_day
+):
+    """``gemini-3.1-pro-preview`` is priced at ``global`` only, so a call at ``us`` names its gap."""
+    model = "gemini-3.1-pro-preview"
+    router.post(GENERATE.replace(MODEL, model)).mock(return_value=ok(text("a")))
+    with (
+        GoogleProvider(model, credentials_file=str(key_file), location=LOCATION) as p,
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+    ):
+        p.chat([Message.user("a")])
+    assert _gaps(caplog) == ["unpriced_tier"]
+    assert _lines_starting(caplog, "cost unpriced ") == [
+        f"cost unpriced provider=google model={model} charge=tokens reason=unpriced_tier"
+    ]
+
+
 def test_a_priced_call_names_no_gap(router, provider, caplog, _pinned_billing_day):
     router.post(GENERATE).mock(return_value=ok(text("hi")))
     with caplog.at_level(logging.INFO, logger="basecradle_harness"):

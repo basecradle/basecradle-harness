@@ -157,8 +157,9 @@ extra, are the journal's evidence that the tool ran. A tool Anthropic reports fa
 is that line's ``outcome=error reason=<error_code>``. Container time, which no response states, is one
 ``cost unpriced charge=container_time reason=not_reported`` line per wake. The rates are the price on
 Anthropic's own host only: a call through any other ``AI_BASE_URL`` carries no ``cost=``, stated once
-as ``cost unpriced charge=tokens reason=unpriced_host``, and a model the table lacks once as
-``reason=unknown_model``. ``provider=anthropic``; no ``endpoint=``, the vendor *is* the endpoint; where
+per wake as ``cost unpriced charge=tokens reason=unpriced_host``, a model the table lacks as
+``reason=unknown_model``, and a tier, speed or geography it does not carry as ``reason=unpriced_tier``;
+each call a gap covers also names it on its own line, ``cost_gap=<reason>`` (issue #878). ``provider=anthropic``; no ``endpoint=``, the vendor *is* the endpoint; where
 the call ran (``inference_geo``) is ``residency=``.
 
 Stateless per turn: the full conversation is sent every call and the harness owns history. This

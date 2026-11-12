@@ -70,7 +70,8 @@ Vertex reports tokens and no dollars, so ``cost=`` on this adapter's ``llm`` lin
 from Google's published rates (`basecradle_harness._google_rates`), by the capital's ruling on #655 —
 one of the two vendors (OpenAI is the other, #657) whose cost is harness arithmetic, tagged
 ``cost_basis=computed`` on the line. A model, a location class, or a traffic tier the
-table does not carry gets **no** ``cost=``, and one WARNING per model per adapter, never a guess.
+table does not carry gets **no** ``cost=``, never a guess: one ``cost unpriced`` WARNING per gap per
+wake, and the reason on each call it covers, ``cost_gap=<reason>`` (issue #878).
 
 Server-side built-ins, and the one Vertex does not support combining (issues #656, #660)
 --------------------------------------------------------------------------------------
@@ -919,8 +920,8 @@ class GoogleProvider:
         Computed, never vendor-stated. A model the table does not carry is ``unknown_model``, usage
         metadata with no count the table reads ``not_reported``, and a call the table carries the
         model of and still cannot price ``unpriced_tier``: a traffic tier other than standard, a
-        billing day no row covers, or a rate the page leaves unstated for a modality the call
-        billed. Each gap is one ``cost unpriced`` line per wake and the reason on **every** call it
+        location class or billing day no row covers, or a rate the page leaves unstated for a
+        modality the call billed. Each gap is one ``cost unpriced`` line per wake and the reason on **every** call it
         unprices (issue #878), so a wake's unpriced calls are counted rather than inferred from
         that one line. A call that reported no usage (`usage`, the line's own reading) states none.
         """
