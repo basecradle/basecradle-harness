@@ -155,6 +155,7 @@ from basecradle_harness._observability import (
     NOT_REPORTED,
     TOKENS_CHARGE,
     UNKNOWN_MODEL,
+    UNPRICED_TIER,
     answered,
     bounded,
     finish_reason,
@@ -168,6 +169,7 @@ from basecradle_harness._observability import (
     scrub,
     tally_server_tools,
     token_counts,
+    usage_reported,
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._retry import diagnostics, fault_slug
@@ -761,6 +763,7 @@ class GoogleProvider:
             usage=usage,
             cap=output_cap(self._default_params),
         )
+        cost, gap = self._cost(meta, usage)
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -769,7 +772,8 @@ class GoogleProvider:
             # A direct-to-vendor SDK has no upstream to name, so there is no `endpoint=`; where the
             # call ran — the residency fact an operator chose this provider for — is `residency=`.
             residency=self.location,
-            cost=self._cost(meta),
+            cost=cost,
+            cost_gap=gap,
             finish_reason=self.last_finish_reason,
             generation_id=response_id,
             **answered(unreadable),
@@ -852,6 +856,10 @@ class GoogleProvider:
         seconds = time.monotonic() - started
         meta = getattr(response, "usage_metadata", None)
         candidate = _first_candidate(response)
+        # Grounding's own input tokens are not charged on Gemini 3, so they are not billed input on
+        # its line either — the count and the computed cost read one rule (issue #759).
+        usage = _wire_usage(meta, tool_prompt=not grounding_tokens_free(self.model))
+        cost, gap = self._cost(meta, usage, grounded=True)
         log_llm_call(
             provider=self.provider,
             purpose=HELPER,
@@ -859,10 +867,9 @@ class GoogleProvider:
             residency=self.location,
             model=self.model,
             seconds=seconds,
-            # Grounding's own input tokens are not charged on Gemini 3, so they are not billed input
-            # on its line either — the count and the computed cost read one rule (issue #759).
-            usage=_wire_usage(meta, tool_prompt=not grounding_tokens_free(self.model)),
-            cost=self._cost(meta, grounded=True),
+            usage=usage,
+            cost=cost,
+            cost_gap=gap,
             outcome="ok",
             generation_id=generation_id({"id": getattr(response, "response_id", None)}),
         )
@@ -904,17 +911,39 @@ class GoogleProvider:
             return
         self._credentials.value.refresh(_token_request((budget.connect, METADATA_TIMEOUT)))
 
-    def _cost(self, meta: Any, *, grounded: bool = False) -> float | None:
-        """This call's dollars at Google's published rates — computed, never vendor-stated (#655)."""
+    def _cost(
+        self, meta: Any, usage: Any, *, grounded: bool = False
+    ) -> tuple[float | None, str | None]:
+        """This call's dollars at Google's published rates, or the line's ``cost_gap`` (#655).
+
+        Computed, never vendor-stated. A model the table does not carry is ``unknown_model``, usage
+        metadata with no count the table reads ``not_reported``, and a call the table carries the
+        model of and still cannot price ``unpriced_tier``: a traffic tier other than standard, a
+        billing day no row covers, or a rate the page leaves unstated for a modality the call
+        billed. Each gap is one ``cost unpriced`` line per wake and the reason on **every** call it
+        unprices (issue #878), so a wake's unpriced calls are counted rather than inferred from
+        that one line. A call that reported no usage (`usage`, the line's own reading) states none.
+        """
+        if not usage_reported(usage):
+            return None, None
         if not known(self.model):
             self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL)
-        return call_cost(
+            return None, UNKNOWN_MODEL
+        tokens = from_usage_metadata(meta)
+        if tokens is None:
+            self._state_gap(TOKENS_CHARGE, NOT_REPORTED)
+            return None, NOT_REPORTED
+        cost = call_cost(
             self.model,
             self.location or "",
-            from_usage_metadata(meta),
+            tokens,
             service_tier=self._default_params.get("service_tier"),
             grounded=grounded,
         )
+        if cost is None:
+            self._state_gap(TOKENS_CHARGE, UNPRICED_TIER)
+            return None, UNPRICED_TIER
+        return cost, None
 
     def _state_gap(self, charge: str, reason: str) -> None:
         """One ``cost unpriced`` WARNING per gap per wake (issue #759)."""

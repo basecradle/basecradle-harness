@@ -7,6 +7,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.192.0] - 2026-11-12
+
+### Fixed: Every call a rate table cannot price says why on its own line, and a tier Anthropic's or Google's table does not carry is no longer silent (issue #878)
+
+0.190.0 and 0.191.0 made each unpriced refuseless call name its gap (`cost_gap=`), because a once-per-wake `cost unpriced` WARNING cannot say how many calls a gap covered, and one gap's line can hide another's. The three rate tables still stated their gaps once per wake and nowhere else, and one of their reasons, `unpriced_tier`, can change from one call to the next (a Flex call beside a Standard one). Auditing them found worse on two: Anthropic's and Google's tables wrote nothing at all for a model they carry on a call they could not price (a priority or batch tier, fast mode, a geography with no multiplier; a priority traffic class, a billing day no row covers), so those calls were unpriced in silence. No unpriced OpenAI call has been observed.
+
+- **Every call an OpenAI, Anthropic or Google table cannot price carries `cost_gap=`** on its own `llm` line, in the reason its `cost unpriced` WARNING names: `unknown_model`, `unpriced_tier`, `unpriced_host`, or `not_reported` (a usage block with no count the table reads). The WARNING is still written once per wake per gap. Google's grounded `search` line carries it too, and so does the describer's, from what it captured.
+- **Anthropic and Google state `unpriced_tier`**, where they stated nothing before.
+- **A call that reported no usage states no gap**, on the WARNING or the line, as on refuseless: it has no tokens a price is missing for.
+- `docs/telemetry.md`'s `cost_gap` row changes with it: the field is no longer refuseless's alone. xAI, OpenRouter and the generic OpenAI-compatible vendor compute no cost, so they have no gap to name and are unchanged.
+
 ## [0.191.0] - 2026-11-12
 
 ### Fixed: A refuseless price list that answered without a price no longer unprices the rest of the wake, and every unpriced call says why on its own line (issue #876)

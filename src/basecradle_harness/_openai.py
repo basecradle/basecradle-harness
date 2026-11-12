@@ -34,7 +34,9 @@ at **OpenAI**, which returns tokens and no price, the line's ``cost=`` is comput
 published Standard rates (`basecradle_harness._openai_rates`, issue #657) and tagged
 ``cost_basis=computed``; a web search's per-call fee rides that call's ``web_search`` ``tool`` line
 (``kind=search.web``), and a code-interpreter container — whose charge no response describes — is a
-stated gap, one ``cost unpriced charge=container_time`` WARNING per wake. Every server-side tool a
+stated gap, one ``cost unpriced charge=container_time`` WARNING per wake. A call the table cannot
+price is one ``cost unpriced charge=tokens`` WARNING per wake per gap, and says why on its own line,
+``cost_gap=<reason>`` (issue #878). Every server-side tool a
 Responses call ran, on any endpoint, is a ``tool`` line beside the call's ``llm`` line
 (``executor=server``; issue #758). Pointed at xAI, nothing is computed: the xAI surfaces state their
 own prices where they state any, and a table of OpenAI's rates says nothing about xAI's.
@@ -848,30 +850,38 @@ class OpenAIProvider:
     def _cost(self, data: Mapping[str, Any], usage: Any) -> tuple[float | None, str | None]:
         """This call's dollars at OpenAI's published rates — computed, never stated (issue #657).
 
-        With the line's ``cost_gap``, which only the live-priced path fills (`_listed_cost`).
-        ``None`` for any endpoint but OpenAI's own, and for anything the table cannot price; each
-        gap that will recur all wake is stated once, so a missing figure is never a silent one.
-        refuseless is priced from its own live list instead.
+        With the line's ``cost_gap``: the reason, on **every** call the table cannot price, beside
+        the once-per-wake ``cost unpriced`` line that names it (issue #878, as #874 and #876 did for
+        the live-priced path, `_listed_cost`). ``unpriced_host`` for any host but OpenAI's own,
+        ``unknown_model`` for a model the table does not carry, ``not_reported`` for a usage block
+        with no token count the table reads, and ``unpriced_tier`` for a call the table carries the
+        model of and still cannot price: a non-Standard tier, which can change from one call to
+        the next, or a prompt past a long-context threshold the model has no row for. A call that
+        reported no usage states no gap: it has no tokens a price is missing for. ``(None, None)``
+        on a vendor this table says nothing about.
         """
         if self._reads_catalog:
             return self._listed_cost(data, usage)
-        if not self._computes_cost or not self._priced_endpoint():
+        if not self._computes_cost or not usage_reported(usage):
             return None, None
+        if not self._priced_endpoint():
+            return None, UNPRICED_HOST
         if not known(self.model):
             self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL)
+            return None, UNKNOWN_MODEL
         tokens = usage_of(usage)
-        served = data.get("service_tier")
+        if tokens is None:
+            self._state_gap(TOKENS_CHARGE, NOT_REPORTED)
+            return None, NOT_REPORTED
         cost = call_cost(
             self.model,
             tokens,
-            served_tier=served,
+            served_tier=data.get("service_tier"),
             asked_tier=self._default_params.get("service_tier"),
         )
-        if cost is None and tokens is not None and known(self.model):
-            # A model the table carries, on a call it still cannot price: a non-Standard tier, or a
-            # prompt past the long-context threshold on a model with no long-context row — both a
-            # rate band the table does not carry. Stated once per wake.
+        if cost is None:
             self._state_gap(TOKENS_CHARGE, UNPRICED_TIER)
+            return None, UNPRICED_TIER
         return cost, None
 
     def _listed_cost(self, data: Mapping[str, Any], usage: Any) -> tuple[float | None, str | None]:

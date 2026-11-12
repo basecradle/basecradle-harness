@@ -221,6 +221,7 @@ from basecradle_harness._observability import (
     TRUNCATED,
     UNKNOWN_MODEL,
     UNPRICED_HOST,
+    UNPRICED_TIER,
     UNREADABLE,
     ServerToolTally,
     bounded,
@@ -232,6 +233,7 @@ from basecradle_harness._observability import (
     slug,
     stamp_generation_id,
     token_counts,
+    usage_reported,
 )
 from basecradle_harness._openai_wire import format_citations
 from basecradle_harness._secret import Sealed
@@ -628,13 +630,15 @@ class AnthropicProvider:
         unfinished = last and self.last_finish_reason == "pause_turn"
         # A tool call cut off at `max_tokens` cannot be run, so it is billed as what it is (#788).
         cut = _cut_off(response)
+        cost, gap = self._cost(usage, wire)
         log_llm_call(
             provider=self.provider,
             model=self.model,
             seconds=time.monotonic() - started,
             usage=wire,
             residency=self._residency(usage),
-            cost=self._cost(usage),
+            cost=cost,
+            cost_gap=gap,
             finish_reason=self.last_finish_reason,
             outcome=REFUSED if refused else (FALLBACK if unfinished or cut else None),
             reason=TRUNCATED if cut else (UNREADABLE if unfinished else None),
@@ -666,26 +670,42 @@ class AnthropicProvider:
         geo = getattr(usage, "inference_geo", None) or self._params.get("inference_geo")
         return geo if isinstance(geo, str) and geo.strip() else None
 
-    def _cost(self, usage: Any) -> float | None:
-        """This call's dollars at Anthropic's published rates — computed, never vendor-stated.
+    def _cost(self, usage: Any, wire: Any) -> tuple[float | None, str | None]:
+        """This call's dollars at Anthropic's published rates, or the line's ``cost_gap``.
 
-        Only for Anthropic's own host (issue #759): a proxy or gateway named by ``AI_BASE_URL``
-        charges its own price, so a call there carries no ``cost=`` and the gap is stated once, as
-        the OpenAI adapter states it. An unknown model is stated once the same way.
+        Computed, never vendor-stated, and only for Anthropic's own host (issue #759): a proxy or
+        gateway named by ``AI_BASE_URL`` charges its own price (``unpriced_host``). A model the
+        table does not carry is ``unknown_model``, a usage block with no count the table reads
+        ``not_reported``, and a call the table carries the model of and still cannot price (a
+        priority or batch tier, fast mode, a geography with no multiplier) ``unpriced_tier``. Each
+        gap is one ``cost unpriced`` line per wake and the reason on **every** call it unprices
+        (issue #878), so a wake's unpriced calls are counted rather than inferred from that one
+        line. A call that reported no usage (`wire`, the line's own reading) states no gap.
         """
+        if not usage_reported(wire):
+            return None, None
         if not priced_host(self.base_url):
             self._state_gap(UNPRICED_HOST)
-            return None
+            return None, UNPRICED_HOST
         if not known(self.model):
             self._state_gap(UNKNOWN_MODEL)
+            return None, UNKNOWN_MODEL
         ttl = (self._cache_control or {}).get("ttl") or DEFAULT_CACHE_TTL
-        return call_cost(
+        tokens = usage_of(usage, written_ttl=ttl)
+        if tokens is None:
+            self._state_gap(NOT_REPORTED)
+            return None, NOT_REPORTED
+        cost = call_cost(
             self.model,
-            usage_of(usage, written_ttl=ttl),
+            tokens,
             geo=self._residency(usage),
             tier=getattr(usage, "service_tier", None),
             speed=getattr(usage, "speed", None),
         )
+        if cost is None:
+            self._state_gap(UNPRICED_TIER)
+            return None, UNPRICED_TIER
+        return cost, None
 
     def _state_gap(self, reason: str) -> None:
         """One ``cost unpriced charge=tokens`` WARNING per gap per wake."""

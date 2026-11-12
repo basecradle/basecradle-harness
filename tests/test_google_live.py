@@ -117,6 +117,7 @@ def test_the_cost_is_the_tables_arithmetic_over_what_vertex_reported(caplog):
     # raw arithmetic failed on exactly the cheap calls this model makes (found running #655's gate).
     assert expected is not None and cost == _money(expected), line
     assert _field(line, "cost_basis") == "computed", line
+    assert _field(line, "cost_gap") is None, line  # issue #878: a priced call names no gap
 
 
 @needs_key
@@ -321,6 +322,7 @@ def test_a_search_is_grounded_cited_and_priced(caplog):
     llm = _llm_line(caplog)
     assert _field(llm, "purpose") == "helper" and _field(llm, "kind") == "search.grounding", llm
     assert _field(llm, "cost") is not None and _field(llm, "cost_basis") == "computed", llm
+    assert _field(llm, "cost_gap") is None, llm  # issue #878: a priced call names no gap
     # The fee rides the `web_search` tool's own line, through the meter the engine opens (#758).
     fee = meter.fields()
     assert (fee["provider"], fee["kind"]) == ("google", "search.grounding"), fee
