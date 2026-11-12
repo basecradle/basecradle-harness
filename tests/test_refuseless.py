@@ -2,7 +2,7 @@
 
 Issue #844. refuseless.com is an OpenAI-compatible vendor reached through the ``openai`` SDK at its
 own host. A completion states tokens and no dollars; the vendor's models list states a ``pricing``
-object per model, so the harness reads that list once per wake and prices each call from it. There
+object per model, so the harness reads that list each wake and prices each call from it. There
 is deliberately no rate table: a figure the list cannot state is a ``cost unpriced`` gap, never an
 estimate.
 
@@ -290,7 +290,7 @@ def test_resolved_config_reports_a_live_computed_basis_and_claims_no_row(refusel
     report = _cost_report(VENDOR, "openai", MODEL)
     assert report == {
         "cost_basis": "computed",
-        "cost_rates_source": f"GET {HOST}/models → data[].pricing, read live once per wake",
+        "cost_rates_source": f"GET {HOST}/models → data[].pricing, read live by each wake",
         "cost_model_priced": None,
     }
     refuseless_env.setenv("AI_BASE_URL", "https://eu.refuseless.example/v1/")
@@ -984,7 +984,7 @@ def test_a_row_that_never_states_a_price_is_read_again_on_the_failed_reads_backo
     assert waits[-1] == LIST_REREAD_CAP
 
 
-def test_a_reread_that_fails_keeps_the_list_that_answered(gaps):
+def test_a_reread_that_fails_keeps_the_list_that_answered(gaps, caplog):
     """Re-asking never makes a call worse off: the held list still prices what it priced."""
     clock = _Clock()
     other_reply = _reply(model=OTHER)
@@ -1018,6 +1018,60 @@ def test_a_reread_that_fails_keeps_the_list_that_answered(gaps):
     assert (third.cost, third.cost_gap) == (None, "not_reported")
     # Never `rates_unavailable`: a list was read, and nothing warns that one could not be.
     assert gaps() == [NOT_REPORTED_GAP]
+    assert not [r for r in caplog.records if "Could not read the model list" in r.getMessage()]
+
+
+def test_a_reread_inside_an_outage_never_takes_a_price_away(gaps):
+    """A re-read asked for one model's gap lands in an outage and answers with no prices: the model
+    the held list priced is still priced, and the gap's model is priced once a read states it."""
+    clock = _Clock()
+    held = _models(_row(MODEL, PLAIN), _row(OTHER, None))
+    degraded = _models(_row(MODEL, None), _row(OTHER, None))
+    healed = _models(_row(MODEL, None), _row(OTHER, PLAIN))
+    # (moment, the model the response names): OTHER's gap asks for a re-read at +5 s, which answers
+    # degraded; OTHER's next gap asks again (due 10 s later, the doubled backoff), which heals it.
+    steps = [(0, OTHER), (5, MODEL), (20, OTHER), (30, OTHER), (31, MODEL)]
+    with respx.mock(assert_all_mocked=True) as router:
+        models = router.get(f"{HOST}/models").mock(
+            side_effect=[httpx.Response(200, json=body) for body in (held, degraded, healed)]
+        )
+        router.post(f"{HOST}/chat/completions").mock(
+            side_effect=[httpx.Response(200, json=_reply(model=model)) for _, model in steps]
+        )
+        adapter = _adapter(catalog=ModelCatalog(clock=clock))
+        calls = []
+        for moment, _ in steps:
+            clock.now = 1000.0 + moment
+            with capture_llm_call() as call:
+                adapter.chat([Message.user("hi")])
+            calls.append(call)
+        adapter.close()
+        assert models.call_count == 3
+    assert [call.cost_gap for call in calls] == ["not_reported", None, "not_reported", None, None]
+    # MODEL stays priced through the degraded read and the healed one, which both state no price
+    # for it; OTHER is priced from the read that states one.
+    assert [calls[i].cost for i in (1, 3, 4)] == [pytest.approx(0.00022)] * 3
+
+
+def test_a_reread_waits_at_least_four_times_as_long_as_the_last_read_took():
+    """The re-read of a slow list that answered keeps reads under a fifth of the wake, as #874's
+    failed read does: the doubling alone (5, 10, 20 s) is shorter than a read near its timeout."""
+    clock = _Clock()
+    catalog = ModelCatalog(clock=clock)
+
+    def slow(request):
+        clock.now += 40.0
+        return httpx.Response(200, json=UNPRICED_LIST)
+
+    with respx.mock(assert_all_mocked=True) as router:
+        router.get(f"{HOST}/models").mock(side_effect=slow)
+        router.post(f"{HOST}/chat/completions").mock(
+            return_value=httpx.Response(200, json=_reply())
+        )
+        adapter = _adapter(catalog=catalog)
+        adapter.chat([Message.user("hi")])
+        adapter.close()
+    assert catalog._next_read - clock.now == LIST_REREAD_SLOWDOWN * 40.0
 
 
 @pytest.mark.parametrize(

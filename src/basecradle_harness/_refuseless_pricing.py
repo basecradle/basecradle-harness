@@ -9,14 +9,16 @@ BaseCradle's request so that its price could be read rather than transcribed. So
 deliberately **not** a rate table, and there is no ``_refuseless_rates.py``: a hand copy of a price
 the vendor publishes live would only be a second, rotting statement of it (@origin). The adapter
 reads the list once per wake per key (`_openai.ModelCatalog`), again after a backoff when a read
-fails (issue #874), and hands each row here.
+fails (issue #874) or answers with a row that could not price a call (issue #876), and hands each
+row here.
 
 The rules every rate table keeps hold here too:
 
 - **A figure the harness cannot state is omitted, never estimated.** No row for the model, a row
   with no ``pricing``, a ``currency`` other than ``USD``, a rate the call needs that is missing or
   not a non-negative number, a usage block missing either count (`usage_of`): each returns no cost, and the adapter
-  states the gap once per wake as a ``cost unpriced charge=tokens`` WARNING. Nothing falls back to a
+  states the gap once per wake as a ``cost unpriced charge=tokens`` WARNING and on each call it
+  covers as ``cost_gap=`` (issue #876). Nothing falls back to a
   constant. The one list read elsewhere that may price a call is the one this process read on the
   same host with the same key, no older than `_openai.LIST_FALLBACK_MAX_AGE`, for a catalog whose
   own read failed (issue #874): the vendor's own figure, read moments before, is not an estimate.
@@ -56,7 +58,7 @@ CURRENCY = "USD"
 #: What `cost_rates_source` reports for this vendor in ``--resolved-config``: where the figure is
 #: read, by path relative to the agent's own API root, and when. No date, because nothing here was
 #: read on a date: the price is the one the vendor serves on the wake that uses it.
-SOURCE = "GET {base_url}/models → data[].pricing, read live once per wake"
+SOURCE = "GET {base_url}/models → data[].pricing, read live by each wake"
 
 
 @dataclass(frozen=True)
