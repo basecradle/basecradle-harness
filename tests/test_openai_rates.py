@@ -444,3 +444,119 @@ def test_a_known_model_on_a_call_the_table_cannot_price_is_a_stated_gap(router, 
         "cost unpriced provider=openai model=gpt-5.4-mini charge=tokens reason=unpriced_tier"
     ]
     assert all(" cost=" not in line for line in _lines(caplog, "llm "))
+
+
+# --- every unpriced call says why on its own line (issue #878) ------------------------------------
+
+
+def _gaps(caplog):
+    """Each ``llm`` line's ``cost_gap``, ``None`` where the line names none, in call order."""
+    return [
+        (match.group(1) if (match := re.search(r" cost_gap=(\S+)", plain(line))) else None)
+        for line in _lines(caplog, "llm ")
+    ]
+
+
+#: A usage block that states nothing: what an unreadable ``fallback`` attempt reports (issue #876).
+_NO_USAGE = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+
+def test_every_call_the_table_cannot_price_carries_its_own_gap_and_a_priced_one_names_none(
+    router, caplog
+):
+    """The once-per-wake line cannot say how many calls went unpriced; each call's line can.
+
+    A Flex call, a Standard one, a Flex one again, and a Flex attempt that reported no usage: two
+    lines carry ``cost_gap=unpriced_tier``, the priced one carries a cost and no gap, the usage-less
+    one carries neither, and the WARNING is still written once.
+    """
+    provider = OpenAIProvider(model="gpt-5.4-mini", api_key=FAKE_KEY, surface="responses")
+    router.post(f"{OPENAI}/responses").mock(
+        side_effect=[
+            httpx.Response(200, json=_body(out_message("a"), service_tier="flex")),
+            httpx.Response(200, json=_body(out_message("b"))),
+            httpx.Response(200, json=_body(out_message("c"), service_tier="flex")),
+            httpx.Response(200, json=_body(out_message("d"), service_tier="flex", usage=_NO_USAGE)),
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        for _ in range(4):
+            provider.chat([Message.user("go")])
+    assert _gaps(caplog) == ["unpriced_tier", None, "unpriced_tier", None]
+    lines = _lines(caplog, "llm ")
+    assert " cost=" in lines[1] and " cost_basis=computed " in lines[1]
+    assert all(" cost=" not in lines[i] for i in (0, 2, 3))
+    assert _lines(caplog, "cost unpriced ") == [
+        "cost unpriced provider=openai model=gpt-5.4-mini charge=tokens reason=unpriced_tier"
+    ]
+
+
+def test_an_unknown_model_names_its_gap_on_every_call_that_reported_usage(router, caplog):
+    """A usage-less attempt first states nothing, so it cannot hide the gap the next call has."""
+    provider = OpenAIProvider(model="gpt-7-nova", api_key=FAKE_KEY, surface="responses")
+    router.post(f"{OPENAI}/responses").mock(
+        side_effect=[
+            httpx.Response(200, json=_body(out_message("a"), usage=_NO_USAGE, model="gpt-7-nova")),
+            httpx.Response(200, json=_body(out_message("b"), model="gpt-7-nova")),
+            httpx.Response(200, json=_body(out_message("c"), model="gpt-7-nova")),
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("go")])
+        assert not _lines(caplog, "cost unpriced ")
+        provider.chat([Message.user("go")])
+        provider.chat([Message.user("go")])
+    assert _gaps(caplog) == [None, "unknown_model", "unknown_model"]
+    assert _lines(caplog, "cost unpriced ") == [
+        "cost unpriced provider=openai model=gpt-7-nova charge=tokens reason=unknown_model"
+    ]
+
+
+def test_another_host_names_its_gap_on_every_call(router, caplog):
+    provider = OpenAIProvider(
+        model="gpt-6-sol",
+        api_key=FAKE_KEY,
+        base_url="https://eu.api.openai.com/v1",
+        surface="responses",
+    )
+    router.post("https://eu.api.openai.com/v1/responses").mock(
+        side_effect=[
+            httpx.Response(200, json=_body(out_message("a"))),
+            httpx.Response(200, json=_body(out_message("b"), usage=_NO_USAGE)),
+            httpx.Response(200, json=_body(out_message("c"))),
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        for _ in range(3):
+            provider.chat([Message.user("go")])
+    assert _gaps(caplog) == ["unpriced_host", None, "unpriced_host"]
+    assert _lines(caplog, "cost unpriced ") == [
+        "cost unpriced provider=openai model=gpt-6-sol charge=tokens reason=unpriced_host"
+    ]
+
+
+def test_usage_with_no_count_the_table_reads_is_not_reported_never_a_tier(router, sol, caplog):
+    """A block stating cached tokens and no input or output count: usage on the line, no price."""
+    router.post(f"{OPENAI}/responses").mock(
+        return_value=httpx.Response(
+            200,
+            json=_body(out_message("a"), usage={"input_tokens_details": {"cached_tokens": 500}}),
+        )
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        sol.chat([Message.user("go")])
+    assert _gaps(caplog) == ["not_reported"]
+    assert _lines(caplog, "cost unpriced ") == [
+        "cost unpriced provider=openai model=gpt-6-sol charge=tokens reason=not_reported"
+    ]
+
+
+def test_a_priced_wake_names_no_gap_anywhere(router, sol, caplog):
+    router.post(f"{OPENAI}/responses").mock(
+        return_value=httpx.Response(200, json=_body(out_message("a")))
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        sol.chat([Message.user("go")])
+        sol.chat([Message.user("go")])
+    assert _gaps(caplog) == [None, None]
+    assert not _lines(caplog, "cost unpriced ")

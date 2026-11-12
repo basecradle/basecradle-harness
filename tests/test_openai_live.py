@@ -175,6 +175,7 @@ def test_a_fleet_model_turn_logs_the_tables_arithmetic_as_its_cost(caplog):
     assert expected is not None and _money(call.cost) == _money(expected)
     line = _line(caplog, "llm provider=")
     assert _field(line, "cost") is not None and _field(line, "cost_basis") == "computed", line
+    assert _field(line, "cost_gap") is None, line  # issue #878: a priced call names no gap
 
 
 @pytest.mark.skipif(not KEY, reason="set AI_API_KEY to run the live OpenAI probe")

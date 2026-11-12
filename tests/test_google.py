@@ -999,6 +999,108 @@ def test_a_model_without_a_rate_gets_no_cost_and_one_warning(router, key_file, c
     )
 
 
+def _gaps(caplog) -> list[str | None]:
+    """Each ``llm`` line's ``cost_gap``, ``None`` where the line names none, in call order."""
+    return [
+        (match.group(1) if (match := re.search(r" cost_gap=(\S+)", plain(line))) else None)
+        for line in _lines_starting(caplog, "llm ")
+    ]
+
+
+_PRIORITY = {
+    "promptTokenCount": 100,
+    "candidatesTokenCount": 10,
+    "totalTokenCount": 110,
+    "trafficType": "ON_DEMAND_PRIORITY",
+}
+
+
+def test_every_call_the_table_cannot_price_carries_its_own_gap(
+    router, provider, caplog, _pinned_billing_day
+):
+    """A priority call, a standard one, a priority one again, and a usage-less one (issue #878).
+
+    Before #878 a known model on a traffic tier the table does not carry logged no cost and no line
+    at all: the gap was silent. Now each such call names ``unpriced_tier``, the WARNING is written
+    once, the priced call names no gap, and the call that reported no usage names none.
+    """
+    router.post(GENERATE).mock(
+        side_effect=[
+            ok(text("a"), usage=_PRIORITY),
+            ok(text("b")),
+            ok(text("c"), usage=_PRIORITY),
+            ok(text("d"), usage={}),
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        for prompt in "abcd":
+            provider.chat([Message.user(prompt)])
+    assert _gaps(caplog) == ["unpriced_tier", None, "unpriced_tier", None]
+    lines = _lines_starting(caplog, "llm ")
+    assert " cost=" in lines[1] and all(" cost=" not in lines[i] for i in (0, 2, 3))
+    assert _lines_starting(caplog, "cost unpriced ") == [
+        "cost unpriced provider=google model=gemini-3.8-flash charge=tokens reason=unpriced_tier"
+    ]
+
+
+def test_an_unknown_model_names_its_gap_on_every_call_that_reported_usage(router, key_file, caplog):
+    path = GENERATE.replace(MODEL, "gemini-9-experimental")
+    router.post(path).mock(side_effect=[ok(text("a"), usage={}), ok(text("b")), ok(text("c"))])
+    with (
+        GoogleProvider(
+            "gemini-9-experimental", credentials_file=str(key_file), location=LOCATION
+        ) as p,
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+    ):
+        p.chat([Message.user("a")])
+        assert not _lines_starting(caplog, "cost unpriced ")  # a usage-less call states no gap
+        p.chat([Message.user("b")])
+        p.chat([Message.user("c")])
+    assert _gaps(caplog) == [None, "unknown_model", "unknown_model"]
+
+
+def test_a_grounded_search_names_its_token_gap_on_its_own_helper_line(router, key_file, caplog):
+    """``search``'s ``llm`` line is priced by the same `_cost`, so it carries the same gap."""
+    path = GENERATE.replace(MODEL, "gemini-9-experimental")
+    router.post(path).mock(return_value=grounded(text("Sunny.")))
+    with (
+        GoogleProvider(
+            "gemini-9-experimental", credentials_file=str(key_file), location=LOCATION
+        ) as p,
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+        tool_meter(),
+    ):
+        p.search("weather")
+        p.search("weather again")
+    assert _gaps(caplog) == ["unknown_model", "unknown_model"]
+    assert all(" purpose=helper " in line for line in _lines_starting(caplog, "llm "))
+
+
+def test_a_location_class_the_table_has_no_row_for_is_an_unpriced_tier(
+    router, key_file, caplog, _pinned_billing_day
+):
+    """``gemini-3.1-pro-preview`` is priced at ``global`` only, so a call at ``us`` names its gap."""
+    model = "gemini-3.1-pro-preview"
+    router.post(GENERATE.replace(MODEL, model)).mock(return_value=ok(text("a")))
+    with (
+        GoogleProvider(model, credentials_file=str(key_file), location=LOCATION) as p,
+        caplog.at_level(logging.INFO, logger="basecradle_harness"),
+    ):
+        p.chat([Message.user("a")])
+    assert _gaps(caplog) == ["unpriced_tier"]
+    assert _lines_starting(caplog, "cost unpriced ") == [
+        f"cost unpriced provider=google model={model} charge=tokens reason=unpriced_tier"
+    ]
+
+
+def test_a_priced_call_names_no_gap(router, provider, caplog, _pinned_billing_day):
+    router.post(GENERATE).mock(return_value=ok(text("hi")))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("go")])
+    assert _gaps(caplog) == [None]
+    assert not _lines_starting(caplog, "cost unpriced ")
+
+
 def test_a_priority_tier_call_is_not_priced_at_standard_rates(router, provider, caplog):
     usage = {
         "promptTokenCount": 100,

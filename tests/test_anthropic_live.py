@@ -242,6 +242,7 @@ def test_the_cost_is_the_tables_arithmetic_over_the_reported_usage(caplog):
     expected = call_cost(MODEL, reported)
     assert expected is not None and expected > 0
     assert _field(line, "cost") == _money(expected)
+    assert _field(line, "cost_gap") is None, line  # issue #878: a priced call names no gap
 
 
 @needs_key

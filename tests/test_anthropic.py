@@ -791,6 +791,84 @@ def test_an_unknown_model_gets_no_cost_and_one_warning(router, caplog):
     ]
 
 
+def _gaps(caplog) -> list[str | None]:
+    """Each ``llm`` line's ``cost_gap``, ``None`` where the line names none, in call order."""
+    return [
+        (match.group(1) if (match := re.search(r" cost_gap=(\S+)", line)) else None)
+        for line in llm_lines(caplog)
+    ]
+
+
+#: A usage block that states nothing: what an unreadable attempt reports (issue #876).
+NO_USAGE = usage(input_tokens=0, output_tokens=0)
+
+
+def test_every_call_the_table_cannot_price_carries_its_own_gap(router, caplog):
+    """A priority call, a standard one, a priority one again, and a usage-less one (issue #878).
+
+    Before #878 a known model on a tier the table does not carry logged no cost and no line at all:
+    the gap was silent. Now each such call names ``unpriced_tier``, the WARNING is written once, the
+    priced call names no gap, and the call that reported no usage names none.
+    """
+    adapter = AnthropicProvider(MODEL, api_key=FAKE_KEY, max_tokens=64)
+    router.post(MESSAGES).mock(
+        side_effect=[
+            reply(text("a"), used=usage(service_tier="priority")),
+            reply(text("b")),
+            reply(text("c"), used=usage(service_tier="priority")),
+            reply(text("d"), used={**NO_USAGE, "service_tier": "priority"}),
+        ]
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        for prompt in "abcd":
+            adapter.chat([Message.user(prompt)])
+    assert _gaps(caplog) == ["unpriced_tier", None, "unpriced_tier", None]
+    lines = llm_lines(caplog)
+    assert " cost=" in lines[1] and all(" cost=" not in lines[i] for i in (0, 2, 3))
+    gaps = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
+    assert gaps == [
+        "cost unpriced provider=anthropic model=claude-haiku-5-5 charge=tokens reason=unpriced_tier"
+    ]
+
+
+def test_an_unknown_model_names_its_gap_on_every_call_that_reported_usage(router, caplog):
+    adapter = AnthropicProvider("claude-future-9", api_key=FAKE_KEY, max_tokens=64)
+    router.post(MESSAGES).mock(
+        side_effect=[reply(text("a"), used=NO_USAGE), reply(text("b")), reply(text("c"))]
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        adapter.chat([Message.user("a")])
+        assert "cost unpriced" not in caplog.text  # a usage-less attempt states no gap
+        adapter.chat([Message.user("b")])
+        adapter.chat([Message.user("c")])
+    assert _gaps(caplog) == [None, "unknown_model", "unknown_model"]
+
+
+def test_a_proxy_names_its_gap_on_every_call(router, caplog):
+    adapter = AnthropicProvider(
+        MODEL, api_key=FAKE_KEY, max_tokens=64, base_url="https://proxy.example.com"
+    )
+    router.post("https://proxy.example.com/v1/messages").mock(
+        side_effect=[reply(text("a")), reply(text("b"))]
+    )
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        adapter.chat([Message.user("a")])
+        adapter.chat([Message.user("b")])
+    assert _gaps(caplog) == ["unpriced_host", "unpriced_host"]
+    gaps = [r.getMessage() for r in caplog.records if r.getMessage().startswith("cost unpriced ")]
+    assert gaps == [
+        "cost unpriced provider=anthropic model=claude-haiku-5-5 charge=tokens reason=unpriced_host"
+    ]
+
+
+def test_a_priced_call_names_no_gap(router, provider, caplog):
+    router.post(MESSAGES).mock(return_value=reply(text("ok")))
+    with caplog.at_level(logging.INFO, logger="basecradle_harness"):
+        provider.chat([Message.user("hi")])
+    assert _gaps(caplog) == [None]
+    assert "cost unpriced" not in caplog.text
+
+
 def test_us_inference_is_priced_at_the_multiplier(router, caplog):
     adapter = AnthropicProvider(MODEL, api_key=FAKE_KEY, max_tokens=64, inference_geo="us")
     router.post(MESSAGES).mock(

@@ -946,8 +946,8 @@ class LlmCall:
     endpoint: str | None = None
     residency: str | None = None
     cost: float | None = None
-    #: Why a call the vendor billed carries no `cost` (``rates_unavailable``, issue #874), for the
-    #: line's ``cost_gap``.
+    #: Why a call the vendor billed carries no computed `cost` (issues #874, #878), for the line's
+    #: ``cost_gap``.
     cost_gap: str | None = None
     finish_reason: str | None = None
     generation_id: str | None = None
@@ -1076,9 +1076,9 @@ def log_llm_call(
     is the vendor's choice of where to run, not a place, so it says no more than that. A cost
     that is computed (a `ComputedCost`, Google's or OpenAI's) is followed by ``cost_basis=computed``;
     a vendor-stated one carries no basis, so its line is unchanged (`COST_BASIS_COMPUTED`).
-    ``cost_gap`` stands where those two would on a billed call the adapter could not price for a
-    reason that varies call to call (``rates_unavailable``: no price list read yet, issue #874), so
-    each such call is counted rather than inferred from a once-per-wake ``cost unpriced`` line.
+    ``cost_gap`` stands where those two would on a billed call an adapter that computes a cost could
+    not price, in the reason its once-per-wake ``cost unpriced`` line names (issues #874, #876,
+    #878), so each such call is counted rather than inferred from that one line.
 
     **A usage block of nothing but zeros is not usage** (issue #488), so the token fields and the
     ``cost`` read out of it are omitted rather than printed as zeros. That is the same honest-absence
