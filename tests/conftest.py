@@ -20,7 +20,7 @@ import respx
 import respx.mocks
 from respx.mocks import HTTPCoreMocker
 
-from basecradle_harness import OpenAIProvider, _mempalace, _mining
+from basecradle_harness import OpenAIProvider, _mempalace, _mining, _openai
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -300,6 +300,19 @@ def _no_ambient_rerank_config(monkeypatch):
     """
     for name in [var for var in os.environ if var.startswith("HARNESS_MEMPALACE_RERANK_")]:
         monkeypatch.delenv(name)
+
+
+@pytest.fixture(autouse=True)
+def _no_price_list_from_another_test():
+    """Forget every models list an earlier test read (issue #874).
+
+    The last list each host and key answered is kept for the life of the process, so a catalog whose
+    own read fails can price from it (`_openai._LAST_LISTS`). The test process is one process, so
+    without this a test that reads a list would price the calls of every later test whose read fails.
+    """
+    _openai._LAST_LISTS.clear()
+    yield
+    _openai._LAST_LISTS.clear()
 
 
 # `scripts/isolated_home.py` is repo tooling, not shipped code, so it is loaded by path.

@@ -43,6 +43,7 @@ from basecradle_harness import (
     OpenAIProvider,
     ProviderError,
     XaiSdkProvider,
+    _openai,
 )
 from basecradle_harness._attribution import log_context_attribution
 from basecradle_harness._describer import Describer
@@ -711,6 +712,9 @@ def refuseless(router, **_):
 
 @scenario
 def refuseless_unpriced(router, **_):
+    # A process that has read no list: the `refuseless` scenario's read would otherwise price this
+    # call from the list it left behind (issue #874), which is the fallback, not the gap.
+    _openai._LAST_LISTS.clear()
     _refuseless(router, httpx.Response(503, json={"error": {"message": "unavailable"}}))
 
 
@@ -1791,6 +1795,9 @@ def test_a_live_listed_price_is_computed_and_a_list_it_cannot_read_is_one_gap(re
     assert priced["cost_basis"] == "computed"
     assert not rendered.heads("refuseless", "cost unpriced")
     assert "cost" not in rendered.llm("refuseless_unpriced").fields
+    # Every call made while no list was read says so on its own line (issue #874).
+    assert rendered.llm("refuseless_unpriced").fields["cost_gap"] == "rates_unavailable"
+    assert "cost_gap" not in priced
     (gap,) = rendered.heads("refuseless_unpriced", "cost unpriced")
     assert gap.fields == {
         "provider": "refuseless",

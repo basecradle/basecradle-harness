@@ -40,18 +40,22 @@ Responses call ran, on any endpoint, is a ``tool`` line beside the call's ``llm`
 own prices where they state any, and a table of OpenAI's rates says nothing about xAI's.
 
 Pointed at **refuseless**, which returns tokens and no price but publishes a live ``pricing`` object
-on every row of its models list, the cost is computed from that list, read once per wake from the
-same host with the same key (`_catalog`), and tagged ``cost_basis=computed``
+on every row of its models list, the cost is computed from that list, read from the same host
+with the same key and held once read (`_catalog`), and tagged ``cost_basis=computed``
 (`basecradle_harness._refuseless_pricing`, issue #844). There is no table for it, by decision: a
-figure the list cannot state is a ``cost unpriced charge=tokens`` gap, never an estimate.
+figure the list cannot state is a ``cost unpriced charge=tokens`` gap, never an estimate. A list
+that could not be read is read again after a backoff, never held unread for the wake, and a call
+made while none has been read says so on its own line, ``cost_gap=rates_unavailable`` (#874).
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -214,52 +218,117 @@ _AFFINITY: dict[tuple[str, str], _Affinity | None] = {
 }
 
 
-class ModelCatalog:
-    """A vendor's models list, read at most once and held whatever it answered (issue #844).
+#: How long after a failed read of a vendor's models list the next ask may read it again, doubling
+#: on each failure up to `LIST_REREAD_CAP` (issue #874). The list prices every call, and a single
+#: attempt held for the whole wake let one blip at the read unprice every call the wake made, calls
+#: that themselves were answered and billed. The backoff keeps an unreachable list from costing a
+#: request (and up to `METADATA_TIMEOUT` of waiting) on every call.
+LIST_REREAD_AFTER = 5.0
+LIST_REREAD_CAP = 300.0
+#: The oldest a list another catalog in this process read may be and still price a call this one
+#: cannot (issue #874). A fleet wake is one process and reads its own list, so this bounds only a
+#: long-lived library caller: a list read seconds ago is the price a call made now was billed at,
+#: and one read yesterday is an estimate, which a figure the harness cannot state never is.
+LIST_FALLBACK_MAX_AGE = 3600.0
 
-    The rows by model id, or ``None`` when the read failed, plus the price gaps already stated
-    against it. One per wake per credential: an adapter makes its own unless it is handed one, and a
-    caller that builds several adapters on the same key and host in one wake (the describer builds
-    one per output budget) hands each the same catalog, so the list is read once and each gap is
-    stated once however many adapters ask. Never shared across wakes, because a price read on an
-    earlier wake is not this wake's price.
+#: The last list each host and key answered in this process, with the moment it was read, for a
+#: catalog whose own read failed (`ModelCatalog.rows`). Keyed on a digest of the key, never the key.
+_LAST_LISTS: dict[tuple[str, str], tuple[float, dict[str, Mapping[str, Any]]]] = {}
+_LAST_LISTS_LOCK = threading.Lock()
+
+
+def list_owner(base_url: str, key: str) -> tuple[str, str]:
+    """Whose list a read answers: the host, and a digest of the key that read it.
+
+    A key is part of it because the price on the list may be the account's own (the vendor serves a
+    ``discounted`` flag), so one account's list never prices another's call. A digest, because the
+    store outlives the adapter that holds the key and is no place for a credential.
+    """
+    return base_url.rstrip("/"), hashlib.sha256(key.encode()).hexdigest()
+
+
+class ModelCatalog:
+    """A vendor's models list, held once read, and read again after a failure (issues #844, #874).
+
+    The rows by model id, plus the price gaps already stated against them. One per wake per
+    credential: an adapter makes its own unless it is handed one, and a caller that builds several
+    adapters on the same key and host in one wake (the describer builds one per output budget)
+    hands each the same catalog, so the list is read once and each gap is stated once however many
+    adapters ask.
+
+    **A failed read is never held for the wake.** The next ask at least `LIST_REREAD_AFTER` seconds
+    later reads again, the wait doubling up to `LIST_REREAD_CAP`, and the first read that answers is
+    held from then on. Until one does, a call is priced from the list this process last read on the
+    same host with the same key, when that is no older than `LIST_FALLBACK_MAX_AGE`; a call with
+    neither is unpriced, and its line says why (``cost_gap=rates_unavailable``).
     """
 
-    def __init__(self) -> None:
-        self._read = False
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
         self._rows: dict[str, Mapping[str, Any]] | None = None
+        #: When the next read may be attempted, and how long to wait after the next failure.
+        self._next_read = 0.0
+        self._backoff = LIST_REREAD_AFTER
+        #: Whether the failure WARNING has been written, so an outage is one line, not one per read.
+        self._warned = False
         #: The ``cost unpriced`` gaps already stated against this list, for `OpenAIProvider._state_gap`.
         self.gaps: set[str] = set()
 
-    def rows(self, client: Any, base_url: str) -> dict[str, Mapping[str, Any]] | None:
-        """The list from `client`'s models API, read on the first ask and held for every later one.
+    def rows(
+        self, client: Any, base_url: str, owner: tuple[str, str]
+    ) -> dict[str, Mapping[str, Any]] | None:
+        """The list from `client`'s models API: held once read, else read, else this process's last.
 
         Read through the SDK's own models API, so it goes to the host every call goes to, with the
         agent's own key, and its unmodeled fields (``pricing``, ``context_length``) survive
-        `model_dump()` exactly as the OpenRouter context read relies on. One attempt: a failure is
-        held as ``None`` and stated once here, and each reader states its own consequence
-        (`OpenAIProvider._listed_cost` a ``rates_unavailable`` gap, `context_limit` the floor), so an
-        unreachable list costs one request, never one per call.
+        `model_dump()` exactly as the OpenRouter context read relies on. ``None`` only when this
+        catalog has never read the list and no other in this process read it recently for `owner`
+        (`list_owner`); each reader states its own consequence (`OpenAIProvider._listed_cost` a
+        ``rates_unavailable`` gap, `context_limit` the floor).
         """
-        if self._read:
+        if self._rows is not None:
             return self._rows
-        self._read = True
-        try:
-            page = client.models.list(timeout=METADATA_TIMEOUT)
-            rows: dict[str, Mapping[str, Any]] = {}
-            for item in page:
-                row = item.model_dump() if hasattr(item, "model_dump") else item
-                if isinstance(row, Mapping) and isinstance(row.get("id"), str):
-                    rows[row["id"]] = row
-        except Exception as exc:  # noqa: BLE001 - a price list must never break a wake
-            _log.warning(
-                "Could not read the model list from %s, so this wake's calls carry no cost= and "
-                "the context limit falls to its floor: %s",
-                base_url,
-                scrub(str(exc)),  # a library caller's own handler has no scrub (issue #857)
-            )
-            return None
-        self._rows = rows
+        now = self._clock()
+        if now >= self._next_read:
+            try:
+                rows = self._read(client)
+            except Exception as exc:  # noqa: BLE001 - a price list must never break a wake
+                self._next_read = self._clock() + self._backoff
+                self._backoff = min(self._backoff * 2, LIST_REREAD_CAP)
+                if not self._warned:
+                    self._warned = True
+                    _log.warning(
+                        "Could not read the model list from %s (%s). Until a later read answers, "
+                        "a call is priced from the list this process last read there if it is "
+                        "under %d s old, and otherwise carries no cost= (cost_gap=%s), and the "
+                        "context limit falls to its floor.",
+                        base_url,
+                        scrub(str(exc)),  # a library caller's own handler has no scrub (#857)
+                        LIST_FALLBACK_MAX_AGE,
+                        RATES_UNAVAILABLE,
+                    )
+            else:
+                if self._warned:
+                    _log.info("Read the model list from %s, so calls are priced again", base_url)
+                self._rows = rows
+                with _LAST_LISTS_LOCK:
+                    _LAST_LISTS[owner] = (self._clock(), rows)
+                return rows
+        with _LAST_LISTS_LOCK:
+            last = _LAST_LISTS.get(owner)
+        if last is not None and self._clock() - last[0] <= LIST_FALLBACK_MAX_AGE:
+            return last[1]
+        return None
+
+    @staticmethod
+    def _read(client: Any) -> dict[str, Mapping[str, Any]]:
+        """One read of the list, as rows by id; raises on anything that is not the list."""
+        page = client.models.list(timeout=METADATA_TIMEOUT)
+        rows: dict[str, Mapping[str, Any]] = {}
+        for item in page:
+            row = item.model_dump() if hasattr(item, "model_dump") else item
+            if isinstance(row, Mapping) and isinstance(row.get("id"), str):
+                rows[row["id"]] = row
         return rows
 
 
@@ -433,9 +502,11 @@ class OpenAIProvider:
         #: read answers both for the whole wake. An equality on the known vendor, so no other
         #: endpoint is ever sent a list read it did not need.
         self._reads_catalog = provider == "refuseless"
-        #: That list, read at most once and held whatever it answered — this adapter's own, or the
-        #: one a caller shares across the adapters it builds on this key in this wake (`ModelCatalog`).
+        #: That list, held once read and read again after a failure — this adapter's own, or the one
+        #: a caller shares across the adapters it builds on this key in this wake (`ModelCatalog`).
         self._catalog_store = catalog if catalog is not None else ModelCatalog()
+        #: Whose list it is (`list_owner`): this host and a digest of this key, never the key.
+        self._list_owner = list_owner(self.base_url, key)
         #: Whether the vendor reports its reasoning **beside** the output rather than inside it, so
         #: the line folds it in (`reasoning_apart`, issue #759). xAI does, on both surfaces; an
         #: equality on the known vendor, so every other endpoint keeps the wire's own reading.
@@ -670,9 +741,9 @@ class OpenAIProvider:
         # (issue #490): the same `finish_reason` this line already hands `log_llm_call`, kept where
         # the engine can reach it without a `capture_llm_call` around every brain call.
         self.last_finish_reason = reason
-        cost = reported_cost(usage)
+        cost, gap = reported_cost(usage), None
         if cost is None:
-            cost = self._cost(data, usage)
+            cost, gap = self._cost(data, usage)
         log_llm_call(
             provider=self.provider,
             model=self.model,
@@ -681,6 +752,7 @@ class OpenAIProvider:
             usage=reasoning_apart(usage) if self._reasoning_apart else usage,
             endpoint=serving_endpoint(data),
             cost=cost,
+            cost_gap=gap,
             # Not for the line — recorded for a `capture_llm_call` caller judging whether the answer
             # it got back is whole (issue #488). One reader covers both surfaces: Chat states it on
             # the choice, Responses only once its `status` goes `incomplete`.
@@ -692,17 +764,18 @@ class OpenAIProvider:
             **answered(unreadable),
         )
 
-    def _cost(self, data: Mapping[str, Any], usage: Any) -> float | None:
+    def _cost(self, data: Mapping[str, Any], usage: Any) -> tuple[float | None, str | None]:
         """This call's dollars at OpenAI's published rates — computed, never stated (issue #657).
 
+        With the line's ``cost_gap``, which only the live-priced path fills (`_listed_cost`).
         ``None`` for any endpoint but OpenAI's own, and for anything the table cannot price; each
         gap that will recur all wake is stated once, so a missing figure is never a silent one.
-        refuseless is priced from its own live list instead (`_listed_cost`).
+        refuseless is priced from its own live list instead.
         """
         if self._reads_catalog:
             return self._listed_cost(data, usage)
         if not self._computes_cost or not self._priced_endpoint():
-            return None
+            return None, None
         if not known(self.model):
             self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL)
         tokens = usage_of(usage)
@@ -718,39 +791,45 @@ class OpenAIProvider:
             # prompt past the long-context threshold on a model with no long-context row — both a
             # rate band the table does not carry. Stated once per wake.
             self._state_gap(TOKENS_CHARGE, UNPRICED_TIER)
-        return cost
+        return cost, None
 
-    def _listed_cost(self, data: Mapping[str, Any], usage: Any) -> float | None:
+    def _listed_cost(self, data: Mapping[str, Any], usage: Any) -> tuple[float | None, str | None]:
         """This call's dollars at the price the vendor's own models list states (issue #844).
 
         Priced by the model the **response** names (the configured one when it names none), from
-        that model's row of the list `_catalog` read this wake. Every way the figure cannot be
-        stated is one ``cost unpriced charge=tokens`` gap, once per wake: ``rates_unavailable`` when
-        the list could not be read, ``unknown_model`` when it has no row for the model, and
-        ``not_reported`` when the vendor did not state what the figure needs: a usable US-dollar
-        rate on the row, both token counts in the usage block, a rate for a cache write
-        (`_refuseless_pricing.pricing_of`, `usage_of` and `call_cost` say exactly when).
+        that model's row of the list `_catalog` holds. Every way the figure cannot be stated is one
+        ``cost unpriced charge=tokens`` gap, once per wake: ``rates_unavailable`` when no list has
+        been read, ``unknown_model`` when it has no row for the model, and ``not_reported`` when
+        the vendor did not state what the figure needs: a usable US-dollar rate on the row, both
+        token counts in the usage block, a rate for a cache write (`_refuseless_pricing.pricing_of`,
+        `usage_of` and `call_cost` say exactly when).
+
+        The second value is the line's ``cost_gap``: ``rates_unavailable`` on **every** call made
+        while no list could be read (issue #874), because that is the one gap that comes and goes
+        within a wake, so a count of calls is the only honest measure of it. The other gaps are a
+        property of the model's row and recur on every call alike, so their once-per-wake line says
+        all there is.
         """
         stated = self._catalog_store.gaps
         rows = self._catalog()
         if rows is None:
             self._state_gap(TOKENS_CHARGE, RATES_UNAVAILABLE, stated=stated)
-            return None
+            return None, RATES_UNAVAILABLE
         named = data.get("model")
         model = named if isinstance(named, str) and named else self.model
         row = rows.get(model)
         if row is None:
             self._state_gap(TOKENS_CHARGE, UNKNOWN_MODEL, model=model, stated=stated)
-            return None
+            return None, None
         pricing = pricing_of(row)
         cost = None if pricing is None else listed_call_cost(pricing, listed_usage(usage))
         if cost is None:
             self._state_gap(TOKENS_CHARGE, NOT_REPORTED, model=model, stated=stated)
-        return cost
+        return cost, None
 
     def _catalog(self) -> dict[str, Mapping[str, Any]] | None:
-        """The vendor's models list as rows by id — read once, by `ModelCatalog.rows`."""
-        return self._catalog_store.rows(self._client, self.base_url)
+        """The vendor's models list as rows by id — by `ModelCatalog.rows`, for this host and key."""
+        return self._catalog_store.rows(self._client, self.base_url, self._list_owner)
 
     def _log_server_tools(self, data: Mapping[str, Any]) -> None:
         """A ``tool`` line per server-side tool a Responses call ran, beside its ``llm`` line (#758).
@@ -827,7 +906,7 @@ class OpenAIProvider:
           requirement 2): a table would answer today and lie after the next model launch, silently.
           An OpenAI agent that wants its real 400 K window sets `HARNESS_MAX_CONTEXT_TOKENS`.
         - Pointed at **refuseless**, the models *list* states ``context_length`` per row, so the row
-          comes from the list `_catalog` reads once for this wake's pricing too (issue #844): one
+          comes from the list `_catalog` holds for this wake's pricing too (issue #844): one
           request answers both, where a single-model read would be a second.
 
         Never fatal: any failure degrades to ``None``, and the wake runs exactly as before.

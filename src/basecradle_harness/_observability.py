@@ -946,6 +946,9 @@ class LlmCall:
     endpoint: str | None = None
     residency: str | None = None
     cost: float | None = None
+    #: Why a call the vendor billed carries no `cost` (``rates_unavailable``, issue #874), for the
+    #: line's ``cost_gap``.
+    cost_gap: str | None = None
     finish_reason: str | None = None
     generation_id: str | None = None
     #: ``refused`` when the vendor refused the content (issue #782), with its own ``category``, so a
@@ -1013,6 +1016,7 @@ def log_llm_call(
     endpoint: str | None = None,
     residency: str | None = None,
     cost: float | None = None,
+    cost_gap: str | None = None,
     finish_reason: str | None = None,
     outcome: str | None = None,
     category: Any = None,
@@ -1050,7 +1054,7 @@ def log_llm_call(
 
     **Field order is the contract** and matches what the NOC's column regexes were written against:
     ``provider purpose kind endpoint residency model duration tokens_in tokens_out tokens_total
-    cached_tokens cache_write_tokens tokens_reasoning cost cost_basis outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
+    cached_tokens cache_write_tokens tokens_reasoning cost cost_basis cost_gap outcome reason detail`` then any purpose-specific `extra` (the reranker's ``surface``/``pool``/
     ``picked``), and last of all ``generation_id`` — the vendor's own id for the call (issue #634),
     rendered last so that no column written before it moves — and then, after even that,
     ``billing=byok`` on a call the provider billed directly (issue #653, `BYOK_BILLING`), for the
@@ -1072,6 +1076,9 @@ def log_llm_call(
     is the vendor's choice of where to run, not a place, so it says no more than that. A cost
     that is computed (a `ComputedCost`, Google's or OpenAI's) is followed by ``cost_basis=computed``;
     a vendor-stated one carries no basis, so its line is unchanged (`COST_BASIS_COMPUTED`).
+    ``cost_gap`` stands where those two would on a billed call the adapter could not price for a
+    reason that varies call to call (``rates_unavailable``: no price list read yet, issue #874), so
+    each such call is counted rather than inferred from a once-per-wake ``cost unpriced`` line.
 
     **A usage block of nothing but zeros is not usage** (issue #488), so the token fields and the
     ``cost`` read out of it are omitted rather than printed as zeros. That is the same honest-absence
@@ -1096,6 +1103,7 @@ def log_llm_call(
         # explicit `purpose` is a caller writing its own line and is never captured.
         captured.provider, captured.model, captured.seconds = provider, model, seconds
         captured.usage, captured.endpoint, captured.cost = usage, endpoint, cost
+        captured.cost_gap = cost_gap
         captured.residency = residency
         captured.finish_reason, captured.generation_id = finish_reason, generation_id
         captured.outcome, captured.category = outcome, slug(category)
@@ -1133,6 +1141,9 @@ def log_llm_call(
             **counts,
             cost=_money(cost),
             cost_basis=cost_basis(cost),
+            # Only on billed tokens with no cost: a figure that exists is never also reported
+            # missing, and a call that reported no usage has nothing a price was missing for.
+            cost_gap=cost_gap if counts and _money(cost) is None else None,
             outcome=outcome,
             category=slug(category),
             attempt=attempt,

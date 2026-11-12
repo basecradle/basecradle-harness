@@ -847,6 +847,7 @@ class Describer:
             # fields the same adapter's main line does (issue #759).
             usage=call.usage,
             cost=call.cost,
+            cost_gap=call.cost_gap,
             outcome=outcome,
             category=call.category if refused else None,
             attempt=None if refused else attempt,
