@@ -831,7 +831,8 @@ HELPER = "helper"
 #: - ``refused``: the vendor refused the content. That is its final word, and the call was billed.
 #: - ``fallback``: the vendor answered and the caller judged the answer unusable. This is a
 #:   non-brain caller only, with an answer slug in `ANSWER_REASONS`.
-#: - ``retrying``: the attempt failed and will be re-issued. Nothing was generated or billed.
+#: - ``retrying``: the attempt failed and will be re-issued. It returned no usage, so its line
+#:   carries no cost.
 #: - ``failed``: the attempt failed and nothing will re-issue it, so the call ended with no answer.
 OK = "ok"
 REFUSED = "refused"
@@ -1216,7 +1217,8 @@ def log_llm_retry(
     What it records is still the only trace that a wake waited: the final line carries
     ``outcome=ok`` and a ``duration=`` that silently includes the sleeps, so without this line a
     recovered rerank is indistinguishable from a fast one. It carries no tokens and no cost,
-    because the attempt generated nothing and was billed nothing.
+    because the attempt returned no usage to price (which is not a claim that the vendor billed
+    nothing: `docs/telemetry.md` → Outcomes).
 
     ``attempt`` arrives pre-rendered as ``"1/3"`` rather than as two numbers, because the *other*
     counter on this line is OpenRouter's own (``routing_attempt=``) and two attempt counters under
@@ -1986,9 +1988,9 @@ def read_answer(
     a malformed body) was written ``outcome=ok`` and then retried, which is one billed attempt saying
     two contradictory things. Reading first lets the one billed line say what happened: `answered`
     gives its fields, ``fallback reason=invalid_response`` for an unreadable answer. The harness's
-    decision (``retrying`` or ``failed``) follows on its own unbilled line. The error is returned,
-    stamped with the response's id (`generation_of`), for the adapter to raise once its lines are
-    written.
+    decision (``retrying`` or ``failed``) follows on its own line, which carries no cost. The error
+    is returned, stamped with the response's id (`generation_of`), for the adapter to raise once its
+    lines are written.
 
     **Any** exception a read raises is caught, not only `ProviderResponseError`: a vendor's body
     malformed in a shape the parser did not foresee (a null tool-call ``function``) raises whatever

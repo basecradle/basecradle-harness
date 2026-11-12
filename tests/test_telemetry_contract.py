@@ -1987,10 +1987,10 @@ def test_every_llm_line_carries_exactly_what_its_outcome_requires(rendered):
     assert seen == set(outcomes), f"no scenario renders {sorted(set(outcomes) - seen)}"
 
 
-def test_an_unreadable_answer_is_billed_once_and_the_give_up_bills_nothing(rendered):
+def test_an_unreadable_answer_is_billed_once_and_the_give_up_carries_no_cost(rendered):
     """One billed attempt, one billed line (issue #782 review): the answer could not be read, so
     its line is `fallback` with its tokens and its id, never `ok`; the engine's give-up follows as a
-    line of its own with nothing billed, naming the same generation."""
+    line of its own with no cost on it, naming the same generation."""
     billed, given_up = rendered.heads("unreadable_answer", "llm")
     assert (billed.fields["outcome"], billed.fields["reason"]) == ("fallback", "invalid_response")
     assert "tokens_in" in billed.fields and billed.fields["purpose"] == "main"

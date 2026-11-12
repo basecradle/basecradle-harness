@@ -482,7 +482,7 @@ def test_the_retry_line_moves_no_other_column(both_lines):
     assert not re.search(STAGE_LABEL, retried)
     assert not re.search(SOURCE_LABEL, retried)
     assert not re.search(WAKE_OUTCOME_GATE, retried)
-    assert "tokens_in=" not in retried and "cost=" not in retried  # nothing was billed
+    assert "tokens_in=" not in retried and "cost=" not in retried  # no usage to price
 
 
 def test_the_retry_line_is_a_warning_and_names_its_provider(both_lines):

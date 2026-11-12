@@ -1023,7 +1023,7 @@ def test_the_give_up_leaves_a_diagnosable_log_trail(caplog):
     assert final.startswith("llm provider=") and " purpose=main " in final
     assert " outcome=failed attempt=3/3 reason=invalid_response " in final
     assert " step=1/" in final  # where the wake died
-    assert "tokens_in=" not in final and "cost=" not in final  # nothing was billed
+    assert "tokens_in=" not in final and "cost=" not in final  # no usage to price
 
 
 class ServerErrorProvider:
